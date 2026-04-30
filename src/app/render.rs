@@ -1341,6 +1341,31 @@ impl App {
                             );
                     }
                 }
+
+                // Vertical scrollbar overlaid on the right edge of the agent
+                // pane whenever scrollback exists. We render unconditionally
+                // (including in alt-screen mode) because Claude Code/Codex
+                // keep meaningful chat history in scrollback even while
+                // using the alternate screen buffer; the suppression that
+                // applies to the small text badge would hide useful
+                // navigation feedback here.
+                {
+                    use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
+                    let total = self.snapshot_buf.scrollback_total as usize;
+                    let visible = term_area.height as usize;
+                    if total > 0 && visible > 0 && term_area.width >= 2 {
+                        // ratatui position is 0 at the top, content_length-1 at the bottom.
+                        // dux's offset is 0 when at the latest (bottom): position = total - offset.
+                        let offset = (self.snapshot_buf.scrollback_offset as usize).min(total);
+                        let position = total.saturating_sub(offset);
+                        let mut state = ScrollbarState::new(total + visible)
+                            .viewport_content_length(visible)
+                            .position(position);
+                        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                            .style(Style::default().fg(self.theme.scroll_indicator_fg))
+                            .render(term_area, frame.buffer_mut(), &mut state);
+                    }
+                }
             }
         }
 
