@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# claude-amq: launch Claude Code with AMQ co-op identity.
+#
+# Identity defaults to the git branch of CWD (= dux worktree name);
+# falls back to "claude-<pid>" when not in a git worktree.
+# Skips AMQ wrapping for oneshot (-p / --print) invocations.
+# Uses the global queue at $AMQ_GLOBAL_ROOT and never auto-creates .amqrc
+# in the worktree.
+#
+# Optional session-history seeding (OFF by default — see notes below):
+#   When CLAUDE_AMQ_SEED_FROM_PARENT=1 is set AND we're in a git worktree
+#   AND the worktree's Claude session dir is empty, copy the parent repo's
+#   session JSONLs into it so `--resume` (interactive picker) can browse
+#   past chats. Avoid combining with `--continue`: the latest parent
+#   session may carry a deferred-tool marker that --continue refuses.
+#   Pair with `resume_args = ["--resume"]` in dux config if enabling.
+set -euo pipefail
+
+for arg in "$@"; do
+  case "$arg" in
+    -p|--print|--bare) exec claude "$@" ;;
+  esac
+done
+
+seed_session_history() {
+  # On by default. Set CLAUDE_AMQ_NO_SEED=1 to skip.
+  [[ "${CLAUDE_AMQ_NO_SEED:-}" == "1" ]] && return 0
+
+  local git_dir git_common_dir main_worktree
+  git_dir=$(git -C "$PWD" rev-parse --absolute-git-dir 2>/dev/null) || return 0
+  git_common_dir=$(git -C "$PWD" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 0
+  [[ "$git_dir" == "$git_common_dir" ]] && return 0
+  main_worktree=$(git -C "$PWD" worktree list --porcelain 2>/dev/null \
+    | awk '/^worktree / {print $2; exit}')
+  [[ -z "$main_worktree" || "$main_worktree" == "$PWD" ]] && return 0
+
+  local enc_self enc_main self_dir main_dir
+  enc_self=$(echo "$PWD"           | sed 's|/|-|g; s|_|-|g')
+  enc_main=$(echo "$main_worktree" | sed 's|/|-|g; s|_|-|g')
+  self_dir="$HOME/.claude/projects/$enc_self"
+  main_dir="$HOME/.claude/projects/$enc_main"
+
+  [[ ! -d "$main_dir" ]] && return 0
+  if compgen -G "$self_dir/*.jsonl" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  mkdir -p "$self_dir"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a "$main_dir"/ "$self_dir"/ 2>/dev/null || true
+  else
+    cp -r "$main_dir"/. "$self_dir"/ 2>/dev/null || true
+  fi
+  local n
+  n=$(find "$self_dir" -name '*.jsonl' 2>/dev/null | wc -l)
+  echo "claude-amq: seeded $n past sessions from $main_worktree" >&2
+}
+seed_session_history || true
+
+ME="${AM_ME:-}"
+if [[ -z "$ME" ]]; then
+  ME=$(git -C "$PWD" branch --show-current 2>/dev/null || true)
+fi
+[[ -z "$ME" ]] && ME="claude-$$"
+# AMQ requires lowercase agent handles.
+ME=$(printf '%s' "$ME" | tr '[:upper:]' '[:lower:]' | sed 's|[^a-z0-9_-]|-|g; s|^-\+||; s|-\+$||')
+
+ROOT="${AMQ_GLOBAL_ROOT:-/data/state/amq}"
+
+# YOLO toggle: when CLAUDE_YOLO=1 is set in the env that launched dux,
+# every claude pane gets --dangerously-skip-permissions prepended. Unset to
+# return to normal permission-prompt mode.
+EXTRA=()
+if [[ "${CLAUDE_YOLO:-}" == "1" ]]; then
+  EXTRA+=(--dangerously-skip-permissions)
+fi
+
+exec amq coop exec --no-init --root "$ROOT" --me "$ME" claude -- "${EXTRA[@]}" "$@"

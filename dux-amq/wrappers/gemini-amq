@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# gemini-amq: launch Gemini CLI with AMQ co-op identity (worktree-scoped).
+# Skips AMQ wrapping for oneshot (-p / --print) invocations.
+# Uses the global queue at $AMQ_GLOBAL_ROOT.
+set -euo pipefail
+
+for arg in "$@"; do
+  case "$arg" in
+    -p|--print) exec gemini "$@" ;;
+  esac
+done
+
+ME="${AM_ME:-}"
+if [[ -z "$ME" ]]; then
+  ME=$(git -C "$PWD" branch --show-current 2>/dev/null || true)
+fi
+[[ -z "$ME" ]] && ME="gemini-$$"
+ME=$(printf '%s' "$ME" | tr '[:upper:]' '[:lower:]' | sed 's|[^a-z0-9_-]|-|g; s|^-\+||; s|-\+$||')
+
+ROOT="${AMQ_GLOBAL_ROOT:-/data/state/amq}"
+
+exec amq coop exec --no-init --root "$ROOT" --me "$ME" gemini -- "$@"

@@ -1,0 +1,11 @@
+// Add these entries to your VSCode User settings.json on the LOCAL machine
+// (not the remote VM). They free Ctrl-G in the terminal so dux's
+// exit_interactive keybind works under VSCode Remote-SSH.
+//
+// The "-" prefix tells VSCode to STOP intercepting that command.
+{
+  "terminal.integrated.commandsToSkipShell": [
+    "-workbench.action.gotoLine",
+    "-workbench.action.terminal.goToRecentDirectory"
+  ]
+}

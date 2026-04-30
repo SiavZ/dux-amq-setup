@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# codex-amq: launch Codex with AMQ co-op identity (worktree-scoped).
+# Skips AMQ for oneshot ("exec ...") invocations used by dux for commit messages.
+# Uses the global queue at $AMQ_GLOBAL_ROOT.
+set -euo pipefail
+
+if [[ "${1:-}" == "exec" ]]; then
+  exec codex "$@"
+fi
+
+ME="${AM_ME:-}"
+if [[ -z "$ME" ]]; then
+  ME=$(git -C "$PWD" branch --show-current 2>/dev/null || true)
+fi
+[[ -z "$ME" ]] && ME="codex-$$"
+ME=$(printf '%s' "$ME" | tr '[:upper:]' '[:lower:]' | sed 's|[^a-z0-9_-]|-|g; s|^-\+||; s|-\+$||')
+
+ROOT="${AMQ_GLOBAL_ROOT:-/data/state/amq}"
+
+exec amq coop exec --no-init --root "$ROOT" --me "$ME" codex -- --dangerously-bypass-approvals-and-sandbox "$@"
