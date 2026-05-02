@@ -74,6 +74,37 @@ if ! grep -q 'Multi-agent environment (AMQ + dux)' "$HOME/.claude/CLAUDE.md" 2>/
   cat "$HERE/config/claude-md-additions.md" >> "$HOME/.claude/CLAUDE.md"
 fi
 
+# 9. VSCode Remote-SSH machine settings (best-effort) ------------------------
+# Free Ctrl-G in the integrated terminal so dux's `exit_interactive` works.
+# Workbench-level settings like commandsToSkipShell are typically resolved
+# on the LOCAL machine, so this VM-side write may or may not propagate. We
+# do it anyway because it's harmless when ineffective and helpful otherwise.
+# The User-settings copy-paste printed below is the authoritative fix.
+configure_vscode_remote() {
+  local f="$HOME/.vscode-server/data/Machine/settings.json"
+  [[ -d "$(dirname "$f")" ]] || return 0
+  if ! command -v jq >/dev/null 2>&1; then
+    warn "jq not installed; skipping VM-side VSCode settings merge"
+    return 0
+  fi
+  local entries='["-workbench.action.gotoLine","-workbench.action.terminal.goToRecentDirectory"]'
+  if [[ ! -f "$f" ]]; then
+    printf '%s\n' "{
+  \"terminal.integrated.commandsToSkipShell\": $entries
+}" > "$f"
+    ok "wrote $f"
+    return 0
+  fi
+  jq --argjson new "$entries" '
+    .["terminal.integrated.commandsToSkipShell"] = (
+      ((.["terminal.integrated.commandsToSkipShell"] // []) + $new) | unique
+    )
+  ' "$f" > "$f.tmp" && mv "$f.tmp" "$f" \
+    && ok "merged Ctrl-G passthrough into $f" \
+    || warn "could not merge $f"
+}
+configure_vscode_remote
+
 ok "install complete"
 echo
 echo "Next steps:"
@@ -82,4 +113,20 @@ echo "  2. (optional) $STATE_ROOT/scripts/finalize-claude-migration.sh"
 echo "     # ONLY after closing every running 'claude' process"
 echo "  3. dux                            # launch"
 echo
-echo "VSCode users on Remote-SSH: see vscode/settings-additions.json"
+echo "─── VSCode Remote-SSH (Windows / macOS local) ───"
+echo "If Ctrl-G still opens VSCode's 'Go to Recent Directory' picker after"
+echo "restarting dux, the workbench setting must live on your LOCAL machine."
+echo "Open VSCode → Cmd/Ctrl+Shift+P → 'Preferences: Open User Settings (JSON)'"
+echo "and merge into the existing terminal.integrated.commandsToSkipShell"
+echo "array (or add the key if absent):"
+echo
+cat <<'JSON'
+    "terminal.integrated.commandsToSkipShell": [
+      "-workbench.action.gotoLine",
+      "-workbench.action.terminal.goToRecentDirectory"
+    ]
+JSON
+echo
+echo "Both entries are needed: the first frees Ctrl-G in editors, the"
+echo "second frees Ctrl-G inside the integrated terminal (which is the"
+echo "one that bites in dux)."
