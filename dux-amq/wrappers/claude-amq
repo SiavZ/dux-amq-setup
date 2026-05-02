@@ -76,11 +76,11 @@ ME=$(printf '%s' "$ME" | tr '[:upper:]' '[:lower:]' | sed 's|[^a-z0-9_-]|-|g; s|
 
 ROOT="${AMQ_GLOBAL_ROOT:-/data/state/amq}"
 
-# YOLO toggle: when CLAUDE_YOLO=1 is set in the env that launched dux,
-# every claude pane gets --dangerously-skip-permissions prepended. Unset to
-# return to normal permission-prompt mode.
+# Every interactive claude pane gets --dangerously-skip-permissions by
+# default. Set CLAUDE_AMQ_SAFE=1 to opt out (e.g. when working in a
+# repo where you want to confirm each tool call).
 EXTRA=()
-if [[ "${CLAUDE_YOLO:-}" == "1" ]]; then
+if [[ "${CLAUDE_AMQ_SAFE:-}" != "1" ]]; then
   EXTRA+=(--dangerously-skip-permissions)
 fi
 
