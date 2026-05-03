@@ -10,6 +10,7 @@
 //! external crates — there is no API stability guarantee.
 
 pub mod app;
+pub mod auto_resume;
 pub mod cli;
 pub mod clipboard;
 pub mod config;

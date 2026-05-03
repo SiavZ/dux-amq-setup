@@ -1094,6 +1094,17 @@ pub(crate) enum WorkerEvent {
     /// "add project" path. The synchronous `add_project` entry point was
     /// turned into a kickoff that resolves the metadata in a worker, so
     /// the UI thread never blocks waiting for git.
+    /// One auto-resume spawn job finished in a worker thread. The PTY
+    /// child process is already running; the UI thread inserts the
+    /// returned [`PtyClient`] into `self.providers` and updates the
+    /// session's status. Errors are logged and the session stays
+    /// detached. Bounded by `[auto_resume]` config (concurrency, stagger,
+    /// staleness filter) — see [`crate::auto_resume::run_scheduler`].
+    AutoResumeSpawned {
+        session_id: String,
+        used_resume_args: bool,
+        result: Result<PtyClient, String>,
+    },
     AddProjectMetaReady {
         path: PathBuf,
         name: String,
@@ -1461,41 +1472,130 @@ impl App {
 
     /// If `defaults.auto_resume_on_start` is enabled, eagerly reconnect every
     /// detached session so all panes are live as soon as dux opens. Skips
-    /// sessions whose worktree no longer exists. Failures are logged but
-    /// don't abort startup — a single bad session shouldn't stop the others.
+    /// sessions whose worktree no longer exists or whose worktree has not
+    /// been touched within `[auto_resume].stale_days` days. Spawns are
+    /// fanned out across worker threads with at most
+    /// `[auto_resume].concurrency` running in parallel and a
+    /// `[auto_resume].stagger_ms` gap between dispatches so we don't open
+    /// N provider TLS handshakes at once.
+    ///
+    /// Failures are logged but don't abort startup — a single bad session
+    /// shouldn't stop the others. Results land as
+    /// [`WorkerEvent::AutoResumeSpawned`] so the UI thread can install the
+    /// returned `PtyClient` into `self.providers` and update session
+    /// status.
     fn auto_resume_all_sessions(&mut self) {
         if !self.config.defaults.auto_resume_on_start {
             return;
         }
+        let stale_days = self.config.auto_resume.stale_days;
+        let mut skipped_stale = 0usize;
         let candidates: Vec<AgentSession> = self
             .sessions
             .iter()
             .filter(|s| Path::new(&s.worktree_path).exists())
             .filter(|s| !self.providers.contains_key(&s.id))
+            .filter(|s| {
+                let stale = crate::auto_resume::is_stale(Path::new(&s.worktree_path), stale_days);
+                if stale {
+                    skipped_stale += 1;
+                }
+                !stale
+            })
             .cloned()
             .collect();
         logger::info(&format!(
-            "auto_resume_on_start: spawning {} agent session(s)",
-            candidates.len()
+            "auto_resume_on_start: spawning {} agent session(s) (skipped {skipped_stale} stale, concurrency={}, stagger={}ms)",
+            candidates.len(),
+            self.config.auto_resume.concurrency,
+            self.config.auto_resume.stagger_ms,
         ));
-        for session in candidates {
-            let use_resume = self.should_resume_session(&session);
-            match self.spawn_pty_for_session(&session, use_resume) {
-                Ok(client) => {
-                    self.providers.insert(session.id.clone(), client);
-                    if use_resume {
-                        self.resume_fallback_candidates
-                            .insert(session.id.clone(), Instant::now());
-                    }
-                    self.mark_session_status(&session.id, SessionStatus::Active);
-                    self.mark_session_provider_started(&session.id);
+        if candidates.is_empty() {
+            return;
+        }
+
+        // Build (session, use_resume) pairs on the UI thread because
+        // `should_resume_session` reads `self.config.providers`. After
+        // this point the worker scheduler owns the data and emits one
+        // WorkerEvent::AutoResumeSpawned per job.
+        let jobs: Vec<(AgentSession, bool)> = candidates
+            .into_iter()
+            .map(|s| {
+                let use_resume = self.should_resume_session(&s);
+                (s, use_resume)
+            })
+            .collect();
+
+        let cfg_auto_resume = self.config.auto_resume.clone();
+        let cfg_full = self.config.clone();
+        let last_pty_size = if self.last_pty_size != (0, 0) {
+            self.last_pty_size
+        } else {
+            (24, 80)
+        };
+        let scrollback_lines = self.config.ui.agent_scrollback_lines;
+        let tx = self.worker_tx.clone();
+
+        thread::Builder::new()
+            .name("auto-resume-scheduler".into())
+            .spawn(move || {
+                crate::auto_resume::run_scheduler(
+                    jobs,
+                    &cfg_auto_resume,
+                    move |(session, use_resume)| {
+                        let result = sessions::spawn_pty_for_auto_resume(
+                            &cfg_full,
+                            &session,
+                            use_resume,
+                            last_pty_size,
+                            scrollback_lines,
+                        )
+                        .map_err(|e| format!("{e:#}"));
+                        let _ = tx.send(WorkerEvent::AutoResumeSpawned {
+                            session_id: session.id.clone(),
+                            used_resume_args: use_resume,
+                            result,
+                        });
+                    },
+                );
+            })
+            .ok();
+    }
+
+    /// Receive one [`WorkerEvent::AutoResumeSpawned`] result. Installs the
+    /// PTY client when the spawn succeeded; otherwise logs and leaves the
+    /// session detached.
+    pub(crate) fn handle_auto_resume_spawned(
+        &mut self,
+        session_id: String,
+        used_resume_args: bool,
+        result: Result<PtyClient, String>,
+    ) {
+        // If the user already reconnected this session manually while the
+        // background spawn was still in flight, drop the duplicate client
+        // rather than racing it into self.providers.
+        if self.providers.contains_key(&session_id) {
+            if result.is_ok() {
+                logger::info(&format!(
+                    "auto_resume_on_start: discarding duplicate spawn for {session_id} (already active)"
+                ));
+            }
+            return;
+        }
+        match result {
+            Ok(client) => {
+                self.providers.insert(session_id.clone(), client);
+                if used_resume_args {
+                    self.resume_fallback_candidates
+                        .insert(session_id.clone(), Instant::now());
                 }
-                Err(e) => {
-                    logger::info(&format!(
-                        "auto_resume_on_start: failed to spawn session {}: {e}",
-                        session.id
-                    ));
-                }
+                self.mark_session_status(&session_id, SessionStatus::Active);
+                self.mark_session_provider_started(&session_id);
+            }
+            Err(e) => {
+                logger::info(&format!(
+                    "auto_resume_on_start: failed to spawn session {session_id}: {e}"
+                ));
             }
         }
     }

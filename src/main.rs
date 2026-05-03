@@ -1,4 +1,5 @@
 mod app;
+mod auto_resume;
 mod cli;
 mod clipboard;
 mod config;

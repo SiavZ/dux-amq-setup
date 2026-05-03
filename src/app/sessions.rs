@@ -302,7 +302,45 @@ impl App {
         let cfg = provider_config(&self.config, &session.provider);
         cfg.supports_session_resume() && session.has_started_provider(&session.provider)
     }
+}
 
+/// Worker-thread variant of [`App::spawn_pty_for_session`].
+///
+/// Used by [`App::auto_resume_all_sessions`] so the bounded scheduler can
+/// run PTY spawns off the UI thread (each `PtyClient::spawn` is a
+/// fork+exec plus a TLS handshake when the provider boots — bounded by
+/// `[auto_resume]` config). Logs use the same format so log scraping
+/// keeps working.
+pub(crate) fn spawn_pty_for_auto_resume(
+    config: &Config,
+    session: &AgentSession,
+    resume: bool,
+    last_pty_size: (u16, u16),
+    scrollback_lines: usize,
+) -> Result<PtyClient> {
+    let cfg = provider_config(config, &session.provider);
+    let launch_args = cfg.interactive_args(resume);
+    let (rows, cols) = last_pty_size;
+    logger::debug(&format!(
+        "spawning PTY {:?} {:?} in {} ({}x{}, resume_supported={})",
+        cfg.command,
+        launch_args,
+        session.worktree_path,
+        cols,
+        rows,
+        cfg.supports_session_resume()
+    ));
+    PtyClient::spawn(
+        &cfg.command,
+        launch_args,
+        Path::new(&session.worktree_path),
+        rows,
+        cols,
+        scrollback_lines,
+    )
+}
+
+impl App {
     pub(crate) fn spawn_companion_terminal_for_session(
         &self,
         session: &AgentSession,

@@ -38,6 +38,7 @@ pub struct Config {
     pub keys: KeysConfig,
     pub macros: MacrosConfig,
     pub storage: StorageConfig,
+    pub auto_resume: AutoResumeConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -205,6 +206,56 @@ impl Default for StorageConfig {
     }
 }
 
+/// Tunables for `defaults.auto_resume_on_start`.
+///
+/// When auto-resume is enabled at startup, dux otherwise spawns a PTY for
+/// every persisted session in a tight loop. With many saved sessions that
+/// causes a fork-bomb / TLS-handshake stampede that some providers
+/// rate-limit, so spawns are bounded by [`Self::concurrency`], staggered by
+/// [`Self::stagger_ms`], and worktrees untouched for more than
+/// [`Self::stale_days`] days are skipped entirely.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoResumeConfig {
+    /// Maximum number of sessions whose PTY may be spawning in parallel.
+    /// Lower = slower startup but less API load. 0 is treated as 1.
+    /// Default 4.
+    #[serde(default = "default_auto_resume_concurrency")]
+    pub concurrency: usize,
+    /// Skip auto-resume for any session whose worktree directory has not
+    /// been modified within this many days. 0 disables the filter (all
+    /// sessions are eligible). Default 30.
+    #[serde(default = "default_auto_resume_stale_days")]
+    pub stale_days: u32,
+    /// Minimum delay (in milliseconds) between successive spawn attempts.
+    /// Smooths out the burst of TLS handshakes when many sessions resume.
+    /// Default 250.
+    #[serde(default = "default_auto_resume_stagger_ms")]
+    pub stagger_ms: u64,
+}
+
+fn default_auto_resume_concurrency() -> usize {
+    4
+}
+
+fn default_auto_resume_stale_days() -> u32 {
+    30
+}
+
+fn default_auto_resume_stagger_ms() -> u64 {
+    250
+}
+
+impl Default for AutoResumeConfig {
+    fn default() -> Self {
+        Self {
+            concurrency: default_auto_resume_concurrency(),
+            stale_days: default_auto_resume_stale_days(),
+            stagger_ms: default_auto_resume_stagger_ms(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
@@ -251,6 +302,7 @@ impl Default for Config {
             keys: KeysConfig::default(),
             macros: MacrosConfig::default(),
             storage: StorageConfig::default(),
+            auto_resume: AutoResumeConfig::default(),
         }
     }
 }
@@ -581,6 +633,7 @@ enum FieldValue {
     OptStr(Option<String>),
     U16(u16),
     U32(u32),
+    U64(u64),
     Usize(usize),
     Bool(bool),
     MultilineStr(Option<String>),
@@ -798,6 +851,35 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             value_fn: |c| FieldValue::U32(c.storage.backup_interval_minutes),
         },
         ConfigEntry::Blank,
+        ConfigEntry::Section("auto_resume"),
+        ConfigEntry::Field {
+            key: "concurrency",
+            comment: Some(CommentSource::Static(
+                "# Maximum number of sessions whose PTY may be spawning in parallel\n\
+                 # when defaults.auto_resume_on_start = true. Lower = slower startup\n\
+                 # but less load on provider APIs. 0 is treated as 1. Default 4.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.auto_resume.concurrency),
+        },
+        ConfigEntry::Field {
+            key: "stale_days",
+            comment: Some(CommentSource::Static(
+                "# Skip auto-resume for any session whose worktree directory has not\n\
+                 # been modified within this many days. 0 disables the filter and\n\
+                 # every persisted session is eligible. Default 30.",
+            )),
+            value_fn: |c| FieldValue::U32(c.auto_resume.stale_days),
+        },
+        ConfigEntry::Field {
+            key: "stagger_ms",
+            comment: Some(CommentSource::Static(
+                "# Minimum delay (milliseconds) between successive spawn attempts.\n\
+                 # Smooths out the burst of provider TLS handshakes when many\n\
+                 # sessions resume at once. Default 250.",
+            )),
+            value_fn: |c| FieldValue::U64(c.auto_resume.stagger_ms),
+        },
+        ConfigEntry::Blank,
         ConfigEntry::Keys,
         ConfigEntry::Blank,
         ConfigEntry::Macros,
@@ -845,6 +927,9 @@ fn render_config(config: &Config, bindings: &crate::keybindings::RuntimeBindings
                         let _ = writeln!(out, "{key} = {n}");
                     }
                     FieldValue::U32(n) => {
+                        let _ = writeln!(out, "{key} = {n}");
+                    }
+                    FieldValue::U64(n) => {
                         let _ = writeln!(out, "{key} = {n}");
                     }
                     FieldValue::Usize(n) => {

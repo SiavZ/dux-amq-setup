@@ -474,6 +474,13 @@ impl App {
                         Err(err) => self.set_error(format!("Commit failed: {err}")),
                     }
                 }
+                WorkerEvent::AutoResumeSpawned {
+                    session_id,
+                    used_resume_args,
+                    result,
+                } => {
+                    self.handle_auto_resume_spawned(session_id, used_resume_args, result);
+                }
                 WorkerEvent::AddProjectMetaReady { path, name, result } => {
                     self.add_project_in_flight = false;
                     match result {
