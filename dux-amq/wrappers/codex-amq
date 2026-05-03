@@ -2,6 +2,12 @@
 # codex-amq: launch Codex with AMQ co-op identity (worktree-scoped).
 # Skips AMQ for oneshot ("exec ...") invocations used by dux for commit messages.
 # Uses the global queue at $AMQ_GLOBAL_ROOT.
+#
+# By default Codex is launched with --dangerously-bypass-approvals-and-sandbox
+# (parity with claude-amq's --dangerously-skip-permissions default). Set
+# CODEX_AMQ_SAFE=1 in the per-pane environment to launch Codex without the
+# bypass flag, which restores normal per-tool approval prompts. See
+# README.md "Security model" for the full threat model.
 set -euo pipefail
 
 if [[ "${1:-}" == "exec" ]]; then
@@ -32,4 +38,15 @@ ROOT="${AMQ_GLOBAL_ROOT:-/data/state/amq}"
 # Stdin must be /dev/tty (see claude-amq for full explanation).
 amq wake --me "$ME" --root "$ROOT" --inject-mode raw </dev/tty >/dev/null 2>&1 &
 
-exec amq coop exec --no-wake --no-init --root "$ROOT" --me "$ME" codex -- --dangerously-bypass-approvals-and-sandbox "$@"
+# Default-on Codex bypass mirrors claude-amq's --dangerously-skip-permissions
+# default. Opt out per-pane with CODEX_AMQ_SAFE=1.
+CODEX_EXTRA=()
+if [[ "${CODEX_AMQ_SAFE:-}" != "1" ]]; then
+  CODEX_EXTRA+=(--dangerously-bypass-approvals-and-sandbox)
+fi
+
+# Allow tests to source this file (and inspect CODEX_EXTRA) without
+# launching codex.
+(return 0 2>/dev/null) && return 0
+
+exec amq coop exec --no-wake --no-init --root "$ROOT" --me "$ME" codex -- "${CODEX_EXTRA[@]}" "$@"
