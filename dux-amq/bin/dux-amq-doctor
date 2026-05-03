@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# dux-amq-doctor — triage tool for the dux+AMQ overlay (audit01 Phase 16, P2-11).
+#
+# Prints the facts a support session needs, in plain human-readable form.
+# Pass `--json` for a machine-readable summary suitable for paste-into-bug-report.
+#
+# Sections (text mode):
+#   - Versions (overlay, dux, amq)
+#   - Kernel & TIOCSTI sysctl
+#   - Persistent disk free space + per-subdir usage
+#   - Symlinks: ~/.claude, ~/.agents
+#   - AMQ: who/list, queue depth per mailbox
+#   - Skills CLI status
+#   - Running provider PIDs and the dux session each belongs to (best-effort)
+
+set -euo pipefail
+
+STATE_ROOT="${STATE_ROOT:-/data/state}"
+AMQ_ROOT="${AMQ_GLOBAL_ROOT:-${STATE_ROOT}/amq}"
+JSON_MODE=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json) JSON_MODE=1; shift ;;
+    -h|--help)
+      sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *) echo "Unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+# ---- helpers -------------------------------------------------------------
+
+section() {
+  if (( JSON_MODE )); then return 0; fi
+  printf '\n\033[1;34m== %s ==\033[0m\n' "$*"
+}
+
+kv() {
+  if (( JSON_MODE )); then return 0; fi
+  printf '  %-22s %s\n' "$1:" "$2"
+}
+
+best_effort() {
+  # Run a command; on failure print a short hyphenated marker.
+  local out
+  if out="$("$@" 2>&1)"; then
+    printf '%s\n' "$out"
+  else
+    printf -- '-- (%s exited %d)\n' "$1" "$?"
+  fi
+}
+
+# ---- data gathering ------------------------------------------------------
+
+# Overlay version: dux-amq/VERSION may not exist yet (Phase 12 will ship it).
+overlay_version="(unset)"
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$HERE/../VERSION" ]]; then
+  overlay_version="$(<"$HERE/../VERSION")"
+elif [[ -f "$STATE_ROOT/dux-amq/VERSION" ]]; then
+  overlay_version="$(<"$STATE_ROOT/dux-amq/VERSION")"
+fi
+
+dux_version="$(dux --version 2>&1 | head -1 || echo '(dux not on PATH)')"
+amq_version="$(amq --version 2>&1 | head -1 || echo '(amq not on PATH)')"
+
+kernel_release="$(uname -r)"
+tiocsti_value="(sysctl absent — pre-6.2 kernel)"
+if [[ -r /proc/sys/dev/tty/legacy_tiocsti ]]; then
+  tiocsti_value="$(<"/proc/sys/dev/tty/legacy_tiocsti")"
+fi
+
+# Persistent disk
+if [[ -d "$STATE_ROOT" ]]; then
+  disk_summary="$(df -h "$STATE_ROOT" | awk 'NR==2 {printf "%s used / %s total (%s)", $3, $2, $5}')"
+else
+  disk_summary="(STATE_ROOT $STATE_ROOT does not exist)"
+fi
+
+# Symlinks
+claude_link="(missing)"
+agents_link="(missing)"
+if [[ -L "$HOME/.claude" ]]; then
+  claude_link="$(readlink "$HOME/.claude")"
+elif [[ -d "$HOME/.claude" ]]; then
+  claude_link="(directory, not symlinked — run finalize-claude-migration.sh)"
+fi
+if [[ -L "$HOME/.agents" ]]; then
+  agents_link="$(readlink "$HOME/.agents")"
+elif [[ -d "$HOME/.agents" ]]; then
+  agents_link="(directory, not symlinked)"
+fi
+
+# AMQ: who + queue depth
+amq_who="(amq not configured)"
+if command -v amq >/dev/null 2>&1; then
+  amq_who="$(amq who 2>&1 | head -20)"
+fi
+
+# Queue depth: count files in $AMQ_ROOT/agents/<handle>/{new,cur}.
+queue_depths=""
+if [[ -d "$AMQ_ROOT/agents" ]]; then
+  while IFS= read -r -d '' agent_dir; do
+    handle="$(basename "$agent_dir")"
+    new_count=0; cur_count=0
+    [[ -d "$agent_dir/new" ]] && new_count=$(find "$agent_dir/new" -maxdepth 1 -type f 2>/dev/null | wc -l)
+    [[ -d "$agent_dir/cur" ]] && cur_count=$(find "$agent_dir/cur" -maxdepth 1 -type f 2>/dev/null | wc -l)
+    queue_depths+="$handle: new=$new_count cur=$cur_count"$'\n'
+  done < <(find "$AMQ_ROOT/agents" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+fi
+queue_depths="${queue_depths%$'\n'}"
+[[ -z "$queue_depths" ]] && queue_depths="(no mailboxes under $AMQ_ROOT/agents)"
+
+# Skills CLI: best-effort.
+skills_status="(npx not on PATH)"
+if command -v npx >/dev/null 2>&1; then
+  # 5s timeout — npx can hit the network and stall.
+  if command -v timeout >/dev/null 2>&1; then
+    skills_status="$(timeout 5 npx skills list 2>&1 | head -20 || echo '(npx skills list timed out or failed)')"
+  else
+    skills_status="$(npx skills list 2>&1 | head -20 || echo '(npx skills list failed)')"
+  fi
+fi
+
+# Running provider PIDs (claude, codex, gemini wrappers) and their dux session.
+# dux uses tmux; on this stack the tmux pane title encodes the session+pane
+# name. Map a PID up to the controlling tmux pane via /proc/<pid>/environ
+# (TMUX, TMUX_PANE) and `tmux display-message`. Fail soft.
+providers=""
+while read -r pid comm; do
+  [[ -n "$pid" ]] || continue
+  cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | head -c 200)"
+  tmux_pane=""
+  if [[ -r "/proc/$pid/environ" ]]; then
+    tmux_pane="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | awk -F= '$1=="TMUX_PANE"{print $2; exit}')"
+  fi
+  session_name="(no tmux pane)"
+  if [[ -n "$tmux_pane" ]] && command -v tmux >/dev/null 2>&1; then
+    session_name="$(tmux display-message -p -t "$tmux_pane" '#S:#W' 2>/dev/null || echo '(tmux display-message failed)')"
+  fi
+  providers+="pid=$pid comm=$comm session=$session_name cmdline=${cmdline:0:80}"$'\n'
+done < <(pgrep -af '(^|/)(claude|codex|gemini)(-amq)?( |$)' 2>/dev/null | awk '{print $1, $2}')
+providers="${providers%$'\n'}"
+[[ -z "$providers" ]] && providers="(no claude/codex/gemini processes running)"
+
+# ---- output --------------------------------------------------------------
+
+if (( JSON_MODE )); then
+  if ! command -v jq >/dev/null 2>&1; then
+    echo '{"error":"jq not on PATH; cannot emit --json"}'
+    exit 3
+  fi
+  jq -n \
+    --arg overlay     "$overlay_version" \
+    --arg dux         "$dux_version" \
+    --arg amq         "$amq_version" \
+    --arg kernel      "$kernel_release" \
+    --arg tiocsti     "$tiocsti_value" \
+    --arg disk        "$disk_summary" \
+    --arg state_root  "$STATE_ROOT" \
+    --arg amq_root    "$AMQ_ROOT" \
+    --arg claude_link "$claude_link" \
+    --arg agents_link "$agents_link" \
+    --arg amq_who     "$amq_who" \
+    --arg queues      "$queue_depths" \
+    --arg skills      "$skills_status" \
+    --arg providers   "$providers" \
+    '{
+      overlay: $overlay,
+      dux: $dux,
+      amq: $amq,
+      kernel: $kernel,
+      tiocsti: $tiocsti,
+      disk: $disk,
+      state_root: $state_root,
+      amq_root: $amq_root,
+      symlinks: {claude: $claude_link, agents: $agents_link},
+      amq_who: $amq_who,
+      queues: $queues,
+      skills: $skills,
+      providers: $providers
+    }'
+  exit 0
+fi
+
+# Text mode.
+section "Versions"
+kv "overlay"  "$overlay_version"
+kv "dux"      "$dux_version"
+kv "amq"      "$amq_version"
+
+section "Kernel"
+kv "release"               "$kernel_release"
+kv "legacy_tiocsti sysctl" "$tiocsti_value"
+
+section "Persistent disk"
+kv "STATE_ROOT" "$STATE_ROOT"
+kv "df -h"      "$disk_summary"
+if [[ -d "$STATE_ROOT" ]] && command -v du >/dev/null 2>&1; then
+  echo "  per-subdir:"
+  du -sh "$STATE_ROOT"/*/ 2>/dev/null | sed 's/^/    /' | head -20
+fi
+
+section "Symlinks"
+# shellcheck disable=SC2088 # display-only label, not a path expansion
+kv "~/.claude"  "$claude_link"
+# shellcheck disable=SC2088
+kv "~/.agents"  "$agents_link"
+
+section "AMQ"
+kv "AMQ_ROOT" "$AMQ_ROOT"
+echo "  amq who:"
+printf '%s\n' "$amq_who" | sed 's/^/    /'
+echo "  queue depths:"
+printf '%s\n' "$queue_depths" | sed 's/^/    /'
+
+section "Skills"
+printf '%s\n' "$skills_status" | sed 's/^/    /'
+
+section "Providers"
+printf '%s\n' "$providers" | sed 's/^/    /'
+
+echo
+echo "(paste \`dux-amq-doctor --json\` into a bug report for a copy-pastable summary)"
