@@ -66,11 +66,11 @@ of P2-3 — the patches had no Rust tests).
 - `cargo clippy --all-targets -- -D warnings` clean.
 
 ## Acceptance criteria
-- [ ] `ScrollbarState::new(total).position(position)` form replaces `+ visible`.
-- [ ] `viewport_content_length` no longer called.
-- [ ] `position = total - offset - 1` (saturating).
-- [ ] Snapshot tests cover offset=0, offset=total-1, small-content.
-- [ ] `patches/0003-…` regenerated; applies cleanly to upstream/main.
+- [x] `ScrollbarState::new(total).position(position)` form replaces `+ visible`.
+- [x] `viewport_content_length` no longer called.
+- [x] `position = total - offset - 1` (saturating).
+- [x] Snapshot tests cover offset=0 (thumb at bottom), offset=total-1 (thumb at top), middle, and content_length=0 short-circuit. Verified against the pinned `ratatui-widgets-0.3.0` source under `~/.cargo/registry/.../ratatui-widgets-0.3.0/src/scrollbar.rs::part_lengths` rather than docs.rs.
+- [ ] `patches/0003-…` regenerated; applies cleanly to upstream/main. *(Track C scope is Rust only — `patches/` regeneration belongs to the wrapper-chain track and is deferred.)*
 
 ## References
 - Audit P1-4, P2-3.

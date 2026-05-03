@@ -1354,13 +1354,28 @@ impl App {
                     let total = self.snapshot_buf.scrollback_total;
                     let visible = term_area.height as usize;
                     if total > 0 && visible > 0 && term_area.width >= 2 {
-                        // ratatui position is 0 at the top, content_length-1 at the bottom.
-                        // dux's offset is 0 when at the latest (bottom): position = total - offset.
+                        // ratatui's `ScrollbarState` clamps `position` to
+                        // `[0, content_length - 1]` and computes the thumb
+                        // span as `position * track_len /
+                        // (content_length - 1 + viewport_len)` (see
+                        // ratatui-widgets-0.3.0 `scrollbar::part_lengths`).
+                        // Earlier this code passed `total + visible` as
+                        // `content_length` *and* called
+                        // `viewport_content_length(visible)`, which inflated
+                        // the denominator by another `visible` so the thumb
+                        // could never reach the bottom of the track.
+                        //
+                        // Use the documented-clean form: `content_length =
+                        // total`, no `viewport_content_length`, and let
+                        // ratatui derive the viewport from the area height.
+                        //
+                        // dux's `scrollback_offset` is 0 when the latest
+                        // line is at the bottom and grows as the user pages
+                        // back; ratatui's position is 0 at the top. Map
+                        // them: position = total - offset - 1 (saturating).
                         let offset = self.snapshot_buf.scrollback_offset.min(total);
-                        let position = total.saturating_sub(offset);
-                        let mut state = ScrollbarState::new(total + visible)
-                            .viewport_content_length(visible)
-                            .position(position);
+                        let position = total.saturating_sub(offset).saturating_sub(1);
+                        let mut state = ScrollbarState::new(total).position(position);
                         Scrollbar::new(ScrollbarOrientation::VerticalRight)
                             .style(Style::default().fg(self.theme.scroll_indicator_fg))
                             .render(term_area, frame.buffer_mut(), &mut state);
