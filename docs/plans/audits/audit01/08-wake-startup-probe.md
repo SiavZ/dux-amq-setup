@@ -60,11 +60,12 @@ silently never delivers AMQ messages on the receive side.
 - `tail -f ~/.local/share/dux-amq/wake-<me>.log` shows real activity, not silenced.
 
 ## Acceptance criteria
-- [ ] No `>/dev/null 2>&1` on `amq wake` anywhere.
-- [ ] Failed startup → red banner pointing at log file.
-- [ ] `kill -0` probe in the launcher; sleep tunable via env.
-- [ ] Log rotates at 5 MiB.
-- [ ] bats covers both paths.
+- [x] No `>/dev/null 2>&1` on `amq wake` anywhere — wake stdout/stderr now appended to `~/.local/share/dux-amq/wake-<me>.log` (`tests/wake_probe.bats` case 5 enforces this statically).
+- [x] Failed startup → red banner pointing at log file (`! amq wake failed to start; see <logfile>` plus tail of last 5 log lines).
+- [x] `kill -0` probe in the launcher; sleep tunable via `DUX_AMQ_WAKE_PROBE_SECS` (default 0.2 s).
+- [x] Log rotates at 5 MiB (size > 5 MiB → `mv -f $logfile $logfile.1`); tested in `wake_probe.bats` case 4.
+- [x] bats covers failure path, success path, STRICT mode, log rotation, and static no-`>/dev/null` assertion (5 cases total).
+- [x] Soft-fail by default (a wake glitch should not block claude); `DUX_AMQ_WAKE_STRICT=1` flips to hard-fail. Wrappers chain `wake_launch ... || warn "continuing without wake"`.
 
 ## References
 - Audit P1-2.

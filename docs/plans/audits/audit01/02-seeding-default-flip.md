@@ -64,11 +64,11 @@ cross-worktree info leak.
 - `grep -nR CLAUDE_AMQ_NO_SEED dux-amq/` empty.
 
 ## Acceptance criteria
-- [ ] Only the `CLAUDE_AMQ_SEED_FROM_PARENT=1` opt-in path remains.
-- [ ] No `CLAUDE_AMQ_NO_SEED` reference anywhere.
-- [ ] README "Trade-offs" matches new default + migration steps.
-- [ ] bats covers default-off and explicit-opt-in.
-- [ ] Sourcing the wrapper does not exec claude.
+- [x] Only the `CLAUDE_AMQ_SEED_FROM_PARENT=1` opt-in path remains.
+- [x] No `CLAUDE_AMQ_NO_SEED` reference in wrapper/config/scripts/install.sh. (README's "Migrating from earlier versions" bullet intentionally names the old var so upgraders see the hint.)
+- [x] README "Trade-offs" matches new default + migration steps.
+- [x] bats covers default-off and explicit-opt-in (`tests/seed_default_off.bats`, 4 cases).
+- [x] Sourcing the wrapper does not exec claude (`(return 0 …) && return 0` guard before `seed_session_history || true`).
 
 ## References
 - Audit P0-3 (recommendation lines 56–62).

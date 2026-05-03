@@ -32,4 +32,8 @@ _amq_shell_setup_guarded() {
 _amq_shell_setup_guarded
 # Optional YOLO toggle for dux panes:
 # export CLAUDE_YOLO=1
+#
+# Per-pane safe-mode opt-outs (defaults are bypass-all; see README "Security model"):
+#   export CLAUDE_AMQ_SAFE=1   # claude-amq: drop --dangerously-skip-permissions
+#   export CODEX_AMQ_SAFE=1    # codex-amq:  drop --dangerously-bypass-approvals-and-sandbox
 # <<< dux-amq vREPLACE_AT_INSTALL <<<
