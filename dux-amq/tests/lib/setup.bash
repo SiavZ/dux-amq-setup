@@ -26,7 +26,10 @@ setup_isolated_home() {
   TEST_HOME="$(mktemp -d -t dux-amq-test.XXXXXX)"
   export TEST_HOME
   export HOME="$TEST_HOME"
-  export PATH="$BATS_TEST_DIRNAME/fakes:$PATH"
+  # Phase 12: prepend `dux-amq/scripts` so `encode-claude-project-dir`
+  # is findable by wrappers under test, mirroring the post-install
+  # state where install.sh has placed it on $LOCAL_BIN.
+  export PATH="$BATS_TEST_DIRNAME/fakes:$BATS_TEST_DIRNAME/../scripts:$PATH"
 }
 
 # Remove the throwaway $HOME. Safe to call when setup_isolated_home was

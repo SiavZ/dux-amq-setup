@@ -100,7 +100,12 @@ strip_block() {
 # branches discover them later (with confusing errors). `jq` was a soft dep at
 # the VSCode-settings step; promote to required so we can drop the non-portable
 # `grep -oP` PCRE scrape entirely.
-for _tool in curl jq sha256sum tar install git rsync awk sed; do
+# `realpath` (GNU coreutils) is required by the wrappers' is_dux_worktree
+# helper for canonicalised path-segment containment (audit01 P0-5).
+# `--` is a GNU coreutils-only option, so a stock BSD `realpath` from
+# macOS will fail at wrapper time even if the binary exists. Linux
+# coreutils > 8.x is fine.
+for _tool in curl jq sha256sum tar install git rsync awk sed realpath; do
   command -v "$_tool" >/dev/null 2>&1 || {
     warn "missing required tool: $_tool (Debian/Ubuntu: apt-get install -y curl jq tar coreutils git rsync gawk sed)"
     exit 1
@@ -188,6 +193,10 @@ say "installing wrappers to $LOCAL_BIN"
 install -m 0755 "$HERE/wrappers/claude-amq"  "$LOCAL_BIN/claude-amq"
 install -m 0755 "$HERE/wrappers/codex-amq"   "$LOCAL_BIN/codex-amq"
 install -m 0755 "$HERE/wrappers/gemini-amq"  "$LOCAL_BIN/gemini-amq"
+# The encoder is the single source of truth for Claude Code's on-disk
+# project-dir naming (audit01 P0-5, audit02 Phase 12). It must be on
+# $PATH so claude-amq's seed step (and Phase 10's purge job) can find it.
+install -m 0755 "$HERE/scripts/encode-claude-project-dir" "$LOCAL_BIN/encode-claude-project-dir"
 install -m 0755 "$HERE/scripts/finalize-claude-migration.sh" "$STATE_ROOT/scripts/finalize-claude-migration.sh"
 
 # 6. dux config --------------------------------------------------------------
