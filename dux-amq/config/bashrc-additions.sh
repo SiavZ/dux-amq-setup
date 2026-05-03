@@ -1,12 +1,35 @@
+# shellcheck shell=bash
 # Append these to ~/.bashrc to wire dux + AMQ into your shell.
+# install.sh substitutes REPLACE_AT_INSTALL with the overlay version
+# (audit01 Phase 12) before appending; the >>>/<<< markers are then used
+# by strip_block() to delete-and-rewrite on every re-install, so version
+# bumps actually propagate.
 
-# === dux + AMQ ===
-export DUX_HOME="/data/state/dux"
-export AMQ_GLOBAL_ROOT="/data/state/amq"
-# Co-op aliases (amc=claude, amx=codex) for ad-hoc shell use outside dux.
-if command -v amq >/dev/null 2>&1; then
-  eval "$(amq shell-setup)"
-fi
+# >>> dux-amq vREPLACE_AT_INSTALL >>>
+export DUX_HOME="${DUX_HOME:-/data/state/dux}"
+export AMQ_GLOBAL_ROOT="${AMQ_GLOBAL_ROOT:-/data/state/amq}"
+# Audit01 P1-8: pinned amq binary path + recorded sha256. The guard below
+# refuses to `eval` shell-setup output if the on-disk binary no longer
+# matches the install-time hash — `eval` runs every interactive shell, so
+# this is a meaningful trust narrowing even though we already pin at
+# install time.
+export AMQ_BIN="${AMQ_BIN:-/data/state/amq-bin/amq}"
+_amq_shell_setup_guarded() {
+  local rec="${AMQ_GLOBAL_ROOT:-/data/state/amq}/binary.sha256"
+  # Silently no-op if the pinned install hasn't run yet.
+  [[ -x "$AMQ_BIN" && -f "$rec" ]] || return 0
+  local exp act
+  exp=$(awk '{print $1}' "$rec")
+  act=$(sha256sum "$AMQ_BIN" 2>/dev/null | awk '{print $1}')
+  if [[ -z "$act" || "$exp" != "$act" ]]; then
+    printf '\033[1;31m!\033[0m amq binary hash mismatch (got %s, expected %s); shell-setup skipped\n' \
+      "${act:-<unreadable>}" "$exp" >&2
+    return 1
+  fi
+  # Hash matches — safe to eval.
+  eval "$("$AMQ_BIN" shell-setup)"
+}
+_amq_shell_setup_guarded
 # Optional YOLO toggle for dux panes:
 # export CLAUDE_YOLO=1
-# === end dux + AMQ ===
+# <<< dux-amq vREPLACE_AT_INSTALL <<<
