@@ -131,16 +131,42 @@ concurrency:
 - `shellcheck -V` ≥ 0.9; running it locally on the new file list passes.
 
 ## Acceptance criteria
-- [ ] All `uses: foo/bar@v...` lines in release/pr/test workflows pinned
+- [x] All `uses: foo/bar@v...` lines in release/pr/test workflows pinned
       to commit SHA with `# vX.Y.Z` comment.
-- [ ] `rust-toolchain.toml` at repo root.
-- [ ] `release.yml` has no workflow-level `permissions:`; each job sets its own.
-- [ ] `pr.yml` and `test.yml` have `permissions: { contents: read }`.
-- [ ] `Swatinem/rust-cache` has `save-if` + `cache-on-failure: false`.
-- [ ] `overlay-ci.yml` shellcheck covers the top-level install.sh and
+- [x] `rust-toolchain.toml` at repo root.
+- [x] `release.yml` has no workflow-level `permissions:`; each job sets its own.
+- [x] `pr.yml` and `test.yml` have `permissions: { contents: read }`.
+- [x] `Swatinem/rust-cache` has `save-if` + `cache-on-failure: false`.
+- [x] `overlay-ci.yml` shellcheck covers the top-level install.sh and
       bashrc-additions.sh.
-- [ ] `release.yml` has `concurrency:` block.
-- [ ] PR: `ci(security): pin actions by SHA, tighten permissions (P0-H, P1-N/O/R/T)`.
+- [x] `release.yml` has `concurrency:` block.
+- [x] PR: `ci(security): pin actions by SHA, tighten permissions (P0-H, P1-N/O/R/T)`.
+
+## Resolved SHAs (audit02 Phase 06)
+
+| Action                     | Tag    | Commit SHA                                 |
+|----------------------------|--------|--------------------------------------------|
+| `actions/checkout`         | v4.2.2 | `11bd71901bbe5b1630ceea73d27597364c9af683` |
+| `dtolnay/rust-toolchain`   | v1     | `e97e2d8cc328f1b50210efc529dca0028893a2d9` |
+| `Swatinem/rust-cache`      | v2.7.5 | `82a92a6e8fbeee089604da2575dc567ae9ddeaab` |
+
+Resolved via `gh api repos/<owner>/<repo>/git/refs/tags/<tag>` (then
+`gh api repos/.../git/tags/<sha>` to dereference annotated tag objects
+to their underlying commits). `pinact`/`go` were not available on the
+verification VM, so the equivalent hand-pin path from Step 6.1 was
+used. `dtolnay/rust-toolchain` ships only a `v1` floating tag (no
+semver tags), and the SHA-pinned commit is paired with
+`rust-toolchain.toml` so the channel is fully deterministic.
+
+`rust-toolchain.toml` channel: `1.85.0` (Rust 2024 edition minimum;
+matches `edition = "2024"` in `Cargo.toml`).
+
+Verification:
+- `make overlay-test` — shellcheck across `install.sh`,
+  `dux-amq/install.sh`, `dux-amq/wrappers/*`, `dux-amq/scripts/*.sh`,
+  `dux-amq/config/bashrc-additions.sh` (all pass) + bats 3/3 ok.
+- `python3 -c 'import yaml; [yaml.safe_load(open(f)) for f in (...)]'`
+  parses all four workflow files cleanly.
 
 ## Known pitfalls
 - `pinact` may rewrite `# Comment` lines next to `uses:` — review and

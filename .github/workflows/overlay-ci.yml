@@ -25,8 +25,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y shellcheck bats jq
 
+      # audit02 P1-T — also lint the top-level installer and the
+      # bashrc-additions snippet (the file with the runtime `eval`).
       - name: shellcheck overlay scripts
-        run: shellcheck dux-amq/install.sh dux-amq/wrappers/* dux-amq/scripts/*.sh
+        run: |
+          shellcheck \
+            install.sh \
+            dux-amq/install.sh \
+            dux-amq/wrappers/* \
+            dux-amq/scripts/*.sh \
+            dux-amq/config/bashrc-additions.sh
 
       - name: bats overlay tests
         run: bats dux-amq/tests
