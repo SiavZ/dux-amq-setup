@@ -2,3 +2,7 @@
 flamegraph.svg
 perf.data
 perf.data.old
+# Audit01 Phase 15 — release artifacts (built by scripts/release-overlay.sh
+# and the release-overlay.yml workflow). Reproducible from any tagged
+# commit, so there's no value in committing them.
+/dist
