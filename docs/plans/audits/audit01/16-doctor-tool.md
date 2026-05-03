@@ -73,11 +73,11 @@ reproducing a user's environment over Slack takes hours.
 - Hash-mismatch branch fires when AMQ binary is corrupted.
 
 ## Acceptance criteria
-- [ ] `dux-amq-doctor` installed to `~/.local/bin/`.
-- [ ] Outputs versions, kernel, tiocsti, disk usage, symlinks, AMQ state, hash check, skills.
-- [ ] `--json` parses cleanly.
-- [ ] Hash-mismatch branch test passes.
-- [ ] README "Troubleshooting" section points at it.
+- [ ] `dux-amq-doctor` installed to `~/.local/bin/`. — script ships at `dux-amq/bin/dux-amq-doctor`; install.sh wiring deferred (Track D guardrail: no install.sh edits).
+- [x] Outputs versions, kernel, tiocsti, disk usage, symlinks, AMQ state, hash check, skills. — verified on this VM (kernel 6.1, AMQ 0.34.0, ~/.claude → /data/state/claude). Hash-check is conditional on Phase 13's `binary.sha256` (not yet shipped) — doctor reads it when present.
+- [x] `--json` parses cleanly. — `dux-amq-doctor --json | jq .` round-trips.
+- [ ] Hash-mismatch branch test passes. — depends on Phase 13's sha256 file.
+- [ ] README "Troubleshooting" section points at it. — deferred to Phase 17 release-gate (out of Track D scope).
 
 ## References
 - Audit P2-11.

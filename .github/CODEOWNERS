@@ -1,0 +1,17 @@
+# Audit01 Phase 06 (P1-5): owner-gated paths.
+#
+# These four Rust files carry our downstream patches. CODEOWNERS forces a
+# review from the listed owner before merge; the upstream-sync workflow
+# opens its weekly PR as a draft so this gate fires reliably.
+#
+# `dux-amq/` and `patches/` are also owner-gated because they encode the
+# overlay's behavior and the patch extraction baseline respectively.
+
+src/clipboard.rs   @SiavZ
+src/app/mod.rs     @SiavZ
+src/app/render.rs  @SiavZ
+src/config.rs      @SiavZ
+
+dux-amq/           @SiavZ
+patches/           @SiavZ
+.github/workflows/upstream-sync.yml @SiavZ
