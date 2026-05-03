@@ -18,6 +18,19 @@
 #   skills     1.5.3 (npm)
 #     skills-rev (avivsinai/agent-message-queue commit pinned for `skills add`)
 #                6a9417d40cc8b9d9f71e9fbb1e39c872d0763b54
+#
+# dux-amq lib distribution (audit01 Stage 3a / wrapper-chain integration).
+# The wrappers source path-encode.sh and wake-launch.sh from a search path.
+# Resolution order (first hit wins, see _dux_amq_lib_locate in each wrapper):
+#   1. $DUX_AMQ_LIB           — env var override (e.g. dev checkouts)
+#   2. <wrapper>/../lib       — sibling of the bin dir (matches dev tree)
+#   3. <wrapper>/../share/dux-amq/lib  — XDG-style install layout (default)
+#   4. /data/state/dux-amq/lib         — system-wide on the persistent disk
+#   5. /usr/local/share/dux-amq/lib    — FHS fallback for root-managed installs
+# This script installs the lib files to slot 3 (under $LOCAL_BIN/../share/...)
+# so a non-root install lands at a path the wrapper will resolve without needing
+# DUX_AMQ_LIB to be set. Override via DUX_AMQ_LIB_DEST if you need a different
+# target (e.g. /usr/local/share/dux-amq/lib for a root install).
 set -euo pipefail
 
 STATE_ROOT="${STATE_ROOT:-/data/state}"
@@ -189,6 +202,17 @@ install -m 0755 "$HERE/wrappers/claude-amq"  "$LOCAL_BIN/claude-amq"
 install -m 0755 "$HERE/wrappers/codex-amq"   "$LOCAL_BIN/codex-amq"
 install -m 0755 "$HERE/wrappers/gemini-amq"  "$LOCAL_BIN/gemini-amq"
 install -m 0755 "$HERE/scripts/finalize-claude-migration.sh" "$STATE_ROOT/scripts/finalize-claude-migration.sh"
+
+# 5b. install shared lib (path-encode.sh, wake-launch.sh) --------------------
+# Audit01 Stage 3a: the wrappers expect a sibling lib dir. Default target is
+# $LOCAL_BIN/../share/dux-amq/lib so a non-root install resolves it via the
+# wrapper's "<bin>/../share/dux-amq/lib" search rule (see header comment).
+DUX_AMQ_LIB_DEST="${DUX_AMQ_LIB_DEST:-$(cd "$LOCAL_BIN/.." && pwd)/share/dux-amq/lib}"
+say "installing dux-amq lib to $DUX_AMQ_LIB_DEST"
+mkdir -p "$DUX_AMQ_LIB_DEST"
+install -m 0644 "$HERE/lib/path-encode.sh" "$DUX_AMQ_LIB_DEST/path-encode.sh"
+install -m 0644 "$HERE/lib/wake-launch.sh" "$DUX_AMQ_LIB_DEST/wake-launch.sh"
+ok "dux-amq lib installed (path-encode.sh, wake-launch.sh)"
 
 # 6. dux config --------------------------------------------------------------
 DUX_HOME="$STATE_ROOT/dux" dux config regenerate --yes >/dev/null
