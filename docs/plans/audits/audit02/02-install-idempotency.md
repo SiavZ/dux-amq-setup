@@ -163,14 +163,20 @@ MD
 - Manual: `rm $STATE_ROOT/amq/binary.sha256 && bash -i -c true` — expect red banner, expect rc != 0.
 
 ## Acceptance criteria
-- [ ] `install.sh:148` is gated by `[[ ! -f "$AMQ_INIT_MARKER" ]]`.
-- [ ] `strip_block` md branch resets `s=0` on next `## ` heading.
-- [ ] Pre-rewrite snapshot of CLAUDE.md saved to `$STATE_ROOT/dux/claude-md.<ts>.bak`.
-- [ ] `verify_sha256` uses `$LOCAL_BIN/amq` when fresh install ran.
-- [ ] `binary.sha256` written 0444 (read-only).
-- [ ] `_amq_shell_setup_guarded` fails closed when record missing but binary present.
-- [ ] Three new bats tests pass.
-- [ ] PR: `fix(install): idempotency hardening (P0-F/G, P1-A, N-3)`.
+- [x] `install.sh:148` is gated by `[[ ! -f "$AMQ_INIT_MARKER" ]]`.
+      Marker corrected from the planned `agents.json` to the actual
+      `meta/config.json` after probing `amq init` v0.34.0.
+- [x] `strip_block` md branch resets `s=0` on next `## ` heading.
+- [x] Pre-rewrite snapshot of CLAUDE.md saved to `$STATE_ROOT/dux/claude-md.<ts>.bak`.
+- [x] `verify_sha256` uses `$LOCAL_BIN/amq` when fresh install ran.
+- [x] `binary.sha256` written 0444 (read-only).
+- [x] `_amq_shell_setup_guarded` fails closed when record missing but binary present.
+- [x] Three new bats tests pass (now five — strip-block.bats has three
+      regression cases, install-idempotency.bats has two integration
+      cases; the original test 2 from the plan was promoted to a unit
+      test against `strip_block` directly so it doesn't have to spin up
+      a full install).
+- [x] PR: `fix(install): idempotency hardening (P0-F/G, P1-A, N-3)`.
 
 ## Known pitfalls
 - Confirm AMQ's actual init marker file name (run `amq init` in a tmpdir;
