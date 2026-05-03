@@ -35,10 +35,14 @@ ME=$(printf '%s' "$ME" | tr '[:upper:]' '[:lower:]' | sed 's|[^a-z0-9_-]|-|g; s|
 
 ROOT="${AMQ_GLOBAL_ROOT:-/data/state/amq}"
 
-# Gemini is crossterm-based; paste mode is the right default. We still
-# start wake explicitly so coop exec doesn't spawn its own (which would
-# otherwise double up on injection). Stdin must be /dev/tty (see
-# claude-amq for full explanation).
-amq wake --me "$ME" --root "$ROOT" --inject-mode auto </dev/tty >/dev/null 2>&1 &
+# Audit02 P0-K (T2): route through amq-receive-verify so unsigned /
+# replay / wrong-MAC envelopes are dropped. See claude-amq for the
+# full rationale and the AMQ v0.34.0 `--inject-via` upstream gap.
+# Note: --inject-via supersedes --inject-mode (mode is the in-process
+# TIOCSTI path; --inject-via runs an external executable instead).
+mkdir -p "$HOME/.local/share/dux-amq" 2>/dev/null || true
+amq wake --me "$ME" --root "$ROOT" \
+  --inject-via amq-receive-verify \
+  </dev/tty >/dev/null 2>"$HOME/.local/share/dux-amq/wake-$ME.log" &
 
 exec amq coop exec --no-wake --no-init --root "$ROOT" --me "$ME" gemini -- "$@"

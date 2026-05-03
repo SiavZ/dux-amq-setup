@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# amq-receive-verify — validate a DUX1 envelope on stdin and emit the
+# clean body to stdout (audit02 P0-K, T2).
+#
+# Reads exactly one line on stdin (the envelope produced by
+# `amq-send-signed`). Drops the message — exits 0 with a stderr warning,
+# never propagating the body — when ANY of these checks fail:
+#
+#   * magic prefix is not literal "DUX1" (legacy / unsigned message)
+#   * timestamp is more than 60 s in the future or 24 h in the past
+#   * nonce has been seen in the dedup file (replay)
+#   * HMAC-SHA256 over `me|to|ts|nonce|body` does not match
+#
+# On success, the unwrapped body is written to stdout (no trailing
+# newline beyond the envelope's own line break).
+#
+# Replay protection state lives at
+# `${XDG_RUNTIME_DIR:-/tmp}/dux-amq/seen-nonces` — one nonce per line.
+# `XDG_RUNTIME_DIR` is the right home for this on Linux (tmpfs, cleared
+# on logout). macOS does not set it; falling back to `/tmp` is fine
+# because `/tmp` is purged on reboot, and our 24 h freshness window
+# already bounds memory.
+#
+# Exit 0 is the only normal exit (so an `--inject-via` invocation does
+# not retry). Exit 1 is reserved for setup errors (missing secret) where
+# retrying could reveal a transient fault.
+#
+# Known limitation (audit02 Phase 08, upstream gap): AMQ v0.34.0's
+# `--inject-via` passes the *notification preview* to the executable as
+# the final argv element and does NOT pipe the message body to stdin.
+# This script therefore only does anything useful when a caller hands it
+# an envelope on stdin — i.e. tests, future AMQ versions that pipe
+# stdin, or a custom drain hook. See the upstream issue note in the
+# commit body of audit02/08-amq-message-auth for the proposed protocol.
+set -euo pipefail
+
+SECRET_PATH="${AMQ_SECRET_PATH:-$HOME/.local/share/dux-amq/amq-secret}"
+if [[ ! -r "$SECRET_PATH" ]]; then
+  printf '[amq-verify] secret not readable at %s\n' "$SECRET_PATH" >&2
+  exit 1
+fi
+SECRET=$(cat "$SECRET_PATH")
+if [[ -z "$SECRET" ]]; then
+  printf '[amq-verify] secret file is empty\n' >&2
+  exit 1
+fi
+
+# `XDG_RUNTIME_DIR` is the correct location on Linux; `/tmp` is the macOS
+# fallback. The dir uses 0700 so a curious peer can't enumerate nonces
+# (which would leak message frequency / sender presence).
+NONCE_DIR="${XDG_RUNTIME_DIR:-/tmp}/dux-amq"
+NONCES="$NONCE_DIR/seen-nonces"
+mkdir -p "$NONCE_DIR"
+chmod 0700 "$NONCE_DIR" 2>/dev/null || true
+touch "$NONCES"
+
+# `read -r` consumes one line. If stdin is empty we drop the message
+# silently — `--inject-via` on AMQ v0.34.0 will exercise this path
+# because it does not pipe stdin. Document and move on.
+if ! IFS= read -r line; then
+  printf '[amq-verify] no envelope on stdin (empty / non-piped invocation)\n' >&2
+  exit 0
+fi
+
+# Tab-separated split. Bash's `read -d ''` on a single line keeps any
+# embedded TABs in the *last* field (BODY), which is exactly what we
+# want — `amq-send-signed` rejects bodies containing literal TAB on the
+# send side, and AMQ handle/timestamp/base64 fields cannot contain TAB.
+IFS=$'\t' read -r MAGIC SENDER RECEIVER TS NONCE MAC BODY <<<"$line"
+
+if [[ "$MAGIC" != "DUX1" ]]; then
+  printf '[amq-verify] dropping unsigned/unknown-magic message (magic=%q sender=%q)\n' \
+    "${MAGIC:-<empty>}" "${SENDER:-?}" >&2
+  exit 0
+fi
+
+# Field-presence check. An envelope with the right magic but a missing
+# field is malformed; treat as if the magic were wrong.
+if [[ -z "$SENDER" || -z "$RECEIVER" || -z "$TS" || -z "$NONCE" || -z "$MAC" ]]; then
+  printf '[amq-verify] dropping malformed DUX1 envelope (missing fields)\n' >&2
+  exit 0
+fi
+
+# Freshness window: ±60 s skew tolerance (clocks drift between hosts;
+# stricter = false positives), 24 h ceiling (longer = nonce file grows
+# without bound). Both ends configurable via env if a deployment needs
+# it; defaults are fine for the dux single-VM case.
+SKEW="${AMQ_AUTH_SKEW_SECONDS:-60}"
+WINDOW="${AMQ_AUTH_WINDOW_SECONDS:-86400}"
+NOW=$(date -u +%s)
+# `date -d <iso8601>` is GNU-only. macOS would need `date -j -f`, but
+# install.sh pre-flights GNU coreutils on Linux and `gdate` from brew
+# coreutils on macOS provides the same flag set.
+if ! MSG_TS=$(date -u -d "$TS" +%s 2>/dev/null); then
+  printf '[amq-verify] dropping message with unparseable timestamp %q\n' "$TS" >&2
+  exit 0
+fi
+DELTA=$((NOW - MSG_TS))
+if (( DELTA < -SKEW )); then
+  printf '[amq-verify] dropping future-dated message (delta=%ds, ts=%s)\n' "$DELTA" "$TS" >&2
+  exit 0
+fi
+if (( DELTA > WINDOW )); then
+  printf '[amq-verify] dropping stale message (age=%ds > %ds, ts=%s)\n' "$DELTA" "$WINDOW" "$TS" >&2
+  exit 0
+fi
+
+# Nonce dedup. `grep -Fxq` is exact-line + literal — perfect for base64
+# nonces (no regex meta-character collisions).
+if grep -Fxq -- "$NONCE" "$NONCES"; then
+  printf '[amq-verify] replay rejected (nonce=%s sender=%s)\n' "$NONCE" "$SENDER" >&2
+  exit 0
+fi
+
+# HMAC verification. Re-derive the canonical payload exactly as the
+# sender did and compare base64 MACs. We use `openssl dgst -hmac` rather
+# than a Python/Node helper to keep the dep footprint matched to the
+# install.sh preflight (which already hard-fails on missing openssl via
+# the broader curl/jq/sha256sum block).
+PAYLOAD="$SENDER|$RECEIVER|$TS|$NONCE|$BODY"
+EXPECT=$(printf '%s' "$PAYLOAD" \
+  | openssl dgst -sha256 -hmac "$SECRET" -binary \
+  | base64 | tr -d '\n')
+if [[ "$MAC" != "$EXPECT" ]]; then
+  printf '[amq-verify] HMAC mismatch from %s (expected %s, got %s)\n' \
+    "$SENDER" "$EXPECT" "$MAC" >&2
+  exit 0
+fi
+
+# Persist nonce. Append-only; we let the file grow up to ~24 h of nonces
+# (~50 KB at one nonce/sec, fine). A periodic cron entry can prune
+# entries older than 24 h — the dedup file is *advisory* (the freshness
+# window is the security-critical bound) so missing entries only let a
+# stale-but-fresh-enough message replay, which the timestamp check
+# already prevents within ±60 s of the original send.
+printf '%s\n' "$NONCE" >>"$NONCES"
+
+# Emit the verified body. Trailing newline matches what `amq drain
+# --include-body` would print, so downstream consumers can treat both
+# the same way.
+printf '%s\n' "$BODY"

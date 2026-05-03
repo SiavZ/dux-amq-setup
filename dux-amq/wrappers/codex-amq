@@ -33,9 +33,13 @@ ME=$(printf '%s' "$ME" | tr '[:upper:]' '[:lower:]' | sed 's|[^a-z0-9_-]|-|g; s|
 
 ROOT="${AMQ_GLOBAL_ROOT:-/data/state/amq}"
 
-# Start wake explicitly in raw mode so injected messages auto-submit.
-# Stdin must be /dev/tty (see claude-amq for full explanation).
-amq wake --me "$ME" --root "$ROOT" --inject-mode raw </dev/tty >/dev/null 2>&1 &
+# Audit02 P0-K (T2): route through amq-receive-verify so unsigned /
+# replay / wrong-MAC envelopes are dropped. See claude-amq for the
+# full rationale and the AMQ v0.34.0 `--inject-via` upstream gap.
+mkdir -p "$HOME/.local/share/dux-amq" 2>/dev/null || true
+amq wake --me "$ME" --root "$ROOT" \
+  --inject-via amq-receive-verify \
+  </dev/tty >/dev/null 2>"$HOME/.local/share/dux-amq/wake-$ME.log" &
 
 # YOLO is OPT-IN. Set CODEX_AMQ_YOLO=1 (or legacy CLAUDE_YOLO=1, kept for
 # backwards compat with the old "one switch flips both panes" UX) to pass

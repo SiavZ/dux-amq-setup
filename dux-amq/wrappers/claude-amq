@@ -136,15 +136,31 @@ if [[ -n "${CLAUDE_AMQ_SAFE:-}" ]]; then
   printf 'claude-amq: CLAUDE_AMQ_SAFE is deprecated; YOLO is now opt-in via CLAUDE_AMQ_YOLO\n' >&2
 fi
 
-# Start the wake-up daemon ourselves with --inject-mode=raw so messages
-# arrive as plain text + carriage return, which Claude Code (Ink-based)
-# auto-submits. The default `auto` mode sometimes picks `paste`, which
-# only types the message without sending it.
+# Audit02 P0-K (T2): route incoming messages through `amq-receive-verify`
+# so unsigned / replay / wrong-MAC envelopes are dropped before they can
+# reach the agent's TTY. The verifier exits 0 with a stderr warning on
+# rejection, so amq wake stays alive across bad messages.
 #
-# CRITICAL: stdin must be re-attached to /dev/tty here. Bash auto-redirects
-# background jobs' stdin to /dev/null in non-interactive scripts (job
-# control off), and `amq wake` then fails its `IsTerminal(stdin)` check
-# and exits as a zombie before it can inject anything.
-amq wake --me "$ME" --root "$ROOT" --inject-mode raw </dev/tty >/dev/null 2>&1 &
+# Stderr is captured to a per-pane log (audit01 P1-2 hygiene) instead of
+# being dropped to /dev/null — `>2>/dev/null` previously hid the
+# "[amq-verify] dropping unsigned" lines that are the entire signal of
+# this phase actually doing its job.
+#
+# Known upstream gap (AMQ v0.34.0): `--inject-via` passes the wake
+# *notification preview* to the executable as the final argv element
+# and does not pipe the message body to stdin. `amq-receive-verify`
+# reads stdin, so under v0.34.0 every wake invocation hits its
+# "[amq-verify] no envelope on stdin" branch and the wake notification
+# is never injected into the TTY. That is functionally equivalent to
+# silencing wake notifications until the upstream issue lands stdin
+# piping (or until we add a drain-side hook that fetches the body and
+# pipes it through). The security goal of this phase — *blocking spoofed
+# unsigned messages from being injected* — still holds because the
+# verifier drops them. See the upstream issue NOTE in the commit body
+# of audit02/08-amq-message-auth.
+mkdir -p "$HOME/.local/share/dux-amq" 2>/dev/null || true
+amq wake --me "$ME" --root "$ROOT" \
+  --inject-via amq-receive-verify \
+  </dev/tty >/dev/null 2>"$HOME/.local/share/dux-amq/wake-$ME.log" &
 
 exec amq coop exec --no-wake --no-init --root "$ROOT" --me "$ME" claude -- ${EXTRA[@]+"${EXTRA[@]}"} "$@"

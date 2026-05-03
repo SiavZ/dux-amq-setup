@@ -236,6 +236,23 @@ install -m 0755 "$HERE/wrappers/gemini-amq"  "$LOCAL_BIN/gemini-amq"
 install -m 0755 "$HERE/scripts/encode-claude-project-dir" "$LOCAL_BIN/encode-claude-project-dir"
 install -m 0755 "$HERE/scripts/finalize-claude-migration.sh" "$STATE_ROOT/scripts/finalize-claude-migration.sh"
 
+# Audit02 P0-K (T2): HMAC envelope tooling. Install the signing helper
+# and the verifier alongside the wrappers — both must be on $PATH so:
+#   * scripts and skills can call `amq-send-signed` instead of `amq send`
+#   * `amq wake --inject-via amq-receive-verify` (in claude-amq /
+#     codex-amq / gemini-amq) can find the verifier without an absolute
+#     path. The wrappers do not export PATH explicitly; `amq` resolves
+#     `--inject-via` against the calling process's $PATH.
+install -m 0755 "$HERE/scripts/amq-secret-init.sh" "$LOCAL_BIN/amq-secret-init.sh"
+install -m 0755 "$HERE/scripts/amq-send-signed"    "$LOCAL_BIN/amq-send-signed"
+install -m 0755 "$HERE/scripts/amq-receive-verify" "$LOCAL_BIN/amq-receive-verify"
+
+# Generate the per-VM HMAC secret (idempotent; preserves an existing
+# secret so signed messages already in flight stay verifiable). Run
+# *after* the AMQ binary is in place so a failure here implicates only
+# the new auth layer, not the queue itself.
+"$HERE/scripts/amq-secret-init.sh"
+
 # 6. dux config --------------------------------------------------------------
 DUX_HOME="$STATE_ROOT/dux" dux config regenerate --yes >/dev/null
 say "patching $STATE_ROOT/dux/config.toml"
