@@ -214,6 +214,11 @@ pub struct App {
     /// don't queue multiple workers. Cleared by
     /// `WorkerEvent::AddProjectMetaReady`.
     pub(crate) add_project_in_flight: bool,
+    /// Latest persistent-disk usage percentage as observed by the
+    /// `spawn_disk_watchdog` worker. `None` until the first sample
+    /// arrives. Drives both the warn/high-water status banners and the
+    /// `create_agent` refusal at `[limits].disk_high_water_pct`.
+    pub(crate) disk_usage_pct: Option<u8>,
     /// Exclusive lock held for the lifetime of this `App` so only one dux
     /// instance runs against a given config directory. Released
     /// automatically on drop (including crashes), so there is nothing to
@@ -1110,6 +1115,17 @@ pub(crate) enum WorkerEvent {
         name: String,
         result: Result<AddProjectMeta, String>,
     },
+    /// Persistent-disk usage sample emitted ~every 60 s by
+    /// [`crate::app::workers::App::spawn_disk_watchdog`]. Drives the
+    /// warn/high-water status banners and gates new agent spawns when
+    /// disk usage exceeds `[limits].disk_high_water_pct`.
+    DiskUsage(u8),
+    /// Total scrollback memory sample emitted ~every 60 s by
+    /// [`crate::app::workers::App::spawn_scrollback_watchdog`] (only
+    /// when `[limits].enable_scrollback_overflow_autodetach = true`).
+    /// Carries the observed footprint in MiB so the UI thread can decide
+    /// whether to detach the oldest pane.
+    ScrollbackUsage(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -1286,6 +1302,7 @@ impl App {
             commit_in_flight: false,
             staged_diff_in_flight: false,
             add_project_in_flight: false,
+            disk_usage_pct: None,
             _single_instance_lock: single_instance_lock,
         };
         // Kick off async git probes for every project so the first frame
@@ -1308,6 +1325,10 @@ impl App {
         self.spawn_changed_files_poller();
         self.spawn_branch_sync_worker();
         self.spawn_gh_status_check();
+        self.spawn_disk_watchdog();
+        if self.config.limits.enable_scrollback_overflow_autodetach {
+            self.spawn_scrollback_watchdog();
+        }
         let mut terminal = ratatui::init();
         execute!(stdout(), EnableMouseCapture)?;
 
