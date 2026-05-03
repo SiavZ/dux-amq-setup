@@ -1,0 +1,11 @@
+# audit02 Phase 06 — pinned toolchain channel.
+#
+# `dtolnay/rust-toolchain@<sha>` reads the channel from this file, which
+# means upgrading Rust is an explicit, reviewable diff rather than an
+# implicit follow-the-`stable`-tag. 1.85.0 is the minimum supported
+# version for Rust edition 2024 (matches Cargo.toml `edition = "2024"`).
+#
+# Bump deliberately when crates require it; do not switch to "stable".
+[toolchain]
+channel = "1.85.0"
+components = ["clippy", "rustfmt"]
