@@ -81,11 +81,15 @@ fn log(level: LogLevel, message: &str) {
     if level > logger.level {
         return;
     }
+    // Sanitize attacker-controlled bytes (git stderr, branch names, PR
+    // titles) before they reach `dux.log`. See `crate::sanitize` for the
+    // threat model. The sanitizer is intentionally call-free — never
+    // log from inside it or this function recurses.
     let line = format!(
         "{} {:<5} {}\n",
         Utc::now().to_rfc3339(),
         level.as_str(),
-        message
+        dux::sanitize::for_terminal(message),
     );
     if let Ok(mut file) = logger.file.lock() {
         let _ = file.write_all(line.as_bytes());
