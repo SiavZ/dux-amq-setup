@@ -33,13 +33,46 @@ ME=$(printf '%s' "$ME" | tr '[:upper:]' '[:lower:]' | sed 's|[^a-z0-9_-]|-|g; s|
 
 ROOT="${AMQ_GLOBAL_ROOT:-/data/state/amq}"
 
-# Audit02 P0-K (T2): route through amq-receive-verify so unsigned /
-# replay / wrong-MAC envelopes are dropped. See claude-amq for the
-# full rationale and the AMQ v0.34.0 `--inject-via` upstream gap.
+# Audit02 P0-K (T2) + Phase 13 (audit01 P1-1): route through verify+
+# bridge. See claude-amq for the full rationale on TIOCSTI fallback.
 mkdir -p "$HOME/.local/share/dux-amq" 2>/dev/null || true
-amq wake --me "$ME" --root "$ROOT" \
-  --inject-via amq-receive-verify \
-  </dev/tty >/dev/null 2>"$HOME/.local/share/dux-amq/wake-$ME.log" &
+WAKE_LOG="$HOME/.local/share/dux-amq/wake-$ME.log"
+
+STATE_ROOT="${STATE_ROOT:-/data/state}"
+LOCAL_BIN="${LOCAL_BIN:-$HOME/.local/bin}"
+
+INJECT_MODE="${DUX_AMQ_INJECT_MODE:-}"
+if [[ -z "$INJECT_MODE" ]]; then
+  if [[ -f "$STATE_ROOT/dux/.tiocsti-state" ]]; then
+    INJECT_MODE="via"
+  else
+    INJECT_MODE="raw"
+  fi
+fi
+
+case "$INJECT_MODE" in
+  raw)
+    amq wake --me "$ME" --root "$ROOT" --inject-mode raw \
+      </dev/tty 2>"$WAKE_LOG" &
+    ;;
+  via)
+    BRIDGE="$LOCAL_BIN/dux-amq-inject-bridge"
+    if [[ ! -x "$BRIDGE" ]]; then
+      BRIDGE=$(command -v dux-amq-inject-bridge 2>/dev/null || true)
+    fi
+    if [[ -n "$BRIDGE" && -x "$BRIDGE" ]]; then
+      amq wake --me "$ME" --root "$ROOT" --inject-via "$BRIDGE" \
+        2>"$WAKE_LOG" &
+    else
+      printf 'codex-amq: dux-amq-inject-bridge not found; wake disabled\n' >&2
+    fi
+    ;;
+  *)
+    printf 'codex-amq: DUX_AMQ_INJECT_MODE=%q not understood; using raw\n' "$INJECT_MODE" >&2
+    amq wake --me "$ME" --root "$ROOT" --inject-mode raw \
+      </dev/tty 2>"$WAKE_LOG" &
+    ;;
+esac
 
 # YOLO is OPT-IN. Set CODEX_AMQ_YOLO=1 (or legacy CLAUDE_YOLO=1, kept for
 # backwards compat with the old "one switch flips both panes" UX) to pass

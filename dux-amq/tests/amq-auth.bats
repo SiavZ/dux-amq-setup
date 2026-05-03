@@ -104,3 +104,59 @@ teardown() {
   run bash -c "printf '%s\n' \"$bad\" | amq-receive-verify 2>/dev/null"
   [[ -z "$output" ]]
 }
+
+# Audit02 Phase 13: argv-mode input fallback. AMQ v0.34.0's
+# `--inject-via` invokes the executable with the envelope as the FINAL
+# argv element (no stdin). Without the argv path, the verifier would
+# silently no-op for every wake notification under v0.34.0.
+
+@test "amq-receive-verify accepts envelope passed as argv \$1 (Phase 13)" {
+  local msg
+  msg=$(amq-send-signed --me alice --to bob --body "via-argv" --print-only)
+  # Close stdin (`</dev/null`) so the script must take the argv branch.
+  run bash -c "amq-receive-verify \"$msg\" </dev/null"
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == "via-argv" ]]
+}
+
+@test "amq-receive-verify drops unsigned argv-mode envelope" {
+  run bash -c 'amq-receive-verify "plain-not-signed" </dev/null 2>&1 1>/dev/null'
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"dropping unsigned"* ]]
+  # And no body on stdout.
+  run bash -c 'amq-receive-verify "plain-not-signed" </dev/null 2>/dev/null'
+  [[ -z "$output" ]]
+}
+
+@test "amq-receive-verify argv-mode replay rejection (nonce dedup)" {
+  local msg
+  msg=$(amq-send-signed --me alice --to bob --body "argv-dup" --print-only)
+  # First delivery via argv: accepted.
+  run bash -c "amq-receive-verify \"$msg\" </dev/null"
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == "argv-dup" ]]
+  # Second delivery via argv: dropped on nonce match.
+  run bash -c "amq-receive-verify \"$msg\" </dev/null 2>&1 1>/dev/null"
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"replay rejected"* ]]
+}
+
+@test "amq-receive-verify prefers stdin over argv when both present" {
+  local stdin_msg argv_msg
+  stdin_msg=$(amq-send-signed --me alice --to bob --body "from-stdin" --print-only)
+  argv_msg=$(amq-send-signed --me alice --to bob --body "from-argv" --print-only)
+  # When stdin has a valid envelope, argv must be ignored.
+  run bash -c "printf '%s\n' \"$stdin_msg\" | amq-receive-verify \"$argv_msg\""
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == "from-stdin" ]]
+}
+
+@test "amq-receive-verify falls back to argv when stdin is empty" {
+  local msg
+  msg=$(amq-send-signed --me alice --to bob --body "stdin-empty-argv-wins" --print-only)
+  # `:` is the no-op command — its output is empty. The script's
+  # IFS= read will return non-zero and the argv branch must take over.
+  run bash -c "amq-receive-verify \"$msg\" < <(:)"
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == "stdin-empty-argv-wins" ]]
+}

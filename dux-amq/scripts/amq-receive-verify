@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
-# amq-receive-verify — validate a DUX1 envelope on stdin and emit the
-# clean body to stdout (audit02 P0-K, T2).
+# amq-receive-verify — validate a DUX1 envelope and emit the clean body
+# to stdout (audit02 P0-K, T2; argv-mode added in audit02 Phase 13).
 #
-# Reads exactly one line on stdin (the envelope produced by
-# `amq-send-signed`). Drops the message — exits 0 with a stderr warning,
-# never propagating the body — when ANY of these checks fail:
+# Input modes (tried in order):
+#   1. STDIN — one envelope line on standard input (legacy / preferred
+#      when the caller controls a pipe, e.g. tests or a future AMQ
+#      version that pipes the body).
+#   2. ARGV — the envelope passed as the first positional argument
+#      ("$1"). This is the path AMQ v0.34.0's `--inject-via` actually
+#      exercises: it spawns the executable with the wake notification
+#      preview as the FINAL argv element. Without this fallback the
+#      verifier silently no-ops under v0.34.0.
+#
+# Drops the message — exits 0 with a stderr warning, never propagating
+# the body — when ANY of these checks fail:
 #
 #   * magic prefix is not literal "DUX1" (legacy / unsigned message)
 #   * timestamp is more than 60 s in the future or 24 h in the past
@@ -25,13 +34,10 @@
 # not retry). Exit 1 is reserved for setup errors (missing secret) where
 # retrying could reveal a transient fault.
 #
-# Known limitation (audit02 Phase 08, upstream gap): AMQ v0.34.0's
-# `--inject-via` passes the *notification preview* to the executable as
-# the final argv element and does NOT pipe the message body to stdin.
-# This script therefore only does anything useful when a caller hands it
-# an envelope on stdin — i.e. tests, future AMQ versions that pipe
-# stdin, or a custom drain hook. See the upstream issue note in the
-# commit body of audit02/08-amq-message-auth for the proposed protocol.
+# Audit02 Phase 13 note: the dux-amq inject bridge invokes this script
+# as `amq-receive-verify "$envelope"` (argv mode), captures stdout, and
+# only proceeds with TTY injection when verification succeeds. See
+# `dux-amq-inject-bridge` for the surrounding flow.
 set -euo pipefail
 
 SECRET_PATH="${AMQ_SECRET_PATH:-$HOME/.local/share/dux-amq/amq-secret}"
@@ -54,11 +60,35 @@ mkdir -p "$NONCE_DIR"
 chmod 0700 "$NONCE_DIR" 2>/dev/null || true
 touch "$NONCES"
 
-# `read -r` consumes one line. If stdin is empty we drop the message
-# silently — `--inject-via` on AMQ v0.34.0 will exercise this path
-# because it does not pipe stdin. Document and move on.
-if ! IFS= read -r line; then
-  printf '[amq-verify] no envelope on stdin (empty / non-piped invocation)\n' >&2
+# Audit02 Phase 13: dual-mode input. Prefer stdin (legacy / piped tests)
+# but fall back to the first positional argument when stdin is empty —
+# that is the shape of every `--inject-via` invocation under AMQ v0.34.0.
+#
+# `read -t 0` is non-blocking; we cannot use it portably across bash
+# versions and macOS. Instead, distinguish by terminal vs pipe: if stdin
+# is a TTY (interactive shell with no pipe attached) we go straight to
+# argv mode. If stdin is a pipe/file we attempt `read` and fall back to
+# argv only when it returns empty.
+line=""
+if [[ -t 0 ]]; then
+  # TTY-attached invocation (typical for `--inject-via`): no body on
+  # stdin, take it from argv. Don't read stdin at all to avoid blocking
+  # if the controlling terminal is somehow line-buffered.
+  if (( $# > 0 )) && [[ -n "$1" ]]; then
+    line="$1"
+  fi
+else
+  # Pipe / file on stdin (typical for tests or `cat env | verify`).
+  if IFS= read -r line; then
+    :
+  fi
+  # Stdin produced nothing readable — try argv before giving up.
+  if [[ -z "$line" ]] && (( $# > 0 )) && [[ -n "$1" ]]; then
+    line="$1"
+  fi
+fi
+if [[ -z "$line" ]]; then
+  printf '[amq-verify] no envelope on stdin or argv (empty invocation)\n' >&2
   exit 0
 fi
 

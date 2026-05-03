@@ -32,6 +32,12 @@ setup() {
   unset CLAUDE_AMQ_YOLO CLAUDE_YOLO CLAUDE_AMQ_SAFE
   unset CODEX_AMQ_YOLO
   unset CLAUDE_AMQ_SEED_FROM_PARENT CLAUDE_AMQ_NO_SEED
+  # Audit02 Phase 13: pin STATE_ROOT under the throwaway $TEST_HOME so
+  # wrappers don't pick up a real /data/state/dux/.tiocsti-state from
+  # the host VM and silently flip into bridge mode for these tests.
+  export STATE_ROOT="$TEST_HOME/state"
+  mkdir -p "$STATE_ROOT/dux"
+  unset DUX_AMQ_INJECT_MODE
 }
 
 teardown() {

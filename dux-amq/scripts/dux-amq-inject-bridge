@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# dux-amq-inject-bridge — TIOCSTI-disabled fallback for `amq wake`
+# (audit02 Phase 13, audit01 P1-1).
+#
+# AMQ v0.34.0's `--inject-mode raw` calls `ioctl(TIOCSTI)` directly and
+# silently fails on Linux ≥ 6.2 / Ubuntu 24.04 / Debian 12+ (kernels
+# built with CONFIG_LEGACY_TIOCSTI=n). The wrappers detect the kernel
+# state at install time (sentinel at $STATE_ROOT/dux/.tiocsti-state)
+# and switch to `--inject-via "$LOCAL_BIN/dux-amq-inject-bridge"`. AMQ
+# spawns this script with the wake notification preview as the FINAL
+# argv element ($1 here).
+#
+# Flow:
+#   1. Validate the envelope through `amq-receive-verify "$1"`. The
+#      verifier does HMAC + freshness + replay checks (audit02 Phase 08)
+#      and writes the cleaned body to stdout. If verify fails (rc != 0
+#      or empty stdout) we exit 0 silently — bad messages MUST NOT be
+#      retried and MUST NOT be injected.
+#
+#   2. Inject the verified body into the dux pane:
+#        a. Strategy 1 — `tmux send-keys`. When $TMUX is set we can
+#           target the current pane (or DUX_TMUX_TARGET) without any
+#           kernel privileges. Most dux-amq users run inside tmux on the
+#           shared spot VM, so this is the common path.
+#        b. Strategy 2 — file queue. When tmux isn't available, write
+#           the body to $HOME/.local/share/dux-amq/inject-queue/<ts>.msg
+#           and let a future dux-side polling consumer pick it up.
+#           Out of scope for Phase 13 to drain that queue; this strategy
+#           is "best-effort durable" — the body is preserved on disk so
+#           the user can retrieve it manually if no consumer runs.
+#
+# Exit status is always 0 on the happy path AND on every soft-failure
+# branch (silent verify rejection, missing tmux, full filesystem). The
+# upstream AMQ contract says: a non-zero `--inject-via` exit means
+# "retry this message later", which we never want for a malformed /
+# spoofed body. Setup errors that *would* benefit from a retry aren't
+# present here (no network calls, no auth tokens to refresh) — every
+# failure mode is either "the message is bad" or "the host is bad",
+# and neither is helped by a retry.
+set -euo pipefail
+
+ENVELOPE="${1:-}"
+
+# Step 1 — verify. `amq-receive-verify` reads from argv (Phase 13
+# patch) when stdin isn't piped. We must invoke it with the same
+# semantics, capturing stdout (the cleaned body) and discarding
+# stderr only after the call so we don't lose drop-reason warnings
+# during operator debugging — the wrapper appends them to wake-$ME.log.
+#
+# A few delicate points:
+#
+#   * `set -e` would kill us if verify exits non-zero. Guard with `||`.
+#   * `command -v` is the cheapest portable lookup; we don't fall back
+#     to a hard absolute path because install.sh always puts the
+#     verifier on $LOCAL_BIN, which is on PATH for the wrapper's
+#     environment (inherited from the parent shell that launched dux).
+#   * Empty stdout from verify means a soft-drop (unsigned, replayed,
+#     stale, MAC mismatch). Exit 0 — never propagate.
+if ! command -v amq-receive-verify >/dev/null 2>&1; then
+  printf '[inject-bridge] amq-receive-verify not on PATH; dropping message\n' >&2
+  exit 0
+fi
+
+# Run the verifier with stdin closed (`</dev/null`) so it picks the
+# argv branch deterministically — even if AMQ ever changes how it
+# wires our stdin, we want the documented argv path.
+body=$(amq-receive-verify "$ENVELOPE" </dev/null 2>/dev/null) || body=""
+if [[ -z "$body" ]]; then
+  # Verifier dropped the message (or was given an empty envelope).
+  # Stay silent; the verifier already logged its reason to its own
+  # stderr, which the wrapper redirected to wake-$ME.log.
+  exit 0
+fi
+
+# Step 2a — tmux send-keys, when available.
+#
+# `DUX_TMUX_TARGET` lets the operator point at a specific pane (e.g.
+# `mywindow:0.1`); the default of empty means "current pane of current
+# window" — the same pane the wrapper is running in.
+#
+# Note: we strip the trailing newline that `amq-receive-verify` always
+# emits (matches `amq drain --include-body`). tmux send-keys would
+# inject a literal `\n` followed by Enter, doubling the keystroke.
+if [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
+  TARGET="${DUX_TMUX_TARGET:-}"
+  # Strip trailing newline. Bash parameter expansion `${var%$'\n'}`
+  # removes only one trailing LF, which is what the verifier emits.
+  send_body="${body%$'\n'}"
+  if [[ -n "$TARGET" ]]; then
+    tmux send-keys -t "$TARGET" -- "$send_body" Enter
+  else
+    tmux send-keys -- "$send_body" Enter
+  fi
+  exit 0
+fi
+
+# Step 2b — file queue fallback.
+#
+# Persist the verified body to disk so an operator (or a future
+# dux-side polling consumer) can recover it. `<ts>.msg` is sortable;
+# `+%s%N` gives nanosecond precision so two near-simultaneous messages
+# don't collide. Falls back to `$$` on macOS (BSD `date` lacks `%N`).
+QUEUE_DIR="$HOME/.local/share/dux-amq/inject-queue"
+mkdir -p "$QUEUE_DIR" 2>/dev/null || {
+  printf '[inject-bridge] cannot create %s; dropping message\n' "$QUEUE_DIR" >&2
+  exit 0
+}
+ts=$(date -u +%s%N 2>/dev/null) || ts=""
+if [[ -z "$ts" || "$ts" == *N* ]]; then
+  # BSD date returned the literal `%N` — use seconds + pid for uniqueness.
+  ts="$(date -u +%s)-$$"
+fi
+target="$QUEUE_DIR/$ts.msg"
+# Use a temp + rename so a concurrent reader never sees a half-written
+# file. Same pattern as Maildir.
+tmp=$(mktemp "$QUEUE_DIR/.inflight.XXXXXX") || exit 0
+printf '%s\n' "${body%$'\n'}" >"$tmp"
+mv -f "$tmp" "$target"
+exit 0

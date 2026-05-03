@@ -1,0 +1,120 @@
+Audit02 Phase 13 — upstream issue note for avivsinai/agent-message-queue
+========================================================================
+
+NOTE: This file *would normally* contain the URL of the filed GitHub
+issue. The agent that produced audit02/13-tiocsti-mitigation was
+running inside an isolated dux worktree without GitHub remote-write
+credentials, so the issue body is recorded here verbatim instead. A
+human reviewer should open the issue against avivsinai/agent-message-queue
+using the text below and append the URL to this file as a follow-up.
+
+------------------------------------------------------------------------
+Title:  Add pts-master transport for TIOCSTI-disabled kernels
+Labels: enhancement, wake/inject, kernel-compat
+------------------------------------------------------------------------
+
+Summary
+-------
+`amq wake --inject-mode raw` calls `unix.Syscall(SYS_IOCTL, fd,
+unix.TIOCSTI, ...)` (see `internal/cli/wake_tiocsti_unix.go`). On
+Linux 6.2+ the `CONFIG_LEGACY_TIOCSTI` kernel option defaults off, and
+on Ubuntu 24.04 LTS / Debian 12+ it is compiled out entirely. On those
+kernels the syscall returns -EINVAL and the message body never reaches
+the target TTY. The user sees no error — wake just silently does
+nothing — which makes this a high-impact correctness regression for
+anyone running a recent stable distro.
+
+Reproduction
+------------
+On Ubuntu 24.04 (or any kernel where `cat /proc/sys/dev/tty/legacy_tiocsti`
+returns 0 or is absent):
+
+    amq init --root /tmp/q --agents alice,bob --force
+    # in pane A (running as bob):
+    amq wake --me bob --root /tmp/q --inject-mode raw </dev/tty &
+    # in pane B:
+    amq send --from alice --to bob --root /tmp/q "hello"
+
+Expected: "hello" appears in pane A's terminal.
+Actual: nothing happens. `dmesg` shows no error; the syscall just
+returns -EINVAL and `amq wake` keeps running (it has no error path
+because TIOCSTI never ENOENT'd in older kernels).
+
+Workarounds we shipped downstream (dux-amq overlay)
+---------------------------------------------------
+The dux-amq wrappers (claude-amq, codex-amq, gemini-amq) detect the
+kernel state at install time by reading /proc/sys/dev/tty/legacy_tiocsti
+and switching to `--inject-via <bridge>`. The bridge:
+
+  1. Verifies the envelope through `amq-receive-verify` (HMAC + nonce
+     + freshness — Phase 08).
+  2. On success, delivers the body via `tmux send-keys` or, if no tmux,
+     writes to ~/.local/share/dux-amq/inject-queue/<ts>.msg.
+
+This works but has structural limitations:
+
+  * tmux-only delivery: a dux pane that isn't inside a tmux session
+    silently drops to the on-disk queue, which has no consumer.
+  * Per-pane fork+exec of bash + verify + tmux per notification —
+    measurable latency overhead vs in-process TIOCSTI.
+  * The inject bridge needs PATH access to amq-receive-verify and tmux,
+    which complicates packaging.
+
+Proposed protocol
+-----------------
+Two complementary upstream changes:
+
+  A. PTS-master transport (kernel-independent).
+     New flag: `--inject-via-pts-master /path/to/master.sock`. The amq
+     daemon owns a Unix socket; clients (panes) connect, send their
+     PTY-master fd via SCM_RIGHTS, and `amq wake` writes the body
+     directly to the master fd. No TIOCSTI required, no per-message
+     fork. Equivalent UX to the current raw mode on supported kernels.
+
+  B. Optional stdin piping for `--inject-via` (also from Phase 08
+     proposal). Even with strategy A, externalised inject helpers are
+     useful (debug taps, audit logging). Today AMQ passes the
+     notification preview as the FINAL ARGV ELEMENT only; piping the
+     full body to stdin would let helpers operate on the real content
+     without re-fetching from the queue.
+
+Acceptance
+----------
+  * `amq wake` works out of the box on Ubuntu 24.04 / Debian 12+.
+  * `amq doctor` (or `amq wake --self-test`) prints which transport
+    will be used and warns on kernel incompatibility.
+  * Documented protocol for fd passing so other tools (dux, codex
+    sidecar, etc.) can implement the receiving side themselves.
+
+References
+----------
+- AMQ source: internal/cli/wake_tiocsti_unix.go (TIOCSTI use).
+- Linux kernel commit 690c8b80
+  ("tty: deprecate TIOCSTI by default", v6.2, Nov 2022).
+- Ubuntu LP #2046192 — TIOCSTI removal in 24.04.
+- dux-amq wrappers (downstream workaround):
+    dux-amq/wrappers/claude-amq
+    dux-amq/wrappers/codex-amq
+    dux-amq/wrappers/gemini-amq
+    dux-amq/scripts/dux-amq-inject-bridge
+- Audit map: docs/audits/audit02.md (audit01 P1-1 row).
+- Phase plan: docs/plans/audits/audit02/13-tiocsti-mitigation.md.
+
+Detection logic we adopted (for issue authors copying the pattern)
+------------------------------------------------------------------
+
+    tiocsti_status() {
+      local proc_path="/proc/sys/dev/tty/legacy_tiocsti"
+      [[ -e "$proc_path" ]] || return 2
+      local val
+      val=$(<"$proc_path") 2>/dev/null || return 2
+      case "$val" in
+        1) return 0 ;;
+        0) return 1 ;;
+        *) return 2 ;;
+      esac
+    }
+
+Returns 0 = usable, 1 = compiled-in-but-off, 2 = compiled-out.
+Reading the procfs file directly avoids needing the `sysctl` binary
+on PATH (it lives in /sbin on Debian and isn't on a typical user PATH).
