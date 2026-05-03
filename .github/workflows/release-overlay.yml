@@ -56,14 +56,27 @@ jobs:
       # maintainer pushed. Catches the "forgot to run bump-version.sh"
       # mistake before any artifact is produced.
       - name: Verify tag matches dux-amq/VERSION
+        id: verify_tag
         run: |
-          want="dux-amq-v$(< dux-amq/VERSION)"
-          if [[ "$want" != "$GITHUB_REF_NAME" ]]; then
-            printf 'tag/VERSION mismatch: tag=%s want=%s\n' "$GITHUB_REF_NAME" "$want" >&2
-            printf 'run scripts/bump-version.sh --version <X.Y.Z> and re-tag\n' >&2
-            exit 1
-          fi
-          printf 'tag %s matches dux-amq/VERSION %s\n' "$GITHUB_REF_NAME" "$(< dux-amq/VERSION)"
+          ver=$(< dux-amq/VERSION)
+          case "$GITHUB_REF_NAME" in
+            "dux-amq-v$ver")
+              printf 'release tag %s matches dux-amq/VERSION %s\n' "$GITHUB_REF_NAME" "$ver"
+              echo "prerelease=false" >> "$GITHUB_OUTPUT"
+              ;;
+            "dux-amq-v$ver-"*)
+              suffix="${GITHUB_REF_NAME#dux-amq-v$ver-}"
+              printf 'pre-release tag %s matches dux-amq/VERSION %s (suffix: %s)\n' \
+                "$GITHUB_REF_NAME" "$ver" "$suffix"
+              echo "prerelease=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              printf 'tag/VERSION mismatch: tag=%s VERSION=%s\n' "$GITHUB_REF_NAME" "$ver" >&2
+              printf 'expected dux-amq-v%s for release, or dux-amq-v%s-<suffix> for pre-release\n' "$ver" "$ver" >&2
+              printf 'run scripts/bump-version.sh --version <X.Y.Z> and re-tag\n' >&2
+              exit 1
+              ;;
+          esac
 
       # Build via the local script so the workflow and a maintainer's
       # `bash scripts/release-overlay.sh` produce byte-identical output.
@@ -123,6 +136,7 @@ jobs:
           # readability of the workflow file.
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
+          prerelease: ${{ steps.verify_tag.outputs.prerelease == 'true' }}
           # Generate notes from commits between this tag and the previous
           # tag; the maintainer can edit afterwards. Append the verified-
           # install one-liner so users have copy-pasteable commands.

@@ -90,12 +90,14 @@ done
 VERSION_FILE="$REPO_ROOT/dux-amq/VERSION"
 if [[ -f "$VERSION_FILE" ]]; then
   declared="$(tr -d '[:space:]' < "$VERSION_FILE")"
-  if [[ "$declared" != "$VERSION" ]]; then
+  # Accept exact match (release) or VERSION-suffix prefix (pre-release).
+  # Mirrors the workflow's tag-vs-VERSION check so local + CI agree.
+  if [[ "$VERSION" != "$declared" && "$VERSION" != "$declared-"* ]]; then
     if [[ $DRY_RUN -eq 1 ]]; then
-      printf 'note: --version=%s differs from dux-amq/VERSION=%s (dry-run, continuing)\n' \
+      printf 'note: --version=%s does not match dux-amq/VERSION=%s (dry-run, continuing)\n' \
         "$VERSION" "$declared" >&2
     else
-      die "--version $VERSION differs from dux-amq/VERSION $declared (run scripts/bump-version.sh first)"
+      die "--version $VERSION does not match dux-amq/VERSION $declared (expected $declared or $declared-<suffix>; run scripts/bump-version.sh if a real bump is intended)"
     fi
   fi
 fi
