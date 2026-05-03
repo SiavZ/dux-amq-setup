@@ -25,7 +25,14 @@ pub(crate) struct Clipboard {
 }
 
 impl Clipboard {
-    pub(crate) fn new() -> Self {
+    /// Spawn the long-lived clipboard worker. Fails (returns `Err`) only if
+    /// the OS refuses to spawn the thread — typically `RLIMIT_NPROC` or
+    /// out-of-memory. The caller (`App::new`) should fall back to
+    /// `Clipboard::noop()` on `Err` and surface a status-line warning, so
+    /// dux still starts and the rest of the TUI remains usable. We do not
+    /// `.expect()` here: a panic during App::bootstrap aborts the whole
+    /// process and the user is given no diagnostic.
+    pub(crate) fn new() -> Result<Self> {
         let (tx, rx) = mpsc::channel::<CopyRequest>();
 
         std::thread::Builder::new()
@@ -33,8 +40,36 @@ impl Clipboard {
             .spawn(move || {
                 clipboard_worker(rx);
             })
-            .expect("failed to spawn clipboard worker thread");
+            .map_err(|e| anyhow!("failed to spawn clipboard worker thread: {e}"))?;
 
+        Ok(Self { tx })
+    }
+
+    /// Construct a clipboard that drops every request and reports a
+    /// terminal-friendly error to the worker. Used as the fallback when
+    /// `Clipboard::new()` fails — keeps `App::clipboard` typed as a real
+    /// `Clipboard` (no `Option`/no trait object) so call sites need no
+    /// changes. Every `copy_text` returns the disabled-clipboard message
+    /// to the worker channel as a `ClipboardCopyCompleted { result: Err }`,
+    /// so the user sees "Clipboard disabled (worker unavailable)" instead
+    /// of silent UI breakage.
+    pub(crate) fn noop() -> Self {
+        let (tx, rx) = mpsc::channel::<CopyRequest>();
+        // Detached worker that just funnels every request into a polite
+        // error event. We do not unwrap thread spawn here either — if even
+        // *this* spawn fails (extreme RLIMIT_NPROC), the channel sender
+        // will report SendError on first use and `copy_text` already maps
+        // that to a user-facing error. So we do best-effort and move on.
+        let _ = std::thread::Builder::new()
+            .name("clipboard-noop".into())
+            .spawn(move || {
+                while let Ok(req) = rx.recv() {
+                    let _ = req.worker_tx.send(WorkerEvent::ClipboardCopyCompleted {
+                        label: req.label,
+                        result: Err("Clipboard disabled (worker unavailable)".into()),
+                    });
+                }
+            });
         Self { tx }
     }
 
@@ -225,6 +260,26 @@ mod tests {
             WorkerEvent::ClipboardCopyCompleted { label, result } => {
                 assert_eq!(label, "Copied.");
                 assert!(result.is_ok());
+            }
+            _ => panic!("unexpected event"),
+        }
+    }
+
+    /// `Clipboard::noop()` must report a clean error to the worker channel
+    /// instead of panicking or hanging — that's the contract `App::new`
+    /// relies on when `Clipboard::new()` fails. (Resolves: P2-2.)
+    #[test]
+    fn clipboard_noop_reports_disabled_to_worker() {
+        let (worker_tx, worker_rx) = mpsc::channel();
+        let clipboard = Clipboard::noop();
+        clipboard.copy_text("hello", "Copied.", &worker_tx).unwrap();
+
+        let event = worker_rx.recv().unwrap();
+        match event {
+            WorkerEvent::ClipboardCopyCompleted { label, result } => {
+                assert_eq!(label, "Copied.");
+                let err = result.expect_err("noop clipboard must report an error");
+                assert!(err.contains("disabled"), "got: {err}");
             }
             _ => panic!("unexpected event"),
         }

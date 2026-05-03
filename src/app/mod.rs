@@ -1096,6 +1096,21 @@ impl App {
         }
         let gh_integration_val = config.ui.github_integration;
         let pr_banner_at_bottom = config.ui.pr_banner_position == "bottom";
+        // Audit01 P2-2: clipboard worker thread spawn can fail (RLIMIT_NPROC,
+        // OOM). Swallow the failure and keep dux usable with a no-op clipboard
+        // — a status warning surfaces the degradation instead of panicking
+        // out of bootstrap. The user sees "Clipboard disabled (worker
+        // unavailable)" on copy attempts and everything else still works.
+        let clipboard = match Clipboard::new() {
+            Ok(c) => c,
+            Err(e) => {
+                logger::warn(&format!(
+                    "clipboard worker unavailable, copy actions disabled: {e}"
+                ));
+                status.warning(format!("Clipboard disabled: {e}"));
+                Clipboard::noop()
+            }
+        };
         let mut app = Self {
             show_diff_line_numbers: config.ui.show_diff_line_numbers,
             left_width_pct: config.ui.left_width_pct,
@@ -1135,7 +1150,7 @@ impl App {
             prompt: PromptState::None,
             input_target: InputTarget::None,
             session_surface: SessionSurface::Agent,
-            clipboard: Clipboard::new(),
+            clipboard,
             worker_tx,
             worker_rx,
             providers: HashMap::new(),
