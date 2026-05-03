@@ -215,15 +215,45 @@ install -m 0644 "$HERE/lib/wake-launch.sh" "$DUX_AMQ_LIB_DEST/wake-launch.sh"
 ok "dux-amq lib installed (path-encode.sh, wake-launch.sh)"
 
 # 6. dux config --------------------------------------------------------------
-DUX_HOME="$STATE_ROOT/dux" dux config regenerate --yes >/dev/null
-say "patching $STATE_ROOT/dux/config.toml"
+# Audit01 P2-8: never blow away a hand-edited config.toml on re-run. We detect
+# "user content" via two markers: a `projects = […]` line (only appears once
+# the user has added at least one project) or any `[macros.…]` section
+# (the upstream defaults ship zero macros). Either is a strong "this file
+# is now mine" signal. On a fresh install (no config.toml yet) we still
+# regenerate exactly as before. `FORCE_REGEN=1` is the explicit override
+# for operators who want to reset to defaults intentionally; the existing
+# file is moved aside as `config.toml.bak.<timestamp>` instead of deleted,
+# so a mistaken FORCE_REGEN is recoverable.
+DUX_CONFIG="$STATE_ROOT/dux/config.toml"
+SKIP_REGEN=
+if [[ -f "$DUX_CONFIG" ]] \
+   && grep -qE '^projects[[:space:]]*=|^\[macros\.' "$DUX_CONFIG" \
+   && [[ "${FORCE_REGEN:-}" != "1" ]]; then
+  warn "config.toml has user content; skipping regenerate (FORCE_REGEN=1 to overwrite)"
+  SKIP_REGEN=1
+fi
+if [[ -n "$SKIP_REGEN" ]]; then
+  ok "preserved $DUX_CONFIG (use FORCE_REGEN=1 to reset)"
+elif [[ -f "$DUX_CONFIG" && "${FORCE_REGEN:-}" == "1" ]]; then
+  _bak="${DUX_CONFIG}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+  cp -p "$DUX_CONFIG" "$_bak"
+  warn "FORCE_REGEN=1 — backed up existing config.toml to $_bak"
+  DUX_HOME="$STATE_ROOT/dux" dux config regenerate --yes >/dev/null
+else
+  DUX_HOME="$STATE_ROOT/dux" dux config regenerate --yes >/dev/null
+fi
+say "patching $DUX_CONFIG"
+# The sed patch block stays unconditional. Each `s|…|…|` is hash-keyed on
+# the upstream-default LHS, so re-running on a file already patched
+# (matches replaced) is a no-op — and re-running on a hand-edited file
+# only touches lines that still hold the literal upstream defaults.
 sed -i \
   -e 's|^prompt_for_name = false$|prompt_for_name = true|' \
   -e 's|^command = "claude"$|command = "claude-amq"|' \
   -e 's|^command = "codex"$|command = "codex-amq"|' \
   -e 's|^command = "gemini"$|command = "gemini-amq"|' \
   -e 's|^resume_args = \["--continue"\]$|resume_args = ["--continue", "--fork-session"]|' \
-  "$STATE_ROOT/dux/config.toml"
+  "$DUX_CONFIG"
 
 # 7. shell rc ----------------------------------------------------------------
 # Audit01 P1-7: delete-then-rewrite (the pyenv/sdkman pattern). On every
