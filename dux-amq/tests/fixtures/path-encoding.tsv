@@ -1,0 +1,19 @@
+# Empirically captured Claude Code path-encoding fixtures.
+# Source: claude 2.1.111 on this VM (2026-05-03) — `claude -p` was run
+# in each /tmp dir below, then the resulting `~/.claude/projects/<NAME>`
+# directory was inspected.
+#
+# Format: <absolute_path>\t<encoded_dirname>
+# Lines starting with '#' and blank lines are ignored.
+/tmp/test-encoder/foo_bar.baz	-tmp-test-encoder-foo-bar-baz
+/tmp/enc-test2/has space	-tmp-enc-test2-has-space
+/tmp/enc-test2/Æneid	-tmp-enc-test2--neid
+/tmp/enc-test2/a--b	-tmp-enc-test2-a--b
+/tmp/enc-test2/a.b.c	-tmp-enc-test2-a-b-c
+/tmp/enc3/a~b	-tmp-enc3-a-b
+/tmp/enc3/foo+bar	-tmp-enc3-foo-bar
+/tmp/enc3/a@b	-tmp-enc3-a-b
+/tmp/enc3/123_abc-XYZ	-tmp-enc3-123-abc-XYZ
+/tmp/enc4/a__b	-tmp-enc4-a--b
+/tmp/enc4/a..b	-tmp-enc4-a--b
+/tmp/encu/日本	-tmp-encu---

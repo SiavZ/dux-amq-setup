@@ -16,6 +16,39 @@
 #   Pair with `resume_args = ["--resume"]` in dux config if enabling.
 set -euo pipefail
 
+# Locate the shared dux-amq lib dir (path-encode.sh, wake-launch.sh, ...).
+# Search order: (1) $DUX_AMQ_LIB env var (set by bashrc-additions.sh),
+# (2) ../lib relative to this script's resolved path (development checkout
+# OR a side-by-side install), (3) common system locations. Fail loudly
+# if the encoder isn't found — silent path-encoding mismatches were the
+# whole point of audit01 P0-5.
+_dux_amq_lib_locate() {
+  if [[ -n "${DUX_AMQ_LIB:-}" && -f "$DUX_AMQ_LIB/path-encode.sh" ]]; then
+    printf '%s' "$DUX_AMQ_LIB"; return 0
+  fi
+  local self_dir
+  self_dir=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
+  for candidate in \
+    "$self_dir/../lib" \
+    "$self_dir/../share/dux-amq/lib" \
+    "/data/state/dux-amq/lib" \
+    "/usr/local/share/dux-amq/lib" \
+  ; do
+    if [[ -f "$candidate/path-encode.sh" ]]; then
+      printf '%s' "$(cd -- "$candidate" && pwd)"; return 0
+    fi
+  done
+  return 1
+}
+DUX_AMQ_LIB_RESOLVED=$(_dux_amq_lib_locate) || {
+  printf '\033[1;31m!\033[0m claude-amq: cannot locate dux-amq lib dir (path-encode.sh)\n' >&2
+  printf '   set DUX_AMQ_LIB or reinstall dux-amq.\n' >&2
+  exit 1
+}
+# Sourced from a runtime-resolved path; static analysis can't follow.
+# shellcheck disable=SC1090,SC1091
+source "$DUX_AMQ_LIB_RESOLVED/path-encode.sh"
+
 for arg in "$@"; do
   case "$arg" in
     -p|--print|--bare) exec claude "$@" ;;
@@ -35,8 +68,8 @@ seed_session_history() {
   [[ -z "$main_worktree" || "$main_worktree" == "$PWD" ]] && return 0
 
   local enc_self enc_main self_dir main_dir
-  enc_self=$(echo "$PWD"           | sed 's|/|-|g; s|_|-|g')
-  enc_main=$(echo "$main_worktree" | sed 's|/|-|g; s|_|-|g')
+  enc_self=$(path_encode "$PWD")
+  enc_main=$(path_encode "$main_worktree")
   self_dir="$HOME/.claude/projects/$enc_self"
   main_dir="$HOME/.claude/projects/$enc_main"
 
@@ -70,8 +103,17 @@ ME="${AM_ME:-}"
 #      git branch was renamed or checked out to something unexpected
 #   3. git branch (legacy fallback)
 #   4. claude-<pid> (no-context fallback)
-if [[ -z "$ME" && "$PWD" == "${DUX_HOME:-/data/state/dux}/worktrees/"* ]]; then
-  ME=$(basename "$PWD")
+# Realpath-canonicalised containment: '$DUX_HOME/worktrees/' must be a
+# strict ancestor of the resolved CWD. The boundary '/' rejects sibling
+# directories like '$DUX_HOME/worktrees-evil/x' which the previous prefix
+# glob `"$DUX_HOME/worktrees/"*` matched (audit01 P0-5).
+if [[ -z "$ME" ]]; then
+  _DUX_WTS=$(realpath -m "${DUX_HOME:-/data/state/dux}/worktrees")
+  _PWD_REAL=$(realpath -m "$PWD")
+  if [[ "$_PWD_REAL" == "$_DUX_WTS"/* ]]; then
+    ME=$(basename "$_PWD_REAL")
+  fi
+  unset _DUX_WTS _PWD_REAL
 fi
 if [[ -z "$ME" ]]; then
   ME=$(git -C "$PWD" branch --show-current 2>/dev/null || true)

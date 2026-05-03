@@ -9,8 +9,16 @@ if [[ "${1:-}" == "exec" ]]; then
 fi
 
 ME="${AM_ME:-}"
-if [[ -z "$ME" && "$PWD" == "${DUX_HOME:-/data/state/dux}/worktrees/"* ]]; then
-  ME=$(basename "$PWD")
+# Realpath-canonicalised containment: '$DUX_HOME/worktrees/' must be a
+# strict ancestor of the resolved CWD. The boundary '/' rejects sibling
+# dirs like '$DUX_HOME/worktrees-evil/x' (audit01 P0-5).
+if [[ -z "$ME" ]]; then
+  _DUX_WTS=$(realpath -m "${DUX_HOME:-/data/state/dux}/worktrees")
+  _PWD_REAL=$(realpath -m "$PWD")
+  if [[ "$_PWD_REAL" == "$_DUX_WTS"/* ]]; then
+    ME=$(basename "$_PWD_REAL")
+  fi
+  unset _DUX_WTS _PWD_REAL
 fi
 if [[ -z "$ME" ]]; then
   ME=$(git -C "$PWD" branch --show-current 2>/dev/null || true)

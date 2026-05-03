@@ -57,7 +57,7 @@ EOF
   # current encoder (s|/|-|g; s|_|-|g) for path components without
   # other special chars (TEST_HOME is /tmp/dux-amq-test.XXXX which is
   # all simple chars).
-  ENC_PARENT=$(printf '%s' "$PARENT" | sed 's|/|-|g; s|_|-|g')
+  ENC_PARENT=$(bash -c "source '$BATS_TEST_DIRNAME/../lib/path-encode.sh'; path_encode '$PARENT'")
   MAIN_PROJ_DIR="$HOME/.claude/projects/$ENC_PARENT"
   mkdir -p "$MAIN_PROJ_DIR"
   printf '{"role":"user"}\n' >"$MAIN_PROJ_DIR/aaaa.jsonl"
@@ -83,7 +83,7 @@ teardown() {
   unset CLAUDE_AMQ_SEED_FROM_PARENT || true
   run bash -c "source '$WRAPPER'; seed_session_history; ls '$HOME/.claude/projects' 2>&1"
   [ "$status" -eq 0 ]
-  ENC_CHILD=$(printf '%s' "$CHILD" | sed 's|/|-|g; s|_|-|g')
+  ENC_CHILD=$(bash -c "source '$BATS_TEST_DIRNAME/../lib/path-encode.sh'; path_encode '$CHILD'")
   # Child's project dir must NOT have been created.
   [ ! -d "$HOME/.claude/projects/$ENC_CHILD" ]
 }
@@ -93,7 +93,7 @@ teardown() {
   export CLAUDE_AMQ_SEED_FROM_PARENT=1
   run bash -c "source '$WRAPPER'; seed_session_history"
   [ "$status" -eq 0 ]
-  ENC_CHILD=$(printf '%s' "$CHILD" | sed 's|/|-|g; s|_|-|g')
+  ENC_CHILD=$(bash -c "source '$BATS_TEST_DIRNAME/../lib/path-encode.sh'; path_encode '$CHILD'")
   [ -d "$HOME/.claude/projects/$ENC_CHILD" ]
   [ -f "$HOME/.claude/projects/$ENC_CHILD/aaaa.jsonl" ]
 }
