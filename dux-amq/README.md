@@ -131,6 +131,27 @@ There is **no sandboxing** between panes other than POSIX file permissions; the 
 - **Keep credentials minimum-scope.** Treat the VM's `gh auth`, GCP/AWS keys, and `~/.ssh/id_*` as broadly delegable to anything that talks to a pane.
 - **Audit AMQ peers**. `amq who` lists every handle that can `amq send` into your panes. A rogue peer is an injection vector.
 
+### Data handling
+
+Every directory below holds chat transcripts, model I/O, or other PII produced by the agents. None of it is encrypted at rest by this overlay — encryption is the operator's job (LUKS recipe above). Treat each path as "personal data, possibly special-category" for GDPR-aware deployments.
+
+| Path                                  | Contents                                                                 | Retention                  |
+|---------------------------------------|--------------------------------------------------------------------------|----------------------------|
+| `~/.claude/projects/`                 | Claude session JSONLs: prompts, responses, tool I/O, secrets pasted in   | unbounded (manual delete)  |
+| `/data/state/claude/`                 | Persistent symlink target for `~/.claude` (after migration)              | unbounded (manual delete)  |
+| `/data/state/codex/`                  | Codex session state, tool I/O                                            | unbounded (manual delete)  |
+| `/data/state/gemini/`                 | Gemini session state                                                     | unbounded (manual delete)  |
+| `/data/state/agents/`                 | Per-agent scratch + AMQ identity hints                                   | unbounded (manual delete)  |
+| `/data/state/amq/`                    | Maildir-style queue: every `amq send` payload between every pair of agents | unbounded; `amq` does not GC |
+| `/data/state/dux/`                    | dux config + sessions DB (worktree paths, last-used providers)           | unbounded (manual delete)  |
+| `/data/state/worktrees/`              | Per-pane git worktrees — full source checkouts including `.env`, secrets, build artifacts | unbounded (manual delete) |
+
+**Retention defaults**: nothing in this overlay implements automatic rotation, redaction, or expiry. If your compliance posture needs short-lived data, add a cron job (`find /data/state/amq -mtime +N -delete`) tailored to your retention policy. AMQ messages are plain files; deleting them is sufficient.
+
+**Encryption recipe**: see the LUKS one-liner under "Recommended deployment" above. After unlock, *every* path in the table lives on the encrypted volume. If the VM is destroyed without unlocking, all of the above is unrecoverable — which is the explicit trade-off this overlay is built around.
+
+**Rotation hooks**: `dux-amq-doctor` (Phase 17) reports queue size and oldest-message age so you know when to prune.
+
 ### Future work
 
 Anthropic's [Claude Code auto mode](https://www.anthropic.com/engineering/claude-code-auto-mode) (March 2026) replaces `--dangerously-skip-permissions` with classifier-gated approval. Re-point `claude-amq` at that flag once the integration story stabilises; until then the YOLO default + this section are the explicit trade-off.
