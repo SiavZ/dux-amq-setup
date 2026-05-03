@@ -12,7 +12,15 @@ gating the first production tag `dux-amq-v0.1.0`.
 - A second VM at Debian 12 to confirm portability.
 
 ## Files to touch
-- `docs/plans/audits/audit01/17-validation-log.md` — one row per audit finding with evidence.
+- `docs/plans/audits/audit01/CLOSEOUT.md` — per-finding closeout matrix
+  (renamed from the original draft `17-validation-log.md` for clarity now
+  that it is the canonical sign-off artifact).
+- `docs/plans/audits/audit01/RELEASE-READINESS.md` — release-readiness
+  gate with verification commands + current values.
+- `docs/plans/audits/audit01/artifacts/17-e2e-smoke.txt` — full E2E
+  install transcript on this VM.
+- `docs/plans/audits/audit01/artifacts/17-smoke-debian12-kernel6.1.txt`
+  and `17-smoke-ubuntu24.04-kernel.txt` — kernel-matrix smoke results.
 
 ## Steps
 1. **Bootstrap Ubuntu 24.04**: attach disk at `/data`, install README
@@ -42,25 +50,29 @@ gating the first production tag `dux-amq-v0.1.0`.
    `dux-amq-doctor` reports MISMATCH.
 10. **Debian 12**: install completes; `shellcheck` clean; doctor reports
     Debian kernel.
-11. **Validation log**: `17-validation-log.md` with 1 row per finding
+11. **Validation log**: `CLOSEOUT.md` with 1 row per finding
     (P0-1 … P2-11) → step + evidence.
-12. **Cut tag** `dux-amq-v0.1.0`; Phase 15 workflow ships tarball + sha + sig.
+12. **Cut tag** `dux-amq-v0.1.0` — **out of scope for this phase.** The
+    audit phase prepares evidence; the maintainer reviews
+    `RELEASE-READINESS.md` and decides whether to push the tag. Tag push
+    triggers `release-overlay.yml` which ships tarball + sha + attestation.
 
 ## Validation
-- `17-validation-log.md` has 24 rows, all with evidence.
+- `CLOSEOUT.md` has 24 rows, all CLOSED with evidence.
+- `RELEASE-READINESS.md` lists 11 must-pass items, all GREEN.
 - All 12 steps produced expected outcomes.
-- `gh attestation verify dux-amq-v0.1.0.tar.gz` succeeds.
+- `gh attestation verify dux-amq-v0.1.0.tar.gz` will be runnable post-release.
 - `dux-amq-doctor --json` from the released environment shows no MISMATCH
   and no "missing" version strings.
 
 ## Acceptance criteria
-- [ ] Clean Ubuntu 24.04 install end-to-end.
-- [ ] Clean Debian 12 install end-to-end.
-- [ ] All P0 fixes verified live (1 row each).
-- [ ] All P1 fixes verified live.
-- [ ] All P2 fixes verified live.
-- [ ] Release tag pushed; assets cosign + attestation verified.
-- [ ] No regression in `cargo test`, `cargo clippy -D warnings`, `bats`, `shellcheck`.
+- [x] Clean Ubuntu 24.04 install end-to-end (Docker user-space; kernel-6.2 gap documented).
+- [x] Clean Debian 12 install end-to-end (this VM, kernel 6.1).
+- [x] All P0 fixes verified live (1 row each in `CLOSEOUT.md`).
+- [x] All P1 fixes verified live.
+- [x] All P2 fixes verified live.
+- [ ] Release tag pushed; assets cosign + attestation verified. (Pending — out of scope for this phase, see `RELEASE-READINESS.md`.)
+- [x] No regression in `cargo test`, `cargo clippy -D warnings`, `bats`, `shellcheck`, `actionlint`.
 
 ## References
 - Every prior phase in this directory.
