@@ -201,4 +201,4 @@ When the workflow PR conflicts on a patched file, follow the rebase recipe in `p
 
 ## License
 
-The wrappers and scripts in this directory are MIT-licensed (matching the dux license in the parent repo).
+The wrappers, scripts, configs, and tests in this directory are MIT-licensed under `dux-amq/LICENSE` (Copyright (c) 2026 SiavZ, dux-amq overlay). The upstream `dux` Rust source under `src/` is MIT-licensed under the repo-root `LICENSE` (Copyright (c) 2026 Patrick D'appollonio). Both are MIT and compatible; the dual file layout makes attribution unambiguous if anyone vendors only the `dux-amq/` subdirectory separately.
