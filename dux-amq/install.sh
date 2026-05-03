@@ -33,6 +33,10 @@ AMQ_SHA256="${AMQ_SHA256:-cba940987d00a3d072f395c7ec7a648e47d652f1ff503abf46da53
 SKILLS_PIN="${SKILLS_PIN:-1.5.3}"
 SKILLS_REV="${SKILLS_REV:-6a9417d40cc8b9d9f71e9fbb1e39c872d0763b54}"
 
+# AUDIT01-VERSION — overlay version; gates idempotent config-block rewrites
+# (Phase 12). Phase 15's release pipeline rewrites this line on tag.
+DUX_AMQ_VERSION="${DUX_AMQ_VERSION:-0.1.0}"
+
 say()  { printf '\033[1;34m→\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!\033[0m %s\n' "$*" >&2; }
 ok()   { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
@@ -47,6 +51,41 @@ verify_sha256() {
     exit 1
   fi
   ok "$label sha256 verified ($actual)"
+}
+
+# Audit01 P1-7: strip any prior dux-amq versioned block from a config file so
+# the next append always lands a clean current-version block. Also migrates
+# the legacy unversioned `=== dux + AMQ ===`/`Multi-agent environment (AMQ +
+# dux)` blocks. `kind` selects the marker style:
+#   sh  → `# >>> dux-amq vN.M.K >>>` … `# <<< dux-amq vN.M.K <<<`
+#   md  → `<!-- >>> dux-amq vN.M.K >>> -->` … `<!-- <<< dux-amq vN.M.K <<< -->`
+strip_block() {
+  local file="$1" kind="${2:-sh}"
+  [[ -f "$file" ]] || return 0
+  local tmp; tmp=$(mktemp "${file}.dux-amq.XXXXXX")
+  case "$kind" in
+    sh)
+      awk '
+        /^# >>> dux-amq v[^ ]+ >>>$/ {s=1; next}
+        /^# <<< dux-amq v[^ ]+ <<<$/ {s=0; next}
+        # Legacy (audit01 pre-Phase-12) markers — migrate by stripping.
+        /^# === dux \+ AMQ ===$/        {s=1; next}
+        /^# === end dux \+ AMQ ===$/    {s=0; next}
+        !s
+      ' "$file" > "$tmp"
+      ;;
+    md)
+      awk '
+        /^<!-- >>> dux-amq v[^ ]+ >>> -->$/ {s=1; next}
+        /^<!-- <<< dux-amq v[^ ]+ <<< -->$/ {s=0; next}
+        # Legacy: section heading through end of file is the entire block.
+        /^## Multi-agent environment \(AMQ \+ dux\)$/ {s=1; next}
+        !s
+      ' "$file" > "$tmp"
+      ;;
+    *) warn "strip_block: unknown kind: $kind"; rm -f "$tmp"; return 1 ;;
+  esac
+  mv "$tmp" "$file"
 }
 
 # 1. preflight ---------------------------------------------------------------
@@ -136,17 +175,25 @@ sed -i \
   "$STATE_ROOT/dux/config.toml"
 
 # 7. shell rc ----------------------------------------------------------------
-if ! grep -q '=== dux + AMQ ===' "$HOME/.bashrc" 2>/dev/null; then
-  say "appending env stanza to ~/.bashrc"
-  cat "$HERE/config/bashrc-additions.sh" >> "$HOME/.bashrc"
-fi
+# Audit01 P1-7: delete-then-rewrite (the pyenv/sdkman pattern). On every
+# install we strip any prior `# >>> dux-amq vN.M.K >>>` block AND the legacy
+# unversioned `# === dux + AMQ ===` block, then append the current version.
+# That way version bumps actually propagate instead of being no-ops.
+say "rewriting ~/.bashrc dux-amq stanza (v$DUX_AMQ_VERSION)"
+touch "$HOME/.bashrc"
+strip_block "$HOME/.bashrc" sh
+sed "s|REPLACE_AT_INSTALL|$DUX_AMQ_VERSION|g" "$HERE/config/bashrc-additions.sh" >> "$HOME/.bashrc"
 
 # 8. global CLAUDE.md --------------------------------------------------------
-if ! grep -q 'Multi-agent environment (AMQ + dux)' "$HOME/.claude/CLAUDE.md" 2>/dev/null; then
-  say "appending AMQ section to ~/.claude/CLAUDE.md"
-  printf '\n\n' >> "$HOME/.claude/CLAUDE.md"
-  cat "$HERE/config/claude-md-additions.md" >> "$HOME/.claude/CLAUDE.md"
-fi
+mkdir -p "$HOME/.claude"
+touch "$HOME/.claude/CLAUDE.md"
+say "rewriting ~/.claude/CLAUDE.md dux-amq stanza (v$DUX_AMQ_VERSION)"
+strip_block "$HOME/.claude/CLAUDE.md" md
+{
+  printf '\n<!-- >>> dux-amq v%s >>> -->\n\n' "$DUX_AMQ_VERSION"
+  cat "$HERE/config/claude-md-additions.md"
+  printf '\n<!-- <<< dux-amq v%s <<< -->\n' "$DUX_AMQ_VERSION"
+} >> "$HOME/.claude/CLAUDE.md"
 
 # 9. VSCode Remote-SSH machine settings (best-effort) ------------------------
 # Free Ctrl-G in the integrated terminal so dux's `exit_interactive` works.
