@@ -41,7 +41,35 @@ Prerequisites:
 - `git`, `curl`, `tar`, `rsync`, `npx`
 - `sudo` access (only for the persistent-disk migration step)
 
-Install:
+### Install from a tagged release (recommended — supply-chain verified)
+
+Each tag pushed to `dux-amq-v*` produces a signed, hash-pinned tarball plus a
+GitHub Artifact Attestation. See [Releases](#releases) below for the verifier
+commands. One-liner that downloads, verifies, and runs:
+
+```bash
+VER=dux-amq-v0.1.0
+curl -fsSLO https://github.com/SiavZ/dux-amq-setup/releases/download/${VER}/${VER}.tar.gz
+curl -fsSLO https://github.com/SiavZ/dux-amq-setup/releases/download/${VER}/${VER}.tar.gz.sha256
+sha256sum -c ${VER}.tar.gz.sha256
+gh attestation verify ${VER}.tar.gz --owner SiavZ
+tar -xzf ${VER}.tar.gz && bash ${VER}/dux-amq/install.sh
+exec bash -l
+```
+
+Or use the bundled bootstrap path (`install.sh --from-tarball <url>`), which
+folds the download / hash / extract / re-exec sequence into a single command:
+
+```bash
+SHA=$(curl -fsSL https://github.com/SiavZ/dux-amq-setup/releases/download/${VER}/${VER}.tar.gz.sha256 | awk '{print $1}')
+bash <(curl -fsSL https://github.com/SiavZ/dux-amq-setup/releases/download/${VER}/${VER}.tar.gz \
+        | tar -xzO --wildcards '*/dux-amq/install.sh') \
+  --from-tarball https://github.com/SiavZ/dux-amq-setup/releases/download/${VER}/${VER}.tar.gz \
+  --sha256 "$SHA"
+```
+
+### Install from a git checkout (development)
+
 ```bash
 git clone https://github.com/SiavZ/dux-amq-setup.git
 cd dux-amq-setup/dux-amq
@@ -183,6 +211,74 @@ Pick one of the following on those distros:
 3. **Pin AMQ to a future release** that uses `posix_openpt(3)` PTY-master writes when upstream ships it.
 
 To verify which path your AMQ binary takes, run `dux-amq/tests/probe-amq-inject.sh` on the target host.
+
+## Releases
+
+Releases live at <https://github.com/SiavZ/dux-amq-setup/releases>. Each tag
+matching `dux-amq-v*` produces four assets:
+
+| Asset                               | Purpose                                                |
+|-------------------------------------|--------------------------------------------------------|
+| `dux-amq-vX.Y.Z.tar.gz`             | the overlay payload (this directory + `patches/` + audit docs) |
+| `dux-amq-vX.Y.Z.tar.gz.sha256`      | hash for `sha256sum -c` verification                   |
+| `dux-amq-vX.Y.Z.tar.gz.sig`         | cosign keyless signature (sigstore Fulcio cert)        |
+| `dux-amq-vX.Y.Z.tar.gz.pem`         | the Fulcio cert chain that signed the .sig            |
+
+There are two independent verifiers; running both is recommended when you do
+not already have an out-of-band channel for the published sha256:
+
+```bash
+# 1) cosign keyless — proves the workflow ran in this repo on this tag
+cosign verify-blob \
+  --certificate-identity-regexp 'https://github.com/SiavZ/dux-amq-setup' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate dux-amq-vX.Y.Z.tar.gz.pem \
+  --signature   dux-amq-vX.Y.Z.tar.gz.sig \
+                dux-amq-vX.Y.Z.tar.gz
+
+# 2) GitHub Artifact Attestations — independent provenance check
+gh attestation verify dux-amq-vX.Y.Z.tar.gz --owner SiavZ
+```
+
+### Reproducible build property
+
+The release tarball is byte-reproducible: anyone with the tagged source can
+rebuild it locally and confirm the published sha256 matches without trusting
+the workflow runner. From a fresh checkout of the tag:
+
+```bash
+git fetch --tags
+git checkout dux-amq-vX.Y.Z
+bash scripts/release-overlay.sh --version X.Y.Z
+sha256sum dist/dux-amq-vX.Y.Z.tar.gz   # compare against the release's .sha256
+```
+
+The reproducibility flags live in `scripts/release-overlay.sh` (GNU tar
+`--sort=name --owner=0 --group=0 --numeric-owner --mtime='1970-01-01 …'`,
+pax format with deterministic pax headers, gzipped via `gzip -n -9`). The
+`.github/workflows/release-overlay.yml` workflow invokes the same script
+with the same arguments, so the workflow's tarball and a maintainer's local
+build produce identical bytes when invoked on the same git ref.
+
+### Maintainer release checklist
+
+1. Run `scripts/bump-version.sh --version X.Y.Z` (idempotent — re-running with
+   the same target is a no-op). Verify `git diff` shows only `dux-amq/VERSION`
+   and `dux-amq/install.sh` (the `# AUDIT01-VERSION`-anchored line).
+2. Commit: `chore(release): bump dux-amq to vX.Y.Z`.
+3. Smoke-test the local build: `bash scripts/release-overlay.sh --version X.Y.Z`,
+   confirm the printed sha256 looks reasonable.
+4. Push the bump commit and open a PR; merge after CODEOWNERS review.
+5. From a fresh checkout of `main`, push the tag:
+   ```bash
+   git tag dux-amq-vX.Y.Z
+   git push origin dux-amq-vX.Y.Z
+   ```
+   The `release-overlay.yml` workflow takes over: re-asserts tag/VERSION
+   parity, builds the tarball, signs with cosign, generates a build-provenance
+   attestation, and creates the GitHub Release with all four assets.
+6. Edit the auto-generated release notes to add a human-readable changelog
+   above the auto-included verified-install / reproducibility blocks.
 
 ## Upstream sync (audit01 Phase 06)
 
