@@ -291,20 +291,42 @@ configure_vscode_remote() {
   fi
   local entries='["-workbench.action.gotoLine","-workbench.action.terminal.goToRecentDirectory"]'
   if [[ ! -f "$f" ]]; then
+    # First write — explicit mode 0644 so re-runs that hit the merge
+    # branch below have a deterministic mode to preserve. (P2-9.)
     printf '%s\n' "{
   \"terminal.integrated.commandsToSkipShell\": $entries
 }" > "$f"
+    chmod 0644 "$f"
     ok "wrote $f"
     return 0
   fi
-  if jq --argjson new "$entries" '
+  # Audit01 P2-9: preserve the original file's mode across the merge. The
+  # plain `jq … > f.tmp && mv f.tmp f` pattern produces a tmp file with
+  # the user's umask (typically 0644 but possibly 0600 on hardened hosts),
+  # then mv overwrites the original — losing whatever mode the user set.
+  # `install -m <mode>` rewrites with an explicit mode so the file ends up
+  # with the *original*'s permissions regardless of umask. We capture the
+  # mode before running jq so a partial-failure midway doesn't leave a
+  # half-permissioned tmp file behind. Idempotent: re-running install.sh
+  # observes the same 0644 (or whatever the operator set) every time.
+  local mode
+  mode=$(stat -c '%a' "$f")
+  if ! jq --argjson new "$entries" '
     .["terminal.integrated.commandsToSkipShell"] = (
       ((.["terminal.integrated.commandsToSkipShell"] // []) + $new) | unique
     )
-  ' "$f" > "$f.tmp" && mv "$f.tmp" "$f"; then
-    ok "merged Ctrl-G passthrough into $f"
+  ' "$f" > "$f.tmp"; then
+    warn "jq merge failed for $f"
+    rm -f "$f.tmp"
+    return 1
+  fi
+  if install -m "$mode" "$f.tmp" "$f"; then
+    rm -f "$f.tmp"
+    ok "merged Ctrl-G passthrough into $f (mode $mode preserved)"
   else
-    warn "could not merge $f"
+    warn "could not install merged $f (mode preserve failed)"
+    rm -f "$f.tmp"
+    return 1
   fi
 }
 configure_vscode_remote
