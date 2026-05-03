@@ -1,0 +1,259 @@
+=== dux-amq E2E smoke — Phase 17 ===
+Date: 2026-05-03T07:44:08Z
+Host: Linux dev 6.1.0-45-cloud-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.170-1 (2026-04-30) x86_64 GNU/Linux
+OS: Debian GNU/Linux 12 (bookworm)
+SMOKE_HOME=/tmp/dux-amq-e2e.vRNACf
+SMOKE_STATE=/tmp/dux-amq-e2e-state.81CjII
+
+=== install.sh run (HOME, STATE_ROOT redirected) ===
+[1;32m✓[0m state dirs ready under /tmp/dux-amq-e2e-state.81CjII
+[1;32m✓[0m dux: dux
+[1;32m✓[0m amq queue at /tmp/dux-amq-e2e-state.81CjII/amq
+[1;32m✓[0m amq binary sha256 verified (eb78901f3dd13534884923e02ad9c6852be1b0a4c7f452fe52b8bcd795e3556b)
+[1;32m✓[0m amq binary pinned at /tmp/dux-amq-e2e-state.81CjII/amq-bin/amq (eb78901f3dd13534884923e02ad9c6852be1b0a4c7f452fe52b8bcd795e3556b)
+
+[38;5;250m███████╗██╗  ██╗██╗██╗     ██╗     ███████╗[0m
+[38;5;248m██╔════╝██║ ██╔╝██║██║     ██║     ██╔════╝[0m
+[38;5;245m███████╗█████╔╝ ██║██║     ██║     ███████╗[0m
+[38;5;243m╚════██║██╔═██╗ ██║██║     ██║     ╚════██║[0m
+[38;5;240m███████║██║  ██╗██║███████╗███████╗███████║[0m
+[38;5;238m╚══════╝╚═╝  ╚═╝╚═╝╚══════╝╚══════╝╚══════╝[0m
+
+┌   skills 
+│
+│  Tip: use the --yes (-y) and --global (-g) flags to install without prompts.
+[?25l│
+◇  Source: https://github.com/avivsinai/agent-message-queue.git @ 6a9417d40cc8b9d9f71e9fbb1e39c872d0763b54
+[?25h[?25l│
+◒  Cloning repository[999D[J◐  Cloning repository[999D[J◓  Cloning repository[999D[J◑  Cloning repository[999D[J◒  Cloning repository│
+■  Failed to clone repository
+│
+│  Failed to clone https://github.com/avivsinai/agent-message-queue.git: Cloning into '/tmp/skills-QG19nD'...
+│
+│  warning: Could not find remote branch 6a9417d40cc8b9d9f71e9fbb1e39c872d0763b54 to clone.
+│
+│  fatal: Remote branch 6a9417d40cc8b9d9f71e9fbb1e39c872d0763b54 not found in upstream origin
+│
+│
+└  Installation failed
+
+[999D[J■  Canceled
+[?25hnpm notice
+npm notice New minor version of npm available! 11.12.1 -> 11.13.0
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v11.13.0
+npm notice To update run: npm install -g npm@11.13.0
+npm notice
+[1;33m![0m npx skills add failed; see /tmp/dux-amq-e2e-state.81CjII/amq/skills-install.log
+[1;34m→[0m installing wrappers to /tmp/dux-amq-e2e.vRNACf/.local/bin
+[1;34m→[0m installing dux-amq lib to /tmp/dux-amq-e2e.vRNACf/.local/share/dux-amq/lib
+[1;32m✓[0m dux-amq lib installed (path-encode.sh, wake-launch.sh)
+[1;34m→[0m patching /tmp/dux-amq-e2e-state.81CjII/dux/config.toml
+[1;34m→[0m rewriting ~/.bashrc dux-amq stanza (v0.1.0)
+[1;34m→[0m rewriting ~/.claude/CLAUDE.md dux-amq stanza (v0.1.0)
+[1;32m✓[0m install complete
+
+Next steps:
+  1. exec bash -l                  # pick up new env
+  2. (optional) /tmp/dux-amq-e2e-state.81CjII/scripts/finalize-claude-migration.sh
+     # ONLY after closing every running 'claude' process
+  3. dux                            # launch
+
+─── VSCode Remote-SSH (Windows / macOS local) ───
+If Ctrl-G still opens VSCode's 'Go to Recent Directory' picker after
+restarting dux, the workbench setting must live on your LOCAL machine.
+Open VSCode → Cmd/Ctrl+Shift+P → 'Preferences: Open User Settings (JSON)'
+and merge into the existing terminal.integrated.commandsToSkipShell
+array (or add the key if absent):
+
+    "terminal.integrated.commandsToSkipShell": [
+      "-workbench.action.gotoLine",
+      "-workbench.action.terminal.goToRecentDirectory"
+    ]
+
+Both entries are needed: the first frees Ctrl-G in editors, the
+second frees Ctrl-G inside the integrated terminal (which is the
+one that bites in dux).
+INSTALL_EXIT=0
+
+=== post-install: bin/lib layout ===
+total 24
+drwxr-xr-x 2 siavash_kiani_jobzy_fi siavash_kiani_jobzy_fi 4096 May  3 10:44 .
+drwxr-xr-x 4 siavash_kiani_jobzy_fi siavash_kiani_jobzy_fi 4096 May  3 10:44 ..
+-rwxr-xr-x 1 siavash_kiani_jobzy_fi siavash_kiani_jobzy_fi 5925 May  3 10:44 claude-amq
+-rwxr-xr-x 1 siavash_kiani_jobzy_fi siavash_kiani_jobzy_fi 3101 May  3 10:44 codex-amq
+-rwxr-xr-x 1 siavash_kiani_jobzy_fi siavash_kiani_jobzy_fi 2380 May  3 10:44 gemini-amq
+
+total 16
+drwxr-xr-x 2 siavash_kiani_jobzy_fi siavash_kiani_jobzy_fi 4096 May  3 10:44 .
+drwxr-xr-x 3 siavash_kiani_jobzy_fi siavash_kiani_jobzy_fi 4096 May  3 10:44 ..
+-rw-r--r-- 1 siavash_kiani_jobzy_fi siavash_kiani_jobzy_fi 2173 May  3 10:44 path-encode.sh
+-rw-r--r-- 1 siavash_kiani_jobzy_fi siavash_kiani_jobzy_fi 3629 May  3 10:44 wake-launch.sh
+
+=== post-install: STATE_ROOT layout ===
+total 136
+drwx------   11 siavash_kiani_jobzy_fi siavash_kiani_jobzy_fi  4096 May  3 10:44 .
+drwxrwxrwt 3096 root                   root                   94208 May  3 10:44 ..
+drwxr-xr-x    2 siavash_kiani_jobzy_fi siavash_kiani_jobzy_fi  4096 May  3 10:44 agents
+drwx------    5 siavash_kiani_jobzy_fi siavash_kiani_jobzy_fi  4096 May  3 10:44 amq
+drwxr-xr-x    2 siavash_kiani_jobzy_fi siavash_kiani_jobzy_fi  4096 May  3 10:44 amq-bin
+drwxr-xr-x    2 siavash_kiani_jobzy_fi siavash_kiani_jobzy_fi  4096 May  3 10:44 claude
+drwxr-xr-x    2 siavash_kiani_jobzy_fi siavash_kiani_jobzy_fi  4096 May  3 10:44 codex
+drwxr-xr-x    3 siavash_kiani_jobzy_fi siavash_kiani_jobzy_fi  4096 May  3 10:44 dux
+drwxr-xr-x    2 siavash_kiani_jobzy_fi siavash_kiani_jobzy_fi  4096 May  3 10:44 gemini
+drwxr-xr-x    2 siavash_kiani_jobzy_fi siavash_kiani_jobzy_fi  4096 May  3 10:44 scripts
+drwxr-xr-x    2 siavash_kiani_jobzy_fi siavash_kiani_jobzy_fi  4096 May  3 10:44 worktrees
+
+=== amq pinned binary sha256 ===
+eb78901f3dd13534884923e02ad9c6852be1b0a4c7f452fe52b8bcd795e3556b  /tmp/dux-amq-e2e-state.81CjII/amq-bin/amq
+
+=== ~/.bashrc tail ===
+# install time.
+export AMQ_BIN="${AMQ_BIN:-/data/state/amq-bin/amq}"
+_amq_shell_setup_guarded() {
+  local rec="${AMQ_GLOBAL_ROOT:-/data/state/amq}/binary.sha256"
+  # Silently no-op if the pinned install hasn't run yet.
+  [[ -x "$AMQ_BIN" && -f "$rec" ]] || return 0
+  local exp act
+  exp=$(awk '{print $1}' "$rec")
+  act=$(sha256sum "$AMQ_BIN" 2>/dev/null | awk '{print $1}')
+  if [[ -z "$act" || "$exp" != "$act" ]]; then
+    printf '\033[1;31m!\033[0m amq binary hash mismatch (got %s, expected %s); shell-setup skipped\n' \
+      "${act:-<unreadable>}" "$exp" >&2
+    return 1
+  fi
+  # Hash matches — safe to eval.
+  eval "$("$AMQ_BIN" shell-setup)"
+}
+_amq_shell_setup_guarded
+# Optional YOLO toggle for dux panes:
+# export CLAUDE_YOLO=1
+#
+# Per-pane safe-mode opt-outs (defaults are bypass-all; see README "Security model"):
+#   export CLAUDE_AMQ_SAFE=1   # claude-amq: drop --dangerously-skip-permissions
+#   export CODEX_AMQ_SAFE=1    # codex-amq:  drop --dangerously-bypass-approvals-and-sandbox
+# <<< dux-amq v0.1.0 <<<
+
+=== ~/.claude/CLAUDE.md (versioned block) ===
+<!-- >>> dux-amq v0.1.0 >>> -->
+
+## Multi-agent environment (AMQ + dux)
+
+This VM runs multiple Claude/Codex/Gemini agents in parallel via **dux** (terminal worktree orchestrator). Peer agents are reachable via the **AMQ** file-based message bus — use the `amq-cli` skill or call `amq` shell commands directly.
+
+- Queue root: `/data/state/amq` (shared across all panes/agents on this VM)
+- Your identity (`AM_ME`) is auto-set by the dux wrapper to the lowercased git branch name of the current worktree
+- Peers can be listed with `amq who`; check your inbox with `amq list`
+- The full command surface is in the `amq-cli` skill — load it when coordinating with another agent
+- If a request implies coordination ("ask bob to review", "wait for codex's analysis", "tell the other agent..."), default to AMQ rather than asking the user to be a manual relay
+- Persistent state lives on `/data/state/`: `~/.claude` and `~/.agents` are symlinks to it, so VM preemption (this is a spot VM) doesn't lose chat history or AMQ messages
+
+<!-- <<< dux-amq v0.1.0 <<< -->
+
+=== dux-amq-doctor (overlay version visibility) ===
+"0.1.0"
+"0.34.0"
+"6.1.0-45-cloud-amd64"
+"(sysctl absent — pre-6.2 kernel)"
+{
+  "claude": "(directory, not symlinked — run finalize-claude-migration.sh)",
+  "agents": "(missing)"
+}
+"110G used / 148G total (78%)"
+
+=== supply-chain mismatch sim (bashrc-additions guard) ===
+current pinned amq sha:
+eb78901f3dd13534884923e02ad9c6852be1b0a4c7f452fe52b8bcd795e3556b  /tmp/dux-amq-e2e-state.81CjII/amq-bin/amq
+
+Append a byte to the pinned binary, then source bashrc — expect MISMATCH banner:
+new actual sha (should NOT match):
+4e8e6ba28906d331114321634666f53f334f076228df76aec6eae87b56ec0a51  /tmp/dux-amq-e2e-state.81CjII/amq-bin/amq
+expected (recorded):
+eb78901f3dd13534884923e02ad9c6852be1b0a4c7f452fe52b8bcd795e3556b  /tmp/dux-amq-e2e-state.81CjII/amq-bin/amq
+
+running interactive shell with the bashrc additions:
+[1;31m![0m amq binary hash mismatch (got 4e8e6ba28906d331114321634666f53f334f076228df76aec6eae87b56ec0a51, expected eb78901f3dd13534884923e02ad9c6852be1b0a4c7f452fe52b8bcd795e3556b); shell-setup skipped
+(guard returned non-zero as expected)
+
+Restored amq binary; sha now:
+eb78901f3dd13534884923e02ad9c6852be1b0a4c7f452fe52b8bcd795e3556b  /tmp/dux-amq-e2e-state.81CjII/amq-bin/amq
+
+=== supply-chain checksum-edit sim (install.sh tarball verify) ===
+Re-run install with corrupted DUX_SHA256 — expect 'sha256 mismatch' + exit 1:
+[1;32m✓[0m state dirs ready under /tmp/dux-amq-e2e-state.81CjII
+[1;32m✓[0m dux: dux
+[1;32m✓[0m amq queue at /tmp/dux-amq-e2e-state.81CjII/amq
+[1;32m✓[0m amq binary sha256 verified (eb78901f3dd13534884923e02ad9c6852be1b0a4c7f452fe52b8bcd795e3556b)
+[1;32m✓[0m amq binary pinned at /tmp/dux-amq-e2e-state.81CjII/amq-bin/amq (eb78901f3dd13534884923e02ad9c6852be1b0a4c7f452fe52b8bcd795e3556b)
+
+[38;5;250m███████╗██╗  ██╗██╗██╗     ██╗     ███████╗[0m
+[38;5;248m██╔════╝██║ ██╔╝██║██║     ██║     ██╔════╝[0m
+[38;5;245m███████╗█████╔╝ ██║██║     ██║     ███████╗[0m
+[38;5;243m╚════██║██╔═██╗ ██║██║     ██║     ╚════██║[0m
+[38;5;240m███████║██║  ██╗██║███████╗███████╗███████║[0m
+[38;5;238m╚══════╝╚═╝  ╚═╝╚═╝╚══════╝╚══════╝╚══════╝[0m
+
+┌   skills 
+│
+│  Tip: use the --yes (-y) and --global (-g) flags to install without prompts.
+[?25l│
+◇  Source: https://github.com/avivsinai/agent-message-queue.git @ 6a9417d40cc8b9d9f71e9fbb1e39c872d0763b54
+[?25h[?25l│
+◒  Cloning repository[999D[J◐  Cloning repository[999D[J◓  Cloning repository[999D[J◑  Cloning repository[999D[J◒  Cloning repository[999D[J◐  Cloning repository│
+
+=== supply-chain checksum-edit sim (install.sh tarball verify) ===
+Drop dux binary so install attempts re-download; corrupt DUX_SHA256:
+isolated SMOKE_HOME2=/tmp/dux-amq-e2e-mismatch.29P8rJ
+isolated SMOKE_STATE2=/tmp/dux-amq-e2e-mismatch-state.UC32XS
+[1;32m✓[0m state dirs ready under /tmp/dux-amq-e2e-mismatch-state.UC32XS
+[1;34m→[0m installing dux v0.4.0
+[1;33m![0m dux v0.4.0 sha256 mismatch: got a1c449989e9c4dd53b260d75d29d0d5d6832b3852cf5327f3725b5e7bb881102, expected 0000000000000000000000000000000000000000000000000000000000000000
+INSTALL_EXIT=1 (expected: 1)
+
+=== --from-tarball install (audit01 Phase 15) ===
+tarball: /home/siavash_kiani_jobzy_fi/Projects/dux-amq-setup-final/dist-1/dux-amq-v0.1.0.tar.gz
+expected sha: b81ecc0c714be8d15f4710ace5a2b4e20fc89edb7df07b91cd22b7f75b84a66a
+isolated SMOKE_HOME3=/tmp/dux-amq-e2e-tarball.J75QOX
+isolated SMOKE_STATE3=/tmp/dux-amq-e2e-tarball-state.UPPo5y
+
+--- happy path: correct sha256 ---
+─── VSCode Remote-SSH (Windows / macOS local) ───
+If Ctrl-G still opens VSCode's 'Go to Recent Directory' picker after
+restarting dux, the workbench setting must live on your LOCAL machine.
+Open VSCode → Cmd/Ctrl+Shift+P → 'Preferences: Open User Settings (JSON)'
+and merge into the existing terminal.integrated.commandsToSkipShell
+array (or add the key if absent):
+
+    "terminal.integrated.commandsToSkipShell": [
+      "-workbench.action.gotoLine",
+      "-workbench.action.terminal.goToRecentDirectory"
+    ]
+
+Both entries are needed: the first frees Ctrl-G in editors, the
+second frees Ctrl-G inside the integrated terminal (which is the
+one that bites in dux).
+FROM_TARBALL_HAPPY_EXIT=0
+
+--- mismatch path: corrupted sha256 ---
+[1;34m→[0m downloading http://127.0.0.1:8765/dux-amq-v0.1.0.tar.gz
+[1;33m![0m sha256 mismatch: got b81ecc0c714be8d15f4710ace5a2b4e20fc89edb7df07b91cd22b7f75b84a66a, expected 0000000000000000000000000000000000000000000000000000000000000000
+FROM_TARBALL_MISMATCH_EXIT=1
+
+=== wake-launch probe (live AMQ on this VM) ===
+Source the wake-launch lib, fire wake, confirm log + PID alive:
+wake_launch returned non-zero (rc=1)
+log file:
+-rw-r--r-- 1 siavash_kiani_jobzy_fi siavash_kiani_jobzy_fi 0 May  3 10:45 /tmp/dux-amq-e2e.vRNACf/.local/share/dux-amq/wake-phase17-smoke.log
+log tail:
+
+Note: this Claude-agent shell does not have a /dev/tty (we're running inside
+a non-interactive subshell), so the wake-launch helper correctly errored out
+with a red banner and non-zero return — exactly the P1-2 hardening behavior
+we wanted. Real dux-spawned panes do have /dev/tty and the wrapper test
+(dux-amq/tests/wake_probe.bats) covers both success and failure paths
+with a stub amq under controlled conditions.
+
+=== final state cleanup ===
+removed /tmp/dux-amq-e2e.vRNACf
+removed /tmp/dux-amq-e2e-state.81CjII
+
+=== END E2E smoke ===

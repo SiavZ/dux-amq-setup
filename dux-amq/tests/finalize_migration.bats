@@ -101,11 +101,15 @@ cleanup_pgrep_fake() {
 @test "concurrent run: second invocation aborts with lock message" {
   install_pgrep_clean
   mkdir -p "$HOME/.claude" "$HOME/.agents"
+  # Pre-create the lock file so the wait-loop's read-open never races
+  # against the background subshell's redirect-create.
+  : >"$DUX_AMQ_FINALIZE_LOCK"
   # Hold the lock from a background flock(1).
   ( flock -x 9; sleep 5 ) 9>"$DUX_AMQ_FINALIZE_LOCK" &
   HOLDER=$!
-  # Give the holder time to grab the lock.
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
+  # Spin until the holder actually owns the lock — `flock -n` returning
+  # non-zero on a non-blocking attempt means the holder has it.
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     if ! flock -n 9 -c true 9<"$DUX_AMQ_FINALIZE_LOCK" 2>/dev/null; then
       break
     fi
