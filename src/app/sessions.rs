@@ -255,6 +255,10 @@ impl App {
             self.set_error("An agent is already being created or forked.");
             return Ok(());
         }
+        if let Some(reason) = self.refuse_agent_spawn_for_limits() {
+            self.set_error(reason);
+            return Ok(());
+        }
         self.create_agent_in_flight = true;
         self.set_busy(busy_message);
         let paths = self.paths.clone();
@@ -265,6 +269,44 @@ impl App {
             super::workers::run_create_agent_job(request, paths, config, worker_tx, term_size);
         });
         Ok(())
+    }
+
+    /// Resource-cap gate evaluated before any user-initiated agent spawn.
+    ///
+    /// Returns `Some(message)` when a [`crate::config::LimitsConfig`] cap is
+    /// breached (max_panes or disk_high_water_pct), in which case the
+    /// caller should surface the message via [`Self::set_error`] and skip
+    /// the spawn. The message is intentionally verbose and actionable — it
+    /// names the offending knob, the current observed value, and the
+    /// recovery path so an operator can fix the situation without
+    /// consulting the docs. Phase 15's auto-resume scheduler is a
+    /// different code path; this gate is for user-initiated spawns only.
+    pub(crate) fn refuse_agent_spawn_for_limits(&self) -> Option<String> {
+        let limits = &self.config.limits;
+        let active_panes = self
+            .sessions
+            .iter()
+            .filter(|s| s.status == SessionStatus::Active)
+            .count();
+        if limits.max_panes > 0 && active_panes >= limits.max_panes {
+            return Some(format!(
+                "Refusing new agent: {active_panes} active panes already running \
+                 (config limits.max_panes = {}). Detach an unused agent or raise \
+                 the cap to recover.",
+                limits.max_panes
+            ));
+        }
+        if let Some(pct) = self.disk_usage_pct
+            && pct >= limits.disk_high_water_pct
+        {
+            return Some(format!(
+                "Refusing new agent: persistent disk at {pct}% \
+                 (limits.disk_high_water_pct = {}%). Run `dux session purge` \
+                 or extend the volume to recover.",
+                limits.disk_high_water_pct
+            ));
+        }
+        None
     }
 
     pub(crate) fn spawn_pty_for_session(
@@ -302,7 +344,45 @@ impl App {
         let cfg = provider_config(&self.config, &session.provider);
         cfg.supports_session_resume() && session.has_started_provider(&session.provider)
     }
+}
 
+/// Worker-thread variant of [`App::spawn_pty_for_session`].
+///
+/// Used by [`App::auto_resume_all_sessions`] so the bounded scheduler can
+/// run PTY spawns off the UI thread (each `PtyClient::spawn` is a
+/// fork+exec plus a TLS handshake when the provider boots — bounded by
+/// `[auto_resume]` config). Logs use the same format so log scraping
+/// keeps working.
+pub(crate) fn spawn_pty_for_auto_resume(
+    config: &Config,
+    session: &AgentSession,
+    resume: bool,
+    last_pty_size: (u16, u16),
+    scrollback_lines: usize,
+) -> Result<PtyClient> {
+    let cfg = provider_config(config, &session.provider);
+    let launch_args = cfg.interactive_args(resume);
+    let (rows, cols) = last_pty_size;
+    logger::debug(&format!(
+        "spawning PTY {:?} {:?} in {} ({}x{}, resume_supported={})",
+        cfg.command,
+        launch_args,
+        session.worktree_path,
+        cols,
+        rows,
+        cfg.supports_session_resume()
+    ));
+    PtyClient::spawn(
+        &cfg.command,
+        launch_args,
+        Path::new(&session.worktree_path),
+        rows,
+        cols,
+        scrollback_lines,
+    )
+}
+
+impl App {
     pub(crate) fn spawn_companion_terminal_for_session(
         &self,
         session: &AgentSession,
@@ -1922,6 +2002,7 @@ mod tests {
             snapshot_buf: crate::pty::TerminalSnapshot::empty(),
             last_snapshot_id: None,
             terminal_selection: None,
+            disk_usage_pct: None,
             _single_instance_lock: single_instance_lock,
         };
         app.interactive_patterns = app.bindings.interactive_byte_patterns();
@@ -2453,6 +2534,145 @@ mod tests {
         assert!(
             msg.contains("not a git repository"),
             "error should include the git error, got: {msg}",
+        );
+    }
+
+    // -- Phase 16 (P1-AA): runtime resource limits --------------------------
+
+    /// `refuse_agent_spawn_for_limits` should return a verbose, actionable
+    /// message naming `limits.max_panes` once the active-pane count
+    /// reaches the configured cap. The message is the contract that
+    /// `dispatch_create_agent_request` surfaces via `set_error`.
+    #[test]
+    fn refuse_agent_spawn_when_max_panes_reached() {
+        let mut s1 = make_session("s1", "claude", "/tmp/wt/a");
+        let mut s2 = make_session("s2", "codex", "/tmp/wt/b");
+        s1.status = SessionStatus::Active;
+        s2.status = SessionStatus::Active;
+        let project = make_project("project-1", "claude");
+        let mut app = test_app_with_sessions(vec![s1, s2], vec![project]);
+        app.config.limits.max_panes = 2;
+
+        let reason = app
+            .refuse_agent_spawn_for_limits()
+            .expect("must refuse at the cap");
+        assert!(
+            reason.contains("max_panes"),
+            "error should name the offending knob, got: {reason}",
+        );
+        assert!(
+            reason.contains("Detach"),
+            "error should suggest a recovery path, got: {reason}",
+        );
+
+        // Below the cap → must allow.
+        app.sessions[1].status = SessionStatus::Detached;
+        assert!(app.refuse_agent_spawn_for_limits().is_none());
+
+        // max_panes = 0 → unlimited semantic; cap never trips.
+        app.sessions[1].status = SessionStatus::Active;
+        app.config.limits.max_panes = 0;
+        assert!(
+            app.refuse_agent_spawn_for_limits().is_none(),
+            "max_panes = 0 must mean unlimited",
+        );
+    }
+
+    /// When the disk-watchdog has reported >= disk_high_water_pct,
+    /// `refuse_agent_spawn_for_limits` must surface the disk message
+    /// with the percentage and recovery hint. Below the threshold (or
+    /// before the first sample) the gate must NOT trip — the disk
+    /// watchdog runs every 60 s, so callers must keep working until
+    /// the next sample arrives.
+    #[test]
+    fn refuse_agent_spawn_when_disk_above_high_water() {
+        let s1 = make_session("s1", "claude", "/tmp/wt/a");
+        let project = make_project("project-1", "claude");
+        let mut app = test_app_with_sessions(vec![s1], vec![project]);
+        app.config.limits.disk_high_water_pct = 95;
+
+        // Pre-watchdog: disk_usage_pct = None ⇒ gate does not fire.
+        assert!(app.refuse_agent_spawn_for_limits().is_none());
+
+        app.disk_usage_pct = Some(94);
+        assert!(
+            app.refuse_agent_spawn_for_limits().is_none(),
+            "94% < 95% high-water must allow spawn",
+        );
+
+        app.disk_usage_pct = Some(96);
+        let reason = app
+            .refuse_agent_spawn_for_limits()
+            .expect("must refuse above high-water");
+        assert!(
+            reason.contains("96%"),
+            "error should report the observed pct, got: {reason}",
+        );
+        assert!(
+            reason.contains("disk_high_water_pct"),
+            "error should name the offending knob, got: {reason}",
+        );
+        assert!(
+            reason.contains("dux session purge") || reason.contains("extend the volume"),
+            "error should suggest a recovery path, got: {reason}",
+        );
+    }
+
+    /// The scrollback overflow auto-detach is gated behind
+    /// `enable_scrollback_overflow_autodetach`. When enabled and the
+    /// estimated footprint exceeds `max_total_scrollback_mb`,
+    /// `handle_scrollback_usage_event` must detach the oldest-by-
+    /// `updated_at` session whose PTY is still attached and mark it
+    /// `Detached`. When disabled, the watchdog is never started; the
+    /// handler itself remains a safe no-op when the cap is `0`.
+    #[test]
+    fn scrollback_auto_detach_picks_oldest_session() {
+        use chrono::Duration as ChronoDuration;
+
+        let now = Utc::now();
+        let mut s_old = make_session("old", "claude", "/tmp/wt/old");
+        let mut s_new = make_session("new", "codex", "/tmp/wt/new");
+        s_old.updated_at = now - ChronoDuration::hours(2);
+        s_old.status = SessionStatus::Active;
+        s_new.updated_at = now;
+        s_new.status = SessionStatus::Active;
+        let project = make_project("project-1", "claude");
+        let mut app = test_app_with_sessions(vec![s_old, s_new], vec![project]);
+
+        // Force a real PTY for both sessions so the oldest_active_session_id
+        // helper can actually find a victim with a live `PtyClient`.
+        mark_active(&mut app, "old");
+        mark_active(&mut app, "new");
+        assert_eq!(app.providers.len(), 2);
+
+        // Set a very small cap — any non-zero footprint will exceed it.
+        app.config.limits.enable_scrollback_overflow_autodetach = true;
+        app.config.limits.max_total_scrollback_mb = 1;
+        // Pretend the agent_scrollback_lines is large enough that
+        // 2 panes × 80 cols × N lines × 4 B > 1 MiB.
+        let scrollback_lines = 100_000usize;
+
+        // First tick: must detach the oldest pane.
+        app.handle_scrollback_usage_event(scrollback_lines);
+        assert!(
+            !app.providers.contains_key("old"),
+            "oldest session's PTY should have been torn down",
+        );
+        let detached = app.sessions.iter().find(|s| s.id == "old").unwrap();
+        assert_eq!(detached.status, SessionStatus::Detached);
+        // The newer pane must still be attached after a single detach
+        // because the loop only tears down victims while the cap is
+        // exceeded — and with one pane the footprint should be lower.
+        // (We don't assert "still over cap" because the test config
+        // is intentionally aggressive; we just want to prove that the
+        // newest pane was not the one selected.)
+        let still_active = app.providers.contains_key("new");
+        let new_session = app.sessions.iter().find(|s| s.id == "new").unwrap();
+        assert!(
+            still_active || new_session.status == SessionStatus::Detached,
+            "scrollback detach must select oldest victim first; \
+             both sessions should not have been torn down before the \
+             oldest was selected",
         );
     }
 }

@@ -474,6 +474,19 @@ impl App {
                         Err(err) => self.set_error(format!("Commit failed: {err}")),
                     }
                 }
+                WorkerEvent::AutoResumeSpawned {
+                    session_id,
+                    used_resume_args,
+                    result,
+                } => {
+                    self.handle_auto_resume_spawned(session_id, used_resume_args, result);
+                }
+                WorkerEvent::DiskUsage(pct) => {
+                    self.handle_disk_usage_event(pct);
+                }
+                WorkerEvent::ScrollbackUsage(scrollback_lines) => {
+                    self.handle_scrollback_usage_event(scrollback_lines);
+                }
                 WorkerEvent::AddProjectMetaReady { path, name, result } => {
                     self.add_project_in_flight = false;
                     match result {
@@ -655,6 +668,204 @@ impl App {
                 entries,
             });
         });
+    }
+
+    /// Handle a [`WorkerEvent::DiskUsage`] sample.
+    ///
+    /// Caches the percentage on `self.disk_usage_pct` so
+    /// [`super::sessions::App::refuse_agent_spawn_for_limits`] can refuse
+    /// new agents at boot AND between samples, then decides whether to
+    /// flash a status-line banner:
+    ///
+    /// * `pct >= disk_high_water_pct` → red error banner; new spawns are
+    ///   refused by the gate above.
+    /// * `pct >= disk_warn_pct` → yellow warning banner; spawns still
+    ///   allowed.
+    /// * otherwise → if the previous tone was Warning/Error and the
+    ///   message looks like a disk banner we set, clear it back to
+    ///   Info.
+    pub(crate) fn handle_disk_usage_event(&mut self, pct: u8) {
+        let high = self.config.limits.disk_high_water_pct;
+        let warn = self.config.limits.disk_warn_pct;
+        let prev = self.disk_usage_pct;
+        self.disk_usage_pct = Some(pct);
+        if pct >= high {
+            self.set_error(format!(
+                "Persistent disk at {pct}% (limits.disk_high_water_pct = {high}%); \
+                 new agents refused. Run `dux session purge` or extend the volume."
+            ));
+        } else if pct >= warn {
+            self.set_warning(format!(
+                "Persistent disk at {pct}% (limits.disk_warn_pct = {warn}%); \
+                 consider running `dux session purge`."
+            ));
+        } else if let Some(prev_pct) = prev
+            && prev_pct >= warn
+            && matches!(
+                self.status.tone(),
+                crate::statusline::StatusTone::Warning | crate::statusline::StatusTone::Error
+            )
+            && self.status.message().contains("Persistent disk at")
+        {
+            // The previous tick had us in warn/high-water territory and
+            // we wrote the banner; now we're back below warn. Only clear
+            // if the status line still shows our banner — otherwise
+            // another subsystem owns it and we mustn't clobber.
+            self.set_info("");
+        }
+    }
+
+    /// Handle a [`WorkerEvent::ScrollbackUsage`] tick.
+    ///
+    /// This event is only emitted when
+    /// `[limits].enable_scrollback_overflow_autodetach = true`. Computes
+    /// the current total scrollback footprint (summed across all live
+    /// PTYs) and, if it exceeds `[limits].max_total_scrollback_mb`,
+    /// detaches the oldest-by-`updated_at` panes one at a time until the
+    /// total drops back under the cap. Detach != kill: the session row
+    /// stays in sqlite and can be reattached manually.
+    pub(crate) fn handle_scrollback_usage_event(&mut self, scrollback_lines: usize) {
+        let cap_bytes = self.config.limits.max_total_scrollback_mb.saturating_mul(
+            // 1 MiB
+            1024 * 1024,
+        );
+        if cap_bytes == 0 {
+            return; // cap disabled
+        }
+        loop {
+            let footprint = self.estimate_total_scrollback_bytes(scrollback_lines);
+            if footprint <= cap_bytes {
+                break;
+            }
+            // Pick the oldest-by-updated_at active pane and detach it.
+            let Some(victim) = self.oldest_active_session_id() else {
+                break; // nothing left to detach
+            };
+            let Some(client) = self.providers.remove(&victim) else {
+                break;
+            };
+            drop(client); // tear down the PTY + free the grid memory
+            self.running_provider_pins.remove(&victim);
+            self.last_pty_activity.remove(&victim);
+            self.resume_fallback_candidates.remove(&victim);
+            self.mark_session_status(&victim, SessionStatus::Detached);
+            logger::info(&format!(
+                "scrollback watchdog auto-detached session {victim}: total \
+                 grid footprint exceeded {} MiB",
+                self.config.limits.max_total_scrollback_mb,
+            ));
+            self.set_warning(format!(
+                "Auto-detached oldest agent: total scrollback exceeded \
+                 limits.max_total_scrollback_mb = {} MiB.",
+                self.config.limits.max_total_scrollback_mb,
+            ));
+        }
+    }
+
+    /// Approximates total scrollback grid memory across every live PTY.
+    /// Each cell is roughly `4 bytes` (alacritty_terminal stores a
+    /// glyph + style). We don't ask the terminal for an exact byte
+    /// count because the watchdog only needs to know whether we're over
+    /// the cap, not the precise number — and a per-cell walk per
+    /// minute would be wasted work.
+    pub(crate) fn estimate_total_scrollback_bytes(&self, scrollback_lines: usize) -> usize {
+        // Default cols when the PTY hasn't been resized yet.
+        let cols = if self.last_pty_size.1 == 0 {
+            80usize
+        } else {
+            self.last_pty_size.1 as usize
+        };
+        const BYTES_PER_CELL: usize = 4;
+        self.providers
+            .len()
+            .saturating_mul(scrollback_lines)
+            .saturating_mul(cols)
+            .saturating_mul(BYTES_PER_CELL)
+    }
+
+    /// Returns the ID of the oldest-by-`updated_at` session whose PTY is
+    /// still attached. Used by the scrollback watchdog to pick a detach
+    /// victim. Sessions without a live `PtyClient` are ignored.
+    pub(crate) fn oldest_active_session_id(&self) -> Option<String> {
+        self.sessions
+            .iter()
+            .filter(|s| self.providers.contains_key(&s.id))
+            .min_by_key(|s| s.updated_at)
+            .map(|s| s.id.clone())
+    }
+
+    /// Sample persistent-disk usage at `paths.root` once a minute and ship
+    /// the percentage back to the UI thread via
+    /// [`WorkerEvent::DiskUsage`].
+    ///
+    /// Uses [`rustix::fs::statvfs`] (already a transitive dependency).
+    /// `statvfs` on a bind-mount reports the underlying filesystem's
+    /// stats, which is the correct behaviour for a watchdog that's trying
+    /// to refuse new agents before the host fills up — a bind-mounted dux
+    /// home that points at `/data` should refuse new agents when `/data`
+    /// is full, not when the bind point alone is full.
+    pub(crate) fn spawn_disk_watchdog(&self) {
+        let tx = self.worker_tx.clone();
+        let root = self.paths.root.clone();
+        thread::Builder::new()
+            .name("disk-watchdog".into())
+            .spawn(move || {
+                // Emit a first sample immediately so the UI can refuse
+                // spawns at boot if the disk is already over high-water.
+                if let Some(pct) = sample_disk_usage_pct(&root)
+                    && tx.send(WorkerEvent::DiskUsage(pct)).is_err()
+                {
+                    return;
+                }
+                loop {
+                    thread::sleep(DISK_WATCHDOG_INTERVAL);
+                    let Some(pct) = sample_disk_usage_pct(&root) else {
+                        continue;
+                    };
+                    if tx.send(WorkerEvent::DiskUsage(pct)).is_err() {
+                        return; // receiver dropped, app shutting down
+                    }
+                }
+            })
+            .ok();
+    }
+
+    /// Sample total scrollback grid memory across all live PTYs once a
+    /// minute and ship the result back via
+    /// [`WorkerEvent::ScrollbackUsage`].
+    ///
+    /// The handler in `drain_events` decides whether to act on the value;
+    /// auto-detach is gated on
+    /// `[limits].enable_scrollback_overflow_autodetach` so this watchdog
+    /// is started only when that flag is `true`.
+    pub(crate) fn spawn_scrollback_watchdog(&self) {
+        let tx = self.worker_tx.clone();
+        let scrollback_lines = self.config.ui.agent_scrollback_lines;
+        // We can't safely peek at the live `PtyClient`s from a worker
+        // thread (they hold non-Send fds), so the worker fires a tick on
+        // a fixed interval and the UI thread computes the footprint when
+        // it drains the event. The footprint is therefore an O(n_panes)
+        // computation on the UI thread, but n is bounded by `max_panes`
+        // (default 16) and the math is just per-pane multiplication, so
+        // it's well under a millisecond.
+        thread::Builder::new()
+            .name("scrollback-watchdog".into())
+            .spawn(move || {
+                loop {
+                    thread::sleep(SCROLLBACK_WATCHDOG_INTERVAL);
+                    // We don't have access to the runtime pane list here;
+                    // signal "tick" by sending a sentinel and let the UI
+                    // thread compute the actual footprint with the
+                    // configured scrollback line count.
+                    if tx
+                        .send(WorkerEvent::ScrollbackUsage(scrollback_lines))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            })
+            .ok();
     }
 
     pub(crate) fn spawn_branch_sync_worker(&self) {
@@ -1455,6 +1666,40 @@ pub(crate) fn browser_entries(dir: &Path) -> Vec<BrowserEntry> {
         );
     }
     entries
+}
+
+// -- Disk + scrollback watchdog helpers --
+
+/// How often [`App::spawn_disk_watchdog`] re-samples persistent-disk
+/// usage. 60 s is short enough to react to a runaway worktree before the
+/// host wedges, long enough that the syscall load is rounding-noise.
+const DISK_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How often [`App::spawn_scrollback_watchdog`] kicks the UI thread to
+/// recompute total scrollback memory and consider an auto-detach.
+const SCROLLBACK_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Sample persistent-disk usage at `path` and return the percentage
+/// (0..=100). `None` is returned on syscall failure (path missing,
+/// permissions, etc.) — the watchdog skips that tick rather than emitting
+/// a misleading "0% used" sample.
+///
+/// `statvfs` on Linux returns `f_blocks` (total fragments) and
+/// `f_bavail` (fragments available to non-root); the byte total is
+/// `f_frsize * f_blocks`. We compute the percentage with `(used * 100 /
+/// total)` and clamp to `u8` so a fileystem that overflows an i64 (which
+/// no realistic 2026-era host has) still produces a safe value.
+pub(crate) fn sample_disk_usage_pct(path: &Path) -> Option<u8> {
+    let stat = rustix::fs::statvfs(path).ok()?;
+    let total_blocks = stat.f_blocks;
+    if total_blocks == 0 {
+        return None;
+    }
+    let avail_blocks = stat.f_bavail;
+    let used_blocks = total_blocks.saturating_sub(avail_blocks);
+    // Multiply before the divide to keep precision on small filesystems.
+    let pct = (used_blocks.saturating_mul(100) / total_blocks).min(100);
+    Some(pct as u8)
 }
 
 // -- GitHub PR sync helpers (run on background threads) --

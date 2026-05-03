@@ -38,6 +38,8 @@ pub struct Config {
     pub keys: KeysConfig,
     pub macros: MacrosConfig,
     pub storage: StorageConfig,
+    pub auto_resume: AutoResumeConfig,
+    pub limits: LimitsConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -205,6 +207,139 @@ impl Default for StorageConfig {
     }
 }
 
+/// Tunables for `defaults.auto_resume_on_start`.
+///
+/// When auto-resume is enabled at startup, dux otherwise spawns a PTY for
+/// every persisted session in a tight loop. With many saved sessions that
+/// causes a fork-bomb / TLS-handshake stampede that some providers
+/// rate-limit, so spawns are bounded by [`Self::concurrency`], staggered by
+/// [`Self::stagger_ms`], and worktrees untouched for more than
+/// [`Self::stale_days`] days are skipped entirely.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoResumeConfig {
+    /// Maximum number of sessions whose PTY may be spawning in parallel.
+    /// Lower = slower startup but less API load. 0 is treated as 1.
+    /// Default 4.
+    #[serde(default = "default_auto_resume_concurrency")]
+    pub concurrency: usize,
+    /// Skip auto-resume for any session whose worktree directory has not
+    /// been modified within this many days. 0 disables the filter (all
+    /// sessions are eligible). Default 30.
+    #[serde(default = "default_auto_resume_stale_days")]
+    pub stale_days: u32,
+    /// Minimum delay (in milliseconds) between successive spawn attempts.
+    /// Smooths out the burst of TLS handshakes when many sessions resume.
+    /// Default 250.
+    #[serde(default = "default_auto_resume_stagger_ms")]
+    pub stagger_ms: u64,
+}
+
+fn default_auto_resume_concurrency() -> usize {
+    4
+}
+
+fn default_auto_resume_stale_days() -> u32 {
+    30
+}
+
+fn default_auto_resume_stagger_ms() -> u64 {
+    250
+}
+
+impl Default for AutoResumeConfig {
+    fn default() -> Self {
+        Self {
+            concurrency: default_auto_resume_concurrency(),
+            stale_days: default_auto_resume_stale_days(),
+            stagger_ms: default_auto_resume_stagger_ms(),
+        }
+    }
+}
+
+/// Runtime resource caps. Hard limits enforced at agent-creation time
+/// (panes / disk) and a soft, opt-in cap for total scrollback memory that
+/// auto-detaches the oldest pane when exceeded.
+///
+/// Without these caps, dux can happily fork-bomb the host into OOM by
+/// spawning ~100 panes × 1 MB grids + ~100 MB provider processes in under a
+/// minute. The defaults below are conservative enough for a 32 GB workstation
+/// and easy to raise per host.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LimitsConfig {
+    /// Maximum number of simultaneously-active agent panes. New
+    /// `create_agent` requests are refused with a status-line error when
+    /// the cap is hit. `0` means unlimited (NOT recommended). Default 16.
+    #[serde(default = "default_max_panes")]
+    pub max_panes: usize,
+    /// Maximum companion (raw shell) terminals. Documented for symmetry
+    /// with `max_panes`; honoured at terminal-spawn time.
+    /// `0` means unlimited. Default 4.
+    #[serde(default = "default_max_companion_terminals")]
+    pub max_companion_terminals: usize,
+    /// Soft cap on total scrollback grid memory across all panes (MiB).
+    /// When exceeded AND `enable_scrollback_overflow_autodetach = true`,
+    /// oldest-by-`updated_at` panes are auto-detached (their grid is
+    /// freed) until the total drops back under the cap. Detach != kill;
+    /// the persisted session record is preserved. Default 256.
+    #[serde(default = "default_max_total_scrollback_mb")]
+    pub max_total_scrollback_mb: usize,
+    /// When persistent-disk usage at `paths.root` exceeds this percentage,
+    /// `create_agent` is refused with a red status line. Default 95.
+    #[serde(default = "default_disk_high_water_pct")]
+    pub disk_high_water_pct: u8,
+    /// When persistent-disk usage at `paths.root` exceeds this percentage,
+    /// a yellow warning is shown on the status line but agent creation is
+    /// still allowed. Default 80.
+    #[serde(default = "default_disk_warn_pct")]
+    pub disk_warn_pct: u8,
+    /// Master switch for the soft scrollback cap. When `false` (the
+    /// default), the disk-watchdog still samples and the warn/high-water
+    /// disk banners still fire, but no pane is ever auto-detached because
+    /// of scrollback growth. Operators can opt in once they're comfortable
+    /// that an unattended detach won't surprise them mid-meeting.
+    #[serde(default = "default_enable_scrollback_overflow_autodetach")]
+    pub enable_scrollback_overflow_autodetach: bool,
+}
+
+fn default_max_panes() -> usize {
+    16
+}
+
+fn default_max_companion_terminals() -> usize {
+    4
+}
+
+fn default_max_total_scrollback_mb() -> usize {
+    256
+}
+
+fn default_disk_high_water_pct() -> u8 {
+    95
+}
+
+fn default_disk_warn_pct() -> u8 {
+    80
+}
+
+fn default_enable_scrollback_overflow_autodetach() -> bool {
+    false
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_panes: default_max_panes(),
+            max_companion_terminals: default_max_companion_terminals(),
+            max_total_scrollback_mb: default_max_total_scrollback_mb(),
+            disk_high_water_pct: default_disk_high_water_pct(),
+            disk_warn_pct: default_disk_warn_pct(),
+            enable_scrollback_overflow_autodetach: default_enable_scrollback_overflow_autodetach(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
@@ -251,6 +386,8 @@ impl Default for Config {
             keys: KeysConfig::default(),
             macros: MacrosConfig::default(),
             storage: StorageConfig::default(),
+            auto_resume: AutoResumeConfig::default(),
+            limits: LimitsConfig::default(),
         }
     }
 }
@@ -581,6 +718,7 @@ enum FieldValue {
     OptStr(Option<String>),
     U16(u16),
     U32(u32),
+    U64(u64),
     Usize(usize),
     Bool(bool),
     MultilineStr(Option<String>),
@@ -798,6 +936,96 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             value_fn: |c| FieldValue::U32(c.storage.backup_interval_minutes),
         },
         ConfigEntry::Blank,
+        ConfigEntry::Section("auto_resume"),
+        ConfigEntry::Field {
+            key: "concurrency",
+            comment: Some(CommentSource::Static(
+                "# Maximum number of sessions whose PTY may be spawning in parallel\n\
+                 # when defaults.auto_resume_on_start = true. Lower = slower startup\n\
+                 # but less load on provider APIs. 0 is treated as 1. Default 4.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.auto_resume.concurrency),
+        },
+        ConfigEntry::Field {
+            key: "stale_days",
+            comment: Some(CommentSource::Static(
+                "# Skip auto-resume for any session whose worktree directory has not\n\
+                 # been modified within this many days. 0 disables the filter and\n\
+                 # every persisted session is eligible. Default 30.",
+            )),
+            value_fn: |c| FieldValue::U32(c.auto_resume.stale_days),
+        },
+        ConfigEntry::Field {
+            key: "stagger_ms",
+            comment: Some(CommentSource::Static(
+                "# Minimum delay (milliseconds) between successive spawn attempts.\n\
+                 # Smooths out the burst of provider TLS handshakes when many\n\
+                 # sessions resume at once. Default 250.",
+            )),
+            value_fn: |c| FieldValue::U64(c.auto_resume.stagger_ms),
+        },
+        ConfigEntry::Blank,
+        ConfigEntry::Section("limits"),
+        ConfigEntry::Field {
+            key: "max_panes",
+            comment: Some(CommentSource::Static(
+                "# Maximum number of simultaneously-active agent panes. New agent\n\
+                 # creation is refused with a status-line error when the cap is\n\
+                 # hit; detach an unused pane or raise this value to recover.\n\
+                 # 0 means unlimited (NOT recommended on shared hosts). Default 16.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.limits.max_panes),
+        },
+        ConfigEntry::Field {
+            key: "max_companion_terminals",
+            comment: Some(CommentSource::Static(
+                "# Maximum number of companion (raw shell) terminals across all\n\
+                 # sessions. 0 means unlimited. Default 4.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.limits.max_companion_terminals),
+        },
+        ConfigEntry::Field {
+            key: "max_total_scrollback_mb",
+            comment: Some(CommentSource::Static(
+                "# Soft cap on total scrollback grid memory across all panes (MiB).\n\
+                 # Only enforced when enable_scrollback_overflow_autodetach = true,\n\
+                 # in which case oldest-by-updated_at panes are detached (not killed)\n\
+                 # until the total drops back under this cap. Default 256.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.limits.max_total_scrollback_mb),
+        },
+        ConfigEntry::Field {
+            key: "disk_high_water_pct",
+            comment: Some(CommentSource::Static(
+                "# When persistent-disk usage at the dux config root exceeds this\n\
+                 # percentage, new agent creation is refused with a red status line.\n\
+                 # Run `dux session purge` (or extend the volume) to recover.\n\
+                 # Default 95.",
+            )),
+            value_fn: |c| FieldValue::U16(u16::from(c.limits.disk_high_water_pct)),
+        },
+        ConfigEntry::Field {
+            key: "disk_warn_pct",
+            comment: Some(CommentSource::Static(
+                "# When persistent-disk usage at the dux config root exceeds this\n\
+                 # percentage, a yellow warning is shown on the status line but\n\
+                 # agent creation is still allowed. Default 80.",
+            )),
+            value_fn: |c| FieldValue::U16(u16::from(c.limits.disk_warn_pct)),
+        },
+        ConfigEntry::Field {
+            key: "enable_scrollback_overflow_autodetach",
+            comment: Some(CommentSource::Static(
+                "# When true, a background watchdog samples total scrollback grid\n\
+                 # memory once per minute and auto-detaches the oldest-by-updated_at\n\
+                 # panes once max_total_scrollback_mb is exceeded. Default false\n\
+                 # because an unattended detach can surprise an operator mid-call.\n\
+                 # Detached sessions remain in the database and can be reattached\n\
+                 # manually like any other detached session.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.limits.enable_scrollback_overflow_autodetach),
+        },
+        ConfigEntry::Blank,
         ConfigEntry::Keys,
         ConfigEntry::Blank,
         ConfigEntry::Macros,
@@ -845,6 +1073,9 @@ fn render_config(config: &Config, bindings: &crate::keybindings::RuntimeBindings
                         let _ = writeln!(out, "{key} = {n}");
                     }
                     FieldValue::U32(n) => {
+                        let _ = writeln!(out, "{key} = {n}");
+                    }
+                    FieldValue::U64(n) => {
                         let _ = writeln!(out, "{key} = {n}");
                     }
                     FieldValue::Usize(n) => {

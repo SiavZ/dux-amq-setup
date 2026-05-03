@@ -5234,6 +5234,7 @@ mod tests {
             commit_in_flight: false,
             staged_diff_in_flight: false,
             add_project_in_flight: false,
+            disk_usage_pct: None,
             _single_instance_lock: single_instance_lock,
         };
         app.interactive_patterns = app.bindings.interactive_byte_patterns();
