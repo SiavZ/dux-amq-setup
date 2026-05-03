@@ -131,6 +131,7 @@ When shelling out to git, **always ensure the command output is immune to user-s
 - When a setting can have a sensible default at first boot (e.g., the user's home directory, platform-specific paths), resolve and store the concrete value in `config.toml` right away — do not leave it commented out or empty. Users should see a working value they can edit, not a placeholder they have to fill in.
 - Preserve safe failure behavior around project refresh and failed agent startup.
 - **Never use byte-based `.len()` or `[..n]` slicing to truncate user-visible strings.** Terminal output, file paths, and UI text can contain multi-byte UTF-8 characters (box-drawing, block elements, CJK, emoji). Always use `.chars().count()` for length and `.chars().take(n).collect()` (or `char_indices().nth()`) for truncation. Byte-based slicing will panic if the index falls inside a multi-byte character.
+- **Update `SECURITY.md` when you add attack surface.** When introducing a new attack surface (a new MCP integration, a new network egress, a new file write outside `$STATE_ROOT`, a new provider CLI, a new wrapper binary), update the STRIDE table in `SECURITY.md` and the long-form companion at `docs/operations/threat-model.md` **in the same PR**. The threat model is a living document; PRs that introduce attack surface without updating it are blocked at review. New threat IDs append at the end (`T13`, `T14`, …) rather than reshuffling existing rows.
 
 ### Logging
 
