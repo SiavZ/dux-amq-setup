@@ -64,11 +64,19 @@ no longer matches the recorded hash.
   banner, no AMQ aliases. Restore → aliases come back.
 
 ## Acceptance criteria
-- [ ] AMQ binary at `$STATE_ROOT/amq-bin/amq` with `0755` perms.
-- [ ] Hash recorded in `$STATE_ROOT/amq/binary.sha256`.
-- [ ] No bare `eval "$(amq shell-setup)"` anywhere.
-- [ ] Guard refuses to eval on hash mismatch (red banner).
-- [ ] bats covers happy, mismatch, missing.
+- [x] AMQ binary at `$STATE_ROOT/amq-bin/amq` with `0755` perms.
+- [x] Hash recorded in `$STATE_ROOT/amq/binary.sha256`.
+- [x] No bare `eval "$(amq shell-setup)"` anywhere.
+- [x] Guard refuses to eval on hash mismatch (red banner).
+- [ ] bats covers happy, mismatch, missing. *(Deferred — Track A cannot create new test files. Manual repro of all three cases performed and documented in the commit message; Track B should land the bats fixtures.)*
+
+Track A also adds an install-time pre-pin gate: `verify_sha256` against
+`AMQ_BINARY_SHA256` runs before copying the binary to `$AMQ_BIN_DIR`, so a
+tampered `amq` already in `$PATH` is rejected at install (exit 1) — the
+runtime guard then becomes a defense-in-depth layer rather than the only
+check. The dedicated `lib/amq-shell-setup-guard.sh` indirection is
+inlined into `bashrc-additions.sh` because Track A scope forbids new
+files; the guard logic itself is byte-identical to the plan's snippet.
 
 ## References
 - Audit P1-8.

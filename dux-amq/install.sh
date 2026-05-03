@@ -33,6 +33,12 @@ AMQ_SHA256="${AMQ_SHA256:-cba940987d00a3d072f395c7ec7a648e47d652f1ff503abf46da53
 SKILLS_PIN="${SKILLS_PIN:-1.5.3}"
 SKILLS_REV="${SKILLS_REV:-6a9417d40cc8b9d9f71e9fbb1e39c872d0763b54}"
 
+# Expected sha256 of the extracted amq binary (audit01 P1-8). Cross-checked
+# against the file inside amq_${AMQ_VERSION}_linux_amd64.tar.gz at install
+# time so a tampered-with binary already in $PATH is rejected before being
+# pinned at $STATE_ROOT/amq-bin/amq.
+AMQ_BINARY_SHA256="${AMQ_BINARY_SHA256:-eb78901f3dd13534884923e02ad9c6852be1b0a4c7f452fe52b8bcd795e3556b}"
+
 # AUDIT01-VERSION — overlay version; gates idempotent config-block rewrites
 # (Phase 12). Phase 15's release pipeline rewrites this line on tag.
 DUX_AMQ_VERSION="${DUX_AMQ_VERSION:-0.1.0}"
@@ -142,6 +148,27 @@ fi
 amq init --root "$STATE_ROOT/amq" --agents claude,codex,gemini --force >/dev/null
 chmod 700 "$STATE_ROOT/amq"
 ok "amq queue at $STATE_ROOT/amq"
+
+# Audit01 P1-8: pin amq at a controlled absolute path under $STATE_ROOT and
+# record its sha256, so the bashrc guard (in bashrc-additions.sh) can refuse
+# to source `amq shell-setup` if the binary on disk no longer matches.
+# Without this guard, every interactive shell start would `eval` whatever the
+# `amq` binary in PATH chose to print — a much larger trust radius than the
+# install-time pin we just verified above.
+#
+# Before pinning, verify the binary about to be copied matches AMQ_BINARY_SHA256
+# (cross-checked against the extracted tarball). This catches the case where
+# the user already has a tampered `amq` in PATH from an earlier untrusted
+# install and the Phase 01 tarball-download branch was skipped.
+AMQ_BIN_DIR="$STATE_ROOT/amq-bin"
+AMQ_BIN_PINNED="$AMQ_BIN_DIR/amq"
+AMQ_BIN_SOURCE="$(command -v amq)"
+mkdir -p "$AMQ_BIN_DIR"
+verify_sha256 "$AMQ_BIN_SOURCE" "$AMQ_BINARY_SHA256" "amq binary"
+install -m 0755 "$AMQ_BIN_SOURCE" "$AMQ_BIN_PINNED"
+sha256sum "$AMQ_BIN_PINNED" > "$STATE_ROOT/amq/binary.sha256"
+chmod 0644 "$STATE_ROOT/amq/binary.sha256"
+ok "amq binary pinned at $AMQ_BIN_PINNED ($(awk '{print $1}' "$STATE_ROOT/amq/binary.sha256"))"
 
 # 4. AMQ skills (gives Claude/etc. native knowledge of amq) ------------------
 # Pin the npm package version, pin the skills-source git ref, block postinstall
