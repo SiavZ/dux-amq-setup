@@ -132,9 +132,12 @@ setup_parent_and_worktree() {
     git -c commit.gpgsign=false commit -q -m init
     git worktree add -q -b feature "$wt" >/dev/null
   )
-  # The wrapper's seed encodes the worktree path with `s|/|-|g; s|_|-|g`.
-  ENC_PARENT=$(echo "$repo" | sed 's|/|-|g; s|_|-|g')
-  ENC_CHILD=$(echo "$wt"   | sed 's|/|-|g; s|_|-|g')
+  # Phase 12: encoding is now done by the shared encode-claude-project-dir
+  # script (single source of truth). It replaces every non-[A-Za-z0-9-]
+  # char with `-`, including `.` (the old inline sed kept `.`). Calling
+  # the script here keeps test fixtures in sync with wrapper behavior.
+  ENC_PARENT=$(encode-claude-project-dir "$repo")
+  ENC_CHILD=$(encode-claude-project-dir "$wt")
   PARENT_SESS_DIR="$HOME/.claude/projects/$ENC_PARENT"
   CHILD_SESS_DIR="$HOME/.claude/projects/$ENC_CHILD"
   mkdir -p "$PARENT_SESS_DIR"

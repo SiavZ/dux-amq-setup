@@ -4,6 +4,19 @@
 # Uses the global queue at $AMQ_GLOBAL_ROOT.
 set -euo pipefail
 
+# See claude-amq for the full rationale on path-segment vs prefix
+# containment (audit01 P0-5). `realpath --` requires GNU coreutils;
+# install.sh preflights it.
+is_dux_worktree() {
+  local pwd_real worktrees_real
+  pwd_real=$(realpath -- "$PWD" 2>/dev/null)        || return 1
+  worktrees_real=$(realpath -- "${DUX_HOME:-/data/state/dux}/worktrees" 2>/dev/null) || return 1
+  case "$pwd_real/" in
+    "$worktrees_real"/*) return 0 ;;
+    *)                   return 1 ;;
+  esac
+}
+
 for arg in "$@"; do
   case "$arg" in
     -p|--print) exec gemini "$@" ;;
@@ -11,7 +24,7 @@ for arg in "$@"; do
 done
 
 ME="${AM_ME:-}"
-if [[ -z "$ME" && "$PWD" == "${DUX_HOME:-/data/state/dux}/worktrees/"* ]]; then
+if [[ -z "$ME" ]] && is_dux_worktree; then
   ME=$(basename "$PWD")
 fi
 if [[ -z "$ME" ]]; then

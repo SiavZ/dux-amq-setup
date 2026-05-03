@@ -17,6 +17,34 @@
 #   a deferred-tool marker that --continue refuses.
 set -euo pipefail
 
+# Returns 0 when $PWD is *inside* the dux worktrees directory, 1 otherwise.
+#
+# Why not a simple `[[ "$PWD" == "$DUX_HOME/worktrees/"* ]]` glob (the
+# previous implementation): the glob also matches sibling directories
+# whose names start with `worktrees`, e.g. `/data/state/dux/worktrees-evil/x`.
+# That path-prefix vs path-segment distinction is the audit01 P0-5 bug.
+#
+# We canonicalize both sides via `realpath --` so a symlinked DUX_HOME
+# or a CWD reached through a symlink still resolves correctly. The
+# trailing slash on `pwd_real/` plus the `/*` pattern on the case label
+# enforces a real path-segment boundary: `/foo/worktrees/` matches but
+# `/foo/worktrees-evil/` does not.
+#
+# Linux note: `realpath --` requires GNU coreutils (the install.sh
+# preflight enforces this). On macOS, `realpath` accepts the same flag
+# starting with coreutils 9.x via brew; users on stock BSD realpath
+# need `brew install coreutils` and either alias or set PATH so that
+# `grealpath`/GNU realpath wins.
+is_dux_worktree() {
+  local pwd_real worktrees_real
+  pwd_real=$(realpath -- "$PWD" 2>/dev/null)        || return 1
+  worktrees_real=$(realpath -- "${DUX_HOME:-/data/state/dux}/worktrees" 2>/dev/null) || return 1
+  case "$pwd_real/" in
+    "$worktrees_real"/*) return 0 ;;
+    *)                   return 1 ;;
+  esac
+}
+
 for arg in "$@"; do
   case "$arg" in
     -p|--print|--bare) exec claude "$@" ;;
@@ -35,9 +63,24 @@ seed_session_history() {
     | awk '/^worktree / {print $2; exit}')
   [[ -z "$main_worktree" || "$main_worktree" == "$PWD" ]] && return 0
 
-  local enc_self enc_main self_dir main_dir
-  enc_self=$(echo "$PWD"           | sed 's|/|-|g; s|_|-|g')
-  enc_main=$(echo "$main_worktree" | sed 's|/|-|g; s|_|-|g')
+  # Encode each path with the shared encoder script (single source of
+  # truth — see dux-amq/scripts/encode-claude-project-dir). The previous
+  # inline `sed` only handled `/` and `_`; in reality Claude Code rewrites
+  # every char outside [A-Za-z0-9-] to `-`, so paths containing `.`,
+  # spaces, or other punctuation seeded into the wrong directory and the
+  # parent transcripts were silently never picked up.
+  if ! command -v encode-claude-project-dir >/dev/null 2>&1; then
+    printf 'claude-amq: encode-claude-project-dir not on PATH; skipping seed\n' >&2
+    return 0
+  fi
+  # `--` guards against pathological paths that begin with `-`. We also
+  # capture $PWD / $main_worktree via `printf '%s'` (P2-3) before passing
+  # to the encoder — `echo` would interpret a leading `-n` / `-e` as flags.
+  local enc_self enc_main self_dir main_dir pwd_str main_str
+  pwd_str=$(printf '%s' "$PWD")
+  main_str=$(printf '%s' "$main_worktree")
+  enc_self=$(encode-claude-project-dir -- "$pwd_str") || return 0
+  enc_main=$(encode-claude-project-dir -- "$main_str") || return 0
   self_dir="$HOME/.claude/projects/$enc_self"
   main_dir="$HOME/.claude/projects/$enc_main"
 
@@ -65,7 +108,7 @@ ME="${AM_ME:-}"
 #      git branch was renamed or checked out to something unexpected
 #   3. git branch (legacy fallback)
 #   4. claude-<pid> (no-context fallback)
-if [[ -z "$ME" && "$PWD" == "${DUX_HOME:-/data/state/dux}/worktrees/"* ]]; then
+if [[ -z "$ME" ]] && is_dux_worktree; then
   ME=$(basename "$PWD")
 fi
 if [[ -z "$ME" ]]; then
