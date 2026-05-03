@@ -35,8 +35,34 @@ require_install_env() {
   command -v amq >/dev/null      || skip "amq not on PATH"
 }
 
+# Strip the `tests/fakes/` directory from $PATH for tests that drive the
+# real install.sh end-to-end. `setup_isolated_home` prepends `tests/fakes/`
+# so wrapper tests can shadow `amq`, but install.sh resolves `amq` via
+# `command -v` and then sha256-verifies the resolved binary against the
+# pinned production hash (AMQ_BINARY_SHA256). The Phase 01 fake `amq`
+# obviously does not match that pin, so install.sh aborts before it can
+# create `$STATE_ROOT/amq/meta/config.json` (P0-F) or pin the binary at
+# `$STATE_ROOT/amq-bin/amq` (N-3).
+#
+# These two tests assume a real, hash-pinned amq on PATH (see
+# require_install_env above); restoring PATH to that real binary is the
+# only test-only mutation needed — production install.sh is untouched.
+unshadow_real_amq_on_path() {
+  local fakes="$BATS_TEST_DIRNAME/fakes"
+  # Drop `$fakes` (and any duplicate occurrences) from $PATH while
+  # preserving every other entry's order.
+  local IFS=':' new=() entry
+  for entry in $PATH; do
+    [[ "$entry" == "$fakes" ]] && continue
+    new+=("$entry")
+  done
+  PATH="$(IFS=':'; printf '%s' "${new[*]}")"
+  export PATH
+}
+
 @test "P0-F: second install does not wipe amq queue config" {
   require_install_env
+  unshadow_real_amq_on_path
   cd "$REPO_ROOT"
   ./dux-amq/install.sh >/dev/null
   [ -f "$STATE_ROOT/amq/meta/config.json" ]
@@ -55,6 +81,7 @@ PY
 
 @test "N-3: shell-setup guard refuses to eval when binary.sha256 record is removed" {
   require_install_env
+  unshadow_real_amq_on_path
   cd "$REPO_ROOT"
   ./dux-amq/install.sh >/dev/null
   rm -f "$STATE_ROOT/amq/binary.sha256"
