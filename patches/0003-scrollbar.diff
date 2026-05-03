@@ -1,5 +1,5 @@
 diff --git a/src/app/render.rs b/src/app/render.rs
-index 37ad482..248d989 100644
+index 37ad482..b244698 100644
 --- a/src/app/render.rs
 +++ b/src/app/render.rs
 @@ -117,7 +117,7 @@ const WELCOME_TIPS: &[fn(&RuntimeBindings) -> String] = &[
@@ -53,7 +53,7 @@ index 37ad482..248d989 100644
              if let Some(session) = self.selected_session()
                  && session.provider != project.default_provider
              {
-@@ -1358,6 +1341,31 @@ impl App {
+@@ -1358,6 +1341,46 @@ impl App {
                              );
                      }
                  }
@@ -70,13 +70,28 @@ index 37ad482..248d989 100644
 +                    let total = self.snapshot_buf.scrollback_total;
 +                    let visible = term_area.height as usize;
 +                    if total > 0 && visible > 0 && term_area.width >= 2 {
-+                        // ratatui position is 0 at the top, content_length-1 at the bottom.
-+                        // dux's offset is 0 when at the latest (bottom): position = total - offset.
++                        // ratatui's `ScrollbarState` clamps `position` to
++                        // `[0, content_length - 1]` and computes the thumb
++                        // span as `position * track_len /
++                        // (content_length - 1 + viewport_len)` (see
++                        // ratatui-widgets-0.3.0 `scrollbar::part_lengths`).
++                        // Earlier this code passed `total + visible` as
++                        // `content_length` *and* called
++                        // `viewport_content_length(visible)`, which inflated
++                        // the denominator by another `visible` so the thumb
++                        // could never reach the bottom of the track.
++                        //
++                        // Use the documented-clean form: `content_length =
++                        // total`, no `viewport_content_length`, and let
++                        // ratatui derive the viewport from the area height.
++                        //
++                        // dux's `scrollback_offset` is 0 when the latest
++                        // line is at the bottom and grows as the user pages
++                        // back; ratatui's position is 0 at the top. Map
++                        // them: position = total - offset - 1 (saturating).
 +                        let offset = self.snapshot_buf.scrollback_offset.min(total);
-+                        let position = total.saturating_sub(offset);
-+                        let mut state = ScrollbarState::new(total + visible)
-+                            .viewport_content_length(visible)
-+                            .position(position);
++                        let position = total.saturating_sub(offset).saturating_sub(1);
++                        let mut state = ScrollbarState::new(total).position(position);
 +                        Scrollbar::new(ScrollbarOrientation::VerticalRight)
 +                            .style(Style::default().fg(self.theme.scroll_indicator_fg))
 +                            .render(term_area, frame.buffer_mut(), &mut state);
@@ -85,7 +100,7 @@ index 37ad482..248d989 100644
              }
          }
  
-@@ -2794,7 +2802,7 @@ impl App {
+@@ -2794,7 +2817,7 @@ impl App {
                  let detail_lines = vec![
                      Line::from(vec![
                          Span::styled(
@@ -94,7 +109,7 @@ index 37ad482..248d989 100644
                              Style::default().fg(self.theme.hint_desc_fg),
                          ),
                          Span::styled(
-@@ -2805,7 +2813,7 @@ impl App {
+@@ -2805,7 +2828,7 @@ impl App {
                          ),
                      ]),
                      Line::from(vec![Span::styled(
@@ -103,7 +118,7 @@ index 37ad482..248d989 100644
                          Style::default().fg(self.theme.hint_desc_fg),
                      )]),
                  ];
-@@ -2828,7 +2836,7 @@ impl App {
+@@ -2828,7 +2851,7 @@ impl App {
                      .iter()
                      .map(|option| {
                          let status = if option.is_current {
@@ -112,7 +127,7 @@ index 37ad482..248d989 100644
                          } else {
                              "available"
                          };
-@@ -2905,7 +2913,7 @@ impl App {
+@@ -2905,7 +2928,7 @@ impl App {
                      ))
                      .render(frame, cancel_area, &self.theme);
  
@@ -121,7 +136,7 @@ index 37ad482..248d989 100644
                      .kind(ButtonKind::Confirm)
                      .state(button_state_for(
                          ButtonPressedTarget::ChangeDefaultProviderApply,
-@@ -2923,223 +2931,6 @@ impl App {
+@@ -2923,223 +2946,6 @@ impl App {
                      apply_button: apply_area,
                  };
              }
