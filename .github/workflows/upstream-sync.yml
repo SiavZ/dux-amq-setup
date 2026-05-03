@@ -1,0 +1,117 @@
+name: upstream-sync
+
+# Audit01 Phase 06 (P1-5): weekly merge of patrickdappollonio/dux upstream/main
+# into this fork. Opens a DRAFT PR — never auto-merges. Conflicts in the four
+# patched Rust files (src/clipboard.rs, src/app/mod.rs, src/app/render.rs,
+# src/config.rs) surface in the PR body via the `merge --no-edit` step run
+# with continue-on-error. Manual conflict resolution is required.
+
+on:
+  schedule:
+    # Sunday 03:00 UTC. Weekly cadence keeps drift bounded; if missed, the
+    # next run picks up the cumulative diff.
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+
+# Least privilege: only what create-pull-request needs.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge-upstream:
+    runs-on: ubuntu-24.04
+    steps:
+      # Pinned by commit SHA (actions/checkout v4.2.2). Audit01 supply-chain.
+      - name: Checkout fork
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          # Use the default GITHUB_TOKEN; create-pull-request needs write.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git author
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream https://github.com/patrickdappollonio/dux.git
+          git fetch upstream main --tags
+
+      - name: Compute drift summary
+        id: drift
+        run: |
+          behind=$(git rev-list --count HEAD..upstream/main)
+          ahead=$(git rev-list --count upstream/main..HEAD)
+          {
+            echo "behind=$behind"
+            echo "ahead=$ahead"
+            echo "upstream_sha=$(git rev-parse upstream/main)"
+            echo "upstream_short=$(git rev-parse --short upstream/main)"
+          } >> "$GITHUB_OUTPUT"
+          echo "Behind upstream: $behind | Ahead: $ahead"
+
+      - name: Merge upstream/main (allow conflicts to surface)
+        id: merge
+        continue-on-error: true
+        run: |
+          # --no-ff so the merge is a real merge commit (auditable).
+          # --no-edit because the action runner has no editor.
+          git merge --no-ff --no-edit upstream/main 2>&1 | tee /tmp/merge.log
+          if git diff --name-only --diff-filter=U | grep -q .; then
+            {
+              echo "conflicts<<EOF"
+              git diff --name-only --diff-filter=U
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "conflicts=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: No-op when fork is up to date
+        if: steps.drift.outputs.behind == '0'
+        run: |
+          echo "Fork already at upstream/main (${{ steps.drift.outputs.upstream_short }}); nothing to do."
+
+      # Pinned by commit SHA (peter-evans/create-pull-request v6.1.0).
+      - name: Open draft PR
+        if: steps.drift.outputs.behind != '0'
+        uses: peter-evans/create-pull-request@c5a7806660adbe173f04e3e038b0ccdcd758773c # v6.1.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: upstream-sync/auto
+          base: main
+          draft: true
+          title: "merge: upstream/main as of ${{ steps.drift.outputs.upstream_short }}"
+          labels: upstream-sync
+          commit-message: |
+            merge: upstream/main @ ${{ steps.drift.outputs.upstream_short }}
+          body: |
+            ## Weekly upstream-sync (audit01 Phase 06)
+
+            Automated weekly merge from `patrickdappollonio/dux@${{ steps.drift.outputs.upstream_sha }}`.
+
+            - Behind upstream: **${{ steps.drift.outputs.behind }}** commits
+            - Ahead of upstream: **${{ steps.drift.outputs.ahead }}** commits
+            - Conflicts: ${{ steps.merge.outputs.conflicts || 'none' }}
+
+            ### Reviewer checklist — patched Rust files
+
+            Pay attention to these files (CODEOWNERS gates them):
+
+            - [ ] `src/clipboard.rs` — OSC52 / wl-copy fallback (`patches/0001-…`)
+            - [ ] `src/app/mod.rs` — auto-resume on start (`patches/0002-…`)
+            - [ ] `src/app/render.rs` — scrollbar math (`patches/0003-…`)
+            - [ ] `src/config.rs` — `auto_resume` field (`patches/0004-…`)
+
+            If any of the four files conflicted, the rebase recipe is in
+            `patches/README.md`. After resolving, regenerate the affected
+            patch:
+
+            ```bash
+            git diff upstream/main..HEAD -- <file> > patches/000N-….diff
+            ```
+
+            **Do not auto-merge.** This PR is opened as a draft on purpose.

@@ -91,6 +91,21 @@ CLAUDE_YOLO=1 dux
 - **Identity collisions are possible** if two worktrees normalize to the same handle. Pick distinct branch names.
 - **Compaction risk**: on repos with a heavy session history, `--fork-session` inherits all of it, which can push fresh sessions toward 1M-context billing tier earlier. If that bites, set `CLAUDE_AMQ_NO_SEED=1` per-pane or revert `resume_args` to `["--continue"]`.
 
+## Upstream sync (audit01 Phase 06)
+
+This fork tracks `patrickdappollonio/dux@upstream/main` plus four maintained Rust patches:
+
+| Patch | Touches |
+|---|---|
+| `patches/0001-clipboard-osc52.diff`        | `src/clipboard.rs` — OSC52 / wl-copy fallback |
+| `patches/0002-auto-resume-on-start.diff`   | `src/app/mod.rs` — auto-resume sessions on TUI start |
+| `patches/0003-scrollbar.diff`              | `src/app/render.rs` — scrollbar math + render |
+| `patches/0004-config-auto-resume-field.diff` | `src/config.rs` — `auto_resume` config field |
+
+`.github/workflows/upstream-sync.yml` runs every Sunday at 03:00 UTC, opens a **draft** PR titled `merge: upstream/main as of <sha>`, and labels it `upstream-sync`. The PR is never auto-merged; a maintainer reviews the four patched files (gated via `.github/CODEOWNERS`).
+
+When the workflow PR conflicts on a patched file, follow the rebase recipe in `patches/README.md` and regenerate the affected diff from `HEAD`.
+
 ## License
 
 The wrappers and scripts in this directory are MIT-licensed (matching the dux license in the parent repo).

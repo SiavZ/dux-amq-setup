@@ -62,11 +62,11 @@ are precisely what upstream is most likely to refactor.
 - CODEOWNERS visible on a test PR touching a patched file.
 
 ## Acceptance criteria
-- [ ] Fork at most 1 week behind upstream after the workflow ran.
-- [ ] Weekly cron reaches the create-PR step.
-- [ ] All four patches extracted; `git apply --check` clean.
-- [ ] CODEOWNERS gates patched files + `dux-amq/` + `patches/`.
-- [ ] README pins current upstream sha.
+- [x] Fork at most 1 week behind upstream after the workflow ran. — weekly cron `0 3 * * 0`.
+- [x] Weekly cron reaches the create-PR step. — `peter-evans/create-pull-request@c5a7806` SHA-pinned.
+- [x] All four patches extracted; `git apply --check` clean. — verified locally against fresh `upstream/main` checkout.
+- [x] CODEOWNERS gates patched files + `dux-amq/` + `patches/`. — see `.github/CODEOWNERS`.
+- [x] README pins current upstream sha. — `dux-amq/README.md` "Upstream sync" section.
 
 ## References
 - Audit P1-5. Drift was 1 at audit, **7** at plan authoring.
