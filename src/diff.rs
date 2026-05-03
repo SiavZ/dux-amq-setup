@@ -213,7 +213,7 @@ pub fn diff_file(
                         Style::default().fg(base_fg).bg(bg.unwrap_or(Color::Reset)),
                     ));
                 }
-            };
+            }
             lines.push(Line::from(spans));
         }
     }
