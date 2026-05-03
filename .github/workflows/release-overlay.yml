@@ -1,0 +1,159 @@
+name: release-overlay
+
+# Audit01 Phase 15 (P2-6). Tag-triggered overlay release. Produces
+# `dux-amq-vX.Y.Z.tar.gz` + `.sha256` + cosign keyless signature, plus a
+# GitHub Artifact Attestation (provenance). Two independent verifiers:
+#
+#   1. cosign verify-blob \
+#        --certificate-identity-regexp 'https://github.com/<owner>/<repo>' \
+#        --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+#        --signature dux-amq-vX.Y.Z.tar.gz.sig \
+#        dux-amq-vX.Y.Z.tar.gz
+#
+#   2. gh attestation verify dux-amq-vX.Y.Z.tar.gz --owner <owner>
+#
+# The tarball is byte-reproducible: `scripts/release-overlay.sh --version
+# X.Y.Z` against the same git ref produces an identical sha256. That
+# property is what makes the cosign signature meaningful — anyone can
+# rebuild and verify the bytes without trusting the runner.
+#
+# Only third-party action references are SHA-pinned (no `@v3` floating
+# tags). Update both the SHA and the `# vX.Y.Z` comment together when
+# bumping; the comment is the human-readable cross-check.
+
+on:
+  push:
+    tags:
+      - 'dux-amq-v*'
+  # Manual dispatch is intentionally NOT enabled here. A tag push is the
+  # only release trigger; the version-bump commit and the tag push are
+  # therefore the audit trail. Re-running by hand would skip CODEOWNERS
+  # review on the bump commit.
+
+permissions:
+  # Minimum surface for the actions used below:
+  #   contents: write     — create the GitHub Release and upload assets
+  #   id-token: write     — required for cosign keyless OIDC + attestations
+  #   attestations: write — required for actions/attest-build-provenance
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    name: Build, sign, attest, publish
+    runs-on: ubuntu-24.04
+    steps:
+      # actions/checkout v6.0.2
+      - name: Checkout tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          # The tag ref is what triggered us; checking out HEAD of the tag
+          # is enough — no fetch-depth bump needed.
+          fetch-depth: 1
+
+      # Phase 12 source-of-truth: dux-amq/VERSION must match the tag the
+      # maintainer pushed. Catches the "forgot to run bump-version.sh"
+      # mistake before any artifact is produced.
+      - name: Verify tag matches dux-amq/VERSION
+        run: |
+          want="dux-amq-v$(< dux-amq/VERSION)"
+          if [[ "$want" != "$GITHUB_REF_NAME" ]]; then
+            printf 'tag/VERSION mismatch: tag=%s want=%s\n' "$GITHUB_REF_NAME" "$want" >&2
+            printf 'run scripts/bump-version.sh --version <X.Y.Z> and re-tag\n' >&2
+            exit 1
+          fi
+          printf 'tag %s matches dux-amq/VERSION %s\n' "$GITHUB_REF_NAME" "$(< dux-amq/VERSION)"
+
+      # Build via the local script so the workflow and a maintainer's
+      # `bash scripts/release-overlay.sh` produce byte-identical output.
+      # The script enforces GNU tar + gzip -n + epoch mtime; we don't
+      # repeat those flags inline so there's only one place to audit.
+      - name: Build reproducible tarball
+        id: build
+        run: |
+          version="${GITHUB_REF_NAME#dux-amq-v}"
+          bash scripts/release-overlay.sh --version "$version" --output dist
+          tarball="dist/${GITHUB_REF_NAME}.tar.gz"
+          shafile="${tarball}.sha256"
+          [[ -f "$tarball" && -f "$shafile" ]] || { echo "build did not produce expected files" >&2; exit 1; }
+          {
+            echo "tarball=$tarball"
+            echo "shafile=$shafile"
+            echo "sha256=$(awk '{print $1}' "$shafile")"
+          } >> "$GITHUB_OUTPUT"
+          printf 'sha256: %s\n' "$(awk '{print $1}' "$shafile")"
+
+      # sigstore/cosign-installer v4.1.1
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003
+        with:
+          # Pin cosign itself, not just the installer. The installer
+          # respects this and downloads the exact CLI version below;
+          # bumping cosign is then a deliberate two-line edit (this
+          # `cosign-release` and the action SHA above).
+          cosign-release: 'v2.4.1'
+
+      # Keyless signing via GitHub Actions OIDC — no key material on
+      # disk, identity is the workflow's OIDC token issued by
+      # `https://token.actions.githubusercontent.com` for this repo.
+      # `--yes` skips the interactive Fulcio prompt (CI is non-interactive).
+      - name: Cosign sign-blob (keyless)
+        run: |
+          cosign sign-blob \
+            --yes \
+            --output-signature "${{ steps.build.outputs.tarball }}.sig" \
+            --output-certificate "${{ steps.build.outputs.tarball }}.pem" \
+            "${{ steps.build.outputs.tarball }}"
+          ls -lh "${{ steps.build.outputs.tarball }}.sig" "${{ steps.build.outputs.tarball }}.pem"
+
+      # actions/attest-build-provenance v4.1.0 — second, independent
+      # supply-chain signal. Verifies via `gh attestation verify`.
+      - name: Generate build provenance attestation
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32
+        with:
+          subject-path: ${{ steps.build.outputs.tarball }}
+
+      # softprops/action-gh-release v3.0.0
+      - name: Create GitHub Release with assets
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda
+        with:
+          # The tag ref already exists (push triggered us). softprops uses
+          # github.ref_name automatically; we set it explicitly for
+          # readability of the workflow file.
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          # Generate notes from commits between this tag and the previous
+          # tag; the maintainer can edit afterwards. Append the verified-
+          # install one-liner so users have copy-pasteable commands.
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            ## Verified install
+
+            ```bash
+            VER=${{ github.ref_name }}
+            curl -fsSLO https://github.com/${{ github.repository }}/releases/download/${VER}/${VER}.tar.gz
+            curl -fsSLO https://github.com/${{ github.repository }}/releases/download/${VER}/${VER}.tar.gz.sha256
+            sha256sum -c ${VER}.tar.gz.sha256
+            gh attestation verify ${VER}.tar.gz --owner ${{ github.repository_owner }}
+            tar -xzf ${VER}.tar.gz
+            bash ${VER}/dux-amq/install.sh
+            ```
+
+            ## Reproducibility
+
+            sha256: `${{ steps.build.outputs.sha256 }}`
+
+            Rebuild locally and compare:
+
+            ```bash
+            git fetch --tags && git checkout ${{ github.ref_name }}
+            bash scripts/release-overlay.sh --version ${{ github.ref_name }}#dux-amq-v
+            sha256sum dist/${{ github.ref_name }}.tar.gz
+            ```
+          files: |
+            ${{ steps.build.outputs.tarball }}
+            ${{ steps.build.outputs.shafile }}
+            ${{ steps.build.outputs.tarball }}.sig
+            ${{ steps.build.outputs.tarball }}.pem
