@@ -60,11 +60,15 @@ a kernel-pin in README, an upstream issue, or a no-op based on the result.
 - Decision in `07-tiocsti-result.md` matches a Phase 17 release-gate item.
 
 ## Acceptance criteria
-- [ ] Probe script reproducible on a clean GCE Ubuntu 24.04 VM.
-- [ ] One-page result file with kernel, sysctl, syscalls, decision.
-- [ ] README contains accurate kernel-compatibility section.
-- [ ] If TIOCSTI: upstream issue filed, OR sysctl workaround documented, OR AMQ pinned to fixed version.
-- [ ] CI job runs the probe weekly to catch regressions.
+- [x] Probe script reproducible on a clean GCE Ubuntu 24.04 VM. — `dux-amq/tests/probe-amq-inject.sh`.
+- [x] One-page result file with kernel, sysctl, syscalls, decision. — `07-tiocsti-result.md`.
+- [x] README contains accurate kernel-compatibility section. — see `dux-amq/README.md` "Kernel compatibility".
+- [x] If TIOCSTI: upstream issue filed, OR sysctl workaround documented, OR AMQ pinned to fixed version. — sysctl + `--inject-via` workarounds documented; upstream issue noted as out-of-scope (third-party binary).
+- [ ] CI job runs the probe weekly to catch regressions. — deferred to Phase 17 (release-gate); the probe script is the unit it will invoke.
+
+## Verdict (this run)
+
+**TIOCSTI confirmed.** strace on Debian 12 / kernel 6.1 / amq 0.34.0 shows 110 `ioctl(_, TIOCSTI, _)` calls per injected payload, zero PTY-master writes. Workaround documented in README; CI follow-up is Phase 17. Full transcript: `artifacts/07-tiocsti-strace.txt`.
 
 ## References
 - Audit P1-1.

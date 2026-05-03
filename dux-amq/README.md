@@ -91,6 +91,25 @@ CLAUDE_YOLO=1 dux
 - **Identity collisions are possible** if two worktrees normalize to the same handle. Pick distinct branch names.
 - **Compaction risk**: on repos with a heavy session history, `--fork-session` inherits all of it, which can push fresh sessions toward 1M-context billing tier earlier. If that bites, set `CLAUDE_AMQ_NO_SEED=1` per-pane or revert `resume_args` to `["--continue"]`.
 
+## Kernel compatibility (audit01 Phase 07)
+
+`amq wake --inject-mode raw` injects message-arrival notifications via the **`TIOCSTI` ioctl** (verified by strace; see `docs/plans/audits/audit01/07-tiocsti-result.md`). This is broken on Linux 6.2+ kernels where `dev.tty.legacy_tiocsti=0` is the default — Ubuntu 24.04 and Debian 12-with-backports both ship that default.
+
+Pick one of the following on those distros:
+
+1. **Sysctl pin (recommended for single-user VMs):**
+   ```bash
+   echo 'dev.tty.legacy_tiocsti = 1' | sudo tee /etc/sysctl.d/99-amq.conf
+   sudo sysctl --system
+   ```
+2. **External injection (no sysctl needed, no root):**
+   ```bash
+   amq wake --me <agent> --inject-via <bin> --inject-arg <arg>
+   ```
+3. **Pin AMQ to a future release** that uses `posix_openpt(3)` PTY-master writes when upstream ships it.
+
+To verify which path your AMQ binary takes, run `dux-amq/tests/probe-amq-inject.sh` on the target host.
+
 ## Upstream sync (audit01 Phase 06)
 
 This fork tracks `patrickdappollonio/dux@upstream/main` plus four maintained Rust patches:
