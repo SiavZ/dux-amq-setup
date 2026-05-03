@@ -2,15 +2,52 @@
 # install.sh — set up dux + AMQ on a Linux VM with a persistent disk at /data.
 # Idempotent: re-run at will. Won't move files on the boot disk if /data is
 # missing — bails early.
+#
+# Supply-chain pins (audit01 / P0-2). Update these together when bumping a
+# dependency; recompute hashes against fresh downloads (see Validation section
+# in docs/plans/audits/audit01/01-supply-chain-hardening.md).
+#
+#   dux        v0.4.0
+#     tarball: dux-linux-amd64.tar.gz
+#     sha256:  a1c449989e9c4dd53b260d75d29d0d5d6832b3852cf5327f3725b5e7bb881102
+#
+#   amq        v0.34.0   (commit 6a9417d40cc8b9d9f71e9fbb1e39c872d0763b54)
+#     tarball: amq_0.34.0_linux_amd64.tar.gz
+#     sha256:  cba940987d00a3d072f395c7ec7a648e47d652f1ff503abf46da538595510d7a
+#
+#   skills     1.5.3 (npm)
+#     skills-rev (avivsinai/agent-message-queue commit pinned for `skills add`)
+#                6a9417d40cc8b9d9f71e9fbb1e39c872d0763b54
 set -euo pipefail
 
 STATE_ROOT="${STATE_ROOT:-/data/state}"
 LOCAL_BIN="${HOME}/.local/bin"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Pinned versions + sha256 (overrideable for testing only; CI must use defaults).
+DUX_TAG="${DUX_TAG:-v0.4.0}"
+DUX_SHA256="${DUX_SHA256:-a1c449989e9c4dd53b260d75d29d0d5d6832b3852cf5327f3725b5e7bb881102}"
+AMQ_TAG="${AMQ_TAG:-v0.34.0}"
+AMQ_VERSION="${AMQ_VERSION:-0.34.0}"
+AMQ_SHA256="${AMQ_SHA256:-cba940987d00a3d072f395c7ec7a648e47d652f1ff503abf46da538595510d7a}"
+SKILLS_PIN="${SKILLS_PIN:-1.5.3}"
+SKILLS_REV="${SKILLS_REV:-6a9417d40cc8b9d9f71e9fbb1e39c872d0763b54}"
+
 say()  { printf '\033[1;34m→\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!\033[0m %s\n' "$*" >&2; }
 ok()   { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
+
+# Verify a downloaded artifact's sha256 against an expected value. Bails out
+# on mismatch — the calling install branch must not proceed.
+verify_sha256() {
+  local file="$1" expected="$2" label="$3" actual
+  actual=$(sha256sum "$file" | awk '{print $1}')
+  if [[ "$actual" != "$expected" ]]; then
+    warn "$label sha256 mismatch: got $actual, expected $expected"
+    exit 1
+  fi
+  ok "$label sha256 verified ($actual)"
+}
 
 # 1. preflight ---------------------------------------------------------------
 [[ -d /data ]] || { warn "/data not mounted — set up a persistent disk first."; exit 1; }
@@ -19,28 +56,54 @@ ok "state dirs ready under $STATE_ROOT"
 
 # 2. dux ---------------------------------------------------------------------
 if ! command -v dux >/dev/null 2>&1; then
-  say "installing dux"
-  TAG=$(curl -fsSL https://api.github.com/repos/patrickdappollonio/dux/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+')
-  TMP=$(mktemp -d); cd "$TMP"
-  curl -fsSL -o dux.tar.gz "https://github.com/patrickdappollonio/dux/releases/download/${TAG}/dux-linux-amd64.tar.gz"
-  tar -xzf dux.tar.gz; install -m 0755 dux "$LOCAL_BIN/dux"
-  cd - >/dev/null; rm -rf "$TMP"
+  say "installing dux $DUX_TAG"
+  TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+  curl -fsSL -o "$TMP/dux.tar.gz" \
+    "https://github.com/patrickdappollonio/dux/releases/download/${DUX_TAG}/dux-linux-amd64.tar.gz"
+  verify_sha256 "$TMP/dux.tar.gz" "$DUX_SHA256" "dux ${DUX_TAG}"
+  tar -xzf "$TMP/dux.tar.gz" -C "$TMP"
+  install -m 0755 "$TMP/dux" "$LOCAL_BIN/dux"
+  rm -rf "$TMP"; trap - EXIT
 fi
 ok "dux: $(dux --help 2>&1 | head -1 || echo installed)"
 
 # 3. AMQ ---------------------------------------------------------------------
+# Bypass the upstream `curl … | bash` install script entirely: download the
+# pinned release tarball, verify sha256, install the binary directly. The
+# upstream installer's behavior (paths, side effects) is then irrelevant to
+# our trust boundary. Install log is teed to $STATE_ROOT/amq/install.log so
+# stderr is never silenced.
 if ! command -v amq >/dev/null 2>&1; then
-  say "installing amq"
-  curl -fsSL https://raw.githubusercontent.com/avivsinai/agent-message-queue/main/scripts/install.sh | bash
+  say "installing amq $AMQ_TAG"
+  AMQ_LOG="$STATE_ROOT/amq/install.log"
+  : > "$AMQ_LOG"
+  TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+  {
+    echo "[$(date -u +%FT%TZ)] downloading amq ${AMQ_TAG}"
+    curl -fsSL -o "$TMP/amq.tar.gz" \
+      "https://github.com/avivsinai/agent-message-queue/releases/download/${AMQ_TAG}/amq_${AMQ_VERSION}_linux_amd64.tar.gz"
+    verify_sha256 "$TMP/amq.tar.gz" "$AMQ_SHA256" "amq ${AMQ_TAG}"
+    tar -xzf "$TMP/amq.tar.gz" -C "$TMP"
+    install -m 0755 "$TMP/amq" "$LOCAL_BIN/amq"
+    echo "[$(date -u +%FT%TZ)] amq installed to $LOCAL_BIN/amq"
+  } 2>&1 | tee -a "$AMQ_LOG"
+  rm -rf "$TMP"; trap - EXIT
 fi
 amq init --root "$STATE_ROOT/amq" --agents claude,codex,gemini --force >/dev/null
 chmod 700 "$STATE_ROOT/amq"
 ok "amq queue at $STATE_ROOT/amq"
 
 # 4. AMQ skills (gives Claude/etc. native knowledge of amq) ------------------
+# Pin the npm package version, pin the skills-source git ref, block postinstall
+# scripts (--ignore-scripts), and tee the full output to a log. Failure is
+# non-fatal — the AMQ binary alone is enough to operate.
 if command -v npx >/dev/null 2>&1; then
-  npx -y skills add avivsinai/agent-message-queue -g -y >/dev/null 2>&1 || \
-    warn "npx skills add failed; install manually if needed"
+  SKILLS_LOG="$STATE_ROOT/amq/skills-install.log"
+  : > "$SKILLS_LOG"
+  npx --yes --ignore-scripts "skills@${SKILLS_PIN}" add \
+    "avivsinai/agent-message-queue#${SKILLS_REV}" -g -y \
+    2>&1 | tee -a "$SKILLS_LOG" || \
+    warn "npx skills add failed; see $SKILLS_LOG"
 fi
 
 # 5. install wrappers --------------------------------------------------------

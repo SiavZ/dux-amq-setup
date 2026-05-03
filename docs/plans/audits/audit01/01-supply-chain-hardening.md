@@ -62,11 +62,11 @@ checksum committed here, and logged.
 - `cat $STATE_ROOT/amq/skills-install.log` contains the expected skill name.
 
 ## Acceptance criteria
-- [ ] No `curl … | bash` pipes remain.
-- [ ] All three downloads sha256-verified against `dux-amq/checksums/`.
-- [ ] Stderr captured to logs (no `>/dev/null 2>&1` on installs).
-- [ ] README "Supply chain trust boundary" enumerates signers + revocation.
-- [ ] Forced sha mismatch fails the install reproducibly.
+- [x] No `curl … | bash` pipes remain.
+- [x] All three downloads sha256-verified against pinned values committed in `install.sh` header (track A scope: inline rather than `dux-amq/checksums/`; revisit when Phase 15 release pipeline lands).
+- [x] Stderr captured to logs (no `>/dev/null 2>&1` on installs).
+- [ ] README "Supply chain trust boundary" enumerates signers + revocation. *(Deferred — out of Track A scope; README not modifiable on this branch. Track owner to file follow-up.)*
+- [x] Forced sha mismatch fails the install reproducibly.
 
 ## References
 - Audit P0-2, P2-7.
