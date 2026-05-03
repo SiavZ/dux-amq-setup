@@ -100,12 +100,11 @@ impl App {
                                     existing.current_branch = branch_name;
                                 }
                                 self.set_info(format!(
-                                    "Refreshed project \"{}\". Local branch is up to date with remote.",
-                                    project_name,
+                                    "Refreshed project \"{project_name}\". Local branch is up to date with remote.",
                                 ));
                             }
                             Err(e) => self
-                                .set_error(format!("Project refresh failed for \"{}\": {e}", project_name)),
+                                .set_error(format!("Project refresh failed for \"{project_name}\": {e}")),
                         },
                         PullTarget::Session => match result {
                             Ok(_) => {
@@ -236,8 +235,7 @@ impl App {
                 }
                 WorkerEvent::RefsChanged(session_id) => {
                     logger::debug(&format!(
-                        "[gh-integration] refs watcher: triggering PR check for session {}",
-                        session_id,
+                        "[gh-integration] refs watcher: triggering PR check for session {session_id}",
                     ));
                     self.spawn_pr_check_for_session(&session_id);
                 }
@@ -550,8 +548,7 @@ impl App {
                 }
                 Err(err) => {
                     logger::error(&format!(
-                        "fallback PTY spawn also failed for {}: {err}",
-                        session_id
+                        "fallback PTY spawn also failed for {session_id}: {err}",
                     ));
                     self.mark_session_status(session_id, SessionStatus::Detached);
                 }
@@ -790,8 +787,7 @@ impl App {
             }
             Err(e) => {
                 logger::warn(&format!(
-                    "[gh-integration] refs watcher: failed to create watcher (falling back to poll-only): {}",
-                    e,
+                    "[gh-integration] refs watcher: failed to create watcher (falling back to poll-only): {e}",
                 ));
             }
         }
@@ -1003,8 +999,7 @@ impl App {
                 }
                 Err(err) => {
                     logger::error(&format!(
-                        "timeout fallback PTY spawn failed for {}: {err}",
-                        session_id
+                        "timeout fallback PTY spawn failed for {session_id}: {err}",
                     ));
                     self.mark_session_status(&session_id, SessionStatus::Detached);
                 }

@@ -770,7 +770,7 @@ impl App {
         }
         self.clamp_terminal_cursor();
         if let Some(label) = label {
-            self.set_info(format!("Deleted terminal \"{}\"", label));
+            self.set_info(format!("Deleted terminal \"{label}\""));
         }
     }
 
@@ -1216,8 +1216,7 @@ impl App {
                 );
                 if let Some(detached) = &detached_label {
                     msg.push_str(&format!(
-                        " Agent \"{}\" was detached to avoid worktree conflicts.",
-                        detached,
+                        " Agent \"{detached}\" was detached to avoid worktree conflicts.",
                     ));
                 }
                 if let Some(project) = self.projects.iter().find(|p| p.id == session.project_id)
@@ -1295,8 +1294,7 @@ impl App {
                 };
                 if let Some(detached) = &detached_label {
                     msg.push_str(&format!(
-                        " Agent \"{}\" was detached to avoid worktree conflicts.",
-                        detached,
+                        " Agent \"{detached}\" was detached to avoid worktree conflicts.",
                     ));
                 }
                 if let Some(project) = self.projects.iter().find(|p| p.id == session.project_id)
@@ -1771,8 +1769,7 @@ impl App {
         self.mark_session_status(&conflicting.id, SessionStatus::Detached);
 
         logger::info(&format!(
-            "auto-detached {} agent \"{}\" to avoid worktree conflict",
-            provider, label,
+            "auto-detached {provider} agent \"{label}\" to avoid worktree conflict",
         ));
         Some(label)
     }
