@@ -51,6 +51,17 @@ verify_sha256() {
 
 # 1. preflight ---------------------------------------------------------------
 [[ -d /data ]] || { warn "/data not mounted — set up a persistent disk first."; exit 1; }
+# Audit01 P1-6: hard-fail on missing tools instead of letting individual install
+# branches discover them later (with confusing errors). `jq` was a soft dep at
+# the VSCode-settings step; promote to required so we can drop the non-portable
+# `grep -oP` PCRE scrape entirely.
+for _tool in curl jq sha256sum tar install git rsync awk sed; do
+  command -v "$_tool" >/dev/null 2>&1 || {
+    warn "missing required tool: $_tool (Debian/Ubuntu: apt-get install -y curl jq tar coreutils git rsync gawk sed)"
+    exit 1
+  }
+done
+unset _tool
 mkdir -p "$STATE_ROOT"/{claude,agents,codex,gemini,dux,amq,worktrees,scripts} "$LOCAL_BIN"
 ok "state dirs ready under $STATE_ROOT"
 
