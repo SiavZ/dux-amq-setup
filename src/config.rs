@@ -120,6 +120,13 @@ pub struct Defaults {
     pub commit_prompt: Option<String>,
     pub enable_randomized_pet_name_by_default: bool,
     pub auto_resume_on_start: bool,
+    /// Cap on concurrent PTY spawns during auto-resume. Defaults to 4 to
+    /// avoid a thundering-herd of provider processes at startup.
+    pub auto_resume_concurrency: usize,
+    /// Skip auto-resume for sessions whose worktree directory has not been
+    /// modified within the last N days. `0` disables the staleness skip
+    /// (preserving pre-existing behavior).
+    pub auto_resume_max_age_days: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -262,6 +269,8 @@ impl Default for Defaults {
             commit_prompt: Some(DEFAULT_COMMIT_PROMPT.to_string()),
             enable_randomized_pet_name_by_default: false,
             auto_resume_on_start: false,
+            auto_resume_concurrency: 4,
+            auto_resume_max_age_days: 0,
         }
     }
 }
@@ -557,6 +566,7 @@ enum FieldValue {
     Str(String),
     OptStr(Option<String>),
     U16(u16),
+    U32(u32),
     Usize(usize),
     Bool(bool),
     MultilineStr(Option<String>),
@@ -646,6 +656,27 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
                  # Caveat: spawning N agents at once means N provider processes (CPU/RAM).",
             )),
             value_fn: |c| FieldValue::Bool(c.defaults.auto_resume_on_start),
+        },
+        ConfigEntry::Blank,
+        ConfigEntry::Field {
+            key: "auto_resume_concurrency",
+            comment: Some(CommentSource::Static(
+                "# Cap on concurrent PTY spawns during auto-resume. Sessions are\n\
+                 # processed in chunks of this size with a UI-event drain between\n\
+                 # chunks so the TUI stays responsive while N>cap agents come\n\
+                 # back online. Default 4.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.defaults.auto_resume_concurrency),
+        },
+        ConfigEntry::Blank,
+        ConfigEntry::Field {
+            key: "auto_resume_max_age_days",
+            comment: Some(CommentSource::Static(
+                "# Skip auto-resume for sessions whose worktree directory has not\n\
+                 # been modified within the last N days. 0 disables the staleness\n\
+                 # skip so all sessions are reconnected (preserves prior behavior).",
+            )),
+            value_fn: |c| FieldValue::U32(c.defaults.auto_resume_max_age_days),
         },
         ConfigEntry::Blank,
         ConfigEntry::Providers,
@@ -807,6 +838,9 @@ fn render_config(config: &Config, bindings: &crate::keybindings::RuntimeBindings
                     FieldValue::U16(n) => {
                         let _ = writeln!(out, "{key} = {n}");
                     }
+                    FieldValue::U32(n) => {
+                        let _ = writeln!(out, "{key} = {n}");
+                    }
                     FieldValue::Usize(n) => {
                         let _ = writeln!(out, "{key} = {n}");
                     }
@@ -894,6 +928,18 @@ pub fn save_config(
         "defaults",
         "enable_randomized_pet_name_by_default",
         config.defaults.enable_randomized_pet_name_by_default,
+    );
+    patch_table_usize(
+        &mut doc,
+        "defaults",
+        "auto_resume_concurrency",
+        config.defaults.auto_resume_concurrency,
+    );
+    patch_table_u32(
+        &mut doc,
+        "defaults",
+        "auto_resume_max_age_days",
+        config.defaults.auto_resume_max_age_days,
     );
     remove_table_key(&mut doc, "defaults", "prompt_for_name");
 
@@ -1043,6 +1089,11 @@ fn patch_table_opt_multiline(doc: &mut DocumentMut, section: &str, key: &str, va
 }
 
 fn patch_table_u16(doc: &mut DocumentMut, section: &str, key: &str, value: u16) {
+    let table = ensure_table(doc, section);
+    table[key] = toml_edit::value(i64::from(value));
+}
+
+fn patch_table_u32(doc: &mut DocumentMut, section: &str, key: &str, value: u32) {
     let table = ensure_table(doc, section);
     table[key] = toml_edit::value(i64::from(value));
 }

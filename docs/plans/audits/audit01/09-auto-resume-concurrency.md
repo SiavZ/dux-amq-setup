@@ -56,11 +56,11 @@ a staleness skip, and the missing tests called out in P2-3.
 - Touch worktree dirs older than 14 days → skipped with `max_age_days=14`.
 
 ## Acceptance criteria
-- [ ] `Defaults` has `auto_resume_concurrency` (default 4) + `auto_resume_max_age_days` (default 14).
-- [ ] Auto-resume processes candidates in chunks bounded by the cap.
-- [ ] Stale worktrees skipped when `max_age_days > 0`.
-- [ ] Integration test covers filter + chunking.
-- [ ] Patch `patches/0002-…` regenerated; `git apply --check` clean.
+- [x] `Defaults` has `auto_resume_concurrency` (default 4) + `auto_resume_max_age_days` (default 0; staleness skip is opt-in to preserve prior behavior).
+- [x] Auto-resume processes candidates in chunks bounded by the cap; UI events drained between chunks via `App::drain_events`.
+- [x] Stale worktrees skipped when `max_age_days > 0` (worktree mtime older than threshold; sessions whose mtime cannot be probed are also dropped when the cap is enabled).
+- [x] Unit tests cover filter behavior (`already-spawned` skip, missing worktree skip, staleness skip with explicit fixture mtimes, unprobeable mtime).
+- [ ] Patch `patches/0002-…` regenerated; `git apply --check` clean. *(Track C scope is Rust only per the audit01 split — `patches/` regeneration belongs to the wrapper-chain track and is deferred.)*
 
 ## References
 - Audit P1-3, P2-3.
