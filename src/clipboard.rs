@@ -118,9 +118,24 @@ fn base64_encode(data: &[u8]) -> String {
 }
 
 /// Format an OSC 52 escape sequence for the system clipboard ("c").
-/// Terminator is BEL (`\x07`) which is more widely supported than ST.
+///
+/// Terminator defaults to BEL (`\x07`) which is what xterm, WezTerm, kitty,
+/// and the VSCode integrated terminal accept. A small set of older terminals
+/// (rxvt without `allowWindowOps`, very old xterm builds) silently drop BEL
+/// terminators; for those, set `DUX_OSC52_TERMINATOR=ST` to switch to the
+/// canonical String Terminator (`ESC \`). Both forms are spec-compliant
+/// (xterm ctlseqs, "Operating System Commands"); BEL is the de-facto default
+/// because it's a single byte and survives stripping by some shells.
+///
+/// See audit01 P2-1 for rationale; this is hygiene-only — we do not flip the
+/// default until a real-world failure is reported.
 fn osc52_sequence(text: &str) -> String {
-    format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()))
+    let term = if std::env::var("DUX_OSC52_TERMINATOR").as_deref() == Ok("ST") {
+        "\x1b\\"
+    } else {
+        "\x07"
+    };
+    format!("\x1b]52;c;{}{}", base64_encode(text.as_bytes()), term)
 }
 
 /// Emit an OSC 52 copy via /dev/tty so the escape reaches the controlling
@@ -245,6 +260,16 @@ mod tests {
 
     #[test]
     fn osc52_sequence_format() {
+        // SAFETY: tests in this module guard OSC 52 terminator selection by
+        // serializing on a single env var. Cargo runs tests in threads in
+        // the same process, so we must not race two readers/writers; tests
+        // that touch DUX_OSC52_TERMINATOR live behind a shared mutex below.
+        let _g = OSC52_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::remove_var("DUX_OSC52_TERMINATOR");
+        }
         let s = osc52_sequence("hi");
         // ESC ] 52 ; c ; <base64> BEL
         assert!(s.starts_with("\x1b]52;c;"));
@@ -252,4 +277,44 @@ mod tests {
         let payload = &s[7..s.len() - 1];
         assert_eq!(payload, "aGk=");
     }
+
+    #[test]
+    fn osc52_sequence_st_terminator_when_env_set() {
+        let _g = OSC52_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: lock above serializes any other test in this module that
+        // reads/writes DUX_OSC52_TERMINATOR. Restore on drop via the guard.
+        unsafe {
+            std::env::set_var("DUX_OSC52_TERMINATOR", "ST");
+        }
+        let s = osc52_sequence("hi");
+        // ESC ] 52 ; c ; <base64> ESC \
+        assert!(s.starts_with("\x1b]52;c;"));
+        assert!(s.ends_with("\x1b\\"));
+        let payload = &s[7..s.len() - 2];
+        assert_eq!(payload, "aGk=");
+        unsafe {
+            std::env::remove_var("DUX_OSC52_TERMINATOR");
+        }
+    }
+
+    /// Other values (empty, garbage) leave BEL in place — only the literal
+    /// "ST" flips the terminator.
+    #[test]
+    fn osc52_sequence_unknown_env_value_uses_bel() {
+        let _g = OSC52_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::set_var("DUX_OSC52_TERMINATOR", "garbage");
+        }
+        let s = osc52_sequence("hi");
+        assert!(s.ends_with('\x07'), "got: {:?}", s);
+        unsafe {
+            std::env::remove_var("DUX_OSC52_TERMINATOR");
+        }
+    }
+
+    static OSC52_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

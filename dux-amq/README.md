@@ -12,6 +12,7 @@ This directory does **not** modify dux source. It sits alongside the dux Rust so
 - **Spot-VM survival**: dux config + sessions, AMQ queue, and Claude session JSONLs all live on a persistent disk (default `/data/state/`)
 - **Optional past-chat seeding** in fresh worktrees: opt-in with `CLAUDE_AMQ_SEED_FROM_PARENT=1`, then `resume_args = ["--resume"]` lets the picker browse copied history
 - **YOLO toggle**: `CLAUDE_YOLO=1 dux` adds `--dangerously-skip-permissions` to every pane
+- **OSC 52 clipboard with ST fallback**: copy-from-pane works over SSH and through the VSCode terminal; export `DUX_OSC52_TERMINATOR=ST` if your terminal silently drops BEL-terminated OSC 52 sequences (rxvt, very old xterm builds)
 
 ## Layout
 
