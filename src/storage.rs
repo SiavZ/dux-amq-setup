@@ -7,6 +7,92 @@ use rusqlite::{Connection, params};
 
 use crate::model::{AgentSession, SessionStatus};
 
+/// Ordered list of schema migrations. Each entry is `(version, sql)`.
+///
+/// Rules (see `docs/contributing/schema-policy.md`):
+///
+/// 1. **Migrations are immutable.** Never edit an SQL file once it has been
+///    committed. To fix a bug introduced in migration N, write a new
+///    migration N+1 that corrects the data.
+/// 2. Append-only: new migrations are added to the end of this slice with
+///    a strictly increasing `version`.
+/// 3. Each migration's SQL must leave the schema in a consistent state. The
+///    runner records the version in `PRAGMA user_version` after applying.
+///
+/// SQLite's `PRAGMA user_version` is per-database and survives the
+/// `Storage::backup_to` SQLite Online Backup API used in Phase 14, so a
+/// `.bak` copy automatically carries the correct schema version.
+const MIGRATIONS: &[(u32, &str)] = &[
+    (
+        1,
+        include_str!("storage/migrations/0001_initial_schema.sql"),
+    ),
+    // TODO(audit02 Phase 18): add `0002_session_state_v2.sql` once the
+    // session state machine lands. The migration shape sketched in
+    // `docs/plans/audits/audit02/19-schema-versioning.md` (§19.3) adds a
+    // `state_json` column to `agent_sessions` and back-fills it from the
+    // existing `status` column. Until Phase 18 merges, leaving the slot
+    // empty keeps `MIGRATIONS` honest — every entry is a real migration.
+];
+
+/// Apply any migrations whose version is greater than the database's
+/// current `PRAGMA user_version` and bump `user_version` after each.
+///
+/// Idempotent: running this on an already-migrated database is a no-op
+/// because every migration's `version` is `<= user_version`. Migrations
+/// run in declaration order; SQLite executes each `execute_batch` inside
+/// an implicit transaction so a failure rolls back the partial DDL.
+///
+/// The `PRAGMA user_version = {n}` write uses `format!` because the
+/// version number is a hardcoded `u32` literal from `MIGRATIONS`, never
+/// user input — bound parameters are not allowed in PRAGMA statements.
+fn run_migrations(conn: &Connection) -> Result<()> {
+    let current: u32 = conn
+        .query_row("PRAGMA user_version;", [], |r| r.get(0))
+        .context("failed to read PRAGMA user_version")?;
+    for (version, sql) in MIGRATIONS {
+        if *version <= current {
+            continue;
+        }
+        conn.execute_batch(sql)
+            .with_context(|| format!("migration {version} failed"))?;
+        conn.execute_batch(&format!("PRAGMA user_version = {version};"))
+            .with_context(|| format!("failed to set user_version = {version}"))?;
+        crate::logger::info(&format!(
+            "storage: applied migration {version} (user_version now {version})"
+        ));
+    }
+
+    // Backwards-compatibility shim for databases that predate
+    // `user_version` tracking: the original `migrate()` body invoked
+    // `ensure_column` here to add columns that were grafted onto the
+    // schema over time (`title`, `project_path`, `started_providers`,
+    // and the `session_prs.state` / `session_prs.title` defaults). After
+    // migration 1 runs against a fresh DB these columns are present
+    // already and the calls are no-ops. They remain to handle the case
+    // where an older user upgrades from a version that had the columns
+    // but not the canonical schema captured here.
+    //
+    // `ensure_column` is `#[deprecated]`; suppress the warning at this
+    // single call site because we are explicitly keeping it for the
+    // legacy upgrade path. New schema additions must go through a new
+    // numbered migration file, never via `ensure_column`.
+    #[allow(deprecated)]
+    {
+        ensure_column(conn, "agent_sessions", "title", "text")?;
+        ensure_column(conn, "agent_sessions", "project_path", "text")?;
+        ensure_column(
+            conn,
+            "agent_sessions",
+            "started_providers",
+            "text not null default '[]'",
+        )?;
+        ensure_column(conn, "session_prs", "state", "text not null default 'OPEN'")?;
+        ensure_column(conn, "session_prs", "title", "text not null default ''")?;
+    }
+    Ok(())
+}
+
 /// A stored PR association loaded from the database.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredPr {
@@ -65,51 +151,7 @@ impl SessionStore {
 
     fn migrate(&self) -> Result<()> {
         let conn = self.conn();
-        conn.execute_batch(
-            r#"
-            create table if not exists agent_sessions (
-                id text primary key,
-                project_id text not null,
-                provider text not null,
-                source_branch text not null,
-                branch_name text not null,
-                worktree_path text not null,
-                title text,
-                project_path text,
-                status text not null,
-                created_at text not null,
-                updated_at text not null
-            );
-            "#,
-        )?;
-        ensure_column(&conn, "agent_sessions", "title", "text")?;
-        ensure_column(&conn, "agent_sessions", "project_path", "text")?;
-        ensure_column(
-            &conn,
-            "agent_sessions",
-            "started_providers",
-            "text not null default '[]'",
-        )?;
-        conn.execute_batch(
-            r#"
-            create table if not exists session_prs (
-                session_id text not null,
-                pr_number integer not null,
-                owner_repo text not null,
-                state text not null default 'OPEN',
-                primary key (session_id, pr_number),
-                foreign key (session_id) references agent_sessions(id) on delete cascade
-            );
-            "#,
-        )?;
-        ensure_column(
-            &conn,
-            "session_prs",
-            "state",
-            "text not null default 'OPEN'",
-        )?;
-        ensure_column(&conn, "session_prs", "title", "text not null default ''")?;
-        Ok(())
+        run_migrations(&conn)
     }
 
     /// Insert a PR association or update its state and title if it already exists.
@@ -513,6 +555,17 @@ mod pr_tests {
     }
 }
 
+/// Idempotently `ALTER TABLE ... ADD COLUMN` if `column` is missing.
+///
+/// **Deprecated.** This shim predates the `MIGRATIONS` registry and is
+/// retained only so that databases created before `PRAGMA user_version`
+/// was wired up keep working. New schema changes must be added as a
+/// numbered migration in `src/storage/migrations/` and listed in
+/// [`MIGRATIONS`]; see `docs/contributing/schema-policy.md` for the
+/// rules on naming, immutability, and review requirements.
+#[deprecated(
+    note = "schema changes must go through src/storage/migrations/ — see docs/contributing/schema-policy.md"
+)]
 fn ensure_column(conn: &Connection, table: &str, column: &str, sql_type: &str) -> Result<()> {
     let mut stmt = conn.prepare(&format!("pragma table_info({table})"))?;
     let existing = stmt
