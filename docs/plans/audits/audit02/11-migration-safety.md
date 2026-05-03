@@ -122,14 +122,14 @@ fi
   target — never missing.
 
 ## Acceptance criteria
-- [ ] `flock -n 9` at script entry; second invocation fails fast.
-- [ ] `ensure_no_claude` called before each destructive op (≥ 3 times).
-- [ ] Default rsync invocation has NO `--delete`.
-- [ ] Pre-existing `~/.claude` directory backed up to
+- [x] `flock -n 9` at script entry; second invocation fails fast.
+- [x] `ensure_no_claude` called before each destructive op (≥ 3 times).
+- [x] Default rsync invocation has NO `--delete`.
+- [x] Pre-existing `~/.claude` directory backed up to
       `~/.claude.bak.<ts>` (never deleted in-place).
-- [ ] Symlink swap uses `mv -Tn` on a staged `~/.claude.new`.
-- [ ] 5 bats tests pass.
-- [ ] PR: `fix(finalize): flock + atomic swap + drop --delete (audit01 P0-4)`.
+- [x] Symlink swap uses `mv -Tn` on a staged `~/.claude.new`.
+- [x] 5 bats tests pass.
+- [x] PR: `fix(finalize): flock + atomic swap + drop --delete (audit01 P0-4)`.
 
 ## Known pitfalls
 - macOS `mv` does NOT call `rename(2)` for directories the same way as
