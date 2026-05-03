@@ -1522,19 +1522,27 @@ impl App {
     }
 
     pub(crate) fn set_info(&mut self, message: impl Into<String>) {
-        self.status.info(message);
+        // Single point of entry for status sanitization. Strips ANSI/OSC
+        // escape sequences from attacker-controlled bytes (git stderr,
+        // branch names, PR titles) and caps length so a runaway error
+        // can't blow the status line. See `crate::sanitize`.
+        self.status
+            .info(dux::sanitize::truncate(&message.into(), 512));
     }
 
     pub(crate) fn set_busy(&mut self, message: impl Into<String>) {
-        self.status.busy(message);
+        self.status
+            .busy(dux::sanitize::truncate(&message.into(), 512));
     }
 
     pub(crate) fn set_warning(&mut self, message: impl Into<String>) {
-        self.status.warning(message);
+        self.status
+            .warning(dux::sanitize::truncate(&message.into(), 512));
     }
 
     pub(crate) fn set_error(&mut self, message: impl Into<String>) {
-        self.status.error(message);
+        self.status
+            .error(dux::sanitize::truncate(&message.into(), 512));
     }
 
     /// Show a status-line warning when a missing project is highlighted, or
