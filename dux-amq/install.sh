@@ -33,6 +33,93 @@
 # target (e.g. /usr/local/share/dux-amq/lib for a root install).
 set -euo pipefail
 
+# ----------------------------------------------------------------------------
+# Optional: install-from-release-tarball bootstrap (audit01 Phase 15 / P2-6).
+#
+# When invoked as `install.sh --from-tarball <url> [--sha256 <hex>]`, this
+# script downloads the tarball, sha256-verifies it (if a hash was given),
+# extracts it under a tempdir, and re-execs the install.sh that lives
+# *inside* the extracted tree. The caller's install.sh has no further role
+# after the re-exec — every supply-chain pin (dux/amq/skills/lib/etc) lives
+# in the inner install.sh, which is what the release-overlay.yml workflow
+# signed.
+#
+# This path is ADDITIVE. The default invocation (`./install.sh` from a git
+# clone) is unchanged: the args parser only triggers when --from-tarball
+# is the first argument; otherwise the rest of the script runs as before.
+#
+# `--sha256` is optional but strongly recommended:
+#   - If supplied, the download must match exactly or we bail.
+#   - If omitted, we print a loud warning and the actual sha256 we computed,
+#     so a downstream operator can compare against the published `.sha256`
+#     file out-of-band. We never silently trust an unhashed tarball.
+# ----------------------------------------------------------------------------
+if [[ "${1:-}" == "--from-tarball" ]]; then
+  shift
+  _ft_url=""
+  _ft_sha=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --sha256) _ft_sha="${2:-}"; shift 2 ;;
+      --) shift; break ;;
+      -h|--help)
+        cat <<'EOF'
+install.sh --from-tarball <url> [--sha256 <hex>]
+
+Bootstrap path: download a release tarball, verify, extract, re-exec the
+install.sh inside it. Equivalent to:
+
+  curl -fsSLO <url>
+  curl -fsSLO <url>.sha256        # if you want to verify out-of-band
+  sha256sum -c $(basename <url>).sha256
+  tar -xzf $(basename <url>)
+  bash dux-amq-vX.Y.Z/dux-amq/install.sh
+
+…but bundled into one command so the trust boundary lives in install.sh
+itself, which the release workflow signs.
+EOF
+        exit 0
+        ;;
+      http*|*://*)
+        _ft_url="$1"; shift
+        ;;
+      *)
+        if [[ -z "$_ft_url" ]]; then _ft_url="$1"; shift
+        else printf 'install.sh --from-tarball: unknown arg: %s\n' "$1" >&2; exit 1
+        fi
+        ;;
+    esac
+  done
+  [[ -n "$_ft_url" ]] || { printf 'install.sh --from-tarball: <url> is required\n' >&2; exit 1; }
+  command -v curl     >/dev/null 2>&1 || { printf 'install.sh --from-tarball: curl required\n' >&2; exit 1; }
+  command -v tar      >/dev/null 2>&1 || { printf 'install.sh --from-tarball: tar required\n' >&2; exit 1; }
+  command -v sha256sum>/dev/null 2>&1 || { printf 'install.sh --from-tarball: sha256sum required\n' >&2; exit 1; }
+  _ft_tmp="$(mktemp -d)"
+  trap 'rm -rf "$_ft_tmp"' EXIT
+  _ft_archive="$_ft_tmp/$(basename "$_ft_url")"
+  printf '\033[1;34m→\033[0m downloading %s\n' "$_ft_url"
+  curl -fsSL -o "$_ft_archive" "$_ft_url"
+  _ft_actual="$(sha256sum "$_ft_archive" | awk '{print $1}')"
+  if [[ -n "$_ft_sha" ]]; then
+    if [[ "$_ft_actual" != "$_ft_sha" ]]; then
+      printf '\033[1;33m!\033[0m sha256 mismatch: got %s, expected %s\n' "$_ft_actual" "$_ft_sha" >&2
+      exit 1
+    fi
+    printf '\033[1;32m✓\033[0m sha256 verified (%s)\n' "$_ft_actual"
+  else
+    printf '\033[1;33m!\033[0m no --sha256 supplied; computed sha256 is %s\n' "$_ft_actual" >&2
+    printf '\033[1;33m!\033[0m verify against the published .sha256 file before trusting this build\n' >&2
+  fi
+  tar -xzf "$_ft_archive" -C "$_ft_tmp"
+  # Tarball layout produced by scripts/release-overlay.sh:
+  #   <tag>/dux-amq/install.sh   (the install we want to re-exec)
+  _ft_inner="$(find "$_ft_tmp" -maxdepth 3 -type f -name install.sh -path '*/dux-amq/install.sh' | head -1)"
+  [[ -n "$_ft_inner" ]] || { printf 'install.sh --from-tarball: no dux-amq/install.sh inside tarball\n' >&2; exit 1; }
+  printf '\033[1;34m→\033[0m re-execing %s\n' "$_ft_inner"
+  trap - EXIT  # let the inner install own its own tempdir lifecycle
+  exec bash "$_ft_inner" "$@"
+fi
+
 STATE_ROOT="${STATE_ROOT:-/data/state}"
 LOCAL_BIN="${HOME}/.local/bin"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -53,7 +140,12 @@ SKILLS_REV="${SKILLS_REV:-6a9417d40cc8b9d9f71e9fbb1e39c872d0763b54}"
 AMQ_BINARY_SHA256="${AMQ_BINARY_SHA256:-eb78901f3dd13534884923e02ad9c6852be1b0a4c7f452fe52b8bcd795e3556b}"
 
 # AUDIT01-VERSION — overlay version; gates idempotent config-block rewrites
-# (Phase 12). Phase 15's release pipeline rewrites this line on tag.
+# (Phase 12). Phase 15's `scripts/bump-version.sh` rewrites the line below
+# (anchored on this comment) and `dux-amq/VERSION` in a single pass; the
+# release-overlay.yml workflow then asserts the two stay in lockstep
+# before publishing the tagged tarball. Do NOT hand-edit the value here —
+# run `scripts/bump-version.sh --version X.Y.Z` so every tracked location
+# updates atomically.
 DUX_AMQ_VERSION="${DUX_AMQ_VERSION:-0.1.0}"
 
 say()  { printf '\033[1;34m→\033[0m %s\n' "$*"; }
