@@ -125,6 +125,35 @@ that `--continue` refuses.
 - `--continue --fork-session` lets a worktree pick up the parent repo's most-recent chat as context, forking off cleanly so deferred-tool markers don't block resume.
 - All inter-pane communication is `amq send <peer> "..."` from the agent — no MCP, no daemon, just files on disk.
 
+## Kernel compatibility (TIOCSTI)
+
+`amq wake` injects messages into agent panes via `ioctl(TIOCSTI)` by default. Linux 6.2 (Nov 2022) made `CONFIG_LEGACY_TIOCSTI` default-off, and Ubuntu 24.04 LTS / Debian 12+ ship the option built out entirely. On those kernels, `--inject-mode raw` silently fails — every wake notification is dropped before reaching the agent.
+
+`install.sh` detects the kernel state by reading `/proc/sys/dev/tty/legacy_tiocsti`:
+
+| Procfs value | Meaning                                | Sentinel `$STATE_ROOT/dux/.tiocsti-state` |
+|--------------|----------------------------------------|-------------------------------------------|
+| `1`          | TIOCSTI compiled in AND enabled        | absent (raw mode)                         |
+| `0`          | Compiled in but disabled at runtime    | present (via mode)                        |
+| (file absent)| Compiled out — no runtime toggle helps | present (via mode)                        |
+
+When the sentinel is present, the wrappers switch `amq wake` to `--inject-via "$LOCAL_BIN/dux-amq-inject-bridge"`. The bridge:
+
+1. Validates the envelope (HMAC + freshness + replay) via `amq-receive-verify`.
+2. On success, delivers the body either by `tmux send-keys` (when `$TMUX` is set) or by writing to `~/.local/share/dux-amq/inject-queue/<ts>.msg` for later pickup.
+
+Override the auto-detected mode per-pane:
+
+```bash
+DUX_AMQ_INJECT_MODE=raw    # force TIOCSTI even on locked-down kernels
+DUX_AMQ_INJECT_MODE=via    # force bridge mode (e.g. for testing)
+DUX_TMUX_TARGET=<pane>     # specific tmux target for the bridge (default: current pane)
+```
+
+Inspect at runtime: `cat $STATE_ROOT/dux/.tiocsti-state` (absent → raw mode active). Wake stderr lands in `~/.local/share/dux-amq/wake-<me>.log` — verify-drop reasons are visible there.
+
+A native upstream fix (HMAC envelope + stdin piping inside AMQ itself) is tracked in `docs/plans/audits/audit02/artifacts/13-upstream-issue.txt`.
+
 ## Trade-offs
 
 - **No native dux hook** for worktree-create lifecycle, so seeding past-chat history (when enabled) is done in the wrapper (one-shot, on first launch).

@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# amq-send-signed — wrapper around `amq send` that wraps the body in a
+# DUX1 HMAC-SHA256 envelope (audit02 P0-K, T2).
+#
+# Usage:
+#   amq-send-signed --to <peer> --me <self> --body <text> [--print-only]
+#
+# Envelope format (TAB-separated; literal magic guards against legacy
+# unsigned messages reaching the verifier):
+#
+#   DUX1\t<sender>\t<recipient>\t<utc-iso8601>\t<nonce-b64>\t<mac-b64>\t<body>
+#
+# The MAC covers the canonical pipe-joined string `me|to|ts|nonce|body`.
+# Receivers reject unknown magic, stale/future timestamps (60 s skew,
+# 24 h window), replayed nonces, and mismatched MACs. See
+# `amq-receive-verify` for the symmetric verification.
+#
+# `--print-only` writes the envelope to stdout and skips `amq send`. The
+# bats tests use this so they can exercise the verifier without a live
+# AMQ queue.
+set -euo pipefail
+
+TO=""
+ME=""
+BODY=""
+PRINT_ONLY=0
+
+usage() {
+  cat <<'EOF' >&2
+usage: amq-send-signed --to <peer> --me <self> --body <text> [--print-only]
+
+  --to PEER       Recipient agent handle (lowercase, AMQ-validated upstream).
+  --me SELF       Sender agent handle.
+  --body TEXT     Message body. Must not contain literal TAB (envelope delimiter).
+  --print-only    Emit the envelope on stdout instead of invoking `amq send`.
+
+  $AMQ_SECRET_PATH overrides the default secret location
+  ($HOME/.local/share/dux-amq/amq-secret). Run `amq-secret-init.sh`
+  if the secret has not been created yet.
+EOF
+}
+
+while (($#)); do
+  case "$1" in
+    --to)         TO="${2:?--to requires a value}"; shift 2 ;;
+    --me)         ME="${2:?--me requires a value}"; shift 2 ;;
+    --body)       BODY="${2:?--body requires a value}"; shift 2 ;;
+    --print-only) PRINT_ONLY=1; shift ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            printf 'amq-send-signed: unknown arg %q\n' "$1" >&2; usage; exit 2 ;;
+  esac
+done
+
+if [[ -z "$TO" || -z "$ME" || -z "$BODY" ]]; then
+  printf 'amq-send-signed: --to, --me, --body are all required\n' >&2
+  usage
+  exit 2
+fi
+
+# Embedded TAB would break the envelope parser on the receiving end and
+# could be used to smuggle fields. Reject early with a clear error rather
+# than silently truncating.
+case "$BODY" in
+  *$'\t'*)
+    printf 'amq-send-signed: body contains literal TAB; refusing to sign\n' >&2
+    exit 2
+    ;;
+esac
+
+SECRET_PATH="${AMQ_SECRET_PATH:-$HOME/.local/share/dux-amq/amq-secret}"
+if [[ ! -r "$SECRET_PATH" ]]; then
+  printf 'amq-send-signed: secret not readable at %s (run amq-secret-init.sh)\n' "$SECRET_PATH" >&2
+  exit 1
+fi
+SECRET=$(cat "$SECRET_PATH")
+if [[ -z "$SECRET" ]]; then
+  printf 'amq-send-signed: secret file is empty\n' >&2
+  exit 1
+fi
+
+# 96-bit nonce (12 random bytes -> 16 base64 chars); collision probability
+# is negligible at our message rates and the receiver dedups for 24 h.
+NONCE=$(head -c 12 /dev/urandom | base64 | tr -d '\n')
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# Canonicalize with `|` as a delimiter that cannot appear in a base64
+# nonce/mac and is unlikely to be the first char of an agent handle.
+# AMQ already restricts handles to [a-z0-9_-]+ so `|` is safe there.
+PAYLOAD="$ME|$TO|$TS|$NONCE|$BODY"
+MAC=$(printf '%s' "$PAYLOAD" \
+  | openssl dgst -sha256 -hmac "$SECRET" -binary \
+  | base64 | tr -d '\n')
+
+# Tab-separated, magic prefix DUX1. The body comes last so the parser on
+# the verifier side can treat any remaining text — including embedded
+# `|` characters — as the literal body without further escaping.
+printf -v ENVELOPE 'DUX1\t%s\t%s\t%s\t%s\t%s\t%s' \
+  "$ME" "$TO" "$TS" "$NONCE" "$MAC" "$BODY"
+
+if (( PRINT_ONLY )); then
+  printf '%s\n' "$ENVELOPE"
+  exit 0
+fi
+
+exec amq send --to "$TO" --me "$ME" --body "$ENVELOPE"

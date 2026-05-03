@@ -47,6 +47,42 @@ say()  { printf '\033[1;34m→\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!\033[0m %s\n' "$*" >&2; }
 ok()   { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
 
+# Audit02 Phase 13 (audit01 P1-1): detect kernel-side TIOCSTI support.
+#
+# AMQ v0.34.0's `--inject-mode raw` uses `unix.Syscall(SYS_IOCTL, fd,
+# unix.TIOCSTI, ...)` with no PTY-master fallback. Linux 6.2 (Nov 2022)
+# made `CONFIG_LEGACY_TIOCSTI` default-off, and Ubuntu 24.04 LTS /
+# Debian 12+ ship the option built out entirely (the sysctl key is
+# absent — it isn't merely set to 0). Without TIOCSTI, every wake
+# notification is silently dropped before reaching the agent's TTY.
+#
+# Returns:
+#   0 — sysctl reports `1` (kernel built with the option AND it's on)
+#   1 — sysctl reports `0` (compiled in but disabled at runtime; the
+#       operator can lift it with `sudo sysctl -w dev.tty.legacy_tiocsti=1`)
+#   2 — sysctl key absent / file not found (kernel built without the
+#       option; runtime toggle won't help)
+#
+# Reads `/proc/sys/dev/tty/legacy_tiocsti` directly rather than shelling
+# out to `sysctl`. The `sysctl` binary lives in `/sbin` on Debian and
+# isn't on a non-root user's PATH; the procfs file IS readable to all
+# users (mode 0644 on stock kernels). One less external dependency.
+tiocsti_status() {
+  # `TIOCSTI_PROC_PATH` is overridable for tests; production callers
+  # leave it unset and we fall back to the canonical procfs file.
+  local proc_path="${TIOCSTI_PROC_PATH:-/proc/sys/dev/tty/legacy_tiocsti}"
+  if [[ ! -e "$proc_path" ]]; then
+    return 2
+  fi
+  local val
+  val=$(<"$proc_path") 2>/dev/null || return 2
+  case "$val" in
+    1) return 0 ;;
+    0) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
 # Verify a downloaded artifact's sha256 against an expected value. Bails out
 # on mismatch — the calling install branch must not proceed.
 verify_sha256() {
@@ -104,24 +140,64 @@ strip_block() {
 
 # 1. preflight ---------------------------------------------------------------
 [[ -d /data ]] || { warn "/data not mounted — set up a persistent disk first."; exit 1; }
-# Audit01 P1-6: hard-fail on missing tools instead of letting individual install
-# branches discover them later (with confusing errors). `jq` was a soft dep at
-# the VSCode-settings step; promote to required so we can drop the non-portable
-# `grep -oP` PCRE scrape entirely.
-# `realpath` (GNU coreutils) is required by the wrappers' is_dux_worktree
-# helper for canonicalised path-segment containment (audit01 P0-5).
-# `--` is a GNU coreutils-only option, so a stock BSD `realpath` from
-# macOS will fail at wrapper time even if the binary exists. Linux
-# coreutils > 8.x is fine.
-for _tool in curl jq sha256sum tar install git rsync awk sed realpath; do
-  command -v "$_tool" >/dev/null 2>&1 || {
-    warn "missing required tool: $_tool (Debian/Ubuntu: apt-get install -y curl jq tar coreutils git rsync gawk sed)"
-    exit 1
-  }
+# Audit01 P1-6 / Audit02 P1-C: hard-fail on missing tools, but collect ALL
+# misses in one pass so the operator can `apt-get install` the full list in
+# one shot instead of fix → re-run → next-error → repeat.
+#
+# `realpath` (GNU coreutils, audit02 Phase 12) — required by the wrappers'
+#   is_dux_worktree helper for canonicalised path-segment containment
+#   (audit01 P0-5). The `--` arg-separator is GNU-only; stock BSD realpath
+#   on macOS will fail at wrapper time even if the binary exists.
+# `openssl` (audit02 Phase 08) — required by amq-secret-init.sh /
+#   amq-send-signed / amq-receive-verify for HMAC envelope signing.
+# `jq` was a soft dep at the VSCode-settings step; required so we can
+#   drop the non-portable `grep -oP` PCRE scrape entirely.
+missing=()
+for _tool in curl jq sha256sum tar install git rsync awk sed realpath openssl; do
+  command -v "$_tool" >/dev/null 2>&1 || missing+=("$_tool")
 done
 unset _tool
+if (( ${#missing[@]} > 0 )); then
+  warn "missing required tools: ${missing[*]}"
+  warn "  Debian/Ubuntu: apt-get install -y ${missing[*]}"
+  warn "  macOS:         brew install ${missing[*]}"
+  exit 1
+fi
 mkdir -p "$STATE_ROOT"/{claude,agents,codex,gemini,dux,amq,worktrees,scripts} "$LOCAL_BIN"
 ok "state dirs ready under $STATE_ROOT"
+
+# Audit02 Phase 13: TIOCSTI kernel-state detection. Write a sentinel
+# file under $STATE_ROOT/dux/.tiocsti-state when the kernel doesn't
+# support `--inject-mode raw`. Each wrapper reads this sentinel at
+# startup and switches `amq wake` to bridge mode (see Phase 13 plan).
+#
+# The sentinel content is informational ("tiocsti_disabled"); only its
+# *presence* is consulted at runtime. A separate flag file rather than
+# a config-toml entry keeps this concern out of dux's config schema —
+# this is purely about the message-bus TTY transport, not a user
+# preference.
+TIOCSTI_FLAG="$STATE_ROOT/dux/.tiocsti-state"
+if tiocsti_status; then
+  # Kernel supports it AND it's enabled — clear any stale sentinel from
+  # a previous install on a different (locked-down) kernel.
+  rm -f "$TIOCSTI_FLAG"
+  ok "kernel: dev.tty.legacy_tiocsti=1 — amq wake will use TIOCSTI"
+else
+  case $? in
+    1)
+      warn "kernel: dev.tty.legacy_tiocsti=0 — amq wake injection will not work."
+      warn "  Either run 'sudo sysctl -w dev.tty.legacy_tiocsti=1' (if your kernel"
+      warn "  supports it) or rely on the inject bridge (default since Phase 13)."
+      ;;
+    2)
+      warn "kernel: TIOCSTI not present (CONFIG_LEGACY_TIOCSTI=n)."
+      warn "  Switching to --inject-via bridge mode for amq wake; runtime sysctl"
+      warn "  toggle won't help — the option is compiled out of this kernel."
+      ;;
+  esac
+  printf 'tiocsti_disabled\n' > "$TIOCSTI_FLAG"
+  ok "wrote $TIOCSTI_FLAG (wrappers will use --inject-via bridge)"
+fi
 
 # 2. dux ---------------------------------------------------------------------
 if ! command -v dux >/dev/null 2>&1; then
@@ -235,6 +311,31 @@ install -m 0755 "$HERE/wrappers/gemini-amq"  "$LOCAL_BIN/gemini-amq"
 # $PATH so claude-amq's seed step (and Phase 10's purge job) can find it.
 install -m 0755 "$HERE/scripts/encode-claude-project-dir" "$LOCAL_BIN/encode-claude-project-dir"
 install -m 0755 "$HERE/scripts/finalize-claude-migration.sh" "$STATE_ROOT/scripts/finalize-claude-migration.sh"
+
+# Audit02 P0-K (T2): HMAC envelope tooling. Install the signing helper
+# and the verifier alongside the wrappers — both must be on $PATH so:
+#   * scripts and skills can call `amq-send-signed` instead of `amq send`
+#   * `amq wake --inject-via amq-receive-verify` (in claude-amq /
+#     codex-amq / gemini-amq) can find the verifier without an absolute
+#     path. The wrappers do not export PATH explicitly; `amq` resolves
+#     `--inject-via` against the calling process's $PATH.
+install -m 0755 "$HERE/scripts/amq-secret-init.sh" "$LOCAL_BIN/amq-secret-init.sh"
+install -m 0755 "$HERE/scripts/amq-send-signed"    "$LOCAL_BIN/amq-send-signed"
+install -m 0755 "$HERE/scripts/amq-receive-verify" "$LOCAL_BIN/amq-receive-verify"
+
+# Audit02 Phase 13: TIOCSTI fallback bridge. Wrappers point
+# `amq wake --inject-via "$LOCAL_BIN/dux-amq-inject-bridge"` when
+# `.tiocsti-state` is present. The bridge runs verify internally, then
+# either sends keys to the current tmux pane or queues to disk. Always
+# install it so the runtime mode (via DUX_AMQ_INJECT_MODE=via) works
+# even on TIOCSTI-OK kernels for forced-fallback testing.
+install -m 0755 "$HERE/scripts/dux-amq-inject-bridge" "$LOCAL_BIN/dux-amq-inject-bridge"
+
+# Generate the per-VM HMAC secret (idempotent; preserves an existing
+# secret so signed messages already in flight stay verifiable). Run
+# *after* the AMQ binary is in place so a failure here implicates only
+# the new auth layer, not the queue itself.
+"$HERE/scripts/amq-secret-init.sh"
 
 # 6. dux config --------------------------------------------------------------
 DUX_HOME="$STATE_ROOT/dux" dux config regenerate --yes >/dev/null
