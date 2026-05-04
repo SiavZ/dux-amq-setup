@@ -333,7 +333,7 @@ impl App {
         if !defer_global && let Some(action) = self.bindings.lookup(&key, BindingScope::Global) {
             match action {
                 Action::Quit => {
-                    let agent_count = self.runtime.providers.len();
+                    let agent_count = self.live_pty_count();
                     let terminal_count = self.running_companion_terminal_count();
                     if agent_count + terminal_count > 0 {
                         self.ui.prompt = PromptState::ConfirmQuit {
@@ -545,7 +545,7 @@ impl App {
                     if self.selected_session().is_some()
                         && self
                             .selected_session()
-                            .map(|s| self.runtime.providers.contains_key(&s.id))
+                            .map(|s| s.state.has_pty())
                             .unwrap_or(false)
                     {
                         self.ui.focus = FocusPane::Center;
@@ -618,7 +618,7 @@ impl App {
                     // or entering interactive mode if the agent is active.
                     let has_provider = self
                         .selected_session()
-                        .map(|s| self.runtime.providers.contains_key(&s.id))
+                        .map(|s| s.state.has_pty())
                         .unwrap_or(false);
                     if has_provider {
                         self.reset_pty_scrollback();
@@ -4403,7 +4403,7 @@ impl App {
                         self.reload_changed_files();
                         if self
                             .selected_session()
-                            .map(|s| self.runtime.providers.contains_key(&s.id))
+                            .map(|s| s.state.has_pty())
                             .unwrap_or(false)
                         {
                             self.ui.input_target = InputTarget::Agent;
@@ -4422,7 +4422,7 @@ impl App {
                 self.reload_changed_files();
                 if self
                     .selected_session()
-                    .map(|s| self.runtime.providers.contains_key(&s.id))
+                    .map(|s| s.state.has_pty())
                     .unwrap_or(false)
                 {
                     self.ui.input_target = InputTarget::Agent;
@@ -4449,7 +4449,7 @@ impl App {
         if self.selected_session().is_some()
             && self
                 .selected_session()
-                .map(|s| self.runtime.providers.contains_key(&s.id))
+                .map(|s| s.state.has_pty())
                 .unwrap_or(false)
         {
             self.reset_pty_scrollback();
@@ -5049,7 +5049,7 @@ mod tests {
     use crate::editor::{DetectedEditor, EditorKind};
     use crate::keybindings::{Action, BINDING_DEFS, BindingScope, RuntimeBindings};
     use crate::model::{
-        AgentSession, ChangedFile, CompanionTerminalStatus, Project, ProviderKind, SessionStatus,
+        AgentSession, ChangedFile, CompanionTerminalStatus, Project, ProviderKind, SessionState,
         SessionSurface,
     };
     use crate::pty::PtyClient;
@@ -5132,7 +5132,7 @@ mod tests {
             worktree_path: paths.worktrees_root.to_string_lossy().to_string(),
             title: None,
             started_providers: Vec::new(),
-            status: SessionStatus::Detached,
+            state: SessionState::Created { created_at: now },
             created_at: now,
             updated_at: now,
         };
@@ -5167,7 +5167,6 @@ mod tests {
         let runtime = RuntimeState {
             worker_tx,
             worker_rx,
-            providers: std::collections::HashMap::new(),
             running_provider_pins: std::collections::HashMap::new(),
             companion_terminals: std::collections::HashMap::new(),
             pulls_in_flight: std::collections::HashSet::new(),
@@ -5717,10 +5716,9 @@ mod tests {
         let worktree_path = app.sessions[0].worktree_path.clone();
         let worktree = std::path::Path::new(&worktree_path);
         let args = vec!["-c".to_string(), "sleep 5".to_string()];
-        app.runtime.providers.insert(
-            app.sessions[0].id.clone(),
-            PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000).expect("spawn agent"),
-        );
+        let pty = PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000).expect("spawn agent");
+        let s_id = app.sessions[0].id.clone();
+        app.install_pty_for_session(&s_id, crate::pty::PtyHandle::new(pty));
         app.runtime.companion_terminals.insert(
             "term-1".to_string(),
             crate::app::CompanionTerminal {
@@ -5953,18 +5951,22 @@ mod tests {
             worktree_path: app.paths.worktrees_root.join("other").display().to_string(),
             title: None,
             started_providers: Vec::new(),
-            status: SessionStatus::Detached,
+            state: SessionState::Created { created_at: now },
             created_at: now,
             updated_at: now,
         });
         let args = vec!["-c".to_string(), "sleep 5".to_string()];
-        app.runtime.providers.insert(
-            "session-1".to_string(),
-            PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000).expect("spawn first"),
+        app.install_pty_for_session(
+            "session-1",
+            crate::pty::PtyHandle::new(
+                PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000).expect("spawn first"),
+            ),
         );
-        app.runtime.providers.insert(
-            "session-2".to_string(),
-            PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000).expect("spawn second"),
+        app.install_pty_for_session(
+            "session-2",
+            crate::pty::PtyHandle::new(
+                PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000).expect("spawn second"),
+            ),
         );
 
         app.ui.prompt = PromptState::KillRunning(KillRunningPrompt {
@@ -5981,23 +5983,27 @@ mod tests {
             .unwrap();
         app.resolve_confirm_kill_running(true);
 
-        assert!(app.runtime.providers.contains_key("session-1"));
-        assert!(!app.runtime.providers.contains_key("session-2"));
+        assert!(app.session_has_pty("session-1"));
+        assert!(!app.session_has_pty("session-2"));
     }
 
     #[test]
     fn kill_selected_removes_running_targets_and_resets_terminal_surface() {
         let mut app = test_app(default_bindings());
-        let worktree = std::path::Path::new(&app.sessions[0].worktree_path);
+        let worktree_path = app.sessions[0].worktree_path.clone();
+        let worktree = std::path::Path::new(&worktree_path);
         let args = vec!["-c".to_string(), "sleep 5".to_string()];
-        app.runtime.providers.insert(
-            "session-1".to_string(),
-            PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000).expect("spawn agent"),
+        let session_id = app.sessions[0].id.clone();
+        app.install_pty_for_session(
+            &session_id,
+            crate::pty::PtyHandle::new(
+                PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000).expect("spawn agent"),
+            ),
         );
         app.runtime.companion_terminals.insert(
             "term-1".to_string(),
             crate::app::CompanionTerminal {
-                session_id: app.sessions[0].id.clone(),
+                session_id: session_id.clone(),
                 label: "shell".to_string(),
                 foreground_cmd: None,
                 client: PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000)
@@ -6015,7 +6021,7 @@ mod tests {
             searching: false,
             hovered_visible_index: 0,
             selected_ids: [
-                RuntimeTargetId::Agent("session-1".to_string()),
+                RuntimeTargetId::Agent(session_id),
                 RuntimeTargetId::Terminal("term-1".to_string()),
             ]
             .into_iter()
@@ -6027,7 +6033,7 @@ mod tests {
             .unwrap();
         app.resolve_confirm_kill_running(true);
 
-        assert!(app.runtime.providers.is_empty());
+        assert!(app.live_pty_count() == 0);
         assert!(app.runtime.companion_terminals.is_empty());
         assert_eq!(app.session_surface, SessionSurface::Agent);
         assert_eq!(app.ui.fullscreen_overlay, FullscreenOverlay::None);
@@ -6621,17 +6627,19 @@ mod tests {
         app.selected_left = 1;
         app.center_mode = CenterMode::Agent;
         app.ui.focus = FocusPane::Center;
-        app.runtime.providers.insert(
-            "session-1".to_string(),
-            PtyClient::spawn(
-                "sh",
-                &["-c".to_string(), "printf ready; sleep 0.2".to_string()],
-                std::path::Path::new("."),
-                10,
-                10,
-                100,
-            )
-            .expect("spawn pty"),
+        app.install_pty_for_session(
+            "session-1",
+            crate::pty::PtyHandle::new(
+                PtyClient::spawn(
+                    "sh",
+                    &["-c".to_string(), "printf ready; sleep 0.2".to_string()],
+                    std::path::Path::new("."),
+                    10,
+                    10,
+                    100,
+                )
+                .expect("spawn pty"),
+            ),
         );
 
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 30, 5));
@@ -6649,17 +6657,19 @@ mod tests {
         app.selected_left = 1;
         app.center_mode = CenterMode::Agent;
         app.ui.focus = FocusPane::Left;
-        app.runtime.providers.insert(
-            "session-1".to_string(),
-            PtyClient::spawn(
-                "sh",
-                &["-c".to_string(), "printf ready; sleep 0.2".to_string()],
-                std::path::Path::new("."),
-                10,
-                10,
-                100,
-            )
-            .expect("spawn pty"),
+        app.install_pty_for_session(
+            "session-1",
+            crate::pty::PtyHandle::new(
+                PtyClient::spawn(
+                    "sh",
+                    &["-c".to_string(), "printf ready; sleep 0.2".to_string()],
+                    std::path::Path::new("."),
+                    10,
+                    10,
+                    100,
+                )
+                .expect("spawn pty"),
+            ),
         );
 
         // First click focuses the center pane (from Left).
@@ -6680,17 +6690,19 @@ mod tests {
         app.selected_left = 1;
         app.center_mode = CenterMode::Agent;
         app.ui.focus = FocusPane::Center;
-        app.runtime.providers.insert(
-            "session-1".to_string(),
-            PtyClient::spawn(
-                "sh",
-                &["-c".to_string(), "printf ready; sleep 0.2".to_string()],
-                std::path::Path::new("."),
-                10,
-                10,
-                100,
-            )
-            .expect("spawn pty"),
+        app.install_pty_for_session(
+            "session-1",
+            crate::pty::PtyHandle::new(
+                PtyClient::spawn(
+                    "sh",
+                    &["-c".to_string(), "printf ready; sleep 0.2".to_string()],
+                    std::path::Path::new("."),
+                    10,
+                    10,
+                    100,
+                )
+                .expect("spawn pty"),
+            ),
         );
 
         // Down → Up → Down mirrors what the event loop sees for a real
@@ -6871,7 +6883,7 @@ mod tests {
             worktree_path: app.paths.worktrees_root.to_string_lossy().to_string(),
             title: None,
             started_providers: Vec::new(),
-            status: SessionStatus::Detached,
+            state: SessionState::Created { created_at: now },
             created_at: now,
             updated_at: now,
         });
@@ -7803,12 +7815,13 @@ cyan = "#00ffff"
     #[test]
     fn quit_prompt_counts_running_companion_terminals_and_agents() {
         let mut app = test_app(default_bindings());
-        let worktree = std::path::Path::new(&app.sessions[0].worktree_path);
+        let worktree_path = app.sessions[0].worktree_path.clone();
+        let worktree = std::path::Path::new(&worktree_path);
         let (command, args) = ("/bin/sh", vec!["-c".to_string(), "sleep 5".to_string()]);
         let provider =
             PtyClient::spawn(command, &args, worktree, 24, 80, 1_000).expect("spawn test agent");
         let session_id = app.sessions[0].id.clone();
-        app.runtime.providers.insert(session_id.clone(), provider);
+        app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(provider));
         // Insert a companion terminal to simulate a running terminal.
         let term_client =
             PtyClient::spawn(command, &args, worktree, 24, 80, 1_000).expect("spawn test terminal");
@@ -7846,7 +7859,9 @@ cyan = "#00ffff"
         let original_session_id = app.sessions[0].id.clone();
         let original_worktree = app.sessions[0].worktree_path.clone();
         app.sessions[0].provider = ProviderKind::from_str("codex");
-        app.sessions[0].status = SessionStatus::Detached;
+        app.sessions[0].state = SessionState::Created {
+            created_at: chrono::Utc::now(),
+        };
         app.session_store
             .upsert_session(&app.sessions[0])
             .expect("persist session");
@@ -7892,7 +7907,6 @@ cyan = "#00ffff"
     fn change_agent_provider_swaps_but_warns_when_agent_is_running() {
         let mut app = test_app(default_bindings());
         app.sessions[0].provider = ProviderKind::from_str("codex");
-        app.sessions[0].status = SessionStatus::Active;
         let session_id = app.sessions[0].id.clone();
 
         let worktree = std::path::Path::new(&app.sessions[0].worktree_path);
@@ -7905,7 +7919,11 @@ cyan = "#00ffff"
             1_000,
         )
         .expect("spawn test agent");
-        app.runtime.providers.insert(session_id.clone(), provider);
+        // Phase 18 phase 2: install via the state machine — this
+        // moves the session into `Live` and is the new analogue of
+        // setting `status = Active` + inserting into the providers
+        // HashMap.
+        app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(provider));
 
         app.rebuild_left_items();
         app.selected_left = app
@@ -7936,7 +7954,7 @@ cyan = "#00ffff"
         let persisted = app.session_store.load_sessions().expect("load sessions");
         assert_eq!(persisted[0].provider.as_str(), "gemini");
         assert!(
-            app.runtime.providers.contains_key(&session_id),
+            app.session_has_pty(&session_id),
             "the old PTY keeps running until the user exits it"
         );
         assert_eq!(
@@ -7952,14 +7970,16 @@ cyan = "#00ffff"
         assert!(matches!(app.ui.prompt, PromptState::None));
 
         // Clean up so the PTY doesn't outlive the test.
-        app.runtime.providers.remove(&session_id);
+        let _ = app.take_session_pty(&session_id);
     }
 
     #[test]
     fn change_agent_provider_preserves_resume_for_previously_started_provider() {
         let mut app = test_app(default_bindings());
         app.sessions[0].provider = ProviderKind::from_str("claude");
-        app.sessions[0].status = SessionStatus::Detached;
+        app.sessions[0].state = SessionState::Created {
+            created_at: chrono::Utc::now(),
+        };
         app.sessions[0].started_providers = vec!["codex".to_string(), "claude".to_string()];
         app.session_store
             .upsert_session(&app.sessions[0])
@@ -8015,7 +8035,9 @@ cyan = "#00ffff"
     fn change_agent_provider_marks_providers_without_resume_support() {
         let mut app = test_app(default_bindings());
         app.sessions[0].provider = ProviderKind::from_str("codex");
-        app.sessions[0].status = SessionStatus::Detached;
+        app.sessions[0].state = SessionState::Created {
+            created_at: chrono::Utc::now(),
+        };
         // Pretend copilot was launched earlier — it still shouldn't advertise
         // resume because copilot's config has `resume_args: None`.
         app.sessions[0].started_providers = vec!["copilot".to_string()];
@@ -8140,17 +8162,19 @@ cyan = "#00ffff"
         let mut app = test_app(default_bindings());
         app.ui.focus = FocusPane::Center;
         app.center_mode = CenterMode::Agent;
-        app.runtime.providers.insert(
-            "session-1".to_string(),
-            PtyClient::spawn(
-                "sh",
-                &["-c".to_string(), "printf ready; sleep 0.2".to_string()],
-                std::path::Path::new("."),
-                10,
-                10,
-                100,
-            )
-            .expect("spawn pty"),
+        app.install_pty_for_session(
+            "session-1",
+            crate::pty::PtyHandle::new(
+                PtyClient::spawn(
+                    "sh",
+                    &["-c".to_string(), "printf ready; sleep 0.2".to_string()],
+                    std::path::Path::new("."),
+                    10,
+                    10,
+                    100,
+                )
+                .expect("spawn pty"),
+            ),
         );
 
         // Ctrl+G from non-interactive center pane should enter interactive mode.
@@ -8697,8 +8721,7 @@ cyan = "#00ffff"
         let args = vec!["-c".to_string(), "exit 1".to_string()];
         let client =
             PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000).expect("spawn quick-exit");
-        app.runtime.providers.insert(session_id.clone(), client);
-        app.mark_session_status(&session_id, SessionStatus::Active);
+        app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
         app.resume_fallback_candidates
             .insert(session_id.clone(), std::time::Instant::now());
         app.selected_left = 1;
@@ -8711,10 +8734,14 @@ cyan = "#00ffff"
         // The fallback should have spawned a fresh session, so the provider
         // is still present and the session is active (not detached).
         assert!(
-            app.runtime.providers.contains_key(&session_id),
+            app.session_has_pty(&session_id),
             "provider should still be present after fallback retry"
         );
-        assert_eq!(app.sessions[0].status, SessionStatus::Active);
+        assert!(
+            app.sessions[0].state.is_live(),
+            "expected session to be Live, got {:?}",
+            app.sessions[0].state
+        );
         assert!(
             !app.resume_fallback_candidates.contains_key(&session_id),
             "candidate should have been removed after fallback"
@@ -8736,8 +8763,7 @@ cyan = "#00ffff"
         let args = vec!["-c".to_string(), "seq 1 30".to_string()];
         let client =
             PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000).expect("spawn with output");
-        app.runtime.providers.insert(session_id.clone(), client);
-        app.mark_session_status(&session_id, SessionStatus::Active);
+        app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
         app.resume_fallback_candidates
             .insert(session_id.clone(), std::time::Instant::now());
         app.selected_left = 1;
@@ -8749,7 +8775,14 @@ cyan = "#00ffff"
 
         // Since the PTY had substantial output (>5 lines), the fallback
         // should NOT have triggered. The session should be detached.
-        assert_eq!(app.sessions[0].status, SessionStatus::Detached);
+        // Phase 18 phase 2: tearing down the PTY moves the session
+        // to `Exited` (a PTY-less `Detached` is no longer
+        // representable in the typestate).
+        assert!(
+            !app.sessions[0].state.has_pty(),
+            "expected session to have no PTY, got {:?}",
+            app.sessions[0].state
+        );
         assert!(
             !app.resume_fallback_candidates.contains_key(&session_id),
             "candidate should have been removed even when skipped"
@@ -8779,8 +8812,7 @@ cyan = "#00ffff"
         ];
         let client =
             PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000).expect("spawn one-liner");
-        app.runtime.providers.insert(session_id.clone(), client);
-        app.mark_session_status(&session_id, SessionStatus::Active);
+        app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
         app.resume_fallback_candidates
             .insert(session_id.clone(), std::time::Instant::now());
         app.selected_left = 1;
@@ -8793,10 +8825,14 @@ cyan = "#00ffff"
         // Despite having output, the fallback should trigger because the
         // output is minimal (one line, no scrollback).
         assert!(
-            app.runtime.providers.contains_key(&session_id),
+            app.session_has_pty(&session_id),
             "provider should still be present after fallback retry"
         );
-        assert_eq!(app.sessions[0].status, SessionStatus::Active);
+        assert!(
+            app.sessions[0].state.is_live(),
+            "expected session to be Live, got {:?}",
+            app.sessions[0].state
+        );
         assert!(
             app.status.text().contains("No prior session to resume"),
             "status should inform user about fallback: {:?}",
@@ -8813,8 +8849,7 @@ cyan = "#00ffff"
         let args = vec!["-c".to_string(), "exit 1".to_string()];
         let client =
             PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000).expect("spawn quick-exit");
-        app.runtime.providers.insert(session_id.clone(), client);
-        app.mark_session_status(&session_id, SessionStatus::Active);
+        app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
         // Deliberately not adding to resume_fallback_candidates.
         app.selected_left = 1;
         app.session_surface = SessionSurface::Agent;
@@ -8824,10 +8859,17 @@ cyan = "#00ffff"
 
         // Without being a candidate, the session should just go to detached.
         assert!(
-            !app.runtime.providers.contains_key(&session_id),
+            !app.session_has_pty(&session_id),
             "provider should have been removed"
         );
-        assert_eq!(app.sessions[0].status, SessionStatus::Detached);
+        // Phase 18 phase 2: tearing down the PTY moves the session
+        // to `Exited` (a PTY-less `Detached` is no longer
+        // representable in the typestate).
+        assert!(
+            !app.sessions[0].state.has_pty(),
+            "expected session to have no PTY, got {:?}",
+            app.sessions[0].state
+        );
     }
 
     #[test]
@@ -8849,8 +8891,7 @@ cyan = "#00ffff"
         let args = vec!["-c".to_string(), "sleep 5".to_string()];
         let client =
             PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000).expect("spawn hung resume");
-        app.runtime.providers.insert(session_id.clone(), client);
-        app.mark_session_status(&session_id, SessionStatus::Active);
+        app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
         app.resume_fallback_candidates.insert(
             session_id.clone(),
             std::time::Instant::now() - std::time::Duration::from_millis(20),
@@ -8861,10 +8902,14 @@ cyan = "#00ffff"
         app.drain_events();
 
         assert!(
-            app.runtime.providers.contains_key(&session_id),
+            app.session_has_pty(&session_id),
             "provider should still be present after timeout fallback"
         );
-        assert_eq!(app.sessions[0].status, SessionStatus::Active);
+        assert!(
+            app.sessions[0].state.is_live(),
+            "expected session to be Live, got {:?}",
+            app.sessions[0].state
+        );
         assert!(
             !app.resume_fallback_candidates.contains_key(&session_id),
             "candidate should have been removed after timeout fallback"
@@ -8895,14 +8940,13 @@ cyan = "#00ffff"
         let args = vec!["-c".to_string(), "sleep 5".to_string()];
         let client =
             PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000).expect("spawn fresh hang");
-        app.runtime.providers.insert(session_id.clone(), client);
-        app.mark_session_status(&session_id, SessionStatus::Active);
+        app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
 
         app.drain_events();
         std::thread::sleep(std::time::Duration::from_millis(30));
         app.drain_events();
 
-        assert!(app.runtime.providers.contains_key(&session_id));
+        assert!(app.session_has_pty(&session_id));
         assert!(app.resume_fallback_candidates.is_empty());
     }
 
@@ -8922,7 +8966,7 @@ cyan = "#00ffff"
         ];
         let client = PtyClient::spawn("sh", &args, std::path::Path::new("."), 5, 40, 100)
             .expect("spawn pty");
-        app.runtime.providers.insert(session_id, client);
+        app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
 
         // Enter interactive agent mode.
         app.ui.input_target = InputTarget::Agent;
@@ -9142,7 +9186,7 @@ cyan = "#00ffff"
         let args = vec!["-c".to_string(), "sleep 5".to_string()];
         let client = PtyClient::spawn("sh", &args, std::path::Path::new("."), 5, 40, 100)
             .expect("spawn pty");
-        app.runtime.providers.insert(session_id, client);
+        app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
 
         app.ui.input_target = InputTarget::Agent;
         app.session_surface = SessionSurface::Agent;
@@ -9767,17 +9811,19 @@ cyan = "#00ffff"
         app.ui.fullscreen_overlay = FullscreenOverlay::Agent;
 
         // Spawn a real PTY so write_bytes has somewhere to go.
-        app.runtime.providers.insert(
-            "session-1".to_string(),
-            PtyClient::spawn(
-                "sh",
-                &["-c".to_string(), "cat; sleep 0.5".to_string()],
-                std::path::Path::new("."),
-                10,
-                10,
-                100,
-            )
-            .expect("spawn pty"),
+        app.install_pty_for_session(
+            "session-1",
+            crate::pty::PtyHandle::new(
+                PtyClient::spawn(
+                    "sh",
+                    &["-c".to_string(), "cat; sleep 0.5".to_string()],
+                    std::path::Path::new("."),
+                    10,
+                    10,
+                    100,
+                )
+                .expect("spawn pty"),
+            ),
         );
         // Wait for the shell to produce output so has_output() is true.
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -9808,17 +9854,19 @@ cyan = "#00ffff"
         let mut app = test_app(default_bindings());
         app.ui.input_target = InputTarget::Agent;
 
-        app.runtime.providers.insert(
-            "session-1".to_string(),
-            PtyClient::spawn(
-                "sh",
-                &["-c".to_string(), "cat; sleep 0.5".to_string()],
-                std::path::Path::new("."),
-                10,
-                10,
-                100,
-            )
-            .expect("spawn pty"),
+        app.install_pty_for_session(
+            "session-1",
+            crate::pty::PtyHandle::new(
+                PtyClient::spawn(
+                    "sh",
+                    &["-c".to_string(), "cat; sleep 0.5".to_string()],
+                    std::path::Path::new("."),
+                    10,
+                    10,
+                    100,
+                )
+                .expect("spawn pty"),
+            ),
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -9849,17 +9897,19 @@ cyan = "#00ffff"
         app.ui.input_target = InputTarget::Agent;
         app.ui.fullscreen_overlay = FullscreenOverlay::Agent;
 
-        app.runtime.providers.insert(
-            "session-1".to_string(),
-            PtyClient::spawn(
-                "sh",
-                &["-c".to_string(), "cat; sleep 0.5".to_string()],
-                std::path::Path::new("."),
-                10,
-                10,
-                100,
-            )
-            .expect("spawn pty"),
+        app.install_pty_for_session(
+            "session-1",
+            crate::pty::PtyHandle::new(
+                PtyClient::spawn(
+                    "sh",
+                    &["-c".to_string(), "cat; sleep 0.5".to_string()],
+                    std::path::Path::new("."),
+                    10,
+                    10,
+                    100,
+                )
+                .expect("spawn pty"),
+            ),
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -9893,9 +9943,7 @@ cyan = "#00ffff"
             100,
         )
         .expect("spawn pty");
-        app.runtime
-            .providers
-            .insert("session-1".to_string(), client);
+        app.install_pty_for_session("session-1", crate::pty::PtyHandle::new(client));
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         // Feed 100 'x' characters — they should all be forwarded.
@@ -10121,7 +10169,7 @@ cyan = "#00ffff"
             100,
         )
         .expect("spawn pty");
-        app.runtime.providers.insert(session_id, client);
+        app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
         app.ui.input_target = InputTarget::Agent;
         app.session_surface = crate::model::SessionSurface::Agent;
 
@@ -10151,7 +10199,7 @@ cyan = "#00ffff"
         // Wait for cat to echo the bytes back into the embedded terminal.
         std::thread::sleep(std::time::Duration::from_millis(300));
 
-        let provider = app.runtime.providers.values().next().expect("provider");
+        let provider = app.find_pty_handle(&session_id).expect("provider");
         let snapshot = provider.snapshot();
         let rendered: String = snapshot
             .cells
@@ -10216,7 +10264,7 @@ cyan = "#00ffff"
             100,
         )
         .expect("spawn pty");
-        app.runtime.providers.insert(session_id, client);
+        app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
         app.ui.input_target = InputTarget::Agent;
         app.session_surface = crate::model::SessionSurface::Agent;
 
@@ -10243,7 +10291,7 @@ cyan = "#00ffff"
 
         std::thread::sleep(std::time::Duration::from_millis(300));
 
-        let provider = app.runtime.providers.values().next().expect("provider");
+        let provider = app.find_pty_handle(&session_id).expect("provider");
         let snapshot = provider.snapshot();
         let rendered: String = snapshot
             .cells
@@ -10458,7 +10506,6 @@ cyan = "#00ffff"
         let mut app = test_app(default_bindings());
         app.projects[0].default_provider = ProviderKind::from_str("codex");
         app.sessions[0].provider = ProviderKind::from_str("codex");
-        app.sessions[0].status = SessionStatus::Active;
         let session_id = app.sessions[0].id.clone();
 
         // Spawn a real PTY so the session looks live.
@@ -10472,7 +10519,7 @@ cyan = "#00ffff"
             1_000,
         )
         .expect("spawn test agent");
-        app.runtime.providers.insert(session_id.clone(), pty);
+        app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(pty));
 
         app.rebuild_left_items();
         app.selected_left = app
@@ -10529,7 +10576,7 @@ cyan = "#00ffff"
         );
 
         // Tearing down the PTY clears the pin — the next launch will be gemini.
-        app.runtime.providers.remove(&session_id);
+        let _ = app.take_session_pty(&session_id);
         app.runtime.running_provider_pins.remove(&session_id);
         assert_eq!(
             app.running_provider_for(&app.sessions[0]).as_str(),

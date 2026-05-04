@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use dux::config::DuxPaths;
-use dux::model::{AgentSession, ProviderKind, SessionStatus};
+use dux::model::{AgentSession, ProviderKind, SessionState};
 use dux::purge::{
     self, PurgeConfig, PurgeItem, PurgeOutcome, build_plan, confirm_with_reader, execute,
     plan_for_session,
@@ -148,7 +148,7 @@ impl PurgeHarness {
             worktree_path: worktree.to_string_lossy().to_string(),
             title: None,
             started_providers: Vec::new(),
-            status: SessionStatus::Active,
+            state: SessionState::Created { created_at: now },
             created_at: now,
             updated_at: now,
         };

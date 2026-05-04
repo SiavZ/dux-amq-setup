@@ -283,11 +283,7 @@ impl App {
     /// different code path; this gate is for user-initiated spawns only.
     pub(crate) fn refuse_agent_spawn_for_limits(&self) -> Option<String> {
         let limits = &self.config.limits;
-        let active_panes = self
-            .sessions
-            .iter()
-            .filter(|s| s.status == SessionStatus::Active)
-            .count();
+        let active_panes = self.sessions.iter().filter(|s| s.state.is_live()).count();
         if limits.max_panes > 0 && active_panes >= limits.max_panes {
             return Some(format!(
                 "Refusing new agent: {active_panes} active panes already running \
@@ -750,7 +746,11 @@ impl App {
         // would vanish from the UI but reappear on restart.
         self.session_store.delete_session(&session.id)?;
 
-        self.runtime.providers.remove(&session.id);
+        // Drop the PTY (kills child + joins reader) before removing
+        // the session from the in-memory list. `take_session_pty`
+        // returns the handle which falls out of scope at end of
+        // statement.
+        let _ = self.take_session_pty(&session.id);
         self.runtime.running_provider_pins.remove(&session.id);
         self.last_pty_activity.remove(&session.id);
         self.resume_fallback_candidates.remove(&session.id);
@@ -937,14 +937,14 @@ impl App {
         self.ui.prompt = PromptState::None;
 
         let session_id = self.sessions[session_index].id.clone();
-        let running = self.runtime.providers.contains_key(&session_id);
+        let running = self.session_has_pty(&session_id);
         let previous_provider = self.sessions[session_index].provider.clone();
 
         let session = &mut self.sessions[session_index];
         session.provider = selected.provider.clone();
         session.updated_at = Utc::now();
-        let updated = session.clone();
-        self.session_store.upsert_session(&updated)?;
+        self.session_store
+            .upsert_session(&self.sessions[session_index])?;
 
         // Pin the still-running provider so UI labels stay truthful until
         // the user exits and relaunches the agent. Only set on the first
@@ -1269,8 +1269,10 @@ impl App {
             ));
             return Ok(());
         }
-        // Kill existing PTY if the agent is still active.
-        self.runtime.providers.remove(&session.id);
+        // Kill existing PTY if the agent is still active. Dropping
+        // the handle returned by `take_session_pty` runs PtyClient's
+        // Drop (kills child + joins reader thread).
+        let _ = self.take_session_pty(&session.id);
         self.runtime.running_provider_pins.remove(&session.id);
         self.last_pty_activity.remove(&session.id);
         self.resume_fallback_candidates.remove(&session.id);
@@ -1284,8 +1286,7 @@ impl App {
         ));
         match self.spawn_pty_for_session(&session, false) {
             Ok(client) => {
-                self.runtime.providers.insert(session.id.clone(), client);
-                self.mark_session_status(&session.id, SessionStatus::Active);
+                self.install_pty_for_session(&session.id, crate::pty::PtyHandle::new(client));
                 self.mark_session_provider_started(&session.id);
                 self.show_agent_surface();
                 self.ui.input_target = InputTarget::Agent;
@@ -1335,7 +1336,7 @@ impl App {
             provider = %session.provider.as_str(),
             "reconnecting session",
         );
-        if self.runtime.providers.contains_key(&session.id) {
+        if self.session_has_pty(&session.id) {
             self.set_info(format!(
                 "Agent \"{}\" is already connected.",
                 session.branch_name
@@ -1355,12 +1356,11 @@ impl App {
         let use_resume = self.should_resume_session(&session);
         match self.spawn_pty_for_session(&session, use_resume) {
             Ok(client) => {
-                self.runtime.providers.insert(session.id.clone(), client);
+                self.install_pty_for_session(&session.id, crate::pty::PtyHandle::new(client));
                 if use_resume {
                     self.resume_fallback_candidates
                         .insert(session.id.clone(), Instant::now());
                 }
-                self.mark_session_status(&session.id, SessionStatus::Active);
                 self.mark_session_provider_started(&session.id);
                 self.show_agent_surface();
                 self.ui.input_target = InputTarget::Agent;
@@ -1598,7 +1598,7 @@ impl App {
         let mut runtimes = Vec::new();
 
         for session in &self.sessions {
-            if !self.runtime.providers.contains_key(&session.id) {
+            if !session.state.has_pty() {
                 continue;
             }
             let project_name = self.project_name_for_session(session);
@@ -1781,10 +1781,11 @@ impl App {
         for target_id in target_ids {
             match target_id {
                 RuntimeTargetId::Agent(session_id) => {
-                    if self.runtime.providers.remove(session_id).is_some() {
+                    if self.take_session_pty(session_id).is_some() {
                         self.runtime.running_provider_pins.remove(session_id);
                         self.last_pty_activity.remove(session_id);
-                        self.mark_session_status(session_id, SessionStatus::Detached);
+                        // Manual kill — child is dead, mark as Exited.
+                        self.mark_session_exited(session_id, None);
                         killed_agents += 1;
                         if selected_session_id.as_deref() == Some(session_id.as_str()) {
                             selected_agent_killed = true;
@@ -1848,20 +1849,19 @@ impl App {
         let conflicting = self
             .sessions
             .iter()
-            .find(|s| {
-                s.id != exclude_id
-                    && s.worktree_path == worktree_path
-                    && self.runtime.providers.contains_key(&s.id)
-            })
+            .find(|s| s.id != exclude_id && s.worktree_path == worktree_path && s.state.has_pty())
             .cloned()?;
 
         let label = self.session_label(&conflicting);
         let provider = conflicting.provider.as_str().to_string();
-        self.runtime.providers.remove(&conflicting.id);
+        // Drop the PTY (kills child + joins reader). After the
+        // handle falls out of scope, mark the session detached.
+        let _ = self.take_session_pty(&conflicting.id);
         self.runtime.running_provider_pins.remove(&conflicting.id);
         self.last_pty_activity.remove(&conflicting.id);
         self.resume_fallback_candidates.remove(&conflicting.id);
-        self.mark_session_status(&conflicting.id, SessionStatus::Detached);
+        // Auto-detach killed the child; mark Exited so UI reflects it.
+        self.mark_session_exited(&conflicting.id, None);
 
         logger::info(&format!(
             "auto-detached {provider} agent \"{label}\" to avoid worktree conflict",
@@ -1875,7 +1875,7 @@ mod tests {
     use super::*;
     use crate::config::DuxPaths;
     use crate::keybindings::{BINDING_DEFS, RuntimeBindings};
-    use crate::model::{AgentSession, Project, ProviderKind, SessionStatus};
+    use crate::model::{AgentSession, Project, ProviderKind, SessionState};
     use crate::storage::SessionStore;
     use crate::theme::Theme;
     use chrono::Utc;
@@ -1942,7 +1942,6 @@ mod tests {
         let runtime = RuntimeState {
             worker_tx,
             worker_rx,
-            providers: std::collections::HashMap::new(),
             running_provider_pins: std::collections::HashMap::new(),
             companion_terminals: std::collections::HashMap::new(),
             pulls_in_flight: std::collections::HashSet::new(),
@@ -2043,7 +2042,7 @@ mod tests {
             worktree_path: worktree.to_string(),
             title: None,
             started_providers: Vec::new(),
-            status: SessionStatus::Detached,
+            state: SessionState::Created { created_at: now },
             created_at: now,
             updated_at: now,
         }
@@ -2061,13 +2060,15 @@ mod tests {
         }
     }
 
-    /// Inserts a dummy PtyClient placeholder into `app.runtime.providers` so that the
-    /// session appears "active" without actually spawning a process.
+    /// Spawn a `echo` PTY and install it on the named session so the
+    /// session transitions into `SessionState::Live` without going
+    /// through the full create-agent pipeline. Used by tests that
+    /// need a session to look "active" for state-machine assertions.
     fn mark_active(app: &mut App, session_id: &str) {
         let client =
             crate::pty::PtyClient::spawn("echo", &[], std::path::Path::new("/tmp"), 24, 80, 1000)
                 .expect("spawn echo for test");
-        app.runtime.providers.insert(session_id.to_string(), client);
+        app.install_pty_for_session(session_id, crate::pty::PtyHandle::new(client));
     }
 
     #[test]
@@ -2080,7 +2081,7 @@ mod tests {
 
         let label = app.detach_conflicting_worktree_session("/tmp/wt/a", "s2");
         assert!(label.is_some());
-        assert!(!app.runtime.providers.contains_key("s1"));
+        assert!(!app.session_has_pty("s1"));
     }
 
     #[test]
@@ -2093,7 +2094,7 @@ mod tests {
 
         let label = app.detach_conflicting_worktree_session("/tmp/wt/b", "s2");
         assert!(label.is_none());
-        assert!(app.runtime.providers.contains_key("s1"));
+        assert!(app.session_has_pty("s1"));
     }
 
     #[test]
@@ -2105,7 +2106,7 @@ mod tests {
 
         let label = app.detach_conflicting_worktree_session("/tmp/wt/a", "s1");
         assert!(label.is_none());
-        assert!(app.runtime.providers.contains_key("s1"));
+        assert!(app.session_has_pty("s1"));
     }
 
     #[test]
@@ -2118,9 +2119,15 @@ mod tests {
 
         let label = app.detach_conflicting_worktree_session("/tmp/wt/a", "s2");
         assert!(label.is_some());
-        assert!(!app.runtime.providers.contains_key("s1"));
+        assert!(!app.session_has_pty("s1"));
         let s1_session = app.sessions.iter().find(|s| s.id == "s1").unwrap();
-        assert_eq!(s1_session.status, SessionStatus::Detached);
+        // After auto-detach we kill the child + drop the handle, so
+        // the session is `Exited` (the new model can't represent a
+        // PTY-less `Detached`).
+        assert!(matches!(
+            s1_session.state,
+            crate::model::SessionState::Exited { .. }
+        ));
     }
 
     #[test]
@@ -2570,12 +2577,15 @@ mod tests {
     /// `dispatch_create_agent_request` surfaces via `set_error`.
     #[test]
     fn refuse_agent_spawn_when_max_panes_reached() {
-        let mut s1 = make_session("s1", "claude", "/tmp/wt/a");
-        let mut s2 = make_session("s2", "codex", "/tmp/wt/b");
-        s1.status = SessionStatus::Active;
-        s2.status = SessionStatus::Active;
+        let s1 = make_session("s1", "claude", "/tmp/wt/a");
+        let s2 = make_session("s2", "codex", "/tmp/wt/b");
         let project = make_project("project-1", "claude");
         let mut app = test_app_with_sessions(vec![s1, s2], vec![project]);
+        // Promote both sessions to `Live` (the new "active") by
+        // installing a real PTY handle on each — `mark_active` was
+        // updated for Phase 18 phase 2 to use `install_pty_for_session`.
+        mark_active(&mut app, "s1");
+        mark_active(&mut app, "s2");
         app.config.limits.max_panes = 2;
 
         let reason = app
@@ -2590,12 +2600,14 @@ mod tests {
             "error should suggest a recovery path, got: {reason}",
         );
 
-        // Below the cap → must allow.
-        app.sessions[1].status = SessionStatus::Detached;
+        // Below the cap → must allow. Detach s2 by tearing down its
+        // PTY (the new state machine moves it to `Exited`, which is
+        // not Live and so doesn't count toward `max_panes`).
+        app.mark_session_exited("s2", None);
         assert!(app.refuse_agent_spawn_for_limits().is_none());
 
         // max_panes = 0 → unlimited semantic; cap never trips.
-        app.sessions[1].status = SessionStatus::Active;
+        mark_active(&mut app, "s2");
         app.config.limits.max_panes = 0;
         assert!(
             app.refuse_agent_spawn_for_limits().is_none(),
@@ -2658,9 +2670,7 @@ mod tests {
         let mut s_old = make_session("old", "claude", "/tmp/wt/old");
         let mut s_new = make_session("new", "codex", "/tmp/wt/new");
         s_old.updated_at = now - ChronoDuration::hours(2);
-        s_old.status = SessionStatus::Active;
         s_new.updated_at = now;
-        s_new.status = SessionStatus::Active;
         let project = make_project("project-1", "claude");
         let mut app = test_app_with_sessions(vec![s_old, s_new], vec![project]);
 
@@ -2668,7 +2678,7 @@ mod tests {
         // helper can actually find a victim with a live `PtyClient`.
         mark_active(&mut app, "old");
         mark_active(&mut app, "new");
-        assert_eq!(app.runtime.providers.len(), 2);
+        assert_eq!(app.live_pty_count(), 2);
 
         // Set a very small cap — any non-zero footprint will exceed it.
         app.config.limits.enable_scrollback_overflow_autodetach = true;
@@ -2680,21 +2690,24 @@ mod tests {
         // First tick: must detach the oldest pane.
         app.handle_scrollback_usage_event(scrollback_lines);
         assert!(
-            !app.runtime.providers.contains_key("old"),
+            !app.session_has_pty("old"),
             "oldest session's PTY should have been torn down",
         );
-        let detached = app.sessions.iter().find(|s| s.id == "old").unwrap();
-        assert_eq!(detached.status, SessionStatus::Detached);
+        let old_session = app.sessions.iter().find(|s| s.id == "old").unwrap();
+        // After kill-and-detach on the oldest pane the new state
+        // machine puts the session into `Exited` (the watchdog drops
+        // the PTY handle, which kills the child).
+        assert!(matches!(
+            old_session.state,
+            crate::model::SessionState::Exited { .. }
+        ));
         // The newer pane must still be attached after a single detach
         // because the loop only tears down victims while the cap is
         // exceeded — and with one pane the footprint should be lower.
-        // (We don't assert "still over cap" because the test config
-        // is intentionally aggressive; we just want to prove that the
-        // newest pane was not the one selected.)
-        let still_active = app.runtime.providers.contains_key("new");
+        let still_active = app.session_has_pty("new");
         let new_session = app.sessions.iter().find(|s| s.id == "new").unwrap();
         assert!(
-            still_active || new_session.status == SessionStatus::Detached,
+            still_active || matches!(new_session.state, crate::model::SessionState::Exited { .. }),
             "scrollback detach must select oldest victim first; \
              both sessions should not have been torn down before the \
              oldest was selected",

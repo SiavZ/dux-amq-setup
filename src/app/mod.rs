@@ -39,7 +39,7 @@ use crate::keybindings::{
 use crate::lockfile::SingleInstanceLock;
 use crate::logger;
 use crate::model::{
-    AgentSession, ChangedFile, CompanionTerminalStatus, Project, ProviderKind, SessionStatus,
+    AgentSession, ChangedFile, CompanionTerminalStatus, Project, ProviderKind, SessionState,
     SessionSurface,
 };
 use crate::provider;
@@ -1175,7 +1175,6 @@ impl App {
         let runtime = RuntimeState {
             worker_tx,
             worker_rx,
-            providers: HashMap::new(),
             running_provider_pins: HashMap::new(),
             companion_terminals: HashMap::new(),
             pulls_in_flight: HashSet::new(),
@@ -1436,9 +1435,14 @@ impl App {
             .collect();
         for (id, exists) in ids {
             if exists {
-                self.mark_session_status(&id, SessionStatus::Detached);
+                // Sessions loaded from storage land in `Created` (no
+                // PTY can survive across restarts). Leave that as-is
+                // unless auto-resume picks them up — the fresh
+                // `created_at` was already stamped in
+                // `PersistedSessionState::from`. No transition needed.
+                let _ = id;
             } else {
-                self.mark_session_status(&id, SessionStatus::Exited);
+                self.mark_session_exited(&id, None);
             }
         }
     }
@@ -1467,7 +1471,7 @@ impl App {
             .sessions
             .iter()
             .filter(|s| Path::new(&s.worktree_path).exists())
-            .filter(|s| !self.runtime.providers.contains_key(&s.id))
+            .filter(|s| !s.state.has_pty())
             .filter(|s| {
                 let stale = crate::auto_resume::is_stale(Path::new(&s.worktree_path), stale_days);
                 if stale {
@@ -1547,7 +1551,7 @@ impl App {
         // If the user already reconnected this session manually while the
         // background spawn was still in flight, drop the duplicate client
         // rather than racing it into self.runtime.providers.
-        if self.runtime.providers.contains_key(&session_id) {
+        if self.session_has_pty(&session_id) {
             if result.is_ok() {
                 logger::info(&format!(
                     "auto_resume_on_start: discarding duplicate spawn for {session_id} (already active)"
@@ -1557,12 +1561,11 @@ impl App {
         }
         match result {
             Ok(client) => {
-                self.runtime.providers.insert(session_id.clone(), client);
+                self.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
                 if used_resume_args {
                     self.resume_fallback_candidates
                         .insert(session_id.clone(), Instant::now());
                 }
-                self.mark_session_status(&session_id, SessionStatus::Active);
                 self.mark_session_provider_started(&session_id);
             }
             Err(e) => {
@@ -1665,10 +1668,20 @@ impl App {
     /// activity timestamp used by the left-pane streaming indicator.
     fn poll_pty_activity(&mut self) {
         let now = Instant::now();
-        for (session_id, provider) in &self.runtime.providers {
-            if provider.take_received_data() {
-                self.last_pty_activity.insert(session_id.clone(), now);
+        // Walk sessions whose state owns a PTY — `Live` and
+        // `Detached`. We can't borrow `self.sessions` immutably and
+        // mutate `self.last_pty_activity` at the same time, so
+        // collect dirty IDs first.
+        let mut active = Vec::new();
+        for session in &self.sessions {
+            if let Some(handle) = session.state.pty_handle()
+                && handle.take_received_data()
+            {
+                active.push(session.id.clone());
             }
+        }
+        for id in active {
+            self.last_pty_activity.insert(id, now);
         }
     }
 
@@ -1763,7 +1776,7 @@ impl App {
     fn resource_monitor_targets(&self) -> Vec<(String, u32)> {
         let mut targets = Vec::new();
         for session in &self.sessions {
-            if let Some(pty) = self.runtime.providers.get(&session.id)
+            if let Some(pty) = session.state.pty_handle()
                 && let Some(pid) = pty.child_process_id()
             {
                 let title = session.title.as_deref().unwrap_or(&session.branch_name);
@@ -2364,18 +2377,230 @@ impl App {
         }
     }
 
-    pub(crate) fn mark_session_status(&mut self, session_id: &str, status: SessionStatus) {
-        if let Some(session) = self
+    /// Locate the [`PtyHandle`](crate::pty::PtyHandle) for a session
+    /// whose state currently owns one (`Live` or `Detached`).
+    pub(crate) fn find_pty_handle(&self, session_id: &str) -> Option<&crate::pty::PtyHandle> {
+        self.sessions
+            .iter()
+            .find(|candidate| candidate.id == session_id)
+            .and_then(|s| s.state.pty_handle())
+    }
+
+    /// Mutable variant of [`App::find_pty_handle`]. Not yet used by
+    /// the runtime — `PtyClient::write_bytes` works on `&self`, so
+    /// most call sites only need the immutable accessor — but kept
+    /// available so future scrolling/resize plumbing can stay
+    /// inside the typestate API rather than reaching into runtime
+    /// internals.
+    #[allow(dead_code)]
+    pub(crate) fn find_pty_handle_mut(
+        &mut self,
+        session_id: &str,
+    ) -> Option<&mut crate::pty::PtyHandle> {
+        self.sessions
+            .iter_mut()
+            .find(|candidate| candidate.id == session_id)
+            .and_then(|s| s.state.pty_handle_mut())
+    }
+
+    /// True if the session currently has an attached PTY (`Live` or
+    /// `Detached`). Replaces the legacy `runtime.providers.contains_key`
+    /// check.
+    pub(crate) fn session_has_pty(&self, session_id: &str) -> bool {
+        self.sessions
+            .iter()
+            .any(|candidate| candidate.id == session_id && candidate.state.has_pty())
+    }
+
+    /// Number of sessions with an attached PTY (`Live` or `Detached`).
+    /// Replaces `runtime.providers.len()`.
+    pub(crate) fn live_pty_count(&self) -> usize {
+        self.sessions.iter().filter(|s| s.state.has_pty()).count()
+    }
+
+    /// Install a freshly-spawned PTY on a session, transitioning into
+    /// `SessionState::Live`. Replaces the legacy `providers.insert(id,
+    /// client) + mark_session_status(id, Active)` pair. Returns the
+    /// previously-owned [`PtyHandle`] if the session already had one
+    /// — caller can let it drop to kill the previous child.
+    pub(crate) fn install_pty_for_session(
+        &mut self,
+        session_id: &str,
+        pty: crate::pty::PtyHandle,
+    ) -> Option<crate::pty::PtyHandle> {
+        let now = Utc::now();
+        let Some(session) = self
             .sessions
             .iter_mut()
             .find(|candidate| candidate.id == session_id)
-        {
-            if session.status == status {
-                return;
+        else {
+            return Some(pty);
+        };
+        let previous = session.state.pty_handle().is_some();
+        let placeholder = SessionState::Created { created_at: now };
+        let current = std::mem::replace(&mut session.state, placeholder);
+        // Pull the old PTY out (if any) before consuming `current` —
+        // we still want to return it to the caller.
+        let (old_pty, current_for_transition) = match current {
+            SessionState::Live {
+                pty_handle,
+                spawned_at,
+                last_active_at,
+            } => (
+                Some(pty_handle),
+                // Transition to Spawning so on_spawn_succeeded works.
+                SessionState::Spawning {
+                    since: spawned_at.max(last_active_at),
+                },
+            ),
+            SessionState::Detached {
+                pty_handle,
+                detached_at,
+            } => (
+                Some(pty_handle),
+                SessionState::Spawning { since: detached_at },
+            ),
+            SessionState::Spawning { since } => (None, SessionState::Spawning { since }),
+            SessionState::Created { created_at } => {
+                (None, SessionState::Spawning { since: created_at })
             }
-            session.status = status;
-            session.updated_at = Utc::now();
-            let _ = self.session_store.upsert_session(session);
+            SessionState::Exited { exited_at, .. } => {
+                (None, SessionState::Spawning { since: exited_at })
+            }
+        };
+        let next = match current_for_transition.on_spawn_succeeded(pty, now) {
+            Ok(s) => s,
+            Err(_) => unreachable!("forced Spawning -> Live transition should always succeed"),
+        };
+        session.state = next;
+        session.updated_at = now;
+        let _ = self.session_store.upsert_session(session);
+        if previous {
+            // Strictly speaking the old PTY was already taken out
+            // above; this branch documents the swap intent.
+        }
+        old_pty
+    }
+
+    /// Move a `Live` session into [`SessionState::Detached`] (UI
+    /// pane closed, child still running). Not yet used by the
+    /// runtime — current detach paths kill the child outright via
+    /// [`App::take_session_pty`] + [`App::mark_session_exited`] —
+    /// but kept available for the doctor tool and future "soft
+    /// detach" UX.
+    #[allow(dead_code)]
+    pub(crate) fn detach_session_pty(&mut self, session_id: &str) -> bool {
+        let now = Utc::now();
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|candidate| candidate.id == session_id)
+        else {
+            return false;
+        };
+        let placeholder = SessionState::Created { created_at: now };
+        let current = std::mem::replace(&mut session.state, placeholder);
+        match current {
+            SessionState::Live { .. } => {
+                let next = current.detach(now).expect("Live -> Detached");
+                session.state = next;
+                session.updated_at = now;
+                let _ = self.session_store.upsert_session(session);
+                true
+            }
+            SessionState::Detached { .. } => {
+                // Already detached — keep state as-is.
+                session.state = current;
+                false
+            }
+            other => {
+                // No PTY to detach; leave the state alone but restore.
+                session.state = other;
+                false
+            }
+        }
+    }
+
+    /// Reattach a UI pane to a previously-detached PTY, transitioning
+    /// the session back to `Live`. Returns true if the transition
+    /// happened. Not yet wired into a UI flow; pairs with
+    /// [`App::detach_session_pty`].
+    #[allow(dead_code)]
+    pub(crate) fn reattach_session_pty(&mut self, session_id: &str) -> bool {
+        let now = Utc::now();
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|candidate| candidate.id == session_id)
+        else {
+            return false;
+        };
+        let placeholder = SessionState::Created { created_at: now };
+        let current = std::mem::replace(&mut session.state, placeholder);
+        match current {
+            SessionState::Detached { .. } => {
+                let next = current.reattach(now).expect("Detached -> Live");
+                session.state = next;
+                session.updated_at = now;
+                let _ = self.session_store.upsert_session(session);
+                true
+            }
+            SessionState::Live { .. } => {
+                session.state = current;
+                false
+            }
+            other => {
+                session.state = other;
+                false
+            }
+        }
+    }
+
+    /// Mark a session as exited and drop any owned PTY. The exit code
+    /// is plumbed through to the new state. Always succeeds.
+    pub(crate) fn mark_session_exited(&mut self, session_id: &str, exit_code: Option<i32>) {
+        let now = Utc::now();
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|candidate| candidate.id == session_id)
+        else {
+            return;
+        };
+        let placeholder = SessionState::Created { created_at: now };
+        let current = std::mem::replace(&mut session.state, placeholder);
+        // `into_exited` drops the embedded PtyHandle (kills the child,
+        // joins the reader thread).
+        session.state = current.into_exited(exit_code, now);
+        session.updated_at = now;
+        let _ = self.session_store.upsert_session(session);
+    }
+
+    /// Forcibly remove the session's PTY, returning it to the caller
+    /// (which can drop it to kill the child or hand it to a fresh
+    /// owner). The session moves to `SessionState::Created` —
+    /// callers that want the metadata to reflect "the user just
+    /// exited the agent" should follow up with
+    /// [`App::mark_session_exited`] instead.
+    pub(crate) fn take_session_pty(&mut self, session_id: &str) -> Option<crate::pty::PtyHandle> {
+        let now = Utc::now();
+        let session = self
+            .sessions
+            .iter_mut()
+            .find(|candidate| candidate.id == session_id)?;
+        let placeholder = SessionState::Created { created_at: now };
+        let current = std::mem::replace(&mut session.state, placeholder);
+        match current {
+            SessionState::Live { pty_handle, .. } | SessionState::Detached { pty_handle, .. } => {
+                session.state = SessionState::Created { created_at: now };
+                session.updated_at = now;
+                let _ = self.session_store.upsert_session(session);
+                Some(pty_handle)
+            }
+            other => {
+                session.state = other;
+                None
+            }
         }
     }
 
@@ -2440,7 +2665,7 @@ impl App {
     }
 
     pub(crate) fn running_process_count(&self) -> usize {
-        self.runtime.providers.len() + self.runtime.companion_terminals.len()
+        self.live_pty_count() + self.runtime.companion_terminals.len()
     }
 
     pub(crate) fn running_companion_terminal_count(&self) -> usize {
@@ -2489,7 +2714,7 @@ impl App {
         match self.session_surface {
             SessionSurface::Agent => {
                 let session_id = self.selected_session()?.id.as_str();
-                self.runtime.providers.get(session_id)
+                self.find_pty_handle(session_id).map(|h| h.client())
             }
             SessionSurface::Terminal => {
                 let id = self.active_terminal_id.as_ref()?;
@@ -2502,35 +2727,56 @@ impl App {
     /// surface, reusing the existing cell allocation. Returns `true` if a
     /// provider was found and the snapshot was updated.
     pub(crate) fn refresh_snapshot_buf(&mut self) -> bool {
-        let (client_id, client): (String, Option<&PtyClient>) = match self.session_surface {
+        // Resolve the surface ID first so we don't carry an active
+        // borrow into the snapshot+state-update phase.
+        let (client_id, surface) = match self.session_surface {
             SessionSurface::Agent => {
                 let session_id = match self.selected_session() {
                     Some(s) => s.id.clone(),
                     None => return false,
                 };
-                let provider = self.runtime.providers.get(&session_id);
-                (session_id, provider)
+                (session_id, SessionSurface::Agent)
             }
             SessionSurface::Terminal => {
                 let id = match self.active_terminal_id.as_ref() {
                     Some(id) => id.clone(),
                     None => return false,
                 };
-                let provider = self.runtime.companion_terminals.get(&id).map(|t| &t.client);
-                (id, provider)
+                (id, SessionSurface::Terminal)
             }
         };
-        if let Some(provider) = client {
-            if self.last_snapshot_id.as_deref() != Some(&client_id) {
-                provider.mark_dirty();
-                self.last_snapshot_id = Some(client_id);
-                self.terminal_selection = None;
-            }
-            provider.snapshot_into(&mut self.snapshot_buf);
-            true
-        } else {
-            false
+        let switched = self.last_snapshot_id.as_deref() != Some(&client_id);
+        if switched {
+            self.last_snapshot_id = Some(client_id.clone());
+            self.terminal_selection = None;
         }
+        // Take the snapshot buffer out of `self` so we can pass a
+        // mutable reference to `provider.snapshot_into` while still
+        // holding an immutable borrow of `self` for the provider
+        // lookup. The buffer is unconditionally restored before
+        // we return.
+        let mut buf = std::mem::replace(&mut self.snapshot_buf, TerminalSnapshot::empty());
+        let success = {
+            let provider: Option<&PtyClient> = match surface {
+                SessionSurface::Agent => self.find_pty_handle(&client_id).map(|h| h.client()),
+                SessionSurface::Terminal => self
+                    .runtime
+                    .companion_terminals
+                    .get(&client_id)
+                    .map(|t| &t.client),
+            };
+            if let Some(provider) = provider {
+                if switched {
+                    provider.mark_dirty();
+                }
+                provider.snapshot_into(&mut buf);
+                true
+            } else {
+                false
+            }
+        };
+        self.snapshot_buf = buf;
+        success
     }
 }
 

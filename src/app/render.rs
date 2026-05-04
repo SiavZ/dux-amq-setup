@@ -557,7 +557,7 @@ impl App {
                     }
                     LeftItem::Session(index) => {
                         let session = &self.sessions[*index];
-                        let (dot, dot_color) = self.theme.session_dot(&session.status);
+                        let (dot, dot_color) = self.theme.session_dot(&session.state);
                         let is_last = !collapsed_left_items
                             .get(i + 1)
                             .is_some_and(|next| matches!(next, LeftItem::Session(_)));
@@ -667,16 +667,14 @@ impl App {
                         .clone()
                         .unwrap_or_else(|| session.branch_name.clone());
                     let (dot, dot_color) =
-                        if matches!(session.status, crate::model::SessionStatus::Active)
-                            && self.is_agent_streaming(&session.id)
-                        {
+                        if session.state.is_live() && self.is_agent_streaming(&session.id) {
                             let idx = self.spinner_frame_index();
                             (
                                 crate::theme::SPINNER_FRAMES[idx].to_string(),
                                 self.theme.session_active,
                             )
                         } else {
-                            let (d, c) = self.theme.session_dot(&session.status);
+                            let (d, c) = self.theme.session_dot(&session.state);
                             (d.to_string(), c)
                         };
                     // While a background delete is in flight for this session,
@@ -1170,7 +1168,7 @@ impl App {
         let session_active = match active_surface {
             SessionSurface::Agent => session_id
                 .as_ref()
-                .map(|id| self.runtime.providers.contains_key(id))
+                .map(|id| self.session_has_pty(id))
                 .unwrap_or(false),
             SessionSurface::Terminal => terminal_status.is_running(),
         };

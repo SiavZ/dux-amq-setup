@@ -706,7 +706,7 @@ pub fn build_plans_for_all(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ProviderKind, SessionStatus};
+    use crate::model::{ProviderKind, SessionState};
 
     fn fixture_paths(root: &Path) -> DuxPaths {
         DuxPaths {
@@ -730,7 +730,7 @@ mod tests {
             worktree_path: worktree.to_string_lossy().to_string(),
             title: None,
             started_providers: Vec::new(),
-            status: SessionStatus::Active,
+            state: SessionState::Created { created_at: now },
             created_at: now,
             updated_at: now,
         }

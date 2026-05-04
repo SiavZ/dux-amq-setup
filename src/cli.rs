@@ -1018,10 +1018,13 @@ fn collect_sessions_snapshot(paths: &DuxPaths) -> SessionsSnapshot {
             let mut exited = 0usize;
             let mut orphaned = 0usize;
             for s in &sessions {
-                match s.status {
-                    crate::model::SessionStatus::Active => active += 1,
-                    crate::model::SessionStatus::Detached => detached += 1,
-                    crate::model::SessionStatus::Exited => exited += 1,
+                use crate::model::SessionState;
+                match &s.state {
+                    SessionState::Live { .. } => active += 1,
+                    SessionState::Created { .. }
+                    | SessionState::Spawning { .. }
+                    | SessionState::Detached { .. } => detached += 1,
+                    SessionState::Exited { .. } => exited += 1,
                 }
                 if !Path::new(&s.worktree_path).exists() {
                     orphaned += 1;
@@ -1059,7 +1062,7 @@ mod tests {
     use super::*;
     use crate::config::{self, Config};
     use crate::keybindings::RuntimeBindings;
-    use crate::model::{AgentSession, ProviderKind, SessionStatus};
+    use crate::model::{AgentSession, ProviderKind, SessionState};
 
     #[test]
     fn reset_rejects_unknown_flags() {
@@ -1181,7 +1184,7 @@ mod tests {
         std::fs::create_dir_all(&live_two).expect("live2");
         let store = SessionStore::open(&paths.sessions_db_path).expect("store");
         let now = Utc::now();
-        let mk = |id: &str, wt: &str, status: SessionStatus| AgentSession {
+        let mk = |id: &str, wt: &str, state: SessionState| AgentSession {
             id: id.to_string(),
             project_id: "p".to_string(),
             project_path: None,
@@ -1191,32 +1194,52 @@ mod tests {
             worktree_path: wt.to_string(),
             title: None,
             started_providers: Vec::new(),
-            status,
+            state,
             created_at: now,
             updated_at: now,
         };
-        store
-            .upsert_session(&mk("a1", live.to_str().unwrap(), SessionStatus::Active))
-            .unwrap();
-        store
-            .upsert_session(&mk("a2", live.to_str().unwrap(), SessionStatus::Active))
-            .unwrap();
-        store
-            .upsert_session(&mk(
-                "d1",
-                live_two.to_str().unwrap(),
-                SessionStatus::Detached,
-            ))
-            .unwrap();
-        store
-            .upsert_session(&mk("x1", "/no/such/path-xyz-orphan", SessionStatus::Exited))
-            .unwrap();
+        // Post-Phase-18 phase 2: a persisted session can only round-trip
+        // as `Created`, `Spawning`, or `Exited` (Live + Detached embed a
+        // PTY handle that cannot survive a process restart). The
+        // snapshot test seeds three "detached" rows (which load as
+        // Created and bucket into `detached`) and one Exited orphan.
+        let d1 = mk(
+            "d1",
+            live.to_str().unwrap(),
+            SessionState::Created { created_at: now },
+        );
+        let d2 = mk(
+            "d2",
+            live.to_str().unwrap(),
+            SessionState::Created { created_at: now },
+        );
+        let d3 = mk(
+            "d3",
+            live_two.to_str().unwrap(),
+            SessionState::Created { created_at: now },
+        );
+        let x1 = mk(
+            "x1",
+            "/no/such/path-xyz-orphan",
+            SessionState::Exited {
+                exit_code: None,
+                exited_at: now,
+            },
+        );
+        store.upsert_session(&d1).unwrap();
+        store.upsert_session(&d2).unwrap();
+        store.upsert_session(&d3).unwrap();
+        store.upsert_session(&x1).unwrap();
         drop(store);
 
         let snap = collect_sessions_snapshot(&paths);
         assert_eq!(snap.integrity, "ok");
-        assert_eq!(snap.active, 2);
-        assert_eq!(snap.detached, 1);
+        // Post-Phase-18 phase 2: persisted sessions never load as
+        // Live (the PtyHandle cannot survive across restarts), so
+        // the doctor snapshot's `active` count is structurally 0
+        // for any cold load.
+        assert_eq!(snap.active, 0);
+        assert_eq!(snap.detached, 3);
         assert_eq!(snap.exited, 1);
         assert_eq!(snap.orphaned_worktrees, 1);
     }
@@ -1292,7 +1315,7 @@ mod tests {
                     worktree_path: worktree.to_string_lossy().to_string(),
                     title: None,
                     started_providers: Vec::new(),
-                    status: SessionStatus::Active,
+                    state: SessionState::Created { created_at: now },
                     created_at: now,
                     updated_at: now,
                 })

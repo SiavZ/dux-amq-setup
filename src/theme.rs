@@ -599,11 +599,22 @@ impl Theme {
         }
     }
 
-    pub fn session_dot(&self, status: &crate::model::SessionStatus) -> (&'static str, Color) {
-        match status {
-            crate::model::SessionStatus::Active => ("●", self.session_active),
-            crate::model::SessionStatus::Detached => ("◐", self.session_detached),
-            crate::model::SessionStatus::Exited => ("○", self.session_exited),
+    /// Render the status dot for a session. After audit02 P1-Z phase 2
+    /// the dot is derived from [`SessionState`](crate::model::SessionState):
+    /// `Live` shows as a filled dot in the active colour; `Spawning`
+    /// borrows the same active colour (the user just hit "create"
+    /// and is staring at the spawn flicker, so showing it as fully
+    /// active is the right cue); `Detached` and `Created` show as a
+    /// half-circle in the detached colour; `Exited` shows as an open
+    /// circle.
+    pub fn session_dot(&self, state: &crate::model::SessionState) -> (&'static str, Color) {
+        use crate::model::SessionState;
+        match state {
+            SessionState::Live { .. } | SessionState::Spawning { .. } => ("●", self.session_active),
+            SessionState::Created { .. } | SessionState::Detached { .. } => {
+                ("◐", self.session_detached)
+            }
+            SessionState::Exited { .. } => ("○", self.session_exited),
         }
     }
 
