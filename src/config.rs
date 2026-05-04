@@ -1963,10 +1963,10 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
     if name == "claude" {
         out.push_str("#\n");
         out.push_str(
-            "# Example: auto-retry when Anthropic surfaces a transient server-side\n\
-             # rate-limit (distinct from the 5-hour usage limit). Claude Code's internal\n\
-             # retry budget exhausts in seconds; this rule waits 1m / 2m / 5m / 10m\n\
-             # before sending \"please continue\" to resume the conversation.\n",
+            "# Example 1 — server-throttle auto-retry. Anthropic surfaces a transient\n\
+             # server-side rate-limit (distinct from the 5-hour usage limit). Claude\n\
+             # Code's internal retry budget exhausts in seconds; this rule waits 1m /\n\
+             # 2m / 5m / 10m before sending \"please continue\" to resume.\n",
         );
         out.push_str("#\n");
         out.push_str("# [[providers.claude.watch]]\n");
@@ -1976,6 +1976,44 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
         out.push_str("# backoff = { initial_ms = 60000, max_ms = 600000, multiplier = 2.0, jitter_ms = 5000 }\n");
         out.push_str("# budget = { max_attempts = 5 }\n");
         out.push_str("# cooldown_ms = 30000\n");
+        out.push('\n');
+        out.push_str(
+            "# Example 2 — 5-hour usage-limit auto-resume (Unix-timestamp variant).\n\
+             # Claude Code emits messages like `Claude AI usage limit reached|<ts>`\n\
+             # where <ts> is a Unix-seconds reset time. The rule captures the\n\
+             # timestamp, waits until then, and resumes. The backoff is the\n\
+             # *fallback* used only if the timestamp fails to parse.\n",
+        );
+        out.push_str("#\n");
+        out.push_str("# [[providers.claude.watch]]\n");
+        out.push_str("# pattern = \"Claude AI usage limit reached\\\\|(?<ts>\\\\d+)\"\n");
+        out.push_str("# action = \"wait_until_capture\"\n");
+        out.push_str("# capture = \"ts\"\n");
+        out.push_str("# format = \"unix_seconds\"\n");
+        out.push_str("# text = \"please continue\"\n");
+        out.push_str("# backoff = { initial_ms = 600000, max_ms = 3600000, multiplier = 2.0, jitter_ms = 30000 }\n");
+        out.push_str("# budget = { max_attempts = 3 }\n");
+        out.push_str("# cooldown_ms = 60000\n");
+        out.push('\n');
+        out.push_str(
+            "# Example 3 — 5-hour usage-limit auto-resume (clock-time variant).\n\
+             # Claude Code newer builds say \"Your limit will reset at 3pm\". The rule\n\
+             # captures the time, treats it as today's local time (rolling to tomorrow\n\
+             # if already past), and resumes then. The optional `(Timezone)` suffix\n\
+             # is stripped — set your TZ env var to match the displayed timezone.\n",
+        );
+        out.push_str("#\n");
+        out.push_str("# [[providers.claude.watch]]\n");
+        out.push_str(
+            "# pattern = \"limit will reset at (?<t>\\\\d{1,2}(?::\\\\d{2})?\\\\s*(?:am|pm)?)\"\n",
+        );
+        out.push_str("# action = \"wait_until_capture\"\n");
+        out.push_str("# capture = \"t\"\n");
+        out.push_str("# format = \"clock_local\"\n");
+        out.push_str("# text = \"please continue\"\n");
+        out.push_str("# backoff = { initial_ms = 600000, max_ms = 3600000, multiplier = 2.0, jitter_ms = 30000 }\n");
+        out.push_str("# budget = { max_attempts = 3 }\n");
+        out.push_str("# cooldown_ms = 60000\n");
     }
     out.push('\n');
 }
@@ -3093,9 +3131,9 @@ oneshot_output = "stdout"
         assert!(rendered.contains("\"Multi\" = { text = \"line1\\nline2\", surface = \"both\" }"));
     }
 
-    /// The canonical config template ships a commented `[[providers.claude.watch]]`
-    /// example so users discover the feature. This is intentionally opt-in:
-    /// rules write bytes into the agent's PTY unprompted.
+    /// The canonical config template ships commented `[[providers.claude.watch]]`
+    /// examples so users discover the feature. All examples are intentionally
+    /// opt-in: rules write bytes into the agent's PTY unprompted.
     #[test]
     fn render_provider_config_includes_claude_watch_example() {
         let rendered = render_default_config();
@@ -3107,10 +3145,25 @@ oneshot_output = "stdout"
             rendered.contains("# pattern = \"API Error.*Server is temporarily limiting requests\""),
             "Claude watch example must include the throttle pattern:\n{rendered}"
         );
-        // The example must remain commented out — never active by default.
+        // Phase 2: 5-hour usage limit examples for both unix_seconds and
+        // clock_local formats.
+        assert!(
+            rendered.contains("# format = \"unix_seconds\""),
+            "Claude template must ship the 5h usage-limit unix_seconds example:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("# format = \"clock_local\""),
+            "Claude template must ship the 5h usage-limit clock_local example:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("# action = \"wait_until_capture\""),
+            "Claude template must reference the wait_until_capture action:\n{rendered}"
+        );
+        // None of the examples may be uncommented in the default
+        // template — rules are strictly opt-in.
         assert!(
             !rendered.contains("\n[[providers.claude.watch]]"),
-            "Claude watch example must not be uncommented in the default template:\n{rendered}"
+            "Claude watch examples must not be uncommented in the default template:\n{rendered}"
         );
     }
 
