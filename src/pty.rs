@@ -1391,11 +1391,7 @@ mod tests {
         // instead of using tmux send-keys. Dropping this would
         // re-introduce the "stuck in input field" bug.
         let mut cmd = CommandBuilder::new("printf");
-        apply_terminal_env_from_parent(
-            &mut cmd,
-            Some(OsStr::new("xterm-256color")),
-            None,
-        );
+        apply_terminal_env_from_parent(&mut cmd, Some(OsStr::new("xterm-256color")), None);
         assert_eq!(
             cmd.get_env("DUX_PANE").and_then(|value| value.to_str()),
             Some("1"),

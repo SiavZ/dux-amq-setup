@@ -184,10 +184,7 @@ impl App {
                         reason = %rejection.human(),
                         "queue entry rejected after claim; left at .inflight.* for inspection",
                     );
-                    self.set_warning(format!(
-                        "AMQ inject: {}",
-                        rejection.human(),
-                    ));
+                    self.set_warning(format!("AMQ inject: {}", rejection.human(),));
                 }
             }
         }
@@ -221,8 +218,7 @@ impl App {
 
         // Snapshot receivers because we'll mutate `amq_inject_pending`
         // inside the loop and can't iterate it directly.
-        let receivers: Vec<String> =
-            self.runtime.amq_inject_pending.keys().cloned().collect();
+        let receivers: Vec<String> = self.runtime.amq_inject_pending.keys().cloned().collect();
 
         for receiver in receivers {
             // Resolve target session. `_unrouted` falls back to the

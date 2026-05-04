@@ -313,12 +313,8 @@ pub fn spawn_inject_watcher<E>(
 where
     E: Send + 'static,
 {
-    fs::create_dir_all(&queue_dir).with_context(|| {
-        format!(
-            "creating amq-inject queue dir {}",
-            queue_dir.display()
-        )
-    })?;
+    fs::create_dir_all(&queue_dir)
+        .with_context(|| format!("creating amq-inject queue dir {}", queue_dir.display()))?;
     let notify_tx = event_tx.clone();
     let mut watcher = RecommendedWatcher::new(
         move |res: Result<notify::Event, notify::Error>| {
@@ -391,7 +387,6 @@ pub fn preview(body: &str, max_chars: usize) -> String {
     }
     out
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -591,10 +586,7 @@ mod tests {
         }
         let cfg = AmqInjectConfig::default();
         let resolved = resolve_queue_dir(&cfg).unwrap();
-        assert_eq!(
-            resolved,
-            PathBuf::from("/custom/xdg/dux-amq/inject-queue")
-        );
+        assert_eq!(resolved, PathBuf::from("/custom/xdg/dux-amq/inject-queue"));
         unsafe {
             match saved {
                 Some(v) => std::env::set_var("XDG_DATA_HOME", v),

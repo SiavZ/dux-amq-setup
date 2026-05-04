@@ -2563,9 +2563,7 @@ mod tests {
         assert_eq!(cfg.poll_interval_ms, 5_000);
         assert_eq!(cfg.max_message_bytes, 65_536);
         assert!(
-            cfg.busy_markers
-                .iter()
-                .any(|m| m == "esc to interrupt"),
+            cfg.busy_markers.iter().any(|m| m == "esc to interrupt"),
             "default busy markers should include Claude Code's footer"
         );
     }
