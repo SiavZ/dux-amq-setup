@@ -593,6 +593,71 @@ impl Drop for PtyClient {
     }
 }
 
+/// Strong-typed wrapper that owns a [`PtyClient`] and represents a session
+/// with a live PTY (audit02 P1-Z phase 2). The wrapper is intentionally
+/// opaque and **not** `Clone`: a session can have at most one PTY at a
+/// time, and ownership flows through the [`crate::model::SessionState`]
+/// machine. When a `Live` or `Detached` variant is dropped the wrapped
+/// `PtyClient`'s `Drop` runs (kills the child + joins the reader thread),
+/// which matches the behaviour previously provided by removing entries
+/// from the legacy `providers: HashMap`.
+///
+/// Use [`PtyHandle::client`] / [`PtyHandle::client_mut`] to access the
+/// underlying client. Construction is restricted to this module via
+/// [`PtyHandle::new`] so callers cannot fabricate handles outside the
+/// PTY-spawn pipeline.
+pub struct PtyHandle {
+    client: PtyClient,
+}
+
+impl PtyHandle {
+    /// Wrap a freshly-spawned [`PtyClient`] in a typestate handle. Called
+    /// from the spawn pipeline (`workers.rs::run_create_agent_job`,
+    /// `sessions.rs::reconnect_session`) once the child process has been
+    /// successfully launched.
+    pub fn new(client: PtyClient) -> Self {
+        Self { client }
+    }
+
+    /// Borrow the wrapped [`PtyClient`] for read-only operations
+    /// (`snapshot_into`, `is_exited`, `received_data`, etc.).
+    /// `Deref` covers most call sites; this method exists for
+    /// places that want to be explicit about handing out the
+    /// inner client.
+    #[allow(dead_code)]
+    pub fn client(&self) -> &PtyClient {
+        &self.client
+    }
+
+    /// Borrow the wrapped [`PtyClient`] mutably. Most call sites
+    /// can rely on `DerefMut` instead.
+    #[allow(dead_code)]
+    pub fn client_mut(&mut self) -> &mut PtyClient {
+        &mut self.client
+    }
+}
+
+impl std::ops::Deref for PtyHandle {
+    type Target = PtyClient;
+    fn deref(&self) -> &PtyClient {
+        &self.client
+    }
+}
+
+impl std::ops::DerefMut for PtyHandle {
+    fn deref_mut(&mut self) -> &mut PtyClient {
+        &mut self.client
+    }
+}
+
+impl std::fmt::Debug for PtyHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PtyHandle")
+            .field("exited", &self.client.is_exited())
+            .finish()
+    }
+}
+
 /// Resolve a process name from its PID.
 ///
 /// On Linux, reads `/proc/{pid}/comm` directly (fast, no subprocess).

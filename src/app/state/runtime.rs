@@ -14,14 +14,16 @@ use std::time::Instant;
 
 use crate::lockfile::SingleInstanceLock;
 use crate::model::ProviderKind;
-use crate::pty::PtyClient;
 
 use super::super::{BranchSyncEntry, CompanionTerminal, PrSyncEntry, WorkerEvent};
 
 pub(crate) struct RuntimeState {
     pub(crate) worker_tx: Sender<WorkerEvent>,
     pub(crate) worker_rx: Receiver<WorkerEvent>,
-    pub(crate) providers: HashMap<String, PtyClient>,
+    // audit02 P1-Z phase 2 (Phase 18): the legacy `providers:
+    // HashMap<String, PtyClient>` field is gone. PTY ownership now
+    // lives inside `SessionState::Live` / `SessionState::Detached` on
+    // each `AgentSession`. Look up handles via `App::find_pty_handle`.
     /// When a provider swap happens while the agent's PTY is still running,
     /// the currently-spawned provider is pinned here so UI labels keep
     /// showing what's actually running until the user exits and relaunches
