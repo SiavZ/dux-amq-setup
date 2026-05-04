@@ -50,21 +50,18 @@ use crate::storage::SessionStore;
 use crate::theme::Theme;
 
 mod state;
-pub(crate) use state::{RuntimeState, UiState};
+pub(crate) use state::{GitState, RuntimeState, UiState};
 
 use text_input::TextInput;
 
 pub struct App {
     pub(crate) ui: UiState,
     pub(crate) runtime: RuntimeState,
+    pub(crate) git: GitState,
     pub(crate) config: Config,
     pub(crate) paths: DuxPaths,
     pub(crate) bindings: RuntimeBindings,
     pub(crate) session_store: SessionStore,
-    pub(crate) projects: Vec<Project>,
-    pub(crate) sessions: Vec<AgentSession>,
-    pub(crate) staged_files: Vec<ChangedFile>,
-    pub(crate) unstaged_files: Vec<ChangedFile>,
     pub(crate) selected_left: usize,
     pub(crate) left_section: LeftSection,
     pub(crate) selected_terminal_index: usize,
@@ -72,7 +69,6 @@ pub struct App {
     pub(crate) files_index: usize,
     pub(crate) files_search: TextInput,
     pub(crate) files_search_active: bool,
-    pub(crate) commit_input: TextInput,
     pub(crate) left_width_pct: u16,
     pub(crate) right_width_pct: u16,
     pub(crate) terminal_pane_height_pct: u16,
@@ -88,9 +84,6 @@ pub struct App {
     pub(crate) create_agent_in_flight: bool,
     pub(crate) resource_stats_in_flight: bool,
     pub(crate) last_pty_size: (u16, u16),
-    /// Tracks when each agent last received PTY data, for the streaming
-    /// activity spinner in the left pane.
-    pub(crate) last_pty_activity: HashMap<String, Instant>,
     pub(crate) prev_scrollback_offset: usize,
     pub(crate) show_diff_line_numbers: bool,
     pub(crate) last_diff_height: u16,
@@ -102,7 +95,6 @@ pub struct App {
     /// regardless of how fast the event loop is running.
     pub(crate) start_time: Instant,
     pub(crate) readonly_nudge_tick: Option<u64>,
-    pub(crate) collapsed_projects: HashSet<String>,
     pub(crate) left_items_cache: Vec<LeftItem>,
     pub(crate) interactive_patterns: InteractiveBytePatterns,
     pub(crate) raw_input_buf: Vec<u8>,
@@ -114,22 +106,6 @@ pub struct App {
     /// (`ESC[200~` … `ESC[201~`). Inside a paste, intercept matching is
     /// skipped so pasted text doesn't trigger keybindings.
     pub(crate) in_bracket_paste: bool,
-    /// Session IDs spawned with resume args and the wall-clock time the resume
-    /// attempt began. Used for one-shot fallbacks when resume exits quickly or
-    /// hangs without rendering visible output.
-    pub(crate) resume_fallback_candidates: HashMap<String, Instant>,
-    /// Session IDs whose worktree is currently being removed by a background
-    /// worker. Prevents duplicate delete requests from spawning a second
-    /// worker while the first is still running; also drives the dimmed
-    /// visual cue on the left pane row so the user can see the in-flight
-    /// state.
-    pub(crate) pending_deletions: HashSet<String>,
-    /// Maps session IDs to the exact Busy message set by
-    /// `begin_delete_session`. Used by the worker event handler to decide
-    /// whether the current status-line content was set by this deletion (and
-    /// should be cleared) or by an unrelated operation (and should be left
-    /// alone). Cleared per-session when the worker event arrives.
-    pub(crate) deletion_busy_messages: HashMap<String, String>,
     /// Cached syntax highlighting resources shared across diff computations.
     pub(crate) syntax_cache: SyntaxCache,
     /// Reusable snapshot buffer to avoid per-frame allocation of terminal cells.
@@ -139,27 +115,6 @@ pub struct App {
     last_snapshot_id: Option<String>,
     /// Active text selection in the terminal viewport, if any.
     pub(crate) terminal_selection: Option<TerminalSelection>,
-    /// Last time `reload_changed_files` dispatched a one-shot
-    /// `dispatch_changed_files` job. Used to debounce rapid session
-    /// navigation — if the user paged through 10 sessions in a quarter
-    /// second we'd otherwise spawn 10 git processes. The
-    /// `spawn_changed_files_poller` covers steady-state refresh; this
-    /// debounce just needs to suppress thundering herds on selection
-    /// changes.
-    pub(crate) last_changed_files_dispatch: Option<Instant>,
-    /// Set to `true` while a one-shot `commit` worker is in flight so
-    /// `execute_commit` can refuse re-entry. Cleared by
-    /// `WorkerEvent::CommitFinished`.
-    pub(crate) commit_in_flight: bool,
-    /// Set to `true` while a one-shot `staged_diff` worker is in flight
-    /// for the AI-commit-message generator. Cleared by
-    /// `WorkerEvent::StagedDiffReady`.
-    pub(crate) staged_diff_in_flight: bool,
-    /// Set to `true` while an `add_project` git probe is in flight so
-    /// duplicate kicks (e.g. user re-presses Enter on the path prompt)
-    /// don't queue multiple workers. Cleared by
-    /// `WorkerEvent::AddProjectMetaReady`.
-    pub(crate) add_project_in_flight: bool,
     /// Latest persistent-disk usage percentage as observed by the
     /// `spawn_disk_watchdog` worker. `None` until the first sample
     /// arrives. Drives both the warn/high-water status banners and the
@@ -1192,9 +1147,28 @@ impl App {
             refs_watch_paths: HashMap::new(),
             _single_instance_lock: single_instance_lock,
         };
+        let git = GitState {
+            projects,
+            sessions,
+            staged_files: Vec::new(),
+            unstaged_files: Vec::new(),
+            collapsed_projects: HashSet::new(),
+            commit_input: TextInput::new()
+                .with_multiline(4)
+                .with_placeholder("Type your commit message\u{2026}"),
+            last_pty_activity: HashMap::new(),
+            last_changed_files_dispatch: None,
+            commit_in_flight: false,
+            staged_diff_in_flight: false,
+            add_project_in_flight: false,
+            resume_fallback_candidates: HashMap::new(),
+            pending_deletions: HashSet::new(),
+            deletion_busy_messages: HashMap::new(),
+        };
         let mut app = Self {
             ui,
             runtime,
+            git,
             show_diff_line_numbers: config.ui.show_diff_line_numbers,
             left_width_pct: config.ui.left_width_pct,
             right_width_pct: config.ui.right_width_pct,
@@ -1205,10 +1179,6 @@ impl App {
             config,
             paths,
             session_store,
-            projects,
-            sessions,
-            staged_files: Vec::new(),
-            unstaged_files: Vec::new(),
             selected_left: 0,
             left_section: LeftSection::Projects,
             selected_terminal_index: 0,
@@ -1216,9 +1186,6 @@ impl App {
             files_index: 0,
             files_search: TextInput::new(),
             files_search_active: false,
-            commit_input: TextInput::new()
-                .with_multiline(4)
-                .with_placeholder("Type your commit message\u{2026}"),
             center_mode: CenterMode::Agent,
             status,
             session_surface: SessionSurface::Agent,
@@ -1229,7 +1196,6 @@ impl App {
             create_agent_in_flight: false,
             resource_stats_in_flight: false,
             last_pty_size: (0, 0),
-            last_pty_activity: HashMap::new(),
             prev_scrollback_offset: 0,
             last_diff_height: 0,
             last_diff_visual_lines: 0,
@@ -1237,30 +1203,22 @@ impl App {
             tick_count: 0,
             start_time: Instant::now(),
             readonly_nudge_tick: None,
-            collapsed_projects: HashSet::new(),
             left_items_cache: Vec::new(),
             interactive_patterns,
             raw_input_buf: Vec::new(),
             loading_input_buf: Vec::new(),
             in_bracket_paste: false,
-            resume_fallback_candidates: HashMap::new(),
-            pending_deletions: HashSet::new(),
-            deletion_busy_messages: HashMap::new(),
             syntax_cache: SyntaxCache::new(),
             snapshot_buf: TerminalSnapshot::empty(),
             last_snapshot_id: None,
             terminal_selection: None,
-            last_changed_files_dispatch: None,
-            commit_in_flight: false,
-            staged_diff_in_flight: false,
-            add_project_in_flight: false,
             disk_usage_pct: None,
         };
         // Kick off async git probes for every project so the first frame
         // can render placeholders immediately. The main loop fills in the
         // metadata as `ProjectMetaReady` events arrive on the worker
         // channel.
-        let project_paths = project_paths_for_meta(&app.projects);
+        let project_paths = project_paths_for_meta(&app.git.projects);
         workers::dispatch_project_meta(app.runtime.worker_tx.clone(), project_paths);
 
         app.restore_sessions();
@@ -1426,9 +1384,10 @@ impl App {
     fn restore_sessions(&mut self) {
         logger::info(&format!(
             "restoring {} persisted sessions",
-            self.sessions.len()
+            self.git.sessions.len()
         ));
         let ids: Vec<(String, bool)> = self
+            .git
             .sessions
             .iter()
             .map(|s| (s.id.clone(), Path::new(&s.worktree_path).exists()))
@@ -1468,6 +1427,7 @@ impl App {
         let stale_days = self.config.auto_resume.stale_days;
         let mut skipped_stale = 0usize;
         let candidates: Vec<AgentSession> = self
+            .git
             .sessions
             .iter()
             .filter(|s| Path::new(&s.worktree_path).exists())
@@ -1563,7 +1523,8 @@ impl App {
             Ok(client) => {
                 self.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
                 if used_resume_args {
-                    self.resume_fallback_candidates
+                    self.git
+                        .resume_fallback_candidates
                         .insert(session_id.clone(), Instant::now());
                 }
                 self.mark_session_provider_started(&session_id);
@@ -1669,11 +1630,11 @@ impl App {
     fn poll_pty_activity(&mut self) {
         let now = Instant::now();
         // Walk sessions whose state owns a PTY — `Live` and
-        // `Detached`. We can't borrow `self.sessions` immutably and
-        // mutate `self.last_pty_activity` at the same time, so
+        // `Detached`. We can't borrow `self.git.sessions` immutably and
+        // mutate `self.git.last_pty_activity` at the same time, so
         // collect dirty IDs first.
         let mut active = Vec::new();
-        for session in &self.sessions {
+        for session in &self.git.sessions {
             if let Some(handle) = session.state.pty_handle()
                 && handle.take_received_data()
             {
@@ -1681,14 +1642,15 @@ impl App {
             }
         }
         for id in active {
-            self.last_pty_activity.insert(id, now);
+            self.git.last_pty_activity.insert(id, now);
         }
     }
 
     /// Returns `true` if the given agent received PTY data within the last
     /// second, indicating it is actively streaming output.
     pub(crate) fn is_agent_streaming(&self, session_id: &str) -> bool {
-        self.last_pty_activity
+        self.git
+            .last_pty_activity
             .get(session_id)
             .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
     }
@@ -1726,7 +1688,7 @@ impl App {
             .copied()
             .and_then(|item| match item {
                 LeftItem::Project(idx) => {
-                    let p = self.projects.get(idx)?;
+                    let p = self.git.projects.get(idx)?;
                     p.path_missing.then(|| p.path.clone())
                 }
                 _ => None,
@@ -1775,7 +1737,7 @@ impl App {
     /// full process tree under each root.
     fn resource_monitor_targets(&self) -> Vec<(String, u32)> {
         let mut targets = Vec::new();
-        for session in &self.sessions {
+        for session in &self.git.sessions {
             if let Some(pty) = session.state.pty_handle()
                 && let Some(pid) = pty.child_process_id()
             {
@@ -2046,12 +2008,12 @@ impl App {
 
     pub(crate) fn rebuild_left_items(&mut self) {
         let mut items = Vec::new();
-        for (project_index, project) in self.projects.iter().enumerate() {
+        for (project_index, project) in self.git.projects.iter().enumerate() {
             items.push(LeftItem::Project(project_index));
-            if project.path_missing || self.collapsed_projects.contains(&project.id) {
+            if project.path_missing || self.git.collapsed_projects.contains(&project.id) {
                 continue;
             }
-            for (session_index, session) in self.sessions.iter().enumerate() {
+            for (session_index, session) in self.git.sessions.iter().enumerate() {
                 if session.project_id == project.id {
                     items.push(LeftItem::Session(session_index));
                 }
@@ -2061,21 +2023,23 @@ impl App {
     }
 
     pub(crate) fn sort_sessions_by_updated(&mut self) {
-        self.sessions
+        self.git
+            .sessions
             .sort_by_key(|b| std::cmp::Reverse(b.updated_at));
         self.rebuild_left_items();
         self.set_info("Agents sorted by most recently updated.");
     }
 
     pub(crate) fn sort_sessions_by_created(&mut self) {
-        self.sessions
+        self.git
+            .sessions
             .sort_by_key(|b| std::cmp::Reverse(b.created_at));
         self.rebuild_left_items();
         self.set_info("Agents sorted by creation date (newest first).");
     }
 
     pub(crate) fn sort_sessions_by_name(&mut self) {
-        self.sessions.sort_by(|a, b| {
+        self.git.sessions.sort_by(|a, b| {
             let name_a = a.title.as_deref().unwrap_or(&a.branch_name);
             let name_b = b.title.as_deref().unwrap_or(&b.branch_name);
             name_a.to_lowercase().cmp(&name_b.to_lowercase())
@@ -2087,21 +2051,21 @@ impl App {
     pub(crate) fn toggle_collapse_selected_project(&mut self) {
         if let Some(project) = self.selected_project() {
             let id = project.id.clone();
-            let has_sessions = self.sessions.iter().any(|s| s.project_id == id);
+            let has_sessions = self.git.sessions.iter().any(|s| s.project_id == id);
             if !has_sessions {
                 return;
             }
-            if self.collapsed_projects.contains(&id) {
-                self.collapsed_projects.remove(&id);
+            if self.git.collapsed_projects.contains(&id) {
+                self.git.collapsed_projects.remove(&id);
             } else {
-                self.collapsed_projects.insert(id.clone());
+                self.git.collapsed_projects.insert(id.clone());
             }
             self.rebuild_left_items();
 
             // Move selection to the toggled project so collapsing from a
             // child session leaves the cursor on the parent header.
             if let Some(new_index) = self.left_items().iter().position(
-                |item| matches!(item, LeftItem::Project(pi) if self.projects[*pi].id == id),
+                |item| matches!(item, LeftItem::Project(pi) if self.git.projects[*pi].id == id),
             ) {
                 self.selected_left = new_index;
             }
@@ -2110,9 +2074,10 @@ impl App {
 
     pub(crate) fn selected_project(&self) -> Option<&Project> {
         match self.left_items().get(self.selected_left) {
-            Some(LeftItem::Project(index)) => self.projects.get(*index),
-            Some(LeftItem::Session(index)) => self.sessions.get(*index).and_then(|session| {
-                self.projects
+            Some(LeftItem::Project(index)) => self.git.projects.get(*index),
+            Some(LeftItem::Session(index)) => self.git.sessions.get(*index).and_then(|session| {
+                self.git
+                    .projects
                     .iter()
                     .find(|project| project.id == session.project_id)
             }),
@@ -2122,13 +2087,14 @@ impl App {
 
     pub(crate) fn selected_session(&self) -> Option<&AgentSession> {
         match self.left_items().get(self.selected_left) {
-            Some(LeftItem::Session(index)) => self.sessions.get(*index),
+            Some(LeftItem::Session(index)) => self.git.sessions.get(*index),
             _ => None,
         }
     }
 
     pub(crate) fn project_name_for_session(&self, session: &AgentSession) -> String {
-        self.projects
+        self.git
+            .projects
             .iter()
             .find(|p| p.id == session.project_id)
             .map(|p| p.name.clone())
@@ -2161,8 +2127,8 @@ impl App {
         // Clear the visible file list immediately. Without this, rapidly
         // switching sessions paints stale data from the previous session
         // until the worker reply arrives.
-        self.staged_files = Vec::new();
-        self.unstaged_files = Vec::new();
+        self.git.staged_files = Vec::new();
+        self.git.unstaged_files = Vec::new();
         self.clamp_files_cursor();
 
         // Debounce: rapid `Tab` / `Shift-Tab` navigation can trigger this
@@ -2172,14 +2138,14 @@ impl App {
         // `spawn_changed_files_poller`) covers the gaps.
         const RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
         let now = Instant::now();
-        let should_dispatch = match self.last_changed_files_dispatch {
+        let should_dispatch = match self.git.last_changed_files_dispatch {
             Some(last) => now.duration_since(last) >= RELOAD_DEBOUNCE,
             None => true,
         };
         if let Some(p) = worktree
             && should_dispatch
         {
-            self.last_changed_files_dispatch = Some(now);
+            self.git.last_changed_files_dispatch = Some(now);
             workers::dispatch_changed_files(self.runtime.worker_tx.clone(), p);
         }
 
@@ -2191,16 +2157,16 @@ impl App {
 
     pub(crate) fn selected_changed_file(&self) -> Option<&ChangedFile> {
         match self.right_section {
-            RightSection::Staged => self.staged_files.get(self.files_index),
-            RightSection::Unstaged => self.unstaged_files.get(self.files_index),
+            RightSection::Staged => self.git.staged_files.get(self.files_index),
+            RightSection::Unstaged => self.git.unstaged_files.get(self.files_index),
             RightSection::CommitInput => None,
         }
     }
 
     pub(crate) fn current_files_len(&self) -> usize {
         match self.right_section {
-            RightSection::Staged => self.staged_files.len(),
-            RightSection::Unstaged => self.unstaged_files.len(),
+            RightSection::Staged => self.git.staged_files.len(),
+            RightSection::Unstaged => self.git.unstaged_files.len(),
             RightSection::CommitInput => 0,
         }
     }
@@ -2276,14 +2242,16 @@ impl App {
         let needle = self.files_search.text.to_lowercase();
         let mut matches = Vec::new();
         matches.extend(
-            self.unstaged_files
+            self.git
+                .unstaged_files
                 .iter()
                 .enumerate()
                 .filter(|(_, file)| file.path.to_lowercase().contains(&needle))
                 .map(|(index, _)| (RightSection::Unstaged, index)),
         );
         matches.extend(
-            self.staged_files
+            self.git
+                .staged_files
                 .iter()
                 .enumerate()
                 .filter(|(_, file)| file.path.to_lowercase().contains(&needle))
@@ -2331,24 +2299,25 @@ impl App {
         // Capture the previous title before mutating, in case we need to
         // revert on a failed branch rename.
         let previous_title = self
+            .git
             .sessions
             .iter()
             .find(|s| s.id == session_id)
             .and_then(|s| s.title.clone());
 
         // Always update the display title immediately.
-        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+        if let Some(session) = self.git.sessions.iter_mut().find(|s| s.id == session_id) {
             session.title = Some(name.clone());
             session.updated_at = Utc::now();
         }
-        if let Some(session) = self.sessions.iter().find(|s| s.id == session_id) {
+        if let Some(session) = self.git.sessions.iter().find(|s| s.id == session_id) {
             let _ = self.session_store.upsert_session(session);
         }
         self.rebuild_left_items();
 
         // Optionally rename the git branch in a background worker.
         if rename_branch {
-            let Some(session) = self.sessions.iter().find(|s| s.id == session_id) else {
+            let Some(session) = self.git.sessions.iter().find(|s| s.id == session_id) else {
                 return;
             };
             let old_branch = session.branch_name.clone();
@@ -2380,7 +2349,8 @@ impl App {
     /// Locate the [`PtyHandle`](crate::pty::PtyHandle) for a session
     /// whose state currently owns one (`Live` or `Detached`).
     pub(crate) fn find_pty_handle(&self, session_id: &str) -> Option<&crate::pty::PtyHandle> {
-        self.sessions
+        self.git
+            .sessions
             .iter()
             .find(|candidate| candidate.id == session_id)
             .and_then(|s| s.state.pty_handle())
@@ -2397,7 +2367,8 @@ impl App {
         &mut self,
         session_id: &str,
     ) -> Option<&mut crate::pty::PtyHandle> {
-        self.sessions
+        self.git
+            .sessions
             .iter_mut()
             .find(|candidate| candidate.id == session_id)
             .and_then(|s| s.state.pty_handle_mut())
@@ -2407,7 +2378,8 @@ impl App {
     /// `Detached`). Replaces the legacy `runtime.providers.contains_key`
     /// check.
     pub(crate) fn session_has_pty(&self, session_id: &str) -> bool {
-        self.sessions
+        self.git
+            .sessions
             .iter()
             .any(|candidate| candidate.id == session_id && candidate.state.has_pty())
     }
@@ -2415,7 +2387,11 @@ impl App {
     /// Number of sessions with an attached PTY (`Live` or `Detached`).
     /// Replaces `runtime.providers.len()`.
     pub(crate) fn live_pty_count(&self) -> usize {
-        self.sessions.iter().filter(|s| s.state.has_pty()).count()
+        self.git
+            .sessions
+            .iter()
+            .filter(|s| s.state.has_pty())
+            .count()
     }
 
     /// Install a freshly-spawned PTY on a session, transitioning into
@@ -2430,6 +2406,7 @@ impl App {
     ) -> Option<crate::pty::PtyHandle> {
         let now = Utc::now();
         let Some(session) = self
+            .git
             .sessions
             .iter_mut()
             .find(|candidate| candidate.id == session_id)
@@ -2492,6 +2469,7 @@ impl App {
     pub(crate) fn detach_session_pty(&mut self, session_id: &str) -> bool {
         let now = Utc::now();
         let Some(session) = self
+            .git
             .sessions
             .iter_mut()
             .find(|candidate| candidate.id == session_id)
@@ -2529,6 +2507,7 @@ impl App {
     pub(crate) fn reattach_session_pty(&mut self, session_id: &str) -> bool {
         let now = Utc::now();
         let Some(session) = self
+            .git
             .sessions
             .iter_mut()
             .find(|candidate| candidate.id == session_id)
@@ -2561,6 +2540,7 @@ impl App {
     pub(crate) fn mark_session_exited(&mut self, session_id: &str, exit_code: Option<i32>) {
         let now = Utc::now();
         let Some(session) = self
+            .git
             .sessions
             .iter_mut()
             .find(|candidate| candidate.id == session_id)
@@ -2585,6 +2565,7 @@ impl App {
     pub(crate) fn take_session_pty(&mut self, session_id: &str) -> Option<crate::pty::PtyHandle> {
         let now = Utc::now();
         let session = self
+            .git
             .sessions
             .iter_mut()
             .find(|candidate| candidate.id == session_id)?;
@@ -2606,6 +2587,7 @@ impl App {
 
     pub(crate) fn mark_session_provider_started(&mut self, session_id: &str) {
         let Some(session) = self
+            .git
             .sessions
             .iter_mut()
             .find(|candidate| candidate.id == session_id)
@@ -2626,6 +2608,7 @@ impl App {
     pub(crate) fn update_branch_sync_sessions(&self) {
         if let Ok(mut guard) = self.runtime.branch_sync_sessions.lock() {
             *guard = self
+                .git
                 .sessions
                 .iter()
                 .map(|s| BranchSyncEntry {

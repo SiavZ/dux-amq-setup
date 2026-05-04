@@ -49,6 +49,7 @@ impl App {
         logger::info(&format!("attempting to add project {}", path.display()));
 
         if self
+            .git
             .projects
             .iter()
             .any(|project| Path::new(&project.path) == path.as_path())
@@ -60,7 +61,7 @@ impl App {
             return Ok(());
         }
 
-        if self.add_project_in_flight {
+        if self.git.add_project_in_flight {
             self.set_warning(
                 "Already validating an \"add project\" request. Wait for it to finish.",
             );
@@ -73,7 +74,7 @@ impl App {
         // open the branch-mismatch warning, surface a non-repo error, or
         // call `finish_add_project` directly. This keeps the UI responsive
         // even when the repo is on a slow filesystem or holds a lock.
-        self.add_project_in_flight = true;
+        self.git.add_project_in_flight = true;
         self.set_busy(format!(
             "Validating \"{}\" as a git repository\u{2026}",
             path.display()
@@ -154,7 +155,7 @@ impl App {
             commit_prompt: None,
         });
         save_config(&self.paths.config_path, &self.config, &self.bindings)?;
-        self.projects.push(Project {
+        self.git.projects.push(Project {
             id: project_id,
             name: display_name.clone(),
             path,
@@ -283,7 +284,12 @@ impl App {
     /// different code path; this gate is for user-initiated spawns only.
     pub(crate) fn refuse_agent_spawn_for_limits(&self) -> Option<String> {
         let limits = &self.config.limits;
-        let active_panes = self.sessions.iter().filter(|s| s.state.is_live()).count();
+        let active_panes = self
+            .git
+            .sessions
+            .iter()
+            .filter(|s| s.state.is_live())
+            .count();
         if limits.max_panes > 0 && active_panes >= limits.max_panes {
             return Some(format!(
                 "Refusing new agent: {active_panes} active panes already running \
@@ -503,7 +509,13 @@ impl App {
         let session_id = terminal.session_id.clone();
         drop(items);
 
-        let Some(session) = self.sessions.iter().find(|s| s.id == session_id).cloned() else {
+        let Some(session) = self
+            .git
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .cloned()
+        else {
             self.set_warning("The parent agent session no longer exists.");
             return Ok(());
         };
@@ -565,7 +577,7 @@ impl App {
         if let Some(pos) = self
             .left_items()
             .iter()
-            .position(|item| matches!(item, LeftItem::Session(idx) if self.sessions.get(*idx).map(|s| s.id.as_str()) == Some(session_id.as_str())))
+            .position(|item| matches!(item, LeftItem::Session(idx) if self.git.sessions.get(*idx).map(|s| s.id.as_str()) == Some(session_id.as_str())))
         {
             self.selected_left = pos;
         }
@@ -613,6 +625,7 @@ impl App {
             return Ok(());
         };
         let worktree_shared = self
+            .git
             .sessions
             .iter()
             .any(|s| s.id != session.id && s.worktree_path == session.worktree_path);
@@ -640,15 +653,22 @@ impl App {
         // Reject duplicate delete requests for the same session. The first
         // worker will clean up when it finishes; spawning a second one would
         // just race and confuse the status line.
-        if self.pending_deletions.contains(session_id) {
+        if self.git.pending_deletions.contains(session_id) {
             self.set_error("Deletion already in progress for this agent. Wait for it to finish.");
             return;
         }
 
-        let Some(session) = self.sessions.iter().find(|s| s.id == session_id).cloned() else {
+        let Some(session) = self
+            .git
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .cloned()
+        else {
             return;
         };
         let Some(project) = self
+            .git
             .projects
             .iter()
             .find(|project| project.id == session.project_id)
@@ -657,6 +677,7 @@ impl App {
             return;
         };
         let other_sessions_on_worktree = self
+            .git
             .sessions
             .iter()
             .any(|s| s.id != session.id && s.worktree_path == session.worktree_path);
@@ -670,7 +691,7 @@ impl App {
             // Mark in-flight BEFORE spawning, so a fast follow-up action from
             // the same event loop tick can see the guard. The worker event
             // handler clears the entry on completion (Ok or Err).
-            self.pending_deletions.insert(session.id.clone());
+            self.git.pending_deletions.insert(session.id.clone());
             let sid = session.id.clone();
             let project_path = project.path.clone();
             let worktree_path = session.worktree_path.clone();
@@ -694,7 +715,8 @@ impl App {
                 session.branch_name
             );
             self.set_busy(&busy_msg);
-            self.deletion_busy_messages
+            self.git
+                .deletion_busy_messages
                 .insert(session.id.clone(), busy_msg);
         } else {
             logger::info(&format!(
@@ -727,15 +749,23 @@ impl App {
         remove_outcome: Option<bool>,
         update_status: bool,
     ) -> Result<()> {
-        let Some(session) = self.sessions.iter().find(|s| s.id == session_id).cloned() else {
+        let Some(session) = self
+            .git
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .cloned()
+        else {
             return Ok(());
         };
         let project = self
+            .git
             .projects
             .iter()
             .find(|project| project.id == session.project_id)
             .cloned();
         let other_sessions_on_worktree = self
+            .git
             .sessions
             .iter()
             .any(|s| s.id != session.id && s.worktree_path == session.worktree_path);
@@ -752,10 +782,12 @@ impl App {
         // statement.
         let _ = self.take_session_pty(&session.id);
         self.runtime.running_provider_pins.remove(&session.id);
-        self.last_pty_activity.remove(&session.id);
-        self.resume_fallback_candidates.remove(&session.id);
+        self.git.last_pty_activity.remove(&session.id);
+        self.git.resume_fallback_candidates.remove(&session.id);
         self.clear_companion_terminals_for_session(&session.id);
-        self.sessions.retain(|candidate| candidate.id != session.id);
+        self.git
+            .sessions
+            .retain(|candidate| candidate.id != session.id);
         self.update_branch_sync_sessions();
         self.rebuild_left_items();
         self.selected_left = self.selected_left.saturating_sub(1);
@@ -915,6 +947,7 @@ impl App {
             return Ok(());
         };
         let Some(session_index) = self
+            .git
             .sessions
             .iter()
             .position(|session| session.id == prompt.session_id)
@@ -936,15 +969,15 @@ impl App {
 
         self.ui.prompt = PromptState::None;
 
-        let session_id = self.sessions[session_index].id.clone();
+        let session_id = self.git.sessions[session_index].id.clone();
         let running = self.session_has_pty(&session_id);
-        let previous_provider = self.sessions[session_index].provider.clone();
+        let previous_provider = self.git.sessions[session_index].provider.clone();
 
-        let session = &mut self.sessions[session_index];
+        let session = &mut self.git.sessions[session_index];
         session.provider = selected.provider.clone();
         session.updated_at = Utc::now();
         self.session_store
-            .upsert_session(&self.sessions[session_index])?;
+            .upsert_session(&self.git.sessions[session_index])?;
 
         // Pin the still-running provider so UI labels stay truthful until
         // the user exits and relaunches the agent. Only set on the first
@@ -1052,7 +1085,7 @@ impl App {
             ));
             return Ok(());
         }
-        refresh_project_defaults(&mut self.projects, &self.config);
+        refresh_project_defaults(&mut self.git.projects, &self.config);
         self.rebuild_left_items();
         self.set_info(format!(
             "Default provider changed to {}. New agent sessions will use it; existing agents keep their current provider. Use \"change-agent-provider\" on a session to switch providers for an existing worktree.",
@@ -1174,12 +1207,12 @@ impl App {
             self.set_error("Select a project first.");
             return Ok(());
         };
-        let has_sessions = self.sessions.iter().any(|s| s.project_id == project.id);
+        let has_sessions = self.git.sessions.iter().any(|s| s.project_id == project.id);
         if has_sessions {
             self.set_error("Delete all agents in this project first.");
             return Ok(());
         }
-        self.projects.retain(|p| p.id != project.id);
+        self.git.projects.retain(|p| p.id != project.id);
         self.config
             .projects
             .retain(|p| Path::new(&p.path) != Path::new(&project.path));
@@ -1201,9 +1234,10 @@ impl App {
         // the rest, but firing a duplicate for an already-pending session
         // would race the existing worker.
         let pending_in_project = self
+            .git
             .sessions
             .iter()
-            .any(|s| s.project_id == project.id && self.pending_deletions.contains(&s.id));
+            .any(|s| s.project_id == project.id && self.git.pending_deletions.contains(&s.id));
         if pending_in_project {
             self.set_error(
                 "Cannot delete project while agent worktree removals are in progress. \
@@ -1214,6 +1248,7 @@ impl App {
 
         logger::info(&format!("deleting project {}", project.path));
         let session_ids = self
+            .git
             .sessions
             .iter()
             .filter(|session| session.project_id == project.id)
@@ -1221,6 +1256,7 @@ impl App {
             .collect::<Vec<_>>();
         for session_id in session_ids {
             if let Some(index) = self
+                .git
                 .sessions
                 .iter()
                 .position(|session| session.id == session_id)
@@ -1240,7 +1276,9 @@ impl App {
                 self.begin_delete_session(&session_id, true);
             }
         }
-        self.projects.retain(|candidate| candidate.id != project.id);
+        self.git
+            .projects
+            .retain(|candidate| candidate.id != project.id);
         self.config
             .projects
             .retain(|candidate| Path::new(&candidate.path) != Path::new(&project.path));
@@ -1274,8 +1312,8 @@ impl App {
         // Drop (kills child + joins reader thread).
         let _ = self.take_session_pty(&session.id);
         self.runtime.running_provider_pins.remove(&session.id);
-        self.last_pty_activity.remove(&session.id);
-        self.resume_fallback_candidates.remove(&session.id);
+        self.git.last_pty_activity.remove(&session.id);
+        self.git.resume_fallback_candidates.remove(&session.id);
 
         let detached_label =
             self.detach_conflicting_worktree_session(&session.worktree_path, &session.id);
@@ -1303,7 +1341,11 @@ impl App {
                         " Agent \"{detached}\" was detached to avoid worktree conflicts.",
                     ));
                 }
-                if let Some(project) = self.projects.iter().find(|p| p.id == session.project_id)
+                if let Some(project) = self
+                    .git
+                    .projects
+                    .iter()
+                    .find(|p| p.id == session.project_id)
                     && project.default_provider != session.provider
                 {
                     msg.push_str(&format!(
@@ -1358,7 +1400,8 @@ impl App {
             Ok(client) => {
                 self.install_pty_for_session(&session.id, crate::pty::PtyHandle::new(client));
                 if use_resume {
-                    self.resume_fallback_candidates
+                    self.git
+                        .resume_fallback_candidates
                         .insert(session.id.clone(), Instant::now());
                 }
                 self.mark_session_provider_started(&session.id);
@@ -1386,7 +1429,11 @@ impl App {
                         " Agent \"{detached}\" was detached to avoid worktree conflicts.",
                     ));
                 }
-                if let Some(project) = self.projects.iter().find(|p| p.id == session.project_id)
+                if let Some(project) = self
+                    .git
+                    .projects
+                    .iter()
+                    .find(|p| p.id == session.project_id)
                     && project.default_provider != session.provider
                 {
                     msg.push_str(&format!(
@@ -1467,10 +1514,12 @@ impl App {
 
     pub(crate) fn copy_selected_path(&mut self) -> Result<()> {
         let path = match self.left_items().get(self.selected_left) {
-            Some(LeftItem::Session(index)) => {
-                self.sessions.get(*index).map(|s| s.worktree_path.clone())
-            }
-            Some(LeftItem::Project(index)) => self.projects.get(*index).map(|p| p.path.clone()),
+            Some(LeftItem::Session(index)) => self
+                .git
+                .sessions
+                .get(*index)
+                .map(|s| s.worktree_path.clone()),
+            Some(LeftItem::Project(index)) => self.git.projects.get(*index).map(|p| p.path.clone()),
             None => None,
         };
         match path {
@@ -1597,7 +1646,7 @@ impl App {
     pub(crate) fn running_runtime_snapshot(&self) -> Vec<KillableRuntime> {
         let mut runtimes = Vec::new();
 
-        for session in &self.sessions {
+        for session in &self.git.sessions {
             if !session.state.has_pty() {
                 continue;
             }
@@ -1625,6 +1674,7 @@ impl App {
 
         for (terminal_id, terminal) in self.terminal_items() {
             let (project_name, session_label) = self
+                .git
                 .sessions
                 .iter()
                 .find(|session| session.id == terminal.session_id)
@@ -1783,7 +1833,7 @@ impl App {
                 RuntimeTargetId::Agent(session_id) => {
                     if self.take_session_pty(session_id).is_some() {
                         self.runtime.running_provider_pins.remove(session_id);
-                        self.last_pty_activity.remove(session_id);
+                        self.git.last_pty_activity.remove(session_id);
                         // Manual kill — child is dead, mark as Exited.
                         self.mark_session_exited(session_id, None);
                         killed_agents += 1;
@@ -1847,6 +1897,7 @@ impl App {
         exclude_id: &str,
     ) -> Option<String> {
         let conflicting = self
+            .git
             .sessions
             .iter()
             .find(|s| s.id != exclude_id && s.worktree_path == worktree_path && s.state.has_pty())
@@ -1858,8 +1909,8 @@ impl App {
         // handle falls out of scope, mark the session detached.
         let _ = self.take_session_pty(&conflicting.id);
         self.runtime.running_provider_pins.remove(&conflicting.id);
-        self.last_pty_activity.remove(&conflicting.id);
-        self.resume_fallback_candidates.remove(&conflicting.id);
+        self.git.last_pty_activity.remove(&conflicting.id);
+        self.git.resume_fallback_candidates.remove(&conflicting.id);
         // Auto-detach killed the child; mark Exited so UI reflects it.
         self.mark_session_exited(&conflicting.id, None);
 
@@ -1959,17 +2010,32 @@ mod tests {
             refs_watch_paths: std::collections::HashMap::new(),
             _single_instance_lock: single_instance_lock,
         };
-        let mut app = App {
-            ui,
-            runtime,
-            config: Config::default(),
-            paths,
-            bindings,
-            session_store,
+        let git = crate::app::GitState {
             projects,
             sessions,
             staged_files: Vec::new(),
             unstaged_files: Vec::new(),
+            collapsed_projects: std::collections::HashSet::new(),
+            commit_input: TextInput::new()
+                .with_multiline(4)
+                .with_placeholder("Type your commit message\u{2026}"),
+            last_pty_activity: std::collections::HashMap::new(),
+            last_changed_files_dispatch: None,
+            commit_in_flight: false,
+            staged_diff_in_flight: false,
+            add_project_in_flight: false,
+            resume_fallback_candidates: std::collections::HashMap::new(),
+            pending_deletions: std::collections::HashSet::new(),
+            deletion_busy_messages: std::collections::HashMap::new(),
+        };
+        let mut app = App {
+            ui,
+            runtime,
+            git,
+            config: Config::default(),
+            paths,
+            bindings,
+            session_store,
             selected_left: 0,
             left_section: crate::app::LeftSection::Projects,
             selected_terminal_index: 0,
@@ -1977,9 +2043,6 @@ mod tests {
             files_index: 0,
             files_search: TextInput::new(),
             files_search_active: false,
-            commit_input: TextInput::new()
-                .with_multiline(4)
-                .with_placeholder("Type your commit message\u{2026}"),
             show_diff_line_numbers: false,
             left_width_pct: 20,
             right_width_pct: 23,
@@ -1994,13 +2057,8 @@ mod tests {
             terminal_return_to_list: false,
             terminal_counter: 0,
             create_agent_in_flight: false,
-            last_changed_files_dispatch: None,
-            commit_in_flight: false,
-            staged_diff_in_flight: false,
-            add_project_in_flight: false,
             resource_stats_in_flight: false,
             last_pty_size: (0, 0),
-            last_pty_activity: std::collections::HashMap::new(),
             prev_scrollback_offset: 0,
             last_diff_height: 0,
             last_diff_visual_lines: 0,
@@ -2008,7 +2066,6 @@ mod tests {
             tick_count: 0,
             start_time: std::time::Instant::now(),
             readonly_nudge_tick: None,
-            collapsed_projects: std::collections::HashSet::new(),
             left_items_cache: Vec::new(),
             interactive_patterns: crate::keybindings::InteractiveBytePatterns {
                 bindings: Vec::new(),
@@ -2016,9 +2073,6 @@ mod tests {
             raw_input_buf: Vec::new(),
             loading_input_buf: Vec::new(),
             in_bracket_paste: false,
-            resume_fallback_candidates: std::collections::HashMap::new(),
-            pending_deletions: std::collections::HashSet::new(),
-            deletion_busy_messages: std::collections::HashMap::new(),
             syntax_cache: crate::diff::SyntaxCache::new(),
             snapshot_buf: crate::pty::TerminalSnapshot::empty(),
             last_snapshot_id: None,
@@ -2120,7 +2174,7 @@ mod tests {
         let label = app.detach_conflicting_worktree_session("/tmp/wt/a", "s2");
         assert!(label.is_some());
         assert!(!app.session_has_pty("s1"));
-        let s1_session = app.sessions.iter().find(|s| s.id == "s1").unwrap();
+        let s1_session = app.git.sessions.iter().find(|s| s.id == "s1").unwrap();
         // After auto-detach we kill the child + drop the handle, so
         // the session is `Exited` (the new model can't represent a
         // PTY-less `Detached`).
@@ -2151,6 +2205,7 @@ mod tests {
         // We can't call begin_delete_session directly because git::remove_worktree
         // would fail on a non-existent repo, but we can verify the guard logic.
         let has_sibling = app
+            .git
             .sessions
             .iter()
             .any(|s| s.id != "s1" && s.worktree_path == "/tmp/wt/a");
@@ -2164,6 +2219,7 @@ mod tests {
         let app = test_app_with_sessions(vec![s1], vec![project]);
 
         let has_sibling = app
+            .git
             .sessions
             .iter()
             .any(|s| s.id != "s1" && s.worktree_path == "/tmp/wt/a");
@@ -2179,12 +2235,14 @@ mod tests {
 
         assert!(app.should_resume_session(&session));
 
-        app.sessions[0].provider = ProviderKind::from_str("codex");
-        let session = app.sessions[0].clone();
+        app.git.sessions[0].provider = ProviderKind::from_str("codex");
+        let session = app.git.sessions[0].clone();
         assert!(!app.should_resume_session(&session));
 
-        app.sessions[0].started_providers.push("codex".to_string());
-        let session = app.sessions[0].clone();
+        app.git.sessions[0]
+            .started_providers
+            .push("codex".to_string());
+        let session = app.git.sessions[0].clone();
         assert!(app.should_resume_session(&session));
     }
 
@@ -2197,7 +2255,7 @@ mod tests {
         app.mark_session_provider_started("s1");
 
         assert_eq!(
-            app.sessions[0].started_providers,
+            app.git.sessions[0].started_providers,
             vec!["claude".to_string()]
         );
         let persisted = app.session_store.load_sessions().expect("load sessions");
@@ -2239,7 +2297,7 @@ mod tests {
         // Session must still be present: the worker thread has been spawned
         // but hasn't (at most) completed the cleanup on our thread yet.
         assert!(
-            app.sessions.iter().any(|s| s.id == "s1"),
+            app.git.sessions.iter().any(|s| s.id == "s1"),
             "session must remain until the worker reports success",
         );
     }
@@ -2261,7 +2319,7 @@ mod tests {
         app.begin_delete_session("s1", false);
 
         assert!(
-            app.sessions.iter().all(|s| s.id != "s1"),
+            app.git.sessions.iter().all(|s| s.id != "s1"),
             "no-git path should complete immediately",
         );
         assert!(
@@ -2303,7 +2361,7 @@ mod tests {
         app.begin_delete_session("s1", true);
 
         assert!(
-            app.pending_deletions.contains("s1"),
+            app.git.pending_deletions.contains("s1"),
             "session must be marked pending while async worker runs",
         );
     }
@@ -2324,7 +2382,7 @@ mod tests {
         app.begin_delete_session("s1", false);
 
         assert!(
-            app.pending_deletions.is_empty(),
+            app.git.pending_deletions.is_empty(),
             "inline path should never populate pending_deletions",
         );
     }
@@ -2344,11 +2402,15 @@ mod tests {
         let mut app = test_app_with_sessions(vec![s1], vec![project]);
 
         app.begin_delete_session("s1", true);
-        assert_eq!(app.pending_deletions.len(), 1, "first call records pending");
+        assert_eq!(
+            app.git.pending_deletions.len(),
+            1,
+            "first call records pending"
+        );
 
         app.begin_delete_session("s1", true);
         assert_eq!(
-            app.pending_deletions.len(),
+            app.git.pending_deletions.len(),
             1,
             "duplicate request must not spawn a second worker",
         );
@@ -2372,12 +2434,13 @@ mod tests {
         // the tracking map entry.
         let busy_msg = "Removing worktree for agent \"branch-s1\"\u{2026}";
         app.set_busy(busy_msg);
-        app.pending_deletions.insert("s1".to_string());
-        app.deletion_busy_messages
+        app.git.pending_deletions.insert("s1".to_string());
+        app.git
+            .deletion_busy_messages
             .insert("s1".to_string(), busy_msg.to_string());
 
         // Another code path removes the session before the worker replies.
-        app.sessions.retain(|s| s.id != "s1");
+        app.git.sessions.retain(|s| s.id != "s1");
 
         // The worker then reports success.
         app.runtime
@@ -2390,7 +2453,7 @@ mod tests {
         app.drain_events();
 
         assert!(
-            app.pending_deletions.is_empty(),
+            app.git.pending_deletions.is_empty(),
             "pending guard must be cleared on completion",
         );
         assert_ne!(
@@ -2415,10 +2478,11 @@ mod tests {
         let project = make_project_at("project-1", "claude", &project_dir.path().to_string_lossy());
         let mut app = test_app_with_sessions(vec![s1], vec![project]);
 
-        app.pending_deletions.insert("s1".to_string());
-        app.deletion_busy_messages
+        app.git.pending_deletions.insert("s1".to_string());
+        app.git
+            .deletion_busy_messages
             .insert("s1".to_string(), "Removing worktree\u{2026}".to_string());
-        app.sessions.retain(|s| s.id != "s1");
+        app.git.sessions.retain(|s| s.id != "s1");
 
         // Another action already set a non-Busy status.
         app.set_info("Deleted project \"demo\" and all its agents");
@@ -2459,12 +2523,12 @@ mod tests {
         let project = make_project_at("project-1", "claude", &project_dir.path().to_string_lossy());
         let mut app = test_app_with_sessions(vec![s1], vec![project]);
 
-        app.pending_deletions.insert("s1".to_string());
-        app.deletion_busy_messages.insert(
+        app.git.pending_deletions.insert("s1".to_string());
+        app.git.deletion_busy_messages.insert(
             "s1".to_string(),
             "Removing worktree for agent \"branch-s1\"\u{2026}".to_string(),
         );
-        app.sessions.retain(|s| s.id != "s1");
+        app.git.sessions.retain(|s| s.id != "s1");
 
         // An unrelated operation set its own Busy message.
         app.set_busy("Pushing to remote\u{2026}");
@@ -2510,7 +2574,7 @@ mod tests {
         let mut app = test_app_with_sessions(vec![s1], vec![project]);
 
         // Simulate an async delete in-flight for this session.
-        app.pending_deletions.insert("s1".to_string());
+        app.git.pending_deletions.insert("s1".to_string());
 
         // The project is the first item in the list, select it.
         app.selected_left = 0;
@@ -2520,11 +2584,11 @@ mod tests {
 
         // Session must still be present — deletion was refused.
         assert!(
-            app.sessions.iter().any(|s| s.id == "s1"),
+            app.git.sessions.iter().any(|s| s.id == "s1"),
             "session must not be removed when deletion is blocked",
         );
         assert!(
-            app.projects.iter().any(|p| p.id == "project-1"),
+            app.git.projects.iter().any(|p| p.id == "project-1"),
             "project must not be removed when deletion is blocked",
         );
         assert_eq!(
@@ -2547,7 +2611,7 @@ mod tests {
         let project = make_project_at("project-1", "claude", &project_dir.path().to_string_lossy());
         let mut app = test_app_with_sessions(vec![s1], vec![project]);
 
-        app.pending_deletions.insert("s1".to_string());
+        app.git.pending_deletions.insert("s1".to_string());
 
         app.runtime
             .worker_tx
@@ -2693,7 +2757,7 @@ mod tests {
             !app.session_has_pty("old"),
             "oldest session's PTY should have been torn down",
         );
-        let old_session = app.sessions.iter().find(|s| s.id == "old").unwrap();
+        let old_session = app.git.sessions.iter().find(|s| s.id == "old").unwrap();
         // After kill-and-detach on the oldest pane the new state
         // machine puts the session into `Exited` (the watchdog drops
         // the PTY handle, which kills the child).
@@ -2705,7 +2769,7 @@ mod tests {
         // because the loop only tears down victims while the cap is
         // exceeded — and with one pane the footprint should be lower.
         let still_active = app.session_has_pty("new");
-        let new_session = app.sessions.iter().find(|s| s.id == "new").unwrap();
+        let new_session = app.git.sessions.iter().find(|s| s.id == "new").unwrap();
         assert!(
             still_active || matches!(new_session.state, crate::model::SessionState::Exited { .. }),
             "scrollback detach must select oldest victim first; \

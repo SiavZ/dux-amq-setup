@@ -364,7 +364,7 @@ impl App {
                     self.set_info("Command palette opened.");
                 }
                 Action::FocusNext => {
-                    let has_staged = !self.staged_files.is_empty();
+                    let has_staged = !self.git.staged_files.is_empty();
                     if self.ui.focus == FocusPane::Left
                         && self.left_section == LeftSection::Projects
                         && self.has_terminal_items()
@@ -403,7 +403,7 @@ impl App {
                     self.ui.fullscreen_overlay = FullscreenOverlay::None;
                 }
                 Action::FocusPrev => {
-                    let has_staged = !self.staged_files.is_empty();
+                    let has_staged = !self.git.staged_files.is_empty();
                     if self.ui.focus == FocusPane::Left
                         && self.left_section == LeftSection::Terminals
                     {
@@ -755,12 +755,12 @@ impl App {
                 Action::StageUnstage if self.right_section != RightSection::CommitInput => {
                     self.toggle_stage_selected_file()?;
                 }
-                Action::CommitChanges if !self.staged_files.is_empty() => {
+                Action::CommitChanges if !self.git.staged_files.is_empty() => {
                     self.execute_commit()?;
                 }
                 Action::OpenDiff => {
                     if self.right_section == RightSection::CommitInput {
-                        if !self.staged_files.is_empty() {
+                        if !self.git.staged_files.is_empty() {
                             self.ui.input_target = InputTarget::CommitMessage;
                         }
                     } else {
@@ -773,7 +773,7 @@ impl App {
                 Action::GenerateCommitMessage => {
                     self.trigger_ai_commit_message()?;
                 }
-                Action::EngageCommitInput if !self.staged_files.is_empty() => {
+                Action::EngageCommitInput if !self.git.staged_files.is_empty() => {
                     self.ui.input_target = InputTarget::CommitMessage;
                 }
                 Action::PushToRemote => {
@@ -805,7 +805,7 @@ impl App {
         }
         // TextInput handles Enter (newline), Up/Down (line nav), and all
         // editing keys in multiline mode.
-        self.commit_input.handle_key(key);
+        self.git.commit_input.handle_key(key);
         Ok(())
     }
 
@@ -886,8 +886,8 @@ impl App {
         };
         let worktree = PathBuf::from(&session.worktree_path);
         let file = match self.right_section {
-            RightSection::Staged => self.staged_files.get(self.files_index),
-            RightSection::Unstaged => self.unstaged_files.get(self.files_index),
+            RightSection::Staged => self.git.staged_files.get(self.files_index),
+            RightSection::Unstaged => self.git.unstaged_files.get(self.files_index),
             RightSection::CommitInput => return Ok(()),
         };
         let Some(file) = file else { return Ok(()) };
@@ -903,10 +903,11 @@ impl App {
         }
         self.reload_changed_files();
         // If the section we were in is now empty, move to the other one.
-        if self.right_section == RightSection::Staged && self.staged_files.is_empty() {
+        if self.right_section == RightSection::Staged && self.git.staged_files.is_empty() {
             self.right_section = RightSection::Unstaged;
             self.clamp_files_cursor();
-        } else if self.right_section == RightSection::Unstaged && self.unstaged_files.is_empty() {
+        } else if self.right_section == RightSection::Unstaged && self.git.unstaged_files.is_empty()
+        {
             self.right_section = RightSection::Staged;
             self.clamp_files_cursor();
         }
@@ -915,7 +916,7 @@ impl App {
 
     fn confirm_discard_selected_file(&mut self) -> Result<()> {
         let file = match self.right_section {
-            RightSection::Unstaged => self.unstaged_files.get(self.files_index),
+            RightSection::Unstaged => self.git.unstaged_files.get(self.files_index),
             RightSection::Staged => {
                 self.set_error("Unstage the file first to discard changes.");
                 return Ok(());
@@ -932,14 +933,14 @@ impl App {
     }
 
     fn trigger_ai_commit_message(&mut self) -> Result<()> {
-        if self.staged_files.is_empty() {
+        if self.git.staged_files.is_empty() {
             self.set_error("Stage files first.");
             return Ok(());
         }
-        if self.commit_input.overlay().is_some() {
+        if self.git.commit_input.overlay().is_some() {
             return Ok(());
         }
-        if self.staged_diff_in_flight {
+        if self.git.staged_diff_in_flight {
             self.set_warning("Already preparing the staged diff. Wait for it to finish.");
             return Ok(());
         }
@@ -952,8 +953,9 @@ impl App {
         // Capture the staged diff on a worker thread so a slow git invocation
         // doesn't freeze the UI. The provider call is kicked off only after
         // the diff arrives via `WorkerEvent::StagedDiffReady`.
-        self.staged_diff_in_flight = true;
-        self.commit_input
+        self.git.staged_diff_in_flight = true;
+        self.git
+            .commit_input
             .set_overlay("Generating commit message\u{2026}");
         self.set_busy("Reading staged diff for AI commit message\u{2026}");
         workers::dispatch_staged_diff(self.runtime.worker_tx.clone(), worktree);
@@ -965,17 +967,18 @@ impl App {
     /// in another worker so we don't block on it either.
     pub(crate) fn launch_commit_message_provider(&mut self, worktree: PathBuf, diff_text: String) {
         if diff_text.is_empty() {
-            self.commit_input.clear_overlay();
+            self.git.commit_input.clear_overlay();
             self.set_error("No staged diff found.");
             return;
         }
         let Some(session) = self
+            .git
             .sessions
             .iter()
             .find(|s| Path::new(&s.worktree_path) == worktree.as_path())
             .cloned()
         else {
-            self.commit_input.clear_overlay();
+            self.git.commit_input.clear_overlay();
             self.set_error("Selected session is no longer available.");
             return;
         };
@@ -998,15 +1001,15 @@ impl App {
     }
 
     fn execute_commit(&mut self) -> Result<()> {
-        if self.commit_in_flight {
+        if self.git.commit_in_flight {
             self.set_warning("A commit is already in progress. Wait for it to finish.");
             return Ok(());
         }
-        if self.staged_files.is_empty() {
+        if self.git.staged_files.is_empty() {
             self.set_error("No staged changes to commit.");
             return Ok(());
         }
-        if self.commit_input.text.trim().is_empty() {
+        if self.git.commit_input.text.trim().is_empty() {
             self.set_error("Enter a commit message first.");
             return Ok(());
         }
@@ -1015,15 +1018,16 @@ impl App {
             return Ok(());
         };
         let worktree = PathBuf::from(&session.worktree_path);
-        let message = self.commit_input.text.clone();
+        let message = self.git.commit_input.text.clone();
 
         // Block re-entry by setting `commit_in_flight` and disabling the
         // commit input overlay; the worker reply (`CommitFinished`) is the
         // only thing that releases either. We deliberately do NOT block
         // the UI thread itself — that would re-introduce the freeze this
         // phase is meant to fix.
-        self.commit_in_flight = true;
-        self.commit_input
+        self.git.commit_in_flight = true;
+        self.git
+            .commit_input
             .set_overlay("Committing staged changes\u{2026}");
         self.set_busy("Committing staged changes\u{2026}");
         workers::dispatch_commit(self.runtime.worker_tx.clone(), worktree, message);
@@ -3209,7 +3213,7 @@ impl App {
             && contains_point(area, column, row)
         {
             let index = usize::from(row.saturating_sub(area.y));
-            let file_index = (index < self.unstaged_files.len()).then_some(index);
+            let file_index = (index < self.git.unstaged_files.len()).then_some(index);
             return Some(MouseTarget::UnstagedFile(file_index));
         }
 
@@ -3217,7 +3221,7 @@ impl App {
             && contains_point(area, column, row)
         {
             let index = usize::from(row.saturating_sub(area.y));
-            let file_index = (index < self.staged_files.len()).then_some(index);
+            let file_index = (index < self.git.staged_files.len()).then_some(index);
             return Some(MouseTarget::StagedFile(file_index));
         }
 
@@ -4382,20 +4386,20 @@ impl App {
     fn activate_selected_left_item(&mut self) -> Result<()> {
         match self.left_items().get(self.selected_left) {
             Some(LeftItem::Project(project_index)) => {
-                let project = &self.projects[*project_index];
+                let project = &self.git.projects[*project_index];
                 if project.path_missing {
                     self.set_warning(format!("Project path not found: {}", project.path));
                     return Ok(());
                 }
                 let project_id = project.id.clone();
-                let has_sessions = self.sessions.iter().any(|s| s.project_id == project_id);
+                let has_sessions = self.git.sessions.iter().any(|s| s.project_id == project_id);
                 if has_sessions {
-                    if self.collapsed_projects.contains(&project_id) {
-                        self.collapsed_projects.remove(&project_id);
+                    if self.git.collapsed_projects.contains(&project_id) {
+                        self.git.collapsed_projects.remove(&project_id);
                         self.rebuild_left_items();
                     }
                     if let Some(pos) = self.left_items().iter().position(|item| {
-                        matches!(item, LeftItem::Session(si) if self.sessions[*si].project_id == project_id)
+                        matches!(item, LeftItem::Session(si) if self.git.sessions[*si].project_id == project_id)
                     }) {
                         self.selected_left = pos;
                         self.center_mode = CenterMode::Agent;
@@ -4502,12 +4506,13 @@ impl App {
 
     fn set_commit_cursor_from_mouse(&mut self, column: u16, row: u16) {
         let Some(text_area) = self.ui.mouse_layout.commit_text_area else {
-            self.commit_input.move_end();
+            self.git.commit_input.move_end();
             return;
         };
         let display_row = usize::from(row.saturating_sub(text_area.y));
         let display_col = usize::from(column.saturating_sub(text_area.x));
-        self.commit_input
+        self.git
+            .commit_input
             .set_cursor_from_display_pos(display_row, display_col);
     }
 
@@ -4517,7 +4522,7 @@ impl App {
         } else {
             -(MOUSE_WHEEL_LINES as isize)
         };
-        self.commit_input.scroll_by(delta);
+        self.git.commit_input.scroll_by(delta);
     }
 
     fn scroll_file_selection(&mut self, section: RightSection, down: bool) {
@@ -5184,17 +5189,32 @@ mod tests {
             refs_watch_paths: std::collections::HashMap::new(),
             _single_instance_lock: single_instance_lock,
         };
-        let mut app = App {
-            ui,
-            runtime,
-            config: Config::default(),
-            paths,
-            bindings,
-            session_store,
+        let git = crate::app::GitState {
             projects: vec![project],
             sessions: vec![session],
             staged_files: Vec::new(),
             unstaged_files: Vec::new(),
+            collapsed_projects: std::collections::HashSet::new(),
+            commit_input: TextInput::new()
+                .with_multiline(4)
+                .with_placeholder("Type your commit message\u{2026}"),
+            last_pty_activity: std::collections::HashMap::new(),
+            last_changed_files_dispatch: None,
+            commit_in_flight: false,
+            staged_diff_in_flight: false,
+            add_project_in_flight: false,
+            resume_fallback_candidates: std::collections::HashMap::new(),
+            pending_deletions: std::collections::HashSet::new(),
+            deletion_busy_messages: std::collections::HashMap::new(),
+        };
+        let mut app = App {
+            ui,
+            runtime,
+            git,
+            config: Config::default(),
+            paths,
+            bindings,
+            session_store,
             selected_left: 0,
             left_section: crate::app::LeftSection::Projects,
             selected_terminal_index: 0,
@@ -5202,9 +5222,6 @@ mod tests {
             files_index: 0,
             files_search: TextInput::new(),
             files_search_active: false,
-            commit_input: TextInput::new()
-                .with_multiline(4)
-                .with_placeholder("Type your commit message\u{2026}"),
             show_diff_line_numbers: false,
             left_width_pct: 20,
             right_width_pct: 23,
@@ -5221,7 +5238,6 @@ mod tests {
             create_agent_in_flight: false,
             resource_stats_in_flight: false,
             last_pty_size: (0, 0),
-            last_pty_activity: std::collections::HashMap::new(),
             prev_scrollback_offset: 0,
             last_diff_height: 0,
             last_diff_visual_lines: 0,
@@ -5229,7 +5245,6 @@ mod tests {
             tick_count: 0,
             start_time: std::time::Instant::now(),
             readonly_nudge_tick: None,
-            collapsed_projects: std::collections::HashSet::new(),
             left_items_cache: Vec::new(),
             interactive_patterns: crate::keybindings::InteractiveBytePatterns {
                 bindings: Vec::new(),
@@ -5237,17 +5252,10 @@ mod tests {
             raw_input_buf: Vec::new(),
             loading_input_buf: Vec::new(),
             in_bracket_paste: false,
-            resume_fallback_candidates: std::collections::HashMap::new(),
-            pending_deletions: std::collections::HashSet::new(),
-            deletion_busy_messages: std::collections::HashMap::new(),
             syntax_cache: crate::diff::SyntaxCache::new(),
             snapshot_buf: crate::pty::TerminalSnapshot::empty(),
             last_snapshot_id: None,
             terminal_selection: None,
-            last_changed_files_dispatch: None,
-            commit_in_flight: false,
-            staged_diff_in_flight: false,
-            add_project_in_flight: false,
             disk_usage_pct: None,
         };
         app.interactive_patterns = app.bindings.interactive_byte_patterns();
@@ -5439,7 +5447,7 @@ mod tests {
         original: &str,
         updated: &str,
     ) {
-        let worktree = std::path::Path::new(&app.sessions[0].worktree_path);
+        let worktree = std::path::Path::new(&app.git.sessions[0].worktree_path);
         std::fs::create_dir_all(worktree).expect("worktree dir");
 
         Command::new("git")
@@ -5487,7 +5495,7 @@ mod tests {
         app.refresh_selected_project()
             .expect("repeat refresh should not error");
 
-        let repo_path = app.projects[0].path.clone();
+        let repo_path = app.git.projects[0].path.clone();
         assert!(app.runtime.pulls_in_flight.contains(&repo_path));
         assert_eq!(app.status.tone(), crate::statusline::StatusTone::Warning);
         assert!(app.status.text().contains("already in progress"));
@@ -5496,7 +5504,7 @@ mod tests {
     #[test]
     fn project_pull_completion_clears_in_flight_guard() {
         let mut app = test_app(default_bindings());
-        let repo_path = app.projects[0].path.clone();
+        let repo_path = app.git.projects[0].path.clone();
         app.runtime.pulls_in_flight.insert(repo_path.clone());
 
         app.runtime
@@ -5504,8 +5512,8 @@ mod tests {
             .send(WorkerEvent::PullCompleted {
                 repo_path,
                 target: PullTarget::Project {
-                    project_id: app.projects[0].id.clone(),
-                    project_name: app.projects[0].name.clone(),
+                    project_id: app.git.projects[0].id.clone(),
+                    project_name: app.git.projects[0].name.clone(),
                 },
                 result: Ok(Some("feature/demo".to_string())),
             })
@@ -5514,7 +5522,7 @@ mod tests {
         app.drain_events();
 
         assert!(app.runtime.pulls_in_flight.is_empty());
-        assert_eq!(app.projects[0].current_branch, "feature/demo");
+        assert_eq!(app.git.projects[0].current_branch, "feature/demo");
         assert_eq!(app.status.tone(), crate::statusline::StatusTone::Info);
     }
 
@@ -5527,7 +5535,7 @@ mod tests {
         app.pull_from_remote()
             .expect("repeat pull should not error");
 
-        let repo_path = app.sessions[0].worktree_path.clone();
+        let repo_path = app.git.sessions[0].worktree_path.clone();
         assert!(app.runtime.pulls_in_flight.contains(&repo_path));
         assert_eq!(app.status.tone(), crate::statusline::StatusTone::Warning);
         assert!(app.status.text().contains("already in progress"));
@@ -5590,7 +5598,7 @@ mod tests {
 
         assert!(matches!(app.ui.prompt, PromptState::None));
         assert_eq!(
-            app.sessions[0].title.as_deref(),
+            app.git.sessions[0].title.as_deref(),
             Some("agent-branch"),
             "custom confirm binding should apply the rename"
         );
@@ -5612,17 +5620,17 @@ mod tests {
     #[test]
     fn rename_title_only_does_not_change_branch_name() {
         let mut app = test_app(default_bindings());
-        let original_branch = app.sessions[0].branch_name.clone();
+        let original_branch = app.git.sessions[0].branch_name.clone();
 
         app.apply_rename_session("session-1", "new-title".to_string(), false);
 
         assert_eq!(
-            app.sessions[0].title.as_deref(),
+            app.git.sessions[0].title.as_deref(),
             Some("new-title"),
             "title should be updated"
         );
         assert_eq!(
-            app.sessions[0].branch_name, original_branch,
+            app.git.sessions[0].branch_name, original_branch,
             "branch_name should remain unchanged when rename_branch is false"
         );
     }
@@ -5713,16 +5721,16 @@ mod tests {
     #[test]
     fn open_kill_running_snapshots_agents_and_terminals() {
         let mut app = test_app(default_bindings());
-        let worktree_path = app.sessions[0].worktree_path.clone();
+        let worktree_path = app.git.sessions[0].worktree_path.clone();
         let worktree = std::path::Path::new(&worktree_path);
         let args = vec!["-c".to_string(), "sleep 5".to_string()];
         let pty = PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000).expect("spawn agent");
-        let s_id = app.sessions[0].id.clone();
+        let s_id = app.git.sessions[0].id.clone();
         app.install_pty_for_session(&s_id, crate::pty::PtyHandle::new(pty));
         app.runtime.companion_terminals.insert(
             "term-1".to_string(),
             crate::app::CompanionTerminal {
-                session_id: app.sessions[0].id.clone(),
+                session_id: app.git.sessions[0].id.clone(),
                 label: "shell".to_string(),
                 foreground_cmd: Some("python".to_string()),
                 client: PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000)
@@ -5764,13 +5772,13 @@ mod tests {
     #[test]
     fn kill_running_terminal_label_deduplicates_term_prefix() {
         let mut app = test_app(default_bindings());
-        let worktree_path = app.sessions[0].worktree_path.clone();
+        let worktree_path = app.git.sessions[0].worktree_path.clone();
         let worktree = std::path::Path::new(&worktree_path);
         let args = vec!["-c".to_string(), "sleep 5".to_string()];
         app.runtime.companion_terminals.insert(
             "term-1".to_string(),
             crate::app::CompanionTerminal {
-                session_id: app.sessions[0].id.clone(),
+                session_id: app.git.sessions[0].id.clone(),
                 label: "shell".to_string(),
                 foreground_cmd: Some("TERM sleep".to_string()),
                 client: PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000)
@@ -5937,14 +5945,14 @@ mod tests {
     #[test]
     fn kill_visible_only_kills_filtered_rows() {
         let mut app = test_app(default_bindings());
-        let worktree_path = app.sessions[0].worktree_path.clone();
+        let worktree_path = app.git.sessions[0].worktree_path.clone();
         let worktree = std::path::Path::new(&worktree_path);
         std::fs::create_dir_all(app.paths.worktrees_root.join("other")).expect("other worktree");
         let now = Utc::now();
-        app.sessions.push(AgentSession {
+        app.git.sessions.push(AgentSession {
             id: "session-2".to_string(),
-            project_id: app.projects[0].id.clone(),
-            project_path: Some(app.projects[0].path.clone()),
+            project_id: app.git.projects[0].id.clone(),
+            project_path: Some(app.git.projects[0].path.clone()),
             provider: ProviderKind::from_str("claude"),
             source_branch: "main".to_string(),
             branch_name: "beta-agent".to_string(),
@@ -5990,10 +5998,10 @@ mod tests {
     #[test]
     fn kill_selected_removes_running_targets_and_resets_terminal_surface() {
         let mut app = test_app(default_bindings());
-        let worktree_path = app.sessions[0].worktree_path.clone();
+        let worktree_path = app.git.sessions[0].worktree_path.clone();
         let worktree = std::path::Path::new(&worktree_path);
         let args = vec!["-c".to_string(), "sleep 5".to_string()];
-        let session_id = app.sessions[0].id.clone();
+        let session_id = app.git.sessions[0].id.clone();
         app.install_pty_for_session(
             &session_id,
             crate::pty::PtyHandle::new(
@@ -6200,7 +6208,7 @@ mod tests {
     #[test]
     fn copy_path_copies_selected_session_worktree() {
         let mut app = test_app(default_bindings());
-        let _worktree_path = app.sessions[0].worktree_path.clone();
+        let _worktree_path = app.git.sessions[0].worktree_path.clone();
         app.clipboard = Clipboard::from_fn(clipboard_ok);
 
         app.copy_selected_path().unwrap();
@@ -6401,7 +6409,7 @@ mod tests {
         let mut app = test_app(default_bindings());
         app.ui.focus = FocusPane::Files;
         app.right_section = RightSection::Unstaged;
-        app.unstaged_files = vec![
+        app.git.unstaged_files = vec![
             ChangedFile {
                 path: "src/lib.rs".into(),
                 status: "M".into(),
@@ -6417,7 +6425,7 @@ mod tests {
                 binary: false,
             },
         ];
-        app.staged_files = vec![ChangedFile {
+        app.git.staged_files = vec![ChangedFile {
             path: "tests/main.rs".into(),
             status: "A".into(),
             additions: 3,
@@ -6461,7 +6469,7 @@ mod tests {
             "fn main() {}\n",
             "fn main() { println!(\"hi\"); }\n",
         );
-        app.unstaged_files = vec![ChangedFile {
+        app.git.unstaged_files = vec![ChangedFile {
             path: "src/main.rs".into(),
             status: "M".into(),
             additions: 1,
@@ -6506,8 +6514,8 @@ mod tests {
     fn mouse_click_empty_left_list_focuses_left_pane() {
         let mut app = test_app(default_bindings());
         install_mouse_layout(&mut app);
-        app.projects.clear();
-        app.sessions.clear();
+        app.git.projects.clear();
+        app.git.sessions.clear();
         app.left_items_cache.clear();
         app.selected_left = 0;
         app.ui.focus = FocusPane::Center;
@@ -6521,7 +6529,7 @@ mod tests {
     fn mouse_click_right_row_focuses_and_selects_unstaged_file() {
         let mut app = test_app(default_bindings());
         install_mouse_layout(&mut app);
-        app.unstaged_files = vec![
+        app.git.unstaged_files = vec![
             ChangedFile {
                 path: "a.txt".into(),
                 status: "M".into(),
@@ -6732,14 +6740,14 @@ mod tests {
     fn mouse_journey_can_switch_files_sections_by_clicking_rows() {
         let mut app = test_app(default_bindings());
         install_mouse_layout(&mut app);
-        app.unstaged_files = vec![ChangedFile {
+        app.git.unstaged_files = vec![ChangedFile {
             path: "a.txt".into(),
             status: "M".into(),
             additions: 1,
             deletions: 0,
             binary: false,
         }];
-        app.staged_files = vec![ChangedFile {
+        app.git.staged_files = vec![ChangedFile {
             path: "b.txt".into(),
             status: "A".into(),
             additions: 3,
@@ -6769,7 +6777,7 @@ mod tests {
             "fn main() {}\n",
             "fn main() { println!(\"hi\"); }\n",
         );
-        app.unstaged_files = vec![ChangedFile {
+        app.git.unstaged_files = vec![ChangedFile {
             path: "src/main.rs".into(),
             status: "M".into(),
             additions: 1,
@@ -6800,7 +6808,7 @@ mod tests {
             "fn main() {}\n",
             "fn main() { println!(\"hi\"); }\n",
         );
-        app.unstaged_files = vec![ChangedFile {
+        app.git.unstaged_files = vec![ChangedFile {
             path: "src/main.rs".into(),
             status: "M".into(),
             additions: 1,
@@ -6873,10 +6881,10 @@ mod tests {
     fn left_move_down_closes_open_diff_when_moving_between_agents() {
         let mut app = test_app(default_bindings());
         let now = Utc::now();
-        app.sessions.push(AgentSession {
+        app.git.sessions.push(AgentSession {
             id: "session-2".to_string(),
-            project_id: app.projects[0].id.clone(),
-            project_path: Some(app.projects[0].path.clone()),
+            project_id: app.git.projects[0].id.clone(),
+            project_path: Some(app.git.projects[0].path.clone()),
             provider: ProviderKind::from_str("codex"),
             source_branch: "main".to_string(),
             branch_name: "agent-branch-2".to_string(),
@@ -6956,7 +6964,7 @@ mod tests {
     fn mouse_click_commit_text_first_click_only_focuses_commit_input() {
         let mut app = test_app(default_bindings());
         install_mouse_layout(&mut app);
-        app.commit_input = TextInput::with_text("hello world".to_string());
+        app.git.commit_input = TextInput::with_text("hello world".to_string());
         app.ui.focus = FocusPane::Center;
 
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 80, 15));
@@ -6970,22 +6978,22 @@ mod tests {
     fn mouse_click_commit_text_second_click_enters_edit_mode_and_moves_cursor() {
         let mut app = test_app(default_bindings());
         install_mouse_layout(&mut app);
-        app.commit_input = TextInput::with_text("abc\ndef".to_string());
-        app.commit_input.cursor = 0;
+        app.git.commit_input = TextInput::with_text("abc\ndef".to_string());
+        app.git.commit_input.cursor = 0;
 
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 80, 16));
         assert_eq!(app.ui.input_target, InputTarget::None);
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 80, 16));
 
         assert_eq!(app.ui.input_target, InputTarget::CommitMessage);
-        assert!(app.commit_input.cursor > 0);
+        assert!(app.git.commit_input.cursor > 0);
     }
 
     #[test]
     fn mouse_journey_commit_chrome_then_text_enters_editing() {
         let mut app = test_app(default_bindings());
         install_mouse_layout(&mut app);
-        app.commit_input = TextInput::with_text("hello".to_string());
+        app.git.commit_input = TextInput::with_text("hello".to_string());
         app.ui.focus = FocusPane::Center;
 
         // Click inside the commit block (below the border row that the divider
@@ -7003,13 +7011,13 @@ mod tests {
     fn mouse_wheel_commit_text_scrolls_commit_viewport() {
         let mut app = test_app(default_bindings());
         install_mouse_layout(&mut app);
-        app.commit_input =
+        app.git.commit_input =
             TextInput::with_text((0..20).map(|i| format!("line {i}\n")).collect::<String>())
                 .with_multiline(4);
 
         app.handle_mouse(mouse(MouseEventKind::ScrollDown, 80, 15));
 
-        assert!(app.commit_input.scroll_offset() > 0);
+        assert!(app.git.commit_input.scroll_offset() > 0);
         assert_eq!(app.right_section, RightSection::CommitInput);
     }
 
@@ -7041,14 +7049,14 @@ mod tests {
         // staged inner content: rows 8..12 (y=8, height=5)
         app.ui.mouse_layout.unstaged_list = Some(Rect::new(78, 1, 21, 6));
         app.ui.mouse_layout.staged_list = Some(Rect::new(78, 8, 21, 5));
-        app.unstaged_files = vec![ChangedFile {
+        app.git.unstaged_files = vec![ChangedFile {
             path: "a.txt".into(),
             status: "M".into(),
             additions: 1,
             deletions: 0,
             binary: false,
         }];
-        app.staged_files = vec![ChangedFile {
+        app.git.staged_files = vec![ChangedFile {
             path: "b.txt".into(),
             status: "A".into(),
             additions: 1,
@@ -7092,14 +7100,14 @@ mod tests {
         install_mouse_layout(&mut app);
         app.ui.mouse_layout.unstaged_list = Some(Rect::new(78, 1, 21, 6));
         app.ui.mouse_layout.staged_list = Some(Rect::new(78, 8, 21, 5));
-        app.unstaged_files = vec![ChangedFile {
+        app.git.unstaged_files = vec![ChangedFile {
             path: "a.txt".into(),
             status: "M".into(),
             additions: 1,
             deletions: 0,
             binary: false,
         }];
-        app.staged_files = vec![ChangedFile {
+        app.git.staged_files = vec![ChangedFile {
             path: "b.txt".into(),
             status: "A".into(),
             additions: 1,
@@ -7126,7 +7134,7 @@ mod tests {
         // commit_area: rows 13..19 (y=13, height=6) — includes border
         app.ui.mouse_layout.staged_list = Some(Rect::new(78, 9, 21, 3));
         app.ui.mouse_layout.commit_area = Some(Rect::new(77, 13, 23, 6));
-        app.staged_files = vec![ChangedFile {
+        app.git.staged_files = vec![ChangedFile {
             path: "b.txt".into(),
             status: "A".into(),
             additions: 1,
@@ -7169,7 +7177,7 @@ mod tests {
         install_mouse_layout(&mut app);
         app.ui.mouse_layout.staged_list = Some(Rect::new(78, 9, 21, 3));
         app.ui.mouse_layout.commit_area = Some(Rect::new(77, 13, 23, 6));
-        app.staged_files = vec![ChangedFile {
+        app.git.staged_files = vec![ChangedFile {
             path: "b.txt".into(),
             status: "A".into(),
             additions: 1,
@@ -7263,7 +7271,7 @@ mod tests {
     #[test]
     fn mouse_click_project_browser_row_selects_then_double_click_opens_entry() {
         let mut app = test_app(default_bindings());
-        let root = PathBuf::from(&app.projects[0].path);
+        let root = PathBuf::from(&app.git.projects[0].path);
         let child = root.join("child");
         std::fs::create_dir_all(&child).expect("child dir");
         app.ui.prompt = PromptState::BrowseProjects {
@@ -7445,7 +7453,7 @@ cyan = "#00ffff"
     fn mouse_click_browser_search_input_moves_cursor_and_edits_filter() {
         let mut app = test_app(default_bindings());
         app.ui.prompt = PromptState::BrowseProjects {
-            current_dir: PathBuf::from(&app.projects[0].path),
+            current_dir: PathBuf::from(&app.git.projects[0].path),
             entries: Vec::new(),
             loading: false,
             selected: 0,
@@ -7478,7 +7486,7 @@ cyan = "#00ffff"
     fn mouse_click_browser_path_input_moves_cursor_and_edits_path() {
         let mut app = test_app(default_bindings());
         app.ui.prompt = PromptState::BrowseProjects {
-            current_dir: PathBuf::from(&app.projects[0].path),
+            current_dir: PathBuf::from(&app.git.projects[0].path),
             entries: Vec::new(),
             loading: false,
             selected: 0,
@@ -7507,10 +7515,10 @@ cyan = "#00ffff"
     #[test]
     fn mouse_click_pick_editor_row_selects_then_double_click_opens_editor() {
         let mut app = test_app(default_bindings());
-        std::fs::create_dir_all(&app.sessions[0].worktree_path).expect("worktree");
+        std::fs::create_dir_all(&app.git.sessions[0].worktree_path).expect("worktree");
         app.ui.prompt = PromptState::PickEditor {
             session_label: "agent-branch".to_string(),
-            worktree_path: app.sessions[0].worktree_path.clone(),
+            worktree_path: app.git.sessions[0].worktree_path.clone(),
             editors: vec![DetectedEditor {
                 kind: EditorKind::VsCode,
                 label: "VS Code",
@@ -7742,8 +7750,8 @@ cyan = "#00ffff"
         // immediate feedback for cursor moves and toggles.
         let mut app = test_app(default_bindings());
         app.ui.prompt = PromptState::ConfirmDeleteAgent {
-            session_id: app.sessions[0].id.clone(),
-            branch_name: app.sessions[0].branch_name.clone(),
+            session_id: app.git.sessions[0].id.clone(),
+            branch_name: app.git.sessions[0].branch_name.clone(),
             focus: DeleteAgentFocus::Cancel,
             delete_worktree: false,
             worktree_shared: false,
@@ -7815,12 +7823,12 @@ cyan = "#00ffff"
     #[test]
     fn quit_prompt_counts_running_companion_terminals_and_agents() {
         let mut app = test_app(default_bindings());
-        let worktree_path = app.sessions[0].worktree_path.clone();
+        let worktree_path = app.git.sessions[0].worktree_path.clone();
         let worktree = std::path::Path::new(&worktree_path);
         let (command, args) = ("/bin/sh", vec!["-c".to_string(), "sleep 5".to_string()]);
         let provider =
             PtyClient::spawn(command, &args, worktree, 24, 80, 1_000).expect("spawn test agent");
-        let session_id = app.sessions[0].id.clone();
+        let session_id = app.git.sessions[0].id.clone();
         app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(provider));
         // Insert a companion terminal to simulate a running terminal.
         let term_client =
@@ -7856,14 +7864,14 @@ cyan = "#00ffff"
     #[test]
     fn change_agent_provider_swaps_in_place_when_stopped() {
         let mut app = test_app(default_bindings());
-        let original_session_id = app.sessions[0].id.clone();
-        let original_worktree = app.sessions[0].worktree_path.clone();
-        app.sessions[0].provider = ProviderKind::from_str("codex");
-        app.sessions[0].state = SessionState::Created {
+        let original_session_id = app.git.sessions[0].id.clone();
+        let original_worktree = app.git.sessions[0].worktree_path.clone();
+        app.git.sessions[0].provider = ProviderKind::from_str("codex");
+        app.git.sessions[0].state = SessionState::Created {
             created_at: chrono::Utc::now(),
         };
         app.session_store
-            .upsert_session(&app.sessions[0])
+            .upsert_session(&app.git.sessions[0])
             .expect("persist session");
 
         app.rebuild_left_items();
@@ -7890,10 +7898,10 @@ cyan = "#00ffff"
             .expect("apply provider swap");
 
         // Exactly one session still exists; its provider was mutated in place.
-        assert_eq!(app.sessions.len(), 1);
-        assert_eq!(app.sessions[0].id, original_session_id);
-        assert_eq!(app.sessions[0].provider.as_str(), "gemini");
-        assert_eq!(app.sessions[0].worktree_path, original_worktree);
+        assert_eq!(app.git.sessions.len(), 1);
+        assert_eq!(app.git.sessions[0].id, original_session_id);
+        assert_eq!(app.git.sessions[0].provider.as_str(), "gemini");
+        assert_eq!(app.git.sessions[0].worktree_path, original_worktree);
         assert!(matches!(app.ui.prompt, PromptState::None));
 
         let persisted = app.session_store.load_sessions().expect("load sessions");
@@ -7906,10 +7914,10 @@ cyan = "#00ffff"
     #[test]
     fn change_agent_provider_swaps_but_warns_when_agent_is_running() {
         let mut app = test_app(default_bindings());
-        app.sessions[0].provider = ProviderKind::from_str("codex");
-        let session_id = app.sessions[0].id.clone();
+        app.git.sessions[0].provider = ProviderKind::from_str("codex");
+        let session_id = app.git.sessions[0].id.clone();
 
-        let worktree = std::path::Path::new(&app.sessions[0].worktree_path);
+        let worktree = std::path::Path::new(&app.git.sessions[0].worktree_path);
         let provider = PtyClient::spawn(
             "/bin/sh",
             &["-c".to_string(), "sleep 5".to_string()],
@@ -7950,7 +7958,7 @@ cyan = "#00ffff"
 
         // Provider is swapped now; the warning just tells the user the running
         // PTY hasn't caught up yet.
-        assert_eq!(app.sessions[0].provider.as_str(), "gemini");
+        assert_eq!(app.git.sessions[0].provider.as_str(), "gemini");
         let persisted = app.session_store.load_sessions().expect("load sessions");
         assert_eq!(persisted[0].provider.as_str(), "gemini");
         assert!(
@@ -7976,13 +7984,13 @@ cyan = "#00ffff"
     #[test]
     fn change_agent_provider_preserves_resume_for_previously_started_provider() {
         let mut app = test_app(default_bindings());
-        app.sessions[0].provider = ProviderKind::from_str("claude");
-        app.sessions[0].state = SessionState::Created {
+        app.git.sessions[0].provider = ProviderKind::from_str("claude");
+        app.git.sessions[0].state = SessionState::Created {
             created_at: chrono::Utc::now(),
         };
-        app.sessions[0].started_providers = vec!["codex".to_string(), "claude".to_string()];
+        app.git.sessions[0].started_providers = vec!["codex".to_string(), "claude".to_string()];
         app.session_store
-            .upsert_session(&app.sessions[0])
+            .upsert_session(&app.git.sessions[0])
             .expect("persist session with history");
 
         app.rebuild_left_items();
@@ -8017,9 +8025,9 @@ cyan = "#00ffff"
         app.apply_change_agent_provider()
             .expect("swap back to codex");
 
-        assert_eq!(app.sessions[0].provider.as_str(), "codex");
+        assert_eq!(app.git.sessions[0].provider.as_str(), "codex");
         // should_resume_session uses started_providers + config's resume_args.
-        let session = app.sessions[0].clone();
+        let session = app.git.sessions[0].clone();
         assert!(
             app.should_resume_session(&session),
             "codex was launched on this worktree earlier, so resume must be active"
@@ -8034,13 +8042,13 @@ cyan = "#00ffff"
     #[test]
     fn change_agent_provider_marks_providers_without_resume_support() {
         let mut app = test_app(default_bindings());
-        app.sessions[0].provider = ProviderKind::from_str("codex");
-        app.sessions[0].state = SessionState::Created {
+        app.git.sessions[0].provider = ProviderKind::from_str("codex");
+        app.git.sessions[0].state = SessionState::Created {
             created_at: chrono::Utc::now(),
         };
         // Pretend copilot was launched earlier — it still shouldn't advertise
         // resume because copilot's config has `resume_args: None`.
-        app.sessions[0].started_providers = vec!["copilot".to_string()];
+        app.git.sessions[0].started_providers = vec!["copilot".to_string()];
 
         app.rebuild_left_items();
         app.selected_left = app
@@ -8262,8 +8270,8 @@ cyan = "#00ffff"
 
         assert_eq!(app.running_companion_terminal_count(), 0);
 
-        let session_id = app.sessions[0].id.clone();
-        let worktree = std::path::Path::new(&app.sessions[0].worktree_path);
+        let session_id = app.git.sessions[0].id.clone();
+        let worktree = std::path::Path::new(&app.git.sessions[0].worktree_path);
         let (command, args) = ("/bin/sh", vec!["-c".to_string(), "sleep 2".to_string()]);
         let client = PtyClient::spawn(command, &args, worktree, 24, 80, 1_000).expect("spawn");
         app.runtime.companion_terminals.insert(
@@ -8434,7 +8442,7 @@ cyan = "#00ffff"
             "fn main() { println!(\"hi\"); }\n",
         );
         app.selected_left = 1;
-        app.unstaged_files = vec![ChangedFile {
+        app.git.unstaged_files = vec![ChangedFile {
             path: "src/main.rs".into(),
             status: "M".into(),
             additions: 1,
@@ -8454,7 +8462,7 @@ cyan = "#00ffff"
 
         assert!(matches!(app.ui.prompt, PromptState::None));
         let contents = std::fs::read_to_string(
-            PathBuf::from(&app.sessions[0].worktree_path).join("src/main.rs"),
+            PathBuf::from(&app.git.sessions[0].worktree_path).join("src/main.rs"),
         )
         .expect("discarded file");
         assert_eq!(contents, "fn main() {}\n");
@@ -8464,8 +8472,8 @@ cyan = "#00ffff"
     fn mouse_click_delete_dialog_cancel_button_closes_prompt() {
         let mut app = test_app(default_bindings());
         app.ui.prompt = PromptState::ConfirmDeleteAgent {
-            session_id: app.sessions[0].id.clone(),
-            branch_name: app.sessions[0].branch_name.clone(),
+            session_id: app.git.sessions[0].id.clone(),
+            branch_name: app.git.sessions[0].branch_name.clone(),
             focus: DeleteAgentFocus::Cancel,
             delete_worktree: false,
             worktree_shared: false,
@@ -8483,8 +8491,8 @@ cyan = "#00ffff"
     fn mouse_click_delete_dialog_checkbox_toggles_delete_worktree() {
         let mut app = test_app(default_bindings());
         app.ui.prompt = PromptState::ConfirmDeleteAgent {
-            session_id: app.sessions[0].id.clone(),
-            branch_name: app.sessions[0].branch_name.clone(),
+            session_id: app.git.sessions[0].id.clone(),
+            branch_name: app.git.sessions[0].branch_name.clone(),
             focus: DeleteAgentFocus::Cancel,
             delete_worktree: false,
             worktree_shared: false,
@@ -8510,8 +8518,8 @@ cyan = "#00ffff"
     fn shift_tab_moves_delete_agent_focus_backwards() {
         let mut app = test_app(default_bindings());
         app.ui.prompt = PromptState::ConfirmDeleteAgent {
-            session_id: app.sessions[0].id.clone(),
-            branch_name: app.sessions[0].branch_name.clone(),
+            session_id: app.git.sessions[0].id.clone(),
+            branch_name: app.git.sessions[0].branch_name.clone(),
             focus: DeleteAgentFocus::Cancel,
             delete_worktree: false,
             worktree_shared: false,
@@ -8549,7 +8557,7 @@ cyan = "#00ffff"
     #[test]
     fn mouse_click_rename_input_moves_cursor() {
         let mut app = test_app(default_bindings());
-        let sid = app.sessions[0].id.clone();
+        let sid = app.git.sessions[0].id.clone();
         app.ui.prompt = PromptState::RenameSession {
             session_id: sid,
             input: TextInput::with_text("rename me".to_string()),
@@ -8568,7 +8576,7 @@ cyan = "#00ffff"
     #[test]
     fn mouse_click_rename_checkbox_toggles_branch_rename() {
         let mut app = test_app(default_bindings());
-        let sid = app.sessions[0].id.clone();
+        let sid = app.git.sessions[0].id.clone();
         app.ui.prompt = PromptState::RenameSession {
             session_id: sid,
             input: TextInput::with_text("rename me".to_string()),
@@ -8715,14 +8723,15 @@ cyan = "#00ffff"
                 ..Default::default()
             },
         );
-        let session_id = app.sessions[0].id.clone();
-        let worktree = std::path::Path::new(&app.sessions[0].worktree_path);
+        let session_id = app.git.sessions[0].id.clone();
+        let worktree = std::path::Path::new(&app.git.sessions[0].worktree_path);
         // Spawn a process that exits immediately without producing output.
         let args = vec!["-c".to_string(), "exit 1".to_string()];
         let client =
             PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000).expect("spawn quick-exit");
         app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
-        app.resume_fallback_candidates
+        app.git
+            .resume_fallback_candidates
             .insert(session_id.clone(), std::time::Instant::now());
         app.selected_left = 1;
         app.session_surface = SessionSurface::Agent;
@@ -8738,12 +8747,12 @@ cyan = "#00ffff"
             "provider should still be present after fallback retry"
         );
         assert!(
-            app.sessions[0].state.is_live(),
+            app.git.sessions[0].state.is_live(),
             "expected session to be Live, got {:?}",
-            app.sessions[0].state
+            app.git.sessions[0].state
         );
         assert!(
-            !app.resume_fallback_candidates.contains_key(&session_id),
+            !app.git.resume_fallback_candidates.contains_key(&session_id),
             "candidate should have been removed after fallback"
         );
         assert!(
@@ -8756,15 +8765,16 @@ cyan = "#00ffff"
     #[test]
     fn resume_fallback_skipped_when_pty_had_substantial_output() {
         let mut app = test_app(default_bindings());
-        let session_id = app.sessions[0].id.clone();
-        let worktree = std::path::Path::new(&app.sessions[0].worktree_path);
+        let session_id = app.git.sessions[0].id.clone();
+        let worktree = std::path::Path::new(&app.git.sessions[0].worktree_path);
         // Spawn a process that produces many lines of output before exiting.
         // This simulates a real agent session that ran and then exited normally.
         let args = vec!["-c".to_string(), "seq 1 30".to_string()];
         let client =
             PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000).expect("spawn with output");
         app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
-        app.resume_fallback_candidates
+        app.git
+            .resume_fallback_candidates
             .insert(session_id.clone(), std::time::Instant::now());
         app.selected_left = 1;
         app.session_surface = SessionSurface::Agent;
@@ -8779,12 +8789,12 @@ cyan = "#00ffff"
         // to `Exited` (a PTY-less `Detached` is no longer
         // representable in the typestate).
         assert!(
-            !app.sessions[0].state.has_pty(),
+            !app.git.sessions[0].state.has_pty(),
             "expected session to have no PTY, got {:?}",
-            app.sessions[0].state
+            app.git.sessions[0].state
         );
         assert!(
-            !app.resume_fallback_candidates.contains_key(&session_id),
+            !app.git.resume_fallback_candidates.contains_key(&session_id),
             "candidate should have been removed even when skipped"
         );
     }
@@ -8801,8 +8811,8 @@ cyan = "#00ffff"
                 ..Default::default()
             },
         );
-        let session_id = app.sessions[0].id.clone();
-        let worktree = std::path::Path::new(&app.sessions[0].worktree_path);
+        let session_id = app.git.sessions[0].id.clone();
+        let worktree = std::path::Path::new(&app.git.sessions[0].worktree_path);
         // Spawn a process that prints a single line (like a failed --continue)
         // and then exits. The fallback should still trigger because the output
         // is minimal (≤5 lines with no scrollback).
@@ -8813,7 +8823,8 @@ cyan = "#00ffff"
         let client =
             PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000).expect("spawn one-liner");
         app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
-        app.resume_fallback_candidates
+        app.git
+            .resume_fallback_candidates
             .insert(session_id.clone(), std::time::Instant::now());
         app.selected_left = 1;
         app.session_surface = SessionSurface::Agent;
@@ -8829,9 +8840,9 @@ cyan = "#00ffff"
             "provider should still be present after fallback retry"
         );
         assert!(
-            app.sessions[0].state.is_live(),
+            app.git.sessions[0].state.is_live(),
             "expected session to be Live, got {:?}",
-            app.sessions[0].state
+            app.git.sessions[0].state
         );
         assert!(
             app.status.text().contains("No prior session to resume"),
@@ -8843,8 +8854,8 @@ cyan = "#00ffff"
     #[test]
     fn no_fallback_for_non_candidate_sessions() {
         let mut app = test_app(default_bindings());
-        let session_id = app.sessions[0].id.clone();
-        let worktree = std::path::Path::new(&app.sessions[0].worktree_path);
+        let session_id = app.git.sessions[0].id.clone();
+        let worktree = std::path::Path::new(&app.git.sessions[0].worktree_path);
         // Spawn a process that exits immediately, but do NOT add it as a candidate.
         let args = vec!["-c".to_string(), "exit 1".to_string()];
         let client =
@@ -8866,9 +8877,9 @@ cyan = "#00ffff"
         // to `Exited` (a PTY-less `Detached` is no longer
         // representable in the typestate).
         assert!(
-            !app.sessions[0].state.has_pty(),
+            !app.git.sessions[0].state.has_pty(),
             "expected session to have no PTY, got {:?}",
-            app.sessions[0].state
+            app.git.sessions[0].state
         );
     }
 
@@ -8885,14 +8896,14 @@ cyan = "#00ffff"
                 ..Default::default()
             },
         );
-        app.sessions[0].provider = ProviderKind::from_str("opencode");
-        let session_id = app.sessions[0].id.clone();
-        let worktree = std::path::Path::new(&app.sessions[0].worktree_path);
+        app.git.sessions[0].provider = ProviderKind::from_str("opencode");
+        let session_id = app.git.sessions[0].id.clone();
+        let worktree = std::path::Path::new(&app.git.sessions[0].worktree_path);
         let args = vec!["-c".to_string(), "sleep 5".to_string()];
         let client =
             PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000).expect("spawn hung resume");
         app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
-        app.resume_fallback_candidates.insert(
+        app.git.resume_fallback_candidates.insert(
             session_id.clone(),
             std::time::Instant::now() - std::time::Duration::from_millis(20),
         );
@@ -8906,12 +8917,12 @@ cyan = "#00ffff"
             "provider should still be present after timeout fallback"
         );
         assert!(
-            app.sessions[0].state.is_live(),
+            app.git.sessions[0].state.is_live(),
             "expected session to be Live, got {:?}",
-            app.sessions[0].state
+            app.git.sessions[0].state
         );
         assert!(
-            !app.resume_fallback_candidates.contains_key(&session_id),
+            !app.git.resume_fallback_candidates.contains_key(&session_id),
             "candidate should have been removed after timeout fallback"
         );
         assert!(
@@ -8934,9 +8945,9 @@ cyan = "#00ffff"
                 ..Default::default()
             },
         );
-        app.sessions[0].provider = ProviderKind::from_str("opencode");
-        let session_id = app.sessions[0].id.clone();
-        let worktree = std::path::Path::new(&app.sessions[0].worktree_path);
+        app.git.sessions[0].provider = ProviderKind::from_str("opencode");
+        let session_id = app.git.sessions[0].id.clone();
+        let worktree = std::path::Path::new(&app.git.sessions[0].worktree_path);
         let args = vec!["-c".to_string(), "sleep 5".to_string()];
         let client =
             PtyClient::spawn("/bin/sh", &args, worktree, 24, 80, 1_000).expect("spawn fresh hang");
@@ -8947,7 +8958,7 @@ cyan = "#00ffff"
         app.drain_events();
 
         assert!(app.session_has_pty(&session_id));
-        assert!(app.resume_fallback_candidates.is_empty());
+        assert!(app.git.resume_fallback_candidates.is_empty());
     }
 
     // ── Scroll-mode input suppression tests ─────────────────────────
@@ -8956,7 +8967,7 @@ cyan = "#00ffff"
     /// enough scrollback history so we can engage scroll mode.
     fn app_with_scrolled_back_pty() -> App {
         let mut app = test_app(default_bindings());
-        let session_id = app.sessions[0].id.clone();
+        let session_id = app.git.sessions[0].id.clone();
 
         // Spawn a shell that prints enough lines to fill the 5-row terminal
         // and produce scrollback history, then sleeps to stay alive.
@@ -9181,7 +9192,7 @@ cyan = "#00ffff"
     /// and a mouse layout so we can test click-outside-overlay behavior.
     fn app_with_interactive_agent_pty() -> App {
         let mut app = test_app(default_bindings());
-        let session_id = app.sessions[0].id.clone();
+        let session_id = app.git.sessions[0].id.clone();
 
         let args = vec!["-c".to_string(), "sleep 5".to_string()];
         let client = PtyClient::spawn("sh", &args, std::path::Path::new("."), 5, 40, 100)
@@ -10159,7 +10170,7 @@ cyan = "#00ffff"
         // literal `^[[200` and `^[[201` strings. If the text is sent as-is,
         // only the macro text will appear.
         let mut app = test_app(default_bindings());
-        let session_id = app.sessions[0].id.clone();
+        let session_id = app.git.sessions[0].id.clone();
         let client = PtyClient::spawn(
             "sh",
             &["-c".to_string(), "stty raw -echo; exec cat -v".to_string()],
@@ -10254,7 +10265,7 @@ cyan = "#00ffff"
         // works, the `^[` and `^M` markers will appear between the two
         // halves of the macro text.
         let mut app = test_app(default_bindings());
-        let session_id = app.sessions[0].id.clone();
+        let session_id = app.git.sessions[0].id.clone();
         let client = PtyClient::spawn(
             "sh",
             &["-c".to_string(), "stty raw -echo; exec cat -v".to_string()],
@@ -10316,9 +10327,9 @@ cyan = "#00ffff"
 
         // project-1 inherits the global default (no explicit override).
         app.config.projects.push(ProjectConfig {
-            id: app.projects[0].id.clone(),
-            path: app.projects[0].path.clone(),
-            name: Some(app.projects[0].name.clone()),
+            id: app.git.projects[0].id.clone(),
+            path: app.git.projects[0].path.clone(),
+            name: Some(app.git.projects[0].name.clone()),
             default_provider: None,
             commit_prompt: None,
         });
@@ -10340,9 +10351,9 @@ cyan = "#00ffff"
             default_provider: Some("gemini".to_string()),
             commit_prompt: None,
         });
-        app.projects.push(pinned);
+        app.git.projects.push(pinned);
 
-        let original_session_provider = app.sessions[0].provider.clone();
+        let original_session_provider = app.git.sessions[0].provider.clone();
 
         app.open_change_default_provider_prompt()
             .expect("open default provider picker");
@@ -10367,6 +10378,7 @@ cyan = "#00ffff"
 
         // Inherited project picks up the new default.
         let inherited = app
+            .git
             .projects
             .iter()
             .find(|project| project.id == "project-1")
@@ -10375,6 +10387,7 @@ cyan = "#00ffff"
 
         // Pinned project keeps its explicit override.
         let pinned = app
+            .git
             .projects
             .iter()
             .find(|project| project.id == "project-2")
@@ -10382,7 +10395,7 @@ cyan = "#00ffff"
         assert_eq!(pinned.default_provider.as_str(), "gemini");
 
         // Existing sessions are untouched — provider is frozen at creation.
-        assert_eq!(app.sessions[0].provider, original_session_provider);
+        assert_eq!(app.git.sessions[0].provider, original_session_provider);
 
         assert!(matches!(app.ui.prompt, PromptState::None));
         assert!(
@@ -10428,8 +10441,8 @@ cyan = "#00ffff"
         use ratatui::backend::TestBackend;
 
         let mut app = test_app(default_bindings());
-        app.projects[0].default_provider = ProviderKind::from_str("codex");
-        app.sessions[0].provider = ProviderKind::from_str("gemini");
+        app.git.projects[0].default_provider = ProviderKind::from_str("codex");
+        app.git.sessions[0].provider = ProviderKind::from_str("gemini");
         app.rebuild_left_items();
         app.selected_left = app
             .left_items()
@@ -10466,8 +10479,8 @@ cyan = "#00ffff"
         use ratatui::backend::TestBackend;
 
         let mut app = test_app(default_bindings());
-        app.projects[0].default_provider = ProviderKind::from_str("codex");
-        app.sessions[0].provider = ProviderKind::from_str("codex");
+        app.git.projects[0].default_provider = ProviderKind::from_str("codex");
+        app.git.sessions[0].provider = ProviderKind::from_str("codex");
         app.rebuild_left_items();
         app.selected_left = app
             .left_items()
@@ -10504,12 +10517,12 @@ cyan = "#00ffff"
         use ratatui::backend::TestBackend;
 
         let mut app = test_app(default_bindings());
-        app.projects[0].default_provider = ProviderKind::from_str("codex");
-        app.sessions[0].provider = ProviderKind::from_str("codex");
-        let session_id = app.sessions[0].id.clone();
+        app.git.projects[0].default_provider = ProviderKind::from_str("codex");
+        app.git.sessions[0].provider = ProviderKind::from_str("codex");
+        let session_id = app.git.sessions[0].id.clone();
 
         // Spawn a real PTY so the session looks live.
-        let worktree = std::path::Path::new(&app.sessions[0].worktree_path);
+        let worktree = std::path::Path::new(&app.git.sessions[0].worktree_path);
         let pty = PtyClient::spawn(
             "/bin/sh",
             &["-c".to_string(), "sleep 5".to_string()],
@@ -10545,8 +10558,11 @@ cyan = "#00ffff"
 
         // session.provider is now gemini, but the PTY is still running codex;
         // running_provider_for should reflect that.
-        assert_eq!(app.sessions[0].provider.as_str(), "gemini");
-        assert_eq!(app.running_provider_for(&app.sessions[0]).as_str(), "codex");
+        assert_eq!(app.git.sessions[0].provider.as_str(), "gemini");
+        assert_eq!(
+            app.running_provider_for(&app.git.sessions[0]).as_str(),
+            "codex"
+        );
 
         let backend = TestBackend::new(200, 30);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -10579,7 +10595,7 @@ cyan = "#00ffff"
         let _ = app.take_session_pty(&session_id);
         app.runtime.running_provider_pins.remove(&session_id);
         assert_eq!(
-            app.running_provider_for(&app.sessions[0]).as_str(),
+            app.running_provider_for(&app.git.sessions[0]).as_str(),
             "gemini"
         );
 

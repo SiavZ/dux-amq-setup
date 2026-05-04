@@ -534,7 +534,7 @@ impl App {
                 .enumerate()
                 .map(|(i, item)| match item {
                     LeftItem::Project(index) => {
-                        let project = &self.projects[*index];
+                        let project = &self.git.projects[*index];
                         if project.path_missing {
                             ListItem::new(Line::from(Span::styled(
                                 "⚠",
@@ -542,13 +542,14 @@ impl App {
                             )))
                         } else {
                             let has_sessions =
-                                self.sessions.iter().any(|s| s.project_id == project.id);
-                            let icon =
-                                if !has_sessions || self.collapsed_projects.contains(&project.id) {
-                                    "▸"
-                                } else {
-                                    "▾"
-                                };
+                                self.git.sessions.iter().any(|s| s.project_id == project.id);
+                            let icon = if !has_sessions
+                                || self.git.collapsed_projects.contains(&project.id)
+                            {
+                                "▸"
+                            } else {
+                                "▾"
+                            };
                             ListItem::new(Line::from(Span::styled(
                                 icon,
                                 Style::default().fg(self.theme.project_icon),
@@ -556,7 +557,7 @@ impl App {
                         }
                     }
                     LeftItem::Session(index) => {
-                        let session = &self.sessions[*index];
+                        let session = &self.git.sessions[*index];
                         let (dot, dot_color) = self.theme.session_dot(&session.state);
                         let is_last = !collapsed_left_items
                             .get(i + 1)
@@ -609,7 +610,7 @@ impl App {
 
         let session_counts: HashMap<String, usize> = {
             let mut counts = HashMap::new();
-            for session in &self.sessions {
+            for session in &self.git.sessions {
                 *counts.entry(session.project_id.clone()).or_insert(0) += 1;
             }
             counts
@@ -621,7 +622,7 @@ impl App {
             .enumerate()
             .map(|(i, item)| match item {
                 LeftItem::Project(index) => {
-                    let project = &self.projects[*index];
+                    let project = &self.git.projects[*index];
                     if project.path_missing {
                         let spans = vec![
                             Span::styled("⚠ ", Style::default().fg(self.theme.project_missing_fg)),
@@ -633,11 +634,12 @@ impl App {
                         ListItem::new(Line::from(spans))
                     } else {
                         let count = session_counts.get(&project.id).copied().unwrap_or(0);
-                        let icon = if count == 0 || self.collapsed_projects.contains(&project.id) {
-                            "▸ "
-                        } else {
-                            "▾ "
-                        };
+                        let icon =
+                            if count == 0 || self.git.collapsed_projects.contains(&project.id) {
+                                "▸ "
+                            } else {
+                                "▾ "
+                            };
                         let mut spans = vec![
                             Span::styled(icon, Style::default().fg(self.theme.project_icon)),
                             Span::styled(
@@ -657,7 +659,7 @@ impl App {
                     }
                 }
                 LeftItem::Session(index) => {
-                    let session = &self.sessions[*index];
+                    let session = &self.git.sessions[*index];
                     let is_last = !left_items
                         .get(i + 1)
                         .is_some_and(|next| matches!(next, LeftItem::Session(_)));
@@ -684,7 +686,7 @@ impl App {
                     // excluded because it renders through a separate helper
                     // and the in-flight window is too brief to justify
                     // threading a deletion flag through it.
-                    let deleting = self.pending_deletions.contains(&session.id);
+                    let deleting = self.git.pending_deletions.contains(&session.id);
                     let label_color = if deleting {
                         self.theme.session_deleting
                     } else {
@@ -744,7 +746,7 @@ impl App {
                 }
             })
             .collect::<Vec<_>>();
-        let title = format!("Projects ({})", self.projects.len());
+        let title = format!("Projects ({})", self.git.projects.len());
         self.ui.mouse_layout.left_list = self
             .themed_block(&title, projects_focused)
             .inner(projects_area);
@@ -1520,9 +1522,10 @@ impl App {
         if self.ui.right_collapsed {
             let focused = self.ui.focus == FocusPane::Files;
             let all_files: Vec<(&str, Color)> = self
+                .git
                 .unstaged_files
                 .iter()
-                .chain(self.staged_files.iter())
+                .chain(self.git.staged_files.iter())
                 .map(|f| (f.status.as_str(), self.theme.file_status_fg))
                 .collect();
             let items: Vec<ListItem> = all_files
@@ -1546,7 +1549,7 @@ impl App {
             return;
         }
 
-        let has_staged = !self.staged_files.is_empty();
+        let has_staged = !self.git.staged_files.is_empty();
         let focused = self.ui.focus == FocusPane::Files;
 
         if has_staged {
@@ -1563,7 +1566,7 @@ impl App {
                 frame,
                 chunks[0],
                 "Changes",
-                &self.unstaged_files,
+                &self.git.unstaged_files,
                 RightSection::Unstaged,
                 true,
             );
@@ -1574,7 +1577,7 @@ impl App {
                 frame,
                 area,
                 "Changes",
-                &self.unstaged_files,
+                &self.git.unstaged_files,
                 RightSection::Unstaged,
                 true,
             );
@@ -1600,7 +1603,7 @@ impl App {
             frame,
             files_area,
             "Staged Changes",
-            &self.staged_files,
+            &self.git.staged_files,
             RightSection::Staged,
             false,
         );
@@ -1788,12 +1791,14 @@ impl App {
 
         // Update TextInput's display dimensions to match the available area.
         let text_w = text_area.width as usize;
-        self.commit_input
+        self.git
+            .commit_input
             .set_display_width(if text_w > 0 { Some(text_w) } else { None });
-        self.commit_input
+        self.git
+            .commit_input
             .set_visible_lines(text_area.height as usize);
 
-        if let Some(overlay) = self.commit_input.overlay() {
+        if let Some(overlay) = self.git.commit_input.overlay() {
             // Overlay (e.g. "Generating commit message…") with spinner prefix.
             let idx = self.spinner_frame_index();
             let spinner = crate::theme::SPINNER_FRAMES[idx];
@@ -1801,18 +1806,18 @@ impl App {
             Paragraph::new(text)
                 .style(Style::default().fg(self.theme.hint_desc_fg))
                 .render(text_area, frame.buffer_mut());
-        } else if self.commit_input.is_empty() && !focused {
+        } else if self.git.commit_input.is_empty() && !focused {
             // Show placeholder when unfocused and empty — nothing to render
             // (the placeholder is shown only when focused, below).
         } else {
             // Render visible lines from TextInput (handles wrapping + scroll).
-            let visible = self.commit_input.visible_lines();
-            let (cursor_row, cursor_col) = self.commit_input.cursor_display_position();
-            let is_empty = self.commit_input.is_empty();
+            let visible = self.git.commit_input.visible_lines();
+            let (cursor_row, cursor_col) = self.git.commit_input.cursor_display_position();
+            let is_empty = self.git.commit_input.is_empty();
 
             // When empty and focused, show the placeholder.
             if is_empty {
-                if let Some(ph) = self.commit_input.placeholder() {
+                if let Some(ph) = self.git.commit_input.placeholder() {
                     Paragraph::new(ph.to_string())
                         .style(Style::default().fg(self.theme.hint_desc_fg))
                         .render(text_area, frame.buffer_mut());
