@@ -28,15 +28,19 @@ impl App {
                         &session.worktree_path,
                         &session.id,
                     );
-                    self.runtime.providers.insert(session.id.clone(), client);
-                    self.git.sessions.insert(0, session.clone());
-                    self.mark_session_provider_started(&session.id);
+                    let session_id = session.id.clone();
+                    self.git.sessions.insert(0, session);
+                    self.install_pty_for_session(
+                        &session_id,
+                        crate::pty::PtyHandle::new(client),
+                    );
+                    self.mark_session_provider_started(&session_id);
                     self.update_branch_sync_sessions();
                     self.rebuild_left_items();
                     self.selected_left = self
                         .left_items()
                         .iter()
-                        .position(|item| matches!(item, LeftItem::Session(index) if self.git.sessions.get(*index).map(|candidate| candidate.id.as_str()) == Some(session.id.as_str())))
+                        .position(|item| matches!(item, LeftItem::Session(index) if self.git.sessions.get(*index).map(|candidate| candidate.id.as_str()) == Some(session_id.as_str())))
                         .unwrap_or(0);
                     self.reload_changed_files();
                     self.show_agent_surface();
@@ -509,11 +513,14 @@ impl App {
             }
         }
         self.retry_hung_resume_sessions();
-        // Detect PTY exits.
+        // Detect PTY exits by walking sessions whose state owns a PTY.
         let mut exited = Vec::new();
-        for (session_id, provider) in &mut self.runtime.providers {
-            if provider.is_exited() || provider.try_wait().is_some() {
-                exited.push(session_id.clone());
+        for session in self.git.sessions.iter_mut() {
+            let Some(handle) = session.state.pty_handle_mut() else {
+                continue;
+            };
+            if handle.is_exited() || handle.try_wait().is_some() {
+                exited.push(session.id.clone());
             }
         }
 
@@ -535,9 +542,7 @@ impl App {
             // typically prints 1-2 lines of error; a real session produces
             // far more output and scrollback history.
             let is_minimal = self
-                .runtime
-                .providers
-                .get(session_id)
+                .find_pty_handle(session_id)
                 .map(|p| p.has_minimal_output(5))
                 .unwrap_or(true);
             if !is_minimal {
@@ -552,7 +557,8 @@ impl App {
             else {
                 continue;
             };
-            self.runtime.providers.remove(session_id);
+            // Drop the previous PTY (kills child + joins reader).
+            let _ = self.take_session_pty(session_id);
             self.runtime.running_provider_pins.remove(session_id);
             self.git.last_pty_activity.remove(session_id);
             logger::info(&format!(
@@ -561,8 +567,7 @@ impl App {
             ));
             match self.spawn_pty_for_session(&session, false) {
                 Ok(client) => {
-                    self.runtime.providers.insert(session_id.clone(), client);
-                    self.mark_session_status(session_id, SessionStatus::Active);
+                    self.install_pty_for_session(session_id, crate::pty::PtyHandle::new(client));
                     self.mark_session_provider_started(session_id);
                     let proj_name = self.project_name_for_session(&session);
                     self.set_info(format!(
@@ -577,7 +582,7 @@ impl App {
                     logger::error(&format!(
                         "fallback PTY spawn also failed for {session_id}: {err}",
                     ));
-                    self.mark_session_status(session_id, SessionStatus::Detached);
+                    self.mark_session_exited(session_id, None);
                 }
             }
         }
@@ -586,10 +591,11 @@ impl App {
             if retried.contains(session_id) {
                 continue;
             }
-            self.runtime.providers.remove(session_id);
             self.runtime.running_provider_pins.remove(session_id);
             self.git.last_pty_activity.remove(session_id);
-            self.mark_session_status(session_id, SessionStatus::Detached);
+            // Child has exited — `mark_session_exited` drops the
+            // (possibly already-dead) PTY handle.
+            self.mark_session_exited(session_id, None);
         }
         if !exited.is_empty() {
             // If the currently-viewed session just exited (and was not retried),
@@ -756,14 +762,19 @@ impl App {
             let Some(victim) = self.oldest_active_session_id() else {
                 break; // nothing left to detach
             };
-            let Some(client) = self.runtime.providers.remove(&victim) else {
+            // Drop the PTY handle on the victim — `take_session_pty`
+            // returns the handle, and letting it fall out of scope
+            // here kills the child + joins the reader thread, freeing
+            // the grid memory and PTY-backed resources.
+            let Some(_handle) = self.take_session_pty(&victim) else {
                 break;
             };
-            drop(client); // tear down the PTY + free the grid memory
             self.runtime.running_provider_pins.remove(&victim);
             self.git.last_pty_activity.remove(&victim);
             self.git.resume_fallback_candidates.remove(&victim);
-            self.mark_session_status(&victim, SessionStatus::Detached);
+            // Child has exited — `mark_session_exited` drops the
+            // (possibly already-dead) PTY handle.
+            self.mark_session_exited(&victim, None);
             logger::info(&format!(
                 "scrollback watchdog auto-detached session {victim}: total \
                  grid footprint exceeded {} MiB",
@@ -791,9 +802,7 @@ impl App {
             self.last_pty_size.1 as usize
         };
         const BYTES_PER_CELL: usize = 4;
-        self.runtime
-            .providers
-            .len()
+        self.live_pty_count()
             .saturating_mul(scrollback_lines)
             .saturating_mul(cols)
             .saturating_mul(BYTES_PER_CELL)
@@ -806,7 +815,7 @@ impl App {
         self.git
             .sessions
             .iter()
-            .filter(|s| self.runtime.providers.contains_key(&s.id))
+            .filter(|s| s.state.has_pty())
             .min_by_key(|s| s.updated_at)
             .map(|s| s.id.clone())
     }
@@ -1080,7 +1089,7 @@ impl App {
                     branch_name: s.branch_name.clone(),
                     worktree_path: s.worktree_path.clone(),
                     known_pr: known_map.get(&s.id).cloned(),
-                    agent_exited: !self.runtime.providers.contains_key(&s.id),
+                    agent_exited: !s.state.has_pty(),
                 })
                 .collect();
         }
@@ -1144,7 +1153,7 @@ impl App {
             branch_name: session.branch_name.clone(),
             worktree_path: session.worktree_path.clone(),
             known_pr,
-            agent_exited: !self.runtime.providers.contains_key(session_id),
+            agent_exited: !self.session_has_pty(session_id),
         };
         let tx = self.runtime.worker_tx.clone();
         thread::spawn(move || {
@@ -1192,7 +1201,7 @@ impl App {
             if started_at.elapsed() < Duration::from_millis(timeout_ms) {
                 continue;
             }
-            let Some(provider) = self.runtime.providers.get(session_id) else {
+            let Some(provider) = self.find_pty_handle(session_id) else {
                 continue;
             };
             if provider.has_output() {
@@ -1212,7 +1221,8 @@ impl App {
             else {
                 continue;
             };
-            self.runtime.providers.remove(&session_id);
+            // Drop the previous PTY (kills child + joins reader).
+            let _ = self.take_session_pty(&session_id);
             self.runtime.running_provider_pins.remove(&session_id);
             self.git.last_pty_activity.remove(&session_id);
             logger::info(&format!(
@@ -1221,8 +1231,7 @@ impl App {
             ));
             match self.spawn_pty_for_session(&session, false) {
                 Ok(client) => {
-                    self.runtime.providers.insert(session_id.clone(), client);
-                    self.mark_session_status(&session_id, SessionStatus::Active);
+                    self.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
                     self.mark_session_provider_started(&session_id);
                     let proj_name = self.project_name_for_session(&session);
                     self.set_info(format!(
@@ -1236,7 +1245,7 @@ impl App {
                     logger::error(&format!(
                         "timeout fallback PTY spawn failed for {session_id}: {err}",
                     ));
-                    self.mark_session_status(&session_id, SessionStatus::Detached);
+                    self.mark_session_exited(&session_id, None);
                 }
             }
         }
@@ -1474,7 +1483,13 @@ pub(crate) fn run_create_agent_job(
         worktree_path: worktree_path.to_string_lossy().to_string(),
         title: None,
         started_providers: Vec::new(),
-        status: SessionStatus::Active,
+        // The session is brand-new and has no PTY yet; the spawn
+        // pipeline will transition it to `Live` once the PtyClient
+        // is plumbed back to the UI thread (via
+        // `App::install_pty_for_session`).
+        state: crate::model::SessionState::Created {
+            created_at: Utc::now(),
+        },
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };

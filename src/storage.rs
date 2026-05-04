@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 
-use crate::model::{AgentSession, SessionState, SessionStatus};
+use crate::model::{AgentSession, SessionState};
 
 /// Ordered list of schema migrations. Each entry is `(version, sql)`.
 ///
@@ -239,14 +239,15 @@ impl SessionStore {
 
     pub fn upsert_session(&self, session: &AgentSession) -> Result<()> {
         let conn = self.conn();
-        // audit02 P1-Z phase 1: persist the new `SessionState` JSON
-        // alongside the legacy `status` column. Until `AgentSession`
-        // grows an explicit `state` field (phase 2), we synthesize
-        // one from the legacy status — that round-trips faithfully
-        // because both halves stay in sync per row.
-        let state_json = SessionState::from_legacy_status(&session.status, session.updated_at)
-            .to_json()
-            .ok();
+        // audit02 P1-Z phase 2: `SessionState` is the single source of
+        // truth. The legacy `status` column is still written so that
+        // a Phase 18-aware binary downgrading to a Phase-17 binary can
+        // still read its sessions (best-effort, no support
+        // guarantees). The on-disk shape goes through
+        // `PersistedSessionState`, which folds Live/Detached into a
+        // PTY-less variant.
+        let state_json = session.state.to_json().ok();
+        let legacy_status = legacy_status_str_for(&session.state);
         conn.execute(
             r#"
             insert into agent_sessions
@@ -275,7 +276,7 @@ impl SessionStore {
                 session.worktree_path,
                 session.title,
                 serialize_started_providers(&session.started_providers),
-                session.status.as_str(),
+                legacy_status,
                 state_json,
                 session.created_at.to_rfc3339(),
                 session.updated_at.to_rfc3339(),
@@ -296,19 +297,19 @@ impl SessionStore {
         let rows = stmt.query_map([], |row| {
             let started_providers: String = row.get(8)?;
             let legacy_status_str: String = row.get(9)?;
-            let _state_json: Option<String> = row.get(10)?;
+            let state_json: Option<String> = row.get(10)?;
             let created_at: String = row.get(11)?;
             let updated_at: String = row.get(12)?;
-            // audit02 P1-Z phase 1: the legacy `status` column is
-            // still the canonical answer for `AgentSession.status`.
-            // The new `state_json` column is written on every upsert
-            // so a future phase 2 reader can use it; phase 1 only
-            // reads it for tests and diagnostics. Preferring
-            // `state_json` here would change observable behaviour
-            // (e.g. the `Active` -> `Detached` collapse documented
-            // on `PersistedSessionState`) before the rest of the app
-            // is ready for it.
-            let status = SessionStatus::from_str(&legacy_status_str);
+            // audit02 P1-Z phase 2: prefer the new `state_json`
+            // column. Fall back to the legacy `status` text if the
+            // row pre-dates migration 0002 (or the JSON is corrupt).
+            let updated_dt = parse_time(&updated_at).unwrap_or_else(Utc::now);
+            let state = state_json
+                .as_deref()
+                .and_then(|j| SessionState::from_json(j).ok())
+                .unwrap_or_else(|| {
+                    SessionState::from_legacy_status_str(&legacy_status_str, updated_dt)
+                });
             Ok(AgentSession {
                 id: row.get(0)?,
                 project_id: row.get::<_, String>(1).unwrap_or_default(),
@@ -319,9 +320,9 @@ impl SessionStore {
                 title: row.get(6)?,
                 project_path: row.get(7)?,
                 started_providers: parse_started_providers(&started_providers),
-                status,
+                state,
                 created_at: parse_time(&created_at).unwrap_or_else(Utc::now),
-                updated_at: parse_time(&updated_at).unwrap_or_else(Utc::now),
+                updated_at: updated_dt,
             })
         })?;
 
@@ -393,6 +394,24 @@ fn parse_time(value: &str) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
+/// Map a [`SessionState`] onto the legacy three-letter `status` column
+/// kept for backwards compat with older binaries (audit02 P1-Z phase
+/// 2). New code MUST not branch on this string — read
+/// `AgentSession::state` instead. The mapping mirrors the pre-Phase-18
+/// semantics: a session with a live PTY is `"active"`, one with a
+/// living-but-detached PTY is `"detached"`, anything pre-spawn is
+/// `"detached"` (matches the legacy convention that pre-attached
+/// sessions show as detached), and `Exited` is `"exited"`.
+fn legacy_status_str_for(state: &SessionState) -> &'static str {
+    match state {
+        SessionState::Live { .. } => "active",
+        SessionState::Exited { .. } => "exited",
+        SessionState::Created { .. }
+        | SessionState::Spawning { .. }
+        | SessionState::Detached { .. } => "detached",
+    }
+}
+
 // audit02 Phase 24 (P2-10) — log a warn instead of swallowing serde_json
 // failures. The fallback values ("[]" / empty Vec) are preserved so this
 // is purely additive observability; corrupt rows still degrade gracefully
@@ -448,7 +467,7 @@ fn test_session(
         worktree_path: format!("/tmp/{id}"),
         title: None,
         started_providers: Vec::new(),
-        status: SessionStatus::Active,
+        state: SessionState::Created { created_at },
         created_at,
         updated_at,
     }
