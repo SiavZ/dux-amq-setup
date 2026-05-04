@@ -53,12 +53,33 @@ impl Default for WatchRule {
 /// text = "please continue"
 /// append_enter = true
 /// ```
+///
+/// The `wait_until_capture` variant pairs a regex capture group with a
+/// parser, schedules the fire for the resulting instant, then sends
+/// `text` — useful for messages like Claude Code's "5-hour usage limit
+/// reached" where the reset time is encoded in the message body.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum WatchAction {
     /// Write `text` (optionally followed by `\r` to simulate Enter) to the
     /// agent's PTY.
     SendText {
+        text: String,
+        #[serde(default = "default_append_enter")]
+        append_enter: bool,
+    },
+    /// Extract the named capture group from the rule's regex, parse it
+    /// using `format`, and schedule the action for the parsed instant.
+    /// At fire time, sends `text` like a `send_text` action. If the
+    /// capture is missing or unparseable, falls back to the rule's
+    /// backoff curve and emits a warning.
+    WaitUntilCapture {
+        /// Name of the regex capture group holding the time value.
+        /// Must match `(?<name>…)` in the `pattern` field.
+        capture: String,
+        /// Parser kind to apply to the captured string.
+        format: WaitFormat,
+        /// Text to send once the wait elapses.
         text: String,
         #[serde(default = "default_append_enter")]
         append_enter: bool,
@@ -74,8 +95,53 @@ impl Default for WatchAction {
     }
 }
 
+impl WatchAction {
+    /// Text payload sent when the action fires. Both variants ship a
+    /// text payload — the only difference is *when* the engine fires.
+    pub(crate) fn text(&self) -> &str {
+        match self {
+            Self::SendText { text, .. } => text,
+            Self::WaitUntilCapture { text, .. } => text,
+        }
+    }
+
+    /// Whether to append CR to the payload.
+    pub(crate) fn append_enter(&self) -> bool {
+        match self {
+            Self::SendText { append_enter, .. } => *append_enter,
+            Self::WaitUntilCapture { append_enter, .. } => *append_enter,
+        }
+    }
+}
+
 fn default_append_enter() -> bool {
     true
+}
+
+/// Parser kinds for `WatchAction::WaitUntilCapture`. The captured string
+/// is interpreted according to this enum and turned into a future
+/// `Instant` for scheduling.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitFormat {
+    /// Integer seconds since the Unix epoch (e.g. `1738531200`).
+    UnixSeconds,
+    /// Integer milliseconds since the Unix epoch.
+    UnixMillis,
+    /// Wall-clock time of day (`"3pm"`, `"3:00pm"`, `"15:00"`,
+    /// `"3:30 pm"`). Optional trailing `(Timezone)` suffix is stripped
+    /// and ignored — we treat the time as today's local time and roll
+    /// to tomorrow if already past. Timezone-aware parsing is
+    /// intentionally out of scope: the user's `TZ` env var typically
+    /// matches the displayed timezone, and rolling to tomorrow handles
+    /// the most common ambiguity.
+    ClockLocal,
+    /// Floating-point seconds from now.
+    InSeconds,
+    /// Floating-point minutes from now.
+    InMinutes,
+    /// Floating-point hours from now (e.g. `"5"` for "in 5 hours").
+    InHours,
 }
 
 /// Exponential backoff parameters with jitter.

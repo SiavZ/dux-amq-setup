@@ -387,9 +387,11 @@ on launch, then per-session `auto_resume: <id> started/skipped/failed`.
 **Attack scenario.** Phase 26 introduces user-configurable watch
 rules under `[[providers.<name>.watch]]` in `config.toml`. Each
 rule pairs a regex against the agent's terminal output with an
-action — currently only `send_text`, which writes bytes back into
-the agent's PTY when the regex matches. Two distinct abuse paths
-follow:
+action — `send_text` (Phase 1) writes bytes back into the agent's
+PTY when the regex matches, and `wait_until_capture` (Phase 2)
+does the same after waiting until a parsed time captured from the
+matched text. Both variants ultimately write attacker-influenceable
+bytes back into the agent. Two distinct abuse paths follow:
 
 1. **Regex DoS.** An attacker (a malicious project the agent is
    editing, or an upstream prompt-injection that gets the model to

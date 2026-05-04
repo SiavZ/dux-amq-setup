@@ -263,12 +263,17 @@ impl RuleRuntime {
             self.state = RuleState::Idle;
         }
 
-        // Phase 2: pending fire-time reached → dispatch action.
+        // Phase 2: pending fire-time reached → dispatch action. Both
+        // action variants emit a SendText effect at fire time; only the
+        // *scheduling* of fire_at differs between SendText (backoff) and
+        // WaitUntilCapture (parsed reset time).
         if let RuleState::Pending { fire_at } = self.state
             && now >= fire_at
         {
-            let WatchAction::SendText { text, append_enter } = self.rule.action.clone();
-            out.push(WatchEffect::SendText { text, append_enter });
+            out.push(WatchEffect::SendText {
+                text: self.rule.action.text().to_string(),
+                append_enter: self.rule.action.append_enter(),
+            });
             self.attempts_made = self.attempts_made.saturating_add(1);
             let cooldown = Duration::from_millis(self.rule.cooldown_ms);
             self.state = RuleState::Cooling {
@@ -291,17 +296,69 @@ impl RuleRuntime {
                 )));
                 return;
             }
+            let (fire_at, warning) = self.schedule_fire_at(snapshot, now, rng);
+            if let Some(msg) = warning {
+                out.push(WatchEffect::StatusWarning(msg));
+            }
+            self.state = RuleState::Pending { fire_at };
+            self.baseline_match_count = matches;
+        }
+    }
+
+    /// Pick `fire_at` for the next pending state. Dispatches on the
+    /// action variant: `SendText` uses the rule's backoff curve (the
+    /// Phase 1 behavior), while `WaitUntilCapture` extracts the named
+    /// capture from the most recent regex match in the snapshot, parses
+    /// it via `reset_time`, and uses the resulting instant — falling
+    /// back to the backoff curve (with a returned warning string) if
+    /// the parse fails.
+    fn schedule_fire_at(
+        &self,
+        snapshot: &str,
+        now: Instant,
+        rng: &mut SmallRng,
+    ) -> (Instant, Option<String>) {
+        let mut backoff_fire = || {
             let delay_ms = self.rule.backoff.deterministic_delay_ms(self.attempts_made);
             let jitter_ms = if self.rule.backoff.jitter_ms > 0 {
                 rng.gen_range(0..=self.rule.backoff.jitter_ms)
             } else {
                 0
             };
-            let total = Duration::from_millis(delay_ms.saturating_add(jitter_ms));
-            self.state = RuleState::Pending {
-                fire_at: now + total,
-            };
-            self.baseline_match_count = matches;
+            now + Duration::from_millis(delay_ms.saturating_add(jitter_ms))
+        };
+
+        match &self.rule.action {
+            WatchAction::SendText { .. } => (backoff_fire(), None),
+            WatchAction::WaitUntilCapture {
+                capture, format, ..
+            } => {
+                let captured = self
+                    .regex
+                    .captures_iter(snapshot)
+                    .last()
+                    .and_then(|c| c.name(capture).map(|m| m.as_str().to_string()));
+                let parsed = captured.as_deref().and_then(|s| {
+                    crate::watch::reset_time::parse(*format, s, now, chrono::Utc::now())
+                });
+                match parsed {
+                    Some(target) => {
+                        let jitter_ms = if self.rule.backoff.jitter_ms > 0 {
+                            rng.gen_range(0..=self.rule.backoff.jitter_ms)
+                        } else {
+                            0
+                        };
+                        (target + Duration::from_millis(jitter_ms), None)
+                    }
+                    None => {
+                        let warning = format!(
+                            "watch rule \"{}\": failed to parse capture \"{}\" — falling back to backoff",
+                            self.label, capture
+                        );
+                        (backoff_fire(), Some(warning))
+                    }
+                }
+            }
         }
     }
 }
@@ -320,7 +377,7 @@ fn truncate_for_label(pattern: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::watch::rule::{WatchAction, WatchBackoff, WatchBudget, WatchRule};
+    use crate::watch::rule::{WaitFormat, WatchAction, WatchBackoff, WatchBudget, WatchRule};
 
     fn rule(pattern: &str) -> WatchRule {
         WatchRule {
@@ -582,5 +639,127 @@ mod tests {
         let (engine, errors) = WatchEngine::new("s1", &rules);
         assert_eq!(engine.rule_count(), MAX_RULES_PER_PROVIDER);
         assert!(errors.iter().any(|e| e.contains("too many rules")));
+    }
+
+    /// `WaitUntilCapture` schedules `fire_at` from the parsed capture
+    /// rather than the backoff curve. With `in_seconds = "10"` we expect
+    /// the rule to fire ~10s after the match, regardless of backoff.
+    #[test]
+    fn wait_until_capture_uses_parsed_offset() {
+        let r = WatchRule {
+            pattern: r"reset in (?<n>\d+) seconds".to_string(),
+            label: "5h-limit".to_string(),
+            action: WatchAction::WaitUntilCapture {
+                capture: "n".to_string(),
+                format: WaitFormat::InSeconds,
+                text: "please continue".to_string(),
+                append_enter: true,
+            },
+            backoff: WatchBackoff {
+                // Make backoff very long so we'd notice if the engine
+                // mistakenly used the backoff path.
+                initial_ms: 60_000_000,
+                max_ms: 60_000_000,
+                multiplier: 1.0,
+                jitter_ms: 0,
+            },
+            budget: WatchBudget { max_attempts: 3 },
+            cooldown_ms: 0,
+        };
+
+        let (mut engine, errors) = WatchEngine::new("s1", &[r]);
+        assert!(errors.is_empty(), "load errors: {errors:?}");
+        let t0 = Instant::now();
+        engine.observe("agent reset in 10 seconds and resume", t0);
+        let fire_at = match engine.rules[0].state {
+            RuleState::Pending { fire_at } => fire_at,
+            other => panic!("expected Pending, got {other:?}"),
+        };
+        let elapsed = fire_at.duration_since(t0).as_secs();
+        assert!(
+            (8..=12).contains(&elapsed),
+            "expected ~10s offset, got {elapsed}s"
+        );
+    }
+
+    /// `WaitUntilCapture` falls back to the backoff curve and emits a
+    /// warning when the captured text fails to parse.
+    #[test]
+    fn wait_until_capture_falls_back_to_backoff_on_parse_failure() {
+        let r = WatchRule {
+            pattern: r"limit reached \| (?<ts>\S+)".to_string(),
+            label: "bad-capture".to_string(),
+            action: WatchAction::WaitUntilCapture {
+                capture: "ts".to_string(),
+                format: WaitFormat::UnixSeconds,
+                text: "please continue".to_string(),
+                append_enter: true,
+            },
+            backoff: WatchBackoff {
+                initial_ms: 5_000,
+                max_ms: 60_000,
+                multiplier: 2.0,
+                jitter_ms: 0,
+            },
+            budget: WatchBudget { max_attempts: 3 },
+            cooldown_ms: 0,
+        };
+
+        let (mut engine, errors) = WatchEngine::new("s1", &[r]);
+        assert!(errors.is_empty());
+        let t0 = Instant::now();
+        let effects = engine.observe("limit reached | not-a-timestamp", t0);
+        assert!(
+            effects.iter().any(
+                |e| matches!(e, WatchEffect::StatusWarning(msg) if msg.contains("failed to parse"))
+            ),
+            "expected fallback warning, got {effects:?}"
+        );
+        let fire_at = match engine.rules[0].state {
+            RuleState::Pending { fire_at } => fire_at,
+            other => panic!("expected Pending after fallback, got {other:?}"),
+        };
+        // Should be within backoff range (5s).
+        let elapsed = fire_at.duration_since(t0).as_secs();
+        assert!(
+            (4..=6).contains(&elapsed),
+            "expected ~5s backoff fallback, got {elapsed}s"
+        );
+    }
+
+    /// When the capture group is missing from the regex (rule misconfig),
+    /// the engine falls back to backoff and emits a warning rather than
+    /// panicking.
+    #[test]
+    fn wait_until_capture_missing_capture_group_falls_back() {
+        let r = WatchRule {
+            // Pattern has no `(?<n>…)` group.
+            pattern: r"reset soon".to_string(),
+            label: "missing-capture".to_string(),
+            action: WatchAction::WaitUntilCapture {
+                capture: "n".to_string(),
+                format: WaitFormat::InSeconds,
+                text: "please continue".to_string(),
+                append_enter: true,
+            },
+            backoff: WatchBackoff {
+                initial_ms: 3_000,
+                max_ms: 30_000,
+                multiplier: 2.0,
+                jitter_ms: 0,
+            },
+            budget: WatchBudget { max_attempts: 3 },
+            cooldown_ms: 0,
+        };
+        let (mut engine, _) = WatchEngine::new("s1", &[r]);
+        let t0 = Instant::now();
+        let effects = engine.observe("reset soon!", t0);
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, WatchEffect::StatusWarning(_))),
+            "expected fallback warning"
+        );
+        assert!(matches!(engine.rules[0].state, RuleState::Pending { .. }));
     }
 }
