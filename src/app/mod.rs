@@ -338,6 +338,24 @@ pub(crate) struct KillRunningPrompt {
     pub(crate) focus: KillRunningFocus,
 }
 
+/// One row in the watch-rules modal: a single rule on a single session.
+#[derive(Clone, Debug)]
+pub(crate) struct WatchRuleRow {
+    pub(crate) session_id: String,
+    /// Display label for the session (`title` if set, else branch name).
+    pub(crate) session_label: String,
+    pub(crate) rule_idx: usize,
+    pub(crate) snapshot: crate::watch::RuleSnapshot,
+}
+
+/// State for the watch-rules palette modal. Lists every loaded rule
+/// across every session with disarm/rearm actions. See `WatchEngine::rules_snapshot`.
+#[derive(Clone, Debug)]
+pub(crate) struct WatchRulesPrompt {
+    pub(crate) entries: Vec<WatchRuleRow>,
+    pub(crate) selected: usize,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ChangeAgentProviderOption {
     pub(crate) provider: ProviderKind,
@@ -445,6 +463,7 @@ pub(crate) enum PromptState {
     ChangeTheme(ChangeThemePrompt),
     KillRunning(KillRunningPrompt),
     ConfirmKillRunning(ConfirmKillRunningPrompt),
+    WatchRules(WatchRulesPrompt),
     ConfirmDeleteAgent {
         session_id: String,
         branch_name: String,
@@ -1787,6 +1806,7 @@ impl App {
             "delete-agent" => self.confirm_delete_selected_session(),
             "rename-agent" => self.open_rename_session(),
             "kill-running" => self.open_kill_running(),
+            "watch-rules" => self.open_watch_rules_prompt(),
             "reconnect-agent" => self.reconnect_selected_session(),
             "force-reconnect-agent" => self.force_reconnect_agent(),
             "show-agent" => self.activate_center_agent(),
@@ -2671,6 +2691,88 @@ impl App {
                 self.apply_watch_effect(&session_id, effect);
             }
         }
+    }
+
+    /// Build a `WatchRulesPrompt` from the currently-loaded engines and
+    /// install it as the active modal. Sessions without an attached
+    /// engine contribute no rows; sessions with an engine but zero
+    /// rules also contribute no rows. The empty case is handled by the
+    /// renderer (shows a hint pointing at `config.toml`).
+    pub(crate) fn open_watch_rules_prompt(&mut self) -> Result<()> {
+        let mut entries: Vec<WatchRuleRow> = Vec::new();
+        for (session_id, engine) in &self.runtime.watch_engines {
+            let session_label = self
+                .git
+                .sessions
+                .iter()
+                .find(|s| s.id == *session_id)
+                .map(|s| s.title.clone().unwrap_or_else(|| s.branch_name.clone()))
+                .unwrap_or_else(|| session_id.clone());
+            for snapshot in engine.rules_snapshot() {
+                entries.push(WatchRuleRow {
+                    session_id: session_id.clone(),
+                    session_label: session_label.clone(),
+                    rule_idx: snapshot.idx,
+                    snapshot,
+                });
+            }
+        }
+        // Stable ordering: by session label, then by rule index.
+        entries.sort_by(|a, b| {
+            a.session_label
+                .cmp(&b.session_label)
+                .then(a.rule_idx.cmp(&b.rule_idx))
+        });
+        self.ui.prompt = PromptState::WatchRules(WatchRulesPrompt {
+            entries,
+            selected: 0,
+        });
+        Ok(())
+    }
+
+    /// Toggle disarm on the watch-rule row currently highlighted in the
+    /// modal. Refreshes the prompt's snapshot list afterwards so the
+    /// rendered state reflects the new disarm flag immediately.
+    pub(crate) fn toggle_selected_watch_rule(&mut self) {
+        let (session_id, rule_idx, currently_disarmed, label) = match &self.ui.prompt {
+            PromptState::WatchRules(prompt) => {
+                let Some(row) = prompt.entries.get(prompt.selected) else {
+                    return;
+                };
+                (
+                    row.session_id.clone(),
+                    row.rule_idx,
+                    matches!(row.snapshot.state, crate::watch::RuleStateKind::Disarmed),
+                    row.snapshot.label.clone(),
+                )
+            }
+            _ => return,
+        };
+        let action_label = {
+            let Some(engine) = self.runtime.watch_engines.get_mut(&session_id) else {
+                return;
+            };
+            if currently_disarmed {
+                engine.rearm(rule_idx);
+                "re-armed"
+            } else {
+                engine.disarm(rule_idx);
+                "disarmed"
+            }
+        };
+        // Refresh the prompt's snapshots so the row's state badge
+        // reflects the toggle immediately on the next render.
+        if let PromptState::WatchRules(prompt) = &mut self.ui.prompt {
+            for row in &mut prompt.entries {
+                if row.session_id == session_id
+                    && let Some(engine) = self.runtime.watch_engines.get(&row.session_id)
+                    && let Some(snap) = engine.rules_snapshot().into_iter().nth(row.rule_idx)
+                {
+                    row.snapshot = snap;
+                }
+            }
+        }
+        self.set_info(format!("Watch rule \"{label}\" {action_label}."));
     }
 
     fn apply_watch_effect(&mut self, session_id: &str, effect: crate::watch::WatchEffect) {

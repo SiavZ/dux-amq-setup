@@ -4644,6 +4644,160 @@ impl App {
                     }),
                 };
             }
+            PromptState::WatchRules(prompt) => {
+                self.render_dim_overlay(frame);
+                let popup = centered_rect(78, 60, frame.area());
+                self.clear_overlay_area(frame, popup);
+
+                let items: Vec<ListItem> = if prompt.entries.is_empty() {
+                    vec![
+                        ListItem::new("No watch rules loaded."),
+                        ListItem::new(""),
+                        ListItem::new(Line::from(vec![Span::styled(
+                            "Configure rules under [[providers.<name>.watch]] in config.toml.",
+                            Style::default().fg(self.theme.hint_desc_fg),
+                        )])),
+                    ]
+                } else {
+                    let session_col = prompt
+                        .entries
+                        .iter()
+                        .map(|e| e.session_label.chars().count())
+                        .max()
+                        .unwrap_or(0)
+                        .min(28);
+                    let label_col = prompt
+                        .entries
+                        .iter()
+                        .map(|e| e.snapshot.label.chars().count())
+                        .max()
+                        .unwrap_or(0)
+                        .min(40);
+                    prompt
+                        .entries
+                        .iter()
+                        .map(|row| {
+                            let session_label = if row.session_label.chars().count() > session_col {
+                                row.session_label
+                                    .chars()
+                                    .take(session_col)
+                                    .collect::<String>()
+                            } else {
+                                row.session_label.clone()
+                            };
+                            let session_padded = format!("{session_label:session_col$}");
+                            let rule_label = if row.snapshot.label.chars().count() > label_col {
+                                row.snapshot
+                                    .label
+                                    .chars()
+                                    .take(label_col)
+                                    .collect::<String>()
+                            } else {
+                                row.snapshot.label.clone()
+                            };
+                            let rule_padded = format!("{rule_label:label_col$}");
+                            let (badge_text, badge_color) = match row.snapshot.state {
+                                crate::watch::RuleStateKind::Idle => {
+                                    ("armed", self.theme.session_active)
+                                }
+                                crate::watch::RuleStateKind::Pending => {
+                                    ("pending", self.theme.session_detached)
+                                }
+                                crate::watch::RuleStateKind::Cooling => {
+                                    ("cooling", self.theme.session_detached)
+                                }
+                                crate::watch::RuleStateKind::Disarmed => {
+                                    ("disarmed", self.theme.session_exited)
+                                }
+                            };
+                            let attempts = format!(
+                                "{}/{}",
+                                row.snapshot.attempts_made, row.snapshot.max_attempts
+                            );
+                            let spans = vec![
+                                Span::styled(
+                                    session_padded,
+                                    Style::default()
+                                        .fg(self.theme.help_section_header_fg)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    "  ",
+                                    Style::default().fg(self.theme.hint_dim_desc_fg),
+                                ),
+                                Span::styled(
+                                    rule_padded,
+                                    Style::default().add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    "  ",
+                                    Style::default().fg(self.theme.hint_dim_desc_fg),
+                                ),
+                                Span::styled(
+                                    format!("[{badge_text:<8}]"),
+                                    Style::default().fg(badge_color),
+                                ),
+                                Span::styled(
+                                    "  ",
+                                    Style::default().fg(self.theme.hint_dim_desc_fg),
+                                ),
+                                Span::styled(
+                                    attempts,
+                                    Style::default().fg(self.theme.hint_desc_fg),
+                                ),
+                            ];
+                            ListItem::new(Line::from(spans))
+                        })
+                        .collect::<Vec<_>>()
+                };
+
+                let total = prompt.entries.len();
+                let mut state = ListState::default()
+                    .with_selected(Some(prompt.selected.min(total.saturating_sub(1))));
+
+                let [list_area, hint_area] = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(3), Constraint::Length(3)])
+                    .areas(popup);
+
+                let title = if total == 0 {
+                    "Watch Rules".to_string()
+                } else {
+                    format!("Watch Rules ({total})")
+                };
+                let block = self.themed_overlay_block(&title);
+
+                let list = List::new(items)
+                    .block(block)
+                    .highlight_style(self.theme.selection_style());
+                StatefulWidget::render(list, list_area, frame.buffer_mut(), &mut state);
+
+                // Footer hint.
+                let confirm_key = self.bindings.label_for(Action::Confirm);
+                let close_key = self.bindings.label_for(Action::CloseOverlay);
+                let mut hint_spans = vec![Span::raw(" ")];
+                if total > 0 {
+                    hint_spans.extend(self.theme.key_badge_default(&confirm_key));
+                    hint_spans.push(Span::styled(
+                        " toggle disarm  ",
+                        Style::default().fg(self.theme.hint_desc_fg),
+                    ));
+                }
+                hint_spans.extend(self.theme.key_badge_default(&close_key));
+                hint_spans.push(Span::styled(
+                    " close",
+                    Style::default().fg(self.theme.hint_desc_fg),
+                ));
+                let hint_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(ratatui::widgets::BorderType::Rounded)
+                    .border_style(Style::default().fg(self.theme.overlay_border))
+                    .style(Style::default().bg(self.theme.overlay_bg));
+                let hint = Paragraph::new(Line::from(hint_spans))
+                    .block(hint_block)
+                    .wrap(Wrap { trim: true });
+                Widget::render(hint, hint_area, frame.buffer_mut());
+            }
             PromptState::None => {}
         }
     }

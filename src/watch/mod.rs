@@ -21,6 +21,6 @@ pub mod engine;
 pub mod reset_time;
 pub mod rule;
 
-pub use engine::{WatchEffect, WatchEngine};
+pub use engine::{RuleSnapshot, RuleStateKind, WatchEffect, WatchEngine};
 #[allow(unused_imports)] // re-exported for tests + future palette code
 pub use rule::{WaitFormat, WatchAction, WatchBackoff, WatchBudget, WatchRule};
