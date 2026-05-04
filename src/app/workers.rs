@@ -29,14 +29,14 @@ impl App {
                         &session.id,
                     );
                     self.runtime.providers.insert(session.id.clone(), client);
-                    self.sessions.insert(0, session.clone());
+                    self.git.sessions.insert(0, session.clone());
                     self.mark_session_provider_started(&session.id);
                     self.update_branch_sync_sessions();
                     self.rebuild_left_items();
                     self.selected_left = self
                         .left_items()
                         .iter()
-                        .position(|item| matches!(item, LeftItem::Session(index) if self.sessions.get(*index).map(|candidate| candidate.id.as_str()) == Some(session.id.as_str())))
+                        .position(|item| matches!(item, LeftItem::Session(index) if self.git.sessions.get(*index).map(|candidate| candidate.id.as_str()) == Some(session.id.as_str())))
                         .unwrap_or(0);
                     self.reload_changed_files();
                     self.show_agent_surface();
@@ -49,13 +49,13 @@ impl App {
                     self.set_error(message);
                 }
                 WorkerEvent::ChangedFilesReady { staged, unstaged } => {
-                    self.staged_files = staged;
-                    self.unstaged_files = unstaged;
+                    self.git.staged_files = staged;
+                    self.git.unstaged_files = unstaged;
                     self.clamp_files_cursor();
                 }
                 WorkerEvent::CommitMessageGenerated(msg) => {
-                    self.commit_input.clear_overlay();
-                    self.commit_input.set_text(msg);
+                    self.git.commit_input.clear_overlay();
+                    self.git.commit_input.set_text(msg);
                     self.ui.input_target = InputTarget::CommitMessage;
                     {
                         let exit_key = self.bindings.label_for(Action::ExitCommitInput);
@@ -66,7 +66,7 @@ impl App {
                     }
                 }
                 WorkerEvent::CommitMessageFailed(err) => {
-                    self.commit_input.clear_overlay();
+                    self.git.commit_input.clear_overlay();
                     {
                         let gen_key = self.bindings.label_for(Action::GenerateCommitMessage);
                         self.set_error(format!(
@@ -93,7 +93,7 @@ impl App {
                             project_name,
                         } => match result {
                             Ok(branch_name) => {
-                                if let Some(existing) = self
+                                if let Some(existing) = self.git
                                     .projects
                                     .iter_mut()
                                     .find(|candidate| candidate.id == project_id)
@@ -131,7 +131,7 @@ impl App {
                 } => match result {
                     Ok(()) => {
                         if let Some(session) =
-                            self.sessions.iter_mut().find(|s| s.id == session_id)
+                            self.git.sessions.iter_mut().find(|s| s.id == session_id)
                         {
                             session.branch_name = new_branch.clone();
                             session.updated_at = Utc::now();
@@ -148,7 +148,7 @@ impl App {
                         // mixed state where the display name changed but the
                         // branch didn't.
                         if let Some(session) =
-                            self.sessions.iter_mut().find(|s| s.id == session_id)
+                            self.git.sessions.iter_mut().find(|s| s.id == session_id)
                         {
                             session.title = previous_title;
                             session.updated_at = Utc::now();
@@ -164,7 +164,7 @@ impl App {
                     let mut changed = false;
                     for (session_id, actual_branch) in updates {
                         if let Some(session) =
-                            self.sessions.iter_mut().find(|s| s.id == session_id)
+                            self.git.sessions.iter_mut().find(|s| s.id == session_id)
                             && session.branch_name != actual_branch {
                                 logger::info(&format!(
                                     "branch sync: session {} branch changed {} -> {}",
@@ -260,7 +260,7 @@ impl App {
                     // Always clear the in-flight guard so the session is
                     // interactive again — whether we're about to remove it
                     // (Ok path) or leave it in place for retry (Err path).
-                    self.pending_deletions.remove(&session_id);
+                    self.git.pending_deletions.remove(&session_id);
 
                     // Retrieve (and remove) the exact Busy message we set
                     // when the worker was spawned. We compare this against
@@ -268,7 +268,7 @@ impl App {
                     // tone alone, because another operation (push, pull,
                     // refresh, concurrent delete) may have since set its own
                     // Busy message that we must not clobber.
-                    let our_busy_msg = self.deletion_busy_messages.remove(&session_id);
+                    let our_busy_msg = self.git.deletion_busy_messages.remove(&session_id);
 
                     match result {
                         Ok(branch_already_deleted) => {
@@ -286,7 +286,7 @@ impl App {
                                         && self.status.message() == msg.as_str()
                                 });
 
-                            if self.sessions.iter().any(|s| s.id == session_id) {
+                            if self.git.sessions.iter().any(|s| s.id == session_id) {
                                 if let Err(e) = self.finish_delete_session(
                                     &session_id,
                                     true,
@@ -311,7 +311,7 @@ impl App {
                             // deletes can be in flight concurrently, and a
                             // bare error would be ambiguous.
                             if let Some(session) =
-                                self.sessions.iter().find(|s| s.id == session_id)
+                                self.git.sessions.iter().find(|s| s.id == session_id)
                             {
                                 let name = session
                                     .title
@@ -399,7 +399,7 @@ impl App {
                     remote_default: _,
                 } => {
                     let path_str = path.to_string_lossy().to_string();
-                    if let Some(proj) = self
+                    if let Some(proj) = self.git
                         .projects
                         .iter_mut()
                         .find(|p| Path::new(&p.path) == path.as_path())
@@ -430,8 +430,8 @@ impl App {
                     }
                     match result {
                         Ok((staged, unstaged)) => {
-                            self.staged_files = staged;
-                            self.unstaged_files = unstaged;
+                            self.git.staged_files = staged;
+                            self.git.unstaged_files = unstaged;
                             self.clamp_files_cursor();
                         }
                         Err(err) => {
@@ -445,13 +445,13 @@ impl App {
                     }
                 }
                 WorkerEvent::StagedDiffReady { worktree, result } => {
-                    self.staged_diff_in_flight = false;
+                    self.git.staged_diff_in_flight = false;
                     match result {
                         Ok(diff) => {
                             self.launch_commit_message_provider(worktree, diff);
                         }
                         Err(err) => {
-                            self.commit_input.clear_overlay();
+                            self.git.commit_input.clear_overlay();
                             self.set_error(format!("Failed to read staged diff: {err}"));
                         }
                     }
@@ -461,11 +461,11 @@ impl App {
                     message: _,
                     result,
                 } => {
-                    self.commit_in_flight = false;
-                    self.commit_input.clear_overlay();
+                    self.git.commit_in_flight = false;
+                    self.git.commit_input.clear_overlay();
                     match result {
                         Ok(()) => {
-                            self.commit_input.clear();
+                            self.git.commit_input.clear();
                             let push_key = self.bindings.label_for(Action::PushToRemote);
                             let ai_key = self.bindings.label_for(Action::GenerateCommitMessage);
                             self.set_info(format!(
@@ -490,7 +490,7 @@ impl App {
                     self.handle_scrollback_usage_event(scrollback_lines);
                 }
                 WorkerEvent::AddProjectMetaReady { path, name, result } => {
-                    self.add_project_in_flight = false;
+                    self.git.add_project_in_flight = false;
                     match result {
                         Ok(meta) => {
                             if let Err(e) = self.resume_add_project_after_meta(path, name, meta) {
@@ -522,7 +522,12 @@ impl App {
         // This handles `claude --continue || claude` style fallback.
         let mut retried = HashSet::new();
         for session_id in &exited {
-            if self.resume_fallback_candidates.remove(session_id).is_none() {
+            if self
+                .git
+                .resume_fallback_candidates
+                .remove(session_id)
+                .is_none()
+            {
                 continue;
             }
             // Check whether the exited process produced only minimal output
@@ -538,12 +543,18 @@ impl App {
             if !is_minimal {
                 continue;
             }
-            let Some(session) = self.sessions.iter().find(|s| s.id == *session_id).cloned() else {
+            let Some(session) = self
+                .git
+                .sessions
+                .iter()
+                .find(|s| s.id == *session_id)
+                .cloned()
+            else {
                 continue;
             };
             self.runtime.providers.remove(session_id);
             self.runtime.running_provider_pins.remove(session_id);
-            self.last_pty_activity.remove(session_id);
+            self.git.last_pty_activity.remove(session_id);
             logger::info(&format!(
                 "resume args exited without output for agent \"{}\", retrying with regular args",
                 session.branch_name
@@ -577,7 +588,7 @@ impl App {
             }
             self.runtime.providers.remove(session_id);
             self.runtime.running_provider_pins.remove(session_id);
-            self.last_pty_activity.remove(session_id);
+            self.git.last_pty_activity.remove(session_id);
             self.mark_session_status(session_id, SessionStatus::Detached);
         }
         if !exited.is_empty() {
@@ -750,8 +761,8 @@ impl App {
             };
             drop(client); // tear down the PTY + free the grid memory
             self.runtime.running_provider_pins.remove(&victim);
-            self.last_pty_activity.remove(&victim);
-            self.resume_fallback_candidates.remove(&victim);
+            self.git.last_pty_activity.remove(&victim);
+            self.git.resume_fallback_candidates.remove(&victim);
             self.mark_session_status(&victim, SessionStatus::Detached);
             logger::info(&format!(
                 "scrollback watchdog auto-detached session {victim}: total \
@@ -792,7 +803,8 @@ impl App {
     /// still attached. Used by the scrollback watchdog to pick a detach
     /// victim. Sessions without a live `PtyClient` are ignored.
     pub(crate) fn oldest_active_session_id(&self) -> Option<String> {
-        self.sessions
+        self.git
+            .sessions
             .iter()
             .filter(|s| self.runtime.providers.contains_key(&s.id))
             .min_by_key(|s| s.updated_at)
@@ -963,7 +975,7 @@ impl App {
                 self.runtime.refs_watch_paths.clear();
                 // Populate the path map and start watching existing sessions.
                 let mut paths = HashMap::new();
-                for session in &self.sessions {
+                for session in &self.git.sessions {
                     let refs_dir = PathBuf::from(&session.worktree_path)
                         .join(".git")
                         .join("refs")
@@ -1060,6 +1072,7 @@ impl App {
 
         if let Ok(mut guard) = self.runtime.pr_sync_sessions.lock() {
             *guard = self
+                .git
                 .sessions
                 .iter()
                 .map(|s| PrSyncEntry {
@@ -1118,7 +1131,7 @@ impl App {
         {
             return;
         }
-        let Some(session) = self.sessions.iter().find(|s| s.id == session_id) else {
+        let Some(session) = self.git.sessions.iter().find(|s| s.id == session_id) else {
             return;
         };
         let known_pr = self
@@ -1168,8 +1181,8 @@ impl App {
     fn retry_hung_resume_sessions(&mut self) {
         let mut hung = Vec::new();
 
-        for (session_id, started_at) in &self.resume_fallback_candidates {
-            let Some(session) = self.sessions.iter().find(|s| s.id == *session_id) else {
+        for (session_id, started_at) in &self.git.resume_fallback_candidates {
+            let Some(session) = self.git.sessions.iter().find(|s| s.id == *session_id) else {
                 continue;
             };
             let cfg = provider_config(&self.config, &session.provider);
@@ -1189,13 +1202,19 @@ impl App {
         }
 
         for session_id in hung {
-            self.resume_fallback_candidates.remove(&session_id);
-            let Some(session) = self.sessions.iter().find(|s| s.id == session_id).cloned() else {
+            self.git.resume_fallback_candidates.remove(&session_id);
+            let Some(session) = self
+                .git
+                .sessions
+                .iter()
+                .find(|s| s.id == session_id)
+                .cloned()
+            else {
                 continue;
             };
             self.runtime.providers.remove(&session_id);
             self.runtime.running_provider_pins.remove(&session_id);
-            self.last_pty_activity.remove(&session_id);
+            self.git.last_pty_activity.remove(&session_id);
             logger::info(&format!(
                 "resume args produced no visible output for agent \"{}\" within timeout, retrying with regular args",
                 session.branch_name
