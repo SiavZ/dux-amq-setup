@@ -2259,6 +2259,30 @@ impl App {
             return Ok(false);
         }
 
+        if let PromptState::WatchRules(prompt) = &mut self.ui.prompt {
+            let palette_action = self.bindings.lookup(&key, BindingScope::Palette);
+            let dialog_action = self.bindings.lookup(&key, BindingScope::Dialog);
+            let global_action = self.bindings.lookup(&key, BindingScope::Global);
+            let action = palette_action.or(dialog_action).or(global_action);
+
+            match action {
+                Some(Action::CloseOverlay) => {
+                    self.ui.prompt = PromptState::None;
+                }
+                Some(Action::MoveDown) if prompt.selected + 1 < prompt.entries.len() => {
+                    prompt.selected += 1;
+                }
+                Some(Action::MoveUp) if prompt.selected > 0 => {
+                    prompt.selected -= 1;
+                }
+                Some(Action::Confirm) => {
+                    self.toggle_selected_watch_rule();
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
         if let PromptState::ConfirmKillRunning(confirm_prompt) = &mut self.ui.prompt {
             match self.bindings.lookup(&key, BindingScope::Dialog) {
                 Some(Action::CloseOverlay) => {
@@ -10621,5 +10645,183 @@ cyan = "#00ffff"
             !rendered.contains("→"),
             "arrow should disappear once no swap is pending, got: {rendered}"
         );
+    }
+
+    // ── Watch-rules palette modal (Phase 3) ─────────────────────────────
+
+    fn make_watch_rule(label: &str, pattern: &str) -> crate::watch::WatchRule {
+        crate::watch::WatchRule {
+            pattern: pattern.to_string(),
+            label: label.to_string(),
+            action: crate::watch::WatchAction::SendText {
+                text: "please continue".to_string(),
+                append_enter: true,
+            },
+            backoff: crate::watch::WatchBackoff::default(),
+            budget: crate::watch::WatchBudget { max_attempts: 5 },
+            cooldown_ms: 1_000,
+        }
+    }
+
+    /// Opening the modal with no watch engines loaded yields an empty
+    /// `entries` list — the renderer surfaces a hint pointing at config.toml.
+    #[test]
+    fn open_watch_rules_prompt_empty_state() {
+        let mut app = test_app(default_bindings());
+        app.open_watch_rules_prompt().expect("open");
+        let PromptState::WatchRules(prompt) = &app.ui.prompt else {
+            panic!("expected WatchRules prompt, got {:?}", app.ui.prompt);
+        };
+        assert!(prompt.entries.is_empty(), "no engines should ⇒ no entries");
+        assert_eq!(prompt.selected, 0);
+    }
+
+    /// With two rules attached to one session, the modal lists both,
+    /// sorted by rule index. Initial state for each is `Idle`.
+    #[test]
+    fn open_watch_rules_prompt_lists_attached_rules() {
+        let mut app = test_app(default_bindings());
+        let session_id = app.git.sessions[0].id.clone();
+        let rules = vec![
+            make_watch_rule("throttle", "rate limited"),
+            make_watch_rule("usage-limit", "Claude usage limit reached"),
+        ];
+        let (engine, errors) = crate::watch::WatchEngine::new(session_id.clone(), &rules);
+        assert!(errors.is_empty(), "rules should compile cleanly");
+        app.runtime.watch_engines.insert(session_id.clone(), engine);
+
+        app.open_watch_rules_prompt().expect("open");
+        let PromptState::WatchRules(prompt) = &app.ui.prompt else {
+            panic!("expected WatchRules prompt");
+        };
+        assert_eq!(prompt.entries.len(), 2);
+        assert_eq!(prompt.entries[0].snapshot.label, "throttle");
+        assert_eq!(prompt.entries[1].snapshot.label, "usage-limit");
+        assert_eq!(prompt.entries[0].session_id, session_id);
+        assert!(matches!(
+            prompt.entries[0].snapshot.state,
+            crate::watch::RuleStateKind::Idle
+        ));
+    }
+
+    /// Enter on an armed rule disarms it; the row's snapshot is
+    /// refreshed in-place so the renderer immediately reflects the new
+    /// state badge without reopening the modal.
+    #[test]
+    fn toggle_selected_watch_rule_disarms_then_rearms() {
+        let mut app = test_app(default_bindings());
+        let session_id = app.git.sessions[0].id.clone();
+        let rules = vec![make_watch_rule("test", "trigger")];
+        let (engine, _) = crate::watch::WatchEngine::new(session_id.clone(), &rules);
+        app.runtime.watch_engines.insert(session_id.clone(), engine);
+
+        app.open_watch_rules_prompt().expect("open");
+        // First toggle: Idle → Disarmed.
+        app.toggle_selected_watch_rule();
+        let PromptState::WatchRules(prompt) = &app.ui.prompt else {
+            panic!("prompt closed unexpectedly");
+        };
+        assert!(matches!(
+            prompt.entries[0].snapshot.state,
+            crate::watch::RuleStateKind::Disarmed
+        ));
+        let engine = app
+            .runtime
+            .watch_engines
+            .get(&session_id)
+            .expect("engine still present");
+        assert!(engine.is_disarmed(0));
+
+        // Second toggle: Disarmed → Idle.
+        app.toggle_selected_watch_rule();
+        let PromptState::WatchRules(prompt) = &app.ui.prompt else {
+            panic!("prompt closed");
+        };
+        assert!(matches!(
+            prompt.entries[0].snapshot.state,
+            crate::watch::RuleStateKind::Idle
+        ));
+        let engine = app
+            .runtime
+            .watch_engines
+            .get(&session_id)
+            .expect("engine still present");
+        assert!(!engine.is_disarmed(0));
+    }
+
+    /// Pressing Esc in the modal closes it. (Lookup via `BindingScope::Palette`
+    /// + `Dialog` + `Global` so default keybindings reach the handler.)
+    #[test]
+    fn watch_rules_modal_closes_on_close_overlay_action() {
+        let mut app = test_app(default_bindings());
+        let session_id = app.git.sessions[0].id.clone();
+        let rules = vec![make_watch_rule("test", "trigger")];
+        let (engine, _) = crate::watch::WatchEngine::new(session_id.clone(), &rules);
+        app.runtime.watch_engines.insert(session_id, engine);
+        app.open_watch_rules_prompt().expect("open");
+        assert!(matches!(app.ui.prompt, PromptState::WatchRules(_)));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("handle key");
+        assert!(
+            matches!(app.ui.prompt, PromptState::None),
+            "expected prompt closed, got {:?}",
+            app.ui.prompt
+        );
+    }
+
+    /// Up/Down navigate the selection; out-of-range navigation clamps.
+    #[test]
+    fn watch_rules_modal_navigates_with_arrows() {
+        let mut app = test_app(default_bindings());
+        let session_id = app.git.sessions[0].id.clone();
+        let rules = vec![
+            make_watch_rule("a", "p1"),
+            make_watch_rule("b", "p2"),
+            make_watch_rule("c", "p3"),
+        ];
+        let (engine, _) = crate::watch::WatchEngine::new(session_id.clone(), &rules);
+        app.runtime.watch_engines.insert(session_id, engine);
+        app.open_watch_rules_prompt().expect("open");
+
+        // Down arrow advances.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .expect("down");
+        let PromptState::WatchRules(p) = &app.ui.prompt else {
+            panic!()
+        };
+        assert_eq!(p.selected, 1);
+        // Down again.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .expect("down");
+        let PromptState::WatchRules(p) = &app.ui.prompt else {
+            panic!()
+        };
+        assert_eq!(p.selected, 2);
+        // Down at end clamps.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .expect("down");
+        let PromptState::WatchRules(p) = &app.ui.prompt else {
+            panic!()
+        };
+        assert_eq!(p.selected, 2);
+        // Up moves back.
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .expect("up");
+        let PromptState::WatchRules(p) = &app.ui.prompt else {
+            panic!()
+        };
+        assert_eq!(p.selected, 1);
+    }
+
+    /// The `watch-rules` palette command opens the modal end-to-end.
+    #[test]
+    fn watch_rules_palette_command_opens_modal() {
+        let mut app = test_app(default_bindings());
+        // No engines attached — open via execute_command and verify the
+        // modal's empty state.
+        app.execute_command("watch-rules".to_string())
+            .expect("execute_command");
+        assert!(matches!(app.ui.prompt, PromptState::WatchRules(_)));
     }
 }

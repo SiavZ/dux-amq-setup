@@ -54,6 +54,38 @@ pub enum WatchEffect {
     StatusWarning(String),
 }
 
+/// Coarse rule state, exposed to the UI for the watch-rules modal.
+/// Mirrors the internal `RuleState` enum minus the timing fields, which
+/// the UI does not need.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuleStateKind {
+    /// Watching for a fresh match.
+    Idle,
+    /// Match observed; waiting for the backoff to elapse.
+    Pending,
+    /// Just fired; suppressing repeats until cooldown ends.
+    Cooling,
+    /// Budget exhausted or manually disarmed.
+    Disarmed,
+}
+
+/// Read-only snapshot of one rule's runtime state. Built by
+/// [`WatchEngine::rules_snapshot`] for the watch-rules modal.
+#[derive(Clone, Debug)]
+pub struct RuleSnapshot {
+    /// Position in the engine's rule list. Use this with
+    /// [`WatchEngine::disarm`] / [`WatchEngine::rearm`].
+    pub idx: usize,
+    /// Resolved label (rule.label or a truncated copy of the pattern).
+    pub label: String,
+    /// Number of times the rule has fired this session.
+    pub attempts_made: u32,
+    /// Per-rule cap from the rule's `budget.max_attempts`.
+    pub max_attempts: u32,
+    /// Current state of the rule's mini state machine.
+    pub state: RuleStateKind,
+}
+
 /// Per-rule runtime state.
 #[derive(Debug)]
 struct RuleRuntime {
@@ -166,6 +198,29 @@ impl WatchEngine {
     /// Number of loaded rules (after invalid-rule filtering).
     pub fn rule_count(&self) -> usize {
         self.rules.len()
+    }
+
+    /// Read-only snapshot of every loaded rule's state. Used by the
+    /// watch-rules modal to render the list — keeps the engine's
+    /// internal `RuleState` private while letting the UI display
+    /// armed/disarmed/cooling indicators.
+    pub fn rules_snapshot(&self) -> Vec<RuleSnapshot> {
+        self.rules
+            .iter()
+            .enumerate()
+            .map(|(idx, r)| RuleSnapshot {
+                idx,
+                label: r.label.clone(),
+                attempts_made: r.attempts_made,
+                max_attempts: r.rule.budget.max_attempts,
+                state: match r.state {
+                    RuleState::Idle => RuleStateKind::Idle,
+                    RuleState::Pending { .. } => RuleStateKind::Pending,
+                    RuleState::Cooling { .. } => RuleStateKind::Cooling,
+                    RuleState::Disarmed => RuleStateKind::Disarmed,
+                },
+            })
+            .collect()
     }
 
     /// Resolved label for the rule at `idx`, if any.

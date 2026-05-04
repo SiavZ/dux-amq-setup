@@ -88,6 +88,7 @@ pub enum Action {
     TogglePrBannerPosition,
     ForceReconnectAgent,
     ChangeTheme,
+    WatchRules,
 }
 
 /// Where a binding's key combo is matched.
@@ -256,6 +257,7 @@ impl Action {
             Action::TogglePrBannerPosition => "toggle_pr_banner_position",
             Action::ForceReconnectAgent => "force_reconnect_agent",
             Action::ChangeTheme => "change_theme",
+            Action::WatchRules => "watch_rules",
         }
     }
 
@@ -353,6 +355,9 @@ impl Action {
             }
             Action::ForceReconnectAgent => "Restart the agent without resuming the prior session.",
             Action::ChangeTheme => "Open a picker to switch the dux color theme.",
+            Action::WatchRules => {
+                "Open a modal listing every loaded watch rule across sessions, with controls to disarm or re-arm individual rules."
+            }
         }
     }
 
@@ -432,7 +437,8 @@ impl Action {
             | Action::TogglePrBannerPosition
             | Action::ForceReconnectAgent
             | Action::ChangeDefaultProvider
-            | Action::ChangeTheme => None,
+            | Action::ChangeTheme
+            | Action::WatchRules => None,
         }
     }
 }
@@ -1452,6 +1458,17 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         palette: Some(PaletteEntry {
             name: "force-reconnect-agent",
             description: "Force-reconnect the agent with a fresh session (no --continue)",
+        }),
+    },
+    BindingDef {
+        action: Action::WatchRules,
+        default_keys: &[],
+        scopes: &[],
+        help: None,
+        hint_contexts: &[],
+        palette: Some(PaletteEntry {
+            name: "watch-rules",
+            description: "Manage watch rules — disarm or re-arm individual rules across sessions",
         }),
     },
 ];
