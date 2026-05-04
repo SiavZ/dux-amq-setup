@@ -5,13 +5,14 @@
 //! caches. They are accessed from worker callbacks and the main loop, but are
 //! only incidentally touched by rendering code.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::amq_inject::QueuedMessage;
 use crate::lockfile::SingleInstanceLock;
 use crate::model::ProviderKind;
 
@@ -59,4 +60,23 @@ pub(crate) struct RuntimeState {
     /// whose provider has no rules in the config never get an entry —
     /// the per-tick scan is then skipped entirely. See `crate::watch`.
     pub(crate) watch_engines: HashMap<String, crate::watch::WatchEngine>,
+    /// Filesystem watcher for the AMQ inject-queue. Held to keep the
+    /// inotify thread alive; `None` when the drainer is disabled or
+    /// the watcher couldn't be created (graceful fallback to poll-only).
+    /// See `crate::amq_inject` for the underlying machinery and
+    /// `crate::app::amq_inject` for the App-side glue.
+    pub(crate) amq_inject_watcher: Option<Arc<Mutex<notify::RecommendedWatcher>>>,
+    /// Resolved queue root path. Cached so each tick doesn't re-resolve
+    /// `XDG_DATA_HOME`. Empty when `[amq.inject].enabled = false` or
+    /// resolution failed (no `$HOME`).
+    pub(crate) amq_inject_queue_dir: Option<PathBuf>,
+    /// Per-receiver delivery queue. Each entry is a `QueuedMessage`
+    /// already claimed via the `.inflight.` rename, so only this App
+    /// instance can deliver it. Drained by `App::tick_amq_inject` when
+    /// the matching session is idle.
+    pub(crate) amq_inject_pending: HashMap<String, VecDeque<QueuedMessage>>,
+    /// Last time we surfaced a "no matching session for receiver X"
+    /// status warning, keyed by receiver. Rate-limited so a queue full
+    /// of messages for an unknown handle doesn't spam the status line.
+    pub(crate) amq_inject_last_warned: HashMap<String, Instant>,
 }

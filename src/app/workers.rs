@@ -493,6 +493,9 @@ impl App {
                 WorkerEvent::ScrollbackUsage(scrollback_lines) => {
                     self.handle_scrollback_usage_event(scrollback_lines);
                 }
+                WorkerEvent::AmqInjectScanRequested => {
+                    self.drain_inject_queue_dir();
+                }
                 WorkerEvent::AddProjectMetaReady { path, name, result } => {
                     self.git.add_project_in_flight = false;
                     match result {
