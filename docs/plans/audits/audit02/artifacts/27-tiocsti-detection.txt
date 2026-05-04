@@ -1,0 +1,36 @@
+#       operator can lift it with `sudo sysctl -w dev.tty.legacy_tiocsti=1`)
+#   2 — sysctl key absent / file not found (kernel built without the
+#       option; runtime toggle won't help)
+#
+# Reads `/proc/sys/dev/tty/legacy_tiocsti` directly rather than shelling
+# out to `sysctl`. The `sysctl` binary lives in `/sbin` on Debian and
+# isn't on a non-root user's PATH; the procfs file IS readable to all
+# users (mode 0644 on stock kernels). One less external dependency.
+tiocsti_status() {
+  # `TIOCSTI_PROC_PATH` is overridable for tests; production callers
+  # leave it unset and we fall back to the canonical procfs file.
+  local proc_path="${TIOCSTI_PROC_PATH:-/proc/sys/dev/tty/legacy_tiocsti}"
+  if [[ ! -e "$proc_path" ]]; then
+    return 2
+  fi
+  local val
+  val=$(<"$proc_path") 2>/dev/null || return 2
+--
+if tiocsti_status; then
+  # Kernel supports it AND it's enabled — clear any stale sentinel from
+  # a previous install on a different (locked-down) kernel.
+  rm -f "$TIOCSTI_FLAG"
+  ok "kernel: dev.tty.legacy_tiocsti=1 — amq wake will use TIOCSTI"
+else
+  case $? in
+    1)
+      warn "kernel: dev.tty.legacy_tiocsti=0 — amq wake injection will not work."
+      warn "  Either run 'sudo sysctl -w dev.tty.legacy_tiocsti=1' (if your kernel"
+      warn "  supports it) or rely on the inject bridge (default since Phase 13)."
+      ;;
+    2)
+      warn "kernel: TIOCSTI not present (CONFIG_LEGACY_TIOCSTI=n)."
+      warn "  Switching to --inject-via bridge mode for amq wake; runtime sysctl"
+---runtime check---
+/bin/bash: line 5: sysctl: command not found
+cat: /proc/sys/dev/tty/legacy_tiocsti: No such file or directory

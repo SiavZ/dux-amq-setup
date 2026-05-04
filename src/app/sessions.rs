@@ -17,7 +17,7 @@ impl App {
                         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
                     })
             });
-        self.prompt = PromptState::BrowseProjects {
+        self.ui.prompt = PromptState::BrowseProjects {
             current_dir: start_dir.clone(),
             entries: Vec::new(),
             loading: true,
@@ -47,11 +47,7 @@ impl App {
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(raw_path.trim()));
         logger::info(&format!("attempting to add project {}", path.display()));
-        if !path.exists() || !git::is_git_repo(&path) {
-            logger::error(&format!("add project rejected for {}", path.display()));
-            self.set_error(format!("\"{}\" is not a git repository.", path.display()));
-            return Ok(());
-        }
+
         if self
             .projects
             .iter()
@@ -63,12 +59,44 @@ impl App {
             ));
             return Ok(());
         }
-        let branch = git::current_branch(&path)?;
+
+        if self.add_project_in_flight {
+            self.set_warning(
+                "Already validating an \"add project\" request. Wait for it to finish.",
+            );
+            return Ok(());
+        }
+
+        // Probe is_git_repo + current_branch + remote_default_branch on a
+        // worker thread. The result lands as
+        // `WorkerEvent::AddProjectMetaReady`, which decides whether to
+        // open the branch-mismatch warning, surface a non-repo error, or
+        // call `finish_add_project` directly. This keeps the UI responsive
+        // even when the repo is on a slow filesystem or holds a lock.
+        self.add_project_in_flight = true;
+        self.set_busy(format!(
+            "Validating \"{}\" as a git repository\u{2026}",
+            path.display()
+        ));
+        workers::dispatch_add_project_meta(self.runtime.worker_tx.clone(), path, name);
+        Ok(())
+    }
+
+    /// Resume `add_project` after the background git probe completed
+    /// successfully. Splits out so it can be called from the worker-event
+    /// handler without re-doing the duplicate-path check.
+    pub(crate) fn resume_add_project_after_meta(
+        &mut self,
+        path: PathBuf,
+        name: String,
+        meta: AddProjectMeta,
+    ) -> Result<()> {
+        let branch = meta.current_branch;
 
         // Check whether the current branch matches the remote default branch.
         // Two-tier warning: confident when origin/HEAD is available, heuristic
         // when it isn't but the branch name doesn't look like a main branch.
-        let warning_kind = match git::remote_default_branch(&path) {
+        let warning_kind = match meta.remote_default {
             Some(default) if default != branch => Some(BranchWarningKind::Known {
                 default_branch: default,
             }),
@@ -83,7 +111,7 @@ impl App {
             // "switch to main, then add". The heuristic path ignores this
             // field (no checkbox is shown).
             let checkout_default = matches!(kind, BranchWarningKind::Known { .. });
-            self.prompt = PromptState::ConfirmNonDefaultBranch {
+            self.ui.prompt = PromptState::ConfirmNonDefaultBranch {
                 path: path.to_string_lossy().to_string(),
                 name,
                 current_branch: branch,
@@ -133,6 +161,7 @@ impl App {
             default_provider: self.config.default_provider(),
             current_branch: branch,
             path_missing: false,
+            meta_loaded: true,
         });
         self.rebuild_left_items();
         logger::info(&format!("registered project {}", path_buf.display()));
@@ -186,9 +215,9 @@ impl App {
             randomized_name = Some(name);
         }
 
-        self.input_target = InputTarget::None;
-        self.fullscreen_overlay = FullscreenOverlay::None;
-        self.prompt = PromptState::NameNewAgent {
+        self.ui.input_target = InputTarget::None;
+        self.ui.fullscreen_overlay = FullscreenOverlay::None;
+        self.ui.prompt = PromptState::NameNewAgent {
             request,
             input,
             randomize_name,
@@ -211,7 +240,7 @@ impl App {
         self.set_busy(format!(
             "Checking out \"{target_branch}\" in {path} before adding the project..."
         ));
-        let worker_tx = self.worker_tx.clone();
+        let worker_tx = self.runtime.worker_tx.clone();
         thread::spawn(move || {
             super::workers::run_add_project_checkout_job(path, name, target_branch, worker_tx);
         });
@@ -226,16 +255,58 @@ impl App {
             self.set_error("An agent is already being created or forked.");
             return Ok(());
         }
+        if let Some(reason) = self.refuse_agent_spawn_for_limits() {
+            self.set_error(reason);
+            return Ok(());
+        }
         self.create_agent_in_flight = true;
         self.set_busy(busy_message);
         let paths = self.paths.clone();
         let config = self.config.clone();
-        let worker_tx = self.worker_tx.clone();
+        let worker_tx = self.runtime.worker_tx.clone();
         let term_size = crossterm::terminal::size().unwrap_or((80, 24));
         thread::spawn(move || {
             super::workers::run_create_agent_job(request, paths, config, worker_tx, term_size);
         });
         Ok(())
+    }
+
+    /// Resource-cap gate evaluated before any user-initiated agent spawn.
+    ///
+    /// Returns `Some(message)` when a [`crate::config::LimitsConfig`] cap is
+    /// breached (max_panes or disk_high_water_pct), in which case the
+    /// caller should surface the message via [`Self::set_error`] and skip
+    /// the spawn. The message is intentionally verbose and actionable — it
+    /// names the offending knob, the current observed value, and the
+    /// recovery path so an operator can fix the situation without
+    /// consulting the docs. Phase 15's auto-resume scheduler is a
+    /// different code path; this gate is for user-initiated spawns only.
+    pub(crate) fn refuse_agent_spawn_for_limits(&self) -> Option<String> {
+        let limits = &self.config.limits;
+        let active_panes = self
+            .sessions
+            .iter()
+            .filter(|s| s.status == SessionStatus::Active)
+            .count();
+        if limits.max_panes > 0 && active_panes >= limits.max_panes {
+            return Some(format!(
+                "Refusing new agent: {active_panes} active panes already running \
+                 (config limits.max_panes = {}). Detach an unused agent or raise \
+                 the cap to recover.",
+                limits.max_panes
+            ));
+        }
+        if let Some(pct) = self.disk_usage_pct
+            && pct >= limits.disk_high_water_pct
+        {
+            return Some(format!(
+                "Refusing new agent: persistent disk at {pct}% \
+                 (limits.disk_high_water_pct = {}%). Run `dux session purge` \
+                 or extend the volume to recover.",
+                limits.disk_high_water_pct
+            ));
+        }
+        None
     }
 
     pub(crate) fn spawn_pty_for_session(
@@ -273,7 +344,45 @@ impl App {
         let cfg = provider_config(&self.config, &session.provider);
         cfg.supports_session_resume() && session.has_started_provider(&session.provider)
     }
+}
 
+/// Worker-thread variant of [`App::spawn_pty_for_session`].
+///
+/// Used by [`App::auto_resume_all_sessions`] so the bounded scheduler can
+/// run PTY spawns off the UI thread (each `PtyClient::spawn` is a
+/// fork+exec plus a TLS handshake when the provider boots — bounded by
+/// `[auto_resume]` config). Logs use the same format so log scraping
+/// keeps working.
+pub(crate) fn spawn_pty_for_auto_resume(
+    config: &Config,
+    session: &AgentSession,
+    resume: bool,
+    last_pty_size: (u16, u16),
+    scrollback_lines: usize,
+) -> Result<PtyClient> {
+    let cfg = provider_config(config, &session.provider);
+    let launch_args = cfg.interactive_args(resume);
+    let (rows, cols) = last_pty_size;
+    logger::debug(&format!(
+        "spawning PTY {:?} {:?} in {} ({}x{}, resume_supported={})",
+        cfg.command,
+        launch_args,
+        session.worktree_path,
+        cols,
+        rows,
+        cfg.supports_session_resume()
+    ));
+    PtyClient::spawn(
+        &cfg.command,
+        launch_args,
+        Path::new(&session.worktree_path),
+        rows,
+        cols,
+        scrollback_lines,
+    )
+}
+
+impl App {
     pub(crate) fn spawn_companion_terminal_for_session(
         &self,
         session: &AgentSession,
@@ -302,15 +411,15 @@ impl App {
     }
 
     pub(crate) fn show_agent_surface(&mut self) {
-        self.focus = FocusPane::Center;
+        self.ui.focus = FocusPane::Center;
         self.center_mode = CenterMode::Agent;
         self.session_surface = SessionSurface::Agent;
-        self.fullscreen_overlay = FullscreenOverlay::None;
+        self.ui.fullscreen_overlay = FullscreenOverlay::None;
     }
 
     pub(crate) fn show_companion_terminal_surface(&mut self) {
         self.session_surface = SessionSurface::Terminal;
-        self.fullscreen_overlay = FullscreenOverlay::Terminal;
+        self.ui.fullscreen_overlay = FullscreenOverlay::Terminal;
     }
 
     /// Always spawns a new companion terminal for the selected session.
@@ -335,7 +444,7 @@ impl App {
                 .unwrap_or_else(|| session.branch_name.clone());
             format!("{base} ({count})")
         };
-        self.companion_terminals.insert(
+        self.runtime.companion_terminals.insert(
             terminal_id.clone(),
             CompanionTerminal {
                 session_id: session.id.clone(),
@@ -347,7 +456,7 @@ impl App {
         self.active_terminal_id = Some(terminal_id);
         self.terminal_return_to_list = true;
         self.show_companion_terminal_surface();
-        self.input_target = InputTarget::Terminal;
+        self.ui.input_target = InputTarget::Terminal;
         self.set_info(format!(
             "Launched terminal for agent \"{}\".",
             session.branch_name
@@ -364,6 +473,7 @@ impl App {
         };
 
         let first = self
+            .runtime
             .companion_terminals
             .iter()
             .filter(|(_, t)| t.session_id == session.id)
@@ -378,7 +488,7 @@ impl App {
             self.active_terminal_id = Some(terminal_id);
             self.terminal_return_to_list = false;
             self.show_companion_terminal_surface();
-            self.input_target = InputTarget::Terminal;
+            self.ui.input_target = InputTarget::Terminal;
             self.set_info(format!("Opened terminal \"{label}\"."));
             Ok(())
         } else {
@@ -414,7 +524,7 @@ impl App {
         } else {
             format!("{base} ({count})")
         };
-        self.companion_terminals.insert(
+        self.runtime.companion_terminals.insert(
             terminal_id.clone(),
             CompanionTerminal {
                 session_id: session.id.clone(),
@@ -426,7 +536,7 @@ impl App {
         self.active_terminal_id = Some(terminal_id);
         self.terminal_return_to_list = true;
         self.show_companion_terminal_surface();
-        self.input_target = InputTarget::Terminal;
+        self.ui.input_target = InputTarget::Terminal;
         self.set_info(format!(
             "Launched new terminal for agent \"{}\".",
             session.branch_name
@@ -468,7 +578,7 @@ impl App {
         self.active_terminal_id = Some(terminal_id);
         self.terminal_return_to_list = false;
         self.show_companion_terminal_surface();
-        self.input_target = InputTarget::Terminal;
+        self.ui.input_target = InputTarget::Terminal;
         self.set_info(format!("Opened terminal \"{label}\"."));
         Ok(())
     }
@@ -510,81 +620,13 @@ impl App {
             .sessions
             .iter()
             .any(|s| s.id != session.id && s.worktree_path == session.worktree_path);
-        self.prompt = PromptState::ConfirmDeleteAgent {
+        self.ui.prompt = PromptState::ConfirmDeleteAgent {
             session_id: session.id.clone(),
             branch_name: session.branch_name.clone(),
             focus: DeleteAgentFocus::Cancel, // Cancel is the safe default
             delete_worktree: false,          // Opt-in destructive action
             worktree_shared,
         };
-        Ok(())
-    }
-
-    /// Delete the agent session identified by `session_id`, blocking the
-    /// calling thread for any git work. Used by bulk flows like project
-    /// deletion, where we must complete all removals before the parent
-    /// operation proceeds. User-initiated single-agent deletes go through
-    /// [`begin_delete_session`] so git work runs off the UI thread.
-    ///
-    /// When `delete_worktree` is true AND no other sessions share the worktree,
-    /// the git worktree and branch are removed first. If the git removal fails,
-    /// the session record is preserved so the caller can retry without losing
-    /// the agent. When `delete_worktree` is false, the worktree and branch
-    /// are always preserved.
-    pub(crate) fn do_delete_session(
-        &mut self,
-        session_id: &str,
-        delete_worktree: bool,
-    ) -> Result<()> {
-        let Some(session) = self.sessions.iter().find(|s| s.id == session_id).cloned() else {
-            return Ok(());
-        };
-        logger::info(&format!(
-            "deleting session {} at {} (delete_worktree={}, sync)",
-            session.id, session.worktree_path, delete_worktree
-        ));
-        let Some(project) = self
-            .projects
-            .iter()
-            .find(|project| project.id == session.project_id)
-            .cloned()
-        else {
-            return Ok(());
-        };
-        let other_sessions_on_worktree = self
-            .sessions
-            .iter()
-            .any(|s| s.id != session.id && s.worktree_path == session.worktree_path);
-
-        let should_remove_worktree = delete_worktree && !other_sessions_on_worktree;
-
-        // Attempt git operations FIRST so a failure leaves the agent intact.
-        // Worktrees are user data — if we can't remove the worktree cleanly, we
-        // must not leave the user with a deleted agent record and an orphaned
-        // worktree on disk.
-        //
-        // Callers must ensure no async worker is already removing this
-        // worktree (`pending_deletions` should not contain this session).
-        // `delete_selected_project` checks this at entry; `begin_delete_session`
-        // uses a separate async path entirely. If a caller violates this
-        // contract two concurrent git calls will race, so we assert in debug.
-        debug_assert!(
-            !self.pending_deletions.contains(session_id),
-            "do_delete_session called while an async delete worker is in-flight for {}",
-            session_id,
-        );
-        let remove_outcome = if should_remove_worktree {
-            let result = git::remove_worktree(
-                Path::new(&project.path),
-                Path::new(&session.worktree_path),
-                &session.branch_name,
-            )?;
-            Some(result.branch_already_deleted)
-        } else {
-            None
-        };
-
-        self.finish_delete_session(session_id, delete_worktree, remove_outcome, true)?;
         Ok(())
     }
 
@@ -637,7 +679,7 @@ impl App {
             let project_path = project.path.clone();
             let worktree_path = session.worktree_path.clone();
             let branch_name = session.branch_name.clone();
-            let tx = self.worker_tx.clone();
+            let tx = self.runtime.worker_tx.clone();
             std::thread::spawn(move || {
                 let result = git::remove_worktree(
                     Path::new(&project_path),
@@ -708,8 +750,8 @@ impl App {
         // would vanish from the UI but reappear on restart.
         self.session_store.delete_session(&session.id)?;
 
-        self.providers.remove(&session.id);
-        self.running_provider_pins.remove(&session.id);
+        self.runtime.providers.remove(&session.id);
+        self.runtime.running_provider_pins.remove(&session.id);
         self.last_pty_activity.remove(&session.id);
         self.resume_fallback_candidates.remove(&session.id);
         self.clear_companion_terminals_for_session(&session.id);
@@ -789,7 +831,7 @@ impl App {
             self.set_error("Select a terminal first.");
             return Ok(());
         };
-        self.prompt = PromptState::ConfirmDeleteTerminal {
+        self.ui.prompt = PromptState::ConfirmDeleteTerminal {
             terminal_id: (*terminal_id).clone(),
             terminal_label: terminal.label.clone(),
             confirm_selected: false, // Cancel is default
@@ -799,17 +841,18 @@ impl App {
 
     pub(crate) fn do_delete_terminal(&mut self, terminal_id: &str) {
         let label = self
+            .runtime
             .companion_terminals
             .get(terminal_id)
             .map(|t| t.label.clone());
         // Removing from the map drops PtyClient, which kills the child process.
-        self.companion_terminals.remove(terminal_id);
+        self.runtime.companion_terminals.remove(terminal_id);
         if self.active_terminal_id.as_deref() == Some(terminal_id) {
             self.active_terminal_id = None;
         }
         self.clamp_terminal_cursor();
         if let Some(label) = label {
-            self.set_info(format!("Deleted terminal \"{}\"", label));
+            self.set_info(format!("Deleted terminal \"{label}\""));
         }
     }
 
@@ -845,9 +888,9 @@ impl App {
             self.set_error("No providers are configured.");
             return Ok(());
         }
-        self.input_target = InputTarget::None;
-        self.fullscreen_overlay = FullscreenOverlay::None;
-        self.prompt = PromptState::ChangeAgentProvider(ChangeAgentProviderPrompt {
+        self.ui.input_target = InputTarget::None;
+        self.ui.fullscreen_overlay = FullscreenOverlay::None;
+        self.ui.prompt = PromptState::ChangeAgentProvider(ChangeAgentProviderPrompt {
             session_id: session.id.clone(),
             session_label: self.session_label(&session),
             worktree_path: session.worktree_path.clone(),
@@ -862,12 +905,12 @@ impl App {
     }
 
     pub(crate) fn apply_change_agent_provider(&mut self) -> Result<()> {
-        let prompt = match &self.prompt {
+        let prompt = match &self.ui.prompt {
             PromptState::ChangeAgentProvider(prompt) => prompt.clone(),
             _ => return Ok(()),
         };
         let Some(selected) = prompt.options.get(prompt.selected).cloned() else {
-            self.prompt = PromptState::None;
+            self.ui.prompt = PromptState::None;
             self.set_error("Select a provider first.");
             return Ok(());
         };
@@ -876,13 +919,13 @@ impl App {
             .iter()
             .position(|session| session.id == prompt.session_id)
         else {
-            self.prompt = PromptState::None;
+            self.ui.prompt = PromptState::None;
             self.set_error("The selected agent is no longer available.");
             return Ok(());
         };
 
         if selected.is_current {
-            self.prompt = PromptState::None;
+            self.ui.prompt = PromptState::None;
             self.set_info(format!(
                 "Agent \"{}\" already uses {}. Pick another provider to swap.",
                 prompt.session_label,
@@ -891,10 +934,10 @@ impl App {
             return Ok(());
         }
 
-        self.prompt = PromptState::None;
+        self.ui.prompt = PromptState::None;
 
         let session_id = self.sessions[session_index].id.clone();
-        let running = self.providers.contains_key(&session_id);
+        let running = self.runtime.providers.contains_key(&session_id);
         let previous_provider = self.sessions[session_index].provider.clone();
 
         let session = &mut self.sessions[session_index];
@@ -907,7 +950,8 @@ impl App {
         // the user exits and relaunches the agent. Only set on the first
         // swap-while-running — later swaps don't change what's spawned.
         if running {
-            self.running_provider_pins
+            self.runtime
+                .running_provider_pins
                 .entry(session_id.clone())
                 .or_insert(previous_provider.clone());
         }
@@ -967,9 +1011,9 @@ impl App {
             .position(|option| option.is_current)
             .unwrap_or(0);
         let current = self.config.default_provider();
-        self.input_target = InputTarget::None;
-        self.fullscreen_overlay = FullscreenOverlay::None;
-        self.prompt = PromptState::ChangeDefaultProvider(ChangeDefaultProviderPrompt {
+        self.ui.input_target = InputTarget::None;
+        self.ui.fullscreen_overlay = FullscreenOverlay::None;
+        self.ui.prompt = PromptState::ChangeDefaultProvider(ChangeDefaultProviderPrompt {
             current,
             options,
             selected,
@@ -982,16 +1026,16 @@ impl App {
     }
 
     pub(crate) fn apply_change_default_provider(&mut self) -> Result<()> {
-        let prompt = match &self.prompt {
+        let prompt = match &self.ui.prompt {
             PromptState::ChangeDefaultProvider(prompt) => prompt.clone(),
             _ => return Ok(()),
         };
         let Some(selected) = prompt.options.get(prompt.selected).cloned() else {
-            self.prompt = PromptState::None;
+            self.ui.prompt = PromptState::None;
             self.set_error("Select a provider first.");
             return Ok(());
         };
-        self.prompt = PromptState::None;
+        self.ui.prompt = PromptState::None;
         if selected.is_current {
             self.set_info(format!(
                 "{} is already the default provider. Pick a different one to change it.",
@@ -1028,9 +1072,9 @@ impl App {
             .iter()
             .position(|opt| opt.id == current)
             .unwrap_or(0);
-        self.input_target = InputTarget::None;
-        self.fullscreen_overlay = FullscreenOverlay::None;
-        self.prompt = PromptState::ChangeTheme(ChangeThemePrompt {
+        self.ui.input_target = InputTarget::None;
+        self.ui.fullscreen_overlay = FullscreenOverlay::None;
+        self.ui.prompt = PromptState::ChangeTheme(ChangeThemePrompt {
             options,
             selected,
             current,
@@ -1048,7 +1092,7 @@ impl App {
     /// just leaves the previously-previewed theme in place; the picker stays
     /// open so the user can pick a different one.
     pub(crate) fn preview_change_theme_selection(&mut self) {
-        let id = match &self.prompt {
+        let id = match &self.ui.prompt {
             PromptState::ChangeTheme(prompt) => prompt
                 .options
                 .get(prompt.selected)
@@ -1064,11 +1108,11 @@ impl App {
     /// Cancel the theme picker. Reloads the theme that was active when the
     /// picker opened so any live previews are reverted.
     pub(crate) fn cancel_change_theme(&mut self) {
-        let original = match &self.prompt {
+        let original = match &self.ui.prompt {
             PromptState::ChangeTheme(prompt) => Some(prompt.current.clone()),
             _ => None,
         };
-        self.prompt = PromptState::None;
+        self.ui.prompt = PromptState::None;
         if let Some(original) = original
             && let Ok(theme) = crate::theme::load(&original, &self.paths)
         {
@@ -1077,16 +1121,16 @@ impl App {
     }
 
     pub(crate) fn apply_change_theme(&mut self) -> Result<()> {
-        let prompt = match &self.prompt {
+        let prompt = match &self.ui.prompt {
             PromptState::ChangeTheme(prompt) => prompt.clone(),
             _ => return Ok(()),
         };
         let Some(selected) = prompt.options.get(prompt.selected).cloned() else {
-            self.prompt = PromptState::None;
+            self.ui.prompt = PromptState::None;
             self.set_error("Select a theme first.");
             return Ok(());
         };
-        self.prompt = PromptState::None;
+        self.ui.prompt = PromptState::None;
         if selected.id == prompt.current {
             self.set_info(format!(
                 "Theme \"{}\" is already active. Pick a different one to change it.",
@@ -1152,11 +1196,10 @@ impl App {
             return Ok(());
         };
 
-        // Refuse if any of this project's sessions have an async worktree
-        // removal in-flight. `do_delete_session` runs git synchronously and
-        // would race the worker, potentially leaving the project deletion
-        // half-finished. The user must wait for the worker to complete (or
-        // fail) before retrying.
+        // Refuse if any of this project's sessions already have an async
+        // worktree removal in-flight. We're about to dispatch new ones for
+        // the rest, but firing a duplicate for an already-pending session
+        // would race the existing worker.
         let pending_in_project = self
             .sessions
             .iter()
@@ -1191,8 +1234,10 @@ impl App {
                     .unwrap_or(self.selected_left);
                 // When deleting a project we also remove each agent's
                 // worktree — the project itself is going away, so leaving
-                // orphaned worktrees around would be surprising.
-                self.do_delete_session(&session_id, true)?;
+                // orphaned worktrees around would be surprising. Use the
+                // async path so a stuck `git worktree remove` cannot hang
+                // the UI thread; the worker reply finishes the cleanup.
+                self.begin_delete_session(&session_id, true);
             }
         }
         self.projects.retain(|candidate| candidate.id != project.id);
@@ -1225,8 +1270,8 @@ impl App {
             return Ok(());
         }
         // Kill existing PTY if the agent is still active.
-        self.providers.remove(&session.id);
-        self.running_provider_pins.remove(&session.id);
+        self.runtime.providers.remove(&session.id);
+        self.runtime.running_provider_pins.remove(&session.id);
         self.last_pty_activity.remove(&session.id);
         self.resume_fallback_candidates.remove(&session.id);
 
@@ -1239,12 +1284,12 @@ impl App {
         ));
         match self.spawn_pty_for_session(&session, false) {
             Ok(client) => {
-                self.providers.insert(session.id.clone(), client);
+                self.runtime.providers.insert(session.id.clone(), client);
                 self.mark_session_status(&session.id, SessionStatus::Active);
                 self.mark_session_provider_started(&session.id);
                 self.show_agent_surface();
-                self.input_target = InputTarget::Agent;
-                self.fullscreen_overlay = FullscreenOverlay::Agent;
+                self.ui.input_target = InputTarget::Agent;
+                self.ui.fullscreen_overlay = FullscreenOverlay::Agent;
                 let proj_name = self.project_name_for_session(&session);
                 let mut msg = format!(
                     "Started fresh {} session for agent \"{}\" in project \"{}\". Use /sessions inside the agent to restore a prior conversation.",
@@ -1254,8 +1299,7 @@ impl App {
                 );
                 if let Some(detached) = &detached_label {
                     msg.push_str(&format!(
-                        " Agent \"{}\" was detached to avoid worktree conflicts.",
-                        detached,
+                        " Agent \"{detached}\" was detached to avoid worktree conflicts.",
                     ));
                 }
                 if let Some(project) = self.projects.iter().find(|p| p.id == session.project_id)
@@ -1284,8 +1328,14 @@ impl App {
             self.set_error("Select a stopped agent first to reconnect.");
             return Ok(());
         };
-        logger::info(&format!("reconnecting session {}", session.id));
-        if self.providers.contains_key(&session.id) {
+        tracing::info!(
+            target: "dux::sessions",
+            session_id = %session.id,
+            branch = %session.branch_name,
+            provider = %session.provider.as_str(),
+            "reconnecting session",
+        );
+        if self.runtime.providers.contains_key(&session.id) {
             self.set_info(format!(
                 "Agent \"{}\" is already connected.",
                 session.branch_name
@@ -1305,7 +1355,7 @@ impl App {
         let use_resume = self.should_resume_session(&session);
         match self.spawn_pty_for_session(&session, use_resume) {
             Ok(client) => {
-                self.providers.insert(session.id.clone(), client);
+                self.runtime.providers.insert(session.id.clone(), client);
                 if use_resume {
                     self.resume_fallback_candidates
                         .insert(session.id.clone(), Instant::now());
@@ -1313,8 +1363,8 @@ impl App {
                 self.mark_session_status(&session.id, SessionStatus::Active);
                 self.mark_session_provider_started(&session.id);
                 self.show_agent_surface();
-                self.input_target = InputTarget::Agent;
-                self.fullscreen_overlay = FullscreenOverlay::Agent;
+                self.ui.input_target = InputTarget::Agent;
+                self.ui.fullscreen_overlay = FullscreenOverlay::Agent;
                 let proj_name = self.project_name_for_session(&session);
                 let mut msg = if use_resume {
                     format!(
@@ -1333,8 +1383,7 @@ impl App {
                 };
                 if let Some(detached) = &detached_label {
                     msg.push_str(&format!(
-                        " Agent \"{}\" was detached to avoid worktree conflicts.",
-                        detached,
+                        " Agent \"{detached}\" was detached to avoid worktree conflicts.",
                     ));
                 }
                 if let Some(project) = self.projects.iter().find(|p| p.id == session.project_id)
@@ -1383,7 +1432,7 @@ impl App {
             worktree_path,
             rel_path,
         };
-        self.focus = FocusPane::Center;
+        self.ui.focus = FocusPane::Center;
         Ok(())
     }
 
@@ -1429,7 +1478,7 @@ impl App {
                 match self.clipboard.copy_text(
                     &p,
                     "Agent's path copied to clipboard.",
-                    &self.worker_tx,
+                    &self.runtime.worker_tx,
                 ) {
                     Ok(()) => self.set_busy("Copying path to clipboard…"),
                     Err(e) => self.set_error(format!("Copy path failed: {e}")),
@@ -1494,7 +1543,7 @@ impl App {
             })
             .unwrap_or(0);
         let session_label = self.session_label(&session);
-        self.prompt = PromptState::PickEditor {
+        self.ui.prompt = PromptState::PickEditor {
             session_label,
             worktree_path: session.worktree_path.clone(),
             editors,
@@ -1527,7 +1576,7 @@ impl App {
             return Ok(());
         }
 
-        self.prompt = PromptState::KillRunning(KillRunningPrompt {
+        self.ui.prompt = PromptState::KillRunning(KillRunningPrompt {
             runtimes,
             filter: TextInput::new(),
             searching: false,
@@ -1549,7 +1598,7 @@ impl App {
         let mut runtimes = Vec::new();
 
         for session in &self.sessions {
-            if !self.providers.contains_key(&session.id) {
+            if !self.runtime.providers.contains_key(&session.id) {
                 continue;
             }
             let project_name = self.project_name_for_session(session);
@@ -1667,7 +1716,7 @@ impl App {
         &mut self,
         action: KillRunningAction,
     ) -> Result<()> {
-        let PromptState::KillRunning(prompt) = &self.prompt else {
+        let PromptState::KillRunning(prompt) = &self.ui.prompt else {
             return Ok(());
         };
         let prompt = prompt.clone();
@@ -1705,7 +1754,7 @@ impl App {
             return Ok(());
         }
 
-        self.prompt = PromptState::ConfirmKillRunning(ConfirmKillRunningPrompt {
+        self.ui.prompt = PromptState::ConfirmKillRunning(ConfirmKillRunningPrompt {
             previous: prompt,
             action,
             target_ids,
@@ -1732,8 +1781,8 @@ impl App {
         for target_id in target_ids {
             match target_id {
                 RuntimeTargetId::Agent(session_id) => {
-                    if self.providers.remove(session_id).is_some() {
-                        self.running_provider_pins.remove(session_id);
+                    if self.runtime.providers.remove(session_id).is_some() {
+                        self.runtime.running_provider_pins.remove(session_id);
                         self.last_pty_activity.remove(session_id);
                         self.mark_session_status(session_id, SessionStatus::Detached);
                         killed_agents += 1;
@@ -1743,7 +1792,12 @@ impl App {
                     }
                 }
                 RuntimeTargetId::Terminal(terminal_id) => {
-                    if self.companion_terminals.remove(terminal_id).is_some() {
+                    if self
+                        .runtime
+                        .companion_terminals
+                        .remove(terminal_id)
+                        .is_some()
+                    {
                         killed_terminals += 1;
                         if active_terminal_id.as_deref() == Some(terminal_id.as_str()) {
                             active_terminal_killed = true;
@@ -1756,20 +1810,21 @@ impl App {
         if active_terminal_killed {
             self.active_terminal_id = None;
             if self.session_surface == SessionSurface::Terminal {
-                self.input_target = InputTarget::None;
-                self.fullscreen_overlay = FullscreenOverlay::None;
+                self.ui.input_target = InputTarget::None;
+                self.ui.fullscreen_overlay = FullscreenOverlay::None;
                 self.session_surface = SessionSurface::Agent;
             }
         }
 
         if selected_agent_killed && self.session_surface == SessionSurface::Agent {
-            self.input_target = InputTarget::None;
-            self.fullscreen_overlay = FullscreenOverlay::None;
-            self.focus = FocusPane::Left;
+            self.ui.input_target = InputTarget::None;
+            self.ui.fullscreen_overlay = FullscreenOverlay::None;
+            self.ui.focus = FocusPane::Left;
         }
 
         self.clamp_terminal_cursor();
-        self.has_active_processes
+        self.runtime
+            .has_active_processes
             .store(self.running_process_count() > 0, Ordering::Relaxed);
 
         (killed_agents, killed_terminals)
@@ -1796,21 +1851,20 @@ impl App {
             .find(|s| {
                 s.id != exclude_id
                     && s.worktree_path == worktree_path
-                    && self.providers.contains_key(&s.id)
+                    && self.runtime.providers.contains_key(&s.id)
             })
             .cloned()?;
 
         let label = self.session_label(&conflicting);
         let provider = conflicting.provider.as_str().to_string();
-        self.providers.remove(&conflicting.id);
-        self.running_provider_pins.remove(&conflicting.id);
+        self.runtime.providers.remove(&conflicting.id);
+        self.runtime.running_provider_pins.remove(&conflicting.id);
         self.last_pty_activity.remove(&conflicting.id);
         self.resume_fallback_candidates.remove(&conflicting.id);
         self.mark_session_status(&conflicting.id, SessionStatus::Detached);
 
         logger::info(&format!(
-            "auto-detached {} agent \"{}\" to avoid worktree conflict",
-            provider, label,
+            "auto-detached {provider} agent \"{label}\" to avoid worktree conflict",
         ));
         Some(label)
     }
@@ -1860,7 +1914,55 @@ mod tests {
         let (worker_tx, worker_rx) = mpsc::channel();
         let single_instance_lock = crate::lockfile::SingleInstanceLock::acquire(&paths.lock_path)
             .expect("single-instance lock for test App");
+        let ui = UiState {
+            focus: FocusPane::Left,
+            fullscreen_overlay: FullscreenOverlay::None,
+            prompt: PromptState::None,
+            input_target: InputTarget::None,
+            help_scroll: None,
+            last_help_height: 0,
+            last_help_lines: 0,
+            resize_mode: false,
+            left_collapsed: false,
+            right_collapsed: false,
+            right_hidden: false,
+            mouse_layout: MouseLayoutState::default(),
+            overlay_layout: OverlayMouseLayoutState::default(),
+            mouse_drag: None,
+            last_mouse_click: None,
+            pressed_button: None,
+            macro_bar: None,
+            force_redraw: false,
+            welcome_tip_index: 0,
+            welcome_logo_visible: false,
+            welcome_logo_alt: false,
+            welcome_tip_selection: usize::MAX,
+            pr_banner_at_bottom: true,
+        };
+        let runtime = RuntimeState {
+            worker_tx,
+            worker_rx,
+            providers: std::collections::HashMap::new(),
+            running_provider_pins: std::collections::HashMap::new(),
+            companion_terminals: std::collections::HashMap::new(),
+            pulls_in_flight: std::collections::HashSet::new(),
+            watched_worktree: Arc::new(Mutex::new(None::<PathBuf>)),
+            has_active_processes: Arc::new(AtomicBool::new(false)),
+            sigwinch_flag: Arc::new(AtomicBool::new(false)),
+            branch_sync_sessions: Arc::new(Mutex::new(Vec::new())),
+            gh_status: crate::model::GhStatus::Unknown,
+            github_integration_enabled: false,
+            pr_statuses: std::collections::HashMap::new(),
+            pr_sync_sessions: Arc::new(Mutex::new(Vec::new())),
+            pr_sync_enabled: Arc::new(AtomicBool::new(false)),
+            pr_last_checked: std::collections::HashMap::new(),
+            refs_watcher: None,
+            refs_watch_paths: std::collections::HashMap::new(),
+            _single_instance_lock: single_instance_lock,
+        };
         let mut app = App {
+            ui,
+            runtime,
             config: Config::default(),
             paths,
             bindings,
@@ -1885,31 +1987,18 @@ mod tests {
             terminal_pane_height_pct: 35,
             staged_pane_height_pct: 50,
             commit_pane_height_pct: 40,
-            focus: FocusPane::Left,
             center_mode: CenterMode::Agent,
-            left_collapsed: false,
-            right_collapsed: false,
-            right_hidden: false,
-            resize_mode: false,
-            help_scroll: None,
-            last_help_height: 0,
-            last_help_lines: 0,
-            fullscreen_overlay: FullscreenOverlay::None,
             status: StatusLine::new("ready"),
-            prompt: PromptState::None,
-            input_target: InputTarget::None,
             session_surface: crate::model::SessionSurface::Agent,
             clipboard: Clipboard::new(),
-            worker_tx,
-            worker_rx,
-            providers: std::collections::HashMap::new(),
-            running_provider_pins: std::collections::HashMap::new(),
-            companion_terminals: std::collections::HashMap::new(),
             active_terminal_id: None,
             terminal_return_to_list: false,
             terminal_counter: 0,
             create_agent_in_flight: false,
-            pulls_in_flight: std::collections::HashSet::new(),
+            last_changed_files_dispatch: None,
+            commit_in_flight: false,
+            staged_diff_in_flight: false,
+            add_project_in_flight: false,
             resource_stats_in_flight: false,
             last_pty_size: (0, 0),
             last_pty_activity: std::collections::HashMap::new(),
@@ -1920,38 +2009,14 @@ mod tests {
             tick_count: 0,
             start_time: std::time::Instant::now(),
             readonly_nudge_tick: None,
-            watched_worktree: Arc::new(Mutex::new(None::<PathBuf>)),
-            has_active_processes: Arc::new(AtomicBool::new(false)),
             collapsed_projects: std::collections::HashSet::new(),
             left_items_cache: Vec::new(),
-            mouse_layout: MouseLayoutState::default(),
-            overlay_layout: OverlayMouseLayoutState::default(),
-            mouse_drag: None,
-            last_mouse_click: None,
-            pressed_button: None,
             interactive_patterns: crate::keybindings::InteractiveBytePatterns {
                 bindings: Vec::new(),
             },
             raw_input_buf: Vec::new(),
             loading_input_buf: Vec::new(),
             in_bracket_paste: false,
-            macro_bar: None,
-            sigwinch_flag: Arc::new(AtomicBool::new(false)),
-            force_redraw: false,
-            welcome_tip_index: 0,
-            welcome_logo_visible: false,
-            welcome_logo_alt: false,
-            welcome_tip_selection: usize::MAX,
-            branch_sync_sessions: Arc::new(Mutex::new(Vec::new())),
-            gh_status: crate::model::GhStatus::Unknown,
-            github_integration_enabled: false,
-            pr_banner_at_bottom: true,
-            pr_statuses: std::collections::HashMap::new(),
-            pr_sync_sessions: Arc::new(Mutex::new(Vec::new())),
-            pr_sync_enabled: Arc::new(AtomicBool::new(false)),
-            pr_last_checked: std::collections::HashMap::new(),
-            refs_watcher: None,
-            refs_watch_paths: std::collections::HashMap::new(),
             resume_fallback_candidates: std::collections::HashMap::new(),
             pending_deletions: std::collections::HashSet::new(),
             deletion_busy_messages: std::collections::HashMap::new(),
@@ -1959,7 +2024,7 @@ mod tests {
             snapshot_buf: crate::pty::TerminalSnapshot::empty(),
             last_snapshot_id: None,
             terminal_selection: None,
-            _single_instance_lock: single_instance_lock,
+            disk_usage_pct: None,
         };
         app.interactive_patterns = app.bindings.interactive_byte_patterns();
         app.rebuild_left_items();
@@ -1992,16 +2057,17 @@ mod tests {
             default_provider: ProviderKind::from_str(provider),
             current_branch: "main".to_string(),
             path_missing: false,
+            meta_loaded: true,
         }
     }
 
-    /// Inserts a dummy PtyClient placeholder into `app.providers` so that the
+    /// Inserts a dummy PtyClient placeholder into `app.runtime.providers` so that the
     /// session appears "active" without actually spawning a process.
     fn mark_active(app: &mut App, session_id: &str) {
         let client =
             crate::pty::PtyClient::spawn("echo", &[], std::path::Path::new("/tmp"), 24, 80, 1000)
                 .expect("spawn echo for test");
-        app.providers.insert(session_id.to_string(), client);
+        app.runtime.providers.insert(session_id.to_string(), client);
     }
 
     #[test]
@@ -2014,7 +2080,7 @@ mod tests {
 
         let label = app.detach_conflicting_worktree_session("/tmp/wt/a", "s2");
         assert!(label.is_some());
-        assert!(!app.providers.contains_key("s1"));
+        assert!(!app.runtime.providers.contains_key("s1"));
     }
 
     #[test]
@@ -2027,7 +2093,7 @@ mod tests {
 
         let label = app.detach_conflicting_worktree_session("/tmp/wt/b", "s2");
         assert!(label.is_none());
-        assert!(app.providers.contains_key("s1"));
+        assert!(app.runtime.providers.contains_key("s1"));
     }
 
     #[test]
@@ -2039,7 +2105,7 @@ mod tests {
 
         let label = app.detach_conflicting_worktree_session("/tmp/wt/a", "s1");
         assert!(label.is_none());
-        assert!(app.providers.contains_key("s1"));
+        assert!(app.runtime.providers.contains_key("s1"));
     }
 
     #[test]
@@ -2052,7 +2118,7 @@ mod tests {
 
         let label = app.detach_conflicting_worktree_session("/tmp/wt/a", "s2");
         assert!(label.is_some());
-        assert!(!app.providers.contains_key("s1"));
+        assert!(!app.runtime.providers.contains_key("s1"));
         let s1_session = app.sessions.iter().find(|s| s.id == "s1").unwrap();
         assert_eq!(s1_session.status, SessionStatus::Detached);
     }
@@ -2075,7 +2141,7 @@ mod tests {
         let app = test_app_with_sessions(vec![s1, s2], vec![project]);
 
         // Deleting s1 should preserve the worktree because s2 still uses it.
-        // We can't call do_delete_session directly because git::remove_worktree
+        // We can't call begin_delete_session directly because git::remove_worktree
         // would fail on a non-existent repo, but we can verify the guard logic.
         let has_sibling = app
             .sessions
@@ -2141,104 +2207,8 @@ mod tests {
             default_provider: ProviderKind::from_str(provider),
             current_branch: "main".to_string(),
             path_missing: false,
+            meta_loaded: true,
         }
-    }
-
-    /// With `delete_worktree = false`, the session record is removed but the
-    /// worktree on disk is left alone and git is never invoked. The project
-    /// path here is not a git repo — if the code accidentally invoked git it
-    /// would return `Err` and this test would catch it.
-    #[test]
-    fn do_delete_session_preserves_worktree_when_flag_off() {
-        let project_dir = tempdir().expect("project tempdir");
-        let worktree_dir = tempdir().expect("worktree tempdir");
-        let worktree_path = worktree_dir.path().to_string_lossy().to_string();
-
-        let mut s1 = make_session("s1", "claude", &worktree_path);
-        s1.project_id = "project-1".to_string();
-        let project = make_project_at("project-1", "claude", &project_dir.path().to_string_lossy());
-        let mut app = test_app_with_sessions(vec![s1], vec![project]);
-
-        app.do_delete_session("s1", false)
-            .expect("delete should succeed without touching git");
-
-        assert!(
-            app.sessions.iter().all(|s| s.id != "s1"),
-            "session should be removed"
-        );
-        assert!(
-            worktree_dir.path().exists(),
-            "worktree directory must be preserved on disk when delete_worktree=false",
-        );
-    }
-
-    /// When another session shares the worktree, the worktree must be
-    /// preserved even if the user checked "also delete the worktree" — other
-    /// sessions still depend on it. Git must not be invoked.
-    #[test]
-    fn do_delete_session_keeps_shared_worktree_even_when_flag_on() {
-        let project_dir = tempdir().expect("project tempdir");
-        let worktree_dir = tempdir().expect("worktree tempdir");
-        let worktree_path = worktree_dir.path().to_string_lossy().to_string();
-
-        let mut s1 = make_session("s1", "claude", &worktree_path);
-        let mut s2 = make_session("s2", "codex", &worktree_path);
-        s1.project_id = "project-1".to_string();
-        s2.project_id = "project-1".to_string();
-        let project = make_project_at("project-1", "claude", &project_dir.path().to_string_lossy());
-        let mut app = test_app_with_sessions(vec![s1, s2], vec![project]);
-
-        app.do_delete_session("s1", true)
-            .expect("delete should succeed without touching git for shared worktree");
-
-        assert!(
-            app.sessions.iter().all(|s| s.id != "s1"),
-            "s1 should be removed"
-        );
-        assert!(
-            app.sessions.iter().any(|s| s.id == "s2"),
-            "s2 should remain"
-        );
-        assert!(
-            worktree_dir.path().exists(),
-            "shared worktree must be preserved when siblings exist",
-        );
-    }
-
-    /// If git fails to remove the worktree, the session record must remain —
-    /// otherwise the user loses their agent with no way to retry. We force
-    /// the git call to fail by pointing the project path at a directory that
-    /// is not a git repository.
-    #[test]
-    fn do_delete_session_preserves_session_when_git_fails() {
-        let project_dir = tempdir().expect("project tempdir");
-        // Intentionally NOT a git repo — `git worktree remove` will exit
-        // non-zero, which bubbles up as Err from git::remove_worktree.
-        let worktree_dir = tempdir().expect("worktree tempdir");
-        let worktree_path = worktree_dir.path().to_string_lossy().to_string();
-
-        let mut s1 = make_session("s1", "claude", &worktree_path);
-        s1.project_id = "project-1".to_string();
-        let project = make_project_at("project-1", "claude", &project_dir.path().to_string_lossy());
-        let mut app = test_app_with_sessions(vec![s1], vec![project]);
-
-        let err = app
-            .do_delete_session("s1", true)
-            .expect_err("git should fail against a non-git project dir");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.to_lowercase().contains("worktree") || msg.contains("git"),
-            "error should mention git/worktree, got: {msg}",
-        );
-
-        assert!(
-            app.sessions.iter().any(|s| s.id == "s1"),
-            "session must be preserved when git fails so user can retry",
-        );
-        assert!(
-            worktree_dir.path().exists(),
-            "worktree directory should be untouched on failure",
-        );
     }
 
     /// The async path (`begin_delete_session`) must NOT remove the session
@@ -2403,7 +2373,8 @@ mod tests {
         app.sessions.retain(|s| s.id != "s1");
 
         // The worker then reports success.
-        app.worker_tx
+        app.runtime
+            .worker_tx
             .send(WorkerEvent::WorktreeRemoveCompleted {
                 session_id: "s1".to_string(),
                 result: Ok(false),
@@ -2445,7 +2416,8 @@ mod tests {
         // Another action already set a non-Busy status.
         app.set_info("Deleted project \"demo\" and all its agents");
 
-        app.worker_tx
+        app.runtime
+            .worker_tx
             .send(WorkerEvent::WorktreeRemoveCompleted {
                 session_id: "s1".to_string(),
                 result: Ok(false),
@@ -2490,7 +2462,8 @@ mod tests {
         // An unrelated operation set its own Busy message.
         app.set_busy("Pushing to remote\u{2026}");
 
-        app.worker_tx
+        app.runtime
+            .worker_tx
             .send(WorkerEvent::WorktreeRemoveCompleted {
                 session_id: "s1".to_string(),
                 result: Ok(false),
@@ -2514,9 +2487,10 @@ mod tests {
     }
 
     /// Project deletion must be refused when any of the project's sessions
-    /// have an async worktree removal in-flight. Allowing it would race the
-    /// synchronous `do_delete_session` against the worker and could leave the
-    /// project half-deleted with an orphaned worktree.
+    /// have an async worktree removal in-flight. Allowing it would dispatch
+    /// a second `begin_delete_session` worker for the same session and race
+    /// the in-flight one, potentially leaving the project half-deleted with
+    /// an orphaned worktree.
     #[test]
     fn delete_selected_project_blocked_when_pending() {
         let project_dir = tempdir().expect("project tempdir");
@@ -2568,7 +2542,8 @@ mod tests {
 
         app.pending_deletions.insert("s1".to_string());
 
-        app.worker_tx
+        app.runtime
+            .worker_tx
             .send(WorkerEvent::WorktreeRemoveCompleted {
                 session_id: "s1".to_string(),
                 result: Err("fatal: not a git repository".to_string()),
@@ -2584,6 +2559,145 @@ mod tests {
         assert!(
             msg.contains("not a git repository"),
             "error should include the git error, got: {msg}",
+        );
+    }
+
+    // -- Phase 16 (P1-AA): runtime resource limits --------------------------
+
+    /// `refuse_agent_spawn_for_limits` should return a verbose, actionable
+    /// message naming `limits.max_panes` once the active-pane count
+    /// reaches the configured cap. The message is the contract that
+    /// `dispatch_create_agent_request` surfaces via `set_error`.
+    #[test]
+    fn refuse_agent_spawn_when_max_panes_reached() {
+        let mut s1 = make_session("s1", "claude", "/tmp/wt/a");
+        let mut s2 = make_session("s2", "codex", "/tmp/wt/b");
+        s1.status = SessionStatus::Active;
+        s2.status = SessionStatus::Active;
+        let project = make_project("project-1", "claude");
+        let mut app = test_app_with_sessions(vec![s1, s2], vec![project]);
+        app.config.limits.max_panes = 2;
+
+        let reason = app
+            .refuse_agent_spawn_for_limits()
+            .expect("must refuse at the cap");
+        assert!(
+            reason.contains("max_panes"),
+            "error should name the offending knob, got: {reason}",
+        );
+        assert!(
+            reason.contains("Detach"),
+            "error should suggest a recovery path, got: {reason}",
+        );
+
+        // Below the cap → must allow.
+        app.sessions[1].status = SessionStatus::Detached;
+        assert!(app.refuse_agent_spawn_for_limits().is_none());
+
+        // max_panes = 0 → unlimited semantic; cap never trips.
+        app.sessions[1].status = SessionStatus::Active;
+        app.config.limits.max_panes = 0;
+        assert!(
+            app.refuse_agent_spawn_for_limits().is_none(),
+            "max_panes = 0 must mean unlimited",
+        );
+    }
+
+    /// When the disk-watchdog has reported >= disk_high_water_pct,
+    /// `refuse_agent_spawn_for_limits` must surface the disk message
+    /// with the percentage and recovery hint. Below the threshold (or
+    /// before the first sample) the gate must NOT trip — the disk
+    /// watchdog runs every 60 s, so callers must keep working until
+    /// the next sample arrives.
+    #[test]
+    fn refuse_agent_spawn_when_disk_above_high_water() {
+        let s1 = make_session("s1", "claude", "/tmp/wt/a");
+        let project = make_project("project-1", "claude");
+        let mut app = test_app_with_sessions(vec![s1], vec![project]);
+        app.config.limits.disk_high_water_pct = 95;
+
+        // Pre-watchdog: disk_usage_pct = None ⇒ gate does not fire.
+        assert!(app.refuse_agent_spawn_for_limits().is_none());
+
+        app.disk_usage_pct = Some(94);
+        assert!(
+            app.refuse_agent_spawn_for_limits().is_none(),
+            "94% < 95% high-water must allow spawn",
+        );
+
+        app.disk_usage_pct = Some(96);
+        let reason = app
+            .refuse_agent_spawn_for_limits()
+            .expect("must refuse above high-water");
+        assert!(
+            reason.contains("96%"),
+            "error should report the observed pct, got: {reason}",
+        );
+        assert!(
+            reason.contains("disk_high_water_pct"),
+            "error should name the offending knob, got: {reason}",
+        );
+        assert!(
+            reason.contains("dux session purge") || reason.contains("extend the volume"),
+            "error should suggest a recovery path, got: {reason}",
+        );
+    }
+
+    /// The scrollback overflow auto-detach is gated behind
+    /// `enable_scrollback_overflow_autodetach`. When enabled and the
+    /// estimated footprint exceeds `max_total_scrollback_mb`,
+    /// `handle_scrollback_usage_event` must detach the oldest-by-
+    /// `updated_at` session whose PTY is still attached and mark it
+    /// `Detached`. When disabled, the watchdog is never started; the
+    /// handler itself remains a safe no-op when the cap is `0`.
+    #[test]
+    fn scrollback_auto_detach_picks_oldest_session() {
+        use chrono::Duration as ChronoDuration;
+
+        let now = Utc::now();
+        let mut s_old = make_session("old", "claude", "/tmp/wt/old");
+        let mut s_new = make_session("new", "codex", "/tmp/wt/new");
+        s_old.updated_at = now - ChronoDuration::hours(2);
+        s_old.status = SessionStatus::Active;
+        s_new.updated_at = now;
+        s_new.status = SessionStatus::Active;
+        let project = make_project("project-1", "claude");
+        let mut app = test_app_with_sessions(vec![s_old, s_new], vec![project]);
+
+        // Force a real PTY for both sessions so the oldest_active_session_id
+        // helper can actually find a victim with a live `PtyClient`.
+        mark_active(&mut app, "old");
+        mark_active(&mut app, "new");
+        assert_eq!(app.runtime.providers.len(), 2);
+
+        // Set a very small cap — any non-zero footprint will exceed it.
+        app.config.limits.enable_scrollback_overflow_autodetach = true;
+        app.config.limits.max_total_scrollback_mb = 1;
+        // Pretend the agent_scrollback_lines is large enough that
+        // 2 panes × 80 cols × N lines × 4 B > 1 MiB.
+        let scrollback_lines = 100_000usize;
+
+        // First tick: must detach the oldest pane.
+        app.handle_scrollback_usage_event(scrollback_lines);
+        assert!(
+            !app.runtime.providers.contains_key("old"),
+            "oldest session's PTY should have been torn down",
+        );
+        let detached = app.sessions.iter().find(|s| s.id == "old").unwrap();
+        assert_eq!(detached.status, SessionStatus::Detached);
+        // The newer pane must still be attached after a single detach
+        // because the loop only tears down victims while the cap is
+        // exceeded — and with one pane the footprint should be lower.
+        // (We don't assert "still over cap" because the test config
+        // is intentionally aggressive; we just want to prove that the
+        // newest pane was not the one selected.)
+        let still_active = app.runtime.providers.contains_key("new");
+        let new_session = app.sessions.iter().find(|s| s.id == "new").unwrap();
+        assert!(
+            still_active || new_session.status == SessionStatus::Detached,
+            "scrollback detach must select oldest victim first; \
+             both sessions should not have been torn down before the \
+             oldest was selected",
         );
     }
 }

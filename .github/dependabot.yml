@@ -1,0 +1,30 @@
+# audit02 Phase 24 (P2-2) — automated dependency updates.
+#
+# Cargo: weekly update PRs for direct + indirect dependencies; patches
+# are grouped to reduce noise. Major/minor land as separate PRs so the
+# diff is reviewable.
+#
+# github-actions: weekly SHA-pinned upgrade PRs. Combined with Phase 06's
+# `pinact` baseline this means new pins are proposed by Dependabot rather
+# than applied by hand.
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    allow:
+      - dependency-type: "direct"
+      - dependency-type: "indirect"
+    groups:
+      patches:
+        update-types: ["patch"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5

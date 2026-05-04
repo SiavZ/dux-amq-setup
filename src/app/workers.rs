@@ -2,7 +2,7 @@ use super::*;
 
 impl App {
     pub(crate) fn drain_events(&mut self) {
-        while let Ok(event) = self.worker_rx.try_recv() {
+        while let Ok(event) = self.runtime.worker_rx.try_recv() {
             match event {
                 WorkerEvent::CreateAgentProgress(message) => self.set_busy(message),
                 WorkerEvent::CreateAgentReady(boxed) => {
@@ -15,10 +15,12 @@ impl App {
                     self.create_agent_in_flight = false;
                     self.last_pty_size = pty_size;
                     if let Err(err) = self.session_store.upsert_session(&session) {
-                        logger::error(&format!(
-                            "session store upsert failed for {}: {err}",
-                            session.id
-                        ));
+                        tracing::error!(
+                            target: "dux::workers",
+                            session_id = %session.id,
+                            err = %err,
+                            "session store upsert failed",
+                        );
                         self.set_error(format!("Failed to persist session: {err}"));
                         continue;
                     }
@@ -26,7 +28,7 @@ impl App {
                         &session.worktree_path,
                         &session.id,
                     );
-                    self.providers.insert(session.id.clone(), client);
+                    self.runtime.providers.insert(session.id.clone(), client);
                     self.sessions.insert(0, session.clone());
                     self.mark_session_provider_started(&session.id);
                     self.update_branch_sync_sessions();
@@ -38,8 +40,8 @@ impl App {
                         .unwrap_or(0);
                     self.reload_changed_files();
                     self.show_agent_surface();
-                    self.input_target = InputTarget::Agent;
-                    self.fullscreen_overlay = FullscreenOverlay::Agent;
+                    self.ui.input_target = InputTarget::Agent;
+                    self.ui.fullscreen_overlay = FullscreenOverlay::Agent;
                     self.set_info(status_message);
                 }
                 WorkerEvent::CreateAgentFailed(message) => {
@@ -54,7 +56,7 @@ impl App {
                 WorkerEvent::CommitMessageGenerated(msg) => {
                     self.commit_input.clear_overlay();
                     self.commit_input.set_text(msg);
-                    self.input_target = InputTarget::CommitMessage;
+                    self.ui.input_target = InputTarget::CommitMessage;
                     {
                         let exit_key = self.bindings.label_for(Action::ExitCommitInput);
                         let commit_key = self.bindings.label_for(Action::CommitChanges);
@@ -84,7 +86,7 @@ impl App {
                     target,
                     result,
                 } => {
-                    self.pulls_in_flight.remove(&repo_path);
+                    self.runtime.pulls_in_flight.remove(&repo_path);
                     match target {
                         PullTarget::Project {
                             project_id,
@@ -100,12 +102,11 @@ impl App {
                                     existing.current_branch = branch_name;
                                 }
                                 self.set_info(format!(
-                                    "Refreshed project \"{}\". Local branch is up to date with remote.",
-                                    project_name,
+                                    "Refreshed project \"{project_name}\". Local branch is up to date with remote.",
                                 ));
                             }
                             Err(e) => self
-                                .set_error(format!("Project refresh failed for \"{}\": {e}", project_name)),
+                                .set_error(format!("Project refresh failed for \"{project_name}\": {e}")),
                         },
                         PullTarget::Session => match result {
                             Ok(_) => {
@@ -181,9 +182,9 @@ impl App {
                     }
                 }
                 WorkerEvent::GhStatusChecked(status) => {
-                    self.gh_status = status;
+                    self.runtime.gh_status = status;
                     if matches!(status, crate::model::GhStatus::Available)
-                        && self.github_integration_enabled
+                        && self.runtime.github_integration_enabled
                     {
                         logger::info("[gh-integration] gh CLI is available and authenticated");
                         self.update_pr_sync_sessions();
@@ -193,7 +194,7 @@ impl App {
                     } else {
                         logger::info(&format!(
                             "[gh-integration] gh status: {:?}, integration enabled: {}",
-                            status, self.github_integration_enabled,
+                            status, self.runtime.github_integration_enabled,
                         ));
                     }
                 }
@@ -201,7 +202,7 @@ impl App {
                     let now = Instant::now();
                     let mut changed = false;
                     for (session_id, maybe_pr) in results {
-                        self.pr_last_checked.insert(session_id.clone(), now);
+                        self.runtime.pr_last_checked.insert(session_id.clone(), now);
                         match maybe_pr {
                             Some(pr) => {
                                 // Persist the PR association (including state) so it
@@ -218,11 +219,11 @@ impl App {
                                     state_str,
                                     &pr.title,
                                 );
-                                self.pr_statuses.insert(session_id, pr);
+                                self.runtime.pr_statuses.insert(session_id, pr);
                                 changed = true;
                             }
                             None => {
-                                if self.pr_statuses.remove(&session_id).is_some() {
+                                if self.runtime.pr_statuses.remove(&session_id).is_some() {
                                     changed = true;
                                 }
                             }
@@ -236,8 +237,7 @@ impl App {
                 }
                 WorkerEvent::RefsChanged(session_id) => {
                     logger::debug(&format!(
-                        "[gh-integration] refs watcher: triggering PR check for session {}",
-                        session_id,
+                        "[gh-integration] refs watcher: triggering PR check for session {session_id}",
                     ));
                     self.spawn_pr_check_for_session(&session_id);
                 }
@@ -248,7 +248,7 @@ impl App {
                         loading,
                         selected,
                         ..
-                    } = &mut self.prompt
+                    } = &mut self.ui.prompt
                         && *current_dir == dir
                     {
                         *current_entries = entries;
@@ -338,7 +338,7 @@ impl App {
                         last_refresh,
                         first_sample,
                         ..
-                    } = &mut self.prompt
+                    } = &mut self.ui.prompt
                     {
                         *rows = stats;
                         *last_refresh = Instant::now();
@@ -392,12 +392,126 @@ impl App {
                         ));
                     }
                 },
+                WorkerEvent::ProjectMetaReady {
+                    path,
+                    is_git,
+                    current_branch,
+                    remote_default: _,
+                } => {
+                    let path_str = path.to_string_lossy().to_string();
+                    if let Some(proj) = self
+                        .projects
+                        .iter_mut()
+                        .find(|p| Path::new(&p.path) == path.as_path())
+                    {
+                        proj.path_missing = !is_git;
+                        proj.current_branch = if is_git {
+                            current_branch.unwrap_or_else(|| "main".to_string())
+                        } else {
+                            String::new()
+                        };
+                        proj.meta_loaded = true;
+                    } else {
+                        logger::info(&format!(
+                            "ProjectMetaReady arrived for unknown project path {path_str}; \
+                             discarding (project may have been removed)"
+                        ));
+                    }
+                }
+                WorkerEvent::ReloadChangedFilesReady { worktree, result } => {
+                    // Discard out-of-order replies: by the time the worker
+                    // returned, the user may have switched to a different
+                    // session. The currently-selected worktree wins.
+                    let current = self
+                        .selected_session()
+                        .map(|s| PathBuf::from(&s.worktree_path));
+                    if current.as_deref() != Some(worktree.as_path()) {
+                        continue;
+                    }
+                    match result {
+                        Ok((staged, unstaged)) => {
+                            self.staged_files = staged;
+                            self.unstaged_files = unstaged;
+                            self.clamp_files_cursor();
+                        }
+                        Err(err) => {
+                            logger::error(&format!(
+                                "changed_files refresh failed for {}: {err}",
+                                worktree.display()
+                            ));
+                            // Leave the lists empty — the steady-state
+                            // poller will retry on its next tick.
+                        }
+                    }
+                }
+                WorkerEvent::StagedDiffReady { worktree, result } => {
+                    self.staged_diff_in_flight = false;
+                    match result {
+                        Ok(diff) => {
+                            self.launch_commit_message_provider(worktree, diff);
+                        }
+                        Err(err) => {
+                            self.commit_input.clear_overlay();
+                            self.set_error(format!("Failed to read staged diff: {err}"));
+                        }
+                    }
+                }
+                WorkerEvent::CommitFinished {
+                    worktree: _,
+                    message: _,
+                    result,
+                } => {
+                    self.commit_in_flight = false;
+                    self.commit_input.clear_overlay();
+                    match result {
+                        Ok(()) => {
+                            self.commit_input.clear();
+                            let push_key = self.bindings.label_for(Action::PushToRemote);
+                            let ai_key = self.bindings.label_for(Action::GenerateCommitMessage);
+                            self.set_info(format!(
+                                "Changes committed successfully. Press {push_key} to push to remote, or {ai_key} to generate an AI message."
+                            ));
+                            self.reload_changed_files();
+                        }
+                        Err(err) => self.set_error(format!("Commit failed: {err}")),
+                    }
+                }
+                WorkerEvent::AutoResumeSpawned {
+                    session_id,
+                    used_resume_args,
+                    result,
+                } => {
+                    self.handle_auto_resume_spawned(session_id, used_resume_args, result);
+                }
+                WorkerEvent::DiskUsage(pct) => {
+                    self.handle_disk_usage_event(pct);
+                }
+                WorkerEvent::ScrollbackUsage(scrollback_lines) => {
+                    self.handle_scrollback_usage_event(scrollback_lines);
+                }
+                WorkerEvent::AddProjectMetaReady { path, name, result } => {
+                    self.add_project_in_flight = false;
+                    match result {
+                        Ok(meta) => {
+                            if let Err(e) = self.resume_add_project_after_meta(path, name, meta) {
+                                self.set_error(format!("{e:#}"));
+                            }
+                        }
+                        Err(err) => {
+                            logger::error(&format!(
+                                "add project rejected for {}: {err}",
+                                path.display()
+                            ));
+                            self.set_error(err);
+                        }
+                    }
+                }
             }
         }
         self.retry_hung_resume_sessions();
         // Detect PTY exits.
         let mut exited = Vec::new();
-        for (session_id, provider) in &mut self.providers {
+        for (session_id, provider) in &mut self.runtime.providers {
             if provider.is_exited() || provider.try_wait().is_some() {
                 exited.push(session_id.clone());
             }
@@ -416,6 +530,7 @@ impl App {
             // typically prints 1-2 lines of error; a real session produces
             // far more output and scrollback history.
             let is_minimal = self
+                .runtime
                 .providers
                 .get(session_id)
                 .map(|p| p.has_minimal_output(5))
@@ -426,8 +541,8 @@ impl App {
             let Some(session) = self.sessions.iter().find(|s| s.id == *session_id).cloned() else {
                 continue;
             };
-            self.providers.remove(session_id);
-            self.running_provider_pins.remove(session_id);
+            self.runtime.providers.remove(session_id);
+            self.runtime.running_provider_pins.remove(session_id);
             self.last_pty_activity.remove(session_id);
             logger::info(&format!(
                 "resume args exited without output for agent \"{}\", retrying with regular args",
@@ -435,7 +550,7 @@ impl App {
             ));
             match self.spawn_pty_for_session(&session, false) {
                 Ok(client) => {
-                    self.providers.insert(session_id.clone(), client);
+                    self.runtime.providers.insert(session_id.clone(), client);
                     self.mark_session_status(session_id, SessionStatus::Active);
                     self.mark_session_provider_started(session_id);
                     let proj_name = self.project_name_for_session(&session);
@@ -449,8 +564,7 @@ impl App {
                 }
                 Err(err) => {
                     logger::error(&format!(
-                        "fallback PTY spawn also failed for {}: {err}",
-                        session_id
+                        "fallback PTY spawn also failed for {session_id}: {err}",
                     ));
                     self.mark_session_status(session_id, SessionStatus::Detached);
                 }
@@ -461,8 +575,8 @@ impl App {
             if retried.contains(session_id) {
                 continue;
             }
-            self.providers.remove(session_id);
-            self.running_provider_pins.remove(session_id);
+            self.runtime.providers.remove(session_id);
+            self.runtime.running_provider_pins.remove(session_id);
             self.last_pty_activity.remove(session_id);
             self.mark_session_status(session_id, SessionStatus::Detached);
         }
@@ -475,9 +589,9 @@ impl App {
             {
                 let key = self.bindings.label_for(Action::ReconnectAgent);
                 if self.session_surface == SessionSurface::Agent {
-                    self.input_target = InputTarget::None;
-                    self.fullscreen_overlay = FullscreenOverlay::None;
-                    self.focus = FocusPane::Left;
+                    self.ui.input_target = InputTarget::None;
+                    self.ui.fullscreen_overlay = FullscreenOverlay::None;
+                    self.ui.focus = FocusPane::Left;
                     self.set_info(format!(
                         "Agent CLI process has exited. Press \"{key}\" to relaunch."
                     ));
@@ -496,13 +610,13 @@ impl App {
         }
 
         let mut exited_terminal_ids = Vec::new();
-        for (terminal_id, terminal) in &mut self.companion_terminals {
+        for (terminal_id, terminal) in &mut self.runtime.companion_terminals {
             if terminal.client.is_exited() || terminal.client.try_wait().is_some() {
                 exited_terminal_ids.push(terminal_id.clone());
             }
         }
         for terminal_id in &exited_terminal_ids {
-            self.companion_terminals.remove(terminal_id);
+            self.runtime.companion_terminals.remove(terminal_id);
         }
         if !exited_terminal_ids.is_empty() {
             // If the active terminal just exited, close the overlay.
@@ -510,10 +624,10 @@ impl App {
                 && exited_terminal_ids.contains(active_id)
             {
                 self.active_terminal_id = None;
-                if self.input_target == InputTarget::Terminal {
-                    self.input_target = InputTarget::None;
+                if self.ui.input_target == InputTarget::Terminal {
+                    self.ui.input_target = InputTarget::None;
                 }
-                self.fullscreen_overlay = FullscreenOverlay::None;
+                self.ui.fullscreen_overlay = FullscreenOverlay::None;
                 self.session_surface = SessionSurface::Agent;
                 self.set_info("Terminal exited. Press the terminal key to launch a new one.");
             }
@@ -522,7 +636,7 @@ impl App {
 
         // Poll foreground process names every ~2 seconds (every 20 ticks).
         if self.tick_count.is_multiple_of(20) {
-            for terminal in self.companion_terminals.values_mut() {
+            for terminal in self.runtime.companion_terminals.values_mut() {
                 terminal.foreground_cmd = terminal.client.foreground_process_name();
             }
         }
@@ -531,19 +645,20 @@ impl App {
         // the overlay is open and enough wall-clock time has elapsed (~2s).
         if let PromptState::ResourceMonitor {
             ref last_refresh, ..
-        } = self.prompt
+        } = self.ui.prompt
             && last_refresh.elapsed() >= Duration::from_secs(2)
         {
             self.spawn_resource_stats_worker();
         }
 
         // Keep the poller's interval flag in sync with whether any runtime PTY is alive.
-        self.has_active_processes
+        self.runtime
+            .has_active_processes
             .store(self.running_process_count() > 0, Ordering::Relaxed);
     }
 
     pub(crate) fn spawn_browser_entries(&self, dir: &Path) {
-        let tx = self.worker_tx.clone();
+        let tx = self.runtime.worker_tx.clone();
         let dir = dir.to_path_buf();
         thread::spawn(move || {
             let entries = browser_entries(&dir);
@@ -559,13 +674,212 @@ impl App {
         });
     }
 
+    /// Handle a [`WorkerEvent::DiskUsage`] sample.
+    ///
+    /// Caches the percentage on `self.disk_usage_pct` so
+    /// [`super::sessions::App::refuse_agent_spawn_for_limits`] can refuse
+    /// new agents at boot AND between samples, then decides whether to
+    /// flash a status-line banner:
+    ///
+    /// * `pct >= disk_high_water_pct` → red error banner; new spawns are
+    ///   refused by the gate above.
+    /// * `pct >= disk_warn_pct` → yellow warning banner; spawns still
+    ///   allowed.
+    /// * otherwise → if the previous tone was Warning/Error and the
+    ///   message looks like a disk banner we set, clear it back to
+    ///   Info.
+    pub(crate) fn handle_disk_usage_event(&mut self, pct: u8) {
+        let high = self.config.limits.disk_high_water_pct;
+        let warn = self.config.limits.disk_warn_pct;
+        let prev = self.disk_usage_pct;
+        self.disk_usage_pct = Some(pct);
+        if pct >= high {
+            self.set_error(format!(
+                "Persistent disk at {pct}% (limits.disk_high_water_pct = {high}%); \
+                 new agents refused. Run `dux session purge` or extend the volume."
+            ));
+        } else if pct >= warn {
+            self.set_warning(format!(
+                "Persistent disk at {pct}% (limits.disk_warn_pct = {warn}%); \
+                 consider running `dux session purge`."
+            ));
+        } else if let Some(prev_pct) = prev
+            && prev_pct >= warn
+            && matches!(
+                self.status.tone(),
+                crate::statusline::StatusTone::Warning | crate::statusline::StatusTone::Error
+            )
+            && self.status.message().contains("Persistent disk at")
+        {
+            // The previous tick had us in warn/high-water territory and
+            // we wrote the banner; now we're back below warn. Only clear
+            // if the status line still shows our banner — otherwise
+            // another subsystem owns it and we mustn't clobber.
+            self.set_info("");
+        }
+    }
+
+    /// Handle a [`WorkerEvent::ScrollbackUsage`] tick.
+    ///
+    /// This event is only emitted when
+    /// `[limits].enable_scrollback_overflow_autodetach = true`. Computes
+    /// the current total scrollback footprint (summed across all live
+    /// PTYs) and, if it exceeds `[limits].max_total_scrollback_mb`,
+    /// detaches the oldest-by-`updated_at` panes one at a time until the
+    /// total drops back under the cap. Detach != kill: the session row
+    /// stays in sqlite and can be reattached manually.
+    pub(crate) fn handle_scrollback_usage_event(&mut self, scrollback_lines: usize) {
+        let cap_bytes = self.config.limits.max_total_scrollback_mb.saturating_mul(
+            // 1 MiB
+            1024 * 1024,
+        );
+        if cap_bytes == 0 {
+            return; // cap disabled
+        }
+        loop {
+            let footprint = self.estimate_total_scrollback_bytes(scrollback_lines);
+            if footprint <= cap_bytes {
+                break;
+            }
+            // Pick the oldest-by-updated_at active pane and detach it.
+            let Some(victim) = self.oldest_active_session_id() else {
+                break; // nothing left to detach
+            };
+            let Some(client) = self.runtime.providers.remove(&victim) else {
+                break;
+            };
+            drop(client); // tear down the PTY + free the grid memory
+            self.runtime.running_provider_pins.remove(&victim);
+            self.last_pty_activity.remove(&victim);
+            self.resume_fallback_candidates.remove(&victim);
+            self.mark_session_status(&victim, SessionStatus::Detached);
+            logger::info(&format!(
+                "scrollback watchdog auto-detached session {victim}: total \
+                 grid footprint exceeded {} MiB",
+                self.config.limits.max_total_scrollback_mb,
+            ));
+            self.set_warning(format!(
+                "Auto-detached oldest agent: total scrollback exceeded \
+                 limits.max_total_scrollback_mb = {} MiB.",
+                self.config.limits.max_total_scrollback_mb,
+            ));
+        }
+    }
+
+    /// Approximates total scrollback grid memory across every live PTY.
+    /// Each cell is roughly `4 bytes` (alacritty_terminal stores a
+    /// glyph + style). We don't ask the terminal for an exact byte
+    /// count because the watchdog only needs to know whether we're over
+    /// the cap, not the precise number — and a per-cell walk per
+    /// minute would be wasted work.
+    pub(crate) fn estimate_total_scrollback_bytes(&self, scrollback_lines: usize) -> usize {
+        // Default cols when the PTY hasn't been resized yet.
+        let cols = if self.last_pty_size.1 == 0 {
+            80usize
+        } else {
+            self.last_pty_size.1 as usize
+        };
+        const BYTES_PER_CELL: usize = 4;
+        self.runtime
+            .providers
+            .len()
+            .saturating_mul(scrollback_lines)
+            .saturating_mul(cols)
+            .saturating_mul(BYTES_PER_CELL)
+    }
+
+    /// Returns the ID of the oldest-by-`updated_at` session whose PTY is
+    /// still attached. Used by the scrollback watchdog to pick a detach
+    /// victim. Sessions without a live `PtyClient` are ignored.
+    pub(crate) fn oldest_active_session_id(&self) -> Option<String> {
+        self.sessions
+            .iter()
+            .filter(|s| self.runtime.providers.contains_key(&s.id))
+            .min_by_key(|s| s.updated_at)
+            .map(|s| s.id.clone())
+    }
+
+    /// Sample persistent-disk usage at `paths.root` once a minute and ship
+    /// the percentage back to the UI thread via
+    /// [`WorkerEvent::DiskUsage`].
+    ///
+    /// Uses [`rustix::fs::statvfs`] (already a transitive dependency).
+    /// `statvfs` on a bind-mount reports the underlying filesystem's
+    /// stats, which is the correct behaviour for a watchdog that's trying
+    /// to refuse new agents before the host fills up — a bind-mounted dux
+    /// home that points at `/data` should refuse new agents when `/data`
+    /// is full, not when the bind point alone is full.
+    pub(crate) fn spawn_disk_watchdog(&self) {
+        let tx = self.runtime.worker_tx.clone();
+        let root = self.paths.root.clone();
+        thread::Builder::new()
+            .name("disk-watchdog".into())
+            .spawn(move || {
+                // Emit a first sample immediately so the UI can refuse
+                // spawns at boot if the disk is already over high-water.
+                if let Some(pct) = sample_disk_usage_pct(&root)
+                    && tx.send(WorkerEvent::DiskUsage(pct)).is_err()
+                {
+                    return;
+                }
+                loop {
+                    thread::sleep(DISK_WATCHDOG_INTERVAL);
+                    let Some(pct) = sample_disk_usage_pct(&root) else {
+                        continue;
+                    };
+                    if tx.send(WorkerEvent::DiskUsage(pct)).is_err() {
+                        return; // receiver dropped, app shutting down
+                    }
+                }
+            })
+            .ok();
+    }
+
+    /// Sample total scrollback grid memory across all live PTYs once a
+    /// minute and ship the result back via
+    /// [`WorkerEvent::ScrollbackUsage`].
+    ///
+    /// The handler in `drain_events` decides whether to act on the value;
+    /// auto-detach is gated on
+    /// `[limits].enable_scrollback_overflow_autodetach` so this watchdog
+    /// is started only when that flag is `true`.
+    pub(crate) fn spawn_scrollback_watchdog(&self) {
+        let tx = self.runtime.worker_tx.clone();
+        let scrollback_lines = self.config.ui.agent_scrollback_lines;
+        // We can't safely peek at the live `PtyClient`s from a worker
+        // thread (they hold non-Send fds), so the worker fires a tick on
+        // a fixed interval and the UI thread computes the footprint when
+        // it drains the event. The footprint is therefore an O(n_panes)
+        // computation on the UI thread, but n is bounded by `max_panes`
+        // (default 16) and the math is just per-pane multiplication, so
+        // it's well under a millisecond.
+        thread::Builder::new()
+            .name("scrollback-watchdog".into())
+            .spawn(move || {
+                loop {
+                    thread::sleep(SCROLLBACK_WATCHDOG_INTERVAL);
+                    // We don't have access to the runtime pane list here;
+                    // signal "tick" by sending a sentinel and let the UI
+                    // thread compute the actual footprint with the
+                    // configured scrollback line count.
+                    if tx
+                        .send(WorkerEvent::ScrollbackUsage(scrollback_lines))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            })
+            .ok();
+    }
+
     pub(crate) fn spawn_branch_sync_worker(&self) {
         let interval_secs = self.config.ui.branch_sync_interval;
         if interval_secs == 0 {
             return; // disabled by config
         }
-        let tx = self.worker_tx.clone();
-        let sessions = Arc::clone(&self.branch_sync_sessions);
+        let tx = self.runtime.worker_tx.clone();
+        let sessions = Arc::clone(&self.runtime.branch_sync_sessions);
         thread::spawn(move || {
             let interval = Duration::from_secs(u64::from(interval_secs));
             loop {
@@ -594,7 +908,7 @@ impl App {
     pub(crate) fn spawn_refs_watcher(&mut self) {
         use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 
-        let tx = self.worker_tx.clone();
+        let tx = self.runtime.worker_tx.clone();
         // Build a reverse map of watched paths for event routing.
         let path_to_session: Arc<Mutex<HashMap<PathBuf, String>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -645,8 +959,8 @@ impl App {
 
         match watcher_result {
             Ok(watcher) => {
-                self.refs_watcher = Some(Arc::new(Mutex::new(watcher)));
-                self.refs_watch_paths.clear();
+                self.runtime.refs_watcher = Some(Arc::new(Mutex::new(watcher)));
+                self.runtime.refs_watch_paths.clear();
                 // Populate the path map and start watching existing sessions.
                 let mut paths = HashMap::new();
                 for session in &self.sessions {
@@ -655,7 +969,7 @@ impl App {
                         .join("refs")
                         .join("heads");
                     if refs_dir.is_dir()
-                        && let Some(ref watcher_arc) = self.refs_watcher
+                        && let Some(ref watcher_arc) = self.runtime.refs_watcher
                         && let Ok(mut w) = watcher_arc.lock()
                     {
                         match w.watch(&refs_dir, RecursiveMode::NonRecursive) {
@@ -677,20 +991,19 @@ impl App {
                         }
                     }
                 }
-                self.refs_watch_paths = paths.clone();
+                self.runtime.refs_watch_paths = paths.clone();
                 // Populate the closure's path map so events can route to sessions.
                 if let Ok(mut map) = path_to_session.lock() {
                     *map = paths;
                 }
                 logger::info(&format!(
                     "[gh-integration] refs watcher: initialized, watching {} session(s)",
-                    self.refs_watch_paths.len(),
+                    self.runtime.refs_watch_paths.len(),
                 ));
             }
             Err(e) => {
                 logger::warn(&format!(
-                    "[gh-integration] refs watcher: failed to create watcher (falling back to poll-only): {}",
-                    e,
+                    "[gh-integration] refs watcher: failed to create watcher (falling back to poll-only): {e}",
                 ));
             }
         }
@@ -699,10 +1012,10 @@ impl App {
     // -- GitHub PR integration workers --
 
     pub(crate) fn spawn_gh_status_check(&self) {
-        if !self.github_integration_enabled {
+        if !self.runtime.github_integration_enabled {
             return;
         }
-        let tx = self.worker_tx.clone();
+        let tx = self.runtime.worker_tx.clone();
         thread::spawn(move || {
             use crate::model::GhStatus;
             // Step 1: Is `gh` on PATH?
@@ -745,7 +1058,7 @@ impl App {
             .map(|pr| (pr.session_id.clone(), pr))
             .collect();
 
-        if let Ok(mut guard) = self.pr_sync_sessions.lock() {
+        if let Ok(mut guard) = self.runtime.pr_sync_sessions.lock() {
             *guard = self
                 .sessions
                 .iter()
@@ -754,16 +1067,16 @@ impl App {
                     branch_name: s.branch_name.clone(),
                     worktree_path: s.worktree_path.clone(),
                     known_pr: known_map.get(&s.id).cloned(),
-                    agent_exited: !self.providers.contains_key(&s.id),
+                    agent_exited: !self.runtime.providers.contains_key(&s.id),
                 })
                 .collect();
         }
     }
 
     pub(crate) fn spawn_pr_sync_worker(&self) {
-        let tx = self.worker_tx.clone();
-        let sessions = Arc::clone(&self.pr_sync_sessions);
-        let enabled = Arc::clone(&self.pr_sync_enabled);
+        let tx = self.runtime.worker_tx.clone();
+        let sessions = Arc::clone(&self.runtime.pr_sync_sessions);
+        let enabled = Arc::clone(&self.runtime.pr_sync_enabled);
         enabled.store(true, Ordering::Relaxed);
         thread::spawn(move || {
             let interval = Duration::from_secs(45);
@@ -781,8 +1094,8 @@ impl App {
     }
 
     pub(crate) fn spawn_initial_pr_refresh(&self) {
-        let tx = self.worker_tx.clone();
-        let sessions = Arc::clone(&self.pr_sync_sessions);
+        let tx = self.runtime.worker_tx.clone();
+        let sessions = Arc::clone(&self.runtime.pr_sync_sessions);
         thread::spawn(move || {
             let results = run_pr_sync(&sessions);
             if !results.is_empty() {
@@ -794,13 +1107,13 @@ impl App {
     /// Trigger a one-shot PR check for a single session, unless it was checked
     /// recently (within 10 seconds).
     pub(crate) fn spawn_pr_check_for_session(&mut self, session_id: &str) {
-        if !self.github_integration_enabled
-            || !matches!(self.gh_status, crate::model::GhStatus::Available)
+        if !self.runtime.github_integration_enabled
+            || !matches!(self.runtime.gh_status, crate::model::GhStatus::Available)
         {
             return;
         }
         // Rate-limit: skip if checked within the last 10 seconds.
-        if let Some(last) = self.pr_last_checked.get(session_id)
+        if let Some(last) = self.runtime.pr_last_checked.get(session_id)
             && last.elapsed() < Duration::from_secs(10)
         {
             return;
@@ -818,9 +1131,9 @@ impl App {
             branch_name: session.branch_name.clone(),
             worktree_path: session.worktree_path.clone(),
             known_pr,
-            agent_exited: !self.providers.contains_key(session_id),
+            agent_exited: !self.runtime.providers.contains_key(session_id),
         };
-        let tx = self.worker_tx.clone();
+        let tx = self.runtime.worker_tx.clone();
         thread::spawn(move || {
             let result = check_pr_for_entry(&entry);
             let _ = tx.send(WorkerEvent::PrStatusReady(vec![(entry.session_id, result)]));
@@ -828,9 +1141,9 @@ impl App {
     }
 
     pub(crate) fn spawn_changed_files_poller(&self) {
-        let tx = self.worker_tx.clone();
-        let watched = Arc::clone(&self.watched_worktree);
-        let has_agent = Arc::clone(&self.has_active_processes);
+        let tx = self.runtime.worker_tx.clone();
+        let watched = Arc::clone(&self.runtime.watched_worktree);
+        let has_agent = Arc::clone(&self.runtime.has_active_processes);
         thread::spawn(move || {
             loop {
                 let interval = if has_agent.load(Ordering::Relaxed) {
@@ -866,7 +1179,7 @@ impl App {
             if started_at.elapsed() < Duration::from_millis(timeout_ms) {
                 continue;
             }
-            let Some(provider) = self.providers.get(session_id) else {
+            let Some(provider) = self.runtime.providers.get(session_id) else {
                 continue;
             };
             if provider.has_output() {
@@ -880,8 +1193,8 @@ impl App {
             let Some(session) = self.sessions.iter().find(|s| s.id == session_id).cloned() else {
                 continue;
             };
-            self.providers.remove(&session_id);
-            self.running_provider_pins.remove(&session_id);
+            self.runtime.providers.remove(&session_id);
+            self.runtime.running_provider_pins.remove(&session_id);
             self.last_pty_activity.remove(&session_id);
             logger::info(&format!(
                 "resume args produced no visible output for agent \"{}\" within timeout, retrying with regular args",
@@ -889,7 +1202,7 @@ impl App {
             ));
             match self.spawn_pty_for_session(&session, false) {
                 Ok(client) => {
-                    self.providers.insert(session_id.clone(), client);
+                    self.runtime.providers.insert(session_id.clone(), client);
                     self.mark_session_status(&session_id, SessionStatus::Active);
                     self.mark_session_provider_started(&session_id);
                     let proj_name = self.project_name_for_session(&session);
@@ -902,8 +1215,7 @@ impl App {
                 }
                 Err(err) => {
                     logger::error(&format!(
-                        "timeout fallback PTY spawn failed for {}: {err}",
-                        session_id
+                        "timeout fallback PTY spawn failed for {session_id}: {err}",
                     ));
                     self.mark_session_status(&session_id, SessionStatus::Detached);
                 }
@@ -1149,7 +1461,14 @@ pub(crate) fn run_create_agent_job(
     };
     let provider_cfg = provider_config(&config, &session.provider);
     if let Err(hint) = check_provider_available(&provider_cfg) {
-        logger::error(&format!("provider not found for {}: {hint}", session.id));
+        tracing::error!(
+            target: "dux::workers",
+            session_id = %session.id,
+            provider = %session.provider.as_str(),
+            command = %provider_cfg.command,
+            hint = %hint,
+            "provider not found",
+        );
         if owns_worktree {
             let _ = git::remove_worktree(
                 &repo_path,
@@ -1176,7 +1495,14 @@ pub(crate) fn run_create_agent_job(
     ) {
         Ok(client) => client,
         Err(err) => {
-            logger::error(&format!("PTY spawn failed for {}: {err}", session.id));
+            tracing::error!(
+                target: "dux::workers",
+                session_id = %session.id,
+                command = %provider_cfg.command,
+                worktree = %worktree_path.display(),
+                err = %err,
+                "pty spawn failed",
+            );
             if owns_worktree {
                 let _ = git::remove_worktree(
                     &repo_path,
@@ -1191,13 +1517,136 @@ pub(crate) fn run_create_agent_job(
             return;
         }
     };
-    logger::info(&format!("PTY session started for {}", session.id));
+    tracing::info!(
+        target: "dux::workers",
+        session_id = %session.id,
+        provider = %session.provider.as_str(),
+        rows = rows,
+        cols = cols,
+        "pty session started",
+    );
     let _ = worker_tx.send(WorkerEvent::CreateAgentReady(Box::new(AgentReadyData {
         session,
         client,
         pty_size: (rows, cols),
         status_message,
     })));
+}
+
+/// Fan out `git is_git_repo` + `current_branch` + `remote_default_branch`
+/// for each provided project path. Each path runs in its own thread, so a
+/// stuck git process for one project cannot delay the rest. Results land
+/// asynchronously on the worker channel as
+/// [`WorkerEvent::ProjectMetaReady`]; the main loop uses them to fill in
+/// the placeholder `Project` rows produced by `load_projects`.
+///
+/// Spawning N short-lived threads is acceptable here — N is typically <20
+/// (the number of projects in `config.toml`) and the alternative (a single
+/// serial thread) would re-introduce the head-of-line blocking the original
+/// synchronous code suffered from.
+pub(crate) fn dispatch_project_meta(tx: Sender<WorkerEvent>, paths: Vec<PathBuf>) {
+    for path in paths {
+        let tx = tx.clone();
+        let _ = thread::Builder::new()
+            .name(format!("project-meta-{}", path.display()))
+            .spawn(move || {
+                let exists = path.exists();
+                let is_git = exists && git::is_git_repo(&path);
+                let current_branch = if is_git {
+                    git::current_branch(&path).ok()
+                } else {
+                    None
+                };
+                let remote_default = if is_git {
+                    git::remote_default_branch(&path)
+                } else {
+                    None
+                };
+                let _ = tx.send(WorkerEvent::ProjectMetaReady {
+                    path,
+                    is_git,
+                    current_branch,
+                    remote_default,
+                });
+            });
+    }
+}
+
+/// Run `git status --porcelain` against `worktree` on a worker thread and
+/// send the result back as [`WorkerEvent::ReloadChangedFilesReady`]. Used
+/// by `App::reload_changed_files`, which used to block the UI thread.
+///
+/// The reply carries the worktree path so out-of-order replies (rapid
+/// session switching) can be discarded by the main loop without clobbering
+/// the currently-selected pane.
+pub(crate) fn dispatch_changed_files(tx: Sender<WorkerEvent>, worktree: PathBuf) {
+    let _ = thread::Builder::new()
+        .name(format!("changed-files-{}", worktree.display()))
+        .spawn(move || {
+            let result = git::changed_files(&worktree).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(WorkerEvent::ReloadChangedFilesReady { worktree, result });
+        });
+}
+
+/// Run `git diff --cached` against `worktree` on a worker thread and send
+/// the result back as [`WorkerEvent::StagedDiffReady`]. Used by the AI
+/// commit-message generator, which used to call `git::staged_diff_text`
+/// inline before spawning the provider thread.
+pub(crate) fn dispatch_staged_diff(tx: Sender<WorkerEvent>, worktree: PathBuf) {
+    let _ = thread::Builder::new()
+        .name(format!("staged-diff-{}", worktree.display()))
+        .spawn(move || {
+            let result = git::staged_diff_text(&worktree).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(WorkerEvent::StagedDiffReady { worktree, result });
+        });
+}
+
+/// Run `git commit -m <message>` against `worktree` on a worker thread.
+/// The caller is responsible for blocking input via `PromptState::Busy*`
+/// before dispatching, and for re-enabling input in the event handler so
+/// the UI stays responsive (and ordering stays correct).
+pub(crate) fn dispatch_commit(tx: Sender<WorkerEvent>, worktree: PathBuf, message: String) {
+    let _ = thread::Builder::new()
+        .name(format!("commit-{}", worktree.display()))
+        .spawn(move || {
+            let result = git::commit(&worktree, &message)
+                .map(|_| ())
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(WorkerEvent::CommitFinished {
+                worktree,
+                message,
+                result,
+            });
+        });
+}
+
+/// Run the synchronous git probes that gate "add project" — `is_git_repo`,
+/// `current_branch`, and `remote_default_branch` — on a worker thread.
+/// Results land as [`WorkerEvent::AddProjectMetaReady`] so the main loop
+/// can either show the branch-mismatch warning, surface a non-repo error,
+/// or proceed to `finish_add_project`.
+pub(crate) fn dispatch_add_project_meta(tx: Sender<WorkerEvent>, path: PathBuf, name: String) {
+    let _ = thread::Builder::new()
+        .name(format!("add-project-meta-{}", path.display()))
+        .spawn(move || {
+            let result = if !path.exists() {
+                Err(format!("\"{}\" does not exist.", path.display()))
+            } else if !git::is_git_repo(&path) {
+                Err(format!("\"{}\" is not a git repository.", path.display()))
+            } else {
+                match git::current_branch(&path) {
+                    Ok(branch) => {
+                        let remote_default = git::remote_default_branch(&path);
+                        Ok(AddProjectMeta {
+                            current_branch: branch,
+                            remote_default,
+                        })
+                    }
+                    Err(err) => Err(format!("{err:#}")),
+                }
+            };
+            let _ = tx.send(WorkerEvent::AddProjectMetaReady { path, name, result });
+        });
 }
 
 pub(crate) fn browser_entries(dir: &Path) -> Vec<BrowserEntry> {
@@ -1243,6 +1692,40 @@ pub(crate) fn browser_entries(dir: &Path) -> Vec<BrowserEntry> {
         );
     }
     entries
+}
+
+// -- Disk + scrollback watchdog helpers --
+
+/// How often [`App::spawn_disk_watchdog`] re-samples persistent-disk
+/// usage. 60 s is short enough to react to a runaway worktree before the
+/// host wedges, long enough that the syscall load is rounding-noise.
+const DISK_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How often [`App::spawn_scrollback_watchdog`] kicks the UI thread to
+/// recompute total scrollback memory and consider an auto-detach.
+const SCROLLBACK_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Sample persistent-disk usage at `path` and return the percentage
+/// (0..=100). `None` is returned on syscall failure (path missing,
+/// permissions, etc.) — the watchdog skips that tick rather than emitting
+/// a misleading "0% used" sample.
+///
+/// `statvfs` on Linux returns `f_blocks` (total fragments) and
+/// `f_bavail` (fragments available to non-root); the byte total is
+/// `f_frsize * f_blocks`. We compute the percentage with `(used * 100 /
+/// total)` and clamp to `u8` so a fileystem that overflows an i64 (which
+/// no realistic 2026-era host has) still produces a safe value.
+pub(crate) fn sample_disk_usage_pct(path: &Path) -> Option<u8> {
+    let stat = rustix::fs::statvfs(path).ok()?;
+    let total_blocks = stat.f_blocks;
+    if total_blocks == 0 {
+        return None;
+    }
+    let avail_blocks = stat.f_bavail;
+    let used_blocks = total_blocks.saturating_sub(avail_blocks);
+    // Multiply before the divide to keep precision on small filesystems.
+    let pct = (used_blocks.saturating_mul(100) / total_blocks).min(100);
+    Some(pct as u8)
 }
 
 // -- GitHub PR sync helpers (run on background threads) --
@@ -1437,4 +1920,52 @@ fn parse_pr_json_value(obj: &serde_json::Value, owner_repo: &str) -> Option<crat
         title,
         owner_repo: owner_repo.to_string(),
     })
+}
+
+// ---- audit02 phase 14: SQLite WAL + integrity + periodic backup -------------
+//
+// `spawn_backup_worker` is added at the end of this file to minimize merge-
+// conflict surface with audit02 phase 04 (which is also touching workers.rs).
+// It owns its own background thread that wakes on a fixed interval and copies
+// the live `sessions.sqlite3` into `sessions.sqlite3.bak` using SQLite's Online
+// Backup API (which is WAL-aware — a hot `cp` is not). Wiring this into
+// `App::new` is intentionally deferred to a follow-up that is allowed to edit
+// `src/app/mod.rs`; this phase is scoped to storage.rs / workers.rs / config.rs.
+
+/// Spawn the periodic-backup worker.
+///
+/// The worker sleeps for `interval`, then asks `storage` to back itself up to
+/// `<paths.root>/sessions.sqlite3.bak`. Errors are logged at warn level and do
+/// not stop the loop — a transient I/O failure shouldn't take down the worker.
+/// If `interval` is zero the function returns immediately without spawning.
+#[allow(dead_code)] // wired from App::new in a follow-up commit (Phase 14 step 14.3 wiring)
+pub fn spawn_backup_worker(
+    storage: std::sync::Arc<crate::storage::SessionStore>,
+    paths: crate::config::DuxPaths,
+    interval: std::time::Duration,
+) {
+    if interval.is_zero() {
+        crate::logger::info("[storage] periodic backup disabled (backup_interval_minutes = 0)");
+        return;
+    }
+    let dst = paths.root.join("sessions.sqlite3.bak");
+    let res = std::thread::Builder::new()
+        .name("storage-backup".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(interval);
+                match storage.backup_to(&dst) {
+                    Ok(()) => {
+                        crate::logger::debug(&format!("[storage] backup ok -> {}", dst.display()))
+                    }
+                    Err(e) => crate::logger::warn(&format!(
+                        "[storage] backup to {} failed: {e}",
+                        dst.display()
+                    )),
+                }
+            }
+        });
+    if let Err(e) = res {
+        crate::logger::warn(&format!("[storage] failed to spawn backup worker: {e}"));
+    }
 }

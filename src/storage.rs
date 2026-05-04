@@ -1,8 +1,101 @@
+use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard};
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 
-use crate::model::{AgentSession, SessionStatus};
+use crate::model::{AgentSession, SessionState, SessionStatus};
+
+/// Ordered list of schema migrations. Each entry is `(version, sql)`.
+///
+/// Rules (see `docs/contributing/schema-policy.md`):
+///
+/// 1. **Migrations are immutable.** Never edit an SQL file once it has been
+///    committed. To fix a bug introduced in migration N, write a new
+///    migration N+1 that corrects the data.
+/// 2. Append-only: new migrations are added to the end of this slice with
+///    a strictly increasing `version`.
+/// 3. Each migration's SQL must leave the schema in a consistent state. The
+///    runner records the version in `PRAGMA user_version` after applying.
+///
+/// SQLite's `PRAGMA user_version` is per-database and survives the
+/// `Storage::backup_to` SQLite Online Backup API used in Phase 14, so a
+/// `.bak` copy automatically carries the correct schema version.
+const MIGRATIONS: &[(u32, &str)] = &[
+    (
+        1,
+        include_str!("storage/migrations/0001_initial_schema.sql"),
+    ),
+    (
+        2,
+        include_str!("storage/migrations/0002_session_state_v2.sql"),
+    ),
+];
+
+/// Apply any migrations whose version is greater than the database's
+/// current `PRAGMA user_version` and bump `user_version` after each.
+///
+/// Idempotent: running this on an already-migrated database is a no-op
+/// because every migration's `version` is `<= user_version`. Migrations
+/// run in declaration order; SQLite executes each `execute_batch` inside
+/// an implicit transaction so a failure rolls back the partial DDL.
+///
+/// The `PRAGMA user_version = {n}` write uses `format!` because the
+/// version number is a hardcoded `u32` literal from `MIGRATIONS`, never
+/// user input — bound parameters are not allowed in PRAGMA statements.
+fn run_migrations(conn: &Connection) -> Result<()> {
+    let current: u32 = conn
+        .query_row("PRAGMA user_version;", [], |r| r.get(0))
+        .context("failed to read PRAGMA user_version")?;
+    for (version, sql) in MIGRATIONS {
+        if *version <= current {
+            continue;
+        }
+        conn.execute_batch(sql)
+            .with_context(|| format!("migration {version} failed"))?;
+        conn.execute_batch(&format!("PRAGMA user_version = {version};"))
+            .with_context(|| format!("failed to set user_version = {version}"))?;
+        crate::logger::info(&format!(
+            "storage: applied migration {version} (user_version now {version})"
+        ));
+    }
+
+    // Backwards-compatibility shim for databases that predate
+    // `user_version` tracking: the original `migrate()` body invoked
+    // `ensure_column` here to add columns that were grafted onto the
+    // schema over time (`title`, `project_path`, `started_providers`,
+    // and the `session_prs.state` / `session_prs.title` defaults). After
+    // migration 1 runs against a fresh DB these columns are present
+    // already and the calls are no-ops. They remain to handle the case
+    // where an older user upgrades from a version that had the columns
+    // but not the canonical schema captured here.
+    //
+    // `ensure_column` is `#[deprecated]`; suppress the warning at this
+    // single call site because we are explicitly keeping it for the
+    // legacy upgrade path. New schema additions must go through a new
+    // numbered migration file, never via `ensure_column`.
+    #[allow(deprecated)]
+    {
+        ensure_column(conn, "agent_sessions", "title", "text")?;
+        ensure_column(conn, "agent_sessions", "project_path", "text")?;
+        ensure_column(
+            conn,
+            "agent_sessions",
+            "started_providers",
+            "text not null default '[]'",
+        )?;
+        ensure_column(conn, "session_prs", "state", "text not null default 'OPEN'")?;
+        ensure_column(conn, "session_prs", "title", "text not null default ''")?;
+        // audit02 P1-Z: nullable state_json column for the new
+        // SessionState machine. Migration 0002 adds this for any DB
+        // tracked via `user_version`; this shim covers the legacy
+        // pre-`user_version` path the same way the older columns are
+        // handled above.
+        ensure_column(conn, "agent_sessions", "state_json", "text")?;
+    }
+    Ok(())
+}
 
 /// A stored PR association loaded from the database.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -14,70 +107,55 @@ pub struct StoredPr {
     pub title: String,
 }
 
+/// SQLite-backed persistence for sessions and PR associations.
+///
+/// The connection is wrapped in `Arc<Mutex<Connection>>` so that it can be
+/// shared with background workers (e.g. the periodic backup worker added in
+/// audit02 P1-W). Internally every method locks the mutex before issuing a
+/// query; the lock window is short and uncontended in practice.
 pub struct SessionStore {
-    conn: Connection,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl SessionStore {
-    pub fn open(path: &std::path::Path) -> Result<Self> {
+    /// Open or create a `sessions.sqlite3` database at `path` and run
+    /// startup PRAGMAs plus an integrity check.
+    ///
+    /// On corruption, fails fast with an error message that points at the
+    /// `.bak` file so the operator knows where to recover from.
+    pub fn open(path: &Path) -> Result<Self> {
         let conn =
-            Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-        let store = Self { conn };
+            open_connection(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let store = Self {
+            conn: Arc::new(Mutex::new(conn)),
+        };
         store.migrate()?;
         Ok(store)
     }
 
-    fn migrate(&self) -> Result<()> {
-        self.conn.execute_batch(
-            r#"
-            create table if not exists agent_sessions (
-                id text primary key,
-                project_id text not null,
-                provider text not null,
-                source_branch text not null,
-                branch_name text not null,
-                worktree_path text not null,
-                title text,
-                project_path text,
-                status text not null,
-                created_at text not null,
-                updated_at text not null
-            );
-            "#,
-        )?;
-        ensure_column(&self.conn, "agent_sessions", "title", "text")?;
-        ensure_column(&self.conn, "agent_sessions", "project_path", "text")?;
-        ensure_column(
-            &self.conn,
-            "agent_sessions",
-            "started_providers",
-            "text not null default '[]'",
-        )?;
-        self.conn.execute_batch(
-            r#"
-            create table if not exists session_prs (
-                session_id text not null,
-                pr_number integer not null,
-                owner_repo text not null,
-                state text not null default 'OPEN',
-                primary key (session_id, pr_number),
-                foreign key (session_id) references agent_sessions(id) on delete cascade
-            );
-            "#,
-        )?;
-        ensure_column(
-            &self.conn,
-            "session_prs",
-            "state",
-            "text not null default 'OPEN'",
-        )?;
-        ensure_column(
-            &self.conn,
-            "session_prs",
-            "title",
-            "text not null default ''",
-        )?;
+    /// Acquire the underlying connection lock. Panics if the mutex is
+    /// poisoned (a previous holder panicked while holding it). Public so
+    /// integration tests can issue `PRAGMA` queries.
+    pub fn conn(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().expect("storage mutex poisoned")
+    }
+
+    /// Online-backup the live database to `dst` using SQLite's backup API.
+    ///
+    /// This is safe to run concurrently with normal writes — the backup
+    /// API copies pages atomically and works correctly even when WAL is
+    /// enabled (a hot `cp` of the `.sqlite3` file alone would miss the
+    /// `-wal` and `-shm` companions).
+    pub fn backup_to(&self, dst: &Path) -> Result<()> {
+        let src = self.conn();
+        src.backup(rusqlite::MAIN_DB, dst, None)
+            .with_context(|| format!("backup to {} failed", dst.display()))?;
         Ok(())
+    }
+
+    fn migrate(&self) -> Result<()> {
+        let conn = self.conn();
+        run_migrations(&conn)
     }
 
     /// Insert a PR association or update its state and title if it already exists.
@@ -89,7 +167,8 @@ impl SessionStore {
         state: &str,
         title: &str,
     ) -> Result<()> {
-        self.conn.execute(
+        let conn = self.conn();
+        conn.execute(
             r#"
             insert into session_prs (session_id, pr_number, owner_repo, state, title)
             values (?1, ?2, ?3, ?4, ?5)
@@ -104,7 +183,8 @@ impl SessionStore {
 
     /// Load all known PRs for a session, ordered by pr_number descending (latest first).
     pub fn load_prs(&self, session_id: &str) -> Result<Vec<StoredPr>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
             r#"
             select pr_number, owner_repo, state, title
             from session_prs
@@ -131,7 +211,8 @@ impl SessionStore {
 
     /// Load the latest (highest-numbered) PR for each session that has at least one.
     pub fn load_all_latest_prs(&self) -> Result<Vec<StoredPr>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
             r#"
             select session_id, pr_number, owner_repo, state, title
             from session_prs
@@ -157,12 +238,21 @@ impl SessionStore {
     }
 
     pub fn upsert_session(&self, session: &AgentSession) -> Result<()> {
-        self.conn.execute(
+        let conn = self.conn();
+        // audit02 P1-Z phase 1: persist the new `SessionState` JSON
+        // alongside the legacy `status` column. Until `AgentSession`
+        // grows an explicit `state` field (phase 2), we synthesize
+        // one from the legacy status — that round-trips faithfully
+        // because both halves stay in sync per row.
+        let state_json = SessionState::from_legacy_status(&session.status, session.updated_at)
+            .to_json()
+            .ok();
+        conn.execute(
             r#"
             insert into agent_sessions
-                (id, project_id, project_path, provider, source_branch, branch_name, worktree_path, title, started_providers, status, created_at, updated_at)
+                (id, project_id, project_path, provider, source_branch, branch_name, worktree_path, title, started_providers, status, state_json, created_at, updated_at)
             values
-                (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             on conflict(id) do update set
                 project_path=excluded.project_path,
                 provider=excluded.provider,
@@ -172,6 +262,7 @@ impl SessionStore {
                 title=excluded.title,
                 started_providers=excluded.started_providers,
                 status=excluded.status,
+                state_json=excluded.state_json,
                 updated_at=excluded.updated_at
             "#,
             params![
@@ -185,6 +276,7 @@ impl SessionStore {
                 session.title,
                 serialize_started_providers(&session.started_providers),
                 session.status.as_str(),
+                state_json,
                 session.created_at.to_rfc3339(),
                 session.updated_at.to_rfc3339(),
             ],
@@ -193,17 +285,30 @@ impl SessionStore {
     }
 
     pub fn load_sessions(&self) -> Result<Vec<AgentSession>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
             r#"
-            select id, project_id, provider, source_branch, branch_name, worktree_path, title, project_path, started_providers, status, created_at, updated_at
+            select id, project_id, provider, source_branch, branch_name, worktree_path, title, project_path, started_providers, status, state_json, created_at, updated_at
             from agent_sessions
             order by updated_at desc
             "#,
         )?;
         let rows = stmt.query_map([], |row| {
             let started_providers: String = row.get(8)?;
-            let created_at: String = row.get(10)?;
-            let updated_at: String = row.get(11)?;
+            let legacy_status_str: String = row.get(9)?;
+            let _state_json: Option<String> = row.get(10)?;
+            let created_at: String = row.get(11)?;
+            let updated_at: String = row.get(12)?;
+            // audit02 P1-Z phase 1: the legacy `status` column is
+            // still the canonical answer for `AgentSession.status`.
+            // The new `state_json` column is written on every upsert
+            // so a future phase 2 reader can use it; phase 1 only
+            // reads it for tests and diagnostics. Preferring
+            // `state_json` here would change observable behaviour
+            // (e.g. the `Active` -> `Detached` collapse documented
+            // on `PersistedSessionState`) before the rest of the app
+            // is ready for it.
+            let status = SessionStatus::from_str(&legacy_status_str);
             Ok(AgentSession {
                 id: row.get(0)?,
                 project_id: row.get::<_, String>(1).unwrap_or_default(),
@@ -214,7 +319,7 @@ impl SessionStore {
                 title: row.get(6)?,
                 project_path: row.get(7)?,
                 started_providers: parse_started_providers(&started_providers),
-                status: SessionStatus::from_str(row.get::<_, String>(9)?.as_str()),
+                status,
                 created_at: parse_time(&created_at).unwrap_or_else(Utc::now),
                 updated_at: parse_time(&updated_at).unwrap_or_else(Utc::now),
             })
@@ -228,10 +333,58 @@ impl SessionStore {
     }
 
     pub fn delete_session(&self, id: &str) -> Result<()> {
-        self.conn
-            .execute("delete from agent_sessions where id = ?1", params![id])?;
+        let conn = self.conn();
+        conn.execute("delete from agent_sessions where id = ?1", params![id])?;
         Ok(())
     }
+
+    /// Returns a clone of the inner `Arc<Mutex<Connection>>` so a handle can
+    /// be shared with background workers (e.g. backup worker) without
+    /// transferring ownership.
+    #[allow(dead_code)] // consumed by spawn_backup_worker once wired (Phase 14 step 14.3)
+    pub fn shared_conn(&self) -> Arc<Mutex<Connection>> {
+        Arc::clone(&self.conn)
+    }
+}
+
+/// Open a SQLite connection at `path` with the dux startup PRAGMAs and a
+/// fast-fail integrity check.
+///
+/// The PRAGMA batch enables WAL journaling (so readers don't block writers
+/// and vice-versa), `synchronous = NORMAL` (the right durability/perf
+/// balance for a TUI workload — `OFF` would risk data loss on power-loss),
+/// memory temp tables, a 128 MiB mmap window, an autocheckpoint at 1000
+/// pages (~4 MiB at default page size), and foreign-key enforcement.
+fn open_connection(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.execute_batch(
+        r#"
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        PRAGMA temp_store = MEMORY;
+        PRAGMA mmap_size = 134217728;
+        PRAGMA wal_autocheckpoint = 1000;
+        PRAGMA foreign_keys = ON;
+        "#,
+    )?;
+
+    // Skip the integrity check for in-memory databases used by unit tests:
+    // they're always pristine, and PRAGMA integrity_check on a freshly
+    // opened :memory: DB can return rows that confuse the path-display
+    // logic (which assumes a real file path).
+    if path != Path::new(":memory:") {
+        let mut stmt = conn.prepare("PRAGMA integrity_check;")?;
+        let result: String = stmt.query_row([], |r| r.get(0))?;
+        if result != "ok" {
+            anyhow::bail!(
+                "sqlite integrity check failed for {}: {result}; restore from {}.bak",
+                path.display(),
+                path.display()
+            );
+        }
+    }
+
+    Ok(conn)
 }
 
 fn parse_time(value: &str) -> Option<DateTime<Utc>> {
@@ -240,12 +393,36 @@ fn parse_time(value: &str) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
+// audit02 Phase 24 (P2-10) — log a warn instead of swallowing serde_json
+// failures. The fallback values ("[]" / empty Vec) are preserved so this
+// is purely additive observability; corrupt rows still degrade gracefully
+// rather than crashing the session loader.
 fn serialize_started_providers(started_providers: &[String]) -> String {
-    serde_json::to_string(started_providers).unwrap_or_else(|_| "[]".to_string())
+    match serde_json::to_string(started_providers) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                target: "dux::storage",
+                err = %e,
+                "started_providers serialize failed; persisting []"
+            );
+            "[]".to_string()
+        }
+    }
 }
 
 fn parse_started_providers(value: &str) -> Vec<String> {
-    serde_json::from_str::<Vec<String>>(value).unwrap_or_default()
+    match serde_json::from_str::<Vec<String>>(value) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                target: "dux::storage",
+                err = %e,
+                "started_providers parse failed; defaulting to empty"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Opens an in-memory session store for tests.
@@ -344,6 +521,96 @@ mod tests {
 }
 
 #[cfg(test)]
+mod ensure_column_validation_tests {
+    use super::*;
+
+    #[test]
+    fn ensure_column_rejects_injection() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER);").unwrap();
+
+        // Hostile column name: classic SQL-injection payload.
+        #[allow(deprecated)]
+        let bad_column = ensure_column(&conn, "t", "x; DROP TABLE t; --", "TEXT");
+        assert!(
+            bad_column.is_err(),
+            "injection in column should be rejected"
+        );
+
+        // Hostile sql_type: trailing statement plus comment.
+        #[allow(deprecated)]
+        let bad_type = ensure_column(&conn, "t", "ok_name", "TEXT; DROP TABLE t; --");
+        assert!(
+            bad_type.is_err(),
+            "injection in sql_type should be rejected"
+        );
+
+        // Hostile table name: starts with a digit (not an identifier).
+        #[allow(deprecated)]
+        let bad_table = ensure_column(&conn, "1bad", "ok_name", "TEXT");
+        assert!(
+            bad_table.is_err(),
+            "non-identifier table should be rejected"
+        );
+
+        // Hostile sql_type: SQL comment in the middle.
+        #[allow(deprecated)]
+        let comment_type = ensure_column(&conn, "t", "ok_name", "TEXT /* sneaky */");
+        assert!(
+            comment_type.is_err(),
+            "block-comment in sql_type should be rejected"
+        );
+
+        // Confirm the table is still intact (no DROP got through).
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='t'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "table 't' must survive the rejected payloads");
+
+        // Sanity: a clean call still succeeds.
+        #[allow(deprecated)]
+        let ok = ensure_column(&conn, "t", "extra", "TEXT");
+        assert!(ok.is_ok(), "well-formed inputs should still work");
+    }
+
+    #[test]
+    fn ensure_column_accepts_legacy_defaults() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER);").unwrap();
+        // These exact strings appear in the legacy ensure_column call sites
+        // inside `run_migrations` and must keep working unchanged.
+        #[allow(deprecated)]
+        {
+            ensure_column(
+                &conn,
+                "t",
+                "started_providers",
+                "text not null default '[]'",
+            )
+            .unwrap();
+            ensure_column(&conn, "t", "state", "text not null default 'OPEN'").unwrap();
+            ensure_column(&conn, "t", "title", "text not null default ''").unwrap();
+        }
+    }
+
+    #[test]
+    fn is_safe_ident_matches_pattern() {
+        assert!(is_safe_ident("agent_sessions"));
+        assert!(is_safe_ident("_under"));
+        assert!(is_safe_ident("Col1"));
+        assert!(!is_safe_ident(""));
+        assert!(!is_safe_ident("1col"));
+        assert!(!is_safe_ident("col-name"));
+        assert!(!is_safe_ident("col;drop"));
+        assert!(!is_safe_ident("col name"));
+    }
+}
+
+#[cfg(test)]
 mod pr_tests {
     use super::*;
     use chrono::Duration;
@@ -428,7 +695,35 @@ mod pr_tests {
     }
 }
 
+/// Idempotently `ALTER TABLE ... ADD COLUMN` if `column` is missing.
+///
+/// **Deprecated.** This shim predates the `MIGRATIONS` registry and is
+/// retained only so that databases created before `PRAGMA user_version`
+/// was wired up keep working. New schema changes must be added as a
+/// numbered migration in `src/storage/migrations/` and listed in
+/// [`MIGRATIONS`]; see `docs/contributing/schema-policy.md` for the
+/// rules on naming, immutability, and review requirements.
+///
+/// As defense-in-depth (audit02 P1-K), `table` and `column` must match
+/// `[A-Za-z_][A-Za-z0-9_]*` and `sql_type` must be one of the SQLite
+/// storage classes (optionally followed by a constraint clause). Inputs
+/// that fail these checks return an error rather than splicing into the
+/// generated DDL — this guarantees we never SQL-inject ourselves even if
+/// a future caller forgets that all three arguments are interpolated raw.
+#[deprecated(
+    note = "schema changes must go through src/storage/migrations/ — see docs/contributing/schema-policy.md"
+)]
 fn ensure_column(conn: &Connection, table: &str, column: &str, sql_type: &str) -> Result<()> {
+    if !is_safe_ident(table) {
+        anyhow::bail!("ensure_column: rejected unsafe table name {table:?}");
+    }
+    if !is_safe_ident(column) {
+        anyhow::bail!("ensure_column: rejected unsafe column name {column:?}");
+    }
+    if !is_safe_sql_type(sql_type) {
+        anyhow::bail!("ensure_column: rejected unsafe sql_type {sql_type:?}");
+    }
+
     let mut stmt = conn.prepare(&format!("pragma table_info({table})"))?;
     let existing = stmt
         .query_map([], |row| row.get::<_, String>(1))?
@@ -441,4 +736,70 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, sql_type: &str) -
         [],
     )?;
     Ok(())
+}
+
+/// Return `true` when `s` looks like a safe SQL identifier:
+/// non-empty, starts with an ASCII letter or `_`, and contains only
+/// ASCII alphanumerics and `_` thereafter.
+///
+/// Free-standing so the rejection test can call it without pulling the
+/// whole `ensure_column` body through.
+fn is_safe_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Return `true` when `s` is one of SQLite's storage classes (optionally
+/// followed by a column constraint clause separated by ASCII whitespace).
+/// This deliberately accepts the constraint suffix because the legacy
+/// `ensure_column` call sites use values like
+/// `"text not null default '[]'"`. Anything containing a semicolon, a
+/// SQL comment marker, or a quote is rejected.
+fn is_safe_sql_type(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    // Reject anything that could end the current statement or smuggle a
+    // comment past it. SQLite treats `--` and `/*` as comment markers and
+    // `;` as a statement terminator.
+    if s.contains(';')
+        || s.contains("--")
+        || s.contains("/*")
+        || s.contains('"')
+        || s.contains('\'')
+    {
+        // The legacy default literal `'[]'` *does* contain `'`, so we
+        // re-allow that exact constraint shape further down. Anything
+        // else is rejected here.
+        return is_known_legacy_default_literal(s);
+    }
+    const STORAGE_CLASSES: &[&str] = &["TEXT", "INTEGER", "REAL", "BLOB", "NULL", "NUMERIC"];
+    let upper = s.trim().to_ascii_uppercase();
+    STORAGE_CLASSES
+        .iter()
+        .any(|class| upper == *class || upper.starts_with(&format!("{class} ")))
+}
+
+/// Whitelist for the small set of legacy `ensure_column` defaults that
+/// embed a single-quoted SQL literal — currently `text not null default
+/// '[]'` and `text not null default ''`. Keeps the broader
+/// quote-rejection in [`is_safe_sql_type`] intact while preserving the
+/// pre-Phase-19 `started_providers` / `session_prs.title` schema shims.
+fn is_known_legacy_default_literal(s: &str) -> bool {
+    let normalized: String = s
+        .trim()
+        .to_ascii_lowercase()
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    matches!(
+        normalized.as_str(),
+        "text not null default '[]'" | "text not null default ''" | "text not null default 'open'"
+    )
 }

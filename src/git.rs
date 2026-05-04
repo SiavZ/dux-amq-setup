@@ -32,22 +32,23 @@ struct StatusEntry {
 const NULL_DEVICE: &str = "/dev/null";
 
 pub fn current_branch(repo_path: &Path) -> Result<String> {
+    // audit02 Phase 21 (P2-11) — pass `&Path` directly so non-UTF-8
+    // worktree paths (legal on macOS HFS+/APFS and Linux ext4) survive
+    // the `Command::arg` round-trip byte-for-byte. `Path: AsRef<OsStr>`,
+    // and `Command::arg` consumes `AsRef<OsStr>`, so no lossy round-trip
+    // through UTF-8 happens. `to_string_lossy()` would have replaced
+    // invalid byte sequences with U+FFFD before git ever saw them.
     let output = Command::new("git")
-        .args([
-            "-C",
-            repo_path.to_string_lossy().as_ref(),
-            "symbolic-ref",
-            "--quiet",
-            "--short",
-            "HEAD",
-        ])
+        .arg("-C")
+        .arg(repo_path)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
         .output()
         .with_context(|| format!("failed to inspect {}", repo_path.display()))?;
     if !output.status.success() {
         return Err(anyhow!(
             "git symbolic-ref failed for {}: {}",
             repo_path.display(),
-            String::from_utf8_lossy(&output.stderr)
+            crate::sanitize::utf8_lossy(&output.stderr)
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -61,13 +62,12 @@ pub fn current_branch(repo_path: &Path) -> Result<String> {
 /// should fall back to a heuristic (e.g. checking if the current branch is
 /// `main` or `master`).
 pub fn remote_default_branch(repo_path: &Path) -> Option<String> {
+    // audit02 Phase 21 (P2-11) — see `current_branch` above for why
+    // `&Path` is passed directly instead of `to_string_lossy()`.
     let output = Command::new("git")
-        .args([
-            "-C",
-            repo_path.to_string_lossy().as_ref(),
-            "symbolic-ref",
-            "refs/remotes/origin/HEAD",
-        ])
+        .arg("-C")
+        .arg(repo_path)
+        .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -81,33 +81,28 @@ pub fn remote_default_branch(repo_path: &Path) -> Option<String> {
 }
 
 pub fn is_git_repo(path: &Path) -> bool {
+    // audit02 Phase 21 (P2-11) — `&Path` passed directly preserves
+    // non-UTF-8 path bytes; required for `tests/git_portability.rs`.
     Command::new("git")
-        .args([
-            "-C",
-            path.to_string_lossy().as_ref(),
-            "rev-parse",
-            "--git-dir",
-        ])
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--git-dir"])
         .output()
         .map(|out| out.status.success())
         .unwrap_or(false)
 }
 
 pub fn is_dirty(repo_path: &Path) -> Result<bool> {
+    // audit02 Phase 21 (P2-11) — `&Path` arg, see `current_branch`.
     let output = Command::new("git")
-        .args([
-            "-C",
-            repo_path.to_string_lossy().as_ref(),
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=no",
-        ])
+        .arg("-C")
+        .arg(repo_path)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=no"])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
             "git status failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            crate::sanitize::utf8_lossy(&output.stderr)
         ));
     }
     Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
@@ -115,20 +110,16 @@ pub fn is_dirty(repo_path: &Path) -> Result<bool> {
 
 pub fn pull_current_branch(repo_path: &Path) -> Result<()> {
     let branch = current_branch(repo_path)?;
+    // audit02 Phase 21 (P2-11) — `&Path` arg, see `current_branch`.
     let output = Command::new("git")
-        .args([
-            "-C",
-            repo_path.to_string_lossy().as_ref(),
-            "pull",
-            "--ff-only",
-            "origin",
-            &branch,
-        ])
+        .arg("-C")
+        .arg(repo_path)
+        .args(["pull", "--ff-only", "origin", &branch])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
             "git pull failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            crate::sanitize::utf8_lossy(&output.stderr)
         ));
     }
     Ok(())
@@ -141,18 +132,16 @@ pub fn pull_current_branch(repo_path: &Path) -> Result<()> {
 /// surface the concrete reason (e.g. conflicting unstaged changes) to the
 /// user. Requires git >= 2.23 (August 2019).
 pub fn switch_branch(repo_path: &Path, branch_name: &str) -> Result<()> {
+    // audit02 Phase 21 (P2-11) — `&Path` arg, see `current_branch`.
     let output = Command::new("git")
-        .args([
-            "-C",
-            repo_path.to_string_lossy().as_ref(),
-            "switch",
-            branch_name,
-        ])
+        .arg("-C")
+        .arg(repo_path)
+        .args(["switch", "--", branch_name])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
             "git switch {branch_name} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            crate::sanitize::utf8_lossy(&output.stderr).trim()
         ));
     }
     Ok(())
@@ -163,17 +152,12 @@ pub fn switch_branch(repo_path: &Path, branch_name: &str) -> Result<()> {
 /// Uses the plumbing command `git rev-parse --verify --quiet` and inspects
 /// only the exit code — no stdout is parsed.
 pub fn branch_exists(repo_path: &Path, name: &str) -> Option<BranchLocation> {
-    let repo = repo_path.to_string_lossy();
+    // audit02 Phase 21 (P2-11) — `&Path` arg, see `current_branch`.
     let local_ref = format!("refs/heads/{name}");
     let local = Command::new("git")
-        .args([
-            "-C",
-            repo.as_ref(),
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &local_ref,
-        ])
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "--verify", "--quiet", &local_ref])
         .output()
         .ok()
         .is_some_and(|o| o.status.success());
@@ -182,14 +166,9 @@ pub fn branch_exists(repo_path: &Path, name: &str) -> Option<BranchLocation> {
     }
     let remote_ref = format!("refs/remotes/origin/{name}");
     let remote = Command::new("git")
-        .args([
-            "-C",
-            repo.as_ref(),
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &remote_ref,
-        ])
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "--verify", "--quiet", &remote_ref])
         .output()
         .ok()
         .is_some_and(|o| o.status.success());
@@ -212,22 +191,19 @@ pub fn create_worktree_existing_branch(
     let project_root = worktrees_root.join(project_name);
     fs::create_dir_all(&project_root)?;
     let worktree_path = project_root.join(branch_name);
-    let repo = repo_path.to_string_lossy();
-    let worktree = worktree_path.to_string_lossy();
+    // audit02 Phase 21 (P2-11) — `&Path` args preserve non-UTF-8 bytes
+    // in both the repo location and the new worktree's destination.
     let output = Command::new("git")
-        .args([
-            "-C",
-            repo.as_ref(),
-            "worktree",
-            "add",
-            worktree.as_ref(),
-            branch_name,
-        ])
+        .arg("-C")
+        .arg(repo_path)
+        .args(["worktree", "add", "--"])
+        .arg(&worktree_path)
+        .arg(branch_name)
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
             "git worktree add failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            crate::sanitize::utf8_lossy(&output.stderr)
         ));
     }
     let canonical = worktree_path.canonicalize().unwrap_or(worktree_path);
@@ -256,18 +232,13 @@ pub fn create_worktree_from_start_point(
     let project_root = worktrees_root.join(project_name);
     fs::create_dir_all(&project_root)?;
     let worktree_path = project_root.join(&branch_name);
-    let repo = repo_path.to_string_lossy();
-    let worktree = worktree_path.to_string_lossy();
+    // audit02 Phase 21 (P2-11) — `&Path` args, see `current_branch`.
     let mut command = Command::new("git");
-    command.args([
-        "-C",
-        repo.as_ref(),
-        "worktree",
-        "add",
-        "-b",
-        &branch_name,
-        worktree.as_ref(),
-    ]);
+    command
+        .arg("-C")
+        .arg(repo_path)
+        .args(["worktree", "add", "-b", &branch_name, "--"])
+        .arg(&worktree_path);
     if let Some(start_point) = start_point {
         command.arg(start_point);
     }
@@ -275,7 +246,7 @@ pub fn create_worktree_from_start_point(
     if !output.status.success() {
         return Err(anyhow!(
             "git worktree add failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            crate::sanitize::utf8_lossy(&output.stderr)
         ));
     }
     let canonical = worktree_path.canonicalize().unwrap_or(worktree_path);
@@ -283,20 +254,18 @@ pub fn create_worktree_from_start_point(
 }
 
 pub fn head_commit(repo_path: &Path) -> Result<String> {
+    // audit02 Phase 21 (P2-11) — `&Path` arg, see `current_branch`.
     let output = Command::new("git")
-        .args([
-            "-C",
-            repo_path.to_string_lossy().as_ref(),
-            "rev-parse",
-            "HEAD",
-        ])
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "HEAD"])
         .output()
         .with_context(|| format!("failed to inspect HEAD for {}", repo_path.display()))?;
     if !output.status.success() {
         return Err(anyhow!(
             "git rev-parse HEAD failed for {}: {}",
             repo_path.display(),
-            String::from_utf8_lossy(&output.stderr)
+            crate::sanitize::utf8_lossy(&output.stderr)
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -326,42 +295,32 @@ pub fn remove_worktree(
     worktree_path: &Path,
     branch_name: &str,
 ) -> Result<RemoveResult> {
+    // audit02 Phase 21 (P2-11) — `&Path` args, see `current_branch`.
     let output = Command::new("git")
-        .args([
-            "-C",
-            repo_path.to_string_lossy().as_ref(),
-            "worktree",
-            "remove",
-            "--force",
-            worktree_path.to_string_lossy().as_ref(),
-        ])
+        .arg("-C")
+        .arg(repo_path)
+        .args(["worktree", "remove", "--force"])
+        .arg(worktree_path)
         .output()?;
     if !output.status.success() {
         if worktree_path.exists() {
             return Err(anyhow!(
                 "git worktree remove failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                crate::sanitize::utf8_lossy(&output.stderr)
             ));
         }
         // Worktree already gone from disk — prune stale git refs.
         let _ = Command::new("git")
-            .args([
-                "-C",
-                repo_path.to_string_lossy().as_ref(),
-                "worktree",
-                "prune",
-            ])
+            .arg("-C")
+            .arg(repo_path)
+            .args(["worktree", "prune"])
             .output();
     }
     // Best-effort branch deletion.
     let branch_output = Command::new("git")
-        .args([
-            "-C",
-            repo_path.to_string_lossy().as_ref(),
-            "branch",
-            "-D",
-            branch_name,
-        ])
+        .arg("-C")
+        .arg(repo_path)
+        .args(["branch", "-D", branch_name])
         .output()?;
     Ok(RemoveResult {
         branch_already_deleted: !branch_output.status.success(),
@@ -369,22 +328,16 @@ pub fn remove_worktree(
 }
 
 pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<ChangedFile>)> {
-    let wt = worktree_path.to_string_lossy();
-
+    // audit02 Phase 21 (P2-11) — `&Path` args, see `current_branch`.
     let output = Command::new("git")
-        .args([
-            "-C",
-            wt.as_ref(),
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-        ])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
             "git status failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            crate::sanitize::utf8_lossy(&output.stderr)
         ));
     }
 
@@ -429,7 +382,9 @@ pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<Chan
     }
 
     if let Ok(ns) = Command::new("git")
-        .args(["-C", wt.as_ref(), "diff", "--numstat", "-z"])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["diff", "--numstat", "-z"])
         .output()
         && ns.status.success()
     {
@@ -466,7 +421,9 @@ pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<Chan
     }
 
     if let Ok(ns) = Command::new("git")
-        .args(["-C", wt.as_ref(), "diff", "--cached", "--numstat", "-z"])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["diff", "--cached", "--numstat", "-z"])
         .output()
         && ns.status.success()
     {
@@ -490,10 +447,11 @@ pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<Chan
 }
 
 fn untracked_file_diff_stat(worktree_path: &Path, rel_path: &str) -> Option<DiffStat> {
+    // audit02 Phase 21 (P2-11) — `&Path` arg, see `current_branch`.
     let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
         .args([
-            "-C",
-            worktree_path.to_string_lossy().as_ref(),
             "diff",
             "--no-index",
             "--numstat",
@@ -610,28 +568,32 @@ where
 }
 
 pub fn stage_file(worktree_path: &Path, file_path: &str) -> Result<()> {
-    let wt = worktree_path.to_string_lossy();
+    // audit02 Phase 21 (P2-11) — `&Path` arg, see `current_branch`.
     let output = Command::new("git")
-        .args(["-C", wt.as_ref(), "add", "--", file_path])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["add", "--", file_path])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
             "git add failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            crate::sanitize::utf8_lossy(&output.stderr)
         ));
     }
     Ok(())
 }
 
 pub fn unstage_file(worktree_path: &Path, file_path: &str) -> Result<()> {
-    let wt = worktree_path.to_string_lossy();
+    // audit02 Phase 21 (P2-11) — `&Path` arg, see `current_branch`.
     let output = Command::new("git")
-        .args(["-C", wt.as_ref(), "reset", "HEAD", "--", file_path])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["reset", "HEAD", "--", file_path])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
             "git reset failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            crate::sanitize::utf8_lossy(&output.stderr)
         ));
     }
     Ok(())
@@ -647,14 +609,16 @@ pub fn discard_file(worktree_path: &Path, file_path: &str, is_untracked: bool) -
         }
         return Ok(());
     }
-    let wt = worktree_path.to_string_lossy();
+    // audit02 Phase 21 (P2-11) — `&Path` arg, see `current_branch`.
     let output = Command::new("git")
-        .args(["-C", wt.as_ref(), "checkout", "--", file_path])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["checkout", "--", file_path])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
             "git checkout failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            crate::sanitize::utf8_lossy(&output.stderr)
         ));
     }
     Ok(())
@@ -663,50 +627,49 @@ pub fn discard_file(worktree_path: &Path, file_path: &str, is_untracked: bool) -
 /// Return the text of `git diff --cached` for the given worktree.
 /// Uses `-c color.diff=false` to strip ANSI escapes regardless of user config.
 pub fn staged_diff_text(worktree_path: &Path) -> Result<String> {
-    let wt = worktree_path.to_string_lossy();
+    // audit02 Phase 21 (P2-11) — `&Path` arg, see `current_branch`.
     let output = Command::new("git")
-        .args([
-            "-C",
-            wt.as_ref(),
-            "-c",
-            "color.diff=false",
-            "diff",
-            "--cached",
-        ])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["-c", "color.diff=false", "diff", "--cached"])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
             "git diff --cached failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            crate::sanitize::utf8_lossy(&output.stderr)
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 pub fn commit(worktree_path: &Path, message: &str) -> Result<String> {
-    let wt = worktree_path.to_string_lossy();
+    // audit02 Phase 21 (P2-11) — `&Path` arg, see `current_branch`.
     let output = Command::new("git")
-        .args(["-C", wt.as_ref(), "commit", "-m", message])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["commit", "-m", message])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
             "git commit failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            crate::sanitize::utf8_lossy(&output.stderr)
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 pub fn push(worktree_path: &Path) -> Result<String> {
-    let wt = worktree_path.to_string_lossy();
     let branch = current_branch(worktree_path)?;
+    // audit02 Phase 21 (P2-11) — `&Path` arg, see `current_branch`.
     let output = Command::new("git")
-        .args(["-C", wt.as_ref(), "push", "-u", "origin", &branch])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["push", "-u", "origin", &branch])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
             "git push failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            crate::sanitize::utf8_lossy(&output.stderr)
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -716,14 +679,11 @@ pub fn push(worktree_path: &Path) -> Result<String> {
 /// for new (untracked) files. Uses the plumbing command `cat-file` which is
 /// immune to user configuration.
 pub fn file_bytes_at_head(worktree_path: &Path, path: &str) -> Result<Option<Vec<u8>>> {
+    // audit02 Phase 21 (P2-11) — `&Path` arg, see `current_branch`.
     let output = Command::new("git")
-        .args([
-            "-C",
-            worktree_path.to_string_lossy().as_ref(),
-            "cat-file",
-            "-p",
-            &format!("HEAD:{path}"),
-        ])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["cat-file", "-p", &format!("HEAD:{path}")])
         .output()?;
     if !output.status.success() {
         // File doesn't exist at HEAD (new/untracked file).
@@ -763,27 +723,23 @@ pub fn ellipsize_middle(input: &str, max_width: usize) -> String {
 /// Rename a git branch inside a worktree. Runs `git branch -m <old> <new>`
 /// from within the worktree directory.
 pub fn rename_branch(worktree_path: &Path, old_name: &str, new_name: &str) -> Result<()> {
+    // audit02 Phase 21 (P2-11) — `&Path` arg, see `current_branch`.
     let output = Command::new("git")
-        .args([
-            "-C",
-            worktree_path.to_string_lossy().as_ref(),
-            "branch",
-            "-m",
-            old_name,
-            new_name,
-        ])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["branch", "-m", "--", old_name, new_name])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
             "git branch rename failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            crate::sanitize::utf8_lossy(&output.stderr).trim()
         ));
     }
     Ok(())
 }
 
 pub fn docker_style_name() -> String {
-    petname::petname(2, "-").expect("petname generation should not fail")
+    petname::petname(2, "-").unwrap_or_else(|| format!("agent-{}", uuid::Uuid::new_v4().simple()))
 }
 
 /// Returns `true` if `name` contains only characters safe for git branch names:
@@ -834,14 +790,11 @@ pub fn agent_name_char_map(text: &str, cursor: usize, ch: char) -> Option<char> 
 /// Returns `"owner/repo"` parsed from the `origin` remote URL, or `None` if
 /// the remote doesn't point to GitHub or the command fails.
 pub fn remote_owner_repo(worktree_path: &Path) -> Option<String> {
+    // audit02 Phase 21 (P2-11) — `&Path` arg, see `current_branch`.
     let output = Command::new("git")
-        .args([
-            "-C",
-            worktree_path.to_string_lossy().as_ref(),
-            "remote",
-            "get-url",
-            "origin",
-        ])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["remote", "get-url", "origin"])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -1028,16 +981,12 @@ mod tests {
     /// Create a worktree + branch from the test repo. Returns the worktree path.
     fn add_worktree(repo: &Path, branch: &str) -> PathBuf {
         let wt = repo.join(format!("wt-{branch}"));
+        // audit02 Phase 21 (P2-11) — `&Path` args, mirrors production code.
         let out = Command::new("git")
-            .args([
-                "-C",
-                repo.to_string_lossy().as_ref(),
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                wt.to_string_lossy().as_ref(),
-            ])
+            .arg("-C")
+            .arg(repo)
+            .args(["worktree", "add", "-b", branch])
+            .arg(&wt)
             .output()
             .unwrap();
         assert!(

@@ -1,0 +1,26 @@
+# audit02 Phase 24 (P2-1) — code owners for review routing.
+#
+# CODEOWNERS only takes effect when branch protection enables
+# "Require review from Code Owners". Without that, this file is
+# informational. See docs/plans/audits/audit02/26-* for the
+# branch-protection rollout.
+
+# Default owner for the repository
+*                              @SiavZ
+
+# Rust patches to upstream files require sharper review
+src/clipboard.rs               @SiavZ
+src/app/mod.rs                 @SiavZ
+src/app/render.rs              @SiavZ
+src/config.rs                  @SiavZ
+
+# Audit deliverables
+docs/audits/                   @SiavZ
+docs/plans/audits/             @SiavZ
+
+# Supply-chain critical
+.github/workflows/             @SiavZ
+.github/dependabot.yml         @SiavZ
+dux-amq/install.sh             @SiavZ
+deny.toml                      @SiavZ
+rust-toolchain.toml            @SiavZ

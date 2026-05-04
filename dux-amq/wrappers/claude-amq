@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# claude-amq: launch Claude Code with AMQ co-op identity.
+#
+# Identity defaults to the git branch of CWD (= dux worktree name);
+# falls back to "claude-<pid>" when not in a git worktree.
+# Skips AMQ wrapping for oneshot (-p / --print) invocations.
+# Uses the global queue at $AMQ_GLOBAL_ROOT and never auto-creates .amqrc
+# in the worktree.
+#
+# Optional session-history seeding (OFF by default — see notes below):
+#   Set CLAUDE_AMQ_SEED_FROM_PARENT=1 to enable. Be aware: rsync clones the
+#   parent worktree's full Claude history (~100 MB on heavy repos) — disk
+#   amplification N×, possible token-billing escalation, and cross-worktree
+#   info leak (parent transcripts may carry secrets/PII from a different
+#   feature). Pair with `resume_args = ["--resume"]` in dux config if used.
+#   Avoid combining with `--continue`: the latest parent session may carry
+#   a deferred-tool marker that --continue refuses.
+set -euo pipefail
+
+# Returns 0 when $PWD is *inside* the dux worktrees directory, 1 otherwise.
+#
+# Why not a simple `[[ "$PWD" == "$DUX_HOME/worktrees/"* ]]` glob (the
+# previous implementation): the glob also matches sibling directories
+# whose names start with `worktrees`, e.g. `/data/state/dux/worktrees-evil/x`.
+# That path-prefix vs path-segment distinction is the audit01 P0-5 bug.
+#
+# We canonicalize both sides via `realpath --` so a symlinked DUX_HOME
+# or a CWD reached through a symlink still resolves correctly. The
+# trailing slash on `pwd_real/` plus the `/*` pattern on the case label
+# enforces a real path-segment boundary: `/foo/worktrees/` matches but
+# `/foo/worktrees-evil/` does not.
+#
+# Linux note: `realpath --` requires GNU coreutils (the install.sh
+# preflight enforces this). On macOS, `realpath` accepts the same flag
+# starting with coreutils 9.x via brew; users on stock BSD realpath
+# need `brew install coreutils` and either alias or set PATH so that
+# `grealpath`/GNU realpath wins.
+is_dux_worktree() {
+  local pwd_real worktrees_real
+  pwd_real=$(realpath -- "$PWD" 2>/dev/null)        || return 1
+  worktrees_real=$(realpath -- "${DUX_HOME:-/data/state/dux}/worktrees" 2>/dev/null) || return 1
+  case "$pwd_real/" in
+    "$worktrees_real"/*) return 0 ;;
+    *)                   return 1 ;;
+  esac
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    -p|--print|--bare) exec claude "$@" ;;
+  esac
+done
+
+seed_session_history() {
+  # OFF by default. Set CLAUDE_AMQ_SEED_FROM_PARENT=1 to enable.
+  [[ "${CLAUDE_AMQ_SEED_FROM_PARENT:-}" == "1" ]] || return 0
+
+  local git_dir git_common_dir main_worktree
+  git_dir=$(git -C "$PWD" rev-parse --absolute-git-dir 2>/dev/null) || return 0
+  git_common_dir=$(git -C "$PWD" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 0
+  [[ "$git_dir" == "$git_common_dir" ]] && return 0
+  main_worktree=$(git -C "$PWD" worktree list --porcelain 2>/dev/null \
+    | awk '/^worktree / {print $2; exit}')
+  [[ -z "$main_worktree" || "$main_worktree" == "$PWD" ]] && return 0
+
+  # Encode each path with the shared encoder script (single source of
+  # truth — see dux-amq/scripts/encode-claude-project-dir). The previous
+  # inline `sed` only handled `/` and `_`; in reality Claude Code rewrites
+  # every char outside [A-Za-z0-9-] to `-`, so paths containing `.`,
+  # spaces, or other punctuation seeded into the wrong directory and the
+  # parent transcripts were silently never picked up.
+  if ! command -v encode-claude-project-dir >/dev/null 2>&1; then
+    printf 'claude-amq: encode-claude-project-dir not on PATH; skipping seed\n' >&2
+    return 0
+  fi
+  # `--` guards against pathological paths that begin with `-`. We also
+  # capture $PWD / $main_worktree via `printf '%s'` (P2-3) before passing
+  # to the encoder — `echo` would interpret a leading `-n` / `-e` as flags.
+  local enc_self enc_main self_dir main_dir pwd_str main_str
+  pwd_str=$(printf '%s' "$PWD")
+  main_str=$(printf '%s' "$main_worktree")
+  enc_self=$(encode-claude-project-dir -- "$pwd_str") || return 0
+  enc_main=$(encode-claude-project-dir -- "$main_str") || return 0
+  self_dir="$HOME/.claude/projects/$enc_self"
+  main_dir="$HOME/.claude/projects/$enc_main"
+
+  [[ ! -d "$main_dir" ]] && return 0
+  if compgen -G "$self_dir/*.jsonl" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  mkdir -p "$self_dir"
+  # Audit02 P1-D: previously rsync errors were swallowed via `2>/dev/null
+  # || true` and the wrapper happily reported "seeded N past sessions"
+  # even when the seed was partial (or empty). Capture stderr to a
+  # tempfile, count any warnings, and report partial-seed status
+  # accurately. Seeding is best-effort — we don't fail the wrapper — but
+  # the user must see the error count so a silent partial seed can't
+  # masquerade as success.
+  local rsync_log seed_rc=0
+  rsync_log=$(mktemp -t claude-amq-seed.XXXXXX) || {
+    echo "claude-amq: could not allocate tempfile for seed log; skipping seed" >&2
+    return 0
+  }
+  if command -v rsync >/dev/null 2>&1; then
+    if ! rsync -a "$main_dir"/ "$self_dir"/ 2>"$rsync_log"; then
+      seed_rc=$?
+      echo "claude-amq: seed partial (rsync rc=$seed_rc); see $rsync_log" >&2
+    fi
+  else
+    if ! cp -r "$main_dir"/. "$self_dir"/ 2>"$rsync_log"; then
+      seed_rc=$?
+      echo "claude-amq: seed partial (cp rc=$seed_rc); see $rsync_log" >&2
+    fi
+  fi
+  local n warn_lines
+  n=$(find "$self_dir" -name '*.jsonl' 2>/dev/null | wc -l)
+  if [[ -s "$rsync_log" ]]; then
+    warn_lines=$(wc -l <"$rsync_log" | tr -d '[:space:]')
+    echo "claude-amq: seeded $n files (with $warn_lines rsync warnings; see $rsync_log)" >&2
+  else
+    echo "claude-amq: seeded $n past sessions from $main_worktree" >&2
+    rm -f "$rsync_log"
+  fi
+}
+seed_session_history || true
+
+ME="${AM_ME:-}"
+# Identity priority:
+#   1. AM_ME from env (explicit override)
+#   2. dux worktree dir basename — stable per-pane and unique, even if the
+#      git branch was renamed or checked out to something unexpected
+#   3. git branch (legacy fallback)
+#   4. claude-<pid> (no-context fallback)
+if [[ -z "$ME" ]] && is_dux_worktree; then
+  ME=$(basename "$PWD")
+fi
+if [[ -z "$ME" ]]; then
+  ME=$(git -C "$PWD" branch --show-current 2>/dev/null || true)
+fi
+[[ -z "$ME" ]] && ME="claude-$$"
+# AMQ requires lowercase agent handles.
+ME=$(printf '%s' "$ME" | tr '[:upper:]' '[:lower:]' | sed 's|[^a-z0-9_-]|-|g; s|^-\+||; s|-\+$||')
+
+ROOT="${AMQ_GLOBAL_ROOT:-/data/state/amq}"
+
+# Audit02 P1-F: identity collision detection.
+#
+# AMQ stores per-agent state under "$ROOT/agents/<handle>/". The ME
+# normalization above maps disjoint branch names to the same handle —
+# e.g. "Feature/Login" and "feature-login" both become "feature-login".
+# Without a collision check, the second wrapper invocation silently
+# overwrites the first agent's state and steals its inbox.
+#
+# Strategy: stash the original $PWD next to the agent dir on first
+# invocation. Subsequent invocations compare and refuse if the path
+# differs. We compare against $PWD literally (NOT realpath) so users
+# who symlink-mount the same physical worktree to two different
+# locations don't trigger false-positives — the AMQ state is shared
+# either way.
+ME_REGISTRATION="$ROOT/agents/$ME/.dux-amq-source"
+if [[ -f "$ME_REGISTRATION" ]]; then
+  prev=$(cat "$ME_REGISTRATION" 2>/dev/null || true)
+  if [[ -n "$prev" && "$prev" != "$PWD" ]]; then
+    printf '\033[1;31m!\033[0m [dux-amq] identity collision: %s already registered to %s (current: %s).\n' \
+      "$ME" "$prev" "$PWD" >&2
+    printf '            Rename one branch (avoid normalize-collisions) or set AM_ME explicitly.\n' >&2
+    exit 1
+  fi
+fi
+mkdir -p "$ROOT/agents/$ME" 2>/dev/null || true
+# Mode 0644 marker — informational, not a security boundary.
+printf '%s\n' "$PWD" > "$ME_REGISTRATION" 2>/dev/null || true
+
+# YOLO is OPT-IN. Set CLAUDE_AMQ_YOLO=1 (or legacy CLAUDE_YOLO=1) to enable.
+# Anthropic CVEs in 2025–26 (CVE-2025-59536 et al) targeted credential
+# exfil through this attack class — default-deny is mandatory in prod.
+EXTRA=()
+if [[ "${CLAUDE_AMQ_YOLO:-${CLAUDE_YOLO:-}}" == "1" ]]; then
+  EXTRA+=(--dangerously-skip-permissions)
+  printf 'claude-amq: YOLO enabled — tool calls will not prompt\n' >&2
+fi
+
+# Transitional warning for users who set the legacy opt-out variable.
+# CLAUDE_AMQ_SAFE used to disable YOLO; since YOLO is now opt-in, the
+# variable is meaningless and silently keeping it set hides intent.
+if [[ -n "${CLAUDE_AMQ_SAFE:-}" ]]; then
+  printf 'claude-amq: CLAUDE_AMQ_SAFE is deprecated; YOLO is now opt-in via CLAUDE_AMQ_YOLO\n' >&2
+fi
+
+# Audit02 P0-K (T2) + Phase 13 (audit01 P1-1): route incoming messages
+# through verify-then-bridge. Two transports are wired:
+#
+#   raw  → `amq wake --inject-mode raw` — uses `ioctl(TIOCSTI)` to push
+#          characters into the controlling TTY. Fast, in-process, but
+#          REQUIRES `dev.tty.legacy_tiocsti=1` on Linux. Kernels built
+#          with `CONFIG_LEGACY_TIOCSTI=n` (Linux 6.2+, Ubuntu 24.04,
+#          Debian 12+) silently drop every notification.
+#   via  → `amq wake --inject-via dux-amq-inject-bridge` — AMQ spawns
+#          the bridge per notification with the envelope as argv. The
+#          bridge calls amq-receive-verify (HMAC + freshness + replay)
+#          and, on success, uses tmux send-keys / a file queue to
+#          deliver the body. Works on any kernel.
+#
+# Selection priority:
+#   1. DUX_AMQ_INJECT_MODE env var (escape hatch / test override).
+#   2. Presence of $STATE_ROOT/dux/.tiocsti-state (written by install.sh
+#      when it detects a TIOCSTI-disabled kernel) → via.
+#   3. Default → raw (preserves the legacy fast path on TIOCSTI-OK hosts).
+#
+# Stderr is captured to a per-pane log (audit01 P1-2 hygiene) instead of
+# being dropped to /dev/null — `>2>/dev/null` previously hid the
+# "[amq-verify] dropping unsigned" lines that are the entire signal of
+# this phase actually doing its job.
+LOG_DIR="$HOME/.local/share/dux-amq"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+WAKE_LOG="$LOG_DIR/wake-$ME.log"
+WAKE_PID="$LOG_DIR/wake-$ME.pid"
+
+STATE_ROOT="${STATE_ROOT:-/data/state}"
+LOCAL_BIN="${LOCAL_BIN:-$HOME/.local/bin}"
+
+INJECT_MODE="${DUX_AMQ_INJECT_MODE:-}"
+if [[ -z "$INJECT_MODE" ]]; then
+  if [[ -f "$STATE_ROOT/dux/.tiocsti-state" ]]; then
+    INJECT_MODE="via"
+  else
+    INJECT_MODE="raw"
+  fi
+fi
+
+# Audit02 P1-B: replace bare `&` with `setsid … & disown` and a PID
+# file. The bare-`&` form left `amq wake` as a child of the wrapper's
+# bash; if the parent shell hung up (SSH disconnect, terminal closed),
+# the wake daemon got SIGHUP and exited silently — every queued message
+# from peers was then dropped until the next interactive launch.
+#
+# `setsid` puts wake in its own session+process group, decoupled from
+# the controlling TTY. `disown` removes it from bash's job table so
+# `set -e` and shell exit don't reap it. The PID file under
+# $LOG_DIR/wake-$ME.pid lets the doctor tool (Phase 20) check liveness
+# without scanning /proc.
+#
+# Linux note: `setsid(1)` here is util-linux. macOS ships a different
+# implementation that lacks some flags but the bare invocation we use
+# is portable. dux-amq is Linux-only per the README, so this is mostly
+# documentary.
+#
+# Stderr is captured to $WAKE_LOG (audit01 P1-2 hygiene). stdout was
+# previously dropped; we now also append it so the doctor tool can
+# diff the log to spot wake-side errors.
+case "$INJECT_MODE" in
+  raw)
+    setsid amq wake --me "$ME" --root "$ROOT" --inject-mode raw \
+      </dev/tty >>"$WAKE_LOG" 2>&1 &
+    disown
+    echo $! > "$WAKE_PID"
+    ;;
+  via)
+    # The bridge MUST be a single executable — AMQ doesn't support
+    # shell-pipeline strings as `--inject-via`. The bridge wraps verify
+    # and the inject strategy; see dux-amq/scripts/dux-amq-inject-bridge.
+    BRIDGE="$LOCAL_BIN/dux-amq-inject-bridge"
+    if [[ ! -x "$BRIDGE" ]]; then
+      # Fall back to PATH lookup (test environments / unpinned installs).
+      BRIDGE=$(command -v dux-amq-inject-bridge 2>/dev/null || true)
+    fi
+    if [[ -n "$BRIDGE" && -x "$BRIDGE" ]]; then
+      setsid amq wake --me "$ME" --root "$ROOT" --inject-via "$BRIDGE" \
+        >>"$WAKE_LOG" 2>&1 &
+      disown
+      echo $! > "$WAKE_PID"
+    else
+      printf 'claude-amq: dux-amq-inject-bridge not found; wake disabled\n' >&2
+    fi
+    ;;
+  *)
+    printf 'claude-amq: DUX_AMQ_INJECT_MODE=%q not understood; using raw\n' "$INJECT_MODE" >&2
+    setsid amq wake --me "$ME" --root "$ROOT" --inject-mode raw \
+      </dev/tty >>"$WAKE_LOG" 2>&1 &
+    disown
+    echo $! > "$WAKE_PID"
+    ;;
+esac
+
+exec amq coop exec --no-wake --no-init --root "$ROOT" --me "$ME" claude -- ${EXTRA[@]+"${EXTRA[@]}"} "$@"

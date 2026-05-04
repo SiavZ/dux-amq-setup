@@ -28,6 +28,12 @@ Rules:
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Internal schema version of this `config.toml`. Used by
+    /// [`migrate_config`] to apply backwards-compatible upgrades on
+    /// load. Do not edit by hand — `dux config regenerate` will write
+    /// the correct value.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub defaults: Defaults,
     pub providers: ProvidersConfig,
     pub terminal: TerminalConfig,
@@ -37,6 +43,52 @@ pub struct Config {
     pub editor: EditorConfig,
     pub keys: KeysConfig,
     pub macros: MacrosConfig,
+    pub storage: StorageConfig,
+    pub auto_resume: AutoResumeConfig,
+    pub limits: LimitsConfig,
+}
+
+/// Current canonical config schema version. Increment whenever a new
+/// migration arm is added to [`migrate_config`]; see
+/// `docs/contributing/schema-policy.md`.
+pub const CONFIG_SCHEMA_CURRENT: u32 = 1;
+
+/// Default value for [`Config::schema_version`] when the field is
+/// missing from `config.toml` (i.e. the file predates this field). A
+/// missing field is treated as schema version 1, and [`migrate_config`]
+/// brings it forward to [`CONFIG_SCHEMA_CURRENT`].
+fn default_schema_version() -> u32 {
+    1
+}
+
+/// Walk a [`Config`] forward to [`CONFIG_SCHEMA_CURRENT`] by applying
+/// each version-specific upgrade arm in order. Designed as a ladder so
+/// future migrations only need to add a new arm — never edit existing
+/// ones (see `docs/contributing/schema-policy.md`).
+///
+/// The function is total: a config already at or beyond the current
+/// version is returned unchanged. Versions newer than this build of
+/// dux are also returned as-is — `Config::load` chooses how to handle
+/// that case.
+pub fn migrate_config(mut c: Config) -> Config {
+    while c.schema_version < CONFIG_SCHEMA_CURRENT {
+        match c.schema_version {
+            0 => {
+                // 0 -> 1: pre-versioning configs simply adopt the
+                // current canonical layout. No field renames or value
+                // rewrites are required because the new fields added
+                // since v0 (the `[storage]` section, etc.) all carry
+                // serde defaults via `#[serde(default)]`.
+                c.schema_version = 1;
+            }
+            // TODO(audit02 Phases 15/16): when `[limits]` and the
+            // `[auto_resume]` section land, bump
+            // `CONFIG_SCHEMA_CURRENT` to 2 and add an arm that rewrites
+            // `c.schema_version = 1` to fill those defaults explicitly.
+            _ => break,
+        }
+    }
+    c
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -119,6 +171,7 @@ pub struct Defaults {
     pub start_directory: Option<String>,
     pub commit_prompt: Option<String>,
     pub enable_randomized_pet_name_by_default: bool,
+    pub auto_resume_on_start: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -184,6 +237,160 @@ fn new_project_id() -> String {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
+pub struct StorageConfig {
+    /// Minutes between automatic `sessions.sqlite3` backups via the
+    /// SQLite Online Backup API. Set to 0 to disable. Default: 30.
+    #[serde(default = "default_backup_interval_minutes")]
+    pub backup_interval_minutes: u32,
+}
+
+fn default_backup_interval_minutes() -> u32 {
+    30
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            backup_interval_minutes: default_backup_interval_minutes(),
+        }
+    }
+}
+
+/// Tunables for `defaults.auto_resume_on_start`.
+///
+/// When auto-resume is enabled at startup, dux otherwise spawns a PTY for
+/// every persisted session in a tight loop. With many saved sessions that
+/// causes a fork-bomb / TLS-handshake stampede that some providers
+/// rate-limit, so spawns are bounded by [`Self::concurrency`], staggered by
+/// [`Self::stagger_ms`], and worktrees untouched for more than
+/// [`Self::stale_days`] days are skipped entirely.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoResumeConfig {
+    /// Maximum number of sessions whose PTY may be spawning in parallel.
+    /// Lower = slower startup but less API load. 0 is treated as 1.
+    /// Default 4.
+    #[serde(default = "default_auto_resume_concurrency")]
+    pub concurrency: usize,
+    /// Skip auto-resume for any session whose worktree directory has not
+    /// been modified within this many days. 0 disables the filter (all
+    /// sessions are eligible). Default 30.
+    #[serde(default = "default_auto_resume_stale_days")]
+    pub stale_days: u32,
+    /// Minimum delay (in milliseconds) between successive spawn attempts.
+    /// Smooths out the burst of TLS handshakes when many sessions resume.
+    /// Default 250.
+    #[serde(default = "default_auto_resume_stagger_ms")]
+    pub stagger_ms: u64,
+}
+
+fn default_auto_resume_concurrency() -> usize {
+    4
+}
+
+fn default_auto_resume_stale_days() -> u32 {
+    30
+}
+
+fn default_auto_resume_stagger_ms() -> u64 {
+    250
+}
+
+impl Default for AutoResumeConfig {
+    fn default() -> Self {
+        Self {
+            concurrency: default_auto_resume_concurrency(),
+            stale_days: default_auto_resume_stale_days(),
+            stagger_ms: default_auto_resume_stagger_ms(),
+        }
+    }
+}
+
+/// Runtime resource caps. Hard limits enforced at agent-creation time
+/// (panes / disk) and a soft, opt-in cap for total scrollback memory that
+/// auto-detaches the oldest pane when exceeded.
+///
+/// Without these caps, dux can happily fork-bomb the host into OOM by
+/// spawning ~100 panes × 1 MB grids + ~100 MB provider processes in under a
+/// minute. The defaults below are conservative enough for a 32 GB workstation
+/// and easy to raise per host.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LimitsConfig {
+    /// Maximum number of simultaneously-active agent panes. New
+    /// `create_agent` requests are refused with a status-line error when
+    /// the cap is hit. `0` means unlimited (NOT recommended). Default 16.
+    #[serde(default = "default_max_panes")]
+    pub max_panes: usize,
+    /// Maximum companion (raw shell) terminals. Documented for symmetry
+    /// with `max_panes`; honoured at terminal-spawn time.
+    /// `0` means unlimited. Default 4.
+    #[serde(default = "default_max_companion_terminals")]
+    pub max_companion_terminals: usize,
+    /// Soft cap on total scrollback grid memory across all panes (MiB).
+    /// When exceeded AND `enable_scrollback_overflow_autodetach = true`,
+    /// oldest-by-`updated_at` panes are auto-detached (their grid is
+    /// freed) until the total drops back under the cap. Detach != kill;
+    /// the persisted session record is preserved. Default 256.
+    #[serde(default = "default_max_total_scrollback_mb")]
+    pub max_total_scrollback_mb: usize,
+    /// When persistent-disk usage at `paths.root` exceeds this percentage,
+    /// `create_agent` is refused with a red status line. Default 95.
+    #[serde(default = "default_disk_high_water_pct")]
+    pub disk_high_water_pct: u8,
+    /// When persistent-disk usage at `paths.root` exceeds this percentage,
+    /// a yellow warning is shown on the status line but agent creation is
+    /// still allowed. Default 80.
+    #[serde(default = "default_disk_warn_pct")]
+    pub disk_warn_pct: u8,
+    /// Master switch for the soft scrollback cap. When `false` (the
+    /// default), the disk-watchdog still samples and the warn/high-water
+    /// disk banners still fire, but no pane is ever auto-detached because
+    /// of scrollback growth. Operators can opt in once they're comfortable
+    /// that an unattended detach won't surprise them mid-meeting.
+    #[serde(default = "default_enable_scrollback_overflow_autodetach")]
+    pub enable_scrollback_overflow_autodetach: bool,
+}
+
+fn default_max_panes() -> usize {
+    16
+}
+
+fn default_max_companion_terminals() -> usize {
+    4
+}
+
+fn default_max_total_scrollback_mb() -> usize {
+    256
+}
+
+fn default_disk_high_water_pct() -> u8 {
+    95
+}
+
+fn default_disk_warn_pct() -> u8 {
+    80
+}
+
+fn default_enable_scrollback_overflow_autodetach() -> bool {
+    false
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_panes: default_max_panes(),
+            max_companion_terminals: default_max_companion_terminals(),
+            max_total_scrollback_mb: default_max_total_scrollback_mb(),
+            disk_high_water_pct: default_disk_high_water_pct(),
+            disk_warn_pct: default_disk_warn_pct(),
+            enable_scrollback_overflow_autodetach: default_enable_scrollback_overflow_autodetach(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UiConfig {
     pub left_width_pct: u16,
     pub right_width_pct: u16,
@@ -202,6 +409,7 @@ pub struct UiConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            schema_version: CONFIG_SCHEMA_CURRENT,
             defaults: Defaults::default(),
             providers: ProvidersConfig::default(),
             terminal: TerminalConfig::default(),
@@ -227,6 +435,9 @@ impl Default for Config {
             editor: EditorConfig::default(),
             keys: KeysConfig::default(),
             macros: MacrosConfig::default(),
+            storage: StorageConfig::default(),
+            auto_resume: AutoResumeConfig::default(),
+            limits: LimitsConfig::default(),
         }
     }
 }
@@ -260,6 +471,7 @@ impl Default for Defaults {
             start_directory,
             commit_prompt: Some(DEFAULT_COMMIT_PROMPT.to_string()),
             enable_randomized_pet_name_by_default: false,
+            auto_resume_on_start: false,
         }
     }
 }
@@ -452,9 +664,26 @@ pub fn ensure_config(paths: &DuxPaths) -> Result<Config> {
             .with_context(|| format!("failed to write {}", paths.config_path.display()))?;
     }
 
-    let mut config: Config = toml::from_str(&doc.to_string())
+    let parsed: Config = toml::from_str(&doc.to_string())
         .with_context(|| format!("failed to parse {}", paths.config_path.display()))?;
+    let original_version = parsed.schema_version;
+    let mut config = migrate_config(parsed);
     config.providers.ensure_defaults();
+
+    // If `migrate_config` advanced `schema_version`, persist the
+    // upgraded form so the next launch is a no-op. We rewrite via the
+    // same `save_config` path used elsewhere so user comments and
+    // unknown keys are preserved.
+    if config.schema_version != original_version {
+        let bindings = crate::keybindings::RuntimeBindings::from_keys_config(&config.keys);
+        save_config(&paths.config_path, &config, &bindings).with_context(|| {
+            format!(
+                "failed to persist migrated config to {}",
+                paths.config_path.display()
+            )
+        })?;
+    }
+
     Ok(config)
 }
 
@@ -555,6 +784,8 @@ enum FieldValue {
     Str(String),
     OptStr(Option<String>),
     U16(u16),
+    U32(u32),
+    U64(u64),
     Usize(usize),
     Bool(bool),
     MultilineStr(Option<String>),
@@ -599,6 +830,16 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             "# Every value is materialized here so the file doubles as documentation.",
         ),
         ConfigEntry::Blank,
+        ConfigEntry::Field {
+            key: "schema_version",
+            comment: Some(CommentSource::Static(
+                "# Internal config schema version. Managed by dux — do not edit by hand.\n\
+                 # `dux config regenerate` writes the current value; older configs are\n\
+                 # migrated forward automatically on load.",
+            )),
+            value_fn: |c| FieldValue::U32(c.schema_version),
+        },
+        ConfigEntry::Blank,
         ConfigEntry::Section("defaults"),
         ConfigEntry::Field {
             key: "provider",
@@ -633,6 +874,17 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
                  # When false, the prompt starts empty and the pet-name checkbox is off.",
             )),
             value_fn: |c| FieldValue::Bool(c.defaults.enable_randomized_pet_name_by_default),
+        },
+        ConfigEntry::Blank,
+        ConfigEntry::Field {
+            key: "auto_resume_on_start",
+            comment: Some(CommentSource::Static(
+                "# When true, every persisted agent session is reconnected automatically\n\
+                 # at startup so all panes are live as soon as dux opens. Default false:\n\
+                 # sessions stay detached until you focus them.\n\
+                 # Caveat: spawning N agents at once means N provider processes (CPU/RAM).",
+            )),
+            value_fn: |c| FieldValue::Bool(c.defaults.auto_resume_on_start),
         },
         ConfigEntry::Blank,
         ConfigEntry::Providers,
@@ -748,6 +1000,109 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             value_fn: |c| FieldValue::Str(c.editor.default.clone()),
         },
         ConfigEntry::Blank,
+        ConfigEntry::Section("storage"),
+        ConfigEntry::Field {
+            key: "backup_interval_minutes",
+            comment: Some(CommentSource::Static(
+                "# Minutes between automatic sessions.sqlite3 backups via the SQLite\n\
+                 # Online Backup API. Backups are written to sessions.sqlite3.bak\n\
+                 # next to the live database. Set to 0 to disable. Default: 30.\n\
+                 # On a fresh start dux runs PRAGMA integrity_check; if the live\n\
+                 # database is corrupt, dux refuses to start and points at the .bak.",
+            )),
+            value_fn: |c| FieldValue::U32(c.storage.backup_interval_minutes),
+        },
+        ConfigEntry::Blank,
+        ConfigEntry::Section("auto_resume"),
+        ConfigEntry::Field {
+            key: "concurrency",
+            comment: Some(CommentSource::Static(
+                "# Maximum number of sessions whose PTY may be spawning in parallel\n\
+                 # when defaults.auto_resume_on_start = true. Lower = slower startup\n\
+                 # but less load on provider APIs. 0 is treated as 1. Default 4.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.auto_resume.concurrency),
+        },
+        ConfigEntry::Field {
+            key: "stale_days",
+            comment: Some(CommentSource::Static(
+                "# Skip auto-resume for any session whose worktree directory has not\n\
+                 # been modified within this many days. 0 disables the filter and\n\
+                 # every persisted session is eligible. Default 30.",
+            )),
+            value_fn: |c| FieldValue::U32(c.auto_resume.stale_days),
+        },
+        ConfigEntry::Field {
+            key: "stagger_ms",
+            comment: Some(CommentSource::Static(
+                "# Minimum delay (milliseconds) between successive spawn attempts.\n\
+                 # Smooths out the burst of provider TLS handshakes when many\n\
+                 # sessions resume at once. Default 250.",
+            )),
+            value_fn: |c| FieldValue::U64(c.auto_resume.stagger_ms),
+        },
+        ConfigEntry::Blank,
+        ConfigEntry::Section("limits"),
+        ConfigEntry::Field {
+            key: "max_panes",
+            comment: Some(CommentSource::Static(
+                "# Maximum number of simultaneously-active agent panes. New agent\n\
+                 # creation is refused with a status-line error when the cap is\n\
+                 # hit; detach an unused pane or raise this value to recover.\n\
+                 # 0 means unlimited (NOT recommended on shared hosts). Default 16.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.limits.max_panes),
+        },
+        ConfigEntry::Field {
+            key: "max_companion_terminals",
+            comment: Some(CommentSource::Static(
+                "# Maximum number of companion (raw shell) terminals across all\n\
+                 # sessions. 0 means unlimited. Default 4.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.limits.max_companion_terminals),
+        },
+        ConfigEntry::Field {
+            key: "max_total_scrollback_mb",
+            comment: Some(CommentSource::Static(
+                "# Soft cap on total scrollback grid memory across all panes (MiB).\n\
+                 # Only enforced when enable_scrollback_overflow_autodetach = true,\n\
+                 # in which case oldest-by-updated_at panes are detached (not killed)\n\
+                 # until the total drops back under this cap. Default 256.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.limits.max_total_scrollback_mb),
+        },
+        ConfigEntry::Field {
+            key: "disk_high_water_pct",
+            comment: Some(CommentSource::Static(
+                "# When persistent-disk usage at the dux config root exceeds this\n\
+                 # percentage, new agent creation is refused with a red status line.\n\
+                 # Run `dux session purge` (or extend the volume) to recover.\n\
+                 # Default 95.",
+            )),
+            value_fn: |c| FieldValue::U16(u16::from(c.limits.disk_high_water_pct)),
+        },
+        ConfigEntry::Field {
+            key: "disk_warn_pct",
+            comment: Some(CommentSource::Static(
+                "# When persistent-disk usage at the dux config root exceeds this\n\
+                 # percentage, a yellow warning is shown on the status line but\n\
+                 # agent creation is still allowed. Default 80.",
+            )),
+            value_fn: |c| FieldValue::U16(u16::from(c.limits.disk_warn_pct)),
+        },
+        ConfigEntry::Field {
+            key: "enable_scrollback_overflow_autodetach",
+            comment: Some(CommentSource::Static(
+                "# When true, a background watchdog samples total scrollback grid\n\
+                 # memory once per minute and auto-detaches the oldest-by-updated_at\n\
+                 # panes once max_total_scrollback_mb is exceeded. Default false\n\
+                 # because an unattended detach can surprise an operator mid-call.\n\
+                 # Detached sessions remain in the database and can be reattached\n\
+                 # manually like any other detached session.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.limits.enable_scrollback_overflow_autodetach),
+        },
+        ConfigEntry::Blank,
         ConfigEntry::Keys,
         ConfigEntry::Blank,
         ConfigEntry::Macros,
@@ -792,6 +1147,12 @@ fn render_config(config: &Config, bindings: &crate::keybindings::RuntimeBindings
                         let _ = writeln!(out, "{key} = \"\"");
                     }
                     FieldValue::U16(n) => {
+                        let _ = writeln!(out, "{key} = {n}");
+                    }
+                    FieldValue::U32(n) => {
+                        let _ = writeln!(out, "{key} = {n}");
+                    }
+                    FieldValue::U64(n) => {
                         let _ = writeln!(out, "{key} = {n}");
                     }
                     FieldValue::Usize(n) => {
@@ -861,6 +1222,9 @@ pub fn save_config(
     let mut doc: DocumentMut = raw
         .parse()
         .with_context(|| format!("failed to parse {}", config_path.display()))?;
+
+    // --- top-level (no section header) ---
+    patch_root_u32(&mut doc, "schema_version", config.schema_version);
 
     // --- [defaults] ---
     patch_table_str(&mut doc, "defaults", "provider", &config.defaults.provider);
@@ -1032,6 +1396,34 @@ fn patch_table_opt_multiline(doc: &mut DocumentMut, section: &str, key: &str, va
 fn patch_table_u16(doc: &mut DocumentMut, section: &str, key: &str, value: u16) {
     let table = ensure_table(doc, section);
     table[key] = toml_edit::value(i64::from(value));
+}
+
+/// Patch a top-level (no section header) integer key. Used for keys
+/// that live at the document root, like `schema_version`. The new key
+/// is inserted at the top of the document so it appears before any
+/// section header — required by TOML grammar.
+fn patch_root_u32(doc: &mut DocumentMut, key: &str, value: u32) {
+    let new_item = toml_edit::value(i64::from(value));
+    let table = doc.as_table_mut();
+    if table.contains_key(key) {
+        table[key] = new_item;
+    } else {
+        // `Table::insert` appends; we need it before any section header
+        // to remain syntactically valid TOML (bare keys cannot follow a
+        // table header). `toml_edit` lets us push to the front by
+        // re-inserting all existing entries after the new one.
+        let existing: Vec<(String, Item)> = table
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        for (k, _) in &existing {
+            table.remove(k);
+        }
+        table.insert(key, new_item);
+        for (k, v) in existing {
+            table.insert(&k, v);
+        }
+    }
 }
 
 fn patch_table_usize(doc: &mut DocumentMut, section: &str, key: &str, value: usize) {
@@ -2756,9 +3148,12 @@ args = [\"-l\"]
     }
 
     #[test]
+    #[serial_test::serial(env_mutation)]
     fn expand_path_dollar_var() {
-        // SAFETY: test-only env manipulation; tests are run with --test-threads=1
-        // or use unique variable names to avoid races.
+        // SAFETY: test-only env manipulation. `#[serial(env_mutation)]`
+        // serializes every env-mutating test in this module so they can't
+        // race the process-global table even under `cargo test`'s default
+        // multi-threaded runner.
         unsafe { std::env::set_var("DUX_TEST_VAR_1", "/test/value") };
         let result = expand_path("$DUX_TEST_VAR_1/subdir").unwrap();
         assert_eq!(result, "/test/value/subdir");
@@ -2766,6 +3161,7 @@ args = [\"-l\"]
     }
 
     #[test]
+    #[serial_test::serial(env_mutation)]
     fn expand_path_braced_var() {
         unsafe { std::env::set_var("DUX_TEST_VAR_2", "/braced") };
         let result = expand_path("${DUX_TEST_VAR_2}/sub").unwrap();
@@ -2795,6 +3191,7 @@ args = [\"-l\"]
     }
 
     #[test]
+    #[serial_test::serial(env_mutation)]
     fn expand_path_rejects_traversal() {
         unsafe { std::env::set_var("DUX_TEST_VAR_3", "/safe") };
         assert!(expand_path("$DUX_TEST_VAR_3/../etc/passwd").is_none());
