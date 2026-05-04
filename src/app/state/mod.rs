@@ -8,9 +8,13 @@
 //!   atomics, lockfile, gh/PR tracking, refs watchers).
 //! - [`UiState`] — visual/interaction state (pane focus, scroll offsets, modal
 //!   stack, mouse layout, welcome state, force-redraw flag).
+//! - [`GitState`] — projects + sessions + change-file caches + commit-message
+//!   editor + in-flight markers for git-driven background workers.
 
+mod git;
 mod runtime;
 mod ui;
 
+pub(crate) use git::GitState;
 pub(crate) use runtime::RuntimeState;
 pub(crate) use ui::UiState;
