@@ -22,7 +22,13 @@ set -euo pipefail
 
 STATE_ROOT="${STATE_ROOT:-/data/state}"
 LOCAL_BIN="${HOME}/.local/bin"
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Pure-bash dirname so preflight can run even when PATH is stripped
+# (Phase 22's wrappers-p1.bats #51/#52 invokes install.sh under
+# `env -i PATH=""` to verify preflight aggregates all missing tools).
+# `dirname` is not a bash builtin; `cd`/`pwd` are.
+HERE="${BASH_SOURCE[0]%/*}"
+[[ "$HERE" == "${BASH_SOURCE[0]}" ]] && HERE="."   # no slash → script in cwd
+HERE="$(cd "$HERE" && pwd)"
 
 # Pinned versions + sha256 (overrideable for testing only; CI must use defaults).
 DUX_TAG="${DUX_TAG:-v0.4.0}"
