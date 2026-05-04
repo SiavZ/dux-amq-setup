@@ -367,12 +367,36 @@ fn parse_time(value: &str) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
+// audit02 Phase 24 (P2-10) — log a warn instead of swallowing serde_json
+// failures. The fallback values ("[]" / empty Vec) are preserved so this
+// is purely additive observability; corrupt rows still degrade gracefully
+// rather than crashing the session loader.
 fn serialize_started_providers(started_providers: &[String]) -> String {
-    serde_json::to_string(started_providers).unwrap_or_else(|_| "[]".to_string())
+    match serde_json::to_string(started_providers) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                target: "dux::storage",
+                err = %e,
+                "started_providers serialize failed; persisting []"
+            );
+            "[]".to_string()
+        }
+    }
 }
 
 fn parse_started_providers(value: &str) -> Vec<String> {
-    serde_json::from_str::<Vec<String>>(value).unwrap_or_default()
+    match serde_json::from_str::<Vec<String>>(value) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                target: "dux::storage",
+                err = %e,
+                "started_providers parse failed; defaulting to empty"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Opens an in-memory session store for tests.
