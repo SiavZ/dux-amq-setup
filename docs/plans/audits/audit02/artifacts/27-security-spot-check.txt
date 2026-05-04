@@ -1,0 +1,39 @@
+## Security posture spot-check
+
+### YOLO defaults
+OK CLAUDE_AMQ_YOLO opt-in
+OK CODEX_AMQ_YOLO opt-in
+
+### GHA SHA pinning (no tag-pinned actions)
+OK: all SHA-pinned
+
+### CI security jobs
+OK cargo audit
+OK cargo deny
+OK macOS matrix
+
+### Provenance/SBOM in release
+OK attestations
+OK SBOM
+OK SHA256SUMS
+
+### AMQ message auth
+OK amq-secret-init
+OK amq-send-signed
+OK amq-receive-verify
+
+### Doctor tool
+OK dux-amq-doctor
+
+### Schema versioning
+OK migrations dir
+0001_initial_schema.sql
+0002_session_state_v2.sql
+
+### Operational docs
+OK SECURITY.md
+OK threat-model.md
+OK encryption-at-rest.md
+OK CODEOWNERS
+OK dependabot.yml
+OK deny.toml

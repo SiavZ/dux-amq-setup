@@ -1,0 +1,28 @@
+00-preflight.md                                               5/ 6
+01-wrapper-defaults.md                                        6/ 7
+02-install-idempotency.md                                     8/ 8
+03-sanitizer.md                                               0/ 7
+04-ui-thread-workers.md                                       0/ 5
+05-pty-poison-and-reader-join.md                              0/ 7
+06-gha-pinning.md                                             8/ 8
+07-ci-security-gates.md                                       0/ 9
+08-amq-message-auth.md                                        0/ 8
+09-tracing-migration.md                                       0/ 7
+10-gdpr-purge.md                                              0/ 8
+11-migration-safety.md                                        7/ 7
+12-path-encoding-cwd.md                                       0/ 6
+13-tiocsti-mitigation.md                                      0/ 7
+14-sqlite-wal-integrity.md                                    0/ 6
+15-auto-resume-concurrency.md                                 0/ 7
+16-resource-limits.md                                         0/ 7
+17-app-decomposition.md                                       0/ 7
+18-session-state-machine.md                                   0/ 6
+19-schema-versioning.md                                       0/ 8
+20-doctor-tool.md                                             0/ 8
+21-macos-ci-portability.md                                    0/ 5
+22-wrapper-p1-bundle.md                                       0/ 8
+23-rust-p1-bundle.md                                          0/ 7
+24-p2-bundle.md                                               0/11
+25-encryption-at-rest.md                                      0/ 6
+26-threat-model-docs.md                                       0/ 5
+27-final-validation.md                                        0/10

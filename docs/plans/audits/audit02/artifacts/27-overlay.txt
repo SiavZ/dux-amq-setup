@@ -1,0 +1,78 @@
+shellcheck \
+  install.sh \
+  dux-amq/install.sh \
+  dux-amq/wrappers/* \
+  dux-amq/scripts/*.sh \
+  dux-amq/scripts/dux-amq-doctor \
+  dux-amq/config/bashrc-additions.sh
+bats dux-amq/tests
+1..69
+ok 1 amq-secret-init.sh writes 32-byte base64 secret with mode 0600
+ok 2 amq-receive-verify drops unsigned messages
+ok 3 amq-receive-verify accepts a well-signed message and emits the body
+ok 4 amq-receive-verify rejects replayed envelopes (nonce dedup)
+ok 5 amq-receive-verify rejects MAC-mismatched envelopes
+ok 6 amq-receive-verify accepts envelope passed as argv $1 (Phase 13)
+ok 7 amq-receive-verify drops unsigned argv-mode envelope
+ok 8 amq-receive-verify argv-mode replay rejection (nonce dedup)
+ok 9 amq-receive-verify prefers stdin over argv when both present
+ok 10 amq-receive-verify falls back to argv when stdin is empty
+ok 11 doctor produces all expected sections
+ok 12 doctor --anonymize redacts host paths and agent identifiers
+ok 13 doctor --json emits valid JSON
+ok 14 doctor exits 0 when amq queue is uninitialized
+ok 15 encode-claude-project-dir matches recorded fixtures
+ok 16 encoder rejects relative path
+ok 17 encoder strips a single trailing slash
+ok 18 encoder preserves case (Claude does not lowercase)
+ok 19 is_dux_worktree rejects sibling /worktrees-evil prefix
+ok 20 is_dux_worktree accepts /worktrees/x
+ok 21 is_dux_worktree rejects when DUX_HOME does not exist
+ok 22 is_dux_worktree definition is byte-identical across all three wrappers
+ok 23 finalize aborts when claude is running
+ok 24 finalize is idempotent on a finalised tree
+ok 25 finalize preserves pre-existing files at destination by default
+ok 26 finalize honors FINALIZE_FORCE_DELETE=1
+ok 27 two parallel finalize invocations: one wins, one fails fast
+ok 28 dux-amq-inject-bridge sends verified body via tmux send-keys
+ok 29 dux-amq-inject-bridge uses DUX_TMUX_TARGET when set
+ok 30 dux-amq-inject-bridge drops unsigned envelope without injecting
+ok 31 dux-amq-inject-bridge drops MAC-mismatched envelope
+ok 32 dux-amq-inject-bridge falls back to file queue without TMUX
+ok 33 dux-amq-inject-bridge handles empty argv silently
+ok 34 P0-F: second install does not wipe amq queue config
+ok 35 N-3: shell-setup guard refuses to eval when binary.sha256 record is removed
+ok 36 setup_isolated_home creates a fresh $HOME under /tmp
+ok 37 setup_isolated_home prepends tests/fakes to PATH
+ok 38 teardown_isolated_home removes $TEST_HOME and is idempotent
+ok 39 P0-G: legacy md branch preserves user content after the AMQ heading
+ok 40 P0-G: versioned md markers are still stripped
+ok 41 P0-G: explicit end-sentinel resets the legacy block
+ok 42 tiocsti_status: file absent → rc=2 (compiled-out kernel)
+ok 43 tiocsti_status: file=1 → rc=0 (TIOCSTI usable)
+ok 44 tiocsti_status: file=0 → rc=1 (compiled in but disabled)
+ok 45 tiocsti_status: file=garbage → rc=2 (treat as compiled-out)
+ok 46 tiocsti_status: empty file → rc=2 (treat as compiled-out)
+ok 47 install.sh writes and removes $STATE_ROOT/dux/.tiocsti-state
+ok 48 P1-B: claude-amq writes wake-$ME.pid under $LOG_DIR
+ok 49 P1-B: codex-amq writes wake-$ME.pid under $LOG_DIR
+ok 50 P1-B: gemini-amq writes wake-$ME.pid under $LOG_DIR
+ok 51 P1-C: install.sh preflight reports all missing tools, not just the first
+ok 52 P1-C: install.sh preflight lists realpath and openssl as required
+ok 53 P1-D: claude-amq seed reports warning count when rsync emits warnings
+ok 54 P1-D: claude-amq seed reports plain count on clean rsync
+ok 55 P1-E: bashrc guard refuses when amq binary is newer than binary.sha256
+ok 56 P1-E: bashrc guard accepts when binary.sha256 mtime > binary mtime
+ok 57 P1-F: claude-amq refuses when handle already registered to a different $PWD
+ok 58 P1-F: same handle from same $PWD is allowed (idempotent)
+ok 59 P1-F: codex-amq also enforces collision detection
+ok 60 P1-F: gemini-amq also enforces collision detection
+ok 61 claude-amq does not pass YOLO flag by default
+ok 62 claude-amq passes YOLO flag when CLAUDE_AMQ_YOLO=1
+ok 63 claude-amq passes YOLO flag when legacy CLAUDE_YOLO=1
+ok 64 claude-amq prints transitional warning when CLAUDE_AMQ_SAFE is set
+ok 65 codex-amq does not pass sandbox-bypass flag by default
+ok 66 codex-amq passes sandbox-bypass flag when CODEX_AMQ_YOLO=1
+ok 67 codex-amq passes sandbox-bypass flag when legacy CLAUDE_YOLO=1
+ok 68 claude-amq does NOT seed by default
+ok 69 claude-amq seeds when CLAUDE_AMQ_SEED_FROM_PARENT=1
