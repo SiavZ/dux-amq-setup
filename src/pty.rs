@@ -1098,6 +1098,16 @@ fn apply_terminal_env_from_parent(
     if let Some(colorterm) = parent_colorterm.filter(|value| !value.is_empty()) {
         cmd.env("COLORTERM", colorterm);
     }
+
+    // `DUX_PANE` is the marker the dux-amq-inject-bridge uses to detect
+    // that it's running inside a dux-spawned process tree. When present,
+    // the bridge skips its tmux send-keys path and instead writes to the
+    // file queue under `~/.local/share/dux-amq/inject-queue/<receiver>/`,
+    // which the dux-side drainer (see `crate::amq_inject`) consumes only
+    // when the agent is idle. This avoids the "stuck in input field"
+    // failure mode where Claude Code's Ink input drops a trailing Enter
+    // received during streaming.
+    cmd.env("DUX_PANE", "1");
 }
 
 fn resolve_term_from_parent(parent_term: Option<&OsStr>) -> String {
@@ -1371,6 +1381,25 @@ mod tests {
         assert_eq!(
             cmd.get_env("COLORTERM").and_then(|value| value.to_str()),
             Some("truecolor")
+        );
+    }
+
+    #[test]
+    fn apply_terminal_env_marks_children_as_under_dux() {
+        // Every PTY-spawned child must see DUX_PANE=1 so the
+        // dux-amq-inject-bridge knows to write to the file queue
+        // instead of using tmux send-keys. Dropping this would
+        // re-introduce the "stuck in input field" bug.
+        let mut cmd = CommandBuilder::new("printf");
+        apply_terminal_env_from_parent(
+            &mut cmd,
+            Some(OsStr::new("xterm-256color")),
+            None,
+        );
+        assert_eq!(
+            cmd.get_env("DUX_PANE").and_then(|value| value.to_str()),
+            Some("1"),
+            "PTY children must have DUX_PANE exported for the inject-bridge to detect dux"
         );
     }
 

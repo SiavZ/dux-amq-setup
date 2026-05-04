@@ -7,10 +7,16 @@
 #     attempting any injection.
 #   * Drops unsigned / replayed / MAC-mismatched messages silently
 #     (exit 0, no body emitted, nothing typed into the TTY).
-#   * Uses `tmux send-keys` when $TMUX is set and `tmux` is on PATH.
-#   * Falls back to a file queue under
-#     ~/.local/share/dux-amq/inject-queue/<ts>.msg when tmux isn't
-#     available.
+#   * Uses `tmux send-keys` when $TMUX is set, `tmux` is on PATH, and
+#     dux is NOT the parent process tree (no $DUX_PANE).
+#   * When $DUX_PANE is set (running under dux), ALWAYS writes to the
+#     file queue regardless of $TMUX, so the dux-side drainer can
+#     deliver the body once the agent is idle. This avoids the
+#     "stuck in input field" failure where Claude Code's Ink input
+#     drops a trailing Enter received during streaming.
+#   * Routes queue files to a per-receiver subdirectory keyed off
+#     $AM_ME (sanitised), with `_unrouted/` as the fallback when
+#     $AM_ME is missing.
 #
 # `tmux` is shimmed via tests/fakes/ so tests can record what the
 # bridge would have sent without needing a real tmux server.
@@ -36,9 +42,12 @@ setup() {
   : >"$TMUX_LOG"
   export TMUX_LOG
 
-  # Force-unset $TMUX so the default test environment doesn't
-  # accidentally trip the tmux branch via the parent shell's session.
+  # Force-unset $TMUX and $DUX_PANE so the default test environment
+  # doesn't accidentally trip a non-default branch via the parent
+  # shell's session.
   unset TMUX
+  unset DUX_PANE
+  unset AM_ME
 }
 
 teardown() {
@@ -66,8 +75,8 @@ EOF
   export PATH
 }
 
-# 13.1 — happy path with tmux: verified body becomes a `send-keys` call.
-@test "dux-amq-inject-bridge sends verified body via tmux send-keys" {
+# 13.1 — happy path with tmux (no DUX_PANE): verified body → send-keys.
+@test "dux-amq-inject-bridge sends verified body via tmux send-keys when not under dux" {
   install_fake_tmux
   export TMUX="/tmp/fake-tmux-socket,1234,0"
   local msg
@@ -78,8 +87,8 @@ EOF
   grep -Fxq -- "send-keys" "$TMUX_LOG"
   grep -Fxq -- "hello-world" "$TMUX_LOG"
   grep -Fxq -- "Enter" "$TMUX_LOG"
-  # No file in the queue when tmux delivery succeeded.
-  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*.msg" >/dev/null
+  # No file in any subdirectory of the queue when tmux delivery succeeded.
+  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*/*.msg" >/dev/null
 }
 
 # 13.2 — DUX_TMUX_TARGET is honored.
@@ -103,8 +112,8 @@ EOF
   [ "$status" -eq 0 ]
   # tmux must NOT have been called at all.
   [ ! -s "$TMUX_LOG" ]
-  # File queue must be empty.
-  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*.msg" >/dev/null
+  # File queue must be empty (no per-receiver subdir created).
+  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*/*.msg" >/dev/null
 }
 
 # 13.4 — security: MAC-mismatched envelopes are NEVER injected.
@@ -119,18 +128,20 @@ EOF
   [ ! -s "$TMUX_LOG" ]
 }
 
-# 13.5 — fallback: no $TMUX → body lands in the file queue.
-@test "dux-amq-inject-bridge falls back to file queue without TMUX" {
+# 13.5 — fallback (no TMUX, no AM_ME): body lands in `_unrouted/`.
+@test "dux-amq-inject-bridge falls back to _unrouted queue without TMUX or AM_ME" {
   unset TMUX
   local msg
   msg=$(amq-send-signed --me alice --to bob --body "queued-msg" --print-only)
   run dux-amq-inject-bridge "$msg"
   [ "$status" -eq 0 ]
-  # Exactly one file under the queue dir, containing the body.
+  # Exactly one file under `_unrouted/`, containing the body.
   local files
-  mapfile -t files < <(compgen -G "$HOME/.local/share/dux-amq/inject-queue/*.msg")
+  mapfile -t files < <(compgen -G "$HOME/.local/share/dux-amq/inject-queue/_unrouted/*.msg")
   [ "${#files[@]}" -eq 1 ]
   grep -Fxq -- "queued-msg" "${files[0]}"
+  # No file at the legacy flat path (no top-level *.msg).
+  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*.msg" >/dev/null
 }
 
 # 13.6 — empty argv: bridge must exit 0 silently (verify dropped it).
@@ -138,5 +149,74 @@ EOF
   unset TMUX
   run dux-amq-inject-bridge ""
   [ "$status" -eq 0 ]
-  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*.msg" >/dev/null
+  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*/*.msg" >/dev/null
+}
+
+# 13.7 — under dux: DUX_PANE=1 forces the queue path even with TMUX.
+@test "dux-amq-inject-bridge prefers queue over tmux when DUX_PANE is set" {
+  install_fake_tmux
+  export TMUX="/tmp/fake-tmux-socket,1234,0"
+  export DUX_PANE="1"
+  export AM_ME="bob"
+  local msg
+  msg=$(amq-send-signed --me alice --to bob --body "under-dux" --print-only)
+  run dux-amq-inject-bridge "$msg"
+  [ "$status" -eq 0 ]
+  # tmux must NOT have been called — DUX_PANE wins over $TMUX.
+  [ ! -s "$TMUX_LOG" ]
+  # Body must be queued under bob/, not _unrouted/.
+  local files
+  mapfile -t files < <(compgen -G "$HOME/.local/share/dux-amq/inject-queue/bob/*.msg")
+  [ "${#files[@]}" -eq 1 ]
+  grep -Fxq -- "under-dux" "${files[0]}"
+}
+
+# 13.8 — receiver path: AM_ME determines the subdirectory.
+@test "dux-amq-inject-bridge keys queue files on sanitised AM_ME" {
+  unset TMUX
+  export AM_ME="bob"
+  local msg
+  msg=$(amq-send-signed --me alice --to bob --body "addressed" --print-only)
+  run dux-amq-inject-bridge "$msg"
+  [ "$status" -eq 0 ]
+  local files
+  mapfile -t files < <(compgen -G "$HOME/.local/share/dux-amq/inject-queue/bob/*.msg")
+  [ "${#files[@]}" -eq 1 ]
+  grep -Fxq -- "addressed" "${files[0]}"
+}
+
+# 13.9 — receiver sanitisation: uppercase + bad chars normalised to
+# the same lowercase regex the wrappers apply, blocking path traversal.
+@test "dux-amq-inject-bridge sanitises AM_ME (uppercase, slashes, dots)" {
+  unset TMUX
+  # Mirrors the wrapper sanitisation: tr '[:upper:]' '[:lower:]' then
+  # sed 's|[^a-z0-9_-]|-|g; s|^-\+||; s|-\+$||'. So "Feature/Login.v2"
+  # becomes "feature-login-v2".
+  export AM_ME="Feature/Login.v2"
+  local msg
+  msg=$(amq-send-signed --me alice --to bob --body "sanitised" --print-only)
+  run dux-amq-inject-bridge "$msg"
+  [ "$status" -eq 0 ]
+  local files
+  mapfile -t files < <(compgen -G "$HOME/.local/share/dux-amq/inject-queue/feature-login-v2/*.msg")
+  [ "${#files[@]}" -eq 1 ]
+  # The unsanitised value MUST NOT exist as a directory — defence
+  # against `..` or absolute paths sneaking in through AM_ME.
+  [ ! -d "$HOME/.local/share/dux-amq/inject-queue/Feature/Login.v2" ]
+}
+
+# 13.10 — receiver sanitisation cannot escape the queue root.
+@test "dux-amq-inject-bridge rejects path-traversal AM_ME" {
+  unset TMUX
+  # `..` would map to `--` after sed, which then has leading dashes
+  # stripped to empty. Empty receivers fall back to `_unrouted/`.
+  export AM_ME="../../etc"
+  local msg
+  msg=$(amq-send-signed --me alice --to bob --body "traversal" --print-only)
+  run dux-amq-inject-bridge "$msg"
+  [ "$status" -eq 0 ]
+  # The body landed somewhere INSIDE inject-queue/, not above it.
+  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/../*.msg" >/dev/null
+  # And not in any directory derived from the literal `../../etc`.
+  [ ! -e "$HOME/.local/share/etc" ]
 }
