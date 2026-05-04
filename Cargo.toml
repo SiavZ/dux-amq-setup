@@ -42,7 +42,11 @@ serial_test = "3"
 opt-level = "z"   # Optimize for size.
 lto = true        # Enable link time optimization.
 codegen-units = 1 # Reduce parallel code generation units.
-debug = 0         # No debug information
+# audit02 Phase 24 (P2-4) — `line-tables-only` keeps file:line in panic
+# backtraces (huge diagnostics win) at a small (~1-2%) size cost. Strip
+# below still removes the symbol table from the shipped binary.
+debug = "line-tables-only"
+strip = true      # Strip symbols at link.
 
 [profile.profiling]
 inherits = "release"

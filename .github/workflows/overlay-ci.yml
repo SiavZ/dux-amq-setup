@@ -6,7 +6,11 @@ name: overlay-ci
 
 on:
   pull_request:
+  # audit02 Phase 24 (P2-9) — scope push runs to `main` so feature
+  # branches don't double-spend CI minutes (the PR checks already
+  # cover them).
   push:
+    branches: [main]
 
 # Default to least privilege; the jobs below only read source.
 permissions:
