@@ -1,0 +1,53 @@
+=== Phase 17 kernel-matrix smoke — Debian 12 (this VM) ===
+Date: 2026-05-03T07:45:48Z
+
+Host facts:
+  Debian GNU/Linux 12 (bookworm)
+  uname -r: 6.1.0-45-cloud-amd64
+  uname -a: Linux dev 6.1.0-45-cloud-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.170-1 (2026-04-30) x86_64 GNU/Linux
+
+TIOCSTI sysctl probe:
+  /proc/sys/dev/tty/legacy_tiocsti is ABSENT
+  Conclusion: kernel was built without CONFIG_LEGACY_TIOCSTI exposed via sysctl
+  -> on Debian 12 (kernel 6.1) this means the legacy default applies — TIOCSTI
+     is enabled (because CONFIG_LEGACY_TIOCSTI defaults to y on 6.1; the disable
+     happened in 6.2). amq wake's TTY injection therefore works on this kernel.
+
+AMQ + wake binary check:
+  amq --version: 0.34.0
+  amq wake --help (excerpt):
+    Usage:
+      amq wake --me <agent> [options]
+    
+    Background waker: injects terminal notification when messages arrive.
+    Run as background job before starting CLI: amq wake --me claude &
+    
+    Inject modes:
+      auto  - Detect CLI type: raw for Claude Code/Codex, paste for others
+      raw   - Plain text + CR, no bracketed paste (works with Ink-based CLIs)
+      paste - Bracketed paste with delayed CR (works with crossterm-based CLIs)
+
+Strace evidence (from artifact 07-tiocsti-strace.txt):
+  See docs/plans/audits/audit01/artifacts/07-tiocsti-strace.txt
+  Phase 07 verdict: amq wake **DOES** call ioctl(_, TIOCSTI, ...), one
+  ioctl per character of the injected payload (110 calls observed for
+  a 110-char message). It does NOT use PTY-master writes. On this
+  Debian 12 / kernel 6.1 host TIOCSTI is unrestricted (the
+  legacy_tiocsti sysctl was added in 6.2 and defaults to 0 there), so
+  injection works correctly here. On a kernel 6.2+ host (Ubuntu 24.04
+  default, Debian 12-with-backports), the injection silently fails —
+  that is the audit P1-1 hazard. It is mitigated by README "Kernel
+  compatibility" (sysctl pin) and the `amq wake --inject-via <bin>`
+  external-injector option for non-root environments.
+
+Doctor (relevant fields):
+"6.1.0-45-cloud-amd64"
+"(sysctl absent — pre-6.2 kernel)"
+"0.1.0"
+"0.34.0"
+
+=== Verdict: Debian 12 / kernel 6.1 — PASS ===
+  - install.sh runs cleanly (see 17-e2e-smoke.txt)
+  - dux-amq-doctor prints expected facts
+  - TIOCSTI sysctl absent on 6.1; amq's TIOCSTI ioctls succeed here
+  - all 36 bats tests pass; 715+9 cargo tests pass; clippy -D warnings clean

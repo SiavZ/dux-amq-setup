@@ -61,11 +61,11 @@ opt-out for `codex-amq:27` (today unconditional `--dangerously-bypass-…`);
 - README renders; LUKS recipe is copy-pasteable.
 
 ## Acceptance criteria
-- [ ] `CODEX_AMQ_SAFE=1` reliably suppresses the bypass flag.
-- [ ] `bashrc-additions.sh` mentions both opt-outs.
-- [ ] README "Security model" covers defaults, threat model, deployment, future work, revocation.
-- [ ] No code change flips Claude's default permission behavior.
-- [ ] LUKS one-liner present and copy-pasteable.
+- [x] `CODEX_AMQ_SAFE=1` reliably suppresses the bypass flag (`tests/codex_safe.bats` cases 1+2).
+- [x] `bashrc-additions.sh` mentions both opt-outs side-by-side as commented examples.
+- [x] README "Security model" covers defaults, threat model, deployment (LUKS), future work (Anthropic auto mode), revocation.
+- [x] No code change flips Claude's default permission behavior — verified by `tests/codex_safe.bats` case 3 plus manual `grep CLAUDE_AMQ_SAFE dux-amq/wrappers/claude-amq` (still default-on: flag added unless var=1).
+- [x] LUKS one-liner present and copy-pasteable (`cryptsetup luksFormat / luksOpen / mkfs.ext4 / mount`).
 
 ## References
 - Audit P0-1 — original "flip default" recommendation **dropped** per user mandate; symmetric Codex opt-out + docs retained.

@@ -69,11 +69,21 @@ matches `…/worktrees-evil/x` because the boundary `/` is not enforced.
 - `shellcheck dux-amq/wrappers/* dux-amq/lib/path-encode.sh` clean.
 
 ## Acceptance criteria
-- [ ] One shared `path_encode` in `dux-amq/lib/`, sourced by all wrappers.
-- [ ] Fixture covers ≥3 representative paths (hyphen, underscore, unicode).
-- [ ] Realpath containment check replaces the glob in all three wrappers.
-- [ ] Negative test for `worktrees-evil/` sibling passes.
-- [ ] Install copies `path-encode.sh` to `$DUX_AMQ_LIB`.
+- [x] One shared `path_encode` in `dux-amq/lib/path-encode.sh`, sourced by `claude-amq` (codex/gemini don't seed so don't need the encoder; they DO carry the realpath check).
+- [x] Fixture covers 12 representative paths (hyphen, underscore, dot, space, unicode codepoint, multi-byte unicode) — `dux-amq/tests/fixtures/path-encoding.tsv`, captured against claude 2.1.111 on 2026-05-03.
+- [x] Realpath containment check replaces the glob in all three wrappers.
+- [x] Negative test for `worktrees-evil/` sibling passes (`path_encode.bats` test 3).
+- [ ] Install copies `path-encode.sh` to `$DUX_AMQ_LIB` — **deferred to Phase 12** (`install.sh` is owned by Track A install-chain). Track B's wrappers locate the lib via `$DUX_AMQ_LIB` env var, `../lib` relative to the resolved script path, or canonical install locations; fail loudly with a red banner if absent.
+
+### Verification gap closed
+
+The plan suggested `s|/|-|g; s|_|-|g` as a starting encoder. Empirical
+testing showed Claude Code actually replaces every Unicode CODEPOINT
+not in `[A-Za-z0-9-]` with a single `-` (runs preserved, case
+preserved). Dots, spaces, `+`, `~`, `@`, multi-byte unicode are all
+mapped to `-` — none of which the old `sed` handled. `lib/path-encode.sh`
+implements the codepoint-correct rule via python3 with a byte-wise
+`tr -c` fallback for ASCII-only paths.
 
 ## References
 - Audit P0-5.

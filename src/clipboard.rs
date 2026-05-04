@@ -25,7 +25,14 @@ pub(crate) struct Clipboard {
 }
 
 impl Clipboard {
-    pub(crate) fn new() -> Self {
+    /// Spawn the long-lived clipboard worker. Fails (returns `Err`) only if
+    /// the OS refuses to spawn the thread — typically `RLIMIT_NPROC` or
+    /// out-of-memory. The caller (`App::new`) should fall back to
+    /// `Clipboard::noop()` on `Err` and surface a status-line warning, so
+    /// dux still starts and the rest of the TUI remains usable. We do not
+    /// `.expect()` here: a panic during App::bootstrap aborts the whole
+    /// process and the user is given no diagnostic.
+    pub(crate) fn new() -> Result<Self> {
         let (tx, rx) = mpsc::channel::<CopyRequest>();
 
         std::thread::Builder::new()
@@ -33,8 +40,36 @@ impl Clipboard {
             .spawn(move || {
                 clipboard_worker(rx);
             })
-            .expect("failed to spawn clipboard worker thread");
+            .map_err(|e| anyhow!("failed to spawn clipboard worker thread: {e}"))?;
 
+        Ok(Self { tx })
+    }
+
+    /// Construct a clipboard that drops every request and reports a
+    /// terminal-friendly error to the worker. Used as the fallback when
+    /// `Clipboard::new()` fails — keeps `App::clipboard` typed as a real
+    /// `Clipboard` (no `Option`/no trait object) so call sites need no
+    /// changes. Every `copy_text` returns the disabled-clipboard message
+    /// to the worker channel as a `ClipboardCopyCompleted { result: Err }`,
+    /// so the user sees "Clipboard disabled (worker unavailable)" instead
+    /// of silent UI breakage.
+    pub(crate) fn noop() -> Self {
+        let (tx, rx) = mpsc::channel::<CopyRequest>();
+        // Detached worker that just funnels every request into a polite
+        // error event. We do not unwrap thread spawn here either — if even
+        // *this* spawn fails (extreme RLIMIT_NPROC), the channel sender
+        // will report SendError on first use and `copy_text` already maps
+        // that to a user-facing error. So we do best-effort and move on.
+        let _ = std::thread::Builder::new()
+            .name("clipboard-noop".into())
+            .spawn(move || {
+                while let Ok(req) = rx.recv() {
+                    let _ = req.worker_tx.send(WorkerEvent::ClipboardCopyCompleted {
+                        label: req.label,
+                        result: Err("Clipboard disabled (worker unavailable)".into()),
+                    });
+                }
+            });
         Self { tx }
     }
 
@@ -118,9 +153,24 @@ fn base64_encode(data: &[u8]) -> String {
 }
 
 /// Format an OSC 52 escape sequence for the system clipboard ("c").
-/// Terminator is BEL (`\x07`) which is more widely supported than ST.
+///
+/// Terminator defaults to BEL (`\x07`) which is what xterm, WezTerm, kitty,
+/// and the VSCode integrated terminal accept. A small set of older terminals
+/// (rxvt without `allowWindowOps`, very old xterm builds) silently drop BEL
+/// terminators; for those, set `DUX_OSC52_TERMINATOR=ST` to switch to the
+/// canonical String Terminator (`ESC \`). Both forms are spec-compliant
+/// (xterm ctlseqs, "Operating System Commands"); BEL is the de-facto default
+/// because it's a single byte and survives stripping by some shells.
+///
+/// See audit01 P2-1 for rationale; this is hygiene-only — we do not flip the
+/// default until a real-world failure is reported.
 fn osc52_sequence(text: &str) -> String {
-    format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()))
+    let term = if std::env::var("DUX_OSC52_TERMINATOR").as_deref() == Ok("ST") {
+        "\x1b\\"
+    } else {
+        "\x07"
+    };
+    format!("\x1b]52;c;{}{}", base64_encode(text.as_bytes()), term)
 }
 
 /// Emit an OSC 52 copy via /dev/tty so the escape reaches the controlling
@@ -215,6 +265,26 @@ mod tests {
         }
     }
 
+    /// `Clipboard::noop()` must report a clean error to the worker channel
+    /// instead of panicking or hanging — that's the contract `App::new`
+    /// relies on when `Clipboard::new()` fails. (Resolves: P2-2.)
+    #[test]
+    fn clipboard_noop_reports_disabled_to_worker() {
+        let (worker_tx, worker_rx) = mpsc::channel();
+        let clipboard = Clipboard::noop();
+        clipboard.copy_text("hello", "Copied.", &worker_tx).unwrap();
+
+        let event = worker_rx.recv().unwrap();
+        match event {
+            WorkerEvent::ClipboardCopyCompleted { label, result } => {
+                assert_eq!(label, "Copied.");
+                let err = result.expect_err("noop clipboard must report an error");
+                assert!(err.contains("disabled"), "got: {err}");
+            }
+            _ => panic!("unexpected event"),
+        }
+    }
+
     #[test]
     fn clipboard_from_fn_reports_errors() {
         let (worker_tx, worker_rx) = mpsc::channel();
@@ -245,6 +315,16 @@ mod tests {
 
     #[test]
     fn osc52_sequence_format() {
+        // SAFETY: tests in this module guard OSC 52 terminator selection by
+        // serializing on a single env var. Cargo runs tests in threads in
+        // the same process, so we must not race two readers/writers; tests
+        // that touch DUX_OSC52_TERMINATOR live behind a shared mutex below.
+        let _g = OSC52_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::remove_var("DUX_OSC52_TERMINATOR");
+        }
         let s = osc52_sequence("hi");
         // ESC ] 52 ; c ; <base64> BEL
         assert!(s.starts_with("\x1b]52;c;"));
@@ -252,4 +332,44 @@ mod tests {
         let payload = &s[7..s.len() - 1];
         assert_eq!(payload, "aGk=");
     }
+
+    #[test]
+    fn osc52_sequence_st_terminator_when_env_set() {
+        let _g = OSC52_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: lock above serializes any other test in this module that
+        // reads/writes DUX_OSC52_TERMINATOR. Restore on drop via the guard.
+        unsafe {
+            std::env::set_var("DUX_OSC52_TERMINATOR", "ST");
+        }
+        let s = osc52_sequence("hi");
+        // ESC ] 52 ; c ; <base64> ESC \
+        assert!(s.starts_with("\x1b]52;c;"));
+        assert!(s.ends_with("\x1b\\"));
+        let payload = &s[7..s.len() - 2];
+        assert_eq!(payload, "aGk=");
+        unsafe {
+            std::env::remove_var("DUX_OSC52_TERMINATOR");
+        }
+    }
+
+    /// Other values (empty, garbage) leave BEL in place — only the literal
+    /// "ST" flips the terminator.
+    #[test]
+    fn osc52_sequence_unknown_env_value_uses_bel() {
+        let _g = OSC52_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::set_var("DUX_OSC52_TERMINATOR", "garbage");
+        }
+        let s = osc52_sequence("hi");
+        assert!(s.ends_with('\x07'), "got: {:?}", s);
+        unsafe {
+            std::env::remove_var("DUX_OSC52_TERMINATOR");
+        }
+    }
+
+    static OSC52_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

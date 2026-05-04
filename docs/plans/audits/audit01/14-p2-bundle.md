@@ -69,13 +69,25 @@ Land seven small P2 fixes as one PR `chore(audit01): P2 polish bundle`.
   on fresh install.
 
 ## Acceptance criteria
-- [ ] `DUX_OSC52_TERMINATOR=ST` switches terminator; default stays BEL.
-- [ ] `Clipboard::new` → `Result`; App falls back to no-op on error.
-- [ ] README has both Security-model (Phase 05) and Data-handling sections.
-- [ ] `dux-amq/LICENSE` exists with overlay-author copyright.
-- [ ] `regenerate` gated on user content; `FORCE_REGEN=1` overrides.
-- [ ] jq merge preserves mode.
-- [ ] No `cd -` or `echo "$PWD"` remains; `shellcheck` green.
+- [x] `DUX_OSC52_TERMINATOR=ST` switches terminator; default stays BEL.
+- [x] `Clipboard::new` → `Result`; App falls back to no-op on error.
+- [x] README has both Security-model (Phase 05) and Data-handling sections.
+- [x] `dux-amq/LICENSE` exists with overlay-author copyright.
+- [x] `regenerate` gated on user content; `FORCE_REGEN=1` overrides.
+- [x] jq merge preserves mode.
+- [x] No `cd -` or `echo "$PWD"` remains; `shellcheck` green.
+
+## Implementation log
+
+| Finding | Commit | Subject |
+|---|---|---|
+| P2-1 | adb3981 | fix(clipboard): env-gated OSC 52 ST terminator fallback |
+| P2-2 | c3c0bcf | fix(clipboard): Clipboard::new returns Result + noop fallback |
+| P2-4 | e5fe32a | docs(overlay): append Data handling subsection to Security model |
+| P2-5 | 326a369 | docs(overlay): add dux-amq/LICENSE for overlay attribution |
+| P2-8 | 53d1546 | fix(install): preserve hand-edited dux config.toml across re-runs |
+| P2-9 | 4c872f8 | fix(install): preserve mode on VSCode settings.json jq merge |
+| P2-10 | 7cc9485 | test(overlay): regression guards for bash quoting nits |
 
 ## References
 - Audit P2-1, P2-2, P2-4, P2-5, P2-8, P2-9, P2-10.

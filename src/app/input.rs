@@ -5146,7 +5146,7 @@ mod tests {
             prompt: PromptState::None,
             input_target: InputTarget::None,
             session_surface: crate::model::SessionSurface::Agent,
-            clipboard: Clipboard::new(),
+            clipboard: Clipboard::new().unwrap_or_else(|_| Clipboard::noop()),
             worker_tx,
             worker_rx,
             providers: std::collections::HashMap::new(),

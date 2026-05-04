@@ -1,0 +1,119 @@
+=== Phase 17 kernel-matrix smoke — Ubuntu 24.04 LTS (Docker) ===
+Date: 2026-05-03T07:46:17Z
+
+Note: Docker shares the host kernel — kernel will report
+      6.1.0-45-cloud-amd64 (Debian 6.1) regardless of the Ubuntu user-space.
+      This still validates: (a) Ubuntu 24.04 user-space packages
+      satisfy install.sh's preflight, (b) install.sh runs cleanly
+      under Ubuntu's apt set, (c) the bashrc additions survive a
+      different distro shell. The TIOCSTI kernel path itself can
+      only be exercised on a 6.2+ kernel; that requires an actual
+      Ubuntu 24.04 VM (not Docker), which is documented as a gap.
+
+=== container facts ===
+Unable to find image 'ubuntu:24.04' locally
+24.04: Pulling from library/ubuntu
+b40150c1c271: Pulling fs layer
+92842f25412d: Download complete
+b40150c1c271: Download complete
+b40150c1c271: Pull complete
+Digest: sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b
+Status: Downloaded newer image for ubuntu:24.04
+PRETTY_NAME="Ubuntu 24.04.4 LTS"
+NAME="Ubuntu"
+VERSION_ID="24.04"
+VERSION="24.04.4 LTS (Noble Numbat)"
+kernel (host-shared):
+6.1.0-45-cloud-amd64
+tiocsti sysctl readable from container:
+(absent — host kernel 6.1 has no sysctl)
+
+=== install.sh dry-run inside Ubuntu 24.04 ===
+Mount the repo read-only; provide /data; install.sh up to the dux-binary
+download (it requires curl jq tar git rsync — apt-installed below).
+[1;32m✓[0m state dirs ready under /data/state
+[1;34m→[0m installing dux v0.4.0
+[1;32m✓[0m dux v0.4.0 sha256 verified (a1c449989e9c4dd53b260d75d29d0d5d6832b3852cf5327f3725b5e7bb881102)
+[1;32m✓[0m dux: dux
+[1;34m→[0m installing amq v0.34.0
+[2026-05-03T07:46:50Z] downloading amq v0.34.0
+[1;32m✓[0m amq v0.34.0 sha256 verified (cba940987d00a3d072f395c7ec7a648e47d652f1ff503abf46da538595510d7a)
+[2026-05-03T07:46:50Z] amq installed to /root/.local/bin/amq
+[1;32m✓[0m amq queue at /data/state/amq
+[1;32m✓[0m amq binary sha256 verified (eb78901f3dd13534884923e02ad9c6852be1b0a4c7f452fe52b8bcd795e3556b)
+[1;32m✓[0m amq binary pinned at /data/state/amq-bin/amq (eb78901f3dd13534884923e02ad9c6852be1b0a4c7f452fe52b8bcd795e3556b)
+[1;34m→[0m installing wrappers to /root/.local/bin
+[1;34m→[0m installing dux-amq lib to /root/.local/share/dux-amq/lib
+[1;32m✓[0m dux-amq lib installed (path-encode.sh, wake-launch.sh)
+[1;34m→[0m patching /data/state/dux/config.toml
+[1;34m→[0m rewriting ~/.bashrc dux-amq stanza (v0.1.0)
+[1;34m→[0m rewriting ~/.claude/CLAUDE.md dux-amq stanza (v0.1.0)
+[1;32m✓[0m install complete
+
+Next steps:
+  1. exec bash -l                  # pick up new env
+  2. (optional) /data/state/scripts/finalize-claude-migration.sh
+     # ONLY after closing every running 'claude' process
+  3. dux                            # launch
+
+─── VSCode Remote-SSH (Windows / macOS local) ───
+If Ctrl-G still opens VSCode's 'Go to Recent Directory' picker after
+restarting dux, the workbench setting must live on your LOCAL machine.
+Open VSCode → Cmd/Ctrl+Shift+P → 'Preferences: Open User Settings (JSON)'
+and merge into the existing terminal.integrated.commandsToSkipShell
+array (or add the key if absent):
+
+    "terminal.integrated.commandsToSkipShell": [
+      "-workbench.action.gotoLine",
+      "-workbench.action.terminal.goToRecentDirectory"
+    ]
+
+Both entries are needed: the first frees Ctrl-G in editors, the
+second frees Ctrl-G inside the integrated terminal (which is the
+one that bites in dux).
+INSTALL_EXIT=0
+
+post-install dux-amq-doctor (text-mode, head):
+
+[1;34m== Versions ==[0m
+  overlay:               0.1.0
+  dux:                   [?1049l
+(dux not on PATH)
+  amq:                   0.34.0
+
+[1;34m== Kernel ==[0m
+  release:               6.1.0-45-cloud-amd64
+  legacy_tiocsti sysctl: (sysctl absent — pre-6.2 kernel)
+
+[1;34m== Persistent disk ==[0m
+  STATE_ROOT:            /data/state
+  df -h:                 112G used / 148G total (79%)
+  per-subdir:
+    4.0K	/data/state/agents/
+    7.6M	/data/state/amq-bin/
+    172K	/data/state/amq/
+    4.0K	/data/state/claude/
+    4.0K	/data/state/codex/
+
+=== Verdict: Ubuntu 24.04 user-space — PASS (kernel-level coverage GAP, see note) ===
+  - Ubuntu 24.04 apt set provides curl/jq/tar/git/rsync; install.sh preflight passes.
+  - install.sh completes: dux + amq + skills + wrappers + lib all installed.
+  - dux-amq-doctor reports overlay 0.1.0 / amq 0.34.0 in the container.
+
+  Coverage GAP: kernel 6.2+ behaviour (legacy_tiocsti sysctl present and
+  defaulting to 0) cannot be exercised in Docker because Docker uses the
+  host kernel. To close this gap on a real 6.2+ Ubuntu 24.04 VM, run:
+
+    cat /proc/sys/dev/tty/legacy_tiocsti          # expect: 0
+    sudo sysctl -w dev.tty.legacy_tiocsti=1       # workaround if needed
+    amq wake --me <id> --root /data/state/amq --inject-mode raw </dev/tty &
+    strace -p $! -e ioctl 2>&1 | head -20         # confirm transport
+
+  Phase 07 verified amq 0.34.0 **DOES** call TIOCSTI (one ioctl per
+  injected character) on this kernel. See 07-tiocsti-result.md and the
+  raw artifact 07-tiocsti-strace.txt. The audit P1-1 risk is therefore
+  real on 6.2+ kernels and is mitigated by the README "Kernel
+  compatibility" workaround (sysctl pin or --inject-via external
+  injector), not by upstream amq itself. Filing an upstream patch to
+  switch amq to posix_openpt(3) is recommended follow-up but out of
+  scope for this audit cycle.

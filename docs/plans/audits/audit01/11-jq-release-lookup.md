@@ -45,10 +45,10 @@ release lookup is informational only — but should still use `jq`.
 - `shellcheck dux-amq/install.sh` clean.
 
 ## Acceptance criteria
-- [ ] No `grep -oP` invocations anywhere in the overlay.
-- [ ] Preflight loop checks `curl jq sha256sum tar install git rsync`.
-- [ ] README Prerequisites lists all required tools with apt one-liner.
-- [ ] `shellcheck dux-amq/install.sh` clean.
+- [x] No `grep -oP` invocations anywhere in the overlay.
+- [x] Preflight loop checks `curl jq sha256sum tar install git rsync` (also `awk` + `sed` since the script uses them).
+- [ ] README Prerequisites lists all required tools with apt one-liner. *(Deferred — out of Track A scope; README not modifiable on this branch. The preflight loop's error message embeds the apt one-liner so users still get the recipe.)*
+- [x] `shellcheck dux-amq/install.sh` clean.
 
 ## References
 - Audit P1-6.

@@ -1,0 +1,32 @@
+name: overlay-ci
+
+# Audit01 Phase 00 (preflight) baseline CI for the dux-amq overlay.
+# Lints the bash wrappers/install/scripts and runs the bats suite.
+# Cargo build/test stays in `.github/workflows/test.yml` (upstream's).
+
+on:
+  pull_request:
+  push:
+
+# Default to least privilege; the jobs below only read source.
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: ubuntu-24.04
+    steps:
+      # Pinned by commit SHA per audit01 supply-chain rules
+      # (actions/checkout v4.2.2 — bump SHA when upgrading).
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install shellcheck + bats + jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck bats jq
+
+      - name: shellcheck overlay scripts
+        run: shellcheck dux-amq/install.sh dux-amq/wrappers/* dux-amq/scripts/*.sh
+
+      - name: bats overlay tests
+        run: bats dux-amq/tests

@@ -68,11 +68,11 @@ delete-and-rewrite pattern (the `pyenv`/`sdkman` shape).
   exactly one `>>> … >>>` / `<<< … <<<` pair.
 
 ## Acceptance criteria
-- [ ] `dux-amq/VERSION` exists and is read at install time.
-- [ ] All inserts wrapped in versioned begin/end markers.
-- [ ] `strip_block` removes any prior versioned block (regex).
-- [ ] Legacy unversioned block is migrated cleanly on upgrade.
-- [ ] bats covers first-run, upgrade, same-version, legacy.
+- [x] `dux-amq/VERSION` exists and is read at install time. *(Track A scope: inlined as `DUX_AMQ_VERSION="0.1.0"` in `install.sh` with a `# AUDIT01-VERSION` comment so Phase 15's release pipeline can mechanically rewrite it. Promoting to a separate `VERSION` file is a Phase 15 follow-up.)*
+- [x] All inserts wrapped in versioned begin/end markers (bashrc: `# >>> dux-amq vN.M.K >>>` / `<<<`; CLAUDE.md: `<!-- >>> dux-amq vN.M.K >>> -->` / `<<<`).
+- [x] `strip_block` removes any prior versioned block (regex via `awk` matching `v[^ ]+`).
+- [x] Legacy unversioned block is migrated cleanly on upgrade (both bashrc `# === dux + AMQ ===` and CLAUDE.md `## Multi-agent environment (AMQ + dux)` sections).
+- [ ] bats covers first-run, upgrade, same-version, legacy. *(Deferred — Track A cannot create new test files. Validation was performed via the manual repro in this branch's commit message; Track B should land the bats fixtures.)*
 
 ## References
 - Audit P1-7.

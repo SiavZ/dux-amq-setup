@@ -1096,6 +1096,21 @@ impl App {
         }
         let gh_integration_val = config.ui.github_integration;
         let pr_banner_at_bottom = config.ui.pr_banner_position == "bottom";
+        // Audit01 P2-2: clipboard worker thread spawn can fail (RLIMIT_NPROC,
+        // OOM). Swallow the failure and keep dux usable with a no-op clipboard
+        // — a status warning surfaces the degradation instead of panicking
+        // out of bootstrap. The user sees "Clipboard disabled (worker
+        // unavailable)" on copy attempts and everything else still works.
+        let clipboard = match Clipboard::new() {
+            Ok(c) => c,
+            Err(e) => {
+                logger::warn(&format!(
+                    "clipboard worker unavailable, copy actions disabled: {e}"
+                ));
+                status.warning(format!("Clipboard disabled: {e}"));
+                Clipboard::noop()
+            }
+        };
         let mut app = Self {
             show_diff_line_numbers: config.ui.show_diff_line_numbers,
             left_width_pct: config.ui.left_width_pct,
@@ -1135,7 +1150,7 @@ impl App {
             prompt: PromptState::None,
             input_target: InputTarget::None,
             session_surface: SessionSurface::Agent,
-            clipboard: Clipboard::new(),
+            clipboard,
             worker_tx,
             worker_rx,
             providers: HashMap::new(),
@@ -1375,42 +1390,59 @@ impl App {
 
     /// If `defaults.auto_resume_on_start` is enabled, eagerly reconnect every
     /// detached session so all panes are live as soon as dux opens. Skips
-    /// sessions whose worktree no longer exists. Failures are logged but
-    /// don't abort startup — a single bad session shouldn't stop the others.
+    /// sessions whose worktree no longer exists, sessions whose provider is
+    /// already spawned, and (when `auto_resume_max_age_days > 0`) worktrees
+    /// whose mtime is older than that threshold. Spawns are processed in
+    /// chunks of `auto_resume_concurrency` to avoid a thundering-herd at
+    /// startup; UI events are drained between chunks so the TUI stays
+    /// responsive while N>cap agents come back online. Failures are logged
+    /// but don't abort startup — a single bad session shouldn't stop the
+    /// others.
     fn auto_resume_all_sessions(&mut self) {
         if !self.config.defaults.auto_resume_on_start {
             return;
         }
-        let candidates: Vec<AgentSession> = self
-            .sessions
-            .iter()
-            .filter(|s| Path::new(&s.worktree_path).exists())
-            .filter(|s| !self.providers.contains_key(&s.id))
-            .cloned()
-            .collect();
+        let now = std::time::SystemTime::now();
+        let max_age_days = self.config.defaults.auto_resume_max_age_days;
+        let candidates = filter_auto_resume_candidates(
+            &self.sessions,
+            |id| self.providers.contains_key(id),
+            |path| Path::new(path).exists(),
+            |path| std::fs::metadata(path).and_then(|m| m.modified()).ok(),
+            now,
+            max_age_days,
+        );
+        // Cap of 0 would mean "never spawn"; clamp to 1 so a misconfiguration
+        // doesn't silently disable auto-resume.
+        let cap = self.config.defaults.auto_resume_concurrency.max(1);
         logger::info(&format!(
-            "auto_resume_on_start: spawning {} agent session(s)",
+            "auto_resume_on_start: spawning {} agent session(s) (cap {cap})",
             candidates.len()
         ));
-        for session in candidates {
-            let use_resume = self.should_resume_session(&session);
-            match self.spawn_pty_for_session(&session, use_resume) {
-                Ok(client) => {
-                    self.providers.insert(session.id.clone(), client);
-                    if use_resume {
-                        self.resume_fallback_candidates
-                            .insert(session.id.clone(), Instant::now());
+        for chunk in candidates.chunks(cap) {
+            for session in chunk {
+                let use_resume = self.should_resume_session(session);
+                match self.spawn_pty_for_session(session, use_resume) {
+                    Ok(client) => {
+                        self.providers.insert(session.id.clone(), client);
+                        if use_resume {
+                            self.resume_fallback_candidates
+                                .insert(session.id.clone(), Instant::now());
+                        }
+                        self.mark_session_status(&session.id, SessionStatus::Active);
+                        self.mark_session_provider_started(&session.id);
                     }
-                    self.mark_session_status(&session.id, SessionStatus::Active);
-                    self.mark_session_provider_started(&session.id);
-                }
-                Err(e) => {
-                    logger::info(&format!(
-                        "auto_resume_on_start: failed to spawn session {}: {e}",
-                        session.id
-                    ));
+                    Err(e) => {
+                        logger::info(&format!(
+                            "auto_resume_on_start: failed to spawn session {}: {e}",
+                            session.id
+                        ));
+                    }
                 }
             }
+            // Yield to background workers (PTY output, branch sync, …) so
+            // the TUI stays responsive between spawn batches.
+            self.drain_events();
         }
     }
 
@@ -2506,6 +2538,56 @@ fn aggregate_tree(
     (cpu, rss, count, children)
 }
 
+/// Filter `sessions` down to the set that should be auto-resumed at startup.
+///
+/// Skips sessions where:
+/// - the provider for that session is already spawned (`already_spawned`),
+/// - the worktree directory no longer exists (`worktree_exists` returns
+///   `false`), or
+/// - `max_age_days > 0` and the worktree mtime (via `worktree_mtime`) is
+///   older than `max_age_days` days from `now`. Sessions whose mtime cannot
+///   be probed in this case are also skipped — we can't prove they're
+///   fresh, so we err on the side of preserving the spirit of the cap.
+///
+/// The closures are injected so this can be exercised by unit tests without
+/// touching the filesystem or instantiating a full [`App`].
+pub(crate) fn filter_auto_resume_candidates<S, E, M>(
+    sessions: &[AgentSession],
+    already_spawned: S,
+    worktree_exists: E,
+    worktree_mtime: M,
+    now: std::time::SystemTime,
+    max_age_days: u32,
+) -> Vec<AgentSession>
+where
+    S: Fn(&str) -> bool,
+    E: Fn(&str) -> bool,
+    M: Fn(&str) -> Option<std::time::SystemTime>,
+{
+    let max_age = (max_age_days > 0)
+        .then(|| std::time::Duration::from_secs(u64::from(max_age_days).saturating_mul(86_400)));
+    sessions
+        .iter()
+        .filter(|s| !already_spawned(&s.id))
+        .filter(|s| worktree_exists(&s.worktree_path))
+        .filter(|s| match max_age {
+            None => true,
+            Some(max) => match worktree_mtime(&s.worktree_path) {
+                Some(mtime) => match now.duration_since(mtime) {
+                    // mtime is in the past (normal case): skip if older than max.
+                    Ok(age) => age <= max,
+                    // mtime is in the future (clock drift, NFS, etc.): treat
+                    // as fresh rather than dropping potentially-good sessions.
+                    Err(_) => true,
+                },
+                // No mtime probe — can't prove freshness, drop it.
+                None => false,
+            },
+        })
+        .cloned()
+        .collect()
+}
+
 pub(crate) fn provider_config(config: &Config, provider: &ProviderKind) -> ProviderCommandConfig {
     config
         .providers
@@ -2723,5 +2805,105 @@ mod tests {
         assert!(sel.contains(4, 5));
         assert!(!sel.contains(2, 9));
         assert!(!sel.contains(4, 6));
+    }
+
+    // -- auto_resume filter (Phase 09) -----------------------------------
+
+    fn auto_resume_session(id: &str, worktree: &str) -> AgentSession {
+        let now = chrono::Utc::now();
+        AgentSession {
+            id: id.to_string(),
+            project_id: "project-1".to_string(),
+            project_path: Some("/tmp/project".to_string()),
+            provider: ProviderKind::from_str("claude"),
+            source_branch: "main".to_string(),
+            branch_name: format!("branch-{id}"),
+            worktree_path: worktree.to_string(),
+            title: None,
+            started_providers: Vec::new(),
+            status: SessionStatus::Detached,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn auto_resume_filter_skips_already_spawned_sessions() {
+        let sessions = vec![
+            auto_resume_session("a", "/wt/a"),
+            auto_resume_session("b", "/wt/b"),
+            auto_resume_session("c", "/wt/c"),
+        ];
+        let spawned = ["b"];
+        let kept = filter_auto_resume_candidates(
+            &sessions,
+            |id| spawned.contains(&id),
+            |_| true,
+            |_| Some(std::time::SystemTime::now()),
+            std::time::SystemTime::now(),
+            0,
+        );
+        let ids: Vec<&str> = kept.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "c"]);
+    }
+
+    #[test]
+    fn auto_resume_filter_skips_missing_worktrees() {
+        let sessions = vec![
+            auto_resume_session("a", "/wt/a"),
+            auto_resume_session("b", "/wt/missing"),
+            auto_resume_session("c", "/wt/c"),
+        ];
+        let kept = filter_auto_resume_candidates(
+            &sessions,
+            |_| false,
+            |path| path != "/wt/missing",
+            |_| Some(std::time::SystemTime::now()),
+            std::time::SystemTime::now(),
+            0,
+        );
+        let ids: Vec<&str> = kept.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "c"]);
+    }
+
+    #[test]
+    fn auto_resume_filter_skips_stale_when_max_age_set() {
+        let sessions = vec![
+            auto_resume_session("fresh", "/wt/fresh"),
+            auto_resume_session("stale", "/wt/stale"),
+        ];
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(30 * 86_400);
+        // fresh: 1 day old; stale: 20 days old.
+        let mtimes = |path: &str| match path {
+            "/wt/fresh" => Some(now - std::time::Duration::from_secs(86_400)),
+            "/wt/stale" => Some(now - std::time::Duration::from_secs(20 * 86_400)),
+            _ => None,
+        };
+        // max_age_days = 14 ⇒ stale is older than the cutoff.
+        let kept = filter_auto_resume_candidates(&sessions, |_| false, |_| true, mtimes, now, 14);
+        let ids: Vec<&str> = kept.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["fresh"]);
+
+        // max_age_days = 0 ⇒ staleness check disabled, both kept.
+        let kept = filter_auto_resume_candidates(&sessions, |_| false, |_| true, mtimes, now, 0);
+        let ids: Vec<&str> = kept.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["fresh", "stale"]);
+    }
+
+    #[test]
+    fn auto_resume_filter_drops_sessions_with_unprobeable_mtime_when_capped() {
+        // When the staleness skip is enabled but we can't read mtime, we
+        // can't prove freshness so drop the session. (Conservative: avoids
+        // re-spawning long-abandoned worktrees on weird filesystems.)
+        let sessions = vec![auto_resume_session("a", "/wt/a")];
+        let kept = filter_auto_resume_candidates(
+            &sessions,
+            |_| false,
+            |_| true,
+            |_| None,
+            std::time::SystemTime::now(),
+            7,
+        );
+        assert!(kept.is_empty(), "unprobeable mtime should be skipped");
     }
 }

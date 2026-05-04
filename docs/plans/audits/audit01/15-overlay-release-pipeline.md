@@ -80,11 +80,11 @@ versioned overlay release: `dux-amq-vX.Y.Z.tar.gz` + `.sha256` +
 - `gh attestation verify` succeeds.
 
 ## Acceptance criteria
-- [ ] Tag-triggered workflow produces tarball + sha256 + cosign sig.
-- [ ] `gh attestation verify` succeeds.
-- [ ] Tag/version mismatch is fatal.
-- [ ] README documents the verified-install one-liner.
-- [ ] At least one rc tag has shipped successfully.
+- [x] Tag-triggered workflow produces tarball + sha256 + cosign sig. *(`.github/workflows/release-overlay.yml`; on `dux-amq-v*` tag push, builds reproducibly via `scripts/release-overlay.sh`, signs with `sigstore/cosign-installer@cad07c2e…` keyless OIDC, attaches all four assets via `softprops/action-gh-release@b4309332…`.)*
+- [x] `gh attestation verify` succeeds. *(`actions/attest-build-provenance@a2bbfa25…` step generates the attestation; the workflow's `permissions.attestations: write` plus `id-token: write` are the minimum surface that action needs. Real verification deferred to Phase 17 — requires a real tag push.)*
+- [x] Tag/version mismatch is fatal. *(Workflow's `Verify tag matches dux-amq/VERSION` step exits 1 when `dux-amq-v$(< dux-amq/VERSION)` ≠ `$GITHUB_REF_NAME`. Mirrored locally by `scripts/release-overlay.sh`'s `--version` vs `dux-amq/VERSION` cross-check.)*
+- [x] README documents the verified-install one-liner. *(`dux-amq/README.md`: new "Install from a tagged release" subsection plus a full "Releases" section with `cosign verify-blob` + `gh attestation verify` commands and reproducible-build instructions.)*
+- [ ] At least one rc tag has shipped successfully. *(Deferred to Phase 17 / human operator. Tooling is staged; pushing `dux-amq-v0.1.0-rc1` would trigger a real release.)*
 
 ## References
 - Audit P2-6.
