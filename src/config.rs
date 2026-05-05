@@ -455,6 +455,27 @@ pub struct AmqInjectConfig {
     /// Default 65536 (64 KiB).
     #[serde(default = "default_amq_inject_max_message_bytes")]
     pub max_message_bytes: u64,
+    /// Strict HMAC verification of incoming wake envelopes by the
+    /// inject-bridge. When `false` (the default), the bridge skips
+    /// `amq-receive-verify`: signed `DUX1\t...` envelopes are still
+    /// transparently unwrapped, but plain `amq send` bodies pass
+    /// through as-is. When `true`, the bridge runs the verifier and
+    /// drops any unsigned/replayed/MAC-mismatched envelope.
+    ///
+    /// Why default `false`: per the trust model in `SECURITY.md`,
+    /// dux runs as a single-user, single-Linux-account TUI. All panes
+    /// share `$HOME` and FS perms, including the HMAC secret at
+    /// `~/.local/share/dux-amq/amq-secret`. A peer process at the same
+    /// UID can read the secret directly (or `ptrace` the signer).
+    /// Strict verification doesn't add a meaningful boundary against
+    /// peers that already share the user account, and it silently
+    /// drops every legacy `amq send` message until every sender
+    /// migrates to `amq-send-signed`. Operators that genuinely cross
+    /// a trust boundary (e.g. proxying wake notifications across
+    /// hosts) can flip this to `true`. dux exports `DUX_AMQ_VERIFY=1`
+    /// to spawned PTYs when the value is `true`.
+    #[serde(default = "default_amq_inject_verify_envelope")]
+    pub verify_envelope: bool,
 }
 
 fn default_amq_inject_enabled() -> bool {
@@ -484,6 +505,10 @@ fn default_amq_inject_max_message_bytes() -> u64 {
     65_536
 }
 
+fn default_amq_inject_verify_envelope() -> bool {
+    false
+}
+
 impl Default for AmqInjectConfig {
     fn default() -> Self {
         Self {
@@ -494,6 +519,7 @@ impl Default for AmqInjectConfig {
             delivery_timeout_secs: default_amq_inject_delivery_timeout_secs(),
             poll_interval_ms: default_amq_inject_poll_interval_ms(),
             max_message_bytes: default_amq_inject_max_message_bytes(),
+            verify_envelope: default_amq_inject_verify_envelope(),
         }
     }
 }
@@ -1301,6 +1327,26 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
                  # body that survived `amq-receive-verify`. Default 65536 (64 KiB).",
             )),
             value_fn: |c| FieldValue::U64(c.amq.inject.max_message_bytes),
+        },
+        ConfigEntry::Field {
+            key: "verify_envelope",
+            comment: Some(CommentSource::Static(
+                "# Strict HMAC verification of incoming wake envelopes by the\n\
+                 # inject-bridge. When false (the default), `DUX1\\t...` envelopes\n\
+                 # from `amq-send-signed` are transparently unwrapped, and plain\n\
+                 # `amq send` bodies pass through as-is. When true, dux exports\n\
+                 # DUX_AMQ_VERIFY=1 to spawned PTYs and the bridge drops any\n\
+                 # unsigned/replayed/MAC-mismatched envelope.\n\
+                 #\n\
+                 # Default false rationale: dux runs as a single-user, single-Linux-\n\
+                 # account TUI per SECURITY.md. The HMAC secret at\n\
+                 # ~/.local/share/dux-amq/amq-secret is readable by every same-UID\n\
+                 # peer (and the signer is `ptrace`-able), so verifying against\n\
+                 # peers in $HOME isn't a defensible boundary. Flip this to true\n\
+                 # only if your wake notifications cross a real trust boundary\n\
+                 # (e.g. proxied across hosts).",
+            )),
+            value_fn: |c| FieldValue::Bool(c.amq.inject.verify_envelope),
         },
         ConfigEntry::Blank,
         ConfigEntry::Keys,
@@ -2566,6 +2612,27 @@ mod tests {
             cfg.busy_markers.iter().any(|m| m == "esc to interrupt"),
             "default busy markers should include Claude Code's footer"
         );
+        assert!(
+            !cfg.verify_envelope,
+            "verify_envelope must default to false per single-user-VM trust model"
+        );
+    }
+
+    #[test]
+    fn amq_inject_verify_envelope_round_trips() {
+        // Strict mode is opt-in: verify both true and false survive a
+        // render → parse cycle, since the bridge keys off this value
+        // via DUX_AMQ_VERIFY at PTY spawn time.
+        for value in [true, false] {
+            let mut cfg = Config::default();
+            cfg.amq.inject.verify_envelope = value;
+            let rendered = render_config_default(&cfg);
+            let parsed: Config = toml::from_str(&rendered).expect("config should parse");
+            assert_eq!(
+                parsed.amq.inject.verify_envelope, value,
+                "verify_envelope = {value} did not survive round-trip"
+            );
+        }
     }
 
     #[test]

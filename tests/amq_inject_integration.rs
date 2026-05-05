@@ -11,7 +11,9 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use dux::amq_inject::{InjectRejection, claim, read_validated, scan_queue_dir};
+use dux::amq_inject::{
+    InjectRejection, claim, read_validated, reclaim_stale_inflight, scan_queue_dir,
+};
 use dux::pty::PtyClient;
 
 fn wait_until<F: FnMut() -> bool>(mut cond: F, timeout: Duration, step: Duration) -> bool {
@@ -143,5 +145,59 @@ fn drainer_skips_inflight_files_during_scan() {
             .unwrap()
             .to_string_lossy()
             .ends_with("001.msg")
+    );
+}
+
+/// End-to-end recovery: simulate a prior dux instance that crashed
+/// mid-claim by leaving a `.inflight.<ts>.msg` file behind. Run the
+/// reclaim sweep, scan, claim, validate, write through a PTY, and
+/// confirm the body actually lands in the agent's input. This is the
+/// exact path that orphaned a real message in production before this
+/// fix.
+#[test]
+fn reclaim_then_deliver_recovers_orphan() {
+    let cwd = std::env::temp_dir();
+    let client = PtyClient::spawn("cat", &[], &cwd, 24, 80, 1_000).expect("spawn cat in PTY");
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let queue_root = tmp.path().to_path_buf();
+    let alice = queue_root.join("alice");
+    fs::create_dir_all(&alice).unwrap();
+
+    // Pretend a prior dux claimed this message and then died.
+    let stale_inflight = alice.join(".inflight.001.msg");
+    fs::write(&stale_inflight, "recovered orphan body\n").unwrap();
+
+    // Reclaim sweep — this is what App::spawn_amq_inject_watcher
+    // calls before the watcher starts.
+    let n = reclaim_stale_inflight(&queue_root).expect("reclaim");
+    assert_eq!(n, 1);
+    let restored = alice.join("001.msg");
+    assert!(restored.exists());
+    assert!(!stale_inflight.exists());
+
+    // Now the regular scan + claim + deliver path picks it up.
+    let outcome = scan_queue_dir(&queue_root).unwrap();
+    assert_eq!(outcome.messages.len(), 1);
+    let inflight = claim(&outcome.messages[0].path).expect("claim");
+    let body = read_validated(&inflight, 65_536).expect("validated read");
+    assert_eq!(body, "recovered orphan body");
+
+    let mut payload = body.into_bytes();
+    payload.push(b'\r');
+    client.write_bytes(&payload).expect("PTY write");
+    let saw_echo = wait_until(
+        || {
+            client
+                .scan_recent_lines(30)
+                .contains("recovered orphan body")
+        },
+        Duration::from_secs(2),
+        Duration::from_millis(20),
+    );
+    assert!(
+        saw_echo,
+        "cat should echo the reclaimed body within 2s; actual: {:?}",
+        client.scan_recent_lines(30)
     );
 }

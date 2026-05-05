@@ -3,10 +3,16 @@
 # audit02 Phase 13 (audit01 P1-1): TIOCSTI fallback bridge.
 #
 # Validates that `dux-amq-inject-bridge`:
-#   * Verifies the envelope through `amq-receive-verify` BEFORE
-#     attempting any injection.
-#   * Drops unsigned / replayed / MAC-mismatched messages silently
-#     (exit 0, no body emitted, nothing typed into the TTY).
+#   * Defaults to SKIP mode: transparently unwraps a `DUX1\t...`
+#     envelope when present (so signed senders interop), and delivers
+#     plain bodies as-is otherwise. No HMAC check. This matches the
+#     trust model in SECURITY.md: same-UID peers share $HOME so an
+#     HMAC secret in $HOME isn't a defensible boundary, and the
+#     verifier was silently dropping every legacy `amq send` message.
+#   * In STRICT mode (DUX_AMQ_VERIFY=1, opt-in): runs the envelope
+#     through `amq-receive-verify` and drops on any verification
+#     failure (unsigned/replayed/stale/MAC-mismatch). Reserved for
+#     environments that genuinely cross a trust boundary.
 #   * Uses `tmux send-keys` when $TMUX is set, `tmux` is on PATH, and
 #     dux is NOT the parent process tree (no $DUX_PANE).
 #   * When $DUX_PANE is set (running under dux), ALWAYS writes to the
@@ -48,6 +54,7 @@ setup() {
   unset TMUX
   unset DUX_PANE
   unset AM_ME
+  unset DUX_AMQ_VERIFY
 }
 
 teardown() {
@@ -104,10 +111,11 @@ EOF
   grep -Fxq -- "mywin:0.1" "$TMUX_LOG"
 }
 
-# 13.3 — security: unsigned envelopes are NEVER injected.
-@test "dux-amq-inject-bridge drops unsigned envelope without injecting" {
+# 13.3 — strict mode: unsigned envelopes are dropped silently.
+@test "dux-amq-inject-bridge (strict) drops unsigned envelope without injecting" {
   install_fake_tmux
   export TMUX="/tmp/fake-tmux-socket,1234,0"
+  export DUX_AMQ_VERIFY=1
   run dux-amq-inject-bridge "plain-spoofed-text"
   [ "$status" -eq 0 ]
   # tmux must NOT have been called at all.
@@ -116,10 +124,11 @@ EOF
   ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*/*.msg" >/dev/null
 }
 
-# 13.4 — security: MAC-mismatched envelopes are NEVER injected.
-@test "dux-amq-inject-bridge drops MAC-mismatched envelope" {
+# 13.4 — strict mode: MAC-mismatched envelopes are dropped.
+@test "dux-amq-inject-bridge (strict) drops MAC-mismatched envelope" {
   install_fake_tmux
   export TMUX="/tmp/fake-tmux-socket,1234,0"
+  export DUX_AMQ_VERIFY=1
   local msg bad
   msg=$(amq-send-signed --me alice --to bob --body "real" --print-only)
   bad=${msg/real/EVIL}
@@ -219,4 +228,82 @@ EOF
   ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/../*.msg" >/dev/null
   # And not in any directory derived from the literal `../../etc`.
   [ ! -e "$HOME/.local/share/etc" ]
+}
+
+# 13.11 — skip mode (default): plain unsigned bodies are delivered as-is.
+@test "dux-amq-inject-bridge (skip mode) delivers unsigned body via tmux" {
+  install_fake_tmux
+  export TMUX="/tmp/fake-tmux-socket,1234,0"
+  # No DUX_AMQ_VERIFY → default skip mode.
+  run dux-amq-inject-bridge "hello-from-legacy-amq-send"
+  [ "$status" -eq 0 ]
+  grep -Fxq -- "send-keys" "$TMUX_LOG"
+  grep -Fxq -- "hello-from-legacy-amq-send" "$TMUX_LOG"
+  grep -Fxq -- "Enter" "$TMUX_LOG"
+}
+
+# 13.12 — skip mode: DUX1 envelope is unwrapped without MAC check.
+@test "dux-amq-inject-bridge (skip mode) unwraps DUX1 envelope without verifying MAC" {
+  install_fake_tmux
+  export TMUX="/tmp/fake-tmux-socket,1234,0"
+  local msg bad
+  msg=$(amq-send-signed --me alice --to bob --body "unwrap-me" --print-only)
+  # Mangle the MAC so amq-receive-verify (in strict mode) WOULD reject
+  # it. Skip mode must still deliver the inner body.
+  bad=${msg/unwrap-me/unwrap-me}  # body untouched; force a body-substr match below
+  # Tamper with the MAC: replace any one base64 char in the 6th field.
+  # Simpler approach: just append junk to the MAC in field 6. Splitting
+  # on TAB:
+  IFS=$'\t' read -ra fields <<<"$msg"
+  fields[5]="${fields[5]}TAMPERED"
+  bad=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' "${fields[0]}" "${fields[1]}" "${fields[2]}" "${fields[3]}" "${fields[4]}" "${fields[5]}" "${fields[6]}")
+  run dux-amq-inject-bridge "$bad"
+  [ "$status" -eq 0 ]
+  grep -Fxq -- "send-keys" "$TMUX_LOG"
+  grep -Fxq -- "unwrap-me" "$TMUX_LOG"
+}
+
+# 13.13 — skip mode: malformed DUX1 (too few fields) falls back to raw.
+@test "dux-amq-inject-bridge (skip mode) treats malformed DUX1 as raw body" {
+  install_fake_tmux
+  export TMUX="/tmp/fake-tmux-socket,1234,0"
+  # `DUX1\t<sender>` only — five missing fields. Bridge should treat
+  # the whole thing as a raw body rather than panic or drop.
+  local broken=$'DUX1\talice'
+  run dux-amq-inject-bridge "$broken"
+  [ "$status" -eq 0 ]
+  grep -Fxq -- "send-keys" "$TMUX_LOG"
+  # Whole envelope visible in the log (skip mode delivered raw).
+  grep -Fq -- "DUX1" "$TMUX_LOG"
+  grep -Fq -- "alice" "$TMUX_LOG"
+}
+
+# 13.14 — skip mode: empty argv is still a no-op (matches strict mode).
+@test "dux-amq-inject-bridge (skip mode) handles empty argv silently" {
+  install_fake_tmux
+  export TMUX="/tmp/fake-tmux-socket,1234,0"
+  run dux-amq-inject-bridge ""
+  [ "$status" -eq 0 ]
+  [ ! -s "$TMUX_LOG" ]
+}
+
+# 13.15 — skip mode: body containing internal TABs survives unwrap.
+@test "dux-amq-inject-bridge (skip mode) preserves internal TABs in DUX1 body" {
+  install_fake_tmux
+  export TMUX="/tmp/fake-tmux-socket,1234,0"
+  # The signed envelope's body field happens to be the LAST field —
+  # any internal TABs inside the body will appear as additional
+  # tab-separated fields. The bridge must reassemble them.
+  #
+  # We can't easily generate a signed envelope with an internal TAB
+  # via amq-send-signed (it explicitly forbids that). So construct a
+  # syntactically-valid envelope by hand and assert the bridge keeps
+  # the trailing fields concatenated.
+  local hand_made
+  hand_made=$'DUX1\talice\tbob\t2026-05-05T00:00:00Z\tnonceXYZ\tMACABC\tline1\tline2'
+  run dux-amq-inject-bridge "$hand_made"
+  [ "$status" -eq 0 ]
+  # Both halves of the body should land in tmux send-keys.
+  grep -Fq -- "line1" "$TMUX_LOG"
+  grep -Fq -- "line2" "$TMUX_LOG"
 }

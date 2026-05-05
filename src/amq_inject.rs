@@ -67,6 +67,20 @@ pub struct QueuedMessage {
     /// Original `<ts>.msg` path before the inflight rename. Carried
     /// for log/diagnostic purposes only.
     pub source_path: PathBuf,
+    /// Two-phase delivery state. `false` = body has not been typed
+    /// into the agent's PTY yet; `true` = body was typed and we're
+    /// waiting for the next tick to send the trailing `\r` as a
+    /// discrete keystroke.
+    ///
+    /// Why two phases: Claude Code (Ink) coalesces a single PTY
+    /// write that contains body bytes + trailing CR into a paste-like
+    /// buffer; the trailing `\r` ends up appended to the input field
+    /// rather than firing as a submit keystroke. Splitting the write
+    /// across two ticks (~16 ms apart in the typical run loop)
+    /// produces two separate `read()` calls on Ink's stdin so the
+    /// final `\r` arrives alone and is interpreted as Enter.
+    /// See `App::tick_amq_inject` for the state machine.
+    pub body_typed: bool,
 }
 
 /// Reasons a queue file was rejected. Surfaced as
@@ -240,6 +254,85 @@ pub fn claim(path: &Path) -> Result<PathBuf> {
     fs::rename(path, &inflight)
         .with_context(|| format!("claim {} -> {}", path.display(), inflight.display()))?;
     Ok(inflight)
+}
+
+/// Sweep the queue at startup and rename every drainer-format
+/// `.inflight.<ts>.msg` file back to `<ts>.msg`. These are leftovers
+/// from a prior dux instance that crashed mid-delivery — the
+/// single-instance lock guarantees no other dux is currently holding
+/// them, so there's no race.
+///
+/// **Bridge-format temp files (`.inflight.XXXXXX` from `mktemp`,
+/// without the `.msg` suffix) are intentionally skipped**: those
+/// represent a bridge invocation that's still in the middle of
+/// `printf … >$tmp; mv -f $tmp $target`, and renaming them would
+/// corrupt the in-flight write. The drainer-format inflight files are
+/// always named `.inflight.<original-basename>` where the original
+/// basename ends in `.msg`, so the suffix check is the safe
+/// differentiator.
+///
+/// Returns the count of files reclaimed. Errors during a single
+/// rename are logged and do not abort the sweep — a partially-stuck
+/// queue is still better than no recovery.
+pub fn reclaim_stale_inflight(queue_dir: &Path) -> Result<usize> {
+    let mut reclaimed = 0usize;
+    let entries = match fs::read_dir(queue_dir) {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(anyhow!("read_dir({}): {e}", queue_dir.display())),
+    };
+    for receiver_entry in entries.flatten() {
+        if !receiver_entry
+            .file_type()
+            .map(|t| t.is_dir())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let receiver_dir = receiver_entry.path();
+        let inner = match fs::read_dir(&receiver_dir) {
+            Ok(it) => it,
+            Err(_) => continue,
+        };
+        for entry in inner.flatten() {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            if !name_str.starts_with(INFLIGHT_PREFIX) {
+                continue;
+            }
+            // Bridge-format mktemp temps don't end in `.msg`; leave
+            // them alone so we don't yank a half-written file out
+            // from under a concurrent bridge process.
+            if !name_str.ends_with(".msg") {
+                continue;
+            }
+            let original_name = &name_str[INFLIGHT_PREFIX.len()..];
+            let original_path = receiver_dir.join(original_name);
+            let inflight_path = entry.path();
+            match fs::rename(&inflight_path, &original_path) {
+                Ok(()) => {
+                    reclaimed += 1;
+                    tracing::info!(
+                        target: "dux::amq_inject",
+                        path = %original_path.display(),
+                        "reclaimed stale inflight from prior dux instance",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "dux::amq_inject",
+                        from = %inflight_path.display(),
+                        to = %original_path.display(),
+                        err = %e,
+                        "stale inflight reclaim failed",
+                    );
+                }
+            }
+        }
+    }
+    Ok(reclaimed)
 }
 
 /// Reverse of [`claim`]: rename the in-flight back to its `.msg` form
@@ -517,6 +610,84 @@ mod tests {
         symlink(&target, &link).unwrap();
         let result = read_validated(&link, 1024);
         assert!(matches!(result, Err(InjectRejection::Symlink)));
+    }
+
+    #[test]
+    fn reclaim_stale_inflight_renames_drainer_format_files() {
+        let dir = tempdir().unwrap();
+        let queue = dir.path().to_path_buf();
+        let alice = queue.join("alice");
+        fs::create_dir_all(&alice).unwrap();
+
+        // Drainer-format inflight (orphaned by a prior crash).
+        let stale_drainer = alice.join(".inflight.001.msg");
+        fs::write(&stale_drainer, b"orphan-body\n").unwrap();
+
+        // Bridge-format mktemp temp (concurrent in-flight write —
+        // MUST be left alone or we corrupt the bridge's printf+mv).
+        let bridge_temp = alice.join(".inflight.aBcXyZ");
+        fs::write(&bridge_temp, b"in-progress\n").unwrap();
+
+        // Regular live message — must not be touched.
+        let live = alice.join("002.msg");
+        fs::write(&live, b"new-arrival\n").unwrap();
+
+        let n = reclaim_stale_inflight(&queue).unwrap();
+        assert_eq!(n, 1, "expected exactly one drainer-format reclaim");
+
+        let recovered = alice.join("001.msg");
+        assert!(
+            recovered.exists(),
+            "drainer-format inflight should be renamed back"
+        );
+        assert!(!stale_drainer.exists());
+        assert!(
+            bridge_temp.exists(),
+            "bridge-format mktemp temp must NOT be renamed"
+        );
+        assert!(live.exists(), "live messages must not be touched");
+    }
+
+    #[test]
+    fn reclaim_stale_inflight_handles_missing_queue_dir() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let n = reclaim_stale_inflight(&missing).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn reclaim_stale_inflight_skips_non_dir_entries_in_queue_root() {
+        let dir = tempdir().unwrap();
+        let queue = dir.path().to_path_buf();
+        // A stray file at the root level (could be a leftover from
+        // the legacy flat layout or operator detritus). Reclaim must
+        // not fail on it or try to enter it as a dir.
+        fs::write(queue.join("README.txt"), b"hello").unwrap();
+        let alice = queue.join("alice");
+        fs::create_dir_all(&alice).unwrap();
+        fs::write(alice.join(".inflight.001.msg"), b"x").unwrap();
+        let n = reclaim_stale_inflight(&queue).unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn reclaim_stale_inflight_continues_past_per_file_errors() {
+        let dir = tempdir().unwrap();
+        let queue = dir.path().to_path_buf();
+        let alice = queue.join("alice");
+        fs::create_dir_all(&alice).unwrap();
+        // Two reclaimable files; first one's destination already
+        // exists (collision — should be logged + skipped).
+        fs::write(alice.join(".inflight.001.msg"), b"a").unwrap();
+        fs::write(alice.join("001.msg"), b"existing").unwrap(); // collision target
+        fs::write(alice.join(".inflight.002.msg"), b"b").unwrap();
+        let n = reclaim_stale_inflight(&queue).unwrap();
+        // POSIX `rename` overwrites the destination, so collision
+        // produces a successful rename. Both reclaim. Document this
+        // explicitly so a future change to e.g. `renameat2(NOREPLACE)`
+        // surfaces here.
+        assert_eq!(n, 2);
     }
 
     #[test]

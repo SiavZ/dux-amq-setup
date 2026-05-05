@@ -1,7 +1,7 @@
 # Threat Model — long-form companion
 
 This document is the long-form companion to the STRIDE table in
-[`/SECURITY.md`](../../SECURITY.md). For each row T1–T12 we capture
+[`/SECURITY.md`](../../SECURITY.md). For each row T1–T14 we capture
 the concrete attack scenario, the mitigation in code (with
 file:line references taken from `docs/audits/audit02.md`), the
 residual risk after mitigation, and the detection mechanism — what
@@ -50,37 +50,100 @@ dux.log` reveals when the dangerous flag was active.
 
 ## T2 — Compromised AMQ peer spoofs `--me <other>` and injects text
 
+**Status: accepted-risk in single-user-VM mode.** The Phase 08
+HMAC mitigation is preserved as opt-in but no longer the default.
+The full reasoning lives below; the short version is that the
+mitigation defends against an attacker that doesn't exist in dux's
+declared trust model.
+
 **Attack scenario.** Two panes share `$STATE_ROOT/amq`. Pane `bob`
 is compromised (e.g. via T1). It runs
 `amq send --me alice <victim> "rm -rf $HOME"`. The victim pane,
 configured with `--inject-mode raw`, auto-types the payload into
 its underlying CLI as if it came from `alice`. The receiver has no
 way to verify the sender; AMQ wrappers
-(`claude-amq:96`, `codex-amq:25`, `gemini-amq:29`) trust whatever
+(`claude-amq`, `codex-amq`, `gemini-amq`) trust whatever
 `--me` claims.
 
-**Mitigation in code.** Phase 08 adds an HMAC-signed envelope:
-each `amq send` (via `dux-amq/scripts/amq-send-signed`) reads a
-per-VM secret from `$AMQ_SECRET_PATH` (default
-`$HOME/.local/share/dux-amq/amq-secret`, mode 0600, owned by the
-wrapper user — initialized by `dux-amq/scripts/amq-secret-init.sh`)
-and signs the payload + a monotonic nonce. Receivers verify via
-`amq-receive-verify` and reject replays. Defense in depth: messages
-from senders not on a per-pane allowlist are escalated from
-`--inject-mode raw` to `--inject-mode confirm`, requiring a human
-keystroke. To rotate the secret, `rm` the file and restart every
-pane — rotation invalidates every in-flight signed envelope by design.
+**Why the original Phase 08 HMAC mitigation does not actually defend
+this surface.** Phase 08 added an HMAC-signed envelope: each
+`amq send` (via `dux-amq/scripts/amq-send-signed`) reads a per-VM
+secret from `$AMQ_SECRET_PATH` (default
+`$HOME/.local/share/dux-amq/amq-secret`, mode 0600) and signs the
+payload + a monotonic nonce. Receivers verify via
+`amq-receive-verify` and reject replays. Implementation-wise this
+works as designed.
 
-**Residual risk.** Anyone who can read `$AMQ_SECRET_PATH`
-can forge messages. Since dux is single-user-on-a-VM, that means
-any code running as the operator can already forge — the HMAC
-limits the blast radius to *post-compromise* attackers, not
-arbitrary peers. Replay protection caps at the nonce window size.
+But the trust model in [SECURITY.md](../../SECURITY.md) explicitly
+states: *"dux runs as a single-user, single-Linux-account TUI. All
+panes spawned by dux share the same `$HOME`, the same filesystem
+permissions, and the same environment. There is no in-VM isolation
+between panes. One compromised pane = one compromised user account."*
 
-**Detection.** Rejected envelopes log `amq: signature mismatch
-from <handle>` at WARN; replays log `amq: replay nonce <n>`. The
-`doctor` `amq` section reports the count of rejected envelopes in
-the last 24 h.
+Inside that model, every "peer" is a process running as the same
+Linux user. Same-UID processes can:
+
+- `cat $HOME/.local/share/dux-amq/amq-secret` and forge envelopes
+  with valid MACs (the secret is mode 0600 by the same UID).
+- `ptrace` the signing process and read the secret from memory.
+- `LD_PRELOAD` the signer to substitute the body before signing.
+
+Per Linus Torvalds's canonical position ([Debian thread, 2014](https://linux.debian.devel.narkive.com/66QPZz2A/using-sgid-binaries-to-defend-against-ld-preload-ptrace)),
+*"there is a complete lack of a security boundary between processes
+of the same user."* The MIT 6.828 OS-security course
+([2008 lecture](https://pdos.csail.mit.edu/6.828/2008/lec/l-security.html))
+makes the same point. T2's mitigation defends a boundary that
+Linux itself does not enforce.
+
+A second, concrete cost surfaced in production: enforcing strict
+verification at the receiver silently dropped every legacy
+`amq send` body that hadn't been wrapped through `amq-send-signed`.
+Most senders don't go through the signed path — the skill teaches
+plain `amq send` and the upstream AMQ binary has no signing
+support — so the mitigation broke the steady-state flow without
+adding a meaningful defense.
+
+**Mitigation in code (current).**
+
+- The bridge defaults to **skip mode**: it transparently unwraps a
+  `DUX1\t...` envelope when present (so legacy `amq-send-signed`
+  callers still interop) and treats plain bodies as raw. No HMAC
+  check.
+- Strict mode is opt-in via `[amq.inject].verify_envelope = true`
+  in dux's `config.toml`. dux exports `DUX_AMQ_VERIFY=1` to
+  spawned PTYs at bootstrap; the bridge calls
+  `amq-receive-verify`; unsigned/replayed/MAC-mismatched envelopes
+  are dropped silently. Reserved for environments that genuinely
+  cross a trust boundary — proxying wakes across hosts, mixed-trust
+  agents under the same UID via setuid shims, etc.
+- The `amq-send-signed` and `amq-receive-verify` tooling is kept
+  in the overlay and is exercised by the bats suite.
+- The per-VM secret at `$AMQ_SECRET_PATH` is still initialised by
+  `amq-secret-init.sh` so opt-in works out of the box. To rotate,
+  `rm` the file and restart every pane.
+
+**Residual risk.** In skip mode (the default), any peer process
+running as the same Linux user can write to another peer's AMQ
+inbox with a forged `--me`. This is concretely no worse than what
+the same peer could already do via `ptrace`/`LD_PRELOAD`/direct
+filesystem access against the signer in strict mode — the
+boundary doesn't exist in either case. In strict mode, the residual
+risk is the original Phase 08 risk: attackers with read access to
+`$AMQ_SECRET_PATH` can still forge.
+
+**Detection.** When strict mode is active, rejected envelopes are
+written to `~/.local/share/dux-amq/wake-<me>.log` by
+`amq-receive-verify`'s stderr. dux's main JSON log records every
+delivered wake under `target: "dux::amq_inject"` for the
+post-bridge half of the path; the bridge itself stays silent on
+the happy path so AMQ's `--inject-via` retry contract is preserved.
+
+**Reverting accepted-risk status.** If a future deployment lands
+in a context where `same-UID` does become a meaningful boundary
+(e.g. a setuid-segregated multi-tenant variant of dux), this
+section must be updated and `verify_envelope = true` shipped as
+the default. `[amq.inject].verify_envelope` was named
+deliberately so the policy flip is a one-line config change.
 
 ---
 
@@ -454,6 +517,65 @@ rule fires. The status line surfaces every rule fire
 
 ---
 
+## T14 — Malicious file in `~/.local/share/dux-amq/inject-queue/` injects unauthorised text into a dux session
+
+**Attack scenario.** dux's drainer (`crate::amq_inject` and
+`crate::app::inject_runtime`) reads files from a per-receiver
+queue under `~/.local/share/dux-amq/inject-queue/<receiver>/<ts>.msg`
+and types each body into the matching session's PTY. An attacker
+with same-UID write access to the queue dir — i.e. anyone running
+as the dux operator (per the trust model T2 already concedes) —
+can drop a hand-crafted `.msg` file. The drainer would type it
+into whichever session matches the parent directory name, with
+`\r` to submit. Concretely: drop
+`inject-queue/payment-ms-engineer/666.msg` containing
+`yes, run rm -rf` and the message would land in the
+payment-ms-engineer session as if it had been routed through AMQ.
+
+This is a derivative of T2 — same trust boundary — but lands in
+the agent's input field rather than the AMQ inbox, so it bypasses
+any agent-side filtering on AMQ message metadata.
+
+**Mitigation in code.** The drainer rejects:
+
+- Files larger than `[amq.inject].max_message_bytes` (default 64
+  KiB). A legitimate wake notification is ~150 bytes; the cap stops
+  a forged multi-megabyte body.
+- Symlinks. `fs::symlink_metadata` is checked before `read_to_string`,
+  so symlink swaps under TOCTOU don't escape the queue root.
+- Receiver subdirectories that don't match the wrapper's
+  sanitisation regex (`[a-z0-9_-]+`, no `..`, no leading dash).
+  Anything else is logged at WARN and skipped.
+- Inflight files left behind by a crashed prior dux instance are
+  reclaimed at startup (renamed back to `.msg`); bridge-format
+  `mktemp .inflight.XXXXXX` files (no `.msg` suffix) are skipped
+  on purpose so a concurrent in-progress write isn't corrupted.
+
+The bridge runs `amq-receive-verify` (HMAC + freshness + replay)
+ahead of writing the queue file *only* when strict mode is opted
+into (see T2). In skip mode (the default), unsigned bodies pass
+through. This is consistent with T2's accepted-risk reasoning:
+defending the queue against same-UID writers requires defending
+the agent's PTY against same-UID writers, which is not a boundary
+Linux gives us.
+
+**Residual risk.** Same-UID code can already type into the
+session's PTY directly via `ioctl(TIOCSTI)` (where supported) or
+by writing to `/proc/<pid>/fd/0`, so the queue is not adding new
+attack surface beyond what the OS already provides at this trust
+level. The size cap and symlink check exist primarily to keep the
+drainer's *own* failure modes bounded — operator error and
+filesystem hiccups — rather than to harden against a hostile peer.
+
+**Detection.** Rejections log at WARN under
+`target: "dux::amq_inject"` with `path` and `reason` fields.
+Successful deliveries log at INFO with a body preview. The
+status line surfaces "no session matches receiver X" warnings
+(rate-limited to once per minute per receiver) when a queued file
+can't be routed.
+
+---
+
 ## Maintenance
 
 When you add or change attack surface in this codebase, you must
@@ -461,7 +583,10 @@ update both `SECURITY.md` (the table) and this file (the
 paragraph). PRs that touch the surface listed above without
 updating these documents are blocked at review.
 
-The IDs `T1`–`T13` are stable references; new threats append at
-the end (`T14`, `T15`, …) rather than reshuffling. Retired
+The IDs `T1`–`T14` are stable references; new threats append at
+the end (`T15`, `T16`, …) rather than reshuffling. Retired
 threats are kept in the table with a `~~strikethrough~~` and a
-note pointing to the PR that retired them.
+note pointing to the PR that retired them. Threats that move to
+**accepted-risk in single-user-VM mode** keep their original ID,
+get a `Status:` line at the top of their long-form section, and
+remain referenced from `SECURITY.md`'s "Accepted risks" list.

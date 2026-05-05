@@ -58,6 +58,45 @@ pub(crate) fn sanitise_handle(name: &str) -> String {
     out
 }
 
+/// Pure helper that does the receiver→session-id resolution given a
+/// flat list of `(session_id, branch_name, worktree_path)` triples and
+/// a sanitised receiver. Mirrors the AMQ wrapper's ME-derivation
+/// priority: worktree dir basename first (the path the wrappers
+/// actually take inside a dux pane), then branch name (legacy
+/// fallback), then exact session id (operator escape hatch). See the
+/// docstring on `App::find_session_for_receiver` for the full
+/// rationale.
+///
+/// Returns `None` when no session matches. Stops at the first match
+/// in priority order — if two sessions both sanitise to the same
+/// receiver, the one whose worktree basename matches wins regardless
+/// of declaration order.
+pub(crate) fn match_receiver<'a, I>(sessions: I, receiver: &str) -> Option<&'a str>
+where
+    I: Clone + IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+{
+    for (id, _branch, worktree) in sessions.clone() {
+        if let Some(basename) = std::path::Path::new(worktree)
+            .file_name()
+            .and_then(|n| n.to_str())
+            && sanitise_handle(basename) == receiver
+        {
+            return Some(id);
+        }
+    }
+    for (id, branch, _worktree) in sessions.clone() {
+        if sanitise_handle(branch) == receiver {
+            return Some(id);
+        }
+    }
+    for (id, _branch, _worktree) in sessions {
+        if id == receiver {
+            return Some(id);
+        }
+    }
+    None
+}
+
 impl App {
     /// Bootstrap the AMQ inject-queue watcher. Called once during
     /// `App::run`. Failures are logged but never fatal — dux must
@@ -79,6 +118,30 @@ impl App {
             return;
         };
         self.runtime.amq_inject_queue_dir = Some(queue_dir.clone());
+
+        // Reclaim any stale `.inflight.<ts>.msg` files from a prior
+        // dux instance that crashed mid-delivery. The single-instance
+        // lock guarantees nobody else is currently processing them.
+        // Bridge-format mktemp temps (no `.msg` suffix) are skipped
+        // so we don't corrupt an in-progress write.
+        match amq_inject::reclaim_stale_inflight(&queue_dir) {
+            Ok(0) => {}
+            Ok(n) => {
+                tracing::info!(
+                    target: "dux::amq_inject",
+                    reclaimed = n,
+                    "reclaimed stale inflight files from prior dux instance",
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "dux::amq_inject",
+                    queue_dir = %queue_dir.display(),
+                    err = %err,
+                    "reclaim sweep failed; some queued messages may stay stuck",
+                );
+            }
+        }
 
         let tx = self.runtime.worker_tx.clone();
         let make_event = || WorkerEvent::AmqInjectScanRequested;
@@ -165,6 +228,7 @@ impl App {
                         body,
                         inflight_path: inflight,
                         source_path: pending.path.clone(),
+                        body_typed: false,
                     };
                     self.runtime
                         .amq_inject_pending
@@ -243,11 +307,27 @@ impl App {
                 continue;
             }
 
-            // Drain the head as long as the agent is idle. We loop
-            // here so a backlog of messages drains in one tick when
-            // the agent's been idle for a while. The busy check is
-            // re-run between deliveries because each Enter we type
-            // changes the snapshot.
+            // Two-phase delivery loop:
+            //   Phase 1 (head.body_typed = false): write the body
+            //     bytes to the PTY, mark `body_typed = true`, then
+            //     break out of the inner loop. The next tick will
+            //     pick this entry back up for phase 2.
+            //   Phase 2 (head.body_typed = true): write a discrete
+            //     `\r` to the PTY, unlink the inflight file, pop the
+            //     entry, and continue draining the queue.
+            //
+            // Why split: a single PTY write of `body + \r` gets
+            // coalesced by Ink (Claude Code's TUI framework) into a
+            // paste-shaped buffer; the trailing `\r` ends up appended
+            // to the input field rather than firing as a submit
+            // keystroke. Splitting across two ticks puts a real time
+            // gap between writes (~16 ms typical), which produces two
+            // separate `read()` calls on Ink's stdin so the final
+            // `\r` arrives alone and is interpreted as Enter.
+            //
+            // The busy-check is re-run between every pop so a backlog
+            // of messages stops draining if the agent goes back into
+            // streaming mid-batch.
             loop {
                 let queue_empty = self
                     .runtime
@@ -273,16 +353,46 @@ impl App {
                     break;
                 }
 
-                // Pop head and deliver.
-                let Some(head) = self
+                // Decide which phase the head is in. Read-only borrow
+                // released before we mutate.
+                let phase = self
                     .runtime
                     .amq_inject_pending
-                    .get_mut(&receiver)
-                    .and_then(|q| q.pop_front())
-                else {
-                    break;
-                };
-                self.deliver_inject(&session_id, &receiver, &head);
+                    .get(&receiver)
+                    .and_then(|q| q.front())
+                    .map(|head| head.body_typed);
+
+                match phase {
+                    Some(false) => {
+                        // Phase 1: type the body, leave the entry at
+                        // the head of the queue with body_typed=true,
+                        // and break out so the next tick handles \r.
+                        let body = {
+                            let q = self
+                                .runtime
+                                .amq_inject_pending
+                                .get_mut(&receiver)
+                                .expect("queue exists per phase peek");
+                            let head_mut = q.front_mut().expect("head exists per phase peek");
+                            head_mut.body_typed = true;
+                            head_mut.body.clone()
+                        };
+                        self.deliver_inject_body(&session_id, &receiver, &body);
+                        break;
+                    }
+                    Some(true) => {
+                        // Phase 2: pop, write \r, unlink, status-line.
+                        let head = self
+                            .runtime
+                            .amq_inject_pending
+                            .get_mut(&receiver)
+                            .and_then(|q| q.pop_front())
+                            .expect("head exists per phase peek");
+                        self.deliver_inject_enter(&session_id, &receiver, &head);
+                        // Loop continues to drain next message.
+                    }
+                    None => break,
+                }
             }
 
             // Tidy up empty queues so the receivers Vec next tick
@@ -301,27 +411,105 @@ impl App {
 
     /// Map a sanitised receiver name back to a session id. Returns
     /// `None` if no live session has a matching branch name.
+    /// Map a sanitised receiver name back to a session id, mirroring
+    /// the AMQ wrapper's `ME` derivation priority. The wrappers in
+    /// `dux-amq/wrappers/` resolve their handle as:
+    ///
+    ///   1. `$AM_ME` env if set (explicit override)
+    ///   2. `basename($PWD)` if running inside a dux worktree
+    ///   3. git `branch --show-current`
+    ///   4. `<provider>-<pid>` (no-context fallback)
+    ///
+    /// Step 2 is what fires for every dux-spawned pane, and it picks
+    /// up the **worktree directory name** — i.e. whatever the branch
+    /// was called when the worktree was created via `git worktree add`.
+    /// dux can later rename the branch in that worktree (the user
+    /// pushes a feature branch, switches to a hotfix, etc.); the
+    /// directory name does not follow.
+    ///
+    /// So the receiver "front-end-qa" can correspond to a session
+    /// whose `branch_name` is now `fix/qa-s45-charge-schema-paymentmethod`
+    /// but whose `worktree_path` ends in `Front-end-QA`. We try the
+    /// directory basename first (matching the primary path the
+    /// wrappers actually use), then fall back to branch name (matching
+    /// the legacy fallback path), and finally settle for an exact
+    /// match against the session id (so an operator can address by id
+    /// when the worktree dir name is ambiguous).
     fn find_session_for_receiver(&self, receiver: &str) -> Option<String> {
-        for session in &self.git.sessions {
-            if sanitise_handle(&session.branch_name) == receiver {
-                return Some(session.id.clone());
-            }
-        }
-        None
+        let triples: Vec<(&str, &str, &str)> = self
+            .git
+            .sessions
+            .iter()
+            .map(|s| {
+                (
+                    s.id.as_str(),
+                    s.branch_name.as_str(),
+                    s.worktree_path.as_str(),
+                )
+            })
+            .collect();
+        match_receiver(triples.iter().copied(), receiver).map(|s| s.to_string())
     }
 
-    /// Type the body into the session's PTY and submit with `\r`.
-    /// Reuses `crate::app::input::macro_payload_bytes` so embedded
-    /// newlines become Alt-Enter (a newline within the prompt) rather
-    /// than premature submits — the same chokepoint watch effects use.
-    fn deliver_inject(&mut self, session_id: &str, receiver: &str, msg: &QueuedMessage) {
-        let mut payload = crate::app::input::macro_payload_bytes(&msg.body);
-        // Trailing CR submits the prompt. Equivalent to
-        // `WatchEffect::SendText { append_enter: true }`.
-        payload.push(b'\r');
+    /// Phase 1 of two-phase delivery: type the body into the
+    /// session's PTY without the trailing `\r`. Reuses
+    /// `crate::app::input::macro_payload_bytes` so embedded newlines
+    /// become Alt-Enter (a newline within the prompt) rather than
+    /// premature submits — the same chokepoint watch effects use.
+    /// The inflight file stays on disk; phase 2 unlinks it.
+    fn deliver_inject_body(&mut self, session_id: &str, receiver: &str, body: &str) {
+        let payload = crate::app::input::macro_payload_bytes(body);
         let write_result = self
             .find_pty_handle(session_id)
             .map(|handle| handle.write_bytes(&payload));
+        match write_result {
+            Some(Ok(())) => {
+                tracing::debug!(
+                    target: "dux::amq_inject",
+                    session_id = %session_id,
+                    receiver = %receiver,
+                    body_preview = %amq_inject::preview(body, 80),
+                    "typed AMQ wake body (phase 1); awaiting tick 2 to send Enter",
+                );
+            }
+            Some(Err(err)) => {
+                // PTY write failed; mark this entry not-yet-typed so
+                // the next tick retries phase 1. The inflight file is
+                // already in pending so it survives the failure.
+                tracing::warn!(
+                    target: "dux::amq_inject",
+                    session_id = %session_id,
+                    receiver = %receiver,
+                    err = %err,
+                    "phase-1 PTY write failed; will retry next tick",
+                );
+                if let Some(q) = self.runtime.amq_inject_pending.get_mut(receiver)
+                    && let Some(head) = q.front_mut()
+                {
+                    head.body_typed = false;
+                }
+            }
+            None => {
+                // No PTY (session gone). Roll back so a future
+                // re-spawn picks the message up.
+                if let Some(q) = self.runtime.amq_inject_pending.get_mut(receiver)
+                    && let Some(head) = q.front_mut()
+                {
+                    head.body_typed = false;
+                }
+            }
+        }
+    }
+
+    /// Phase 2 of two-phase delivery: write a discrete `\r` to the
+    /// session's PTY, unlink the inflight file, and surface success
+    /// in the status line. The split-write pattern is what makes
+    /// Ink's stdin reader see the `\r` as a separate keystroke
+    /// rather than coalescing it into the body's paste buffer.
+    fn deliver_inject_enter(&mut self, session_id: &str, receiver: &str, msg: &QueuedMessage) {
+        let write_result = self
+            .find_pty_handle(session_id)
+            .map(|handle| handle.write_bytes(b"\r"));
         match write_result {
             Some(Ok(())) => {
                 if let Err(err) = std::fs::remove_file(&msg.inflight_path) {
@@ -348,9 +536,13 @@ impl App {
                 ));
             }
             Some(Err(err)) => {
-                // PTY write failed — most likely the agent process
-                // exited between the busy check and the write. Put
-                // the file back and try again next tick.
+                // PTY write of \r failed. The body is already in the
+                // input field; release the file so the next tick
+                // re-attempts phase 1 (typing the body again would
+                // duplicate, but at least Enter eventually fires).
+                // Better than leaving the body floating without
+                // submission. The single-instance lock + claim
+                // semantics still ensure no duplicate file delivery.
                 let _ = amq_inject::release(&msg.inflight_path);
                 tracing::warn!(
                     target: "dux::amq_inject",
@@ -358,11 +550,11 @@ impl App {
                     receiver = %receiver,
                     path = %msg.inflight_path.display(),
                     err = %err,
-                    "PTY write failed; released for retry",
+                    "phase-2 PTY write (Enter) failed; released for retry",
                 );
             }
             None => {
-                // No PTY anymore. Same recovery path as a write error.
+                // No PTY anymore. Same recovery path as write error.
                 let _ = amq_inject::release(&msg.inflight_path);
             }
         }
@@ -421,7 +613,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitise_handle;
+    use super::{match_receiver, sanitise_handle};
 
     #[test]
     fn sanitise_lowercases_uppercase_letters() {
@@ -456,5 +648,89 @@ mod tests {
         // routes to `_unrouted/`.
         assert_eq!(sanitise_handle("..."), "");
         assert_eq!(sanitise_handle("///"), "");
+    }
+
+    /// The production bug that motivated this regression test:
+    /// dux's sessions table had `branch_name = "fix/qa-s45-..."` for a
+    /// worktree at `/data/state/dux/worktrees/Jobzy-Front-end/Front-end-QA/`,
+    /// while the AMQ wrapper had derived `AM_ME = front-end-qa` from the
+    /// worktree dir basename. The drainer's old branch-only matcher
+    /// returned None and every wake notification stayed orphaned in
+    /// `inject-queue/front-end-qa/.inflight.<ts>.msg`.
+    #[test]
+    fn match_receiver_matches_worktree_basename_when_branch_diverges() {
+        let sessions = [(
+            "session-uuid-1",
+            "fix/qa-s45-charge-schema-paymentmethod",
+            "/data/state/dux/worktrees/Jobzy-Front-end/Front-end-QA",
+        )];
+        assert_eq!(
+            match_receiver(sessions.iter().copied(), "front-end-qa"),
+            Some("session-uuid-1"),
+        );
+    }
+
+    #[test]
+    fn match_receiver_falls_back_to_branch_name_when_basename_does_not_match() {
+        let sessions = [(
+            "session-uuid-2",
+            "feature-login",
+            "/some/path/legacy-name-from-creation",
+        )];
+        assert_eq!(
+            match_receiver(sessions.iter().copied(), "feature-login"),
+            Some("session-uuid-2"),
+        );
+    }
+
+    #[test]
+    fn match_receiver_falls_back_to_session_id_for_operator_addressing() {
+        let sessions = [("af882c2d", "fix/foo", "/wt/Bar")];
+        // Receiver = exact session id.
+        assert_eq!(
+            match_receiver(sessions.iter().copied(), "af882c2d"),
+            Some("af882c2d"),
+        );
+    }
+
+    #[test]
+    fn match_receiver_returns_none_when_nothing_matches() {
+        let sessions = [("id1", "main", "/wt/main"), ("id2", "dev", "/wt/dev")];
+        assert_eq!(
+            match_receiver(sessions.iter().copied(), "front-end-qa"),
+            None
+        );
+    }
+
+    #[test]
+    fn match_receiver_basename_priority_beats_branch_priority() {
+        // Two sessions: A's worktree-basename is "alice", B's branch
+        // is "alice". Worktree basename wins because the wrapper's
+        // primary path inside dux is basename($PWD).
+        let sessions = [
+            ("idA", "fix/random", "/wt/Alice"),     // basename → alice
+            ("idB", "alice", "/wt/something-else"), // branch → alice
+        ];
+        assert_eq!(
+            match_receiver(sessions.iter().copied(), "alice"),
+            Some("idA"),
+        );
+    }
+
+    #[test]
+    fn match_receiver_branch_match_wins_when_no_basename_match() {
+        // Session A's branch matches but basename does not; with no
+        // sessions matching by basename, we fall through to branch.
+        let sessions = [("idA", "alice", "/wt/random-dir")];
+        assert_eq!(
+            match_receiver(sessions.iter().copied(), "alice"),
+            Some("idA"),
+        );
+    }
+
+    #[test]
+    fn match_receiver_handles_empty_session_list() {
+        let sessions: Vec<(&str, &str, &str)> = vec![];
+        assert_eq!(match_receiver(sessions.iter().copied(), "anything"), None);
     }
 }
