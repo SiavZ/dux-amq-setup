@@ -260,6 +260,9 @@ impl App {
             self.set_error(reason);
             return Ok(());
         }
+        if let Some(warning) = self.soft_warn_for_pane_count() {
+            self.set_warning(warning);
+        }
         self.create_agent_in_flight = true;
         self.set_busy(busy_message);
         let paths = self.paths.clone();
@@ -309,6 +312,36 @@ impl App {
             ));
         }
         None
+    }
+
+    /// Soft-warning gate evaluated before agent spawn, after the hard
+    /// refusal in [`Self::refuse_agent_spawn_for_limits`] returned
+    /// `None`. Returns `Some(message)` when the live pane count has
+    /// reached `[limits].max_panes_soft_warn` (and that value is
+    /// non-zero); the caller surfaces it via [`Self::set_warning`]
+    /// without aborting the spawn. This is the non-blocking nudge
+    /// for operators who set `max_panes = 0` (= no hard cap) but
+    /// still want a heads-up when the pane count climbs.
+    pub(crate) fn soft_warn_for_pane_count(&self) -> Option<String> {
+        let limits = &self.config.limits;
+        if limits.max_panes_soft_warn == 0 {
+            return None;
+        }
+        let active_panes = self
+            .git
+            .sessions
+            .iter()
+            .filter(|s| s.state.is_live())
+            .count();
+        if active_panes < limits.max_panes_soft_warn {
+            return None;
+        }
+        Some(format!(
+            "{active_panes} active agent panes (limits.max_panes_soft_warn = {}). \
+             Detach unused agents to free RAM, or raise the threshold (or set 0 \
+             to silence) in config.toml.",
+            limits.max_panes_soft_warn
+        ))
     }
 
     pub(crate) fn spawn_pty_for_session(
@@ -2682,6 +2715,68 @@ mod tests {
             app.refuse_agent_spawn_for_limits().is_none(),
             "max_panes = 0 must mean unlimited",
         );
+    }
+
+    /// `soft_warn_for_pane_count` must return None below the threshold,
+    /// Some(message) at or above it (when the threshold is non-zero),
+    /// and None unconditionally when threshold == 0 (warning disabled).
+    /// The message must name `limits.max_panes_soft_warn` so an operator
+    /// can locate the knob without docs.
+    #[test]
+    fn soft_warn_for_pane_count_fires_at_threshold_only() {
+        let s1 = make_session("s1", "claude", "/tmp/wt/a");
+        let s2 = make_session("s2", "claude", "/tmp/wt/b");
+        let project = make_project("project-1", "claude");
+        let mut app = test_app_with_sessions(vec![s1, s2], vec![project]);
+        app.config.limits.max_panes = 0; // no hard cap
+        app.config.limits.max_panes_soft_warn = 2;
+
+        // Zero live sessions → below threshold → no warning.
+        assert!(app.soft_warn_for_pane_count().is_none());
+
+        mark_active(&mut app, "s1");
+        // 1 < 2 → still below.
+        assert!(app.soft_warn_for_pane_count().is_none());
+
+        mark_active(&mut app, "s2");
+        // 2 >= 2 → fires.
+        let warn = app
+            .soft_warn_for_pane_count()
+            .expect("must warn at threshold");
+        assert!(
+            warn.contains("max_panes_soft_warn"),
+            "warning should name the knob, got: {warn}",
+        );
+        assert!(
+            warn.contains('2'),
+            "warning should report the active count, got: {warn}",
+        );
+
+        // Threshold = 0 → warning disabled regardless of count.
+        app.config.limits.max_panes_soft_warn = 0;
+        assert!(
+            app.soft_warn_for_pane_count().is_none(),
+            "max_panes_soft_warn = 0 must silence the warning",
+        );
+    }
+
+    /// When max_panes is set (hard cap) AND soft warn is at the same
+    /// value, the hard refusal wins — caller checks refuse first, then
+    /// warn, so the warn function still returns Some() but the spawn
+    /// path never reaches it. The two functions are independent: each
+    /// answers its own question.
+    #[test]
+    fn soft_warn_independent_of_hard_cap() {
+        let s1 = make_session("s1", "claude", "/tmp/wt/a");
+        let project = make_project("project-1", "claude");
+        let mut app = test_app_with_sessions(vec![s1], vec![project]);
+        app.config.limits.max_panes = 5;
+        app.config.limits.max_panes_soft_warn = 1;
+        mark_active(&mut app, "s1");
+
+        // Below hard cap, at/above soft → both functions agree.
+        assert!(app.refuse_agent_spawn_for_limits().is_none());
+        assert!(app.soft_warn_for_pane_count().is_some());
     }
 
     /// When the disk-watchdog has reported >= disk_high_water_pct,

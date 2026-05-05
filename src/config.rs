@@ -324,14 +324,24 @@ impl Default for AutoResumeConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LimitsConfig {
-    /// Maximum number of simultaneously-active agent panes. New
-    /// `create_agent` requests are refused with a status-line error when
-    /// the cap is hit. `0` means unlimited (NOT recommended). Default 16.
+    /// Hard cap on simultaneously-active agent panes. New `create_agent`
+    /// requests are refused with a status-line error when the cap is
+    /// hit. `0` means unlimited. Default 0 (no hard cap; matches
+    /// operator preference for spawn freedom — pair with
+    /// `max_panes_soft_warn` below for a non-blocking nudge).
     #[serde(default = "default_max_panes")]
     pub max_panes: usize,
-    /// Maximum companion (raw shell) terminals. Documented for symmetry
-    /// with `max_panes`; honoured at terminal-spawn time.
-    /// `0` means unlimited. Default 4.
+    /// Soft warning threshold for active agent panes. When the live
+    /// pane count reaches this number, a yellow status-line note is
+    /// shown at agent creation time but the spawn proceeds. Set to
+    /// `0` to disable the warning entirely. Default 16 — matches
+    /// what used to be the hard cap, so operators who want the
+    /// classic refusal behaviour can still set
+    /// `max_panes = max_panes_soft_warn = 16`.
+    #[serde(default = "default_max_panes_soft_warn")]
+    pub max_panes_soft_warn: usize,
+    /// Hard cap on companion (raw shell) terminals across all
+    /// sessions. `0` means unlimited. Default 0.
     #[serde(default = "default_max_companion_terminals")]
     pub max_companion_terminals: usize,
     /// Soft cap on total scrollback grid memory across all panes (MiB).
@@ -360,11 +370,15 @@ pub struct LimitsConfig {
 }
 
 fn default_max_panes() -> usize {
+    0
+}
+
+fn default_max_panes_soft_warn() -> usize {
     16
 }
 
 fn default_max_companion_terminals() -> usize {
-    4
+    0
 }
 
 fn default_max_total_scrollback_mb() -> usize {
@@ -387,6 +401,7 @@ impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             max_panes: default_max_panes(),
+            max_panes_soft_warn: default_max_panes_soft_warn(),
             max_companion_terminals: default_max_companion_terminals(),
             max_total_scrollback_mb: default_max_total_scrollback_mb(),
             disk_high_water_pct: default_disk_high_water_pct(),
@@ -1186,12 +1201,25 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
         ConfigEntry::Field {
             key: "max_panes",
             comment: Some(CommentSource::Static(
-                "# Maximum number of simultaneously-active agent panes. New agent\n\
+                "# Hard cap on simultaneously-active agent panes. New agent\n\
                  # creation is refused with a status-line error when the cap is\n\
                  # hit; detach an unused pane or raise this value to recover.\n\
-                 # 0 means unlimited (NOT recommended on shared hosts). Default 16.",
+                 # 0 means unlimited (no hard cap). Default 0 — pair with\n\
+                 # max_panes_soft_warn below for a non-blocking nudge instead.",
             )),
             value_fn: |c| FieldValue::Usize(c.limits.max_panes),
+        },
+        ConfigEntry::Field {
+            key: "max_panes_soft_warn",
+            comment: Some(CommentSource::Static(
+                "# Soft warning threshold for active agent panes. When the live\n\
+                 # pane count reaches this number, a yellow status-line note is\n\
+                 # shown at agent creation time but the spawn proceeds. Set 0\n\
+                 # to disable the warning entirely. Default 16 — matches what\n\
+                 # used to be the hard cap, so operators who want the classic\n\
+                 # refusal behaviour can set max_panes = max_panes_soft_warn = 16.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.limits.max_panes_soft_warn),
         },
         ConfigEntry::Field {
             key: "max_companion_terminals",
