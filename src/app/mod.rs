@@ -1092,6 +1092,31 @@ impl App {
             "bootstrapping dux",
         );
 
+        // Apply `[amq.inject].verify_envelope` to the process env before
+        // we spawn any PTY. The bridge (running deep inside the AMQ
+        // wake daemon's process tree, far from dux's own state) reads
+        // `DUX_AMQ_VERIFY` to pick strict vs. skip mode. Setting it
+        // here means every PTY child — and the wake daemon they spawn —
+        // inherits the right value via portable_pty's default
+        // env-propagation. Skipping the var altogether keeps
+        // out-of-process consumers (operators running plain
+        // `dux-amq-inject-bridge` outside dux) on the default skip
+        // mode without false-tripping strict verification.
+        //
+        // `set_var` / `remove_var` are unsafe in Rust 2024 because of
+        // multi-threaded racing concerns; we run before any worker
+        // thread is spawned, so this is safe in practice.
+        unsafe {
+            if config.amq.inject.verify_envelope {
+                std::env::set_var("DUX_AMQ_VERIFY", "1");
+            } else {
+                // Be defensive: if the operator launched dux from a
+                // shell that already had DUX_AMQ_VERIFY=1 exported,
+                // unset it so config wins.
+                std::env::remove_var("DUX_AMQ_VERIFY");
+            }
+        }
+
         // Validate and build runtime keybindings from config.
         if let Err(msg) = validate_keys(&config.keys) {
             eprintln!(
