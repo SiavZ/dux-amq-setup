@@ -28,12 +28,56 @@ use super::*;
 
 use std::time::Duration;
 
-use crate::amq_inject::{self, QueuedMessage, UNROUTED_RECEIVER, snapshot_indicates_busy};
+use crate::amq_inject::{self, QueuedMessage, UNROUTED_RECEIVER};
 
 /// How long between repeat warnings about the same un-deliverable
 /// receiver. Stops a queue full of messages for an unknown handle
 /// from spamming the status line at tick rate.
 const WARN_RATE_LIMIT: Duration = Duration::from_secs(60);
+
+/// How long between repeat `debug`-level "drainer holding for X"
+/// trace events for the same receiver. Without this throttle the
+/// main loop ticks (~10 Hz idle, faster on input) would each emit
+/// one event per held receiver, and the JSON log would grow at the
+/// tick rate. Set to 60 s so a typical operator running with
+/// `RUST_LOG=dux::amq_inject=debug` sees one diagnostic line per
+/// minute per held receiver — enough to confirm whether a delivery
+/// is being held or simply hasn't fired, without flooding `dux.log`.
+pub(crate) const HOLD_LOG_RATE_LIMIT: Duration = Duration::from_secs(60);
+
+/// Reasons the drainer can hold a message instead of delivering.
+/// Each variant carries enough context to diagnose without a stack
+/// trace; see `App::log_holding` for the formatted output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HoldReason<'a> {
+    /// Receiver has no matching session in `git.sessions`. The
+    /// message stays in the per-receiver queue until either a
+    /// matching session spawns or the operator moves the file out.
+    NoSession,
+    /// `InputTarget::Agent` is set and the active session is the
+    /// receiver target — the user is typing into that pane right now,
+    /// so we don't interrupt them.
+    UserTyping,
+    /// Session matched by name but its PTY handle is gone
+    /// (detached/exited). Re-spawn the session and the next tick
+    /// will pick it up.
+    PtyGone,
+    /// Bottom-of-screen scan turned up a configured busy marker
+    /// (e.g. "esc to interrupt"). The matching marker is included
+    /// for diagnosis when the user disagrees with our verdict.
+    BusyMarker(&'a str),
+}
+
+impl<'a> HoldReason<'a> {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoSession => "no_matching_session",
+            Self::UserTyping => "user_typing_in_target_session",
+            Self::PtyGone => "pty_gone",
+            Self::BusyMarker(_) => "busy_marker_detected",
+        }
+    }
+}
 
 /// Sanitise a string the same way the AMQ wrappers do before deriving
 /// the agent handle. Used to match a receiver name (already sanitised
@@ -298,12 +342,14 @@ impl App {
             let Some(session_id) = session_id else {
                 self.maybe_warn_no_session(&receiver, now);
                 self.maybe_warn_timeout(&receiver, now, timeout);
+                self.log_holding(&receiver, now, HoldReason::NoSession);
                 continue;
             };
 
             // Don't interrupt the user mid-prompt. Same rule that
             // `tick_watch_engines` enforces on its own auto-actions.
             if active_session.as_deref() == Some(session_id.as_str()) {
+                self.log_holding(&receiver, now, HoldReason::UserTyping);
                 continue;
             }
 
@@ -345,11 +391,13 @@ impl App {
                         // (detached/exited). Leave queued; if the user
                         // re-spawns, we'll pick it up.
                         self.maybe_warn_timeout(&receiver, now, timeout);
+                        self.log_holding(&receiver, now, HoldReason::PtyGone);
                         break;
                     }
                 };
-                if snapshot_indicates_busy(&snapshot, &busy_markers) {
+                if let Some(matched) = amq_inject::snapshot_busy_marker(&snapshot, &busy_markers) {
                     self.maybe_warn_timeout(&receiver, now, timeout);
+                    self.log_holding(&receiver, now, HoldReason::BusyMarker(matched));
                     break;
                 }
 
@@ -562,6 +610,68 @@ impl App {
 
     /// Surface a status-line warning when a queued receiver has no
     /// matching live session. Rate-limited so a backlog doesn't spam.
+    /// Emit a `debug`-level trace event the first time (and at most
+    /// once per [`HOLD_LOG_RATE_LIMIT`] thereafter) we hold a
+    /// receiver's queue without delivering. Default `info` filter
+    /// drops these — opt in with `RUST_LOG=dux::amq_inject=debug` to
+    /// diagnose why an expected delivery hasn't fired yet.
+    ///
+    /// The event includes:
+    /// - the receiver handle,
+    /// - the hold reason (no session / user typing / pty gone /
+    ///   busy marker detected, with the matching marker substring),
+    /// - the queue depth (helpful when many messages have piled up),
+    /// - a sanitised preview of the head body (so a peek at one
+    ///   `dux.log` line tells you what's stuck without correlating
+    ///   timestamps against the on-disk inject-queue).
+    ///
+    /// The receiver-keyed throttle map is shared across all reasons
+    /// so a flapping busy/idle agent doesn't bypass the rate limit
+    /// by alternating reasons.
+    fn log_holding(&mut self, receiver: &str, now: Instant, reason: HoldReason<'_>) {
+        let last = self
+            .runtime
+            .amq_inject_last_held_logged
+            .get(receiver)
+            .copied();
+        let due = last.is_none_or(|t| now.duration_since(t) >= HOLD_LOG_RATE_LIMIT);
+        if !due {
+            return;
+        }
+        self.runtime
+            .amq_inject_last_held_logged
+            .insert(receiver.to_string(), now);
+        let queue = self.runtime.amq_inject_pending.get(receiver);
+        let depth = queue.map(|q| q.len()).unwrap_or(0);
+        let body_preview = queue
+            .and_then(|q| q.front())
+            .map(|head| amq_inject::preview(&head.body, 80))
+            .unwrap_or_default();
+        let matched_marker = match reason {
+            HoldReason::BusyMarker(m) => Some(m.to_string()),
+            _ => None,
+        };
+        match matched_marker {
+            Some(m) => tracing::debug!(
+                target: "dux::amq_inject",
+                receiver = %receiver,
+                reason = %reason.as_str(),
+                marker = %m,
+                queue_depth = depth,
+                body_preview = %body_preview,
+                "drainer holding queued message(s)",
+            ),
+            None => tracing::debug!(
+                target: "dux::amq_inject",
+                receiver = %receiver,
+                reason = %reason.as_str(),
+                queue_depth = depth,
+                body_preview = %body_preview,
+                "drainer holding queued message(s)",
+            ),
+        }
+    }
+
     fn maybe_warn_no_session(&mut self, receiver: &str, now: Instant) {
         let last = self.runtime.amq_inject_last_warned.get(receiver).copied();
         let due = last.is_none_or(|t| now.duration_since(t) >= WARN_RATE_LIMIT);
