@@ -139,8 +139,8 @@ that `--continue` refuses.
 
 When the sentinel is present, the wrappers switch `amq wake` to `--inject-via "$LOCAL_BIN/dux-amq-inject-bridge"`. The bridge:
 
-1. Validates the envelope (HMAC + freshness + replay) via `amq-receive-verify`.
-2. On success, picks one of three delivery strategies:
+1. **Skip mode (default)** transparently unwraps a `DUX1\t...` envelope when present (so legacy `amq-send-signed` callers interop) and treats plain `amq send` bodies as raw. No HMAC check. Per the trust model in [SECURITY.md](../SECURITY.md), same-UID peers share `$HOME` and can read the HMAC secret directly, so verification doesn't add a defensible boundary against peers — insisting on it just silently dropped every legacy unsigned message. Set `[amq.inject].verify_envelope = true` in dux's `config.toml` to opt back into strict mode (dux exports `DUX_AMQ_VERIFY=1` to spawned PTYs; the bridge calls `amq-receive-verify`; unsigned/replayed/MAC-mismatched envelopes are dropped). Outside dux, set `DUX_AMQ_VERIFY=1` directly in the shell that runs `amq wake` for the same effect.
+2. Picks one of three delivery strategies for the body:
    - **Under dux** (`$DUX_PANE` is exported by the dux PTY spawn): always write to the file queue at `~/.local/share/dux-amq/inject-queue/<receiver>/<ts>.msg`. The dux-side drainer (see `[amq.inject]` in `config.toml`) types the body into the matching session's PTY only when the agent is idle. This avoids the "stuck in input field" failure where Claude Code's Ink input would drop a trailing Enter received during streaming.
    - **Outside dux, with tmux**: `tmux send-keys -- "$body" Enter` against the current pane (or `$DUX_TMUX_TARGET` if set).
    - **Outside dux, no tmux**: write to the same file queue and let an operator recover the body manually.

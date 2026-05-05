@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # dux-amq-inject-bridge — TIOCSTI-disabled fallback for `amq wake`
 # (audit02 Phase 13, audit01 P1-1; receiver-keyed queue rev added when
-# the dux-side drainer was implemented).
+# the dux-side drainer was implemented; verify-opt-in rev added when
+# T2 was reclassified as accepted-risk in single-user-VM mode).
 #
 # AMQ v0.34.0's `--inject-mode raw` calls `ioctl(TIOCSTI)` directly and
 # silently fails on Linux ≥ 6.2 / Ubuntu 24.04 / Debian 12+ (kernels
@@ -12,13 +13,33 @@
 # argv element ($1 here).
 #
 # Flow:
-#   1. Validate the envelope through `amq-receive-verify "$1"`. The
-#      verifier does HMAC + freshness + replay checks (audit02 Phase 08)
-#      and writes the cleaned body to stdout. If verify fails (rc != 0
-#      or empty stdout) we exit 0 silently — bad messages MUST NOT be
-#      retried and MUST NOT be injected.
+#   1. (Optional) Verify the envelope through `amq-receive-verify` when
+#      `DUX_AMQ_VERIFY=1`. Verification was originally mandatory
+#      (audit02 Phase 08, T2: "compromised peer spoofs identity"), but
+#      our trust model in SECURITY.md states all panes share the same
+#      Linux user, $HOME, and FS perms — i.e. there's no boundary
+#      between peers in the first place. A peer with same-UID access
+#      can `cat ~/.local/share/dux-amq/amq-secret` (mode 0600 on the
+#      same $HOME) or `ptrace`/`LD_PRELOAD` the signer. Per Linus
+#      ("there is a complete lack of a security boundary between
+#      processes of the same user") and MIT 6.828, HMAC against a
+#      same-UID adversary is not a meaningful boundary. So strict
+#      verification is now opt-in for environments that genuinely
+#      bridge a trust boundary (e.g. wake notifications proxied across
+#      hosts) — most users want skip mode.
 #
-#   2. Inject the verified body into the dux pane. Strategy selection:
+#      Skip mode (default): if the envelope starts with `DUX1\t` we
+#      transparently extract the inner body without checking the MAC
+#      (so signed senders still work end-to-end); otherwise we use the
+#      argv as-is. Either way we deliver SOMETHING — that's the entire
+#      point of the change.
+#
+#      Strict mode (`DUX_AMQ_VERIFY=1`): the original behaviour. We
+#      call `amq-receive-verify` and drop on any failure (unsigned,
+#      stale, replayed, MAC mismatch). dux exports this env var when
+#      `[amq.inject].verify_envelope = true` in `config.toml`.
+#
+#   2. Inject the body into the dux pane. Strategy selection:
 #        a. When DUX_PANE is set (dux is the parent process tree), we
 #           ALWAYS go to the file queue. The dux-side drainer reads it
 #           and types into the agent's PTY only when the agent is idle
@@ -46,50 +67,83 @@
 # warning instead of dropping.
 #
 # Exit status is always 0 on the happy path AND on every soft-failure
-# branch (silent verify rejection, missing tmux, full filesystem). The
-# upstream AMQ contract says: a non-zero `--inject-via` exit means
-# "retry this message later", which we never want for a malformed /
-# spoofed body. Setup errors that *would* benefit from a retry aren't
-# present here (no network calls, no auth tokens to refresh) — every
-# failure mode is either "the message is bad" or "the host is bad",
-# and neither is helped by a retry.
+# branch (silent verify rejection in strict mode, missing tmux, full
+# filesystem). The upstream AMQ contract says: a non-zero
+# `--inject-via` exit means "retry this message later", which we never
+# want for a malformed/spoofed body. Setup errors that *would* benefit
+# from a retry aren't present here (no network calls, no auth tokens
+# to refresh) — every failure mode is either "the message is bad" or
+# "the host is bad", and neither is helped by a retry.
 set -euo pipefail
 
 ENVELOPE="${1:-}"
 
-# Step 1 — verify. `amq-receive-verify` reads from argv (Phase 13
-# patch) when stdin isn't piped. We must invoke it with the same
-# semantics, capturing stdout (the cleaned body) and discarding
-# stderr only after the call so we don't lose drop-reason warnings
-# during operator debugging — the wrapper appends them to wake-$ME.log.
-#
-# A few delicate points:
-#
-#   * `set -e` would kill us if verify exits non-zero. Guard with `||`.
-#   * `command -v` is the cheapest portable lookup; we don't fall back
-#     to a hard absolute path because install.sh always puts the
-#     verifier on $LOCAL_BIN, which is on PATH for the wrapper's
-#     environment (inherited from the parent shell that launched dux).
-#   * Empty stdout from verify means a soft-drop (unsigned, replayed,
-#     stale, MAC mismatch). Exit 0 — never propagate.
-if ! command -v amq-receive-verify >/dev/null 2>&1; then
-  printf '[inject-bridge] amq-receive-verify not on PATH; dropping message\n' >&2
+# Mode selection. Default is skip-verify, matching the trust model in
+# SECURITY.md (T2 accepted-risk in single-user-VM mode). dux exports
+# DUX_AMQ_VERIFY=1 when the operator opts back into strict mode via
+# `[amq.inject].verify_envelope = true`. Outside dux, env unset =
+# default = skip.
+VERIFY_MODE="${DUX_AMQ_VERIFY:-0}"
+
+# Empty envelope is always a no-op regardless of mode. Stays exit 0
+# because retrying empty input would just produce another empty input.
+if [[ -z "$ENVELOPE" ]]; then
   exit 0
 fi
 
-# Run the verifier with stdin closed (`</dev/null`) so it picks the
-# argv branch deterministically — even if AMQ ever changes how it
-# wires our stdin, we want the documented argv path.
-body=$(amq-receive-verify "$ENVELOPE" </dev/null 2>/dev/null) || body=""
-if [[ -z "$body" ]]; then
-  # Verifier dropped the message (or was given an empty envelope).
-  # Stay silent; the verifier already logged its reason to its own
-  # stderr, which the wrapper redirected to wake-$ME.log.
-  exit 0
+if [[ "$VERIFY_MODE" == "1" ]]; then
+  # ---- Strict mode (opt-in) ----
+  #
+  # Run the verifier with stdin closed (`</dev/null`) so it picks the
+  # argv branch deterministically. Empty stdout = soft-drop (unsigned,
+  # replayed, stale, MAC mismatch); we exit 0 silently per AMQ
+  # `--inject-via` contract.
+  if ! command -v amq-receive-verify >/dev/null 2>&1; then
+    printf '[inject-bridge] DUX_AMQ_VERIFY=1 but amq-receive-verify not on PATH; dropping\n' >&2
+    exit 0
+  fi
+  body=$(amq-receive-verify "$ENVELOPE" </dev/null 2>/dev/null) || body=""
+  if [[ -z "$body" ]]; then
+    # Verifier dropped the message; it logged the reason to its own
+    # stderr (which the wrapper redirects to wake-$ME.log).
+    exit 0
+  fi
+else
+  # ---- Skip mode (default) ----
+  #
+  # Transparently unwrap a DUX1 envelope when present so signed
+  # senders (legacy `amq-send-signed` callers) keep working without
+  # the receiver agent seeing the raw `DUX1\talice\tbob\t...` text.
+  # Plain `amq send` bodies pass through as-is.
+  #
+  # Envelope shape (TAB-delimited, see `amq-send-signed`):
+  #   DUX1\t<sender>\t<recipient>\t<utc-iso>\t<nonce>\t<mac>\t<body>
+  #
+  # Inner body may itself contain TABs (see audit02 P0-K). We can't
+  # use `cut -f7-` reliably without GNU `cut`, so do the split in
+  # bash: skip exactly six TAB-separated header fields, return the
+  # rest. Keeps macOS portability without the verifier dependency.
+  if [[ "$ENVELOPE" == DUX1$'\t'* ]]; then
+    rest="${ENVELOPE#DUX1$'\t'}"
+    # Skip 5 more fields: sender, recipient, ts, nonce, mac.
+    for _ in 1 2 3 4 5; do
+      next="${rest#*$'\t'}"
+      if [[ "$next" == "$rest" ]]; then
+        # Malformed envelope (fewer than 7 fields). Treat as raw.
+        rest="$ENVELOPE"
+        break
+      fi
+      rest="$next"
+    done
+    body="$rest"
+  else
+    body="$ENVELOPE"
+  fi
 fi
 
-# Strip trailing newline emitted by `amq-receive-verify`. Bash
-# parameter expansion `${var%$'\n'}` removes only one trailing LF.
+# Strip the trailing newline emitted by `amq-receive-verify` (strict
+# mode) or any LF the upstream attached (skip mode). Bash parameter
+# expansion `${var%$'\n'}` removes exactly one trailing LF.
 send_body="${body%$'\n'}"
 
 # Resolve receiver from $AM_ME, applying the same sanitisation the
@@ -134,12 +188,6 @@ fi
 
 # Step 2c — file queue (under dux always; outside dux as final
 # fallback when tmux isn't available).
-#
-# Persist the verified body to disk so the dux-side drainer (or an
-# operator, in the no-dux case) can recover it. `<ts>.msg` is
-# sortable; `+%s%N` gives nanosecond precision so two near-simultaneous
-# messages don't collide. Falls back to `$$` on macOS (BSD `date`
-# lacks `%N`).
 QUEUE_ROOT="$HOME/.local/share/dux-amq/inject-queue"
 QUEUE_DIR="$QUEUE_ROOT/$RECEIVER"
 mkdir -p "$QUEUE_DIR" 2>/dev/null || {

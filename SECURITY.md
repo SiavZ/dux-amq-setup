@@ -49,7 +49,7 @@ into source, residual risk, and detection signals, see
 | #   | Threat                                                                                                  | STRIDE | Asset                  | Mitigation                                                            | Phase        |
 |-----|---------------------------------------------------------------------------------------------------------|--------|------------------------|-----------------------------------------------------------------------|--------------|
 | T1  | Malicious repo executes via `--dangerously-skip-permissions`                                            | T,E    | Host shell, API tokens | Default-deny YOLO; opt-in via `CLAUDE_AMQ_YOLO=1` / `CODEX_AMQ_YOLO=1` | 01           |
-| T2  | Compromised AMQ peer spoofs `--me <other>` and injects text                                             | S,T    | Sibling panes          | HMAC-signed envelope + replay protection (per-VM secret at `$AMQ_SECRET_PATH`, default `~/.local/share/dux-amq/amq-secret`, mode 0600) | 08           |
+| T2  | Compromised AMQ peer spoofs `--me <other>` and injects text                                             | S,T    | Sibling panes          | **Accepted-risk in single-user-VM mode** (see "Accepted risks" below). Strict HMAC verification is opt-in via `[amq.inject].verify_envelope = true`; `amq-send-signed` / `amq-receive-verify` and the per-VM secret at `~/.local/share/dux-amq/amq-secret` (mode 0600) remain available for cross-trust-boundary deployments | 08, accepted in single-user-VM rev |
 | T3  | Tampered `amq` binary `eval`'d on every shell                                                           | T,E    | TCB                    | sha256-pinned binary + bashrc hash guard fails closed                 | 02           |
 | T4  | Spot-VM preemption mid-sqlite write                                                                     | T,D    | sessions.sqlite3       | WAL journal + integrity check + periodic `.bak`                       | 14           |
 | T5  | Plaintext API tokens / chat on persistent disk after VM destroyed                                       | I      | Tokens, PII            | gocryptfs / LUKS playbook in `docs/operations/encryption-at-rest.md`  | 25           |
@@ -89,6 +89,27 @@ into source, residual risk, and detection signals, see
 - **TIOCSTI on legacy kernels.** Mitigation requires
   `dev.tty.legacy_tiocsti=0`; we document the sysctl in Phase 13
   but cannot guarantee its presence on every host kernel.
+- **AMQ peer spoofing within the same Linux user account (T2,
+  reclassified).** Originally Phase 08 mitigated this with an
+  HMAC envelope and a per-VM secret at
+  `~/.local/share/dux-amq/amq-secret` (mode 0600). On reflection
+  the mitigation does not match the trust model declared above:
+  every "peer" is a process running as the same Linux user with
+  full access to `$HOME`, including the secret file. A peer can
+  `cat` the secret directly, `ptrace` the signer, or `LD_PRELOAD`
+  into it — none of which the HMAC check defends against. Per
+  Linus Torvalds ("there is a complete lack of a security
+  boundary between processes of the same user") and the MIT
+  6.828 OS-security course, same-UID is not a defensible
+  boundary on Linux. We've therefore made strict verification
+  **opt-in** (`[amq.inject].verify_envelope = true`) and left it
+  off by default. Operators that genuinely cross a trust boundary
+  with their wake notifications — proxying across hosts, or
+  running mixed-trust agents under the same UID via setuid
+  shims — should flip the switch and accept the legacy-message
+  drop semantics. The HMAC tooling
+  (`amq-send-signed`/`amq-receive-verify`) remains in the
+  overlay and is exercised by the bats suite.
 
 ## Verification
 
