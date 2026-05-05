@@ -27,16 +27,26 @@ use dux::config::{Config, LimitsConfig, render_default_config};
 #[test]
 fn limits_defaults_match_audit_phase_16() {
     // The defaults are part of the public contract: a fresh installation
-    // must boot with a 16-pane cap, a 4-companion-terminal cap, a 256
-    // MiB scrollback soft-cap, an 80%/95% disk warn/high-water pair, and
-    // auto-detach disabled. Operators can raise any of them; the test
-    // pins the defaults so a future code change can't silently shift
-    // them.
+    // must boot with no hard pane cap (max_panes = 0; soft warning at
+    // 16 instead — the prior hard cap value), no hard companion-terminal
+    // cap, a 256 MiB scrollback soft-cap, an 80%/95% disk warn/high-water
+    // pair, and auto-detach disabled. Operators can raise any of them;
+    // the test pins the defaults so a future code change can't silently
+    // shift them.
+    //
+    // The 16/4 hard caps from the original Phase 16 design migrated to
+    // soft warnings after operator feedback that spawn freedom matters
+    // more than RAM-budget enforcement on a single-user VM. The disk
+    // watchdog and scrollback caps still fire independently.
     let limits = LimitsConfig::default();
-    assert_eq!(limits.max_panes, 16, "default max_panes");
+    assert_eq!(limits.max_panes, 0, "default max_panes (no hard cap)");
     assert_eq!(
-        limits.max_companion_terminals, 4,
-        "default max_companion_terminals"
+        limits.max_panes_soft_warn, 16,
+        "default max_panes_soft_warn (matches the prior hard-cap value)"
+    );
+    assert_eq!(
+        limits.max_companion_terminals, 0,
+        "default max_companion_terminals (no hard cap)"
     );
     assert_eq!(
         limits.max_total_scrollback_mb, 256,
@@ -66,6 +76,7 @@ fn canonical_config_renders_limits_section() {
     );
     for key in [
         "max_panes",
+        "max_panes_soft_warn",
         "max_companion_terminals",
         "max_total_scrollback_mb",
         "disk_high_water_pct",
@@ -89,6 +100,10 @@ fn limits_section_round_trips_through_toml() {
     let parsed: Config = toml::from_str(&body).expect("rendered config parses");
     let original = LimitsConfig::default();
     assert_eq!(parsed.limits.max_panes, original.max_panes);
+    assert_eq!(
+        parsed.limits.max_panes_soft_warn,
+        original.max_panes_soft_warn
+    );
     assert_eq!(
         parsed.limits.max_companion_terminals,
         original.max_companion_terminals
