@@ -58,6 +58,45 @@ pub(crate) fn sanitise_handle(name: &str) -> String {
     out
 }
 
+/// Pure helper that does the receiver→session-id resolution given a
+/// flat list of `(session_id, branch_name, worktree_path)` triples and
+/// a sanitised receiver. Mirrors the AMQ wrapper's ME-derivation
+/// priority: worktree dir basename first (the path the wrappers
+/// actually take inside a dux pane), then branch name (legacy
+/// fallback), then exact session id (operator escape hatch). See the
+/// docstring on `App::find_session_for_receiver` for the full
+/// rationale.
+///
+/// Returns `None` when no session matches. Stops at the first match
+/// in priority order — if two sessions both sanitise to the same
+/// receiver, the one whose worktree basename matches wins regardless
+/// of declaration order.
+pub(crate) fn match_receiver<'a, I>(sessions: I, receiver: &str) -> Option<&'a str>
+where
+    I: Clone + IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+{
+    for (id, _branch, worktree) in sessions.clone() {
+        if let Some(basename) = std::path::Path::new(worktree)
+            .file_name()
+            .and_then(|n| n.to_str())
+            && sanitise_handle(basename) == receiver
+        {
+            return Some(id);
+        }
+    }
+    for (id, branch, _worktree) in sessions.clone() {
+        if sanitise_handle(branch) == receiver {
+            return Some(id);
+        }
+    }
+    for (id, _branch, _worktree) in sessions {
+        if id == receiver {
+            return Some(id);
+        }
+    }
+    None
+}
+
 impl App {
     /// Bootstrap the AMQ inject-queue watcher. Called once during
     /// `App::run`. Failures are logged but never fatal — dux must
@@ -325,13 +364,44 @@ impl App {
 
     /// Map a sanitised receiver name back to a session id. Returns
     /// `None` if no live session has a matching branch name.
+    /// Map a sanitised receiver name back to a session id, mirroring
+    /// the AMQ wrapper's `ME` derivation priority. The wrappers in
+    /// `dux-amq/wrappers/` resolve their handle as:
+    ///
+    ///   1. `$AM_ME` env if set (explicit override)
+    ///   2. `basename($PWD)` if running inside a dux worktree
+    ///   3. git `branch --show-current`
+    ///   4. `<provider>-<pid>` (no-context fallback)
+    ///
+    /// Step 2 is what fires for every dux-spawned pane, and it picks
+    /// up the **worktree directory name** — i.e. whatever the branch
+    /// was called when the worktree was created via `git worktree add`.
+    /// dux can later rename the branch in that worktree (the user
+    /// pushes a feature branch, switches to a hotfix, etc.); the
+    /// directory name does not follow.
+    ///
+    /// So the receiver "front-end-qa" can correspond to a session
+    /// whose `branch_name` is now `fix/qa-s45-charge-schema-paymentmethod`
+    /// but whose `worktree_path` ends in `Front-end-QA`. We try the
+    /// directory basename first (matching the primary path the
+    /// wrappers actually use), then fall back to branch name (matching
+    /// the legacy fallback path), and finally settle for an exact
+    /// match against the session id (so an operator can address by id
+    /// when the worktree dir name is ambiguous).
     fn find_session_for_receiver(&self, receiver: &str) -> Option<String> {
-        for session in &self.git.sessions {
-            if sanitise_handle(&session.branch_name) == receiver {
-                return Some(session.id.clone());
-            }
-        }
-        None
+        let triples: Vec<(&str, &str, &str)> = self
+            .git
+            .sessions
+            .iter()
+            .map(|s| {
+                (
+                    s.id.as_str(),
+                    s.branch_name.as_str(),
+                    s.worktree_path.as_str(),
+                )
+            })
+            .collect();
+        match_receiver(triples.iter().copied(), receiver).map(|s| s.to_string())
     }
 
     /// Type the body into the session's PTY and submit with `\r`.
@@ -445,7 +515,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitise_handle;
+    use super::{match_receiver, sanitise_handle};
 
     #[test]
     fn sanitise_lowercases_uppercase_letters() {
@@ -480,5 +550,89 @@ mod tests {
         // routes to `_unrouted/`.
         assert_eq!(sanitise_handle("..."), "");
         assert_eq!(sanitise_handle("///"), "");
+    }
+
+    /// The production bug that motivated this regression test:
+    /// dux's sessions table had `branch_name = "fix/qa-s45-..."` for a
+    /// worktree at `/data/state/dux/worktrees/Jobzy-Front-end/Front-end-QA/`,
+    /// while the AMQ wrapper had derived `AM_ME = front-end-qa` from the
+    /// worktree dir basename. The drainer's old branch-only matcher
+    /// returned None and every wake notification stayed orphaned in
+    /// `inject-queue/front-end-qa/.inflight.<ts>.msg`.
+    #[test]
+    fn match_receiver_matches_worktree_basename_when_branch_diverges() {
+        let sessions = [(
+            "session-uuid-1",
+            "fix/qa-s45-charge-schema-paymentmethod",
+            "/data/state/dux/worktrees/Jobzy-Front-end/Front-end-QA",
+        )];
+        assert_eq!(
+            match_receiver(sessions.iter().copied(), "front-end-qa"),
+            Some("session-uuid-1"),
+        );
+    }
+
+    #[test]
+    fn match_receiver_falls_back_to_branch_name_when_basename_does_not_match() {
+        let sessions = [(
+            "session-uuid-2",
+            "feature-login",
+            "/some/path/legacy-name-from-creation",
+        )];
+        assert_eq!(
+            match_receiver(sessions.iter().copied(), "feature-login"),
+            Some("session-uuid-2"),
+        );
+    }
+
+    #[test]
+    fn match_receiver_falls_back_to_session_id_for_operator_addressing() {
+        let sessions = [("af882c2d", "fix/foo", "/wt/Bar")];
+        // Receiver = exact session id.
+        assert_eq!(
+            match_receiver(sessions.iter().copied(), "af882c2d"),
+            Some("af882c2d"),
+        );
+    }
+
+    #[test]
+    fn match_receiver_returns_none_when_nothing_matches() {
+        let sessions = [("id1", "main", "/wt/main"), ("id2", "dev", "/wt/dev")];
+        assert_eq!(
+            match_receiver(sessions.iter().copied(), "front-end-qa"),
+            None
+        );
+    }
+
+    #[test]
+    fn match_receiver_basename_priority_beats_branch_priority() {
+        // Two sessions: A's worktree-basename is "alice", B's branch
+        // is "alice". Worktree basename wins because the wrapper's
+        // primary path inside dux is basename($PWD).
+        let sessions = [
+            ("idA", "fix/random", "/wt/Alice"),     // basename → alice
+            ("idB", "alice", "/wt/something-else"), // branch → alice
+        ];
+        assert_eq!(
+            match_receiver(sessions.iter().copied(), "alice"),
+            Some("idA"),
+        );
+    }
+
+    #[test]
+    fn match_receiver_branch_match_wins_when_no_basename_match() {
+        // Session A's branch matches but basename does not; with no
+        // sessions matching by basename, we fall through to branch.
+        let sessions = [("idA", "alice", "/wt/random-dir")];
+        assert_eq!(
+            match_receiver(sessions.iter().copied(), "alice"),
+            Some("idA"),
+        );
+    }
+
+    #[test]
+    fn match_receiver_handles_empty_session_list() {
+        let sessions: Vec<(&str, &str, &str)> = vec![];
+        assert_eq!(match_receiver(sessions.iter().copied(), "anything"), None);
     }
 }
