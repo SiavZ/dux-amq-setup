@@ -1199,6 +1199,7 @@ impl App {
             refs_watch_paths: HashMap::new(),
             _single_instance_lock: single_instance_lock,
             watch_engines: HashMap::new(),
+            watch_pending_enters: HashSet::new(),
             amq_inject_watcher: None,
             amq_inject_queue_dir: None,
             amq_inject_pending: HashMap::new(),
@@ -2705,6 +2706,16 @@ impl App {
     /// the session is the selected one), so an auto-action does not
     /// arrive in the middle of the user's prompt.
     pub(crate) fn tick_watch_engines(&mut self) {
+        // Phase 2 of two-phase SendText delivery: flush any deferred
+        // Enter keystrokes from the previous tick. This split — body
+        // bytes in tick N, `\r` in tick N+1 — defeats Ink's
+        // paste-coalesce that would otherwise treat the trailing CR
+        // as part of the body buffer instead of a submit keystroke.
+        // See `apply_watch_effect` for the matching write side, and
+        // `crate::app::inject_runtime` for the AMQ drainer that
+        // pioneered this fix.
+        self.flush_pending_watch_enters();
+
         if self.runtime.watch_engines.is_empty() {
             return;
         }
@@ -2729,6 +2740,44 @@ impl App {
             };
             for effect in effects {
                 self.apply_watch_effect(&session_id, effect);
+            }
+        }
+    }
+
+    /// Drain `runtime.watch_pending_enters` and write a discrete `\r`
+    /// to each session's PTY. Called at the start of every
+    /// `tick_watch_engines`. The set is cleared regardless of write
+    /// success — a failing write is logged and the deferred Enter is
+    /// dropped rather than retried, because retrying a stale Enter
+    /// after the agent has rendered something else could submit
+    /// unintended text.
+    fn flush_pending_watch_enters(&mut self) {
+        if self.runtime.watch_pending_enters.is_empty() {
+            return;
+        }
+        let pending: Vec<String> = self.runtime.watch_pending_enters.drain().collect();
+        for session_id in pending {
+            let Some(handle) = self.find_pty_handle(&session_id) else {
+                tracing::debug!(
+                    target: "dux::watch",
+                    session_id = %session_id,
+                    "deferred Enter skipped: PTY no longer attached",
+                );
+                continue;
+            };
+            if let Err(err) = handle.write_bytes(b"\r") {
+                tracing::warn!(
+                    target: "dux::watch",
+                    session_id = %session_id,
+                    err = %err,
+                    "deferred Enter write failed; nudge body may sit in input field",
+                );
+            } else {
+                tracing::debug!(
+                    target: "dux::watch",
+                    session_id = %session_id,
+                    "delivered deferred Enter (phase 2)",
+                );
             }
         }
     }
@@ -2818,22 +2867,42 @@ impl App {
     fn apply_watch_effect(&mut self, session_id: &str, effect: crate::watch::WatchEffect) {
         match effect {
             crate::watch::WatchEffect::SendText { text, append_enter } => {
-                // Translate embedded newlines to Alt-Enter so multi-line
-                // text doesn't accidentally submit; the trailing CR (when
-                // append_enter is true) performs the actual submit.
-                let mut payload = crate::app::input::macro_payload_bytes(&text);
-                if append_enter {
-                    payload.push(b'\r');
-                }
-                if let Some(handle) = self.find_pty_handle(session_id)
-                    && let Err(err) = handle.write_bytes(&payload)
-                {
+                // Phase 1 of two-phase delivery: write body bytes only
+                // and DEFER the trailing CR to the next tick. Embedded
+                // newlines still become Alt-Enter so multi-line text
+                // doesn't submit early. The discrete `\r` lands on the
+                // next `tick_watch_engines` call via
+                // `flush_pending_watch_enters`, after Ink has had a
+                // chance to consume the body chunk on its stdin.
+                //
+                // Why split: a single PTY write of `body + \r` arrives
+                // on Ink's stdin reader as one chunk; Ink coalesces it
+                // into a paste-shaped buffer and treats the trailing
+                // `\r` as multi-line continuation instead of a submit
+                // keystroke, leaving the body sitting in the input
+                // field. Splitting across two ticks puts a real time
+                // gap between writes (~16 ms typical), producing two
+                // separate `read()` calls on Ink's stdin so the final
+                // `\r` arrives alone and is interpreted as Enter.
+                // Same fix the AMQ drainer uses — see
+                // `crate::app::inject_runtime::deliver_inject_enter`.
+                let payload = crate::app::input::macro_payload_bytes(&text);
+                let Some(handle) = self.find_pty_handle(session_id) else {
+                    return;
+                };
+                if let Err(err) = handle.write_bytes(&payload) {
                     tracing::warn!(
                         target: "dux::watch",
                         session_id = %session_id,
                         err = %err,
-                        "watch send_text failed",
+                        "watch send_text body write failed",
                     );
+                    return;
+                }
+                if append_enter {
+                    self.runtime
+                        .watch_pending_enters
+                        .insert(session_id.to_string());
                 }
             }
             crate::watch::WatchEffect::StatusInfo(msg) => self.set_info(msg),

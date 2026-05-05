@@ -60,6 +60,18 @@ pub(crate) struct RuntimeState {
     /// whose provider has no rules in the config never get an entry —
     /// the per-tick scan is then skipped entirely. See `crate::watch`.
     pub(crate) watch_engines: HashMap<String, crate::watch::WatchEngine>,
+    /// Sessions with a deferred `\r` from a watch-effect `SendText`
+    /// that requested `append_enter = true`. Flushed at the start of
+    /// the next `tick_watch_engines` so the body bytes (written in
+    /// the previous tick) and the Enter keystroke land as **two**
+    /// separate `read()` calls on Ink's stdin. Without this split,
+    /// Ink coalesces `body + \r` into a paste-shaped buffer and the
+    /// trailing `\r` ends up appended to the input field instead of
+    /// firing as a submit keystroke — exact same failure mode as
+    /// the AMQ drainer fix in `crate::app::inject_runtime`.
+    /// `HashSet` because re-firing for the same session in one tick
+    /// would still produce a single Enter; idempotent by design.
+    pub(crate) watch_pending_enters: HashSet<String>,
     /// Filesystem watcher for the AMQ inject-queue. Held to keep the
     /// inotify thread alive; `None` when the drainer is disabled or
     /// the watcher couldn't be created (graceful fallback to poll-only).
