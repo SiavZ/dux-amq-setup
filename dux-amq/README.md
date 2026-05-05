@@ -8,7 +8,7 @@ This directory does **not** modify dux source. It sits alongside the dux Rust so
 
 - **Worktree-per-agent UI** (dux) for parallel Claude/Codex/Gemini sessions
 - **File-based message bus** (AMQ) so agents on the same VM can `send`/`list`/`read` between each other
-- **Automatic identity**: each dux pane's AMQ handle is its git branch name, lowercased + sanitized
+- **Automatic identity**: each dux pane's AMQ handle is the worktree directory basename, lowercased + sanitized to `[a-z0-9_-]` (typically the original branch name at worktree creation; stable across branch renames inside the worktree)
 - **Spot-VM survival**: dux config + sessions, AMQ queue, and Claude session JSONLs all live on a persistent disk (default `/data/state/`)
 - **Past-chat resume** in fresh worktrees via `--continue --fork-session` (bypasses deferred-tool blocks)
 - **YOLO is opt-in** (audit02 P0-A): `CLAUDE_AMQ_YOLO=1` / `CODEX_AMQ_YOLO=1` enable the per-pane `--dangerously-*` flag. See [Permission model](#permission-model).
@@ -137,27 +137,55 @@ that `--continue` refuses.
 | `0`          | Compiled in but disabled at runtime    | present (via mode)                        |
 | (file absent)| Compiled out — no runtime toggle helps | present (via mode)                        |
 
-When the sentinel is present, the wrappers switch `amq wake` to `--inject-via "$LOCAL_BIN/dux-amq-inject-bridge"`. The bridge:
+When the sentinel is present, the wrappers switch `amq wake` to `--inject-via "$LOCAL_BIN/dux-amq-inject-bridge"`. The bridge then runs end-to-end as:
 
-1. **Skip mode (default)** transparently unwraps a `DUX1\t...` envelope when present (so legacy `amq-send-signed` callers interop) and treats plain `amq send` bodies as raw. No HMAC check. Per the trust model in [SECURITY.md](../SECURITY.md), same-UID peers share `$HOME` and can read the HMAC secret directly, so verification doesn't add a defensible boundary against peers — insisting on it just silently dropped every legacy unsigned message. Set `[amq.inject].verify_envelope = true` in dux's `config.toml` to opt back into strict mode (dux exports `DUX_AMQ_VERIFY=1` to spawned PTYs; the bridge calls `amq-receive-verify`; unsigned/replayed/MAC-mismatched envelopes are dropped). Outside dux, set `DUX_AMQ_VERIFY=1` directly in the shell that runs `amq wake` for the same effect.
-2. Picks one of three delivery strategies for the body:
-   - **Under dux** (`$DUX_PANE` is exported by the dux PTY spawn): always write to the file queue at `~/.local/share/dux-amq/inject-queue/<receiver>/<ts>.msg`. The dux-side drainer (see `[amq.inject]` in `config.toml`) types the body into the matching session's PTY only when the agent is idle. This avoids the "stuck in input field" failure where Claude Code's Ink input would drop a trailing Enter received during streaming.
-   - **Outside dux, with tmux**: `tmux send-keys -- "$body" Enter` against the current pane (or `$DUX_TMUX_TARGET` if set).
-   - **Outside dux, no tmux**: write to the same file queue and let an operator recover the body manually.
+```
+amq send → AMQ inbox → wake daemon → bridge → file queue → dux drainer → agent PTY
+```
 
-`<receiver>` is the sanitised `$AM_ME` exported by the wrapper (lowercased branch name, `[a-z0-9_-]` only). When `$AM_ME` is empty, the bridge writes to the literal `_unrouted/` subdirectory; the dux-side drainer routes those messages to the currently-selected session with a status warning.
+Each step is described in the subsections below.
 
-Override the auto-detected mode per-pane:
+### Bridge: verify mode
+
+1. **Skip mode (default)** — transparently unwraps a `DUX1\t...` envelope when present (so legacy `amq-send-signed` callers still interop) and treats plain `amq send` bodies as raw. No HMAC check. Per the trust model in [SECURITY.md](../SECURITY.md), same-UID peers share `$HOME` and can read the HMAC secret directly, so verification doesn't add a defensible boundary against peers — insisting on it just silently dropped every legacy unsigned message in production.
+2. **Strict mode (opt-in)** — set `[amq.inject].verify_envelope = true` in dux's `config.toml`. dux exports `DUX_AMQ_VERIFY=1` to spawned PTYs at bootstrap; the bridge calls `amq-receive-verify`; unsigned, replayed, stale, or MAC-mismatched envelopes are dropped silently. Outside dux, set `DUX_AMQ_VERIFY=1` directly in the shell that runs `amq wake`. Reserved for environments that genuinely cross a trust boundary (e.g. proxying wakes across hosts).
+
+### Bridge: delivery strategy
+
+After unwrap (or verify), the bridge picks one of three strategies for the body:
+
+| Condition | Strategy |
+|-----------|----------|
+| `$DUX_PANE` set (running under dux) | Always write to file queue at `~/.local/share/dux-amq/inject-queue/<receiver>/<ts>.msg` |
+| No `$DUX_PANE` but `$TMUX` set + `tmux` on PATH | `tmux send-keys -- "$body" Enter` against current pane (or `$DUX_TMUX_TARGET`) |
+| Otherwise | Write to the same file queue; an operator can recover the body manually |
+
+`<receiver>` is the sanitised `$AM_ME` exported by the wrapper (`[a-z0-9_-]` only). The wrapper derives `$AM_ME` from `basename($PWD)` of the dux worktree directory, falling back to `git branch --show-current` then `<provider>-<pid>`. When sanitisation collapses to empty, the bridge writes to the literal `_unrouted/` subdirectory; the drainer routes those messages to the currently-selected dux session with a status warning.
+
+### Drainer (`crate::amq_inject` in the dux source)
+
+The drainer is a tick-driven worker inside the dux process. It owns the queue and is responsible for landing each body in the right agent PTY at the right time.
+
+- **Receiver→session mapping** (see `match_receiver` in `src/app/inject_runtime.rs`) mirrors the wrapper's identity-derivation priority: try `sanitise(basename(worktree_path))` first, then `sanitise(branch_name)`, then exact session id. This is necessary because dux sessions can change `branch_name` after worktree creation while the directory name is fixed — without basename matching, every queued message for those sessions would orphan in `.inflight`.
+- **Idle detection.** Before delivering, the drainer scans the last `[amq.inject].busy_scan_lines` rows of the agent's PTY (default 5) for any of `[amq.inject].busy_markers` (default `["esc to interrupt", "ctrl+c to interrupt"]`). If a marker matches, the body stays queued. The same `InputTarget::Agent` guard the watch engine uses also applies, so a user typing in a session is never interrupted.
+- **Two-phase delivery.** Once idle, the drainer types the body in **tick N** then writes a discrete `\r` in **tick N+1**. The ~16 ms gap between ticks gives Ink (Claude Code's TUI framework) time to flush the body chunk on its stdin before the `\r` arrives, so the `\r` is interpreted as a separate Enter keystroke rather than coalesced into a paste-shaped buffer that ignores it. Multi-line bodies have their interior newlines converted to Alt-Enter (`\e\r`) so they don't submit early — same chokepoint watch effects use.
+- **Atomic claim.** On scan, each `<ts>.msg` file is renamed to `.inflight.<ts>.msg` before reading. Once delivered, the inflight file is unlinked. This pattern is the read-side mirror of the bridge's own `mktemp + mv -f` write pattern, and the shared `.inflight.` prefix means a single scan filter excludes both sides' in-flight files.
+- **Crash recovery.** At drainer startup (see `reclaim_stale_inflight`), every `.inflight.<ts>.msg` left behind by a prior dux instance that crashed mid-delivery is renamed back to `<ts>.msg`. The single-instance lock guarantees nobody else is processing them, so the rename is race-free. Bridge-format `mktemp .inflight.XXXXXX` files (no `.msg` suffix) are skipped on purpose — they may belong to a concurrent in-progress write.
+- **Validation.** Files larger than `[amq.inject].max_message_bytes` (default 64 KiB) are rejected after claim and left at the `.inflight.` path for operator inspection. Symlinks are refused. Receiver subdirectories that don't match `[a-z0-9_-]+` are rejected without a claim.
+- **Polling fallback.** A 5-second polling thread (configurable via `[amq.inject].poll_interval_ms`) requests a scan in addition to the `notify` watcher, so filesystems where inotify is lossy (NFS, virtio-9p, some FUSE mounts) still drain.
+
+### Operator overrides
 
 ```bash
 DUX_AMQ_INJECT_MODE=raw    # force TIOCSTI even on locked-down kernels
 DUX_AMQ_INJECT_MODE=via    # force bridge mode (e.g. for testing)
 DUX_TMUX_TARGET=<pane>     # specific tmux target for the bridge (default: current pane)
+DUX_AMQ_VERIFY=1           # opt into strict HMAC verification at the bridge
 ```
 
-Inspect at runtime: `cat $STATE_ROOT/dux/.tiocsti-state` (absent → raw mode active). Wake stderr lands in `~/.local/share/dux-amq/wake-<me>.log` — verify-drop reasons are visible there.
+Inspect at runtime: `cat $STATE_ROOT/dux/.tiocsti-state` (absent → raw mode active). Wake stderr lands in `~/.local/share/dux-amq/wake-<me>.log` — verify-drop reasons are visible there. Drainer activity is in dux's main JSON log under `target: "dux::amq_inject"`; grep for `delivered AMQ wake to session` for a per-message audit trail.
 
-A native upstream fix (HMAC envelope + stdin piping inside AMQ itself) is tracked in `docs/plans/audits/audit02/artifacts/13-upstream-issue.txt`.
+A native upstream fix (HMAC envelope + stdin piping inside AMQ itself) is tracked in `docs/plans/audits/audit02/artifacts/13-upstream-issue.txt`. Upstream AMQ v0.34.0 also added `--defer-while-input` / `--input-quiet-for` flags that gate TIOCSTI on terminal activity heuristics — a coarser version of what dux's drainer does with PTY-snapshot scanning.
 
 ## Trade-offs
 
