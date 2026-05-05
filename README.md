@@ -294,7 +294,7 @@ read-only and safe to run while the TUI is open.
 
 ### Data lifecycle
 
-dux stores per-session data in several places: the worktree on disk, a row in `sessions.sqlite3`, the AMQ inbox (`/data/state/amq/agents/<branch>/`), the per-provider chat history (`/data/state/{claude,codex,gemini}/projects/<encoded>/`), and structured log records tagged with the session's `session_id`. Most workflows leave that data in place — `dux config reset --all` is a holistic factory reset, but it does not target an individual session.
+dux stores per-session data in several places: the worktree on disk, a row in `sessions.sqlite3`, the AMQ inbox (`/data/state/amq/agents/<receiver>/`, where `<receiver>` is the sanitised AMQ handle the wrapper derives from the worktree directory basename — typically the same as the original branch name but stable across branch renames inside the worktree), the per-provider chat history (`/data/state/{claude,codex,gemini}/projects/<encoded>/`), and structured log records tagged with the session's `session_id`. Most workflows leave that data in place — `dux config reset --all` is a holistic factory reset, but it does not target an individual session.
 
 For GDPR Art 17 right-to-erasure (or just "delete this customer's data"), use `dux session purge`:
 
