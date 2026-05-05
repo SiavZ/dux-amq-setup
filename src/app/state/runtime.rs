@@ -79,4 +79,14 @@ pub(crate) struct RuntimeState {
     /// status warning, keyed by receiver. Rate-limited so a queue full
     /// of messages for an unknown handle doesn't spam the status line.
     pub(crate) amq_inject_last_warned: HashMap<String, Instant>,
+    /// Last time we emitted a `debug`-level "drainer holding for X"
+    /// trace event, keyed by receiver. Independent of
+    /// `amq_inject_last_warned` because the warning fires on
+    /// permanently-stuck states (no session match, timeout) while
+    /// the debug event also covers the transient busy-marker hold —
+    /// useful for diagnosing why a delivery hasn't fired yet without
+    /// being a user-visible error. Throttled to one event per
+    /// receiver per `crate::app::inject_runtime::HOLD_LOG_RATE_LIMIT`
+    /// (60 s) so the JSON log doesn't grow with the tick rate.
+    pub(crate) amq_inject_last_held_logged: HashMap<String, Instant>,
 }

@@ -1203,6 +1203,7 @@ impl App {
             amq_inject_queue_dir: None,
             amq_inject_pending: HashMap::new(),
             amq_inject_last_warned: HashMap::new(),
+            amq_inject_last_held_logged: HashMap::new(),
         };
         let git = GitState {
             projects,

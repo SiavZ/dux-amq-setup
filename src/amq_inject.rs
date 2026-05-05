@@ -453,12 +453,26 @@ where
 }
 
 /// Heuristic: is the agent currently busy (streaming, awaiting tool
-/// approval, etc.) given a recent PTY snapshot? Returns `true` if any
-/// configured `busy_marker` substring appears in the snapshot. Plain
-/// substring match — no regex — because the markers are operator-
-/// configurable and we want literal matching to be predictable.
+/// approval, etc.) given a recent PTY snapshot? Returns the first
+/// matching marker substring, or `None` when none of the configured
+/// `busy_markers` appear in the snapshot. Plain substring match —
+/// no regex — because the markers are operator-configurable and we
+/// want literal matching to be predictable. The returned marker is
+/// fed into the drainer's debug log so an operator running with
+/// `RUST_LOG=dux::amq_inject=debug` can see exactly which footer
+/// substring is keeping a delivery held.
+pub fn snapshot_busy_marker<'a>(snapshot: &str, busy_markers: &'a [String]) -> Option<&'a str> {
+    busy_markers
+        .iter()
+        .find(|marker| snapshot.contains(marker.as_str()))
+        .map(|s| s.as_str())
+}
+
+/// Boolean shorthand for [`snapshot_busy_marker`] used in tests where
+/// the matched marker isn't relevant.
+#[cfg(test)]
 pub fn snapshot_indicates_busy(snapshot: &str, busy_markers: &[String]) -> bool {
-    busy_markers.iter().any(|marker| snapshot.contains(marker))
+    snapshot_busy_marker(snapshot, busy_markers).is_some()
 }
 
 /// Truncate a body for status-line display. Operates on chars (not
@@ -728,6 +742,29 @@ mod tests {
         let markers: Vec<String> = vec![];
         let busy = "Working… (24s, esc to interrupt)";
         assert!(!snapshot_indicates_busy(busy, &markers));
+    }
+
+    #[test]
+    fn snapshot_busy_marker_returns_first_match() {
+        // The drainer's debug log surfaces the matching marker so an
+        // operator can see exactly which footer substring is keeping a
+        // delivery held. When multiple markers could match, the
+        // first-in-config wins (stable ordering for predictable logs).
+        let markers = vec![
+            "esc to interrupt".to_string(),
+            "ctrl+c to interrupt".to_string(),
+        ];
+        let snapshot = "press esc to interrupt or ctrl+c to interrupt";
+        assert_eq!(
+            snapshot_busy_marker(snapshot, &markers),
+            Some("esc to interrupt"),
+        );
+    }
+
+    #[test]
+    fn snapshot_busy_marker_returns_none_when_idle() {
+        let markers = vec!["esc to interrupt".to_string()];
+        assert_eq!(snapshot_busy_marker("│ > prompt waiting", &markers), None,);
     }
 
     #[test]

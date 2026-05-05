@@ -5217,6 +5217,7 @@ mod tests {
             amq_inject_queue_dir: None,
             amq_inject_pending: std::collections::HashMap::new(),
             amq_inject_last_warned: std::collections::HashMap::new(),
+            amq_inject_last_held_logged: std::collections::HashMap::new(),
         };
         let git = crate::app::GitState {
             projects: vec![project],
