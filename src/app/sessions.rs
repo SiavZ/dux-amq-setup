@@ -2043,6 +2043,7 @@ mod tests {
             refs_watch_paths: std::collections::HashMap::new(),
             _single_instance_lock: single_instance_lock,
             watch_engines: std::collections::HashMap::new(),
+            watch_pending_enters: std::collections::HashSet::new(),
             amq_inject_watcher: None,
             amq_inject_queue_dir: None,
             amq_inject_pending: std::collections::HashMap::new(),
