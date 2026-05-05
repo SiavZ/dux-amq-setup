@@ -140,7 +140,12 @@ that `--continue` refuses.
 When the sentinel is present, the wrappers switch `amq wake` to `--inject-via "$LOCAL_BIN/dux-amq-inject-bridge"`. The bridge:
 
 1. Validates the envelope (HMAC + freshness + replay) via `amq-receive-verify`.
-2. On success, delivers the body either by `tmux send-keys` (when `$TMUX` is set) or by writing to `~/.local/share/dux-amq/inject-queue/<ts>.msg` for later pickup.
+2. On success, picks one of three delivery strategies:
+   - **Under dux** (`$DUX_PANE` is exported by the dux PTY spawn): always write to the file queue at `~/.local/share/dux-amq/inject-queue/<receiver>/<ts>.msg`. The dux-side drainer (see `[amq.inject]` in `config.toml`) types the body into the matching session's PTY only when the agent is idle. This avoids the "stuck in input field" failure where Claude Code's Ink input would drop a trailing Enter received during streaming.
+   - **Outside dux, with tmux**: `tmux send-keys -- "$body" Enter` against the current pane (or `$DUX_TMUX_TARGET` if set).
+   - **Outside dux, no tmux**: write to the same file queue and let an operator recover the body manually.
+
+`<receiver>` is the sanitised `$AM_ME` exported by the wrapper (lowercased branch name, `[a-z0-9_-]` only). When `$AM_ME` is empty, the bridge writes to the literal `_unrouted/` subdirectory; the dux-side drainer routes those messages to the currently-selected session with a status warning.
 
 Override the auto-detected mode per-pane:
 

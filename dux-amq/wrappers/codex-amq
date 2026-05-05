@@ -31,6 +31,10 @@ fi
 [[ -z "$ME" ]] && ME="codex-$$"
 ME=$(printf '%s' "$ME" | tr '[:upper:]' '[:lower:]' | sed 's|[^a-z0-9_-]|-|g; s|^-\+||; s|-\+$||')
 
+# Export AM_ME so descendants of `amq wake` (notably the inject-bridge)
+# can identify the receiver. See claude-amq for full rationale.
+export AM_ME="$ME"
+
 ROOT="${AMQ_GLOBAL_ROOT:-/data/state/amq}"
 
 # Audit02 P1-F: identity collision detection. See claude-amq for the

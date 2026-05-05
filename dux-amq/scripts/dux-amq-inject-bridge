@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # dux-amq-inject-bridge — TIOCSTI-disabled fallback for `amq wake`
-# (audit02 Phase 13, audit01 P1-1).
+# (audit02 Phase 13, audit01 P1-1; receiver-keyed queue rev added when
+# the dux-side drainer was implemented).
 #
 # AMQ v0.34.0's `--inject-mode raw` calls `ioctl(TIOCSTI)` directly and
 # silently fails on Linux ≥ 6.2 / Ubuntu 24.04 / Debian 12+ (kernels
@@ -17,17 +18,32 @@
 #      or empty stdout) we exit 0 silently — bad messages MUST NOT be
 #      retried and MUST NOT be injected.
 #
-#   2. Inject the verified body into the dux pane:
-#        a. Strategy 1 — `tmux send-keys`. When $TMUX is set we can
-#           target the current pane (or DUX_TMUX_TARGET) without any
-#           kernel privileges. Most dux-amq users run inside tmux on the
-#           shared spot VM, so this is the common path.
-#        b. Strategy 2 — file queue. When tmux isn't available, write
-#           the body to $HOME/.local/share/dux-amq/inject-queue/<ts>.msg
-#           and let a future dux-side polling consumer pick it up.
-#           Out of scope for Phase 13 to drain that queue; this strategy
-#           is "best-effort durable" — the body is preserved on disk so
-#           the user can retrieve it manually if no consumer runs.
+#   2. Inject the verified body into the dux pane. Strategy selection:
+#        a. When DUX_PANE is set (dux is the parent process tree), we
+#           ALWAYS go to the file queue. The dux-side drainer reads it
+#           and types into the agent's PTY only when the agent is idle
+#           — this avoids the "stuck in input field" failure mode
+#           where tmux send-keys delivers the body but the trailing
+#           Enter is dropped because Claude Code's Ink input is in
+#           non-accepting state during streaming.
+#        b. Otherwise, when $TMUX is set, use `tmux send-keys`. This
+#           covers operators running plain claude/codex under tmux
+#           outside dux, where there's no other consumer and the
+#           streaming-state race is less common.
+#        c. Otherwise, write to the file queue and let an operator
+#           (or a future polling consumer) recover the body manually.
+#
+# Queue layout (receiver-keyed):
+#   $QUEUE_DIR/<receiver>/<ts>.msg     — addressed messages
+#   $QUEUE_DIR/_unrouted/<ts>.msg      — fallback when AM_ME is unset
+#                                         or sanitises to empty
+#
+# `<receiver>` is `$AM_ME` after the same sanitisation as the wrapper
+# (lowercase, [a-z0-9_-] only). The leading `_` on `_unrouted` makes it
+# disjoint from any sanitised branch name (which can never start with
+# `_` after the regex strips it). The dux drainer treats `_unrouted/`
+# specially: it routes to the currently selected session with a status
+# warning instead of dropping.
 #
 # Exit status is always 0 on the happy path AND on every soft-failure
 # branch (silent verify rejection, missing tmux, full filesystem). The
@@ -72,20 +88,42 @@ if [[ -z "$body" ]]; then
   exit 0
 fi
 
-# Step 2a — tmux send-keys, when available.
+# Strip trailing newline emitted by `amq-receive-verify`. Bash
+# parameter expansion `${var%$'\n'}` removes only one trailing LF.
+send_body="${body%$'\n'}"
+
+# Resolve receiver from $AM_ME, applying the same sanitisation the
+# wrappers use to produce the AMQ handle. This keeps the queue path
+# disjoint from any directory traversal attempt: only [a-z0-9_-] can
+# survive, and we strip leading/trailing dashes.
+sanitised_receiver=""
+if [[ -n "${AM_ME:-}" ]]; then
+  sanitised_receiver=$(printf '%s' "$AM_ME" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed 's|[^a-z0-9_-]|-|g; s|^-\+||; s|-\+$||')
+fi
+RECEIVER="${sanitised_receiver:-_unrouted}"
+
+# Step 2a — under dux, always go to the queue.
+#
+# `DUX_PANE` is set by dux when it spawns the agent's PTY (see
+# `apply_terminal_env` in src/pty.rs). Children of that PTY (the
+# wrapper, then `setsid amq wake`, then the inject-bridge spawned
+# by AMQ) inherit it. When present, we skip tmux entirely and let
+# the dux-side drainer deliver the body — it knows when the agent
+# is idle and can type the body + submit reliably.
+under_dux=0
+if [[ -n "${DUX_PANE:-}" ]]; then
+  under_dux=1
+fi
+
+# Step 2b — outside dux, prefer tmux send-keys when available.
 #
 # `DUX_TMUX_TARGET` lets the operator point at a specific pane (e.g.
 # `mywindow:0.1`); the default of empty means "current pane of current
 # window" — the same pane the wrapper is running in.
-#
-# Note: we strip the trailing newline that `amq-receive-verify` always
-# emits (matches `amq drain --include-body`). tmux send-keys would
-# inject a literal `\n` followed by Enter, doubling the keystroke.
-if [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
+if (( under_dux == 0 )) && [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
   TARGET="${DUX_TMUX_TARGET:-}"
-  # Strip trailing newline. Bash parameter expansion `${var%$'\n'}`
-  # removes only one trailing LF, which is what the verifier emits.
-  send_body="${body%$'\n'}"
   if [[ -n "$TARGET" ]]; then
     tmux send-keys -t "$TARGET" -- "$send_body" Enter
   else
@@ -94,13 +132,16 @@ if [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
   exit 0
 fi
 
-# Step 2b — file queue fallback.
+# Step 2c — file queue (under dux always; outside dux as final
+# fallback when tmux isn't available).
 #
-# Persist the verified body to disk so an operator (or a future
-# dux-side polling consumer) can recover it. `<ts>.msg` is sortable;
-# `+%s%N` gives nanosecond precision so two near-simultaneous messages
-# don't collide. Falls back to `$$` on macOS (BSD `date` lacks `%N`).
-QUEUE_DIR="$HOME/.local/share/dux-amq/inject-queue"
+# Persist the verified body to disk so the dux-side drainer (or an
+# operator, in the no-dux case) can recover it. `<ts>.msg` is
+# sortable; `+%s%N` gives nanosecond precision so two near-simultaneous
+# messages don't collide. Falls back to `$$` on macOS (BSD `date`
+# lacks `%N`).
+QUEUE_ROOT="$HOME/.local/share/dux-amq/inject-queue"
+QUEUE_DIR="$QUEUE_ROOT/$RECEIVER"
 mkdir -p "$QUEUE_DIR" 2>/dev/null || {
   printf '[inject-bridge] cannot create %s; dropping message\n' "$QUEUE_DIR" >&2
   exit 0
@@ -112,8 +153,11 @@ if [[ -z "$ts" || "$ts" == *N* ]]; then
 fi
 target="$QUEUE_DIR/$ts.msg"
 # Use a temp + rename so a concurrent reader never sees a half-written
-# file. Same pattern as Maildir.
+# file. The temp lives in the same receiver dir to keep the rename
+# atomic across the FS boundary. The `.inflight.` prefix matches the
+# pattern the dux drainer uses for its own in-flight reservation,
+# letting both sides agree on what to skip during scans.
 tmp=$(mktemp "$QUEUE_DIR/.inflight.XXXXXX") || exit 0
-printf '%s\n' "${body%$'\n'}" >"$tmp"
+printf '%s\n' "$send_body" >"$tmp"
 mv -f "$tmp" "$target"
 exit 0

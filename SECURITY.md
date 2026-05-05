@@ -61,6 +61,7 @@ into source, residual risk, and detection signals, see
 | T11 | Symlink swap of `~/.claude` → attacker dir                                                              | T,E    | API tokens             | Symlink target check on launch (planned)                              | future       |
 | T12 | Auto-resume thundering herd on spot-VM reboot                                                           | D      | Host CPU, API quota    | Bounded scheduler (`auto_resume_concurrency`, default 4) + staleness skip | 15        |
 | T13 | Watch-rule regex evaluated on attacker-influenced PTY output (DoS / unintended action firing)           | T,D    | UI thread, child PTY   | Linear-time `regex` crate; per-pattern `size_limit` (64 KiB); rule cap (32/provider); per-rule `budget`/`cooldown_ms`; opt-in (commented defaults); manual disarm | 26 |
+| T14 | Malicious file in `~/.local/share/dux-amq/inject-queue/` injects unauthorised text into a dux session   | T,E    | Agent input            | Bridge runs `amq-receive-verify` (HMAC + freshness + replay) **before** writing; dux-side drainer rejects symlinks, files >`max_message_bytes` (default 64 KiB), and receiver dirs not matching `[a-z0-9_-]+`; claim-via-rename so a single body can only be delivered once; honors `InputTarget::Agent` so user typing is never interrupted | this PR |
 
 ## What's in scope vs. accepted
 

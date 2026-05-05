@@ -1041,6 +1041,13 @@ pub(crate) enum WorkerEvent {
     /// Carries the observed footprint in MiB so the UI thread can decide
     /// whether to detach the oldest pane.
     ScrollbackUsage(usize),
+    /// The AMQ inject-queue watcher (or polling fallback) noticed a
+    /// change. The UI thread reads the queue directory, claims any new
+    /// `<receiver>/<ts>.msg` files, and enqueues them for delivery on
+    /// the next `tick_amq_inject`. No payload because the App-side
+    /// scan needs to inspect every receiver subdir anyway, and the
+    /// notify event paths aren't reliable across all FSes.
+    AmqInjectScanRequested,
 }
 
 #[derive(Clone, Debug)]
@@ -1059,6 +1066,7 @@ pub(crate) enum PullTarget {
 }
 
 mod components;
+mod inject_runtime;
 mod input;
 mod render;
 mod sessions;
@@ -1166,6 +1174,10 @@ impl App {
             refs_watch_paths: HashMap::new(),
             _single_instance_lock: single_instance_lock,
             watch_engines: HashMap::new(),
+            amq_inject_watcher: None,
+            amq_inject_queue_dir: None,
+            amq_inject_pending: HashMap::new(),
+            amq_inject_last_warned: HashMap::new(),
         };
         let git = GitState {
             projects,
@@ -1258,6 +1270,7 @@ impl App {
         if self.config.limits.enable_scrollback_overflow_autodetach {
             self.spawn_scrollback_watchdog();
         }
+        self.spawn_amq_inject_watcher();
         let mut terminal = ratatui::init();
         execute!(stdout(), EnableMouseCapture)?;
 
@@ -1266,6 +1279,7 @@ impl App {
                 self.drain_events();
                 self.poll_pty_activity();
                 self.tick_watch_engines();
+                self.tick_amq_inject();
                 self.tick_count = self.tick_count.wrapping_add(1);
 
                 // Check SIGWINCH — needed when bypassing crossterm's event

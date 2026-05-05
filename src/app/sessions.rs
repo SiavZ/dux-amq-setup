@@ -2010,6 +2010,10 @@ mod tests {
             refs_watch_paths: std::collections::HashMap::new(),
             _single_instance_lock: single_instance_lock,
             watch_engines: std::collections::HashMap::new(),
+            amq_inject_watcher: None,
+            amq_inject_queue_dir: None,
+            amq_inject_pending: std::collections::HashMap::new(),
+            amq_inject_last_warned: std::collections::HashMap::new(),
         };
         let git = crate::app::GitState {
             projects,

@@ -142,6 +142,12 @@ fi
 # AMQ requires lowercase agent handles.
 ME=$(printf '%s' "$ME" | tr '[:upper:]' '[:lower:]' | sed 's|[^a-z0-9_-]|-|g; s|^-\+||; s|-\+$||')
 
+# Export AM_ME so that descendants of `amq wake` (notably the
+# `dux-amq-inject-bridge` spawned per notification) can identify the
+# receiver without re-deriving it from CWD. The dux-side drainer keys
+# its inject-queue on this value.
+export AM_ME="$ME"
+
 ROOT="${AMQ_GLOBAL_ROOT:-/data/state/amq}"
 
 # Audit02 P1-F: identity collision detection.

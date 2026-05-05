@@ -46,6 +46,7 @@ pub struct Config {
     pub storage: StorageConfig,
     pub auto_resume: AutoResumeConfig,
     pub limits: LimitsConfig,
+    pub amq: AmqConfig,
 }
 
 /// Current canonical config schema version. Increment whenever a new
@@ -395,6 +396,108 @@ impl Default for LimitsConfig {
     }
 }
 
+/// Configuration for the AMQ companion (file-based message bus).
+/// Today only the `[amq.inject]` subsection is meaningful; future
+/// subsections (rate-limits, replay-window tuning, etc.) attach here.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AmqConfig {
+    pub inject: AmqInjectConfig,
+}
+
+/// Tunables for the dux-side drainer that consumes
+/// `~/.local/share/dux-amq/inject-queue/<receiver>/*.msg` files written
+/// by `dux-amq-inject-bridge`. The drainer types each body into the
+/// matching session's PTY only when the agent is idle, fixing the
+/// "stuck in input field" failure mode where Claude Code's Ink input
+/// drops a trailing Enter received during streaming.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AmqInjectConfig {
+    /// Master switch. When `false`, no queue files are consumed and
+    /// AMQ wake notifications fall back to whatever the bridge wrote
+    /// to disk (operators can recover bodies manually). Default true.
+    #[serde(default = "default_amq_inject_enabled")]
+    pub enabled: bool,
+    /// Override the queue root. Empty string means
+    /// `~/.local/share/dux-amq/inject-queue` (XDG_DATA_HOME-aware when
+    /// the environment variable is set). Tests use this knob to point
+    /// at a tempdir.
+    #[serde(default)]
+    pub queue_dir: String,
+    /// Bottom-of-screen substrings that, if present, mean the agent
+    /// is busy and Enter should not be delivered yet. Plain literals,
+    /// case-sensitive, no regex. The drainer scans the last
+    /// `busy_scan_lines` PTY rows for any match. Defaults cover Claude
+    /// Code, Codex, and OpenCode footers as of 2026-01.
+    #[serde(default = "default_amq_inject_busy_markers")]
+    pub busy_markers: Vec<String>,
+    /// Number of recent PTY rows the drainer reads when looking for
+    /// busy markers. Smaller is cheaper but risks missing a marker
+    /// that has scrolled out of the footer band. Default 5.
+    #[serde(default = "default_amq_inject_busy_scan_lines")]
+    pub busy_scan_lines: usize,
+    /// Hold a queued message for at most this many seconds before
+    /// surfacing a status-line warning. The file stays on disk so the
+    /// operator can inspect it; we just stop trying to deliver it
+    /// silently. Default 600 (10 minutes).
+    #[serde(default = "default_amq_inject_delivery_timeout_secs")]
+    pub delivery_timeout_secs: u64,
+    /// Polling fallback interval (milliseconds) for filesystems where
+    /// `notify` is lossy (NFS, virtio-9p, some FUSE mounts). The
+    /// `notify`-based watcher runs alongside this poll so most
+    /// changes are detected immediately. Default 5000 (5 seconds).
+    #[serde(default = "default_amq_inject_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    /// Reject queue files larger than this many bytes. Caps memory
+    /// for a single inject and prevents DoS via a forged
+    /// multi-megabyte body that survived `amq-receive-verify`.
+    /// Default 65536 (64 KiB).
+    #[serde(default = "default_amq_inject_max_message_bytes")]
+    pub max_message_bytes: u64,
+}
+
+fn default_amq_inject_enabled() -> bool {
+    true
+}
+
+fn default_amq_inject_busy_markers() -> Vec<String> {
+    vec![
+        "esc to interrupt".to_string(),
+        "ctrl+c to interrupt".to_string(),
+    ]
+}
+
+fn default_amq_inject_busy_scan_lines() -> usize {
+    5
+}
+
+fn default_amq_inject_delivery_timeout_secs() -> u64 {
+    600
+}
+
+fn default_amq_inject_poll_interval_ms() -> u64 {
+    5_000
+}
+
+fn default_amq_inject_max_message_bytes() -> u64 {
+    65_536
+}
+
+impl Default for AmqInjectConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_amq_inject_enabled(),
+            queue_dir: String::new(),
+            busy_markers: default_amq_inject_busy_markers(),
+            busy_scan_lines: default_amq_inject_busy_scan_lines(),
+            delivery_timeout_secs: default_amq_inject_delivery_timeout_secs(),
+            poll_interval_ms: default_amq_inject_poll_interval_ms(),
+            max_message_bytes: default_amq_inject_max_message_bytes(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
@@ -444,6 +547,7 @@ impl Default for Config {
             storage: StorageConfig::default(),
             auto_resume: AutoResumeConfig::default(),
             limits: LimitsConfig::default(),
+            amq: AmqConfig::default(),
         }
     }
 }
@@ -796,6 +900,9 @@ enum FieldValue {
     Usize(usize),
     Bool(bool),
     MultilineStr(Option<String>),
+    /// A TOML inline array of strings, e.g. `["foo", "bar"]`. Empty
+    /// arrays render as `[]`. Used by `[amq.inject].busy_markers`.
+    StrList(Vec<String>),
 }
 
 /// A comment source: static string or dynamically built.
@@ -1110,6 +1217,92 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             value_fn: |c| FieldValue::Bool(c.limits.enable_scrollback_overflow_autodetach),
         },
         ConfigEntry::Blank,
+        ConfigEntry::Comment(
+            "# AMQ inject-queue drainer.\n\
+             #\n\
+             # When the dux-amq companion is installed, peer agents wake each\n\
+             # other through `amq wake`. On Linux kernels with CONFIG_LEGACY_TIOCSTI=n\n\
+             # (Ubuntu 24.04, Debian 12+, kernel 6.2+) the bridge can't ioctl()\n\
+             # text into the controlling TTY, so it writes verified bodies to\n\
+             # ~/.local/share/dux-amq/inject-queue/<receiver>/*.msg instead. The\n\
+             # settings below tune the dux-side drainer that picks them up and\n\
+             # types them into the matching session's PTY only when the agent is\n\
+             # idle — a tmux send-keys directly during streaming would land the\n\
+             # body in Claude Code's input but drop the trailing Enter, leaving\n\
+             # the message visibly stuck until the user pressed Enter manually.",
+        ),
+        ConfigEntry::Section("amq.inject"),
+        ConfigEntry::Field {
+            key: "enabled",
+            comment: Some(CommentSource::Static(
+                "# Master switch for the drainer. When false, no queue files are\n\
+                 # consumed and AMQ wake notifications fall back to whatever the\n\
+                 # bridge wrote to disk (operators can recover bodies manually\n\
+                 # from ~/.local/share/dux-amq/inject-queue/). Default true.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.amq.inject.enabled),
+        },
+        ConfigEntry::Field {
+            key: "queue_dir",
+            comment: Some(CommentSource::Static(
+                "# Override the queue root. Empty string means the default\n\
+                 # ~/.local/share/dux-amq/inject-queue (XDG_DATA_HOME-aware\n\
+                 # when that environment variable is set). Set to an absolute\n\
+                 # path to relocate; tests use this to point at a tempdir.",
+            )),
+            value_fn: |c| FieldValue::Str(c.amq.inject.queue_dir.clone()),
+        },
+        ConfigEntry::Field {
+            key: "busy_markers",
+            comment: Some(CommentSource::Static(
+                "# Bottom-of-screen substrings that mean the agent is busy and\n\
+                 # Enter should not be delivered yet. Plain literals (no regex),\n\
+                 # case-sensitive. The drainer scans the last `busy_scan_lines`\n\
+                 # PTY rows for any of these and holds the queue until they\n\
+                 # disappear. Tune for the agent footer text in your provider —\n\
+                 # the defaults cover Claude Code as of 2026-01.",
+            )),
+            value_fn: |c| FieldValue::StrList(c.amq.inject.busy_markers.clone()),
+        },
+        ConfigEntry::Field {
+            key: "busy_scan_lines",
+            comment: Some(CommentSource::Static(
+                "# Number of recent PTY rows the drainer reads when looking for\n\
+                 # busy markers. Smaller is cheaper but risks missing a marker\n\
+                 # that has scrolled out of the footer band. Default 5.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.amq.inject.busy_scan_lines),
+        },
+        ConfigEntry::Field {
+            key: "delivery_timeout_secs",
+            comment: Some(CommentSource::Static(
+                "# Hold a queued message for at most this many seconds before\n\
+                 # surfacing a status-line warning. The file stays on disk so the\n\
+                 # operator can inspect it; we just stop trying to deliver it\n\
+                 # silently. Default 600 (10 minutes).",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.delivery_timeout_secs),
+        },
+        ConfigEntry::Field {
+            key: "poll_interval_ms",
+            comment: Some(CommentSource::Static(
+                "# Polling fallback interval (milliseconds) for filesystems where\n\
+                 # `notify` is lossy (NFS, virtio-9p, some FUSE mounts). The\n\
+                 # `notify`-based watcher runs alongside this poll so most\n\
+                 # changes are detected immediately. Default 5000.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.poll_interval_ms),
+        },
+        ConfigEntry::Field {
+            key: "max_message_bytes",
+            comment: Some(CommentSource::Static(
+                "# Reject queue files larger than this many bytes. Caps memory\n\
+                 # for a single inject and prevents DoS via a forged multi-megabyte\n\
+                 # body that survived `amq-receive-verify`. Default 65536 (64 KiB).",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.max_message_bytes),
+        },
+        ConfigEntry::Blank,
         ConfigEntry::Keys,
         ConfigEntry::Blank,
         ConfigEntry::Macros,
@@ -1174,6 +1367,13 @@ fn render_config(config: &Config, bindings: &crate::keybindings::RuntimeBindings
                     }
                     FieldValue::MultilineStr(None) => {
                         let _ = writeln!(out, "{key} = \"\"");
+                    }
+                    FieldValue::StrList(items) => {
+                        let parts: Vec<String> = items
+                            .iter()
+                            .map(|s| format!("\"{}\"", escape_toml_string(s)))
+                            .collect();
+                        let _ = writeln!(out, "{key} = [{}]", parts.join(", "));
                     }
                 }
             }
@@ -2325,6 +2525,46 @@ mod tests {
         assert_eq!(
             rendered, re_rendered,
             "render → parse → render should be stable"
+        );
+    }
+
+    #[test]
+    fn default_config_round_trips_amq_inject() {
+        let mut config = Config::default();
+        config.amq.inject.busy_markers =
+            vec!["thinking…".to_string(), "ctrl-c to cancel".to_string()];
+        config.amq.inject.queue_dir = "/tmp/inject".to_string();
+        config.amq.inject.busy_scan_lines = 12;
+        config.amq.inject.delivery_timeout_secs = 90;
+        config.amq.inject.poll_interval_ms = 1234;
+        config.amq.inject.max_message_bytes = 4096;
+        config.amq.inject.enabled = false;
+        let rendered = render_config_default(&config);
+        let parsed: Config = toml::from_str(&rendered).expect("config should parse");
+        assert!(!parsed.amq.inject.enabled);
+        assert_eq!(parsed.amq.inject.queue_dir, "/tmp/inject");
+        assert_eq!(parsed.amq.inject.busy_scan_lines, 12);
+        assert_eq!(parsed.amq.inject.delivery_timeout_secs, 90);
+        assert_eq!(parsed.amq.inject.poll_interval_ms, 1234);
+        assert_eq!(parsed.amq.inject.max_message_bytes, 4096);
+        assert_eq!(
+            parsed.amq.inject.busy_markers,
+            vec!["thinking…".to_string(), "ctrl-c to cancel".to_string()]
+        );
+    }
+
+    #[test]
+    fn amq_inject_defaults_match_constants() {
+        let cfg = AmqInjectConfig::default();
+        assert!(cfg.enabled);
+        assert!(cfg.queue_dir.is_empty());
+        assert_eq!(cfg.busy_scan_lines, 5);
+        assert_eq!(cfg.delivery_timeout_secs, 600);
+        assert_eq!(cfg.poll_interval_ms, 5_000);
+        assert_eq!(cfg.max_message_bytes, 65_536);
+        assert!(
+            cfg.busy_markers.iter().any(|m| m == "esc to interrupt"),
+            "default busy markers should include Claude Code's footer"
         );
     }
 
