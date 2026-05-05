@@ -228,6 +228,7 @@ impl App {
                         body,
                         inflight_path: inflight,
                         source_path: pending.path.clone(),
+                        body_typed: false,
                     };
                     self.runtime
                         .amq_inject_pending
@@ -306,11 +307,27 @@ impl App {
                 continue;
             }
 
-            // Drain the head as long as the agent is idle. We loop
-            // here so a backlog of messages drains in one tick when
-            // the agent's been idle for a while. The busy check is
-            // re-run between deliveries because each Enter we type
-            // changes the snapshot.
+            // Two-phase delivery loop:
+            //   Phase 1 (head.body_typed = false): write the body
+            //     bytes to the PTY, mark `body_typed = true`, then
+            //     break out of the inner loop. The next tick will
+            //     pick this entry back up for phase 2.
+            //   Phase 2 (head.body_typed = true): write a discrete
+            //     `\r` to the PTY, unlink the inflight file, pop the
+            //     entry, and continue draining the queue.
+            //
+            // Why split: a single PTY write of `body + \r` gets
+            // coalesced by Ink (Claude Code's TUI framework) into a
+            // paste-shaped buffer; the trailing `\r` ends up appended
+            // to the input field rather than firing as a submit
+            // keystroke. Splitting across two ticks puts a real time
+            // gap between writes (~16 ms typical), which produces two
+            // separate `read()` calls on Ink's stdin so the final
+            // `\r` arrives alone and is interpreted as Enter.
+            //
+            // The busy-check is re-run between every pop so a backlog
+            // of messages stops draining if the agent goes back into
+            // streaming mid-batch.
             loop {
                 let queue_empty = self
                     .runtime
@@ -336,16 +353,46 @@ impl App {
                     break;
                 }
 
-                // Pop head and deliver.
-                let Some(head) = self
+                // Decide which phase the head is in. Read-only borrow
+                // released before we mutate.
+                let phase = self
                     .runtime
                     .amq_inject_pending
-                    .get_mut(&receiver)
-                    .and_then(|q| q.pop_front())
-                else {
-                    break;
-                };
-                self.deliver_inject(&session_id, &receiver, &head);
+                    .get(&receiver)
+                    .and_then(|q| q.front())
+                    .map(|head| head.body_typed);
+
+                match phase {
+                    Some(false) => {
+                        // Phase 1: type the body, leave the entry at
+                        // the head of the queue with body_typed=true,
+                        // and break out so the next tick handles \r.
+                        let body = {
+                            let q = self
+                                .runtime
+                                .amq_inject_pending
+                                .get_mut(&receiver)
+                                .expect("queue exists per phase peek");
+                            let head_mut = q.front_mut().expect("head exists per phase peek");
+                            head_mut.body_typed = true;
+                            head_mut.body.clone()
+                        };
+                        self.deliver_inject_body(&session_id, &receiver, &body);
+                        break;
+                    }
+                    Some(true) => {
+                        // Phase 2: pop, write \r, unlink, status-line.
+                        let head = self
+                            .runtime
+                            .amq_inject_pending
+                            .get_mut(&receiver)
+                            .and_then(|q| q.pop_front())
+                            .expect("head exists per phase peek");
+                        self.deliver_inject_enter(&session_id, &receiver, &head);
+                        // Loop continues to drain next message.
+                    }
+                    None => break,
+                }
             }
 
             // Tidy up empty queues so the receivers Vec next tick
@@ -404,18 +451,65 @@ impl App {
         match_receiver(triples.iter().copied(), receiver).map(|s| s.to_string())
     }
 
-    /// Type the body into the session's PTY and submit with `\r`.
-    /// Reuses `crate::app::input::macro_payload_bytes` so embedded
-    /// newlines become Alt-Enter (a newline within the prompt) rather
-    /// than premature submits — the same chokepoint watch effects use.
-    fn deliver_inject(&mut self, session_id: &str, receiver: &str, msg: &QueuedMessage) {
-        let mut payload = crate::app::input::macro_payload_bytes(&msg.body);
-        // Trailing CR submits the prompt. Equivalent to
-        // `WatchEffect::SendText { append_enter: true }`.
-        payload.push(b'\r');
+    /// Phase 1 of two-phase delivery: type the body into the
+    /// session's PTY without the trailing `\r`. Reuses
+    /// `crate::app::input::macro_payload_bytes` so embedded newlines
+    /// become Alt-Enter (a newline within the prompt) rather than
+    /// premature submits — the same chokepoint watch effects use.
+    /// The inflight file stays on disk; phase 2 unlinks it.
+    fn deliver_inject_body(&mut self, session_id: &str, receiver: &str, body: &str) {
+        let payload = crate::app::input::macro_payload_bytes(body);
         let write_result = self
             .find_pty_handle(session_id)
             .map(|handle| handle.write_bytes(&payload));
+        match write_result {
+            Some(Ok(())) => {
+                tracing::debug!(
+                    target: "dux::amq_inject",
+                    session_id = %session_id,
+                    receiver = %receiver,
+                    body_preview = %amq_inject::preview(body, 80),
+                    "typed AMQ wake body (phase 1); awaiting tick 2 to send Enter",
+                );
+            }
+            Some(Err(err)) => {
+                // PTY write failed; mark this entry not-yet-typed so
+                // the next tick retries phase 1. The inflight file is
+                // already in pending so it survives the failure.
+                tracing::warn!(
+                    target: "dux::amq_inject",
+                    session_id = %session_id,
+                    receiver = %receiver,
+                    err = %err,
+                    "phase-1 PTY write failed; will retry next tick",
+                );
+                if let Some(q) = self.runtime.amq_inject_pending.get_mut(receiver)
+                    && let Some(head) = q.front_mut()
+                {
+                    head.body_typed = false;
+                }
+            }
+            None => {
+                // No PTY (session gone). Roll back so a future
+                // re-spawn picks the message up.
+                if let Some(q) = self.runtime.amq_inject_pending.get_mut(receiver)
+                    && let Some(head) = q.front_mut()
+                {
+                    head.body_typed = false;
+                }
+            }
+        }
+    }
+
+    /// Phase 2 of two-phase delivery: write a discrete `\r` to the
+    /// session's PTY, unlink the inflight file, and surface success
+    /// in the status line. The split-write pattern is what makes
+    /// Ink's stdin reader see the `\r` as a separate keystroke
+    /// rather than coalescing it into the body's paste buffer.
+    fn deliver_inject_enter(&mut self, session_id: &str, receiver: &str, msg: &QueuedMessage) {
+        let write_result = self
+            .find_pty_handle(session_id)
+            .map(|handle| handle.write_bytes(b"\r"));
         match write_result {
             Some(Ok(())) => {
                 if let Err(err) = std::fs::remove_file(&msg.inflight_path) {
@@ -442,9 +536,13 @@ impl App {
                 ));
             }
             Some(Err(err)) => {
-                // PTY write failed — most likely the agent process
-                // exited between the busy check and the write. Put
-                // the file back and try again next tick.
+                // PTY write of \r failed. The body is already in the
+                // input field; release the file so the next tick
+                // re-attempts phase 1 (typing the body again would
+                // duplicate, but at least Enter eventually fires).
+                // Better than leaving the body floating without
+                // submission. The single-instance lock + claim
+                // semantics still ensure no duplicate file delivery.
                 let _ = amq_inject::release(&msg.inflight_path);
                 tracing::warn!(
                     target: "dux::amq_inject",
@@ -452,11 +550,11 @@ impl App {
                     receiver = %receiver,
                     path = %msg.inflight_path.display(),
                     err = %err,
-                    "PTY write failed; released for retry",
+                    "phase-2 PTY write (Enter) failed; released for retry",
                 );
             }
             None => {
-                // No PTY anymore. Same recovery path as a write error.
+                // No PTY anymore. Same recovery path as write error.
                 let _ = amq_inject::release(&msg.inflight_path);
             }
         }

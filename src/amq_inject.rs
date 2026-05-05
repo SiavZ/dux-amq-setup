@@ -67,6 +67,20 @@ pub struct QueuedMessage {
     /// Original `<ts>.msg` path before the inflight rename. Carried
     /// for log/diagnostic purposes only.
     pub source_path: PathBuf,
+    /// Two-phase delivery state. `false` = body has not been typed
+    /// into the agent's PTY yet; `true` = body was typed and we're
+    /// waiting for the next tick to send the trailing `\r` as a
+    /// discrete keystroke.
+    ///
+    /// Why two phases: Claude Code (Ink) coalesces a single PTY
+    /// write that contains body bytes + trailing CR into a paste-like
+    /// buffer; the trailing `\r` ends up appended to the input field
+    /// rather than firing as a submit keystroke. Splitting the write
+    /// across two ticks (~16 ms apart in the typical run loop)
+    /// produces two separate `read()` calls on Ink's stdin so the
+    /// final `\r` arrives alone and is interpreted as Enter.
+    /// See `App::tick_amq_inject` for the state machine.
+    pub body_typed: bool,
 }
 
 /// Reasons a queue file was rejected. Surfaced as
