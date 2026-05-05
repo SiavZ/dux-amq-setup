@@ -80,6 +80,30 @@ impl App {
         };
         self.runtime.amq_inject_queue_dir = Some(queue_dir.clone());
 
+        // Reclaim any stale `.inflight.<ts>.msg` files from a prior
+        // dux instance that crashed mid-delivery. The single-instance
+        // lock guarantees nobody else is currently processing them.
+        // Bridge-format mktemp temps (no `.msg` suffix) are skipped
+        // so we don't corrupt an in-progress write.
+        match amq_inject::reclaim_stale_inflight(&queue_dir) {
+            Ok(0) => {}
+            Ok(n) => {
+                tracing::info!(
+                    target: "dux::amq_inject",
+                    reclaimed = n,
+                    "reclaimed stale inflight files from prior dux instance",
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "dux::amq_inject",
+                    queue_dir = %queue_dir.display(),
+                    err = %err,
+                    "reclaim sweep failed; some queued messages may stay stuck",
+                );
+            }
+        }
+
         let tx = self.runtime.worker_tx.clone();
         let make_event = || WorkerEvent::AmqInjectScanRequested;
         match amq_inject::spawn_inject_watcher(
