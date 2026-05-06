@@ -1523,13 +1523,21 @@ pub(crate) fn run_create_agent_job(
     )));
     // crossterm::terminal::size() returns (cols, rows).
     let (cols, rows) = term_size;
-    let client = match PtyClient::spawn(
+    // audit03 Phase 3: thread per-session env (YOLO, verify
+    // override) into the spawn so the wrappers see deterministic
+    // CLI flags. `verify_envelope_override.is_none()` falls through
+    // to the global config value here, where the `Config` is in scope.
+    let per_session_env = session
+        .settings
+        .to_pty_env(&session.provider, config.amq.inject.verify_envelope);
+    let client = match PtyClient::spawn_with_env(
         &provider_cfg.command,
         &provider_cfg.args,
         &worktree_path,
         rows,
         cols,
         config.ui.agent_scrollback_lines,
+        per_session_env,
     ) {
         Ok(client) => client,
         Err(err) => {

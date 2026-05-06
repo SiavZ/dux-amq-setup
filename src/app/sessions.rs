@@ -365,13 +365,21 @@ impl App {
             rows,
             cfg.supports_session_resume()
         ));
-        PtyClient::spawn(
+        // audit03 Phase 3: pass per-session env (YOLO, verify
+        // override) through the spawn so wrappers see deterministic
+        // CLI flags. `verify_envelope_override = None` inherits the
+        // global config default.
+        let per_session_env = session
+            .settings
+            .to_pty_env(&session.provider, self.config.amq.inject.verify_envelope);
+        PtyClient::spawn_with_env(
             &cfg.command,
             launch_args,
             Path::new(&session.worktree_path),
             rows,
             cols,
             self.config.ui.agent_scrollback_lines,
+            per_session_env,
         )
     }
 
@@ -407,13 +415,19 @@ pub(crate) fn spawn_pty_for_auto_resume(
         rows,
         cfg.supports_session_resume()
     ));
-    PtyClient::spawn(
+    // audit03 Phase 3: per-session env propagation matches the UI-thread
+    // spawn path so auto-resume and reconnect produce identical wrappers.
+    let per_session_env = session
+        .settings
+        .to_pty_env(&session.provider, config.amq.inject.verify_envelope);
+    PtyClient::spawn_with_env(
         &cfg.command,
         launch_args,
         Path::new(&session.worktree_path),
         rows,
         cols,
         scrollback_lines,
+        per_session_env,
     )
 }
 

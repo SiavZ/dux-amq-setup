@@ -201,6 +201,113 @@ fn pty_write_input() {
     );
 }
 
+/// audit03 Phase 3: `PtyClient::spawn_with_env` propagates the
+/// per-session env vars to the child, while the global terminal-env
+/// vars (`TERM`, `DUX_PANE`) still apply. Spawns a small shell that
+/// prints the relevant env vars and asserts they're present in the
+/// terminal output.
+#[test]
+fn spawn_with_env_propagates_per_session_vars() {
+    use dux::model::{ProviderKind, SessionSettings};
+    use dux::pty::PtyClient;
+    use std::time::Instant;
+
+    // Build a SessionSettings that should yield CLAUDE_AMQ_YOLO=1 and
+    // DUX_AMQ_VERIFY=1. Worker mode + auto_clear are unrelated to env.
+    let settings = SessionSettings {
+        yolo_permissions: true,
+        verify_envelope_override: Some(true),
+        ..SessionSettings::default()
+    };
+    let provider = ProviderKind::new("claude");
+    // verify_envelope_global=false; the override should win.
+    let env = settings.to_pty_env(&provider, false);
+
+    let args = [
+        "-c".to_string(),
+        // Print each env var on its own line so the assert below is
+        // unambiguous regardless of shell quoting.
+        "printf 'CY=%s\\nDV=%s\\nDP=%s\\n' \
+         \"$CLAUDE_AMQ_YOLO\" \"$DUX_AMQ_VERIFY\" \"$DUX_PANE\""
+            .to_string(),
+    ];
+    let cwd = std::path::Path::new("/tmp");
+    let pty = PtyClient::spawn_with_env("/bin/sh", &args, cwd, 24, 80, 1_000, env)
+        .expect("spawn_with_env");
+
+    // Poll the recent-lines snapshot until we see all three markers
+    // or hit the deadline. The reader thread is async so the first
+    // snapshot may be empty.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut snapshot = String::new();
+    while Instant::now() < deadline {
+        snapshot = pty.scan_recent_lines(30);
+        if snapshot.contains("CY=1") && snapshot.contains("DV=1") && snapshot.contains("DP=1") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        snapshot.contains("CY=1"),
+        "expected CLAUDE_AMQ_YOLO=1 in PTY output; got: {snapshot}"
+    );
+    assert!(
+        snapshot.contains("DV=1"),
+        "expected DUX_AMQ_VERIFY=1 in PTY output; got: {snapshot}"
+    );
+    assert!(
+        snapshot.contains("DP=1"),
+        "expected DUX_PANE=1 (terminal env) still present; got: {snapshot}"
+    );
+}
+
+/// audit03 Phase 3: `verify_envelope_override = None` falls back to
+/// the `verify_envelope_global` argument. Asserts both branches —
+/// global=true and global=false — render the right `DUX_AMQ_VERIFY`
+/// value at the child.
+#[test]
+fn spawn_with_env_falls_back_to_global_verify_envelope() {
+    use dux::model::{ProviderKind, SessionSettings};
+
+    let settings = SessionSettings::default();
+    let provider = ProviderKind::new("claude");
+
+    let env_strict = settings.to_pty_env(&provider, true);
+    assert!(
+        env_strict
+            .vars
+            .iter()
+            .any(|(k, v)| k == "DUX_AMQ_VERIFY" && v == "1"),
+        "global=true should yield DUX_AMQ_VERIFY=1; got {:?}",
+        env_strict.vars
+    );
+
+    let env_skip = settings.to_pty_env(&provider, false);
+    assert!(
+        env_skip
+            .vars
+            .iter()
+            .any(|(k, v)| k == "DUX_AMQ_VERIFY" && v == "0"),
+        "global=false should yield DUX_AMQ_VERIFY=0; got {:?}",
+        env_skip.vars
+    );
+
+    // Per-session override beats global in both directions.
+    let overridden = SessionSettings {
+        verify_envelope_override: Some(false),
+        ..SessionSettings::default()
+    };
+    let env_skip_override = overridden.to_pty_env(&provider, true);
+    assert!(
+        env_skip_override
+            .vars
+            .iter()
+            .any(|(k, v)| k == "DUX_AMQ_VERIFY" && v == "0"),
+        "Some(false) override should yield DUX_AMQ_VERIFY=0 even when global=true"
+    );
+}
+
 /// Verify PTY resize doesn't panic.
 #[test]
 fn pty_resize() {

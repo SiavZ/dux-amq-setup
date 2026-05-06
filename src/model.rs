@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::pty::PtyHandle;
+use crate::pty::{PerSessionEnv, PtyHandle};
 
 /// GitHub CLI availability status, checked once at startup.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -548,6 +548,69 @@ impl SessionSettings {
     /// Serialise for storage. Always returns valid JSON.
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).expect("SessionSettings serialises")
+    }
+
+    /// Translate per-session settings into env vars for the spawned
+    /// PTY child. The wrappers (`claude-amq`, `codex-amq`, etc.) read
+    /// these to decide CLI flags. Order is stable for log
+    /// readability.
+    ///
+    /// `verify_envelope_global` is the value of
+    /// `[amq.inject].verify_envelope` from `config.toml` — used as
+    /// the fallback when this session's `verify_envelope_override`
+    /// is `None`. Passing it through here keeps the global config
+    /// look-up at the call site (workers/sessions) where the
+    /// `Config` is already in scope, instead of plumbing config
+    /// access into every PTY spawn helper.
+    pub fn to_pty_env(
+        &self,
+        provider: &ProviderKind,
+        verify_envelope_global: bool,
+    ) -> PerSessionEnv {
+        let mut vars: Vec<(String, String)> = Vec::new();
+        if self.yolo_permissions {
+            match provider.as_str() {
+                "claude" => {
+                    vars.push(("CLAUDE_AMQ_YOLO".into(), "1".into()));
+                }
+                "codex" => {
+                    vars.push(("CODEX_AMQ_YOLO".into(), "1".into()));
+                }
+                "gemini" => {
+                    // Gemini wrapper has no YOLO flag today; document
+                    // the no-op rather than silently dropping it.
+                    tracing::debug!(
+                        target: "dux::session_settings",
+                        provider = %provider.as_str(),
+                        "yolo_permissions=true ignored: no wrapper flag for this provider",
+                    );
+                }
+                _ => {
+                    tracing::debug!(
+                        target: "dux::session_settings",
+                        provider = %provider.as_str(),
+                        "yolo_permissions=true ignored: provider has no YOLO mapping",
+                    );
+                }
+            }
+        }
+        // Always export DUX_AMQ_VERIFY so the wake daemon's bridge
+        // sees a deterministic value. Per-session override beats
+        // global; both serialize the same way (`1` strict, `0` skip)
+        // so the wrapper logic stays single-branch.
+        let strict = self.verify_envelope_override.unwrap_or(verify_envelope_global);
+        vars.push((
+            "DUX_AMQ_VERIFY".into(),
+            if strict { "1".into() } else { "0".into() },
+        ));
+        tracing::debug!(
+            target: "dux::session_settings",
+            provider = %provider.as_str(),
+            yolo = self.yolo_permissions,
+            verify = strict,
+            "translated session_settings to pty env",
+        );
+        PerSessionEnv { vars }
     }
 }
 
