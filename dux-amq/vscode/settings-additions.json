@@ -1,7 +1,8 @@
 // Add these entries to your VSCode User settings.json on the LOCAL machine
-// (not the remote VM). They free Ctrl-G and Ctrl-O in the terminal so
-// dux's exit_interactive keybind and Claude Code's Ctrl-O (toggle verbose
-// / multi-line) reach the running PTY instead of being captured by VS Code.
+// (not the remote VM). They free Ctrl-G, Ctrl-O, and Ctrl-P in the terminal
+// so dux's exit_interactive keybind, dux's open_palette keybind, and Claude
+// Code's Ctrl-O (toggle verbose / multi-line) reach the running PTY instead
+// of being captured by VS Code.
 //
 // Background: VS Code's "commandsToSkipShell" controls which Workbench
 // commands flow through to the integrated terminal. By default it
@@ -18,6 +19,7 @@
   "terminal.integrated.commandsToSkipShell": [
     "-workbench.action.gotoLine",
     "-workbench.action.terminal.goToRecentDirectory",
-    "-workbench.action.files.openFile"
+    "-workbench.action.files.openFile",
+    "-workbench.action.quickOpen"
   ]
 }
