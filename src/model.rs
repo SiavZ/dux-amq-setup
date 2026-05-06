@@ -598,7 +598,9 @@ impl SessionSettings {
         // sees a deterministic value. Per-session override beats
         // global; both serialize the same way (`1` strict, `0` skip)
         // so the wrapper logic stays single-branch.
-        let strict = self.verify_envelope_override.unwrap_or(verify_envelope_global);
+        let strict = self
+            .verify_envelope_override
+            .unwrap_or(verify_envelope_global);
         vars.push((
             "DUX_AMQ_VERIFY".into(),
             if strict { "1".into() } else { "0".into() },

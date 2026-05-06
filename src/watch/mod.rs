@@ -17,6 +17,7 @@
 //! unbounded send-text loop. See `SECURITY.md` (T13) for the long-form
 //! discussion.
 
+pub mod builtin;
 pub mod engine;
 pub mod reset_time;
 pub mod rule;

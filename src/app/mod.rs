@@ -2649,19 +2649,51 @@ impl App {
     /// engine and skips engine construction entirely so the per-tick
     /// matcher loop has no work for this session.
     pub(crate) fn attach_watch_engine(&mut self, session_id: &str) {
-        let provider_kind = match self.git.sessions.iter().find(|s| s.id == session_id) {
-            Some(s) => s.provider.clone(),
+        let (provider_kind, settings) = match self.git.sessions.iter().find(|s| s.id == session_id)
+        {
+            Some(s) => (s.provider.clone(), s.settings.clone()),
             None => return,
         };
-        let rules: Vec<crate::watch::WatchRule> =
-            match self.config.providers.commands.get(provider_kind.as_str()) {
-                Some(cfg) if !cfg.watch.is_empty() => cfg.watch.clone(),
-                _ => {
-                    self.runtime.watch_engines.remove(session_id);
-                    return;
-                }
-            };
-        let (engine, errors) = crate::watch::WatchEngine::new(session_id.to_string(), &rules);
+        // Start from the provider's `[providers.<X>.watch]` rules.
+        let mut rules: Vec<crate::watch::WatchRule> = self
+            .config
+            .providers
+            .commands
+            .get(provider_kind.as_str())
+            .map(|cfg| cfg.watch.clone())
+            .unwrap_or_default();
+
+        // audit03 Phase 4: append the built-in auto-clear-on-task-done
+        // rule when the operator has both put the session in Worker
+        // mode AND ticked the auto-clear box. Asymmetric default: a
+        // session with `mode = Attended` (the default) never sees this
+        // rule even with `auto_clear_on_task_done = true`, because the
+        // Worker postscript that produces the sentinel is the only
+        // way the agent learns to emit it. Enabling auto-clear without
+        // Worker mode would be a no-op anyway, so we don't bother.
+        let auto_clear_idx = if matches!(settings.mode, crate::model::ContextMode::Worker)
+            && settings.auto_clear_on_task_done
+        {
+            let clear_cmd = crate::watch::builtin::provider_clear_command(&provider_kind);
+            rules.push(crate::watch::builtin::auto_clear_rule_for(clear_cmd));
+            tracing::debug!(
+                target: "dux::session_settings",
+                session_id = %session_id,
+                provider = %provider_kind.as_str(),
+                clear_cmd = %clear_cmd,
+                "attached built-in auto-clear-on-task-done rule",
+            );
+            Some(rules.len() - 1)
+        } else {
+            None
+        };
+
+        if rules.is_empty() {
+            self.runtime.watch_engines.remove(session_id);
+            return;
+        }
+
+        let (mut engine, errors) = crate::watch::WatchEngine::new(session_id.to_string(), &rules);
         for err in &errors {
             tracing::warn!(
                 target: "dux::watch",
@@ -2671,6 +2703,31 @@ impl App {
                 "watch rule load error",
             );
         }
+
+        // audit03 Phase 4: replay per-session arm/disarm overrides so
+        // a manual disarm survives restart. The built-in rule is at a
+        // known index (`auto_clear_idx`); user-config rules occupy the
+        // 0..n range that the modal exposes.
+        for (&idx, &armed) in &settings.watch_rule_arm {
+            // Skip overrides that point past the rule list (e.g. config
+            // shrunk between dux runs). We don't error — the operator
+            // is allowed to leave stale overrides in place.
+            if idx >= engine.rule_count() {
+                continue;
+            }
+            // The built-in rule's index is reserved; ignore overrides
+            // for it (the modal also won't surface its index, but be
+            // defensive against forged blobs).
+            if Some(idx) == auto_clear_idx {
+                continue;
+            }
+            if armed {
+                engine.rearm(idx);
+            } else {
+                engine.disarm(idx);
+            }
+        }
+
         if engine.rule_count() > 0 {
             self.runtime
                 .watch_engines
