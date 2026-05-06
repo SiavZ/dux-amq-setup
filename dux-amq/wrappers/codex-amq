@@ -114,4 +114,24 @@ if [[ "${CODEX_AMQ_YOLO:-${CLAUDE_YOLO:-}}" == "1" ]]; then
   printf 'codex-amq: YOLO enabled — sandbox bypass active\n' >&2
 fi
 
+# audit03 Phase 01 §15: per-session system-prompt override.
+#
+# dux exports DUX_SYSTEM_PROMPT for sessions whose operator set a
+# system prompt in the session settings modal. Codex (verified against
+# `codex --help` for the current release) does NOT expose a CLI flag
+# equivalent to claude's `--append-system-prompt` — its system prompt
+# is set via `~/.codex/instructions.md` (process-global) or the `-c`
+# config-override mechanism (which only takes TOML keys, not free-form
+# text). There is no per-invocation safe way to inject the text without
+# rewriting that file, which would race with other concurrent codex
+# sessions on the same host.
+#
+# Until codex grows an `--append-system-prompt` (or equivalent) flag,
+# we warn-and-drop: log a single line to stderr so the operator
+# learns their setting was a no-op for this provider, and pass nothing
+# to codex (NEVER pass an unsupported flag).
+if [[ -n "${DUX_SYSTEM_PROMPT:-}" ]]; then
+  printf 'codex-amq: DUX_SYSTEM_PROMPT set but codex has no equivalent flag; ignoring\n' >&2
+fi
+
 exec amq coop exec --no-wake --no-init --root "$ROOT" --me "$ME" codex -- ${CODEX_EXTRA[@]+"${CODEX_EXTRA[@]}"} "$@"

@@ -105,4 +105,24 @@ case "$INJECT_MODE" in
     ;;
 esac
 
+# audit03 Phase 01 §15: per-session system-prompt override.
+#
+# dux exports DUX_SYSTEM_PROMPT for sessions whose operator set a
+# system prompt in the session settings modal. The current Gemini CLI
+# (verified against `gemini --help`) does NOT expose a `--append-system-prompt`
+# / `--system` / equivalent flag — the documented way to alter the
+# system prompt is via `GEMINI.md` files in the workspace, which are
+# project-scoped, not per-session. Even passing the text via
+# `-i/--prompt-interactive` would land in the user-message stream
+# rather than the system-prompt slot, with materially different
+# semantics.
+#
+# Until Gemini CLI grows an explicit per-invocation flag, we warn-and-drop:
+# log a single line to stderr so the operator learns their setting was
+# a no-op for this provider, and pass nothing to gemini (NEVER pass an
+# unsupported flag).
+if [[ -n "${DUX_SYSTEM_PROMPT:-}" ]]; then
+  printf 'gemini-amq: DUX_SYSTEM_PROMPT set but gemini has no equivalent flag; ignoring\n' >&2
+fi
+
 exec amq coop exec --no-wake --no-init --root "$ROOT" --me "$ME" gemini -- "$@"
