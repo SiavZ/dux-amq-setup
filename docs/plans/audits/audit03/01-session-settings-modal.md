@@ -1149,3 +1149,154 @@ End of spec. Implement phases 2 → 7 in order. Run all verification
 gates. Open one PR with the commits split per Section 10. Cross
 out completed gates as you go and append "DONE" + commit SHA next
 to each one — this doc is the authoritative checklist.
+
+---
+
+## 15 · Appendix: per-session system prompt knob
+
+Phase 6 originally shipped without a system-prompt override, on the
+theory that operators editing `CLAUDE.md` is the documented path. In
+practice that conflates two failure modes: (a) one session needs a
+narrow persona for a single task, and (b) you want the persona
+permanently in the project. Forcing (a) through (b) means every
+worktree clone inherits the persona, and reverting requires a commit
+in the worktree's git history. This appendix describes a
+per-session, opt-in `system_prompt` knob that addresses (a) without
+disturbing (b).
+
+### 15.1 Storage + type extension
+
+`SessionSettings` grows one field:
+
+```rust
+/// Per-session system-prompt text. When `Some` and non-empty (after
+/// trim), dux exports DUX_SYSTEM_PROMPT in the PTY child env at
+/// spawn time; the wrappers translate that into the
+/// provider-specific CLI flag. Default `None`.
+#[serde(default)]
+pub system_prompt: Option<String>,
+```
+
+`#[serde(default)]` keeps the forward-compat invariant: a pre-§15 dux
+binary writes a JSON blob without `system_prompt`; a §15+ binary
+deserialises it as `None`, applies the asymmetric default, and never
+injects an unintended prompt. The matching round-trip test in
+`tests/storage_integration.rs::session_settings_full_payload_round_trip_through_sqlite`
+exercises a `Some("…")` payload to prove serde isn't stripping data.
+
+### 15.2 PTY env propagation
+
+`SessionSettings::to_pty_env` appends one var when the field is
+`Some` AND the contents are non-blank:
+
+```rust
+if let Some(prompt) = self.system_prompt.as_deref()
+    && !prompt.trim().is_empty()
+{
+    vars.push(("DUX_SYSTEM_PROMPT".into(), prompt.to_string()));
+}
+```
+
+Whitespace-only is treated as `None`. This is defensive on two
+boundaries:
+
+- The wrapper's `[[ -n "${DUX_SYSTEM_PROMPT:-}" ]]` test in bash
+  treats any non-empty string (including `"   "`) as truthy, so a
+  single literal space would still trigger
+  `claude --append-system-prompt " "` and quietly mutate the upstream
+  prompt with empty-but-not-quite-empty content. Stripping at the
+  dux side prevents that.
+- The save path in `App::save_session_settings` does the same trim
+  on the persisted blob, so the on-disk JSON never carries `""` —
+  matching the `None` return from `to_pty_env`.
+
+`tests/pty_integration.rs` covers the contract: `None`, empty,
+whitespace-only → no env var; non-blank → exact byte-for-byte
+round-trip including embedded newlines.
+
+### 15.3 Wrapper translation
+
+| Provider | Flag | Behaviour |
+|----------|------|-----------|
+| claude   | `--append-system-prompt <text>` | Appended to default system prompt; verified flag in `claude --help`. |
+| codex    | (none)                          | Warn-and-drop. Codex's system prompt is at `~/.codex/instructions.md` (process-global) or via `-c` config (TOML keys, not free-form text). No safe per-invocation way to inject. |
+| gemini   | (none)                          | Warn-and-drop. Gemini CLI's system prompt is via project-scoped `GEMINI.md`; passing text via `-i/--prompt-interactive` would land in user-message slot, with materially different semantics. |
+
+The warn-and-drop wrappers print one line to stderr so the operator
+learns their setting was a no-op for that provider:
+
+```bash
+codex-amq: DUX_SYSTEM_PROMPT set but codex has no equivalent flag; ignoring
+```
+
+When upstream codex/gemini grow an `--append-system-prompt`
+equivalent the wrapper change is a one-line edit in the same place
+the YOLO flag is wired.
+
+### 15.4 Modal UX
+
+Adds one row to the modal between YOLO and the watch rules (logical
+sibling — both are spawn-time settings):
+
+```
+  System prompt  (--append-system-prompt; needs respawn)  <N> chars
+  > current prompt preview…
+```
+
+`SettingsFocus::SystemPrompt` slots into the focus cycle there, so
+Tab/Shift-Tab and arrow nav reach it naturally. When focused, an
+inline 4-row multiline `TextInput` expands below the header — Enter
+inserts a newline (multiline mode), Tab/Shift-Tab leave the field,
+Esc closes the modal (discarding the buffer the same way Esc on
+Title does).
+
+The "open `$EDITOR` on a tempfile" pattern from the original spec
+draft was replaced with this inline editor because (a) there is no
+existing `$EDITOR` precedent in the dux codebase to mirror, (b)
+spawning external processes from the TUI broadens attack surface,
+and (c) `EditMacros` already uses the inline `with_multiline(N)`
+pattern for prompt-shaped text. The trade-off: editing >4 visible
+lines requires scrolling the inline editor; pasting a long prompt
+still works.
+
+Mouse: clicking the System prompt header row sets focus to
+`SettingsFocus::SystemPrompt`; clicking inside the expanded editor
+is a no-op for hit-testing (the operator can already type once
+focused).
+
+### 15.5 Apply timing
+
+`system_prompt` is a spawn-time setting (the wrapper reads
+`DUX_SYSTEM_PROMPT` once at PTY spawn). The save-summary code rolls
+a system-prompt change into the respawn warning, alongside YOLO and
+AMQ verify, so the operator sees:
+
+```
+Session settings saved: system prompt, spawn-time settings. Press <Reconnect> for spawn-time settings (YOLO, AMQ verify) to take effect.
+```
+
+### 15.6 Tests
+
+- `tests/storage_integration.rs::session_settings_full_payload_round_trip_through_sqlite`
+  — round-trips `system_prompt: Some("…")` through sqlite.
+- `tests/pty_integration.rs::to_pty_env_emits_system_prompt_only_when_set_and_non_blank`
+  + `to_pty_env_emits_system_prompt_for_every_provider` — env-var
+  emission contract.
+- `src/app/sessions.rs` test module — modal seeding,
+  whitespace-only-persists-as-None, save triggers respawn warning,
+  focus cycle includes SystemPrompt.
+- `dux-amq/tests/wrappers.bats` — claude flag pair, codex/gemini
+  warn-and-drop, multi-line preservation, default-deny baseline
+  (no flag when env unset/empty).
+
+### 15.7 Asymmetric default
+
+A missing or corrupted `system_prompt` field MUST default to `None`
+(no override). The serde `#[serde(default)]` attribute combined with
+the existing `parse_or_default` recovery path means:
+
+- pre-§15 binaries' blobs (no `system_prompt` key) → `None` on load.
+- corrupted JSON → `SessionSettings::default()` → `None`.
+- explicit `null` in the JSON → `None`.
+
+Tests pin all three paths.
