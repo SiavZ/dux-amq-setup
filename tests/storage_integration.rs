@@ -117,11 +117,9 @@ fn backup_to_produces_valid_db() {
 }
 
 /// audit03 Phase 01: a session whose `settings` is the default value
-/// must round-trip through sqlite without surprises. The default form
-/// has no fields (yet) but its JSON shape is fixed (`{}`) so we can
-/// observe it on disk too.
+/// must round-trip through sqlite without surprises.
 #[test]
-fn session_settings_round_trip_through_sqlite() {
+fn session_settings_default_round_trip_through_sqlite() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = SessionStore::open(dir.path().join("rt.sqlite3").as_path()).expect("open");
 
@@ -135,7 +133,11 @@ fn session_settings_round_trip_through_sqlite() {
         .expect("session present");
     assert_eq!(s.settings, SessionSettings::default());
 
-    // Confirm the on-disk JSON is the canonical default shape.
+    // The on-disk JSON must be valid JSON (so future readers across
+    // versions can deserialise it). Don't assert on a specific string
+    // shape — adding a field to `SessionSettings` would break a
+    // brittle equality check, which is exactly the forward-compat
+    // contract we're trying to preserve.
     let raw_json: Option<String> = store
         .conn()
         .query_row(
@@ -144,7 +146,42 @@ fn session_settings_round_trip_through_sqlite() {
             |row| row.get(0),
         )
         .expect("read raw json");
-    assert_eq!(raw_json.as_deref(), Some("{}"));
+    let raw = raw_json.expect("session_settings should be NOT NULL after upsert");
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("on-disk json must parse");
+    assert!(
+        parsed.is_object(),
+        "session_settings must serialize to a JSON object, got {raw}"
+    );
+}
+
+/// audit03 Phase 01 / Phase 2: a session whose `settings` carries
+/// non-default values for every typed knob must round-trip through
+/// sqlite preserving each one. This is the canary that
+/// `serde(default)` on individual fields hasn't been mis-applied to
+/// also strip data on serialize.
+#[test]
+fn session_settings_full_payload_round_trip_through_sqlite() {
+    use dux::model::ContextMode;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = SessionStore::open(dir.path().join("full.sqlite3").as_path()).expect("open");
+
+    let mut session = fixture_session("rt-full");
+    session.settings = SessionSettings {
+        mode: ContextMode::Worker,
+        yolo_permissions: true,
+        watch_rule_arm: [(0usize, false), (2, true)].into_iter().collect(),
+        auto_clear_on_task_done: true,
+        verify_envelope_override: Some(true),
+    };
+    store.upsert_session(&session).expect("upsert");
+
+    let loaded = store.load_sessions().expect("load");
+    let s = loaded
+        .iter()
+        .find(|s| s.id == "rt-full")
+        .expect("session present");
+    assert_eq!(s.settings, session.settings);
 }
 
 /// audit03 Phase 01 asymmetric-default policy: a row whose

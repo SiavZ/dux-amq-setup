@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -447,14 +449,76 @@ pub enum SessionSurface {
 /// The asymmetric-risk policy: an empty/missing/corrupt blob must
 /// never enable autonomous behaviour that could disrupt the operator.
 ///
-/// audit03 Phase 01: introduced as part of the session-settings
-/// modal feature. Phase 1 of the rollout (this commit) seeds the
-/// type with its default-only shape so the storage column has
-/// somewhere to deserialise into; subsequent phases populate the
-/// `mode`, `yolo_permissions`, `watch_rule_arm`, etc. fields.
+/// audit03 Phase 01: Phase 2 (this commit) populates the typed knobs
+/// — `mode`, `yolo_permissions`, `watch_rule_arm`, `auto_clear_on_task_done`,
+/// `verify_envelope_override`. Consumers (PTY env, watch engine,
+/// inject runtime, modal) wire up in subsequent phases.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct SessionSettings {}
+pub struct SessionSettings {
+    /// Context mode. Drives auto-clear policy and AMQ sentinel
+    /// injection. See [`ContextMode`] for the variants and asymmetric
+    /// defaults. Default: [`ContextMode::Attended`].
+    #[serde(default)]
+    pub mode: ContextMode,
+
+    /// `--dangerously-skip-permissions` (claude) /
+    /// `--sandbox-bypass` (codex) for this session. When `true`, dux
+    /// sets `CLAUDE_AMQ_YOLO=1` (and the codex equivalent) in the PTY
+    /// child env at spawn time; the `claude-amq` / `codex-amq`
+    /// wrappers translate that into the appropriate CLI flag.
+    /// Default: `false` — operator must opt in.
+    #[serde(default)]
+    pub yolo_permissions: bool,
+
+    /// Per-rule arm/disarm overrides keyed by rule index in the
+    /// provider's `[providers.<X>.watch]` array. Absence = use the
+    /// rule's config-default arm state (always armed today).
+    /// Persisted so a manual disarm survives restart. Default: empty.
+    #[serde(default)]
+    pub watch_rule_arm: HashMap<usize, bool>,
+
+    /// Built-in auto-clear-after-task-done rule, only meaningful when
+    /// `mode == ContextMode::Worker`. Default `false` even for
+    /// workers — the operator opts in twice (set Worker mode AND tick
+    /// this box) to enable autonomous context clearing.
+    #[serde(default)]
+    pub auto_clear_on_task_done: bool,
+
+    /// Per-session override for `[amq.inject].verify_envelope`. `None`
+    /// = inherit the global config default. `Some(true)` = strict
+    /// HMAC verification for this session. `Some(false)` = skip
+    /// verification for this session. Applied at PTY spawn time;
+    /// requires a respawn to take effect.
+    #[serde(default)]
+    pub verify_envelope_override: Option<bool>,
+}
+
+/// Operator-declared "what is this session for". Drives auto-clear
+/// policy, AMQ sentinel injection, and (in future) per-mode watch
+/// rules. The variants are deliberately coarse and stable across the
+/// roadmap; finer grain belongs on individual `SessionSettings`
+/// knobs, not on new modes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextMode {
+    /// Operator-managed session. **Never** auto-cleared, never sees
+    /// the task-done sentinel injected into AMQ wakes. The default
+    /// — applies to humans driving the session by hand.
+    #[default]
+    Attended,
+    /// Coordinator that talks to peers via AMQ. Persistent context.
+    /// Today behaves like [`Self::Attended`] for clearing semantics;
+    /// the label is reserved as a future extension point for
+    /// orchestrator-only watch rules and similar.
+    Orchestrator,
+    /// Stateless processor. Receives task instructions via AMQ,
+    /// emits a `[task-done]` sentinel when the task completes, then
+    /// gets its context cleared if `auto_clear_on_task_done` is also
+    /// true. The dux-side AMQ drainer appends a sentinel-required
+    /// postscript to wakes for these sessions.
+    Worker,
+}
 
 impl SessionSettings {
     /// Parse from the sqlite `session_settings` column value.
