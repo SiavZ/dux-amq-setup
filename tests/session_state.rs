@@ -198,6 +198,7 @@ fn session_state_persists_round_trip_through_store() {
             exit_code: Some(0),
             exited_at: now,
         },
+        settings: dux::model::SessionSettings::default(),
         created_at: now,
         updated_at: now,
     };

@@ -505,8 +505,37 @@ impl App {
     /// become Alt-Enter (a newline within the prompt) rather than
     /// premature submits — the same chokepoint watch effects use.
     /// The inflight file stays on disk; phase 2 unlinks it.
+    ///
+    /// audit03 Phase 5: when the receiving session is in
+    /// [`crate::model::ContextMode::Worker`] mode, dux appends a
+    /// postscript instructing the agent to emit
+    /// `[task-done]` (the literal sentinel from
+    /// `crate::watch::builtin::TASK_DONE_SENTINEL`) at end-of-task.
+    /// The auto-clear watch rule (Phase 4) keys off that sentinel to
+    /// wipe the worker's context. The postscript lives dux-side
+    /// rather than in the bash bridge so the bridge stays stateless;
+    /// the bridge already operates outside dux's process tree (the
+    /// AMQ wake daemon `setsid`s it) and has no SQLite access.
     fn deliver_inject_body(&mut self, session_id: &str, receiver: &str, body: &str) {
-        let payload = crate::app::input::macro_payload_bytes(body);
+        let mode = self
+            .git
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .map(|s| s.settings.mode)
+            .unwrap_or_default();
+
+        let body_with_postscript = apply_inject_postscript(body, mode);
+        if body_with_postscript.len() != body.len() {
+            tracing::debug!(
+                target: "dux::session_settings",
+                session_id = %session_id,
+                receiver = %receiver,
+                "appending Worker-mode task-done postscript to AMQ wake",
+            );
+        }
+
+        let payload = crate::app::input::macro_payload_bytes(&body_with_postscript);
         let write_result = self
             .find_pty_handle(session_id)
             .map(|handle| handle.write_bytes(&payload));
@@ -721,9 +750,34 @@ impl App {
     }
 }
 
+/// audit03 Phase 5: apply the Worker-mode postscript to an AMQ wake
+/// body. Worker sessions get a sentinel-required note appended;
+/// Attended/Orchestrator sessions get the body verbatim. Pure
+/// function: no I/O, no global state, easy to unit-test.
+///
+/// The postscript ends with the literal
+/// [`crate::watch::builtin::TASK_DONE_SENTINEL`] token so the
+/// auto-clear watch rule (Phase 4) keys off the same string the
+/// agent is asked to emit. Keeping these two on the same constant
+/// avoids drift if the sentinel ever changes.
+pub(crate) fn apply_inject_postscript(body: &str, mode: crate::model::ContextMode) -> String {
+    match mode {
+        crate::model::ContextMode::Worker => {
+            format!(
+                "{body}\n\n[Orchestrator note] When this task is complete, end your reply with the literal token {sentinel} so the orchestration layer knows to clean up.",
+                sentinel = crate::watch::builtin::TASK_DONE_SENTINEL,
+            )
+        }
+        crate::model::ContextMode::Attended | crate::model::ContextMode::Orchestrator => {
+            body.to_string()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{match_receiver, sanitise_handle};
+    use super::{apply_inject_postscript, match_receiver, sanitise_handle};
+    use crate::model::ContextMode;
 
     #[test]
     fn sanitise_lowercases_uppercase_letters() {
@@ -842,5 +896,44 @@ mod tests {
     fn match_receiver_handles_empty_session_list() {
         let sessions: Vec<(&str, &str, &str)> = vec![];
         assert_eq!(match_receiver(sessions.iter().copied(), "anything"), None);
+    }
+
+    /// audit03 Phase 5: Worker-mode receivers get a sentinel-required
+    /// postscript appended; Attended/Orchestrator pass through verbatim.
+    /// The postscript MUST end with the literal `[task-done]` token so
+    /// the auto-clear watch rule (Phase 4) can match.
+    #[test]
+    fn postscript_appended_for_worker_mode() {
+        let body = "Please review the design doc.";
+        let out = apply_inject_postscript(body, ContextMode::Worker);
+        assert!(out.starts_with(body), "original body must come first");
+        assert!(
+            out.contains("[task-done]"),
+            "postscript must include the literal sentinel; got: {out}"
+        );
+        assert!(
+            out.contains("[Orchestrator note]"),
+            "postscript must be clearly labelled so the agent treats it as instructions"
+        );
+        assert!(out.len() > body.len(), "postscript must actually add bytes");
+    }
+
+    #[test]
+    fn postscript_skipped_for_attended_and_orchestrator() {
+        let body = "ad-hoc question for human review";
+        assert_eq!(apply_inject_postscript(body, ContextMode::Attended), body);
+        assert_eq!(
+            apply_inject_postscript(body, ContextMode::Orchestrator),
+            body
+        );
+    }
+
+    #[test]
+    fn postscript_uses_canonical_sentinel_constant() {
+        // Defensive: if the canonical sentinel ever changes, this
+        // test should be the first to fire because it pins the
+        // postscript output to the constant in `watch::builtin`.
+        let out = apply_inject_postscript("body", ContextMode::Worker);
+        assert!(out.contains(crate::watch::builtin::TASK_DONE_SENTINEL));
     }
 }

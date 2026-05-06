@@ -116,8 +116,38 @@ struct PendingIngest {
     dropped: bool,
 }
 
+/// Per-session env vars to set on a spawned PTY child. Empty by
+/// default; callers populate from
+/// [`crate::model::SessionSettings::to_pty_env`]. Distinct from the
+/// global `apply_terminal_env`, which sets terminal-protocol vars
+/// (`TERM`, `COLORTERM`, `DUX_PANE`) that don't depend on the
+/// session. New env vars whose value depends on which session is
+/// being spawned go here so the spawn path stays explicit about
+/// per-session state.
+///
+/// Order is preserved across `vars` so log lines stay reproducible
+/// and operator-set vars override later defaults if the same key
+/// appears twice (last-write-wins, the standard env semantic).
+#[derive(Clone, Debug, Default)]
+pub struct PerSessionEnv {
+    pub vars: Vec<(String, String)>,
+}
+
+impl PerSessionEnv {
+    /// Empty per-session env. Equivalent to `Default::default()` but
+    /// reads better at call sites that need to be explicit about
+    /// "this spawn has no per-session settings" (tests, companion
+    /// terminals).
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
 impl PtyClient {
-    /// Spawn a CLI command in a new PTY with the given size.
+    /// Spawn a CLI command in a new PTY with the given size and no
+    /// per-session env vars. Convenience for paths that don't have a
+    /// `SessionSettings` (tests, companion terminals); session-bound
+    /// spawns must use [`Self::spawn_with_env`].
     pub fn spawn(
         command: &str,
         args: &[String],
@@ -125,6 +155,39 @@ impl PtyClient {
         rows: u16,
         cols: u16,
         scrollback_lines: usize,
+    ) -> Result<Self> {
+        Self::spawn_with_env(
+            command,
+            args,
+            cwd,
+            rows,
+            cols,
+            scrollback_lines,
+            PerSessionEnv::empty(),
+        )
+    }
+
+    /// Spawn a CLI command in a new PTY with the given size and a
+    /// list of per-session env vars to set on the child before
+    /// `apply_terminal_env` is applied. The terminal-protocol vars
+    /// (`TERM`, `COLORTERM`, `DUX_PANE`) cannot be overridden by
+    /// per-session env — they're set last so the child always sees a
+    /// consistent baseline regardless of what the operator put in
+    /// `SessionSettings`.
+    ///
+    /// audit03 Phase 01 / Phase 3: introduced for `CLAUDE_AMQ_YOLO`,
+    /// `CODEX_AMQ_YOLO`, and `DUX_AMQ_VERIFY` propagation per
+    /// session. The global `set_var(DUX_AMQ_VERIFY)` workaround in
+    /// `App::bootstrap_with_lock` was removed in the same phase in
+    /// favour of this explicit per-spawn plumbing.
+    pub fn spawn_with_env(
+        command: &str,
+        args: &[String],
+        cwd: &Path,
+        rows: u16,
+        cols: u16,
+        scrollback_lines: usize,
+        per_session: PerSessionEnv,
     ) -> Result<Self> {
         let pty_system = NativePtySystem::default();
         let pair = pty_system
@@ -141,6 +204,9 @@ impl PtyClient {
             cmd.arg(arg);
         }
         cmd.cwd(cwd);
+        for (k, v) in &per_session.vars {
+            cmd.env(k, v);
+        }
         apply_terminal_env(&mut cmd);
 
         let child = pair

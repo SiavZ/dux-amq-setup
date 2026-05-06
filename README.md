@@ -108,6 +108,10 @@ The right pane is a full git staging area. Stage and unstage files, view syntax-
 
 Each agent gets its own companion terminal: a separate shell session in the same worktree. Use it for builds, tests, git operations, or anything else you'd normally do in a terminal. You can spawn multiple companion terminals per agent.
 
+### Per-Session Settings
+
+Every agent session has its own settings drawer (open via the `session-settings` palette command, or its keybinding) covering context mode (Attended / Orchestrator / Worker), YOLO permissions, per-rule arm/disarm for watch rules, auto-clear after task done, and an AMQ verify-envelope override. Defaults are intentionally cautious — a missing or corrupt settings blob always loads as Attended/no-YOLO/no-auto-clear, so an attacker who tampers with the database can't escalate a session into autonomous mode. Settings persist to sqlite and follow the agent across detach + reconnect.
+
 ### Forking Sessions
 
 See an agent going down the wrong path? Fork it. dux creates a new worktree with the current files copied over so you can try a different approach without losing the original session. It's branching, but for your AI conversations.

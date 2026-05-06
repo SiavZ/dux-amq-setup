@@ -1,8 +1,10 @@
+use std::collections::HashMap;
+
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::pty::PtyHandle;
+use crate::pty::{PerSessionEnv, PtyHandle};
 
 /// GitHub CLI availability status, checked once at startup.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -437,6 +439,183 @@ pub enum SessionSurface {
     Terminal,
 }
 
+/// Per-session settings, persisted as JSON in
+/// `agent_sessions.session_settings`. Designed for forward
+/// compatibility: unknown fields are ignored on deserialize, missing
+/// fields use defaults. Adding a new knob does NOT require a schema
+/// migration — only this struct grows.
+///
+/// All fields default to "do nothing" / "operator-managed" semantics.
+/// The asymmetric-risk policy: an empty/missing/corrupt blob must
+/// never enable autonomous behaviour that could disrupt the operator.
+///
+/// audit03 Phase 01: Phase 2 (this commit) populates the typed knobs
+/// — `mode`, `yolo_permissions`, `watch_rule_arm`, `auto_clear_on_task_done`,
+/// `verify_envelope_override`. Consumers (PTY env, watch engine,
+/// inject runtime, modal) wire up in subsequent phases.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionSettings {
+    /// Context mode. Drives auto-clear policy and AMQ sentinel
+    /// injection. See [`ContextMode`] for the variants and asymmetric
+    /// defaults. Default: [`ContextMode::Attended`].
+    #[serde(default)]
+    pub mode: ContextMode,
+
+    /// `--dangerously-skip-permissions` (claude) /
+    /// `--sandbox-bypass` (codex) for this session. When `true`, dux
+    /// sets `CLAUDE_AMQ_YOLO=1` (and the codex equivalent) in the PTY
+    /// child env at spawn time; the `claude-amq` / `codex-amq`
+    /// wrappers translate that into the appropriate CLI flag.
+    /// Default: `false` — operator must opt in.
+    #[serde(default)]
+    pub yolo_permissions: bool,
+
+    /// Per-rule arm/disarm overrides keyed by rule index in the
+    /// provider's `[providers.<X>.watch]` array. Absence = use the
+    /// rule's config-default arm state (always armed today).
+    /// Persisted so a manual disarm survives restart. Default: empty.
+    #[serde(default)]
+    pub watch_rule_arm: HashMap<usize, bool>,
+
+    /// Built-in auto-clear-after-task-done rule, only meaningful when
+    /// `mode == ContextMode::Worker`. Default `false` even for
+    /// workers — the operator opts in twice (set Worker mode AND tick
+    /// this box) to enable autonomous context clearing.
+    #[serde(default)]
+    pub auto_clear_on_task_done: bool,
+
+    /// Per-session override for `[amq.inject].verify_envelope`. `None`
+    /// = inherit the global config default. `Some(true)` = strict
+    /// HMAC verification for this session. `Some(false)` = skip
+    /// verification for this session. Applied at PTY spawn time;
+    /// requires a respawn to take effect.
+    #[serde(default)]
+    pub verify_envelope_override: Option<bool>,
+}
+
+/// Operator-declared "what is this session for". Drives auto-clear
+/// policy, AMQ sentinel injection, and (in future) per-mode watch
+/// rules. The variants are deliberately coarse and stable across the
+/// roadmap; finer grain belongs on individual `SessionSettings`
+/// knobs, not on new modes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextMode {
+    /// Operator-managed session. **Never** auto-cleared, never sees
+    /// the task-done sentinel injected into AMQ wakes. The default
+    /// — applies to humans driving the session by hand.
+    #[default]
+    Attended,
+    /// Coordinator that talks to peers via AMQ. Persistent context.
+    /// Today behaves like [`Self::Attended`] for clearing semantics;
+    /// the label is reserved as a future extension point for
+    /// orchestrator-only watch rules and similar.
+    Orchestrator,
+    /// Stateless processor. Receives task instructions via AMQ,
+    /// emits a `[task-done]` sentinel when the task completes, then
+    /// gets its context cleared if `auto_clear_on_task_done` is also
+    /// true. The dux-side AMQ drainer appends a sentinel-required
+    /// postscript to wakes for these sessions.
+    Worker,
+}
+
+impl SessionSettings {
+    /// Parse from the sqlite `session_settings` column value.
+    /// `None` → returns `Self::default()`. Malformed JSON → logs
+    /// warning and returns `Self::default()` (asymmetric-fail-safe).
+    pub fn parse_or_default(raw: Option<&str>) -> Self {
+        let Some(raw) = raw else {
+            return Self::default();
+        };
+        if raw.trim().is_empty() {
+            return Self::default();
+        }
+        match serde_json::from_str(raw) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(
+                    target: "dux::session_settings",
+                    err = %err,
+                    raw = %raw,
+                    "session_settings JSON malformed; falling back to default",
+                );
+                Self::default()
+            }
+        }
+    }
+
+    /// Serialise for storage. Always returns valid JSON.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("SessionSettings serialises")
+    }
+
+    /// Translate per-session settings into env vars for the spawned
+    /// PTY child. The wrappers (`claude-amq`, `codex-amq`, etc.) read
+    /// these to decide CLI flags. Order is stable for log
+    /// readability.
+    ///
+    /// `verify_envelope_global` is the value of
+    /// `[amq.inject].verify_envelope` from `config.toml` — used as
+    /// the fallback when this session's `verify_envelope_override`
+    /// is `None`. Passing it through here keeps the global config
+    /// look-up at the call site (workers/sessions) where the
+    /// `Config` is already in scope, instead of plumbing config
+    /// access into every PTY spawn helper.
+    pub fn to_pty_env(
+        &self,
+        provider: &ProviderKind,
+        verify_envelope_global: bool,
+    ) -> PerSessionEnv {
+        let mut vars: Vec<(String, String)> = Vec::new();
+        if self.yolo_permissions {
+            match provider.as_str() {
+                "claude" => {
+                    vars.push(("CLAUDE_AMQ_YOLO".into(), "1".into()));
+                }
+                "codex" => {
+                    vars.push(("CODEX_AMQ_YOLO".into(), "1".into()));
+                }
+                "gemini" => {
+                    // Gemini wrapper has no YOLO flag today; document
+                    // the no-op rather than silently dropping it.
+                    tracing::debug!(
+                        target: "dux::session_settings",
+                        provider = %provider.as_str(),
+                        "yolo_permissions=true ignored: no wrapper flag for this provider",
+                    );
+                }
+                _ => {
+                    tracing::debug!(
+                        target: "dux::session_settings",
+                        provider = %provider.as_str(),
+                        "yolo_permissions=true ignored: provider has no YOLO mapping",
+                    );
+                }
+            }
+        }
+        // Always export DUX_AMQ_VERIFY so the wake daemon's bridge
+        // sees a deterministic value. Per-session override beats
+        // global; both serialize the same way (`1` strict, `0` skip)
+        // so the wrapper logic stays single-branch.
+        let strict = self
+            .verify_envelope_override
+            .unwrap_or(verify_envelope_global);
+        vars.push((
+            "DUX_AMQ_VERIFY".into(),
+            if strict { "1".into() } else { "0".into() },
+        ));
+        tracing::debug!(
+            target: "dux::session_settings",
+            provider = %provider.as_str(),
+            yolo = self.yolo_permissions,
+            verify = strict,
+            "translated session_settings to pty env",
+        );
+        PerSessionEnv { vars }
+    }
+}
+
 /// In-memory representation of a session. After audit02 P1-Z phase 2
 /// this struct owns its [`SessionState`] (which in turn may own a
 /// [`PtyHandle`]).
@@ -466,6 +645,11 @@ pub struct AgentSession {
     /// `dux` crate but should go through `App::transition_*` helpers
     /// where possible so we get one chokepoint for state changes.
     pub state: SessionState,
+    /// Per-session settings (mode, YOLO, watch-rule overrides, AMQ
+    /// verify override, etc.). Persisted to `session_settings` as JSON.
+    /// Defaults to [`SessionSettings::default`] for new and legacy
+    /// pre-v3 rows.
+    pub settings: SessionSettings,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -523,6 +707,7 @@ impl AgentSession {
             title: self.title.clone(),
             started_providers: self.started_providers.clone(),
             state,
+            settings: self.settings.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
         }

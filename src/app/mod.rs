@@ -39,8 +39,8 @@ use crate::keybindings::{
 use crate::lockfile::SingleInstanceLock;
 use crate::logger;
 use crate::model::{
-    AgentSession, ChangedFile, CompanionTerminalStatus, Project, ProviderKind, SessionState,
-    SessionSurface,
+    AgentSession, ChangedFile, CompanionTerminalStatus, ContextMode, Project, ProviderKind,
+    SessionSettings, SessionState, SessionSurface,
 };
 use crate::provider;
 use crate::pty::PtyClient;
@@ -543,6 +543,126 @@ pub(crate) enum PromptState {
         last_refresh: Instant,
         first_sample: bool,
     },
+    SessionSettings(SessionSettingsPrompt),
+}
+
+/// State for the per-session settings modal. Built from the live
+/// [`AgentSession::settings`] when the modal opens; the modal mutates
+/// a copy and only writes back on save (Enter / Save button). On
+/// cancel (Esc / Cancel button) the draft is discarded.
+///
+/// audit03 Phase 6.
+#[derive(Clone, Debug)]
+pub(crate) struct SessionSettingsPrompt {
+    pub session_id: String,
+    /// Pretty label for the modal header — falls back to the branch
+    /// name when the session has no operator-set title.
+    pub session_label: String,
+    /// Provider for the underlying session — captured at modal open
+    /// time so any future provider-specific UI logic (e.g. hiding
+    /// YOLO for providers without a wrapper flag) can read it without
+    /// re-resolving the session row. Currently informational only.
+    #[allow(dead_code)]
+    pub provider: ProviderKind,
+    pub draft: SessionSettings,
+    pub draft_title: TextInput,
+    pub focus: SettingsFocus,
+    /// Static metadata about the watch rules available for this
+    /// session's provider — populated once when the modal opens and
+    /// never re-queried (the engine state can change underneath, but
+    /// the rule list itself is config-driven and stable).
+    pub rules: Vec<WatchRuleSummary>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WatchRuleSummary {
+    pub idx: usize,
+    pub label: String,
+    /// Whether the rule is currently armed. When the session has a
+    /// live engine we read this from the engine's snapshot; otherwise
+    /// we assume armed (the config-default). The modal uses this for
+    /// the "live" badge and to decide what state a tick toggles to.
+    pub armed: bool,
+}
+
+/// Cursor position within the session-settings modal. `Tab`/`Shift-Tab`
+/// and `↑`/`↓` cycle through the variants.
+///
+/// `WatchRule(idx)` indexes into [`SessionSettingsPrompt::rules`];
+/// out-of-range indices are skipped during navigation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SettingsFocus {
+    Title,
+    ModeAttended,
+    ModeOrchestrator,
+    ModeWorker,
+    Yolo,
+    WatchRule(usize),
+    AutoClearOnDone,
+    VerifyDefault,
+    VerifyStrict,
+    VerifySkip,
+    SaveButton,
+    CancelButton,
+}
+
+impl SettingsFocus {
+    /// Cycle to the next focus position. `rules_len` is the count of
+    /// available watch rules — when zero, the WatchRule slots are
+    /// skipped entirely. Wraps around at the end of the modal.
+    pub(crate) fn next(self, rules_len: usize) -> Self {
+        match self {
+            Self::Title => Self::ModeAttended,
+            Self::ModeAttended => Self::ModeOrchestrator,
+            Self::ModeOrchestrator => Self::ModeWorker,
+            Self::ModeWorker => Self::Yolo,
+            Self::Yolo => {
+                if rules_len > 0 {
+                    Self::WatchRule(0)
+                } else {
+                    Self::AutoClearOnDone
+                }
+            }
+            Self::WatchRule(idx) => {
+                if idx + 1 < rules_len {
+                    Self::WatchRule(idx + 1)
+                } else {
+                    Self::AutoClearOnDone
+                }
+            }
+            Self::AutoClearOnDone => Self::VerifyDefault,
+            Self::VerifyDefault => Self::VerifyStrict,
+            Self::VerifyStrict => Self::VerifySkip,
+            Self::VerifySkip => Self::SaveButton,
+            Self::SaveButton => Self::CancelButton,
+            Self::CancelButton => Self::Title,
+        }
+    }
+
+    /// Cycle to the previous focus position; mirror of [`Self::next`].
+    pub(crate) fn prev(self, rules_len: usize) -> Self {
+        match self {
+            Self::Title => Self::CancelButton,
+            Self::ModeAttended => Self::Title,
+            Self::ModeOrchestrator => Self::ModeAttended,
+            Self::ModeWorker => Self::ModeOrchestrator,
+            Self::Yolo => Self::ModeWorker,
+            Self::WatchRule(0) => Self::Yolo,
+            Self::WatchRule(idx) => Self::WatchRule(idx - 1),
+            Self::AutoClearOnDone => {
+                if rules_len > 0 {
+                    Self::WatchRule(rules_len - 1)
+                } else {
+                    Self::Yolo
+                }
+            }
+            Self::VerifyDefault => Self::AutoClearOnDone,
+            Self::VerifyStrict => Self::VerifyDefault,
+            Self::VerifySkip => Self::VerifyStrict,
+            Self::SaveButton => Self::VerifySkip,
+            Self::CancelButton => Self::SaveButton,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1092,30 +1212,15 @@ impl App {
             "bootstrapping dux",
         );
 
-        // Apply `[amq.inject].verify_envelope` to the process env before
-        // we spawn any PTY. The bridge (running deep inside the AMQ
-        // wake daemon's process tree, far from dux's own state) reads
-        // `DUX_AMQ_VERIFY` to pick strict vs. skip mode. Setting it
-        // here means every PTY child — and the wake daemon they spawn —
-        // inherits the right value via portable_pty's default
-        // env-propagation. Skipping the var altogether keeps
-        // out-of-process consumers (operators running plain
-        // `dux-amq-inject-bridge` outside dux) on the default skip
-        // mode without false-tripping strict verification.
-        //
-        // `set_var` / `remove_var` are unsafe in Rust 2024 because of
-        // multi-threaded racing concerns; we run before any worker
-        // thread is spawned, so this is safe in practice.
-        unsafe {
-            if config.amq.inject.verify_envelope {
-                std::env::set_var("DUX_AMQ_VERIFY", "1");
-            } else {
-                // Be defensive: if the operator launched dux from a
-                // shell that already had DUX_AMQ_VERIFY=1 exported,
-                // unset it so config wins.
-                std::env::remove_var("DUX_AMQ_VERIFY");
-            }
-        }
+        // audit03 Phase 01 / Phase 3: `DUX_AMQ_VERIFY` now lives in
+        // `SessionSettings.verify_envelope_override` and is set per-PTY
+        // in `PtyClient::spawn_with_env` via `SessionSettings::to_pty_env`.
+        // Sessions whose override is `None` inherit
+        // `config.amq.inject.verify_envelope` at spawn time. This
+        // removes the previous `unsafe { set_var(...) }` workaround that
+        // mutated the dux process env and relied on portable_pty's
+        // default env-propagation — see audit03/01-session-settings-modal.md
+        // §5.4 for the rationale.
 
         // Validate and build runtime keybindings from config.
         if let Err(msg) = validate_keys(&config.keys) {
@@ -1848,6 +1953,7 @@ impl App {
             "rename-agent" => self.open_rename_session(),
             "kill-running" => self.open_kill_running(),
             "watch-rules" => self.open_watch_rules_prompt(),
+            "session-settings" => self.open_session_settings(),
             "reconnect-agent" => self.reconnect_selected_session(),
             "force-reconnect-agent" => self.force_reconnect_agent(),
             "show-agent" => self.activate_center_agent(),
@@ -2664,19 +2770,51 @@ impl App {
     /// engine and skips engine construction entirely so the per-tick
     /// matcher loop has no work for this session.
     pub(crate) fn attach_watch_engine(&mut self, session_id: &str) {
-        let provider_kind = match self.git.sessions.iter().find(|s| s.id == session_id) {
-            Some(s) => s.provider.clone(),
+        let (provider_kind, settings) = match self.git.sessions.iter().find(|s| s.id == session_id)
+        {
+            Some(s) => (s.provider.clone(), s.settings.clone()),
             None => return,
         };
-        let rules: Vec<crate::watch::WatchRule> =
-            match self.config.providers.commands.get(provider_kind.as_str()) {
-                Some(cfg) if !cfg.watch.is_empty() => cfg.watch.clone(),
-                _ => {
-                    self.runtime.watch_engines.remove(session_id);
-                    return;
-                }
-            };
-        let (engine, errors) = crate::watch::WatchEngine::new(session_id.to_string(), &rules);
+        // Start from the provider's `[providers.<X>.watch]` rules.
+        let mut rules: Vec<crate::watch::WatchRule> = self
+            .config
+            .providers
+            .commands
+            .get(provider_kind.as_str())
+            .map(|cfg| cfg.watch.clone())
+            .unwrap_or_default();
+
+        // audit03 Phase 4: append the built-in auto-clear-on-task-done
+        // rule when the operator has both put the session in Worker
+        // mode AND ticked the auto-clear box. Asymmetric default: a
+        // session with `mode = Attended` (the default) never sees this
+        // rule even with `auto_clear_on_task_done = true`, because the
+        // Worker postscript that produces the sentinel is the only
+        // way the agent learns to emit it. Enabling auto-clear without
+        // Worker mode would be a no-op anyway, so we don't bother.
+        let auto_clear_idx = if matches!(settings.mode, crate::model::ContextMode::Worker)
+            && settings.auto_clear_on_task_done
+        {
+            let clear_cmd = crate::watch::builtin::provider_clear_command(&provider_kind);
+            rules.push(crate::watch::builtin::auto_clear_rule_for(clear_cmd));
+            tracing::debug!(
+                target: "dux::session_settings",
+                session_id = %session_id,
+                provider = %provider_kind.as_str(),
+                clear_cmd = %clear_cmd,
+                "attached built-in auto-clear-on-task-done rule",
+            );
+            Some(rules.len() - 1)
+        } else {
+            None
+        };
+
+        if rules.is_empty() {
+            self.runtime.watch_engines.remove(session_id);
+            return;
+        }
+
+        let (mut engine, errors) = crate::watch::WatchEngine::new(session_id.to_string(), &rules);
         for err in &errors {
             tracing::warn!(
                 target: "dux::watch",
@@ -2686,6 +2824,31 @@ impl App {
                 "watch rule load error",
             );
         }
+
+        // audit03 Phase 4: replay per-session arm/disarm overrides so
+        // a manual disarm survives restart. The built-in rule is at a
+        // known index (`auto_clear_idx`); user-config rules occupy the
+        // 0..n range that the modal exposes.
+        for (&idx, &armed) in &settings.watch_rule_arm {
+            // Skip overrides that point past the rule list (e.g. config
+            // shrunk between dux runs). We don't error — the operator
+            // is allowed to leave stale overrides in place.
+            if idx >= engine.rule_count() {
+                continue;
+            }
+            // The built-in rule's index is reserved; ignore overrides
+            // for it (the modal also won't surface its index, but be
+            // defensive against forged blobs).
+            if Some(idx) == auto_clear_idx {
+                continue;
+            }
+            if armed {
+                engine.rearm(idx);
+            } else {
+                engine.disarm(idx);
+            }
+        }
+
         if engine.rule_count() > 0 {
             self.runtime
                 .watch_engines

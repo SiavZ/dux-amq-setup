@@ -89,6 +89,7 @@ pub enum Action {
     ForceReconnectAgent,
     ChangeTheme,
     WatchRules,
+    SessionSettings,
 }
 
 /// Where a binding's key combo is matched.
@@ -258,6 +259,7 @@ impl Action {
             Action::ForceReconnectAgent => "force_reconnect_agent",
             Action::ChangeTheme => "change_theme",
             Action::WatchRules => "watch_rules",
+            Action::SessionSettings => "session_settings",
         }
     }
 
@@ -358,6 +360,9 @@ impl Action {
             Action::WatchRules => {
                 "Open a modal listing every loaded watch rule across sessions, with controls to disarm or re-arm individual rules."
             }
+            Action::SessionSettings => {
+                "Open the per-session settings modal for the selected session (mode, YOLO, watch-rule arm/disarm, auto-clear, AMQ verify override)."
+            }
         }
     }
 
@@ -439,6 +444,7 @@ impl Action {
             | Action::ChangeDefaultProvider
             | Action::ChangeTheme
             | Action::WatchRules => None,
+            Action::SessionSettings => Some("Global"),
         }
     }
 }
@@ -1469,6 +1475,24 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         palette: Some(PaletteEntry {
             name: "watch-rules",
             description: "Manage watch rules — disarm or re-arm individual rules across sessions",
+        }),
+    },
+    // audit03 Phase 6: per-session settings modal. Default
+    // Ctrl-Shift-S — verified free in this BINDING_DEFS table at
+    // implementation time (no other binding uses it). Operator can
+    // rebind via `[keys]` like any other action.
+    BindingDef {
+        action: Action::SessionSettings,
+        default_keys: &[key!(ctrl - shift - s)],
+        scopes: &[BindingScope::Global],
+        help: Some(HelpEntry {
+            section: "Global",
+            description: "Open per-session settings (mode, YOLO, watch rules, auto-clear)",
+        }),
+        hint_contexts: &[],
+        palette: Some(PaletteEntry {
+            name: "session-settings",
+            description: "Per-session settings (mode, YOLO, watch rules, auto-clear, AMQ verify)",
         }),
     },
 ];
