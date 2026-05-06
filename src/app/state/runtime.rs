@@ -101,4 +101,16 @@ pub(crate) struct RuntimeState {
     /// receiver per `crate::app::inject_runtime::HOLD_LOG_RATE_LIMIT`
     /// (60 s) so the JSON log doesn't grow with the tick rate.
     pub(crate) amq_inject_last_held_logged: HashMap<String, Instant>,
+    /// Per-session timestamp of the last byte the operator forwarded
+    /// from their keyboard (or paste / macro / mouse-pass-through)
+    /// into the session's PTY. Used by `tick_amq_inject` to soften
+    /// the active-session skip rule from "skip whenever interactive
+    /// mode is on" to "skip only when interactive AND the operator
+    /// has typed within the last `[amq.inject].active_session_quiet_secs`
+    /// (default 60 s)". Operator-driven: the goal is to deliver
+    /// messages while the operator is watching but not typing.
+    /// Programmatic PTY writes (drainer, watch effects) MUST NOT
+    /// touch this map or they would feed back into themselves and
+    /// permanently block delivery.
+    pub(crate) last_user_keystroke: HashMap<String, Instant>,
 }

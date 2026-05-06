@@ -843,13 +843,31 @@ impl App {
                 } else {
                     return Ok(false);
                 };
-                let filtered = self.filtered_macros(&query);
-                if let Some(&(name, text)) = filtered.get(selected) {
+                // Pull the (name, text) pair out into owned Strings
+                // before doing any &mut self work — `filtered_macros`
+                // returns slices borrowed from `self.macros`, and the
+                // record-keystroke call below needs &mut self.
+                let chosen: Option<(String, String)> = {
+                    let filtered = self.filtered_macros(&query);
+                    filtered
+                        .get(selected)
+                        .map(|&(name, text)| (name.to_string(), text.to_string()))
+                };
+                if let Some((name, text)) = chosen {
+                    let mut wrote = false;
                     if let Some(provider) = self.selected_terminal_surface_client() {
-                        let payload = macro_payload_bytes(text);
-                        let _ = provider.write_bytes(&payload);
+                        let payload = macro_payload_bytes(&text);
+                        if provider.write_bytes(&payload).is_ok() {
+                            wrote = true;
+                        }
                     }
-                    let name = name.to_string();
+                    if wrote {
+                        // Macros are operator-initiated input, not programmatic.
+                        // Update the active-session quiet-window timestamp so
+                        // the AMQ drainer briefly holds delivery (matches
+                        // typing semantics).
+                        self.record_user_keystroke_for_active_session();
+                    }
                     self.set_info(format!("Sent macro \"{name}\"."));
                 }
                 self.close_macro_bar();
@@ -1578,6 +1596,16 @@ impl App {
             }
         }
 
+        // Record operator-driven keystroke time on the active session
+        // BEFORE flushing — once flush_forward_batch clears the batch
+        // we lose the signal. The drainer's active-session skip rule
+        // reads this map to distinguish "operator is mid-typing" from
+        // "operator has interactive mode open but is idle." See
+        // `RuntimeState::last_user_keystroke` for the contract: only
+        // operator-driven writes touch this map; programmatic writes
+        // (drainer, watch effects) MUST NOT.
+        let had_user_input = !forward_batch.is_empty() && !is_scrolled_back;
+
         // Flush any remaining batched forward bytes.
         flush_forward_batch(
             &mut forward_batch,
@@ -1586,11 +1614,31 @@ impl App {
             self.selected_terminal_surface_client(),
         );
 
+        if had_user_input {
+            self.record_user_keystroke_for_active_session();
+        }
+
         if needs_selection_clear {
             self.terminal_selection = None;
         }
 
         Ok(false)
+    }
+
+    /// Record the current `Instant` against the selected session id in
+    /// `runtime.last_user_keystroke`. Called from the input handler
+    /// whenever bytes the operator typed (or pasted, or sent via a
+    /// macro / mouse pass-through) actually reach a session's PTY.
+    /// The drainer's active-session skip uses this map to decide
+    /// whether the operator is "actively typing" (skip) or just
+    /// "watching" (deliver).
+    pub(crate) fn record_user_keystroke_for_active_session(&mut self) {
+        let Some(session_id) = self.selected_session().map(|s| s.id.clone()) else {
+            return;
+        };
+        self.runtime
+            .last_user_keystroke
+            .insert(session_id, std::time::Instant::now());
     }
 
     fn handle_prompt_key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -5536,6 +5584,7 @@ mod tests {
             amq_inject_pending: std::collections::HashMap::new(),
             amq_inject_last_warned: std::collections::HashMap::new(),
             amq_inject_last_held_logged: std::collections::HashMap::new(),
+            last_user_keystroke: std::collections::HashMap::new(),
         };
         let git = crate::app::GitState {
             projects: vec![project],

@@ -491,6 +491,22 @@ pub struct AmqInjectConfig {
     /// to spawned PTYs when the value is `true`.
     #[serde(default = "default_amq_inject_verify_envelope")]
     pub verify_envelope: bool,
+    /// Quiet-window for the active-session skip rule. When the
+    /// operator has interactive mode open on a target session, the
+    /// drainer skips delivery only if the operator has typed within
+    /// the last `active_session_quiet_secs` seconds — otherwise it
+    /// delivers normally. The intent is "don't corrupt an in-flight
+    /// prompt" without "block delivery while the operator is just
+    /// watching." Default 60 (1 minute), which matches how long
+    /// most operators consider themselves "still typing" between
+    /// keystrokes. Set to `0` to disable the quiet window entirely
+    /// (= old behaviour: always skip whenever interactive mode is
+    /// on); set to a very large value (e.g. `u64::MAX`) to escape-
+    /// hatch into "always deliver, never skip" — though that's
+    /// rarely what you want because it WILL corrupt a half-typed
+    /// prompt.
+    #[serde(default = "default_amq_inject_active_session_quiet_secs")]
+    pub active_session_quiet_secs: u64,
 }
 
 fn default_amq_inject_enabled() -> bool {
@@ -524,6 +540,10 @@ fn default_amq_inject_verify_envelope() -> bool {
     false
 }
 
+fn default_amq_inject_active_session_quiet_secs() -> u64 {
+    60
+}
+
 impl Default for AmqInjectConfig {
     fn default() -> Self {
         Self {
@@ -535,6 +555,7 @@ impl Default for AmqInjectConfig {
             poll_interval_ms: default_amq_inject_poll_interval_ms(),
             max_message_bytes: default_amq_inject_max_message_bytes(),
             verify_envelope: default_amq_inject_verify_envelope(),
+            active_session_quiet_secs: default_amq_inject_active_session_quiet_secs(),
         }
     }
 }
@@ -1375,6 +1396,21 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
                  # (e.g. proxied across hosts).",
             )),
             value_fn: |c| FieldValue::Bool(c.amq.inject.verify_envelope),
+        },
+        ConfigEntry::Field {
+            key: "active_session_quiet_secs",
+            comment: Some(CommentSource::Static(
+                "# Quiet-window for the active-session skip rule. When the operator\n\
+                 # has interactive mode open on a target session, the drainer skips\n\
+                 # delivery only if the operator has typed within the last N seconds\n\
+                 # — otherwise it delivers normally. The intent is \"don't corrupt\n\
+                 # an in-flight prompt\" without \"block delivery while the operator\n\
+                 # is just watching.\" Default 60 (1 minute). Set 0 to disable the\n\
+                 # quiet window entirely (= old behaviour: always skip whenever\n\
+                 # interactive mode is on); a very large value disables the skip\n\
+                 # in practice (always deliver, may corrupt half-typed prompts).",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.active_session_quiet_secs),
         },
         ConfigEntry::Blank,
         ConfigEntry::Keys,
