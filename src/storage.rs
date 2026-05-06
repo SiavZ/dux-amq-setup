@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 
-use crate::model::{AgentSession, SessionState};
+use crate::model::{AgentSession, SessionSettings, SessionState};
 
 /// Ordered list of schema migrations. Each entry is `(version, sql)`.
 ///
@@ -30,6 +30,10 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (
         2,
         include_str!("storage/migrations/0002_session_state_v2.sql"),
+    ),
+    (
+        3,
+        include_str!("storage/migrations/0003_session_settings.sql"),
     ),
 ];
 
@@ -93,6 +97,11 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         // pre-`user_version` path the same way the older columns are
         // handled above.
         ensure_column(conn, "agent_sessions", "state_json", "text")?;
+        // audit03 Phase 01: nullable JSON column for the per-session
+        // settings blob. Migration 0003 adds it on the modern path;
+        // this shim covers the same legacy pre-`user_version`
+        // upgrade path.
+        ensure_column(conn, "agent_sessions", "session_settings", "text")?;
     }
     Ok(())
 }
@@ -248,12 +257,13 @@ impl SessionStore {
         // PTY-less variant.
         let state_json = session.state.to_json().ok();
         let legacy_status = legacy_status_str_for(&session.state);
+        let settings_json = session.settings.to_json();
         conn.execute(
             r#"
             insert into agent_sessions
-                (id, project_id, project_path, provider, source_branch, branch_name, worktree_path, title, started_providers, status, state_json, created_at, updated_at)
+                (id, project_id, project_path, provider, source_branch, branch_name, worktree_path, title, started_providers, status, state_json, session_settings, created_at, updated_at)
             values
-                (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             on conflict(id) do update set
                 project_path=excluded.project_path,
                 provider=excluded.provider,
@@ -264,6 +274,7 @@ impl SessionStore {
                 started_providers=excluded.started_providers,
                 status=excluded.status,
                 state_json=excluded.state_json,
+                session_settings=excluded.session_settings,
                 updated_at=excluded.updated_at
             "#,
             params![
@@ -278,6 +289,7 @@ impl SessionStore {
                 serialize_started_providers(&session.started_providers),
                 legacy_status,
                 state_json,
+                settings_json,
                 session.created_at.to_rfc3339(),
                 session.updated_at.to_rfc3339(),
             ],
@@ -289,7 +301,7 @@ impl SessionStore {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             r#"
-            select id, project_id, provider, source_branch, branch_name, worktree_path, title, project_path, started_providers, status, state_json, created_at, updated_at
+            select id, project_id, provider, source_branch, branch_name, worktree_path, title, project_path, started_providers, status, state_json, session_settings, created_at, updated_at
             from agent_sessions
             order by updated_at desc
             "#,
@@ -298,8 +310,9 @@ impl SessionStore {
             let started_providers: String = row.get(8)?;
             let legacy_status_str: String = row.get(9)?;
             let state_json: Option<String> = row.get(10)?;
-            let created_at: String = row.get(11)?;
-            let updated_at: String = row.get(12)?;
+            let session_settings_raw: Option<String> = row.get(11)?;
+            let created_at: String = row.get(12)?;
+            let updated_at: String = row.get(13)?;
             // audit02 P1-Z phase 2: prefer the new `state_json`
             // column. Fall back to the legacy `status` text if the
             // row pre-dates migration 0002 (or the JSON is corrupt).
@@ -310,6 +323,11 @@ impl SessionStore {
                 .unwrap_or_else(|| {
                     SessionState::from_legacy_status_str(&legacy_status_str, updated_dt)
                 });
+            // audit03 Phase 01: NULL or malformed settings JSON falls
+            // back to `SessionSettings::default()` per the asymmetric-
+            // default policy. Malformed blobs are logged inside
+            // `parse_or_default` so post-hoc diagnosis is possible.
+            let settings = SessionSettings::parse_or_default(session_settings_raw.as_deref());
             Ok(AgentSession {
                 id: row.get(0)?,
                 project_id: row.get::<_, String>(1).unwrap_or_default(),
@@ -321,6 +339,7 @@ impl SessionStore {
                 project_path: row.get(7)?,
                 started_providers: parse_started_providers(&started_providers),
                 state,
+                settings,
                 created_at: parse_time(&created_at).unwrap_or_else(Utc::now),
                 updated_at: updated_dt,
             })
@@ -468,6 +487,7 @@ fn test_session(
         title: None,
         started_providers: Vec::new(),
         state: SessionState::Created { created_at },
+        settings: crate::model::SessionSettings::default(),
         created_at,
         updated_at,
     }

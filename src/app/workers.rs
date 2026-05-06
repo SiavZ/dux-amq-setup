@@ -1493,6 +1493,7 @@ pub(crate) fn run_create_agent_job(
         state: crate::model::SessionState::Created {
             created_at: Utc::now(),
         },
+        settings: crate::model::SessionSettings::default(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };

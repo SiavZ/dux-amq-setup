@@ -102,6 +102,77 @@ fn migrate_idempotent() {
     );
 }
 
+/// audit03 Phase 01: opening a v2 database (one that already ran
+/// migrations 1+2) against a current binary must apply migration 0003
+/// and add the `session_settings` column without disturbing existing
+/// rows. Asserts the column exists and `user_version` is bumped to 3.
+#[test]
+fn migrate_v2_to_v3_adds_session_settings_column() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("v2.sqlite3");
+
+    // Build a database that has only migrations 1+2 applied. We can't
+    // call SessionStore::open here (it would run all migrations
+    // including 0003), so we run the SQL by hand and stamp
+    // `user_version` to 2 so the migration runner picks up at 0003 on
+    // the next open.
+    {
+        let conn = rusqlite::Connection::open(&path).expect("open raw");
+        conn.execute_batch(include_str!(
+            "../src/storage/migrations/0001_initial_schema.sql"
+        ))
+        .expect("apply 0001");
+        conn.execute_batch(include_str!(
+            "../src/storage/migrations/0002_session_state_v2.sql"
+        ))
+        .expect("apply 0002");
+        conn.execute_batch("PRAGMA user_version = 2;")
+            .expect("stamp v2");
+    }
+
+    // Sanity-check the pre-migration shape: no `session_settings`
+    // column yet.
+    {
+        let conn = rusqlite::Connection::open(&path).expect("reopen raw");
+        let cols: Vec<String> = conn
+            .prepare("pragma table_info(agent_sessions)")
+            .expect("table_info pre")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query pre")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect pre");
+        assert!(
+            !cols.contains(&"session_settings".to_string()),
+            "v2 schema should not have session_settings yet; columns = {cols:?}"
+        );
+    }
+
+    // Open via SessionStore — runs the remaining migrations.
+    let _store = dux::storage::SessionStore::open(&path).expect("open at v3");
+
+    // Confirm the new column exists, is nullable, and `user_version`
+    // advanced to 3 (or higher if newer migrations land later).
+    let conn = rusqlite::Connection::open(&path).expect("reopen post");
+    let cols: Vec<String> = conn
+        .prepare("pragma table_info(agent_sessions)")
+        .expect("table_info post")
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("query post")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect post");
+    assert!(
+        cols.contains(&"session_settings".to_string()),
+        "session_settings column missing post-migration; columns = {cols:?}"
+    );
+    let user_version: u32 = conn
+        .query_row("PRAGMA user_version;", [], |row| row.get(0))
+        .expect("read user_version");
+    assert!(
+        user_version >= 3,
+        "expected user_version >= 3 after 0003 migration, got {user_version}"
+    );
+}
+
 /// A `config.toml` that predates the `schema_version` field must still
 /// deserialize cleanly (thanks to `#[serde(default)]`) and be moved
 /// forward to `CONFIG_SCHEMA_CURRENT` by `migrate_config`. This

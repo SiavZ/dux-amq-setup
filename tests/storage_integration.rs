@@ -5,7 +5,28 @@
 //! `storage.rs`) so they exercise `dux::storage::SessionStore` through the
 //! library's public surface — the same way an external consumer would.
 
+use chrono::Utc;
+use dux::model::{AgentSession, ProviderKind, SessionSettings, SessionState};
 use dux::storage::SessionStore;
+
+fn fixture_session(id: &str) -> AgentSession {
+    let now = Utc::now();
+    AgentSession {
+        id: id.to_string(),
+        project_id: "proj".to_string(),
+        project_path: None,
+        provider: ProviderKind::new("claude"),
+        source_branch: "main".to_string(),
+        branch_name: format!("branch-{id}"),
+        worktree_path: format!("/tmp/{id}"),
+        title: None,
+        started_providers: Vec::new(),
+        state: SessionState::Created { created_at: now },
+        settings: SessionSettings::default(),
+        created_at: now,
+        updated_at: now,
+    }
+}
 
 /// PRAGMAs in `SessionStore::open` must put SQLite in WAL journaling mode.
 /// WAL is the foundation of the audit02 P1-W hardening: it allows the
@@ -93,4 +114,105 @@ fn backup_to_produces_valid_db() {
         .query_row("PRAGMA journal_mode;", [], |r| r.get(0))
         .expect("query journal_mode on restored DB");
     assert_eq!(mode.to_lowercase(), "wal");
+}
+
+/// audit03 Phase 01: a session whose `settings` is the default value
+/// must round-trip through sqlite without surprises. The default form
+/// has no fields (yet) but its JSON shape is fixed (`{}`) so we can
+/// observe it on disk too.
+#[test]
+fn session_settings_round_trip_through_sqlite() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = SessionStore::open(dir.path().join("rt.sqlite3").as_path()).expect("open");
+
+    let session = fixture_session("rt-default");
+    store.upsert_session(&session).expect("upsert");
+
+    let loaded = store.load_sessions().expect("load");
+    let s = loaded
+        .iter()
+        .find(|s| s.id == "rt-default")
+        .expect("session present");
+    assert_eq!(s.settings, SessionSettings::default());
+
+    // Confirm the on-disk JSON is the canonical default shape.
+    let raw_json: Option<String> = store
+        .conn()
+        .query_row(
+            "select session_settings from agent_sessions where id = 'rt-default'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read raw json");
+    assert_eq!(raw_json.as_deref(), Some("{}"));
+}
+
+/// audit03 Phase 01 asymmetric-default policy: a row whose
+/// `session_settings` column is NULL must load as
+/// `SessionSettings::default()` without any warning. Mirrors what an
+/// older dux binary would write when it doesn't know about the
+/// column.
+#[test]
+fn session_settings_default_when_column_null() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("null.sqlite3");
+    let store = SessionStore::open(&path).expect("open");
+
+    // Insert a normal row, then NULL out the column directly. Doing it
+    // this way (rather than constructing an INSERT by hand) means we
+    // exercise the real upsert path and only override the column we
+    // care about.
+    let session = fixture_session("null-row");
+    store.upsert_session(&session).expect("upsert");
+    store
+        .conn()
+        .execute(
+            "update agent_sessions set session_settings = NULL where id = 'null-row'",
+            [],
+        )
+        .expect("null out");
+
+    let loaded = store.load_sessions().expect("load");
+    let s = loaded
+        .iter()
+        .find(|s| s.id == "null-row")
+        .expect("session present");
+    assert_eq!(
+        s.settings,
+        SessionSettings::default(),
+        "NULL session_settings must load as default()"
+    );
+}
+
+/// audit03 Phase 01 asymmetric-default policy: a row whose
+/// `session_settings` blob is unparseable JSON must load as
+/// `SessionSettings::default()` (and emit a warn-level log, which the
+/// test suite doesn't assert on directly because we don't install a
+/// tracing subscriber here — the behavioural contract is the value).
+#[test]
+fn session_settings_default_when_blob_malformed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("bad.sqlite3");
+    let store = SessionStore::open(&path).expect("open");
+
+    let session = fixture_session("bad-row");
+    store.upsert_session(&session).expect("upsert");
+    store
+        .conn()
+        .execute(
+            "update agent_sessions set session_settings = '{not json' where id = 'bad-row'",
+            [],
+        )
+        .expect("write garbage");
+
+    let loaded = store.load_sessions().expect("load");
+    let s = loaded
+        .iter()
+        .find(|s| s.id == "bad-row")
+        .expect("session present");
+    assert_eq!(
+        s.settings,
+        SessionSettings::default(),
+        "malformed session_settings must load as default()"
+    );
 }

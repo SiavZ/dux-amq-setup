@@ -1195,6 +1195,7 @@ mod tests {
             title: None,
             started_providers: Vec::new(),
             state,
+            settings: crate::model::SessionSettings::default(),
             created_at: now,
             updated_at: now,
         };
@@ -1316,6 +1317,7 @@ mod tests {
                     title: None,
                     started_providers: Vec::new(),
                     state: SessionState::Created { created_at: now },
+                    settings: crate::model::SessionSettings::default(),
                     created_at: now,
                     updated_at: now,
                 })

@@ -437,6 +437,56 @@ pub enum SessionSurface {
     Terminal,
 }
 
+/// Per-session settings, persisted as JSON in
+/// `agent_sessions.session_settings`. Designed for forward
+/// compatibility: unknown fields are ignored on deserialize, missing
+/// fields use defaults. Adding a new knob does NOT require a schema
+/// migration — only this struct grows.
+///
+/// All fields default to "do nothing" / "operator-managed" semantics.
+/// The asymmetric-risk policy: an empty/missing/corrupt blob must
+/// never enable autonomous behaviour that could disrupt the operator.
+///
+/// audit03 Phase 01: introduced as part of the session-settings
+/// modal feature. Phase 1 of the rollout (this commit) seeds the
+/// type with its default-only shape so the storage column has
+/// somewhere to deserialise into; subsequent phases populate the
+/// `mode`, `yolo_permissions`, `watch_rule_arm`, etc. fields.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionSettings {}
+
+impl SessionSettings {
+    /// Parse from the sqlite `session_settings` column value.
+    /// `None` → returns `Self::default()`. Malformed JSON → logs
+    /// warning and returns `Self::default()` (asymmetric-fail-safe).
+    pub fn parse_or_default(raw: Option<&str>) -> Self {
+        let Some(raw) = raw else {
+            return Self::default();
+        };
+        if raw.trim().is_empty() {
+            return Self::default();
+        }
+        match serde_json::from_str(raw) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(
+                    target: "dux::session_settings",
+                    err = %err,
+                    raw = %raw,
+                    "session_settings JSON malformed; falling back to default",
+                );
+                Self::default()
+            }
+        }
+    }
+
+    /// Serialise for storage. Always returns valid JSON.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("SessionSettings serialises")
+    }
+}
+
 /// In-memory representation of a session. After audit02 P1-Z phase 2
 /// this struct owns its [`SessionState`] (which in turn may own a
 /// [`PtyHandle`]).
@@ -466,6 +516,11 @@ pub struct AgentSession {
     /// `dux` crate but should go through `App::transition_*` helpers
     /// where possible so we get one chokepoint for state changes.
     pub state: SessionState,
+    /// Per-session settings (mode, YOLO, watch-rule overrides, AMQ
+    /// verify override, etc.). Persisted to `session_settings` as JSON.
+    /// Defaults to [`SessionSettings::default`] for new and legacy
+    /// pre-v3 rows.
+    pub settings: SessionSettings,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -523,6 +578,7 @@ impl AgentSession {
             title: self.title.clone(),
             started_providers: self.started_providers.clone(),
             state,
+            settings: self.settings.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
