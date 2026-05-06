@@ -173,6 +173,7 @@ fn session_settings_full_payload_round_trip_through_sqlite() {
         watch_rule_arm: [(0usize, false), (2, true)].into_iter().collect(),
         auto_clear_on_task_done: true,
         verify_envelope_override: Some(true),
+        system_prompt: Some("You are a senior reviewer. Be thorough but kind.".to_string()),
     };
     store.upsert_session(&session).expect("upsert");
 

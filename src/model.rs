@@ -492,6 +492,21 @@ pub struct SessionSettings {
     /// requires a respawn to take effect.
     #[serde(default)]
     pub verify_envelope_override: Option<bool>,
+
+    /// Per-session system-prompt text appended to the upstream CLI's
+    /// default system prompt. When `Some` and non-empty (after trim),
+    /// dux exports `DUX_SYSTEM_PROMPT` in the PTY child env at spawn
+    /// time; the wrappers translate it into the provider-specific CLI
+    /// flag (claude `--append-system-prompt`; codex/gemini have no
+    /// equivalent today and warn-and-drop). Default `None` per the
+    /// asymmetric-fail-safe policy: a missing or corrupted blob never
+    /// injects a prompt. Whitespace-only values are also treated as
+    /// `None` so an operator can't accidentally inject literal
+    /// whitespace as a system prompt.
+    ///
+    /// audit03 Phase 01 §15: per-session system prompt knob.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
 }
 
 /// Operator-declared "what is this session for". Drives auto-clear
@@ -605,11 +620,29 @@ impl SessionSettings {
             "DUX_AMQ_VERIFY".into(),
             if strict { "1".into() } else { "0".into() },
         ));
+
+        // audit03 Phase 01 §15: per-session system prompt → DUX_SYSTEM_PROMPT.
+        // Whitespace-only values are dropped: the wrappers must never
+        // see a literal `" "` (or `"\n"`) as a system prompt because a
+        // claude `--append-system-prompt " "` invocation would still
+        // mutate the upstream prompt with empty content. Treat trimmed
+        // empty as None at the env-var boundary too, mirroring how the
+        // modal save path strips trailing whitespace before persisting.
+        let system_prompt_set = self
+            .system_prompt
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty());
+        if let Some(prompt) = self.system_prompt.as_deref()
+            && !prompt.trim().is_empty()
+        {
+            vars.push(("DUX_SYSTEM_PROMPT".into(), prompt.to_string()));
+        }
         tracing::debug!(
             target: "dux::session_settings",
             provider = %provider.as_str(),
             yolo = self.yolo_permissions,
             verify = strict,
+            system_prompt = system_prompt_set,
             "translated session_settings to pty env",
         );
         PerSessionEnv { vars }
