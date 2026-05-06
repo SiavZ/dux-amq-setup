@@ -16,7 +16,30 @@ failing gate, and continue from there.
 
 ## 0 · Status, goal, and non-goals
 
-**Status**: spec only. No code changes yet.
+**Status**: implemented and landed. Phases 1–7 split as in §10.
+
+**Verification gate summary** (run at the tip of the implementing
+branch):
+
+- **2.A** (storage migration test): `tests/storage_migrations.rs::migrate_v2_to_v3_adds_session_settings_column` passes.
+- **3.A** (round-trip): `tests/storage_integration.rs` covers
+  default round-trip, full-payload round-trip, NULL→default, and
+  malformed-blob→default.
+- **4.A** (modal save-and-apply): `src/app/sessions.rs` test
+  module covers open/save/no-changes-summary/focus-navigation.
+- **5.A** (per-session env): `tests/pty_integration.rs::spawn_with_env_propagates_per_session_vars`
+  + `spawn_with_env_falls_back_to_global_verify_envelope` pass with
+  a real shell child.
+- **6.A** (auto-clear E2E):
+  `tests/watch_engine_integration.rs::auto_clear_rule_fires_on_task_done_sentinel_through_pty`
+  + `auto_clear_rule_provider_clear_command_dispatch` pass.
+- **7.A** (binding wired): `Action::SessionSettings` registered
+  with default `Ctrl-Shift-S`, scoped Global, palette name
+  `session-settings`. Help-entry coverage test passes.
+
+Global gates (`cargo fmt --check`, `cargo clippy --all-targets
+--all-features -- -D warnings`, `cargo test --quiet`, `bats
+dux-amq/tests/`) all green.
 
 **Goal**: a single `PromptState::SessionSettings` modal that lets
 the operator toggle per-session settings, persisted in

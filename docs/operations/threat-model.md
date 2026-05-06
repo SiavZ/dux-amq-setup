@@ -576,6 +576,73 @@ can't be routed.
 
 ---
 
+## T15 — Tampered `agent_sessions.session_settings` blob escalates a session into autonomous mode
+
+**Vector.** An attacker (or a buggy version of dux itself) writes a
+malformed JSON value into `agent_sessions.session_settings`, or
+crafts one that explicitly enables `yolo_permissions: true` /
+`mode: worker` / `auto_clear_on_task_done: true` for a session the
+operator never opted in. On the next dux launch — or the next time
+that session re-spawns — those settings would normally drive PTY
+env propagation (`CLAUDE_AMQ_YOLO=1`), AMQ postscript injection
+(asking the agent to emit `[task-done]`), and the built-in
+auto-clear watch rule.
+
+The attacker model is the same as T1 / T14: same-UID code with
+write access to `~/.dux/sessions.sqlite3`. The novelty is that the
+sqlite blob is now load-bearing for autonomous behaviour, which
+makes the parser the primary attack surface.
+
+**Mitigation in code.** Asymmetric-default policy at the parse
+boundary:
+
+- `SessionSettings::parse_or_default(raw)` (in `src/model.rs`)
+  returns `Self::default()` for `None`, empty string, or any blob
+  that fails `serde_json::from_str`. The fallback emits a `warn!`
+  with `target: "dux::session_settings"` carrying `err` and the
+  raw (sanitisable) input so post-hoc forensics can see what was
+  rejected.
+- `SessionSettings::default()` is the safe everything-off shape:
+  `mode = Attended` (no postscript, no auto-clear),
+  `yolo_permissions = false` (no CLI flag, no env var),
+  `watch_rule_arm = {}` (no overrides),
+  `auto_clear_on_task_done = false` (asymmetric: even Worker mode
+  requires the operator to tick the box explicitly), and
+  `verify_envelope_override = None` (inherit the global config
+  default).
+- Every consumer reads through this filter:
+  `src/app/workers.rs` and `src/app/sessions.rs` call
+  `session.settings.to_pty_env(...)` at PTY spawn, and
+  `src/app/inject_runtime.rs::deliver_inject_body` /
+  `apply_inject_postscript` consult `session.settings.mode` for the
+  postscript decision. None of those paths read the raw column text
+  directly.
+
+A successful tamper that produces *valid* JSON enabling autonomous
+behaviour requires the same write access an attacker already needs
+to type into the PTY directly (T14 residual). The defence here is
+limited to keeping the *parser* a deterministic, fail-safe
+chokepoint so a malformed blob can never produce surprising
+defaults — not to defending against a same-UID attacker who has
+lawful access to the database.
+
+**Residual risk.** Same-UID code with write access to
+`sessions.sqlite3` can plant valid JSON enabling YOLO. The
+mitigation is operator awareness via the modal (the operator can
+inspect any session's settings at a glance) and the existing
+T1/T14 chain. A future hardening would be SQLCipher with an
+operator-derived key, currently tracked under T5
+(encryption-at-rest playbook).
+
+**Detection.** Malformed-blob rejections log at WARN under
+`dux::session_settings` with the raw input. Settings-driven
+decisions (env var set, postscript appended, built-in rule
+attached) log at DEBUG under the same target so an operator
+running with `RUST_LOG=dux::session_settings=debug` can audit
+which session enabled what.
+
+---
+
 ## Maintenance
 
 When you add or change attack surface in this codebase, you must
@@ -583,8 +650,8 @@ update both `SECURITY.md` (the table) and this file (the
 paragraph). PRs that touch the surface listed above without
 updating these documents are blocked at review.
 
-The IDs `T1`–`T14` are stable references; new threats append at
-the end (`T15`, `T16`, …) rather than reshuffling. Retired
+The IDs `T1`–`T15` are stable references; new threats append at
+the end (`T16`, `T17`, …) rather than reshuffling. Retired
 threats are kept in the table with a `~~strikethrough~~` and a
 note pointing to the PR that retired them. Threats that move to
 **accepted-risk in single-user-VM mode** keep their original ID,
