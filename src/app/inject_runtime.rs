@@ -346,11 +346,32 @@ impl App {
                 continue;
             };
 
-            // Don't interrupt the user mid-prompt. Same rule that
-            // `tick_watch_engines` enforces on its own auto-actions.
+            // Don't interrupt the operator mid-prompt — but DO deliver
+            // when interactive mode is open and the operator hasn't
+            // typed in a while. The old rule "skip whenever interactive
+            // mode is on the target session" was too coarse: an operator
+            // who kept the pane interactive to watch the agent saw all
+            // AMQ messages held until they exited interactive mode.
+            //
+            // The quiet-window heuristic: skip only when interactive AND
+            // `now - last_user_keystroke < active_session_quiet_secs`.
+            // Default quiet window is 60 s (config:
+            // `[amq.inject].active_session_quiet_secs`). Set to 0 to
+            // restore the old always-skip behaviour.
+            //
+            // The map is populated by `record_user_keystroke_for_active_session`
+            // in the input handler, which fires when the operator's
+            // keystrokes (or paste / macro) reach a session's PTY.
+            // Programmatic writes (drainer, watch effects) MUST NOT
+            // touch the map or the heuristic feeds back into itself.
             if active_session.as_deref() == Some(session_id.as_str()) {
-                self.log_holding(&receiver, now, HoldReason::UserTyping);
-                continue;
+                let quiet = Duration::from_secs(self.config.amq.inject.active_session_quiet_secs);
+                let last = self.runtime.last_user_keystroke.get(&session_id).copied();
+                if should_hold_for_quiet_window(last, now, quiet) {
+                    self.log_holding(&receiver, now, HoldReason::UserTyping);
+                    continue;
+                }
+                // else: interactive but quiet → fall through and deliver
             }
 
             // Two-phase delivery loop:
@@ -774,10 +795,36 @@ pub(crate) fn apply_inject_postscript(body: &str, mode: crate::model::ContextMod
     }
 }
 
+/// Decide whether the AMQ drainer should hold a message that targets the
+/// currently-focused interactive session.
+///
+/// Returns `true` when the message must be held (skip this tick); `false`
+/// when the operator looks idle enough that delivery is safe.
+///
+/// Rules:
+/// - `quiet == 0` is the legacy "always skip while interactive" mode and
+///   short-circuits to `true` regardless of keystroke history.
+/// - Otherwise, hold iff the last recorded user keystroke is within the
+///   quiet window. With no recorded keystroke, the operator is treated as
+///   idle and the message flows.
+fn should_hold_for_quiet_window(
+    last_keystroke: Option<Instant>,
+    now: Instant,
+    quiet: Duration,
+) -> bool {
+    if quiet.is_zero() {
+        return true;
+    }
+    last_keystroke.is_some_and(|t| now.duration_since(t) < quiet)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{apply_inject_postscript, match_receiver, sanitise_handle};
+    use super::{
+        apply_inject_postscript, match_receiver, sanitise_handle, should_hold_for_quiet_window,
+    };
     use crate::model::ContextMode;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn sanitise_lowercases_uppercase_letters() {
@@ -935,5 +982,58 @@ mod tests {
         // postscript output to the constant in `watch::builtin`.
         let out = apply_inject_postscript("body", ContextMode::Worker);
         assert!(out.contains(crate::watch::builtin::TASK_DONE_SENTINEL));
+    }
+
+    /// Quiet-window heuristic: when the operator has typed within the
+    /// configured window, the drainer should still hold the message
+    /// even though the target session is the active pane.
+    #[test]
+    fn quiet_window_holds_when_user_typed_recently() {
+        let now = Instant::now();
+        let last = now - Duration::from_secs(5);
+        let quiet = Duration::from_secs(60);
+        assert!(should_hold_for_quiet_window(Some(last), now, quiet));
+    }
+
+    /// After the quiet window has elapsed, the drainer should release
+    /// the message even though the session is still in the foreground.
+    #[test]
+    fn quiet_window_delivers_after_idle_long_enough() {
+        let now = Instant::now();
+        let last = now - Duration::from_secs(120);
+        let quiet = Duration::from_secs(60);
+        assert!(!should_hold_for_quiet_window(Some(last), now, quiet));
+    }
+
+    /// First-ever delivery to a session has no recorded keystroke.
+    /// The operator is treated as idle; deliver immediately.
+    #[test]
+    fn quiet_window_delivers_when_no_keystroke_recorded() {
+        let now = Instant::now();
+        let quiet = Duration::from_secs(60);
+        assert!(!should_hold_for_quiet_window(None, now, quiet));
+    }
+
+    /// `active_session_quiet_secs = 0` is the legacy escape hatch that
+    /// restores the original always-hold-while-interactive behaviour.
+    /// In that mode keystroke history is irrelevant.
+    #[test]
+    fn quiet_window_zero_always_holds() {
+        let now = Instant::now();
+        let quiet = Duration::from_secs(0);
+        assert!(should_hold_for_quiet_window(None, now, quiet));
+        assert!(should_hold_for_quiet_window(Some(now), now, quiet));
+        let stale = now - Duration::from_secs(10_000);
+        assert!(should_hold_for_quiet_window(Some(stale), now, quiet));
+    }
+
+    /// Boundary: a keystroke exactly at the quiet-window edge counts
+    /// as "no longer typing". `duration_since(t) < quiet` is strict.
+    #[test]
+    fn quiet_window_boundary_releases_at_exact_edge() {
+        let now = Instant::now();
+        let quiet = Duration::from_secs(60);
+        let last = now - quiet;
+        assert!(!should_hold_for_quiet_window(Some(last), now, quiet));
     }
 }
