@@ -187,6 +187,23 @@ if [[ "${CLAUDE_AMQ_YOLO:-${CLAUDE_YOLO:-}}" == "1" ]]; then
   printf 'claude-amq: YOLO enabled — tool calls will not prompt\n' >&2
 fi
 
+# audit03 Phase 01 §15: per-session system-prompt override.
+#
+# dux exports DUX_SYSTEM_PROMPT in the per-PTY child env when the
+# operator sets a non-empty per-session system prompt in the session
+# settings modal. Claude supports this directly via the
+# `--append-system-prompt <text>` flag, which appends the text to the
+# default system prompt for the session (verified against
+# `claude --help`).
+#
+# The flag accepts an arbitrary string (including embedded newlines).
+# We pass the env var verbatim — quoting via `"$DUX_SYSTEM_PROMPT"`
+# keeps shell metacharacters and newlines intact across the exec
+# boundary.
+if [[ -n "${DUX_SYSTEM_PROMPT:-}" ]]; then
+  EXTRA+=(--append-system-prompt "$DUX_SYSTEM_PROMPT")
+fi
+
 # Transitional warning for users who set the legacy opt-out variable.
 # CLAUDE_AMQ_SAFE used to disable YOLO; since YOLO is now opt-in, the
 # variable is meaningless and silently keeping it set hides intent.

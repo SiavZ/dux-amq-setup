@@ -308,6 +308,101 @@ fn spawn_with_env_falls_back_to_global_verify_envelope() {
     );
 }
 
+/// audit03 Phase 01 §15: per-session `system_prompt` propagates to
+/// `DUX_SYSTEM_PROMPT` only when present and non-blank. Empty,
+/// whitespace-only, and `None` values must NOT export the var (fail-safe
+/// default — claude's `--append-system-prompt ""` would still alter the
+/// model's prompt with empty content).
+#[test]
+fn to_pty_env_emits_system_prompt_only_when_set_and_non_blank() {
+    use dux::model::{ProviderKind, SessionSettings};
+
+    let provider = ProviderKind::new("claude");
+
+    // None: no env var.
+    let env_none = SessionSettings::default().to_pty_env(&provider, false);
+    assert!(
+        !env_none.vars.iter().any(|(k, _)| k == "DUX_SYSTEM_PROMPT"),
+        "None system_prompt must not export DUX_SYSTEM_PROMPT"
+    );
+
+    // Some(""): no env var (treated as None).
+    let env_empty = SessionSettings {
+        system_prompt: Some(String::new()),
+        ..SessionSettings::default()
+    }
+    .to_pty_env(&provider, false);
+    assert!(
+        !env_empty.vars.iter().any(|(k, _)| k == "DUX_SYSTEM_PROMPT"),
+        "empty system_prompt must not export DUX_SYSTEM_PROMPT"
+    );
+
+    // Some("   \n\t  "): no env var (whitespace-only).
+    let env_blank = SessionSettings {
+        system_prompt: Some("   \n\t  ".into()),
+        ..SessionSettings::default()
+    }
+    .to_pty_env(&provider, false);
+    assert!(
+        !env_blank.vars.iter().any(|(k, _)| k == "DUX_SYSTEM_PROMPT"),
+        "whitespace-only system_prompt must not export DUX_SYSTEM_PROMPT"
+    );
+
+    // Some("be helpful"): exports the literal value.
+    let env_set = SessionSettings {
+        system_prompt: Some("be helpful".into()),
+        ..SessionSettings::default()
+    }
+    .to_pty_env(&provider, false);
+    assert!(
+        env_set
+            .vars
+            .iter()
+            .any(|(k, v)| k == "DUX_SYSTEM_PROMPT" && v == "be helpful"),
+        "non-blank system_prompt must export DUX_SYSTEM_PROMPT verbatim, got {:?}",
+        env_set.vars
+    );
+
+    // Multi-line with embedded newlines: passed through verbatim.
+    let env_multi = SessionSettings {
+        system_prompt: Some("line one\nline two".into()),
+        ..SessionSettings::default()
+    }
+    .to_pty_env(&provider, false);
+    assert!(
+        env_multi
+            .vars
+            .iter()
+            .any(|(k, v)| k == "DUX_SYSTEM_PROMPT" && v == "line one\nline two"),
+        "multi-line system_prompt must round-trip embedded newlines"
+    );
+}
+
+/// audit03 Phase 01 §15: `DUX_SYSTEM_PROMPT` is emitted regardless of
+/// provider — the wrappers (`claude-amq`, `codex-amq`, `gemini-amq`)
+/// decide whether to translate it into a CLI flag or warn-and-drop. dux
+/// must not pre-filter by provider; that decision lives in the wrapper.
+#[test]
+fn to_pty_env_emits_system_prompt_for_every_provider() {
+    use dux::model::{ProviderKind, SessionSettings};
+
+    let settings = SessionSettings {
+        system_prompt: Some("custom".into()),
+        ..SessionSettings::default()
+    };
+    for provider_name in ["claude", "codex", "gemini", "opencode"] {
+        let provider = ProviderKind::new(provider_name);
+        let env = settings.to_pty_env(&provider, false);
+        assert!(
+            env.vars
+                .iter()
+                .any(|(k, v)| k == "DUX_SYSTEM_PROMPT" && v == "custom"),
+            "expected DUX_SYSTEM_PROMPT=custom for provider {provider_name}; got {:?}",
+            env.vars
+        );
+    }
+}
+
 /// Verify PTY resize doesn't panic.
 #[test]
 fn pty_resize() {

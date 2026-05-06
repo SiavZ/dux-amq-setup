@@ -566,6 +566,15 @@ pub(crate) struct SessionSettingsPrompt {
     pub provider: ProviderKind,
     pub draft: SessionSettings,
     pub draft_title: TextInput,
+    /// audit03 Phase 01 §15: dedicated multiline `TextInput` for the
+    /// per-session system prompt. Constructed via
+    /// [`TextInput::with_multiline`] so Enter inserts a newline (rather
+    /// than triggering Save) while the row is focused. The textual
+    /// content is mirrored into [`SessionSettings::system_prompt`] at
+    /// save time — never read directly from `draft.system_prompt`
+    /// while the modal is open, so the operator can cancel and
+    /// discard their edits.
+    pub draft_system_prompt: TextInput,
     pub focus: SettingsFocus,
     /// Static metadata about the watch rules available for this
     /// session's provider — populated once when the modal opens and
@@ -597,6 +606,13 @@ pub(crate) enum SettingsFocus {
     ModeOrchestrator,
     ModeWorker,
     Yolo,
+    /// audit03 Phase 01 §15: per-session `--append-system-prompt`
+    /// override. Logical sibling of `Yolo` (both are spawn-time
+    /// settings); placed immediately after it in the focus cycle.
+    /// When focused, plain keystrokes are forwarded to the row's
+    /// dedicated multiline `TextInput` (mirrors the `Title` focus
+    /// behaviour — Tab / Shift-Tab / Esc / Enter still escape).
+    SystemPrompt,
     WatchRule(usize),
     AutoClearOnDone,
     VerifyDefault,
@@ -616,7 +632,11 @@ impl SettingsFocus {
             Self::ModeAttended => Self::ModeOrchestrator,
             Self::ModeOrchestrator => Self::ModeWorker,
             Self::ModeWorker => Self::Yolo,
-            Self::Yolo => {
+            // audit03 Phase 01 §15: SystemPrompt is the sibling of Yolo
+            // — both are spawn-time settings — so it sits immediately
+            // after Yolo in the cycle and before the watch rules.
+            Self::Yolo => Self::SystemPrompt,
+            Self::SystemPrompt => {
                 if rules_len > 0 {
                     Self::WatchRule(0)
                 } else {
@@ -647,13 +667,14 @@ impl SettingsFocus {
             Self::ModeOrchestrator => Self::ModeAttended,
             Self::ModeWorker => Self::ModeOrchestrator,
             Self::Yolo => Self::ModeWorker,
-            Self::WatchRule(0) => Self::Yolo,
+            Self::SystemPrompt => Self::Yolo,
+            Self::WatchRule(0) => Self::SystemPrompt,
             Self::WatchRule(idx) => Self::WatchRule(idx - 1),
             Self::AutoClearOnDone => {
                 if rules_len > 0 {
                     Self::WatchRule(rules_len - 1)
                 } else {
-                    Self::Yolo
+                    Self::SystemPrompt
                 }
             }
             Self::VerifyDefault => Self::AutoClearOnDone,

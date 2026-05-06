@@ -32,6 +32,11 @@ setup() {
   unset CLAUDE_AMQ_YOLO CLAUDE_YOLO CLAUDE_AMQ_SAFE
   unset CODEX_AMQ_YOLO
   unset CLAUDE_AMQ_SEED_FROM_PARENT CLAUDE_AMQ_NO_SEED
+  # audit03 Phase 01 §15: DUX_SYSTEM_PROMPT is a per-session env var
+  # set by dux's PTY spawner. Tests may override it explicitly; reset
+  # to unset between tests so a leaked value can't pollute the
+  # default-deny baseline that the YOLO/seed assertions depend on.
+  unset DUX_SYSTEM_PROMPT
   # Audit02 Phase 13: pin STATE_ROOT under the throwaway $TEST_HOME so
   # wrappers don't pick up a real /data/state/dux/.tiocsti-state from
   # the host VM and silently flip into bridge mode for these tests.
@@ -178,4 +183,115 @@ setup_parent_and_worktree() {
   )
   [ -f "$CHILD_SESS_DIR/sample.jsonl" ] \
     || { printf 'seed did not happen (missing: %s)\n' "$CHILD_SESS_DIR/sample.jsonl" >&2; return 1; }
+}
+
+# --- DUX_SYSTEM_PROMPT translation (audit03 Phase 01 §15) -------------------
+#
+# Each provider's wrapper consumes DUX_SYSTEM_PROMPT differently:
+#   claude  → translates to `--append-system-prompt <text>` (verified
+#             flag in claude --help)
+#   codex   → no equivalent flag; warn-and-drop
+#   gemini  → no equivalent flag; warn-and-drop
+#
+# Tests assert each wrapper's behaviour: the recorded provider argv
+# either contains the flag-and-value pair (claude) or omits it
+# (codex/gemini), and the warn-and-drop providers emit a stderr
+# diagnostic so the operator learns the setting was a no-op.
+
+# Helper: assert two consecutive lines in the recorded argv match the
+# given pair, in order. Accommodates the wrapper using `--flag` `value`
+# (separate argv entries — what bash's `EXTRA+=(--flag "$value")`
+# emits), not the `--flag=value` form.
+assert_argv_sequence() {
+  local first="$1"
+  local second="$2"
+  local prev=""
+  while IFS= read -r line; do
+    if [[ "$prev" == "$first" && "$line" == "$second" ]]; then
+      return 0
+    fi
+    prev="$line"
+  done <"$ARGV_FILE"
+  {
+    printf 'expected consecutive argv lines %q then %q; not found\n' "$first" "$second"
+    printf '--- recorded argv ---\n'
+    cat "$ARGV_FILE"
+  } >&2
+  return 1
+}
+
+@test "claude-amq passes --append-system-prompt when DUX_SYSTEM_PROMPT is set" {
+  DUX_SYSTEM_PROMPT="be concise" run "$WRAPPERS_DIR/claude-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_contains "--append-system-prompt"
+  assert_argv_contains "be concise"
+  # And the flag must immediately precede its value (a stray flag with
+  # no value would mis-bind to whatever the next argv slot is).
+  assert_argv_sequence "--append-system-prompt" "be concise"
+}
+
+@test "claude-amq does NOT pass --append-system-prompt when DUX_SYSTEM_PROMPT is unset" {
+  unset DUX_SYSTEM_PROMPT
+  run "$WRAPPERS_DIR/claude-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_missing "--append-system-prompt"
+}
+
+@test "claude-amq does NOT pass --append-system-prompt when DUX_SYSTEM_PROMPT is empty" {
+  DUX_SYSTEM_PROMPT="" run "$WRAPPERS_DIR/claude-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_missing "--append-system-prompt"
+}
+
+@test "claude-amq preserves multi-line DUX_SYSTEM_PROMPT through the exec boundary" {
+  # Newlines inside the env var must round-trip — the wrapper's
+  # `EXTRA+=(--append-system-prompt "$DUX_SYSTEM_PROMPT")` quoting
+  # preserves them; the fake amq writes one argv per line so a
+  # multi-line value lands as multiple lines in the recording.
+  DUX_SYSTEM_PROMPT=$'line one\nline two' run "$WRAPPERS_DIR/claude-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_contains "--append-system-prompt"
+  # The fake records each argv literal; a multi-line value has a real
+  # `\n` inside it, so `grep -Fxq` still works because grep matches
+  # against the line, but the argv file's record-splitting puts the
+  # second physical line in its own slot. We assert at least one of
+  # the two halves landed.
+  grep -F "line one" "$ARGV_FILE" >/dev/null \
+    || { printf 'expected first line of multi-line system prompt in argv\n%s\n' "$(cat "$ARGV_FILE")" >&2; return 1; }
+}
+
+@test "codex-amq warns and drops when DUX_SYSTEM_PROMPT is set" {
+  DUX_SYSTEM_PROMPT="ignored" run "$WRAPPERS_DIR/codex-amq"
+  [ "$status" -eq 0 ]
+  # No equivalent flag — codex must not see one.
+  assert_argv_missing "--append-system-prompt"
+  assert_argv_missing "ignored"
+  # And the operator must see the warn-and-drop notice.
+  [[ "$output" == *"codex-amq: DUX_SYSTEM_PROMPT set but codex has no equivalent flag"* ]] \
+    || { printf 'expected warn-and-drop message; got:\n%s\n' "$output" >&2; return 1; }
+}
+
+@test "codex-amq is silent when DUX_SYSTEM_PROMPT is unset" {
+  unset DUX_SYSTEM_PROMPT
+  run "$WRAPPERS_DIR/codex-amq"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"DUX_SYSTEM_PROMPT"* ]] \
+    || { printf 'unexpected diagnostic when prompt unset; got:\n%s\n' "$output" >&2; return 1; }
+}
+
+@test "gemini-amq warns and drops when DUX_SYSTEM_PROMPT is set" {
+  DUX_SYSTEM_PROMPT="ignored" run "$WRAPPERS_DIR/gemini-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_missing "--append-system-prompt"
+  assert_argv_missing "ignored"
+  [[ "$output" == *"gemini-amq: DUX_SYSTEM_PROMPT set but gemini has no equivalent flag"* ]] \
+    || { printf 'expected warn-and-drop message; got:\n%s\n' "$output" >&2; return 1; }
+}
+
+@test "gemini-amq is silent when DUX_SYSTEM_PROMPT is unset" {
+  unset DUX_SYSTEM_PROMPT
+  run "$WRAPPERS_DIR/gemini-amq"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"DUX_SYSTEM_PROMPT"* ]] \
+    || { printf 'unexpected diagnostic when prompt unset; got:\n%s\n' "$output" >&2; return 1; }
 }

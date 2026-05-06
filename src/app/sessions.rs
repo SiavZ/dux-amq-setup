@@ -1986,12 +1986,21 @@ impl App {
         // the modal handler.
         self.ui.input_target = InputTarget::None;
         self.ui.fullscreen_overlay = FullscreenOverlay::None;
+        // audit03 Phase 01 §15: seed the system-prompt editor from
+        // the persisted value (or empty when None). 8 visible lines is
+        // the same height the EditMacros text editor uses; long
+        // prompts scroll within the modal. This mirrors the pattern
+        // used by `EditMacros` for multi-line prompt-like text.
+        let system_prompt_text = session.settings.system_prompt.clone().unwrap_or_default();
+        let draft_system_prompt = TextInput::with_text(system_prompt_text).with_multiline(8);
+
         self.ui.prompt = PromptState::SessionSettings(SessionSettingsPrompt {
             session_id: session.id.clone(),
             session_label: label.clone(),
             provider: session.provider.clone(),
             draft: session.settings.clone(),
             draft_title: TextInput::with_text(label).with_char_map(crate::git::agent_name_char_map),
+            draft_system_prompt,
             // Open with focus on the first interactive control rather
             // than the Title text input. Arrow keys at Title focus get
             // routed to the TextInput (which doesn't move the cursor
@@ -2060,13 +2069,33 @@ impl App {
             return Ok(());
         };
         let session_id = prompt.session_id.clone();
-        let new_settings = prompt.draft.clone();
+        let mut new_settings = prompt.draft.clone();
         let new_title_raw = prompt.draft_title.text.trim().to_string();
         let new_title = (!new_title_raw.is_empty()).then_some(new_title_raw);
 
+        // audit03 Phase 01 §15: mirror the dedicated system-prompt
+        // TextInput into the draft settings on save. Strip trailing
+        // whitespace and treat all-whitespace as None so the persisted
+        // blob never carries `""` (which would still trigger
+        // `--append-system-prompt ""` on the wrapper side); the
+        // matching to_pty_env logic also rejects whitespace-only.
+        let trimmed_prompt = prompt.draft_system_prompt.text.trim_end().to_string();
+        new_settings.system_prompt = if trimmed_prompt.trim().is_empty() {
+            None
+        } else {
+            Some(trimmed_prompt)
+        };
+
         // Detect what changed before mutating the session in-place so
         // we can build a precise status-line summary.
-        let (mode_changed, yolo_changed, verify_changed, auto_clear_changed, title_changed) = {
+        let (
+            mode_changed,
+            yolo_changed,
+            verify_changed,
+            auto_clear_changed,
+            title_changed,
+            system_prompt_changed,
+        ) = {
             let Some(session) = self.git.sessions.iter().find(|s| s.id == session_id) else {
                 self.set_error("Session disappeared while editing settings.");
                 self.ui.prompt = PromptState::None;
@@ -2078,6 +2107,7 @@ impl App {
                 session.settings.verify_envelope_override != new_settings.verify_envelope_override,
                 session.settings.auto_clear_on_task_done != new_settings.auto_clear_on_task_done,
                 session.title != new_title,
+                session.settings.system_prompt != new_settings.system_prompt,
             )
         };
 
@@ -2114,11 +2144,18 @@ impl App {
             self.attach_watch_engine(&session_id);
         }
 
-        let needs_respawn = yolo_changed || verify_changed;
+        // audit03 Phase 01 §15: system_prompt is also a spawn-time
+        // setting (the wrapper reads DUX_SYSTEM_PROMPT once at PTY
+        // spawn and translates it into the upstream CLI's
+        // `--append-system-prompt` flag). Roll a system_prompt change
+        // into the respawn warning so the operator knows to detach +
+        // relaunch for it to take effect.
+        let needs_respawn = yolo_changed || verify_changed || system_prompt_changed;
         let summary = build_session_settings_save_summary(
             mode_changed,
             title_changed,
             auto_clear_changed,
+            system_prompt_changed,
             needs_respawn,
         );
         if needs_respawn {
@@ -2167,6 +2204,7 @@ pub(crate) fn build_session_settings_save_summary(
     mode_changed: bool,
     title_changed: bool,
     auto_clear_changed: bool,
+    system_prompt_changed: bool,
     needs_respawn: bool,
 ) -> String {
     let mut parts: Vec<&str> = Vec::new();
@@ -2178,6 +2216,13 @@ pub(crate) fn build_session_settings_save_summary(
     }
     if auto_clear_changed {
         parts.push("auto-clear");
+    }
+    // audit03 Phase 01 §15: surface system-prompt edits explicitly so
+    // an operator who only changed the prompt sees a precise summary
+    // (rather than the generic "spawn-time settings" line which also
+    // covers YOLO + AMQ verify).
+    if system_prompt_changed {
+        parts.push("system prompt");
     }
     if needs_respawn {
         parts.push("spawn-time settings");
@@ -3143,6 +3188,11 @@ mod tests {
         s1.settings.mode = ContextMode::Worker;
         s1.settings.yolo_permissions = true;
         s1.settings.auto_clear_on_task_done = true;
+        // audit03 Phase 01 §15: prove the system_prompt seed path —
+        // the multiline TextInput must pre-fill with the persisted
+        // value so re-opening the modal doesn't appear to lose the
+        // operator's previous edits.
+        s1.settings.system_prompt = Some("speak like a pirate".to_string());
         let project = make_project("project-1", "claude");
         let mut app = test_app_with_sessions(vec![s1], vec![project]);
         // Force the left pane to point at the session row.
@@ -3161,6 +3211,15 @@ mod tests {
         assert_eq!(p.draft.mode, ContextMode::Worker);
         assert!(p.draft.yolo_permissions);
         assert!(p.draft.auto_clear_on_task_done);
+        assert_eq!(
+            p.draft.system_prompt.as_deref(),
+            Some("speak like a pirate"),
+            "draft.system_prompt should mirror the persisted value"
+        );
+        assert_eq!(
+            p.draft_system_prompt.text, "speak like a pirate",
+            "draft_system_prompt TextInput should pre-fill with the persisted value"
+        );
         // Initial focus is the first interactive control, NOT Title.
         // See `open_session_settings` for the rationale (Title focus
         // would route arrow keys into TextInput and the operator
@@ -3191,6 +3250,12 @@ mod tests {
             p.draft.auto_clear_on_task_done = true;
             p.draft.yolo_permissions = true;
             p.draft.verify_envelope_override = Some(true);
+            // audit03 Phase 01 §15: type a system prompt into the
+            // dedicated multiline text input. The save path mirrors
+            // this into `draft.system_prompt` so we never persist
+            // stale text from the draft.
+            p.draft_system_prompt
+                .set_text("be concise and cite sources".to_string());
         } else {
             panic!("modal not open");
         }
@@ -3206,6 +3271,10 @@ mod tests {
         assert!(s.settings.auto_clear_on_task_done);
         assert!(s.settings.yolo_permissions);
         assert_eq!(s.settings.verify_envelope_override, Some(true));
+        assert_eq!(
+            s.settings.system_prompt.as_deref(),
+            Some("be concise and cite sources")
+        );
 
         // SQLite updated — load through a fresh handle to confirm.
         let reloaded = app.session_store.load_sessions().expect("reload");
@@ -3214,6 +3283,90 @@ mod tests {
         assert!(r.settings.auto_clear_on_task_done);
         assert!(r.settings.yolo_permissions);
         assert_eq!(r.settings.verify_envelope_override, Some(true));
+        assert_eq!(
+            r.settings.system_prompt.as_deref(),
+            Some("be concise and cite sources")
+        );
+    }
+
+    /// audit03 Phase 01 §15: whitespace-only system-prompt drafts
+    /// must persist as `None`, not `Some("")`. A `Some("")` blob
+    /// would still trigger `claude --append-system-prompt ""` on the
+    /// wrapper side and quietly mutate the upstream prompt.
+    #[test]
+    fn save_session_settings_system_prompt_whitespace_persists_as_none() {
+        let s1 = make_session("ws", "claude", "/tmp/wt/ws");
+        let project = make_project("project-1", "claude");
+        let mut app = test_app_with_sessions(vec![s1], vec![project]);
+        app.session_store
+            .upsert_session(&app.git.sessions[0].clone())
+            .expect("seed");
+
+        app.rebuild_left_items();
+        app.selected_left = app
+            .left_items()
+            .iter()
+            .position(|item| matches!(item, LeftItem::Session(_)))
+            .expect("session row");
+        app.open_session_settings().expect("open");
+
+        if let PromptState::SessionSettings(p) = &mut app.ui.prompt {
+            // Whitespace-only — explicitly different glyphs to assert
+            // the trim on save handles each one.
+            p.draft_system_prompt.set_text("   \n\t  \n".to_string());
+        } else {
+            panic!("modal not open");
+        }
+        app.save_session_settings().expect("save");
+
+        let s = app.git.sessions.iter().find(|s| s.id == "ws").unwrap();
+        assert_eq!(
+            s.settings.system_prompt, None,
+            "whitespace-only draft must persist as None to keep the wrapper from \
+             receiving an empty --append-system-prompt"
+        );
+    }
+
+    /// audit03 Phase 01 §15: a system_prompt change alone must trip the
+    /// respawn warning so the operator knows the running PTY did not
+    /// pick up the new prompt — only the next spawn will.
+    #[test]
+    fn save_session_settings_system_prompt_change_triggers_respawn_warning() {
+        let s1 = make_session("rs", "claude", "/tmp/wt/rs");
+        let project = make_project("project-1", "claude");
+        let mut app = test_app_with_sessions(vec![s1], vec![project]);
+        app.session_store
+            .upsert_session(&app.git.sessions[0].clone())
+            .expect("seed");
+
+        app.rebuild_left_items();
+        app.selected_left = app
+            .left_items()
+            .iter()
+            .position(|item| matches!(item, LeftItem::Session(_)))
+            .expect("session row");
+        app.open_session_settings().expect("open");
+
+        if let PromptState::SessionSettings(p) = &mut app.ui.prompt {
+            // Only system_prompt changes — no other knob.
+            p.draft_system_prompt.set_text("review pls".to_string());
+        } else {
+            panic!("modal not open");
+        }
+        app.save_session_settings().expect("save");
+
+        let summary = app.status.message();
+        assert!(
+            summary.contains("system prompt"),
+            "summary should call out system prompt edit; got: {summary}"
+        );
+        assert!(
+            summary.contains("Reconnect agent")
+                || summary.contains("spawn-time")
+                || summary.contains("respawn")
+                || summary.contains("Detach"),
+            "system_prompt change must trigger respawn-style warning; got: {summary}"
+        );
     }
 
     #[test]
@@ -3241,10 +3394,21 @@ mod tests {
 
     #[test]
     fn settings_focus_navigation_skips_empty_watch_rules() {
-        // No rules → Yolo → AutoClearOnDone (not WatchRule(0)).
-        assert_eq!(SettingsFocus::Yolo.next(0), SettingsFocus::AutoClearOnDone);
-        // With rules → Yolo → WatchRule(0).
-        assert_eq!(SettingsFocus::Yolo.next(3), SettingsFocus::WatchRule(0));
+        // audit03 Phase 01 §15: Yolo always advances to SystemPrompt
+        // (logical sibling — both spawn-time settings); SystemPrompt
+        // then routes through the watch rules or skips them when empty.
+        assert_eq!(SettingsFocus::Yolo.next(0), SettingsFocus::SystemPrompt);
+        assert_eq!(SettingsFocus::Yolo.next(3), SettingsFocus::SystemPrompt);
+        // No rules → SystemPrompt → AutoClearOnDone.
+        assert_eq!(
+            SettingsFocus::SystemPrompt.next(0),
+            SettingsFocus::AutoClearOnDone
+        );
+        // With rules → SystemPrompt → WatchRule(0).
+        assert_eq!(
+            SettingsFocus::SystemPrompt.next(3),
+            SettingsFocus::WatchRule(0)
+        );
         // Last WatchRule → AutoClearOnDone.
         assert_eq!(
             SettingsFocus::WatchRule(2).next(3),
@@ -3252,35 +3416,50 @@ mod tests {
         );
         // Wrap from CancelButton back to Title.
         assert_eq!(SettingsFocus::CancelButton.next(0), SettingsFocus::Title);
-        // Reverse skips empty rules.
-        assert_eq!(SettingsFocus::AutoClearOnDone.prev(0), SettingsFocus::Yolo);
+        // Reverse: AutoClearOnDone → last WatchRule (or SystemPrompt
+        // when empty), WatchRule(0) → SystemPrompt, SystemPrompt → Yolo.
+        assert_eq!(
+            SettingsFocus::AutoClearOnDone.prev(0),
+            SettingsFocus::SystemPrompt
+        );
         assert_eq!(
             SettingsFocus::AutoClearOnDone.prev(3),
             SettingsFocus::WatchRule(2)
         );
+        assert_eq!(
+            SettingsFocus::WatchRule(0).prev(3),
+            SettingsFocus::SystemPrompt
+        );
+        assert_eq!(SettingsFocus::SystemPrompt.prev(0), SettingsFocus::Yolo);
     }
 
     #[test]
     fn build_session_settings_save_summary_lists_changed_knobs() {
         // No changes.
         assert_eq!(
-            build_session_settings_save_summary(false, false, false, false),
+            build_session_settings_save_summary(false, false, false, false, false),
             "Session settings saved (no changes)."
         );
         // Title only.
         assert_eq!(
-            build_session_settings_save_summary(false, true, false, false),
+            build_session_settings_save_summary(false, true, false, false, false),
             "Session settings saved: title."
         );
         // Mode + auto-clear.
         assert_eq!(
-            build_session_settings_save_summary(true, false, true, false),
+            build_session_settings_save_summary(true, false, true, false, false),
             "Session settings saved: context mode, auto-clear."
         );
         // Respawn-only changes.
         assert_eq!(
-            build_session_settings_save_summary(false, false, false, true),
+            build_session_settings_save_summary(false, false, false, false, true),
             "Session settings saved: spawn-time settings."
+        );
+        // audit03 Phase 01 §15: system-prompt edits surface as their
+        // own labelled change AND roll into the respawn flag.
+        assert_eq!(
+            build_session_settings_save_summary(false, false, false, true, true),
+            "Session settings saved: system prompt, spawn-time settings."
         );
     }
 }
