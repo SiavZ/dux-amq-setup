@@ -3461,12 +3461,12 @@ impl App {
                     cursor_x += button_widths[index] + gap;
                 }
                 self.ui.overlay_layout.active = OverlayMouseLayout::KillRunning {
-                    input: match self.ui.overlay_layout.active {
-                        OverlayMouseLayout::KillRunning { input, .. } => input,
+                    input: match &self.ui.overlay_layout.active {
+                        OverlayMouseLayout::KillRunning { input, .. } => *input,
                         _ => None,
                     },
-                    list: match self.ui.overlay_layout.active {
-                        OverlayMouseLayout::KillRunning { list, .. } => list,
+                    list: match &self.ui.overlay_layout.active {
+                        OverlayMouseLayout::KillRunning { list, .. } => *list,
                         _ => Rect::default(),
                     },
                     items: visible_indices.len(),
@@ -4832,145 +4832,248 @@ impl App {
             .constraints([Constraint::Min(3), Constraint::Length(3)])
             .areas(inner);
 
-        // Build the visual rows. Each entry is `(focus, lines)` so the
-        // selected row can be highlighted as a single block.
-        let mut sections: Vec<Vec<Line<'static>>> = Vec::new();
+        // Paint the form-area background so each per-row render below
+        // sits on the overlay's filled rectangle. The previous
+        // implementation rendered everything as a single `Paragraph`
+        // which carried the background style; rendering row-by-row
+        // means we have to paint the area first.
+        let form_block = Block::default().style(Style::default().bg(self.theme.overlay_bg));
+        Widget::render(form_block, form_area, frame.buffer_mut());
+
+        // Rows captured for mouse hit-testing. Pushed in draw order so
+        // the click handler can walk them top-down to find the first
+        // hit. Title is captured separately because its click semantics
+        // differ (text-input cursor placement vs. row toggle).
+        let mut rows: Vec<(Rect, SettingsFocus)> = Vec::new();
+
+        // `cursor_y` tracks the next free row inside `form_area`.
+        // Stops drawing once we run out of vertical space — the modal
+        // is sized generously, but defensive clamping keeps a small
+        // terminal from panicking on out-of-bounds writes.
+        let mut cursor_y = form_area.y;
+        let form_bottom = form_area.y.saturating_add(form_area.height);
+
+        let label_style = Style::default()
+            .fg(self.theme.input_label_fg)
+            .add_modifier(Modifier::BOLD);
+
+        // Helper: render a single Line into a 1-row band starting at
+        // `cursor_y` and advance the cursor. Returns the rect that the
+        // line was rendered into so callers can record it for mouse
+        // hit-testing. Lines that don't fit are silently dropped.
+        let draw_line = |line: Line<'static>, frame: &mut Frame, y: &mut u16| -> Rect {
+            if *y >= form_bottom {
+                return Rect::default();
+            }
+            let row_rect = Rect::new(form_area.x, *y, form_area.width, 1);
+            Paragraph::new(line)
+                .style(Style::default().bg(self.theme.overlay_bg))
+                .render(row_rect, frame.buffer_mut());
+            *y = y.saturating_add(1);
+            row_rect
+        };
 
         // ── Title input ─────────────────────────────────
-        sections.push(vec![Line::from(Span::styled(
-            "Title",
-            Style::default()
-                .fg(self.theme.input_label_fg)
-                .add_modifier(Modifier::BOLD),
-        ))]);
+        draw_line(
+            Line::from(Span::styled("Title", label_style)),
+            frame,
+            &mut cursor_y,
+        );
         let title_row_focused = prompt.focus == SettingsFocus::Title;
         let title_box =
             settings_input_line(&prompt.draft_title.text, title_row_focused, &self.theme);
-        sections.push(vec![title_box]);
+        let title_input: Rect = draw_line(title_box, frame, &mut cursor_y);
 
         // ── Context mode ────────────────────────────────
-        sections.push(vec![Line::from(Span::styled(
-            "Context mode  (live for clearing semantics; postscript applies on next AMQ wake)",
-            Style::default()
-                .fg(self.theme.input_label_fg)
-                .add_modifier(Modifier::BOLD),
-        ))]);
-        sections.push(vec![radio_line(
-            "attended",
-            "operator-managed, never auto-cleared",
-            prompt.draft.mode == ContextMode::Attended,
-            prompt.focus == SettingsFocus::ModeAttended,
-            &self.theme,
-        )]);
-        sections.push(vec![radio_line(
-            "orchestrator",
-            "coordinates peers, persists context",
-            prompt.draft.mode == ContextMode::Orchestrator,
-            prompt.focus == SettingsFocus::ModeOrchestrator,
-            &self.theme,
-        )]);
-        sections.push(vec![radio_line(
-            "worker",
-            "stateless, gets task-done postscript on AMQ wakes",
-            prompt.draft.mode == ContextMode::Worker,
-            prompt.focus == SettingsFocus::ModeWorker,
-            &self.theme,
-        )]);
+        draw_line(
+            Line::from(Span::styled(
+                "Context mode  (live for clearing semantics; postscript applies on next AMQ wake)",
+                label_style,
+            )),
+            frame,
+            &mut cursor_y,
+        );
+        let attended_rect = draw_line(
+            radio_line(
+                "attended",
+                "operator-managed, never auto-cleared",
+                prompt.draft.mode == ContextMode::Attended,
+                prompt.focus == SettingsFocus::ModeAttended,
+                &self.theme,
+            ),
+            frame,
+            &mut cursor_y,
+        );
+        rows.push((attended_rect, SettingsFocus::ModeAttended));
+        let orchestrator_rect = draw_line(
+            radio_line(
+                "orchestrator",
+                "coordinates peers, persists context",
+                prompt.draft.mode == ContextMode::Orchestrator,
+                prompt.focus == SettingsFocus::ModeOrchestrator,
+                &self.theme,
+            ),
+            frame,
+            &mut cursor_y,
+        );
+        rows.push((orchestrator_rect, SettingsFocus::ModeOrchestrator));
+        let worker_rect = draw_line(
+            radio_line(
+                "worker",
+                "stateless, gets task-done postscript on AMQ wakes",
+                prompt.draft.mode == ContextMode::Worker,
+                prompt.focus == SettingsFocus::ModeWorker,
+                &self.theme,
+            ),
+            frame,
+            &mut cursor_y,
+        );
+        rows.push((worker_rect, SettingsFocus::ModeWorker));
 
         // ── Permissions (YOLO) ──────────────────────────
-        sections.push(vec![Line::from(Span::styled(
-            "Permissions  (needs respawn — Reconnect agent to apply)",
-            Style::default()
-                .fg(self.theme.input_label_fg)
-                .add_modifier(Modifier::BOLD),
-        ))]);
-        sections.push(vec![checkbox_line(
-            "YOLO  (--dangerously-skip-permissions / --sandbox-bypass)",
-            prompt.draft.yolo_permissions,
-            prompt.focus == SettingsFocus::Yolo,
-            &self.theme,
-        )]);
+        draw_line(
+            Line::from(Span::styled(
+                "Permissions  (needs respawn — Reconnect agent to apply)",
+                label_style,
+            )),
+            frame,
+            &mut cursor_y,
+        );
+        let yolo_rect = draw_line(
+            checkbox_line(
+                "YOLO  (--dangerously-skip-permissions / --sandbox-bypass)",
+                prompt.draft.yolo_permissions,
+                prompt.focus == SettingsFocus::Yolo,
+                &self.theme,
+            ),
+            frame,
+            &mut cursor_y,
+        );
+        rows.push((yolo_rect, SettingsFocus::Yolo));
 
         // ── Watch rules ─────────────────────────────────
-        sections.push(vec![Line::from(Span::styled(
-            "Watch rules  (live — overrides apply at next tick)",
-            Style::default()
-                .fg(self.theme.input_label_fg)
-                .add_modifier(Modifier::BOLD),
-        ))]);
+        draw_line(
+            Line::from(Span::styled(
+                "Watch rules  (live — overrides apply at next tick)",
+                label_style,
+            )),
+            frame,
+            &mut cursor_y,
+        );
         if prompt.rules.is_empty() {
-            sections.push(vec![Line::from(Span::styled(
-                "  (no rules configured for this provider)",
-                Style::default().fg(self.theme.hint_dim_desc_fg),
-            ))]);
+            draw_line(
+                Line::from(Span::styled(
+                    "  (no rules configured for this provider)",
+                    Style::default().fg(self.theme.hint_dim_desc_fg),
+                )),
+                frame,
+                &mut cursor_y,
+            );
         } else {
             for rule in &prompt.rules {
-                sections.push(vec![checkbox_line(
-                    &rule.label,
-                    rule.armed,
-                    prompt.focus == SettingsFocus::WatchRule(rule.idx),
-                    &self.theme,
-                )]);
+                let rect = draw_line(
+                    checkbox_line(
+                        &rule.label,
+                        rule.armed,
+                        prompt.focus == SettingsFocus::WatchRule(rule.idx),
+                        &self.theme,
+                    ),
+                    frame,
+                    &mut cursor_y,
+                );
+                rows.push((rect, SettingsFocus::WatchRule(rule.idx)));
             }
         }
 
         // ── Auto-clear after task done ───────────────────
-        sections.push(vec![checkbox_line(
-            "Auto-clear after task done  (live, only fires for Worker mode)",
-            prompt.draft.auto_clear_on_task_done,
-            prompt.focus == SettingsFocus::AutoClearOnDone,
-            &self.theme,
-        )]);
+        let auto_clear_rect = draw_line(
+            checkbox_line(
+                "Auto-clear after task done  (live, only fires for Worker mode)",
+                prompt.draft.auto_clear_on_task_done,
+                prompt.focus == SettingsFocus::AutoClearOnDone,
+                &self.theme,
+            ),
+            frame,
+            &mut cursor_y,
+        );
+        rows.push((auto_clear_rect, SettingsFocus::AutoClearOnDone));
 
         // ── AMQ verify_envelope override ─────────────────
-        sections.push(vec![Line::from(Span::styled(
-            "AMQ inject verify_envelope  (needs respawn)",
-            Style::default()
-                .fg(self.theme.input_label_fg)
-                .add_modifier(Modifier::BOLD),
-        ))]);
-        sections.push(vec![radio_line(
-            "default",
-            "inherit [amq.inject].verify_envelope from config",
-            prompt.draft.verify_envelope_override.is_none(),
-            prompt.focus == SettingsFocus::VerifyDefault,
-            &self.theme,
-        )]);
-        sections.push(vec![radio_line(
-            "strict",
-            "force HMAC verification for this session",
-            prompt.draft.verify_envelope_override == Some(true),
-            prompt.focus == SettingsFocus::VerifyStrict,
-            &self.theme,
-        )]);
-        sections.push(vec![radio_line(
-            "skip",
-            "force unsigned for this session",
-            prompt.draft.verify_envelope_override == Some(false),
-            prompt.focus == SettingsFocus::VerifySkip,
-            &self.theme,
-        )]);
+        draw_line(
+            Line::from(Span::styled(
+                "AMQ inject verify_envelope  (needs respawn)",
+                label_style,
+            )),
+            frame,
+            &mut cursor_y,
+        );
+        let verify_default_rect = draw_line(
+            radio_line(
+                "default",
+                "inherit [amq.inject].verify_envelope from config",
+                prompt.draft.verify_envelope_override.is_none(),
+                prompt.focus == SettingsFocus::VerifyDefault,
+                &self.theme,
+            ),
+            frame,
+            &mut cursor_y,
+        );
+        rows.push((verify_default_rect, SettingsFocus::VerifyDefault));
+        let verify_strict_rect = draw_line(
+            radio_line(
+                "strict",
+                "force HMAC verification for this session",
+                prompt.draft.verify_envelope_override == Some(true),
+                prompt.focus == SettingsFocus::VerifyStrict,
+                &self.theme,
+            ),
+            frame,
+            &mut cursor_y,
+        );
+        rows.push((verify_strict_rect, SettingsFocus::VerifyStrict));
+        let verify_skip_rect = draw_line(
+            radio_line(
+                "skip",
+                "force unsigned for this session",
+                prompt.draft.verify_envelope_override == Some(false),
+                prompt.focus == SettingsFocus::VerifySkip,
+                &self.theme,
+            ),
+            frame,
+            &mut cursor_y,
+        );
+        rows.push((verify_skip_rect, SettingsFocus::VerifySkip));
 
         // ── Save / Cancel buttons ─────────────────────────
-        sections.push(vec![button_row(
-            prompt.focus == SettingsFocus::SaveButton,
-            prompt.focus == SettingsFocus::CancelButton,
-            &self.theme,
-        )]);
-
-        // Flatten sections into a single Vec<Line>; sections are
-        // already separated visually by their content (labels are
-        // bold and indented, rows are not). We don't insert blanks
-        // between sections to maximise the room available for the
-        // watch-rules list — operators with many rules need every
-        // line. The form area scrolls (via `Paragraph` wrap) if it
-        // overflows.
-        let lines: Vec<Line<'static>> = sections.into_iter().flatten().collect();
-
-        let form = Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .style(Style::default().bg(self.theme.overlay_bg));
-        Widget::render(form, form_area, frame.buffer_mut());
+        // Render the row, capture the y, then split horizontally so
+        // mouse hit-testing can distinguish Save from Cancel even
+        // though they share a row.
+        let buttons_y = cursor_y;
+        let buttons_rect = draw_line(
+            button_row(
+                prompt.focus == SettingsFocus::SaveButton,
+                prompt.focus == SettingsFocus::CancelButton,
+                &self.theme,
+            ),
+            frame,
+            &mut cursor_y,
+        );
+        if buttons_rect.height > 0 {
+            // The `button_row` line is "    [ Save ]    [ Cancel ]";
+            // we reproduce its layout here so the rects line up with
+            // the painted glyphs. Keep these constants in sync with
+            // the helper.
+            const LEAD: u16 = 4;
+            const SAVE_LABEL_LEN: u16 = "[ Save ]".len() as u16;
+            const GAP: u16 = 4;
+            const CANCEL_LABEL_LEN: u16 = "[ Cancel ]".len() as u16;
+            let save_x = form_area.x.saturating_add(LEAD);
+            let cancel_x = save_x.saturating_add(SAVE_LABEL_LEN).saturating_add(GAP);
+            let save_rect = Rect::new(save_x, buttons_y, SAVE_LABEL_LEN, 1);
+            let cancel_rect = Rect::new(cancel_x, buttons_y, CANCEL_LABEL_LEN, 1);
+            rows.push((save_rect, SettingsFocus::SaveButton));
+            rows.push((cancel_rect, SettingsFocus::CancelButton));
+        }
 
         // Footer hint.
         let confirm_key = self.bindings.label_for(Action::Confirm);
@@ -5011,6 +5114,8 @@ impl App {
             .block(hint_block)
             .wrap(Wrap { trim: true });
         Widget::render(hint, hint_area, frame.buffer_mut());
+
+        self.ui.overlay_layout.active = OverlayMouseLayout::SessionSettings { title_input, rows };
     }
 
     fn render_edit_macros(&mut self, frame: &mut Frame) {

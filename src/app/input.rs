@@ -115,6 +115,20 @@ enum PromptMouseTarget {
     Checkbox(OverlayCheckboxId),
     RenameInput,
     NameNewAgentInput,
+    /// Click landed on the session-settings title text input. Behaves
+    /// like a text-input click: set focus to Title and position the
+    /// cursor from the click column. Distinct from
+    /// [`PromptMouseTarget::SessionSettingsRow`] because the title row
+    /// must not toggle anything — the operator is editing text.
+    SessionSettingsTitle,
+    /// Click landed on a non-title interactive row of the session
+    /// settings modal. The row is identified by its [`SettingsFocus`]
+    /// position, captured by the renderer in draw order so the
+    /// resolution is deterministic. The dispatcher sets focus and then
+    /// fires the row-appropriate side-effect: toggle for radios /
+    /// checkboxes / auto-clear, save for `SaveButton`, dismiss for
+    /// `CancelButton`.
+    SessionSettingsRow(SettingsFocus),
 }
 
 impl ButtonPressedTarget {
@@ -194,7 +208,13 @@ impl ButtonPressedTarget {
             | PromptMouseTarget::RuntimeKillItem(_)
             | PromptMouseTarget::Checkbox(_)
             | PromptMouseTarget::RenameInput
-            | PromptMouseTarget::NameNewAgentInput => None,
+            | PromptMouseTarget::NameNewAgentInput
+            // Session-settings rows (radios, checkboxes, Save/Cancel) all
+            // fire on Down via `dispatch_prompt_target_action` — there is
+            // no separate press-and-release gesture in this modal, so
+            // they don't go through the `ButtonPressedTarget` flow.
+            | PromptMouseTarget::SessionSettingsTitle
+            | PromptMouseTarget::SessionSettingsRow(_) => None,
         }
     }
 }
@@ -3139,7 +3159,7 @@ impl App {
     }
 
     fn prompt_mouse_target(&self, column: u16, row: u16) -> Option<PromptMouseTarget> {
-        match self.ui.overlay_layout.active {
+        match self.ui.overlay_layout.active.clone() {
             OverlayMouseLayout::None | OverlayMouseLayout::Help => None,
             OverlayMouseLayout::Command {
                 input,
@@ -3363,6 +3383,21 @@ impl App {
                         .then_some(PromptMouseTarget::NameNewAgentInput)
                 }
             }
+            OverlayMouseLayout::SessionSettings { title_input, rows } => {
+                // Hit-test the rows first (more specific) so a stray row
+                // overlap with the title rect can't steal a row click.
+                // The renderer is the one in charge of laying these out
+                // without overlap; this ordering is just defensive.
+                for (rect, focus) in &rows {
+                    if contains_point(*rect, column, row) {
+                        return Some(PromptMouseTarget::SessionSettingsRow(*focus));
+                    }
+                }
+                if contains_point(title_input, column, row) {
+                    return Some(PromptMouseTarget::SessionSettingsTitle);
+                }
+                None
+            }
         }
     }
 
@@ -3575,8 +3610,8 @@ impl App {
     }
 
     fn set_command_palette_cursor_from_mouse(&mut self, column: u16) {
-        let input_area = match self.ui.overlay_layout.active {
-            OverlayMouseLayout::Command { input, .. } => input,
+        let input_area = match &self.ui.overlay_layout.active {
+            OverlayMouseLayout::Command { input, .. } => *input,
             _ => return,
         };
         if let PromptState::Command { input, .. } = &mut self.ui.prompt {
@@ -3636,10 +3671,10 @@ impl App {
     }
 
     fn set_browser_input_cursor_from_mouse(&mut self, column: u16) {
-        let input_area = match self.ui.overlay_layout.active {
+        let input_area = match &self.ui.overlay_layout.active {
             OverlayMouseLayout::BrowseProjects {
                 input: Some(input), ..
-            } => input,
+            } => *input,
             _ => return,
         };
         if let PromptState::BrowseProjects {
@@ -3674,10 +3709,10 @@ impl App {
     }
 
     fn set_kill_running_search_cursor_from_mouse(&mut self, column: u16) {
-        let input_area = match self.ui.overlay_layout.active {
+        let input_area = match &self.ui.overlay_layout.active {
             OverlayMouseLayout::KillRunning {
                 input: Some(input), ..
-            } => input,
+            } => *input,
             _ => return,
         };
         if let PromptState::KillRunning(prompt) = &mut self.ui.prompt {
@@ -4115,8 +4150,8 @@ impl App {
     }
 
     fn set_rename_cursor_from_mouse(&mut self, column: u16) {
-        let input_area = match self.ui.overlay_layout.active {
-            OverlayMouseLayout::RenameSession { input, .. } => input,
+        let input_area = match &self.ui.overlay_layout.active {
+            OverlayMouseLayout::RenameSession { input, .. } => *input,
             _ => return,
         };
         if let PromptState::RenameSession { input, .. } = &mut self.ui.prompt {
@@ -4124,9 +4159,29 @@ impl App {
         }
     }
 
+    /// Position the title text-input cursor inside the session
+    /// settings modal from a click column. Mirrors
+    /// [`Self::set_rename_cursor_from_mouse`] for the rename modal —
+    /// the session-settings title row is also a single-line
+    /// `TextInput` rendered inside an overlay-allocated rect.
+    fn set_session_settings_title_cursor_from_mouse(&mut self, column: u16) {
+        let input_area = match &self.ui.overlay_layout.active {
+            OverlayMouseLayout::SessionSettings { title_input, .. } => *title_input,
+            _ => return,
+        };
+        if let PromptState::SessionSettings(prompt) = &mut self.ui.prompt {
+            // The renderer prefixes the text with two spaces and a
+            // bracket. `settings_input_line` writes "  [ {text} ]" so
+            // the displayed cursor offset matches a 4-column prefix
+            // ("  [ ").
+            prompt.draft_title.cursor =
+                cursor_from_single_line_position(&prompt.draft_title.text, input_area, 4, column);
+        }
+    }
+
     fn set_name_new_agent_cursor_from_mouse(&mut self, column: u16) {
-        let input_area = match self.ui.overlay_layout.active {
-            OverlayMouseLayout::NameNewAgent { input, .. } => input,
+        let input_area = match &self.ui.overlay_layout.active {
+            OverlayMouseLayout::NameNewAgent { input, .. } => *input,
             _ => return,
         };
         if let PromptState::NameNewAgent { input, focus, .. } = &mut self.ui.prompt {
@@ -4215,9 +4270,9 @@ impl App {
                         list,
                         items,
                         offset,
-                    } = self.ui.overlay_layout.active
+                    } = &self.ui.overlay_layout.active
                         && let Some(index) =
-                            Self::overlay_row_at(list, offset, items, mouse.column, mouse.row)
+                            Self::overlay_row_at(*list, *offset, *items, mouse.column, mouse.row)
                     {
                         *selected_row = index;
                         if let Some(VisualRow::Parent(row_idx)) = visual.get(index) {
@@ -4441,6 +4496,44 @@ impl App {
             }
             PromptMouseTarget::NameNewAgentInput => {
                 self.set_name_new_agent_cursor_from_mouse(mouse.column);
+            }
+            PromptMouseTarget::SessionSettingsTitle => {
+                // Click on the title text-input: focus the row and
+                // position the cursor where the click landed. Toggling
+                // would be wrong here — the operator is editing text.
+                self.set_session_settings_focus(SettingsFocus::Title);
+                self.set_session_settings_title_cursor_from_mouse(mouse.column);
+            }
+            PromptMouseTarget::SessionSettingsRow(focus) => {
+                // Single-click on a non-title row: set focus, then
+                // immediately fire the row-appropriate action. Save
+                // and Cancel buttons fire on Down here (rather than
+                // going through the press-and-release flow used by
+                // other modals) because the design hint calls for an
+                // immediate response and there is no other competing
+                // gesture in this modal that would justify deferring
+                // until Up.
+                self.set_session_settings_focus(focus);
+                match focus {
+                    SettingsFocus::Title => {
+                        // Defensive: a `SessionSettingsRow(Title)`
+                        // shouldn't be emitted by the hit-tester
+                        // (Title goes through `SessionSettingsTitle`),
+                        // but if it ever is, just leave the focus set
+                        // and don't toggle anything.
+                    }
+                    SettingsFocus::SaveButton => {
+                        if let Err(err) = self.save_session_settings_and_close() {
+                            self.set_error(format!("{err:#}"));
+                        }
+                    }
+                    SettingsFocus::CancelButton => {
+                        self.ui.prompt = PromptState::None;
+                    }
+                    _ => {
+                        self.toggle_session_settings_focused_row();
+                    }
+                }
             }
             // Button targets are handled by `activate_button` and never
             // reach this path — `from_prompt_target` returns `Some(_)`
@@ -5241,7 +5334,7 @@ mod tests {
         LeftSection, MacroBarState, MouseClickTarget, MouseLayoutState, NameNewAgentFocus,
         OverlayCheckbox, OverlayCheckboxId, OverlayMouseLayout, OverlayMouseLayoutState,
         ProcessInfo, PromptState, PullTarget, ResourceStats, RightSection, RuntimeState,
-        RuntimeTargetId, TextInput, UiState, WorkerEvent,
+        RuntimeTargetId, SessionSettingsPrompt, SettingsFocus, TextInput, UiState, WorkerEvent,
     };
     use crate::clipboard::Clipboard;
     use crate::config::{Config, DuxPaths, ProjectConfig};
@@ -5617,6 +5710,46 @@ mod tests {
                 id: OverlayCheckboxId::NameNewAgentRandomizedPetName,
                 rect: Rect::new(24, 12, 34, 2),
             }),
+        };
+    }
+
+    /// Install a session-settings prompt and a matching overlay
+    /// layout. The rect coordinates are arbitrary but kept disjoint so
+    /// each row has its own hit-test target — the production renderer
+    /// computes them from the popup geometry, but mouse logic only
+    /// reads the rects, so test code is free to use whatever values
+    /// keep the test arithmetic readable. Watch rules are omitted for
+    /// brevity; production code path with rules is exercised by
+    /// `open_session_settings_seeds_draft_from_live_session` etc.
+    fn install_session_settings_overlay(app: &mut App) {
+        let sid = app.git.sessions[0].id.clone();
+        app.ui.prompt = PromptState::SessionSettings(SessionSettingsPrompt {
+            session_id: sid,
+            session_label: "demo".to_string(),
+            provider: crate::model::ProviderKind::from_str("codex"),
+            draft: crate::model::SessionSettings::default(),
+            draft_title: TextInput::with_text("draft title".to_string()),
+            focus: SettingsFocus::ModeAttended,
+            rules: Vec::new(),
+        });
+        // Layout: title input on row 5, mode rows on 7/8/9, yolo on 11,
+        // auto-clear on 13, verify rows on 15/16/17, save/cancel on
+        // row 19. Each rect is 30 cols wide starting at column 10 so
+        // hit-tests within `(10..=39, target_row)` resolve.
+        app.ui.overlay_layout.active = OverlayMouseLayout::SessionSettings {
+            title_input: Rect::new(10, 5, 30, 1),
+            rows: vec![
+                (Rect::new(10, 7, 30, 1), SettingsFocus::ModeAttended),
+                (Rect::new(10, 8, 30, 1), SettingsFocus::ModeOrchestrator),
+                (Rect::new(10, 9, 30, 1), SettingsFocus::ModeWorker),
+                (Rect::new(10, 11, 30, 1), SettingsFocus::Yolo),
+                (Rect::new(10, 13, 30, 1), SettingsFocus::AutoClearOnDone),
+                (Rect::new(10, 15, 30, 1), SettingsFocus::VerifyDefault),
+                (Rect::new(10, 16, 30, 1), SettingsFocus::VerifyStrict),
+                (Rect::new(10, 17, 30, 1), SettingsFocus::VerifySkip),
+                (Rect::new(14, 19, 8, 1), SettingsFocus::SaveButton),
+                (Rect::new(26, 19, 10, 1), SettingsFocus::CancelButton),
+            ],
         };
     }
 
@@ -8818,6 +8951,208 @@ cyan = "#00ffff"
                 assert_eq!(randomized_name.as_deref(), Some(input.text.as_str()));
             }
             other => panic!("expected name-new-agent prompt, got {other:?}"),
+        }
+    }
+
+    /// Click on a checkbox row of the session-settings modal: the
+    /// click should land focus on that row and immediately toggle the
+    /// underlying boolean. Mirrors the rename-modal checkbox click
+    /// test — both modals advertise an instant single-click toggle.
+    #[test]
+    fn mouse_click_session_settings_checkbox_focuses_and_toggles() {
+        let mut app = test_app(default_bindings());
+        install_session_settings_overlay(&mut app);
+
+        // YOLO row at (10..40, y=11). Default starts unchecked.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 20, 11));
+
+        match &app.ui.prompt {
+            PromptState::SessionSettings(p) => {
+                assert_eq!(p.focus, SettingsFocus::Yolo);
+                assert!(
+                    p.draft.yolo_permissions,
+                    "click on YOLO row should toggle yolo_permissions on"
+                );
+            }
+            other => panic!("expected SessionSettings, got {other:?}"),
+        }
+    }
+
+    /// Click on a radio row sets focus and selects that mode. Mode
+    /// radios are different from checkboxes: clicking flips the
+    /// `mode` enum to a fixed variant rather than negating a boolean.
+    #[test]
+    fn mouse_click_session_settings_radio_selects_mode() {
+        let mut app = test_app(default_bindings());
+        install_session_settings_overlay(&mut app);
+
+        // Default mode is Attended; clicking the Worker row at y=9
+        // should set mode = Worker.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 20, 9));
+
+        match &app.ui.prompt {
+            PromptState::SessionSettings(p) => {
+                assert_eq!(p.focus, SettingsFocus::ModeWorker);
+                assert_eq!(p.draft.mode, crate::model::ContextMode::Worker);
+            }
+            other => panic!("expected SessionSettings, got {other:?}"),
+        }
+    }
+
+    /// Click outside any of the captured rects must leave the prompt
+    /// untouched — no spurious focus changes, no prompt dismissal.
+    /// Guards against the hit-tester accidentally falling through to
+    /// the title or to an off-by-one row.
+    #[test]
+    fn mouse_click_session_settings_outside_rect_is_noop() {
+        let mut app = test_app(default_bindings());
+        install_session_settings_overlay(&mut app);
+        let initial_focus = match &app.ui.prompt {
+            PromptState::SessionSettings(p) => p.focus,
+            other => panic!("expected SessionSettings, got {other:?}"),
+        };
+        let initial_mode = match &app.ui.prompt {
+            PromptState::SessionSettings(p) => p.draft.mode,
+            _ => unreachable!(),
+        };
+
+        // Row 6 (between title at 5 and ModeAttended at 7) is dead
+        // space. Click should be ignored.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 20, 6));
+
+        match &app.ui.prompt {
+            PromptState::SessionSettings(p) => {
+                assert_eq!(p.focus, initial_focus, "focus must not change");
+                assert_eq!(p.draft.mode, initial_mode, "mode must not change");
+            }
+            other => panic!("modal closed unexpectedly: {other:?}"),
+        }
+    }
+
+    /// Click on the SaveButton rect must fire the save flow, which
+    /// dismisses the modal. Other tests cover the persistence side of
+    /// `save_session_settings` — here we only assert that the click
+    /// path reaches the save function (observable via the dismissal).
+    #[test]
+    fn mouse_click_session_settings_save_button_fires_save() {
+        let mut app = test_app(default_bindings());
+        install_session_settings_overlay(&mut app);
+
+        // SaveButton rect at (14..22, y=19).
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 16, 19));
+
+        assert!(
+            matches!(app.ui.prompt, PromptState::None),
+            "save button click must close the modal; got {:?}",
+            app.ui.prompt
+        );
+    }
+
+    /// Click on the CancelButton rect must dismiss the modal without
+    /// running the save flow. The draft is discarded.
+    #[test]
+    fn mouse_click_session_settings_cancel_button_dismisses_modal() {
+        let mut app = test_app(default_bindings());
+        install_session_settings_overlay(&mut app);
+
+        // CancelButton rect at (26..36, y=19).
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 28, 19));
+
+        assert!(
+            matches!(app.ui.prompt, PromptState::None),
+            "cancel button click must close the modal; got {:?}",
+            app.ui.prompt
+        );
+    }
+
+    /// Render the live session-settings modal and confirm the
+    /// renderer publishes a `SessionSettings` overlay layout with
+    /// non-empty title and rows. Guards against future refactors that
+    /// might forget to assign `overlay_layout.active` and silently
+    /// regress mouse support — keyboard nav would still work, but
+    /// clicks would be dead.
+    #[test]
+    fn render_session_settings_publishes_overlay_layout_with_rows() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_app(default_bindings());
+        app.rebuild_left_items();
+        app.selected_left = app
+            .left_items()
+            .iter()
+            .position(|item| matches!(item, LeftItem::Session(_)))
+            .expect("session row exists");
+        app.open_session_settings().expect("open modal");
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render frame");
+
+        match &app.ui.overlay_layout.active {
+            OverlayMouseLayout::SessionSettings { title_input, rows } => {
+                assert!(
+                    title_input.width > 0 && title_input.height > 0,
+                    "title input rect must be non-empty: {title_input:?}"
+                );
+                // Every focus position the keyboard nav can reach
+                // (minus Title, which lives in `title_input`) must
+                // appear in `rows`. WatchRule slots only appear when
+                // the live engine has rules; the test session has no
+                // rules wired, so we only check the always-present
+                // positions here.
+                let focuses: Vec<SettingsFocus> = rows.iter().map(|(_, f)| *f).collect();
+                for required in [
+                    SettingsFocus::ModeAttended,
+                    SettingsFocus::ModeOrchestrator,
+                    SettingsFocus::ModeWorker,
+                    SettingsFocus::Yolo,
+                    SettingsFocus::AutoClearOnDone,
+                    SettingsFocus::VerifyDefault,
+                    SettingsFocus::VerifyStrict,
+                    SettingsFocus::VerifySkip,
+                    SettingsFocus::SaveButton,
+                    SettingsFocus::CancelButton,
+                ] {
+                    assert!(
+                        focuses.contains(&required),
+                        "renderer must publish a hit-test rect for {required:?}; got {focuses:?}"
+                    );
+                }
+            }
+            other => panic!("expected SessionSettings overlay layout, got {other:?}"),
+        }
+    }
+
+    /// Click on the title input rect must focus Title and position
+    /// the cursor — but must NOT toggle anything. Mirrors the rename
+    /// modal's text-input click semantics.
+    #[test]
+    fn mouse_click_session_settings_title_focuses_and_positions_cursor() {
+        let mut app = test_app(default_bindings());
+        install_session_settings_overlay(&mut app);
+
+        // Title rect is (10..40, y=5). The renderer prefixes the
+        // visible text with "  [ " (4 cols), so a click at column 14
+        // lands on column 0 of the text. A click at column 17 lands
+        // on column 3 of the text (here: the 'f' in "draft title").
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 17, 5));
+
+        match &app.ui.prompt {
+            PromptState::SessionSettings(p) => {
+                assert_eq!(p.focus, SettingsFocus::Title);
+                assert_eq!(
+                    p.draft_title.cursor, 3,
+                    "cursor should land 3 cols past the prefix"
+                );
+                // Critical: clicking the title must NOT mutate
+                // anything else on the draft.
+                assert_eq!(p.draft.mode, crate::model::ContextMode::Attended);
+                assert!(!p.draft.yolo_permissions);
+            }
+            other => panic!("expected SessionSettings, got {other:?}"),
         }
     }
 

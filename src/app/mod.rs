@@ -844,7 +844,7 @@ impl MouseLayoutState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct OverlayMouseLayoutState {
     pub(crate) active: OverlayMouseLayout,
 }
@@ -869,7 +869,7 @@ pub(crate) struct OverlayCheckbox {
     pub(crate) rect: Rect,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) enum OverlayMouseLayout {
     #[default]
     None,
@@ -966,6 +966,19 @@ pub(crate) enum OverlayMouseLayout {
     NameNewAgent {
         input: Rect,
         checkbox: Option<OverlayCheckbox>,
+    },
+    /// Per-session settings modal (audit03 Phase 7). Carries the
+    /// title text-input rect plus one entry per non-title interactive
+    /// row, populated in draw order so a click resolves to a single,
+    /// deterministic focus position. The rows list intentionally uses
+    /// `(Rect, SettingsFocus)` instead of `OverlayCheckbox` because the
+    /// modal mixes radios, checkboxes, and buttons — capturing the
+    /// focus position directly avoids extending `OverlayCheckboxId`
+    /// with a dozen radio/button variants that would only be used
+    /// here.
+    SessionSettings {
+        title_input: Rect,
+        rows: Vec<(Rect, SettingsFocus)>,
     },
 }
 
