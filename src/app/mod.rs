@@ -39,8 +39,8 @@ use crate::keybindings::{
 use crate::lockfile::SingleInstanceLock;
 use crate::logger;
 use crate::model::{
-    AgentSession, ChangedFile, CompanionTerminalStatus, Project, ProviderKind, SessionState,
-    SessionSurface,
+    AgentSession, ChangedFile, CompanionTerminalStatus, ContextMode, Project, ProviderKind,
+    SessionSettings, SessionState, SessionSurface,
 };
 use crate::provider;
 use crate::pty::PtyClient;
@@ -543,6 +543,126 @@ pub(crate) enum PromptState {
         last_refresh: Instant,
         first_sample: bool,
     },
+    SessionSettings(SessionSettingsPrompt),
+}
+
+/// State for the per-session settings modal. Built from the live
+/// [`AgentSession::settings`] when the modal opens; the modal mutates
+/// a copy and only writes back on save (Enter / Save button). On
+/// cancel (Esc / Cancel button) the draft is discarded.
+///
+/// audit03 Phase 6.
+#[derive(Clone, Debug)]
+pub(crate) struct SessionSettingsPrompt {
+    pub session_id: String,
+    /// Pretty label for the modal header — falls back to the branch
+    /// name when the session has no operator-set title.
+    pub session_label: String,
+    /// Provider for the underlying session — captured at modal open
+    /// time so any future provider-specific UI logic (e.g. hiding
+    /// YOLO for providers without a wrapper flag) can read it without
+    /// re-resolving the session row. Currently informational only.
+    #[allow(dead_code)]
+    pub provider: ProviderKind,
+    pub draft: SessionSettings,
+    pub draft_title: TextInput,
+    pub focus: SettingsFocus,
+    /// Static metadata about the watch rules available for this
+    /// session's provider — populated once when the modal opens and
+    /// never re-queried (the engine state can change underneath, but
+    /// the rule list itself is config-driven and stable).
+    pub rules: Vec<WatchRuleSummary>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WatchRuleSummary {
+    pub idx: usize,
+    pub label: String,
+    /// Whether the rule is currently armed. When the session has a
+    /// live engine we read this from the engine's snapshot; otherwise
+    /// we assume armed (the config-default). The modal uses this for
+    /// the "live" badge and to decide what state a tick toggles to.
+    pub armed: bool,
+}
+
+/// Cursor position within the session-settings modal. `Tab`/`Shift-Tab`
+/// and `↑`/`↓` cycle through the variants.
+///
+/// `WatchRule(idx)` indexes into [`SessionSettingsPrompt::rules`];
+/// out-of-range indices are skipped during navigation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SettingsFocus {
+    Title,
+    ModeAttended,
+    ModeOrchestrator,
+    ModeWorker,
+    Yolo,
+    WatchRule(usize),
+    AutoClearOnDone,
+    VerifyDefault,
+    VerifyStrict,
+    VerifySkip,
+    SaveButton,
+    CancelButton,
+}
+
+impl SettingsFocus {
+    /// Cycle to the next focus position. `rules_len` is the count of
+    /// available watch rules — when zero, the WatchRule slots are
+    /// skipped entirely. Wraps around at the end of the modal.
+    pub(crate) fn next(self, rules_len: usize) -> Self {
+        match self {
+            Self::Title => Self::ModeAttended,
+            Self::ModeAttended => Self::ModeOrchestrator,
+            Self::ModeOrchestrator => Self::ModeWorker,
+            Self::ModeWorker => Self::Yolo,
+            Self::Yolo => {
+                if rules_len > 0 {
+                    Self::WatchRule(0)
+                } else {
+                    Self::AutoClearOnDone
+                }
+            }
+            Self::WatchRule(idx) => {
+                if idx + 1 < rules_len {
+                    Self::WatchRule(idx + 1)
+                } else {
+                    Self::AutoClearOnDone
+                }
+            }
+            Self::AutoClearOnDone => Self::VerifyDefault,
+            Self::VerifyDefault => Self::VerifyStrict,
+            Self::VerifyStrict => Self::VerifySkip,
+            Self::VerifySkip => Self::SaveButton,
+            Self::SaveButton => Self::CancelButton,
+            Self::CancelButton => Self::Title,
+        }
+    }
+
+    /// Cycle to the previous focus position; mirror of [`Self::next`].
+    pub(crate) fn prev(self, rules_len: usize) -> Self {
+        match self {
+            Self::Title => Self::CancelButton,
+            Self::ModeAttended => Self::Title,
+            Self::ModeOrchestrator => Self::ModeAttended,
+            Self::ModeWorker => Self::ModeOrchestrator,
+            Self::Yolo => Self::ModeWorker,
+            Self::WatchRule(0) => Self::Yolo,
+            Self::WatchRule(idx) => Self::WatchRule(idx - 1),
+            Self::AutoClearOnDone => {
+                if rules_len > 0 {
+                    Self::WatchRule(rules_len - 1)
+                } else {
+                    Self::Yolo
+                }
+            }
+            Self::VerifyDefault => Self::AutoClearOnDone,
+            Self::VerifyStrict => Self::VerifyDefault,
+            Self::VerifySkip => Self::VerifyStrict,
+            Self::SaveButton => Self::VerifySkip,
+            Self::CancelButton => Self::SaveButton,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1833,6 +1953,7 @@ impl App {
             "rename-agent" => self.open_rename_session(),
             "kill-running" => self.open_kill_running(),
             "watch-rules" => self.open_watch_rules_prompt(),
+            "session-settings" => self.open_session_settings(),
             "reconnect-agent" => self.reconnect_selected_session(),
             "force-reconnect-agent" => self.force_reconnect_agent(),
             "show-agent" => self.activate_center_agent(),

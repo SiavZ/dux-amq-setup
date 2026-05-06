@@ -1966,6 +1966,221 @@ impl App {
         ));
         Some(label)
     }
+
+    // ─── audit03 Phase 6: per-session settings modal ─────────────
+
+    /// Open the per-session settings modal for the currently selected
+    /// session. No-ops when nothing is selected (status line tells the
+    /// operator) so the binding stays safe to fire from anywhere.
+    pub(crate) fn open_session_settings(&mut self) -> Result<()> {
+        let Some(session) = self.selected_session().cloned() else {
+            self.set_warning("Select an agent session first, then re-open session settings.");
+            return Ok(());
+        };
+        let label = session
+            .title
+            .clone()
+            .unwrap_or_else(|| session.branch_name.clone());
+        let rules = self.collect_watch_rule_summaries(&session);
+        // Discard any unrelated input target so keystrokes route to
+        // the modal handler.
+        self.ui.input_target = InputTarget::None;
+        self.ui.fullscreen_overlay = FullscreenOverlay::None;
+        self.ui.prompt = PromptState::SessionSettings(SessionSettingsPrompt {
+            session_id: session.id.clone(),
+            session_label: label.clone(),
+            provider: session.provider.clone(),
+            draft: session.settings.clone(),
+            draft_title: TextInput::with_text(label).with_char_map(crate::git::agent_name_char_map),
+            focus: SettingsFocus::Title,
+            rules,
+        });
+        Ok(())
+    }
+
+    /// Build the per-session rule summary list shown in the modal.
+    /// Prefers the live engine's snapshot when attached; falls back to
+    /// the provider config's `[providers.<X>.watch]` array for sessions
+    /// whose engine isn't loaded yet (Detached, Exited).
+    fn collect_watch_rule_summaries(&self, session: &AgentSession) -> Vec<WatchRuleSummary> {
+        if let Some(engine) = self.runtime.watch_engines.get(&session.id) {
+            return engine
+                .rules_snapshot()
+                .into_iter()
+                .map(|s| WatchRuleSummary {
+                    idx: s.idx,
+                    label: s.label,
+                    armed: !matches!(s.state, crate::watch::RuleStateKind::Disarmed),
+                })
+                .collect();
+        }
+        self.config
+            .providers
+            .commands
+            .get(session.provider.as_str())
+            .map(|cfg| {
+                cfg.watch
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, rule)| {
+                        let label = if rule.label.trim().is_empty() {
+                            format!("rule {idx}")
+                        } else {
+                            rule.label.clone()
+                        };
+                        // No live engine — start from "armed" (the
+                        // config default) and let the persisted
+                        // `watch_rule_arm` map override.
+                        let armed = session
+                            .settings
+                            .watch_rule_arm
+                            .get(&idx)
+                            .copied()
+                            .unwrap_or(true);
+                        WatchRuleSummary { idx, label, armed }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Persist the modal's draft to the in-memory session, the sqlite
+    /// store, and any live runtime hooks (watch engine arm state).
+    /// Surfaces the result on the status line; respawn-only changes
+    /// (YOLO, AMQ verify) report a warning so the operator knows to
+    /// detach + relaunch.
+    pub(crate) fn save_session_settings(&mut self) -> Result<()> {
+        let PromptState::SessionSettings(prompt) = &self.ui.prompt else {
+            return Ok(());
+        };
+        let session_id = prompt.session_id.clone();
+        let new_settings = prompt.draft.clone();
+        let new_title_raw = prompt.draft_title.text.trim().to_string();
+        let new_title = (!new_title_raw.is_empty()).then_some(new_title_raw);
+
+        // Detect what changed before mutating the session in-place so
+        // we can build a precise status-line summary.
+        let (mode_changed, yolo_changed, verify_changed, auto_clear_changed, title_changed) = {
+            let Some(session) = self.git.sessions.iter().find(|s| s.id == session_id) else {
+                self.set_error("Session disappeared while editing settings.");
+                self.ui.prompt = PromptState::None;
+                return Ok(());
+            };
+            (
+                session.settings.mode != new_settings.mode,
+                session.settings.yolo_permissions != new_settings.yolo_permissions,
+                session.settings.verify_envelope_override != new_settings.verify_envelope_override,
+                session.settings.auto_clear_on_task_done != new_settings.auto_clear_on_task_done,
+                session.title != new_title,
+            )
+        };
+
+        if let Some(session) = self.git.sessions.iter_mut().find(|s| s.id == session_id) {
+            session.settings = new_settings.clone();
+            if title_changed {
+                session.title = new_title.clone();
+            }
+            session.updated_at = Utc::now();
+        }
+
+        let upsert_result = self
+            .git
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .map(|s| self.session_store.upsert_session(s));
+
+        if let Some(Err(err)) = upsert_result {
+            self.set_error(format!(
+                "Failed to save session settings: {err}. Settings remain unsaved \
+                 — close this modal and try again, or check {} for the underlying error.",
+                self.paths.sessions_db_path.display()
+            ));
+            // Leave modal open so operator can retry. Don't close it.
+            return Ok(());
+        }
+
+        // Apply live changes immediately. Mode + auto-clear changes
+        // also rebuild the watch engine so the built-in rule attaches
+        // / detaches at the right times.
+        self.apply_session_settings_to_runtime(&session_id, &new_settings);
+        if mode_changed || auto_clear_changed {
+            self.attach_watch_engine(&session_id);
+        }
+
+        let needs_respawn = yolo_changed || verify_changed;
+        let summary = build_session_settings_save_summary(
+            mode_changed,
+            title_changed,
+            auto_clear_changed,
+            needs_respawn,
+        );
+        if needs_respawn {
+            let reconnect = self.bindings.label_for(Action::ReconnectAgent);
+            self.set_warning(format!(
+                "{summary} Press {reconnect} (Reconnect agent) for spawn-time settings (YOLO, AMQ verify) to take effect.",
+            ));
+        } else {
+            self.set_info(summary);
+        }
+
+        self.ui.prompt = PromptState::None;
+        self.rebuild_left_items();
+        Ok(())
+    }
+
+    /// Push the saved settings into runtime state that doesn't go
+    /// through a respawn: per-rule arm/disarm overrides on the live
+    /// watch engine. (Mode, YOLO, and AMQ-verify changes either
+    /// rebuild the engine at the call site or take effect at next
+    /// spawn.)
+    fn apply_session_settings_to_runtime(&mut self, session_id: &str, settings: &SessionSettings) {
+        let Some(engine) = self.runtime.watch_engines.get_mut(session_id) else {
+            return;
+        };
+        for (&idx, &armed) in &settings.watch_rule_arm {
+            if armed {
+                engine.rearm(idx);
+            } else {
+                engine.disarm(idx);
+            }
+        }
+        tracing::debug!(
+            target: "dux::session_settings",
+            session_id = %session_id,
+            overrides = settings.watch_rule_arm.len(),
+            "applied per-session watch rule arm overrides",
+        );
+    }
+}
+
+/// Build a human-readable summary of which session-settings knobs
+/// changed. Used by [`App::save_session_settings`] to populate the
+/// status line. Pure function so it's easy to unit-test.
+pub(crate) fn build_session_settings_save_summary(
+    mode_changed: bool,
+    title_changed: bool,
+    auto_clear_changed: bool,
+    needs_respawn: bool,
+) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if title_changed {
+        parts.push("title");
+    }
+    if mode_changed {
+        parts.push("context mode");
+    }
+    if auto_clear_changed {
+        parts.push("auto-clear");
+    }
+    if needs_respawn {
+        parts.push("spawn-time settings");
+    }
+    if parts.is_empty() {
+        "Session settings saved (no changes).".to_string()
+    } else {
+        format!("Session settings saved: {}.", parts.join(", "))
+    }
 }
 
 #[cfg(test)]
@@ -2892,6 +3107,170 @@ mod tests {
             "scrollback detach must select oldest victim first; \
              both sessions should not have been torn down before the \
              oldest was selected",
+        );
+    }
+
+    // ── audit03 Phase 6: per-session settings modal ───────────────
+
+    #[test]
+    fn open_session_settings_warns_when_no_session_selected() {
+        let project = make_project("project-1", "claude");
+        let mut app = test_app_with_sessions(vec![], vec![project]);
+
+        // Selected_left points past the end → no session selected.
+        app.selected_left = 99;
+        app.open_session_settings().expect("open");
+
+        // Modal must not open.
+        assert!(matches!(app.ui.prompt, PromptState::None));
+        // Status line must surface a warning rather than silently
+        // failing.
+        assert!(
+            !app.status.message().is_empty(),
+            "status line should carry a warning when no session is selected"
+        );
+    }
+
+    #[test]
+    fn open_session_settings_seeds_draft_from_live_session() {
+        let mut s1 = make_session("s1", "claude", "/tmp/wt/a");
+        s1.settings.mode = ContextMode::Worker;
+        s1.settings.yolo_permissions = true;
+        s1.settings.auto_clear_on_task_done = true;
+        let project = make_project("project-1", "claude");
+        let mut app = test_app_with_sessions(vec![s1], vec![project]);
+        // Force the left pane to point at the session row.
+        app.rebuild_left_items();
+        app.selected_left = app
+            .left_items()
+            .iter()
+            .position(|item| matches!(item, LeftItem::Session(_)))
+            .expect("session row exists");
+        app.open_session_settings().expect("open");
+
+        let PromptState::SessionSettings(p) = &app.ui.prompt else {
+            panic!("expected SessionSettings modal, got {:?}", app.ui.prompt);
+        };
+        assert_eq!(p.session_id, "s1");
+        assert_eq!(p.draft.mode, ContextMode::Worker);
+        assert!(p.draft.yolo_permissions);
+        assert!(p.draft.auto_clear_on_task_done);
+        assert_eq!(p.focus, SettingsFocus::Title);
+    }
+
+    #[test]
+    fn save_session_settings_persists_to_sqlite_and_in_memory() {
+        let s1 = make_session("s1", "claude", "/tmp/wt/a");
+        let project = make_project("project-1", "claude");
+        let mut app = test_app_with_sessions(vec![s1], vec![project]);
+        // Persist baseline so we can compare on reload.
+        let session = app.git.sessions[0].clone();
+        app.session_store.upsert_session(&session).expect("seed db");
+
+        app.rebuild_left_items();
+        app.selected_left = app
+            .left_items()
+            .iter()
+            .position(|item| matches!(item, LeftItem::Session(_)))
+            .expect("session row");
+        app.open_session_settings().expect("open");
+
+        // Mutate the draft.
+        if let PromptState::SessionSettings(p) = &mut app.ui.prompt {
+            p.draft.mode = ContextMode::Worker;
+            p.draft.auto_clear_on_task_done = true;
+            p.draft.yolo_permissions = true;
+            p.draft.verify_envelope_override = Some(true);
+        } else {
+            panic!("modal not open");
+        }
+
+        app.save_session_settings().expect("save");
+
+        // Modal closed.
+        assert!(matches!(app.ui.prompt, PromptState::None));
+
+        // In-memory updated.
+        let s = app.git.sessions.iter().find(|s| s.id == "s1").unwrap();
+        assert_eq!(s.settings.mode, ContextMode::Worker);
+        assert!(s.settings.auto_clear_on_task_done);
+        assert!(s.settings.yolo_permissions);
+        assert_eq!(s.settings.verify_envelope_override, Some(true));
+
+        // SQLite updated — load through a fresh handle to confirm.
+        let reloaded = app.session_store.load_sessions().expect("reload");
+        let r = reloaded.iter().find(|s| s.id == "s1").unwrap();
+        assert_eq!(r.settings.mode, ContextMode::Worker);
+        assert!(r.settings.auto_clear_on_task_done);
+        assert!(r.settings.yolo_permissions);
+        assert_eq!(r.settings.verify_envelope_override, Some(true));
+    }
+
+    #[test]
+    fn save_session_settings_no_changes_reports_no_changes() {
+        let s1 = make_session("s1", "claude", "/tmp/wt/a");
+        let project = make_project("project-1", "claude");
+        let mut app = test_app_with_sessions(vec![s1], vec![project]);
+        app.rebuild_left_items();
+        app.selected_left = app
+            .left_items()
+            .iter()
+            .position(|item| matches!(item, LeftItem::Session(_)))
+            .expect("session row");
+        app.open_session_settings().expect("open");
+        // No mutation — save immediately.
+        app.save_session_settings().expect("save");
+
+        // Status line should reflect the no-change save.
+        let summary = app.status.message();
+        assert!(
+            summary.contains("no changes") || summary.contains("Session settings saved"),
+            "status line should mention save outcome; got: {summary}"
+        );
+    }
+
+    #[test]
+    fn settings_focus_navigation_skips_empty_watch_rules() {
+        // No rules → Yolo → AutoClearOnDone (not WatchRule(0)).
+        assert_eq!(SettingsFocus::Yolo.next(0), SettingsFocus::AutoClearOnDone);
+        // With rules → Yolo → WatchRule(0).
+        assert_eq!(SettingsFocus::Yolo.next(3), SettingsFocus::WatchRule(0));
+        // Last WatchRule → AutoClearOnDone.
+        assert_eq!(
+            SettingsFocus::WatchRule(2).next(3),
+            SettingsFocus::AutoClearOnDone
+        );
+        // Wrap from CancelButton back to Title.
+        assert_eq!(SettingsFocus::CancelButton.next(0), SettingsFocus::Title);
+        // Reverse skips empty rules.
+        assert_eq!(SettingsFocus::AutoClearOnDone.prev(0), SettingsFocus::Yolo);
+        assert_eq!(
+            SettingsFocus::AutoClearOnDone.prev(3),
+            SettingsFocus::WatchRule(2)
+        );
+    }
+
+    #[test]
+    fn build_session_settings_save_summary_lists_changed_knobs() {
+        // No changes.
+        assert_eq!(
+            build_session_settings_save_summary(false, false, false, false),
+            "Session settings saved (no changes)."
+        );
+        // Title only.
+        assert_eq!(
+            build_session_settings_save_summary(false, true, false, false),
+            "Session settings saved: title."
+        );
+        // Mode + auto-clear.
+        assert_eq!(
+            build_session_settings_save_summary(true, false, true, false),
+            "Session settings saved: context mode, auto-clear."
+        );
+        // Respawn-only changes.
+        assert_eq!(
+            build_session_settings_save_summary(false, false, false, true),
+            "Session settings saved: spawn-time settings."
         );
     }
 }

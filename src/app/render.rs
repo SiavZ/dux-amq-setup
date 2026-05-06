@@ -4798,8 +4798,219 @@ impl App {
                     .wrap(Wrap { trim: true });
                 Widget::render(hint, hint_area, frame.buffer_mut());
             }
+            PromptState::SessionSettings(_) => {
+                self.render_session_settings(frame);
+            }
             PromptState::None => {}
         }
+    }
+
+    /// Render the per-session settings modal (audit03 Phase 6).
+    /// Centred popup, rows for title / context mode / permissions /
+    /// watch rules / auto-clear / AMQ verify, with a Save / Cancel
+    /// footer. The `(live)` and `(needs respawn)` apply-timing tags
+    /// are baked into the row labels so the operator never has to
+    /// guess which knob takes effect when.
+    fn render_session_settings(&mut self, frame: &mut Frame) {
+        let PromptState::SessionSettings(prompt) = &self.ui.prompt else {
+            return;
+        };
+
+        self.render_dim_overlay(frame);
+        let popup = centered_rect(70, 80, frame.area());
+        self.clear_overlay_area(frame, popup);
+
+        let title = format!("Session Settings — {}", prompt.session_label);
+        let outer = self.themed_overlay_block(&title);
+        let inner = outer.inner(popup);
+        outer.render(popup, frame.buffer_mut());
+
+        // Reserve the bottom 3 rows for the footer hint bar; the rest
+        // is the form area.
+        let [form_area, hint_area] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(3)])
+            .areas(inner);
+
+        // Build the visual rows. Each entry is `(focus, lines)` so the
+        // selected row can be highlighted as a single block.
+        let mut sections: Vec<Vec<Line<'static>>> = Vec::new();
+
+        // ── Title input ─────────────────────────────────
+        sections.push(vec![Line::from(Span::styled(
+            "Title",
+            Style::default()
+                .fg(self.theme.input_label_fg)
+                .add_modifier(Modifier::BOLD),
+        ))]);
+        let title_row_focused = prompt.focus == SettingsFocus::Title;
+        let title_box =
+            settings_input_line(&prompt.draft_title.text, title_row_focused, &self.theme);
+        sections.push(vec![title_box]);
+
+        // ── Context mode ────────────────────────────────
+        sections.push(vec![Line::from(Span::styled(
+            "Context mode  (live for clearing semantics; postscript applies on next AMQ wake)",
+            Style::default()
+                .fg(self.theme.input_label_fg)
+                .add_modifier(Modifier::BOLD),
+        ))]);
+        sections.push(vec![radio_line(
+            "attended",
+            "operator-managed, never auto-cleared",
+            prompt.draft.mode == ContextMode::Attended,
+            prompt.focus == SettingsFocus::ModeAttended,
+            &self.theme,
+        )]);
+        sections.push(vec![radio_line(
+            "orchestrator",
+            "coordinates peers, persists context",
+            prompt.draft.mode == ContextMode::Orchestrator,
+            prompt.focus == SettingsFocus::ModeOrchestrator,
+            &self.theme,
+        )]);
+        sections.push(vec![radio_line(
+            "worker",
+            "stateless, gets task-done postscript on AMQ wakes",
+            prompt.draft.mode == ContextMode::Worker,
+            prompt.focus == SettingsFocus::ModeWorker,
+            &self.theme,
+        )]);
+
+        // ── Permissions (YOLO) ──────────────────────────
+        sections.push(vec![Line::from(Span::styled(
+            "Permissions  (needs respawn — Reconnect agent to apply)",
+            Style::default()
+                .fg(self.theme.input_label_fg)
+                .add_modifier(Modifier::BOLD),
+        ))]);
+        sections.push(vec![checkbox_line(
+            "YOLO  (--dangerously-skip-permissions / --sandbox-bypass)",
+            prompt.draft.yolo_permissions,
+            prompt.focus == SettingsFocus::Yolo,
+            &self.theme,
+        )]);
+
+        // ── Watch rules ─────────────────────────────────
+        sections.push(vec![Line::from(Span::styled(
+            "Watch rules  (live — overrides apply at next tick)",
+            Style::default()
+                .fg(self.theme.input_label_fg)
+                .add_modifier(Modifier::BOLD),
+        ))]);
+        if prompt.rules.is_empty() {
+            sections.push(vec![Line::from(Span::styled(
+                "  (no rules configured for this provider)",
+                Style::default().fg(self.theme.hint_dim_desc_fg),
+            ))]);
+        } else {
+            for rule in &prompt.rules {
+                sections.push(vec![checkbox_line(
+                    &rule.label,
+                    rule.armed,
+                    prompt.focus == SettingsFocus::WatchRule(rule.idx),
+                    &self.theme,
+                )]);
+            }
+        }
+
+        // ── Auto-clear after task done ───────────────────
+        sections.push(vec![checkbox_line(
+            "Auto-clear after task done  (live, only fires for Worker mode)",
+            prompt.draft.auto_clear_on_task_done,
+            prompt.focus == SettingsFocus::AutoClearOnDone,
+            &self.theme,
+        )]);
+
+        // ── AMQ verify_envelope override ─────────────────
+        sections.push(vec![Line::from(Span::styled(
+            "AMQ inject verify_envelope  (needs respawn)",
+            Style::default()
+                .fg(self.theme.input_label_fg)
+                .add_modifier(Modifier::BOLD),
+        ))]);
+        sections.push(vec![radio_line(
+            "default",
+            "inherit [amq.inject].verify_envelope from config",
+            prompt.draft.verify_envelope_override.is_none(),
+            prompt.focus == SettingsFocus::VerifyDefault,
+            &self.theme,
+        )]);
+        sections.push(vec![radio_line(
+            "strict",
+            "force HMAC verification for this session",
+            prompt.draft.verify_envelope_override == Some(true),
+            prompt.focus == SettingsFocus::VerifyStrict,
+            &self.theme,
+        )]);
+        sections.push(vec![radio_line(
+            "skip",
+            "force unsigned for this session",
+            prompt.draft.verify_envelope_override == Some(false),
+            prompt.focus == SettingsFocus::VerifySkip,
+            &self.theme,
+        )]);
+
+        // ── Save / Cancel buttons ─────────────────────────
+        sections.push(vec![button_row(
+            prompt.focus == SettingsFocus::SaveButton,
+            prompt.focus == SettingsFocus::CancelButton,
+            &self.theme,
+        )]);
+
+        // Flatten sections into a single Vec<Line>; sections are
+        // already separated visually by their content (labels are
+        // bold and indented, rows are not). We don't insert blanks
+        // between sections to maximise the room available for the
+        // watch-rules list — operators with many rules need every
+        // line. The form area scrolls (via `Paragraph` wrap) if it
+        // overflows.
+        let lines: Vec<Line<'static>> = sections.into_iter().flatten().collect();
+
+        let form = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().bg(self.theme.overlay_bg));
+        Widget::render(form, form_area, frame.buffer_mut());
+
+        // Footer hint.
+        let confirm_key = self.bindings.label_for(Action::Confirm);
+        let close_key = self.bindings.label_for(Action::CloseOverlay);
+        let next_key = self.bindings.label_for(Action::FocusNext);
+        let mut hints: Vec<Span> = vec![Span::raw(" ")];
+        hints.extend(self.theme.key_badge_default(&next_key));
+        hints.push(Span::styled(
+            " next field  ",
+            Style::default().fg(self.theme.hint_desc_fg),
+        ));
+        hints.extend(self.theme.key_badge_default(&confirm_key));
+        hints.push(Span::styled(
+            " toggle / save  ",
+            Style::default().fg(self.theme.hint_desc_fg),
+        ));
+        hints.push(Span::styled(
+            "Space",
+            Style::default()
+                .fg(self.theme.input_label_fg)
+                .add_modifier(Modifier::BOLD),
+        ));
+        hints.push(Span::styled(
+            " toggle  ",
+            Style::default().fg(self.theme.hint_desc_fg),
+        ));
+        hints.extend(self.theme.key_badge_default(&close_key));
+        hints.push(Span::styled(
+            " cancel",
+            Style::default().fg(self.theme.hint_desc_fg),
+        ));
+        let hint_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::default().fg(self.theme.overlay_border))
+            .style(Style::default().bg(self.theme.overlay_bg));
+        let hint = Paragraph::new(Line::from(hints))
+            .block(hint_block)
+            .wrap(Wrap { trim: true });
+        Widget::render(hint, hint_area, frame.buffer_mut());
     }
 
     fn render_edit_macros(&mut self, frame: &mut Frame) {
@@ -5845,6 +6056,110 @@ pub(crate) fn centered_rect_exact(width: u16, height: u16, area: Rect) -> Rect {
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     Rect::new(x, y, width, height)
+}
+
+/// audit03 Phase 6: render the title input line for the session
+/// settings modal as a bracketed box with focus highlighting. Pure
+/// Line builder so the render function stays declarative.
+fn settings_input_line(text: &str, focused: bool, theme: &Theme) -> Line<'static> {
+    let style = if focused {
+        Style::default()
+            .fg(theme.input_label_fg)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else {
+        Style::default().fg(theme.input_label_fg)
+    };
+    let display = if text.is_empty() {
+        "(empty title — branch name will be shown)".to_string()
+    } else {
+        text.to_string()
+    };
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled("[ ", style),
+        Span::styled(display, style),
+        Span::styled(" ]", style),
+    ])
+}
+
+/// audit03 Phase 6: render a radio-style row for the session settings
+/// modal. `selected` is the data state (●/○); `focused` is the cursor
+/// position (highlight).
+fn radio_line(
+    label: &str,
+    description: &str,
+    selected: bool,
+    focused: bool,
+    theme: &Theme,
+) -> Line<'static> {
+    let bullet = if selected { "● " } else { "○ " };
+    let label_style = if focused {
+        Style::default()
+            .fg(theme.input_label_fg)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else if selected {
+        Style::default()
+            .fg(theme.input_label_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.hint_desc_fg)
+    };
+    let desc_style = Style::default().fg(theme.hint_dim_desc_fg);
+    Line::from(vec![
+        Span::raw("    "),
+        Span::styled(bullet, label_style),
+        Span::styled(label.to_string(), label_style),
+        Span::raw("  "),
+        Span::styled(format!("— {description}"), desc_style),
+    ])
+}
+
+/// audit03 Phase 6: render a checkbox-style row.
+fn checkbox_line(label: &str, checked: bool, focused: bool, theme: &Theme) -> Line<'static> {
+    let mark = if checked { "[x] " } else { "[ ] " };
+    let style = if focused {
+        Style::default()
+            .fg(theme.input_label_fg)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else if checked {
+        Style::default()
+            .fg(theme.input_label_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.hint_desc_fg)
+    };
+    Line::from(vec![
+        Span::raw("    "),
+        Span::styled(mark, style),
+        Span::styled(label.to_string(), style),
+    ])
+}
+
+/// audit03 Phase 6: render the Save / Cancel button row for the
+/// session settings modal.
+fn button_row(save_focused: bool, cancel_focused: bool, theme: &Theme) -> Line<'static> {
+    let save_style = if save_focused {
+        Style::default()
+            .fg(theme.input_label_fg)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else {
+        Style::default()
+            .fg(theme.input_label_fg)
+            .add_modifier(Modifier::BOLD)
+    };
+    let cancel_style = if cancel_focused {
+        Style::default()
+            .fg(theme.input_label_fg)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else {
+        Style::default().fg(theme.hint_desc_fg)
+    };
+    Line::from(vec![
+        Span::raw("    "),
+        Span::styled("[ Save ]", save_style),
+        Span::raw("    "),
+        Span::styled("[ Cancel ]", cancel_style),
+    ])
 }
 
 fn render_single_line_cursor_input(

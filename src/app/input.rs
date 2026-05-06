@@ -480,6 +480,9 @@ impl App {
                         ));
                     }
                 }
+                Action::SessionSettings => {
+                    self.open_session_settings()?;
+                }
                 _ => {}
             }
             return Ok(false);
@@ -2283,6 +2286,14 @@ impl App {
             return Ok(false);
         }
 
+        // audit03 Phase 6: per-session settings modal. Title focus
+        // forwards plain keystrokes to the TextInput; every other
+        // focus position handles arrow / tab / space / enter / esc
+        // and lets typing characters fall through (no-op).
+        if matches!(&self.ui.prompt, PromptState::SessionSettings(_)) {
+            return self.handle_session_settings_key(key);
+        }
+
         if let PromptState::ConfirmKillRunning(confirm_prompt) = &mut self.ui.prompt {
             match self.bindings.lookup(&key, BindingScope::Dialog) {
                 Some(Action::CloseOverlay) => {
@@ -2667,6 +2678,161 @@ impl App {
             return Ok(false);
         }
 
+        Ok(false)
+    }
+
+    /// audit03 Phase 6: handle a key event while the per-session
+    /// settings modal is open. Title focus forwards keystrokes to the
+    /// `TextInput`; everything else operates on `prompt.draft`.
+    fn handle_session_settings_key(&mut self, key: KeyEvent) -> Result<bool> {
+        // Resolve action lookups once; the modal honours dialog +
+        // global bindings (Tab, Esc, Enter, arrows) but ignores
+        // pane-scoped bindings.
+        let palette_action = self.bindings.lookup(&key, BindingScope::Palette);
+        let dialog_action = self.bindings.lookup(&key, BindingScope::Dialog);
+        let global_action = self.bindings.lookup(&key, BindingScope::Global);
+        let action = palette_action.or(dialog_action).or(global_action);
+
+        let is_plain_char = matches!(key.code, KeyCode::Char(_))
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT);
+
+        // Take focus + rules_len out before mutably borrowing the
+        // prompt for nav/toggle so the borrow checker stays happy.
+        let (focus, rules_len) = match &self.ui.prompt {
+            PromptState::SessionSettings(p) => (p.focus, p.rules.len()),
+            _ => return Ok(false),
+        };
+
+        // Title row: forward typing to the TextInput, but still let
+        // Tab / Esc / Enter escape.
+        if focus == SettingsFocus::Title {
+            match action {
+                Some(Action::CloseOverlay) => {
+                    self.ui.prompt = PromptState::None;
+                    return Ok(false);
+                }
+                Some(Action::Confirm) if !is_plain_char => {
+                    return self.save_session_settings_and_close();
+                }
+                Some(Action::FocusNext) => {
+                    self.set_session_settings_focus(focus.next(rules_len));
+                    return Ok(false);
+                }
+                Some(Action::FocusPrev) => {
+                    self.set_session_settings_focus(focus.prev(rules_len));
+                    return Ok(false);
+                }
+                _ => {
+                    if let PromptState::SessionSettings(p) = &mut self.ui.prompt {
+                        p.draft_title.handle_key(key);
+                    }
+                    return Ok(false);
+                }
+            }
+        }
+
+        // Non-title rows.
+        match action {
+            Some(Action::CloseOverlay) => {
+                self.ui.prompt = PromptState::None;
+            }
+            Some(Action::Confirm) => {
+                if focus == SettingsFocus::CancelButton {
+                    self.ui.prompt = PromptState::None;
+                } else if focus == SettingsFocus::SaveButton {
+                    return self.save_session_settings_and_close();
+                } else {
+                    self.toggle_session_settings_focused_row();
+                }
+            }
+            Some(Action::FocusNext) | Some(Action::MoveDown) => {
+                self.set_session_settings_focus(focus.next(rules_len));
+            }
+            Some(Action::FocusPrev) | Some(Action::MoveUp) => {
+                self.set_session_settings_focus(focus.prev(rules_len));
+            }
+            _ => {
+                // Per CLAUDE.md "Space activates focused button" tenet:
+                // Space toggles checkboxes / radios / fires Save/Cancel
+                // buttons regardless of how the keybinding is mapped.
+                if matches!(key.code, KeyCode::Char(' ')) {
+                    if focus == SettingsFocus::CancelButton {
+                        self.ui.prompt = PromptState::None;
+                    } else if focus == SettingsFocus::SaveButton {
+                        return self.save_session_settings_and_close();
+                    } else {
+                        self.toggle_session_settings_focused_row();
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn set_session_settings_focus(&mut self, focus: SettingsFocus) {
+        if let PromptState::SessionSettings(p) = &mut self.ui.prompt {
+            p.focus = focus;
+        }
+    }
+
+    /// Toggle the field at `focus`. Radio groups (Mode, Verify) set
+    /// the chosen variant; checkboxes (YOLO, watch rules,
+    /// AutoClearOnDone) flip the bool. Save / Cancel / Title are
+    /// handled by the caller, not here.
+    fn toggle_session_settings_focused_row(&mut self) {
+        let PromptState::SessionSettings(p) = &mut self.ui.prompt else {
+            return;
+        };
+        match p.focus {
+            SettingsFocus::Title | SettingsFocus::SaveButton | SettingsFocus::CancelButton => {}
+            SettingsFocus::ModeAttended => {
+                p.draft.mode = ContextMode::Attended;
+            }
+            SettingsFocus::ModeOrchestrator => {
+                p.draft.mode = ContextMode::Orchestrator;
+            }
+            SettingsFocus::ModeWorker => {
+                p.draft.mode = ContextMode::Worker;
+            }
+            SettingsFocus::Yolo => {
+                p.draft.yolo_permissions = !p.draft.yolo_permissions;
+            }
+            SettingsFocus::WatchRule(idx) => {
+                let summary_armed = p
+                    .rules
+                    .iter()
+                    .find(|r| r.idx == idx)
+                    .map(|r| r.armed)
+                    .unwrap_or(true);
+                let prev = p
+                    .draft
+                    .watch_rule_arm
+                    .get(&idx)
+                    .copied()
+                    .unwrap_or(summary_armed);
+                p.draft.watch_rule_arm.insert(idx, !prev);
+                if let Some(r) = p.rules.iter_mut().find(|r| r.idx == idx) {
+                    r.armed = !prev;
+                }
+            }
+            SettingsFocus::AutoClearOnDone => {
+                p.draft.auto_clear_on_task_done = !p.draft.auto_clear_on_task_done;
+            }
+            SettingsFocus::VerifyDefault => {
+                p.draft.verify_envelope_override = None;
+            }
+            SettingsFocus::VerifyStrict => {
+                p.draft.verify_envelope_override = Some(true);
+            }
+            SettingsFocus::VerifySkip => {
+                p.draft.verify_envelope_override = Some(false);
+            }
+        }
+    }
+
+    fn save_session_settings_and_close(&mut self) -> Result<bool> {
+        self.save_session_settings()?;
         Ok(false)
     }
 
