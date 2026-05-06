@@ -2705,7 +2705,11 @@ impl App {
         };
 
         // Title row: forward typing to the TextInput, but still let
-        // Tab / Esc / Enter escape.
+        // Tab / Shift-Tab / Up / Down / Esc / Enter escape so the
+        // operator can leave the field with the same nav keys that
+        // work in every other row of the modal. Plain characters and
+        // editing keys (Backspace, cursor movement within the field)
+        // still go to the TextInput.
         if focus == SettingsFocus::Title {
             match action {
                 Some(Action::CloseOverlay) => {
@@ -2715,11 +2719,11 @@ impl App {
                 Some(Action::Confirm) if !is_plain_char => {
                     return self.save_session_settings_and_close();
                 }
-                Some(Action::FocusNext) => {
+                Some(Action::FocusNext) | Some(Action::MoveDown) => {
                     self.set_session_settings_focus(focus.next(rules_len));
                     return Ok(false);
                 }
-                Some(Action::FocusPrev) => {
+                Some(Action::FocusPrev) | Some(Action::MoveUp) => {
                     self.set_session_settings_focus(focus.prev(rules_len));
                     return Ok(false);
                 }
