@@ -398,25 +398,63 @@ strip_block "$HOME/.claude/CLAUDE.md" md
   printf '\n<!-- <<< dux-amq v%s <<< -->\n' "$DUX_AMQ_VERSION"
 } >> "$HOME/.claude/CLAUDE.md"
 
-# 9. VSCode Remote-SSH machine settings (best-effort) ------------------------
-# Free Ctrl-G in the integrated terminal so dux's `exit_interactive` works.
-# Workbench-level settings like commandsToSkipShell are typically resolved
-# on the LOCAL machine, so this VM-side write may or may not propagate. We
-# do it anyway because it's harmless when ineffective and helpful otherwise.
-# The User-settings copy-paste printed below is the authoritative fix.
+# 9. VSCode Remote-SSH machine settings ------------------------------------
+# Merge `terminal.integrated.commandsToSkipShell` entries into the VM's
+# `~/.vscode-server/data/Machine/settings.json` so the operator's local
+# VS Code (when connected via Remote-SSH) sees keystrokes like Ctrl-G,
+# Ctrl-O, Ctrl-P flow through to the integrated terminal instead of being
+# captured by the Workbench. The setting's `machine-overridable` scope
+# means the remote-machine-level settings.json IS respected — verified
+# against the docs at code.visualstudio.com/docs/remote/ssh ("Open Remote
+# Settings" writes to this exact file, and disk reads pick it up on
+# Remote-SSH attach without needing the command).
+#
+# The list of entries is read from `dux-amq/vscode/settings-additions.json`
+# (the operator-facing JSONC template), so install.sh and the docs stay in
+# sync. Adding a new freed combo is a one-line change to that file.
+#
+# Idempotent: jq's `unique` dedups on each re-run. A user with their own
+# local-side `commandsToSkipShell` list overrides the remote machine list
+# entirely (that's the standard precedence: User > Remote > Workspace), so
+# we never override an explicit operator choice.
 configure_vscode_remote() {
   local f="$HOME/.vscode-server/data/Machine/settings.json"
-  [[ -d "$(dirname "$f")" ]] || return 0
-  if ! command -v jq >/dev/null 2>&1; then
-    warn "jq not installed; skipping VM-side VSCode settings merge"
+  if [[ ! -d "$(dirname "$f")" ]]; then
+    say "VS Code Remote-SSH not detected (~/.vscode-server missing) — skipping terminal passthrough config"
     return 0
   fi
-  local entries='["-workbench.action.gotoLine","-workbench.action.terminal.goToRecentDirectory"]'
+  if ! command -v jq >/dev/null 2>&1; then
+    warn "jq not installed; skipping VM-side VS Code settings merge"
+    return 0
+  fi
+
+  # Read entries from the canonical JSONC template. Strip `//` line
+  # comments first (the file uses no `/* */` blocks; verified in the
+  # template itself). The template's only key is `commandsToSkipShell`,
+  # so picking out the value is straightforward.
+  local source="$HERE/vscode/settings-additions.json"
+  if [[ ! -f "$source" ]]; then
+    warn "$source not found; skipping VS Code passthrough config"
+    return 0
+  fi
+  local entries
+  entries=$(sed 's|//.*$||' "$source" \
+    | jq -c '.["terminal.integrated.commandsToSkipShell"]') || {
+    warn "could not parse $source as JSONC; skipping VS Code passthrough config"
+    return 0
+  }
+  if [[ -z "$entries" || "$entries" == "null" ]]; then
+    warn "$source missing terminal.integrated.commandsToSkipShell; skipping"
+    return 0
+  fi
+  local count
+  count=$(jq -r 'length' <<<"$entries")
+
   if [[ ! -f "$f" ]]; then
     printf '%s\n' "{
   \"terminal.integrated.commandsToSkipShell\": $entries
 }" > "$f"
-    ok "wrote $f"
+    ok "wrote $f with $count VS Code terminal passthrough entries (reload VS Code window to apply)"
     return 0
   fi
   if jq --argjson new "$entries" '
@@ -424,9 +462,10 @@ configure_vscode_remote() {
       ((.["terminal.integrated.commandsToSkipShell"] // []) + $new) | unique
     )
   ' "$f" > "$f.tmp" && mv "$f.tmp" "$f"; then
-    ok "merged Ctrl-G passthrough into $f"
+    ok "merged $count VS Code terminal passthrough entries into $f (reload VS Code window to apply)"
   else
-    warn "could not merge $f"
+    warn "could not merge $f; remove $f.tmp manually if it was left behind"
+    rm -f "$f.tmp"
   fi
 }
 configure_vscode_remote
