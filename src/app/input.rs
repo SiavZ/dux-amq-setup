@@ -2756,6 +2756,49 @@ impl App {
             }
         }
 
+        // audit03 Phase 01 §15: SystemPrompt row hosts a multiline
+        // TextInput. Routing mirrors the Title row above with two
+        // differences:
+        //
+        //   - Up / Down navigate WITHIN the editor (multiline TextInput
+        //     consumes them); the operator leaves the field with Tab /
+        //     Shift-Tab. We deliberately do NOT alias Down → FocusNext
+        //     here — that would silently steal the most-natural way to
+        //     move the cursor between lines.
+        //   - Enter inserts a newline (multiline behaviour). Save
+        //     therefore only fires through the Save button or via the
+        //     dialog-scope Confirm binding (currently Ctrl-Enter when
+        //     no plain char is involved).
+        //
+        // Esc still closes the modal — keystrokes inside the editor are
+        // ephemeral until Save, so this discards a half-typed prompt
+        // the same way Esc on Title discards a half-typed title.
+        if focus == SettingsFocus::SystemPrompt {
+            match action {
+                Some(Action::CloseOverlay) => {
+                    self.ui.prompt = PromptState::None;
+                    return Ok(false);
+                }
+                Some(Action::Confirm) if !is_plain_char && key.code != KeyCode::Enter => {
+                    return self.save_session_settings_and_close();
+                }
+                Some(Action::FocusNext) => {
+                    self.set_session_settings_focus(focus.next(rules_len));
+                    return Ok(false);
+                }
+                Some(Action::FocusPrev) => {
+                    self.set_session_settings_focus(focus.prev(rules_len));
+                    return Ok(false);
+                }
+                _ => {
+                    if let PromptState::SessionSettings(p) = &mut self.ui.prompt {
+                        p.draft_system_prompt.handle_key(key);
+                    }
+                    return Ok(false);
+                }
+            }
+        }
+
         // Non-title rows.
         match action {
             Some(Action::CloseOverlay) => {
@@ -2809,7 +2852,17 @@ impl App {
             return;
         };
         match p.focus {
-            SettingsFocus::Title | SettingsFocus::SaveButton | SettingsFocus::CancelButton => {}
+            // SystemPrompt has no toggle semantics — it's a text editor.
+            // Space at SystemPrompt focus is captured by the multiline
+            // TextInput in the focus-specific branch in
+            // `handle_session_settings_key`; we should never reach this
+            // arm for SystemPrompt, but leave it explicit so adding new
+            // input paths later doesn't accidentally overwrite the
+            // prompt buffer.
+            SettingsFocus::Title
+            | SettingsFocus::SystemPrompt
+            | SettingsFocus::SaveButton
+            | SettingsFocus::CancelButton => {}
             SettingsFocus::ModeAttended => {
                 p.draft.mode = ContextMode::Attended;
             }
@@ -5729,13 +5782,18 @@ mod tests {
             provider: crate::model::ProviderKind::from_str("codex"),
             draft: crate::model::SessionSettings::default(),
             draft_title: TextInput::with_text("draft title".to_string()),
+            // audit03 Phase 01 §15: tests need a multiline-shaped buffer
+            // so handle_key Enter inserts a newline (not save) when
+            // SystemPrompt is focused.
+            draft_system_prompt: TextInput::new().with_multiline(8),
             focus: SettingsFocus::ModeAttended,
             rules: Vec::new(),
         });
         // Layout: title input on row 5, mode rows on 7/8/9, yolo on 11,
-        // auto-clear on 13, verify rows on 15/16/17, save/cancel on
-        // row 19. Each rect is 30 cols wide starting at column 10 so
-        // hit-tests within `(10..=39, target_row)` resolve.
+        // system prompt row on 12, auto-clear on 13, verify rows on
+        // 15/16/17, save/cancel on row 19. Each rect is 30 cols wide
+        // starting at column 10 so hit-tests within `(10..=39,
+        // target_row)` resolve.
         app.ui.overlay_layout.active = OverlayMouseLayout::SessionSettings {
             title_input: Rect::new(10, 5, 30, 1),
             rows: vec![
@@ -5743,6 +5801,7 @@ mod tests {
                 (Rect::new(10, 8, 30, 1), SettingsFocus::ModeOrchestrator),
                 (Rect::new(10, 9, 30, 1), SettingsFocus::ModeWorker),
                 (Rect::new(10, 11, 30, 1), SettingsFocus::Yolo),
+                (Rect::new(10, 12, 30, 1), SettingsFocus::SystemPrompt),
                 (Rect::new(10, 13, 30, 1), SettingsFocus::AutoClearOnDone),
                 (Rect::new(10, 15, 30, 1), SettingsFocus::VerifyDefault),
                 (Rect::new(10, 16, 30, 1), SettingsFocus::VerifyStrict),
@@ -9109,6 +9168,10 @@ cyan = "#00ffff"
                     SettingsFocus::ModeOrchestrator,
                     SettingsFocus::ModeWorker,
                     SettingsFocus::Yolo,
+                    // audit03 Phase 01 §15: SystemPrompt row must
+                    // publish a click-target so mouse users can focus
+                    // the multiline editor.
+                    SettingsFocus::SystemPrompt,
                     SettingsFocus::AutoClearOnDone,
                     SettingsFocus::VerifyDefault,
                     SettingsFocus::VerifyStrict,

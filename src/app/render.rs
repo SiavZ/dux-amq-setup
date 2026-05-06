@@ -4951,6 +4951,89 @@ impl App {
         );
         rows.push((yolo_rect, SettingsFocus::Yolo));
 
+        // ── System prompt (audit03 Phase 01 §15) ───────────
+        //
+        // Single header row captures the click target; when focused,
+        // an inline 4-row multiline editor expands below it. The
+        // header row stays the click target — clicking inside the
+        // expanded editor is a no-op for hit-testing (the operator
+        // can already type once focused). Length badge on the header
+        // mirrors the EditMacros approach where the operator wants a
+        // glance-summary without unfolding the editor.
+        let system_prompt_text = &prompt.draft_system_prompt.text;
+        let system_prompt_len = system_prompt_text.chars().count();
+        let system_prompt_focused = prompt.focus == SettingsFocus::SystemPrompt;
+        let badge = if system_prompt_len == 0 {
+            "(none)".to_string()
+        } else {
+            format!("{system_prompt_len} chars")
+        };
+        let header_label_style = if system_prompt_focused {
+            Style::default()
+                .fg(self.theme.input_label_fg)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default()
+                .fg(self.theme.input_label_fg)
+                .add_modifier(Modifier::BOLD)
+        };
+        let badge_style = Style::default().fg(self.theme.hint_dim_desc_fg);
+        let respawn_style = Style::default().fg(self.theme.hint_dim_desc_fg);
+        let system_prompt_header_rect = draw_line(
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "System prompt  (--append-system-prompt; needs respawn)  ",
+                    header_label_style,
+                ),
+                Span::styled(badge, badge_style),
+                Span::styled("  ", respawn_style),
+            ]),
+            frame,
+            &mut cursor_y,
+        );
+        rows.push((system_prompt_header_rect, SettingsFocus::SystemPrompt));
+
+        if system_prompt_focused {
+            // Render up to 4 visible lines of the multiline TextInput.
+            // The editor pads each line with a leading space so the
+            // hardware cursor (set by `render_multiline_input`) sits
+            // visually inside a "  > " prefix.
+            const SYSTEM_PROMPT_EDITOR_HEIGHT: u16 = 4;
+            let avail_height = form_bottom.saturating_sub(cursor_y);
+            let editor_height = avail_height.min(SYSTEM_PROMPT_EDITOR_HEIGHT);
+            if editor_height > 0 {
+                let editor_rect = Rect::new(
+                    form_area.x + 4,
+                    cursor_y,
+                    form_area.width.saturating_sub(4),
+                    editor_height,
+                );
+                self.render_multiline_input(&prompt.draft_system_prompt, editor_rect, frame);
+                cursor_y = cursor_y.saturating_add(editor_height);
+            }
+        } else if system_prompt_len > 0 {
+            // Compact preview when not focused — first line of the
+            // prompt, truncated to the row width. Helps the operator
+            // confirm what's persisted without entering the field.
+            let first_line = system_prompt_text.lines().next().unwrap_or("");
+            let avail_width = form_area.width.saturating_sub(6) as usize;
+            let preview: String = if first_line.chars().count() > avail_width {
+                first_line
+                    .chars()
+                    .take(avail_width.saturating_sub(1))
+                    .collect::<String>()
+                    + "…"
+            } else {
+                first_line.to_string()
+            };
+            draw_line(
+                Line::from(vec![Span::raw("    "), Span::styled(preview, badge_style)]),
+                frame,
+                &mut cursor_y,
+            );
+        }
+
         // ── Watch rules ─────────────────────────────────
         draw_line(
             Line::from(Span::styled(
