@@ -2324,6 +2324,23 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
         out.push_str("# backoff = { initial_ms = 600000, max_ms = 3600000, multiplier = 2.0, jitter_ms = 30000 }\n");
         out.push_str("# budget = { max_attempts = 3 }\n");
         out.push_str("# cooldown_ms = 60000\n");
+        out.push('\n');
+        out.push_str(
+            "# Example 4 — Anthropic API overload auto-retry. When upstream servers\n\
+             # are saturated the API surfaces an `overloaded_error` (HTTP 529).\n\
+             # Claude Code prints messages like `API Error: Overloaded` or\n\
+             # `API Error · 529 · Overloaded`. Overloads typically clear in tens\n\
+             # of seconds, so the backoff is shorter than the throttle rule above\n\
+             # but still escalates if the condition persists.\n",
+        );
+        out.push_str("#\n");
+        out.push_str("# [[providers.claude.watch]]\n");
+        out.push_str("# pattern = \"API Error.*[Oo]verloaded\"\n");
+        out.push_str("# action = \"send_text\"\n");
+        out.push_str("# text = \"please continue\"\n");
+        out.push_str("# backoff = { initial_ms = 30000, max_ms = 600000, multiplier = 2.0, jitter_ms = 5000 }\n");
+        out.push_str("# budget = { max_attempts = 5 }\n");
+        out.push_str("# cooldown_ms = 30000\n");
     }
     out.push('\n');
 }
@@ -3529,6 +3546,14 @@ oneshot_output = "stdout"
         assert!(
             rendered.contains("# action = \"wait_until_capture\""),
             "Claude template must reference the wait_until_capture action:\n{rendered}"
+        );
+        // Phase 4 (overload-resume): canonical template must ship the
+        // 529 / `overloaded_error` auto-retry example so users discover
+        // the recovery path the same way they discover the throttle
+        // and 5-hour-usage-limit ones.
+        assert!(
+            rendered.contains("# pattern = \"API Error.*[Oo]verloaded\""),
+            "Claude template must ship the overload-retry example:\n{rendered}"
         );
         // None of the examples may be uncommented in the default
         // template — rules are strictly opt-in.
