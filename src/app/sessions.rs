@@ -1992,7 +1992,13 @@ impl App {
             provider: session.provider.clone(),
             draft: session.settings.clone(),
             draft_title: TextInput::with_text(label).with_char_map(crate::git::agent_name_char_map),
-            focus: SettingsFocus::Title,
+            // Open with focus on the first interactive control rather
+            // than the Title text input. Arrow keys at Title focus get
+            // routed to the TextInput (which doesn't move the cursor
+            // vertically) so a user who instinctively presses Down/Up
+            // first sees the modal as unresponsive. Tab/Shift-Tab still
+            // cycle to Title when the operator wants to rename.
+            focus: SettingsFocus::ModeAttended,
             rules,
         });
         Ok(())
@@ -3155,7 +3161,11 @@ mod tests {
         assert_eq!(p.draft.mode, ContextMode::Worker);
         assert!(p.draft.yolo_permissions);
         assert!(p.draft.auto_clear_on_task_done);
-        assert_eq!(p.focus, SettingsFocus::Title);
+        // Initial focus is the first interactive control, NOT Title.
+        // See `open_session_settings` for the rationale (Title focus
+        // would route arrow keys into TextInput and the operator
+        // perceives the modal as unresponsive).
+        assert_eq!(p.focus, SettingsFocus::ModeAttended);
     }
 
     #[test]
