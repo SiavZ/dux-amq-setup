@@ -741,6 +741,40 @@ impl App {
         }
     }
 
+    fn center_scrollbar_at_mouse(&self, column: u16, row: u16) -> bool {
+        let Some(term_area) = self.ui.mouse_layout.agent_term else {
+            return false;
+        };
+        self.snapshot_buf.scrollback_total > 0
+            && term_area.height > 0
+            && term_area.width >= 2
+            && column == term_area.x + term_area.width.saturating_sub(1)
+            && row >= term_area.y
+            && row < term_area.y + term_area.height
+    }
+
+    fn set_center_scrollback_from_mouse(&self, row: u16) {
+        let Some(provider) = self.selected_terminal_surface_client() else {
+            return;
+        };
+        let Some(term_area) = self.ui.mouse_layout.agent_term else {
+            return;
+        };
+        let total = self.snapshot_buf.scrollback_total;
+        if total == 0 || term_area.height == 0 {
+            return;
+        }
+
+        let clamped_row = row.clamp(
+            term_area.y,
+            term_area.y + term_area.height.saturating_sub(1),
+        );
+        let relative = usize::from(clamped_row.saturating_sub(term_area.y));
+        let denominator = usize::from(term_area.height.saturating_sub(1)).max(1);
+        let position = (relative * total + denominator / 2) / denominator;
+        provider.set_scrollback(total.saturating_sub(position));
+    }
+
     fn handle_files_search_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc | KeyCode::Enter => {
@@ -1555,6 +1589,16 @@ impl App {
                         if outside_overlay {
                             self.exit_interactive_mode();
                             return Ok(false);
+                        }
+
+                        if self.center_scrollbar_at_mouse(mouse_ev.column, mouse_ev.row)
+                            || matches!(self.ui.mouse_drag, Some(ResizeDragState::CenterScrollbar))
+                        {
+                            self.terminal_selection = None;
+                            if self.handle_mouse(mouse_ev) {
+                                return Ok(true);
+                            }
+                            continue;
                         }
 
                         let child_wants_mouse = self
@@ -5326,6 +5370,11 @@ impl App {
     }
 
     fn update_dragged_panes(&mut self, column: u16, row: u16) {
+        if matches!(self.ui.mouse_drag, Some(ResizeDragState::CenterScrollbar)) {
+            self.set_center_scrollback_from_mouse(row);
+            return;
+        }
+
         let body = self.ui.mouse_layout.body;
         if body.width == 0 {
             return;
@@ -5388,6 +5437,9 @@ impl App {
                     }
                 }
             }
+            Some(ResizeDragState::CenterScrollbar) => {
+                self.set_center_scrollback_from_mouse(row);
+            }
             None => {}
         }
     }
@@ -5440,6 +5492,14 @@ impl App {
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if self.center_scrollbar_at_mouse(mouse.column, mouse.row) {
+                    self.ui.mouse_drag = Some(ResizeDragState::CenterScrollbar);
+                    self.ui.focus = FocusPane::Center;
+                    self.terminal_selection = None;
+                    self.set_center_scrollback_from_mouse(mouse.row);
+                    return false;
+                }
+
                 if let Some(drag) = self.resize_drag_at_mouse(mouse.column, mouse.row) {
                     self.ui.mouse_drag = Some(drag);
                     self.update_dragged_panes(mouse.column, mouse.row);
@@ -5532,8 +5592,12 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) if self.ui.mouse_drag.is_some() => {
                 self.update_dragged_panes(mouse.column, mouse.row);
             }
-            MouseEventKind::Up(MouseButton::Left) if self.ui.mouse_drag.take().is_some() => {
-                self.persist_pane_widths();
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(drag) = self.ui.mouse_drag.take()
+                    && drag != ResizeDragState::CenterScrollbar
+                {
+                    self.persist_pane_widths();
+                }
             }
             MouseEventKind::ScrollDown => match self.mouse_target(mouse.column, mouse.row) {
                 Some(MouseTarget::LeftRow(_)) => {
@@ -5780,8 +5844,8 @@ mod tests {
         KillRunningFooterAction, KillRunningPrompt, KillableRuntime, KillableRuntimeKind, LeftItem,
         LeftSection, MacroBarState, MouseClickTarget, MouseLayoutState, NameNewAgentFocus,
         OverlayCheckbox, OverlayCheckboxId, OverlayMouseLayout, OverlayMouseLayoutState,
-        ProcessInfo, PromptState, PullTarget, ResourceStats, RightSection, RuntimeState,
-        RuntimeTargetId, SessionSettingsPrompt, SettingsFocus, TextInput, UiState,
+        ProcessInfo, PromptState, PullTarget, ResizeDragState, ResourceStats, RightSection,
+        RuntimeState, RuntimeTargetId, SessionSettingsPrompt, SettingsFocus, TextInput, UiState,
         WatchRuleSummary, WorkerEvent,
     };
     use crate::clipboard::Clipboard;
@@ -10078,6 +10142,56 @@ cyan = "#00ffff"
     }
 
     #[test]
+    fn mouse_drag_center_scrollbar_sets_scrollback_offset() {
+        let mut app = app_with_scrolled_back_pty();
+        app.ui.mouse_layout.agent_term = Some(Rect::new(10, 10, 40, 5));
+        app.snapshot_buf.scrollback_total = 5;
+        app.snapshot_buf.scrollback_offset = 3;
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 49, 10));
+        assert_eq!(app.ui.mouse_drag, Some(ResizeDragState::CenterScrollbar));
+        assert_eq!(
+            app.selected_terminal_surface_client()
+                .unwrap()
+                .scrollback_offset(),
+            5
+        );
+
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 49, 14));
+        assert_eq!(
+            app.selected_terminal_surface_client()
+                .unwrap()
+                .scrollback_offset(),
+            0
+        );
+
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 49, 14));
+        assert_eq!(app.ui.mouse_drag, None);
+    }
+
+    #[test]
+    fn interactive_mouse_on_scrollbar_uses_host_drag_not_selection() {
+        let mut app = app_with_scrolled_back_pty();
+        app.ui.mouse_layout.agent_term = Some(Rect::new(10, 10, 40, 5));
+        app.snapshot_buf.scrollback_total = 5;
+        app.snapshot_buf.scrollback_offset = 3;
+
+        let mut input = sgr_mouse_down(50, 11);
+        input.extend_from_slice(&sgr_mouse_drag(50, 15));
+        input.extend_from_slice(&sgr_mouse_up(50, 15));
+        app.process_raw_input_bytes(&input).unwrap();
+
+        assert_eq!(
+            app.selected_terminal_surface_client()
+                .unwrap()
+                .scrollback_offset(),
+            0
+        );
+        assert!(app.terminal_selection.is_none());
+        assert_eq!(app.ui.mouse_drag, None);
+    }
+
+    #[test]
     fn scrolled_back_suppresses_regular_key_forwarding() {
         let mut app = app_with_scrolled_back_pty();
         // Feed a regular ASCII character 'x' (0x78) — should be dropped.
@@ -10264,6 +10378,14 @@ cyan = "#00ffff"
     /// Build an SGR mouse left-button-down sequence at 1-based (cx, cy).
     fn sgr_mouse_down(cx: u16, cy: u16) -> Vec<u8> {
         format!("\x1b[<0;{cx};{cy}M").into_bytes()
+    }
+
+    fn sgr_mouse_drag(cx: u16, cy: u16) -> Vec<u8> {
+        format!("\x1b[<32;{cx};{cy}M").into_bytes()
+    }
+
+    fn sgr_mouse_up(cx: u16, cy: u16) -> Vec<u8> {
+        format!("\x1b[<0;{cx};{cy}m").into_bytes()
     }
 
     /// Helper: set up an App with a live PTY in interactive agent mode
