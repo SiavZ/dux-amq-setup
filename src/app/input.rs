@@ -2604,111 +2604,7 @@ impl App {
         }
 
         if matches!(self.ui.prompt, PromptState::NameNewAgent { .. }) {
-            let is_plain_char = matches!(key.code, KeyCode::Char(_))
-                && !key.modifiers.contains(KeyModifiers::CONTROL);
-            let action = if is_plain_char {
-                None
-            } else {
-                self.bindings.lookup(&key, BindingScope::Dialog)
-            };
-
-            match action {
-                Some(Action::CloseOverlay) => {
-                    self.ui.prompt = PromptState::None;
-                }
-                Some(Action::ToggleSelection) => {
-                    self.toggle_name_new_agent_randomized_name();
-                }
-                Some(Action::Confirm) => {
-                    // Extract the name from the input before taking ownership.
-                    let name = if let PromptState::NameNewAgent { input, .. } = &self.ui.prompt {
-                        input.text.trim().to_string()
-                    } else {
-                        unreachable!()
-                    };
-                    if name.is_empty() {
-                        self.set_error("Agent name cannot be empty.");
-                        self.ui.prompt = PromptState::None;
-                        return Ok(false);
-                    }
-                    if !git::is_valid_agent_name(&name) {
-                        self.set_error(
-                            "Agent name may only contain letters, digits, dashes, underscores, \
-                             or slashes. It cannot start with \"-\" or \"/\", end with \"/\", \
-                             or contain \"//\".",
-                        );
-                        return Ok(false);
-                    }
-                    // Take ownership of the prompt to extract the request.
-                    let old_prompt = std::mem::replace(&mut self.ui.prompt, PromptState::None);
-                    let PromptState::NameNewAgent { mut request, .. } = old_prompt else {
-                        unreachable!()
-                    };
-
-                    // For NewProject requests, check whether the branch already
-                    // exists locally or on the remote before creating a new one.
-                    if let CreateAgentRequest::NewProject { ref project, .. } = request {
-                        let repo_path = std::path::PathBuf::from(&project.path);
-                        if let Some(location) = git::branch_exists(&repo_path, &name) {
-                            if let CreateAgentRequest::NewProject {
-                                ref mut custom_name,
-                                ..
-                            } = request
-                            {
-                                *custom_name = Some(name.clone());
-                            }
-                            self.ui.prompt = PromptState::ConfirmUseExistingBranch {
-                                request,
-                                branch_name: name,
-                                location,
-                                confirm_selected: false,
-                            };
-                            return Ok(false);
-                        }
-                    }
-
-                    let msg = match &request {
-                        CreateAgentRequest::NewProject { project, .. } => {
-                            format!(
-                                "Creating a new agent worktree \"{name}\" for project \"{}\" and launching a fresh session...",
-                                project.name
-                            )
-                        }
-                        CreateAgentRequest::ForkSession { source_label, .. } => {
-                            format!(
-                                "Forking agent \"{source_label}\" as \"{name}\" by cloning its current worktree contents into a fresh session...",
-                            )
-                        }
-                    };
-                    match &mut request {
-                        CreateAgentRequest::NewProject { custom_name, .. }
-                        | CreateAgentRequest::ForkSession { custom_name, .. } => {
-                            *custom_name = Some(name);
-                        }
-                    }
-                    self.dispatch_create_agent_request(request, msg)?;
-                }
-                _ => {
-                    if key.code == KeyCode::Char(' ') {
-                        let checkbox_focused = matches!(
-                            self.ui.prompt,
-                            PromptState::NameNewAgent {
-                                focus: NameNewAgentFocus::Checkbox,
-                                ..
-                            }
-                        );
-                        if checkbox_focused {
-                            self.toggle_name_new_agent_randomized_name();
-                        } else if let PromptState::NameNewAgent { input, .. } = &mut self.ui.prompt
-                        {
-                            input.handle_key(key);
-                        }
-                    } else if let PromptState::NameNewAgent { input, .. } = &mut self.ui.prompt {
-                        input.handle_key(key);
-                    }
-                }
-            }
-            return Ok(false);
+            return self.handle_name_new_agent_key(key);
         }
 
         if let PromptState::RenameSession {
@@ -2746,6 +2642,422 @@ impl App {
             return Ok(false);
         }
 
+        Ok(false)
+    }
+
+    fn handle_name_new_agent_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let focus = match &self.ui.prompt {
+            PromptState::NameNewAgent { focus, .. } => *focus,
+            _ => return Ok(false),
+        };
+        let dialog_action = self.bindings.lookup(&key, BindingScope::Dialog);
+        let global_action = self.bindings.lookup(&key, BindingScope::Global);
+        let action = dialog_action.or(global_action);
+        let is_plain_char = matches!(key.code, KeyCode::Char(_))
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT);
+
+        if focus == NameNewAgentFocus::Input {
+            match action {
+                Some(Action::CloseOverlay) => {
+                    self.ui.prompt = PromptState::None;
+                }
+                Some(Action::Confirm) if !is_plain_char => {
+                    return self.submit_name_new_agent_prompt();
+                }
+                _ if Self::name_new_agent_next_key(key) => {
+                    self.advance_name_new_agent_focus(false);
+                }
+                _ if Self::name_new_agent_prev_key(key) => {
+                    self.advance_name_new_agent_focus(true);
+                }
+                _ => {
+                    if let PromptState::NameNewAgent { input, .. } = &mut self.ui.prompt {
+                        input.handle_key(key);
+                    }
+                }
+            }
+            return Ok(false);
+        }
+
+        if focus == NameNewAgentFocus::SystemPrompt {
+            match action {
+                Some(Action::CloseOverlay) => {
+                    self.ui.prompt = PromptState::None;
+                    return Ok(false);
+                }
+                _ if matches!(key.code, KeyCode::Tab) => {
+                    self.advance_name_new_agent_focus(false);
+                    return Ok(false);
+                }
+                _ if matches!(key.code, KeyCode::Down) => {
+                    self.advance_name_new_agent_focus(false);
+                    return Ok(false);
+                }
+                _ if matches!(key.code, KeyCode::BackTab) => {
+                    self.advance_name_new_agent_focus(true);
+                    return Ok(false);
+                }
+                _ if matches!(key.code, KeyCode::Up) => {
+                    self.advance_name_new_agent_focus(true);
+                    return Ok(false);
+                }
+                _ => {
+                    if let PromptState::NameNewAgent {
+                        draft_system_prompt,
+                        ..
+                    } = &mut self.ui.prompt
+                    {
+                        draft_system_prompt.handle_key(key);
+                    }
+                    return Ok(false);
+                }
+            }
+        }
+
+        match action {
+            Some(Action::CloseOverlay) => {
+                self.ui.prompt = PromptState::None;
+            }
+            Some(Action::Confirm) => match focus {
+                NameNewAgentFocus::CreateButton => {
+                    return self.submit_name_new_agent_prompt();
+                }
+                NameNewAgentFocus::CancelButton => {
+                    self.ui.prompt = PromptState::None;
+                }
+                _ => self.toggle_name_new_agent_focused_row(),
+            },
+            _ if Self::name_new_agent_next_key(key) => {
+                self.advance_name_new_agent_focus(false);
+            }
+            _ if Self::name_new_agent_prev_key(key) => {
+                self.advance_name_new_agent_focus(true);
+            }
+            _ if matches!(key.code, KeyCode::Right | KeyCode::Char('l')) => {
+                if focus == NameNewAgentFocus::Provider {
+                    self.cycle_name_new_agent_provider(1);
+                } else {
+                    self.advance_name_new_agent_focus(false);
+                }
+            }
+            _ if matches!(key.code, KeyCode::Left | KeyCode::Char('h')) => {
+                if focus == NameNewAgentFocus::Provider {
+                    self.cycle_name_new_agent_provider(-1);
+                } else {
+                    self.advance_name_new_agent_focus(true);
+                }
+            }
+            _ if matches!(key.code, KeyCode::Char(' ')) => match focus {
+                NameNewAgentFocus::CreateButton => {
+                    return self.submit_name_new_agent_prompt();
+                }
+                NameNewAgentFocus::CancelButton => {
+                    self.ui.prompt = PromptState::None;
+                }
+                _ => self.toggle_name_new_agent_focused_row(),
+            },
+            _ => {}
+        }
+
+        Ok(false)
+    }
+
+    fn name_new_agent_next_key(key: KeyEvent) -> bool {
+        matches!(key.code, KeyCode::Tab | KeyCode::Down)
+    }
+
+    fn name_new_agent_prev_key(key: KeyEvent) -> bool {
+        matches!(key.code, KeyCode::BackTab | KeyCode::Up)
+    }
+
+    fn name_new_agent_focus_order(
+        rules: &[WatchRuleSummary],
+        show_advanced: bool,
+    ) -> Vec<NameNewAgentFocus> {
+        let mut order = vec![
+            NameNewAgentFocus::Input,
+            NameNewAgentFocus::Provider,
+            NameNewAgentFocus::Checkbox,
+            NameNewAgentFocus::AdvancedToggle,
+        ];
+        if show_advanced {
+            order.extend([
+                NameNewAgentFocus::ModeAttended,
+                NameNewAgentFocus::ModeOrchestrator,
+                NameNewAgentFocus::ModeWorker,
+                NameNewAgentFocus::Yolo,
+                NameNewAgentFocus::SystemPrompt,
+            ]);
+            order.extend(
+                rules
+                    .iter()
+                    .map(|rule| NameNewAgentFocus::WatchRule(rule.idx)),
+            );
+            order.extend([
+                NameNewAgentFocus::AutoClearOnDone,
+                NameNewAgentFocus::VerifyDefault,
+                NameNewAgentFocus::VerifyStrict,
+                NameNewAgentFocus::VerifySkip,
+            ]);
+        }
+        order.extend([
+            NameNewAgentFocus::CreateButton,
+            NameNewAgentFocus::CancelButton,
+        ]);
+        order
+    }
+
+    fn advance_name_new_agent_focus(&mut self, reverse: bool) {
+        let (current, rules, show_advanced) = match &self.ui.prompt {
+            PromptState::NameNewAgent {
+                focus,
+                rules,
+                show_advanced,
+                ..
+            } => (*focus, rules.clone(), *show_advanced),
+            _ => return,
+        };
+        let order = Self::name_new_agent_focus_order(&rules, show_advanced);
+        let current_idx = order
+            .iter()
+            .position(|candidate| *candidate == current)
+            .unwrap_or(0);
+        let next_idx = if reverse {
+            current_idx
+                .checked_sub(1)
+                .unwrap_or(order.len().saturating_sub(1))
+        } else {
+            (current_idx + 1) % order.len().max(1)
+        };
+        if let PromptState::NameNewAgent { focus, .. } = &mut self.ui.prompt
+            && let Some(next) = order.get(next_idx)
+        {
+            *focus = *next;
+        }
+    }
+
+    fn cycle_name_new_agent_provider(&mut self, delta: isize) {
+        let (provider, settings) = {
+            let PromptState::NameNewAgent {
+                provider_options,
+                selected_provider,
+                draft_settings,
+                ..
+            } = &mut self.ui.prompt
+            else {
+                return;
+            };
+            if provider_options.is_empty() {
+                return;
+            }
+            let len = provider_options.len() as isize;
+            let next = (*selected_provider as isize + delta).rem_euclid(len) as usize;
+            *selected_provider = next;
+            draft_settings.watch_rule_arm.clear();
+            (provider_options[next].clone(), draft_settings.clone())
+        };
+        let rules = self.collect_provider_watch_rule_summaries(&provider, &settings);
+        if let PromptState::NameNewAgent {
+            rules: prompt_rules,
+            ..
+        } = &mut self.ui.prompt
+        {
+            *prompt_rules = rules;
+        }
+    }
+
+    fn toggle_name_new_agent_focused_row(&mut self) {
+        let focus = match &self.ui.prompt {
+            PromptState::NameNewAgent { focus, .. } => *focus,
+            _ => return,
+        };
+        match focus {
+            NameNewAgentFocus::Input | NameNewAgentFocus::SystemPrompt => {}
+            NameNewAgentFocus::Provider => self.cycle_name_new_agent_provider(1),
+            NameNewAgentFocus::AdvancedToggle => {
+                if let PromptState::NameNewAgent {
+                    show_advanced,
+                    focus,
+                    ..
+                } = &mut self.ui.prompt
+                {
+                    *show_advanced = !*show_advanced;
+                    if !*show_advanced {
+                        *focus = NameNewAgentFocus::AdvancedToggle;
+                    }
+                }
+            }
+            NameNewAgentFocus::Checkbox => self.toggle_name_new_agent_randomized_name(),
+            NameNewAgentFocus::ModeAttended => {
+                if let PromptState::NameNewAgent { draft_settings, .. } = &mut self.ui.prompt {
+                    draft_settings.mode = ContextMode::Attended;
+                }
+            }
+            NameNewAgentFocus::ModeOrchestrator => {
+                if let PromptState::NameNewAgent { draft_settings, .. } = &mut self.ui.prompt {
+                    draft_settings.mode = ContextMode::Orchestrator;
+                }
+            }
+            NameNewAgentFocus::ModeWorker => {
+                if let PromptState::NameNewAgent { draft_settings, .. } = &mut self.ui.prompt {
+                    draft_settings.mode = ContextMode::Worker;
+                }
+            }
+            NameNewAgentFocus::Yolo => {
+                if let PromptState::NameNewAgent { draft_settings, .. } = &mut self.ui.prompt {
+                    draft_settings.yolo_permissions = !draft_settings.yolo_permissions;
+                }
+            }
+            NameNewAgentFocus::WatchRule(idx) => {
+                if let PromptState::NameNewAgent {
+                    draft_settings,
+                    rules,
+                    ..
+                } = &mut self.ui.prompt
+                {
+                    let summary_armed = rules
+                        .iter()
+                        .find(|rule| rule.idx == idx)
+                        .map(|rule| rule.armed)
+                        .unwrap_or(true);
+                    let prev = draft_settings
+                        .watch_rule_arm
+                        .get(&idx)
+                        .copied()
+                        .unwrap_or(summary_armed);
+                    draft_settings.watch_rule_arm.insert(idx, !prev);
+                    if let Some(rule) = rules.iter_mut().find(|rule| rule.idx == idx) {
+                        rule.armed = !prev;
+                    }
+                }
+            }
+            NameNewAgentFocus::AutoClearOnDone => {
+                if let PromptState::NameNewAgent { draft_settings, .. } = &mut self.ui.prompt {
+                    draft_settings.auto_clear_on_task_done =
+                        !draft_settings.auto_clear_on_task_done;
+                }
+            }
+            NameNewAgentFocus::VerifyDefault => {
+                if let PromptState::NameNewAgent { draft_settings, .. } = &mut self.ui.prompt {
+                    draft_settings.verify_envelope_override = None;
+                }
+            }
+            NameNewAgentFocus::VerifyStrict => {
+                if let PromptState::NameNewAgent { draft_settings, .. } = &mut self.ui.prompt {
+                    draft_settings.verify_envelope_override = Some(true);
+                }
+            }
+            NameNewAgentFocus::VerifySkip => {
+                if let PromptState::NameNewAgent { draft_settings, .. } = &mut self.ui.prompt {
+                    draft_settings.verify_envelope_override = Some(false);
+                }
+            }
+            NameNewAgentFocus::CreateButton | NameNewAgentFocus::CancelButton => {}
+        }
+    }
+
+    fn submit_name_new_agent_prompt(&mut self) -> Result<bool> {
+        let name = if let PromptState::NameNewAgent { input, .. } = &self.ui.prompt {
+            input.text.trim().to_string()
+        } else {
+            return Ok(false);
+        };
+        if name.is_empty() {
+            self.set_error("Agent name cannot be empty.");
+            return Ok(false);
+        }
+        if !git::is_valid_agent_name(&name) {
+            self.set_error(
+                "Agent name may only contain letters, digits, dashes, underscores, \
+                 or slashes. It cannot start with \"-\" or \"/\", end with \"/\", \
+                 or contain \"//\".",
+            );
+            return Ok(false);
+        }
+
+        let old_prompt = std::mem::replace(&mut self.ui.prompt, PromptState::None);
+        let PromptState::NameNewAgent {
+            request,
+            provider_options,
+            selected_provider,
+            mut draft_settings,
+            draft_system_prompt,
+            ..
+        } = old_prompt
+        else {
+            unreachable!()
+        };
+        let mut request = *request;
+        let provider = provider_options
+            .get(selected_provider)
+            .cloned()
+            .or_else(|| provider_options.first().cloned())
+            .unwrap_or_else(|| match &request {
+                CreateAgentRequest::NewProject { provider, .. }
+                | CreateAgentRequest::ForkSession { provider, .. } => provider.clone(),
+            });
+        let trimmed_prompt = draft_system_prompt.text.trim_end().to_string();
+        draft_settings.system_prompt = if trimmed_prompt.trim().is_empty() {
+            None
+        } else {
+            Some(trimmed_prompt)
+        };
+
+        match &mut request {
+            CreateAgentRequest::NewProject {
+                custom_name,
+                provider: request_provider,
+                settings,
+                ..
+            }
+            | CreateAgentRequest::ForkSession {
+                custom_name,
+                provider: request_provider,
+                settings,
+                ..
+            } => {
+                *custom_name = Some(name.clone());
+                *request_provider = provider.clone();
+                *settings = draft_settings;
+            }
+        }
+
+        if let CreateAgentRequest::NewProject { ref project, .. } = request {
+            let repo_path = std::path::PathBuf::from(&project.path);
+            if let Some(location) = git::branch_exists(&repo_path, &name) {
+                self.ui.prompt = PromptState::ConfirmUseExistingBranch {
+                    request,
+                    branch_name: name,
+                    location,
+                    confirm_selected: false,
+                };
+                return Ok(false);
+            }
+        }
+
+        let msg = match &request {
+            CreateAgentRequest::NewProject {
+                project, provider, ..
+            } => {
+                format!(
+                    "Creating a new {provider} agent worktree \"{name}\" for project \"{}\" and launching a fresh session...",
+                    project.name,
+                    provider = provider.as_str()
+                )
+            }
+            CreateAgentRequest::ForkSession {
+                source_label,
+                provider,
+                ..
+            } => {
+                format!(
+                    "Forking agent \"{source_label}\" as \"{name}\" and launching {}...",
+                    provider.as_str()
+                )
+            }
+        };
+        self.dispatch_create_agent_request(request, msg)?;
         Ok(false)
     }
 
@@ -6038,6 +6350,10 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .unwrap();
 
         assert!(matches!(app.ui.prompt, PromptState::None));
         assert_eq!(
@@ -6535,7 +6851,10 @@ mod tests {
                 focus,
                 ..
             } => {
-                assert!(matches!(request, CreateAgentRequest::ForkSession { .. }));
+                assert!(matches!(
+                    request.as_ref(),
+                    CreateAgentRequest::ForkSession { .. }
+                ));
                 assert!(input.text.is_empty());
                 assert!(!*randomize_name);
                 assert_eq!(*focus, NameNewAgentFocus::Input);
@@ -6559,7 +6878,10 @@ mod tests {
                 focus,
                 ..
             } => {
-                assert!(matches!(request, CreateAgentRequest::NewProject { .. }));
+                assert!(matches!(
+                    request.as_ref(),
+                    CreateAgentRequest::NewProject { .. }
+                ));
                 assert!(input.text.is_empty());
                 assert!(!*randomize_name);
                 assert_eq!(*focus, NameNewAgentFocus::Input);
@@ -6597,6 +6919,10 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .unwrap();
 
         let generated = match &app.ui.prompt {
             PromptState::NameNewAgent {
@@ -6615,7 +6941,7 @@ mod tests {
             other => panic!("expected name-new-agent prompt, got {other:?}"),
         };
 
-        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
             .unwrap();
 
         match &app.ui.prompt {

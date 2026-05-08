@@ -436,7 +436,21 @@ pub(crate) enum ConfirmNonDefaultBranchFocus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NameNewAgentFocus {
     Input,
+    Provider,
+    AdvancedToggle,
     Checkbox,
+    ModeAttended,
+    ModeOrchestrator,
+    ModeWorker,
+    Yolo,
+    SystemPrompt,
+    WatchRule(usize),
+    AutoClearOnDone,
+    VerifyDefault,
+    VerifyStrict,
+    VerifySkip,
+    CreateButton,
+    CancelButton,
 }
 
 #[derive(Clone, Debug)]
@@ -495,10 +509,16 @@ pub(crate) enum PromptState {
         rename_branch: bool,
     },
     NameNewAgent {
-        request: CreateAgentRequest,
+        request: Box<CreateAgentRequest>,
         input: TextInput,
         randomize_name: bool,
         randomized_name: Option<String>,
+        provider_options: Vec<ProviderKind>,
+        selected_provider: usize,
+        draft_settings: SessionSettings,
+        draft_system_prompt: TextInput,
+        rules: Vec<WatchRuleSummary>,
+        show_advanced: bool,
         focus: NameNewAgentFocus,
     },
     PickEditor {
@@ -1061,12 +1081,16 @@ pub(crate) enum CreateAgentRequest {
         project: Project,
         custom_name: Option<String>,
         use_existing_branch: bool,
+        provider: ProviderKind,
+        settings: SessionSettings,
     },
     ForkSession {
         project: Project,
         source_session: Box<AgentSession>,
         source_label: String,
         custom_name: Option<String>,
+        provider: ProviderKind,
+        settings: SessionSettings,
     },
 }
 

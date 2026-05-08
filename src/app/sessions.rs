@@ -181,6 +181,8 @@ impl App {
         }
 
         self.open_name_new_agent_prompt(CreateAgentRequest::NewProject {
+            provider: project.default_provider.clone(),
+            settings: SessionSettings::default(),
             project,
             custom_name: None,
             use_existing_branch: false,
@@ -199,6 +201,8 @@ impl App {
         let source_label = self.session_label(&source_session);
 
         self.open_name_new_agent_prompt(CreateAgentRequest::ForkSession {
+            provider: source_session.provider.clone(),
+            settings: source_session.settings.clone(),
             project,
             source_session: Box::new(source_session),
             source_label,
@@ -218,14 +222,81 @@ impl App {
 
         self.ui.input_target = InputTarget::None;
         self.ui.fullscreen_overlay = FullscreenOverlay::None;
+        let provider = match &request {
+            CreateAgentRequest::NewProject { provider, .. }
+            | CreateAgentRequest::ForkSession { provider, .. } => provider.clone(),
+        };
+        let settings = match &request {
+            CreateAgentRequest::NewProject { settings, .. }
+            | CreateAgentRequest::ForkSession { settings, .. } => settings.clone(),
+        };
+        let provider_options = self.provider_options_for_prompt(&provider);
+        let selected_provider = provider_options
+            .iter()
+            .position(|candidate| candidate == &provider)
+            .unwrap_or(0);
+        let selected_provider_kind = provider_options
+            .get(selected_provider)
+            .cloned()
+            .unwrap_or(provider);
+        let rules = self.collect_provider_watch_rule_summaries(&selected_provider_kind, &settings);
+        let system_prompt_text = settings.system_prompt.clone().unwrap_or_default();
+
         self.ui.prompt = PromptState::NameNewAgent {
-            request,
+            request: Box::new(request),
             input,
             randomize_name,
             randomized_name,
+            provider_options,
+            selected_provider,
+            draft_settings: settings,
+            draft_system_prompt: TextInput::with_text(system_prompt_text).with_multiline(4),
+            rules,
+            show_advanced: false,
             focus: NameNewAgentFocus::Input,
         };
         Ok(())
+    }
+
+    fn provider_options_for_prompt(&self, preferred: &ProviderKind) -> Vec<ProviderKind> {
+        let mut options: Vec<ProviderKind> = self
+            .config
+            .providers
+            .commands
+            .keys()
+            .map(|name| ProviderKind::from_str(name))
+            .collect();
+        if options.is_empty() || !options.iter().any(|provider| provider == preferred) {
+            options.insert(0, preferred.clone());
+        }
+        options
+    }
+
+    pub(crate) fn collect_provider_watch_rule_summaries(
+        &self,
+        provider: &ProviderKind,
+        settings: &SessionSettings,
+    ) -> Vec<WatchRuleSummary> {
+        self.config
+            .providers
+            .commands
+            .get(provider.as_str())
+            .map(|cfg| {
+                cfg.watch
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, rule)| {
+                        let label = if rule.label.trim().is_empty() {
+                            format!("rule {idx}")
+                        } else {
+                            rule.label.clone()
+                        };
+                        let armed = settings.watch_rule_arm.get(&idx).copied().unwrap_or(true);
+                        WatchRuleSummary { idx, label, armed }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Spawns a background worker that runs `git switch <target_branch>` in
