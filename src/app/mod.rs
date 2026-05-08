@@ -1032,6 +1032,7 @@ pub(crate) enum ResizeDragState {
     TerminalDivider,
     StagedDivider,
     CommitDivider,
+    CenterScrollbar,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
