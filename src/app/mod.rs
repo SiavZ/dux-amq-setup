@@ -2499,7 +2499,7 @@ impl App {
                 session_id: session.id,
                 input: TextInput::with_text(current_name)
                     .with_char_map(crate::git::agent_name_char_map),
-                rename_branch: true,
+                rename_branch: false,
             };
         } else {
             self.set_error("No agent session selected.");
