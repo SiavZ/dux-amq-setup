@@ -4512,57 +4512,69 @@ impl App {
                 input,
                 randomize_name,
                 focus,
+                provider_options,
+                selected_provider,
+                draft_settings,
+                draft_system_prompt,
+                rules,
+                show_advanced,
                 ..
             } => {
                 self.render_dim_overlay(frame);
-                let checkbox = Checkbox::new("Use randomized pet name")
-                    .checked(*randomize_name)
-                    .state(if *focus == NameNewAgentFocus::Checkbox {
-                        CheckboxState::Focused
-                    } else {
-                        CheckboxState::Normal
-                    });
-                let dialog_width = 60.min(frame.area().width.max(1));
-                let inner_width = dialog_width.saturating_sub(2);
-                let checkbox_height = checkbox
-                    .layout(
-                        inner_width,
-                        checkbox.marker_style(Style::default()),
-                        checkbox.label_style(Style::default()),
-                    )
-                    .height
-                    .saturating_add(1);
-                let checkbox_spacing = 1;
-                let footer_spacing = 1;
-                let area = centered_rect_exact(
-                    dialog_width,
-                    8 + checkbox_spacing + checkbox_height + footer_spacing,
-                    frame.area(),
-                );
+                let advanced_rows = if *show_advanced {
+                    12 + rules.len() as u16
+                        + if *focus == NameNewAgentFocus::SystemPrompt {
+                            4
+                        } else {
+                            0
+                        }
+                } else {
+                    0
+                };
+                let dialog_width = 76.min(frame.area().width.max(1));
+                let area = centered_rect_exact(dialog_width, 14 + advanced_rows, frame.area());
                 self.clear_overlay_area(frame, area);
 
-                let outer = self.themed_overlay_block("Name New Agent");
+                let outer = self.themed_overlay_block("New Agent");
                 let inner = outer.inner(area);
                 outer.render(area, frame.buffer_mut());
 
-                let [label_area, input_area, _, checkbox_area, _, hint_area] = Layout::default()
+                let [form_area, hint_area] = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(1),
-                        Constraint::Length(3),
-                        Constraint::Length(checkbox_spacing),
-                        Constraint::Length(checkbox_height),
-                        Constraint::Length(footer_spacing),
-                        Constraint::Min(1),
-                    ])
+                    .constraints([Constraint::Min(3), Constraint::Length(3)])
                     .areas(inner);
 
-                Paragraph::new(Line::from(Span::styled(
-                    " Enter a name for the new agent (used as branch name):",
-                    Style::default().fg(self.theme.input_label_fg),
-                )))
-                .render(label_area, frame.buffer_mut());
+                Widget::render(
+                    Block::default().style(Style::default().bg(self.theme.overlay_bg)),
+                    form_area,
+                    frame.buffer_mut(),
+                );
 
+                let mut cursor_y = form_area.y;
+                let form_bottom = form_area.y.saturating_add(form_area.height);
+                let label_style = Style::default()
+                    .fg(self.theme.input_label_fg)
+                    .add_modifier(Modifier::BOLD);
+                let draw_line = |line: Line<'static>, frame: &mut Frame, y: &mut u16| -> Rect {
+                    if *y >= form_bottom {
+                        return Rect::default();
+                    }
+                    let row_rect = Rect::new(form_area.x, *y, form_area.width, 1);
+                    Paragraph::new(line)
+                        .style(Style::default().bg(self.theme.overlay_bg))
+                        .render(row_rect, frame.buffer_mut());
+                    *y = y.saturating_add(1);
+                    row_rect
+                };
+
+                draw_line(
+                    Line::from(Span::styled(
+                        "Agent name  (branch/worktree name)",
+                        label_style,
+                    )),
+                    frame,
+                    &mut cursor_y,
+                );
                 // Input field with cursor indicator.
                 let display = if input.cursor < input.text.len() {
                     let (before, after) = input.text.split_at(input.cursor);
@@ -4591,43 +4603,281 @@ impl App {
                 let input_block = Block::default()
                     .borders(Borders::ALL)
                     .border_set(border::ROUNDED)
-                    .border_style(Style::default().fg(self.theme.overlay_border));
+                    .border_style(Style::default().fg(if *focus == NameNewAgentFocus::Input {
+                        self.theme.input_cursor_bg
+                    } else {
+                        self.theme.overlay_border
+                    }));
+                let input_area = Rect::new(form_area.x, cursor_y, form_area.width, 3);
                 let input_inner = input_block.inner(input_area);
                 Paragraph::new(display)
                     .block(input_block)
                     .render(input_area, frame.buffer_mut());
+                cursor_y = cursor_y.saturating_add(3);
 
-                let (checkbox_rect, _) = self.render_overlay_checkbox(
+                draw_line(
+                    Line::from(Span::styled("Harness", label_style)),
                     frame,
-                    checkbox_area,
-                    "Use randomized pet name",
-                    *randomize_name,
-                    if *focus == NameNewAgentFocus::Checkbox {
-                        CheckboxState::Focused
-                    } else {
-                        CheckboxState::Normal
-                    },
-                    Some(Line::from(Span::styled(
-                        format!(
-                            "{}Fills this prompt with a fresh pet-tool name",
-                            Checkbox::indent()
+                    &mut cursor_y,
+                );
+                let provider_name = provider_options
+                    .get(*selected_provider)
+                    .or_else(|| provider_options.first())
+                    .map(|provider| provider.as_str())
+                    .unwrap_or("(none)");
+                draw_line(
+                    Line::from(vec![
+                        Span::styled(
+                            if *focus == NameNewAgentFocus::Provider {
+                                "  > "
+                            } else {
+                                "    "
+                            },
+                            Style::default().fg(self.theme.input_label_fg),
                         ),
-                        Style::default().fg(self.theme.hint_desc_fg),
-                    ))),
+                        Span::styled(
+                            provider_name.to_string(),
+                            Style::default().fg(self.theme.text_fg),
+                        ),
+                        Span::styled(
+                            "  (Left/Right to choose)",
+                            Style::default().fg(self.theme.hint_dim_desc_fg),
+                        ),
+                    ]),
+                    frame,
+                    &mut cursor_y,
+                );
+
+                let checkbox_rect = draw_line(
+                    checkbox_line(
+                        "Use randomized pet name",
+                        *randomize_name,
+                        *focus == NameNewAgentFocus::Checkbox,
+                        &self.theme,
+                    ),
+                    frame,
+                    &mut cursor_y,
+                );
+
+                draw_line(
+                    checkbox_line(
+                        "Advanced settings",
+                        *show_advanced,
+                        *focus == NameNewAgentFocus::AdvancedToggle,
+                        &self.theme,
+                    ),
+                    frame,
+                    &mut cursor_y,
+                );
+
+                if *show_advanced {
+                    draw_line(Line::from(""), frame, &mut cursor_y);
+                    draw_line(
+                        Line::from(Span::styled("Context mode", label_style)),
+                        frame,
+                        &mut cursor_y,
+                    );
+                    draw_line(
+                        radio_line(
+                            "attended",
+                            "operator-managed, persistent context",
+                            draft_settings.mode == ContextMode::Attended,
+                            *focus == NameNewAgentFocus::ModeAttended,
+                            &self.theme,
+                        ),
+                        frame,
+                        &mut cursor_y,
+                    );
+                    draw_line(
+                        radio_line(
+                            "orchestrator",
+                            "coordinates peers, persistent context",
+                            draft_settings.mode == ContextMode::Orchestrator,
+                            *focus == NameNewAgentFocus::ModeOrchestrator,
+                            &self.theme,
+                        ),
+                        frame,
+                        &mut cursor_y,
+                    );
+                    draw_line(
+                        radio_line(
+                            "worker",
+                            "expects task-done and can auto-clear",
+                            draft_settings.mode == ContextMode::Worker,
+                            *focus == NameNewAgentFocus::ModeWorker,
+                            &self.theme,
+                        ),
+                        frame,
+                        &mut cursor_y,
+                    );
+
+                    draw_line(
+                        checkbox_line(
+                            "YOLO permissions  (spawn-time)",
+                            draft_settings.yolo_permissions,
+                            *focus == NameNewAgentFocus::Yolo,
+                            &self.theme,
+                        ),
+                        frame,
+                        &mut cursor_y,
+                    );
+
+                    let prompt_len = draft_system_prompt.text.chars().count();
+                    draw_line(
+                        Line::from(vec![
+                            Span::styled(
+                                if *focus == NameNewAgentFocus::SystemPrompt {
+                                    "  > System prompt  "
+                                } else {
+                                    "    System prompt  "
+                                },
+                                Style::default().fg(self.theme.input_label_fg),
+                            ),
+                            Span::styled(
+                                if prompt_len == 0 {
+                                    "(none)".to_string()
+                                } else {
+                                    format!("{prompt_len} chars")
+                                },
+                                Style::default().fg(self.theme.hint_dim_desc_fg),
+                            ),
+                        ]),
+                        frame,
+                        &mut cursor_y,
+                    );
+                    if *focus == NameNewAgentFocus::SystemPrompt {
+                        let editor_rect = Rect::new(
+                            form_area.x + 4,
+                            cursor_y,
+                            form_area.width.saturating_sub(4),
+                            4,
+                        );
+                        self.render_multiline_input(draft_system_prompt, editor_rect, frame);
+                        cursor_y = cursor_y.saturating_add(4);
+                    }
+
+                    draw_line(
+                        Line::from(Span::styled("Watch rules", label_style)),
+                        frame,
+                        &mut cursor_y,
+                    );
+                    if rules.is_empty() {
+                        draw_line(
+                            Line::from(Span::styled(
+                                "  (no rules configured for this harness)",
+                                Style::default().fg(self.theme.hint_dim_desc_fg),
+                            )),
+                            frame,
+                            &mut cursor_y,
+                        );
+                    } else {
+                        for rule in rules {
+                            draw_line(
+                                checkbox_line(
+                                    &rule.label,
+                                    rule.armed,
+                                    *focus == NameNewAgentFocus::WatchRule(rule.idx),
+                                    &self.theme,
+                                ),
+                                frame,
+                                &mut cursor_y,
+                            );
+                        }
+                    }
+
+                    draw_line(
+                        checkbox_line(
+                            "Auto-clear after task done  (Worker mode)",
+                            draft_settings.auto_clear_on_task_done,
+                            *focus == NameNewAgentFocus::AutoClearOnDone,
+                            &self.theme,
+                        ),
+                        frame,
+                        &mut cursor_y,
+                    );
+
+                    draw_line(
+                        Line::from(Span::styled("AMQ verify envelope", label_style)),
+                        frame,
+                        &mut cursor_y,
+                    );
+                    draw_line(
+                        radio_line(
+                            "default",
+                            "inherit global config",
+                            draft_settings.verify_envelope_override.is_none(),
+                            *focus == NameNewAgentFocus::VerifyDefault,
+                            &self.theme,
+                        ),
+                        frame,
+                        &mut cursor_y,
+                    );
+                    draw_line(
+                        radio_line(
+                            "strict",
+                            "force HMAC verification",
+                            draft_settings.verify_envelope_override == Some(true),
+                            *focus == NameNewAgentFocus::VerifyStrict,
+                            &self.theme,
+                        ),
+                        frame,
+                        &mut cursor_y,
+                    );
+                    draw_line(
+                        radio_line(
+                            "skip",
+                            "force unsigned injection",
+                            draft_settings.verify_envelope_override == Some(false),
+                            *focus == NameNewAgentFocus::VerifySkip,
+                            &self.theme,
+                        ),
+                        frame,
+                        &mut cursor_y,
+                    );
+                }
+
+                draw_line(Line::from(""), frame, &mut cursor_y);
+                draw_line(
+                    Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(
+                            "[ Create ]",
+                            if *focus == NameNewAgentFocus::CreateButton {
+                                Style::default()
+                                    .fg(self.theme.input_cursor_fg)
+                                    .bg(self.theme.input_cursor_bg)
+                            } else {
+                                Style::default().fg(self.theme.text_fg)
+                            },
+                        ),
+                        Span::raw("    "),
+                        Span::styled(
+                            "[ Cancel ]",
+                            if *focus == NameNewAgentFocus::CancelButton {
+                                Style::default()
+                                    .fg(self.theme.input_cursor_fg)
+                                    .bg(self.theme.input_cursor_bg)
+                            } else {
+                                Style::default().fg(self.theme.text_fg)
+                            },
+                        ),
+                    ]),
+                    frame,
+                    &mut cursor_y,
                 );
 
                 let confirm_key = self.bindings.label_for(Action::Confirm);
                 let close_key = self.bindings.label_for(Action::CloseOverlay);
-                let toggle_key = self.bindings.label_for(Action::ToggleSelection);
+                let next_key = self.bindings.label_for(Action::FocusNext);
                 let mut hints = vec![Span::raw(" ")];
-                hints.extend(self.theme.key_badge_default(&confirm_key));
+                hints.extend(self.theme.key_badge_default(&next_key));
                 hints.push(Span::styled(
-                    " confirm  ",
+                    " next field  ",
                     Style::default().fg(self.theme.hint_desc_fg),
                 ));
-                hints.extend(self.theme.key_badge_default(&toggle_key));
+                hints.extend(self.theme.key_badge_default(&confirm_key));
                 hints.push(Span::styled(
-                    " randomize  ",
+                    " toggle / create  ",
                     Style::default().fg(self.theme.hint_desc_fg),
                 ));
                 hints.extend(self.theme.key_badge_default(&close_key));
@@ -4635,7 +4885,15 @@ impl App {
                     " cancel",
                     Style::default().fg(self.theme.hint_desc_fg),
                 ));
-                Paragraph::new(Line::from(hints)).render(hint_area, frame.buffer_mut());
+                let hint_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(ratatui::widgets::BorderType::Rounded)
+                    .border_style(Style::default().fg(self.theme.overlay_border))
+                    .style(Style::default().bg(self.theme.overlay_bg));
+                Paragraph::new(Line::from(hints))
+                    .block(hint_block)
+                    .wrap(Wrap { trim: true })
+                    .render(hint_area, frame.buffer_mut());
                 self.ui.overlay_layout.active = OverlayMouseLayout::NameNewAgent {
                     input: input_inner,
                     checkbox: Some(OverlayCheckbox {

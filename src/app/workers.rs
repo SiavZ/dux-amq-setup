@@ -1284,6 +1284,7 @@ pub(crate) fn run_create_agent_job(
     let (
         project,
         provider,
+        settings,
         source_branch,
         status_message,
         branch_name,
@@ -1294,6 +1295,8 @@ pub(crate) fn run_create_agent_job(
             project,
             custom_name,
             use_existing_branch,
+            provider,
+            settings,
         } => {
             let repo_path = PathBuf::from(&project.path);
 
@@ -1371,14 +1374,15 @@ pub(crate) fn run_create_agent_job(
             } else {
                 format!(
                     "Created {} agent \"{}\" in project \"{}\". The new worktree is ready in a fresh session.",
-                    project.default_provider.as_str(),
+                    provider.as_str(),
                     branch_name,
                     project.name
                 )
             };
             (
                 project.clone(),
-                project.default_provider.clone(),
+                provider,
+                settings,
                 project.current_branch.clone(),
                 status_message,
                 branch_name,
@@ -1391,6 +1395,8 @@ pub(crate) fn run_create_agent_job(
             source_session,
             source_label,
             custom_name,
+            provider,
+            settings,
         } => {
             let source_worktree = PathBuf::from(&source_session.worktree_path);
             let _ = worker_tx.send(WorkerEvent::CreateAgentProgress(format!(
@@ -1446,14 +1452,15 @@ pub(crate) fn run_create_agent_job(
             }
             let status_message = format!(
                 "Forked {} agent \"{}\" from \"{}\" in project \"{}\". The new worktree starts with copied files and a fresh session.",
-                source_session.provider.as_str(),
+                provider.as_str(),
                 branch_name,
                 source_label,
                 project.name
             );
             (
                 project,
-                source_session.provider,
+                provider,
+                settings,
                 source_session.branch_name,
                 status_message,
                 branch_name,
@@ -1493,7 +1500,7 @@ pub(crate) fn run_create_agent_job(
         state: crate::model::SessionState::Created {
             created_at: Utc::now(),
         },
-        settings: crate::model::SessionSettings::default(),
+        settings,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
