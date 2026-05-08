@@ -1007,6 +1007,7 @@ pub(crate) enum OverlayMouseLayout {
     NameNewAgent {
         input: Rect,
         checkbox: Option<OverlayCheckbox>,
+        rows: Vec<(Rect, NameNewAgentFocus)>,
     },
     /// Per-session settings modal (audit03 Phase 7). Carries the
     /// title text-input rect plus one entry per non-title interactive

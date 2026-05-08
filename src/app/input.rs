@@ -115,6 +115,7 @@ enum PromptMouseTarget {
     Checkbox(OverlayCheckboxId),
     RenameInput,
     NameNewAgentInput,
+    NameNewAgentRow(NameNewAgentFocus),
     /// Click landed on the session-settings title text input. Behaves
     /// like a text-input click: set focus to Title and position the
     /// cursor from the click column. Distinct from
@@ -209,6 +210,7 @@ impl ButtonPressedTarget {
             | PromptMouseTarget::Checkbox(_)
             | PromptMouseTarget::RenameInput
             | PromptMouseTarget::NameNewAgentInput
+            | PromptMouseTarget::NameNewAgentRow(_)
             // Session-settings rows (radios, checkboxes, Save/Cancel) all
             // fire on Down via `dispatch_prompt_target_action` — there is
             // no separate press-and-release gesture in this modal, so
@@ -3788,7 +3790,16 @@ impl App {
                     contains_point(input, column, row).then_some(PromptMouseTarget::RenameInput)
                 }
             }
-            OverlayMouseLayout::NameNewAgent { input, checkbox } => {
+            OverlayMouseLayout::NameNewAgent {
+                input,
+                checkbox,
+                rows,
+            } => {
+                for (rect, focus) in rows {
+                    if contains_point(rect, column, row) {
+                        return Some(PromptMouseTarget::NameNewAgentRow(focus));
+                    }
+                }
                 if checkbox.is_some_and(|checkbox| contains_point(checkbox.rect, column, row)) {
                     checkbox.map(|checkbox| PromptMouseTarget::Checkbox(checkbox.id))
                 } else {
@@ -4910,6 +4921,29 @@ impl App {
             PromptMouseTarget::NameNewAgentInput => {
                 self.set_name_new_agent_cursor_from_mouse(mouse.column);
             }
+            PromptMouseTarget::NameNewAgentRow(focus) => {
+                if let PromptState::NameNewAgent {
+                    focus: current_focus,
+                    ..
+                } = &mut self.ui.prompt
+                {
+                    *current_focus = focus;
+                }
+                match focus {
+                    NameNewAgentFocus::Input => {
+                        self.set_name_new_agent_cursor_from_mouse(mouse.column);
+                    }
+                    NameNewAgentFocus::CreateButton => {
+                        if let Err(err) = self.submit_name_new_agent_prompt() {
+                            self.set_error(format!("{err:#}"));
+                        }
+                    }
+                    NameNewAgentFocus::CancelButton => {
+                        self.ui.prompt = PromptState::None;
+                    }
+                    _ => self.toggle_name_new_agent_focused_row(),
+                }
+            }
             PromptMouseTarget::SessionSettingsTitle => {
                 // Click on the title text-input: focus the row and
                 // position the cursor where the click landed. Toggling
@@ -5747,7 +5781,8 @@ mod tests {
         LeftSection, MacroBarState, MouseClickTarget, MouseLayoutState, NameNewAgentFocus,
         OverlayCheckbox, OverlayCheckboxId, OverlayMouseLayout, OverlayMouseLayoutState,
         ProcessInfo, PromptState, PullTarget, ResourceStats, RightSection, RuntimeState,
-        RuntimeTargetId, SessionSettingsPrompt, SettingsFocus, TextInput, UiState, WorkerEvent,
+        RuntimeTargetId, SessionSettingsPrompt, SettingsFocus, TextInput, UiState,
+        WatchRuleSummary, WorkerEvent,
     };
     use crate::clipboard::Clipboard;
     use crate::config::{Config, DuxPaths, ProjectConfig};
@@ -6124,6 +6159,7 @@ mod tests {
                 id: OverlayCheckboxId::NameNewAgentRandomizedPetName,
                 rect: Rect::new(24, 12, 34, 2),
             }),
+            rows: Vec::new(),
         };
     }
 
@@ -6954,6 +6990,71 @@ mod tests {
                 assert!(!*randomize_name);
                 assert!(input.text.is_empty(), "generated name was {generated}");
                 assert!(randomized_name.is_none());
+            }
+            other => panic!("expected name-new-agent prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn name_prompt_mouse_toggles_advanced_settings_row() {
+        let mut app = test_app(default_bindings());
+        app.create_agent_for_selected_project().unwrap();
+        app.ui.overlay_layout.active = OverlayMouseLayout::NameNewAgent {
+            input: Rect::new(10, 5, 30, 1),
+            checkbox: None,
+            rows: vec![(Rect::new(10, 9, 40, 1), NameNewAgentFocus::AdvancedToggle)],
+        };
+
+        app.handle_prompt_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 12, 9));
+
+        match &app.ui.prompt {
+            PromptState::NameNewAgent {
+                show_advanced,
+                focus,
+                ..
+            } => {
+                assert!(*show_advanced);
+                assert_eq!(*focus, NameNewAgentFocus::AdvancedToggle);
+            }
+            other => panic!("expected name-new-agent prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn name_prompt_mouse_toggles_watch_rule_row() {
+        let mut app = test_app(default_bindings());
+        app.create_agent_for_selected_project().unwrap();
+        if let PromptState::NameNewAgent {
+            show_advanced,
+            rules,
+            ..
+        } = &mut app.ui.prompt
+        {
+            *show_advanced = true;
+            *rules = vec![WatchRuleSummary {
+                idx: 0,
+                label: "rate limit".to_string(),
+                armed: true,
+            }];
+        }
+        app.ui.overlay_layout.active = OverlayMouseLayout::NameNewAgent {
+            input: Rect::new(10, 5, 30, 1),
+            checkbox: None,
+            rows: vec![(Rect::new(10, 12, 40, 1), NameNewAgentFocus::WatchRule(0))],
+        };
+
+        app.handle_prompt_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 12, 12));
+
+        match &app.ui.prompt {
+            PromptState::NameNewAgent {
+                rules,
+                draft_settings,
+                focus,
+                ..
+            } => {
+                assert_eq!(*focus, NameNewAgentFocus::WatchRule(0));
+                assert!(!rules[0].armed);
+                assert_eq!(draft_settings.watch_rule_arm.get(&0), Some(&false));
             }
             other => panic!("expected name-new-agent prompt, got {other:?}"),
         }
