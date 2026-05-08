@@ -6553,14 +6553,14 @@ mod tests {
     }
 
     #[test]
-    fn open_rename_session_initializes_rename_branch_true() {
+    fn open_rename_session_initializes_rename_branch_false() {
         let mut app = test_app(default_bindings());
 
         app.open_rename_session().unwrap();
 
         match &app.ui.prompt {
             PromptState::RenameSession { rename_branch, .. } => {
-                assert!(*rename_branch, "rename_branch should default to true");
+                assert!(!*rename_branch, "rename_branch should default to false");
             }
             other => panic!("expected RenameSession, got {other:?}"),
         }
