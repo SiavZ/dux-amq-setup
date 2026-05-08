@@ -4522,17 +4522,19 @@ impl App {
             } => {
                 self.render_dim_overlay(frame);
                 let advanced_rows = if *show_advanced {
-                    12 + rules.len() as u16
-                        + if *focus == NameNewAgentFocus::SystemPrompt {
-                            4
-                        } else {
-                            0
-                        }
+                    let rule_rows = (rules.len() as u16).max(1);
+                    let system_prompt_editor_rows = if *focus == NameNewAgentFocus::SystemPrompt {
+                        4
+                    } else {
+                        0
+                    };
+                    13 + rule_rows + system_prompt_editor_rows
                 } else {
                     0
                 };
+                let form_rows = 10 + advanced_rows;
                 let dialog_width = 76.min(frame.area().width.max(1));
-                let area = centered_rect_exact(dialog_width, 14 + advanced_rows, frame.area());
+                let area = centered_rect_exact(dialog_width, form_rows + 5, frame.area());
                 self.clear_overlay_area(frame, area);
 
                 let outer = self.themed_overlay_block("New Agent");
@@ -4551,6 +4553,7 @@ impl App {
                 );
 
                 let mut cursor_y = form_area.y;
+                let mut rows: Vec<(Rect, NameNewAgentFocus)> = Vec::new();
                 let form_bottom = form_area.y.saturating_add(form_area.height);
                 let label_style = Style::default()
                     .fg(self.theme.input_label_fg)
@@ -4625,7 +4628,7 @@ impl App {
                     .or_else(|| provider_options.first())
                     .map(|provider| provider.as_str())
                     .unwrap_or("(none)");
-                draw_line(
+                let provider_rect = draw_line(
                     Line::from(vec![
                         Span::styled(
                             if *focus == NameNewAgentFocus::Provider {
@@ -4647,6 +4650,7 @@ impl App {
                     frame,
                     &mut cursor_y,
                 );
+                rows.push((provider_rect, NameNewAgentFocus::Provider));
 
                 let checkbox_rect = draw_line(
                     checkbox_line(
@@ -4658,8 +4662,9 @@ impl App {
                     frame,
                     &mut cursor_y,
                 );
+                rows.push((checkbox_rect, NameNewAgentFocus::Checkbox));
 
-                draw_line(
+                let advanced_toggle_rect = draw_line(
                     checkbox_line(
                         "Advanced settings",
                         *show_advanced,
@@ -4669,6 +4674,7 @@ impl App {
                     frame,
                     &mut cursor_y,
                 );
+                rows.push((advanced_toggle_rect, NameNewAgentFocus::AdvancedToggle));
 
                 if *show_advanced {
                     draw_line(Line::from(""), frame, &mut cursor_y);
@@ -4677,7 +4683,7 @@ impl App {
                         frame,
                         &mut cursor_y,
                     );
-                    draw_line(
+                    let mode_attended_rect = draw_line(
                         radio_line(
                             "attended",
                             "operator-managed, persistent context",
@@ -4688,7 +4694,8 @@ impl App {
                         frame,
                         &mut cursor_y,
                     );
-                    draw_line(
+                    rows.push((mode_attended_rect, NameNewAgentFocus::ModeAttended));
+                    let mode_orchestrator_rect = draw_line(
                         radio_line(
                             "orchestrator",
                             "coordinates peers, persistent context",
@@ -4699,7 +4706,8 @@ impl App {
                         frame,
                         &mut cursor_y,
                     );
-                    draw_line(
+                    rows.push((mode_orchestrator_rect, NameNewAgentFocus::ModeOrchestrator));
+                    let mode_worker_rect = draw_line(
                         radio_line(
                             "worker",
                             "expects task-done and can auto-clear",
@@ -4710,8 +4718,9 @@ impl App {
                         frame,
                         &mut cursor_y,
                     );
+                    rows.push((mode_worker_rect, NameNewAgentFocus::ModeWorker));
 
-                    draw_line(
+                    let yolo_rect = draw_line(
                         checkbox_line(
                             "YOLO permissions  (spawn-time)",
                             draft_settings.yolo_permissions,
@@ -4721,9 +4730,10 @@ impl App {
                         frame,
                         &mut cursor_y,
                     );
+                    rows.push((yolo_rect, NameNewAgentFocus::Yolo));
 
                     let prompt_len = draft_system_prompt.text.chars().count();
-                    draw_line(
+                    let system_prompt_rect = draw_line(
                         Line::from(vec![
                             Span::styled(
                                 if *focus == NameNewAgentFocus::SystemPrompt {
@@ -4745,6 +4755,7 @@ impl App {
                         frame,
                         &mut cursor_y,
                     );
+                    rows.push((system_prompt_rect, NameNewAgentFocus::SystemPrompt));
                     if *focus == NameNewAgentFocus::SystemPrompt {
                         let editor_rect = Rect::new(
                             form_area.x + 4,
@@ -4772,7 +4783,7 @@ impl App {
                         );
                     } else {
                         for rule in rules {
-                            draw_line(
+                            let rule_rect = draw_line(
                                 checkbox_line(
                                     &rule.label,
                                     rule.armed,
@@ -4782,10 +4793,11 @@ impl App {
                                 frame,
                                 &mut cursor_y,
                             );
+                            rows.push((rule_rect, NameNewAgentFocus::WatchRule(rule.idx)));
                         }
                     }
 
-                    draw_line(
+                    let auto_clear_rect = draw_line(
                         checkbox_line(
                             "Auto-clear after task done  (Worker mode)",
                             draft_settings.auto_clear_on_task_done,
@@ -4795,13 +4807,14 @@ impl App {
                         frame,
                         &mut cursor_y,
                     );
+                    rows.push((auto_clear_rect, NameNewAgentFocus::AutoClearOnDone));
 
                     draw_line(
                         Line::from(Span::styled("AMQ verify envelope", label_style)),
                         frame,
                         &mut cursor_y,
                     );
-                    draw_line(
+                    let verify_default_rect = draw_line(
                         radio_line(
                             "default",
                             "inherit global config",
@@ -4812,7 +4825,8 @@ impl App {
                         frame,
                         &mut cursor_y,
                     );
-                    draw_line(
+                    rows.push((verify_default_rect, NameNewAgentFocus::VerifyDefault));
+                    let verify_strict_rect = draw_line(
                         radio_line(
                             "strict",
                             "force HMAC verification",
@@ -4823,7 +4837,8 @@ impl App {
                         frame,
                         &mut cursor_y,
                     );
-                    draw_line(
+                    rows.push((verify_strict_rect, NameNewAgentFocus::VerifyStrict));
+                    let verify_skip_rect = draw_line(
                         radio_line(
                             "skip",
                             "force unsigned injection",
@@ -4834,6 +4849,7 @@ impl App {
                         frame,
                         &mut cursor_y,
                     );
+                    rows.push((verify_skip_rect, NameNewAgentFocus::VerifySkip));
                 }
 
                 draw_line(Line::from(""), frame, &mut cursor_y);
@@ -4900,6 +4916,7 @@ impl App {
                         id: OverlayCheckboxId::NameNewAgentRandomizedPetName,
                         rect: checkbox_rect,
                     }),
+                    rows,
                 };
             }
             PromptState::WatchRules(prompt) => {

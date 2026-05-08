@@ -1,6 +1,20 @@
 use super::*;
 use crate::editor;
 
+fn watch_rule_display_label(idx: usize, label: &str, pattern: &str) -> String {
+    let trimmed_label = label.trim();
+    if !trimmed_label.is_empty() {
+        return trimmed_label.to_string();
+    }
+
+    let trimmed_pattern = pattern.trim();
+    if !trimmed_pattern.is_empty() {
+        return trimmed_pattern.chars().take(64).collect();
+    }
+
+    format!("rule {idx}")
+}
+
 impl App {
     pub(crate) fn open_project_browser(&mut self) -> Result<()> {
         let start_dir = self
@@ -286,11 +300,7 @@ impl App {
                     .iter()
                     .enumerate()
                     .map(|(idx, rule)| {
-                        let label = if rule.label.trim().is_empty() {
-                            format!("rule {idx}")
-                        } else {
-                            rule.label.clone()
-                        };
+                        let label = watch_rule_display_label(idx, &rule.label, &rule.pattern);
                         let armed = settings.watch_rule_arm.get(&idx).copied().unwrap_or(true);
                         WatchRuleSummary { idx, label, armed }
                     })
@@ -2109,11 +2119,7 @@ impl App {
                     .iter()
                     .enumerate()
                     .map(|(idx, rule)| {
-                        let label = if rule.label.trim().is_empty() {
-                            format!("rule {idx}")
-                        } else {
-                            rule.label.clone()
-                        };
+                        let label = watch_rule_display_label(idx, &rule.label, &rule.pattern);
                         // No live engine — start from "armed" (the
                         // config default) and let the persisted
                         // `watch_rule_arm` map override.
@@ -2505,6 +2511,32 @@ mod tests {
             path_missing: false,
             meta_loaded: true,
         }
+    }
+
+    #[test]
+    fn provider_watch_rule_summary_uses_pattern_when_label_missing() {
+        let mut app = test_app_with_sessions(Vec::new(), Vec::new());
+        let provider = ProviderKind::from_str("codex");
+        app.config.providers.commands.insert(
+            "codex".to_string(),
+            crate::config::ProviderCommandConfig {
+                watch: vec![crate::watch::WatchRule {
+                    pattern: "API Error.*rate limit".to_string(),
+                    label: String::new(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let summaries = app.collect_provider_watch_rule_summaries(
+            &provider,
+            &crate::model::SessionSettings::default(),
+        );
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].label, "API Error.*rate limit");
+        assert!(summaries[0].armed);
     }
 
     /// Spawn a `echo` PTY and install it on the named session so the
