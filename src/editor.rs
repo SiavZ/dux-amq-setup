@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::env;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -112,7 +112,7 @@ pub fn launch_editor(editor: &DetectedEditor, path: &Path) -> Result<()> {
     }
 
     Command::new(&editor.command)
-        .arg(path)
+        .args(editor_launch_args(editor, path))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -120,6 +120,18 @@ pub fn launch_editor(editor: &DetectedEditor, path: &Path) -> Result<()> {
         .with_context(|| format!("failed to launch {} via {}", editor.label, editor.command))?;
 
     Ok(())
+}
+
+fn editor_launch_args(editor: &DetectedEditor, path: &Path) -> Vec<OsString> {
+    let mut args = Vec::new();
+    match editor.kind {
+        EditorKind::Cursor | EditorKind::VsCode | EditorKind::Antigravity => {
+            args.push(OsString::from("--new-window"));
+        }
+        EditorKind::Zed => {}
+    }
+    args.push(path.as_os_str().to_os_string());
+    args
 }
 
 fn detect_editors_from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<DetectedEditor> {
@@ -165,6 +177,7 @@ fn spec_for_kind(kind: EditorKind) -> &'static EditorSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn detect_editors_prefers_popular_order() {
@@ -197,5 +210,59 @@ mod tests {
         let editor = detected.first().expect("editor should be detected");
         assert!(matches_configured_editor(editor, "vscode"));
         assert!(matches_configured_editor(editor, "code-insiders"));
+    }
+
+    #[test]
+    fn vscode_launch_args_force_new_window() {
+        let editor = DetectedEditor {
+            kind: EditorKind::VsCode,
+            label: "VS Code",
+            config_key: "vscode",
+            command: "code".to_string(),
+        };
+        let path = PathBuf::from("/tmp/agent-worktree");
+
+        assert_eq!(
+            editor_launch_args(&editor, &path),
+            vec![
+                OsString::from("--new-window"),
+                OsString::from("/tmp/agent-worktree")
+            ]
+        );
+    }
+
+    #[test]
+    fn cursor_launch_args_force_new_window() {
+        let editor = DetectedEditor {
+            kind: EditorKind::Cursor,
+            label: "Cursor",
+            config_key: "cursor",
+            command: "cursor".to_string(),
+        };
+        let path = PathBuf::from("/tmp/agent-worktree");
+
+        assert_eq!(
+            editor_launch_args(&editor, &path),
+            vec![
+                OsString::from("--new-window"),
+                OsString::from("/tmp/agent-worktree")
+            ]
+        );
+    }
+
+    #[test]
+    fn zed_launch_args_keep_single_path_arg() {
+        let editor = DetectedEditor {
+            kind: EditorKind::Zed,
+            label: "Zed",
+            config_key: "zed",
+            command: "zed".to_string(),
+        };
+        let path = PathBuf::from("/tmp/agent-worktree");
+
+        assert_eq!(
+            editor_launch_args(&editor, &path),
+            vec![OsString::from("/tmp/agent-worktree")]
+        );
     }
 }
