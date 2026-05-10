@@ -570,7 +570,10 @@ impl App {
                     }
                 })
                 .collect::<Vec<_>>();
-            let mut state = ListState::default().with_selected(Some(self.selected_left));
+            self.ensure_left_selection_visible_in(usize::from(area.height).saturating_sub(2));
+            let mut state = ListState::default()
+                .with_selected(Some(self.selected_left))
+                .with_offset(self.left_scroll_offset);
             StatefulWidget::render(
                 List::new(items)
                     .block(self.themed_block("", focused))
@@ -579,6 +582,7 @@ impl App {
                 frame.buffer_mut(),
                 &mut state,
             );
+            self.left_scroll_offset = state.offset();
             return;
         }
 
@@ -750,12 +754,14 @@ impl App {
         self.ui.mouse_layout.left_list = self
             .themed_block(&title, projects_focused)
             .inner(projects_area);
-        let mut state =
-            ListState::default().with_selected(if self.left_section == LeftSection::Projects {
+        self.ensure_left_selection_visible_in(usize::from(self.ui.mouse_layout.left_list.height));
+        let mut state = ListState::default()
+            .with_selected(if self.left_section == LeftSection::Projects {
                 Some(self.selected_left)
             } else {
                 None
-            });
+            })
+            .with_offset(self.left_scroll_offset);
         StatefulWidget::render(
             List::new(items)
                 .block(self.themed_block(&title, projects_focused))
@@ -764,6 +770,7 @@ impl App {
             frame.buffer_mut(),
             &mut state,
         );
+        self.left_scroll_offset = state.offset();
 
         // Render terminals section if any terminals exist.
         if let Some(term_area) = terminals_area {

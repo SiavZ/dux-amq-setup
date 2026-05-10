@@ -3883,7 +3883,8 @@ impl App {
             if self.left_items().is_empty() {
                 return Some(MouseTarget::LeftPane);
             }
-            let index = usize::from(row.saturating_sub(self.ui.mouse_layout.left_list.y));
+            let visible_index = usize::from(row.saturating_sub(self.ui.mouse_layout.left_list.y));
+            let index = self.left_scroll_offset.saturating_add(visible_index);
             if index < self.left_items().len() {
                 return Some(MouseTarget::LeftRow(index));
             }
@@ -4038,6 +4039,33 @@ impl App {
             self.selected_left = index;
             self.close_diff_view();
             self.reload_changed_files();
+        }
+        self.ensure_left_selection_visible();
+    }
+
+    pub(crate) fn ensure_left_selection_visible(&mut self) {
+        let visible_rows = usize::from(self.ui.mouse_layout.left_list.height).max(1);
+        self.ensure_left_selection_visible_in(visible_rows);
+    }
+
+    pub(crate) fn ensure_left_selection_visible_in(&mut self, visible_rows: usize) {
+        let item_count = self.left_items().len();
+        if item_count == 0 {
+            self.left_scroll_offset = 0;
+            return;
+        }
+        let visible_rows = visible_rows.max(1);
+        let max_offset = item_count.saturating_sub(visible_rows);
+        self.left_scroll_offset = self.left_scroll_offset.min(max_offset);
+        if self.selected_left < self.left_scroll_offset {
+            self.left_scroll_offset = self.selected_left.min(max_offset);
+        } else {
+            let last_visible = self.left_scroll_offset + visible_rows - 1;
+            if self.selected_left > last_visible {
+                self.left_scroll_offset = (self.selected_left + 1)
+                    .saturating_sub(visible_rows)
+                    .min(max_offset);
+            }
         }
     }
 
@@ -5323,22 +5351,42 @@ impl App {
         }
     }
 
-    fn handle_left_mouse_wheel(&mut self, down: bool, column: u16, row: u16) {
-        let target_index = match self.mouse_target(column, row) {
-            Some(MouseTarget::LeftRow(index)) => index,
-            _ => self.selected_left,
-        };
-        self.set_left_selection(target_index);
+    fn handle_left_mouse_wheel(&mut self, down: bool) {
+        self.ui.focus = FocusPane::Left;
+        self.left_section = LeftSection::Projects;
+        self.ui.input_target = InputTarget::None;
+        self.ui.fullscreen_overlay = FullscreenOverlay::None;
 
-        if down {
-            if self.selected_left + 1 < self.left_items().len() {
-                self.selected_left += 1;
-                self.reload_changed_files();
-            }
-        } else if self.selected_left > 0 {
-            self.selected_left -= 1;
-            self.reload_changed_files();
+        let item_count = self.left_items().len();
+        if item_count == 0 {
+            self.left_scroll_offset = 0;
+            return;
         }
+
+        let visible_rows = usize::from(self.ui.mouse_layout.left_list.height).max(1);
+        let max_offset = item_count.saturating_sub(visible_rows);
+        if max_offset == 0 {
+            let new_selection = if down {
+                (self.selected_left + 1).min(item_count - 1)
+            } else {
+                self.selected_left.saturating_sub(1)
+            };
+            self.set_left_selection(new_selection);
+            return;
+        }
+
+        self.left_scroll_offset = if down {
+            (self.left_scroll_offset + MOUSE_WHEEL_LINES).min(max_offset)
+        } else {
+            self.left_scroll_offset.saturating_sub(MOUSE_WHEEL_LINES)
+        };
+
+        let last_visible =
+            (self.left_scroll_offset + visible_rows.saturating_sub(1)).min(item_count - 1);
+        let new_selection = self
+            .selected_left
+            .clamp(self.left_scroll_offset, last_visible);
+        self.set_left_selection(new_selection);
     }
 
     fn handle_center_mouse_wheel(&mut self, mouse: MouseEvent) {
@@ -5600,8 +5648,8 @@ impl App {
                 }
             }
             MouseEventKind::ScrollDown => match self.mouse_target(mouse.column, mouse.row) {
-                Some(MouseTarget::LeftRow(_)) => {
-                    self.handle_left_mouse_wheel(true, mouse.column, mouse.row)
+                Some(MouseTarget::LeftRow(_) | MouseTarget::LeftPane) => {
+                    self.handle_left_mouse_wheel(true)
                 }
                 Some(MouseTarget::Center) => self.handle_center_mouse_wheel(mouse),
                 Some(MouseTarget::UnstagedFile(_)) => {
@@ -5618,8 +5666,8 @@ impl App {
                 _ => {}
             },
             MouseEventKind::ScrollUp => match self.mouse_target(mouse.column, mouse.row) {
-                Some(MouseTarget::LeftRow(_)) => {
-                    self.handle_left_mouse_wheel(false, mouse.column, mouse.row)
+                Some(MouseTarget::LeftRow(_) | MouseTarget::LeftPane) => {
+                    self.handle_left_mouse_wheel(false)
                 }
                 Some(MouseTarget::Center) => self.handle_center_mouse_wheel(mouse),
                 Some(MouseTarget::UnstagedFile(_)) => {
@@ -5836,8 +5884,8 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex, mpsc};
 
-    use super::DOUBLE_CLICK_THRESHOLD;
     use super::components::{ButtonPressedTarget, PressedButton};
+    use super::{DOUBLE_CLICK_THRESHOLD, MOUSE_WHEEL_LINES, MouseTarget};
     use crate::app::{
         App, CenterMode, ConfirmKillRunningPrompt, CreateAgentRequest, DeleteAgentFocus, FocusPane,
         FullscreenOverlay, InputTarget, KillRunningAction, KillRunningFocus,
@@ -6024,6 +6072,7 @@ mod tests {
             bindings,
             session_store,
             selected_left: 0,
+            left_scroll_offset: 0,
             left_section: crate::app::LeftSection::Projects,
             selected_terminal_index: 0,
             right_section: RightSection::Unstaged,
@@ -7669,6 +7718,38 @@ mod tests {
 
         assert_eq!(app.ui.focus, FocusPane::Left);
         assert_eq!(app.selected_left, 1);
+    }
+
+    #[test]
+    fn mouse_wheel_left_pane_scrolls_overflowing_agent_list() {
+        let mut app = test_app(default_bindings());
+        install_mouse_layout(&mut app);
+        for i in 0..12 {
+            let mut session = app.git.sessions[0].clone();
+            session.id = format!("session-extra-{i}");
+            session.branch_name = format!("agent-extra-{i}");
+            session.worktree_path = app
+                .paths
+                .worktrees_root
+                .join(format!("agent-extra-{i}"))
+                .to_string_lossy()
+                .to_string();
+            app.git.sessions.push(session);
+        }
+        app.rebuild_left_items();
+        app.selected_left = 1;
+        app.left_scroll_offset = 0;
+
+        // Scroll on the left-pane border/chrome, not directly on a row.
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 2, 0));
+
+        assert_eq!(app.ui.focus, FocusPane::Left);
+        assert_eq!(app.left_scroll_offset, MOUSE_WHEEL_LINES);
+        assert_eq!(app.selected_left, MOUSE_WHEEL_LINES);
+        assert!(matches!(
+            app.mouse_target(2, 1),
+            Some(MouseTarget::LeftRow(index)) if index == MOUSE_WHEEL_LINES
+        ));
     }
 
     #[test]
