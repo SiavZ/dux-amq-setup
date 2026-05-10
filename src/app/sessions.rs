@@ -178,10 +178,56 @@ impl App {
             path_missing: false,
             meta_loaded: true,
         });
+        if let Some(project) = self.git.projects.last() {
+            self.ensure_project_worktree_link_logged(project);
+        }
         self.rebuild_left_items();
         logger::info(&format!("registered project {}", path_buf.display()));
         self.set_info(format!("Added project \"{display_name}\" to workspace"));
         Ok(())
+    }
+
+    pub(crate) fn ensure_project_worktree_links(&self) {
+        for project in &self.git.projects {
+            self.ensure_project_worktree_link_logged(project);
+        }
+    }
+
+    pub(crate) fn ensure_project_worktree_link_for_project_id(&self, project_id: &str) {
+        let Some(project) = self
+            .git
+            .projects
+            .iter()
+            .find(|candidate| candidate.id == project_id)
+        else {
+            return;
+        };
+        self.ensure_project_worktree_link_logged(project);
+    }
+
+    fn ensure_project_worktree_link_logged(&self, project: &Project) {
+        if project.path_missing {
+            return;
+        }
+        match git::ensure_project_worktrees_link(
+            Path::new(&project.path),
+            &self.paths.worktrees_root,
+            &project.name,
+        ) {
+            Ok(link_path) => tracing::debug!(
+                target: "dux::worktrees",
+                project_id = %project.id,
+                link = %link_path.display(),
+                "project worktree explorer link ready",
+            ),
+            Err(err) => tracing::warn!(
+                target: "dux::worktrees",
+                project_id = %project.id,
+                project_path = %project.path,
+                err = %err,
+                "failed to expose project worktrees in project root",
+            ),
+        }
     }
 
     pub(crate) fn create_agent_for_selected_project(&mut self) -> Result<()> {

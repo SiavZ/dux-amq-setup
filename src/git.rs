@@ -30,6 +30,8 @@ struct StatusEntry {
 }
 
 const NULL_DEVICE: &str = "/dev/null";
+pub const PROJECT_WORKTREES_LINK_NAME: &str = "dux-worktrees";
+const PROJECT_WORKTREES_EXCLUDE_PATTERN: &str = "/dux-worktrees";
 
 pub fn current_branch(repo_path: &Path) -> Result<String> {
     // audit02 Phase 21 (P2-11) — pass `&Path` directly so non-UTF-8
@@ -251,6 +253,122 @@ pub fn create_worktree_from_start_point(
     }
     let canonical = worktree_path.canonicalize().unwrap_or(worktree_path);
     Ok((branch_name, canonical))
+}
+
+/// Exposes Dux-managed agent worktrees inside the canonical project folder.
+///
+/// Agent worktrees live under the Dux state directory so they remain isolated
+/// git worktrees. Editors opened on the canonical project root cannot see
+/// those paths unless Dux places a local ignored link back into the project.
+pub fn ensure_project_worktrees_link(
+    repo_path: &Path,
+    worktrees_root: &Path,
+    project_name: &str,
+) -> Result<PathBuf> {
+    let project_worktrees_root = worktrees_root.join(project_name);
+    fs::create_dir_all(&project_worktrees_root)
+        .with_context(|| format!("failed to create {}", project_worktrees_root.display()))?;
+    let project_worktrees_root = project_worktrees_root
+        .canonicalize()
+        .unwrap_or(project_worktrees_root);
+
+    ensure_project_worktrees_link_ignored(repo_path)?;
+
+    let link_path = repo_path.join(PROJECT_WORKTREES_LINK_NAME);
+    match fs::symlink_metadata(&link_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let existing_target = fs::read_link(&link_path)
+                .with_context(|| format!("failed to inspect {}", link_path.display()))?;
+            let resolved_existing = if existing_target.is_absolute() {
+                existing_target.clone()
+            } else {
+                link_path
+                    .parent()
+                    .unwrap_or(repo_path)
+                    .join(&existing_target)
+            };
+            let resolved_existing = resolved_existing
+                .canonicalize()
+                .unwrap_or(resolved_existing);
+            if resolved_existing != project_worktrees_root {
+                fs::remove_file(&link_path)
+                    .with_context(|| format!("failed to replace {}", link_path.display()))?;
+                symlink(&project_worktrees_root, &link_path).with_context(|| {
+                    format!(
+                        "failed to link {} to {}",
+                        link_path.display(),
+                        project_worktrees_root.display()
+                    )
+                })?;
+            }
+        }
+        Ok(_) => {
+            return Err(anyhow!(
+                "{} already exists and is not a symlink; refusing to overwrite it",
+                link_path.display()
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            symlink(&project_worktrees_root, &link_path).with_context(|| {
+                format!(
+                    "failed to link {} to {}",
+                    link_path.display(),
+                    project_worktrees_root.display()
+                )
+            })?;
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect {}", link_path.display()));
+        }
+    }
+
+    Ok(link_path)
+}
+
+fn ensure_project_worktrees_link_ignored(repo_path: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .output()
+        .with_context(|| format!("failed to locate git excludes for {}", repo_path.display()))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git rev-parse --git-path info/exclude failed for {}: {}",
+            repo_path.display(),
+            crate::sanitize::utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let exclude_path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    let exclude_path = if exclude_path.is_absolute() {
+        exclude_path
+    } else {
+        repo_path.join(exclude_path)
+    };
+    if let Some(parent) = exclude_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let existing = fs::read_to_string(&exclude_path).unwrap_or_default();
+    if existing
+        .lines()
+        .any(|line| line.trim() == PROJECT_WORKTREES_EXCLUDE_PATTERN)
+    {
+        return Ok(());
+    }
+
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str("# dux local agent worktree explorer link\n");
+    updated.push_str(PROJECT_WORKTREES_EXCLUDE_PATTERN);
+    updated.push('\n');
+    fs::write(&exclude_path, updated)
+        .with_context(|| format!("failed to update {}", exclude_path.display()))?;
+    Ok(())
 }
 
 pub fn head_commit(repo_path: &Path) -> Result<String> {
@@ -1040,6 +1158,52 @@ mod tests {
             fs::read_to_string(forked.join("fork.txt")).unwrap(),
             "from source branch\n"
         );
+    }
+
+    #[test]
+    fn ensure_project_worktrees_link_creates_ignored_symlink() {
+        let repo = init_test_repo();
+        let worktrees_root = repo.path().join("dux-state").join("worktrees");
+
+        let link =
+            ensure_project_worktrees_link(repo.path(), &worktrees_root, "Demo-Project").unwrap();
+
+        let target = worktrees_root.join("Demo-Project").canonicalize().unwrap();
+        let link_meta = fs::symlink_metadata(&link).unwrap();
+        assert!(link_meta.file_type().is_symlink());
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+        assert!(target.is_dir());
+
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["status", "--porcelain=v1", "--"])
+            .arg(PROJECT_WORKTREES_LINK_NAME)
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert!(
+            String::from_utf8_lossy(&status.stdout).is_empty(),
+            "worktree explorer link should be ignored by git status"
+        );
+
+        let exclude =
+            fs::read_to_string(repo.path().join(".git").join("info").join("exclude")).unwrap();
+        assert!(exclude.contains(PROJECT_WORKTREES_EXCLUDE_PATTERN));
+    }
+
+    #[test]
+    fn ensure_project_worktrees_link_refuses_real_path() {
+        let repo = init_test_repo();
+        let worktrees_root = repo.path().join("dux-state").join("worktrees");
+        fs::create_dir(repo.path().join(PROJECT_WORKTREES_LINK_NAME)).unwrap();
+
+        let result = ensure_project_worktrees_link(repo.path(), &worktrees_root, "Demo-Project");
+
+        assert!(result.is_err());
+        let metadata = fs::symlink_metadata(repo.path().join(PROJECT_WORKTREES_LINK_NAME)).unwrap();
+        assert!(metadata.file_type().is_dir());
+        assert!(!metadata.file_type().is_symlink());
     }
 
     #[test]

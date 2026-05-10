@@ -28,6 +28,7 @@ impl App {
                         &session.worktree_path,
                         &session.id,
                     );
+                    self.ensure_project_worktree_link_for_project_id(&session.project_id);
                     let session_id = session.id.clone();
                     self.git.sessions.insert(0, session);
                     self.install_pty_for_session(

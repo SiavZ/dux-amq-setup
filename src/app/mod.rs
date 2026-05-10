@@ -1448,6 +1448,7 @@ impl App {
         let project_paths = project_paths_for_meta(&app.git.projects);
         workers::dispatch_project_meta(app.runtime.worker_tx.clone(), project_paths);
 
+        app.ensure_project_worktree_links();
         app.restore_sessions();
         app.auto_resume_all_sessions();
         app.seed_pr_statuses_from_db();
