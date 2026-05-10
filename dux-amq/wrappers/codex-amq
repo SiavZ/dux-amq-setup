@@ -37,6 +37,26 @@ export AM_ME="$ME"
 
 ROOT="${AMQ_GLOBAL_ROOT:-/data/state/amq}"
 
+register_amq_handle() {
+  local cfg="$ROOT/meta/config.json"
+  local lock="$ROOT/meta/config.lock"
+  local tmp
+
+  mkdir -p "$ROOT/meta" "$ROOT/agents/$ME" 2>/dev/null || true
+  [[ -f "$cfg" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  (
+    command -v flock >/dev/null 2>&1 && flock 9
+    tmp="$cfg.tmp.$$"
+    if jq --arg me "$ME" '.agents = ((.agents // []) + [$me] | unique)' "$cfg" >"$tmp"; then
+      mv "$tmp" "$cfg"
+    else
+      rm -f "$tmp"
+    fi
+  ) 9>"$lock" 2>/dev/null || true
+}
+
 # Audit02 P1-F: identity collision detection. See claude-amq for the
 # full rationale; the marker stores $PWD literally so symlink-mounted
 # duplicate paths don't trigger false-positives.
@@ -50,7 +70,7 @@ if [[ -f "$ME_REGISTRATION" ]]; then
     exit 1
   fi
 fi
-mkdir -p "$ROOT/agents/$ME" 2>/dev/null || true
+register_amq_handle
 printf '%s\n' "$PWD" > "$ME_REGISTRATION" 2>/dev/null || true
 
 # Audit02 P0-K (T2) + Phase 13 (audit01 P1-1): route through verify+

@@ -86,6 +86,24 @@ teardown() {
   [ -f "$HOME/.local/share/dux-amq/wake-p1pane.pid" ]
 }
 
+@test "P1-F: wrappers register dynamic handles in AMQ config.json" {
+  mkdir -p "$AMQ_GLOBAL_ROOT/meta"
+  cat >"$AMQ_GLOBAL_ROOT/meta/config.json" <<'JSON'
+{"version":1,"created_utc":"2026-05-09T00:00:00Z","agents":["claude","codex","gemini"]}
+JSON
+
+  AM_ME=claude-pane run "$WRAPPERS_DIR/claude-amq"
+  [ "$status" -eq 0 ]
+  AM_ME=codex-pane run "$WRAPPERS_DIR/codex-amq"
+  [ "$status" -eq 0 ]
+  AM_ME=gemini-pane run "$WRAPPERS_DIR/gemini-amq"
+  [ "$status" -eq 0 ]
+
+  jq -e '.agents | index("claude-pane")' "$AMQ_GLOBAL_ROOT/meta/config.json" >/dev/null
+  jq -e '.agents | index("codex-pane")' "$AMQ_GLOBAL_ROOT/meta/config.json" >/dev/null
+  jq -e '.agents | index("gemini-pane")' "$AMQ_GLOBAL_ROOT/meta/config.json" >/dev/null
+}
+
 # ---------------------------------------------------------------------------
 # P1-C: preflight collects ALL missing tools, fails with one list.
 # ---------------------------------------------------------------------------

@@ -159,7 +159,14 @@ pub fn is_valid_receiver(name: &str) -> bool {
 /// rejected entries separately so the caller can emit warnings. Does
 /// not recurse beyond the per-receiver dir — multi-level subdirectories
 /// inside a receiver are ignored on purpose (forces a flat layout).
+#[allow(dead_code)]
 pub fn scan_queue_dir(queue_dir: &Path) -> Result<ScanOutcome> {
+    scan_queue_dir_limited(queue_dir, usize::MAX)
+}
+
+/// Limited variant of [`scan_queue_dir`]. Used by the live TUI so a large
+/// AMQ backlog cannot make one scan claim/load an unbounded number of files.
+pub fn scan_queue_dir_limited(queue_dir: &Path, max_messages: usize) -> Result<ScanOutcome> {
     let mut messages = Vec::new();
     let mut rejections = Vec::new();
     let entries = match fs::read_dir(queue_dir) {
@@ -197,6 +204,9 @@ pub fn scan_queue_dir(queue_dir: &Path) -> Result<ScanOutcome> {
             Err(_) => continue,
         };
         for file_entry in inner.flatten() {
+            if messages.len() >= max_messages {
+                break;
+            }
             let file_name = file_entry.file_name();
             let Some(file_str) = file_name.to_str() else {
                 continue;
@@ -211,6 +221,9 @@ pub fn scan_queue_dir(queue_dir: &Path) -> Result<ScanOutcome> {
                 receiver: name_str.to_string(),
                 path: file_entry.path(),
             });
+        }
+        if messages.len() >= max_messages {
+            break;
         }
     }
     // Stable order: by receiver, then filename. The bridge generates
@@ -557,6 +570,21 @@ mod tests {
                 .to_string_lossy()
                 .ends_with("001.msg")
         );
+    }
+
+    #[test]
+    fn scan_queue_dir_limited_stops_at_cap() {
+        let dir = tempdir().unwrap();
+        let queue = dir.path().to_path_buf();
+        let bob = queue.join("bob");
+        fs::create_dir_all(&bob).unwrap();
+        fs::write(bob.join("001.msg"), b"first\n").unwrap();
+        fs::write(bob.join("002.msg"), b"second\n").unwrap();
+        fs::write(bob.join("003.msg"), b"third\n").unwrap();
+
+        let outcome = scan_queue_dir_limited(&queue, 2).unwrap();
+        assert_eq!(outcome.messages.len(), 2);
+        assert!(bob.join("003.msg").exists());
     }
 
     #[test]

@@ -45,6 +45,23 @@ const WARN_RATE_LIMIT: Duration = Duration::from_secs(60);
 /// is being held or simply hasn't fired, without flooding `dux.log`.
 pub(crate) const HOLD_LOG_RATE_LIMIT: Duration = Duration::from_secs(60);
 
+/// Keep the AMQ bridge from turning a large backlog into a large in-memory
+/// pending queue. Files beyond this per-scan budget remain as `.msg` files and
+/// will be picked up by later notify/poll scans.
+const MAX_INJECT_CLAIMS_PER_SCAN: usize = 32;
+
+/// Hard cap on AMQ messages claimed but not yet delivered. Claimed files are
+/// renamed to `.inflight.*`, so bounding this also bounds crash recovery work.
+const MAX_INJECT_PENDING_TOTAL: usize = 128;
+
+/// Per-receiver cap so one noisy handle does not starve other receivers or
+/// leave hundreds of `.inflight.*` files behind if dux exits mid-batch.
+const MAX_INJECT_PENDING_PER_RECEIVER: usize = 32;
+
+/// Bound PTY writes per UI tick. Delivery remains fast, but AMQ injection can
+/// no longer monopolise the event loop when many receivers have backlogs.
+const MAX_INJECT_ACTIONS_PER_TICK: usize = 16;
+
 /// Reasons the drainer can hold a message instead of delivering.
 /// Each variant carries enough context to diagnose without a stack
 /// trace; see `App::log_holding` for the formatted output.
@@ -228,7 +245,24 @@ impl App {
             return;
         };
         let max_bytes = self.config.amq.inject.max_message_bytes;
-        let outcome = match amq_inject::scan_queue_dir(&queue_dir) {
+        let available_capacity = MAX_INJECT_PENDING_TOTAL.saturating_sub(
+            self.runtime
+                .amq_inject_pending
+                .values()
+                .map(|q| q.len())
+                .sum::<usize>(),
+        );
+        let scan_limit = MAX_INJECT_CLAIMS_PER_SCAN.min(available_capacity);
+        if scan_limit == 0 {
+            tracing::debug!(
+                target: "dux::amq_inject",
+                max_pending = MAX_INJECT_PENDING_TOTAL,
+                "pending queue is full; deferring AMQ inject scan",
+            );
+            return;
+        }
+
+        let outcome = match amq_inject::scan_queue_dir_limited(&queue_dir, scan_limit) {
             Ok(o) => o,
             Err(err) => {
                 tracing::warn!(
@@ -241,6 +275,15 @@ impl App {
             }
         };
 
+        let mut total_pending = self
+            .runtime
+            .amq_inject_pending
+            .values()
+            .map(|q| q.len())
+            .sum::<usize>();
+        let mut claimed_this_scan = 0usize;
+        let mut deferred_this_scan = 0usize;
+
         for (path, reason) in &outcome.rejections {
             tracing::warn!(
                 target: "dux::amq_inject",
@@ -251,6 +294,20 @@ impl App {
         }
 
         for pending in outcome.messages {
+            let receiver_depth = self
+                .runtime
+                .amq_inject_pending
+                .get(&pending.receiver)
+                .map(|q| q.len())
+                .unwrap_or(0);
+            if claimed_this_scan >= MAX_INJECT_CLAIMS_PER_SCAN
+                || total_pending >= MAX_INJECT_PENDING_TOTAL
+                || receiver_depth >= MAX_INJECT_PENDING_PER_RECEIVER
+            {
+                deferred_this_scan += 1;
+                continue;
+            }
+
             let inflight = match amq_inject::claim(&pending.path) {
                 Ok(p) => p,
                 Err(err) => {
@@ -265,6 +322,7 @@ impl App {
                     continue;
                 }
             };
+            claimed_this_scan += 1;
             match amq_inject::read_validated(&inflight, max_bytes) {
                 Ok(body) => {
                     let queued = QueuedMessage {
@@ -279,6 +337,7 @@ impl App {
                         .entry(pending.receiver.clone())
                         .or_default()
                         .push_back(queued);
+                    total_pending += 1;
                 }
                 Err(rejection) => {
                     // Validation failed AFTER claim. The file is
@@ -295,6 +354,18 @@ impl App {
                     self.set_warning(format!("AMQ inject: {}", rejection.human(),));
                 }
             }
+        }
+
+        if deferred_this_scan > 0 {
+            tracing::info!(
+                target: "dux::amq_inject",
+                deferred = deferred_this_scan,
+                claimed = claimed_this_scan,
+                max_claims_per_scan = MAX_INJECT_CLAIMS_PER_SCAN,
+                max_pending_total = MAX_INJECT_PENDING_TOTAL,
+                max_pending_per_receiver = MAX_INJECT_PENDING_PER_RECEIVER,
+                "deferred AMQ inject files because the drainer is at its safety budget",
+            );
         }
     }
 
@@ -328,7 +399,11 @@ impl App {
         // inside the loop and can't iterate it directly.
         let receivers: Vec<String> = self.runtime.amq_inject_pending.keys().cloned().collect();
 
-        for receiver in receivers {
+        let mut actions_this_tick = 0usize;
+        'receivers: for receiver in receivers {
+            if actions_this_tick >= MAX_INJECT_ACTIONS_PER_TICK {
+                break;
+            }
             // Resolve target session. `_unrouted` falls back to the
             // currently-selected session so messages from peers using
             // an older bridge (no AM_ME export) still land somewhere
@@ -396,6 +471,16 @@ impl App {
             // of messages stops draining if the agent goes back into
             // streaming mid-batch.
             loop {
+                if actions_this_tick >= MAX_INJECT_ACTIONS_PER_TICK {
+                    tracing::debug!(
+                        target: "dux::amq_inject",
+                        actions = actions_this_tick,
+                        max_actions = MAX_INJECT_ACTIONS_PER_TICK,
+                        "hit AMQ inject per-tick write budget; deferring remaining pending messages",
+                    );
+                    break 'receivers;
+                }
+
                 let queue_empty = self
                     .runtime
                     .amq_inject_pending
@@ -447,6 +532,7 @@ impl App {
                             head_mut.body.clone()
                         };
                         self.deliver_inject_body(&session_id, &receiver, &body);
+                        actions_this_tick += 1;
                         break;
                     }
                     Some(true) => {
@@ -458,6 +544,7 @@ impl App {
                             .and_then(|q| q.pop_front())
                             .expect("head exists per phase peek");
                         self.deliver_inject_enter(&session_id, &receiver, &head);
+                        actions_this_tick += 1;
                         // Loop continues to drain next message.
                     }
                     None => break,

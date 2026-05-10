@@ -4,6 +4,7 @@ mod auto_resume;
 mod cli;
 mod clipboard;
 mod config;
+mod crash;
 mod diff;
 mod editor;
 mod git;
@@ -36,6 +37,7 @@ fn main() -> Result<()> {
     }
 
     let paths = config::DuxPaths::discover()?;
+    crash::install_panic_hook(paths.root.clone());
 
     if args.first().map(|s| s.as_str()) == Some("doctor") {
         // No lockfile: doctor is read-only and must work even when a TUI
