@@ -2954,22 +2954,37 @@ impl App {
         } else {
             None
         };
-        // Expire stale suppression entries so the map doesn't grow.
-        self.runtime
-            .watch_suppress_until
-            .retain(|_, until| now < *until);
         let session_ids: Vec<String> = self.runtime.watch_engines.keys().cloned().collect();
         for session_id in session_ids {
             if active_session.as_deref() == Some(session_id.as_str()) {
                 continue;
             }
-            if self
-                .runtime
-                .watch_suppress_until
-                .get(&session_id)
-                .is_some_and(|until| now < *until)
-            {
-                continue;
+            // AMQ inject suppression: skip sessions within the
+            // suppression window. When the window expires, rebaseline
+            // once so any leftover postscript sentinel in the PTY is
+            // absorbed into the baseline — only genuinely new matches
+            // from the agent's output will fire after this point.
+            if let Some(until) = self.runtime.watch_suppress_until.remove(&session_id) {
+                if now < until {
+                    self.runtime
+                        .watch_suppress_until
+                        .insert(session_id, until);
+                    continue;
+                }
+                // Suppression just expired — rebaseline before the
+                // first observe so stale postscript matches don't
+                // false-fire.
+                if let Some(handle) = self.find_pty_handle(&session_id) {
+                    let snapshot = handle.scan_recent_lines(30);
+                    if let Some(engine) = self.runtime.watch_engines.get_mut(&session_id) {
+                        engine.rebaseline(&snapshot);
+                        tracing::debug!(
+                            target: "dux::watch",
+                            session_id = %session_id,
+                            "rebaselined watch engine after AMQ suppression expired",
+                        );
+                    }
+                }
             }
             let snapshot = match self.find_pty_handle(&session_id) {
                 Some(handle) => handle.scan_recent_lines(30),

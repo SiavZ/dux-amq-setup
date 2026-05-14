@@ -285,7 +285,6 @@ impl WatchEngine {
     /// after programmatically typing text that contains a watched pattern
     /// so the engine treats those occurrences as pre-existing rather than
     /// fresh incidents.
-    #[allow(dead_code)]
     pub fn rebaseline(&mut self, snapshot: &str) {
         for rule in &mut self.rules {
             if matches!(rule.state, RuleState::Disarmed) {
