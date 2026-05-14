@@ -283,8 +283,9 @@ impl WatchEngine {
     /// Advance every rule's `baseline_match_count` to the current number
     /// of matches in `snapshot`, without scheduling any fires. Call this
     /// after programmatically typing text that contains a watched pattern
-    /// (e.g. the AMQ postscript with `[task-done]`) so the engine treats
-    /// those occurrences as pre-existing rather than fresh incidents.
+    /// so the engine treats those occurrences as pre-existing rather than
+    /// fresh incidents.
+    #[allow(dead_code)]
     pub fn rebaseline(&mut self, snapshot: &str) {
         for rule in &mut self.rules {
             if matches!(rule.state, RuleState::Disarmed) {

@@ -62,6 +62,16 @@ const MAX_INJECT_PENDING_PER_RECEIVER: usize = 32;
 /// no longer monopolise the event loop when many receivers have backlogs.
 const MAX_INJECT_ACTIONS_PER_TICK: usize = 16;
 
+/// How long after AMQ delivery the watch engine should skip observing
+/// the target session. Prevents the `[task-done]` sentinel in the
+/// Worker-mode postscript from false-firing the auto-clear rule.
+/// The window must be long enough for the agent's TUI to consume the
+/// input and push the postscript off the visible terminal area. 10 s
+/// is conservative: Claude Code typically clears the input and starts
+/// streaming within 1-2 s, and the postscript is at the end of the
+/// message so it scrolls off first.
+const WATCH_SUPPRESS_AFTER_INJECT: Duration = Duration::from_secs(10);
+
 /// Reasons the drainer can hold a message instead of delivering.
 /// Each variant carries enough context to diagnose without a stack
 /// trace; see `App::log_holding` for the formatted output.
@@ -668,16 +678,16 @@ impl App {
                     body_preview = %amq_inject::preview(body, 80),
                     "typed AMQ wake body (phase 1); awaiting tick 2 to send Enter",
                 );
-                // Rebaseline immediately so `tick_watch_engines`
-                // (which runs between phase 1 and phase 2) doesn't
-                // see the `[task-done]` in the just-typed postscript
-                // as a fresh match.
-                if let Some(handle) = self.find_pty_handle(session_id) {
-                    let snapshot = handle.scan_recent_lines(30);
-                    if let Some(engine) = self.runtime.watch_engines.get_mut(session_id) {
-                        engine.rebaseline(&snapshot);
-                    }
-                }
+                // Suppress the watch engine for this session so the
+                // postscript's `[task-done]` sentinel (about to appear
+                // in the PTY) doesn't false-fire the auto-clear rule.
+                // The suppression covers phase 1 → phase 2 and a few
+                // seconds beyond, giving the agent time to consume the
+                // input and push the postscript off the visible area.
+                self.runtime.watch_suppress_until.insert(
+                    session_id.to_string(),
+                    Instant::now() + WATCH_SUPPRESS_AFTER_INJECT,
+                );
             }
             Some(Err(err)) => {
                 // PTY write failed; mark this entry not-yet-typed so
@@ -744,24 +754,16 @@ impl App {
                     amq_inject::preview(&msg.body, 60),
                 ));
 
-                // Rebaseline the watch engine so the `[task-done]`
-                // token inside the postscript (visible in the PTY
-                // snapshot right now) is absorbed into the baseline
-                // match count. Without this, the next
-                // `tick_watch_engines` would see the sentinel as a
-                // fresh match and fire `/clear` immediately — before
-                // the agent even starts working.
-                if let Some(handle) = self.find_pty_handle(session_id) {
-                    let snapshot = handle.scan_recent_lines(30);
-                    if let Some(engine) = self.runtime.watch_engines.get_mut(session_id) {
-                        engine.rebaseline(&snapshot);
-                        tracing::debug!(
-                            target: "dux::amq_inject",
-                            session_id = %session_id,
-                            "rebaselined watch engine after AMQ delivery",
-                        );
-                    }
-                }
+                // Refresh the suppression window so it starts from
+                // the moment the agent actually receives the input
+                // (phase 2 Enter). The phase 1 stamp covered the gap
+                // between body-write and Enter; this one covers the
+                // gap until the postscript scrolls off the visible
+                // terminal area.
+                self.runtime.watch_suppress_until.insert(
+                    session_id.to_string(),
+                    Instant::now() + WATCH_SUPPRESS_AFTER_INJECT,
+                );
             }
             Some(Err(err)) => {
                 // PTY write of \r failed. The body is already in the

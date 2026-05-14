@@ -116,4 +116,13 @@ pub(crate) struct RuntimeState {
     /// Number of in-flight PR check threads. Bounded so a burst of
     /// refs-watcher events can't spawn hundreds of `gh` subprocesses.
     pub(crate) pr_checks_in_flight: Arc<AtomicUsize>,
+    /// Per-session timestamp until which the watch engine should skip
+    /// observing this session. Set after AMQ inject delivery so the
+    /// postscript's `[task-done]` sentinel (visible in the PTY while
+    /// the agent is still processing the input) doesn't false-fire
+    /// the auto-clear rule. The suppression window is short (seconds)
+    /// — long enough for the postscript to scroll off the visible
+    /// terminal area, short enough to not delay the legitimate
+    /// auto-clear when the agent finishes its task.
+    pub(crate) watch_suppress_until: HashMap<String, Instant>,
 }

@@ -1373,6 +1373,7 @@ impl App {
             amq_inject_last_held_logged: HashMap::new(),
             last_user_keystroke: HashMap::new(),
             pr_checks_in_flight: Arc::new(AtomicUsize::new(0)),
+            watch_suppress_until: HashMap::new(),
         };
         let git = GitState {
             projects,
@@ -2953,9 +2954,21 @@ impl App {
         } else {
             None
         };
+        // Expire stale suppression entries so the map doesn't grow.
+        self.runtime
+            .watch_suppress_until
+            .retain(|_, until| now < *until);
         let session_ids: Vec<String> = self.runtime.watch_engines.keys().cloned().collect();
         for session_id in session_ids {
             if active_session.as_deref() == Some(session_id.as_str()) {
+                continue;
+            }
+            if self
+                .runtime
+                .watch_suppress_until
+                .get(&session_id)
+                .is_some_and(|until| now < *until)
+            {
                 continue;
             }
             let snapshot = match self.find_pty_handle(&session_id) {

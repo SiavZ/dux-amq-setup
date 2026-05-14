@@ -962,6 +962,7 @@ impl App {
         self.runtime.pr_statuses.remove(&session.id);
         self.runtime.last_user_keystroke.remove(&session.id);
         self.runtime.watch_engines.remove(&session.id);
+        self.runtime.watch_suppress_until.remove(&session.id);
         self.clear_companion_terminals_for_session(&session.id);
         self.git
             .sessions
@@ -2458,6 +2459,7 @@ mod tests {
             amq_inject_last_held_logged: std::collections::HashMap::new(),
             last_user_keystroke: std::collections::HashMap::new(),
             pr_checks_in_flight: Arc::new(AtomicUsize::new(0)),
+            watch_suppress_until: std::collections::HashMap::new(),
         };
         let git = crate::app::GitState {
             projects,
