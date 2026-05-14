@@ -1131,8 +1131,12 @@ impl App {
     }
 
     /// Trigger a one-shot PR check for a single session, unless it was checked
-    /// recently (within 10 seconds).
+    /// recently (within 10 seconds). Bounded to at most 4 concurrent `gh`
+    /// subprocesses so a burst of refs-watcher events can't exhaust system
+    /// resources.
     pub(crate) fn spawn_pr_check_for_session(&mut self, session_id: &str) {
+        const MAX_PR_CHECKS_IN_FLIGHT: usize = 4;
+
         if !self.runtime.github_integration_enabled
             || !matches!(self.runtime.gh_status, crate::model::GhStatus::Available)
         {
@@ -1142,6 +1146,15 @@ impl App {
         if let Some(last) = self.runtime.pr_last_checked.get(session_id)
             && last.elapsed() < Duration::from_secs(10)
         {
+            return;
+        }
+        if self.runtime.pr_checks_in_flight.load(Ordering::Relaxed) >= MAX_PR_CHECKS_IN_FLIGHT {
+            tracing::debug!(
+                target: "dux::workers",
+                session_id = %session_id,
+                max = MAX_PR_CHECKS_IN_FLIGHT,
+                "skipping PR check — too many in flight",
+            );
             return;
         }
         let Some(session) = self.git.sessions.iter().find(|s| s.id == session_id) else {
@@ -1160,9 +1173,12 @@ impl App {
             agent_exited: !self.session_has_pty(session_id),
         };
         let tx = self.runtime.worker_tx.clone();
+        let in_flight = Arc::clone(&self.runtime.pr_checks_in_flight);
+        in_flight.fetch_add(1, Ordering::Relaxed);
         thread::spawn(move || {
             let result = check_pr_for_entry(&entry);
             let _ = tx.send(WorkerEvent::PrStatusReady(vec![(entry.session_id, result)]));
+            in_flight.fetch_sub(1, Ordering::Relaxed);
         });
     }
 

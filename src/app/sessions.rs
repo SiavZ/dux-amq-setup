@@ -958,6 +958,10 @@ impl App {
         self.runtime.running_provider_pins.remove(&session.id);
         self.git.last_pty_activity.remove(&session.id);
         self.git.resume_fallback_candidates.remove(&session.id);
+        self.runtime.pr_last_checked.remove(&session.id);
+        self.runtime.pr_statuses.remove(&session.id);
+        self.runtime.last_user_keystroke.remove(&session.id);
+        self.runtime.watch_engines.remove(&session.id);
         self.clear_companion_terminals_for_session(&session.id);
         self.git
             .sessions
@@ -2366,7 +2370,7 @@ mod tests {
     use crate::storage::SessionStore;
     use crate::theme::Theme;
     use chrono::Utc;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, Mutex, mpsc};
     use tempfile::tempdir;
 
@@ -2453,6 +2457,7 @@ mod tests {
             amq_inject_last_warned: std::collections::HashMap::new(),
             amq_inject_last_held_logged: std::collections::HashMap::new(),
             last_user_keystroke: std::collections::HashMap::new(),
+            pr_checks_in_flight: Arc::new(AtomicUsize::new(0)),
         };
         let git = crate::app::GitState {
             projects,

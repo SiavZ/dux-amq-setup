@@ -5881,7 +5881,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, Mutex, mpsc};
 
     use super::components::{ButtonPressedTarget, PressedButton};
@@ -6044,6 +6044,7 @@ mod tests {
             amq_inject_last_warned: std::collections::HashMap::new(),
             amq_inject_last_held_logged: std::collections::HashMap::new(),
             last_user_keystroke: std::collections::HashMap::new(),
+            pr_checks_in_flight: Arc::new(AtomicUsize::new(0)),
         };
         let git = crate::app::GitState {
             projects: vec![project],

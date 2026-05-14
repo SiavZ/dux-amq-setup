@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -1372,6 +1372,7 @@ impl App {
             amq_inject_last_warned: HashMap::new(),
             amq_inject_last_held_logged: HashMap::new(),
             last_user_keystroke: HashMap::new(),
+            pr_checks_in_flight: Arc::new(AtomicUsize::new(0)),
         };
         let git = GitState {
             projects,

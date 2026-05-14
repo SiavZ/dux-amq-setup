@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -113,4 +113,7 @@ pub(crate) struct RuntimeState {
     /// touch this map or they would feed back into themselves and
     /// permanently block delivery.
     pub(crate) last_user_keystroke: HashMap<String, Instant>,
+    /// Number of in-flight PR check threads. Bounded so a burst of
+    /// refs-watcher events can't spawn hundreds of `gh` subprocesses.
+    pub(crate) pr_checks_in_flight: Arc<AtomicUsize>,
 }

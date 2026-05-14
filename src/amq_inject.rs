@@ -75,12 +75,15 @@ pub struct QueuedMessage {
     /// Why two phases: Claude Code (Ink) coalesces a single PTY
     /// write that contains body bytes + trailing CR into a paste-like
     /// buffer; the trailing `\r` ends up appended to the input field
-    /// rather than firing as a submit keystroke. Splitting the write
-    /// across two ticks (~16 ms apart in the typical run loop)
-    /// produces two separate `read()` calls on Ink's stdin so the
-    /// final `\r` arrives alone and is interpreted as Enter.
+    /// rather than firing as a submit keystroke. The configurable
+    /// `phase_delay_ms` enforces a minimum time gap between the two
+    /// writes so Ink's stdin sees them as separate `read()` calls.
     /// See `App::tick_amq_inject` for the state machine.
     pub body_typed: bool,
+    /// Wall-clock instant when phase 1 completed. Phase 2 waits until
+    /// `now - body_typed_at >= phase_delay_ms` before sending `\r`.
+    /// `None` when `body_typed` is false (phase 1 hasn't happened).
+    pub body_typed_at: Option<std::time::Instant>,
 }
 
 /// Reasons a queue file was rejected. Surfaced as

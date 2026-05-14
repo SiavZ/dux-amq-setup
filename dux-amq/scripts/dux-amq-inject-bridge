@@ -194,12 +194,14 @@ mkdir -p "$QUEUE_DIR" 2>/dev/null || {
   printf '[inject-bridge] cannot create %s; dropping message\n' "$QUEUE_DIR" >&2
   exit 0
 }
+# Use mktemp for the final filename to guarantee uniqueness even when the
+# system clock jumps backward (NTP correction, VM suspend/resume). The
+# timestamp prefix preserves arrival-order sorting for the drainer; the
+# random suffix from mktemp prevents collisions.
 ts=$(date -u +%s%N 2>/dev/null) || ts=""
 if [[ -z "$ts" || "$ts" == *N* ]]; then
-  # BSD date returned the literal `%N` — use seconds + pid for uniqueness.
-  ts="$(date -u +%s)-$$"
+  ts="$(date -u +%s)"
 fi
-target="$QUEUE_DIR/$ts.msg"
 # Use a temp + rename so a concurrent reader never sees a half-written
 # file. The temp lives in the same receiver dir to keep the rename
 # atomic across the FS boundary. The `.inflight.` prefix matches the
@@ -207,5 +209,8 @@ target="$QUEUE_DIR/$ts.msg"
 # letting both sides agree on what to skip during scans.
 tmp=$(mktemp "$QUEUE_DIR/.inflight.XXXXXX") || exit 0
 printf '%s\n' "$send_body" >"$tmp"
+# Derive the final name from the temp's random suffix to stay unique.
+suffix="${tmp##*.inflight.}"
+target="$QUEUE_DIR/${ts}-${suffix}.msg"
 mv -f "$tmp" "$target"
 exit 0

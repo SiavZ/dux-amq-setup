@@ -507,6 +507,20 @@ pub struct AmqInjectConfig {
     /// prompt.
     #[serde(default = "default_amq_inject_active_session_quiet_secs")]
     pub active_session_quiet_secs: u64,
+    /// Minimum delay in milliseconds between phase 1 (type body) and
+    /// phase 2 (send Enter) of AMQ inject delivery. The two-phase
+    /// split exists because Claude Code's Ink TUI coalesces a single
+    /// PTY write of body+CR into a paste buffer, making the trailing
+    /// CR part of the text rather than a submit keystroke. Splitting
+    /// across time gives Ink two separate `read()` calls.
+    ///
+    /// The default (50 ms) is conservative enough to survive heavy CPU
+    /// load where tick intervals shrink below 16 ms, while staying
+    /// imperceptible to the user. Set higher (e.g. 100) if you see
+    /// messages typed but not submitted; set to 0 to restore the old
+    /// "next tick" behaviour.
+    #[serde(default = "default_amq_inject_phase_delay_ms")]
+    pub phase_delay_ms: u64,
 }
 
 fn default_amq_inject_enabled() -> bool {
@@ -544,6 +558,10 @@ fn default_amq_inject_active_session_quiet_secs() -> u64 {
     60
 }
 
+fn default_amq_inject_phase_delay_ms() -> u64 {
+    50
+}
+
 impl Default for AmqInjectConfig {
     fn default() -> Self {
         Self {
@@ -556,6 +574,7 @@ impl Default for AmqInjectConfig {
             max_message_bytes: default_amq_inject_max_message_bytes(),
             verify_envelope: default_amq_inject_verify_envelope(),
             active_session_quiet_secs: default_amq_inject_active_session_quiet_secs(),
+            phase_delay_ms: default_amq_inject_phase_delay_ms(),
         }
     }
 }
@@ -1411,6 +1430,18 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
                  # in practice (always deliver, may corrupt half-typed prompts).",
             )),
             value_fn: |c| FieldValue::U64(c.amq.inject.active_session_quiet_secs),
+        },
+        ConfigEntry::Field {
+            key: "phase_delay_ms",
+            comment: Some(CommentSource::Static(
+                "# Minimum delay in milliseconds between phase 1 (type body) and\n\
+                 # phase 2 (send Enter) of AMQ inject delivery. Splitting the write\n\
+                 # across time prevents Claude Code's Ink from coalescing body+CR\n\
+                 # into a paste buffer. Default 50 (imperceptible but survives heavy\n\
+                 # CPU load). Set higher if you see messages typed but not submitted;\n\
+                 # set to 0 to restore the old next-tick behaviour.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.phase_delay_ms),
         },
         ConfigEntry::Blank,
         ConfigEntry::Keys,
@@ -2697,6 +2728,10 @@ mod tests {
             !cfg.verify_envelope,
             "verify_envelope must default to false per single-user-VM trust model"
         );
+        assert_eq!(
+            cfg.phase_delay_ms, 50,
+            "phase_delay_ms default must be 50 ms"
+        );
     }
 
     #[test]
@@ -2712,6 +2747,20 @@ mod tests {
             assert_eq!(
                 parsed.amq.inject.verify_envelope, value,
                 "verify_envelope = {value} did not survive round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn amq_inject_phase_delay_ms_round_trips() {
+        for value in [0, 50, 200] {
+            let mut cfg = Config::default();
+            cfg.amq.inject.phase_delay_ms = value;
+            let rendered = render_config_default(&cfg);
+            let parsed: Config = toml::from_str(&rendered).expect("config should parse");
+            assert_eq!(
+                parsed.amq.inject.phase_delay_ms, value,
+                "phase_delay_ms = {value} did not survive round-trip"
             );
         }
     }

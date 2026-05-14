@@ -130,13 +130,13 @@ ME="${AM_ME:-}"
 #   1. AM_ME from env (explicit override)
 #   2. dux worktree dir basename — stable per-pane and unique, even if the
 #      git branch was renamed or checked out to something unexpected
-#   3. git branch (legacy fallback)
+#   3. git branch (legacy fallback, using plumbing per CLAUDE.md git safety)
 #   4. claude-<pid> (no-context fallback)
 if [[ -z "$ME" ]] && is_dux_worktree; then
   ME=$(basename "$PWD")
 fi
 if [[ -z "$ME" ]]; then
-  ME=$(git -C "$PWD" branch --show-current 2>/dev/null || true)
+  ME=$(git -C "$PWD" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
 fi
 [[ -z "$ME" ]] && ME="claude-$$"
 # AMQ requires lowercase agent handles.
@@ -178,15 +178,19 @@ register_amq_handle() {
 # Without a collision check, the second wrapper invocation silently
 # overwrites the first agent's state and steals its inbox.
 #
-# Strategy: stash the original $PWD next to the agent dir on first
-# invocation. Subsequent invocations compare and refuse if the path
-# differs. We compare against $PWD literally (NOT realpath) so users
-# who symlink-mount the same physical worktree to two different
-# locations don't trigger false-positives — the AMQ state is shared
-# either way.
+# Strategy: use a symlink whose target IS the registered $PWD. Symlink
+# creation (`ln -s`) is atomic on POSIX — two concurrent wrappers
+# can't both succeed. The first wins; the second sees EEXIST, reads
+# the existing link target, and compares. We compare against $PWD
+# literally (NOT realpath) so users who symlink-mount the same physical
+# worktree to two different locations don't trigger false-positives.
 ME_REGISTRATION="$ROOT/agents/$ME/.dux-amq-source"
-if [[ -f "$ME_REGISTRATION" ]]; then
-  prev=$(cat "$ME_REGISTRATION" 2>/dev/null || true)
+if [[ -L "$ME_REGISTRATION" || -f "$ME_REGISTRATION" ]]; then
+  if [[ -L "$ME_REGISTRATION" ]]; then
+    prev=$(readlink "$ME_REGISTRATION" 2>/dev/null || true)
+  else
+    prev=$(cat "$ME_REGISTRATION" 2>/dev/null || true)
+  fi
   if [[ -n "$prev" && "$prev" != "$PWD" ]]; then
     printf '\033[1;31m!\033[0m [dux-amq] identity collision: %s already registered to %s (current: %s).\n' \
       "$ME" "$prev" "$PWD" >&2
@@ -195,8 +199,12 @@ if [[ -f "$ME_REGISTRATION" ]]; then
   fi
 fi
 register_amq_handle
-# Mode 0644 marker — informational, not a security boundary.
-printf '%s\n' "$PWD" > "$ME_REGISTRATION" 2>/dev/null || true
+# Atomic registration: rm + ln -s. The window between rm and ln is
+# unavoidable but harmless — a concurrent wrapper attempting ln -s in
+# that window will either succeed (taking ownership) or fail with
+# EEXIST (our ln won the race), both of which are correct outcomes.
+rm -f "$ME_REGISTRATION" 2>/dev/null || true
+ln -s "$PWD" "$ME_REGISTRATION" 2>/dev/null || true
 
 # YOLO is OPT-IN. Set CLAUDE_AMQ_YOLO=1 (or legacy CLAUDE_YOLO=1) to enable.
 # Anthropic CVEs in 2025–26 (CVE-2025-59536 et al) targeted credential
@@ -262,6 +270,37 @@ WAKE_PID="$LOG_DIR/wake-$ME.pid"
 
 STATE_ROOT="${STATE_ROOT:-/data/state}"
 LOCAL_BIN="${LOCAL_BIN:-$HOME/.local/bin}"
+
+# Reap a stale wake daemon from a prior invocation for the same $ME.
+# Without this, re-running the wrapper (session restart, reconnect)
+# spawns a duplicate daemon — both race to deliver wake notifications,
+# causing double-delivery. The PID file written by the prior run lets us
+# kill-then-replace cleanly.
+reap_stale_wake() {
+  [[ -f "$WAKE_PID" ]] || return 0
+  local old_pid
+  old_pid=$(cat "$WAKE_PID" 2>/dev/null) || return 0
+  [[ -z "$old_pid" ]] && return 0
+  # Verify the PID is actually an `amq` process before killing — a
+  # recycled PID could belong to an unrelated process.
+  if kill -0 "$old_pid" 2>/dev/null; then
+    local cmdline=""
+    if [[ -r "/proc/$old_pid/cmdline" ]]; then
+      cmdline=$(tr '\0' ' ' < "/proc/$old_pid/cmdline" 2>/dev/null || true)
+    fi
+    if [[ "$cmdline" == *amq*wake* ]]; then
+      kill "$old_pid" 2>/dev/null || true
+      # Brief wait for clean shutdown; don't block the wrapper.
+      local i=0
+      while (( i < 5 )) && kill -0 "$old_pid" 2>/dev/null; do
+        sleep 0.1
+        (( i++ )) || true
+      done
+    fi
+  fi
+  rm -f "$WAKE_PID"
+}
+reap_stale_wake
 
 INJECT_MODE="${DUX_AMQ_INJECT_MODE:-}"
 if [[ -z "$INJECT_MODE" ]]; then

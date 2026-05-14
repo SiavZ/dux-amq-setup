@@ -331,6 +331,7 @@ impl App {
                         inflight_path: inflight,
                         source_path: pending.path.clone(),
                         body_typed: false,
+                        body_typed_at: None,
                     };
                     self.runtime
                         .amq_inject_pending
@@ -386,6 +387,7 @@ impl App {
         let busy_markers = self.config.amq.inject.busy_markers.clone();
         let busy_scan_lines = self.config.amq.inject.busy_scan_lines.max(1);
         let timeout = Duration::from_secs(self.config.amq.inject.delivery_timeout_secs);
+        let phase_delay = Duration::from_millis(self.config.amq.inject.phase_delay_ms);
 
         // Snapshot the active-session id once so the inner loop never
         // has to borrow self.ui twice.
@@ -509,18 +511,19 @@ impl App {
 
                 // Decide which phase the head is in. Read-only borrow
                 // released before we mutate.
-                let phase = self
+                let phase_info = self
                     .runtime
                     .amq_inject_pending
                     .get(&receiver)
                     .and_then(|q| q.front())
-                    .map(|head| head.body_typed);
+                    .map(|head| (head.body_typed, head.body_typed_at));
 
-                match phase {
-                    Some(false) => {
+                match phase_info {
+                    Some((false, _)) => {
                         // Phase 1: type the body, leave the entry at
                         // the head of the queue with body_typed=true,
-                        // and break out so the next tick handles \r.
+                        // record the timestamp, and break out so a
+                        // future tick handles \r after the phase delay.
                         let body = {
                             let q = self
                                 .runtime
@@ -529,14 +532,23 @@ impl App {
                                 .expect("queue exists per phase peek");
                             let head_mut = q.front_mut().expect("head exists per phase peek");
                             head_mut.body_typed = true;
+                            head_mut.body_typed_at = Some(now);
                             head_mut.body.clone()
                         };
                         self.deliver_inject_body(&session_id, &receiver, &body);
                         actions_this_tick += 1;
                         break;
                     }
-                    Some(true) => {
-                        // Phase 2: pop, write \r, unlink, status-line.
+                    Some((true, typed_at)) => {
+                        // Phase 2: enforce the configured phase delay
+                        // before sending \r. This prevents coalescing
+                        // under heavy CPU load where ticks fire faster
+                        // than the Ink input flush cycle.
+                        if let Some(at) = typed_at {
+                            if now.duration_since(at) < phase_delay {
+                                break;
+                            }
+                        }
                         let head = self
                             .runtime
                             .amq_inject_pending
@@ -672,6 +684,7 @@ impl App {
                     && let Some(head) = q.front_mut()
                 {
                     head.body_typed = false;
+                    head.body_typed_at = None;
                 }
             }
             None => {
@@ -681,6 +694,7 @@ impl App {
                     && let Some(head) = q.front_mut()
                 {
                     head.body_typed = false;
+                    head.body_typed_at = None;
                 }
             }
         }
@@ -1122,5 +1136,40 @@ mod tests {
         let quiet = Duration::from_secs(60);
         let last = now - quiet;
         assert!(!should_hold_for_quiet_window(Some(last), now, quiet));
+    }
+
+    /// Phase delay: when `body_typed_at` is too recent relative to `now`,
+    /// the drainer should skip phase 2 and wait for the next tick.
+    #[test]
+    fn phase_delay_holds_when_typed_too_recently() {
+        let now = Instant::now();
+        let typed_at = now - Duration::from_millis(10);
+        let delay = Duration::from_millis(50);
+        assert!(
+            now.duration_since(typed_at) < delay,
+            "typed 10ms ago should be within 50ms delay"
+        );
+    }
+
+    /// Phase delay: when enough time has passed since phase 1, phase 2
+    /// should proceed.
+    #[test]
+    fn phase_delay_releases_after_configured_delay() {
+        let now = Instant::now();
+        let typed_at = now - Duration::from_millis(100);
+        let delay = Duration::from_millis(50);
+        assert!(
+            now.duration_since(typed_at) >= delay,
+            "typed 100ms ago should exceed 50ms delay"
+        );
+    }
+
+    /// Phase delay of 0 restores the old next-tick behaviour.
+    #[test]
+    fn phase_delay_zero_releases_immediately() {
+        let now = Instant::now();
+        let typed_at = now;
+        let delay = Duration::from_millis(0);
+        assert!(now.duration_since(typed_at) >= delay);
     }
 }
