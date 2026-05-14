@@ -280,6 +280,23 @@ impl WatchEngine {
         effects
     }
 
+    /// Advance every rule's `baseline_match_count` to the current number
+    /// of matches in `snapshot`, without scheduling any fires. Call this
+    /// after programmatically typing text that contains a watched pattern
+    /// (e.g. the AMQ postscript with `[task-done]`) so the engine treats
+    /// those occurrences as pre-existing rather than fresh incidents.
+    pub fn rebaseline(&mut self, snapshot: &str) {
+        for rule in &mut self.rules {
+            if matches!(rule.state, RuleState::Disarmed) {
+                continue;
+            }
+            let matches = rule.regex.find_iter(snapshot).count();
+            if matches > rule.baseline_match_count {
+                rule.baseline_match_count = matches;
+            }
+        }
+    }
+
     /// True if any loaded rule is non-empty. Used to skip the per-tick
     /// snapshot work entirely when no rules apply.
     #[allow(dead_code)] // Phase 3: tick path can short-circuit per-engine.
@@ -816,5 +833,82 @@ mod tests {
             "expected fallback warning"
         );
         assert!(matches!(engine.rules[0].state, RuleState::Pending { .. }));
+    }
+
+    /// `rebaseline` absorbs existing matches into the baseline so they
+    /// don't trigger on the next `observe`. This is the mechanism that
+    /// prevents the AMQ postscript's `[task-done]` from false-firing
+    /// the auto-clear rule.
+    #[test]
+    fn rebaseline_absorbs_existing_matches() {
+        let r = rule(r"\[task-done\]");
+        let (mut engine, _) = WatchEngine::new("s1", &[r]);
+        let t0 = Instant::now();
+
+        let snapshot = "body text\n[task-done]\nmore text";
+        engine.rebaseline(snapshot);
+        assert_eq!(engine.rules[0].baseline_match_count, 1);
+
+        // observe should NOT fire because the match is already baselined.
+        let effects = engine.observe(snapshot, t0);
+        assert!(
+            effects.is_empty(),
+            "rebaselined match should not trigger: {effects:?}"
+        );
+        assert!(
+            matches!(engine.rules[0].state, RuleState::Idle),
+            "rule should stay Idle after rebaseline"
+        );
+    }
+
+    /// After rebaseline, a *new* occurrence beyond the baseline still
+    /// fires — rebaseline doesn't permanently suppress the rule.
+    #[test]
+    fn rebaseline_allows_new_matches_to_fire() {
+        let r = rule(r"\[task-done\]");
+        let (mut engine, _) = WatchEngine::new("s1", &[r]);
+        let t0 = Instant::now();
+
+        engine.rebaseline("[task-done]");
+        assert_eq!(engine.rules[0].baseline_match_count, 1);
+
+        // A second occurrence increases the count → should schedule.
+        let snapshot_with_two = "[task-done]\nagent output\n[task-done]";
+        engine.observe(snapshot_with_two, t0);
+        assert!(
+            matches!(engine.rules[0].state, RuleState::Pending { .. }),
+            "new match beyond baseline should trigger Pending"
+        );
+    }
+
+    /// Rebaseline on a snapshot with zero matches is a no-op — it
+    /// never lowers the baseline (that's the ratchet-down logic in
+    /// `tick`, not rebaseline's job).
+    #[test]
+    fn rebaseline_does_not_lower_baseline() {
+        let r = rule(r"\[task-done\]");
+        let (mut engine, _) = WatchEngine::new("s1", &[r]);
+
+        engine.rebaseline("[task-done]");
+        assert_eq!(engine.rules[0].baseline_match_count, 1);
+
+        engine.rebaseline("no matches here");
+        assert_eq!(
+            engine.rules[0].baseline_match_count, 1,
+            "rebaseline must not lower baseline"
+        );
+    }
+
+    /// Rebaseline skips disarmed rules entirely.
+    #[test]
+    fn rebaseline_skips_disarmed_rules() {
+        let r = rule(r"\[task-done\]");
+        let (mut engine, _) = WatchEngine::new("s1", &[r]);
+        engine.disarm(0);
+        engine.rebaseline("[task-done]");
+        assert_eq!(
+            engine.rules[0].baseline_match_count, 0,
+            "disarmed rule should not be rebaselined"
+        );
     }
 }

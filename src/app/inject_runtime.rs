@@ -668,6 +668,16 @@ impl App {
                     body_preview = %amq_inject::preview(body, 80),
                     "typed AMQ wake body (phase 1); awaiting tick 2 to send Enter",
                 );
+                // Rebaseline immediately so `tick_watch_engines`
+                // (which runs between phase 1 and phase 2) doesn't
+                // see the `[task-done]` in the just-typed postscript
+                // as a fresh match.
+                if let Some(handle) = self.find_pty_handle(session_id) {
+                    let snapshot = handle.scan_recent_lines(30);
+                    if let Some(engine) = self.runtime.watch_engines.get_mut(session_id) {
+                        engine.rebaseline(&snapshot);
+                    }
+                }
             }
             Some(Err(err)) => {
                 // PTY write failed; mark this entry not-yet-typed so
@@ -733,6 +743,25 @@ impl App {
                     receiver,
                     amq_inject::preview(&msg.body, 60),
                 ));
+
+                // Rebaseline the watch engine so the `[task-done]`
+                // token inside the postscript (visible in the PTY
+                // snapshot right now) is absorbed into the baseline
+                // match count. Without this, the next
+                // `tick_watch_engines` would see the sentinel as a
+                // fresh match and fire `/clear` immediately — before
+                // the agent even starts working.
+                if let Some(handle) = self.find_pty_handle(session_id) {
+                    let snapshot = handle.scan_recent_lines(30);
+                    if let Some(engine) = self.runtime.watch_engines.get_mut(session_id) {
+                        engine.rebaseline(&snapshot);
+                        tracing::debug!(
+                            target: "dux::amq_inject",
+                            session_id = %session_id,
+                            "rebaselined watch engine after AMQ delivery",
+                        );
+                    }
+                }
             }
             Some(Err(err)) => {
                 // PTY write of \r failed. The body is already in the
