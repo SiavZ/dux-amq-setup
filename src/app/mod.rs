@@ -3017,9 +3017,8 @@ impl App {
             .runtime
             .watch_pending_enters
             .iter()
-            .filter_map(|(session_id, typed_at)| {
-                (now.duration_since(*typed_at) >= phase_delay).then(|| session_id.clone())
-            })
+            .filter(|(_, typed_at)| now.duration_since(**typed_at) >= phase_delay)
+            .map(|(session_id, _)| session_id.clone())
             .collect();
         for session_id in pending {
             self.runtime.watch_pending_enters.remove(&session_id);
