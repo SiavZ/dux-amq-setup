@@ -1365,10 +1365,11 @@ impl App {
             refs_watch_paths: HashMap::new(),
             _single_instance_lock: single_instance_lock,
             watch_engines: HashMap::new(),
-            watch_pending_enters: HashSet::new(),
+            watch_pending_enters: HashMap::new(),
             amq_inject_watcher: None,
             amq_inject_queue_dir: None,
             amq_inject_pending: HashMap::new(),
+            amq_inject_startup_grace_until: None,
             amq_inject_last_warned: HashMap::new(),
             amq_inject_last_held_logged: HashMap::new(),
             last_user_keystroke: HashMap::new(),
@@ -2966,9 +2967,7 @@ impl App {
             // from the agent's output will fire after this point.
             if let Some(until) = self.runtime.watch_suppress_until.remove(&session_id) {
                 if now < until {
-                    self.runtime
-                        .watch_suppress_until
-                        .insert(session_id, until);
+                    self.runtime.watch_suppress_until.insert(session_id, until);
                     continue;
                 }
                 // Suppression just expired — rebaseline before the
@@ -3000,19 +2999,29 @@ impl App {
         }
     }
 
-    /// Drain `runtime.watch_pending_enters` and write a discrete `\r`
-    /// to each session's PTY. Called at the start of every
-    /// `tick_watch_engines`. The set is cleared regardless of write
-    /// success — a failing write is logged and the deferred Enter is
-    /// dropped rather than retried, because retrying a stale Enter
-    /// after the agent has rendered something else could submit
-    /// unintended text.
+    /// Drain mature `runtime.watch_pending_enters` entries and write a
+    /// discrete `\r` to each session's PTY. Called at the start of
+    /// every `tick_watch_engines`. Entries remain pending until the
+    /// same phase delay used by AMQ injection has elapsed, because
+    /// next-tick delivery can still be too fast for Ink-based harnesses
+    /// and leave `/clear` or `/new` sitting in the input field.
     fn flush_pending_watch_enters(&mut self) {
         if self.runtime.watch_pending_enters.is_empty() {
             return;
         }
-        let pending: Vec<String> = self.runtime.watch_pending_enters.drain().collect();
+        let now = Instant::now();
+        let phase_delay = crate::app::inject_runtime::effective_enter_phase_delay(
+            self.config.amq.inject.phase_delay_ms,
+        );
+        let pending: Vec<String> = self
+            .runtime
+            .watch_pending_enters
+            .iter()
+            .filter(|(_, typed_at)| now.duration_since(**typed_at) >= phase_delay)
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
         for session_id in pending {
+            self.runtime.watch_pending_enters.remove(&session_id);
             let Some(handle) = self.find_pty_handle(&session_id) else {
                 tracing::debug!(
                     target: "dux::watch",
@@ -3158,7 +3167,7 @@ impl App {
                 if append_enter {
                     self.runtime
                         .watch_pending_enters
-                        .insert(session_id.to_string());
+                        .insert(session_id.to_string(), Instant::now());
                 }
             }
             crate::watch::WatchEffect::StatusInfo(msg) => self.set_info(msg),

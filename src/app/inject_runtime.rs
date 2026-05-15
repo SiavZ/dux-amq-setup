@@ -72,6 +72,22 @@ const MAX_INJECT_ACTIONS_PER_TICK: usize = 16;
 /// message so it scrolls off first.
 const WATCH_SUPPRESS_AFTER_INJECT: Duration = Duration::from_secs(10);
 
+/// Minimum non-zero gap between body bytes and the Enter keystroke.
+///
+/// Values below this have repeatedly proven too small for Ink-based
+/// harnesses under load: the body and CR can still be read as a single
+/// paste-shaped buffer, leaving the text in the input field. `0` remains
+/// an explicit debugging escape hatch for the old next-tick behavior.
+pub(crate) const MIN_ENTER_PHASE_DELAY_MS: u64 = 250;
+
+pub(crate) fn effective_enter_phase_delay(configured_ms: u64) -> Duration {
+    if configured_ms == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_millis(configured_ms.max(MIN_ENTER_PHASE_DELAY_MS))
+    }
+}
+
 /// Reasons the drainer can hold a message instead of delivering.
 /// Each variant carries enough context to diagnose without a stack
 /// trace; see `App::log_holding` for the formatted output.
@@ -233,6 +249,9 @@ impl App {
                 // Kick off an initial scan so any messages queued
                 // while dux wasn't running get drained on the first
                 // tick instead of waiting for the next FS event.
+                self.runtime.amq_inject_startup_grace_until = Some(
+                    Instant::now() + Duration::from_millis(self.config.amq.inject.startup_grace_ms),
+                );
                 let _ = tx.send(WorkerEvent::AmqInjectScanRequested);
             }
             Err(err) => {
@@ -394,10 +413,16 @@ impl App {
             return;
         }
         let now = Instant::now();
+        if let Some(until) = self.runtime.amq_inject_startup_grace_until {
+            if now < until {
+                return;
+            }
+            self.runtime.amq_inject_startup_grace_until = None;
+        }
         let busy_markers = self.config.amq.inject.busy_markers.clone();
         let busy_scan_lines = self.config.amq.inject.busy_scan_lines.max(1);
         let timeout = Duration::from_secs(self.config.amq.inject.delivery_timeout_secs);
-        let phase_delay = Duration::from_millis(self.config.amq.inject.phase_delay_ms);
+        let phase_delay = effective_enter_phase_delay(self.config.amq.inject.phase_delay_ms);
 
         // Snapshot the active-session id once so the inner loop never
         // has to borrow self.ui twice.
@@ -953,7 +978,8 @@ fn should_hold_for_quiet_window(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_inject_postscript, match_receiver, sanitise_handle, should_hold_for_quiet_window,
+        apply_inject_postscript, effective_enter_phase_delay, match_receiver, sanitise_handle,
+        should_hold_for_quiet_window,
     };
     use crate::model::ContextMode;
     use std::time::{Duration, Instant};
@@ -1175,10 +1201,10 @@ mod tests {
     fn phase_delay_holds_when_typed_too_recently() {
         let now = Instant::now();
         let typed_at = now - Duration::from_millis(10);
-        let delay = Duration::from_millis(50);
+        let delay = effective_enter_phase_delay(50);
         assert!(
             now.duration_since(typed_at) < delay,
-            "typed 10ms ago should be within 50ms delay"
+            "typed 10ms ago should be within effective delay"
         );
     }
 
@@ -1187,11 +1213,11 @@ mod tests {
     #[test]
     fn phase_delay_releases_after_configured_delay() {
         let now = Instant::now();
-        let typed_at = now - Duration::from_millis(100);
-        let delay = Duration::from_millis(50);
+        let typed_at = now - Duration::from_millis(300);
+        let delay = effective_enter_phase_delay(50);
         assert!(
             now.duration_since(typed_at) >= delay,
-            "typed 100ms ago should exceed 50ms delay"
+            "typed 300ms ago should exceed effective delay"
         );
     }
 
@@ -1202,5 +1228,13 @@ mod tests {
         let typed_at = now;
         let delay = Duration::from_millis(0);
         assert!(now.duration_since(typed_at) >= delay);
+    }
+
+    #[test]
+    fn phase_delay_nonzero_values_are_floored() {
+        assert_eq!(effective_enter_phase_delay(1), Duration::from_millis(250));
+        assert_eq!(effective_enter_phase_delay(50), Duration::from_millis(250));
+        assert_eq!(effective_enter_phase_delay(500), Duration::from_millis(500));
+        assert_eq!(effective_enter_phase_delay(0), Duration::ZERO);
     }
 }

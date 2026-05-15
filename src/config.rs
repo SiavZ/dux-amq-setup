@@ -514,13 +514,19 @@ pub struct AmqInjectConfig {
     /// CR part of the text rather than a submit keystroke. Splitting
     /// across time gives Ink two separate `read()` calls.
     ///
-    /// The default (50 ms) is conservative enough to survive heavy CPU
-    /// load where tick intervals shrink below 16 ms, while staying
-    /// imperceptible to the user. Set higher (e.g. 100) if you see
-    /// messages typed but not submitted; set to 0 to restore the old
-    /// "next tick" behaviour.
+    /// The default (250 ms) is long enough for Ink-based harnesses to
+    /// drain the typed body before Enter arrives. Runtime delivery uses
+    /// at least this default for any non-zero configured value; set to 0
+    /// only as a debugging escape hatch to restore the old next-tick
+    /// behavior.
     #[serde(default = "default_amq_inject_phase_delay_ms")]
     pub phase_delay_ms: u64,
+    /// Grace period after dux starts before queued AMQ wake files are
+    /// delivered. Dux may have restored sessions in the UI before the
+    /// provider TUI has finished booting; delivering during that window
+    /// can type messages into a half-initialized harness. Default 3000.
+    #[serde(default = "default_amq_inject_startup_grace_ms")]
+    pub startup_grace_ms: u64,
 }
 
 fn default_amq_inject_enabled() -> bool {
@@ -559,7 +565,11 @@ fn default_amq_inject_active_session_quiet_secs() -> u64 {
 }
 
 fn default_amq_inject_phase_delay_ms() -> u64 {
-    50
+    250
+}
+
+fn default_amq_inject_startup_grace_ms() -> u64 {
+    3_000
 }
 
 impl Default for AmqInjectConfig {
@@ -575,6 +585,7 @@ impl Default for AmqInjectConfig {
             verify_envelope: default_amq_inject_verify_envelope(),
             active_session_quiet_secs: default_amq_inject_active_session_quiet_secs(),
             phase_delay_ms: default_amq_inject_phase_delay_ms(),
+            startup_grace_ms: default_amq_inject_startup_grace_ms(),
         }
     }
 }
@@ -1435,13 +1446,23 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             key: "phase_delay_ms",
             comment: Some(CommentSource::Static(
                 "# Minimum delay in milliseconds between phase 1 (type body) and\n\
-                 # phase 2 (send Enter) of AMQ inject delivery. Splitting the write\n\
-                 # across time prevents Claude Code's Ink from coalescing body+CR\n\
-                 # into a paste buffer. Default 50 (imperceptible but survives heavy\n\
-                 # CPU load). Set higher if you see messages typed but not submitted;\n\
-                 # set to 0 to restore the old next-tick behaviour.",
+                 # phase 2 (send Enter) of AMQ inject delivery and watch-rule\n\
+                 # SendText actions. Splitting the write across time prevents\n\
+                 # Ink-based harnesses from coalescing body+CR into a paste buffer.\n\
+                 # Default 250. Non-zero values below 250 are raised to 250 at\n\
+                 # runtime; set 0 only as a debugging escape hatch for old next-tick\n\
+                 # behaviour.",
             )),
             value_fn: |c| FieldValue::U64(c.amq.inject.phase_delay_ms),
+        },
+        ConfigEntry::Field {
+            key: "startup_grace_ms",
+            comment: Some(CommentSource::Static(
+                "# Delay queued AMQ delivery for this many milliseconds after dux\n\
+                 # starts. This lets auto-resumed provider TUIs finish booting before\n\
+                 # old queue files are typed into them. Default 3000.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.startup_grace_ms),
         },
         ConfigEntry::Blank,
         ConfigEntry::Keys,
@@ -2697,6 +2718,8 @@ mod tests {
         config.amq.inject.poll_interval_ms = 1234;
         config.amq.inject.max_message_bytes = 4096;
         config.amq.inject.enabled = false;
+        config.amq.inject.phase_delay_ms = 777;
+        config.amq.inject.startup_grace_ms = 4_321;
         let rendered = render_config_default(&config);
         let parsed: Config = toml::from_str(&rendered).expect("config should parse");
         assert!(!parsed.amq.inject.enabled);
@@ -2705,6 +2728,8 @@ mod tests {
         assert_eq!(parsed.amq.inject.delivery_timeout_secs, 90);
         assert_eq!(parsed.amq.inject.poll_interval_ms, 1234);
         assert_eq!(parsed.amq.inject.max_message_bytes, 4096);
+        assert_eq!(parsed.amq.inject.phase_delay_ms, 777);
+        assert_eq!(parsed.amq.inject.startup_grace_ms, 4_321);
         assert_eq!(
             parsed.amq.inject.busy_markers,
             vec!["thinking…".to_string(), "ctrl-c to cancel".to_string()]
@@ -2729,8 +2754,12 @@ mod tests {
             "verify_envelope must default to false per single-user-VM trust model"
         );
         assert_eq!(
-            cfg.phase_delay_ms, 50,
-            "phase_delay_ms default must be 50 ms"
+            cfg.phase_delay_ms, 250,
+            "phase_delay_ms default must be 250 ms"
+        );
+        assert_eq!(
+            cfg.startup_grace_ms, 3_000,
+            "startup_grace_ms default must be 3000 ms"
         );
     }
 

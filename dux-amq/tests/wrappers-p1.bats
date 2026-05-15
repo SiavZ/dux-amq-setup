@@ -324,8 +324,8 @@ setup_parent_and_worktree_with_unreadable_file() {
   run "$WRAPPERS_DIR/claude-amq"
   [ "$status" -eq 0 ]
   marker="$AMQ_GLOBAL_ROOT/agents/p1pane/.dux-amq-source"
-  [ -f "$marker" ]
-  [[ "$(cat "$marker")" == "$TEST_HOME" ]]
+  [ -L "$marker" ]
+  [[ "$(readlink "$marker")" == "$TEST_HOME" ]]
 
   # Second invocation from a different directory MUST be refused.
   mkdir -p "$TEST_HOME/elsewhere"
@@ -342,7 +342,7 @@ setup_parent_and_worktree_with_unreadable_file() {
   }
   # And the marker must still point at the *first* $PWD — second
   # invocation is refused, not silently overwritten.
-  [[ "$(cat "$marker")" == "$TEST_HOME" ]]
+  [[ "$(readlink "$marker")" == "$TEST_HOME" ]]
 }
 
 @test "P1-F: same handle from same \$PWD is allowed (idempotent)" {

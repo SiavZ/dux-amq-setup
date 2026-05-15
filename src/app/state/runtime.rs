@@ -61,17 +61,12 @@ pub(crate) struct RuntimeState {
     /// the per-tick scan is then skipped entirely. See `crate::watch`.
     pub(crate) watch_engines: HashMap<String, crate::watch::WatchEngine>,
     /// Sessions with a deferred `\r` from a watch-effect `SendText`
-    /// that requested `append_enter = true`. Flushed at the start of
-    /// the next `tick_watch_engines` so the body bytes (written in
-    /// the previous tick) and the Enter keystroke land as **two**
-    /// separate `read()` calls on Ink's stdin. Without this split,
-    /// Ink coalesces `body + \r` into a paste-shaped buffer and the
-    /// trailing `\r` ends up appended to the input field instead of
-    /// firing as a submit keystroke — exact same failure mode as
-    /// the AMQ drainer fix in `crate::app::inject_runtime`.
-    /// `HashSet` because re-firing for the same session in one tick
-    /// would still produce a single Enter; idempotent by design.
-    pub(crate) watch_pending_enters: HashSet<String>,
+    /// that requested `append_enter = true`, keyed by when the body
+    /// bytes were typed. Flushed only after `[amq.inject].phase_delay_ms`
+    /// has elapsed so the body and Enter land as separate reads in
+    /// Ink-based harnesses. This shares the same timing discipline as
+    /// the AMQ drainer path.
+    pub(crate) watch_pending_enters: HashMap<String, Instant>,
     /// Filesystem watcher for the AMQ inject-queue. Held to keep the
     /// inotify thread alive; `None` when the drainer is disabled or
     /// the watcher couldn't be created (graceful fallback to poll-only).
@@ -87,6 +82,10 @@ pub(crate) struct RuntimeState {
     /// instance can deliver it. Drained by `App::tick_amq_inject` when
     /// the matching session is idle.
     pub(crate) amq_inject_pending: HashMap<String, VecDeque<QueuedMessage>>,
+    /// Do not deliver claimed AMQ messages before this instant. Set on
+    /// startup so old queue files do not type into provider TUIs while
+    /// auto-resume is still bringing them up.
+    pub(crate) amq_inject_startup_grace_until: Option<Instant>,
     /// Last time we surfaced a "no matching session for receiver X"
     /// status warning, keyed by receiver. Rate-limited so a queue full
     /// of messages for an unknown handle doesn't spam the status line.
