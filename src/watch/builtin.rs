@@ -22,6 +22,10 @@ use crate::model::ProviderKind;
 
 use super::rule::{WatchAction, WatchBackoff, WatchBudget, WatchRule};
 
+/// Effectively unlimited for a long-running worker session, while still
+/// keeping the engine's generic finite-budget model.
+pub const AUTO_CLEAR_MAX_ATTEMPTS: u32 = 10_000;
+
 /// Default sentinel the orchestrator instructs Worker-mode agents to
 /// emit at end-of-task. Lowercased, square-bracketed, no whitespace.
 /// The dux-side AMQ drainer also appends a postscript note to wake
@@ -37,9 +41,9 @@ pub const TASK_DONE_SENTINEL: &str = "[task-done]";
 
 /// Build the built-in auto-clear-on-task-done rule for a session
 /// whose provider's "wipe context" command is `clear_command`. The
-/// rule fires exactly once (`max_attempts = 1`) and has a long
-/// cooldown so a second sentinel emitted while the clear is still
-/// in flight doesn't race-fire.
+/// rule can fire repeatedly across tasks, but has a long cooldown so
+/// a duplicate sentinel emitted while the clear is still in flight
+/// doesn't race-fire.
 ///
 /// Pattern: literal `[task-done]` (regex-escaped to avoid the
 /// brackets being interpreted as a character class).
@@ -66,13 +70,13 @@ pub fn auto_clear_rule_for(clear_command: &str) -> WatchRule {
             multiplier: 2.0,
             jitter_ms: 500,
         },
-        // Single fire per session lifetime; once the context is
-        // cleared, the next task starts fresh and would re-arm only
-        // through the engine's manual `rearm` (which the modal does
-        // not currently surface for built-ins). This is intentional
-        // — accidentally double-firing /clear would wipe the user's
-        // next prompt before they could read the agent's response.
-        budget: WatchBudget { max_attempts: 1 },
+        // Auto-clear must keep working for every AMQ task in a long
+        // worker session. The engine's baseline/cooldown logic handles
+        // stale visible sentinels, so this budget is only a hard guard
+        // against runaway behavior, not a per-task limit.
+        budget: WatchBudget {
+            max_attempts: AUTO_CLEAR_MAX_ATTEMPTS,
+        },
         cooldown_ms: 60_000,
     }
 }
@@ -125,7 +129,7 @@ mod tests {
     fn auto_clear_rule_has_safe_defaults() {
         let r = auto_clear_rule_for("/clear");
         assert_eq!(r.pattern, r"\[task-done\]");
-        assert_eq!(r.budget.max_attempts, 1);
+        assert_eq!(r.budget.max_attempts, AUTO_CLEAR_MAX_ATTEMPTS);
         match r.action {
             WatchAction::SendText { text, append_enter } => {
                 assert_eq!(text, "/clear");

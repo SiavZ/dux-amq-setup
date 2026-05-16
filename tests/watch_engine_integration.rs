@@ -209,6 +209,59 @@ fn auto_clear_rule_fires_on_task_done_sentinel_through_pty() {
     assert_eq!(text, "/clear", "claude provider's clear command is /clear");
 }
 
+#[test]
+fn auto_clear_rule_fires_for_multiple_completed_tasks() {
+    use dux::model::ProviderKind;
+    use dux::watch::builtin::{auto_clear_rule_for, provider_clear_command};
+
+    let provider = ProviderKind::new("claude");
+    let mut rule = auto_clear_rule_for(provider_clear_command(&provider));
+    rule.backoff.initial_ms = 10;
+    rule.backoff.multiplier = 1.0;
+    rule.backoff.jitter_ms = 0;
+    rule.cooldown_ms = 20;
+
+    let (mut engine, errors) = WatchEngine::new("auto-clear-repeat".to_string(), &[rule]);
+    assert!(errors.is_empty(), "load errors: {errors:?}");
+
+    let t0 = Instant::now();
+    assert!(engine.observe("first task [task-done]", t0).is_empty());
+    let effects = engine.observe("first task [task-done]", t0 + Duration::from_millis(15));
+    assert!(
+        effects.iter().any(|effect| {
+            matches!(
+                effect,
+                WatchEffect::SendText { text, append_enter: true } if text == "/clear"
+            )
+        }),
+        "first task completion should trigger clear: {effects:?}"
+    );
+
+    // Simulate the provider clearing the visible transcript before the
+    // next task completes. This ratchets the match baseline back to zero.
+    assert!(
+        engine
+            .observe("transcript cleared", t0 + Duration::from_millis(40))
+            .is_empty()
+    );
+
+    assert!(
+        engine
+            .observe("second task [task-done]", t0 + Duration::from_millis(50))
+            .is_empty()
+    );
+    let effects = engine.observe("second task [task-done]", t0 + Duration::from_millis(65));
+    assert!(
+        effects.iter().any(|effect| {
+            matches!(
+                effect,
+                WatchEffect::SendText { text, append_enter: true } if text == "/clear"
+            )
+        }),
+        "second task completion should trigger clear too: {effects:?}"
+    );
+}
+
 /// audit03 Phase 4: codex sessions get `/new` instead of `/clear` and
 /// unknown providers fall back to `/clear` (the safe default).
 #[test]
