@@ -60,7 +60,8 @@ register_amq_handle() {
 }
 
 # Audit02 P1-F: identity collision detection. See claude-amq for full
-# rationale. Uses atomic symlink creation.
+# rationale. Uses atomic symlink creation. Stale registrations from
+# deleted/renamed worktrees are replaced automatically.
 ME_REGISTRATION="$ROOT/agents/$ME/.dux-amq-source"
 if [[ -L "$ME_REGISTRATION" || -f "$ME_REGISTRATION" ]]; then
   if [[ -L "$ME_REGISTRATION" ]]; then
@@ -69,10 +70,19 @@ if [[ -L "$ME_REGISTRATION" || -f "$ME_REGISTRATION" ]]; then
     prev=$(cat "$ME_REGISTRATION" 2>/dev/null || true)
   fi
   if [[ -n "$prev" && "$prev" != "$PWD" ]]; then
+    current_real=$(realpath -- "$PWD" 2>/dev/null || true)
+    prev_real=$(realpath -- "$prev" 2>/dev/null || true)
+    if [[ -n "$current_real" && -n "$prev_real" && "$prev_real" == "$current_real" ]]; then
+      :
+    elif [[ "$prev" = /* && ! -e "$prev" ]]; then
+      printf '[dux-amq] replacing stale registration for %s: %s no longer exists\n' \
+        "$ME" "$prev" >&2
+    else
     printf '\033[1;31m!\033[0m [dux-amq] identity collision: %s already registered to %s (current: %s).\n' \
       "$ME" "$prev" "$PWD" >&2
     printf '            Rename one branch (avoid normalize-collisions) or set AM_ME explicitly.\n' >&2
     exit 1
+    fi
   fi
 fi
 register_amq_handle
