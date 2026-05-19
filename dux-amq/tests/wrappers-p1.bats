@@ -357,6 +357,24 @@ setup_parent_and_worktree_with_unreadable_file() {
   }
 }
 
+@test "P1-F: stale registration for missing worktree is replaced" {
+  mkdir -p "$AMQ_GLOBAL_ROOT/agents/p1pane" "$TEST_HOME/current"
+  ln -s "$TEST_HOME/missing-worktree" "$AMQ_GLOBAL_ROOT/agents/p1pane/.dux-amq-source"
+
+  cd "$TEST_HOME/current"
+  run "$WRAPPERS_DIR/codex-amq"
+  [ "$status" -eq 0 ] || {
+    printf 'expected stale registration replacement; got status %s output:\n%s\n' \
+      "$status" "$output" >&2
+    return 1
+  }
+  [[ "$output" == *"replacing stale registration"* ]] || {
+    printf 'expected stale registration warning; got:\n%s\n' "$output" >&2
+    return 1
+  }
+  [[ "$(readlink "$AMQ_GLOBAL_ROOT/agents/p1pane/.dux-amq-source")" == "$TEST_HOME/current" ]]
+}
+
 @test "P1-F: codex-amq also enforces collision detection" {
   cd "$TEST_HOME"
   run "$WRAPPERS_DIR/codex-amq"
