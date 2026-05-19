@@ -524,9 +524,15 @@ pub struct AmqInjectConfig {
     /// Grace period after dux starts before queued AMQ wake files are
     /// delivered. Dux may have restored sessions in the UI before the
     /// provider TUI has finished booting; delivering during that window
-    /// can type messages into a half-initialized harness. Default 3000.
+    /// can type messages into a half-initialized harness. Default 10000.
     #[serde(default = "default_amq_inject_startup_grace_ms")]
     pub startup_grace_ms: u64,
+    /// Minimum quiet period after submitting one AMQ wake to a session
+    /// before another wake may be injected into that same session.
+    /// This prevents a backlog from being typed faster than the
+    /// provider TUI can enter its busy/responding state. Default 10000.
+    #[serde(default = "default_amq_inject_post_delivery_cooldown_ms")]
+    pub post_delivery_cooldown_ms: u64,
 }
 
 fn default_amq_inject_enabled() -> bool {
@@ -569,7 +575,11 @@ fn default_amq_inject_phase_delay_ms() -> u64 {
 }
 
 fn default_amq_inject_startup_grace_ms() -> u64 {
-    3_000
+    10_000
+}
+
+fn default_amq_inject_post_delivery_cooldown_ms() -> u64 {
+    10_000
 }
 
 impl Default for AmqInjectConfig {
@@ -586,6 +596,7 @@ impl Default for AmqInjectConfig {
             active_session_quiet_secs: default_amq_inject_active_session_quiet_secs(),
             phase_delay_ms: default_amq_inject_phase_delay_ms(),
             startup_grace_ms: default_amq_inject_startup_grace_ms(),
+            post_delivery_cooldown_ms: default_amq_inject_post_delivery_cooldown_ms(),
         }
     }
 }
@@ -1460,9 +1471,19 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             comment: Some(CommentSource::Static(
                 "# Delay queued AMQ delivery for this many milliseconds after dux\n\
                  # starts. This lets auto-resumed provider TUIs finish booting before\n\
-                 # old queue files are typed into them. Default 3000.",
+                 # old queue files are typed into them. Default 10000.",
             )),
             value_fn: |c| FieldValue::U64(c.amq.inject.startup_grace_ms),
+        },
+        ConfigEntry::Field {
+            key: "post_delivery_cooldown_ms",
+            comment: Some(CommentSource::Static(
+                "# Minimum delay after submitting one AMQ wake before another wake\n\
+                 # may be injected into the same session. This prevents a backlog\n\
+                 # from spamming a provider TUI before it can show a busy marker.\n\
+                 # Default 10000.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.post_delivery_cooldown_ms),
         },
         ConfigEntry::Blank,
         ConfigEntry::Keys,
@@ -2720,6 +2741,7 @@ mod tests {
         config.amq.inject.enabled = false;
         config.amq.inject.phase_delay_ms = 777;
         config.amq.inject.startup_grace_ms = 4_321;
+        config.amq.inject.post_delivery_cooldown_ms = 9_876;
         let rendered = render_config_default(&config);
         let parsed: Config = toml::from_str(&rendered).expect("config should parse");
         assert!(!parsed.amq.inject.enabled);
@@ -2730,6 +2752,7 @@ mod tests {
         assert_eq!(parsed.amq.inject.max_message_bytes, 4096);
         assert_eq!(parsed.amq.inject.phase_delay_ms, 777);
         assert_eq!(parsed.amq.inject.startup_grace_ms, 4_321);
+        assert_eq!(parsed.amq.inject.post_delivery_cooldown_ms, 9_876);
         assert_eq!(
             parsed.amq.inject.busy_markers,
             vec!["thinking…".to_string(), "ctrl-c to cancel".to_string()]
@@ -2758,8 +2781,12 @@ mod tests {
             "phase_delay_ms default must be 250 ms"
         );
         assert_eq!(
-            cfg.startup_grace_ms, 3_000,
-            "startup_grace_ms default must be 3000 ms"
+            cfg.startup_grace_ms, 10_000,
+            "startup_grace_ms default must be 10000 ms"
+        );
+        assert_eq!(
+            cfg.post_delivery_cooldown_ms, 10_000,
+            "post_delivery_cooldown_ms default must be 10000 ms"
         );
     }
 

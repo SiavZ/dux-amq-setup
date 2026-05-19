@@ -86,6 +86,10 @@ pub(crate) struct RuntimeState {
     /// startup so old queue files do not type into provider TUIs while
     /// auto-resume is still bringing them up.
     pub(crate) amq_inject_startup_grace_until: Option<Instant>,
+    /// Per-session backpressure after a successful AMQ submit. Prevents
+    /// a large backlog from typing multiple wake notifications before
+    /// the provider TUI has time to enter a busy/responding state.
+    pub(crate) amq_inject_cooldown_until: HashMap<String, Instant>,
     /// Last time we surfaced a "no matching session for receiver X"
     /// status warning, keyed by receiver. Rate-limited so a queue full
     /// of messages for an unknown handle doesn't spam the status line.

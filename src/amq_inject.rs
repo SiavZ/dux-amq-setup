@@ -104,6 +104,10 @@ pub enum InjectRejection {
     /// I/O error while reading the file. The drainer leaves the file
     /// in place so the operator can recover it.
     Io { msg: String },
+    /// Body contains a terminal control byte such as Ctrl-C or ESC.
+    /// Injecting those into an agent PTY can interrupt the harness or
+    /// corrupt its terminal state.
+    UnsafeControl { codepoint: u32 },
 }
 
 impl InjectRejection {
@@ -117,6 +121,9 @@ impl InjectRejection {
                 format!("queue subdir name {name:?} is not a valid receiver; skipping")
             }
             Self::Io { msg } => format!("queue file I/O error: {msg}"),
+            Self::UnsafeControl { codepoint } => {
+                format!("queue body contains unsafe control character U+{codepoint:04X}; skipping")
+            }
         }
     }
 }
@@ -401,6 +408,14 @@ pub fn read_validated(inflight_path: &Path, max_bytes: u64) -> Result<String, In
     // The bridge writes `printf '%s\n'`. Strip exactly one trailing
     // LF so multi-line bodies aren't extended.
     let body = raw.strip_suffix('\n').unwrap_or(&raw).to_string();
+    if let Some(ch) = body
+        .chars()
+        .find(|&ch| ch.is_control() && ch != '\n' && ch != '\t')
+    {
+        return Err(InjectRejection::UnsafeControl {
+            codepoint: ch as u32,
+        });
+    }
     Ok(body)
 }
 
@@ -626,6 +641,29 @@ mod tests {
         assert_eq!(
             read_validated(&path, 1024).unwrap(),
             "line one\nline two\nline three".to_string()
+        );
+    }
+
+    #[test]
+    fn read_validated_rejects_unsafe_control_characters() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ctrl-c.msg");
+        fs::write(&path, b"\x03\n").unwrap();
+        let result = read_validated(&path, 1024);
+        assert!(matches!(
+            result,
+            Err(InjectRejection::UnsafeControl { codepoint: 0x03 })
+        ));
+    }
+
+    #[test]
+    fn read_validated_allows_tabs_and_interior_newlines() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("multiline.msg");
+        fs::write(&path, b"line\tone\nline two\n").unwrap();
+        assert_eq!(
+            read_validated(&path, 1024).unwrap(),
+            "line\tone\nline two".to_string()
         );
     }
 

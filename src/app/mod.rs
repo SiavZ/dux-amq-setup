@@ -1370,6 +1370,7 @@ impl App {
             amq_inject_queue_dir: None,
             amq_inject_pending: HashMap::new(),
             amq_inject_startup_grace_until: None,
+            amq_inject_cooldown_until: HashMap::new(),
             amq_inject_last_warned: HashMap::new(),
             amq_inject_last_held_logged: HashMap::new(),
             last_user_keystroke: HashMap::new(),
