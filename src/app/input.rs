@@ -6042,6 +6042,7 @@ mod tests {
             amq_inject_queue_dir: None,
             amq_inject_pending: std::collections::HashMap::new(),
             amq_inject_startup_grace_until: None,
+            amq_inject_cooldown_until: std::collections::HashMap::new(),
             amq_inject_last_warned: std::collections::HashMap::new(),
             amq_inject_last_held_logged: std::collections::HashMap::new(),
             last_user_keystroke: std::collections::HashMap::new(),

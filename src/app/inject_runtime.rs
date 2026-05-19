@@ -109,6 +109,10 @@ pub(crate) enum HoldReason<'a> {
     /// (e.g. "esc to interrupt"). The matching marker is included
     /// for diagnosis when the user disagrees with our verdict.
     BusyMarker(&'a str),
+    /// A previous AMQ wake was just submitted to this same session.
+    /// Hold the next wake briefly so a backlog cannot outrun the
+    /// provider TUI's transition into a busy/responding state.
+    PostDeliveryCooldown,
 }
 
 impl<'a> HoldReason<'a> {
@@ -118,6 +122,7 @@ impl<'a> HoldReason<'a> {
             Self::UserTyping => "user_typing_in_target_session",
             Self::PtyGone => "pty_gone",
             Self::BusyMarker(_) => "busy_marker_detected",
+            Self::PostDeliveryCooldown => "post_delivery_cooldown",
         }
     }
 }
@@ -486,14 +491,26 @@ impl App {
                 // else: interactive but quiet → fall through and deliver
             }
 
-            // Two-phase delivery loop:
+            if let Some(until) = self
+                .runtime
+                .amq_inject_cooldown_until
+                .get(&session_id)
+                .copied()
+            {
+                if now < until {
+                    self.log_holding(&receiver, now, HoldReason::PostDeliveryCooldown);
+                    continue;
+                }
+                self.runtime.amq_inject_cooldown_until.remove(&session_id);
+            }
+
+            // Two-phase delivery:
             //   Phase 1 (head.body_typed = false): write the body
             //     bytes to the PTY, mark `body_typed = true`, then
-            //     break out of the inner loop. The next tick will
-            //     pick this entry back up for phase 2.
+            //     let a future tick pick this entry back up for phase 2.
             //   Phase 2 (head.body_typed = true): write a discrete
             //     `\r` to the PTY, unlink the inflight file, pop the
-            //     entry, and continue draining the queue.
+            //     entry, and arm the post-delivery cooldown.
             //
             // Why split: a single PTY write of `body + \r` gets
             // coalesced by Ink (Claude Code's TUI framework) into a
@@ -504,98 +521,91 @@ impl App {
             // separate `read()` calls on Ink's stdin so the final
             // `\r` arrives alone and is interpreted as Enter.
             //
-            // The busy-check is re-run between every pop so a backlog
-            // of messages stops draining if the agent goes back into
-            // streaming mid-batch.
-            loop {
-                if actions_this_tick >= MAX_INJECT_ACTIONS_PER_TICK {
-                    tracing::debug!(
-                        target: "dux::amq_inject",
-                        actions = actions_this_tick,
-                        max_actions = MAX_INJECT_ACTIONS_PER_TICK,
-                        "hit AMQ inject per-tick write budget; deferring remaining pending messages",
-                    );
-                    break 'receivers;
-                }
+            if actions_this_tick >= MAX_INJECT_ACTIONS_PER_TICK {
+                tracing::debug!(
+                    target: "dux::amq_inject",
+                    actions = actions_this_tick,
+                    max_actions = MAX_INJECT_ACTIONS_PER_TICK,
+                    "hit AMQ inject per-tick write budget; deferring remaining pending messages",
+                );
+                break 'receivers;
+            }
 
-                let queue_empty = self
-                    .runtime
-                    .amq_inject_pending
-                    .get(&receiver)
-                    .is_none_or(|q| q.is_empty());
-                if queue_empty {
-                    break;
-                }
+            let queue_empty = self
+                .runtime
+                .amq_inject_pending
+                .get(&receiver)
+                .is_none_or(|q| q.is_empty());
+            if queue_empty {
+                continue;
+            }
 
-                let snapshot = match self.find_pty_handle(&session_id) {
-                    Some(handle) => handle.scan_recent_lines(busy_scan_lines),
-                    None => {
-                        // Session matched by name but PTY is gone
-                        // (detached/exited). Leave queued; if the user
-                        // re-spawns, we'll pick it up.
-                        self.maybe_warn_timeout(&receiver, now, timeout);
-                        self.log_holding(&receiver, now, HoldReason::PtyGone);
-                        break;
-                    }
-                };
-                if let Some(matched) = amq_inject::snapshot_busy_marker(&snapshot, &busy_markers) {
+            let snapshot = match self.find_pty_handle(&session_id) {
+                Some(handle) => handle.scan_recent_lines(busy_scan_lines),
+                None => {
+                    // Session matched by name but PTY is gone
+                    // (detached/exited). Leave queued; if the user
+                    // re-spawns, we'll pick it up.
                     self.maybe_warn_timeout(&receiver, now, timeout);
-                    self.log_holding(&receiver, now, HoldReason::BusyMarker(matched));
-                    break;
+                    self.log_holding(&receiver, now, HoldReason::PtyGone);
+                    continue;
                 }
+            };
+            if let Some(matched) = amq_inject::snapshot_busy_marker(&snapshot, &busy_markers) {
+                self.maybe_warn_timeout(&receiver, now, timeout);
+                self.log_holding(&receiver, now, HoldReason::BusyMarker(matched));
+                continue;
+            }
 
-                // Decide which phase the head is in. Read-only borrow
-                // released before we mutate.
-                let phase_info = self
-                    .runtime
-                    .amq_inject_pending
-                    .get(&receiver)
-                    .and_then(|q| q.front())
-                    .map(|head| (head.body_typed, head.body_typed_at));
+            // Decide which phase the head is in. Read-only borrow
+            // released before we mutate.
+            let phase_info = self
+                .runtime
+                .amq_inject_pending
+                .get(&receiver)
+                .and_then(|q| q.front())
+                .map(|head| (head.body_typed, head.body_typed_at));
 
-                match phase_info {
-                    Some((false, _)) => {
-                        // Phase 1: type the body, leave the entry at
-                        // the head of the queue with body_typed=true,
-                        // record the timestamp, and break out so a
-                        // future tick handles \r after the phase delay.
-                        let body = {
-                            let q = self
-                                .runtime
-                                .amq_inject_pending
-                                .get_mut(&receiver)
-                                .expect("queue exists per phase peek");
-                            let head_mut = q.front_mut().expect("head exists per phase peek");
-                            head_mut.body_typed = true;
-                            head_mut.body_typed_at = Some(now);
-                            head_mut.body.clone()
-                        };
-                        self.deliver_inject_body(&session_id, &receiver, &body);
-                        actions_this_tick += 1;
-                        break;
-                    }
-                    Some((true, typed_at)) => {
-                        // Phase 2: enforce the configured phase delay
-                        // before sending \r. This prevents coalescing
-                        // under heavy CPU load where ticks fire faster
-                        // than the Ink input flush cycle.
-                        if let Some(at) = typed_at {
-                            if now.duration_since(at) < phase_delay {
-                                break;
-                            }
-                        }
-                        let head = self
+            match phase_info {
+                Some((false, _)) => {
+                    // Phase 1: type the body, leave the entry at
+                    // the head of the queue with body_typed=true,
+                    // record the timestamp, and let a future tick
+                    // handle \r after the phase delay.
+                    let body = {
+                        let q = self
                             .runtime
                             .amq_inject_pending
                             .get_mut(&receiver)
-                            .and_then(|q| q.pop_front())
-                            .expect("head exists per phase peek");
-                        self.deliver_inject_enter(&session_id, &receiver, &head);
-                        actions_this_tick += 1;
-                        // Loop continues to drain next message.
-                    }
-                    None => break,
+                            .expect("queue exists per phase peek");
+                        let head_mut = q.front_mut().expect("head exists per phase peek");
+                        head_mut.body_typed = true;
+                        head_mut.body_typed_at = Some(now);
+                        head_mut.body.clone()
+                    };
+                    self.deliver_inject_body(&session_id, &receiver, &body);
+                    actions_this_tick += 1;
                 }
+                Some((true, typed_at)) => {
+                    // Phase 2: enforce the configured phase delay
+                    // before sending \r. This prevents coalescing
+                    // under heavy CPU load where ticks fire faster
+                    // than the Ink input flush cycle.
+                    if let Some(at) = typed_at {
+                        if now.duration_since(at) < phase_delay {
+                            continue;
+                        }
+                    }
+                    let head = self
+                        .runtime
+                        .amq_inject_pending
+                        .get_mut(&receiver)
+                        .and_then(|q| q.pop_front())
+                        .expect("head exists per phase peek");
+                    self.deliver_inject_enter(&session_id, &receiver, &head);
+                    actions_this_tick += 1;
+                }
+                None => {}
             }
 
             // Tidy up empty queues so the receivers Vec next tick
@@ -713,6 +723,13 @@ impl App {
                     session_id.to_string(),
                     Instant::now() + WATCH_SUPPRESS_AFTER_INJECT,
                 );
+                let cooldown =
+                    Duration::from_millis(self.config.amq.inject.post_delivery_cooldown_ms);
+                if !cooldown.is_zero() {
+                    self.runtime
+                        .amq_inject_cooldown_until
+                        .insert(session_id.to_string(), Instant::now() + cooldown);
+                }
             }
             Some(Err(err)) => {
                 // PTY write failed; mark this entry not-yet-typed so
