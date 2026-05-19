@@ -375,16 +375,21 @@ impl App {
                     total_pending += 1;
                 }
                 Err(rejection) => {
-                    // Validation failed AFTER claim. The file is
-                    // already renamed to `.inflight.<name>` so future
-                    // scans won't see it; we leave it there for the
-                    // operator to inspect rather than loop forever
-                    // re-rejecting the same broken file.
+                    // Validation failed AFTER claim. Move the file out
+                    // of the drainer path so startup recovery does not
+                    // reclaim and re-reject the same broken payload on
+                    // every run.
+                    let quarantine = amq_inject::quarantine_rejected(&inflight);
+                    let quarantine_path = quarantine
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|err| format!("quarantine failed: {err}"));
                     tracing::warn!(
                         target: "dux::amq_inject",
                         path = %inflight.display(),
                         reason = %rejection.human(),
-                        "queue entry rejected after claim; left at .inflight.* for inspection",
+                        quarantine = %quarantine_path,
+                        "queue entry rejected after claim; quarantined",
                     );
                     self.set_warning(format!("AMQ inject: {}", rejection.human(),));
                 }
