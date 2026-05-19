@@ -384,6 +384,45 @@ pub fn release(inflight_path: &Path) -> Result<PathBuf> {
     Ok(original)
 }
 
+/// Move a claimed but invalid queue file out of the drainer path.
+///
+/// Rejected files cannot be delivered, but leaving them as `.inflight.*`
+/// makes startup recovery reclaim and re-reject them forever. Keep them
+/// available for inspection under a per-receiver `.rejected/` directory
+/// that normal scans do not recurse into.
+pub fn quarantine_rejected(inflight_path: &Path) -> Result<PathBuf> {
+    let parent = inflight_path
+        .parent()
+        .ok_or_else(|| anyhow!("inflight file has no parent: {}", inflight_path.display()))?;
+    let basename = inflight_path
+        .file_name()
+        .ok_or_else(|| anyhow!("inflight file has no basename: {}", inflight_path.display()))?;
+    let reject_dir = parent.join(".rejected");
+    fs::create_dir_all(&reject_dir)
+        .with_context(|| format!("create reject dir {}", reject_dir.display()))?;
+
+    let mut rejected = reject_dir.join(basename);
+    if rejected.exists() {
+        let basename = basename.to_string_lossy();
+        for suffix in 1.. {
+            let candidate = reject_dir.join(format!("{basename}.{suffix}"));
+            if !candidate.exists() {
+                rejected = candidate;
+                break;
+            }
+        }
+    }
+
+    fs::rename(inflight_path, &rejected).with_context(|| {
+        format!(
+            "quarantine rejected queue file {} -> {}",
+            inflight_path.display(),
+            rejected.display()
+        )
+    })?;
+    Ok(rejected)
+}
+
 /// Read and validate a queue file by path. Caller is expected to have
 /// already called [`claim`] so the path here is the `.inflight.` form.
 /// Returns the body with one trailing `\n` stripped (mirroring the
@@ -665,6 +704,23 @@ mod tests {
             read_validated(&path, 1024).unwrap(),
             "line\tone\nline two".to_string()
         );
+    }
+
+    #[test]
+    fn quarantine_rejected_moves_inflight_file_out_of_scan_path() {
+        let dir = tempdir().unwrap();
+        let receiver = dir.path().join("alice");
+        fs::create_dir_all(&receiver).unwrap();
+        let inflight = receiver.join(".inflight.001.msg");
+        fs::write(&inflight, b"\x03\n").unwrap();
+
+        let rejected = quarantine_rejected(&inflight).unwrap();
+
+        assert!(!inflight.exists());
+        assert_eq!(rejected, receiver.join(".rejected/.inflight.001.msg"));
+        assert_eq!(fs::read(&rejected).unwrap(), b"\x03\n");
+        let outcome = scan_queue_dir(dir.path()).unwrap();
+        assert!(outcome.messages.is_empty());
     }
 
     #[test]
