@@ -38,6 +38,7 @@ tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter", "fm
 tracing-appender = "0.2.5"
 
 [dev-dependencies]
+filetime = "0.2"
 serial_test = "3"
 
 [profile.release]
