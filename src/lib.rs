@@ -9,6 +9,7 @@
 //! into the running TUI. Library consumers are expected to be tests, not
 //! external crates — there is no API stability guarantee.
 
+pub mod amq_activity;
 pub mod amq_inject;
 pub mod app;
 pub mod auto_resume;

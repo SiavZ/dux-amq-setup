@@ -4717,7 +4717,7 @@ impl App {
                     let mode_worker_rect = draw_line(
                         radio_line(
                             "worker",
-                            "expects task-done and can auto-clear",
+                            "task-done auto-clear, suppressed during AMQ collaboration",
                             draft_settings.mode == ContextMode::Worker,
                             *focus == NameNewAgentFocus::ModeWorker,
                             &self.theme,
@@ -4806,7 +4806,7 @@ impl App {
 
                     let auto_clear_rect = draw_line(
                         checkbox_line(
-                            "Auto-clear after task done  (Worker mode)",
+                            "Auto-clear after task done  (Worker, AMQ-guarded)",
                             draft_settings.auto_clear_on_task_done,
                             *focus == NameNewAgentFocus::AutoClearOnDone,
                             &self.theme,
@@ -5202,7 +5202,7 @@ impl App {
         let worker_rect = draw_line(
             radio_line(
                 "worker",
-                "stateless, gets task-done postscript on AMQ wakes",
+                "task-done auto-clear, suppressed during AMQ collaboration",
                 prompt.draft.mode == ContextMode::Worker,
                 prompt.focus == SettingsFocus::ModeWorker,
                 &self.theme,
@@ -5353,7 +5353,7 @@ impl App {
         // ── Auto-clear after task done ───────────────────
         let auto_clear_rect = draw_line(
             checkbox_line(
-                "Auto-clear after task done  (live, only fires for Worker mode)",
+                "Auto-clear after task done  (live, Worker only, AMQ-guarded)",
                 prompt.draft.auto_clear_on_task_done,
                 prompt.focus == SettingsFocus::AutoClearOnDone,
                 &self.theme,

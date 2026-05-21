@@ -541,6 +541,13 @@ pub struct AmqInjectConfig {
     /// provider TUI can enter its busy/responding state. Default 10000.
     #[serde(default = "default_amq_inject_post_delivery_cooldown_ms")]
     pub post_delivery_cooldown_ms: u64,
+    /// Suppress Worker auto-clear when this session has AMQ activity
+    /// newer than this many seconds. This protects active collaboration
+    /// threads from losing context between back-and-forth messages.
+    /// Default 1800 (30 minutes). Set to 0 to disable the recent-activity
+    /// guard; unread/pending AMQ messages still block auto-clear.
+    #[serde(default = "default_amq_inject_auto_clear_collaboration_quiet_secs")]
+    pub auto_clear_collaboration_quiet_secs: u64,
 }
 
 fn default_amq_inject_enabled() -> bool {
@@ -594,6 +601,10 @@ fn default_amq_inject_post_delivery_cooldown_ms() -> u64 {
     10_000
 }
 
+fn default_amq_inject_auto_clear_collaboration_quiet_secs() -> u64 {
+    1_800
+}
+
 impl Default for AmqInjectConfig {
     fn default() -> Self {
         Self {
@@ -610,6 +621,8 @@ impl Default for AmqInjectConfig {
             phase_delay_ms: default_amq_inject_phase_delay_ms(),
             startup_grace_ms: default_amq_inject_startup_grace_ms(),
             post_delivery_cooldown_ms: default_amq_inject_post_delivery_cooldown_ms(),
+            auto_clear_collaboration_quiet_secs:
+                default_amq_inject_auto_clear_collaboration_quiet_secs(),
         }
     }
 }
@@ -1508,6 +1521,18 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
                  # Default 10000.",
             )),
             value_fn: |c| FieldValue::U64(c.amq.inject.post_delivery_cooldown_ms),
+        },
+        ConfigEntry::Field {
+            key: "auto_clear_collaboration_quiet_secs",
+            comment: Some(CommentSource::Static(
+                "# Suppress Worker auto-clear while AMQ collaboration is active.\n\
+                 # Unread inbox/new, outbox/pending, and pending dux inject files\n\
+                 # always block auto-clear; this window also blocks it after recent\n\
+                 # AMQ inbox/outbox/receipt activity so back-and-forth threads keep\n\
+                 # their context. Default 1800 (30 minutes). Set 0 to disable only\n\
+                 # the recent-activity window.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.auto_clear_collaboration_quiet_secs),
         },
         ConfigEntry::Blank,
         ConfigEntry::Keys,
@@ -2767,6 +2792,7 @@ mod tests {
         config.amq.inject.phase_delay_ms = 777;
         config.amq.inject.startup_grace_ms = 4_321;
         config.amq.inject.post_delivery_cooldown_ms = 9_876;
+        config.amq.inject.auto_clear_collaboration_quiet_secs = 2_222;
         let rendered = render_config_default(&config);
         let parsed: Config = toml::from_str(&rendered).expect("config should parse");
         assert!(!parsed.amq.inject.enabled);
@@ -2779,6 +2805,7 @@ mod tests {
         assert_eq!(parsed.amq.inject.phase_delay_ms, 777);
         assert_eq!(parsed.amq.inject.startup_grace_ms, 4_321);
         assert_eq!(parsed.amq.inject.post_delivery_cooldown_ms, 9_876);
+        assert_eq!(parsed.amq.inject.auto_clear_collaboration_quiet_secs, 2_222);
         assert_eq!(
             parsed.amq.inject.busy_markers,
             vec!["thinking…".to_string(), "ctrl-c to cancel".to_string()]
@@ -2814,6 +2841,10 @@ mod tests {
         assert_eq!(
             cfg.post_delivery_cooldown_ms, 10_000,
             "post_delivery_cooldown_ms default must be 10000 ms"
+        );
+        assert_eq!(
+            cfg.auto_clear_collaboration_quiet_secs, 1_800,
+            "auto_clear_collaboration_quiet_secs default must be 1800 s"
         );
     }
 

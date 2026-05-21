@@ -46,6 +46,7 @@ fn rule_matching(pattern: &str, text: &str) -> WatchRule {
         },
         budget: WatchBudget { max_attempts: 3 },
         cooldown_ms: 100,
+        ..Default::default()
     }
 }
 
