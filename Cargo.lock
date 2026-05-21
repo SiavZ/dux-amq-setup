@@ -555,6 +555,7 @@ dependencies = [
  "content_inspector",
  "crokey",
  "crossterm",
+ "filetime",
  "home",
  "indexmap",
  "notify",

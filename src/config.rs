@@ -458,6 +458,14 @@ pub struct AmqInjectConfig {
     /// silently. Default 600 (10 minutes).
     #[serde(default = "default_amq_inject_delivery_timeout_secs")]
     pub delivery_timeout_secs: u64,
+    /// Maximum age for an AMQ wake file before dux treats it as stale
+    /// and moves it to the receiver's `.expired/` directory instead of
+    /// injecting it into an agent. This applies both to plain `.msg`
+    /// files left while dux was offline and to `.inflight.*.msg` files
+    /// reclaimed after a crash/restart. Set to 0 to disable expiry and
+    /// replay all queued wake files. Default 600 (10 minutes).
+    #[serde(default = "default_amq_inject_max_message_age_secs")]
+    pub max_message_age_secs: u64,
     /// Polling fallback interval (milliseconds) for filesystems where
     /// `notify` is lossy (NFS, virtio-9p, some FUSE mounts). The
     /// `notify`-based watcher runs alongside this poll so most
@@ -554,6 +562,10 @@ fn default_amq_inject_delivery_timeout_secs() -> u64 {
     600
 }
 
+fn default_amq_inject_max_message_age_secs() -> u64 {
+    600
+}
+
 fn default_amq_inject_poll_interval_ms() -> u64 {
     5_000
 }
@@ -590,6 +602,7 @@ impl Default for AmqInjectConfig {
             busy_markers: default_amq_inject_busy_markers(),
             busy_scan_lines: default_amq_inject_busy_scan_lines(),
             delivery_timeout_secs: default_amq_inject_delivery_timeout_secs(),
+            max_message_age_secs: default_amq_inject_max_message_age_secs(),
             poll_interval_ms: default_amq_inject_poll_interval_ms(),
             max_message_bytes: default_amq_inject_max_message_bytes(),
             verify_envelope: default_amq_inject_verify_envelope(),
@@ -1398,6 +1411,17 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
                  # silently. Default 600 (10 minutes).",
             )),
             value_fn: |c| FieldValue::U64(c.amq.inject.delivery_timeout_secs),
+        },
+        ConfigEntry::Field {
+            key: "max_message_age_secs",
+            comment: Some(CommentSource::Static(
+                "# Maximum age for AMQ wake files before dux moves them to the\n\
+                 # receiver's .expired/ directory instead of injecting them.\n\
+                 # Applies to stale .msg files and crash-left .inflight.*.msg\n\
+                 # files on startup, and to held in-memory messages. Set 0 to\n\
+                 # replay all queued wake files. Default 600 (10 minutes).",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.max_message_age_secs),
         },
         ConfigEntry::Field {
             key: "poll_interval_ms",
@@ -2736,6 +2760,7 @@ mod tests {
         config.amq.inject.queue_dir = "/tmp/inject".to_string();
         config.amq.inject.busy_scan_lines = 12;
         config.amq.inject.delivery_timeout_secs = 90;
+        config.amq.inject.max_message_age_secs = 91;
         config.amq.inject.poll_interval_ms = 1234;
         config.amq.inject.max_message_bytes = 4096;
         config.amq.inject.enabled = false;
@@ -2748,6 +2773,7 @@ mod tests {
         assert_eq!(parsed.amq.inject.queue_dir, "/tmp/inject");
         assert_eq!(parsed.amq.inject.busy_scan_lines, 12);
         assert_eq!(parsed.amq.inject.delivery_timeout_secs, 90);
+        assert_eq!(parsed.amq.inject.max_message_age_secs, 91);
         assert_eq!(parsed.amq.inject.poll_interval_ms, 1234);
         assert_eq!(parsed.amq.inject.max_message_bytes, 4096);
         assert_eq!(parsed.amq.inject.phase_delay_ms, 777);
@@ -2766,6 +2792,7 @@ mod tests {
         assert!(cfg.queue_dir.is_empty());
         assert_eq!(cfg.busy_scan_lines, 5);
         assert_eq!(cfg.delivery_timeout_secs, 600);
+        assert_eq!(cfg.max_message_age_secs, 600);
         assert_eq!(cfg.poll_interval_ms, 5_000);
         assert_eq!(cfg.max_message_bytes, 65_536);
         assert!(

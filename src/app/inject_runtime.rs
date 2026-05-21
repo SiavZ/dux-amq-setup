@@ -216,13 +216,21 @@ impl App {
         // lock guarantees nobody else is currently processing them.
         // Bridge-format mktemp temps (no `.msg` suffix) are skipped
         // so we don't corrupt an in-progress write.
-        match amq_inject::reclaim_stale_inflight(&queue_dir) {
-            Ok(0) => {}
-            Ok(n) => {
+        let max_message_age = if self.config.amq.inject.max_message_age_secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(
+                self.config.amq.inject.max_message_age_secs,
+            ))
+        };
+        match amq_inject::reclaim_stale_inflight_with_max_age(&queue_dir, max_message_age) {
+            Ok(outcome) if outcome.reclaimed == 0 && outcome.expired == 0 => {}
+            Ok(outcome) => {
                 tracing::info!(
                     target: "dux::amq_inject",
-                    reclaimed = n,
-                    "reclaimed stale inflight files from prior dux instance",
+                    reclaimed = outcome.reclaimed,
+                    expired = outcome.expired,
+                    "processed stale inflight files from prior dux instance",
                 );
             }
             Err(err) => {
@@ -231,6 +239,25 @@ impl App {
                     queue_dir = %queue_dir.display(),
                     err = %err,
                     "reclaim sweep failed; some queued messages may stay stuck",
+                );
+            }
+        }
+        match amq_inject::expire_stale_messages(&queue_dir, max_message_age) {
+            Ok(0) => {}
+            Ok(n) => {
+                tracing::warn!(
+                    target: "dux::amq_inject",
+                    expired = n,
+                    max_age_secs = self.config.amq.inject.max_message_age_secs,
+                    "expired stale queued AMQ messages before startup scan",
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "dux::amq_inject",
+                    queue_dir = %queue_dir.display(),
+                    err = %err,
+                    "stale queued AMQ expiry failed; some old messages may still be scanned",
                 );
             }
         }
@@ -279,6 +306,14 @@ impl App {
             return;
         };
         let max_bytes = self.config.amq.inject.max_message_bytes;
+        let max_message_age = if self.config.amq.inject.max_message_age_secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(
+                self.config.amq.inject.max_message_age_secs,
+            ))
+        };
+        let now_wall = std::time::SystemTime::now();
         let available_capacity = MAX_INJECT_PENDING_TOTAL.saturating_sub(
             self.runtime
                 .amq_inject_pending
@@ -328,6 +363,31 @@ impl App {
         }
 
         for pending in outcome.messages {
+            if amq_inject::is_file_older_than(&pending.path, max_message_age, now_wall) {
+                match amq_inject::quarantine_expired(&pending.path) {
+                    Ok(expired_path) => {
+                        tracing::warn!(
+                            target: "dux::amq_inject",
+                            receiver = %pending.receiver,
+                            from = %pending.path.display(),
+                            to = %expired_path.display(),
+                            max_age_secs = self.config.amq.inject.max_message_age_secs,
+                            "expired stale AMQ message before claim",
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "dux::amq_inject",
+                            receiver = %pending.receiver,
+                            path = %pending.path.display(),
+                            err = %err,
+                            "stale AMQ message expiry before claim failed",
+                        );
+                    }
+                }
+                continue;
+            }
+            let modified_at = amq_inject::modified_at(&pending.path);
             let receiver_depth = self
                 .runtime
                 .amq_inject_pending
@@ -364,6 +424,7 @@ impl App {
                         body,
                         inflight_path: inflight,
                         source_path: pending.path.clone(),
+                        modified_at,
                         body_typed: false,
                         body_typed_at: None,
                     };
@@ -542,6 +603,10 @@ impl App {
                 .get(&receiver)
                 .is_none_or(|q| q.is_empty());
             if queue_empty {
+                continue;
+            }
+            if self.expire_pending_amq_head_if_stale(&receiver) {
+                actions_this_tick += 1;
                 continue;
             }
 
@@ -837,6 +902,84 @@ impl App {
         }
     }
 
+    /// Drop one stale held AMQ wake for a receiver. Only messages that
+    /// have not reached phase 1 are expired; once bytes have been typed
+    /// into a provider input field, phase 2 should still send Enter so
+    /// the UI is not left with a floating prompt.
+    fn expire_pending_amq_head_if_stale(&mut self, receiver: &str) -> bool {
+        let max_age_secs = self.config.amq.inject.max_message_age_secs;
+        if max_age_secs == 0 {
+            return false;
+        }
+        let Some(head) = self
+            .runtime
+            .amq_inject_pending
+            .get(receiver)
+            .and_then(|q| q.front())
+        else {
+            return false;
+        };
+        if head.body_typed {
+            return false;
+        }
+        let Some(modified_at) = head.modified_at else {
+            return false;
+        };
+        let Ok(age) = std::time::SystemTime::now().duration_since(modified_at) else {
+            return false;
+        };
+        if age <= Duration::from_secs(max_age_secs) {
+            return false;
+        }
+
+        let Some(msg) = self
+            .runtime
+            .amq_inject_pending
+            .get_mut(receiver)
+            .and_then(|q| q.pop_front())
+        else {
+            return false;
+        };
+        match amq_inject::quarantine_expired(&msg.inflight_path) {
+            Ok(expired_path) => {
+                tracing::warn!(
+                    target: "dux::amq_inject",
+                    receiver = %receiver,
+                    from = %msg.inflight_path.display(),
+                    to = %expired_path.display(),
+                    age_secs = age.as_secs(),
+                    max_age_secs = max_age_secs,
+                    body_preview = %amq_inject::preview(&msg.body, 80),
+                    "expired held AMQ wake instead of injecting stale backlog",
+                );
+                self.set_warning(format!(
+                    "AMQ inject: expired stale message for \"{receiver}\" after {}s; inspect .expired if needed.",
+                    age.as_secs()
+                ));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "dux::amq_inject",
+                    receiver = %receiver,
+                    path = %msg.inflight_path.display(),
+                    err = %err,
+                    "failed to expire held AMQ wake; dropping in-memory pending entry",
+                );
+            }
+        }
+        if self
+            .runtime
+            .amq_inject_pending
+            .get(receiver)
+            .is_some_and(|q| q.is_empty())
+        {
+            self.runtime.amq_inject_pending.remove(receiver);
+            self.runtime.amq_inject_last_warned.remove(receiver);
+            self.runtime.amq_inject_last_held_logged.remove(receiver);
+        }
+        true
+    }
+
     /// Surface a status-line warning when a queued receiver has no
     /// matching live session. Rate-limited so a backlog doesn't spam.
     /// Emit a `debug`-level trace event the first time (and at most
@@ -926,13 +1069,9 @@ impl App {
     /// same way as `maybe_warn_no_session`. We don't move or delete
     /// the file — operators can inspect it.
     fn maybe_warn_timeout(&mut self, receiver: &str, now: Instant, timeout: Duration) {
-        // Find the oldest queued_at across this receiver's queue.
-        // Cheap: we stash queued_at on each message at claim time.
-        // (Currently `QueuedMessage` doesn't carry queued_at — we
-        // approximate using the `last_warned` timer; a real
-        // implementation would add a timestamp field. For now this is
-        // a "soft" timeout that nudges the operator after some
-        // minutes of inactivity.)
+        // This is a soft warning timer. Actual stale-message expiry is
+        // enforced from the queue file's mtime by
+        // `expire_pending_amq_head_if_stale`.
         if timeout.is_zero() {
             return;
         }

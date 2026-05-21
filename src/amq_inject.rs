@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
@@ -67,6 +67,10 @@ pub struct QueuedMessage {
     /// Original `<ts>.msg` path before the inflight rename. Carried
     /// for log/diagnostic purposes only.
     pub source_path: PathBuf,
+    /// Best-effort filesystem modification time for the original
+    /// queue file. Used to expire stale wake notifications before
+    /// they are injected after a reboot or long busy hold.
+    pub modified_at: Option<SystemTime>,
     /// Two-phase delivery state. `false` = body has not been typed
     /// into the agent's PTY yet; `true` = body was typed and we're
     /// waiting for the next tick to send the trailing `\r` as a
@@ -260,6 +264,15 @@ pub struct PendingFile {
     pub path: PathBuf,
 }
 
+/// Outcome of startup recovery for drainer-owned `.inflight.*.msg`
+/// files. Fresh files are reclaimed to `<ts>.msg`; stale files are
+/// moved to `.expired/` so a restart cannot replay an old backlog.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReclaimOutcome {
+    pub reclaimed: usize,
+    pub expired: usize,
+}
+
 /// Atomically claim `path` by renaming it to a sibling with the
 /// `.inflight.` prefix. Subsequent scans skip it; on delivery success
 /// the caller `unlink`s the in-flight path; on failure
@@ -279,11 +292,12 @@ pub fn claim(path: &Path) -> Result<PathBuf> {
     Ok(inflight)
 }
 
-/// Sweep the queue at startup and rename every drainer-format
-/// `.inflight.<ts>.msg` file back to `<ts>.msg`. These are leftovers
+/// Sweep the queue at startup and rename fresh drainer-format
+/// `.inflight.<ts>.msg` files back to `<ts>.msg`. These are leftovers
 /// from a prior dux instance that crashed mid-delivery — the
 /// single-instance lock guarantees no other dux is currently holding
-/// them, so there's no race.
+/// them, so there's no race. Stale files are moved to `.expired/`
+/// instead of being replayed into restored agents.
 ///
 /// **Bridge-format temp files (`.inflight.XXXXXX` from `mktemp`,
 /// without the `.msg` suffix) are intentionally skipped**: those
@@ -294,14 +308,27 @@ pub fn claim(path: &Path) -> Result<PathBuf> {
 /// basename ends in `.msg`, so the suffix check is the safe
 /// differentiator.
 ///
-/// Returns the count of files reclaimed. Errors during a single
-/// rename are logged and do not abort the sweep — a partially-stuck
-/// queue is still better than no recovery.
+/// Returns the count of files reclaimed. Errors during a single rename
+/// are logged and do not abort the sweep — a partially-stuck queue is
+/// still better than no recovery.
+#[allow(dead_code)]
 pub fn reclaim_stale_inflight(queue_dir: &Path) -> Result<usize> {
+    Ok(reclaim_stale_inflight_with_max_age(queue_dir, None)?.reclaimed)
+}
+
+/// Age-bounded variant of [`reclaim_stale_inflight`]. `max_age = None`
+/// preserves the legacy "reclaim everything" behaviour for tests and
+/// explicit operator escape hatches.
+pub fn reclaim_stale_inflight_with_max_age(
+    queue_dir: &Path,
+    max_age: Option<Duration>,
+) -> Result<ReclaimOutcome> {
     let mut reclaimed = 0usize;
+    let mut expired = 0usize;
+    let now = SystemTime::now();
     let entries = match fs::read_dir(queue_dir) {
         Ok(it) => it,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ReclaimOutcome::default()),
         Err(e) => return Err(anyhow!("read_dir({}): {e}", queue_dir.display())),
     };
     for receiver_entry in entries.flatten() {
@@ -334,6 +361,29 @@ pub fn reclaim_stale_inflight(queue_dir: &Path) -> Result<usize> {
             let original_name = &name_str[INFLIGHT_PREFIX.len()..];
             let original_path = receiver_dir.join(original_name);
             let inflight_path = entry.path();
+            if is_file_older_than(&inflight_path, max_age, now) {
+                match quarantine_expired(&inflight_path) {
+                    Ok(expired_path) => {
+                        expired += 1;
+                        tracing::warn!(
+                            target: "dux::amq_inject",
+                            from = %inflight_path.display(),
+                            to = %expired_path.display(),
+                            max_age_secs = max_age.map(|d| d.as_secs()).unwrap_or(0),
+                            "expired stale AMQ inflight instead of replaying it",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "dux::amq_inject",
+                            path = %inflight_path.display(),
+                            err = %e,
+                            "stale AMQ inflight expiry failed",
+                        );
+                    }
+                }
+                continue;
+            }
             match fs::rename(&inflight_path, &original_path) {
                 Ok(()) => {
                     reclaimed += 1;
@@ -355,7 +405,133 @@ pub fn reclaim_stale_inflight(queue_dir: &Path) -> Result<usize> {
             }
         }
     }
-    Ok(reclaimed)
+    Ok(ReclaimOutcome { reclaimed, expired })
+}
+
+/// Move old plain `<ts>.msg` files out of the live queue. This runs at
+/// startup before the initial scan so messages accumulated while dux was
+/// offline do not flood restored panes.
+pub fn expire_stale_messages(queue_dir: &Path, max_age: Option<Duration>) -> Result<usize> {
+    let Some(max_age) = max_age else {
+        return Ok(0);
+    };
+    if max_age.is_zero() {
+        return Ok(0);
+    }
+    let mut expired = 0usize;
+    let now = SystemTime::now();
+    let entries = match fs::read_dir(queue_dir) {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(anyhow!("read_dir({}): {e}", queue_dir.display())),
+    };
+    for receiver_entry in entries.flatten() {
+        if !receiver_entry
+            .file_type()
+            .map(|t| t.is_dir())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let receiver_dir = receiver_entry.path();
+        let inner = match fs::read_dir(&receiver_dir) {
+            Ok(it) => it,
+            Err(_) => continue,
+        };
+        for entry in inner.flatten() {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            if name_str.starts_with('.') || !name_str.ends_with(".msg") {
+                continue;
+            }
+            let path = entry.path();
+            if !is_file_older_than(&path, Some(max_age), now) {
+                continue;
+            }
+            match quarantine_expired(&path) {
+                Ok(expired_path) => {
+                    expired += 1;
+                    tracing::warn!(
+                        target: "dux::amq_inject",
+                        from = %path.display(),
+                        to = %expired_path.display(),
+                        max_age_secs = max_age.as_secs(),
+                        "expired stale AMQ message instead of injecting it",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "dux::amq_inject",
+                        path = %path.display(),
+                        err = %e,
+                        "stale AMQ message expiry failed",
+                    );
+                }
+            }
+        }
+    }
+    Ok(expired)
+}
+
+/// Return the modification time for a queue file if available.
+pub fn modified_at(path: &Path) -> Option<SystemTime> {
+    fs::symlink_metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+}
+
+/// True when a queue file is older than `max_age` relative to `now`.
+/// Future mtimes, missing mtimes, `None`, and zero durations are treated
+/// as non-expiring so clock skew or filesystem oddities don't drop fresh
+/// messages.
+pub fn is_file_older_than(path: &Path, max_age: Option<Duration>, now: SystemTime) -> bool {
+    let Some(max_age) = max_age else {
+        return false;
+    };
+    if max_age.is_zero() {
+        return false;
+    }
+    let Some(modified) = modified_at(path) else {
+        return false;
+    };
+    now.duration_since(modified).is_ok_and(|age| age > max_age)
+}
+
+/// Move a stale queue file out of the live drainer path while keeping it
+/// available for operator inspection.
+pub fn quarantine_expired(path: &Path) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("queue file has no parent: {}", path.display()))?;
+    let basename = path
+        .file_name()
+        .ok_or_else(|| anyhow!("queue file has no basename: {}", path.display()))?;
+    let expired_dir = parent.join(".expired");
+    fs::create_dir_all(&expired_dir)
+        .with_context(|| format!("create expired dir {}", expired_dir.display()))?;
+
+    let mut expired = expired_dir.join(basename);
+    if expired.exists() {
+        let basename = basename.to_string_lossy();
+        for suffix in 1.. {
+            let candidate = expired_dir.join(format!("{basename}.{suffix}"));
+            if !candidate.exists() {
+                expired = candidate;
+                break;
+            }
+        }
+    }
+
+    fs::rename(path, &expired).with_context(|| {
+        format!(
+            "quarantine expired queue file {} -> {}",
+            path.display(),
+            expired.display()
+        )
+    })?;
+    Ok(expired)
 }
 
 /// Reverse of [`claim`]: rename the in-flight back to its `.msg` form
@@ -724,6 +900,23 @@ mod tests {
     }
 
     #[test]
+    fn quarantine_expired_moves_queue_file_out_of_scan_path() {
+        let dir = tempdir().unwrap();
+        let receiver = dir.path().join("alice");
+        fs::create_dir_all(&receiver).unwrap();
+        let stale = receiver.join("001.msg");
+        fs::write(&stale, b"old wake\n").unwrap();
+
+        let expired = quarantine_expired(&stale).unwrap();
+
+        assert!(!stale.exists());
+        assert_eq!(expired, receiver.join(".expired/001.msg"));
+        assert_eq!(fs::read(&expired).unwrap(), b"old wake\n");
+        let outcome = scan_queue_dir(dir.path()).unwrap();
+        assert!(outcome.messages.is_empty());
+    }
+
+    #[test]
     fn read_validated_rejects_oversized_files() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("big.msg");
@@ -785,6 +978,56 @@ mod tests {
             "bridge-format mktemp temp must NOT be renamed"
         );
         assert!(live.exists(), "live messages must not be touched");
+    }
+
+    #[test]
+    fn reclaim_stale_inflight_expires_old_drainer_files_when_age_capped() {
+        let dir = tempdir().unwrap();
+        let queue = dir.path().to_path_buf();
+        let alice = queue.join("alice");
+        fs::create_dir_all(&alice).unwrap();
+
+        let old = alice.join(".inflight.001.msg");
+        fs::write(&old, b"old-body\n").unwrap();
+        let fresh = alice.join(".inflight.002.msg");
+        fs::write(&fresh, b"fresh-body\n").unwrap();
+
+        let old_time = filetime::FileTime::from_unix_time(1, 0);
+        filetime::set_file_mtime(&old, old_time).unwrap();
+
+        let outcome =
+            reclaim_stale_inflight_with_max_age(&queue, Some(Duration::from_secs(60))).unwrap();
+
+        assert_eq!(outcome.reclaimed, 1);
+        assert_eq!(outcome.expired, 1);
+        assert!(alice.join("002.msg").exists());
+        assert!(alice.join(".expired/.inflight.001.msg").exists());
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn expire_stale_messages_moves_old_plain_messages_only() {
+        let dir = tempdir().unwrap();
+        let queue = dir.path().to_path_buf();
+        let alice = queue.join("alice");
+        fs::create_dir_all(&alice).unwrap();
+
+        let old = alice.join("001.msg");
+        fs::write(&old, b"old-body\n").unwrap();
+        let fresh = alice.join("002.msg");
+        fs::write(&fresh, b"fresh-body\n").unwrap();
+        let inflight = alice.join(".inflight.003.msg");
+        fs::write(&inflight, b"inflight\n").unwrap();
+
+        let old_time = filetime::FileTime::from_unix_time(1, 0);
+        filetime::set_file_mtime(&old, old_time).unwrap();
+
+        let expired = expire_stale_messages(&queue, Some(Duration::from_secs(60))).unwrap();
+
+        assert_eq!(expired, 1);
+        assert!(alice.join(".expired/001.msg").exists());
+        assert!(fresh.exists());
+        assert!(inflight.exists());
     }
 
     #[test]
