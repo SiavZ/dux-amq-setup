@@ -141,7 +141,7 @@ that `--continue` refuses.
 When the sentinel is present, the wrappers switch `amq wake` to `--inject-via "$LOCAL_BIN/dux-amq-inject-bridge"`. The bridge then runs end-to-end as:
 
 ```
-amq send → AMQ inbox → wake daemon → bridge → file queue → dux drainer → agent PTY
+amq send → AMQ inbox → wake daemon → bridge auto-drain → file queue → dux drainer → agent PTY
 ```
 
 Each step is described in the subsections below.
@@ -153,13 +153,16 @@ Each step is described in the subsections below.
 
 ### Bridge: delivery strategy
 
-After unwrap (or verify), the bridge picks one of three strategies for the body:
+After unwrap (or verify), the bridge drops raw Ctrl+C interrupt transport bytes and then picks one of three strategies for the body:
 
 | Condition | Strategy |
 |-----------|----------|
-| `$DUX_PANE` set (running under dux) | Always write to file queue at `~/.local/share/dux-amq/inject-queue/<receiver>/<ts>.msg` |
+| `$DUX_PANE` set (running under dux) and `AM_ROOT`/`AMQ_GLOBAL_ROOT` set | Run `amq drain --include-body --root "$root" --me "$AM_ME"` and write that output to `~/.local/share/dux-amq/inject-queue/<receiver>/<ts>.msg` |
+| `$DUX_PANE` set but no AMQ root env | Write the wake body itself to the same file queue |
 | No `$DUX_PANE` but `$TMUX` set + `tmux` on PATH | `tmux send-keys -- "$body" Enter` against current pane (or `$DUX_TMUX_TARGET`) |
 | Otherwise | Write to the same file queue; an operator can recover the body manually |
+
+The auto-drain step is deliberate: dux should inject the actual unread AMQ content, not a reminder that depends on the model choosing to run `amq drain`. The bridge appends a short instruction to act on the drained messages and strips unsafe control bytes before queueing so the Rust drainer will not reject peer-authored bodies.
 
 `<receiver>` is the sanitised `$AM_ME` exported by the wrapper (`[a-z0-9_-]` only). The wrapper derives `$AM_ME` from `basename($PWD)` of the dux worktree directory, falling back to `git branch --show-current` then `<provider>-<pid>`. When sanitisation collapses to empty, the bridge writes to the literal `_unrouted/` subdirectory; the drainer routes those messages to the currently-selected dux session with a status warning.
 
