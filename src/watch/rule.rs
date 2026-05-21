@@ -26,6 +26,11 @@ pub struct WatchRule {
     /// last action, the engine treats it as the same incident — the
     /// backoff curve is not reset and the budget is not consumed again.
     pub cooldown_ms: u64,
+    /// Internal classification for rules constructed by dux itself.
+    /// User TOML never sets this; serde skips it so persisted/configured
+    /// rules remain forward-compatible.
+    #[serde(skip)]
+    pub kind: WatchRuleKind,
 }
 
 impl Default for WatchRule {
@@ -37,8 +42,16 @@ impl Default for WatchRule {
             backoff: WatchBackoff::default(),
             budget: WatchBudget::default(),
             cooldown_ms: 30_000,
+            kind: WatchRuleKind::User,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WatchRuleKind {
+    #[default]
+    User,
+    BuiltInAutoClear,
 }
 
 /// Action variants a rule can dispatch when it fires.

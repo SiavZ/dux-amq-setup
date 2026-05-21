@@ -1,3 +1,4 @@
+mod amq_activity;
 mod amq_inject;
 mod app;
 mod auto_resume;

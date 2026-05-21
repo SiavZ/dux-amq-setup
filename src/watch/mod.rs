@@ -24,4 +24,4 @@ pub mod rule;
 
 pub use engine::{RuleSnapshot, RuleStateKind, WatchEffect, WatchEngine};
 #[allow(unused_imports)] // re-exported for tests + future palette code
-pub use rule::{WaitFormat, WatchAction, WatchBackoff, WatchBudget, WatchRule};
+pub use rule::{WaitFormat, WatchAction, WatchBackoff, WatchBudget, WatchRule, WatchRuleKind};

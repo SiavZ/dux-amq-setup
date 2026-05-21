@@ -11920,6 +11920,7 @@ cyan = "#00ffff"
             backoff: crate::watch::WatchBackoff::default(),
             budget: crate::watch::WatchBudget { max_attempts: 5 },
             cooldown_ms: 1_000,
+            ..Default::default()
         }
     }
 

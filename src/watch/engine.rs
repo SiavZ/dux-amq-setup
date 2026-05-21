@@ -30,7 +30,7 @@ use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use regex::RegexBuilder;
 
-use super::rule::{WatchAction, WatchRule};
+use super::rule::{WatchAction, WatchRule, WatchRuleKind};
 
 /// Cap on the size of compiled regex DFAs (in bytes). Patterns that exceed
 /// this at compile time are rejected — this is the catastrophic-regex
@@ -100,6 +100,7 @@ struct RuleRuntime {
     baseline_match_count: usize,
     /// Resolved label (rule.label, or a truncated copy of the pattern).
     label: String,
+    kind: WatchRuleKind,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -178,6 +179,7 @@ impl WatchEngine {
                 attempts_made: 0,
                 baseline_match_count: 0,
                 label,
+                kind: rule.kind,
             });
         }
 
@@ -288,6 +290,21 @@ impl WatchEngine {
     pub fn rebaseline(&mut self, snapshot: &str) {
         for rule in &mut self.rules {
             if matches!(rule.state, RuleState::Disarmed) {
+                continue;
+            }
+            let matches = rule.regex.find_iter(snapshot).count();
+            if matches > rule.baseline_match_count {
+                rule.baseline_match_count = matches;
+            }
+        }
+    }
+
+    /// Advance the baseline only for rules with the given internal kind.
+    /// Used when app-level policy wants to suppress a built-in rule
+    /// without blocking user-configured watch rules in the same engine.
+    pub(crate) fn rebaseline_kind(&mut self, snapshot: &str, kind: WatchRuleKind) {
+        for rule in &mut self.rules {
+            if rule.kind != kind || matches!(rule.state, RuleState::Disarmed) {
                 continue;
             }
             let matches = rule.regex.find_iter(snapshot).count();
@@ -449,7 +466,9 @@ fn truncate_for_label(pattern: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::watch::rule::{WaitFormat, WatchAction, WatchBackoff, WatchBudget, WatchRule};
+    use crate::watch::rule::{
+        WaitFormat, WatchAction, WatchBackoff, WatchBudget, WatchRule, WatchRuleKind,
+    };
 
     fn rule(pattern: &str) -> WatchRule {
         WatchRule {
@@ -467,6 +486,7 @@ mod tests {
             },
             budget: WatchBudget { max_attempts: 3 },
             cooldown_ms: 500,
+            ..Default::default()
         }
     }
 
@@ -737,6 +757,7 @@ mod tests {
             },
             budget: WatchBudget { max_attempts: 3 },
             cooldown_ms: 0,
+            ..Default::default()
         };
 
         let (mut engine, errors) = WatchEngine::new("s1", &[r]);
@@ -775,6 +796,7 @@ mod tests {
             },
             budget: WatchBudget { max_attempts: 3 },
             cooldown_ms: 0,
+            ..Default::default()
         };
 
         let (mut engine, errors) = WatchEngine::new("s1", &[r]);
@@ -822,6 +844,7 @@ mod tests {
             },
             budget: WatchBudget { max_attempts: 3 },
             cooldown_ms: 0,
+            ..Default::default()
         };
         let (mut engine, _) = WatchEngine::new("s1", &[r]);
         let t0 = Instant::now();
@@ -909,6 +932,36 @@ mod tests {
         assert_eq!(
             engine.rules[0].baseline_match_count, 0,
             "disarmed rule should not be rebaselined"
+        );
+    }
+
+    #[test]
+    fn rebaseline_kind_suppresses_only_matching_kind() {
+        let mut auto = crate::watch::builtin::auto_clear_rule_for("/clear");
+        auto.backoff.initial_ms = 0;
+        auto.backoff.jitter_ms = 0;
+        let mut user = rule("rate limited");
+        user.backoff.initial_ms = 0;
+        user.backoff.jitter_ms = 0;
+        let (mut engine, errors) = WatchEngine::new("s1", &[auto, user]);
+        assert!(errors.is_empty(), "load errors: {errors:?}");
+
+        let snapshot = "[task-done]\nrate limited";
+        engine.rebaseline_kind(snapshot, WatchRuleKind::BuiltInAutoClear);
+        let now = Instant::now();
+        engine.observe(snapshot, now);
+        let effects = engine.observe(snapshot, now);
+        assert!(
+            effects.iter().any(
+                |effect| matches!(effect, WatchEffect::SendText { text, .. } if text == "please continue")
+            ),
+            "user rule should still fire"
+        );
+        assert!(
+            !effects.iter().any(
+                |effect| matches!(effect, WatchEffect::SendText { text, .. } if text == "/clear")
+            ),
+            "auto-clear rule should be suppressed by kind rebaseline"
         );
     }
 }

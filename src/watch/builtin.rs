@@ -20,11 +20,12 @@
 
 use crate::model::ProviderKind;
 
-use super::rule::{WatchAction, WatchBackoff, WatchBudget, WatchRule};
+use super::rule::{WatchAction, WatchBackoff, WatchBudget, WatchRule, WatchRuleKind};
 
 /// Effectively unlimited for a long-running worker session, while still
 /// keeping the engine's generic finite-budget model.
 pub const AUTO_CLEAR_MAX_ATTEMPTS: u32 = 10_000;
+pub const AUTO_CLEAR_LABEL: &str = "auto-clear after task done";
 
 /// Default sentinel the orchestrator instructs Worker-mode agents to
 /// emit at end-of-task. Lowercased, square-bracketed, no whitespace.
@@ -53,7 +54,7 @@ pub fn auto_clear_rule_for(clear_command: &str) -> WatchRule {
         // a fixed literal so the manually escaped form is fine and
         // makes the intent obvious to readers.
         pattern: r"\[task-done\]".to_string(),
-        label: "auto-clear after task done".to_string(),
+        label: AUTO_CLEAR_LABEL.to_string(),
         action: WatchAction::SendText {
             text: clear_command.to_string(),
             append_enter: true,
@@ -78,6 +79,7 @@ pub fn auto_clear_rule_for(clear_command: &str) -> WatchRule {
             max_attempts: AUTO_CLEAR_MAX_ATTEMPTS,
         },
         cooldown_ms: 60_000,
+        kind: WatchRuleKind::BuiltInAutoClear,
     }
 }
 

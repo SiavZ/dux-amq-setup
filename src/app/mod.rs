@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -2990,6 +2990,14 @@ impl App {
                 Some(handle) => handle.scan_recent_lines(30),
                 None => continue,
             };
+            if self.should_suppress_auto_clear_for_collaboration(&session_id)
+                && let Some(engine) = self.runtime.watch_engines.get_mut(&session_id)
+            {
+                engine.rebaseline_kind(
+                    &snapshot,
+                    crate::watch::rule::WatchRuleKind::BuiltInAutoClear,
+                );
+            }
             let effects = match self.runtime.watch_engines.get_mut(&session_id) {
                 Some(engine) => engine.observe(&snapshot, now),
                 None => continue,
@@ -2998,6 +3006,43 @@ impl App {
                 self.apply_watch_effect(&session_id, effect);
             }
         }
+    }
+
+    fn should_suppress_auto_clear_for_collaboration(&self, session_id: &str) -> bool {
+        let Some(session) = self.git.sessions.iter().find(|s| s.id == session_id) else {
+            return true;
+        };
+        if !matches!(session.settings.mode, ContextMode::Worker)
+            || !session.settings.auto_clear_on_task_done
+        {
+            return true;
+        }
+        let receiver = amq_receiver_for_session(session);
+        if self
+            .runtime
+            .amq_inject_pending
+            .get(&receiver)
+            .is_some_and(|q| !q.is_empty())
+        {
+            return true;
+        }
+        if let Some(queue_dir) = &self.runtime.amq_inject_queue_dir
+            && crate::amq_activity::has_pending_inject(queue_dir, &receiver)
+        {
+            return true;
+        }
+        let agent_dir = amq_root_for_collaboration_guard()
+            .join("agents")
+            .join(&receiver);
+        if crate::amq_activity::has_pending_mail(&agent_dir) {
+            return true;
+        }
+        let quiet_secs = self.config.amq.inject.auto_clear_collaboration_quiet_secs;
+        crate::amq_activity::has_recent_activity(
+            &agent_dir,
+            Duration::from_secs(quiet_secs),
+            SystemTime::now(),
+        )
     }
 
     /// Drain mature `runtime.watch_pending_enters` entries and write a
@@ -3528,6 +3573,31 @@ fn aggregate_tree(
     children.sort_by_key(|b| std::cmp::Reverse(b.rss_bytes));
     children.truncate(10);
     (cpu, rss, count, children)
+}
+
+fn amq_receiver_for_session(session: &AgentSession) -> String {
+    if let Some(basename) = Path::new(&session.worktree_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+    {
+        let receiver = crate::app::inject_runtime::sanitise_handle(basename);
+        if !receiver.is_empty() {
+            return receiver;
+        }
+    }
+    let receiver = crate::app::inject_runtime::sanitise_handle(&session.branch_name);
+    if receiver.is_empty() {
+        session.id.clone()
+    } else {
+        receiver
+    }
+}
+
+fn amq_root_for_collaboration_guard() -> PathBuf {
+    std::env::var_os("AM_ROOT")
+        .or_else(|| std::env::var_os("AMQ_GLOBAL_ROOT"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/data/state/amq"))
 }
 
 pub(crate) fn provider_config(config: &Config, provider: &ProviderKind) -> ProviderCommandConfig {
