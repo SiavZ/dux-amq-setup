@@ -146,6 +146,16 @@ fi
 # expansion `${var%$'\n'}` removes exactly one trailing LF.
 send_body="${body%$'\n'}"
 
+# `amq wake` sends an interrupt command before the human-readable
+# interrupt notice for urgent interrupt-labeled messages. Under dux the
+# bridge writes to a file queue, so a raw Ctrl+C byte cannot actually
+# interrupt the agent; it only creates an invalid queue file that the
+# Rust drainer must reject. Drop that transport-only signal and let the
+# following interrupt notice carry the actionable prompt.
+if [[ "$send_body" == $'\003' ]]; then
+  exit 0
+fi
+
 # Resolve receiver from $AM_ME, applying the same sanitisation the
 # wrappers use to produce the AMQ handle. This keeps the queue path
 # disjoint from any directory traversal attempt: only [a-z0-9_-] can
@@ -170,6 +180,31 @@ under_dux=0
 if [[ -n "${DUX_PANE:-}" ]]; then
   under_dux=1
 fi
+
+# Under dux, do not make the model execute a second command just to read
+# the message. Convert the wake notification into the actual AMQ drain
+# output, then queue that output for the dux-side drainer to submit to
+# the agent. This keeps `inbox/new` from accumulating when an agent sees
+# a wake prompt but does not follow the "run amq drain" instruction.
+if (( under_dux == 1 )) && [[ -n "${AM_ROOT:-${AMQ_GLOBAL_ROOT:-}}" ]] && command -v amq >/dev/null 2>&1; then
+  ROOT="${AM_ROOT:-${AMQ_GLOBAL_ROOT:-/data/state/amq}}"
+  drain_limit="${DUX_AMQ_DRAIN_LIMIT:-20}"
+  if drain_out=$(amq drain --root "$ROOT" --me "$RECEIVER" --include-body --limit "$drain_limit" 2>&1); then
+    if [[ -z "$drain_out" ]]; then
+      # Another wake/drain path already consumed the message. Avoid
+      # injecting stale "Drain with..." notices that create confusion.
+      exit 0
+    fi
+    send_body="$drain_out"$'\n''Act on these AMQ messages now. Reply over AMQ when needed.'
+  else
+    printf '[inject-bridge] amq drain failed for %s: %s\n' "$RECEIVER" "$drain_out" >&2
+  fi
+fi
+
+# The Rust drainer rejects unsafe control bytes. AMQ message bodies are
+# peer-authored, so strip transport/control bytes before queueing the
+# drain output; preserve TAB and LF because they are useful formatting.
+send_body=$(printf '%s' "$send_body" | LC_ALL=C tr -d '\000-\010\013\014\015\016-\037\177')
 
 # Step 2b — outside dux, prefer tmux send-keys when available.
 #

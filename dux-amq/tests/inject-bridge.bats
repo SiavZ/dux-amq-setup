@@ -54,6 +54,8 @@ setup() {
   unset TMUX
   unset DUX_PANE
   unset AM_ME
+  unset AM_ROOT
+  unset AMQ_GLOBAL_ROOT
   unset DUX_AMQ_VERIFY
 }
 
@@ -78,6 +80,34 @@ install_fake_tmux() {
 } >>"$TMUX_LOG"
 EOF
   chmod 0755 "$fake_dir/tmux"
+  PATH="$fake_dir:$PATH"
+  export PATH
+}
+
+install_fake_drain_amq() {
+  local fake_dir="$TEST_HOME/bin"
+  mkdir -p "$fake_dir"
+  cat >"$fake_dir/amq" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "drain" ]]; then
+  {
+    printf 'ARGV\n'
+    for a in "$@"; do
+      printf '%s\n' "$a"
+    done
+    printf 'END\n'
+  } >>"${AMQ_DRAIN_ARGV_LOG:?}"
+  printf '[AMQ] 1 new message(s) for bob:\n\n'
+  printf -- '- From: alice\n'
+  printf '  Subject: hello\n'
+  printf '  Body:\n'
+  printf 'drained-body\003\n'
+  exit 0
+fi
+exit 99
+EOF
+  chmod 0755 "$fake_dir/amq"
   PATH="$fake_dir:$PATH"
   export PATH
 }
@@ -178,6 +208,46 @@ EOF
   mapfile -t files < <(compgen -G "$HOME/.local/share/dux-amq/inject-queue/bob/*.msg")
   [ "${#files[@]}" -eq 1 ]
   grep -Fxq -- "under-dux" "${files[0]}"
+}
+
+# 13.7b — under dux with AM_ROOT: bridge auto-drains and queues the
+# actual message body instead of a "run amq drain" reminder.
+@test "dux-amq-inject-bridge auto-drains AMQ when under dux with AM_ROOT" {
+  install_fake_tmux
+  install_fake_drain_amq
+  export TMUX="/tmp/fake-tmux-socket,1234,0"
+  export DUX_PANE="1"
+  export AM_ME="bob"
+  export AM_ROOT="$TEST_HOME/amq-root"
+  AMQ_DRAIN_ARGV_LOG="$TEST_HOME/amq-drain.argv"
+  export AMQ_DRAIN_ARGV_LOG
+
+  run dux-amq-inject-bridge "AMQ: message from alice - hello. Drain with: amq drain --include-body"
+  [ "$status" -eq 0 ]
+  [ ! -s "$TMUX_LOG" ]
+  grep -Fxq -- "drain" "$AMQ_DRAIN_ARGV_LOG"
+  grep -Fxq -- "--root" "$AMQ_DRAIN_ARGV_LOG"
+  grep -Fxq -- "$AM_ROOT" "$AMQ_DRAIN_ARGV_LOG"
+  grep -Fxq -- "--me" "$AMQ_DRAIN_ARGV_LOG"
+  grep -Fxq -- "bob" "$AMQ_DRAIN_ARGV_LOG"
+
+  local files
+  mapfile -t files < <(compgen -G "$HOME/.local/share/dux-amq/inject-queue/bob/*.msg")
+  [ "${#files[@]}" -eq 1 ]
+  grep -Fq -- "[AMQ] 1 new message(s) for bob" "${files[0]}"
+  grep -Fq -- "drained-body" "${files[0]}"
+  grep -Fq -- "Act on these AMQ messages now" "${files[0]}"
+  # Unsafe Ctrl+C from the peer body was stripped before queueing.
+  ! LC_ALL=C grep -q $'\003' "${files[0]}"
+}
+
+# 13.7c — under dux: raw Ctrl+C interrupt transport signals are a no-op.
+@test "dux-amq-inject-bridge drops raw ctrl-c interrupt payload under dux" {
+  export DUX_PANE="1"
+  export AM_ME="bob"
+  run dux-amq-inject-bridge $'\003'
+  [ "$status" -eq 0 ]
+  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*/*.msg" >/dev/null
 }
 
 # 13.8 — receiver path: AM_ME determines the subdirectory.

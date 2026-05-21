@@ -38,6 +38,7 @@ ME=$(printf '%s' "$ME" | tr '[:upper:]' '[:lower:]' | sed 's|[^a-z0-9_-]|-|g; s|
 export AM_ME="$ME"
 
 ROOT="${AMQ_GLOBAL_ROOT:-/data/state/amq}"
+export AM_ROOT="$ROOT"
 
 register_amq_handle() {
   local cfg="$ROOT/meta/config.json"
