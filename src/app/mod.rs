@@ -3046,7 +3046,7 @@ impl App {
     }
 
     /// Drain mature `runtime.watch_pending_enters` entries and write a
-    /// discrete `\r` to each session's PTY. Called at the start of
+    /// discrete provider-submit key to each session's PTY. Called at the start of
     /// every `tick_watch_engines`. Entries remain pending until the
     /// same phase delay used by AMQ injection has elapsed, because
     /// next-tick delivery can still be too fast for Ink-based harnesses
@@ -3076,7 +3076,8 @@ impl App {
                 );
                 continue;
             };
-            if let Err(err) = handle.write_bytes(b"\r") {
+            let submit_key = self.submit_key_bytes_for_session(&session_id);
+            if let Err(err) = handle.write_bytes(submit_key) {
                 tracing::warn!(
                     target: "dux::watch",
                     session_id = %session_id,
