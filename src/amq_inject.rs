@@ -537,6 +537,7 @@ pub fn quarantine_expired(path: &Path) -> Result<PathBuf> {
 /// Reverse of [`claim`]: rename the in-flight back to its `.msg` form
 /// so the next scan picks it up. Used when the PTY write fails (e.g.
 /// the agent has exited between the busy-check and the write).
+#[allow(dead_code)] // Used by tests and retained for manual queue recovery tooling.
 pub fn release(inflight_path: &Path) -> Result<PathBuf> {
     let parent = inflight_path
         .parent()
