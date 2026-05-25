@@ -127,6 +127,17 @@ impl<'a> HoldReason<'a> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AmqDeliveryPhase {
+    /// No bytes for this wake have reached the provider prompt yet.
+    /// Preflight hold gates may still defer delivery safely.
+    TypeBody,
+    /// Body bytes are already in the provider prompt. The drainer must
+    /// submit Enter after the phase delay and must never re-run preflight
+    /// gates or retype the body for this wake.
+    SubmitPending { typed_at: Option<Instant> },
+}
+
 /// Sanitise a string the same way the AMQ wrappers do before deriving
 /// the agent handle. Used to match a receiver name (already sanitised
 /// by the bridge) against a session's `branch_name`.
@@ -529,6 +540,61 @@ impl App {
                 continue;
             };
 
+            let queue_empty = self
+                .runtime
+                .amq_inject_pending
+                .get(&receiver)
+                .is_none_or(|q| q.is_empty());
+            if queue_empty {
+                continue;
+            }
+            if self.expire_pending_amq_head_if_stale(&receiver) {
+                actions_this_tick += 1;
+                continue;
+            }
+
+            let phase = self.inject_delivery_phase(&receiver);
+
+            // Submit-pending is a recovery state, not a preflight state.
+            // Once Dux has typed the AMQ body into a provider prompt,
+            // the only safe forward progress is to send Enter for that
+            // same body. Retyping duplicates the prompt; applying busy,
+            // user-typing, or cooldown gates leaves Codex/Claude/Gemini
+            // with a floating, unsubmitted input field.
+            if let Some(AmqDeliveryPhase::SubmitPending { typed_at }) = phase {
+                if let Some(at) = typed_at
+                    && now.duration_since(at) < phase_delay
+                {
+                    continue;
+                }
+                if self.find_pty_handle(&session_id).is_none() {
+                    self.maybe_warn_timeout(&receiver, now, timeout);
+                    self.log_holding(&receiver, now, HoldReason::PtyGone);
+                    continue;
+                }
+                let head = self
+                    .runtime
+                    .amq_inject_pending
+                    .get(&receiver)
+                    .and_then(|q| q.front())
+                    .cloned()
+                    .expect("head exists per phase peek");
+                if self.deliver_inject_enter(&session_id, &receiver, &head) {
+                    if let Some(q) = self.runtime.amq_inject_pending.get_mut(&receiver) {
+                        q.pop_front();
+                    }
+                    actions_this_tick += 1;
+                } else {
+                    self.maybe_warn_timeout(&receiver, now, timeout);
+                    actions_this_tick += 1;
+                }
+                self.remove_empty_inject_queue(&receiver);
+                continue;
+            }
+
+            // From here down, the message is still pre-delivery: no
+            // bytes have been typed into the provider prompt, so it is
+            // still safe to hold on user activity, cooldown, or busy UI.
             // Don't interrupt the operator mid-prompt — but DO deliver
             // when interactive mode is open and the operator hasn't
             // typed in a while. The old rule "skip whenever interactive
@@ -554,32 +620,8 @@ impl App {
                     self.log_holding(&receiver, now, HoldReason::UserTyping);
                     continue;
                 }
-                // else: interactive but quiet → fall through and deliver
+                // else: interactive but quiet -> fall through and deliver
             }
-
-            let queue_empty = self
-                .runtime
-                .amq_inject_pending
-                .get(&receiver)
-                .is_none_or(|q| q.is_empty());
-            if queue_empty {
-                continue;
-            }
-            if self.expire_pending_amq_head_if_stale(&receiver) {
-                actions_this_tick += 1;
-                continue;
-            }
-
-            // Decide which phase the head is in before applying
-            // post-delivery cooldown. Cooldown is backpressure between
-            // separate wakes; it must never block phase 2 after phase 1
-            // has already typed text into the provider input box.
-            let phase_info = self
-                .runtime
-                .amq_inject_pending
-                .get(&receiver)
-                .and_then(|q| q.front())
-                .map(|head| (head.body_typed, head.body_typed_at));
 
             if let Some(until) = self
                 .runtime
@@ -587,30 +629,16 @@ impl App {
                 .get(&session_id)
                 .copied()
             {
-                if should_hold_for_post_delivery_cooldown(phase_info, Some(until), now) {
+                if should_hold_for_post_delivery_cooldown(phase, Some(until), now) {
                     self.log_holding(&receiver, now, HoldReason::PostDeliveryCooldown);
                     continue;
                 }
                 self.runtime.amq_inject_cooldown_until.remove(&session_id);
             }
 
-            // Two-phase delivery:
-            //   Phase 1 (head.body_typed = false): write the body
-            //     bytes to the PTY, mark `body_typed = true`, then
-            //     let a future tick pick this entry back up for phase 2.
-            //   Phase 2 (head.body_typed = true): write a discrete
-            //     `\r` to the PTY, unlink the inflight file, pop the
-            //     entry, and arm the post-delivery cooldown.
-            //
-            // Why split: a single PTY write of `body + \r` gets
-            // coalesced by Ink (Claude Code's TUI framework) into a
-            // paste-shaped buffer; the trailing `\r` ends up appended
-            // to the input field rather than firing as a submit
-            // keystroke. Splitting across two ticks puts a real time
-            // gap between writes (~16 ms typical), which produces two
-            // separate `read()` calls on Ink's stdin so the final
-            // `\r` arrives alone and is interpreted as Enter.
-            //
+            // Phase 1 only: write body bytes. Phase 2 is handled by
+            // the submit-pending branch above before any preflight hold
+            // gates can run.
             if actions_this_tick >= MAX_INJECT_ACTIONS_PER_TICK {
                 tracing::debug!(
                     target: "dux::amq_inject",
@@ -638,12 +666,8 @@ impl App {
                 continue;
             }
 
-            match phase_info {
-                Some((false, _)) => {
-                    // Phase 1: type the body, leave the entry at
-                    // the head of the queue with body_typed=true,
-                    // record the timestamp, and let a future tick
-                    // handle \r after the phase delay.
+            match phase {
+                Some(AmqDeliveryPhase::TypeBody) => {
                     let body = {
                         let q = self
                             .runtime
@@ -658,39 +682,41 @@ impl App {
                     self.deliver_inject_body(&session_id, &receiver, &body);
                     actions_this_tick += 1;
                 }
-                Some((true, typed_at)) => {
-                    // Phase 2: enforce the configured phase delay
-                    // before sending \r. This prevents coalescing
-                    // under heavy CPU load where ticks fire faster
-                    // than the Ink input flush cycle.
-                    if let Some(at) = typed_at {
-                        if now.duration_since(at) < phase_delay {
-                            continue;
-                        }
-                    }
-                    let head = self
-                        .runtime
-                        .amq_inject_pending
-                        .get_mut(&receiver)
-                        .and_then(|q| q.pop_front())
-                        .expect("head exists per phase peek");
-                    self.deliver_inject_enter(&session_id, &receiver, &head);
-                    actions_this_tick += 1;
+                Some(AmqDeliveryPhase::SubmitPending { .. }) => {
+                    unreachable!("submit-pending handled before pre-delivery hold gates")
                 }
                 None => {}
             }
 
-            // Tidy up empty queues so the receivers Vec next tick
-            // doesn't grow unbounded.
-            if self
-                .runtime
-                .amq_inject_pending
-                .get(&receiver)
-                .is_some_and(|q| q.is_empty())
-            {
-                self.runtime.amq_inject_pending.remove(&receiver);
-                self.runtime.amq_inject_last_warned.remove(&receiver);
-            }
+            self.remove_empty_inject_queue(&receiver);
+        }
+    }
+
+    fn inject_delivery_phase(&self, receiver: &str) -> Option<AmqDeliveryPhase> {
+        self.runtime
+            .amq_inject_pending
+            .get(receiver)
+            .and_then(|q| q.front())
+            .map(|head| {
+                if head.body_typed {
+                    AmqDeliveryPhase::SubmitPending {
+                        typed_at: head.body_typed_at,
+                    }
+                } else {
+                    AmqDeliveryPhase::TypeBody
+                }
+            })
+    }
+
+    fn remove_empty_inject_queue(&mut self, receiver: &str) {
+        if self
+            .runtime
+            .amq_inject_pending
+            .get(receiver)
+            .is_some_and(|q| q.is_empty())
+        {
+            self.runtime.amq_inject_pending.remove(receiver);
+            self.runtime.amq_inject_last_warned.remove(receiver);
         }
     }
 
@@ -832,7 +858,12 @@ impl App {
     /// in the status line. The split-write pattern is what makes
     /// Ink's stdin reader see the `\r` as a separate keystroke
     /// rather than coalescing it into the body's paste buffer.
-    fn deliver_inject_enter(&mut self, session_id: &str, receiver: &str, msg: &QueuedMessage) {
+    fn deliver_inject_enter(
+        &mut self,
+        session_id: &str,
+        receiver: &str,
+        msg: &QueuedMessage,
+    ) -> bool {
         let write_result = self
             .find_pty_handle(session_id)
             .map(|handle| handle.write_bytes(b"\r"));
@@ -878,28 +909,36 @@ impl App {
                         .amq_inject_cooldown_until
                         .insert(session_id.to_string(), Instant::now() + cooldown);
                 }
+                true
             }
             Some(Err(err)) => {
                 // PTY write of \r failed. The body is already in the
-                // input field; release the file so the next tick
-                // re-attempts phase 1 (typing the body again would
-                // duplicate, but at least Enter eventually fires).
-                // Better than leaving the body floating without
-                // submission. The single-instance lock + claim
-                // semantics still ensure no duplicate file delivery.
-                let _ = amq_inject::release(&msg.inflight_path);
+                // input field, so keep this wake in SubmitPending and
+                // retry Enter only. Releasing the inflight file here
+                // would let a later scan retype the body and duplicate
+                // the provider prompt.
                 tracing::warn!(
                     target: "dux::amq_inject",
                     session_id = %session_id,
                     receiver = %receiver,
                     path = %msg.inflight_path.display(),
                     err = %err,
-                    "phase-2 PTY write (Enter) failed; released for retry",
+                    "phase-2 PTY write (Enter) failed; will retry Enter without retyping body",
                 );
+                self.set_warning(format!(
+                    "AMQ inject: Enter submit failed for {receiver}; will retry without retyping."
+                ));
+                false
             }
             None => {
-                // No PTY anymore. Same recovery path as write error.
-                let _ = amq_inject::release(&msg.inflight_path);
+                tracing::warn!(
+                    target: "dux::amq_inject",
+                    session_id = %session_id,
+                    receiver = %receiver,
+                    path = %msg.inflight_path.display(),
+                    "phase-2 PTY write skipped: PTY no longer attached; will retry Enter when it returns",
+                );
+                false
             }
         }
     }
@@ -1143,14 +1182,11 @@ fn should_hold_for_quiet_window(
 /// been typed into the provider input field, otherwise the visible
 /// prompt can sit unsubmitted until the cooldown expires.
 fn should_hold_for_post_delivery_cooldown(
-    phase_info: Option<(bool, Option<Instant>)>,
+    phase: Option<AmqDeliveryPhase>,
     cooldown_until: Option<Instant>,
     now: Instant,
 ) -> bool {
-    let Some((body_typed, _)) = phase_info else {
-        return false;
-    };
-    if body_typed {
+    if !matches!(phase, Some(AmqDeliveryPhase::TypeBody)) {
         return false;
     }
     cooldown_until.is_some_and(|until| now < until)
@@ -1159,8 +1195,8 @@ fn should_hold_for_post_delivery_cooldown(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_inject_postscript, effective_enter_phase_delay, match_receiver, sanitise_handle,
-        should_hold_for_post_delivery_cooldown, should_hold_for_quiet_window,
+        AmqDeliveryPhase, apply_inject_postscript, effective_enter_phase_delay, match_receiver,
+        sanitise_handle, should_hold_for_post_delivery_cooldown, should_hold_for_quiet_window,
     };
     use crate::model::ContextMode;
     use std::time::{Duration, Instant};
@@ -1424,12 +1460,14 @@ mod tests {
         let now = Instant::now();
         let future = now + Duration::from_secs(10);
         assert!(should_hold_for_post_delivery_cooldown(
-            Some((false, None)),
+            Some(AmqDeliveryPhase::TypeBody),
             Some(future),
             now
         ));
         assert!(!should_hold_for_post_delivery_cooldown(
-            Some((true, Some(now))),
+            Some(AmqDeliveryPhase::SubmitPending {
+                typed_at: Some(now)
+            }),
             Some(future),
             now
         ));
@@ -1440,7 +1478,7 @@ mod tests {
         let now = Instant::now();
         let past = now - Duration::from_secs(1);
         assert!(!should_hold_for_post_delivery_cooldown(
-            Some((false, None)),
+            Some(AmqDeliveryPhase::TypeBody),
             Some(past),
             now
         ));
@@ -1450,7 +1488,7 @@ mod tests {
             now
         ));
         assert!(!should_hold_for_post_delivery_cooldown(
-            Some((false, None)),
+            Some(AmqDeliveryPhase::TypeBody),
             None,
             now
         ));
