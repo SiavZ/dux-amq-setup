@@ -557,13 +557,37 @@ impl App {
                 // else: interactive but quiet → fall through and deliver
             }
 
+            let queue_empty = self
+                .runtime
+                .amq_inject_pending
+                .get(&receiver)
+                .is_none_or(|q| q.is_empty());
+            if queue_empty {
+                continue;
+            }
+            if self.expire_pending_amq_head_if_stale(&receiver) {
+                actions_this_tick += 1;
+                continue;
+            }
+
+            // Decide which phase the head is in before applying
+            // post-delivery cooldown. Cooldown is backpressure between
+            // separate wakes; it must never block phase 2 after phase 1
+            // has already typed text into the provider input box.
+            let phase_info = self
+                .runtime
+                .amq_inject_pending
+                .get(&receiver)
+                .and_then(|q| q.front())
+                .map(|head| (head.body_typed, head.body_typed_at));
+
             if let Some(until) = self
                 .runtime
                 .amq_inject_cooldown_until
                 .get(&session_id)
                 .copied()
             {
-                if now < until {
+                if should_hold_for_post_delivery_cooldown(phase_info, Some(until), now) {
                     self.log_holding(&receiver, now, HoldReason::PostDeliveryCooldown);
                     continue;
                 }
@@ -597,19 +621,6 @@ impl App {
                 break 'receivers;
             }
 
-            let queue_empty = self
-                .runtime
-                .amq_inject_pending
-                .get(&receiver)
-                .is_none_or(|q| q.is_empty());
-            if queue_empty {
-                continue;
-            }
-            if self.expire_pending_amq_head_if_stale(&receiver) {
-                actions_this_tick += 1;
-                continue;
-            }
-
             let snapshot = match self.find_pty_handle(&session_id) {
                 Some(handle) => handle.scan_recent_lines(busy_scan_lines),
                 None => {
@@ -626,15 +637,6 @@ impl App {
                 self.log_holding(&receiver, now, HoldReason::BusyMarker(matched));
                 continue;
             }
-
-            // Decide which phase the head is in. Read-only borrow
-            // released before we mutate.
-            let phase_info = self
-                .runtime
-                .amq_inject_pending
-                .get(&receiver)
-                .and_then(|q| q.front())
-                .map(|head| (head.body_typed, head.body_typed_at));
 
             match phase_info {
                 Some((false, _)) => {
@@ -793,13 +795,6 @@ impl App {
                     session_id.to_string(),
                     Instant::now() + WATCH_SUPPRESS_AFTER_INJECT,
                 );
-                let cooldown =
-                    Duration::from_millis(self.config.amq.inject.post_delivery_cooldown_ms);
-                if !cooldown.is_zero() {
-                    self.runtime
-                        .amq_inject_cooldown_until
-                        .insert(session_id.to_string(), Instant::now() + cooldown);
-                }
             }
             Some(Err(err)) => {
                 // PTY write failed; mark this entry not-yet-typed so
@@ -876,6 +871,13 @@ impl App {
                     session_id.to_string(),
                     Instant::now() + WATCH_SUPPRESS_AFTER_INJECT,
                 );
+                let cooldown =
+                    Duration::from_millis(self.config.amq.inject.post_delivery_cooldown_ms);
+                if !cooldown.is_zero() {
+                    self.runtime
+                        .amq_inject_cooldown_until
+                        .insert(session_id.to_string(), Instant::now() + cooldown);
+                }
             }
             Some(Err(err)) => {
                 // PTY write of \r failed. The body is already in the
@@ -1136,11 +1138,29 @@ fn should_hold_for_quiet_window(
     last_keystroke.is_some_and(|t| now.duration_since(t) < quiet)
 }
 
+/// Post-delivery cooldown is backpressure between separate AMQ wakes.
+/// It must not delay phase 2 after the current wake body has already
+/// been typed into the provider input field, otherwise the visible
+/// prompt can sit unsubmitted until the cooldown expires.
+fn should_hold_for_post_delivery_cooldown(
+    phase_info: Option<(bool, Option<Instant>)>,
+    cooldown_until: Option<Instant>,
+    now: Instant,
+) -> bool {
+    let Some((body_typed, _)) = phase_info else {
+        return false;
+    };
+    if body_typed {
+        return false;
+    }
+    cooldown_until.is_some_and(|until| now < until)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         apply_inject_postscript, effective_enter_phase_delay, match_receiver, sanitise_handle,
-        should_hold_for_quiet_window,
+        should_hold_for_post_delivery_cooldown, should_hold_for_quiet_window,
     };
     use crate::model::ContextMode;
     use std::time::{Duration, Instant};
@@ -1397,5 +1417,42 @@ mod tests {
         assert_eq!(effective_enter_phase_delay(50), Duration::from_millis(250));
         assert_eq!(effective_enter_phase_delay(500), Duration::from_millis(500));
         assert_eq!(effective_enter_phase_delay(0), Duration::ZERO);
+    }
+
+    #[test]
+    fn post_delivery_cooldown_holds_only_before_body_is_typed() {
+        let now = Instant::now();
+        let future = now + Duration::from_secs(10);
+        assert!(should_hold_for_post_delivery_cooldown(
+            Some((false, None)),
+            Some(future),
+            now
+        ));
+        assert!(!should_hold_for_post_delivery_cooldown(
+            Some((true, Some(now))),
+            Some(future),
+            now
+        ));
+    }
+
+    #[test]
+    fn post_delivery_cooldown_releases_when_elapsed_or_empty() {
+        let now = Instant::now();
+        let past = now - Duration::from_secs(1);
+        assert!(!should_hold_for_post_delivery_cooldown(
+            Some((false, None)),
+            Some(past),
+            now
+        ));
+        assert!(!should_hold_for_post_delivery_cooldown(
+            None,
+            Some(now),
+            now
+        ));
+        assert!(!should_hold_for_post_delivery_cooldown(
+            Some((false, None)),
+            None,
+            now
+        ));
     }
 }
