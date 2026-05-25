@@ -17,7 +17,8 @@
 //! 3. [`App::tick_amq_inject`] — called once per main-loop tick. For
 //!    each receiver with pending messages, looks up the matching
 //!    session, checks busy/active state, and either writes the body
-//!    to the PTY (followed by `\r` to submit) or leaves it queued.
+//!    to the PTY (followed by a provider-appropriate submit key) or
+//!    leaves it queued.
 //!
 //! The receiver→session mapping uses the same sanitisation the AMQ
 //! wrappers apply (lowercase, `[a-z0-9_-]`), so a session whose
@@ -29,6 +30,7 @@ use super::*;
 use std::time::Duration;
 
 use crate::amq_inject::{self, QueuedMessage, UNROUTED_RECEIVER};
+use crate::model::ProviderKind;
 
 /// How long between repeat warnings about the same un-deliverable
 /// receiver. Stops a queue full of messages for an unknown handle
@@ -61,6 +63,14 @@ const MAX_INJECT_PENDING_PER_RECEIVER: usize = 32;
 /// Bound PTY writes per UI tick. Delivery remains fast, but AMQ injection can
 /// no longer monopolise the event loop when many receivers have backlogs.
 const MAX_INJECT_ACTIONS_PER_TICK: usize = 16;
+
+/// Kitty keyboard protocol encoding for an unmodified Enter key. Modern
+/// Codex enables enhanced keyboard reporting and can distinguish this from a
+/// raw carriage return (`Ctrl-M`), which its keymap may treat as newline.
+const CODEX_ENHANCED_ENTER: &[u8] = b"\x1b[13;1u";
+
+/// Traditional PTY Enter used by Claude, Gemini, and other harnesses.
+const RAW_ENTER: &[u8] = b"\r";
 
 /// How long after AMQ delivery the watch engine should skip observing
 /// the target session. Prevents the `[task-done]` sentinel in the
@@ -201,6 +211,16 @@ where
 }
 
 impl App {
+    pub(crate) fn submit_key_bytes_for_session(&self, session_id: &str) -> &'static [u8] {
+        let provider = self
+            .git
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .map(|s| self.running_provider_for(s));
+        submit_key_bytes_for_provider(provider.as_ref())
+    }
+
     /// Bootstrap the AMQ inject-queue watcher. Called once during
     /// `App::run`. Failures are logged but never fatal — dux must
     /// still come up if the home directory is unwritable or notify
@@ -853,20 +873,21 @@ impl App {
         }
     }
 
-    /// Phase 2 of two-phase delivery: write a discrete `\r` to the
-    /// session's PTY, unlink the inflight file, and surface success
-    /// in the status line. The split-write pattern is what makes
-    /// Ink's stdin reader see the `\r` as a separate keystroke
-    /// rather than coalescing it into the body's paste buffer.
+    /// Phase 2 of two-phase delivery: write a discrete provider-submit
+    /// key to the session's PTY, unlink the inflight file, and surface
+    /// success in the status line. The split-write pattern is what makes
+    /// provider stdin readers see submit as a separate keystroke rather
+    /// than coalescing it into the body's paste buffer.
     fn deliver_inject_enter(
         &mut self,
         session_id: &str,
         receiver: &str,
         msg: &QueuedMessage,
     ) -> bool {
+        let submit_key = self.submit_key_bytes_for_session(session_id);
         let write_result = self
             .find_pty_handle(session_id)
-            .map(|handle| handle.write_bytes(b"\r"));
+            .map(|handle| handle.write_bytes(submit_key));
         match write_result {
             Some(Ok(())) => {
                 if let Err(err) = std::fs::remove_file(&msg.inflight_path) {
@@ -1154,6 +1175,16 @@ pub(crate) fn apply_inject_postscript(body: &str, mode: crate::model::ContextMod
     }
 }
 
+/// Return the PTY bytes that submit a prompt for a provider. Codex needs the
+/// enhanced-keyboard Enter sequence; raw carriage return is `Ctrl-M` to its
+/// keymap and can be interpreted as newline instead of submit.
+pub(crate) fn submit_key_bytes_for_provider(provider: Option<&ProviderKind>) -> &'static [u8] {
+    match provider.map(ProviderKind::as_str) {
+        Some(name) if name.eq_ignore_ascii_case("codex") => CODEX_ENHANCED_ENTER,
+        _ => RAW_ENTER,
+    }
+}
+
 /// Decide whether the AMQ drainer should hold a message that targets the
 /// currently-focused interactive session.
 ///
@@ -1197,9 +1228,28 @@ mod tests {
     use super::{
         AmqDeliveryPhase, apply_inject_postscript, effective_enter_phase_delay, match_receiver,
         sanitise_handle, should_hold_for_post_delivery_cooldown, should_hold_for_quiet_window,
+        submit_key_bytes_for_provider,
     };
-    use crate::model::ContextMode;
+    use crate::model::{ContextMode, ProviderKind};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn codex_submit_uses_enhanced_keyboard_enter() {
+        let provider = ProviderKind::from_str("codex");
+        assert_eq!(
+            submit_key_bytes_for_provider(Some(&provider)),
+            b"\x1b[13;1u"
+        );
+    }
+
+    #[test]
+    fn non_codex_submit_uses_raw_enter() {
+        for name in ["claude", "gemini", "custom"] {
+            let provider = ProviderKind::from_str(name);
+            assert_eq!(submit_key_bytes_for_provider(Some(&provider)), b"\r");
+        }
+        assert_eq!(submit_key_bytes_for_provider(None), b"\r");
+    }
 
     #[test]
     fn sanitise_lowercases_uppercase_letters() {
