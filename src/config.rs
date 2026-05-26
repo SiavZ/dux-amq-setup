@@ -515,12 +515,12 @@ pub struct AmqInjectConfig {
     /// prompt.
     #[serde(default = "default_amq_inject_active_session_quiet_secs")]
     pub active_session_quiet_secs: u64,
-    /// Minimum delay in milliseconds between phase 1 (type body) and
-    /// phase 2 (send Enter) of AMQ inject delivery. The two-phase
-    /// split exists because Claude Code's Ink TUI coalesces a single
-    /// PTY write of body+CR into a paste buffer, making the trailing
-    /// CR part of the text rather than a submit keystroke. Splitting
-    /// across time gives Ink two separate `read()` calls.
+    /// Minimum delay in milliseconds between phase 1 (place body) and
+    /// phase 2 (send Enter) of AMQ inject delivery. Non-Codex
+    /// harnesses use the time split to keep a typed body and trailing
+    /// Enter from coalescing into one paste-like stdin read. Codex
+    /// bodies are sent as explicit bracketed paste, but still share
+    /// this delay before the submit key.
     ///
     /// The default (250 ms) is long enough for Ink-based harnesses to
     /// drain the typed body before Enter arrives. Runtime delivery uses
@@ -1493,10 +1493,11 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
         ConfigEntry::Field {
             key: "phase_delay_ms",
             comment: Some(CommentSource::Static(
-                "# Minimum delay in milliseconds between phase 1 (type body) and\n\
+                "# Minimum delay in milliseconds between phase 1 (place body) and\n\
                  # phase 2 (send Enter) of AMQ inject delivery and watch-rule\n\
-                 # SendText actions. Splitting the write across time prevents\n\
-                 # Ink-based harnesses from coalescing body+CR into a paste buffer.\n\
+                 # SendText actions. Non-Codex harnesses use the time split to\n\
+                 # avoid coalescing body+CR into a paste buffer; Codex bodies are\n\
+                 # sent as explicit bracketed paste before this submit delay.\n\
                  # Default 250. Non-zero values below 250 are raised to 250 at\n\
                  # runtime; set 0 only as a debugging escape hatch for old next-tick\n\
                  # behaviour.",

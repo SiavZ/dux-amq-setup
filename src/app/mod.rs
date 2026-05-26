@@ -2938,13 +2938,10 @@ impl App {
     /// arrive in the middle of the user's prompt.
     pub(crate) fn tick_watch_engines(&mut self) {
         // Phase 2 of two-phase SendText delivery: flush any deferred
-        // Enter keystrokes from the previous tick. This split — body
-        // bytes in tick N, `\r` in tick N+1 — defeats Ink's
-        // paste-coalesce that would otherwise treat the trailing CR
-        // as part of the body buffer instead of a submit keystroke.
-        // See `apply_watch_effect` for the matching write side, and
-        // `crate::app::inject_runtime` for the AMQ drainer that
-        // pioneered this fix.
+        // submit keys from the previous tick. Codex receives phase-1
+        // text as explicit bracketed paste; other harnesses rely on
+        // the time split to keep the submit key separate from the body.
+        // See `apply_watch_effect` for the matching write side.
         self.flush_pending_watch_enters();
 
         if self.runtime.watch_engines.is_empty() {
@@ -3180,25 +3177,12 @@ impl App {
         match effect {
             crate::watch::WatchEffect::SendText { text, append_enter } => {
                 // Phase 1 of two-phase delivery: write body bytes only
-                // and DEFER the trailing CR to the next tick. Embedded
-                // newlines still become Alt-Enter so multi-line text
-                // doesn't submit early. The discrete `\r` lands on the
-                // next `tick_watch_engines` call via
-                // `flush_pending_watch_enters`, after Ink has had a
-                // chance to consume the body chunk on its stdin.
-                //
-                // Why split: a single PTY write of `body + \r` arrives
-                // on Ink's stdin reader as one chunk; Ink coalesces it
-                // into a paste-shaped buffer and treats the trailing
-                // `\r` as multi-line continuation instead of a submit
-                // keystroke, leaving the body sitting in the input
-                // field. Splitting across two ticks puts a real time
-                // gap between writes (~16 ms typical), producing two
-                // separate `read()` calls on Ink's stdin so the final
-                // `\r` arrives alone and is interpreted as Enter.
-                // Same fix the AMQ drainer uses — see
-                // `crate::app::inject_runtime::deliver_inject_enter`.
-                let payload = crate::app::input::macro_payload_bytes(&text);
+                // and DEFER the trailing submit key to a later tick. Codex
+                // receives an explicit bracketed paste body; other harnesses
+                // receive the same macro payload encoding used by manual
+                // macros. The discrete submit key lands via
+                // `flush_pending_watch_enters`, matching the AMQ drainer.
+                let payload = self.inject_body_bytes_for_session(session_id, &text);
                 let Some(handle) = self.find_pty_handle(session_id) else {
                     return;
                 };

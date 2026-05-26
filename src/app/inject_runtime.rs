@@ -64,12 +64,15 @@ const MAX_INJECT_PENDING_PER_RECEIVER: usize = 32;
 /// no longer monopolise the event loop when many receivers have backlogs.
 const MAX_INJECT_ACTIONS_PER_TICK: usize = 16;
 
-/// Kitty keyboard protocol encoding for an unmodified Enter key. Modern
-/// Codex enables enhanced keyboard reporting and can distinguish this from a
-/// raw carriage return (`Ctrl-M`), which its keymap may treat as newline.
-const CODEX_ENHANCED_ENTER: &[u8] = b"\x1b[13;1u";
+/// Bracketed paste markers used by Codex's crossterm TUI. Sending AMQ bodies
+/// as explicit paste events bypasses Codex's rapid-typing paste-burst
+/// heuristic, where a following Enter is intentionally treated as a pasted
+/// newline instead of a submit key.
+const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
-/// Traditional PTY Enter used by Claude, Gemini, and other harnesses.
+/// Traditional PTY Enter. This is also what a real Enter key reaches Codex as
+/// through dux's raw interactive forwarding path.
 const RAW_ENTER: &[u8] = b"\r";
 
 /// How long after AMQ delivery the watch engine should skip observing
@@ -84,10 +87,12 @@ const WATCH_SUPPRESS_AFTER_INJECT: Duration = Duration::from_secs(10);
 
 /// Minimum non-zero gap between body bytes and the Enter keystroke.
 ///
-/// Values below this have repeatedly proven too small for Ink-based
+/// Values below this have repeatedly proven too small for typed-body
 /// harnesses under load: the body and CR can still be read as a single
-/// paste-shaped buffer, leaving the text in the input field. `0` remains
-/// an explicit debugging escape hatch for the old next-tick behavior.
+/// paste-shaped buffer, leaving the text in the input field. Codex now
+/// receives an explicit bracketed-paste body but still uses the same
+/// submit delay. `0` remains an explicit debugging escape hatch for the
+/// old next-tick behavior.
 pub(crate) const MIN_ENTER_PHASE_DELAY_MS: u64 = 250;
 
 pub(crate) fn effective_enter_phase_delay(configured_ms: u64) -> Duration {
@@ -219,6 +224,16 @@ impl App {
             .find(|s| s.id == session_id)
             .map(|s| self.running_provider_for(s));
         submit_key_bytes_for_provider(provider.as_ref())
+    }
+
+    pub(crate) fn inject_body_bytes_for_session(&self, session_id: &str, body: &str) -> Vec<u8> {
+        let provider = self
+            .git
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .map(|s| self.running_provider_for(s));
+        inject_body_bytes_for_provider(body, provider.as_ref())
     }
 
     /// Bootstrap the AMQ inject-queue watcher. Called once during
@@ -782,11 +797,11 @@ impl App {
         match_receiver(triples.iter().copied(), receiver).map(|s| s.to_string())
     }
 
-    /// Phase 1 of two-phase delivery: type the body into the
-    /// session's PTY without the trailing `\r`. Reuses
-    /// `crate::app::input::macro_payload_bytes` so embedded newlines
-    /// become Alt-Enter (a newline within the prompt) rather than
-    /// premature submits — the same chokepoint watch effects use.
+    /// Phase 1 of two-phase delivery: place the body into the session's PTY
+    /// without the trailing submit key. Codex receives an explicit bracketed
+    /// paste event so its paste-burst heuristic does not capture the later
+    /// Enter as a newline. Other harnesses keep the existing macro payload
+    /// encoding where embedded newlines become Alt-Enter.
     /// The inflight file stays on disk; phase 2 unlinks it.
     ///
     /// audit03 Phase 5: when the receiving session is in
@@ -818,7 +833,7 @@ impl App {
             );
         }
 
-        let payload = crate::app::input::macro_payload_bytes(&body_with_postscript);
+        let payload = self.inject_body_bytes_for_session(session_id, &body_with_postscript);
         let write_result = self
             .find_pty_handle(session_id)
             .map(|handle| handle.write_bytes(&payload));
@@ -1175,14 +1190,59 @@ pub(crate) fn apply_inject_postscript(body: &str, mode: crate::model::ContextMod
     }
 }
 
-/// Return the PTY bytes that submit a prompt for a provider. Codex needs the
-/// enhanced-keyboard Enter sequence; raw carriage return is `Ctrl-M` to its
-/// keymap and can be interpreted as newline instead of submit.
-pub(crate) fn submit_key_bytes_for_provider(provider: Option<&ProviderKind>) -> &'static [u8] {
+/// Return the PTY bytes that place prompt text into a provider input field.
+///
+/// Codex handles explicit bracketed paste as `Event::Paste`, which directly
+/// inserts the full text and clears paste-burst state. Raw rapid typing can
+/// trigger Codex's paste-burst protection; if Enter follows that burst, Codex
+/// correctly treats it as a pasted newline instead of submit.
+pub(crate) fn inject_body_bytes_for_provider(
+    body: &str,
+    provider: Option<&ProviderKind>,
+) -> Vec<u8> {
     match provider.map(ProviderKind::as_str) {
-        Some(name) if name.eq_ignore_ascii_case("codex") => CODEX_ENHANCED_ENTER,
-        _ => RAW_ENTER,
+        Some(name) if name.eq_ignore_ascii_case("codex") => bracketed_paste_payload_bytes(body),
+        _ => crate::app::input::macro_payload_bytes(body),
     }
+}
+
+fn bracketed_paste_payload_bytes(body: &str) -> Vec<u8> {
+    let sanitized = sanitize_bracketed_paste_text(body);
+    let mut payload = Vec::with_capacity(
+        BRACKETED_PASTE_START.len() + sanitized.len() + BRACKETED_PASTE_END.len(),
+    );
+    payload.extend_from_slice(BRACKETED_PASTE_START);
+    payload.extend_from_slice(sanitized.as_bytes());
+    payload.extend_from_slice(BRACKETED_PASTE_END);
+    payload
+}
+
+fn sanitize_bracketed_paste_text(body: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\n');
+            }
+            '\n' | '\t' => out.push(ch),
+            ch if ch.is_control() || ch == '\u{7f}' || ch == '\u{9b}' => {
+                let _ = write!(out, "\\x{:02x}", ch as u32);
+            }
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Return the PTY bytes that submit a prompt for a provider.
+pub(crate) fn submit_key_bytes_for_provider(_provider: Option<&ProviderKind>) -> &'static [u8] {
+    RAW_ENTER
 }
 
 /// Decide whether the AMQ drainer should hold a message that targets the
@@ -1226,20 +1286,57 @@ fn should_hold_for_post_delivery_cooldown(
 #[cfg(test)]
 mod tests {
     use super::{
-        AmqDeliveryPhase, apply_inject_postscript, effective_enter_phase_delay, match_receiver,
-        sanitise_handle, should_hold_for_post_delivery_cooldown, should_hold_for_quiet_window,
+        AmqDeliveryPhase, apply_inject_postscript, effective_enter_phase_delay,
+        inject_body_bytes_for_provider, match_receiver, sanitise_handle,
+        should_hold_for_post_delivery_cooldown, should_hold_for_quiet_window,
         submit_key_bytes_for_provider,
     };
     use crate::model::{ContextMode, ProviderKind};
     use std::time::{Duration, Instant};
 
     #[test]
-    fn codex_submit_uses_enhanced_keyboard_enter() {
+    fn codex_body_uses_bracketed_paste() {
         let provider = ProviderKind::from_str("codex");
         assert_eq!(
-            submit_key_bytes_for_provider(Some(&provider)),
-            b"\x1b[13;1u"
+            inject_body_bytes_for_provider("a\nb", Some(&provider)),
+            b"\x1b[200~a\nb\x1b[201~"
         );
+    }
+
+    #[test]
+    fn codex_body_normalizes_crlf_inside_bracketed_paste() {
+        let provider = ProviderKind::from_str("codex");
+        assert_eq!(
+            inject_body_bytes_for_provider("a\r\nb\rc", Some(&provider)),
+            b"\x1b[200~a\nb\nc\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn codex_body_escapes_control_chars_inside_bracketed_paste() {
+        let provider = ProviderKind::from_str("codex");
+        assert_eq!(
+            inject_body_bytes_for_provider("a\x1b[201~b", Some(&provider)),
+            b"\x1b[200~a\\x1b[201~b\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn non_codex_body_uses_macro_payload_newline_encoding() {
+        for name in ["claude", "gemini", "custom"] {
+            let provider = ProviderKind::from_str(name);
+            assert_eq!(
+                inject_body_bytes_for_provider("a\nb", Some(&provider)),
+                b"a\x1b\rb"
+            );
+        }
+        assert_eq!(inject_body_bytes_for_provider("a\nb", None), b"a\x1b\rb");
+    }
+
+    #[test]
+    fn codex_submit_uses_raw_enter() {
+        let provider = ProviderKind::from_str("codex");
+        assert_eq!(submit_key_bytes_for_provider(Some(&provider)), b"\r");
     }
 
     #[test]
