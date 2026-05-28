@@ -380,8 +380,9 @@ fn to_pty_env_emits_system_prompt_only_when_set_and_non_blank() {
 
 /// audit03 Phase 01 §15: `DUX_SYSTEM_PROMPT` is emitted regardless of
 /// provider — the wrappers (`claude-amq`, `codex-amq`, `gemini-amq`)
-/// decide whether to translate it into a CLI flag or warn-and-drop. dux
-/// must not pre-filter by provider; that decision lives in the wrapper.
+/// decide whether to translate it into a CLI flag, launch prompt, or
+/// warn-and-drop. dux must not pre-filter by provider; that decision
+/// lives in the wrapper.
 #[test]
 fn to_pty_env_emits_system_prompt_for_every_provider() {
     use dux::model::{ProviderKind, SessionSettings};
@@ -401,6 +402,41 @@ fn to_pty_env_emits_system_prompt_for_every_provider() {
             env.vars
         );
     }
+}
+
+#[test]
+fn to_pty_env_adds_builtin_orchestrator_policy() {
+    use dux::model::{ContextMode, ORCHESTRATOR_SYSTEM_PROMPT, ProviderKind, SessionSettings};
+
+    let provider = ProviderKind::new("codex");
+    let settings = SessionSettings {
+        mode: ContextMode::Orchestrator,
+        ..SessionSettings::default()
+    };
+    let env = settings.to_pty_env(&provider, false);
+    assert!(
+        env.vars.iter().any(|(k, v)| {
+            k == "DUX_SYSTEM_PROMPT"
+                && v.contains("Dux Orchestrator mode")
+                && v.contains("Orchestrate only")
+        }),
+        "orchestrator mode must export the built-in policy; got {:?}",
+        env.vars
+    );
+
+    let custom = SessionSettings {
+        mode: ContextMode::Orchestrator,
+        system_prompt: Some("Project-specific orchestration rule.".to_string()),
+        ..SessionSettings::default()
+    };
+    let env = custom.to_pty_env(&provider, false);
+    let prompt = env
+        .vars
+        .iter()
+        .find_map(|(k, v)| (k == "DUX_SYSTEM_PROMPT").then_some(v))
+        .expect("orchestrator prompt present");
+    assert!(prompt.starts_with(ORCHESTRATOR_SYSTEM_PROMPT));
+    assert!(prompt.contains("Project-specific orchestration rule."));
 }
 
 /// Verify PTY resize doesn't panic.

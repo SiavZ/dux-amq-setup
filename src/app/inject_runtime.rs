@@ -1257,7 +1257,7 @@ pub(crate) fn submit_key_bytes_for_provider(_provider: Option<&ProviderKind>) ->
 /// - Otherwise, hold iff the last recorded user keystroke is within the
 ///   quiet window. With no recorded keystroke, the operator is treated as
 ///   idle and the message flows.
-fn should_hold_for_quiet_window(
+pub(crate) fn should_hold_for_quiet_window(
     last_keystroke: Option<Instant>,
     now: Instant,
     quiet: Duration,
