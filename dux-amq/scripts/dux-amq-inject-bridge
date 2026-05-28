@@ -181,6 +181,17 @@ if [[ -n "${DUX_PANE:-}" ]]; then
   under_dux=1
 fi
 
+# Dux-spawned panes export DUX_PID. `amq wake` is intentionally started
+# with setsid/disown, so it can outlive the provider process and the Dux
+# UI. If this bridge is later invoked by one of those stale daemons, do
+# not drain AMQ or queue a file for a dead Dux instance; the next live
+# Dux run will spawn a fresh wake daemon and handle new notifications.
+if (( under_dux == 1 )) && [[ -n "${DUX_PID:-}" ]]; then
+  if ! [[ "$DUX_PID" =~ ^[0-9]+$ ]] || ! kill -0 "$DUX_PID" 2>/dev/null; then
+    exit 0
+  fi
+fi
+
 # Under dux, do not make the model execute a second command just to read
 # the message. Convert the wake notification into the actual AMQ drain
 # output, then queue that output for the dux-side drainer to submit to

@@ -633,7 +633,7 @@ impl Default for AmqInjectConfig {
 /// Orchestrator mode is persistent by design, so the worker auto-clear
 /// machinery does not apply. This watchdog is the complementary behavior:
 /// periodically wake Orchestrator sessions with a checkpoint prompt so they
-/// actively poll worker agents instead of waiting forever.
+/// actively poll same-project worker agents instead of waiting forever.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AmqOrchestratorConfig {
@@ -641,8 +641,8 @@ pub struct AmqOrchestratorConfig {
     /// Default true.
     #[serde(default = "default_amq_orchestrator_enabled")]
     pub enabled: bool,
-    /// Seconds between checkpoint nudges sent to each live Orchestrator
-    /// session while at least one other live agent exists. Set to 0 to disable
+    /// Seconds between checkpoint nudges sent to a live Orchestrator project
+    /// while at least one same-project worker exists. Set to 0 to disable
     /// periodic nudges without disabling the built-in Orchestrator prompt.
     /// Default 900 (15 minutes).
     #[serde(default = "default_amq_orchestrator_poll_interval_secs")]
@@ -1580,10 +1580,10 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
              #\n\
              # Sessions marked `mode = orchestrator` receive a built-in role\n\
              # policy at launch. The watchdog below is the timer side of that\n\
-             # policy: while other live agents exist, dux periodically wakes each\n\
-             # live orchestrator with a checkpoint prompt to poll workers through\n\
-             # AMQ, ask for blockers, and push stalled work forward. Delivery uses\n\
-             # the same idle/busy safeguards as AMQ inject.",
+             # policy: while same-project workers exist, dux periodically wakes\n\
+             # one live orchestrator per project with a checkpoint prompt to poll\n\
+             # workers through AMQ, ask for blockers, and push stalled work\n\
+             # forward. Delivery uses the same idle/busy safeguards as AMQ inject.",
         ),
         ConfigEntry::Section("amq.orchestrator"),
         ConfigEntry::Field {
@@ -1599,7 +1599,7 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             key: "poll_interval_secs",
             comment: Some(CommentSource::Static(
                 "# Seconds between checkpoint nudges sent to each live\n\
-                 # Orchestrator while at least one other live agent exists.\n\
+                 # Orchestrator project while at least one same-project worker exists.\n\
                  # Set 0 to disable periodic nudges but keep the launch-time\n\
                  # Orchestrator policy prompt. Default 900 (15 minutes).",
             )),

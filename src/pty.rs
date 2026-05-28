@@ -1170,10 +1170,11 @@ fn apply_terminal_env_from_parent(
     // the bridge skips its tmux send-keys path and instead writes to the
     // file queue under `~/.local/share/dux-amq/inject-queue/<receiver>/`,
     // which the dux-side drainer (see `crate::amq_inject`) consumes only
-    // when the agent is idle. This avoids the "stuck in input field"
-    // failure mode where Claude Code's Ink input drops a trailing Enter
-    // received during streaming.
+    // when the agent is idle. `DUX_PID` lets long-lived `amq wake`
+    // daemons inherited from this pane drop notifications after this
+    // Dux instance exits instead of refilling the queue for a dead UI.
     cmd.env("DUX_PANE", "1");
+    cmd.env("DUX_PID", std::process::id().to_string());
 }
 
 fn resolve_term_from_parent(parent_term: Option<&OsStr>) -> String {
@@ -1462,6 +1463,12 @@ mod tests {
             cmd.get_env("DUX_PANE").and_then(|value| value.to_str()),
             Some("1"),
             "PTY children must have DUX_PANE exported for the inject-bridge to detect dux"
+        );
+        let expected_pid = std::process::id().to_string();
+        assert_eq!(
+            cmd.get_env("DUX_PID").and_then(|value| value.to_str()),
+            Some(expected_pid.as_str()),
+            "PTY children must have DUX_PID exported so stale wake daemons stop queueing"
         );
     }
 
