@@ -6049,6 +6049,7 @@ mod tests {
             pr_checks_in_flight: Arc::new(AtomicUsize::new(0)),
             watch_suppress_until: std::collections::HashMap::new(),
             orchestrator_last_nudged: std::collections::HashMap::new(),
+            orchestrator_policy_injected: std::collections::HashSet::new(),
         };
         let git = crate::app::GitState {
             projects: vec![project],
