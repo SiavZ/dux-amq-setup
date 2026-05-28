@@ -31,10 +31,11 @@ pub(crate) fn build_orchestrator_startup_policy_prompt(
             "\n\nAcknowledge Orchestrator mode briefly. There are no active worker agents yet; wait for assignments or AMQ messages, and do not do hands-on implementation work.",
         );
     } else {
-        out.push_str(
-            "\n\nApply this policy now, then start the first worker polling checkpoint:\n\n",
+        let _ = writeln!(
+            out,
+            "\n\nAcknowledge Orchestrator mode briefly. Dux sees {} active worker agent(s), but do not poll them on startup. Wait for assignments, AMQ messages, or the next scheduled Dux checkpoint.",
+            peers.len()
         );
-        out.push_str(&build_orchestrator_checkpoint_prompt(peers));
     }
     out
 }
@@ -311,6 +312,25 @@ mod tests {
         assert!(prompt.contains("Dux Orchestrator startup policy"));
         assert!(prompt.contains("Orchestrate only"));
         assert!(prompt.contains("There are no active worker agents yet"));
+    }
+
+    #[test]
+    fn startup_policy_prompt_does_not_trigger_worker_poll() {
+        let prompt = build_orchestrator_startup_policy_prompt(
+            crate::model::ORCHESTRATOR_SYSTEM_PROMPT,
+            &[OrchestratorPeer {
+                handle: "front-end-qa".to_string(),
+                label: "QA".to_string(),
+                provider: "codex".to_string(),
+                mode: ContextMode::Worker,
+                branch: "feature/qa".to_string(),
+                worktree: "/tmp/Front-end-QA".to_string(),
+            }],
+        );
+
+        assert!(prompt.contains("do not poll them on startup"));
+        assert!(!prompt.contains("amq send --to <handle>"));
+        assert!(!prompt.contains("Dux Orchestrator checkpoint"));
     }
 
     #[test]
