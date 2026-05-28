@@ -14,6 +14,31 @@ pub(crate) struct OrchestratorPeer {
     pub(crate) worktree: String,
 }
 
+struct OrchestratorTarget {
+    receiver: String,
+    provider: String,
+    startup_policy: String,
+}
+
+pub(crate) fn build_orchestrator_startup_policy_prompt(
+    policy: &str,
+    peers: &[OrchestratorPeer],
+) -> String {
+    let mut out = String::from("[Dux Orchestrator startup policy]\n\n");
+    out.push_str(policy.trim());
+    if peers.is_empty() {
+        out.push_str(
+            "\n\nAcknowledge Orchestrator mode briefly. There are no active worker agents yet; wait for assignments or AMQ messages, and do not do hands-on implementation work.",
+        );
+    } else {
+        out.push_str(
+            "\n\nApply this policy now, then start the first worker polling checkpoint:\n\n",
+        );
+        out.push_str(&build_orchestrator_checkpoint_prompt(peers));
+    }
+    out
+}
+
 pub(crate) fn build_orchestrator_checkpoint_prompt(peers: &[OrchestratorPeer]) -> String {
     let mut out = String::from(
         "[Dux Orchestrator checkpoint]\n\n\
@@ -54,6 +79,10 @@ fn context_mode_label(mode: ContextMode) -> &'static str {
     }
 }
 
+fn provider_needs_pty_orchestrator_policy(provider: &str) -> bool {
+    !provider.eq_ignore_ascii_case("claude")
+}
+
 impl App {
     pub(crate) fn tick_orchestrator_watchdog(&mut self) {
         if !self.config.amq.orchestrator.enabled {
@@ -61,10 +90,6 @@ impl App {
         }
         let poll_interval_secs = self.config.amq.orchestrator.poll_interval_secs;
         if poll_interval_secs == 0 {
-            return;
-        }
-        let peers = self.orchestrator_peers();
-        if peers.is_empty() {
             return;
         }
         let now = Instant::now();
@@ -83,6 +108,9 @@ impl App {
         self.runtime
             .orchestrator_last_nudged
             .retain(|session_id, _| live_orchestrators.contains(session_id));
+        self.runtime
+            .orchestrator_policy_injected
+            .retain(|session_id| live_orchestrators.contains(session_id));
 
         let active_session = if matches!(self.ui.input_target, InputTarget::Agent) {
             self.selected_session().map(|s| s.id.clone())
@@ -91,37 +119,71 @@ impl App {
         };
         let busy_markers = self.config.amq.inject.busy_markers.clone();
         let busy_scan_lines = self.config.amq.inject.busy_scan_lines.max(1);
-        let prompt = build_orchestrator_checkpoint_prompt(&peers);
+        let startup_grace = Duration::from_millis(self.config.amq.inject.startup_grace_ms);
+        let peers = self.orchestrator_peers();
+        let checkpoint_prompt = if peers.is_empty() {
+            None
+        } else {
+            Some(build_orchestrator_checkpoint_prompt(&peers))
+        };
 
         for session_id in orchestrator_ids {
-            let Some(last_nudged) = self
-                .runtime
-                .orchestrator_last_nudged
-                .get(&session_id)
-                .copied()
-            else {
-                self.runtime
-                    .orchestrator_last_nudged
-                    .insert(session_id, now);
+            let Some(target) = self.orchestrator_target_for_session(&session_id) else {
                 continue;
             };
-            if now.duration_since(last_nudged) < poll_interval {
-                continue;
-            }
+            let needs_startup_policy = !self
+                .runtime
+                .orchestrator_policy_injected
+                .contains(&session_id)
+                && provider_needs_pty_orchestrator_policy(&target.provider);
+
+            let prompt = if needs_startup_policy {
+                let first_seen = self
+                    .runtime
+                    .orchestrator_last_nudged
+                    .entry(session_id.clone())
+                    .or_insert(now);
+                if now.duration_since(*first_seen) < startup_grace {
+                    continue;
+                }
+                build_orchestrator_startup_policy_prompt(&target.startup_policy, &peers)
+            } else {
+                if !self
+                    .runtime
+                    .orchestrator_policy_injected
+                    .contains(&session_id)
+                {
+                    self.runtime
+                        .orchestrator_policy_injected
+                        .insert(session_id.clone());
+                }
+                let Some(last_nudged) = self
+                    .runtime
+                    .orchestrator_last_nudged
+                    .get(&session_id)
+                    .copied()
+                else {
+                    self.runtime
+                        .orchestrator_last_nudged
+                        .insert(session_id, now);
+                    continue;
+                };
+                if now.duration_since(last_nudged) < poll_interval {
+                    continue;
+                }
+                let Some(prompt) = checkpoint_prompt.as_ref() else {
+                    continue;
+                };
+                prompt.clone()
+            };
+
             if self.runtime.watch_pending_enters.contains_key(&session_id) {
                 continue;
             }
-            let receiver = self
-                .git
-                .sessions
-                .iter()
-                .find(|s| s.id == session_id)
-                .map(amq_receiver_for_session)
-                .unwrap_or_else(|| session_id.clone());
             if self
                 .runtime
                 .amq_inject_pending
-                .get(&receiver)
+                .get(&target.receiver)
                 .is_some_and(|q| !q.is_empty())
             {
                 continue;
@@ -161,11 +223,18 @@ impl App {
                     self.runtime
                         .orchestrator_last_nudged
                         .insert(session_id.clone(), now);
+                    if needs_startup_policy {
+                        self.runtime
+                            .orchestrator_policy_injected
+                            .insert(session_id.clone());
+                    }
                     tracing::info!(
                         target: "dux::orchestrator",
                         session_id = %session_id,
+                        provider = %target.provider,
                         peer_count = peers.len(),
-                        "sent orchestrator checkpoint nudge",
+                        startup_policy = needs_startup_policy,
+                        "sent orchestrator watchdog prompt",
                     );
                 }
                 Some(Err(err)) => {
@@ -179,6 +248,21 @@ impl App {
                 None => {}
             }
         }
+    }
+
+    fn orchestrator_target_for_session(&self, session_id: &str) -> Option<OrchestratorTarget> {
+        self.git
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .map(|session| OrchestratorTarget {
+                receiver: amq_receiver_for_session(session),
+                provider: self.running_provider_for(session).as_str().to_string(),
+                startup_policy: session
+                    .settings
+                    .effective_system_prompt()
+                    .unwrap_or_else(|| crate::model::ORCHESTRATOR_SYSTEM_PROMPT.to_string()),
+            })
     }
 
     fn orchestrator_peers(&self) -> Vec<OrchestratorPeer> {
@@ -217,5 +301,23 @@ mod tests {
         assert!(prompt.contains("Do not do their implementation work yourself"));
         assert!(prompt.contains("amq send --to <handle>"));
         assert!(prompt.contains("status, blockers, ETA"));
+    }
+
+    #[test]
+    fn startup_policy_prompt_carries_policy_without_peers() {
+        let prompt =
+            build_orchestrator_startup_policy_prompt(crate::model::ORCHESTRATOR_SYSTEM_PROMPT, &[]);
+
+        assert!(prompt.contains("Dux Orchestrator startup policy"));
+        assert!(prompt.contains("Orchestrate only"));
+        assert!(prompt.contains("There are no active worker agents yet"));
+    }
+
+    #[test]
+    fn codex_needs_pty_policy_but_claude_does_not() {
+        assert!(provider_needs_pty_orchestrator_policy("codex"));
+        assert!(provider_needs_pty_orchestrator_policy("gemini"));
+        assert!(!provider_needs_pty_orchestrator_policy("claude"));
+        assert!(!provider_needs_pty_orchestrator_policy("Claude"));
     }
 }

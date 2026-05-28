@@ -180,13 +180,11 @@ fi
 #
 # dux exports DUX_SYSTEM_PROMPT for sessions whose operator set a
 # system prompt in the session settings modal, and for built-in Dux
-# role policies such as Orchestrator mode. Codex does not expose a
-# `--append-system-prompt` equivalent, but the interactive CLI and
-# `codex resume --last` both accept a trailing initial prompt argument.
-# Use that path instead of warning-and-dropping so Codex orchestrators
-# receive the same policy as Claude orchestrators. This is not a true
-# system-prompt append; it is the best per-invocation Codex path that
-# does not mutate process-global files under ~/.codex.
+# role policies such as Orchestrator mode. Codex still does not expose
+# a `--append-system-prompt` equivalent. Do not pass this env var as a
+# launch/resume prompt: that path changes Codex startup semantics under
+# dux and can make interactive sessions exit immediately. Dux delivers
+# Codex orchestrator policy after the PTY is live instead.
 CODEX_ARGS=()
 if (( ${#CODEX_EXTRA[@]} > 0 )); then
   CODEX_ARGS+=("${CODEX_EXTRA[@]}")
@@ -195,7 +193,7 @@ if (( $# > 0 )); then
   CODEX_ARGS+=("$@")
 fi
 if [[ -n "${DUX_SYSTEM_PROMPT:-}" ]]; then
-  CODEX_ARGS+=("$DUX_SYSTEM_PROMPT")
+  printf 'codex-amq: DUX_SYSTEM_PROMPT set but codex has no system-prompt flag; dux will inject orchestrator policy after startup when applicable\n' >&2
 fi
 
 exec amq coop exec --no-wake --no-init --root "$ROOT" --me "$ME" codex -- "${CODEX_ARGS[@]}"

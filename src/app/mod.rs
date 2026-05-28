@@ -1378,6 +1378,7 @@ impl App {
             pr_checks_in_flight: Arc::new(AtomicUsize::new(0)),
             watch_suppress_until: HashMap::new(),
             orchestrator_last_nudged: HashMap::new(),
+            orchestrator_policy_injected: HashSet::new(),
         };
         let git = GitState {
             projects,

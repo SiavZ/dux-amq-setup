@@ -190,13 +190,13 @@ setup_parent_and_worktree() {
 # Each provider's wrapper consumes DUX_SYSTEM_PROMPT differently:
 #   claude  → translates to `--append-system-prompt <text>` (verified
 #             flag in claude --help)
-#   codex   → no equivalent flag; passes text as launch/resume prompt
+#   codex   → no equivalent system-prompt flag; warn-and-drop here
+#             because dux injects Orchestrator policy after startup
 #   gemini  → no equivalent flag; warn-and-drop
 #
 # Tests assert each wrapper's behaviour: the recorded provider argv
 # either contains the flag-and-value pair (claude) or omits it
-# (gemini). Codex receives the prompt as an argv value because that is
-# the only per-invocation path available to interactive Codex.
+# (codex/gemini).
 
 # Helper: assert two consecutive lines in the recorded argv match the
 # given pair, in order. Accommodates the wrapper using `--flag` `value`
@@ -260,20 +260,14 @@ assert_argv_sequence() {
     || { printf 'expected first line of multi-line system prompt in argv\n%s\n' "$(cat "$ARGV_FILE")" >&2; return 1; }
 }
 
-@test "codex-amq passes DUX_SYSTEM_PROMPT as the initial prompt argument" {
+@test "codex-amq warns and drops when DUX_SYSTEM_PROMPT is set" {
   DUX_SYSTEM_PROMPT="be an orchestrator" run "$WRAPPERS_DIR/codex-amq"
   [ "$status" -eq 0 ]
-  # No equivalent flag — codex must not see one.
+  # No equivalent flag — codex must not see the value either.
   assert_argv_missing "--append-system-prompt"
-  assert_argv_contains "be an orchestrator"
-  [[ "$output" != *"DUX_SYSTEM_PROMPT"* ]] \
-    || { printf 'unexpected diagnostic for codex launch prompt; got:\n%s\n' "$output" >&2; return 1; }
-}
-
-@test "codex-amq appends DUX_SYSTEM_PROMPT after resume args" {
-  DUX_SYSTEM_PROMPT="checkpoint now" run "$WRAPPERS_DIR/codex-amq" resume --last
-  [ "$status" -eq 0 ]
-  assert_argv_sequence "--last" "checkpoint now"
+  assert_argv_missing "be an orchestrator"
+  [[ "$output" == *"codex-amq: DUX_SYSTEM_PROMPT set but codex has no system-prompt flag"* ]] \
+    || { printf 'expected warn-and-drop message; got:\n%s\n' "$output" >&2; return 1; }
 }
 
 @test "codex-amq is silent when DUX_SYSTEM_PROMPT is unset" {

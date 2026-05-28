@@ -132,4 +132,9 @@ pub(crate) struct RuntimeState {
     /// This drives proactive polling without depending on provider-specific
     /// background timers inside Codex or Claude.
     pub(crate) orchestrator_last_nudged: HashMap<String, Instant>,
+    /// Orchestrator sessions that have received their startup policy through
+    /// a live PTY injection path. This is primarily for Codex, whose CLI has
+    /// no stable system-prompt flag and must not receive the policy as a
+    /// launch/resume prompt.
+    pub(crate) orchestrator_policy_injected: HashSet<String>,
 }

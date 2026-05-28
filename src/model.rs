@@ -497,8 +497,8 @@ pub struct SessionSettings {
     /// non-empty (after trim), dux exports `DUX_SYSTEM_PROMPT` in the
     /// PTY child env at spawn time; the wrappers translate it into the
     /// provider-specific behavior (claude `--append-system-prompt`;
-    /// codex initial launch/resume prompt; gemini has no equivalent
-    /// today and warn-and-drops). Default `None` per the
+    /// codex/gemini have no equivalent today and warn-and-drop at
+    /// wrapper startup). Default `None` per the
     /// asymmetric-fail-safe policy: a missing or corrupted blob never
     /// injects a prompt. Whitespace-only values are also treated as
     /// `None` so an operator can't accidentally inject literal
