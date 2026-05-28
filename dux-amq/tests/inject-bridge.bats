@@ -210,6 +210,20 @@ EOF
   grep -Fxq -- "under-dux" "${files[0]}"
 }
 
+@test "dux-amq-inject-bridge drops under-dux wake when DUX_PID is dead" {
+  install_fake_tmux
+  export TMUX="/tmp/fake-tmux-socket,1234,0"
+  export DUX_PANE="1"
+  export DUX_PID="999999999"
+  export AM_ME="bob"
+  local msg
+  msg=$(amq-send-signed --me alice --to bob --body "stale-dux" --print-only)
+  run dux-amq-inject-bridge "$msg"
+  [ "$status" -eq 0 ]
+  [ ! -s "$TMUX_LOG" ]
+  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*/*.msg" >/dev/null
+}
+
 # 13.7b — under dux with AM_ROOT: bridge auto-drains and queues the
 # actual message body instead of a "run amq drain" reminder.
 @test "dux-amq-inject-bridge auto-drains AMQ when under dux with AM_ROOT" {

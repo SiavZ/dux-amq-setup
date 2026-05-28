@@ -132,6 +132,10 @@ pub(crate) struct RuntimeState {
     /// This drives proactive polling without depending on provider-specific
     /// background timers inside Codex or Claude.
     pub(crate) orchestrator_last_nudged: HashMap<String, Instant>,
+    /// Last successful Dux-side checkpoint by project. This prevents multiple
+    /// live orchestrators in the same project from all polling the same worker
+    /// set during the same interval after a restart/update.
+    pub(crate) orchestrator_project_last_checkpoint: HashMap<String, Instant>,
     /// Orchestrator sessions that have received their startup policy through
     /// a live PTY injection path. This is primarily for Codex, whose CLI has
     /// no stable system-prompt flag and must not receive the policy as a

@@ -17,6 +17,7 @@ pub(crate) struct OrchestratorPeer {
 struct OrchestratorTarget {
     receiver: String,
     provider: String,
+    project_id: String,
     startup_policy: String,
 }
 
@@ -84,6 +85,20 @@ fn provider_needs_pty_orchestrator_policy(provider: &str) -> bool {
     !provider.eq_ignore_ascii_case("claude")
 }
 
+fn is_orchestrator_checkpoint_peer(
+    candidate_id: &str,
+    candidate_project_id: &str,
+    candidate_mode: ContextMode,
+    candidate_is_live: bool,
+    orchestrator_id: &str,
+    orchestrator_project_id: &str,
+) -> bool {
+    candidate_is_live
+        && candidate_id != orchestrator_id
+        && candidate_project_id == orchestrator_project_id
+        && matches!(candidate_mode, ContextMode::Worker)
+}
+
 impl App {
     pub(crate) fn tick_orchestrator_watchdog(&mut self) {
         if !self.config.amq.orchestrator.enabled {
@@ -112,6 +127,16 @@ impl App {
         self.runtime
             .orchestrator_policy_injected
             .retain(|session_id| live_orchestrators.contains(session_id));
+        let live_orchestrator_projects: HashSet<String> = self
+            .git
+            .sessions
+            .iter()
+            .filter(|s| live_orchestrators.contains(&s.id))
+            .map(|s| s.project_id.clone())
+            .collect();
+        self.runtime
+            .orchestrator_project_last_checkpoint
+            .retain(|project_id, _| live_orchestrator_projects.contains(project_id));
 
         let active_session = if matches!(self.ui.input_target, InputTarget::Agent) {
             self.selected_session().map(|s| s.id.clone())
@@ -121,17 +146,12 @@ impl App {
         let busy_markers = self.config.amq.inject.busy_markers.clone();
         let busy_scan_lines = self.config.amq.inject.busy_scan_lines.max(1);
         let startup_grace = Duration::from_millis(self.config.amq.inject.startup_grace_ms);
-        let peers = self.orchestrator_peers();
-        let checkpoint_prompt = if peers.is_empty() {
-            None
-        } else {
-            Some(build_orchestrator_checkpoint_prompt(&peers))
-        };
 
         for session_id in orchestrator_ids {
             let Some(target) = self.orchestrator_target_for_session(&session_id) else {
                 continue;
             };
+            let peers = self.orchestrator_peers_for_session(&session_id, &target.project_id);
             let needs_startup_policy = !self
                 .runtime
                 .orchestrator_policy_injected
@@ -172,10 +192,20 @@ impl App {
                 if now.duration_since(last_nudged) < poll_interval {
                     continue;
                 }
-                let Some(prompt) = checkpoint_prompt.as_ref() else {
+                if self
+                    .runtime
+                    .orchestrator_project_last_checkpoint
+                    .get(&target.project_id)
+                    .is_some_and(|last_checkpoint| {
+                        now.duration_since(*last_checkpoint) < poll_interval
+                    })
+                {
                     continue;
-                };
-                prompt.clone()
+                }
+                if peers.is_empty() {
+                    continue;
+                }
+                build_orchestrator_checkpoint_prompt(&peers)
             };
 
             if self.runtime.watch_pending_enters.contains_key(&session_id) {
@@ -228,10 +258,15 @@ impl App {
                         self.runtime
                             .orchestrator_policy_injected
                             .insert(session_id.clone());
+                    } else {
+                        self.runtime
+                            .orchestrator_project_last_checkpoint
+                            .insert(target.project_id.clone(), now);
                     }
                     tracing::info!(
                         target: "dux::orchestrator",
                         session_id = %session_id,
+                        project_id = %target.project_id,
                         provider = %target.provider,
                         peer_count = peers.len(),
                         startup_policy = needs_startup_policy,
@@ -259,6 +294,7 @@ impl App {
             .map(|session| OrchestratorTarget {
                 receiver: amq_receiver_for_session(session),
                 provider: self.running_provider_for(session).as_str().to_string(),
+                project_id: session.project_id.clone(),
                 startup_policy: session
                     .settings
                     .effective_system_prompt()
@@ -266,11 +302,24 @@ impl App {
             })
     }
 
-    fn orchestrator_peers(&self) -> Vec<OrchestratorPeer> {
+    fn orchestrator_peers_for_session(
+        &self,
+        orchestrator_id: &str,
+        orchestrator_project_id: &str,
+    ) -> Vec<OrchestratorPeer> {
         self.git
             .sessions
             .iter()
-            .filter(|s| s.state.is_live() && !matches!(s.settings.mode, ContextMode::Orchestrator))
+            .filter(|s| {
+                is_orchestrator_checkpoint_peer(
+                    &s.id,
+                    &s.project_id,
+                    s.settings.mode,
+                    s.state.is_live(),
+                    orchestrator_id,
+                    orchestrator_project_id,
+                )
+            })
             .map(|s| OrchestratorPeer {
                 handle: amq_receiver_for_session(s),
                 label: s.title.clone().unwrap_or_else(|| s.branch_name.clone()),
@@ -331,6 +380,50 @@ mod tests {
         assert!(prompt.contains("do not poll them on startup"));
         assert!(!prompt.contains("amq send --to <handle>"));
         assert!(!prompt.contains("Dux Orchestrator checkpoint"));
+    }
+
+    #[test]
+    fn checkpoint_peers_are_live_workers_in_same_project_only() {
+        assert!(is_orchestrator_checkpoint_peer(
+            "worker-1",
+            "project-a",
+            ContextMode::Worker,
+            true,
+            "orchestrator-1",
+            "project-a",
+        ));
+        assert!(!is_orchestrator_checkpoint_peer(
+            "worker-2",
+            "project-b",
+            ContextMode::Worker,
+            true,
+            "orchestrator-1",
+            "project-a",
+        ));
+        assert!(!is_orchestrator_checkpoint_peer(
+            "attended-1",
+            "project-a",
+            ContextMode::Attended,
+            true,
+            "orchestrator-1",
+            "project-a",
+        ));
+        assert!(!is_orchestrator_checkpoint_peer(
+            "worker-3",
+            "project-a",
+            ContextMode::Worker,
+            false,
+            "orchestrator-1",
+            "project-a",
+        ));
+        assert!(!is_orchestrator_checkpoint_peer(
+            "orchestrator-1",
+            "project-a",
+            ContextMode::Orchestrator,
+            true,
+            "orchestrator-1",
+            "project-a",
+        ));
     }
 
     #[test]
