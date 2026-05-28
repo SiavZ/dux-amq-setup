@@ -12,7 +12,8 @@ This directory does **not** modify dux source. It sits alongside the dux Rust so
 - **Spot-VM survival**: dux config + sessions, AMQ queue, and Claude session JSONLs all live on a persistent disk (default `/data/state/`)
 - **Past-chat resume** in fresh worktrees via `--continue --fork-session` (bypasses deferred-tool blocks)
 - **YOLO is opt-in** (audit02 P0-A): `CLAUDE_AMQ_YOLO=1` / `CODEX_AMQ_YOLO=1` enable the per-pane `--dangerously-*` flag. See [Permission model](#permission-model).
-- **Per-session system prompt** (audit03 §15): the dux session-settings modal can set a custom prompt that's appended to the upstream CLI's default system prompt for one specific session — without touching `CLAUDE.md` or global config. dux exports `DUX_SYSTEM_PROMPT` in the per-PTY env at spawn time; `claude-amq` translates it into `claude --append-system-prompt <text>`. `codex-amq` and `gemini-amq` warn-and-drop because their upstream CLIs have no equivalent flag today.
+- **Per-session system prompt** (audit03 §15): the dux session-settings modal can set a custom prompt for one specific session without touching `CLAUDE.md` or global config. dux exports `DUX_SYSTEM_PROMPT` in the per-PTY env at spawn time; `claude-amq` translates it into `claude --append-system-prompt <text>`. `codex-amq` has no equivalent system-prompt flag, so it passes the text as the interactive launch/resume prompt. `gemini-amq` still warn-and-drops because its upstream CLI has no equivalent flag today.
+- **Orchestrator mode policy**: sessions marked Orchestrator automatically receive a built-in policy that tells them to coordinate through AMQ, avoid hands-on implementation, and proactively poll workers. `[amq.orchestrator]` also runs a Dux-side checkpoint watchdog so Codex and Claude orchestrators get periodic AMQ polling nudges instead of waiting passively.
 
 ## Layout
 

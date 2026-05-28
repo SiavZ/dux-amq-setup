@@ -128,4 +128,8 @@ pub(crate) struct RuntimeState {
     /// terminal area, short enough to not delay the legitimate
     /// auto-clear when the agent finishes its task.
     pub(crate) watch_suppress_until: HashMap<String, Instant>,
+    /// Last Dux-side checkpoint nudge sent to each Orchestrator session.
+    /// This drives proactive polling without depending on provider-specific
+    /// background timers inside Codex or Claude.
+    pub(crate) orchestrator_last_nudged: HashMap<String, Instant>,
 }

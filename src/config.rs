@@ -418,6 +418,7 @@ impl Default for LimitsConfig {
 #[serde(default)]
 pub struct AmqConfig {
     pub inject: AmqInjectConfig,
+    pub orchestrator: AmqOrchestratorConfig,
 }
 
 /// Tunables for the dux-side drainer that consumes
@@ -623,6 +624,44 @@ impl Default for AmqInjectConfig {
             post_delivery_cooldown_ms: default_amq_inject_post_delivery_cooldown_ms(),
             auto_clear_collaboration_quiet_secs:
                 default_amq_inject_auto_clear_collaboration_quiet_secs(),
+        }
+    }
+}
+
+/// Tunables for the Dux-side Orchestrator watchdog.
+///
+/// Orchestrator mode is persistent by design, so the worker auto-clear
+/// machinery does not apply. This watchdog is the complementary behavior:
+/// periodically wake Orchestrator sessions with a checkpoint prompt so they
+/// actively poll worker agents instead of waiting forever.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AmqOrchestratorConfig {
+    /// Master switch. Only sessions explicitly marked Orchestrator are affected.
+    /// Default true.
+    #[serde(default = "default_amq_orchestrator_enabled")]
+    pub enabled: bool,
+    /// Seconds between checkpoint nudges sent to each live Orchestrator
+    /// session while at least one other live agent exists. Set to 0 to disable
+    /// periodic nudges without disabling the built-in Orchestrator prompt.
+    /// Default 900 (15 minutes).
+    #[serde(default = "default_amq_orchestrator_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+}
+
+fn default_amq_orchestrator_enabled() -> bool {
+    true
+}
+
+fn default_amq_orchestrator_poll_interval_secs() -> u64 {
+    900
+}
+
+impl Default for AmqOrchestratorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_amq_orchestrator_enabled(),
+            poll_interval_secs: default_amq_orchestrator_poll_interval_secs(),
         }
     }
 }
@@ -1534,6 +1573,37 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
                  # the recent-activity window.",
             )),
             value_fn: |c| FieldValue::U64(c.amq.inject.auto_clear_collaboration_quiet_secs),
+        },
+        ConfigEntry::Blank,
+        ConfigEntry::Comment(
+            "# Orchestrator watchdog.\n\
+             #\n\
+             # Sessions marked `mode = orchestrator` receive a built-in role\n\
+             # policy at launch. The watchdog below is the timer side of that\n\
+             # policy: while other live agents exist, dux periodically wakes each\n\
+             # live orchestrator with a checkpoint prompt to poll workers through\n\
+             # AMQ, ask for blockers, and push stalled work forward. Delivery uses\n\
+             # the same idle/busy safeguards as AMQ inject.",
+        ),
+        ConfigEntry::Section("amq.orchestrator"),
+        ConfigEntry::Field {
+            key: "enabled",
+            comment: Some(CommentSource::Static(
+                "# Master switch for periodic Orchestrator checkpoint nudges.\n\
+                 # Only sessions explicitly marked Orchestrator are affected.\n\
+                 # Default true.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.amq.orchestrator.enabled),
+        },
+        ConfigEntry::Field {
+            key: "poll_interval_secs",
+            comment: Some(CommentSource::Static(
+                "# Seconds between checkpoint nudges sent to each live\n\
+                 # Orchestrator while at least one other live agent exists.\n\
+                 # Set 0 to disable periodic nudges but keep the launch-time\n\
+                 # Orchestrator policy prompt. Default 900 (15 minutes).",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.orchestrator.poll_interval_secs),
         },
         ConfigEntry::Blank,
         ConfigEntry::Keys,
@@ -2794,6 +2864,8 @@ mod tests {
         config.amq.inject.startup_grace_ms = 4_321;
         config.amq.inject.post_delivery_cooldown_ms = 9_876;
         config.amq.inject.auto_clear_collaboration_quiet_secs = 2_222;
+        config.amq.orchestrator.enabled = false;
+        config.amq.orchestrator.poll_interval_secs = 333;
         let rendered = render_config_default(&config);
         let parsed: Config = toml::from_str(&rendered).expect("config should parse");
         assert!(!parsed.amq.inject.enabled);
@@ -2807,6 +2879,8 @@ mod tests {
         assert_eq!(parsed.amq.inject.startup_grace_ms, 4_321);
         assert_eq!(parsed.amq.inject.post_delivery_cooldown_ms, 9_876);
         assert_eq!(parsed.amq.inject.auto_clear_collaboration_quiet_secs, 2_222);
+        assert!(!parsed.amq.orchestrator.enabled);
+        assert_eq!(parsed.amq.orchestrator.poll_interval_secs, 333);
         assert_eq!(
             parsed.amq.inject.busy_markers,
             vec!["thinking…".to_string(), "ctrl-c to cancel".to_string()]

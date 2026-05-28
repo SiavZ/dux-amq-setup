@@ -1249,6 +1249,7 @@ pub(crate) enum PullTarget {
 mod components;
 mod inject_runtime;
 mod input;
+mod orchestrator;
 mod render;
 mod sessions;
 pub(crate) mod text_input;
@@ -1376,6 +1377,7 @@ impl App {
             last_user_keystroke: HashMap::new(),
             pr_checks_in_flight: Arc::new(AtomicUsize::new(0)),
             watch_suppress_until: HashMap::new(),
+            orchestrator_last_nudged: HashMap::new(),
         };
         let git = GitState {
             projects,
@@ -1480,6 +1482,7 @@ impl App {
                 self.poll_pty_activity();
                 self.tick_watch_engines();
                 self.tick_amq_inject();
+                self.tick_orchestrator_watchdog();
                 self.tick_count = self.tick_count.wrapping_add(1);
 
                 // Check SIGWINCH — needed when bypassing crossterm's event

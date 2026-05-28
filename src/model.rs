@@ -493,12 +493,12 @@ pub struct SessionSettings {
     #[serde(default)]
     pub verify_envelope_override: Option<bool>,
 
-    /// Per-session system-prompt text appended to the upstream CLI's
-    /// default system prompt. When `Some` and non-empty (after trim),
-    /// dux exports `DUX_SYSTEM_PROMPT` in the PTY child env at spawn
-    /// time; the wrappers translate it into the provider-specific CLI
-    /// flag (claude `--append-system-prompt`; codex/gemini have no
-    /// equivalent today and warn-and-drop). Default `None` per the
+    /// Per-session provider-instruction text. When `Some` and
+    /// non-empty (after trim), dux exports `DUX_SYSTEM_PROMPT` in the
+    /// PTY child env at spawn time; the wrappers translate it into the
+    /// provider-specific behavior (claude `--append-system-prompt`;
+    /// codex initial launch/resume prompt; gemini has no equivalent
+    /// today and warn-and-drops). Default `None` per the
     /// asymmetric-fail-safe policy: a missing or corrupted blob never
     /// injects a prompt. Whitespace-only values are also treated as
     /// `None` so an operator can't accidentally inject literal
@@ -508,6 +508,23 @@ pub struct SessionSettings {
     #[serde(default)]
     pub system_prompt: Option<String>,
 }
+
+/// Built-in role policy for sessions marked [`ContextMode::Orchestrator`].
+///
+/// This is injected at the session-settings layer so the policy follows the
+/// role, independent of whether the underlying harness is Claude or Codex.
+pub const ORCHESTRATOR_SYSTEM_PROMPT: &str = "\
+You are running in Dux Orchestrator mode.
+
+Operating rules:
+- Orchestrate only. Do not implement code, edit files, run build/test/lint commands, commit, push, or do hands-on worker tasks unless the user explicitly overrides Orchestrator mode.
+- Use AMQ to assign, poll, unblock, and review worker agents. Keep implementation in Worker sessions.
+- Maintain a visible status model for each active worker: handle, branch/worktree, task, last status, blockers, next checkpoint, and expected proof.
+- Proactively poll active workers every 10-15 minutes, and sooner when a worker is blocked, quiet after a promised checkpoint, or affected by a dependency change.
+- Make polls specific: ask for current status, blockers, ETA, next command/result, and the proof that will demonstrate completion.
+- Do not flood workers. Send at most one nudge per worker per checkpoint unless new information or a missed deadline justifies escalation.
+- Demand production-standard completion: clear scope, no unrelated edits, appropriate tests/lint/security checks, reviewable diffs, and concise handoff notes.
+- Escalate to the human when workers disagree, are blocked by missing decisions, or repeatedly miss checkpoints.";
 
 /// Operator-declared "what is this session for". Drives auto-clear
 /// policy, AMQ sentinel injection, and (in future) per-mode watch
@@ -563,6 +580,21 @@ impl SessionSettings {
     /// Serialise for storage. Always returns valid JSON.
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).expect("SessionSettings serialises")
+    }
+
+    pub fn effective_system_prompt(&self) -> Option<String> {
+        let custom = self
+            .system_prompt
+            .as_deref()
+            .filter(|s| !s.trim().is_empty());
+        match (self.mode, custom) {
+            (ContextMode::Orchestrator, Some(custom)) => {
+                Some(format!("{ORCHESTRATOR_SYSTEM_PROMPT}\n\n{custom}"))
+            }
+            (ContextMode::Orchestrator, None) => Some(ORCHESTRATOR_SYSTEM_PROMPT.to_string()),
+            (_, Some(custom)) => Some(custom.to_string()),
+            (_, None) => None,
+        }
     }
 
     /// Translate per-session settings into env vars for the spawned
@@ -622,17 +654,20 @@ impl SessionSettings {
         ));
 
         // audit03 Phase 01 §15: per-session system prompt → DUX_SYSTEM_PROMPT.
+        // Orchestrator mode also contributes a built-in policy here so the
+        // role instruction follows the session even when the operator does
+        // not add custom text.
         // Whitespace-only values are dropped: the wrappers must never
         // see a literal `" "` (or `"\n"`) as a system prompt because a
         // claude `--append-system-prompt " "` invocation would still
         // mutate the upstream prompt with empty content. Treat trimmed
         // empty as None at the env-var boundary too, mirroring how the
         // modal save path strips trailing whitespace before persisting.
-        let system_prompt_set = self
-            .system_prompt
+        let effective_system_prompt = self.effective_system_prompt();
+        let system_prompt_set = effective_system_prompt
             .as_deref()
             .is_some_and(|s| !s.trim().is_empty());
-        if let Some(prompt) = self.system_prompt.as_deref()
+        if let Some(prompt) = effective_system_prompt.as_deref()
             && !prompt.trim().is_empty()
         {
             vars.push(("DUX_SYSTEM_PROMPT".into(), prompt.to_string()));
