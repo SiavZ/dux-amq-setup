@@ -1064,6 +1064,12 @@ pub(crate) enum LeftItem {
     Session(usize),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LeftItemIdentity {
+    Project(String),
+    Session(String),
+}
+
 pub(crate) struct CompanionTerminal {
     pub(crate) session_id: String,
     pub(crate) label: String,
@@ -2062,18 +2068,11 @@ impl App {
                 self.ui.help_scroll = Some(0);
                 Ok(())
             }
-            "sort-agents-by-updated" => {
-                self.sort_sessions_by_updated();
-                Ok(())
-            }
-            "sort-agents-by-created" => {
-                self.sort_sessions_by_created();
-                Ok(())
-            }
-            "sort-agents-by-name" => {
-                self.sort_sessions_by_name();
-                Ok(())
-            }
+            "move-selected-down" => self.move_selected_left_item_down(),
+            "move-selected-up" => self.move_selected_left_item_up(),
+            "sort-agents-by-updated" => self.sort_sessions_by_updated(),
+            "sort-agents-by-created" => self.sort_sessions_by_created(),
+            "sort-agents-by-name" => self.sort_sessions_by_name(),
             "edit-macros" => {
                 self.open_edit_macros();
                 Ok(())
@@ -2264,30 +2263,208 @@ impl App {
         self.left_items_cache = items;
     }
 
-    pub(crate) fn sort_sessions_by_updated(&mut self) {
+    fn left_item_identity(&self, item: LeftItem) -> Option<LeftItemIdentity> {
+        match item {
+            LeftItem::Project(index) => self
+                .git
+                .projects
+                .get(index)
+                .map(|project| LeftItemIdentity::Project(project.id.clone())),
+            LeftItem::Session(index) => self
+                .git
+                .sessions
+                .get(index)
+                .map(|session| LeftItemIdentity::Session(session.id.clone())),
+        }
+    }
+
+    fn selected_left_identity(&self) -> Option<LeftItemIdentity> {
+        self.left_items()
+            .get(self.selected_left)
+            .copied()
+            .and_then(|item| self.left_item_identity(item))
+    }
+
+    fn left_item_matches_identity(&self, item: LeftItem, identity: &LeftItemIdentity) -> bool {
+        match (item, identity) {
+            (LeftItem::Project(index), LeftItemIdentity::Project(id)) => self
+                .git
+                .projects
+                .get(index)
+                .is_some_and(|project| project.id == *id),
+            (LeftItem::Session(index), LeftItemIdentity::Session(id)) => self
+                .git
+                .sessions
+                .get(index)
+                .is_some_and(|session| session.id == *id),
+            _ => false,
+        }
+    }
+
+    fn restore_left_selection(&mut self, identity: Option<LeftItemIdentity>) {
+        self.rebuild_left_items();
+        if let Some(identity) = identity
+            && let Some(index) = self
+                .left_items()
+                .iter()
+                .copied()
+                .position(|item| self.left_item_matches_identity(item, &identity))
+        {
+            self.selected_left = index;
+            return;
+        }
+        let item_count = self.left_items().len();
+        if item_count == 0 {
+            self.selected_left = 0;
+        } else if self.selected_left >= item_count {
+            self.selected_left = item_count - 1;
+        }
+    }
+
+    fn persist_project_order(&mut self) -> Result<()> {
+        let order: HashMap<&str, usize> = self
+            .git
+            .projects
+            .iter()
+            .enumerate()
+            .map(|(index, project)| (project.id.as_str(), index))
+            .collect();
+        if !self
+            .config
+            .projects
+            .iter()
+            .any(|project| order.contains_key(project.id.as_str()))
+        {
+            return Ok(());
+        }
+        self.config.projects.sort_by_key(|project| {
+            order
+                .get(project.id.as_str())
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+        save_config(&self.paths.config_path, &self.config, &self.bindings)
+    }
+
+    fn persist_session_order(&self) -> Result<()> {
+        let ordered_ids: Vec<String> = self
+            .git
+            .sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect();
+        self.session_store.update_session_order(&ordered_ids)
+    }
+
+    pub(crate) fn move_selected_left_item_up(&mut self) -> Result<()> {
+        self.move_selected_left_item(true)
+    }
+
+    pub(crate) fn move_selected_left_item_down(&mut self) -> Result<()> {
+        self.move_selected_left_item(false)
+    }
+
+    fn move_selected_left_item(&mut self, up: bool) -> Result<()> {
+        let Some(item) = self.left_items().get(self.selected_left).copied() else {
+            return Ok(());
+        };
+        match item {
+            LeftItem::Project(project_index) => {
+                let Some(project) = self.git.projects.get(project_index) else {
+                    return Ok(());
+                };
+                let project_id = project.id.clone();
+                let project_name = project.name.clone();
+                let target_index = if up {
+                    project_index.checked_sub(1)
+                } else {
+                    (project_index + 1 < self.git.projects.len()).then_some(project_index + 1)
+                };
+                let Some(target_index) = target_index else {
+                    let edge = if up { "top" } else { "bottom" };
+                    self.set_info(format!(
+                        "Project \"{project_name}\" is already at the {edge}."
+                    ));
+                    return Ok(());
+                };
+
+                self.git.projects.swap(project_index, target_index);
+                self.persist_project_order()?;
+                self.restore_left_selection(Some(LeftItemIdentity::Project(project_id)));
+                let direction = if up { "up" } else { "down" };
+                self.set_info(format!("Moved project \"{project_name}\" {direction}."));
+            }
+            LeftItem::Session(session_index) => {
+                let Some(session) = self.git.sessions.get(session_index) else {
+                    return Ok(());
+                };
+                let session_id = session.id.clone();
+                let project_id = session.project_id.clone();
+                let session_label = session
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| session.branch_name.clone());
+                let target_index = if up {
+                    self.git.sessions[..session_index]
+                        .iter()
+                        .rposition(|candidate| candidate.project_id == project_id)
+                } else {
+                    self.git.sessions[session_index + 1..]
+                        .iter()
+                        .position(|candidate| candidate.project_id == project_id)
+                        .map(|offset| session_index + 1 + offset)
+                };
+                let Some(target_index) = target_index else {
+                    let edge = if up { "top" } else { "bottom" };
+                    self.set_info(format!(
+                        "Agent \"{session_label}\" is already at the {edge}."
+                    ));
+                    return Ok(());
+                };
+
+                self.git.sessions.swap(session_index, target_index);
+                self.persist_session_order()?;
+                self.restore_left_selection(Some(LeftItemIdentity::Session(session_id)));
+                let direction = if up { "up" } else { "down" };
+                self.set_info(format!("Moved agent \"{session_label}\" {direction}."));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn sort_sessions_by_updated(&mut self) -> Result<()> {
+        let selected = self.selected_left_identity();
         self.git
             .sessions
             .sort_by_key(|b| std::cmp::Reverse(b.updated_at));
-        self.rebuild_left_items();
+        self.persist_session_order()?;
+        self.restore_left_selection(selected);
         self.set_info("Agents sorted by most recently updated.");
+        Ok(())
     }
 
-    pub(crate) fn sort_sessions_by_created(&mut self) {
+    pub(crate) fn sort_sessions_by_created(&mut self) -> Result<()> {
+        let selected = self.selected_left_identity();
         self.git
             .sessions
             .sort_by_key(|b| std::cmp::Reverse(b.created_at));
-        self.rebuild_left_items();
+        self.persist_session_order()?;
+        self.restore_left_selection(selected);
         self.set_info("Agents sorted by creation date (newest first).");
+        Ok(())
     }
 
-    pub(crate) fn sort_sessions_by_name(&mut self) {
+    pub(crate) fn sort_sessions_by_name(&mut self) -> Result<()> {
+        let selected = self.selected_left_identity();
         self.git.sessions.sort_by(|a, b| {
             let name_a = a.title.as_deref().unwrap_or(&a.branch_name);
             let name_b = b.title.as_deref().unwrap_or(&b.branch_name);
             name_a.to_lowercase().cmp(&name_b.to_lowercase())
         });
-        self.rebuild_left_items();
+        self.persist_session_order()?;
+        self.restore_left_selection(selected);
         self.set_info("Agents sorted alphabetically by name.");
+        Ok(())
     }
 
     pub(crate) fn toggle_collapse_selected_project(&mut self) {

@@ -549,6 +549,8 @@ impl App {
                     self.reload_changed_files();
                     self.update_missing_project_warning();
                 }
+                Action::MoveSelectedDown => self.move_selected_left_item_down()?,
+                Action::MoveSelectedUp => self.move_selected_left_item_up()?,
                 Action::FocusAgent | Action::ExitInteractive => {
                     self.activate_selected_left_item()?
                 }
@@ -7898,6 +7900,111 @@ mod tests {
             worktree_path: String::new(),
             rel_path: String::new(),
         };
+    }
+
+    #[test]
+    fn shift_j_moves_selected_project_down_and_persists_config_order() {
+        let mut app = test_app(default_bindings());
+        let root = app.paths.root.clone();
+        app.config.projects = vec![
+            ProjectConfig {
+                id: "project-1".to_string(),
+                path: app.git.projects[0].path.clone(),
+                name: Some("demo".to_string()),
+                default_provider: None,
+                commit_prompt: None,
+            },
+            ProjectConfig {
+                id: "project-2".to_string(),
+                path: root.join("other").to_string_lossy().to_string(),
+                name: Some("other".to_string()),
+                default_provider: None,
+                commit_prompt: None,
+            },
+        ];
+        app.git.projects.push(Project {
+            id: "project-2".to_string(),
+            name: "other".to_string(),
+            path: root.join("other").to_string_lossy().to_string(),
+            default_provider: ProviderKind::from_str("codex"),
+            current_branch: "main".to_string(),
+            path_missing: false,
+            meta_loaded: true,
+        });
+        app.rebuild_left_items();
+        app.selected_left = 0;
+        app.ui.focus = FocusPane::Left;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT))
+            .unwrap();
+
+        let project_ids: Vec<&str> = app
+            .git
+            .projects
+            .iter()
+            .map(|project| project.id.as_str())
+            .collect();
+        assert_eq!(project_ids, vec!["project-2", "project-1"]);
+        assert_eq!(app.selected_left, 1);
+        let config_ids: Vec<&str> = app
+            .config
+            .projects
+            .iter()
+            .map(|project| project.id.as_str())
+            .collect();
+        assert_eq!(config_ids, vec!["project-2", "project-1"]);
+        let saved = std::fs::read_to_string(&app.paths.config_path).expect("config saved");
+        let first = saved.find("project-2").expect("project-2 in config");
+        let second = saved.find("project-1").expect("project-1 in config");
+        assert!(first < second, "project order not persisted:\n{saved}");
+    }
+
+    #[test]
+    fn shift_k_moves_selected_agent_up_and_persists_session_order() {
+        let mut app = test_app(default_bindings());
+        let now = Utc::now();
+        app.git.sessions.push(AgentSession {
+            id: "session-2".to_string(),
+            project_id: app.git.projects[0].id.clone(),
+            project_path: Some(app.git.projects[0].path.clone()),
+            provider: ProviderKind::from_str("codex"),
+            source_branch: "main".to_string(),
+            branch_name: "agent-branch-2".to_string(),
+            worktree_path: app.paths.worktrees_root.to_string_lossy().to_string(),
+            title: None,
+            started_providers: Vec::new(),
+            state: SessionState::Created { created_at: now },
+            settings: crate::model::SessionSettings::default(),
+            created_at: now,
+            updated_at: now,
+        });
+        app.session_store
+            .upsert_session(&app.git.sessions[0])
+            .expect("seed session 1");
+        app.session_store
+            .upsert_session(&app.git.sessions[1])
+            .expect("seed session 2");
+        app.rebuild_left_items();
+        app.selected_left = 2;
+        app.ui.focus = FocusPane::Left;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT))
+            .unwrap();
+
+        let session_ids: Vec<&str> = app
+            .git
+            .sessions
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect();
+        assert_eq!(session_ids, vec!["session-2", "session-1"]);
+        assert_eq!(app.selected_left, 1);
+        let persisted = app.session_store.load_sessions().expect("load sessions");
+        let persisted_ids: Vec<&str> = persisted
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect();
+        assert_eq!(persisted_ids, vec!["session-2", "session-1"]);
     }
 
     #[test]

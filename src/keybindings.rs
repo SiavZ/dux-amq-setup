@@ -7,6 +7,8 @@ pub enum Action {
     // Navigation
     MoveDown,
     MoveUp,
+    MoveSelectedDown,
+    MoveSelectedUp,
     // Projects pane
     ToggleProject,
     NewAgent,
@@ -185,6 +187,8 @@ impl Action {
         match self {
             Action::MoveDown => "move_down",
             Action::MoveUp => "move_up",
+            Action::MoveSelectedDown => "move_selected_down",
+            Action::MoveSelectedUp => "move_selected_up",
             Action::ToggleProject => "toggle_project",
             Action::NewAgent => "new_agent",
             Action::ForkAgent => "fork_agent",
@@ -268,6 +272,8 @@ impl Action {
         match self {
             Action::MoveDown => "Navigate down through projects, sessions, files, and lists.",
             Action::MoveUp => "Navigate up through projects, sessions, files, and lists.",
+            Action::MoveSelectedDown => "Move the selected project or agent down.",
+            Action::MoveSelectedUp => "Move the selected project or agent up.",
             Action::ToggleProject => "Collapse or expand the selected project.",
             Action::NewAgent => "Create a new agent session (worktree).",
             Action::ForkAgent => "Fork the selected agent into a fresh worktree and session.",
@@ -371,6 +377,8 @@ impl Action {
         match self {
             Action::MoveDown
             | Action::MoveUp
+            | Action::MoveSelectedDown
+            | Action::MoveSelectedUp
             | Action::ToggleProject
             | Action::NewAgent
             | Action::ForkAgent
@@ -518,6 +526,40 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         help: None, // covered by MoveDown's combined label
         hint_contexts: &[],
         palette: None,
+    },
+    BindingDef {
+        action: Action::MoveSelectedDown,
+        default_keys: &[key!(shift - j)],
+        scopes: &[BindingScope::Left],
+        help: Some(HelpEntry {
+            section: "Projects pane",
+            description: "Move selected project or agent down",
+        }),
+        hint_contexts: &[
+            (HintContext::LeftProject, "Move down"),
+            (HintContext::LeftSession, "Move down"),
+        ],
+        palette: Some(PaletteEntry {
+            name: "move-selected-down",
+            description: "Move the selected project or agent down",
+        }),
+    },
+    BindingDef {
+        action: Action::MoveSelectedUp,
+        default_keys: &[key!(shift - k)],
+        scopes: &[BindingScope::Left],
+        help: Some(HelpEntry {
+            section: "Projects pane",
+            description: "Move selected project or agent up",
+        }),
+        hint_contexts: &[
+            (HintContext::LeftProject, "Move up"),
+            (HintContext::LeftSession, "Move up"),
+        ],
+        palette: Some(PaletteEntry {
+            name: "move-selected-up",
+            description: "Move the selected project or agent up",
+        }),
     },
     // ── Projects pane ─────────────────────────────────────────────
     BindingDef {
@@ -2341,6 +2383,21 @@ mod tests {
         assert_eq!(
             bindings.lookup(&n, BindingScope::Files),
             Some(Action::SearchNext)
+        );
+    }
+
+    #[test]
+    fn left_scope_resolves_shift_jk_to_reorder_actions() {
+        let bindings = default_bindings();
+        let down = KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT);
+        let up = KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT);
+        assert_eq!(
+            bindings.lookup(&down, BindingScope::Left),
+            Some(Action::MoveSelectedDown)
+        );
+        assert_eq!(
+            bindings.lookup(&up, BindingScope::Left),
+            Some(Action::MoveSelectedUp)
         );
     }
 

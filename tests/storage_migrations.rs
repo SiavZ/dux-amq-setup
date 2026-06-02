@@ -55,6 +55,7 @@ fn migrate_from_empty_db_runs_all_migrations() {
         "project_path",
         "started_providers",
         "status",
+        "sort_order",
         "created_at",
         "updated_at",
     ] {
@@ -170,6 +171,56 @@ fn migrate_v2_to_v3_adds_session_settings_column() {
     assert!(
         user_version >= 3,
         "expected user_version >= 3 after 0003 migration, got {user_version}"
+    );
+}
+
+/// Opening a v3 database with existing sessions must add `sort_order`
+/// and back-fill it to preserve the old startup display order
+/// (`updated_at desc`) before the manual ordering feature takes over.
+#[test]
+fn migrate_v3_to_v4_backfills_session_sort_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("v3.sqlite3");
+
+    {
+        let conn = rusqlite::Connection::open(&path).expect("open raw");
+        conn.execute_batch(include_str!(
+            "../src/storage/migrations/0001_initial_schema.sql"
+        ))
+        .expect("apply 0001");
+        conn.execute_batch(include_str!(
+            "../src/storage/migrations/0002_session_state_v2.sql"
+        ))
+        .expect("apply 0002");
+        conn.execute_batch(include_str!(
+            "../src/storage/migrations/0003_session_settings.sql"
+        ))
+        .expect("apply 0003");
+        conn.execute_batch(
+            r#"
+            insert into agent_sessions
+                (id, project_id, provider, source_branch, branch_name, worktree_path, status, created_at, updated_at)
+            values
+                ('old', 'p', 'claude', 'main', 'old-branch', '/tmp/old', 'detached', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                ('new', 'p', 'claude', 'main', 'new-branch', '/tmp/new', 'detached', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z');
+            PRAGMA user_version = 3;
+            "#,
+        )
+        .expect("seed v3");
+    }
+
+    let store = SessionStore::open(&path).expect("open at v4");
+    let loaded = store.load_sessions().expect("load sessions");
+    let ids: Vec<&str> = loaded.iter().map(|session| session.id.as_str()).collect();
+    assert_eq!(ids, vec!["new", "old"]);
+
+    let user_version: u32 = store
+        .conn()
+        .query_row("PRAGMA user_version;", [], |row| row.get(0))
+        .expect("read user_version");
+    assert!(
+        user_version >= 4,
+        "expected user_version >= 4 after 0004 migration, got {user_version}"
     );
 }
 

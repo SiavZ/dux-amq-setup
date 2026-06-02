@@ -35,6 +35,10 @@ const MIGRATIONS: &[(u32, &str)] = &[
         3,
         include_str!("storage/migrations/0003_session_settings.sql"),
     ),
+    (
+        4,
+        include_str!("storage/migrations/0004_session_sort_order.sql"),
+    ),
 ];
 
 /// Apply any migrations whose version is greater than the database's
@@ -102,6 +106,14 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         // this shim covers the same legacy pre-`user_version`
         // upgrade path.
         ensure_column(conn, "agent_sessions", "session_settings", "text")?;
+        // Manual sidebar order. Migration 0004 back-fills modern DBs;
+        // this shim only guarantees the column exists on legacy paths.
+        ensure_column(
+            conn,
+            "agent_sessions",
+            "sort_order",
+            "integer not null default 0",
+        )?;
     }
     Ok(())
 }
@@ -261,9 +273,13 @@ impl SessionStore {
         conn.execute(
             r#"
             insert into agent_sessions
-                (id, project_id, project_path, provider, source_branch, branch_name, worktree_path, title, started_providers, status, state_json, session_settings, created_at, updated_at)
+                (id, project_id, project_path, provider, source_branch, branch_name, worktree_path, title, started_providers, status, state_json, session_settings, sort_order, created_at, updated_at)
             values
-                (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                    coalesce((select max(sort_order) + 1 from agent_sessions), 0),
+                    ?13, ?14
+                )
             on conflict(id) do update set
                 project_path=excluded.project_path,
                 provider=excluded.provider,
@@ -303,7 +319,7 @@ impl SessionStore {
             r#"
             select id, project_id, provider, source_branch, branch_name, worktree_path, title, project_path, started_providers, status, state_json, session_settings, created_at, updated_at
             from agent_sessions
-            order by updated_at desc
+            order by sort_order asc, updated_at desc, id asc
             "#,
         )?;
         let rows = stmt.query_map([], |row| {
@@ -350,6 +366,23 @@ impl SessionStore {
             sessions.push(row?);
         }
         Ok(sessions)
+    }
+
+    /// Persist the user-visible order of sessions. The app passes its full
+    /// in-memory session list, so this writes a dense 0-based order for the
+    /// rows the UI knows about. Rows not present in `ordered_ids` are left
+    /// unchanged and will continue to sort by their existing position.
+    pub fn update_session_order(&self, ordered_ids: &[String]) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        for (index, id) in ordered_ids.iter().enumerate() {
+            tx.execute(
+                "update agent_sessions set sort_order = ?1 where id = ?2",
+                params![index as i64, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn delete_session(&self, id: &str) -> Result<()> {
@@ -499,12 +532,13 @@ mod tests {
     use chrono::Duration;
 
     #[test]
-    fn load_sessions_ordered_by_updated_at_desc() {
+    fn load_sessions_preserves_insert_order_by_default() {
         let store = test_store();
         let now = Utc::now();
 
-        // Insert three sessions with different updated_at values.
-        // oldest updated first, newest updated last.
+        // Insert three sessions with deliberately non-monotonic updated_at
+        // values. New rows append to the explicit sort_order instead of
+        // jumping around by timestamp.
         let s1 = test_session("a", now - Duration::hours(3), now - Duration::hours(3));
         let s2 = test_session("b", now - Duration::hours(2), now - Duration::hours(1));
         let s3 = test_session("c", now - Duration::hours(1), now - Duration::hours(2));
@@ -516,12 +550,11 @@ mod tests {
         let loaded = store.load_sessions().unwrap();
         let ids: Vec<&str> = loaded.iter().map(|s| s.id.as_str()).collect();
 
-        // s2 has the most recent updated_at, then s3, then s1.
-        assert_eq!(ids, vec!["b", "c", "a"]);
+        assert_eq!(ids, vec!["a", "b", "c"]);
     }
 
     #[test]
-    fn upsert_without_changing_updated_at_preserves_order() {
+    fn upsert_existing_session_does_not_move_it() {
         let store = test_store();
         let now = Utc::now();
 
@@ -537,8 +570,29 @@ mod tests {
         let loaded = store.load_sessions().unwrap();
         let ids: Vec<&str> = loaded.iter().map(|s| s.id.as_str()).collect();
 
-        // Order unchanged: s2 still has the more recent updated_at.
-        assert_eq!(ids, vec!["b", "a"]);
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn update_session_order_persists_manual_order() {
+        let store = test_store();
+        let now = Utc::now();
+
+        let s1 = test_session("a", now, now);
+        let s2 = test_session("b", now, now);
+        let s3 = test_session("c", now, now);
+
+        store.upsert_session(&s1).unwrap();
+        store.upsert_session(&s2).unwrap();
+        store.upsert_session(&s3).unwrap();
+        store
+            .update_session_order(&["c".to_string(), "a".to_string(), "b".to_string()])
+            .unwrap();
+
+        let loaded = store.load_sessions().unwrap();
+        let ids: Vec<&str> = loaded.iter().map(|s| s.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["c", "a", "b"]);
     }
 
     #[test]
