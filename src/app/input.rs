@@ -5540,6 +5540,18 @@ impl App {
             return false;
         }
 
+        if !matches!(self.ui.fullscreen_overlay, FullscreenOverlay::None)
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && !self
+                .ui
+                .mouse_layout
+                .agent_term
+                .is_some_and(|rect| contains_point(rect, mouse.column, mouse.row))
+        {
+            self.exit_interactive_mode();
+            return false;
+        }
+
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.center_scrollbar_at_mouse(mouse.column, mouse.row) {
@@ -10645,6 +10657,34 @@ cyan = "#00ffff"
             FullscreenOverlay::Agent,
             "clicking inside overlay must keep fullscreen"
         );
+    }
+
+    #[test]
+    fn structured_click_outside_fullscreen_agent_exits_interactive_mode() {
+        let mut app = app_with_interactive_agent_pty();
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 1));
+
+        assert_eq!(
+            app.ui.input_target,
+            InputTarget::None,
+            "structured mouse clicks outside overlay must exit interactive mode"
+        );
+        assert_eq!(
+            app.ui.fullscreen_overlay,
+            FullscreenOverlay::None,
+            "structured mouse clicks outside overlay must dismiss fullscreen"
+        );
+    }
+
+    #[test]
+    fn structured_click_inside_fullscreen_agent_stays_interactive() {
+        let mut app = app_with_interactive_agent_pty();
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 30, 5));
+
+        assert_eq!(app.ui.input_target, InputTarget::Agent);
+        assert_eq!(app.ui.fullscreen_overlay, FullscreenOverlay::Agent);
     }
 
     #[test]
