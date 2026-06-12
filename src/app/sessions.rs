@@ -387,6 +387,10 @@ impl App {
             self.set_error(reason);
             return Ok(());
         }
+        if let Some(reason) = self.refuse_agent_spawn_for_amq_collision(&request) {
+            self.set_error(reason);
+            return Ok(());
+        }
         if let Some(warning) = self.soft_warn_for_pane_count() {
             self.set_warning(warning);
         }
@@ -436,6 +440,46 @@ impl App {
                  (limits.disk_high_water_pct = {}%). Run `dux session purge` \
                  or extend the volume to recover.",
                 limits.disk_high_water_pct
+            ));
+        }
+        None
+    }
+
+    /// User-created Dux worktrees derive their AMQ identity from the worktree
+    /// directory basename. Refuse duplicate handles before creating a Git
+    /// worktree so the wrapper does not immediately exit with an identity
+    /// collision.
+    pub(crate) fn refuse_agent_spawn_for_amq_collision(
+        &self,
+        request: &CreateAgentRequest,
+    ) -> Option<String> {
+        let requested_name = match request {
+            CreateAgentRequest::NewProject {
+                custom_name: Some(name),
+                ..
+            }
+            | CreateAgentRequest::ForkSession {
+                custom_name: Some(name),
+                ..
+            } => name,
+            _ => return None,
+        };
+        let requested_handle = amq_handle_for_agent_name(requested_name);
+        if requested_handle.is_empty() {
+            return None;
+        }
+
+        for session in &self.git.sessions {
+            if !std::path::Path::new(&session.worktree_path).exists() {
+                continue;
+            }
+            if amq_handle_for_session(session) != requested_handle {
+                continue;
+            }
+            let label = self.session_label(session);
+            let project = self.project_name_for_session(session);
+            return Some(format!(
+                "Refusing new agent: AMQ handle \"{requested_handle}\" is already used by agent \"{label}\" in project \"{project}\". Pick a unique agent name, for example include the project name, so dux-amq can route messages unambiguously.",
             ));
         }
         None
@@ -2325,6 +2369,32 @@ impl App {
     }
 }
 
+fn amq_handle_for_agent_name(name: &str) -> String {
+    let basename = std::path::Path::new(name)
+        .file_name()
+        .and_then(|part| part.to_str())
+        .unwrap_or(name);
+    let handle = crate::app::inject_runtime::sanitise_handle(basename);
+    if handle.is_empty() {
+        crate::app::inject_runtime::sanitise_handle(name)
+    } else {
+        handle
+    }
+}
+
+fn amq_handle_for_session(session: &AgentSession) -> String {
+    let basename = std::path::Path::new(&session.worktree_path)
+        .file_name()
+        .and_then(|part| part.to_str())
+        .unwrap_or(&session.branch_name);
+    let handle = crate::app::inject_runtime::sanitise_handle(basename);
+    if handle.is_empty() {
+        crate::app::inject_runtime::sanitise_handle(&session.branch_name)
+    } else {
+        handle
+    }
+}
+
 /// Build a human-readable summary of which session-settings knobs
 /// changed. Used by [`App::save_session_settings`] to populate the
 /// status line. Pure function so it's easy to unit-test.
@@ -3114,6 +3184,85 @@ mod tests {
         assert!(
             msg.contains("not a git repository"),
             "error should include the git error, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn refuse_agent_spawn_for_amq_collision_matches_existing_worktree_basename() {
+        let worktree_dir = tempdir().expect("worktree tempdir");
+        let existing_path = worktree_dir.path().join("MurenaOS-gallery-engineer-codex");
+        std::fs::create_dir_all(&existing_path).expect("existing worktree dir");
+        let existing_path = existing_path.to_string_lossy().to_string();
+
+        let mut existing = make_session("s1", "codex", &existing_path);
+        existing.branch_name = "MurenaOS-gallery-engineer-codex".to_string();
+        existing.project_id = "project-1".to_string();
+
+        let existing_project = make_project("project-1", "codex");
+        let mut new_project = make_project("project-2", "codex");
+        new_project.name = "Glimpse".to_string();
+        let app =
+            test_app_with_sessions(vec![existing], vec![existing_project, new_project.clone()]);
+
+        let request = CreateAgentRequest::NewProject {
+            project: new_project,
+            custom_name: Some("MurenaOS-gallery-engineer-codex".to_string()),
+            use_existing_branch: false,
+            provider: ProviderKind::from_str("codex"),
+            settings: crate::model::SessionSettings::default(),
+        };
+
+        let reason = app
+            .refuse_agent_spawn_for_amq_collision(&request)
+            .expect("duplicate AMQ handle should be refused");
+        assert!(
+            reason.contains("murenaos-gallery-engineer-codex"),
+            "message should name the colliding AMQ handle, got: {reason}",
+        );
+        assert!(
+            reason.contains("branch-s1") || reason.contains("MurenaOS-gallery-engineer-codex"),
+            "message should identify the existing agent, got: {reason}",
+        );
+    }
+
+    #[test]
+    fn refuse_agent_spawn_for_amq_collision_uses_worktree_basename_for_slash_names() {
+        let worktree_dir = tempdir().expect("worktree tempdir");
+        let existing_path = worktree_dir.path().join("foo");
+        std::fs::create_dir_all(&existing_path).expect("existing worktree dir");
+        let existing_path = existing_path.to_string_lossy().to_string();
+
+        let mut existing = make_session("s1", "codex", &existing_path);
+        existing.branch_name = "feature/foo".to_string();
+        let project = make_project("project-1", "codex");
+        let app = test_app_with_sessions(vec![existing], vec![project.clone()]);
+
+        let colliding = CreateAgentRequest::NewProject {
+            project: project.clone(),
+            custom_name: Some("other/foo".to_string()),
+            use_existing_branch: false,
+            provider: ProviderKind::from_str("codex"),
+            settings: crate::model::SessionSettings::default(),
+        };
+        let reason = app
+            .refuse_agent_spawn_for_amq_collision(&colliding)
+            .expect("duplicate basename-derived AMQ handle should be refused");
+        assert!(
+            reason.contains("AMQ handle \"foo\""),
+            "message should use the basename-derived handle, got: {reason}",
+        );
+
+        let distinct = CreateAgentRequest::NewProject {
+            project,
+            custom_name: Some("feature/bar".to_string()),
+            use_existing_branch: false,
+            provider: ProviderKind::from_str("codex"),
+            settings: crate::model::SessionSettings::default(),
+        };
+        assert!(
+            app.refuse_agent_spawn_for_amq_collision(&distinct)
+                .is_none(),
+            "distinct basename-derived handle should be allowed",
         );
     }
 
