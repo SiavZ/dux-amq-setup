@@ -29,12 +29,12 @@ pub(crate) fn build_orchestrator_startup_policy_prompt(
     out.push_str(policy.trim());
     if peers.is_empty() {
         out.push_str(
-            "\n\nAcknowledge Orchestrator mode briefly. There are no active worker agents yet; wait for assignments or AMQ messages, and do not do hands-on implementation work.",
+            "\n\nAcknowledge Orchestrator mode briefly. There are no active worker agents yet; wait for assignments or Dux peer messages, and do not do hands-on implementation work.",
         );
     } else {
         let _ = writeln!(
             out,
-            "\n\nAcknowledge Orchestrator mode briefly. Dux sees {} active worker agent(s), but do not poll them on startup. Wait for assignments, AMQ messages, or the next scheduled Dux checkpoint.",
+            "\n\nAcknowledge Orchestrator mode briefly. Dux sees {} active worker agent(s), but do not poll them on startup. Wait for assignments, Dux peer messages, or the next scheduled Dux checkpoint.",
             peers.len()
         );
     }
@@ -44,7 +44,7 @@ pub(crate) fn build_orchestrator_startup_policy_prompt(
 pub(crate) fn build_orchestrator_checkpoint_prompt(peers: &[OrchestratorPeer]) -> String {
     let mut out = String::from(
         "[Dux Orchestrator checkpoint]\n\n\
-Poll active worker agents now through AMQ. Do not do their implementation work yourself.\n\n\
+Poll active worker agents now through `dux peer send`. Do not do their implementation work yourself.\n\n\
 Active agents:\n",
     );
     for peer in peers.iter().take(MAX_CHECKPOINT_PEERS) {
@@ -67,7 +67,7 @@ Active agents:\n",
         );
     }
     out.push_str(
-        "\nFor each active agent, use AMQ to ask for status, blockers, ETA, next command/result, and the proof that will demonstrate completion. Use commands like `amq send --to <handle> --body \"...\"` from inside this session.\n\
+        "\nFor each active agent, use `dux peer send <handle> \"...\"` to ask for status, blockers, ETA, next command/result, and the proof that will demonstrate completion. Do not call `amq` or Claude Peers directly for normal peer routing; Dux chooses the transport.\n\
 Push stale or blocked agents with a concrete next checkpoint. Demand scoped diffs, relevant tests/lint/security checks, and concise handoff notes. Escalate to the human when agents disagree, need a decision, or repeatedly miss checkpoints.",
     );
     out
@@ -349,7 +349,7 @@ mod tests {
 
         assert!(prompt.contains("front-end-qa"));
         assert!(prompt.contains("Do not do their implementation work yourself"));
-        assert!(prompt.contains("amq send --to <handle>"));
+        assert!(prompt.contains("dux peer send <handle>"));
         assert!(prompt.contains("status, blockers, ETA"));
     }
 
@@ -378,7 +378,7 @@ mod tests {
         );
 
         assert!(prompt.contains("do not poll them on startup"));
-        assert!(!prompt.contains("amq send --to <handle>"));
+        assert!(!prompt.contains("dux peer send <handle>"));
         assert!(!prompt.contains("Dux Orchestrator checkpoint"));
     }
 

@@ -24,6 +24,7 @@ pub mod keybindings;
 pub mod lockfile;
 pub mod logger;
 pub mod model;
+pub mod peer;
 pub mod provider;
 pub mod pty;
 pub mod purge;

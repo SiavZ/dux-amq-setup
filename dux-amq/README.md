@@ -7,13 +7,15 @@ This directory does **not** modify dux source. It sits alongside the dux Rust so
 ## What you get
 
 - **Worktree-per-agent UI** (dux) for parallel Claude/Codex/Gemini sessions
-- **File-based message bus** (AMQ) so agents on the same VM can `send`/`list`/`read` between each other
+- **Dux peer router** so agents use `dux peer send` instead of choosing AMQ vs Claude Peers themselves
+- **File-based message bus** (AMQ) so agents on the same VM have a durable cross-provider fallback
 - **Automatic identity**: each dux pane's AMQ handle is the worktree directory basename, lowercased + sanitized to `[a-z0-9_-]` (typically the original branch name at worktree creation; stable across branch renames inside the worktree)
 - **Spot-VM survival**: dux config + sessions, AMQ queue, and Claude session JSONLs all live on a persistent disk (default `/data/state/`)
 - **Past-chat resume** in fresh worktrees via `--continue --fork-session` (bypasses deferred-tool blocks)
 - **YOLO is opt-in** (audit02 P0-A): `CLAUDE_AMQ_YOLO=1` / `CODEX_AMQ_YOLO=1` enable the per-pane `--dangerously-*` flag. See [Permission model](#permission-model).
 - **Per-session system prompt** (audit03 §15): the dux session-settings modal can set a custom prompt for one specific session without touching `CLAUDE.md` or global config. dux exports `DUX_SYSTEM_PROMPT` in the per-PTY env at spawn time; `claude-amq` translates it into `claude --append-system-prompt <text>`. `codex-amq` and `gemini-amq` warn-and-drop because their upstream CLIs have no equivalent system-prompt flag today; Dux injects non-Claude Orchestrator policy after startup instead of changing provider launch semantics.
-- **Orchestrator mode policy**: sessions marked Orchestrator automatically receive a built-in policy that tells them to coordinate through AMQ, avoid hands-on implementation, and proactively poll workers. `[amq.orchestrator]` also runs a Dux-side checkpoint watchdog so Codex and Claude orchestrators get periodic AMQ polling nudges instead of waiting passively.
+- **Orchestrator mode policy**: sessions marked Orchestrator automatically receive a built-in policy that tells them to coordinate through `dux peer send`, avoid hands-on implementation, and proactively poll workers. `[amq.orchestrator]` also runs a Dux-side checkpoint watchdog so Codex and Claude orchestrators get periodic peer-routing nudges instead of waiting passively.
+- **AMQ registry refresh on Dux boot**: Dux reconciles AMQ's `meta/config.json` and Dux-owned source markers from `sessions.sqlite3` when it starts, and `dux peer sync-amq` can run the same refresh manually.
 
 ## Layout
 
@@ -125,7 +127,7 @@ that `--continue` refuses.
 - dux creates a git worktree per pane; each pane gets its own CWD and Claude session storage.
 - The `claude-amq` wrapper sets `AM_ME = <branch>`, ensures `--no-init`, and uses the shared `AMQ_GLOBAL_ROOT` queue.
 - `--continue --fork-session` lets a worktree pick up the parent repo's most-recent chat as context, forking off cleanly so deferred-tool markers don't block resume.
-- All inter-pane communication is `amq send <peer> "..."` from the agent — no MCP, no daemon, just files on disk.
+- Agents should use `dux peer send <peer> "..."`. The router uses Claude Peers only for Claude-to-Claude when both sessions are registered with the Claude Peers broker; otherwise it writes through AMQ.
 
 ## Kernel compatibility (TIOCSTI)
 

@@ -14,6 +14,7 @@ mod keybindings;
 mod lockfile;
 mod logger;
 mod model;
+mod peer;
 mod provider;
 mod pty;
 mod purge;
@@ -32,7 +33,11 @@ use anyhow::Result;
 fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
 
-    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+    if args
+        .first()
+        .map(|arg| arg == "--help" || arg == "-h")
+        .unwrap_or(false)
+    {
         print_help();
         return Ok(());
     }
@@ -96,6 +101,10 @@ fn main() -> Result<()> {
         return cli::run_session(session_args, &paths);
     }
 
+    if args.first().map(|s| s.as_str()) == Some("peer") {
+        return peer::run_peer(&args[1..], &paths);
+    }
+
     // TUI: always create the root directory (so the lockfile can be
     // opened), acquire the lock, then let bootstrap create everything
     // else. A losing process never touches shared state beyond the
@@ -114,6 +123,7 @@ fn print_help() {
           dux              Launch the TUI\n\
           dux config       Manage the configuration file\n\
           dux session      Manage individual sessions (purge for GDPR erasure)\n\
+          dux peer         Route messages between Dux agent sessions\n\
           dux doctor       Print a diagnostic dump (--json, --anonymize)\n\n\
          Config subcommands:\n\
           dux config path          Print the config file path\n\

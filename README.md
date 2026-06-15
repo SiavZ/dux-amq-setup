@@ -135,6 +135,18 @@ dux config regenerate    # Preview a fresh default config
 
 Override the config directory with the `DUX_HOME` environment variable.
 
+### Peer Routing
+
+Agents should send messages through Dux instead of choosing a transport:
+
+```bash
+dux peer send <handle> "status? blockers? next proof?"
+dux peer list
+dux peer sync-amq
+```
+
+`dux peer send` uses Claude Peers only for Claude-to-Claude sessions when both sides are registered there. Mixed Claude/Codex/Gemini routes use AMQ, and Dux refreshes AMQ's agent registry from `sessions.sqlite3` on startup and via `dux peer sync-amq`.
+
 ### Themes
 
 dux writes `config.toml` the first time it launches, so theme setup starts from a real, editable file instead of a guessing game. The generated config includes `[ui].theme = "dux_dark"`, plus comments with built-in theme examples. Edit that value, or use the `change-theme` command from the palette to preview and save a theme from inside the app.

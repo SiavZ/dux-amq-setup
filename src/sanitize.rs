@@ -55,6 +55,29 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Sanitise an AMQ/Dux peer handle the same way the AMQ wrappers do:
+/// lowercase ASCII, keep `[a-z0-9_-]`, replace other characters with
+/// `-`, then trim leading/trailing dashes.
+pub fn amq_handle(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-' {
+            out.push(ch);
+        } else if ch.is_ascii_uppercase() {
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push('-');
+        }
+    }
+    while out.starts_with('-') {
+        out.remove(0);
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +114,12 @@ mod tests {
     fn truncate_with_ellipsis() {
         let s = "0123456789";
         assert_eq!(truncate(s, 5), "0123…");
+    }
+
+    #[test]
+    fn amq_handle_matches_wrapper_rules() {
+        assert_eq!(amq_handle("Feature/Login"), "feature-login");
+        assert_eq!(amq_handle("--Already_OK--"), "already_ok");
+        assert_eq!(amq_handle("!!!"), "");
     }
 }

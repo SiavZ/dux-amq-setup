@@ -1551,9 +1551,10 @@ pub(crate) fn run_create_agent_job(
     // override) into the spawn so the wrappers see deterministic
     // CLI flags. `verify_envelope_override.is_none()` falls through
     // to the global config value here, where the `Config` is in scope.
-    let per_session_env = session
+    let mut per_session_env = session
         .settings
         .to_pty_env(&session.provider, config.amq.inject.verify_envelope);
+    crate::peer::append_session_env(&mut per_session_env, &session);
     let client = match PtyClient::spawn_with_env(
         &provider_cfg.command,
         &provider_cfg.args,

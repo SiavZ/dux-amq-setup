@@ -1309,6 +1309,32 @@ impl App {
         let session_store = SessionStore::open(&paths.sessions_db_path)?;
         let projects = load_projects(&config);
         let sessions = session_store.load_sessions()?;
+        match crate::peer::sync_amq_agents(&paths, &sessions) {
+            Ok(report) if report.skipped => {
+                tracing::debug!(
+                    target: "dux::peer",
+                    "AMQ registry sync skipped; no AMQ root configured"
+                );
+            }
+            Ok(report) => {
+                tracing::debug!(
+                    target: "dux::peer",
+                    root = %report.root.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+                    configured_agents_added = report.configured_agents_added,
+                    stale_config_agents_removed = report.stale_config_agents_removed,
+                    source_links_created = report.source_links_created,
+                    source_links_replaced = report.source_links_replaced,
+                    source_link_conflicts = report.source_link_conflicts.len(),
+                    "AMQ registry synced from Dux sessions"
+                );
+                for conflict in report.source_link_conflicts {
+                    tracing::warn!(target: "dux::peer", conflict = %conflict, "AMQ source link conflict");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(target: "dux::peer", err = %err, "AMQ registry sync failed");
+            }
+        }
         let (worker_tx, worker_rx) = mpsc::channel();
         let watched_worktree: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
         let initial_status = format!(

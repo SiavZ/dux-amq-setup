@@ -157,23 +157,7 @@ enum AmqDeliveryPhase {
 /// the agent handle. Used to match a receiver name (already sanitised
 /// by the bridge) against a session's `branch_name`.
 pub(crate) fn sanitise_handle(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for ch in name.chars() {
-        if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-' {
-            out.push(ch);
-        } else if ch.is_ascii_uppercase() {
-            out.push(ch.to_ascii_lowercase());
-        } else {
-            out.push('-');
-        }
-    }
-    while out.starts_with('-') {
-        out.remove(0);
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    out
+    crate::sanitize::amq_handle(name)
 }
 
 /// Pure helper that does the receiver→session-id resolution given a

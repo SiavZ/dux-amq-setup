@@ -540,9 +540,10 @@ impl App {
         // override) through the spawn so wrappers see deterministic
         // CLI flags. `verify_envelope_override = None` inherits the
         // global config default.
-        let per_session_env = session
+        let mut per_session_env = session
             .settings
             .to_pty_env(&session.provider, self.config.amq.inject.verify_envelope);
+        crate::peer::append_session_env(&mut per_session_env, session);
         PtyClient::spawn_with_env(
             &cfg.command,
             launch_args,
@@ -588,9 +589,10 @@ pub(crate) fn spawn_pty_for_auto_resume(
     ));
     // audit03 Phase 3: per-session env propagation matches the UI-thread
     // spawn path so auto-resume and reconnect produce identical wrappers.
-    let per_session_env = session
+    let mut per_session_env = session
         .settings
         .to_pty_env(&session.provider, config.amq.inject.verify_envelope);
+    crate::peer::append_session_env(&mut per_session_env, session);
     PtyClient::spawn_with_env(
         &cfg.command,
         launch_args,
