@@ -12,9 +12,12 @@ prompt_for_name = true   # branch name == AMQ identity
 [providers.claude]
 command     = "claude-amq"
 resume_args = ["--continue", "--fork-session"]
+forward_scroll = true
 
 [providers.codex]
 command = "codex-amq"
+forward_scroll = true
 
 [providers.gemini]
 command = "gemini-amq"
+forward_scroll = true

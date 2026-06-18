@@ -224,6 +224,14 @@ if [[ "${CLAUDE_AMQ_YOLO:-${CLAUDE_YOLO:-}}" == "1" ]]; then
   printf 'claude-amq: YOLO enabled — tool calls will not prompt\n' >&2
 fi
 
+# Claude-to-Claude Dux routing is intentionally forced through Claude
+# Peers. Loading the MCP server as a development channel lets each
+# interactive Claude session register with the local broker at startup.
+# Set CLAUDE_PEERS_DISABLE=1 only for low-level diagnostics.
+if [[ "${CLAUDE_PEERS_DISABLE:-}" != "1" ]]; then
+  EXTRA+=(--dangerously-load-development-channels server:claude-peers)
+fi
+
 # audit03 Phase 01 §15: per-session system-prompt override.
 #
 # dux exports DUX_SYSTEM_PROMPT in the per-PTY child env when the

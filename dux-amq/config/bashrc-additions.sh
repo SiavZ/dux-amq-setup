@@ -6,6 +6,10 @@
 # bumps actually propagate.
 
 # >>> dux-amq vREPLACE_AT_INSTALL >>>
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) export PATH="$HOME/.local/bin:$PATH" ;;
+esac
 export DUX_HOME="${DUX_HOME:-/data/state/dux}"
 export AMQ_GLOBAL_ROOT="${AMQ_GLOBAL_ROOT:-/data/state/amq}"
 # Audit01 P1-8: pinned amq binary path + recorded sha256. The guard below

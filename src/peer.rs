@@ -221,9 +221,9 @@ dux peer - route messages between Dux agent sessions
 
 Subcommands:
   dux peer send [--from <handle>] [--transport auto|amq|claude-peers] <target> <message...>
-                       Send through the Dux router. Auto uses Claude Peers only
-                       for Claude-to-Claude when both sides are registered there;
-                       mixed-provider routes use AMQ.
+                       Send through the Dux router. Auto requires Claude Peers
+                       for known Claude-to-Claude routes; mixed-provider routes
+                       use AMQ.
   dux peer list        List Dux sessions and transport health.
   dux peer sync-amq    Reconcile AMQ's agent registry from sessions.sqlite3.
 
@@ -414,11 +414,11 @@ fn choose_transport(
         TransportPreference::Auto => {
             if is_claude_session(sender.session.as_ref())
                 && is_claude_session(target.session.as_ref())
-                && claude_peers_has_both(
+            {
+                ensure_claude_peers_registered(
                     sender.session.as_ref().unwrap(),
                     target.session.as_ref().unwrap(),
-                )
-            {
+                )?;
                 Ok(ChosenTransport::ClaudePeers)
             } else {
                 Ok(ChosenTransport::Amq)
@@ -448,12 +448,32 @@ fn is_claude_session(session: Option<&AgentSession>) -> bool {
         .unwrap_or(false)
 }
 
-fn claude_peers_has_both(sender: &AgentSession, target: &AgentSession) -> bool {
-    let Ok(peers) = claude_peers_list() else {
-        return false;
-    };
-    claude_peer_id_for_session(sender, &peers).is_some()
-        && claude_peer_id_for_session(target, &peers).is_some()
+fn ensure_claude_peers_registered(sender: &AgentSession, target: &AgentSession) -> Result<()> {
+    let peers = claude_peers_list().context(
+        "Claude-to-Claude routes require Claude Peers, but the broker is unavailable. \
+         Restart Claude agents after installing claude-peers, or pass --transport amq explicitly \
+         for a manual override",
+    )?;
+
+    let sender_registered = claude_peer_id_for_session(sender, &peers).is_some();
+    let target_registered = claude_peer_id_for_session(target, &peers).is_some();
+    if sender_registered && target_registered {
+        return Ok(());
+    }
+
+    let mut missing = Vec::new();
+    if !sender_registered {
+        missing.push(format!("sender {}", amq_handle_for_session(sender)));
+    }
+    if !target_registered {
+        missing.push(format!("target {}", amq_handle_for_session(target)));
+    }
+    bail!(
+        "Claude-to-Claude routes require Claude Peers, but {} not registered with the broker. \
+         Restart those Claude agents so claude-amq loads server:claude-peers, or pass \
+         --transport amq explicitly for a manual override",
+        missing.join(" and ")
+    );
 }
 
 fn amq_send(root: &Path, from: &str, target: &str, message: &str) -> Result<()> {

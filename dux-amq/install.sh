@@ -317,6 +317,38 @@ if command -v npx >/dev/null 2>&1; then
     warn "npx skills add failed; see $SKILLS_LOG"
 fi
 
+# 4b. Claude Peers MCP -------------------------------------------------------
+# Dux forces known Claude-to-Claude peer routes through Claude Peers. The MCP
+# server is still optional at install time so a transient GitHub/Bun failure
+# does not break AMQ or mixed-provider routing, but the wrapper will enable the
+# development channel whenever the server has been registered with Claude Code.
+CLAUDE_PEERS_DIR="${CLAUDE_PEERS_DIR:-$STATE_ROOT/claude-peers-mcp}"
+if command -v bun >/dev/null 2>&1 && command -v claude >/dev/null 2>&1; then
+  BUN_BIN="$(command -v bun)"
+  if [[ ! -e "$LOCAL_BIN/bun" ]]; then
+    ln -s "$BUN_BIN" "$LOCAL_BIN/bun" || warn "could not link bun into $LOCAL_BIN"
+  fi
+  say "installing Claude Peers MCP into $CLAUDE_PEERS_DIR"
+  if [[ -d "$CLAUDE_PEERS_DIR/.git" ]]; then
+    git -C "$CLAUDE_PEERS_DIR" pull --ff-only || warn "Claude Peers update failed"
+  else
+    rm -rf "$CLAUDE_PEERS_DIR"
+    git clone https://github.com/louislva/claude-peers-mcp.git "$CLAUDE_PEERS_DIR" || \
+      warn "Claude Peers clone failed"
+  fi
+  if [[ -f "$CLAUDE_PEERS_DIR/server.ts" ]]; then
+    if [[ -f "$CLAUDE_PEERS_DIR/package.json" ]]; then
+      (cd "$CLAUDE_PEERS_DIR" && "$BUN_BIN" install) || warn "Claude Peers bun install failed"
+    fi
+    claude mcp remove --scope user claude-peers >/dev/null 2>&1 || true
+    claude mcp add --scope user --transport stdio claude-peers -- \
+      "$BUN_BIN" "$CLAUDE_PEERS_DIR/server.ts" || \
+      warn "Claude Peers MCP registration failed"
+  fi
+else
+  warn "bun or claude not found; skipping Claude Peers MCP install"
+fi
+
 # 5. install wrappers --------------------------------------------------------
 say "installing wrappers to $LOCAL_BIN"
 install -m 0755 "$HERE/wrappers/claude-amq"  "$LOCAL_BIN/claude-amq"
@@ -368,6 +400,9 @@ sed -i \
   -e 's|^command = "codex"$|command = "codex-amq"|' \
   -e 's|^command = "gemini"$|command = "gemini-amq"|' \
   -e 's|^resume_args = \["--continue"\]$|resume_args = ["--continue", "--fork-session"]|' \
+  -e '/^\[providers\.claude\]$/,/^\[/ s|^forward_scroll = false$|forward_scroll = true|' \
+  -e '/^\[providers\.codex\]$/,/^\[/ s|^forward_scroll = false$|forward_scroll = true|' \
+  -e '/^\[providers\.gemini\]$/,/^\[/ s|^forward_scroll = false$|forward_scroll = true|' \
   "$STATE_ROOT/dux/config.toml"
 
 # 7. shell rc ----------------------------------------------------------------

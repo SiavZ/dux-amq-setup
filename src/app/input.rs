@@ -731,6 +731,14 @@ impl App {
         provider.scroll(up, amount);
     }
 
+    fn should_forward_scroll_to_provider(&self) -> bool {
+        matches!(self.ui.input_target, InputTarget::Agent)
+            && self
+                .selected_session()
+                .map(|s| provider_config(&self.config, &s.provider).forward_scroll)
+                .unwrap_or(false)
+    }
+
     fn reset_pty_scrollback(&self) {
         if let Some(provider) = self.selected_terminal_surface_client() {
             provider.set_scrollback(0);
@@ -1459,26 +1467,34 @@ impl App {
                     self.exit_interactive_mode();
                     return Ok(false);
                 }
-                SeqAction::Intercept(Action::ScrollPageUp, _, _) => {
-                    flush_forward_batch(
-                        &mut forward_batch,
-                        is_scrolled_back,
-                        &mut needs_selection_clear,
-                        self.selected_terminal_surface_client(),
-                    );
-                    if self.last_pty_size.0 > 0 {
-                        self.scroll_pty(ScrollDirection::Up, self.last_pty_size.0 as usize);
+                SeqAction::Intercept(Action::ScrollPageUp, _, raw) => {
+                    if self.should_forward_scroll_to_provider() && !is_scrolled_back {
+                        forward_batch.extend_from_slice(&raw);
+                    } else {
+                        flush_forward_batch(
+                            &mut forward_batch,
+                            is_scrolled_back,
+                            &mut needs_selection_clear,
+                            self.selected_terminal_surface_client(),
+                        );
+                        if self.last_pty_size.0 > 0 {
+                            self.scroll_pty(ScrollDirection::Up, self.last_pty_size.0 as usize);
+                        }
                     }
                 }
-                SeqAction::Intercept(Action::ScrollPageDown, _, _) => {
-                    flush_forward_batch(
-                        &mut forward_batch,
-                        is_scrolled_back,
-                        &mut needs_selection_clear,
-                        self.selected_terminal_surface_client(),
-                    );
-                    if self.last_pty_size.0 > 0 {
-                        self.scroll_pty(ScrollDirection::Down, self.last_pty_size.0 as usize);
+                SeqAction::Intercept(Action::ScrollPageDown, _, raw) => {
+                    if self.should_forward_scroll_to_provider() && !is_scrolled_back {
+                        forward_batch.extend_from_slice(&raw);
+                    } else {
+                        flush_forward_batch(
+                            &mut forward_batch,
+                            is_scrolled_back,
+                            &mut needs_selection_clear,
+                            self.selected_terminal_surface_client(),
+                        );
+                        if self.last_pty_size.0 > 0 {
+                            self.scroll_pty(ScrollDirection::Down, self.last_pty_size.0 as usize);
+                        }
                     }
                 }
                 SeqAction::Intercept(Action::ScrollLineUp, conditional, raw) => {
@@ -1564,13 +1580,9 @@ impl App {
                     );
                     if is_scroll {
                         self.terminal_selection = None;
-                        // Check if the provider has forward_scroll enabled
-                        // (only applies to agents, not companion terminals).
-                        let forward = matches!(self.ui.input_target, InputTarget::Agent)
-                            && self
-                                .selected_session()
-                                .map(|s| provider_config(&self.config, &s.provider).forward_scroll)
-                                .unwrap_or(false);
+                        // Provider-owned scrollback applies only to agents,
+                        // not companion terminals.
+                        let forward = self.should_forward_scroll_to_provider();
                         if forward {
                             if let Some(provider) = self.selected_terminal_surface_client() {
                                 let _ = provider.write_bytes(&raw);
@@ -10480,6 +10492,35 @@ cyan = "#00ffff"
         // Feed a regular character — should be forwarded without error.
         let result = app.process_raw_input_bytes(b"x").unwrap();
         assert!(!result);
+    }
+
+    #[test]
+    fn forward_scroll_provider_page_up_at_bottom_does_not_use_host_scrollback() {
+        let mut app = app_with_scrolled_back_pty();
+
+        // Reset scrollback to live bottom. Built-in terminal TUI providers
+        // forward scroll keys to the provider when the host is not already
+        // scrolled back.
+        app.selected_terminal_surface_client()
+            .unwrap()
+            .set_scrollback(0);
+        assert_eq!(
+            app.selected_terminal_surface_client()
+                .unwrap()
+                .scrollback_offset(),
+            0
+        );
+
+        let result = app.process_raw_input_bytes(b"\x1b[5~").unwrap();
+
+        assert!(!result);
+        assert_eq!(
+            app.selected_terminal_surface_client()
+                .unwrap()
+                .scrollback_offset(),
+            0,
+            "PgUp should be forwarded to the provider instead of engaging Dux host scrollback"
+        );
     }
 
     #[test]
