@@ -29,7 +29,7 @@ setup() {
   export AM_ME="testpane"
   # Force-unset every env knob the wrappers consult so each test starts
   # from a clean default-deny baseline regardless of the host shell.
-  unset CLAUDE_AMQ_YOLO CLAUDE_YOLO CLAUDE_AMQ_SAFE
+  unset CLAUDE_AMQ_YOLO CLAUDE_YOLO CLAUDE_AMQ_SAFE CLAUDE_PEERS_DISABLE
   unset CODEX_AMQ_YOLO
   unset CLAUDE_AMQ_SEED_FROM_PARENT CLAUDE_AMQ_NO_SEED
   # audit03 Phase 01 §15: DUX_SYSTEM_PROMPT is a per-session env var
@@ -106,6 +106,21 @@ assert_argv_missing() {
     || { printf 'missing deprecation warning. output:\n%s\n' "$output" >&2; return 1; }
   # And CLAUDE_AMQ_SAFE must NOT silently re-enable YOLO:
   assert_argv_missing "--dangerously-skip-permissions"
+}
+
+@test "claude-amq loads claude-peers with approved channels by default" {
+  run "$WRAPPERS_DIR/claude-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_contains "--channels"
+  assert_argv_contains "server:claude-peers"
+  assert_argv_missing "--dangerously-load-development-channels"
+}
+
+@test "claude-amq can disable claude-peers channel loading" {
+  CLAUDE_PEERS_DISABLE=1 run "$WRAPPERS_DIR/claude-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_missing "--channels"
+  assert_argv_missing "server:claude-peers"
 }
 
 @test "codex-amq does not pass sandbox-bypass flag by default" {

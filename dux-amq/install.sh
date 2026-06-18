@@ -318,10 +318,10 @@ if command -v npx >/dev/null 2>&1; then
 fi
 
 # 4b. Claude Peers MCP -------------------------------------------------------
-# Dux forces known Claude-to-Claude peer routes through Claude Peers. The MCP
+# Dux forces Claude-targeted peer routes through Claude Peers. The MCP
 # server is still optional at install time so a transient GitHub/Bun failure
-# does not break AMQ or mixed-provider routing, but the wrapper will enable the
-# development channel whenever the server has been registered with Claude Code.
+# does not break AMQ or non-Claude routing, but the wrapper will enable the
+# channel whenever the server has been registered with Claude Code.
 CLAUDE_PEERS_DIR="${CLAUDE_PEERS_DIR:-$STATE_ROOT/claude-peers-mcp}"
 if command -v bun >/dev/null 2>&1 && command -v claude >/dev/null 2>&1; then
   BUN_BIN="$(command -v bun)"
@@ -341,7 +341,7 @@ if command -v bun >/dev/null 2>&1 && command -v claude >/dev/null 2>&1; then
       (cd "$CLAUDE_PEERS_DIR" && "$BUN_BIN" install) || warn "Claude Peers bun install failed"
     fi
     claude mcp remove --scope user claude-peers >/dev/null 2>&1 || true
-    claude mcp add --scope user --transport stdio claude-peers -- \
+    claude mcp add --scope user --transport stdio claude-peers --env OPENAI_API_KEY= -- \
       "$BUN_BIN" "$CLAUDE_PEERS_DIR/server.ts" || \
       warn "Claude Peers MCP registration failed"
   fi

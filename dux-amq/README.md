@@ -127,7 +127,7 @@ that `--continue` refuses.
 - dux creates a git worktree per pane; each pane gets its own CWD and Claude session storage.
 - The `claude-amq` wrapper sets `AM_ME = <branch>`, ensures `--no-init`, and uses the shared `AMQ_GLOBAL_ROOT` queue.
 - `--continue --fork-session` lets a worktree pick up the parent repo's most-recent chat as context, forking off cleanly so deferred-tool markers don't block resume.
-- Agents should use `dux peer send <peer> "..."`. The router requires Claude Peers for known Claude-to-Claude Dux sessions and uses AMQ for mixed Claude/Codex/Gemini routes. If Claude Peers is unavailable for a Claude-to-Claude route, the send fails loudly instead of silently falling back to AMQ.
+- Agents should use `dux peer send <peer> "..."`. The router uses Claude Peers for Claude targets and AMQ for non-Claude targets. If Claude Peers is unavailable for a Claude target, the send fails loudly instead of silently falling back to AMQ.
 
 ## Kernel compatibility (TIOCSTI)
 

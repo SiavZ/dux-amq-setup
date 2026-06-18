@@ -109,28 +109,23 @@ fn run_peer_send(args: &[String], paths: &DuxPaths) -> Result<()> {
 
     match transport {
         ChosenTransport::ClaudePeers => {
-            let sender_session = sender
-                .session
-                .as_ref()
-                .ok_or_else(|| anyhow!("Claude Peers requires a known Claude sender session"))?;
             let target_session = target
                 .session
                 .as_ref()
                 .ok_or_else(|| anyhow!("Claude Peers requires a known Claude target session"))?;
-            let peers = claude_peers_list()?;
-            let from_id = claude_peer_id_for_session(sender_session, &peers).ok_or_else(|| {
-                anyhow!(
-                    "Claude Peers is not registered for sender {}",
-                    amq_handle_for_session(sender_session)
-                )
-            })?;
+            let peers = claude_peers_list().context(
+                "Claude-targeted routes require Claude Peers, but the broker is unavailable. \
+                 Restart Claude agents after installing claude-peers, or pass --transport amq \
+                 explicitly for a manual override",
+            )?;
             let to_id = claude_peer_id_for_session(target_session, &peers).ok_or_else(|| {
                 anyhow!(
                     "Claude Peers is not registered for target {}",
                     amq_handle_for_session(target_session)
                 )
             })?;
-            claude_peers_send(&from_id, &to_id, &parsed.message)?;
+            let (from_id, message) = claude_peers_sender(&sender, &peers, &parsed.message);
+            claude_peers_send(&from_id, &to_id, &message)?;
             println!(
                 "sent via claude-peers: {} -> {}",
                 sender.handle, target.handle
@@ -221,9 +216,8 @@ dux peer - route messages between Dux agent sessions
 
 Subcommands:
   dux peer send [--from <handle>] [--transport auto|amq|claude-peers] <target> <message...>
-                       Send through the Dux router. Auto requires Claude Peers
-                       for known Claude-to-Claude routes; mixed-provider routes
-                       use AMQ.
+                       Send through the Dux router. Auto uses Claude Peers for
+                       Claude targets and AMQ for non-Claude targets.
   dux peer list        List Dux sessions and transport health.
   dux peer sync-amq    Reconcile AMQ's agent registry from sessions.sqlite3.
 
@@ -402,23 +396,17 @@ fn resolve_target(target: &str, sessions: &[AgentSession]) -> Result<PeerTarget>
 
 fn choose_transport(
     preference: TransportPreference,
-    sender: &SenderContext,
+    _sender: &SenderContext,
     target: &PeerTarget,
 ) -> Result<ChosenTransport> {
     match preference {
         TransportPreference::Amq => Ok(ChosenTransport::Amq),
         TransportPreference::ClaudePeers => {
-            ensure_claude_to_claude(sender, target)?;
+            ensure_claude_peers_target(target)?;
             Ok(ChosenTransport::ClaudePeers)
         }
         TransportPreference::Auto => {
-            if is_claude_session(sender.session.as_ref())
-                && is_claude_session(target.session.as_ref())
-            {
-                ensure_claude_peers_registered(
-                    sender.session.as_ref().unwrap(),
-                    target.session.as_ref().unwrap(),
-                )?;
+            if is_claude_session(target.session.as_ref()) {
                 Ok(ChosenTransport::ClaudePeers)
             } else {
                 Ok(ChosenTransport::Amq)
@@ -427,10 +415,7 @@ fn choose_transport(
     }
 }
 
-fn ensure_claude_to_claude(sender: &SenderContext, target: &PeerTarget) -> Result<()> {
-    if !is_claude_session(sender.session.as_ref()) {
-        bail!("Claude Peers transport requires a known Claude sender session");
-    }
+fn ensure_claude_peers_target(target: &PeerTarget) -> Result<()> {
     if !is_claude_session(target.session.as_ref()) {
         let provider = target
             .session
@@ -446,34 +431,6 @@ fn is_claude_session(session: Option<&AgentSession>) -> bool {
     session
         .map(|session| session.provider.as_str() == "claude")
         .unwrap_or(false)
-}
-
-fn ensure_claude_peers_registered(sender: &AgentSession, target: &AgentSession) -> Result<()> {
-    let peers = claude_peers_list().context(
-        "Claude-to-Claude routes require Claude Peers, but the broker is unavailable. \
-         Restart Claude agents after installing claude-peers, or pass --transport amq explicitly \
-         for a manual override",
-    )?;
-
-    let sender_registered = claude_peer_id_for_session(sender, &peers).is_some();
-    let target_registered = claude_peer_id_for_session(target, &peers).is_some();
-    if sender_registered && target_registered {
-        return Ok(());
-    }
-
-    let mut missing = Vec::new();
-    if !sender_registered {
-        missing.push(format!("sender {}", amq_handle_for_session(sender)));
-    }
-    if !target_registered {
-        missing.push(format!("target {}", amq_handle_for_session(target)));
-    }
-    bail!(
-        "Claude-to-Claude routes require Claude Peers, but {} not registered with the broker. \
-         Restart those Claude agents so claude-amq loads server:claude-peers, or pass \
-         --transport amq explicitly for a manual override",
-        missing.join(" and ")
-    );
 }
 
 fn amq_send(root: &Path, from: &str, target: &str, message: &str) -> Result<()> {
@@ -521,6 +478,28 @@ fn claude_peers_list() -> Result<Vec<ClaudePeer>> {
     });
     let value = claude_peers_post("/list-peers", &body)?;
     serde_json::from_value(value).context("Claude Peers broker returned malformed peer list")
+}
+
+fn claude_peers_sender(
+    sender: &SenderContext,
+    peers: &[ClaudePeer],
+    message: &str,
+) -> (String, String) {
+    if let Some(session) = sender.session.as_ref()
+        && is_claude_session(Some(session))
+        && let Some(id) = claude_peer_id_for_session(session, peers)
+    {
+        return (id, message.to_string());
+    }
+
+    let body = format!(
+        "DUX peer {handle} sent this via Claude Peers.\n\
+         Reply with `dux peer send {handle} \"...\"`; this sender is not a Claude Peers peer.\n\n\
+         {message}",
+        handle = sender.handle,
+        message = message,
+    );
+    (sender.handle.clone(), body)
 }
 
 fn claude_peers_post(path: &str, body: &Value) -> Result<Value> {
@@ -901,6 +880,44 @@ mod tests {
             .to_string();
 
         assert!(err.contains("cannot target provider codex"));
+    }
+
+    #[test]
+    fn auto_uses_claude_peers_for_claude_targets_from_any_sender() {
+        let dir = tempdir().unwrap();
+        let sender_wt = dir.path().join("sender");
+        let target_wt = dir.path().join("target");
+        fs::create_dir_all(&sender_wt).unwrap();
+        fs::create_dir_all(&target_wt).unwrap();
+        let sender = SenderContext {
+            handle: "sender".to_string(),
+            session: Some(session("s1", "codex", "sender", &sender_wt)),
+        };
+        let target = PeerTarget {
+            handle: "target".to_string(),
+            session: Some(session("s2", "claude", "target", &target_wt)),
+        };
+
+        let transport = choose_transport(TransportPreference::Auto, &sender, &target).unwrap();
+
+        assert_eq!(transport, ChosenTransport::ClaudePeers);
+    }
+
+    #[test]
+    fn non_claude_sender_gets_dux_reply_hint_for_claude_peers() {
+        let dir = tempdir().unwrap();
+        let sender_wt = dir.path().join("sender");
+        fs::create_dir_all(&sender_wt).unwrap();
+        let sender = SenderContext {
+            handle: "sender".to_string(),
+            session: Some(session("s1", "codex", "sender", &sender_wt)),
+        };
+
+        let (from_id, message) = claude_peers_sender(&sender, &[], "status?");
+
+        assert_eq!(from_id, "sender");
+        assert!(message.contains("dux peer send sender"));
+        assert!(message.ends_with("status?"));
     }
 
     #[test]

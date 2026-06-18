@@ -145,7 +145,7 @@ dux peer list
 dux peer sync-amq
 ```
 
-`dux peer send` uses Claude Peers only for Claude-to-Claude sessions when both sides are registered there. Mixed Claude/Codex/Gemini routes use AMQ, and Dux refreshes AMQ's agent registry from `sessions.sqlite3` on startup and via `dux peer sync-amq`.
+`dux peer send` uses Claude Peers for Claude targets and AMQ for non-Claude targets. Dux refreshes AMQ's agent registry from `sessions.sqlite3` on startup and via `dux peer sync-amq`.
 
 ### Themes
 
