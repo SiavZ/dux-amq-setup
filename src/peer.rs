@@ -300,10 +300,15 @@ fn load_sessions_if_present(paths: &DuxPaths) -> Result<Vec<AgentSession>> {
     if !paths.sessions_db_path.exists() {
         return Ok(Vec::new());
     }
-    SessionStore::open(&paths.sessions_db_path)
+    let sessions = SessionStore::open(&paths.sessions_db_path)
         .with_context(|| format!("failed to open {}", paths.sessions_db_path.display()))?
         .load_sessions()
-        .context("failed to load Dux sessions")
+        .context("failed to load Dux sessions")?;
+    Ok(sessions.into_iter().filter(is_routable_session).collect())
+}
+
+fn is_routable_session(session: &AgentSession) -> bool {
+    !session.state.is_exited() && Path::new(&session.worktree_path).exists()
 }
 
 fn infer_sender(from: Option<&str>, sessions: &[AgentSession]) -> Result<SenderContext> {
@@ -857,6 +862,25 @@ mod tests {
 
         assert_eq!(target.handle, "feature-login");
         assert_eq!(target.session.unwrap().id, "s1");
+    }
+
+    #[test]
+    fn routable_sessions_exclude_exited_and_missing_worktrees() {
+        let dir = tempdir().unwrap();
+        let live_wt = dir.path().join("live");
+        fs::create_dir_all(&live_wt).unwrap();
+        let mut exited = session("s2", "codex", "exited", &live_wt);
+        exited.state = SessionState::Exited {
+            exit_code: None,
+            exited_at: Utc::now(),
+        };
+        let missing = session("s3", "claude", "missing", &dir.path().join("missing"));
+
+        assert!(is_routable_session(&session(
+            "s1", "claude", "live", &live_wt
+        )));
+        assert!(!is_routable_session(&exited));
+        assert!(!is_routable_session(&missing));
     }
 
     #[test]

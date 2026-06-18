@@ -225,11 +225,12 @@ if [[ "${CLAUDE_AMQ_YOLO:-${CLAUDE_YOLO:-}}" == "1" ]]; then
 fi
 
 # Claude-targeted Dux routing is intentionally forced through Claude
-# Peers. Loading the approved channel lets each interactive Claude
-# session register with the local broker at startup.
+# Peers. The approved --channels flag accepts server:claude-peers, but
+# currently does not wake Claude from this local channel; use the upstream
+# claude-peers launch path until Claude exposes a working approved path.
 # Set CLAUDE_PEERS_DISABLE=1 only for low-level diagnostics.
 if [[ "${CLAUDE_PEERS_DISABLE:-}" != "1" ]]; then
-  EXTRA+=(--channels server:claude-peers)
+  EXTRA+=(--dangerously-load-development-channels server:claude-peers)
 fi
 
 # audit03 Phase 01 §15: per-session system-prompt override.
