@@ -329,6 +329,10 @@ impl App {
             }
             return Ok(false);
         }
+        if self.files_search_active && self.ui.focus == FocusPane::Files {
+            self.handle_files_search_key(key);
+            return Ok(false);
+        }
         // When typing a commit message, route all keys to the commit input
         // handler so that q, ?, [ etc. are typed instead of triggering
         // global shortcuts.
@@ -787,7 +791,11 @@ impl App {
 
     fn handle_files_search_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc | KeyCode::Enter => {
+            KeyCode::Esc => {
+                self.clear_files_search();
+                return;
+            }
+            KeyCode::Enter => {
                 self.files_search_active = false;
                 return;
             }
@@ -7422,7 +7430,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_search_selects_first_match_and_n_advances() {
+    fn files_search_enter_keeps_query_and_n_advances() {
         let mut app = test_app(default_bindings());
         app.ui.focus = FocusPane::Files;
         app.right_section = RightSection::Unstaged;
@@ -7464,6 +7472,8 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
+        assert!(!app.files_search_active);
+        assert_eq!(app.files_search.text, "main");
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
             .unwrap();
 
@@ -7475,6 +7485,33 @@ mod tests {
 
         assert_eq!(app.right_section, RightSection::Unstaged);
         assert_eq!(app.files_index, 1);
+    }
+
+    #[test]
+    fn esc_clears_active_files_search() {
+        let mut app = test_app(default_bindings());
+        app.ui.focus = FocusPane::Files;
+        app.right_section = RightSection::Unstaged;
+        app.git.unstaged_files = vec![ChangedFile {
+            path: "src/main.rs".into(),
+            status: "M".into(),
+            additions: 1,
+            deletions: 0,
+            binary: false,
+        }];
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            .unwrap();
+        for ch in ['m', 'a', 'i', 'n'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .unwrap();
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(!app.files_search_active);
+        assert!(app.files_search.is_empty());
     }
 
     #[test]

@@ -20,6 +20,18 @@
 #   - MUST exit 0 even when AMQ is uninitialized — operators run this
 #     *because* something is broken; bailing on a missing queue defeats
 #     the purpose.
+if (( BASH_VERSINFO[0] < 4 )); then
+  if [[ "${DUX_AMQ_DOCTOR_BASH_REEXEC:-0}" != 1 ]]; then
+    for _bash in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+      if [[ -x "$_bash" ]] && "$_bash" -c '(( BASH_VERSINFO[0] >= 4 ))' 2>/dev/null; then
+        DUX_AMQ_DOCTOR_BASH_REEXEC=1 exec "$_bash" "${BASH_SOURCE[0]}" "$@"
+      fi
+    done
+  fi
+  printf 'doctor: Bash 4+ required; running %s. Install bash at /opt/homebrew/bin/bash or /usr/local/bin/bash.\n' "${BASH_VERSION:-unknown}" >&2
+  exit 1
+fi
+
 set -euo pipefail
 
 # ----- argv parsing ---------------------------------------------------------
@@ -56,6 +68,31 @@ STATE_ROOT="${STATE_ROOT:-/data/state}"
 DUX_HOME="${DUX_HOME:-$STATE_ROOT/dux}"
 AMQ_GLOBAL_ROOT="${AMQ_GLOBAL_ROOT:-$STATE_ROOT/amq}"
 AMQ_BIN_PINNED="${AMQ_BIN:-$STATE_ROOT/amq-bin/amq}"
+
+# macOS does not ship GNU timeout. Prefer GNU timeout/gtimeout when
+# available; otherwise run the command directly. The no-timeout fallback
+# preserves diagnostics on local developer machines while Linux installs
+# keep the hard hang bound documented above.
+_TIMEOUT_BIN="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
+timeout() {
+  local _seconds="$1"
+  shift || return 127
+  if [[ -n "$_TIMEOUT_BIN" ]]; then
+    "$_TIMEOUT_BIN" "$_seconds" "$@"
+  else
+    "$@"
+  fi
+}
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    return 127
+  fi
+}
 
 # Locate install.sh so we can scrape the overlay version pin without
 # hard-coding it in two places. Search order: $DUX_AMQ_INSTALL_SH (test
@@ -319,7 +356,7 @@ sec_binary_integrity() {
   anon_text "$rec"            rec_disp
   if [[ -x "$AMQ_BIN_PINNED" && -f "$rec" ]]; then
     expected="$(awk '{print $1}' "$rec" 2>/dev/null)"
-    actual="$(to sha256sum "$AMQ_BIN_PINNED" | awk '{print $1}')"
+    actual="$(to sha256_file "$AMQ_BIN_PINNED")"
     if [[ -n "$expected" && "$expected" == "$actual" ]]; then
       status="match"
       kv "amq binary" "$bin_disp"
@@ -359,13 +396,14 @@ sec_binary_integrity() {
 # ============================================================================
 sec_persistent_disk() {
   section "Persistent disk"
-  local df_out
-  if [[ -d /data ]]; then
-    df_out="$(to df -h /data | tail -n +2 | head -1)"
+  local df_out disk_target
+  disk_target="$STATE_ROOT"
+  if [[ -d "$disk_target" ]]; then
+    df_out="$(to df -h "$disk_target" | tail -n +2 | head -1)"
   else
-    df_out="(no /data mount)"
+    df_out="($disk_target missing)"
   fi
-  kv "df /data" "$(anon_text "$df_out")"
+  kv "df state" "$(anon_text "$df_out")"
   j_set disk.df "$df_out"
 
   if [[ -d "$STATE_ROOT" ]]; then
@@ -644,28 +682,15 @@ sec_runtime() {
   fi
   local pid
   pid="$(awk 'NR==1 {print $1}' "$lockfile" 2>/dev/null)"
-  if [[ -z "$pid" || ! -d "/proc/$pid" ]]; then
+  if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
     kv "dux pid" "$pid (stale — process not running)"
     j_set runtime.dux_pid 0 num
     return
   fi
   local rss_kb uptime_s
-  rss_kb="$(awk '/^VmRSS:/ {print $2}' "/proc/${pid}/status" 2>/dev/null || echo 0)"
+  rss_kb="$(ps -o rss= -p "$pid" 2>/dev/null | awk 'NR==1 {print $1}')"
   [[ -z "$rss_kb" ]] && rss_kb=0
-  # /proc/$pid/stat field 22 is the process's start time in clock
-  # ticks since boot. /proc/stat's `btime` is the wall-clock boot time
-  # in seconds. The conversion is exact, but field 2 ("comm") can
-  # contain spaces and parens — split on the closing paren first.
-  uptime_s="$(to bash -c "
-    btime=\$(awk '/^btime/ {print \$2}' /proc/stat)
-    stat=\$(cat /proc/${pid}/stat 2>/dev/null) || exit 1
-    rest=\${stat#*) }
-    starttime=\$(printf '%s' \"\$rest\" | awk '{print \$20}')
-    hz=\$(getconf CLK_TCK)
-    [[ -n \"\$btime\" && -n \"\$starttime\" && -n \"\$hz\" ]] || exit 1
-    now=\$(date +%s)
-    printf '%d' \$(( now - btime - starttime / hz ))
-  ")"
+  uptime_s="$(ps -o etimes= -p "$pid" 2>/dev/null | awk 'NR==1 {print $1}')"
   is_err "$uptime_s" && uptime_s=0
   local h=$((uptime_s / 3600))
   local m=$(((uptime_s % 3600) / 60))

@@ -1755,7 +1755,7 @@ impl App {
             spans.push(Span::raw("  "));
             if self.files_search_active {
                 spans.extend(self.theme.dim_key_badge_default("Enter"));
-                spans.push(Span::styled(" done  ", desc_style));
+                spans.push(Span::styled(" finish  ", desc_style));
                 spans.extend(self.theme.dim_key_badge_default("Esc"));
                 spans.push(Span::styled(" clear", desc_style));
             } else {

@@ -947,30 +947,69 @@ pub fn run_doctor(paths: &DuxPaths, json: bool, anonymize: bool) -> Result<()> {
 }
 
 fn emit_rust_section_text(paths: &DuxPaths, bash_ran: bool) -> Result<()> {
+    let snap = collect_sessions_snapshot(paths);
+    print!("{}", render_rust_section_text(paths, &snap, bash_ran));
+    Ok(())
+}
+
+fn render_rust_section_text(paths: &DuxPaths, snap: &SessionsSnapshot, bash_ran: bool) -> String {
+    let mut out = String::new();
     if !bash_ran {
-        println!(
-            "(dux-amq-doctor not on PATH; emitting Rust-only diagnostics. \
-             Re-run `dux-amq/install.sh` to install the full triage tool.)"
+        out.push_str(
+            "(dux-amq-doctor unavailable or failed; emitting Rust-only diagnostics. \
+             Re-run `dux-amq/install.sh` or run `dux-amq-doctor` directly for details.)\n",
         );
     }
-    println!("\n== Sessions DB (Rust-side) ==");
-    let snap = collect_sessions_snapshot(paths);
-    println!("{:<16} {}", "path:", paths.sessions_db_path.display());
-    println!("{:<16} {}", "integrity:", snap.integrity);
-    println!("{:<16} {}", "active:", snap.active);
-    println!("{:<16} {}", "detached:", snap.detached);
-    println!("{:<16} {}", "exited:", snap.exited);
-    println!("{:<16} {}", "orphaned:", snap.orphaned_worktrees);
-    Ok(())
+    out.push_str("\n== Sessions DB (Rust-side) ==\n");
+    out.push_str(&format!(
+        "{:<16} {}\n",
+        "path:",
+        paths.sessions_db_path.display()
+    ));
+    out.push_str(&format!("{:<16} {}\n", "integrity:", snap.integrity));
+    out.push_str(&format!("{:<16} {}\n", "active:", snap.active));
+    out.push_str(&format!("{:<16} {}\n", "detached:", snap.detached));
+    out.push_str(&format!("{:<16} {}\n", "exited:", snap.exited));
+    out.push_str(&format!(
+        "{:<16} {}\n",
+        "orphaned:", snap.orphaned_worktrees
+    ));
+    append_orphaned_sessions_text(&mut out, snap);
+    out
+}
+
+fn append_orphaned_sessions_text(out: &mut String, snap: &SessionsSnapshot) {
+    if snap.orphaned_sessions.is_empty() {
+        return;
+    }
+
+    let shown = snap.orphaned_sessions.len();
+    let summary = if shown < snap.orphaned_worktrees {
+        format!(
+            "first {shown} of {} (limit {ORPHANED_SESSIONS_LIMIT})",
+            snap.orphaned_worktrees
+        )
+    } else {
+        shown.to_string()
+    };
+    out.push_str(&format!("{:<16} {summary}\n", "orphaned_list:"));
+    for session in &snap.orphaned_sessions {
+        out.push_str(&format!(
+            "  - id={} provider={} branch={} state={} worktree_path={}\n",
+            session.id, session.provider, session.branch, session.state, session.worktree_path
+        ));
+    }
 }
 
 fn emit_rust_section_json(paths: &DuxPaths, _bash_ran: bool) -> Result<()> {
     let snap = collect_sessions_snapshot(paths);
-    // Hand-roll the JSON to avoid pulling in serde_json::json! macro
-    // chains. The string fields are integrity status names that come
-    // from a bounded set we control, so manual escaping is safe; if
-    // that ever changes we should switch to `serde_json::to_string`.
-    let body = serde_json::json!({
+    let body = build_rust_section_json(paths, &snap);
+    println!("{body}");
+    Ok(())
+}
+
+fn build_rust_section_json(paths: &DuxPaths, snap: &SessionsSnapshot) -> serde_json::Value {
+    serde_json::json!({
         "sessions_db_rust": {
             "path": paths.sessions_db_path.display().to_string(),
             "integrity": snap.integrity,
@@ -978,15 +1017,27 @@ fn emit_rust_section_json(paths: &DuxPaths, _bash_ran: bool) -> Result<()> {
             "detached": snap.detached,
             "exited": snap.exited,
             "orphaned_worktrees": snap.orphaned_worktrees,
+            "orphaned_sessions_limit": ORPHANED_SESSIONS_LIMIT,
+            "orphaned_sessions_truncated": snap.orphaned_sessions.len() < snap.orphaned_worktrees,
+            "orphaned_sessions": snap.orphaned_sessions,
         }
-    });
-    println!("{body}");
-    Ok(())
+    })
 }
 
 /// Lightweight snapshot of the sessions DB used only by `dux doctor`.
 /// Counts are computed once per call; this is a cold-path operator tool
 /// so we don't bother caching.
+const ORPHANED_SESSIONS_LIMIT: usize = 10;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+struct OrphanedSessionSnapshot {
+    id: String,
+    provider: String,
+    branch: String,
+    state: String,
+    worktree_path: String,
+}
+
 struct SessionsSnapshot {
     integrity: String,
     active: usize,
@@ -996,6 +1047,7 @@ struct SessionsSnapshot {
     /// non-zero count is operator-visible: dux's session-cleanup code
     /// should have GC'd these.
     orphaned_worktrees: usize,
+    orphaned_sessions: Vec<OrphanedSessionSnapshot>,
 }
 
 fn collect_sessions_snapshot(paths: &DuxPaths) -> SessionsSnapshot {
@@ -1006,6 +1058,7 @@ fn collect_sessions_snapshot(paths: &DuxPaths) -> SessionsSnapshot {
             detached: 0,
             exited: 0,
             orphaned_worktrees: 0,
+            orphaned_sessions: Vec::new(),
         };
     }
     // SessionStore::open already runs PRAGMA integrity_check and
@@ -1017,6 +1070,7 @@ fn collect_sessions_snapshot(paths: &DuxPaths) -> SessionsSnapshot {
             let mut detached = 0usize;
             let mut exited = 0usize;
             let mut orphaned = 0usize;
+            let mut orphaned_sessions = Vec::new();
             for s in &sessions {
                 use crate::model::SessionState;
                 match &s.state {
@@ -1028,6 +1082,15 @@ fn collect_sessions_snapshot(paths: &DuxPaths) -> SessionsSnapshot {
                 }
                 if !Path::new(&s.worktree_path).exists() {
                     orphaned += 1;
+                    if orphaned_sessions.len() < ORPHANED_SESSIONS_LIMIT {
+                        orphaned_sessions.push(OrphanedSessionSnapshot {
+                            id: s.id.clone(),
+                            provider: s.provider.as_str().to_string(),
+                            branch: s.branch_name.clone(),
+                            state: s.state.name().to_string(),
+                            worktree_path: s.worktree_path.clone(),
+                        });
+                    }
                 }
             }
             SessionsSnapshot {
@@ -1036,6 +1099,7 @@ fn collect_sessions_snapshot(paths: &DuxPaths) -> SessionsSnapshot {
                 detached,
                 exited,
                 orphaned_worktrees: orphaned,
+                orphaned_sessions,
             }
         }
         Err(err) => SessionsSnapshot {
@@ -1044,6 +1108,7 @@ fn collect_sessions_snapshot(paths: &DuxPaths) -> SessionsSnapshot {
             detached: 0,
             exited: 0,
             orphaned_worktrees: 0,
+            orphaned_sessions: Vec::new(),
         },
     }
 }
@@ -1160,6 +1225,7 @@ mod tests {
         assert_eq!(snap.integrity, "absent");
         assert_eq!(snap.active, 0);
         assert_eq!(snap.orphaned_worktrees, 0);
+        assert!(snap.orphaned_sessions.is_empty());
     }
 
     #[test]
@@ -1182,6 +1248,8 @@ mod tests {
         std::fs::create_dir_all(&live).expect("live");
         let live_two = worktrees_root.join("live-2");
         std::fs::create_dir_all(&live_two).expect("live2");
+        let orphan = worktrees_root.join("missing-x1");
+        let orphan_path = orphan.to_string_lossy().to_string();
         let store = SessionStore::open(&paths.sessions_db_path).expect("store");
         let now = Utc::now();
         let mk = |id: &str, wt: &str, state: SessionState| AgentSession {
@@ -1221,7 +1289,7 @@ mod tests {
         );
         let x1 = mk(
             "x1",
-            "/no/such/path-xyz-orphan",
+            &orphan_path,
             SessionState::Exited {
                 exit_code: None,
                 exited_at: now,
@@ -1243,6 +1311,101 @@ mod tests {
         assert_eq!(snap.detached, 3);
         assert_eq!(snap.exited, 1);
         assert_eq!(snap.orphaned_worktrees, 1);
+        assert_eq!(
+            snap.orphaned_sessions,
+            vec![OrphanedSessionSnapshot {
+                id: "x1".to_string(),
+                provider: "claude".to_string(),
+                branch: "b-x1".to_string(),
+                state: "exited".to_string(),
+                worktree_path: orphan_path.clone(),
+            }]
+        );
+
+        let text = render_rust_section_text(&paths, &snap, true);
+        assert!(text.contains("orphaned_list:"));
+        assert!(text.contains(&format!(
+            "id=x1 provider=claude branch=b-x1 state=exited worktree_path={orphan_path}"
+        )));
+
+        let json = build_rust_section_json(&paths, &snap);
+        let sessions_db = &json["sessions_db_rust"];
+        assert_eq!(sessions_db["orphaned_worktrees"], 1);
+        assert_eq!(
+            sessions_db["orphaned_sessions_limit"],
+            ORPHANED_SESSIONS_LIMIT
+        );
+        assert_eq!(sessions_db["orphaned_sessions_truncated"], false);
+        assert_eq!(sessions_db["orphaned_sessions"][0]["id"], "x1");
+        assert_eq!(sessions_db["orphaned_sessions"][0]["provider"], "claude");
+        assert_eq!(sessions_db["orphaned_sessions"][0]["branch"], "b-x1");
+        assert_eq!(sessions_db["orphaned_sessions"][0]["state"], "exited");
+        assert_eq!(
+            sessions_db["orphaned_sessions"][0]["worktree_path"],
+            orphan_path
+        );
+    }
+
+    #[test]
+    fn doctor_snapshot_caps_orphaned_session_details() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path().to_path_buf();
+        let worktrees_root = root.join("worktrees");
+        std::fs::create_dir_all(&worktrees_root).expect("worktrees");
+        let paths = DuxPaths {
+            config_path: root.join("config.toml"),
+            sessions_db_path: root.join("sessions.sqlite3"),
+            worktrees_root: worktrees_root.clone(),
+            lock_path: root.join("dux.lock"),
+            root,
+        };
+
+        let store = SessionStore::open(&paths.sessions_db_path).expect("store");
+        let now = Utc::now();
+        for i in 0..(ORPHANED_SESSIONS_LIMIT + 3) {
+            let id = format!("o-{i:02}");
+            let missing = worktrees_root.join(format!("missing-{i:02}"));
+            store
+                .upsert_session(&AgentSession {
+                    id: id.clone(),
+                    project_id: "p".to_string(),
+                    project_path: None,
+                    provider: ProviderKind::new("codex"),
+                    source_branch: "main".to_string(),
+                    branch_name: format!("branch-{i:02}"),
+                    worktree_path: missing.to_string_lossy().to_string(),
+                    title: None,
+                    started_providers: Vec::new(),
+                    state: SessionState::Created { created_at: now },
+                    settings: crate::model::SessionSettings::default(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .unwrap();
+        }
+        drop(store);
+
+        let snap = collect_sessions_snapshot(&paths);
+        assert_eq!(snap.orphaned_worktrees, ORPHANED_SESSIONS_LIMIT + 3);
+        assert_eq!(snap.orphaned_sessions.len(), ORPHANED_SESSIONS_LIMIT);
+        assert_eq!(snap.orphaned_sessions.first().unwrap().id, "o-00");
+        assert_eq!(snap.orphaned_sessions.last().unwrap().id, "o-09");
+
+        let text = render_rust_section_text(&paths, &snap, true);
+        assert!(text.contains("first 10 of 13 (limit 10)"));
+        assert!(text.contains("id=o-09 provider=codex branch=branch-09 state=created"));
+        assert!(!text.contains("id=o-10 "));
+
+        let json = build_rust_section_json(&paths, &snap);
+        let sessions_db = &json["sessions_db_rust"];
+        assert_eq!(sessions_db["orphaned_sessions_truncated"], true);
+        assert_eq!(
+            sessions_db["orphaned_sessions"]
+                .as_array()
+                .expect("orphaned_sessions array")
+                .len(),
+            ORPHANED_SESSIONS_LIMIT
+        );
     }
 
     #[test]

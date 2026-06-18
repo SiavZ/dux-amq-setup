@@ -1352,7 +1352,7 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             key: "max_companion_terminals",
             comment: Some(CommentSource::Static(
                 "# Maximum number of companion (raw shell) terminals across all\n\
-                 # sessions. 0 means unlimited. Default 4.",
+                 # sessions. 0 means unlimited. Default 0.",
             )),
             value_fn: |c| FieldValue::Usize(c.limits.max_companion_terminals),
         },
@@ -2769,6 +2769,7 @@ mod tests {
         assert!(rendered.contains("agent_scrollback_lines = 10000"));
         assert!(rendered.contains("staged_pane_height_pct = "));
         assert!(rendered.contains("commit_pane_height_pct = "));
+        assert!(rendered.contains("# sessions. 0 means unlimited. Default 0."));
         assert!(rendered.contains("[editor]"));
         assert!(rendered.contains("default = \"cursor\""));
         assert!(rendered.contains("[keys]"));
