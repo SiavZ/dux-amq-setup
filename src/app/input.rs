@@ -1592,8 +1592,15 @@ impl App {
                         // not companion terminals.
                         let forward = self.should_forward_scroll_to_provider();
                         if forward {
-                            if let Some(provider) = self.selected_terminal_surface_client() {
-                                let _ = provider.write_bytes(&raw);
+                            if let Some(provider) = self.selected_terminal_surface_client()
+                                && let Some(term_area) = self.ui.mouse_layout.agent_term
+                                && let Some(translated) = crate::raw_input::translate_sgr_mouse(
+                                    &raw,
+                                    term_area.x,
+                                    term_area.y,
+                                )
+                            {
+                                let _ = provider.write_bytes(&translated);
                             }
                         } else if self.handle_mouse(mouse_ev) {
                             return Ok(true);
@@ -11447,6 +11454,50 @@ cyan = "#00ffff"
 
         assert!(!app.in_bracket_paste, "should be reset after exit");
         assert_eq!(app.ui.input_target, InputTarget::None);
+    }
+
+    #[test]
+    fn forwarded_mouse_scroll_uses_terminal_relative_coordinates() {
+        let mut app = test_app(default_bindings());
+        app.config
+            .providers
+            .commands
+            .get_mut("codex")
+            .expect("codex provider")
+            .forward_scroll = true;
+        app.ui.input_target = InputTarget::Agent;
+        app.ui.fullscreen_overlay = FullscreenOverlay::Agent;
+        app.ui.mouse_layout.agent_term = Some(Rect::new(5, 3, 40, 10));
+
+        let session_id = app.git.sessions[0].id.clone();
+        let client = PtyClient::spawn(
+            "sh",
+            &["-c".to_string(), "stty raw -echo; exec cat -v".to_string()],
+            std::path::Path::new("."),
+            5,
+            80,
+            100,
+        )
+        .expect("spawn pty");
+        app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
+        std::thread::sleep(std::time::Duration::from_millis(250));
+
+        app.process_raw_input_bytes(b"\x1b[<64;20;10M")
+            .expect("process scroll");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let rendered = app
+            .find_pty_handle(&session_id)
+            .expect("provider")
+            .scan_recent_lines(5);
+        assert!(
+            rendered.contains("^[[<64;15;7M"),
+            "scroll coordinates should be translated before forwarding; got: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("^[[<64;20;10M"),
+            "raw screen coordinates must not be forwarded; got: {rendered:?}"
+        );
     }
 
     #[test]

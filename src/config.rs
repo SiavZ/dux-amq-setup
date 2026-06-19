@@ -2291,7 +2291,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
                 ],
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("curl -fsSL https://claude.ai/install.sh | bash".to_string()),
-                forward_scroll: false,
+                forward_scroll: true,
                 watch: Vec::new(),
             },
         ),
@@ -3232,9 +3232,9 @@ dangerous = true
     }
 
     #[test]
-    fn providers_use_host_scrollback_by_default_except_opencode() {
+    fn providers_use_host_scrollback_by_default_except_claude_and_opencode() {
         let config = Config::default();
-        for name in ["claude", "codex", "gemini", "copilot"] {
+        for name in ["codex", "gemini", "copilot"] {
             let cfg = config
                 .providers
                 .get(name)
@@ -3245,14 +3245,13 @@ dangerous = true
             );
         }
 
-        let opencode = config
-            .providers
-            .get("opencode")
-            .expect("opencode provider should exist");
-        assert!(
-            opencode.forward_scroll,
-            "opencode keeps provider-owned scrollback"
-        );
+        for name in ["claude", "opencode"] {
+            let cfg = config
+                .providers
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} provider should exist"));
+            assert!(cfg.forward_scroll, "{name} keeps provider-owned scrollback");
+        }
     }
 
     #[test]
