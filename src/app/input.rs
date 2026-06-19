@@ -10532,12 +10532,11 @@ cyan = "#00ffff"
     }
 
     #[test]
-    fn forward_scroll_provider_page_up_at_bottom_does_not_use_host_scrollback() {
+    fn codex_page_up_at_bottom_uses_host_scrollback() {
         let mut app = app_with_scrolled_back_pty();
 
-        // Reset scrollback to live bottom. Built-in terminal TUI providers
-        // forward scroll keys to the provider when the host is not already
-        // scrolled back.
+        // Reset scrollback to live bottom. Codex uses Dux host scrollback,
+        // so PageUp should enter scrollback immediately.
         app.selected_terminal_surface_client()
             .unwrap()
             .set_scrollback(0);
@@ -10551,12 +10550,12 @@ cyan = "#00ffff"
         let result = app.process_raw_input_bytes(b"\x1b[5~").unwrap();
 
         assert!(!result);
-        assert_eq!(
+        assert!(
             app.selected_terminal_surface_client()
                 .unwrap()
-                .scrollback_offset(),
-            0,
-            "PgUp should be forwarded to the provider instead of engaging Dux host scrollback"
+                .scrollback_offset()
+                > 0,
+            "PgUp should engage Dux host scrollback"
         );
     }
 

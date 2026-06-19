@@ -2291,7 +2291,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
                 ],
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("curl -fsSL https://claude.ai/install.sh | bash".to_string()),
-                forward_scroll: true,
+                forward_scroll: false,
                 watch: Vec::new(),
             },
         ),
@@ -2314,7 +2314,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
                 ],
                 oneshot_output: OneshotOutput::Tempfile,
                 install_hint: Some("brew install --cask codex".to_string()),
-                forward_scroll: true,
+                forward_scroll: false,
                 watch: Vec::new(),
             },
         ),
@@ -2328,7 +2328,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
                 oneshot_args: vec!["-p".to_string(), "{prompt}".to_string()],
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("brew install gemini-cli".to_string()),
-                forward_scroll: true,
+                forward_scroll: false,
                 watch: Vec::new(),
             },
         ),
@@ -3232,26 +3232,26 @@ dangerous = true
     }
 
     #[test]
-    fn terminal_tui_providers_forward_scroll_by_default() {
+    fn providers_use_host_scrollback_by_default_except_opencode() {
         let config = Config::default();
-        for name in ["claude", "codex", "gemini", "opencode"] {
+        for name in ["claude", "codex", "gemini", "copilot"] {
             let cfg = config
                 .providers
                 .get(name)
                 .unwrap_or_else(|| panic!("{name} provider should exist"));
             assert!(
-                cfg.forward_scroll,
-                "{name} should forward scroll input to its terminal TUI"
+                !cfg.forward_scroll,
+                "{name} should keep scroll input in dux host scrollback"
             );
         }
 
-        let copilot = config
+        let opencode = config
             .providers
-            .get("copilot")
-            .expect("copilot provider should exist");
+            .get("opencode")
+            .expect("opencode provider should exist");
         assert!(
-            !copilot.forward_scroll,
-            "copilot keeps host scrollback until its terminal behavior is verified"
+            opencode.forward_scroll,
+            "opencode keeps provider-owned scrollback"
         );
     }
 
