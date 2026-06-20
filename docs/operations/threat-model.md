@@ -481,10 +481,10 @@ bytes back into the agent. Two distinct abuse paths follow:
   malicious config (or a supply-chain compromise of the canonical
   template) cannot DoS via thousands of rules.
 - *Per-rule fire budget.* Every rule has a `budget.max_attempts`
-  (default 5). When exhausted, the rule disarms itself for the
-  rest of the session and emits a status warning. Spurious-fire
-  attacks therefore cap at `max_attempts` rule firings, not an
-  unbounded loop.
+  (default 5; `0` means explicitly unlimited). When exhausted, the
+  rule disarms itself for the rest of the session and emits a status
+  warning. Spurious-fire attacks therefore cap at `max_attempts` rule
+  firings unless the operator deliberately marks that rule unlimited.
 - *Cooldown between repeats.* `cooldown_ms` and the
   `baseline_match_count` dedup mean stale matches still visible in
   scrollback do not re-arm the rule. A single attacker payload
@@ -501,7 +501,8 @@ bytes back into the agent. Two distinct abuse paths follow:
 
 **Residual risk.** A user who configures a permissive rule (e.g.
 `text = "yes"`, `pattern = "Continue\\?"`) opts into the spurious-
-fire risk for that rule's `max_attempts` budget. We document this
+fire risk for that rule's `max_attempts` budget, or unbounded risk if
+they set `max_attempts = 0`. We document this
 in the canonical-config comment block above the example. Watch
 rules **never** evaluate during oneshot mode (commit-message
 generation), only during interactive PTY sessions in
@@ -512,7 +513,7 @@ generation), only during interactive PTY sessions in
 (regex too big, malformed, etc.) and
 `watch send_text failed` at WARN if a PTY write fails after a
 rule fires. The status line surfaces every rule fire
-(`watch rule "X": fired (attempt N/M)`) and budget exhaustion
+(`watch rule "X": fired (attempt N/M)` or `N/unlimited`) and budget exhaustion
 (`watch rule "X": budget exhausted; disarming`).
 
 ---

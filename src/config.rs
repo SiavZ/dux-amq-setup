@@ -2461,15 +2461,16 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
     out.push_str(
         "# Patterns are evaluated against output that may include content from the\n\
          # project under edit, so the engine caps regex complexity and per-rule fire\n\
-         # budgets — see SECURITY.md (T13) for the threat model.\n",
+         # budgets by default. `budget.max_attempts = 0` means unlimited.\n\
+         # See SECURITY.md (T13) for the threat model.\n",
     );
     if name == "claude" {
         out.push_str("#\n");
         out.push_str(
             "# Example 1 — server-throttle auto-retry. Anthropic surfaces a transient\n\
              # server-side rate-limit (distinct from the 5-hour usage limit). Claude\n\
-             # Code's internal retry budget exhausts in seconds; this rule waits 1m /\n\
-             # 2m / 5m / 10m before sending \"please continue\" to resume.\n",
+             # Code's internal retry budget exhausts in seconds; this rule keeps\n\
+             # retrying with capped exponential backoff until the API recovers.\n",
         );
         out.push_str("#\n");
         out.push_str("# [[providers.claude.watch]]\n");
@@ -2477,7 +2478,7 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
         out.push_str("# action = \"send_text\"\n");
         out.push_str("# text = \"please continue\"\n");
         out.push_str("# backoff = { initial_ms = 60000, max_ms = 600000, multiplier = 2.0, jitter_ms = 5000 }\n");
-        out.push_str("# budget = { max_attempts = 5 }\n");
+        out.push_str("# budget = { max_attempts = 0 } # unlimited API retry\n");
         out.push_str("# cooldown_ms = 30000\n");
         out.push('\n');
         out.push_str(
@@ -2532,7 +2533,7 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
         out.push_str("# action = \"send_text\"\n");
         out.push_str("# text = \"please continue\"\n");
         out.push_str("# backoff = { initial_ms = 30000, max_ms = 600000, multiplier = 2.0, jitter_ms = 5000 }\n");
-        out.push_str("# budget = { max_attempts = 5 }\n");
+        out.push_str("# budget = { max_attempts = 0 } # unlimited API retry\n");
         out.push_str("# cooldown_ms = 30000\n");
     }
     out.push('\n');
@@ -3794,6 +3795,13 @@ oneshot_output = "stdout"
         assert!(
             rendered.contains("# pattern = \"API Error.*Server is temporarily limiting requests\""),
             "Claude watch example must include the throttle pattern:\n{rendered}"
+        );
+        assert!(
+            rendered
+                .matches("# budget = { max_attempts = 0 } # unlimited API retry")
+                .count()
+                >= 2,
+            "Claude API retry examples must be unlimited:\n{rendered}"
         );
         // Phase 2: 5-hour usage limit examples for both unix_seconds and
         // clock_local formats.

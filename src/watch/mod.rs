@@ -13,9 +13,9 @@
 //! attacker-controlled (project files the agent reads, AI responses, child
 //! process noise). The engine uses the linear-time `regex` crate with a
 //! per-pattern `size_limit` cap to avoid pathological compilation, and bounds
-//! per-rule actions with a budget so a hostile match cannot trigger an
-//! unbounded send-text loop. See `SECURITY.md` (T13) for the long-form
-//! discussion.
+//! per-rule actions with a budget by default. `budget.max_attempts = 0` is an
+//! explicit unlimited opt-in for trusted rules. See `SECURITY.md` (T13) for
+//! the long-form discussion.
 
 pub mod builtin;
 pub mod engine;

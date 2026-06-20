@@ -4992,10 +4992,14 @@ impl App {
                                     ("disarmed", self.theme.session_exited)
                                 }
                             };
-                            let attempts = format!(
-                                "{}/{}",
-                                row.snapshot.attempts_made, row.snapshot.max_attempts
-                            );
+                            let attempts = if row.snapshot.max_attempts == 0 {
+                                format!("{}/unlimited", row.snapshot.attempts_made)
+                            } else {
+                                format!(
+                                    "{}/{}",
+                                    row.snapshot.attempts_made, row.snapshot.max_attempts
+                                )
+                            };
                             let spans = vec![
                                 Span::styled(
                                     session_padded,

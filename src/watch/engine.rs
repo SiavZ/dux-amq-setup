@@ -80,7 +80,7 @@ pub struct RuleSnapshot {
     pub label: String,
     /// Number of times the rule has fired this session.
     pub attempts_made: u32,
-    /// Per-rule cap from the rule's `budget.max_attempts`.
+    /// Per-rule cap from the rule's `budget.max_attempts`; 0 means unlimited.
     pub max_attempts: u32,
     /// Current state of the rule's mini state machine.
     pub state: RuleStateKind,
@@ -369,15 +369,18 @@ impl RuleRuntime {
                 until: now + cooldown,
             };
             out.push(WatchEffect::StatusInfo(format!(
-                "watch rule \"{}\": fired (attempt {}/{})",
-                self.label, self.attempts_made, self.rule.budget.max_attempts
+                "watch rule \"{}\": fired (attempt {})",
+                self.label,
+                self.attempt_label()
             )));
         }
 
         // Phase 3: fresh match while idle → schedule fire (or disarm if
         // budget exhausted).
         if matches!(self.state, RuleState::Idle) && matches > self.baseline_match_count {
-            if self.attempts_made >= self.rule.budget.max_attempts {
+            if !self.rule.budget.is_unlimited()
+                && self.attempts_made >= self.rule.budget.max_attempts
+            {
                 self.state = RuleState::Disarmed;
                 out.push(WatchEffect::StatusWarning(format!(
                     "watch rule \"{}\": budget ({} attempts) exhausted; disarming",
@@ -391,6 +394,14 @@ impl RuleRuntime {
             }
             self.state = RuleState::Pending { fire_at };
             self.baseline_match_count = matches;
+        }
+    }
+
+    fn attempt_label(&self) -> String {
+        if self.rule.budget.is_unlimited() {
+            format!("{}/unlimited", self.attempts_made)
+        } else {
+            format!("{}/{}", self.attempts_made, self.rule.budget.max_attempts)
         }
     }
 
@@ -622,6 +633,30 @@ mod tests {
         // Subsequent ticks are silent.
         let effects = engine.observe("rate\nrate\nrate", now + Duration::from_secs(60));
         assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn zero_budget_means_unlimited() {
+        let mut r = rule("rate");
+        r.budget = WatchBudget { max_attempts: 0 };
+        r.cooldown_ms = 0;
+        r.backoff.initial_ms = 1;
+        r.backoff.multiplier = 1.0;
+        r.backoff.jitter_ms = 0;
+
+        let (mut engine, _) = WatchEngine::new("s1", &[r]);
+        let mut now = Instant::now();
+
+        for count in 1..=8 {
+            let snapshot = "rate\n".repeat(count);
+            engine.observe(&snapshot, now);
+            now += Duration::from_millis(2);
+            engine.observe(&snapshot, now);
+            now += Duration::from_millis(1);
+            assert!(!engine.is_disarmed(0), "attempt {count} disarmed rule");
+        }
+
+        assert_eq!(engine.rules[0].attempts_made, 8);
     }
 
     #[test]

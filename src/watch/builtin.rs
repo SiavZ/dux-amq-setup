@@ -22,8 +22,7 @@ use crate::model::ProviderKind;
 
 use super::rule::{WatchAction, WatchBackoff, WatchBudget, WatchRule, WatchRuleKind};
 
-/// Effectively unlimited for a long-running worker session, while still
-/// keeping the engine's generic finite-budget model.
+/// High finite guard for a long-running worker session.
 pub const AUTO_CLEAR_MAX_ATTEMPTS: u32 = 10_000;
 pub const AUTO_CLEAR_LABEL: &str = "auto-clear after task done";
 

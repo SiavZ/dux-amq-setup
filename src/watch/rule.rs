@@ -196,7 +196,7 @@ impl WatchBackoff {
 }
 
 /// How many times a rule may fire before disarming itself for the rest of
-/// the session.
+/// the session. `0` means unlimited.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WatchBudget {
@@ -206,5 +206,11 @@ pub struct WatchBudget {
 impl Default for WatchBudget {
     fn default() -> Self {
         Self { max_attempts: 5 }
+    }
+}
+
+impl WatchBudget {
+    pub(crate) fn is_unlimited(&self) -> bool {
+        self.max_attempts == 0
     }
 }
