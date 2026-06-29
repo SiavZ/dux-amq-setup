@@ -7,8 +7,10 @@
 #   2. claude-amq DOES pass it when CLAUDE_AMQ_YOLO=1.
 #   3. codex-amq does NOT pass --dangerously-bypass-approvals-and-sandbox by default.
 #   4. codex-amq DOES pass it when CODEX_AMQ_YOLO=1.
-#   5. claude-amq does NOT seed parent session history by default.
-#   6. claude-amq DOES seed when CLAUDE_AMQ_SEED_FROM_PARENT=1.
+#   5. codex-amq passes --dangerously-bypass-hook-trust by default.
+#   6. codex-amq passes it when CLAUDE_YOLO=1 (legacy YOLO path still active).
+#   7. claude-amq does NOT seed parent session history by default.
+#   8. claude-amq DOES seed when CLAUDE_AMQ_SEED_FROM_PARENT=1.
 #
 # Implementation: tests/fakes/amq records argv to $AMQ_FAKE_ARGV_FILE
 # (and is a no-op for `amq wake` so the background daemon spawn doesn't
@@ -111,14 +113,14 @@ assert_argv_missing() {
 @test "claude-amq loads claude-peers channel by default" {
   run "$WRAPPERS_DIR/claude-amq"
   [ "$status" -eq 0 ]
-  assert_argv_contains "--dangerously-load-development-channels"
+  assert_argv_contains "--channels"
   assert_argv_contains "server:claude-peers"
 }
 
 @test "claude-amq can disable claude-peers channel loading" {
   CLAUDE_PEERS_DISABLE=1 run "$WRAPPERS_DIR/claude-amq"
   [ "$status" -eq 0 ]
-  assert_argv_missing "--dangerously-load-development-channels"
+  assert_argv_missing "--channels"
   assert_argv_missing "server:claude-peers"
 }
 
@@ -126,18 +128,21 @@ assert_argv_missing() {
   run "$WRAPPERS_DIR/codex-amq"
   [ "$status" -eq 0 ]
   assert_argv_missing "--dangerously-bypass-approvals-and-sandbox"
+  assert_argv_contains "--dangerously-bypass-hook-trust"
 }
 
 @test "codex-amq passes sandbox-bypass flag when CODEX_AMQ_YOLO=1" {
   CODEX_AMQ_YOLO=1 run "$WRAPPERS_DIR/codex-amq"
   [ "$status" -eq 0 ]
   assert_argv_contains "--dangerously-bypass-approvals-and-sandbox"
+  assert_argv_contains "--dangerously-bypass-hook-trust"
 }
 
 @test "codex-amq passes sandbox-bypass flag when legacy CLAUDE_YOLO=1" {
   CLAUDE_YOLO=1 run "$WRAPPERS_DIR/codex-amq"
   [ "$status" -eq 0 ]
   assert_argv_contains "--dangerously-bypass-approvals-and-sandbox"
+  assert_argv_contains "--dangerously-bypass-hook-trust"
 }
 
 # --- seed tests --------------------------------------------------------------

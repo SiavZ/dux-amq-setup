@@ -186,6 +186,7 @@ fi
 # dux and can make interactive sessions exit immediately. Dux delivers
 # Codex orchestrator policy after the PTY is live instead.
 CODEX_ARGS=()
+CODEX_ARGS+=(--dangerously-bypass-hook-trust)
 if (( ${#CODEX_EXTRA[@]} > 0 )); then
   CODEX_ARGS+=("${CODEX_EXTRA[@]}")
 fi
