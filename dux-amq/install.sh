@@ -322,12 +322,25 @@ fi
 # server is still optional at install time so a transient GitHub/Bun failure
 # does not break AMQ or non-Claude routing, but the wrapper will enable the
 # channel whenever the server has been registered with Claude Code.
-CLAUDE_PEERS_DIR="${CLAUDE_PEERS_DIR:-$STATE_ROOT/claude-peers-mcp}"
+if [[ -z "${CLAUDE_PEERS_DIR:-}" ]]; then
+  case "$STATE_ROOT" in
+    /tmp|/tmp/*|/private/tmp|/private/tmp/*|/var/folders/*)
+      # ponytail: common temp roots only; set CLAUDE_PEERS_DIR for custom scratch mounts.
+      CLAUDE_PEERS_DIR="$HOME/.local/state/claude-peers-mcp"
+      ;;
+    *)
+      CLAUDE_PEERS_DIR="$STATE_ROOT/claude-peers-mcp"
+      ;;
+  esac
+fi
 if command -v bun >/dev/null 2>&1 && command -v claude >/dev/null 2>&1; then
   BUN_BIN="$(command -v bun)"
   if [[ ! -e "$LOCAL_BIN/bun" ]]; then
     ln -s "$BUN_BIN" "$LOCAL_BIN/bun" || warn "could not link bun into $LOCAL_BIN"
   fi
+  case "$CLAUDE_PEERS_DIR" in
+    */*) mkdir -p "${CLAUDE_PEERS_DIR%/*}" ;;
+  esac
   say "installing Claude Peers MCP into $CLAUDE_PEERS_DIR"
   if [[ -d "$CLAUDE_PEERS_DIR/.git" ]]; then
     git -C "$CLAUDE_PEERS_DIR" pull --ff-only || warn "Claude Peers update failed"
