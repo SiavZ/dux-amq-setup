@@ -225,11 +225,12 @@ if [[ "${CLAUDE_AMQ_YOLO:-${CLAUDE_YOLO:-}}" == "1" ]]; then
 fi
 
 # Claude-targeted Dux routing is intentionally forced through Claude
-# Peers. Use the approved --channels flag to avoid the startup
-# confirmation dialog shown by --dangerously-load-development-channels.
+# Peers. Claude Code's allowlisted --channels path no longer accepts
+# local `server:` channels; Claude Peers' own docs require the dev-channel
+# flag for `server:claude-peers`.
 # Set CLAUDE_PEERS_DISABLE=1 only for low-level diagnostics.
 if [[ "${CLAUDE_PEERS_DISABLE:-}" != "1" ]]; then
-  EXTRA+=(--channels server:claude-peers)
+  EXTRA+=(--dangerously-load-development-channels server:claude-peers)
 fi
 
 # audit03 Phase 01 §15: per-session system-prompt override.

@@ -1381,6 +1381,7 @@ impl App {
         let runtime = RuntimeState {
             worker_tx,
             worker_rx,
+            shutdown: Arc::new(AtomicBool::new(false)),
             running_provider_pins: HashMap::new(),
             companion_terminals: HashMap::new(),
             pulls_in_flight: HashSet::new(),

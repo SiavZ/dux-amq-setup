@@ -6061,6 +6061,7 @@ mod tests {
         let runtime = RuntimeState {
             worker_tx,
             worker_rx,
+            shutdown: Arc::new(AtomicBool::new(false)),
             running_provider_pins: std::collections::HashMap::new(),
             companion_terminals: std::collections::HashMap::new(),
             pulls_in_flight: std::collections::HashSet::new(),

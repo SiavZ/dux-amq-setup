@@ -113,14 +113,14 @@ assert_argv_missing() {
 @test "claude-amq loads claude-peers channel by default" {
   run "$WRAPPERS_DIR/claude-amq"
   [ "$status" -eq 0 ]
-  assert_argv_contains "--channels"
+  assert_argv_contains "--dangerously-load-development-channels"
   assert_argv_contains "server:claude-peers"
 }
 
 @test "claude-amq can disable claude-peers channel loading" {
   CLAUDE_PEERS_DISABLE=1 run "$WRAPPERS_DIR/claude-amq"
   [ "$status" -eq 0 ]
-  assert_argv_missing "--channels"
+  assert_argv_missing "--dangerously-load-development-channels"
   assert_argv_missing "server:claude-peers"
 }
 

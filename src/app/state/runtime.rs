@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -21,6 +21,7 @@ use super::super::{BranchSyncEntry, CompanionTerminal, PrSyncEntry, WorkerEvent}
 pub(crate) struct RuntimeState {
     pub(crate) worker_tx: Sender<WorkerEvent>,
     pub(crate) worker_rx: Receiver<WorkerEvent>,
+    pub(crate) shutdown: Arc<AtomicBool>,
     // audit02 P1-Z phase 2 (Phase 18): the legacy `providers:
     // HashMap<String, PtyClient>` field is gone. PTY ownership now
     // lives inside `SessionState::Live` / `SessionState::Detached` on
@@ -141,4 +142,10 @@ pub(crate) struct RuntimeState {
     /// no stable system-prompt flag and must not receive the policy as a
     /// launch/resume prompt.
     pub(crate) orchestrator_policy_injected: HashSet<String>,
+}
+
+impl Drop for RuntimeState {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
 }

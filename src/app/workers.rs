@@ -837,6 +837,7 @@ impl App {
     pub(crate) fn spawn_disk_watchdog(&self) {
         let tx = self.runtime.worker_tx.clone();
         let root = self.paths.root.clone();
+        let shutdown = Arc::clone(&self.runtime.shutdown);
         thread::Builder::new()
             .name("disk-watchdog".into())
             .spawn(move || {
@@ -847,8 +848,11 @@ impl App {
                 {
                     return;
                 }
-                loop {
+                while !shutdown.load(Ordering::Relaxed) {
                     thread::sleep(DISK_WATCHDOG_INTERVAL);
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
                     let Some(pct) = sample_disk_usage_pct(&root) else {
                         continue;
                     };
@@ -871,6 +875,7 @@ impl App {
     pub(crate) fn spawn_scrollback_watchdog(&self) {
         let tx = self.runtime.worker_tx.clone();
         let scrollback_lines = self.config.ui.agent_scrollback_lines;
+        let shutdown = Arc::clone(&self.runtime.shutdown);
         // We can't safely peek at the live `PtyClient`s from a worker
         // thread (they hold non-Send fds), so the worker fires a tick on
         // a fixed interval and the UI thread computes the footprint when
@@ -881,8 +886,11 @@ impl App {
         thread::Builder::new()
             .name("scrollback-watchdog".into())
             .spawn(move || {
-                loop {
+                while !shutdown.load(Ordering::Relaxed) {
                     thread::sleep(SCROLLBACK_WATCHDOG_INTERVAL);
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
                     // We don't have access to the runtime pane list here;
                     // signal "tick" by sending a sentinel and let the UI
                     // thread compute the actual footprint with the
@@ -905,10 +913,14 @@ impl App {
         }
         let tx = self.runtime.worker_tx.clone();
         let sessions = Arc::clone(&self.runtime.branch_sync_sessions);
+        let shutdown = Arc::clone(&self.runtime.shutdown);
         thread::spawn(move || {
             let interval = Duration::from_secs(u64::from(interval_secs));
-            loop {
+            while !shutdown.load(Ordering::Relaxed) {
                 thread::sleep(interval);
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
                 let snapshot = match sessions.lock() {
                     Ok(guard) => guard.clone(),
                     Err(_) => continue,
@@ -1186,14 +1198,18 @@ impl App {
         let tx = self.runtime.worker_tx.clone();
         let watched = Arc::clone(&self.runtime.watched_worktree);
         let has_agent = Arc::clone(&self.runtime.has_active_processes);
+        let shutdown = Arc::clone(&self.runtime.shutdown);
         thread::spawn(move || {
-            loop {
+            while !shutdown.load(Ordering::Relaxed) {
                 let interval = if has_agent.load(Ordering::Relaxed) {
                     Duration::from_secs(2)
                 } else {
                     Duration::from_secs(10)
                 };
                 thread::sleep(interval);
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
                 let path = watched.lock().ok().and_then(|guard| guard.clone());
                 if let Some(worktree_path) = path
                     && let Ok((staged, unstaged)) = git::changed_files(&worktree_path)

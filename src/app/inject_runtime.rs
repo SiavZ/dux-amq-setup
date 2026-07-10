@@ -298,6 +298,7 @@ impl App {
             queue_dir.clone(),
             self.config.amq.inject.poll_interval_ms,
             tx.clone(),
+            Arc::clone(&self.runtime.shutdown),
             make_event,
         ) {
             Ok(watcher) => {

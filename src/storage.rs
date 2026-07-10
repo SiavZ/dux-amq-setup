@@ -390,14 +390,6 @@ impl SessionStore {
         conn.execute("delete from agent_sessions where id = ?1", params![id])?;
         Ok(())
     }
-
-    /// Returns a clone of the inner `Arc<Mutex<Connection>>` so a handle can
-    /// be shared with background workers (e.g. backup worker) without
-    /// transferring ownership.
-    #[allow(dead_code)] // consumed by spawn_backup_worker once wired (Phase 14 step 14.3)
-    pub fn shared_conn(&self) -> Arc<Mutex<Connection>> {
-        Arc::clone(&self.conn)
-    }
 }
 
 /// Open a SQLite connection at `path` with the dux startup PRAGMAs and a

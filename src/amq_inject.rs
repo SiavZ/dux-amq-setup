@@ -22,6 +22,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -648,6 +649,7 @@ pub fn spawn_inject_watcher<E>(
     queue_dir: PathBuf,
     poll_interval_ms: u64,
     event_tx: Sender<E>,
+    shutdown: Arc<AtomicBool>,
     make_event: impl Fn() -> E + Send + 'static + Copy,
 ) -> Result<Arc<Mutex<RecommendedWatcher>>>
 where
@@ -684,8 +686,11 @@ where
     thread::Builder::new()
         .name("dux-amq-inject-poll".to_string())
         .spawn(move || {
-            loop {
+            while !shutdown.load(Ordering::Relaxed) {
                 thread::sleep(interval);
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
                 if poll_tx.send(make_event()).is_err() {
                     // Receiver gone — App is shutting down.
                     break;

@@ -1901,6 +1901,27 @@ mod tests {
         assert!(!fresh.dropped);
     }
 
+    #[test]
+    fn dropping_pty_client_returns_promptly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = PtyClient::spawn(
+            "/bin/sh",
+            &["-c".to_string(), "sleep 5".to_string()],
+            tmp.path(),
+            24,
+            80,
+            100,
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(client);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("dropping PtyClient should not hang");
+    }
+
     /// The resume path drains `pending_bytes` into `terminal.process`. Verify
     /// that a paused-then-drained stream produces an identical terminal state
     /// to feeding the same bytes inline, so users returning from scrollback
