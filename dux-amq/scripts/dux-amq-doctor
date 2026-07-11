@@ -356,7 +356,7 @@ sec_binary_integrity() {
   anon_text "$rec"            rec_disp
   if [[ -x "$AMQ_BIN_PINNED" && -f "$rec" ]]; then
     expected="$(awk '{print $1}' "$rec" 2>/dev/null)"
-    actual="$(to sha256_file "$AMQ_BIN_PINNED")"
+    actual="$(sha256_file "$AMQ_BIN_PINNED" 2>/dev/null || printf '(error)')"
     if [[ -n "$expected" && "$expected" == "$actual" ]]; then
       status="match"
       kv "amq binary" "$bin_disp"
