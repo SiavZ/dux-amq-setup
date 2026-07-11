@@ -7,10 +7,11 @@
 #   2. claude-amq DOES pass it when CLAUDE_AMQ_YOLO=1.
 #   3. codex-amq does NOT pass --dangerously-bypass-approvals-and-sandbox by default.
 #   4. codex-amq DOES pass it when CODEX_AMQ_YOLO=1.
-#   5. codex-amq passes --dangerously-bypass-hook-trust by default.
-#   6. codex-amq passes it when CLAUDE_YOLO=1 (legacy YOLO path still active).
-#   7. claude-amq does NOT seed parent session history by default.
-#   8. claude-amq DOES seed when CLAUDE_AMQ_SEED_FROM_PARENT=1.
+#   5. codex-amq does NOT bypass hook trust by default or merely with YOLO.
+#   6. codex-amq bypasses hook trust only with its explicit opt-in.
+#   7. legacy CLAUDE_YOLO=1 still enables Codex's sandbox bypass.
+#   8. claude-amq does NOT seed parent session history by default.
+#   9. claude-amq DOES seed when CLAUDE_AMQ_SEED_FROM_PARENT=1.
 #
 # Implementation: tests/fakes/amq records argv to $AMQ_FAKE_ARGV_FILE
 # (and is a no-op for `amq wake` so the background daemon spawn doesn't
@@ -32,7 +33,7 @@ setup() {
   # Force-unset every env knob the wrappers consult so each test starts
   # from a clean default-deny baseline regardless of the host shell.
   unset CLAUDE_AMQ_YOLO CLAUDE_YOLO CLAUDE_AMQ_SAFE CLAUDE_PEERS_DISABLE
-  unset CODEX_AMQ_YOLO
+  unset CODEX_AMQ_YOLO CODEX_AMQ_BYPASS_HOOK_TRUST
   unset CLAUDE_AMQ_SEED_FROM_PARENT CLAUDE_AMQ_NO_SEED
   # audit03 Phase 01 §15: DUX_SYSTEM_PROMPT is a per-session env var
   # set by dux's PTY spawner. Tests may override it explicitly; reset
@@ -128,21 +129,29 @@ assert_argv_missing() {
   run "$WRAPPERS_DIR/codex-amq"
   [ "$status" -eq 0 ]
   assert_argv_missing "--dangerously-bypass-approvals-and-sandbox"
-  assert_argv_contains "--dangerously-bypass-hook-trust"
+  assert_argv_missing "--dangerously-bypass-hook-trust"
 }
 
 @test "codex-amq passes sandbox-bypass flag when CODEX_AMQ_YOLO=1" {
   CODEX_AMQ_YOLO=1 run "$WRAPPERS_DIR/codex-amq"
   [ "$status" -eq 0 ]
   assert_argv_contains "--dangerously-bypass-approvals-and-sandbox"
-  assert_argv_contains "--dangerously-bypass-hook-trust"
+  assert_argv_missing "--dangerously-bypass-hook-trust"
 }
 
 @test "codex-amq passes sandbox-bypass flag when legacy CLAUDE_YOLO=1" {
   CLAUDE_YOLO=1 run "$WRAPPERS_DIR/codex-amq"
   [ "$status" -eq 0 ]
   assert_argv_contains "--dangerously-bypass-approvals-and-sandbox"
+  assert_argv_missing "--dangerously-bypass-hook-trust"
+}
+
+@test "codex-amq bypasses hook trust only with explicit opt-in" {
+  CODEX_AMQ_BYPASS_HOOK_TRUST=1 run "$WRAPPERS_DIR/codex-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_missing "--dangerously-bypass-approvals-and-sandbox"
   assert_argv_contains "--dangerously-bypass-hook-trust"
+  [[ "$output" == *"hook trust review bypass enabled"* ]]
 }
 
 # --- seed tests --------------------------------------------------------------

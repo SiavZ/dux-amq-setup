@@ -186,7 +186,10 @@ fi
 # dux and can make interactive sessions exit immediately. Dux delivers
 # Codex orchestrator policy after the PTY is live instead.
 CODEX_ARGS=()
-CODEX_ARGS+=(--dangerously-bypass-hook-trust)
+if [[ "${CODEX_AMQ_BYPASS_HOOK_TRUST:-}" == "1" ]]; then
+  CODEX_ARGS+=(--dangerously-bypass-hook-trust)
+  printf 'codex-amq: hook trust review bypass enabled\n' >&2
+fi
 if (( ${#CODEX_EXTRA[@]} > 0 )); then
   CODEX_ARGS+=("${CODEX_EXTRA[@]}")
 fi
@@ -197,4 +200,8 @@ if [[ -n "${DUX_SYSTEM_PROMPT:-}" ]]; then
   printf 'codex-amq: DUX_SYSTEM_PROMPT set but codex has no system-prompt flag; dux will inject orchestrator policy after startup when applicable\n' >&2
 fi
 
-exec amq coop exec --no-wake --no-init --root "$ROOT" --me "$ME" codex -- "${CODEX_ARGS[@]}"
+if (( ${#CODEX_ARGS[@]} > 0 )); then
+  exec amq coop exec --no-wake --no-init --root "$ROOT" --me "$ME" codex -- "${CODEX_ARGS[@]}"
+else
+  exec amq coop exec --no-wake --no-init --root "$ROOT" --me "$ME" codex --
+fi
