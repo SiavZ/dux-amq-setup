@@ -288,8 +288,14 @@ pub fn claim(path: &Path) -> Result<PathBuf> {
         .to_string_lossy()
         .into_owned();
     let inflight = parent.join(format!("{INFLIGHT_PREFIX}{basename}"));
-    fs::rename(path, &inflight)
-        .with_context(|| format!("claim {} -> {}", path.display(), inflight.display()))?;
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        path,
+        rustix::fs::CWD,
+        &inflight,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .with_context(|| format!("claim {} -> {}", path.display(), inflight.display()))?;
     Ok(inflight)
 }
 
@@ -400,6 +406,26 @@ pub fn reclaim_stale_inflight_with_max_age(
                         "reclaimed stale inflight from prior dux instance",
                     );
                 }
+                Err(rustix::io::Errno::EXIST) => match quarantine_expired(&inflight_path) {
+                    Ok(expired_path) => {
+                        tracing::warn!(
+                            target: "dux::amq_inject",
+                            from = %inflight_path.display(),
+                            to = %expired_path.display(),
+                            destination = %original_path.display(),
+                            "quarantined stranded AMQ inflight after reclaim collision",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "dux::amq_inject",
+                            from = %inflight_path.display(),
+                            to = %original_path.display(),
+                            err = %e,
+                            "stale inflight collision quarantine failed; future claims fail closed",
+                        );
+                    }
+                },
                 Err(e) => {
                     tracing::warn!(
                         target: "dux::amq_inject",
@@ -1066,22 +1092,48 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_stale_inflight_continues_past_per_file_errors() {
+    fn reclaim_collision_preserves_both_bodies_through_the_next_claim() {
         let dir = tempdir().unwrap();
         let queue = dir.path().to_path_buf();
         let alice = queue.join("alice");
         fs::create_dir_all(&alice).unwrap();
-        // Two reclaimable files; first one's destination already
-        // exists (collision — should be logged + skipped).
+        // Two reclaimable files; the first destination was recreated by a
+        // producer while the prior body was still inflight.
         fs::write(alice.join(".inflight.001.msg"), b"a").unwrap();
-        fs::write(alice.join("001.msg"), b"existing").unwrap(); // collision target
+        fs::write(alice.join("001.msg"), b"existing").unwrap();
         fs::write(alice.join(".inflight.002.msg"), b"b").unwrap();
         let n = reclaim_stale_inflight(&queue).unwrap();
         assert_eq!(n, 1);
         assert_eq!(fs::read(alice.join("001.msg")).unwrap(), b"existing");
-        assert_eq!(fs::read(alice.join(".inflight.001.msg")).unwrap(), b"a");
+        assert_eq!(
+            fs::read(alice.join(".expired/.inflight.001.msg")).unwrap(),
+            b"a"
+        );
         assert_eq!(fs::read(alice.join("002.msg")).unwrap(), b"b");
         assert!(!alice.join(".inflight.002.msg").exists());
+
+        let claimed = claim(&alice.join("001.msg")).unwrap();
+        assert_eq!(fs::read(claimed).unwrap(), b"existing");
+        assert_eq!(
+            fs::read(alice.join(".expired/.inflight.001.msg")).unwrap(),
+            b"a",
+            "claiming the producer's replacement must not overwrite the stranded body"
+        );
+    }
+
+    #[test]
+    fn claim_fails_closed_when_the_inflight_destination_exists() {
+        let dir = tempdir().unwrap();
+        let receiver = dir.path().join("alice");
+        fs::create_dir_all(&receiver).unwrap();
+        let queued = receiver.join("001.msg");
+        let inflight = receiver.join(".inflight.001.msg");
+        fs::write(&queued, b"new").unwrap();
+        fs::write(&inflight, b"old").unwrap();
+
+        assert!(claim(&queued).is_err());
+        assert_eq!(fs::read(queued).unwrap(), b"new");
+        assert_eq!(fs::read(inflight).unwrap(), b"old");
     }
 
     #[test]
