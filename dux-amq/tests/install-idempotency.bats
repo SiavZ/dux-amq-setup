@@ -131,6 +131,11 @@ TOML
 
   [ -L "$STATE_ROOT/dux/config.toml" ]
   cmp "$STATE_ROOT/dux/config.toml.expected" "$config_target"
+  ! grep -Fq -- "/data/state" "$HOME/.bashrc"
+  run env -u STATE_ROOT -u DUX_HOME -u AMQ_GLOBAL_ROOT \
+    HOME="$HOME" bash -c 'source "$HOME/.bashrc"; printf "%s|%s|%s\n" "$STATE_ROOT" "$DUX_HOME" "$AMQ_GLOBAL_ROOT"'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"$STATE_ROOT|$STATE_ROOT/dux|$STATE_ROOT/amq"* ]]
 }
 
 @test "P0-F/P0-01: second install preserves AMQ and user-owned Dux config" {

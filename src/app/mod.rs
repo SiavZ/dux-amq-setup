@@ -28,9 +28,8 @@ use uuid::Uuid;
 use crate::clipboard::Clipboard;
 use crate::config::{
     Config, DuxPaths, MacroSurface, ProjectConfig, ProviderCommandConfig, check_provider_available,
-    ensure_config, save_config, validate_keys,
+    ensure_config, validate_keys,
 };
-use crate::diff::SyntaxCache;
 use crate::editor::DetectedEditor;
 use crate::git;
 use crate::keybindings::{
@@ -108,7 +107,6 @@ pub struct App {
     /// skipped so pasted text doesn't trigger keybindings.
     pub(crate) in_bracket_paste: bool,
     /// Cached syntax highlighting resources shared across diff computations.
-    pub(crate) syntax_cache: SyntaxCache,
     /// Reusable snapshot buffer to avoid per-frame allocation of terminal cells.
     pub(crate) snapshot_buf: TerminalSnapshot,
     /// ID of the provider that last populated `snapshot_buf`, used to detect
@@ -1082,6 +1080,8 @@ pub(crate) struct AgentReadyData {
     pub client: PtyClient,
     pub pty_size: (u16, u16), // (rows, cols) the PTY was spawned with
     pub status_message: String,
+    pub owns_worktree: bool,
+    pub owns_branch: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1107,6 +1107,10 @@ pub(crate) enum WorkerEvent {
     CreateAgentProgress(String),
     CreateAgentReady(Box<AgentReadyData>),
     CreateAgentFailed(String),
+    UnpersistedAgentCleanupCompleted {
+        worktree: PathBuf,
+        result: Result<(), String>,
+    },
     ChangedFilesReady {
         staged: Vec<ChangedFile>,
         unstaged: Vec<ChangedFile>,
@@ -1121,7 +1125,8 @@ pub(crate) enum WorkerEvent {
     },
     BrowserEntriesReady {
         dir: PathBuf,
-        entries: Vec<BrowserEntry>,
+        restore_dir: Option<PathBuf>,
+        result: Result<Vec<BrowserEntry>, String>,
     },
     ClipboardCopyCompleted {
         /// Human-readable success message shown in the status bar.
@@ -1131,8 +1136,14 @@ pub(crate) enum WorkerEvent {
     BranchSyncReady(Vec<(String, String)>),
     BranchRenameCompleted {
         session_id: String,
+        worktree: String,
+        old_branch: String,
         new_branch: String,
         previous_title: Option<String>,
+        result: Result<(), String>,
+    },
+    BranchRenameRollbackCompleted {
+        session_id: String,
         result: Result<(), String>,
     },
     ResourceStatsReady(Vec<ResourceStats>),
@@ -1235,6 +1246,42 @@ pub(crate) enum WorkerEvent {
     /// scan needs to inspect every receiver subdir anyway, and the
     /// notify event paths aren't reliable across all FSes.
     AmqInjectScanRequested,
+    GitFileOperationCompleted {
+        action: GitFileAction,
+        worktree: PathBuf,
+        path: String,
+        result: Result<(), String>,
+    },
+    PathCompletionsReady {
+        query: String,
+        reverse: bool,
+        candidates: Vec<String>,
+    },
+    DiffReady {
+        worktree: String,
+        rel_path: String,
+        scroll: u16,
+        focus_when_ready: bool,
+        result: Result<crate::diff::DiffOutput, String>,
+    },
+    ConfigSaveCompleted {
+        success: String,
+        rollback: ConfigSaveRollback,
+        result: Result<(), String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GitFileAction {
+    Stage,
+    Unstage,
+    Discard { untracked: bool },
+}
+
+pub(crate) enum ConfigSaveRollback {
+    None,
+    DefaultProvider(String),
+    Theme(String),
 }
 
 #[derive(Clone, Debug)]
@@ -1406,6 +1453,8 @@ impl App {
             amq_inject_startup_grace_until: None,
             amq_inject_cooldown_until: HashMap::new(),
             amq_inject_last_warned: HashMap::new(),
+            amq_inject_first_pending_at: HashMap::new(),
+            amq_inject_timeout_warned: HashSet::new(),
             amq_inject_last_held_logged: HashMap::new(),
             last_user_keystroke: HashMap::new(),
             pr_checks_in_flight: Arc::new(AtomicUsize::new(0)),
@@ -1476,7 +1525,6 @@ impl App {
             raw_input_buf: Vec::new(),
             loading_input_buf: Vec::new(),
             in_bracket_paste: false,
-            syntax_cache: SyntaxCache::new(),
             snapshot_buf: TerminalSnapshot::empty(),
             last_snapshot_id: None,
             terminal_selection: None,
@@ -1500,6 +1548,15 @@ impl App {
     }
 
     pub fn run(&mut self) -> Result<()> {
+        let backup_interval = Duration::from_secs(
+            u64::from(self.config.storage.backup_interval_minutes).saturating_mul(60),
+        );
+        let _ = workers::spawn_backup_worker(
+            Arc::new(self.session_store.clone()),
+            self.paths.clone(),
+            backup_interval,
+            Arc::clone(&self.runtime.shutdown),
+        );
         self.spawn_changed_files_poller();
         self.spawn_branch_sync_worker();
         self.spawn_gh_status_check();
@@ -1649,6 +1706,7 @@ impl App {
             Ok(())
         };
 
+        workers::flush_config_saves();
         let _ = execute!(stdout(), DisableMouseCapture);
         ratatui::restore();
         result
@@ -2118,31 +2176,24 @@ impl App {
             "toggle-diff-line-numbers" => {
                 self.show_diff_line_numbers = !self.show_diff_line_numbers;
                 self.config.ui.show_diff_line_numbers = self.show_diff_line_numbers;
-                let save_result =
-                    save_config(&self.paths.config_path, &self.config, &self.bindings);
                 let _ = self.refresh_current_diff();
                 let state = if self.show_diff_line_numbers {
                     "enabled"
                 } else {
                     "disabled"
                 };
-                if let Err(err) = save_result {
-                    self.set_error(format!(
-                        "Diff line numbers {state} for this session, but couldn't persist the change to config: {err:#}"
-                    ));
-                } else {
-                    let palette_key = self.bindings.label_for(Action::OpenPalette);
-                    self.set_info(format!(
+                let palette_key = self.bindings.label_for(Action::OpenPalette);
+                self.queue_config_save(
+                    format!(
                         "Diff line numbers {state}. Press {palette_key} to open the palette and toggle back."
-                    ));
-                }
+                    ),
+                    ConfigSaveRollback::None,
+                );
                 Ok(())
             }
             "toggle-github-integration" => {
                 self.runtime.github_integration_enabled = !self.runtime.github_integration_enabled;
                 self.config.ui.github_integration = self.runtime.github_integration_enabled;
-                let save_result =
-                    save_config(&self.paths.config_path, &self.config, &self.bindings);
                 if self.runtime.github_integration_enabled
                     && matches!(self.runtime.gh_status, crate::model::GhStatus::Available)
                 {
@@ -2159,35 +2210,27 @@ impl App {
                 } else {
                     "disabled"
                 };
-                if let Err(err) = save_result {
-                    self.set_error(format!(
-                        "GitHub integration {state} for this session, but couldn't persist the change to config: {err:#}"
-                    ));
-                } else {
-                    self.set_info(format!("GitHub integration {state}."));
-                }
+                self.queue_config_save(
+                    format!("GitHub integration {state}."),
+                    ConfigSaveRollback::None,
+                );
                 Ok(())
             }
             "toggle-randomized-pet-name-default" => {
                 self.config.defaults.enable_randomized_pet_name_by_default =
                     !self.config.defaults.enable_randomized_pet_name_by_default;
-                let save_result =
-                    save_config(&self.paths.config_path, &self.config, &self.bindings);
                 let state = if self.config.defaults.enable_randomized_pet_name_by_default {
                     "enabled — new agent prompts start with a random pet name"
                 } else {
                     "disabled — new agent prompts start empty"
                 };
-                if let Err(err) = save_result {
-                    self.set_error(format!(
-                        "Random pet-name defaults {state} for this session, but couldn't persist the change to config: {err:#}"
-                    ));
-                } else {
-                    let palette_key = self.bindings.label_for(Action::OpenPalette);
-                    self.set_info(format!(
+                let palette_key = self.bindings.label_for(Action::OpenPalette);
+                self.queue_config_save(
+                    format!(
                         "Random pet-name defaults {state}. Press {palette_key} to toggle back."
-                    ));
-                }
+                    ),
+                    ConfigSaveRollback::None,
+                );
                 Ok(())
             }
             "toggle-pr-banner-position" => {
@@ -2198,14 +2241,10 @@ impl App {
                     "top"
                 };
                 self.config.ui.pr_banner_position = pos.to_string();
-                if let Err(err) = save_config(&self.paths.config_path, &self.config, &self.bindings)
-                {
-                    self.set_error(format!(
-                        "PR banner moved to {pos} for this session, but couldn't persist the change to config: {err:#}"
-                    ));
-                } else {
-                    self.set_info(format!("PR banner moved to {pos} of agent pane."));
-                }
+                self.queue_config_save(
+                    format!("PR banner moved to {pos} of agent pane."),
+                    ConfigSaveRollback::None,
+                );
                 Ok(())
             }
             "force-redraw" => {
@@ -2370,7 +2409,8 @@ impl App {
                 .copied()
                 .unwrap_or(usize::MAX)
         });
-        save_config(&self.paths.config_path, &self.config, &self.bindings)
+        self.queue_config_save("", ConfigSaveRollback::None);
+        Ok(())
     }
 
     fn persist_session_order(&self) -> Result<()> {
@@ -2751,24 +2791,28 @@ impl App {
             .find(|s| s.id == session_id)
             .and_then(|s| s.title.clone());
 
-        // Always update the display title immediately.
-        if let Some(session) = self.git.sessions.iter_mut().find(|s| s.id == session_id) {
-            session.title = Some(name.clone());
-            session.updated_at = Utc::now();
-        }
-        if let Some(session) = self.git.sessions.iter().find(|s| s.id == session_id) {
-            let _ = self.session_store.upsert_session(session);
-        }
-        self.rebuild_left_items();
-
         // Optionally rename the git branch in a background worker.
         if rename_branch {
-            let Some(session) = self.git.sessions.iter().find(|s| s.id == session_id) else {
+            let Some(session) = self
+                .git
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == session_id)
+            else {
                 return;
             };
+            session.title = Some(name.clone());
+            session.updated_at = Utc::now();
             let old_branch = session.branch_name.clone();
             if name == old_branch {
-                self.set_info(format!("Renamed agent to \"{name}\"."));
+                let candidate = session.clone();
+                if let Err(err) = self.session_store.upsert_session(&candidate) {
+                    session.title = previous_title;
+                    self.set_error(format!("Couldn't persist agent rename: {err}"));
+                } else {
+                    self.set_info(format!("Renamed agent to \"{name}\"."));
+                }
+                self.rebuild_left_items();
                 return;
             }
             let worktree = session.worktree_path.clone();
@@ -2780,15 +2824,36 @@ impl App {
                     .map_err(|e| e.to_string());
                 let _ = tx.send(WorkerEvent::BranchRenameCompleted {
                     session_id: sid,
+                    worktree,
+                    old_branch,
                     new_branch,
                     previous_title,
                     result,
                 });
             });
+            self.rebuild_left_items();
             self.set_busy(format!("Renaming branch to \"{name}\"\u{2026}"));
         } else {
-            self.set_info(format!("Renamed agent to \"{name}\"."));
+            let Some(index) = self
+                .git
+                .sessions
+                .iter()
+                .position(|session| session.id == session_id)
+            else {
+                return;
+            };
+            let mut candidate = self.git.sessions[index].clone();
+            candidate.title = Some(name.clone());
+            candidate.updated_at = Utc::now();
+            if let Err(err) = self.session_store.upsert_session(&candidate) {
+                self.set_error(format!("Couldn't persist agent rename: {err}"));
+                return;
+            }
+            self.git.sessions[index].title = candidate.title;
+            self.git.sessions[index].updated_at = candidate.updated_at;
+            self.rebuild_left_items();
             self.update_branch_sync_sessions();
+            self.set_info(format!("Renamed agent to \"{name}\"."));
         }
     }
 
@@ -2897,7 +2962,7 @@ impl App {
         };
         session.state = next;
         session.updated_at = now;
-        let _ = self.session_store.upsert_session(session);
+        let persist_error = self.session_store.upsert_session(session).err();
         if previous {
             // Strictly speaking the old PTY was already taken out
             // above; this branch documents the swap intent.
@@ -2906,6 +2971,9 @@ impl App {
         // engine left over from a prior spawn so config changes between
         // restarts take effect.
         self.attach_watch_engine(session_id);
+        if let Some(err) = persist_error {
+            self.report_session_persist_failure(session_id, "installing the agent runtime", &err);
+        }
         old_pty
     }
 
@@ -2933,7 +3001,15 @@ impl App {
                 let next = current.detach(now).expect("Live -> Detached");
                 session.state = next;
                 session.updated_at = now;
-                let _ = self.session_store.upsert_session(session);
+                let persist_error = self.session_store.upsert_session(session).err();
+                if let Some(err) = persist_error {
+                    self.report_session_persist_failure(
+                        session_id,
+                        "detaching the agent runtime",
+                        &err,
+                    );
+                    return false;
+                }
                 true
             }
             SessionState::Detached { .. } => {
@@ -2971,7 +3047,15 @@ impl App {
                 let next = current.reattach(now).expect("Detached -> Live");
                 session.state = next;
                 session.updated_at = now;
-                let _ = self.session_store.upsert_session(session);
+                let persist_error = self.session_store.upsert_session(session).err();
+                if let Some(err) = persist_error {
+                    self.report_session_persist_failure(
+                        session_id,
+                        "reattaching the agent runtime",
+                        &err,
+                    );
+                    return false;
+                }
                 true
             }
             SessionState::Live { .. } => {
@@ -3003,8 +3087,11 @@ impl App {
         // joins the reader thread).
         session.state = current.into_exited(exit_code, now);
         session.updated_at = now;
-        let _ = self.session_store.upsert_session(session);
+        let persist_error = self.session_store.upsert_session(session).err();
         self.detach_watch_engine(session_id);
+        if let Some(err) = persist_error {
+            self.report_session_persist_failure(session_id, "recording the agent exit", &err);
+        }
     }
 
     /// Forcibly remove the session's PTY, returning it to the caller
@@ -3026,7 +3113,14 @@ impl App {
             SessionState::Live { pty_handle, .. } | SessionState::Detached { pty_handle, .. } => {
                 session.state = SessionState::Created { created_at: now };
                 session.updated_at = now;
-                let _ = self.session_store.upsert_session(session);
+                let persist_error = self.session_store.upsert_session(session).err();
+                if let Some(err) = persist_error {
+                    self.report_session_persist_failure(
+                        session_id,
+                        "releasing the agent runtime",
+                        &err,
+                    );
+                }
                 Some(pty_handle)
             }
             other => {
@@ -3431,7 +3525,30 @@ impl App {
         }
 
         session.updated_at = Utc::now();
-        let _ = self.session_store.upsert_session(session);
+        let persist_error = self.session_store.upsert_session(session).err();
+        if let Some(err) = persist_error {
+            self.report_session_persist_failure(session_id, "recording provider history", &err);
+        }
+    }
+
+    fn report_session_persist_failure(
+        &mut self,
+        session_id: &str,
+        operation: &str,
+        err: &anyhow::Error,
+    ) {
+        let safe_session_id = crate::sanitize::for_terminal(session_id);
+        let safe_err = crate::sanitize::for_terminal(&format!("{err:#}"));
+        tracing::error!(
+            target: "dux::storage",
+            session_id = %safe_session_id,
+            operation,
+            err = %safe_err,
+            "session lifecycle persistence failed",
+        );
+        self.set_error(format!(
+            "Couldn't persist {operation} for session {safe_session_id}: {safe_err}"
+        ));
     }
 
     /// Refreshes the shared session snapshot used by the branch-sync worker.

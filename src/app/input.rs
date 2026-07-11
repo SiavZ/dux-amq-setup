@@ -987,25 +987,17 @@ impl App {
         };
         let Some(file) = file else { return Ok(()) };
         let path = file.path.clone();
-        match self.right_section {
-            RightSection::Unstaged => {
-                git::stage_file(&worktree, &path)?;
-            }
-            RightSection::Staged => {
-                git::unstage_file(&worktree, &path)?;
-            }
-            RightSection::CommitInput => {}
-        }
-        self.reload_changed_files();
-        // If the section we were in is now empty, move to the other one.
-        if self.right_section == RightSection::Staged && self.git.staged_files.is_empty() {
-            self.right_section = RightSection::Unstaged;
-            self.clamp_files_cursor();
-        } else if self.right_section == RightSection::Unstaged && self.git.unstaged_files.is_empty()
-        {
-            self.right_section = RightSection::Staged;
-            self.clamp_files_cursor();
-        }
+        let action = match self.right_section {
+            RightSection::Unstaged => GitFileAction::Stage,
+            RightSection::Staged => GitFileAction::Unstage,
+            RightSection::CommitInput => return Ok(()),
+        };
+        workers::dispatch_git_file_operation(
+            self.runtime.worker_tx.clone(),
+            action,
+            worktree,
+            path,
+        );
         Ok(())
     }
 
@@ -2034,8 +2026,7 @@ impl App {
                     ..
                 } = &mut self.ui.prompt
                 {
-                    let mut browse_to: Option<PathBuf> = None;
-                    let mut error_msg = None;
+                    let mut browse_to: Option<(PathBuf, PathBuf)> = None;
                     match key.code {
                         KeyCode::Esc => {
                             *editing_path = false;
@@ -2045,46 +2036,11 @@ impl App {
                         }
                         KeyCode::Tab | KeyCode::BackTab => {
                             if tab_completions.is_empty() {
-                                let input_path = PathBuf::from(path_input.text.as_str());
-                                let (search_dir, prefix) =
-                                    if input_path.is_dir() && path_input.text.ends_with('/') {
-                                        (input_path.clone(), String::new())
-                                    } else {
-                                        let parent = input_path
-                                            .parent()
-                                            .unwrap_or_else(|| std::path::Path::new("/"));
-                                        let file_name = input_path
-                                            .file_name()
-                                            .map(|f| f.to_string_lossy().to_string())
-                                            .unwrap_or_default();
-                                        (parent.to_path_buf(), file_name)
-                                    };
-                                if let Ok(read) = std::fs::read_dir(&search_dir) {
-                                    let prefix_lower = prefix.to_lowercase();
-                                    let mut candidates: Vec<String> = read
-                                        .filter_map(|e| e.ok())
-                                        .filter(|e| {
-                                            e.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
-                                        })
-                                        .filter(|e| {
-                                            let name =
-                                                e.file_name().to_string_lossy().to_lowercase();
-                                            !name.starts_with('.')
-                                                && name.starts_with(&prefix_lower)
-                                        })
-                                        .map(|e| {
-                                            let mut full = search_dir
-                                                .join(e.file_name())
-                                                .to_string_lossy()
-                                                .to_string();
-                                            full.push('/');
-                                            full
-                                        })
-                                        .collect();
-                                    candidates.sort();
-                                    *tab_completions = candidates;
-                                    *tab_index = 0;
-                                }
+                                workers::dispatch_path_completions(
+                                    self.runtime.worker_tx.clone(),
+                                    path_input.text.clone(),
+                                    key.code == KeyCode::BackTab,
+                                );
                             } else if key.code == KeyCode::BackTab {
                                 if *tab_index == 0 {
                                     *tab_index = tab_completions.len().saturating_sub(1);
@@ -2100,17 +2056,13 @@ impl App {
                         }
                         KeyCode::Enter => {
                             let new_dir = PathBuf::from(path_input.text.trim());
-                            if new_dir.is_dir() {
-                                *current_dir = new_dir.clone();
-                                entries.clear();
-                                *loading = true;
-                                *selected = 0;
-                                filter.clear();
-                                browse_to = Some(new_dir);
-                            } else {
-                                error_msg =
-                                    Some(format!("{} is not a directory.", path_input.text.trim()));
-                            }
+                            let previous = current_dir.clone();
+                            *current_dir = new_dir.clone();
+                            entries.clear();
+                            *loading = true;
+                            *selected = 0;
+                            filter.clear();
+                            browse_to = Some((new_dir, previous));
                             *editing_path = false;
                             path_input.clear();
                             tab_completions.clear();
@@ -2127,11 +2079,8 @@ impl App {
                             }
                         }
                     }
-                    if let Some(msg) = error_msg {
-                        self.set_error(msg);
-                    }
-                    if let Some(dir) = browse_to {
-                        self.spawn_browser_entries(&dir);
+                    if let Some((dir, previous)) = browse_to {
+                        self.spawn_browser_path_validation(&dir, previous);
                     }
                 }
                 return Ok(false);
@@ -3453,18 +3402,10 @@ impl App {
                         }
                         entries.sort_by(|(a, _, _), (b, _, _)| a.cmp(b));
 
-                        // Persist
-                        if let Err(err) = crate::config::save_config(
-                            &self.paths.config_path,
-                            &self.config,
-                            &self.bindings,
-                        ) {
-                            self.set_error(format!(
-                                "Couldn't save macro \"{name}\" to config: {err:#}"
-                            ));
-                        } else {
-                            self.set_info(format!("Macro \"{name}\" saved."));
-                        }
+                        self.queue_config_save(
+                            format!("Macro \"{name}\" saved."),
+                            ConfigSaveRollback::None,
+                        );
                         return Ok(false);
                     }
                     // In multiline mode, TextInput handles Enter/Up/Down
@@ -3587,15 +3528,10 @@ impl App {
             *selected = entries.len().saturating_sub(1);
         }
 
-        if let Err(err) =
-            crate::config::save_config(&self.paths.config_path, &self.config, &self.bindings)
-        {
-            self.set_error(format!(
-                "Couldn't persist deletion of macro \"{name}\" to config: {err:#}"
-            ));
-        } else {
-            self.set_info(format!("Macro \"{name}\" deleted."));
-        }
+        self.queue_config_save(
+            format!("Macro \"{name}\" deleted."),
+            ConfigSaveRollback::None,
+        );
         false
     }
 
@@ -4592,15 +4528,14 @@ impl App {
         self.ui.prompt = PromptState::None;
         if confirm && let Some(session) = self.selected_session() {
             let worktree = PathBuf::from(&session.worktree_path);
-            match git::discard_file(&worktree, &file_path, is_untracked) {
-                Ok(()) => {
-                    self.set_info(format!(
-                        "Discarded changes to \"{file_path}\". File restored to last committed state."
-                    ));
-                    self.reload_changed_files();
-                }
-                Err(e) => self.set_error(format!("Discard failed: {e}")),
-            }
+            workers::dispatch_git_file_operation(
+                self.runtime.worker_tx.clone(),
+                GitFileAction::Discard {
+                    untracked: is_untracked,
+                },
+                worktree,
+                file_path,
+            );
         }
         false
     }
@@ -5533,9 +5468,7 @@ impl App {
             self.config.ui.terminal_pane_height_pct = self.terminal_pane_height_pct;
             self.config.ui.staged_pane_height_pct = self.staged_pane_height_pct;
             self.config.ui.commit_pane_height_pct = self.commit_pane_height_pct;
-            if let Err(err) = save_config(&self.paths.config_path, &self.config, &self.bindings) {
-                self.set_error(format!("Couldn't persist pane sizes to config: {err:#}"));
-            }
+            self.queue_config_save("", ConfigSaveRollback::None);
         }
     }
 
@@ -5927,15 +5860,16 @@ mod tests {
 
     use super::components::{ButtonPressedTarget, PressedButton};
     use super::{DOUBLE_CLICK_THRESHOLD, MOUSE_WHEEL_LINES, MouseTarget};
+    use crate::app::workers;
     use crate::app::{
-        App, CenterMode, ConfirmKillRunningPrompt, CreateAgentRequest, DeleteAgentFocus, FocusPane,
-        FullscreenOverlay, InputTarget, KillRunningAction, KillRunningFocus,
-        KillRunningFooterAction, KillRunningPrompt, KillableRuntime, KillableRuntimeKind, LeftItem,
-        LeftSection, MacroBarState, MouseClickTarget, MouseLayoutState, NameNewAgentFocus,
-        OverlayCheckbox, OverlayCheckboxId, OverlayMouseLayout, OverlayMouseLayoutState,
-        ProcessInfo, PromptState, PullTarget, ResizeDragState, ResourceStats, RightSection,
-        RuntimeState, RuntimeTargetId, SessionSettingsPrompt, SettingsFocus, TextInput, UiState,
-        WatchRuleSummary, WorkerEvent,
+        AgentReadyData, App, CenterMode, ConfirmKillRunningPrompt, CreateAgentRequest,
+        DeleteAgentFocus, FocusPane, FullscreenOverlay, InputTarget, KillRunningAction,
+        KillRunningFocus, KillRunningFooterAction, KillRunningPrompt, KillableRuntime,
+        KillableRuntimeKind, LeftItem, LeftSection, MacroBarState, MouseClickTarget,
+        MouseLayoutState, NameNewAgentFocus, OverlayCheckbox, OverlayCheckboxId,
+        OverlayMouseLayout, OverlayMouseLayoutState, ProcessInfo, PromptState, PullTarget,
+        ResizeDragState, ResourceStats, RightSection, RuntimeState, RuntimeTargetId,
+        SessionSettingsPrompt, SettingsFocus, TextInput, UiState, WatchRuleSummary, WorkerEvent,
     };
     use crate::clipboard::Clipboard;
     use crate::config::{Config, DuxPaths, ProjectConfig};
@@ -6086,6 +6020,8 @@ mod tests {
             amq_inject_startup_grace_until: None,
             amq_inject_cooldown_until: std::collections::HashMap::new(),
             amq_inject_last_warned: std::collections::HashMap::new(),
+            amq_inject_first_pending_at: std::collections::HashMap::new(),
+            amq_inject_timeout_warned: std::collections::HashSet::new(),
             amq_inject_last_held_logged: std::collections::HashMap::new(),
             last_user_keystroke: std::collections::HashMap::new(),
             pr_checks_in_flight: Arc::new(AtomicUsize::new(0)),
@@ -6158,7 +6094,6 @@ mod tests {
             raw_input_buf: Vec::new(),
             loading_input_buf: Vec::new(),
             in_bracket_paste: false,
-            syntax_cache: crate::diff::SyntaxCache::new(),
             snapshot_buf: crate::pty::TerminalSnapshot::empty(),
             last_snapshot_id: None,
             terminal_selection: None,
@@ -6177,6 +6112,21 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    fn drain_until(app: &mut App, predicate: impl Fn(&App) -> bool) {
+        for _ in 0..200 {
+            app.drain_events();
+            if predicate(app) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!(
+            "worker event did not arrive before timeout; status={:?} {}",
+            app.status.tone(),
+            app.status.message()
+        );
     }
 
     fn install_mouse_layout(app: &mut App) {
@@ -7545,6 +7495,10 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
 
+        drain_until(&mut app, |app| {
+            app.ui.focus == FocusPane::Center && matches!(app.center_mode, CenterMode::Diff { .. })
+        });
+
         assert_eq!(app.ui.focus, FocusPane::Center);
         assert!(matches!(app.center_mode, CenterMode::Diff { .. }));
     }
@@ -7885,6 +7839,10 @@ mod tests {
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 79, 1));
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 79, 1));
 
+        drain_until(&mut app, |app| {
+            app.ui.focus == FocusPane::Center && matches!(app.center_mode, CenterMode::Diff { .. })
+        });
+
         assert_eq!(app.ui.focus, FocusPane::Center);
         assert!(matches!(app.center_mode, CenterMode::Diff { .. }));
     }
@@ -7931,6 +7889,9 @@ mod tests {
 
         // Second click at the same position must still detect the double-click.
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 79, 1));
+        drain_until(&mut app, |app| {
+            app.ui.focus == FocusPane::Center && matches!(app.center_mode, CenterMode::Diff { .. })
+        });
         assert_eq!(app.ui.focus, FocusPane::Center);
         assert!(matches!(app.center_mode, CenterMode::Diff { .. }));
     }
@@ -8022,6 +7983,7 @@ mod tests {
             .map(|project| project.id.as_str())
             .collect();
         assert_eq!(config_ids, vec!["project-2", "project-1"]);
+        drain_until(&mut app, |app| app.paths.config_path.exists());
         let saved = std::fs::read_to_string(&app.paths.config_path).expect("config saved");
         let first = saved.find("project-2").expect("project-2 in config");
         let second = saved.find("project-1").expect("project-1 in config");
@@ -9661,10 +9623,12 @@ cyan = "#00ffff"
         app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 53, 10));
 
         assert!(matches!(app.ui.prompt, PromptState::None));
-        let contents = std::fs::read_to_string(
-            PathBuf::from(&app.git.sessions[0].worktree_path).join("src/main.rs"),
-        )
-        .expect("discarded file");
+        let changed_path = PathBuf::from(&app.git.sessions[0].worktree_path).join("src/main.rs");
+        drain_until(&mut app, |_| {
+            std::fs::read_to_string(&changed_path)
+                .is_ok_and(|contents| contents == "fn main() {}\n")
+        });
+        let contents = std::fs::read_to_string(changed_path).expect("discarded file");
         assert_eq!(contents, "fn main() {}\n");
     }
 
@@ -11694,6 +11658,7 @@ cyan = "#00ffff"
             panic!("expected EditMacros prompt after resolving delete");
         }
 
+        drain_until(&mut app, |_| config_path.exists());
         assert!(
             config_path.exists(),
             "config file should have been written to disk"
@@ -11708,13 +11673,9 @@ cyan = "#00ffff"
     #[test]
     fn macro_delete_surfaces_save_failure_on_status_line() {
         let mut app = app_with_two_macros();
-        // Point config_path at a directory that doesn't exist so save_config fails.
-        app.paths.config_path = app
-            .paths
-            .root
-            .join("nope")
-            .join("missing")
-            .join("config.toml");
+        let blocked_parent = app.paths.root.join("not-a-directory");
+        std::fs::write(&blocked_parent, "block config writes").expect("write blocker");
+        app.paths.config_path = blocked_parent.join("config.toml");
 
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
             .expect("handle d");
@@ -11722,6 +11683,10 @@ cyan = "#00ffff"
             .expect("handle tab");
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .expect("handle enter");
+
+        drain_until(&mut app, |app| {
+            app.status.tone() == crate::statusline::StatusTone::Error
+        });
 
         assert_eq!(
             app.status.tone(),
@@ -11973,6 +11938,12 @@ cyan = "#00ffff"
 
         app.apply_change_default_provider()
             .expect("apply default provider");
+
+        drain_until(&mut app, |app| {
+            app.status
+                .text()
+                .contains("Default provider changed to claude")
+        });
 
         // Config was updated in memory and on disk.
         assert_eq!(app.config.defaults.provider, "claude");
@@ -12402,5 +12373,197 @@ cyan = "#00ffff"
         app.execute_command("watch-rules".to_string())
             .expect("execute_command");
         assert!(matches!(app.ui.prompt, PromptState::WatchRules(_)));
+    }
+
+    #[test]
+    fn config_persistence_delay_does_not_block_input_handler() {
+        let mut app = test_app(default_bindings());
+        workers::delay_next_config_save(
+            app.paths.config_path.clone(),
+            std::time::Duration::from_millis(400),
+        );
+        app.left_width_pct = app.left_width_pct.saturating_add(1);
+
+        let started = std::time::Instant::now();
+        app.persist_pane_widths();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(150),
+            "input handler waited for delayed config I/O"
+        );
+
+        for _ in 0..200 {
+            app.drain_events();
+            if app.paths.config_path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.paths.config_path.exists(), "worker never saved config");
+    }
+
+    #[test]
+    fn create_agent_db_failure_removes_owned_worktree_without_success() {
+        let mut app = test_app(default_bindings());
+        let repo = app.paths.root.clone();
+        let run_git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_git(&["init", "-b", "main"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "Test"]);
+        std::fs::write(repo.join("README"), "seed\n").expect("write seed");
+        run_git(&["add", "README"]);
+        run_git(&["commit", "-m", "seed"]);
+
+        let worktree = app.paths.worktrees_root.join("unpersisted-agent");
+        let worktree_arg = worktree.to_string_lossy().into_owned();
+        run_git(&["worktree", "add", "-b", "unpersisted-agent", &worktree_arg]);
+        let now = Utc::now();
+        let session = AgentSession {
+            id: "unpersisted-session".to_string(),
+            project_id: "project-1".to_string(),
+            project_path: Some(repo.to_string_lossy().into_owned()),
+            provider: ProviderKind::from_str("codex"),
+            source_branch: "main".to_string(),
+            branch_name: "unpersisted-agent".to_string(),
+            worktree_path: worktree_arg,
+            title: None,
+            started_providers: Vec::new(),
+            state: SessionState::Created { created_at: now },
+            settings: crate::model::SessionSettings::default(),
+            created_at: now,
+            updated_at: now,
+        };
+        let client = PtyClient::spawn(
+            "/bin/sh",
+            &["-c".to_string(), "sleep 5".to_string()],
+            &worktree,
+            24,
+            80,
+            1_000,
+        )
+        .expect("spawn test provider");
+        app.session_store
+            .conn()
+            .execute_batch("pragma query_only = on;")
+            .expect("make database read-only");
+        app.create_agent_in_flight = true;
+        app.runtime
+            .worker_tx
+            .send(WorkerEvent::CreateAgentReady(Box::new(AgentReadyData {
+                session,
+                client,
+                pty_size: (24, 80),
+                status_message: "must not be shown".to_string(),
+                owns_worktree: true,
+                owns_branch: true,
+            })))
+            .expect("send ready event");
+
+        app.drain_events();
+        assert!(!app.create_agent_in_flight);
+        assert!(app.status.message().contains("Failed to persist session"));
+        assert!(!app.status.message().contains("must not be shown"));
+        assert!(
+            app.git
+                .sessions
+                .iter()
+                .all(|candidate| candidate.id != "unpersisted-session")
+        );
+        for _ in 0..200 {
+            app.drain_events();
+            if !worktree.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!worktree.exists(), "owned worktree was orphaned");
+        assert_eq!(app.status.tone(), crate::statusline::StatusTone::Error);
+    }
+
+    #[test]
+    fn branch_rename_db_failure_restores_git_and_memory_without_success() {
+        let mut app = test_app(default_bindings());
+        let repo = app.paths.root.clone();
+        let run_git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_git(&["init", "-b", "main"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "Test"]);
+        std::fs::write(repo.join("README"), "seed\n").expect("write seed");
+        run_git(&["add", "README"]);
+        run_git(&["commit", "-m", "seed"]);
+
+        let now = Utc::now();
+        let session = AgentSession {
+            id: "rename-persist-failure".to_string(),
+            project_id: "project-1".to_string(),
+            project_path: Some(repo.to_string_lossy().into_owned()),
+            provider: ProviderKind::from_str("codex"),
+            source_branch: "main".to_string(),
+            branch_name: "main".to_string(),
+            worktree_path: repo.to_string_lossy().into_owned(),
+            title: None,
+            started_providers: Vec::new(),
+            state: SessionState::Created { created_at: now },
+            settings: crate::model::SessionSettings::default(),
+            created_at: now,
+            updated_at: now,
+        };
+        app.session_store
+            .upsert_session(&session)
+            .expect("seed row");
+        app.git.sessions.push(session);
+        app.session_store
+            .conn()
+            .execute_batch("pragma query_only = on;")
+            .expect("make database read-only");
+
+        app.apply_rename_session("rename-persist-failure", "renamed".to_string(), true);
+        for _ in 0..200 {
+            app.drain_events();
+            if crate::git::current_branch(&repo).is_ok_and(|branch| branch == "main")
+                && app.status.message().contains("couldn't be persisted")
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(crate::git::current_branch(&repo).unwrap(), "main");
+        let memory = app
+            .git
+            .sessions
+            .iter()
+            .find(|candidate| candidate.id == "rename-persist-failure")
+            .unwrap();
+        assert_eq!(memory.branch_name, "main");
+        assert_eq!(memory.title, None);
+        let durable = app.session_store.load_sessions().unwrap();
+        assert_eq!(durable[0].branch_name, "main");
+        assert_eq!(durable[0].title, None);
+        assert!(app.status.message().contains("couldn't be persisted"));
+        assert!(!app.status.message().contains("Renamed agent and branch"));
     }
 }

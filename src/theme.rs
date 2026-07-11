@@ -28,6 +28,7 @@ const GITHUB_PR_OPEN_LABEL: OpalineColor = OpalineColor::new(0, 255, 0);
 const GITHUB_PR_MERGED_LABEL: OpalineColor = OpalineColor::new(170, 100, 220);
 const GITHUB_PR_CLOSED_LABEL: OpalineColor = OpalineColor::new(140, 80, 80);
 
+#[derive(Clone)]
 pub struct Theme {
     /// Base surface color for the dux app — used as a frame-wide pre-fill so
     /// every cell that no widget explicitly paints (gutters, modal interiors,

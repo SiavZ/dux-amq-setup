@@ -11,17 +11,33 @@ impl App {
                         client,
                         pty_size,
                         status_message,
+                        owns_worktree,
+                        owns_branch,
                     } = *boxed;
                     self.create_agent_in_flight = false;
                     self.last_pty_size = pty_size;
                     if let Err(err) = self.session_store.upsert_session(&session) {
+                        let safe_session_id = crate::sanitize::for_terminal(&session.id);
+                        let safe_err = crate::sanitize::for_terminal(&format!("{err:#}"));
                         tracing::error!(
                             target: "dux::workers",
-                            session_id = %session.id,
-                            err = %err,
+                            session_id = %safe_session_id,
+                            err = %safe_err,
                             "session store upsert failed",
                         );
-                        self.set_error(format!("Failed to persist session: {err}"));
+                        self.set_error(format!("Failed to persist session: {safe_err}"));
+                        if owns_worktree
+                            && let Some(repo_path) = session.project_path.as_ref()
+                        {
+                            dispatch_unpersisted_agent_cleanup(
+                                self.runtime.worker_tx.clone(),
+                                PathBuf::from(repo_path),
+                                PathBuf::from(&session.worktree_path),
+                                session.branch_name.clone(),
+                                owns_branch,
+                            );
+                        }
+                        drop(client);
                         continue;
                     }
                     self.detach_conflicting_worktree_session(
@@ -52,6 +68,14 @@ impl App {
                 WorkerEvent::CreateAgentFailed(message) => {
                     self.create_agent_in_flight = false;
                     self.set_error(message);
+                }
+                WorkerEvent::UnpersistedAgentCleanupCompleted { worktree, result } => {
+                    if let Err(err) = result {
+                        self.set_error(format!(
+                            "Session persistence failed and cleanup of {} also failed: {err}",
+                            crate::sanitize::for_terminal(&worktree.display().to_string())
+                        ));
+                    }
                 }
                 WorkerEvent::ChangedFilesReady { staged, unstaged } => {
                     self.git.staged_files = staged;
@@ -130,18 +154,48 @@ impl App {
                 },
                 WorkerEvent::BranchRenameCompleted {
                     session_id,
+                    worktree,
+                    old_branch,
                     new_branch,
                     previous_title,
                     result,
                 } => match result {
                     Ok(()) => {
-                        if let Some(session) =
-                            self.git.sessions.iter_mut().find(|s| s.id == session_id)
-                        {
-                            session.branch_name = new_branch.clone();
-                            session.updated_at = Utc::now();
-                            let _ = self.session_store.upsert_session(session);
+                        let Some(index) = self
+                            .git
+                            .sessions
+                            .iter()
+                            .position(|session| session.id == session_id)
+                        else {
+                            dispatch_branch_rename_rollback(
+                                self.runtime.worker_tx.clone(),
+                                session_id,
+                                worktree,
+                                new_branch,
+                                old_branch,
+                            );
+                            continue;
+                        };
+                        let mut candidate = self.git.sessions[index].clone();
+                        candidate.branch_name = new_branch.clone();
+                        candidate.updated_at = Utc::now();
+                        if let Err(err) = self.session_store.upsert_session(&candidate) {
+                            self.git.sessions[index].title = previous_title;
+                            dispatch_branch_rename_rollback(
+                                self.runtime.worker_tx.clone(),
+                                session_id,
+                                worktree,
+                                new_branch,
+                                old_branch,
+                            );
+                            self.rebuild_left_items();
+                            self.set_error(format!(
+                                "Branch was renamed but couldn't be persisted; restoring it: {err}"
+                            ));
+                            continue;
                         }
+                        self.git.sessions[index].branch_name = candidate.branch_name;
+                        self.git.sessions[index].updated_at = candidate.updated_at;
                         self.update_branch_sync_sessions();
                         self.rebuild_left_items();
                         self.set_info(format!(
@@ -157,7 +211,6 @@ impl App {
                         {
                             session.title = previous_title;
                             session.updated_at = Utc::now();
-                            let _ = self.session_store.upsert_session(session);
                         }
                         self.rebuild_left_items();
                         self.set_error(format!(
@@ -165,21 +218,47 @@ impl App {
                         ));
                     }
                 },
+                WorkerEvent::BranchRenameRollbackCompleted { session_id, result } => {
+                    if let Err(err) = result {
+                        self.set_error(format!(
+                            "Couldn't restore branch after persistence failure for session {}: {err}",
+                            crate::sanitize::for_terminal(&session_id)
+                        ));
+                    }
+                }
                 WorkerEvent::BranchSyncReady(updates) => {
                     let mut changed = false;
                     for (session_id, actual_branch) in updates {
-                        if let Some(session) =
-                            self.git.sessions.iter_mut().find(|s| s.id == session_id)
-                            && session.branch_name != actual_branch {
-                                logger::info(&format!(
-                                    "branch sync: session {} branch changed {} -> {}",
-                                    session_id, session.branch_name, actual_branch,
-                                ));
-                                session.branch_name = actual_branch;
-                                session.updated_at = Utc::now();
-                                let _ = self.session_store.upsert_session(session);
-                                changed = true;
-                            }
+                        let Some(index) = self
+                            .git
+                            .sessions
+                            .iter()
+                            .position(|session| session.id == session_id)
+                        else {
+                            continue;
+                        };
+                        if self.git.sessions[index].branch_name == actual_branch {
+                            continue;
+                        }
+                        let mut candidate = self.git.sessions[index].clone();
+                        candidate.branch_name = actual_branch;
+                        candidate.updated_at = Utc::now();
+                        if let Err(err) = self.session_store.upsert_session(&candidate) {
+                            self.set_error(format!(
+                                "Couldn't persist branch sync for session {}: {err}",
+                                crate::sanitize::for_terminal(&session_id)
+                            ));
+                            continue;
+                        }
+                        logger::info(&format!(
+                            "branch sync: session {} branch changed {} -> {}",
+                            session_id,
+                            self.git.sessions[index].branch_name,
+                            candidate.branch_name,
+                        ));
+                        self.git.sessions[index].branch_name = candidate.branch_name;
+                        self.git.sessions[index].updated_at = candidate.updated_at;
+                        changed = true;
                     }
                     if changed {
                         self.update_branch_sync_sessions();
@@ -246,7 +325,12 @@ impl App {
                     ));
                     self.spawn_pr_check_for_session(&session_id);
                 }
-                WorkerEvent::BrowserEntriesReady { dir, entries } => {
+                WorkerEvent::BrowserEntriesReady {
+                    dir,
+                    restore_dir,
+                    result,
+                } => {
+                    let mut browser_error = None;
                     if let PromptState::BrowseProjects {
                         current_dir,
                         entries: current_entries,
@@ -256,9 +340,21 @@ impl App {
                     } = &mut self.ui.prompt
                         && *current_dir == dir
                     {
-                        *current_entries = entries;
                         *loading = false;
                         *selected = 0;
+                        match result {
+                            Ok(entries) => *current_entries = entries,
+                            Err(err) => {
+                                current_entries.clear();
+                                if let Some(previous) = restore_dir {
+                                    *current_dir = previous;
+                                }
+                                browser_error = Some(err);
+                            }
+                        }
+                    }
+                    if let Some(err) = browser_error {
+                        self.set_error(err);
                     }
                 }
                 WorkerEvent::WorktreeRemoveCompleted { session_id, result } => {
@@ -461,6 +557,140 @@ impl App {
                         }
                     }
                 }
+                WorkerEvent::GitFileOperationCompleted {
+                    action,
+                    worktree,
+                    path,
+                    result,
+                } => match result {
+                    Ok(()) => {
+                        if let GitFileAction::Discard { .. } = action {
+                            self.set_info(format!(
+                                "Discarded changes to \"{path}\". File restored to last committed state."
+                            ));
+                        }
+                        if self
+                            .selected_session()
+                            .is_some_and(|session| Path::new(&session.worktree_path) == worktree)
+                        {
+                            // Mirror the pre-worker synchronous behavior: a
+                            // stage/unstage that empties its source section
+                            // moves focus to the other section so the pane
+                            // isn't left on an empty list. The current lists
+                            // still reflect pre-operation state here.
+                            if let Some(next) = section_after_git_file_op(
+                                &action,
+                                self.git.staged_files.len(),
+                                self.git.unstaged_files.len(),
+                            ) {
+                                self.right_section = next;
+                            }
+                            self.reload_changed_files();
+                        }
+                    }
+                    Err(err) => {
+                        let operation = match action {
+                            GitFileAction::Stage => "Stage",
+                            GitFileAction::Unstage => "Unstage",
+                            GitFileAction::Discard { .. } => "Discard",
+                        };
+                        self.set_error(format!("{operation} failed for \"{path}\": {err}"));
+                    }
+                },
+                WorkerEvent::PathCompletionsReady {
+                    query,
+                    reverse,
+                    candidates,
+                } => {
+                    if let PromptState::BrowseProjects {
+                        editing_path: true,
+                        path_input,
+                        tab_completions,
+                        tab_index,
+                        ..
+                    } = &mut self.ui.prompt
+                        && path_input.text == query
+                    {
+                        *tab_completions = candidates;
+                        if !tab_completions.is_empty() {
+                            *tab_index = if reverse {
+                                tab_completions.len() - 1
+                            } else {
+                                0
+                            };
+                            path_input.set_text(tab_completions[*tab_index].clone());
+                        }
+                    }
+                }
+                WorkerEvent::DiffReady {
+                    worktree,
+                    rel_path,
+                    scroll,
+                    focus_when_ready,
+                    result,
+                } => {
+                    let still_relevant = if focus_when_ready {
+                        self.selected_session()
+                            .is_some_and(|session| session.worktree_path == worktree)
+                    } else {
+                        matches!(
+                            &self.center_mode,
+                            CenterMode::Diff {
+                                worktree_path,
+                                rel_path: current_path,
+                                ..
+                            } if worktree_path == &worktree && current_path == &rel_path
+                        )
+                    };
+                    if !still_relevant {
+                        continue;
+                    }
+                    match result {
+                        Ok(output) => {
+                            self.center_mode = CenterMode::Diff {
+                                lines: Arc::new(output.lines),
+                                scroll,
+                                gutter_width: output.gutter_width,
+                                worktree_path: worktree,
+                                rel_path,
+                            };
+                            if focus_when_ready {
+                                self.ui.focus = FocusPane::Center;
+                            }
+                        }
+                        Err(err) => self.set_error(format!("Couldn't render diff: {err}")),
+                    }
+                }
+                WorkerEvent::ConfigSaveCompleted {
+                    success,
+                    rollback,
+                    result,
+                } => match result {
+                    Ok(()) => {
+                        if !success.is_empty() {
+                            self.set_info(success);
+                        }
+                    }
+                    Err(err) => {
+                        match rollback {
+                            ConfigSaveRollback::None => {}
+                            ConfigSaveRollback::DefaultProvider(previous) => {
+                                self.config.defaults.provider = previous;
+                                refresh_project_defaults(&mut self.git.projects, &self.config);
+                                self.rebuild_left_items();
+                            }
+                            ConfigSaveRollback::Theme(previous) => {
+                                self.config.ui.theme = previous;
+                            }
+                        }
+                        let context = if success.is_empty() {
+                            "config change"
+                        } else {
+                            success.trim_end_matches('.')
+                        };
+                        self.set_error(format!("Couldn't persist {context} to config: {err}"));
+                    }
+                },
                 WorkerEvent::CommitFinished {
                     worktree: _,
                     message: _,
@@ -679,18 +909,29 @@ impl App {
     }
 
     pub(crate) fn spawn_browser_entries(&self, dir: &Path) {
+        self.spawn_browser_entries_with_restore(dir, None);
+    }
+
+    pub(crate) fn spawn_browser_path_validation(&self, dir: &Path, previous: PathBuf) {
+        self.spawn_browser_entries_with_restore(dir, Some(previous));
+    }
+
+    fn spawn_browser_entries_with_restore(&self, dir: &Path, restore_dir: Option<PathBuf>) {
         let tx = self.runtime.worker_tx.clone();
         let dir = dir.to_path_buf();
         thread::spawn(move || {
-            let entries = browser_entries(&dir);
-            logger::debug(&format!(
-                "browser loaded {} with {} entries",
-                dir.display(),
-                entries.len()
-            ));
+            let result = browser_entries(&dir);
+            if let Ok(entries) = &result {
+                logger::debug(&format!(
+                    "browser loaded {} with {} entries",
+                    dir.display(),
+                    entries.len()
+                ));
+            }
             let _ = tx.send(WorkerEvent::BrowserEntriesReady {
                 dir: dir.clone(),
-                entries,
+                restore_dir,
+                result,
             });
         });
     }
@@ -1286,6 +1527,20 @@ impl App {
             }
         }
     }
+
+    pub(crate) fn queue_config_save(
+        &self,
+        success: impl Into<String>,
+        rollback: ConfigSaveRollback,
+    ) {
+        dispatch_config_save(
+            self.runtime.worker_tx.clone(),
+            self.paths.config_path.clone(),
+            self.config.clone(),
+            success.into(),
+            rollback,
+        );
+    }
 }
 
 /// Background job for "Add Project" when the user opted to have dux switch to
@@ -1323,6 +1578,7 @@ pub(crate) fn run_create_agent_job(
         branch_name,
         worktree_path,
         owns_worktree,
+        owns_branch,
     ) = match request {
         CreateAgentRequest::NewProject {
             project,
@@ -1421,6 +1677,7 @@ pub(crate) fn run_create_agent_job(
                 branch_name,
                 worktree_path,
                 true,
+                !attach_existing,
             )
         }
         CreateAgentRequest::ForkSession {
@@ -1477,7 +1734,7 @@ pub(crate) fn run_create_agent_job(
                     source_worktree.display(),
                     worktree_path.display()
                 ));
-                let _ = git::remove_worktree(&repo_path, &worktree_path, &branch_name);
+                let _ = git::remove_worktree(&repo_path, &worktree_path, &branch_name, true);
                 let _ = worker_tx.send(WorkerEvent::CreateAgentFailed(format!(
                     "Failed to copy the source worktree contents for agent \"{source_label}\": {err}",
                 )));
@@ -1498,6 +1755,7 @@ pub(crate) fn run_create_agent_job(
                 status_message,
                 branch_name,
                 worktree_path,
+                true,
                 true,
             )
         }
@@ -1552,6 +1810,7 @@ pub(crate) fn run_create_agent_job(
                 &repo_path,
                 Path::new(&session.worktree_path),
                 &session.branch_name,
+                owns_branch,
             );
         }
         let _ = worker_tx.send(WorkerEvent::CreateAgentFailed(hint));
@@ -1595,6 +1854,7 @@ pub(crate) fn run_create_agent_job(
                     &repo_path,
                     Path::new(&session.worktree_path),
                     &session.branch_name,
+                    owns_branch,
                 );
             }
             let _ = worker_tx.send(WorkerEvent::CreateAgentFailed(format!(
@@ -1617,6 +1877,8 @@ pub(crate) fn run_create_agent_job(
         client,
         pty_size: (rows, cols),
         status_message,
+        owns_worktree,
+        owns_branch,
     })));
 }
 
@@ -1707,6 +1969,398 @@ pub(crate) fn dispatch_commit(tx: Sender<WorkerEvent>, worktree: PathBuf, messag
         });
 }
 
+pub(crate) fn dispatch_git_file_operation(
+    tx: Sender<WorkerEvent>,
+    action: GitFileAction,
+    worktree: PathBuf,
+    path: String,
+) {
+    let _ = thread::Builder::new()
+        .name(format!("git-file-{}", worktree.display()))
+        .spawn(move || {
+            let result = match action {
+                GitFileAction::Stage => git::stage_file(&worktree, &path),
+                GitFileAction::Unstage => git::unstage_file(&worktree, &path),
+                GitFileAction::Discard { untracked } => {
+                    git::discard_file(&worktree, &path, untracked)
+                }
+            }
+            .map_err(|err| format!("{err:#}"));
+            let _ = tx.send(WorkerEvent::GitFileOperationCompleted {
+                action,
+                worktree,
+                path,
+                result,
+            });
+        });
+}
+
+/// Decide whether a completed stage/unstage should move the right-pane focus
+/// off a section it just emptied. `staged`/`unstaged` are the list lengths
+/// *before* the operation is reflected, so a source section with a single
+/// entry is about to become empty. Returns `None` to keep the current section.
+fn section_after_git_file_op(
+    action: &GitFileAction,
+    staged: usize,
+    unstaged: usize,
+) -> Option<RightSection> {
+    match action {
+        GitFileAction::Stage if unstaged <= 1 && staged > 0 => Some(RightSection::Staged),
+        GitFileAction::Unstage if staged <= 1 && unstaged > 0 => Some(RightSection::Unstaged),
+        _ => None,
+    }
+}
+
+fn dispatch_unpersisted_agent_cleanup(
+    tx: Sender<WorkerEvent>,
+    repo: PathBuf,
+    worktree: PathBuf,
+    branch: String,
+    delete_branch: bool,
+) {
+    let _ = thread::Builder::new()
+        .name("unpersisted-agent-cleanup".to_string())
+        .spawn(move || {
+            let result = git::remove_worktree(&repo, &worktree, &branch, delete_branch)
+                .map(|_| ())
+                .map_err(|err| format!("{err:#}"));
+            let _ = tx.send(WorkerEvent::UnpersistedAgentCleanupCompleted { worktree, result });
+        });
+}
+
+fn dispatch_branch_rename_rollback(
+    tx: Sender<WorkerEvent>,
+    session_id: String,
+    worktree: String,
+    renamed_branch: String,
+    original_branch: String,
+) {
+    let _ = thread::Builder::new()
+        .name("branch-rename-rollback".to_string())
+        .spawn(move || {
+            let result =
+                git::rename_branch(Path::new(&worktree), &renamed_branch, &original_branch)
+                    .map_err(|err| format!("{err:#}"));
+            let _ = tx.send(WorkerEvent::BranchRenameRollbackCompleted { session_id, result });
+        });
+}
+
+pub(crate) fn dispatch_path_completions(tx: Sender<WorkerEvent>, query: String, reverse: bool) {
+    let _ = thread::Builder::new()
+        .name("path-completions".to_string())
+        .spawn(move || {
+            let candidates = path_completions(&query);
+            let _ = tx.send(WorkerEvent::PathCompletionsReady {
+                query,
+                reverse,
+                candidates,
+            });
+        });
+}
+
+fn path_completions(query: &str) -> Vec<String> {
+    let input_path = PathBuf::from(query);
+    let (search_dir, prefix) = if input_path.is_dir() && query.ends_with('/') {
+        (input_path, String::new())
+    } else {
+        (
+            input_path
+                .parent()
+                .unwrap_or_else(|| Path::new("/"))
+                .to_path_buf(),
+            input_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        )
+    };
+    let prefix = prefix.to_lowercase();
+    let mut candidates = fs::read_dir(&search_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            !name.starts_with('.') && name.starts_with(&prefix)
+        })
+        .map(|entry| {
+            let mut full = search_dir
+                .join(entry.file_name())
+                .to_string_lossy()
+                .into_owned();
+            full.push('/');
+            full
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_diff(
+    tx: Sender<WorkerEvent>,
+    worktree: String,
+    rel_path: String,
+    theme: Theme,
+    show_line_numbers: bool,
+    tab_width: u16,
+    scroll: u16,
+    focus_when_ready: bool,
+) {
+    let _ = thread::Builder::new()
+        .name(format!("diff-{rel_path}"))
+        .spawn(move || {
+            // ponytail: per-diff SyntaxCache — the shared App cache was
+            // dropped so diff work could move off the UI thread (P1-23).
+            // Cross-diff syntax reuse is lost; if diff latency matters,
+            // give the worker a persistent Arc<Mutex<SyntaxCache>>.
+            let cache = crate::diff::SyntaxCache::new();
+            let result = crate::diff::diff_file(
+                Path::new(&worktree),
+                &rel_path,
+                &theme,
+                &cache,
+                show_line_numbers,
+                tab_width,
+            )
+            .map_err(|err| format!("{err:#}"));
+            let _ = tx.send(WorkerEvent::DiffReady {
+                worktree,
+                rel_path,
+                scroll,
+                focus_when_ready,
+                result,
+            });
+        });
+}
+
+struct ConfigSaveJob {
+    event_tx: Sender<WorkerEvent>,
+    path: PathBuf,
+    config: Config,
+    success: String,
+    rollback: ConfigSaveRollback,
+}
+
+enum ConfigWorkerJob {
+    Save(Box<ConfigSaveJob>),
+    Flush(Sender<()>),
+}
+
+static CONFIG_SAVE_TX: std::sync::OnceLock<Option<Sender<ConfigWorkerJob>>> =
+    std::sync::OnceLock::new();
+
+fn config_save_tx() -> Option<&'static Sender<ConfigWorkerJob>> {
+    CONFIG_SAVE_TX
+        .get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<ConfigWorkerJob>();
+            match thread::Builder::new()
+                .name("config-save".to_string())
+                .spawn(move || run_config_save_worker(rx))
+            {
+                Ok(_) => Some(tx),
+                Err(err) => {
+                    tracing::error!(
+                        target: "dux::workers",
+                        err = %crate::sanitize::for_terminal(&err.to_string()),
+                        "failed to spawn config-save worker; using synchronous persistence",
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+fn run_config_save_worker(rx: mpsc::Receiver<ConfigWorkerJob>) {
+    let mut last_requested = HashMap::<PathBuf, Config>::new();
+    for job in rx {
+        match job {
+            ConfigWorkerJob::Save(job) => {
+                let previous = last_requested.insert(job.path.clone(), job.config.clone());
+                let result = save_config_change(&job.path, previous.as_ref(), &job.config)
+                    .map_err(|err| crate::sanitize::for_terminal(&format!("{err:#}")));
+                let _ = job.event_tx.send(WorkerEvent::ConfigSaveCompleted {
+                    success: job.success,
+                    rollback: job.rollback,
+                    result,
+                });
+            }
+            ConfigWorkerJob::Flush(done) => {
+                let _ = done.send(());
+            }
+        }
+    }
+}
+
+fn save_config_change(path: &Path, previous: Option<&Config>, desired: &Config) -> Result<()> {
+    #[cfg(test)]
+    if let Some(action) = take_config_save_test_action(path) {
+        match action {
+            ConfigSaveTestAction::Delay(delay) => thread::sleep(delay),
+            ConfigSaveTestAction::Fail(message) => anyhow::bail!(message),
+        }
+    }
+
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err.into()),
+    };
+    let mut on_disk = if raw.is_empty() {
+        Config::default()
+    } else {
+        let parsed: Config = toml::from_str(&raw)?;
+        let mut config = crate::config::migrate_config(parsed);
+        config.providers.ensure_defaults();
+        config
+    };
+
+    let baseline = previous.unwrap_or(&on_disk);
+    let baseline = toml::Value::try_from(baseline)?;
+    let desired = toml::Value::try_from(desired)?;
+    let mut patched = toml::Value::try_from(&on_disk)?;
+    apply_toml_delta(&baseline, &desired, &mut patched);
+    on_disk = patched.try_into()?;
+
+    let bindings = RuntimeBindings::from_keys_config(&on_disk.keys);
+    crate::config::save_config(path, &on_disk, &bindings)
+}
+
+fn apply_toml_delta(previous: &toml::Value, desired: &toml::Value, target: &mut toml::Value) {
+    if previous == desired {
+        return;
+    }
+    if let (toml::Value::Table(previous), toml::Value::Table(desired), toml::Value::Table(target)) =
+        (previous, desired, &mut *target)
+    {
+        target.retain(|key, _| desired.contains_key(key) || !previous.contains_key(key));
+        for (key, desired_value) in desired {
+            let previous_value = previous.get(key);
+            if previous_value == Some(desired_value) {
+                continue;
+            }
+            match (previous_value, target.get_mut(key)) {
+                (Some(previous_value), Some(target_value)) => {
+                    apply_toml_delta(previous_value, desired_value, target_value);
+                }
+                (Some(_), None) | (None, _) => {
+                    target.insert(key.clone(), desired_value.clone());
+                }
+            }
+        }
+        return;
+    }
+    *target = desired.clone();
+}
+
+fn save_config_synchronously(job: Box<ConfigSaveJob>) {
+    let bindings = RuntimeBindings::from_keys_config(&job.config.keys);
+    let result = crate::config::save_config(&job.path, &job.config, &bindings)
+        .map_err(|err| crate::sanitize::for_terminal(&format!("{err:#}")));
+    let _ = job.event_tx.send(WorkerEvent::ConfigSaveCompleted {
+        success: job.success,
+        rollback: job.rollback,
+        result,
+    });
+}
+
+fn dispatch_config_save_job(sender: Option<&Sender<ConfigWorkerJob>>, job: Box<ConfigSaveJob>) {
+    let job = if let Some(sender) = sender {
+        match sender.send(ConfigWorkerJob::Save(job)) {
+            Ok(()) => return,
+            Err(err) => {
+                let ConfigWorkerJob::Save(job) = err.0 else {
+                    return;
+                };
+                tracing::warn!(
+                    target: "dux::workers",
+                    "config-save worker stopped; using synchronous persistence",
+                );
+                job
+            }
+        }
+    } else {
+        job
+    };
+    save_config_synchronously(job);
+}
+
+pub(crate) fn dispatch_config_save(
+    event_tx: Sender<WorkerEvent>,
+    path: PathBuf,
+    config: Config,
+    success: String,
+    rollback: ConfigSaveRollback,
+) {
+    dispatch_config_save_job(
+        config_save_tx(),
+        Box::new(ConfigSaveJob {
+            event_tx: event_tx.clone(),
+            path,
+            config,
+            success,
+            rollback,
+        }),
+    );
+}
+
+pub(crate) fn flush_config_saves() {
+    let Some(config_save_tx) = config_save_tx() else {
+        return;
+    };
+    let (done_tx, done_rx) = mpsc::channel();
+    if config_save_tx.send(ConfigWorkerJob::Flush(done_tx)).is_ok() {
+        let _ = done_rx.recv();
+    }
+}
+
+#[cfg(test)]
+enum ConfigSaveTestAction {
+    Delay(Duration),
+    Fail(String),
+}
+
+#[cfg(test)]
+static CONFIG_SAVE_TEST_ACTIONS: std::sync::OnceLock<
+    Mutex<HashMap<PathBuf, std::collections::VecDeque<ConfigSaveTestAction>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn push_config_save_test_action(path: PathBuf, action: ConfigSaveTestAction) {
+    CONFIG_SAVE_TEST_ACTIONS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("config-save test actions lock")
+        .entry(path)
+        .or_default()
+        .push_back(action);
+}
+
+#[cfg(test)]
+fn take_config_save_test_action(path: &Path) -> Option<ConfigSaveTestAction> {
+    let mut actions = CONFIG_SAVE_TEST_ACTIONS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("config-save test actions lock");
+    let action = actions.get_mut(path)?.pop_front();
+    if actions.get(path).is_some_and(|queued| queued.is_empty()) {
+        actions.remove(path);
+    }
+    action
+}
+
+#[cfg(test)]
+pub(crate) fn delay_next_config_save(path: PathBuf, delay: Duration) {
+    push_config_save_test_action(path, ConfigSaveTestAction::Delay(delay));
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_config_save(path: PathBuf, message: impl Into<String>) {
+    push_config_save_test_action(path, ConfigSaveTestAction::Fail(message.into()));
+}
+
 /// Run the synchronous git probes that gate "add project" — `is_git_repo`,
 /// `current_branch`, and `remote_default_branch` — on a worker thread.
 /// Results land as [`WorkerEvent::AddProjectMetaReady`] so the main loop
@@ -1736,11 +2390,15 @@ pub(crate) fn dispatch_add_project_meta(tx: Sender<WorkerEvent>, path: PathBuf, 
         });
 }
 
-pub(crate) fn browser_entries(dir: &Path) -> Vec<BrowserEntry> {
-    let mut entries = fs::read_dir(dir)
-        .ok()
-        .into_iter()
-        .flat_map(|entries| entries.filter_map(Result::ok))
+pub(crate) fn browser_entries(dir: &Path) -> Result<Vec<BrowserEntry>, String> {
+    let read = fs::read_dir(dir).map_err(|err| {
+        format!(
+            "Couldn't open directory {}: {err}",
+            crate::sanitize::for_terminal(&dir.display().to_string())
+        )
+    })?;
+    let mut entries = read
+        .filter_map(Result::ok)
         .filter_map(|entry| {
             let path = entry.path();
             if !path.is_dir() {
@@ -1778,7 +2436,7 @@ pub(crate) fn browser_entries(dir: &Path) -> Vec<BrowserEntry> {
             },
         );
     }
-    entries
+    Ok(entries)
 }
 
 // -- Disk + scrollback watchdog helpers --
@@ -2012,35 +2670,31 @@ fn parse_pr_json_value(obj: &serde_json::Value, owner_repo: &str) -> Option<crat
 // ---- audit02 phase 14: SQLite WAL + integrity + periodic backup -------------
 //
 // `spawn_backup_worker` is added at the end of this file to minimize merge-
-// conflict surface with audit02 phase 04 (which is also touching workers.rs).
-// It owns its own background thread that wakes on a fixed interval and copies
-// the live `sessions.sqlite3` into `sessions.sqlite3.bak` using SQLite's Online
-// Backup API (which is WAL-aware — a hot `cp` is not). Wiring this into
-// `App::new` is intentionally deferred to a follow-up that is allowed to edit
-// `src/app/mod.rs`; this phase is scoped to storage.rs / workers.rs / config.rs.
-
 /// Spawn the periodic-backup worker.
 ///
 /// The worker sleeps for `interval`, then asks `storage` to back itself up to
 /// `<paths.root>/sessions.sqlite3.bak`. Errors are logged at warn level and do
 /// not stop the loop — a transient I/O failure shouldn't take down the worker.
 /// If `interval` is zero the function returns immediately without spawning.
-#[allow(dead_code)] // wired from App::new in a follow-up commit (Phase 14 step 14.3 wiring)
 pub fn spawn_backup_worker(
     storage: std::sync::Arc<crate::storage::SessionStore>,
     paths: crate::config::DuxPaths,
     interval: std::time::Duration,
-) {
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
     if interval.is_zero() {
         crate::logger::info("[storage] periodic backup disabled (backup_interval_minutes = 0)");
-        return;
+        return None;
     }
     let dst = paths.root.join("sessions.sqlite3.bak");
-    let res = std::thread::Builder::new()
+    match std::thread::Builder::new()
         .name("storage-backup".into())
         .spawn(move || {
-            loop {
+            while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                 std::thread::sleep(interval);
+                if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 match storage.backup_to(&dst) {
                     Ok(()) => {
                         crate::logger::debug(&format!("[storage] backup ok -> {}", dst.display()))
@@ -2051,8 +2705,166 @@ pub fn spawn_backup_worker(
                     )),
                 }
             }
-        });
-    if let Err(e) = res {
-        crate::logger::warn(&format!("[storage] failed to spawn backup worker: {e}"));
+        }) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            crate::logger::warn(&format!("[storage] failed to spawn backup worker: {e}"));
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod config_save_divergence_tests {
+    use super::*;
+    use crate::config::Config;
+
+    // audit03 P1-16 review S1: async config saves must not let a failed
+    // earlier edit resurrect on disk when a later edit succeeds. The worker
+    // patches only the field each edit changed (delta between the previous
+    // requested snapshot and the desired one), so disk stays consistent with
+    // the in-memory rollback.
+    #[test]
+    fn failed_edit_does_not_resurrect_when_later_edit_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // Baseline on disk: theme=dark, left width 20.
+        let mut base = Config::default();
+        base.ui.theme = "dark".to_string();
+        base.ui.left_width_pct = 20;
+        let bindings = RuntimeBindings::from_keys_config(&base.keys);
+        crate::config::save_config(&path, &base, &bindings).unwrap();
+
+        // Edit A changes the theme, but its write fails. Nothing lands.
+        let mut edit_a = base.clone();
+        edit_a.ui.theme = "light".to_string();
+        fail_next_config_save(path.clone(), "injected A failure");
+        let res_a = save_config_change(&path, None, &edit_a);
+        assert!(res_a.is_err(), "edit A was supposed to fail");
+
+        // Edit B (queued after A, so its `previous` baseline is A's snapshot)
+        // changes only the width. Its delta must touch width alone, leaving
+        // the theme at the on-disk value — NOT resurrecting A's failed change.
+        let mut edit_b = edit_a.clone();
+        edit_b.ui.left_width_pct = 25;
+        save_config_change(&path, Some(&edit_a), &edit_b).unwrap();
+
+        let on_disk: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk.ui.left_width_pct, 25, "edit B width must persist");
+        assert_eq!(
+            on_disk.ui.theme, "dark",
+            "failed edit A theme must not resurrect on disk"
+        );
+    }
+}
+
+#[cfg(test)]
+mod section_advance_tests {
+    use super::{GitFileAction, RightSection, section_after_git_file_op};
+
+    #[test]
+    fn staging_last_unstaged_file_advances_to_staged() {
+        // Unstaged about to empty (1 → 0), staged has entries.
+        assert_eq!(
+            section_after_git_file_op(&GitFileAction::Stage, 2, 1),
+            Some(RightSection::Staged)
+        );
+    }
+
+    #[test]
+    fn unstaging_last_staged_file_advances_to_unstaged() {
+        assert_eq!(
+            section_after_git_file_op(&GitFileAction::Unstage, 1, 3),
+            Some(RightSection::Unstaged)
+        );
+    }
+
+    #[test]
+    fn no_advance_when_source_section_keeps_entries() {
+        assert_eq!(section_after_git_file_op(&GitFileAction::Stage, 1, 2), None);
+        assert_eq!(
+            section_after_git_file_op(&GitFileAction::Unstage, 3, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn no_advance_when_destination_section_empty() {
+        // Staging the last unstaged file but nothing is staged yet: staying
+        // put is fine (the pane will show the now-empty list either way, and
+        // there is no better section to move to).
+        assert_eq!(section_after_git_file_op(&GitFileAction::Stage, 0, 1), None);
+        assert_eq!(
+            section_after_git_file_op(&GitFileAction::Unstage, 1, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn discard_never_advances() {
+        assert_eq!(
+            section_after_git_file_op(&GitFileAction::Discard { untracked: false }, 0, 1),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod backup_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn backup_worker_runs_on_schedule_and_zero_disables() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = crate::config::DuxPaths {
+            root: temp.path().to_path_buf(),
+            config_path: temp.path().join("config.toml"),
+            sessions_db_path: temp.path().join("sessions.sqlite3"),
+            worktrees_root: temp.path().join("worktrees"),
+            lock_path: temp.path().join("dux.lock"),
+        };
+        let store = std::sync::Arc::new(
+            crate::storage::SessionStore::open(&paths.sessions_db_path).unwrap(),
+        );
+        let disabled = spawn_backup_worker(
+            std::sync::Arc::clone(&store),
+            paths.clone(),
+            std::time::Duration::ZERO,
+            std::sync::Arc::new(AtomicBool::new(false)),
+        );
+        assert!(disabled.is_none());
+        assert!(!paths.root.join("sessions.sqlite3.bak").exists());
+
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+        let handle = spawn_backup_worker(
+            store,
+            paths.clone(),
+            std::time::Duration::from_millis(10),
+            std::sync::Arc::clone(&shutdown),
+        )
+        .expect("worker");
+        for _ in 0..100 {
+            if paths.root.join("sessions.sqlite3.bak").exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(paths.root.join("sessions.sqlite3.bak").exists());
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn app_run_wires_the_periodic_backup_worker() {
+        let app_source = include_str!("mod.rs");
+        let run_body = app_source
+            .split_once("pub fn run(&mut self) -> Result<()> {")
+            .and_then(|(_, tail)| tail.split_once("fn restore_sessions"))
+            .map(|(run, _)| run)
+            .expect("App::run source");
+        assert!(run_body.contains("workers::spawn_backup_worker"));
+        assert!(run_body.contains("backup_interval_minutes"));
     }
 }

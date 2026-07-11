@@ -168,7 +168,6 @@ impl App {
             default_provider: None,
             commit_prompt: None,
         });
-        save_config(&self.paths.config_path, &self.config, &self.bindings)?;
         self.git.projects.push(Project {
             id: project_id,
             name: display_name.clone(),
@@ -183,7 +182,10 @@ impl App {
         }
         self.rebuild_left_items();
         logger::info(&format!("registered project {}", path_buf.display()));
-        self.set_info(format!("Added project \"{display_name}\" to workspace"));
+        self.queue_config_save(
+            format!("Added project \"{display_name}\" to workspace"),
+            ConfigSaveRollback::None,
+        );
         Ok(())
     }
 
@@ -922,6 +924,7 @@ impl App {
                     Path::new(&project_path),
                     Path::new(&worktree_path),
                     &branch_name,
+                    true,
                 )
                 .map(|r| r.branch_already_deleted)
                 .map_err(|e| format!("{e:#}"));
@@ -1303,19 +1306,15 @@ impl App {
         }
         let previous = self.config.defaults.provider.clone();
         self.config.defaults.provider = selected.provider.as_str().to_string();
-        if let Err(err) = save_config(&self.paths.config_path, &self.config, &self.bindings) {
-            self.config.defaults.provider = previous;
-            self.set_error(format!(
-                "Couldn't persist the default provider change: {err:#}"
-            ));
-            return Ok(());
-        }
         refresh_project_defaults(&mut self.git.projects, &self.config);
         self.rebuild_left_items();
-        self.set_info(format!(
-            "Default provider changed to {}. New agent sessions will use it; existing agents keep their current provider. Use \"change-agent-provider\" on a session to switch providers for an existing worktree.",
-            selected.provider.as_str(),
-        ));
+        self.queue_config_save(
+            format!(
+                "Default provider changed to {}. New agent sessions will use it; existing agents keep their current provider. Use \"change-agent-provider\" on a session to switch providers for an existing worktree.",
+                selected.provider.as_str(),
+            ),
+            ConfigSaveRollback::DefaultProvider(previous),
+        );
         Ok(())
     }
 
@@ -1408,22 +1407,14 @@ impl App {
         };
         let previous = self.config.ui.theme.clone();
         self.config.ui.theme = selected.id.clone();
-        if let Err(err) = save_config(&self.paths.config_path, &self.config, &self.bindings) {
-            self.config.ui.theme = previous;
-            self.set_error(format!(
-                "Couldn't persist the theme change: {err:#}. The new theme is loaded for this session only."
-            ));
-            // Still apply to the running session — the user explicitly asked
-            // for it and we'd rather flash a wrong-color UI than silently
-            // ignore the request.
-            self.theme = theme;
-            return Ok(());
-        }
         self.theme = theme;
-        self.set_info(format!(
-            "Theme changed to \"{}\". Future sessions will use it too.",
-            selected.display_name,
-        ));
+        self.queue_config_save(
+            format!(
+                "Theme changed to \"{}\". Future sessions will use it too.",
+                selected.display_name,
+            ),
+            ConfigSaveRollback::Theme(previous),
+        );
         Ok(())
     }
 
@@ -1441,10 +1432,12 @@ impl App {
         self.config
             .projects
             .retain(|p| Path::new(&p.path) != Path::new(&project.path));
-        save_config(&self.paths.config_path, &self.config, &self.bindings)?;
         self.rebuild_left_items();
         self.selected_left = self.selected_left.saturating_sub(1);
-        self.set_info(format!("Removed project \"{}\" from app", project.name));
+        self.queue_config_save(
+            format!("Removed project \"{}\" from app", project.name),
+            ConfigSaveRollback::None,
+        );
         Ok(())
     }
 
@@ -1507,14 +1500,13 @@ impl App {
         self.config
             .projects
             .retain(|candidate| Path::new(&candidate.path) != Path::new(&project.path));
-        save_config(&self.paths.config_path, &self.config, &self.bindings)?;
         self.rebuild_left_items();
         self.selected_left = self.selected_left.saturating_sub(1);
         self.reload_changed_files();
-        self.set_info(format!(
-            "Deleted project \"{}\" and all its agents",
-            project.name
-        ));
+        self.queue_config_save(
+            format!("Deleted project \"{}\" and all its agents", project.name),
+            ConfigSaveRollback::None,
+        );
         Ok(())
     }
 
@@ -1689,22 +1681,16 @@ impl App {
         };
         let worktree_path = session.worktree_path.clone();
         let rel_path = file.path.clone();
-        let output = crate::diff::diff_file(
-            Path::new(&worktree_path),
-            &rel_path,
-            &self.theme,
-            &self.syntax_cache,
-            self.show_diff_line_numbers,
-            self.config.ui.diff_tab_width,
-        )?;
-        self.center_mode = CenterMode::Diff {
-            lines: Arc::new(output.lines),
-            scroll: 0,
-            gutter_width: output.gutter_width,
+        workers::dispatch_diff(
+            self.runtime.worker_tx.clone(),
             worktree_path,
             rel_path,
-        };
-        self.ui.focus = FocusPane::Center;
+            self.theme.clone(),
+            self.show_diff_line_numbers,
+            self.config.ui.diff_tab_width,
+            0,
+            true,
+        );
         Ok(())
     }
 
@@ -1719,21 +1705,16 @@ impl App {
             } => (worktree_path.clone(), rel_path.clone(), *scroll),
             _ => return Ok(()),
         };
-        let output = crate::diff::diff_file(
-            Path::new(&worktree_path),
-            &rel_path,
-            &self.theme,
-            &self.syntax_cache,
-            self.show_diff_line_numbers,
-            self.config.ui.diff_tab_width,
-        )?;
-        self.center_mode = CenterMode::Diff {
-            lines: Arc::new(output.lines),
-            scroll,
-            gutter_width: output.gutter_width,
+        workers::dispatch_diff(
+            self.runtime.worker_tx.clone(),
             worktree_path,
             rel_path,
-        };
+            self.theme.clone(),
+            self.show_diff_line_numbers,
+            self.config.ui.diff_tab_width,
+            scroll,
+            false,
+        );
         Ok(())
     }
 
@@ -2285,22 +2266,23 @@ impl App {
             )
         };
 
-        if let Some(session) = self.git.sessions.iter_mut().find(|s| s.id == session_id) {
-            session.settings = new_settings.clone();
-            if title_changed {
-                session.title = new_title.clone();
-            }
-            session.updated_at = Utc::now();
-        }
-
-        let upsert_result = self
+        let Some(session_index) = self
             .git
             .sessions
             .iter()
-            .find(|s| s.id == session_id)
-            .map(|s| self.session_store.upsert_session(s));
+            .position(|session| session.id == session_id)
+        else {
+            self.set_error("Session disappeared while editing settings.");
+            return Ok(());
+        };
+        let mut candidate = self.git.sessions[session_index].clone();
+        candidate.settings = new_settings.clone();
+        if title_changed {
+            candidate.title = new_title;
+        }
+        candidate.updated_at = Utc::now();
 
-        if let Some(Err(err)) = upsert_result {
+        if let Err(err) = self.session_store.upsert_session(&candidate) {
             self.set_error(format!(
                 "Failed to save session settings: {err}. Settings remain unsaved \
                  — close this modal and try again, or check {} for the underlying error.",
@@ -2309,6 +2291,7 @@ impl App {
             // Leave modal open so operator can retry. Don't close it.
             return Ok(());
         }
+        self.git.sessions[session_index] = candidate;
 
         // Apply live changes immediately. Mode + auto-clear changes
         // also rebuild the watch engine so the built-in rule attaches
@@ -2531,6 +2514,8 @@ mod tests {
             amq_inject_startup_grace_until: None,
             amq_inject_cooldown_until: std::collections::HashMap::new(),
             amq_inject_last_warned: std::collections::HashMap::new(),
+            amq_inject_first_pending_at: std::collections::HashMap::new(),
+            amq_inject_timeout_warned: std::collections::HashSet::new(),
             amq_inject_last_held_logged: std::collections::HashMap::new(),
             last_user_keystroke: std::collections::HashMap::new(),
             pr_checks_in_flight: Arc::new(AtomicUsize::new(0)),
@@ -2603,7 +2588,6 @@ mod tests {
             raw_input_buf: Vec::new(),
             loading_input_buf: Vec::new(),
             in_bracket_paste: false,
-            syntax_cache: crate::diff::SyntaxCache::new(),
             snapshot_buf: crate::pty::TerminalSnapshot::empty(),
             last_snapshot_id: None,
             terminal_selection: None,
@@ -3602,6 +3586,44 @@ mod tests {
             r.settings.system_prompt.as_deref(),
             Some("be concise and cite sources")
         );
+    }
+
+    #[test]
+    fn failed_settings_upsert_preserves_memory_runtime_and_retryable_draft() {
+        let s1 = make_session("fail-save", "claude", "/tmp/wt/fail-save");
+        let old = s1.settings.clone();
+        let project = make_project("project-1", "claude");
+        let mut app = test_app_with_sessions(vec![s1], vec![project]);
+        app.session_store
+            .upsert_session(&app.git.sessions[0])
+            .expect("seed");
+        app.rebuild_left_items();
+        app.selected_left = app
+            .left_items()
+            .iter()
+            .position(|item| matches!(item, LeftItem::Session(_)))
+            .unwrap();
+        app.open_session_settings().unwrap();
+        let PromptState::SessionSettings(prompt) = &mut app.ui.prompt else {
+            panic!("settings prompt");
+        };
+        prompt.draft.mode = ContextMode::Worker;
+        prompt.draft.auto_clear_on_task_done = true;
+        app.session_store
+            .conn()
+            .execute_batch("pragma query_only = on;")
+            .unwrap();
+
+        app.save_session_settings().unwrap();
+
+        assert_eq!(app.git.sessions[0].settings, old);
+        let PromptState::SessionSettings(prompt) = &app.ui.prompt else {
+            panic!("failed save must keep draft open for retry");
+        };
+        assert_eq!(prompt.draft.mode, ContextMode::Worker);
+        assert!(prompt.draft.auto_clear_on_task_done);
+        assert!(app.runtime.watch_engines.is_empty());
+        assert!(app.status.message().contains("Failed to save"));
     }
 
     /// audit03 Phase 01 §15: whitespace-only system-prompt drafts

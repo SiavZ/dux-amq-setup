@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::{self, Config, DuxPaths};
 use crate::git;
@@ -169,7 +169,7 @@ fn run_session_purge(paths: &DuxPaths, args: &[String]) -> Result<()> {
     }
 
     let storage = SessionStore::open(&paths.sessions_db_path)?;
-    let purge_config = PurgeConfig::default_layout();
+    let purge_config = runtime_purge_config(paths);
     let plan = build_plan(&storage, paths, &purge_config, &target)?;
 
     println!("{}", format_plan(&plan, dry_run));
@@ -204,7 +204,7 @@ fn run_session_purge_all(paths: &DuxPaths, yes: bool, dry_run: bool) -> Result<(
         );
     }
     let storage = SessionStore::open(&paths.sessions_db_path)?;
-    let purge_config = PurgeConfig::default_layout();
+    let purge_config = runtime_purge_config(paths);
     let (plans, planning_failures) = build_plans_for_all(&storage, paths, &purge_config)?;
 
     for failure in &planning_failures {
@@ -251,6 +251,15 @@ fn run_session_purge_all(paths: &DuxPaths, yes: bool, dry_run: bool) -> Result<(
         std::process::exit(1);
     }
     Ok(())
+}
+
+fn runtime_purge_config(paths: &DuxPaths) -> PurgeConfig {
+    let logging = fs::read_to_string(&paths.config_path)
+        .ok()
+        .and_then(|raw| toml::from_str::<Config>(&raw).ok())
+        .map(|config| config.logging)
+        .unwrap_or_default();
+    PurgeConfig::default_layout(paths, &logging)
 }
 
 fn format_plan(plan: &PurgePlan, dry_run: bool) -> String {
@@ -370,154 +379,7 @@ fn run_diff_raw(_current_raw: &str, current: &Config) -> Result<()> {
 }
 
 fn run_diff_summary(current: &Config) -> Result<()> {
-    let defaults = Config::default();
-    let mut changes = Vec::new();
-
-    // [defaults]
-    diff_str(
-        &mut changes,
-        "defaults.provider",
-        &defaults.defaults.provider,
-        &current.defaults.provider,
-    );
-    diff_opt_str(
-        &mut changes,
-        "defaults.start_directory",
-        defaults.defaults.start_directory.as_deref(),
-        current.defaults.start_directory.as_deref(),
-    );
-    diff_opt_str(
-        &mut changes,
-        "defaults.commit_prompt",
-        defaults.defaults.commit_prompt.as_deref(),
-        current.defaults.commit_prompt.as_deref(),
-    );
-
-    // [logging]
-    diff_str(
-        &mut changes,
-        "logging.level",
-        &defaults.logging.level,
-        &current.logging.level,
-    );
-    diff_str(
-        &mut changes,
-        "logging.path",
-        &defaults.logging.path,
-        &current.logging.path,
-    );
-
-    // [ui]
-    diff_u16(
-        &mut changes,
-        "ui.left_width_pct",
-        defaults.ui.left_width_pct,
-        current.ui.left_width_pct,
-    );
-    diff_u16(
-        &mut changes,
-        "ui.right_width_pct",
-        defaults.ui.right_width_pct,
-        current.ui.right_width_pct,
-    );
-    diff_u16(
-        &mut changes,
-        "ui.terminal_pane_height_pct",
-        defaults.ui.terminal_pane_height_pct,
-        current.ui.terminal_pane_height_pct,
-    );
-    diff_u16(
-        &mut changes,
-        "ui.staged_pane_height_pct",
-        defaults.ui.staged_pane_height_pct,
-        current.ui.staged_pane_height_pct,
-    );
-    diff_u16(
-        &mut changes,
-        "ui.commit_pane_height_pct",
-        defaults.ui.commit_pane_height_pct,
-        current.ui.commit_pane_height_pct,
-    );
-    diff_usize(
-        &mut changes,
-        "ui.agent_scrollback_lines",
-        defaults.ui.agent_scrollback_lines,
-        current.ui.agent_scrollback_lines,
-    );
-    diff_u16(
-        &mut changes,
-        "ui.branch_sync_interval",
-        defaults.ui.branch_sync_interval,
-        current.ui.branch_sync_interval,
-    );
-
-    // [editor]
-    diff_str(
-        &mut changes,
-        "editor.default",
-        &defaults.editor.default,
-        &current.editor.default,
-    );
-
-    // [terminal]
-    diff_str(
-        &mut changes,
-        "terminal.command",
-        &defaults.terminal.command,
-        &current.terminal.command,
-    );
-    let default_args = defaults
-        .terminal
-        .args
-        .iter()
-        .map(|s| s.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let current_args = current
-        .terminal
-        .args
-        .iter()
-        .map(|s| s.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    diff_str(
-        &mut changes,
-        "terminal.args",
-        &format!("[{default_args}]"),
-        &format!("[{current_args}]"),
-    );
-
-    // [keys]
-    diff_bool(
-        &mut changes,
-        "keys.show_terminal_keys",
-        defaults.keys.show_terminal_keys,
-        current.keys.show_terminal_keys,
-    );
-    diff_keybindings(
-        &mut changes,
-        &defaults.keys.bindings,
-        &current.keys.bindings,
-    );
-
-    // [providers.*]
-    diff_providers(&mut changes, &defaults, current);
-
-    // [[projects]]
-    if !current.projects.is_empty() {
-        changes.push(format!(
-            "projects: {} project(s) configured",
-            current.projects.len()
-        ));
-    }
-
-    // [macros]
-    if !current.macros.entries.is_empty() {
-        changes.push(format!(
-            "macros: {} macro(s) configured",
-            current.macros.entries.len()
-        ));
-    }
+    let changes = config_summary_changes(current)?;
 
     if changes.is_empty() {
         println!("config matches defaults — no differences");
@@ -527,6 +389,60 @@ fn run_diff_summary(current: &Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn config_summary_changes(current: &Config) -> Result<Vec<String>> {
+    let defaults = serde_json::to_value(Config::default())?;
+    let current = serde_json::to_value(current)?;
+    let mut changes = Vec::new();
+    diff_typed_value("", &defaults, &current, &mut changes);
+    Ok(changes)
+}
+
+fn diff_typed_value(
+    path: &str,
+    default: &serde_json::Value,
+    current: &serde_json::Value,
+    changes: &mut Vec<String>,
+) {
+    if let (Some(default), Some(current)) = (default.as_object(), current.as_object()) {
+        let keys: BTreeSet<&str> = default
+            .keys()
+            .chain(current.keys())
+            .map(String::as_str)
+            .collect();
+        for key in keys {
+            let child_path = if path.is_empty() {
+                key.to_string()
+            } else {
+                format!("{path}.{key}")
+            };
+            match (default.get(key), current.get(key)) {
+                (Some(a), Some(b)) => diff_typed_value(&child_path, a, b, changes),
+                (Some(a), None) => {
+                    changes.push(format!("{child_path}: {} -> (missing)", summary_value(a)))
+                }
+                (None, Some(b)) => {
+                    changes.push(format!("{child_path}: (missing) -> {}", summary_value(b)))
+                }
+                (None, None) => {}
+            }
+        }
+    } else if default != current {
+        changes.push(format!(
+            "{path}: {} -> {}",
+            summary_value(default),
+            summary_value(current)
+        ));
+    }
+}
+
+fn summary_value(value: &serde_json::Value) -> String {
+    let rendered = match value {
+        serde_json::Value::String(value) => value.clone(),
+        _ => value.to_string(),
+    };
+    truncate_display(&rendered, 80)
 }
 
 // ---------------------------------------------------------------------------
@@ -554,7 +470,7 @@ fn run_regenerate(paths: &DuxPaths, yes: bool) -> Result<()> {
     }
 
     paths.ensure_dirs()?;
-    fs::write(&paths.config_path, fresh).with_context_path(&paths.config_path)?;
+    config::write_config_atomic(&paths.config_path, &fresh)?;
     println!("config regenerated at {}", paths.config_path.display());
     Ok(())
 }
@@ -562,101 +478,6 @@ fn run_regenerate(paths: &DuxPaths, yes: bool) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Diff helpers
 // ---------------------------------------------------------------------------
-
-fn diff_str(changes: &mut Vec<String>, key: &str, default: &str, current: &str) {
-    if default != current {
-        let d = truncate_display(default, 40);
-        let c = truncate_display(current, 40);
-        changes.push(format!("{key}: {d} -> {c}"));
-    }
-}
-
-fn diff_opt_str(
-    changes: &mut Vec<String>,
-    key: &str,
-    default: Option<&str>,
-    current: Option<&str>,
-) {
-    let d = default.unwrap_or("(unset)");
-    let c = current.unwrap_or("(unset)");
-    if d != c {
-        let d = truncate_display(d, 40);
-        let c = truncate_display(c, 40);
-        changes.push(format!("{key}: {d} -> {c}"));
-    }
-}
-
-fn diff_u16(changes: &mut Vec<String>, key: &str, default: u16, current: u16) {
-    if default != current {
-        changes.push(format!("{key}: {default} -> {current}"));
-    }
-}
-
-fn diff_usize(changes: &mut Vec<String>, key: &str, default: usize, current: usize) {
-    if default != current {
-        changes.push(format!("{key}: {default} -> {current}"));
-    }
-}
-
-fn diff_bool(changes: &mut Vec<String>, key: &str, default: bool, current: bool) {
-    if default != current {
-        changes.push(format!("{key}: {default} -> {current}"));
-    }
-}
-
-fn diff_keybindings(
-    changes: &mut Vec<String>,
-    default: &BTreeMap<String, Vec<String>>,
-    current: &BTreeMap<String, Vec<String>>,
-) {
-    for (action, default_keys) in default {
-        match current.get(action) {
-            Some(current_keys) if current_keys != default_keys => {
-                changes.push(format!(
-                    "keys.{action}: [{}] -> [{}]",
-                    default_keys.join(", "),
-                    current_keys.join(", "),
-                ));
-            }
-            None => {
-                changes.push(format!(
-                    "keys.{action}: [{}] -> (removed)",
-                    default_keys.join(", ")
-                ));
-            }
-            _ => {}
-        }
-    }
-    for action in current.keys() {
-        if !default.contains_key(action) {
-            let keys = &current[action];
-            changes.push(format!("keys.{action}: (new) -> [{}]", keys.join(", "),));
-        }
-    }
-}
-
-fn diff_providers(changes: &mut Vec<String>, defaults: &Config, current: &Config) {
-    for (name, default_cfg) in &defaults.providers.commands {
-        match current.providers.get(name) {
-            Some(current_cfg) => {
-                if default_cfg.command != current_cfg.command {
-                    changes.push(format!(
-                        "providers.{name}.command: {} -> {}",
-                        default_cfg.command, current_cfg.command
-                    ));
-                }
-            }
-            None => {
-                changes.push(format!("providers.{name}: (removed)"));
-            }
-        }
-    }
-    for name in current.providers.commands.keys() {
-        if !defaults.providers.commands.contains_key(name) {
-            changes.push(format!("providers.{name}: (added)"));
-        }
-    }
-}
 
 /// Truncate a display string, replacing the end with "..." if too long.
 fn truncate_display(s: &str, max: usize) -> String {
@@ -909,14 +730,40 @@ fn resolve_doctor_script() -> Option<PathBuf> {
 
 /// Top-level entry point for the `dux doctor` subcommand.
 pub fn run_doctor(paths: &DuxPaths, json: bool, anonymize: bool) -> Result<()> {
-    // 1. Run the bash script, if available, and forward its output
-    //    verbatim. We don't capture-and-reprint: the script's coloring
-    //    relies on it owning stdout (it auto-disables when `! -t 1`).
+    if json {
+        let mut bash_json = serde_json::json!({});
+        let mut bash_ran = false;
+        if let Some(script) = resolve_doctor_script() {
+            let mut cmd = Command::new(&script);
+            cmd.arg("--json");
+            if anonymize {
+                cmd.arg("--anonymize");
+            }
+            match cmd.output() {
+                Ok(output) if output.status.success() => {
+                    bash_json = serde_json::from_slice(&output.stdout)
+                        .with_context(|| format!("{} emitted invalid JSON", script.display()))?;
+                    bash_ran = true;
+                }
+                Ok(output) => eprintln!(
+                    "warning: dux-amq-doctor exited with {} — emitting Rust-only JSON",
+                    output.status.code().unwrap_or(-1),
+                ),
+                Err(err) => eprintln!(
+                    "warning: failed to spawn {}: {err} — emitting Rust-only JSON",
+                    script.display()
+                ),
+            }
+        }
+        let snap = collect_sessions_snapshot(paths);
+        let rust_json = build_rust_section_json(paths, &snap, anonymize);
+        println!("{}", merge_doctor_json(bash_json, rust_json, bash_ran)?);
+        return Ok(());
+    }
+
+    // Text mode lets the script own stdout so its TTY color detection works.
     let bash_ran = if let Some(script) = resolve_doctor_script() {
         let mut cmd = Command::new(&script);
-        if json {
-            cmd.arg("--json");
-        }
         if anonymize {
             cmd.arg("--anonymize");
         }
@@ -938,26 +785,45 @@ pub fn run_doctor(paths: &DuxPaths, json: bool, anonymize: bool) -> Result<()> {
         false
     };
 
-    // 2. Append the Rust-side section. In JSON mode we emit a *second*
-    //    JSON object on its own line; consumers that want a single
-    //    object can `jq -s 'add'`. We deliberately don't try to
-    //    re-parse and merge the bash output — that's brittle and the
-    //    operator-facing use case (eyeballing a dump) doesn't need it.
-    if json {
-        emit_rust_section_json(paths, bash_ran)?;
-    } else {
-        emit_rust_section_text(paths, bash_ran)?;
+    emit_rust_section_text(paths, bash_ran, anonymize)?;
+    Ok(())
+}
+
+fn merge_doctor_json(
+    mut bash: serde_json::Value,
+    rust: serde_json::Value,
+    bash_ran: bool,
+) -> Result<serde_json::Value> {
+    if !bash_ran {
+        bash = serde_json::json!({});
     }
-    Ok(())
+    let bash_obj = bash
+        .as_object_mut()
+        .context("doctor JSON root must be an object")?;
+    let rust_obj = rust
+        .as_object()
+        .context("Rust doctor JSON root must be an object")?;
+    for (key, value) in rust_obj {
+        bash_obj.insert(key.clone(), value.clone());
+    }
+    Ok(bash)
 }
 
-fn emit_rust_section_text(paths: &DuxPaths, bash_ran: bool) -> Result<()> {
+fn emit_rust_section_text(paths: &DuxPaths, bash_ran: bool, anonymize: bool) -> Result<()> {
     let snap = collect_sessions_snapshot(paths);
-    print!("{}", render_rust_section_text(paths, &snap, bash_ran));
+    print!(
+        "{}",
+        render_rust_section_text(paths, &snap, bash_ran, anonymize)
+    );
     Ok(())
 }
 
-fn render_rust_section_text(paths: &DuxPaths, snap: &SessionsSnapshot, bash_ran: bool) -> String {
+fn render_rust_section_text(
+    paths: &DuxPaths,
+    snap: &SessionsSnapshot,
+    bash_ran: bool,
+    anonymize: bool,
+) -> String {
     let mut out = String::new();
     if !bash_ran {
         out.push_str(
@@ -969,7 +835,7 @@ fn render_rust_section_text(paths: &DuxPaths, snap: &SessionsSnapshot, bash_ran:
     out.push_str(&format!(
         "{:<16} {}\n",
         "path:",
-        paths.sessions_db_path.display()
+        doctor_db_path(paths, anonymize)
     ));
     out.push_str(&format!("{:<16} {}\n", "integrity:", snap.integrity));
     out.push_str(&format!("{:<16} {}\n", "active:", snap.active));
@@ -979,11 +845,11 @@ fn render_rust_section_text(paths: &DuxPaths, snap: &SessionsSnapshot, bash_ran:
         "{:<16} {}\n",
         "orphaned:", snap.orphaned_worktrees
     ));
-    append_orphaned_sessions_text(&mut out, snap);
+    append_orphaned_sessions_text(&mut out, snap, anonymize);
     out
 }
 
-fn append_orphaned_sessions_text(out: &mut String, snap: &SessionsSnapshot) {
+fn append_orphaned_sessions_text(out: &mut String, snap: &SessionsSnapshot, anonymize: bool) {
     if snap.orphaned_sessions.is_empty() {
         return;
     }
@@ -998,25 +864,53 @@ fn append_orphaned_sessions_text(out: &mut String, snap: &SessionsSnapshot) {
         shown.to_string()
     };
     out.push_str(&format!("{:<16} {summary}\n", "orphaned_list:"));
-    for session in &snap.orphaned_sessions {
+    for (index, session) in snap.orphaned_sessions.iter().enumerate() {
+        let (id, provider, branch, worktree_path) = if anonymize {
+            let n = index + 1;
+            (
+                format!("session-{n}"),
+                format!("provider-{n}"),
+                format!("branch-{n}"),
+                format!("/WT/session-{n}"),
+            )
+        } else {
+            (
+                session.id.clone(),
+                session.provider.clone(),
+                session.branch.clone(),
+                session.worktree_path.clone(),
+            )
+        };
         out.push_str(&format!(
             "  - id={} provider={} branch={} state={} worktree_path={}\n",
-            session.id, session.provider, session.branch, session.state, session.worktree_path
+            id, provider, branch, session.state, worktree_path
         ));
     }
 }
 
-fn emit_rust_section_json(paths: &DuxPaths, _bash_ran: bool) -> Result<()> {
-    let snap = collect_sessions_snapshot(paths);
-    let body = build_rust_section_json(paths, &snap);
-    println!("{body}");
-    Ok(())
-}
-
-fn build_rust_section_json(paths: &DuxPaths, snap: &SessionsSnapshot) -> serde_json::Value {
+fn build_rust_section_json(
+    paths: &DuxPaths,
+    snap: &SessionsSnapshot,
+    anonymize: bool,
+) -> serde_json::Value {
+    let orphaned_sessions: Vec<serde_json::Value> = snap
+        .orphaned_sessions
+        .iter()
+        .enumerate()
+        .map(|(index, session)| {
+            let n = index + 1;
+            serde_json::json!({
+                "id": if anonymize { format!("session-{n}") } else { session.id.clone() },
+                "provider": if anonymize { format!("provider-{n}") } else { session.provider.clone() },
+                "branch": if anonymize { format!("branch-{n}") } else { session.branch.clone() },
+                "state": session.state,
+                "worktree_path": if anonymize { format!("/WT/session-{n}") } else { session.worktree_path.clone() },
+            })
+        })
+        .collect();
     serde_json::json!({
         "sessions_db_rust": {
-            "path": paths.sessions_db_path.display().to_string(),
+            "path": doctor_db_path(paths, anonymize),
             "integrity": snap.integrity,
             "active": snap.active,
             "detached": snap.detached,
@@ -1024,9 +918,17 @@ fn build_rust_section_json(paths: &DuxPaths, snap: &SessionsSnapshot) -> serde_j
             "orphaned_worktrees": snap.orphaned_worktrees,
             "orphaned_sessions_limit": ORPHANED_SESSIONS_LIMIT,
             "orphaned_sessions_truncated": snap.orphaned_sessions.len() < snap.orphaned_worktrees,
-            "orphaned_sessions": snap.orphaned_sessions,
+            "orphaned_sessions": orphaned_sessions,
         }
     })
+}
+
+fn doctor_db_path(paths: &DuxPaths, anonymize: bool) -> String {
+    if anonymize {
+        "/DUX/sessions.sqlite3".to_string()
+    } else {
+        paths.sessions_db_path.display().to_string()
+    }
 }
 
 /// Lightweight snapshot of the sessions DB used only by `dux doctor`.
@@ -1068,7 +970,7 @@ fn collect_sessions_snapshot(paths: &DuxPaths) -> SessionsSnapshot {
     }
     // SessionStore::open already runs PRAGMA integrity_check and
     // bails on failure; treat that as the authoritative result.
-    match SessionStore::open(&paths.sessions_db_path) {
+    match SessionStore::open_read_only(&paths.sessions_db_path) {
         Ok(store) => {
             let sessions = store.load_sessions().unwrap_or_default();
             let mut active = 0usize;
@@ -1195,24 +1097,98 @@ mod tests {
 
     #[test]
     fn diff_summary_reports_no_differences_for_defaults() {
-        // Just verify it runs without error on defaults.
         let defaults = Config::default();
+        assert!(config_summary_changes(&defaults).unwrap().is_empty());
         run_diff_summary(&defaults).expect("diff summary");
     }
 
     #[test]
-    fn diff_str_records_change() {
-        let mut changes = Vec::new();
-        diff_str(&mut changes, "test.key", "old", "new");
-        assert_eq!(changes.len(), 1);
-        assert!(changes[0].contains("old -> new"));
-    }
+    fn diff_summary_covers_every_typed_section_and_provider_arguments() {
+        fn assert_reports(config: &Config, path: &str) {
+            let changes = config_summary_changes(config).unwrap();
+            assert!(
+                changes.iter().any(|change| change.starts_with(path)),
+                "missing {path} in {changes:#?}"
+            );
+        }
 
-    #[test]
-    fn diff_str_ignores_equal() {
-        let mut changes = Vec::new();
-        diff_str(&mut changes, "test.key", "same", "same");
-        assert!(changes.is_empty());
+        let mut config = Config::default();
+        config.schema_version += 1;
+        assert_reports(&config, "schema_version:");
+
+        let mut config = Config::default();
+        config.defaults.provider = "codex".to_string();
+        assert_reports(&config, "defaults.provider:");
+
+        let mut config = Config::default();
+        config.providers.commands["claude"]
+            .args
+            .push("--audit03".to_string());
+        assert_reports(&config, "providers.claude.args:");
+
+        let mut config = Config::default();
+        let rule = crate::watch::WatchRule {
+            pattern: "audit03".to_string(),
+            ..crate::watch::WatchRule::default()
+        };
+        config.providers.commands["claude"].watch.push(rule);
+        assert_reports(&config, "providers.claude.watch:");
+
+        let mut config = Config::default();
+        config.terminal.command = "/bin/audit03".to_string();
+        assert_reports(&config, "terminal.command:");
+
+        let mut config = Config::default();
+        config.logging.level = "debug".to_string();
+        assert_reports(&config, "logging.level:");
+
+        let mut config = Config::default();
+        config.projects.push(crate::config::ProjectConfig {
+            id: "audit03".to_string(),
+            path: "/tmp/audit03".to_string(),
+            name: None,
+            default_provider: None,
+            commit_prompt: None,
+        });
+        assert_reports(&config, "projects:");
+
+        let mut config = Config::default();
+        config.ui.left_width_pct += 1;
+        assert_reports(&config, "ui.left_width_pct:");
+
+        let mut config = Config::default();
+        config.editor.default = "audit03".to_string();
+        assert_reports(&config, "editor.default:");
+
+        let mut config = Config::default();
+        config.keys.show_terminal_keys = !config.keys.show_terminal_keys;
+        assert_reports(&config, "keys.show_terminal_keys:");
+
+        let mut config = Config::default();
+        config.macros.entries.insert(
+            "audit03".to_string(),
+            crate::config::MacroEntry {
+                text: "proof".to_string(),
+                surface: crate::config::MacroSurface::Both,
+            },
+        );
+        assert_reports(&config, "macros.audit03:");
+
+        let mut config = Config::default();
+        config.storage.backup_interval_minutes += 1;
+        assert_reports(&config, "storage.backup_interval_minutes:");
+
+        let mut config = Config::default();
+        config.auto_resume.concurrency += 1;
+        assert_reports(&config, "auto_resume.concurrency:");
+
+        let mut config = Config::default();
+        config.limits.max_panes += 1;
+        assert_reports(&config, "limits.max_panes:");
+
+        let mut config = Config::default();
+        config.amq.inject.verify_envelope = !config.amq.inject.verify_envelope;
+        assert_reports(&config, "amq.inject.verify_envelope:");
     }
 
     #[test]
@@ -1231,6 +1207,88 @@ mod tests {
         assert_eq!(snap.active, 0);
         assert_eq!(snap.orphaned_worktrees, 0);
         assert!(snap.orphaned_sessions.is_empty());
+    }
+
+    #[test]
+    fn doctor_snapshot_does_not_migrate_or_change_database_bytes() {
+        let tempdir = TempDir::new().unwrap();
+        let root = tempdir.path().to_path_buf();
+        let paths = DuxPaths {
+            config_path: root.join("config.toml"),
+            sessions_db_path: root.join("sessions.sqlite3"),
+            worktrees_root: root.join("worktrees"),
+            lock_path: root.join("dux.lock"),
+            root,
+        };
+        {
+            let conn = rusqlite::Connection::open(&paths.sessions_db_path).unwrap();
+            conn.execute_batch(
+                "create table diagnostic_sentinel(value text); pragma user_version = 0;",
+            )
+            .unwrap();
+        }
+        let before = fs::read(&paths.sessions_db_path).unwrap();
+        let snap = collect_sessions_snapshot(&paths);
+        let after = fs::read(&paths.sessions_db_path).unwrap();
+        assert_eq!(snap.integrity, "ok");
+        assert_eq!(after, before);
+
+        let conn = rusqlite::Connection::open(&paths.sessions_db_path).unwrap();
+        let version: u32 = conn
+            .query_row("pragma user_version", [], |row| row.get(0))
+            .unwrap();
+        let migrated_table_count: i64 = conn
+            .query_row(
+                "select count(*) from sqlite_master where name='agent_sessions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 0);
+        assert_eq!(migrated_table_count, 0);
+    }
+
+    #[test]
+    fn doctor_json_merges_to_one_object_and_anonymizes_rust_fields() {
+        let paths = DuxPaths {
+            root: PathBuf::from("/secret/home/.config/dux"),
+            config_path: PathBuf::from("/secret/home/.config/dux/config.toml"),
+            sessions_db_path: PathBuf::from("/secret/home/.config/dux/sessions.sqlite3"),
+            worktrees_root: PathBuf::from("/secret/home/worktrees"),
+            lock_path: PathBuf::from("/secret/home/.config/dux/dux.lock"),
+        };
+        let snap = SessionsSnapshot {
+            integrity: "ok".to_string(),
+            active: 0,
+            detached: 1,
+            exited: 0,
+            orphaned_worktrees: 1,
+            orphaned_sessions: vec![OrphanedSessionSnapshot {
+                id: "customer-session-id".to_string(),
+                provider: "secret-provider".to_string(),
+                branch: "customer/feature".to_string(),
+                state: "created".to_string(),
+                worktree_path: "/secret/home/worktrees/customer-feature".to_string(),
+            }],
+        };
+        let merged = merge_doctor_json(
+            serde_json::json!({"versions": {"dux": "test"}}),
+            build_rust_section_json(&paths, &snap, true),
+            true,
+        )
+        .unwrap();
+        let encoded = serde_json::to_string(&merged).unwrap();
+        assert_eq!(merged["versions"]["dux"], "test");
+        assert_eq!(merged["sessions_db_rust"]["path"], "/DUX/sessions.sqlite3");
+        for secret in [
+            "/secret/home",
+            "customer-session-id",
+            "secret-provider",
+            "customer/feature",
+        ] {
+            assert!(!encoded.contains(secret), "leaked {secret}: {encoded}");
+        }
+        assert!(encoded.contains("session-1"));
     }
 
     #[test]
@@ -1327,13 +1385,13 @@ mod tests {
             }]
         );
 
-        let text = render_rust_section_text(&paths, &snap, true);
+        let text = render_rust_section_text(&paths, &snap, true, false);
         assert!(text.contains("orphaned_list:"));
         assert!(text.contains(&format!(
             "id=x1 provider=claude branch=b-x1 state=exited worktree_path={orphan_path}"
         )));
 
-        let json = build_rust_section_json(&paths, &snap);
+        let json = build_rust_section_json(&paths, &snap, false);
         let sessions_db = &json["sessions_db_rust"];
         assert_eq!(sessions_db["orphaned_worktrees"], 1);
         assert_eq!(
@@ -1396,12 +1454,12 @@ mod tests {
         assert_eq!(snap.orphaned_sessions.first().unwrap().id, "o-00");
         assert_eq!(snap.orphaned_sessions.last().unwrap().id, "o-09");
 
-        let text = render_rust_section_text(&paths, &snap, true);
+        let text = render_rust_section_text(&paths, &snap, true, false);
         assert!(text.contains("first 10 of 13 (limit 10)"));
         assert!(text.contains("id=o-09 provider=codex branch=branch-09 state=created"));
         assert!(!text.contains("id=o-10 "));
 
-        let json = build_rust_section_json(&paths, &snap);
+        let json = build_rust_section_json(&paths, &snap, false);
         let sessions_db = &json["sessions_db_rust"];
         assert_eq!(sessions_db["orphaned_sessions_truncated"], true);
         assert_eq!(

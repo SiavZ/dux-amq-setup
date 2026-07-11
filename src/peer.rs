@@ -632,10 +632,6 @@ fn optional_amq_root(paths: &DuxPaths) -> Option<PathBuf> {
             return Some(sibling);
         }
     }
-    let data_state = PathBuf::from("/data/state/amq");
-    if data_state.exists() {
-        return Some(data_state);
-    }
     None
 }
 
