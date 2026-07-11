@@ -31,38 +31,29 @@ pub fn parse(
         WaitFormat::UnixSeconds => {
             let secs: i64 = captured.parse().ok()?;
             let target = DateTime::<Utc>::from_timestamp(secs, 0)?;
-            Some(offset_into_instant(target, now_wall, now_instant))
+            offset_into_instant(target, now_wall, now_instant)
         }
         WaitFormat::UnixMillis => {
             let ms: i64 = captured.parse().ok()?;
             let target = DateTime::<Utc>::from_timestamp_millis(ms)?;
-            Some(offset_into_instant(target, now_wall, now_instant))
+            offset_into_instant(target, now_wall, now_instant)
         }
         WaitFormat::ClockLocal => {
             let target = parse_clock_local(captured, Local::now())?;
             let target_utc = target.with_timezone(&Utc);
-            Some(offset_into_instant(target_utc, now_wall, now_instant))
+            offset_into_instant(target_utc, now_wall, now_instant)
         }
         WaitFormat::InSeconds => {
             let n: f64 = captured.parse().ok()?;
-            if !n.is_finite() || n < 0.0 {
-                return None;
-            }
-            Some(now_instant + Duration::from_secs_f64(n))
+            relative_into_instant(n, 1.0, now_instant)
         }
         WaitFormat::InMinutes => {
             let n: f64 = captured.parse().ok()?;
-            if !n.is_finite() || n < 0.0 {
-                return None;
-            }
-            Some(now_instant + Duration::from_secs_f64(n * 60.0))
+            relative_into_instant(n, 60.0, now_instant)
         }
         WaitFormat::InHours => {
             let n: f64 = captured.parse().ok()?;
-            if !n.is_finite() || n < 0.0 {
-                return None;
-            }
-            Some(now_instant + Duration::from_secs_f64(n * 3600.0))
+            relative_into_instant(n, 3600.0, now_instant)
         }
     }
 }
@@ -73,13 +64,22 @@ fn offset_into_instant(
     target: DateTime<Utc>,
     now_wall: DateTime<Utc>,
     now_instant: Instant,
-) -> Instant {
+) -> Option<Instant> {
     let delta = target.signed_duration_since(now_wall);
     let secs = delta.num_seconds();
     if secs <= 0 {
-        return now_instant;
+        return Some(now_instant);
     }
-    now_instant + Duration::from_secs(secs as u64)
+    now_instant.checked_add(Duration::from_secs(secs as u64))
+}
+
+fn relative_into_instant(value: f64, multiplier: f64, now_instant: Instant) -> Option<Instant> {
+    let seconds = value * multiplier;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    let duration = Duration::try_from_secs_f64(seconds).ok()?;
+    now_instant.checked_add(duration)
 }
 
 /// Cached regex for clock-time parsing. Compiled once per process via
@@ -260,6 +260,25 @@ mod tests {
         );
         assert!(parse(WaitFormat::InHours, "five", now_instant, now_wall).is_none());
         assert!(parse(WaitFormat::ClockLocal, "noon-ish", now_instant, now_wall).is_none());
+    }
+
+    #[test]
+    fn unrepresentable_values_return_none_for_every_wait_format() {
+        let now_instant = Instant::now();
+        let now_wall = Utc::now();
+        for (format, captured) in [
+            (WaitFormat::UnixSeconds, i64::MAX.to_string()),
+            (WaitFormat::UnixMillis, i64::MAX.to_string()),
+            (WaitFormat::ClockLocal, "999999999999999999999".to_string()),
+            (WaitFormat::InSeconds, f64::MAX.to_string()),
+            (WaitFormat::InMinutes, f64::MAX.to_string()),
+            (WaitFormat::InHours, f64::MAX.to_string()),
+        ] {
+            assert!(
+                parse(format, &captured, now_instant, now_wall).is_none(),
+                "accepted unrepresentable {format:?} value {captured}"
+            );
+        }
     }
 
     #[test]
