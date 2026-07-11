@@ -205,7 +205,11 @@ fn run_session_purge_all(paths: &DuxPaths, yes: bool, dry_run: bool) -> Result<(
     }
     let storage = SessionStore::open(&paths.sessions_db_path)?;
     let purge_config = PurgeConfig::default_layout();
-    let plans = build_plans_for_all(&storage, paths, &purge_config)?;
+    let (plans, planning_failures) = build_plans_for_all(&storage, paths, &purge_config)?;
+
+    for failure in &planning_failures {
+        eprintln!("WARNING: {failure}");
+    }
 
     println!("about to purge {} session(s)", plans.len());
     for (i, plan) in plans.iter().enumerate() {
@@ -229,9 +233,14 @@ fn run_session_purge_all(paths: &DuxPaths, yes: bool, dry_run: bool) -> Result<(
         }
     }
 
-    let mut any_errors = false;
+    let mut any_errors = !planning_failures.is_empty();
     for plan in &plans {
-        if !dry_run {
+        if !dry_run
+            && plan
+                .items
+                .iter()
+                .any(|item| matches!(item, purge::PurgeItem::AmqInbox(_)))
+        {
             notify_amq_peers_of_purge(&plan.branch);
         }
         let report = execute(plan, &storage, paths, dry_run)?;
@@ -245,16 +254,12 @@ fn run_session_purge_all(paths: &DuxPaths, yes: bool, dry_run: bool) -> Result<(
 }
 
 fn format_plan(plan: &PurgePlan, dry_run: bool) -> String {
+    let session_id = crate::sanitize::for_terminal(&plan.session_id);
+    let branch = crate::sanitize::for_terminal(&plan.branch);
     let header = if dry_run {
-        format!(
-            "DRY-RUN purge plan for session {} (branch {}):",
-            plan.session_id, plan.branch
-        )
+        format!("DRY-RUN purge plan for session {session_id} (branch {branch}):")
     } else {
-        format!(
-            "purge plan for session {} (branch {}):",
-            plan.session_id, plan.branch
-        )
+        format!("purge plan for session {session_id} (branch {branch}):")
     };
     let mut s = String::new();
     s.push_str(&header);

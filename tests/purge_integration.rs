@@ -28,8 +28,8 @@ use chrono::Utc;
 use dux::config::DuxPaths;
 use dux::model::{AgentSession, ProviderKind, SessionState};
 use dux::purge::{
-    self, PurgeConfig, PurgeItem, PurgeOutcome, build_plan, confirm_with_reader, execute,
-    plan_for_session,
+    self, PurgeConfig, PurgeItem, PurgeOutcome, build_plan, build_plans_for_all,
+    confirm_with_reader, execute, plan_for_session,
 };
 use dux::purge_encoding;
 use dux::storage::SessionStore;
@@ -595,4 +595,60 @@ fn purge_allows_missing_descendants_and_reports_validated_paths() {
             .describe()
             .contains(&expected.display().to_string())
     );
+}
+
+#[test]
+fn purge_all_continues_with_valid_plans_and_erases_malformed_rows() {
+    let h = PurgeHarness::new();
+    let mut relative_worktree = h.session.clone();
+    relative_worktree.id = "sid-relative\u{1b}]8;;bad".to_string();
+    relative_worktree.branch_name = "relative-row".to_string();
+    relative_worktree.worktree_path = "relative/worktree".to_string();
+    h.storage
+        .upsert_session(&relative_worktree)
+        .expect("insert relative worktree row");
+
+    let mut absolute_branch = h.session.clone();
+    absolute_branch.id = "sid-absolute-branch".to_string();
+    absolute_branch.branch_name = "/tmp/bad\u{1b}]0;branch".to_string();
+    absolute_branch.worktree_path = h
+        .paths
+        .worktrees_root
+        .join("missing-absolute-branch-row")
+        .to_string_lossy()
+        .into_owned();
+    h.storage
+        .upsert_session(&absolute_branch)
+        .expect("insert absolute branch row");
+
+    let (plans, failures) =
+        build_plans_for_all(&h.storage, &h.paths, &h.config).expect("bulk plans");
+
+    assert_eq!(plans.len(), 3);
+    assert_eq!(failures.len(), 2);
+    assert!(failures.iter().all(|failure| !failure.contains('\u{1b}')));
+    assert!(
+        failures
+            .iter()
+            .all(|failure| failure.contains("using row-only purge"))
+    );
+    assert_eq!(
+        plans
+            .iter()
+            .filter(|plan| plan.items == [PurgeItem::SqliteRow])
+            .count(),
+        2
+    );
+    assert!(
+        plans
+            .iter()
+            .any(|plan| plan.session_id == h.session.id && plan.items.len() > 1),
+        "the valid session must retain its full purge plan"
+    );
+
+    for plan in &plans {
+        let report = execute(plan, &h.storage, &h.paths, false).expect("execute bulk plan");
+        assert!(!report.had_errors(), "{}", report.summary());
+    }
+    assert!(h.storage.load_sessions().expect("load rows").is_empty());
 }

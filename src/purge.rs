@@ -140,11 +140,11 @@ impl PurgeItem {
     pub fn describe(&self) -> String {
         match self {
             Self::SqliteRow => "sqlite row in sessions.sqlite3".to_string(),
-            Self::Worktree(p) => format!("worktree {}", p.display()),
+            Self::Worktree(p) => format!("worktree {}", safe_path(p)),
             Self::ProviderDir { provider, path } => {
-                format!("{provider} chat history {}", path.display())
+                format!("{provider} chat history {}", safe_path(path))
             }
-            Self::AmqInbox(p) => format!("amq inbox {}", p.display()),
+            Self::AmqInbox(p) => format!("amq inbox {}", safe_path(p)),
             Self::LogScopedRedact { since } => {
                 format!("redact log records since {}", since.to_rfc3339())
             }
@@ -191,7 +191,8 @@ impl PurgeReport {
         let prefix = if self.dry_run { "DRY-RUN " } else { "" };
         s.push_str(&format!(
             "{prefix}purge report for session {} (branch {}):\n",
-            self.session_id, self.branch
+            sanitize::for_terminal(&self.session_id),
+            sanitize::for_terminal(&self.branch)
         ));
         for (item, outcome) in &self.entries {
             let tag = match outcome {
@@ -202,7 +203,7 @@ impl PurgeReport {
             };
             s.push_str(&format!("  [{tag}] {}\n", item.describe()));
             if let PurgeOutcome::Skipped(why) | PurgeOutcome::Error(why) = outcome {
-                s.push_str(&format!("        ({why})\n"));
+                s.push_str(&format!("        ({})\n", sanitize::for_terminal(why)));
             }
         }
         s
@@ -326,13 +327,13 @@ pub fn plan_for_session(
 /// (already-missing) targets without weakening containment.
 fn resolve_for_containment(path: &Path) -> Result<PathBuf> {
     if !path.is_absolute() {
-        bail!("purge path must be absolute: {}", path.display());
+        bail!("purge path must be absolute: {}", safe_path(path));
     }
     if path
         .components()
         .any(|component| matches!(component, std::path::Component::ParentDir))
     {
-        bail!("purge path contains parent traversal: {}", path.display());
+        bail!("purge path contains parent traversal: {}", safe_path(path));
     }
 
     let mut ancestor = path;
@@ -343,22 +344,22 @@ fn resolve_for_containment(path: &Path) -> Result<PathBuf> {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 let name = ancestor
                     .file_name()
-                    .ok_or_else(|| anyhow!("could not resolve purge path {}", path.display()))?;
+                    .ok_or_else(|| anyhow!("could not resolve purge path {}", safe_path(path)))?;
                 missing.push(name.to_os_string());
                 ancestor = ancestor
                     .parent()
-                    .ok_or_else(|| anyhow!("could not resolve purge path {}", path.display()))?;
+                    .ok_or_else(|| anyhow!("could not resolve purge path {}", safe_path(path)))?;
             }
             Err(err) => {
                 return Err(err)
-                    .with_context(|| format!("failed to inspect purge path {}", path.display()));
+                    .with_context(|| format!("failed to inspect purge path {}", safe_path(path)));
             }
         }
     }
 
     let mut resolved = ancestor
         .canonicalize()
-        .with_context(|| format!("failed to resolve purge path {}", path.display()))?;
+        .with_context(|| format!("failed to resolve purge path {}", safe_path(path)))?;
     for component in missing.iter().rev() {
         resolved.push(component);
     }
@@ -367,23 +368,27 @@ fn resolve_for_containment(path: &Path) -> Result<PathBuf> {
 
 fn validate_delete_target(root: &Path, target: &Path, category: &str) -> Result<PathBuf> {
     let root = resolve_for_containment(root)
-        .with_context(|| format!("failed to resolve {category} root {}", root.display()))?;
+        .with_context(|| format!("failed to resolve {category} root {}", safe_path(root)))?;
     let target = resolve_for_containment(target)
-        .with_context(|| format!("failed to resolve {category} target {}", target.display()))?;
+        .with_context(|| format!("failed to resolve {category} target {}", safe_path(target)))?;
     if target == root {
         bail!(
             "refusing to purge {category} root itself: {}",
-            target.display()
+            safe_path(&target)
         );
     }
     if !target.starts_with(&root) {
         bail!(
             "refusing {category} target outside {}: {}",
-            root.display(),
-            target.display()
+            safe_path(&root),
+            safe_path(&target)
         );
     }
     Ok(target)
+}
+
+fn safe_path(path: &Path) -> String {
+    sanitize::for_terminal(&path.display().to_string())
 }
 
 /// Map the dynamic provider name (read from config) to a `&'static str`
@@ -414,10 +419,12 @@ pub fn execute(
     paths: &DuxPaths,
     dry_run: bool,
 ) -> Result<PurgeReport> {
+    let safe_session_id = sanitize::for_terminal(&plan.session_id);
+    let safe_branch = sanitize::for_terminal(&plan.branch);
     tracing::info!(
         target: "dux::purge",
-        session_id = %plan.session_id,
-        branch = %plan.branch,
+        session_id = %safe_session_id,
+        branch = %safe_branch,
         items = plan.items.len(),
         dry_run = dry_run,
         "purge cascade starting",
@@ -439,25 +446,25 @@ pub fn execute(
             PurgeOutcome::Error(why) => {
                 tracing::error!(
                     target: "dux::purge",
-                    session_id = %plan.session_id,
+                    session_id = %safe_session_id,
                     item = %item.describe(),
-                    err = %why,
+                    err = %sanitize::for_terminal(why),
                     "purge step failed",
                 );
             }
             PurgeOutcome::Skipped(why) => {
                 tracing::info!(
                     target: "dux::purge",
-                    session_id = %plan.session_id,
+                    session_id = %safe_session_id,
                     item = %item.describe(),
-                    reason = %why,
+                    reason = %sanitize::for_terminal(why),
                     "purge step skipped",
                 );
             }
             PurgeOutcome::DryRun | PurgeOutcome::Done => {
                 tracing::info!(
                     target: "dux::purge",
-                    session_id = %plan.session_id,
+                    session_id = %safe_session_id,
                     item = %item.describe(),
                     "purge step complete",
                 );
@@ -786,12 +793,14 @@ pub fn notify_amq_peers_of_purge(branch: &str) {
 // ---------------------------------------------------------------------------
 
 /// Build plans for every session in storage. Used by `dux session
-/// purge-all`. Returns plans in load order (most-recently-updated first).
+/// purge-all`. Returns plans in load order (most-recently-updated first) and
+/// one operator-facing warning for each malformed row reduced to a row-only
+/// purge.
 pub fn build_plans_for_all(
     storage: &SessionStore,
     paths: &DuxPaths,
     config: &PurgeConfig,
-) -> Result<Vec<PurgePlan>> {
+) -> Result<(Vec<PurgePlan>, Vec<String>)> {
     let sessions = storage
         .load_sessions()
         .context("failed to load sessions for bulk purge planning")?;
@@ -799,10 +808,26 @@ pub fn build_plans_for_all(
         bail!("no sessions found; nothing to purge");
     }
     let mut plans = Vec::with_capacity(sessions.len());
+    let mut failures = Vec::new();
     for session in &sessions {
-        plans.push(plan_for_session(session, paths, config)?);
+        match plan_for_session(session, paths, config) {
+            Ok(plan) => plans.push(plan),
+            Err(err) => {
+                failures.push(format!(
+                    "session {:?} (branch {:?}) has unsafe purge targets: {}; using row-only purge",
+                    sanitize::for_terminal(&session.id),
+                    sanitize::for_terminal(&session.branch_name),
+                    sanitize::for_terminal(&format!("{err:#}")),
+                ));
+                plans.push(PurgePlan {
+                    session_id: session.id.clone(),
+                    branch: session.branch_name.clone(),
+                    items: vec![PurgeItem::SqliteRow],
+                });
+            }
+        }
     }
-    Ok(plans)
+    Ok((plans, failures))
 }
 
 // ---------------------------------------------------------------------------
@@ -850,6 +875,36 @@ mod tests {
                 .map(|(n, p)| ((*n).to_string(), p.clone()))
                 .collect(),
             amq_root,
+        }
+    }
+
+    #[test]
+    fn containment_errors_escape_terminal_controls_in_every_path_bail() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root\u{1b}");
+        let outside = temp.path().join("outside\u{1b}");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+
+        let errors = [
+            resolve_for_containment(Path::new("relative\u{1b}"))
+                .expect_err("relative path must fail"),
+            resolve_for_containment(&temp.path().join("safe/../parent\u{1b}"))
+                .expect_err("parent traversal must fail"),
+            validate_delete_target(&root, &root, "test").expect_err("root target must fail"),
+            validate_delete_target(&root, &outside, "test").expect_err("outside target must fail"),
+        ];
+
+        for error in errors {
+            let message = error.to_string();
+            assert!(
+                !message.contains('\u{1b}'),
+                "unsanitized error: {message:?}"
+            );
+            assert!(
+                message.contains("\\x1b"),
+                "missing escaped control: {message:?}"
+            );
         }
     }
 
