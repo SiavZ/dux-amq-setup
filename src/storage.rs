@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, params};
 
 use crate::model::{AgentSession, SessionSettings, SessionState};
 
@@ -45,14 +45,13 @@ const MIGRATIONS: &[(u32, &str)] = &[
 /// current `PRAGMA user_version` and bump `user_version` after each.
 ///
 /// Idempotent: running this on an already-migrated database is a no-op
-/// because every migration's `version` is `<= user_version`. Migrations
-/// run in declaration order; SQLite executes each `execute_batch` inside
-/// an implicit transaction so a failure rolls back the partial DDL.
+/// because every migration's `version` is `<= user_version`. Each SQL batch
+/// and its `user_version` bump share one explicit transaction.
 ///
 /// The `PRAGMA user_version = {n}` write uses `format!` because the
 /// version number is a hardcoded `u32` literal from `MIGRATIONS`, never
 /// user input — bound parameters are not allowed in PRAGMA statements.
-fn run_migrations(conn: &Connection) -> Result<()> {
+fn run_migrations(conn: &mut Connection) -> Result<()> {
     let current: u32 = conn
         .query_row("PRAGMA user_version;", [], |r| r.get(0))
         .context("failed to read PRAGMA user_version")?;
@@ -60,10 +59,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         if *version <= current {
             continue;
         }
-        conn.execute_batch(sql)
-            .with_context(|| format!("migration {version} failed"))?;
-        conn.execute_batch(&format!("PRAGMA user_version = {version};"))
-            .with_context(|| format!("failed to set user_version = {version}"))?;
+        apply_migration(conn, *version, sql)?;
         crate::logger::info(&format!(
             "storage: applied migration {version} (user_version now {version})"
         ));
@@ -118,6 +114,18 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn apply_migration(conn: &mut Connection, version: u32, sql: &str) -> Result<()> {
+    let tx = conn
+        .transaction()
+        .with_context(|| format!("failed to begin migration {version}"))?;
+    tx.execute_batch(sql)
+        .with_context(|| format!("migration {version} failed"))?;
+    tx.pragma_update(None, "user_version", version)
+        .with_context(|| format!("failed to set user_version = {version}"))?;
+    tx.commit()
+        .with_context(|| format!("failed to commit migration {version}"))
+}
+
 /// A stored PR association loaded from the database.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredPr {
@@ -134,6 +142,7 @@ pub struct StoredPr {
 /// shared with background workers (e.g. the periodic backup worker added in
 /// audit02 P1-W). Internally every method locks the mutex before issuing a
 /// query; the lock window is short and uncontended in practice.
+#[derive(Clone)]
 pub struct SessionStore {
     conn: Arc<Mutex<Connection>>,
 }
@@ -145,13 +154,32 @@ impl SessionStore {
     /// On corruption, fails fast with an error message that points at the
     /// `.bak` file so the operator knows where to recover from.
     pub fn open(path: &Path) -> Result<Self> {
-        let conn =
+        let mut conn =
             open_connection(path).with_context(|| format!("failed to open {}", path.display()))?;
+        run_migrations(&mut conn)?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
-        store.migrate()?;
         Ok(store)
+    }
+
+    /// Open an existing sessions database without running PRAGMAs or schema
+    /// migrations. Intended for diagnostics that promise not to mutate state.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("failed to open {} read-only", path.display()))?;
+        let integrity: String = conn
+            .query_row("pragma integrity_check", [], |row| row.get(0))
+            .context("failed to run read-only integrity check")?;
+        if integrity != "ok" {
+            anyhow::bail!(
+                "sqlite integrity check failed for {}: {integrity}",
+                path.display()
+            );
+        }
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     /// Acquire the underlying connection lock. Panics if the mutex is
@@ -172,11 +200,6 @@ impl SessionStore {
         src.backup(rusqlite::MAIN_DB, dst, None)
             .with_context(|| format!("backup to {} failed", dst.display()))?;
         Ok(())
-    }
-
-    fn migrate(&self) -> Result<()> {
-        let conn = self.conn();
-        run_migrations(&conn)
     }
 
     /// Insert a PR association or update its state and title if it already exists.
@@ -521,6 +544,37 @@ fn test_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_migration_rolls_back_ddl_and_version_then_retries() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let err = apply_migration(
+            &mut conn,
+            7,
+            "create table partial(id integer); insert into missing values (1);",
+        )
+        .expect_err("injected failure");
+        assert!(err.to_string().contains("migration 7 failed"));
+        let partial_exists: i64 = conn
+            .query_row(
+                "select count(*) from sqlite_master where type='table' and name='partial'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let version: u32 = conn
+            .query_row("pragma user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(partial_exists, 0);
+        assert_eq!(version, 0);
+
+        apply_migration(&mut conn, 7, "create table partial(id integer);").unwrap();
+        let version: u32 = conn
+            .query_row("pragma user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 7);
+        conn.execute("insert into partial values (1)", []).unwrap();
+    }
     use chrono::Duration;
 
     #[test]

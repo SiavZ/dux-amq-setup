@@ -95,6 +95,11 @@ pub(crate) struct RuntimeState {
     /// status warning, keyed by receiver. Rate-limited so a queue full
     /// of messages for an unknown handle doesn't spam the status line.
     pub(crate) amq_inject_last_warned: HashMap<String, Instant>,
+    /// First tick on which a receiver's current pending run was observed.
+    pub(crate) amq_inject_first_pending_at: HashMap<String, Instant>,
+    /// Receivers already given their one timeout warning for the current
+    /// pending run. Cleared when that receiver queue empties.
+    pub(crate) amq_inject_timeout_warned: HashSet<String>,
     /// Last time we emitted a `debug`-level "drainer holding for X"
     /// trace event, keyed by receiver. Independent of
     /// `amq_inject_last_warned` because the warning fires on

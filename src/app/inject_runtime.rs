@@ -543,7 +543,7 @@ impl App {
             if actions_this_tick >= MAX_INJECT_ACTIONS_PER_TICK {
                 break;
             }
-            // Resolve target session. `_unrouted` falls back to the
+            // Resolve target session. `.unrouted` falls back to the
             // currently-selected session so messages from peers using
             // an older bridge (no AM_ME export) still land somewhere
             // visible.
@@ -737,6 +737,8 @@ impl App {
         {
             self.runtime.amq_inject_pending.remove(receiver);
             self.runtime.amq_inject_last_warned.remove(receiver);
+            self.runtime.amq_inject_first_pending_at.remove(receiver);
+            self.runtime.amq_inject_timeout_warned.remove(receiver);
         }
     }
 
@@ -1037,6 +1039,8 @@ impl App {
         {
             self.runtime.amq_inject_pending.remove(receiver);
             self.runtime.amq_inject_last_warned.remove(receiver);
+            self.runtime.amq_inject_first_pending_at.remove(receiver);
+            self.runtime.amq_inject_timeout_warned.remove(receiver);
             self.runtime.amq_inject_last_held_logged.remove(receiver);
         }
         true
@@ -1137,9 +1141,13 @@ impl App {
         if timeout.is_zero() {
             return;
         }
-        let last = self.runtime.amq_inject_last_warned.get(receiver).copied();
-        let due = last.is_some_and(|t| now.duration_since(t) >= timeout);
-        if due {
+        if timeout_warning_due(
+            &mut self.runtime.amq_inject_first_pending_at,
+            &mut self.runtime.amq_inject_timeout_warned,
+            receiver,
+            now,
+            timeout,
+        ) {
             self.runtime
                 .amq_inject_last_warned
                 .insert(receiver.to_string(), now);
@@ -1149,6 +1157,17 @@ impl App {
             ));
         }
     }
+}
+
+fn timeout_warning_due(
+    first_pending_at: &mut HashMap<String, Instant>,
+    warned: &mut HashSet<String>,
+    receiver: &str,
+    now: Instant,
+    timeout: Duration,
+) -> bool {
+    let first = *first_pending_at.entry(receiver.to_string()).or_insert(now);
+    now.duration_since(first) >= timeout && warned.insert(receiver.to_string())
 }
 
 /// audit03 Phase 5: apply the Worker-mode postscript to an AMQ wake
@@ -1236,9 +1255,16 @@ pub(crate) fn submit_key_bytes_for_provider(_provider: Option<&ProviderKind>) ->
 /// Returns `true` when the message must be held (skip this tick); `false`
 /// when the operator looks idle enough that delivery is safe.
 ///
+/// Windows at or beyond this bound mean "always deliver, never skip" — the
+/// documented `u64::MAX` escape hatch, generalized to any implausibly long
+/// value so it doesn't hinge on an exact sentinel.
+const ALWAYS_DELIVER_QUIET_WINDOW: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
+
 /// Rules:
 /// - `quiet == 0` is the legacy "always skip while interactive" mode and
 ///   short-circuits to `true` regardless of keystroke history.
+/// - A window at or beyond a decade (`ALWAYS_DELIVER_QUIET_WINDOW`) is the
+///   documented "always deliver" escape hatch and short-circuits to `false`.
 /// - Otherwise, hold iff the last recorded user keystroke is within the
 ///   quiet window. With no recorded keystroke, the operator is treated as
 ///   idle and the message flows.
@@ -1249,6 +1275,13 @@ pub(crate) fn should_hold_for_quiet_window(
 ) -> bool {
     if quiet.is_zero() {
         return true;
+    }
+    // The config documents "a very large value (e.g. u64::MAX)" as the
+    // escape hatch for "always deliver, never skip". Match any window at or
+    // beyond a decade so a large-but-not-exactly-MAX value (u64::MAX/2,
+    // 1e18, …) behaves as documented instead of holding effectively forever.
+    if quiet >= ALWAYS_DELIVER_QUIET_WINDOW {
+        return false;
     }
     last_keystroke.is_some_and(|t| now.duration_since(t) < quiet)
 }
@@ -1271,13 +1304,42 @@ fn should_hold_for_post_delivery_cooldown(
 #[cfg(test)]
 mod tests {
     use super::{
-        AmqDeliveryPhase, apply_inject_postscript, effective_enter_phase_delay,
-        inject_body_bytes_for_provider, match_receiver, sanitise_handle,
-        should_hold_for_post_delivery_cooldown, should_hold_for_quiet_window,
-        submit_key_bytes_for_provider,
+        ALWAYS_DELIVER_QUIET_WINDOW, AmqDeliveryPhase, apply_inject_postscript,
+        effective_enter_phase_delay, inject_body_bytes_for_provider, match_receiver,
+        sanitise_handle, should_hold_for_post_delivery_cooldown, should_hold_for_quiet_window,
+        submit_key_bytes_for_provider, timeout_warning_due,
     };
     use crate::model::{ContextMode, ProviderKind};
+    use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn fresh_pending_receiver_warns_once_after_timeout() {
+        let start = Instant::now();
+        let mut first = HashMap::new();
+        let mut warned = HashSet::new();
+        assert!(!timeout_warning_due(
+            &mut first,
+            &mut warned,
+            "busy-no-pty",
+            start,
+            Duration::from_secs(30),
+        ));
+        assert!(timeout_warning_due(
+            &mut first,
+            &mut warned,
+            "busy-no-pty",
+            start + Duration::from_secs(30),
+            Duration::from_secs(30),
+        ));
+        assert!(!timeout_warning_due(
+            &mut first,
+            &mut warned,
+            "busy-no-pty",
+            start + Duration::from_secs(60),
+            Duration::from_secs(30),
+        ));
+    }
 
     #[test]
     fn codex_body_uses_bracketed_paste() {
@@ -1361,9 +1423,9 @@ mod tests {
 
     #[test]
     fn sanitise_collapses_to_empty_for_pure_garbage() {
-        // Mirrors the bridge's `_unrouted` fallback path: when sanitise
+        // Mirrors the bridge's `.unrouted` fallback path: when sanitise
         // returns empty, the wrapper writes nothing and the bridge
-        // routes to `_unrouted/`.
+        // routes to `.unrouted/`.
         assert_eq!(sanitise_handle("..."), "");
         assert_eq!(sanitise_handle("///"), "");
     }
@@ -1532,6 +1594,32 @@ mod tests {
         assert!(should_hold_for_quiet_window(Some(now), now, quiet));
         let stale = now - Duration::from_secs(10_000);
         assert!(should_hold_for_quiet_window(Some(stale), now, quiet));
+    }
+
+    #[test]
+    fn quiet_window_max_always_delivers() {
+        let now = Instant::now();
+        let quiet = Duration::from_secs(u64::MAX);
+        assert!(!should_hold_for_quiet_window(None, now, quiet));
+        assert!(!should_hold_for_quiet_window(Some(now), now, quiet));
+    }
+
+    /// A large-but-not-`u64::MAX` window must also mean "always deliver",
+    /// not hold effectively forever (audit03 P1-19 review N2).
+    #[test]
+    fn quiet_window_large_finite_value_always_delivers() {
+        let now = Instant::now();
+        // Half of u64::MAX seconds and a plain "100 years" both exceed the
+        // decade escape-hatch threshold.
+        for quiet in [
+            Duration::from_secs(u64::MAX / 2),
+            Duration::from_secs(100 * 365 * 24 * 60 * 60),
+        ] {
+            assert!(!should_hold_for_quiet_window(Some(now), now, quiet));
+        }
+        // Just below the threshold still holds a fresh keystroke.
+        let below = ALWAYS_DELIVER_QUIET_WINDOW - Duration::from_secs(1);
+        assert!(should_hold_for_quiet_window(Some(now), now, below));
     }
 
     /// Boundary: a keystroke exactly at the quiet-window edge counts
