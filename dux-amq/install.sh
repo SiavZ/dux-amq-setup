@@ -405,14 +405,16 @@ install -m 0755 "$HERE/scripts/dux-amq-inject-bridge" "$LOCAL_BIN/dux-amq-inject
 "$HERE/scripts/amq-secret-init.sh"
 
 # 6. dux config --------------------------------------------------------------
-DUX_HOME="$STATE_ROOT/dux" dux config regenerate --yes >/dev/null
+if [[ ! -e "$STATE_ROOT/dux/config.toml" && ! -L "$STATE_ROOT/dux/config.toml" ]]; then
+  DUX_HOME="$STATE_ROOT/dux" dux config regenerate --yes >/dev/null
+fi
 say "patching $STATE_ROOT/dux/config.toml"
 sed -i \
-  -e 's|^prompt_for_name = false$|prompt_for_name = true|' \
-  -e 's|^command = "claude"$|command = "claude-amq"|' \
-  -e 's|^command = "codex"$|command = "codex-amq"|' \
-  -e 's|^command = "gemini"$|command = "gemini-amq"|' \
-  -e 's|^resume_args = \["--continue"\]$|resume_args = ["--continue", "--fork-session"]|' \
+  -e '1,/^\[/ s|^prompt_for_name = false$|prompt_for_name = true|' \
+  -e '/^\[providers\.claude\]$/,/^\[/ s|^command = "claude"$|command = "claude-amq"|' \
+  -e '/^\[providers\.codex\]$/,/^\[/ s|^command = "codex"$|command = "codex-amq"|' \
+  -e '/^\[providers\.gemini\]$/,/^\[/ s|^command = "gemini"$|command = "gemini-amq"|' \
+  -e '/^\[providers\.claude\]$/,/^\[/ s|^resume_args = \["--continue"\]$|resume_args = ["--continue", "--fork-session"]|' \
   -e '/^\[providers\.claude\]$/,/^\[/ s|^forward_scroll = false$|forward_scroll = true|' \
   -e '/^\[providers\.codex\]$/,/^\[/ s|^forward_scroll = false$|forward_scroll = true|' \
   -e '/^\[providers\.gemini\]$/,/^\[/ s|^forward_scroll = false$|forward_scroll = true|' \
