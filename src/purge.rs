@@ -52,6 +52,7 @@
 //! which handles cross-fs deletion natively; we never `rename`-then-
 //! delete (which would fail across mount points).
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -253,7 +254,11 @@ pub fn plan_for_session(
     let mut items = Vec::new();
 
     // 1. Worktree
-    let worktree = PathBuf::from(&session.worktree_path);
+    let worktree = validate_delete_target(
+        &paths.worktrees_root,
+        Path::new(&session.worktree_path),
+        "worktree",
+    )?;
     items.push(PurgeItem::Worktree(worktree));
 
     // 2. Provider dirs — encoded from the worktree's absolute path.
@@ -267,7 +272,12 @@ pub fn plan_for_session(
     })?;
     for (provider_name, root) in &config.provider_data_dirs {
         let provider_static: &'static str = static_provider_name(provider_name);
-        let path = root.join("projects").join(&encoded);
+        let provider_projects = root.join("projects");
+        let path = validate_delete_target(
+            &provider_projects,
+            &provider_projects.join(&encoded),
+            "provider history",
+        )?;
         items.push(PurgeItem::ProviderDir {
             provider: provider_static,
             path,
@@ -277,9 +287,20 @@ pub fn plan_for_session(
     // 3. AMQ inbox. Branch may be empty for malformed rows; skip in
     //    that case by emitting a Worktree-only plan.
     if !session.branch_name.is_empty() {
-        items.push(PurgeItem::AmqInbox(
-            config.amq_root.join("agents").join(&session.branch_name),
-        ));
+        let branch = Path::new(&session.branch_name);
+        if branch.is_absolute()
+            || branch
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            bail!(
+                "refusing unsafe AMQ branch path {:?}",
+                sanitize::for_terminal(&session.branch_name)
+            );
+        }
+        let agents_root = config.amq_root.join("agents");
+        let inbox = validate_delete_target(&agents_root, &agents_root.join(branch), "AMQ inbox")?;
+        items.push(PurgeItem::AmqInbox(inbox));
     }
 
     // 4. Log redact (Phase 09 dep). `since` is informational — the
@@ -293,12 +314,76 @@ pub fn plan_for_session(
     // 5. Sqlite row LAST.
     items.push(PurgeItem::SqliteRow);
 
-    let _ = paths; // reserved for future per-path scoping (logs override etc).
     Ok(PurgePlan {
         session_id: session.id.clone(),
         branch: session.branch_name.clone(),
         items,
     })
+}
+
+/// Resolve an existing path through symlinks, or resolve its deepest existing
+/// ancestor and append the missing suffix. This lets purge validate idempotent
+/// (already-missing) targets without weakening containment.
+fn resolve_for_containment(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("purge path must be absolute: {}", path.display());
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!("purge path contains parent traversal: {}", path.display());
+    }
+
+    let mut ancestor = path;
+    let mut missing = Vec::<OsString>::new();
+    loop {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) => break,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let name = ancestor
+                    .file_name()
+                    .ok_or_else(|| anyhow!("could not resolve purge path {}", path.display()))?;
+                missing.push(name.to_os_string());
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| anyhow!("could not resolve purge path {}", path.display()))?;
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to inspect purge path {}", path.display()));
+            }
+        }
+    }
+
+    let mut resolved = ancestor
+        .canonicalize()
+        .with_context(|| format!("failed to resolve purge path {}", path.display()))?;
+    for component in missing.iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
+fn validate_delete_target(root: &Path, target: &Path, category: &str) -> Result<PathBuf> {
+    let root = resolve_for_containment(root)
+        .with_context(|| format!("failed to resolve {category} root {}", root.display()))?;
+    let target = resolve_for_containment(target)
+        .with_context(|| format!("failed to resolve {category} target {}", target.display()))?;
+    if target == root {
+        bail!(
+            "refusing to purge {category} root itself: {}",
+            target.display()
+        );
+    }
+    if !target.starts_with(&root) {
+        bail!(
+            "refusing {category} target outside {}: {}",
+            root.display(),
+            target.display()
+        );
+    }
+    Ok(target)
 }
 
 /// Map the dynamic provider name (read from config) to a `&'static str`
@@ -338,9 +423,18 @@ pub fn execute(
         "purge cascade starting",
     );
 
-    let mut entries = Vec::with_capacity(plan.items.len());
+    let mut entries: Vec<(PurgeItem, PurgeOutcome)> = Vec::with_capacity(plan.items.len());
     for item in &plan.items {
-        let outcome = execute_item(item, storage, paths, &plan.session_id, dry_run);
+        let prior_step_failed = entries
+            .iter()
+            .any(|(_, outcome)| matches!(outcome, PurgeOutcome::Error(_)));
+        let outcome = if matches!(item, PurgeItem::SqliteRow) && prior_step_failed {
+            PurgeOutcome::Skipped(
+                "prior purge step failed; session row retained for retry".to_string(),
+            )
+        } else {
+            execute_item(item, storage, paths, &plan.session_id, dry_run)
+        };
         match &outcome {
             PurgeOutcome::Error(why) => {
                 tracing::error!(
@@ -400,8 +494,14 @@ fn execute_remove_dir(path: &Path, dry_run: bool) -> PurgeOutcome {
     if dry_run {
         return PurgeOutcome::DryRun;
     }
-    if !path.exists() {
-        return PurgeOutcome::Skipped(format!("{} does not exist", path.display()));
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return PurgeOutcome::Skipped(format!("{} does not exist", path.display()));
+        }
+        Err(err) => {
+            return PurgeOutcome::Error(format!("inspect {}: {err}", path.display()));
+        }
     }
     match fs::remove_dir_all(path) {
         Ok(()) => PurgeOutcome::Done,
@@ -432,11 +532,17 @@ fn execute_delete_row(storage: &SessionStore, session_id: &str, dry_run: bool) -
 /// Returns `Done` even when no records match — the audit trail is the
 /// fact that the rewrite ran, not the count of redacted lines.
 fn execute_redact_logs(paths: &DuxPaths, session_id: &str, dry_run: bool) -> PurgeOutcome {
-    let log_root = match paths.root.exists() {
-        true => paths.root.clone(),
-        false => {
+    let log_root = match fs::metadata(&paths.root) {
+        Ok(_) => paths.root.clone(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return PurgeOutcome::Skipped(format!(
                 "log root {} does not exist",
+                paths.root.display()
+            ));
+        }
+        Err(err) => {
+            return PurgeOutcome::Error(format!(
+                "inspect log root {}: {err}",
                 paths.root.display()
             ));
         }

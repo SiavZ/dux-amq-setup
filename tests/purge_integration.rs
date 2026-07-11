@@ -21,6 +21,7 @@
 
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -210,6 +211,47 @@ fn count_redacted_records(log_text: &str) -> usize {
                 .unwrap_or(false)
         })
         .count()
+}
+
+fn assert_failure_retains_row_and_retry_succeeds(
+    h: &PurgeHarness,
+    item: PurgeItem,
+    execution_paths: &DuxPaths,
+    category: &str,
+) {
+    let failed_plan = dux::purge::PurgePlan {
+        session_id: h.session.id.clone(),
+        branch: h.session.branch_name.clone(),
+        items: vec![item, PurgeItem::SqliteRow],
+    };
+    let failed = execute(&failed_plan, &h.storage, execution_paths, false).expect("execute");
+    assert!(failed.had_errors(), "{category} fault did not fail");
+    assert!(matches!(
+        failed.entries.last(),
+        Some((PurgeItem::SqliteRow, PurgeOutcome::Skipped(reason)))
+            if reason.contains("retained for retry")
+    ));
+    assert_eq!(
+        h.storage.load_sessions().expect("load after failure").len(),
+        1,
+        "{category} failure deleted the durable session identity"
+    );
+
+    let retry = build_plan(&h.storage, &h.paths, &h.config, &h.session.id)
+        .expect("retained row must remain resolvable");
+    let retried = execute(&retry, &h.storage, &h.paths, false).expect("retry execute");
+    assert!(
+        !retried.had_errors(),
+        "{category} retry: {}",
+        retried.summary()
+    );
+    assert!(
+        h.storage
+            .load_sessions()
+            .expect("load after retry")
+            .is_empty(),
+        "{category} retry did not delete the completed session row"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -431,4 +473,126 @@ fn purge_target_resolvable_by_branch_name() {
     assert_eq!(plan.session_id, h.session.id);
     assert_eq!(plan.branch, "audit02-x");
     let _keep = h.tmp;
+}
+
+#[test]
+fn purge_retains_row_after_each_recursive_category_failure_and_retries() {
+    for category in ["worktree", "provider", "amq"] {
+        let h = PurgeHarness::new();
+        let fault = h.tmp.path().join(format!("{category}-fault"));
+        fs::write(&fault, b"not a directory").unwrap();
+        let item = match category {
+            "worktree" => PurgeItem::Worktree(fault),
+            "provider" => PurgeItem::ProviderDir {
+                provider: "claude",
+                path: fault,
+            },
+            "amq" => PurgeItem::AmqInbox(fault),
+            _ => unreachable!(),
+        };
+
+        assert_failure_retains_row_and_retry_succeeds(&h, item, &h.paths, category);
+    }
+}
+
+#[test]
+fn purge_retains_row_after_log_failure_and_retries() {
+    let h = PurgeHarness::new();
+    let log_root_fault = h.tmp.path().join("log-root-fault");
+    fs::write(&log_root_fault, b"not a directory").unwrap();
+    let mut faulty_paths = h.paths.clone();
+    faulty_paths.root = log_root_fault;
+
+    assert_failure_retains_row_and_retry_succeeds(
+        &h,
+        PurgeItem::LogScopedRedact {
+            since: h.session.created_at,
+        },
+        &faulty_paths,
+        "log",
+    );
+}
+
+#[test]
+fn purge_rejects_root_parent_and_symlink_worktree_targets() {
+    let h = PurgeHarness::new();
+
+    for unsafe_path in [
+        PathBuf::from("/"),
+        h.paths.worktrees_root.clone(),
+        h.paths.worktrees_root.join("safe/../../outside"),
+    ] {
+        let mut session = h.session.clone();
+        session.worktree_path = unsafe_path.to_string_lossy().into_owned();
+        assert!(
+            plan_for_session(&session, &h.paths, &h.config).is_err(),
+            "accepted unsafe worktree {}",
+            unsafe_path.display()
+        );
+    }
+
+    let outside = h.tmp.path().join("outside-worktrees");
+    fs::create_dir(&outside).unwrap();
+    let escape = h.paths.worktrees_root.join("escape");
+    symlink(&outside, &escape).unwrap();
+    let mut session = h.session.clone();
+    session.worktree_path = escape.to_string_lossy().into_owned();
+    assert!(plan_for_session(&session, &h.paths, &h.config).is_err());
+}
+
+#[test]
+fn purge_rejects_absolute_and_traversing_amq_branches() {
+    let h = PurgeHarness::new();
+    for branch in ["/tmp/audit03-outside", "../../audit03-outside", "."] {
+        let mut session = h.session.clone();
+        session.branch_name = branch.to_string();
+        assert!(
+            plan_for_session(&session, &h.paths, &h.config).is_err(),
+            "accepted unsafe AMQ branch {branch:?}"
+        );
+    }
+}
+
+#[test]
+fn purge_rejects_provider_and_amq_symlink_escapes() {
+    let provider = PurgeHarness::new();
+    let outside_provider = provider.tmp.path().join("outside-provider");
+    fs::create_dir(&outside_provider).unwrap();
+    fs::remove_dir_all(&provider.claude_dir).unwrap();
+    symlink(&outside_provider, &provider.claude_dir).unwrap();
+    assert!(plan_for_session(&provider.session, &provider.paths, &provider.config).is_err());
+
+    let amq = PurgeHarness::new();
+    let outside_amq = amq.tmp.path().join("outside-amq");
+    fs::create_dir(&outside_amq).unwrap();
+    fs::remove_dir_all(&amq.amq_inbox).unwrap();
+    symlink(&outside_amq, &amq.amq_inbox).unwrap();
+    assert!(plan_for_session(&amq.session, &amq.paths, &amq.config).is_err());
+}
+
+#[test]
+fn purge_allows_missing_descendants_and_reports_validated_paths() {
+    let h = PurgeHarness::new();
+    let mut session = h.session.clone();
+    let missing_worktree = h.paths.worktrees_root.join("missing/session");
+    session.worktree_path = missing_worktree.to_string_lossy().into_owned();
+    session.branch_name = "missing/session".to_string();
+
+    let plan = plan_for_session(&session, &h.paths, &h.config).expect("missing descendants");
+    let planned_worktree = match &plan.items[0] {
+        PurgeItem::Worktree(path) => path,
+        other => panic!("unexpected first item: {other:?}"),
+    };
+    let expected = h
+        .paths
+        .worktrees_root
+        .canonicalize()
+        .unwrap()
+        .join("missing/session");
+    assert_eq!(planned_worktree, &expected);
+    assert!(
+        plan.items[0]
+            .describe()
+            .contains(&expected.display().to_string())
+    );
 }
