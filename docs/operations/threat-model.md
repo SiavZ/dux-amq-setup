@@ -14,14 +14,15 @@ updated whenever new attack surface is added.
 
 ---
 
-## T1 — Malicious repo executes via `--dangerously-skip-permissions`
+## T1 — Malicious repo executes through permission, sandbox, or hook-trust bypasses
 
 **Attack scenario.** An operator clones a third-party repository
 and opens a `dux` pane. The repo contains a `.claude/`
 configuration, a poisoned README, or a doc string that prompt-injects
 the running Claude session. Because the wrapper previously passed
 `--dangerously-skip-permissions` to `claude` and
-`--dangerously-bypass-approvals-and-sandbox` to `codex` by
+`--dangerously-bypass-approvals-and-sandbox` and
+`--dangerously-bypass-hook-trust` to `codex` by
 **default**, the injected payload runs arbitrary commands inside
 the operator's Linux account: exfiltrating `~/.claude/.credentials.json`,
 reading `~/.ssh/id_*`, or launching reverse shells. This is the
@@ -29,22 +30,22 @@ worst-case configuration for the entire 2025–2026 CVE class
 (CVE-2025-59536, CVE-2026-21852, CVE-2026-25723, CVE-2026-33068,
 CVE-2026-35020/35021/35022).
 
-**Mitigation in code.** Phase 01 inverts the default in
-`dux-amq/wrappers/claude-amq:83-85` and
-`dux-amq/wrappers/codex-amq:27`. The wrappers now ship without the
-dangerous flag; an operator who knowingly accepts the risk opts
-in via `CLAUDE_AMQ_YOLO=1` or `CODEX_AMQ_YOLO=1`.
+**Mitigation in code.** The wrappers ship without the permission or
+sandbox bypasses; an operator who knowingly accepts the risk opts in
+via `CLAUDE_AMQ_YOLO=1` or `CODEX_AMQ_YOLO=1`. Codex hook trust review
+is a separate control and remains enabled even in YOLO mode. Disabling
+that review requires the explicit `CODEX_AMQ_BYPASS_HOOK_TRUST=1`
+opt-in in `dux-amq/wrappers/codex-amq`.
 
-**Residual risk.** Operators who set the YOLO env var globally
-(e.g. in `~/.bashrc`) re-create the original posture. Likewise,
+**Residual risk.** Operators who set the YOLO or hook-trust-bypass env
+vars globally (e.g. in `~/.bashrc`) re-create the affected part of the
+original posture. Likewise,
 prompt injection that targets the upstream provider's own
 sandbox-bypass primitives is out of our control.
 
-**Detection.** `dux-amq doctor` prints the active wrapper flags;
-the line `claude flags: …` will show `--dangerously-skip-permissions`
-when YOLO is on. `dux.log` records every PTY spawn argv at INFO via
-the sanitized logger (Phase 03), so a post-mortem `grep skip-permissions
-dux.log` reveals when the dangerous flag was active.
+**Detection.** Each wrapper prints a warning when its dangerous opt-in
+is active. The Codex warning distinguishes sandbox bypass from hook
+trust review bypass so the operator can see which control was disabled.
 
 ---
 
@@ -253,7 +254,13 @@ potential PII survives the delete.
 the per-pane AMQ inbox `$STATE_ROOT/amq/<branch>/`, the sqlite
 session row, the worktree directory, and the `dux.log` lines tagged
 with `session_id=<id>`. The last item depends on Phase 09's
-migration to `tracing` for structured fields.
+migration to `tracing` for structured fields. Before confirmation,
+every recursive target is resolved through symlinks and must be a
+strict descendant of its configured category root; the root itself,
+absolute/traversing branch values, and escapes are rejected. The
+SQLite row is deleted only after every earlier step completes or is
+confirmed absent, so a handled cleanup failure leaves the identity
+available for a retry.
 
 **Residual risk.** Backups (sqlite `.bak`, OS-level snapshots,
 disk encryption snapshots) still contain the data and must be
