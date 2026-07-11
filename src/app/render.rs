@@ -4352,30 +4352,13 @@ impl App {
                 .render(label_area, frame.buffer_mut());
 
                 // Show the input with a cursor indicator.
-                let display = if input.cursor < input.text.len() {
-                    let (before, after) = input.text.split_at(input.cursor);
-                    let (cursor_char, rest) = after.split_at(1);
-                    Line::from(vec![
-                        Span::raw(format!(" {before}")),
-                        Span::styled(
-                            cursor_char.to_string(),
-                            Style::default()
-                                .fg(self.theme.input_cursor_fg)
-                                .bg(self.theme.input_cursor_bg),
-                        ),
-                        Span::raw(rest.to_string()),
-                    ])
-                } else {
-                    Line::from(vec![
-                        Span::raw(format!(" {}", &input.text)),
-                        Span::styled(
-                            " ",
-                            Style::default()
-                                .fg(self.theme.input_cursor_fg)
-                                .bg(self.theme.input_cursor_bg),
-                        ),
-                    ])
-                };
+                let display = render_single_line_cursor_input(
+                    " ",
+                    &input.text,
+                    input.cursor,
+                    self.theme.input_cursor_fg,
+                    self.theme.input_cursor_bg,
+                );
                 let input_block = Block::default()
                     .borders(Borders::ALL)
                     .border_set(border::ROUNDED)
@@ -4586,30 +4569,13 @@ impl App {
                     &mut cursor_y,
                 );
                 // Input field with cursor indicator.
-                let display = if input.cursor < input.text.len() {
-                    let (before, after) = input.text.split_at(input.cursor);
-                    let (cursor_char, rest) = after.split_at(1);
-                    Line::from(vec![
-                        Span::raw(format!(" {before}")),
-                        Span::styled(
-                            cursor_char.to_string(),
-                            Style::default()
-                                .fg(self.theme.input_cursor_fg)
-                                .bg(self.theme.input_cursor_bg),
-                        ),
-                        Span::raw(rest.to_string()),
-                    ])
-                } else {
-                    Line::from(vec![
-                        Span::raw(format!(" {}", &input.text)),
-                        Span::styled(
-                            " ",
-                            Style::default()
-                                .fg(self.theme.input_cursor_fg)
-                                .bg(self.theme.input_cursor_bg),
-                        ),
-                    ])
-                };
+                let display = render_single_line_cursor_input(
+                    " ",
+                    &input.text,
+                    input.cursor,
+                    self.theme.input_cursor_fg,
+                    self.theme.input_cursor_bg,
+                );
                 let input_block = Block::default()
                     .borders(Borders::ALL)
                     .border_set(border::ROUNDED)
@@ -5671,14 +5637,9 @@ impl App {
                             Span::styled(" — ", Style::default().fg(self.theme.input_label_fg)),
                         ];
                         let text_preview = text.replace('\n', "↵");
-                        // " " + name + " (label)" + " — "
-                        let prefix_len = 1 + name.len() + surface_label.len() + 3;
+                        let prefix_len = Line::from(format!(" {name}{surface_label} — ")).width();
                         let max_len = (list_area.width as usize).saturating_sub(prefix_len + 2);
-                        let truncated = if text_preview.len() > max_len {
-                            format!("{}…", &text_preview[..max_len.saturating_sub(1)])
-                        } else {
-                            text_preview
-                        };
+                        let truncated = truncate_status_text(&text_preview, max_len);
                         spans.push(Span::styled(
                             truncated,
                             Style::default().fg(self.theme.hint_desc_fg),
@@ -6861,17 +6822,29 @@ fn set_cell(buf: &mut ratatui::buffer::Buffer, x: u16, y: u16, symbol: &str, sty
     buf[(x, y)].set_symbol(symbol).set_style(style);
 }
 
-/// Truncate `text` to at most `available` **characters**, appending `…` when
-/// trimmed. Using char-based counting avoids panics when the text contains
-/// multi-byte UTF-8 (e.g. box-drawing or block characters).
+/// Truncate `text` to at most `available` terminal columns, appending `…` when
+/// trimmed without slicing through a UTF-8 code point.
 fn truncate_status_text(text: &str, available: usize) -> String {
-    if text.chars().count() > available && available > 1 {
-        let mut truncated: String = text.chars().take(available - 1).collect();
-        truncated.push('…');
-        truncated
-    } else {
-        text.to_owned()
+    if Line::from(text).width() <= available {
+        return text.to_owned();
     }
+    if available == 0 {
+        return String::new();
+    }
+
+    let content_width = available - 1;
+    let mut truncated = String::new();
+    let mut width = 0;
+    for ch in text.chars() {
+        let ch_width = Line::from(ch.to_string()).width();
+        if width + ch_width > content_width {
+            break;
+        }
+        truncated.push(ch);
+        width += ch_width;
+    }
+    truncated.push('…');
+    truncated
 }
 
 #[cfg(test)]
@@ -6955,6 +6928,16 @@ mod tests {
         assert_eq!(line.spans[1].content.as_ref(), "ma");
         assert_eq!(line.spans[2].content.as_ref(), "c");
         assert_eq!(line.spans[3].content.as_ref(), "ro");
+    }
+
+    #[test]
+    fn render_single_line_cursor_input_preserves_multibyte_cursor_character() {
+        let line = render_single_line_cursor_input(" ", "a🙂界", 1, Color::White, Color::Black);
+
+        assert_eq!(line.spans[0].content.as_ref(), " ");
+        assert_eq!(line.spans[1].content.as_ref(), "a");
+        assert_eq!(line.spans[2].content.as_ref(), "🙂");
+        assert_eq!(line.spans[3].content.as_ref(), "界");
     }
 
     #[test]
@@ -7207,7 +7190,7 @@ mod tests {
         // Box-drawing char ─ is 3 bytes but 1 char.
         let text = "Copied: ─────end";
         let result = truncate_status_text(text, 10);
-        assert_eq!(result.chars().count(), 10);
+        assert_eq!(Line::from(result.clone()).width(), 10);
         assert!(result.ends_with('…'));
     }
 
@@ -7216,24 +7199,38 @@ mod tests {
         // Block characters like ██▛▘ are multi-byte; slicing by byte would panic.
         let text = "██▛▘ Opus 4.6 (1M context) · Claude Max";
         let result = truncate_status_text(text, 12);
-        assert_eq!(result.chars().count(), 12);
+        assert_eq!(Line::from(result.clone()).width(), 12);
         assert!(result.ends_with('…'));
     }
 
     #[test]
     fn truncate_status_text_available_zero() {
         // Edge case: zero available should not panic.
-        assert_eq!(truncate_status_text("hello", 0), "hello");
+        assert_eq!(truncate_status_text("hello", 0), "");
     }
 
     #[test]
     fn truncate_status_text_available_one() {
-        // With only 1 char available, no room for truncation marker.
-        assert_eq!(truncate_status_text("hello", 1), "hello");
+        assert_eq!(truncate_status_text("hello", 1), "…");
     }
 
     #[test]
     fn truncate_status_text_empty_input() {
         assert_eq!(truncate_status_text("", 10), "");
+    }
+
+    #[test]
+    fn truncate_status_text_handles_cjk_emoji_and_combining_boundaries() {
+        for (text, widths) in [
+            ("A界B", vec![(1, "…"), (2, "A…"), (3, "A…"), (4, "A界B")]),
+            ("🙂x", vec![(1, "…"), (2, "…"), (3, "🙂x")]),
+            ("e\u{301}x", vec![(1, "…"), (2, "e\u{301}x")]),
+        ] {
+            for (available, expected) in widths {
+                let rendered = truncate_status_text(text, available);
+                assert_eq!(rendered, expected);
+                assert!(Line::from(rendered).width() <= available);
+            }
+        }
     }
 }
