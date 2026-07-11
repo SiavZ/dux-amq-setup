@@ -1854,7 +1854,8 @@ pub struct KeyConflict {
 ///
 /// Mirrors the matching semantics of `RuntimeBindings::lookup()`:
 /// - Plain bindings (no modifiers) only conflict with other plain bindings.
-/// - Modifier bindings conflict only when modifiers are identical.
+/// - Any two modifier bindings on the same code conflict: an incoming event
+///   carrying the union of their modifiers matches both lookup predicates.
 fn keys_conflict(a: &KeyCombination, b: &KeyCombination) -> bool {
     let na = normalize_ctrl_punct(normalize_backtab(a.normalized()));
     let nb = normalize_ctrl_punct(normalize_backtab(b.normalized()));
@@ -1864,7 +1865,7 @@ fn keys_conflict(a: &KeyCombination, b: &KeyCombination) -> bool {
     match (na.modifiers.is_empty(), nb.modifiers.is_empty()) {
         (true, true) => true,
         (true, false) | (false, true) => false,
-        (false, false) => na.modifiers == nb.modifiers,
+        (false, false) => true,
     }
 }
 
@@ -2529,6 +2530,32 @@ mod tests {
         assert!(
             !bad,
             "plain 'd' and 'ctrl-d' should not conflict: {conflicts:?}"
+        );
+    }
+
+    #[test]
+    fn detect_conflicts_rejects_modifier_subset_shadowing() {
+        let mut keys = crate::config::KeysConfig::default();
+        keys.bindings
+            .insert("quit".to_string(), vec!["ctrl-x".to_string()]);
+        keys.bindings
+            .insert("toggle_help".to_string(), vec!["ctrl-alt-x".to_string()]);
+
+        let conflicts = detect_conflicts(&keys);
+        assert!(conflicts.iter().any(|conflict| {
+            (conflict.action_a == "quit" && conflict.action_b == "toggle_help")
+                || (conflict.action_a == "toggle_help" && conflict.action_b == "quit")
+        }));
+
+        let bindings = RuntimeBindings::from_keys_config(&keys);
+        let event = KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        assert_eq!(
+            bindings.lookup(&event, BindingScope::Global),
+            Some(Action::ToggleHelp),
+            "runtime lookup demonstrates why the subset must be rejected"
         );
     }
 

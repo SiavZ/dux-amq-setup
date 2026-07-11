@@ -30,7 +30,6 @@ struct StatusEntry {
     path: String,
 }
 
-const NULL_DEVICE: &str = "/dev/null";
 pub const PROJECT_WORKTREES_LINK_NAME: &str = "dux-worktrees";
 const PROJECT_WORKTREES_EXCLUDE_PATTERN: &str = "/dux-worktrees";
 
@@ -448,6 +447,7 @@ pub fn remove_worktree(
     repo_path: &Path,
     worktree_path: &Path,
     branch_name: &str,
+    delete_branch: bool,
 ) -> Result<RemoveResult> {
     // audit02 Phase 21 (P2-11) — `&Path` args, see `current_branch`.
     let output = Command::new("git")
@@ -470,6 +470,11 @@ pub fn remove_worktree(
             .args(["worktree", "prune"])
             .output();
     }
+    if !delete_branch {
+        return Ok(RemoveResult {
+            branch_already_deleted: false,
+        });
+    }
     // Best-effort branch deletion.
     let branch_output = Command::new("git")
         .arg("-C")
@@ -483,7 +488,7 @@ pub fn remove_worktree(
 
 pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<ChangedFile>)> {
     // audit02 Phase 21 (P2-11) — `&Path` args, see `current_branch`.
-    let output = Command::new("git")
+    let output = changed_files_git_command()
         .arg("-C")
         .arg(worktree_path)
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
@@ -535,7 +540,7 @@ pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<Chan
         }
     }
 
-    if let Ok(ns) = Command::new("git")
+    if let Ok(ns) = changed_files_git_command()
         .arg("-C")
         .arg(worktree_path)
         .args(["diff", "--numstat", "-z"])
@@ -555,26 +560,14 @@ pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<Chan
                     }
                 }
             } else if file.status == "?" {
-                match untracked_file_diff_stat(worktree_path, &file.path) {
-                    Some(DiffStat::Text(a, d)) => {
-                        file.additions = a;
-                        file.deletions = d;
-                    }
-                    Some(DiffStat::Binary) => {
-                        file.binary = true;
-                    }
-                    None => {
-                        let (additions, binary) =
-                            classify_untracked_file_fallback(&worktree_path.join(&file.path));
-                        file.additions = additions;
-                        file.binary = binary;
-                    }
-                }
+                let (additions, binary) = classify_untracked_file(&worktree_path.join(&file.path));
+                file.additions = additions;
+                file.binary = binary;
             }
         }
     }
 
-    if let Ok(ns) = Command::new("git")
+    if let Ok(ns) = changed_files_git_command()
         .arg("-C")
         .arg(worktree_path)
         .args(["diff", "--cached", "--numstat", "-z"])
@@ -600,31 +593,7 @@ pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<Chan
     Ok((staged, unstaged))
 }
 
-fn untracked_file_diff_stat(worktree_path: &Path, rel_path: &str) -> Option<DiffStat> {
-    // audit02 Phase 21 (P2-11) — `&Path` arg, see `current_branch`.
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(worktree_path)
-        .args([
-            "diff",
-            "--no-index",
-            "--numstat",
-            "-z",
-            "--",
-            NULL_DEVICE,
-            rel_path,
-        ])
-        .output()
-        .ok()?;
-
-    if !output.status.success() && output.status.code() != Some(1) {
-        return None;
-    }
-
-    parse_numstat(&output.stdout).into_values().next()
-}
-
-fn classify_untracked_file_fallback(path: &Path) -> (usize, bool) {
+fn classify_untracked_file(path: &Path) -> (usize, bool) {
     let Ok(bytes) = fs::read(path) else {
         return (0, false);
     };
@@ -635,6 +604,17 @@ fn classify_untracked_file_fallback(path: &Path) -> (usize, bool) {
         },
         _ => (0, true),
     }
+}
+
+fn changed_files_git_command() -> Command {
+    #[cfg(test)]
+    CHANGED_FILES_GIT_COMMANDS.with(|count| count.set(count.get() + 1));
+    Command::new("git")
+}
+
+#[cfg(test)]
+thread_local! {
+    static CHANGED_FILES_GIT_COMMANDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn parse_numstat(raw: &[u8]) -> HashMap<String, DiffStat> {
@@ -833,15 +813,47 @@ pub fn push(worktree_path: &Path) -> Result<String> {
 /// for new (untracked) files. Uses the plumbing command `cat-file` which is
 /// immune to user configuration.
 pub fn file_bytes_at_head(worktree_path: &Path, path: &str) -> Result<Option<Vec<u8>>> {
-    // audit02 Phase 21 (P2-11) — `&Path` arg, see `current_branch`.
+    let listing = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["ls-tree", "-z", "HEAD", "--", path])
+        .output()?;
+    if !listing.status.success() {
+        return Err(anyhow!(
+            "git ls-tree failed: {}",
+            crate::sanitize::utf8_lossy(&listing.stderr)
+        ));
+    }
+    if listing.stdout.is_empty() {
+        return Ok(None);
+    }
+    let record = listing
+        .stdout
+        .split(|byte| *byte == 0)
+        .next()
+        .unwrap_or_default();
+    let metadata = record
+        .split(|byte| *byte == b'\t')
+        .next()
+        .ok_or_else(|| anyhow!("git ls-tree returned malformed metadata"))?;
+    let metadata = std::str::from_utf8(metadata).context("git ls-tree metadata was not UTF-8")?;
+    let mut fields = metadata.split_ascii_whitespace();
+    let _mode = fields.next();
+    let object_type = fields.next();
+    let object_id = fields.next();
+    if object_type != Some("blob") || object_id.is_none() {
+        return Err(anyhow!("git ls-tree did not return a blob for {path:?}"));
+    }
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree_path)
-        .args(["cat-file", "-p", &format!("HEAD:{path}")])
+        .args(["cat-file", "blob", object_id.expect("checked above")])
         .output()?;
     if !output.status.success() {
-        // File doesn't exist at HEAD (new/untracked file).
-        return Ok(None);
+        return Err(anyhow!(
+            "git cat-file failed: {}",
+            crate::sanitize::utf8_lossy(&output.stderr)
+        ));
     }
     Ok(Some(output.stdout))
 }
@@ -1374,6 +1386,43 @@ mod tests {
         assert_eq!(branch, "same-name");
     }
 
+    // ── remove_worktree branch-ownership tests (audit03 P1-27 / B1) ──
+
+    #[test]
+    fn remove_worktree_preserves_branch_when_not_owned() {
+        // The attach-to-existing-branch cleanup path: on DB-upsert failure
+        // we must remove the worktree but NOT delete the user's pre-existing
+        // branch. Reverting the owns_branch threading would fail this.
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "preexisting");
+        assert!(branch_exists(repo.path(), "preexisting").is_some());
+
+        remove_worktree(repo.path(), &wt, "preexisting", false).unwrap();
+
+        assert!(!wt.exists(), "worktree should be removed");
+        assert!(
+            branch_exists(repo.path(), "preexisting").is_some(),
+            "unowned branch must survive cleanup"
+        );
+    }
+
+    #[test]
+    fn remove_worktree_deletes_branch_when_owned() {
+        // The freshly-created-branch path: cleanup should remove both the
+        // worktree and the branch this job created.
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "dux-created");
+        assert!(branch_exists(repo.path(), "dux-created").is_some());
+
+        remove_worktree(repo.path(), &wt, "dux-created", true).unwrap();
+
+        assert!(!wt.exists(), "worktree should be removed");
+        assert!(
+            branch_exists(repo.path(), "dux-created").is_none(),
+            "owned branch should be deleted"
+        );
+    }
+
     // ── branch_exists tests ────────────────────────────────────
 
     #[test]
@@ -1468,6 +1517,53 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn changed_files_git_process_count_is_bounded_with_untracked_growth() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "bounded-untracked-processes");
+
+        fs::write(wt.join("one.txt"), "one\n").unwrap();
+        CHANGED_FILES_GIT_COMMANDS.with(|count| count.set(0));
+        changed_files(&wt).unwrap();
+        let one_file_count = CHANGED_FILES_GIT_COMMANDS.with(std::cell::Cell::get);
+
+        for index in 0..100 {
+            fs::write(wt.join(format!("many-{index:03}.txt")), "line\n").unwrap();
+        }
+        CHANGED_FILES_GIT_COMMANDS.with(|count| count.set(0));
+        let (_, files) = changed_files(&wt).unwrap();
+        let many_file_count = CHANGED_FILES_GIT_COMMANDS.with(std::cell::Cell::get);
+
+        assert_eq!(files.len(), 101);
+        assert_eq!(one_file_count, 3);
+        assert_eq!(many_file_count, one_file_count);
+    }
+
+    #[test]
+    fn file_bytes_at_head_distinguishes_new_deleted_binary_and_git_errors() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "head-bytes-cases");
+        fs::write(wt.join("tracked.bin"), [0_u8, 1, 2, 255]).unwrap();
+        run_git(&wt, &["add", "tracked.bin"]);
+        run_git(&wt, &["commit", "-m", "binary"]);
+
+        assert_eq!(
+            file_bytes_at_head(&wt, "tracked.bin").unwrap(),
+            Some(vec![0, 1, 2, 255])
+        );
+        fs::remove_file(wt.join("tracked.bin")).unwrap();
+        assert_eq!(
+            file_bytes_at_head(&wt, "tracked.bin").unwrap(),
+            Some(vec![0, 1, 2, 255]),
+            "deleted working-tree files still have HEAD bytes"
+        );
+        fs::write(wt.join("new.txt"), "new").unwrap();
+        assert_eq!(file_bytes_at_head(&wt, "new.txt").unwrap(), None);
+
+        let non_repo = tempfile::tempdir().unwrap();
+        assert!(file_bytes_at_head(non_repo.path(), "anything").is_err());
     }
 
     #[test]

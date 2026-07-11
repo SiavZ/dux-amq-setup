@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use content_inspector::{ContentType, inspect};
 use ratatui::prelude::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -49,7 +49,11 @@ pub fn diff_file(
 ) -> Result<DiffOutput> {
     let old_bytes = crate::git::file_bytes_at_head(worktree_path, rel_path)?.unwrap_or_default();
     let abs_path = worktree_path.join(rel_path);
-    let new_bytes = std::fs::read(&abs_path).unwrap_or_default();
+    let new_bytes = match std::fs::read(&abs_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(err).with_context(|| format!("read {}", abs_path.display())),
+    };
 
     if old_bytes == new_bytes {
         return Ok(DiffOutput {
@@ -480,6 +484,42 @@ mod tests {
     use super::*;
     use std::process::Command;
     use tempfile::tempdir;
+
+    #[test]
+    fn diff_surfaces_worktree_read_errors_instead_of_rendering_deletion() {
+        let dir = tempdir().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "seed"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::fs::create_dir(dir.path().join("not-a-file")).unwrap();
+        let result = diff_file(
+            dir.path(),
+            "not-a-file",
+            &AppTheme::default_dark(),
+            &SyntaxCache::new(),
+            false,
+            4,
+        );
+        let err = result.err().expect("directory read must surface");
+        assert!(format!("{err:#}").contains("not-a-file"));
+    }
 
     #[test]
     fn binary_files_render_summary_instead_of_text_diff() {
