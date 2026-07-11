@@ -91,6 +91,38 @@ seed_worktree() {
   [[ "$output" == *"== Recent errors"* ]]
 }
 
+@test "binary integrity hashes the pinned binary behind the doctor timeout" {
+  local fake_bin="$TEST_HOME/bin"
+  local amq_bin="$STATE_ROOT/amq-bin/amq"
+  local timeout_log="$TEST_HOME/timeout.log"
+  mkdir -p "$fake_bin" "$(dirname "$amq_bin")" "$AMQ_GLOBAL_ROOT"
+  printf '#!/usr/bin/env bash\nprintf "amq fixture\\n"\n' >"$amq_bin"
+  chmod +x "$amq_bin"
+  printf 'audit03hash  %s\n' "$amq_bin" >"$AMQ_GLOBAL_ROOT/binary.sha256"
+
+  cat >"$fake_bin/timeout" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$DOCTOR_TIMEOUT_LOG"
+shift
+exec "$@"
+SH
+  cat >"$fake_bin/sha256sum" <<'SH'
+#!/usr/bin/env bash
+printf 'audit03hash  %s\n' "$1"
+SH
+  chmod +x "$fake_bin/timeout" "$fake_bin/sha256sum"
+
+  run env \
+    AMQ_BIN="$amq_bin" \
+    DOCTOR_TIMEOUT_LOG="$timeout_log" \
+    PATH="$fake_bin:$PATH" \
+    "$DOCTOR"
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"sha256 matches"* ]]
+  grep -F "5 sha256sum $amq_bin" "$timeout_log"
+}
+
 # ============================================================================
 # Test 2: --anonymize redacts $HOME, branch names, agent IDs.
 # ============================================================================
