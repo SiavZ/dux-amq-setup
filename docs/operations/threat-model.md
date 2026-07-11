@@ -260,7 +260,13 @@ strict descendant of its configured category root; the root itself,
 absolute/traversing branch values, and escapes are rejected. The
 SQLite row is deleted only after every earlier step completes or is
 confirmed absent, so a handled cleanup failure leaves the identity
-available for a retry.
+available for a retry. Bulk purge treats a row whose paths cannot be
+safely planned as a per-session failure instead of aborting the entire
+operation: it reports the validation error, continues every valid
+cascade, and deletes only the malformed SQLite identity. Because the
+unsafe filesystem targets are deliberately not touched, that row-only
+case exits non-zero and requires the operator to remove any residual
+data out-of-band from the reported locations.
 
 **Residual risk.** Backups (sqlite `.bak`, OS-level snapshots,
 disk encryption snapshots) still contain the data and must be
@@ -557,7 +563,11 @@ any agent-side filtering on AMQ message metadata.
 - Inflight files left behind by a crashed prior dux instance are
   reclaimed at startup (renamed back to `.msg`); bridge-format
   `mktemp .inflight.XXXXXX` files (no `.msg` suffix) are skipped
-  on purpose so a concurrent in-progress write isn't corrupted.
+  on purpose so a concurrent in-progress write isn't corrupted. If a
+  producer has recreated the original `.msg`, the stranded inflight is
+  moved to a unique `.expired/` quarantine name. Claims themselves use
+  a no-replace rename, so a quarantine failure cannot turn a later scan
+  into an overwrite of either body.
 
 The bridge runs `amq-receive-verify` (HMAC + freshness + replay)
 ahead of writing the queue file *only* when strict mode is opted
