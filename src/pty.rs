@@ -3,9 +3,9 @@ use std::ffi::OsStr;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -66,6 +66,7 @@ impl TerminalSnapshot {
 /// redraw anyway because pause is only active during scrollback sessions with
 /// TUI-style providers.
 const PAUSE_BUFFER_CAP: usize = 4 * 1024 * 1024;
+const READER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A PTY-based client that spawns a CLI tool in a pseudo-terminal and keeps a
 /// full terminal grid with scrollback using `alacritty_terminal`.
@@ -102,12 +103,11 @@ pub struct PtyClient {
     /// the terminal parser on resume. Bounded by `PAUSE_BUFFER_CAP`; oldest
     /// bytes are dropped on overflow.
     pending_bytes: Arc<Mutex<PendingIngest>>,
-    /// Join handle for the reader thread spawned in `PtyClient::spawn`.
-    /// Joined in `Drop for PtyClient` after the child is killed and the
-    /// master fd is closed, so the reader thread observes EOF and exits.
-    /// This prevents the thread (and its Arc clones / file descriptor
-    /// reference) from leaking past `PtyClient` destruction.
+    /// Join handle and completion signal for the reader thread spawned in
+    /// `PtyClient::spawn`. Shutdown joins only after completion is signalled;
+    /// a stuck reader is detached after a hard deadline.
     reader_handle: Option<JoinHandle<()>>,
+    reader_done: mpsc::Receiver<()>,
 }
 
 #[derive(Default)]
@@ -247,6 +247,7 @@ impl PtyClient {
         // diagnose if it ever sticks around) and stash the handle so `Drop`
         // can join it — otherwise the reader thread holds Arc clones and an
         // open fd past `PtyClient` destruction.
+        let (reader_done_tx, reader_done) = mpsc::channel();
         let reader_handle = thread::Builder::new()
             .name(format!(
                 "pty-reader[{}]",
@@ -267,6 +268,7 @@ impl PtyClient {
                     scroll_paused_ref,
                     pending_bytes_ref,
                 );
+                let _ = reader_done_tx.send(());
             })
             .context("failed to spawn PTY reader thread")?;
 
@@ -283,6 +285,7 @@ impl PtyClient {
             scroll_paused,
             pending_bytes,
             reader_handle: Some(reader_handle),
+            reader_done,
         })
     }
 
@@ -654,25 +657,41 @@ impl PtyClient {
 
 impl Drop for PtyClient {
     fn drop(&mut self) {
-        // Kill the child first so the reader sees EOF on its next read.
+        // portable-pty creates a new session whose process-group id is the
+        // spawned child's pid. Kill the whole group so background descendants
+        // cannot keep the slave end open after the direct child exits.
+        if let Some(pid) = self
+            .child
+            .process_id()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
         let _ = self.child.kill();
         // Touch `master` so dead-code analysis sees a use here too — its
         // presence is load-bearing for the `BorrowedFd` constructed in
         // `foreground_process_name`. See the field-level doc comment.
         let _ = &self.master;
-        // Join the reader thread to release its Arc clones and the cloned
-        // PTY reader fd. The reader exits when the master fd closes (EOF),
-        // which happens once `self.master` is dropped at the end of this
-        // Drop impl. We join here so any `JoinHandle` accounting (and the
-        // `Arc<...>` strong-count drops it owns) completes synchronously.
-        if let Some(handle) = self.reader_handle.take()
-            && let Err(panic) = handle.join()
-        {
-            tracing::warn!(
-                target: "dux::pty",
-                panic = ?panic,
-                "reader thread panicked during shutdown",
-            );
+        if let Some(handle) = self.reader_handle.take() {
+            match self.reader_done.recv_timeout(READER_SHUTDOWN_TIMEOUT) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if let Err(panic) = handle.join() {
+                        tracing::warn!(
+                            target: "dux::pty",
+                            panic = ?panic,
+                            "reader thread panicked during shutdown",
+                        );
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    tracing::warn!(
+                        target: "dux::pty",
+                        timeout_ms = READER_SHUTDOWN_TIMEOUT.as_millis(),
+                        "PTY reader did not stop before shutdown deadline; detaching thread",
+                    );
+                }
+            }
         }
     }
 }
@@ -1920,6 +1939,37 @@ mod tests {
         });
         rx.recv_timeout(std::time::Duration::from_secs(2))
             .expect("dropping PtyClient should not hang");
+    }
+
+    #[test]
+    fn dropping_pty_client_with_background_descendant_returns_promptly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = PtyClient::spawn(
+            "/bin/sh",
+            &[
+                "-c".to_string(),
+                "trap '' HUP; (trap '' HUP; sleep 30) & echo $! > descendant.pid; wait".to_string(),
+            ],
+            tmp.path(),
+            24,
+            80,
+            100,
+        )
+        .unwrap();
+        let pid_file = tmp.path().join("descendant.pid");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !pid_file.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(pid_file.exists(), "background descendant did not start");
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(client);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("background descendant must not make PtyClient::drop hang");
     }
 
     /// The resume path drains `pending_bytes` into `terminal.process`. Verify
