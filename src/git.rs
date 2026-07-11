@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::{Read, Write};
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -351,23 +352,58 @@ fn ensure_project_worktrees_link_ignored(repo_path: &Path) -> Result<()> {
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let existing = fs::read_to_string(&exclude_path).unwrap_or_default();
+    let (mut existing, permissions) = match fs::File::open(&exclude_path) {
+        Ok(mut file) => {
+            let permissions = file
+                .metadata()
+                .with_context(|| format!("failed to inspect {}", exclude_path.display()))?
+                .permissions();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .with_context(|| format!("failed to read {}", exclude_path.display()))?;
+            (bytes, Some(permissions))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (Vec::new(), None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", exclude_path.display()));
+        }
+    };
     if existing
-        .lines()
-        .any(|line| line.trim() == PROJECT_WORKTREES_EXCLUDE_PATTERN)
+        .split(|byte| *byte == b'\n')
+        .any(|line| line.trim_ascii() == PROJECT_WORKTREES_EXCLUDE_PATTERN.as_bytes())
     {
         return Ok(());
     }
 
-    let mut updated = existing;
-    if !updated.is_empty() && !updated.ends_with('\n') {
-        updated.push('\n');
+    if !existing.is_empty() && !existing.ends_with(b"\n") {
+        existing.push(b'\n');
     }
-    updated.push_str("# dux local agent worktree explorer link\n");
-    updated.push_str(PROJECT_WORKTREES_EXCLUDE_PATTERN);
-    updated.push('\n');
-    fs::write(&exclude_path, updated)
-        .with_context(|| format!("failed to update {}", exclude_path.display()))?;
+    existing.extend_from_slice(b"# dux local agent worktree explorer link\n");
+    existing.extend_from_slice(PROJECT_WORKTREES_EXCLUDE_PATTERN.as_bytes());
+    existing.push(b'\n');
+
+    let parent = exclude_path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent", exclude_path.display()))?;
+    let mut replacement = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to stage update for {}", exclude_path.display()))?;
+    if let Some(permissions) = permissions {
+        replacement
+            .as_file()
+            .set_permissions(permissions)
+            .with_context(|| format!("failed to preserve mode on {}", exclude_path.display()))?;
+    }
+    replacement
+        .write_all(&existing)
+        .with_context(|| format!("failed to stage update for {}", exclude_path.display()))?;
+    replacement
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("failed to sync update for {}", exclude_path.display()))?;
+    replacement
+        .persist(&exclude_path)
+        .map_err(|err| err.error)
+        .with_context(|| format!("failed to replace {}", exclude_path.display()))?;
     Ok(())
 }
 
@@ -1204,6 +1240,36 @@ mod tests {
         let metadata = fs::symlink_metadata(repo.path().join(PROJECT_WORKTREES_LINK_NAME)).unwrap();
         assert!(metadata.file_type().is_dir());
         assert!(!metadata.file_type().is_symlink());
+    }
+
+    #[test]
+    fn ensure_project_worktrees_link_preserves_non_utf8_exclude_bytes() {
+        let repo = init_test_repo();
+        let worktrees_root = repo.path().join("dux-state").join("worktrees");
+        let exclude = repo.path().join(".git").join("info").join("exclude");
+        let original = b"# user bytes\n\xff\xfe\n";
+        fs::write(&exclude, original).unwrap();
+
+        ensure_project_worktrees_link(repo.path(), &worktrees_root, "Demo-Project").unwrap();
+
+        let updated = fs::read(&exclude).unwrap();
+        assert!(updated.starts_with(original));
+        assert!(updated.ends_with(b"# dux local agent worktree explorer link\n/dux-worktrees\n"));
+    }
+
+    #[test]
+    fn ensure_project_worktrees_link_fails_closed_when_exclude_is_unreadable() {
+        let repo = init_test_repo();
+        let worktrees_root = repo.path().join("dux-state").join("worktrees");
+        let exclude = repo.path().join(".git").join("info").join("exclude");
+        fs::remove_file(&exclude).unwrap();
+        fs::create_dir(&exclude).unwrap();
+        fs::write(exclude.join("sentinel"), b"preserve me").unwrap();
+
+        let result = ensure_project_worktrees_link(repo.path(), &worktrees_root, "Demo-Project");
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(exclude.join("sentinel")).unwrap(), b"preserve me");
     }
 
     #[test]
