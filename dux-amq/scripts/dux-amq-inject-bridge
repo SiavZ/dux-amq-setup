@@ -28,11 +28,10 @@
 #      bridge a trust boundary (e.g. wake notifications proxied across
 #      hosts) — most users want skip mode.
 #
-#      Skip mode (default): if the envelope starts with `DUX1\t` we
-#      transparently extract the inner body without checking the MAC
-#      (so signed senders still work end-to-end); otherwise we use the
-#      argv as-is. Either way we deliver SOMETHING — that's the entire
-#      point of the change.
+#      Skip mode (default): DUX2 envelopes are decoded byte-for-byte
+#      without checking the MAC; legacy DUX1 envelopes remain readable.
+#      Other input is used as-is. Either way we deliver SOMETHING —
+#      that's the entire point of the change.
 #
 #      Strict mode (`DUX_AMQ_VERIFY=1`): the original behaviour. We
 #      call `amq-receive-verify` and drop on any failure (unsigned,
@@ -56,13 +55,12 @@
 #
 # Queue layout (receiver-keyed):
 #   $QUEUE_DIR/<receiver>/<ts>.msg     — addressed messages
-#   $QUEUE_DIR/_unrouted/<ts>.msg      — fallback when AM_ME is unset
+#   $QUEUE_DIR/.unrouted/<ts>.msg      — fallback when AM_ME is unset
 #                                         or sanitises to empty
 #
 # `<receiver>` is `$AM_ME` after the same sanitisation as the wrapper
-# (lowercase, [a-z0-9_-] only). The leading `_` on `_unrouted` makes it
-# disjoint from any sanitised branch name (which can never start with
-# `_` after the regex strips it). The dux drainer treats `_unrouted/`
+# (lowercase, [a-z0-9_-] only). The leading dot on `.unrouted` makes it
+# disjoint from every valid handle. The dux drainer treats `.unrouted/`
 # specially: it routes to the currently selected session with a status
 # warning instead of dropping.
 #
@@ -91,6 +89,17 @@ if [[ -z "$ENVELOPE" ]]; then
   exit 0
 fi
 
+# Resolve the expected receiver before verification so strict mode can bind
+# the authenticated recipient to the actual wake daemon identity.
+sanitised_receiver=""
+if [[ -n "${AM_ME:-}" ]]; then
+  sanitised_receiver=$(printf '%s' "$AM_ME" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed 's|[^a-z0-9_-]|-|g; s|^-\+||; s|-\+$||')
+fi
+RECEIVER="${sanitised_receiver:-.unrouted}"
+body_is_b64=0
+
 if [[ "$VERIFY_MODE" == "1" ]]; then
   # ---- Strict mode (opt-in) ----
   #
@@ -102,28 +111,27 @@ if [[ "$VERIFY_MODE" == "1" ]]; then
     printf '[inject-bridge] DUX_AMQ_VERIFY=1 but amq-receive-verify not on PATH; dropping\n' >&2
     exit 0
   fi
-  body=$(amq-receive-verify "$ENVELOPE" </dev/null 2>/dev/null) || body=""
-  if [[ -z "$body" ]]; then
-    # Verifier dropped the message; it logged the reason to its own
-    # stderr (which the wrapper redirects to wake-$ME.log).
+  body_b64=$(AMQ_EXPECTED_RECEIVER="$RECEIVER" \
+    amq-receive-verify --emit-base64 "$ENVELOPE" </dev/null) || body_b64=""
+  if [[ -z "$body_b64" ]]; then
     exit 0
   fi
+  body_is_b64=1
 else
   # ---- Skip mode (default) ----
   #
-  # Transparently unwrap a DUX1 envelope when present so signed
-  # senders (legacy `amq-send-signed` callers) keep working without
-  # the receiver agent seeing the raw `DUX1\talice\tbob\t...` text.
-  # Plain `amq send` bodies pass through as-is.
-  #
-  # Envelope shape (TAB-delimited, see `amq-send-signed`):
-  #   DUX1\t<sender>\t<recipient>\t<utc-iso>\t<nonce>\t<mac>\t<body>
-  #
-  # Inner body may itself contain TABs (see audit02 P0-K). We can't
-  # use `cut -f7-` reliably without GNU `cut`, so do the split in
-  # bash: skip exactly six TAB-separated header fields, return the
-  # rest. Keeps macOS portability without the verifier dependency.
-  if [[ "$ENVELOPE" == DUX1$'\t'* ]]; then
+  # DUX2 stores the body as base64, so tabs/newlines and trailing bytes
+  # survive the single argv envelope. Plain `amq send` bodies pass through
+  # as-is. The DUX1 arm below is compatibility for already queued messages.
+  if [[ "$ENVELOPE" == DUX2$'\t'* ]]; then
+    extra=""
+    IFS=$'\t' read -r magic _sender _recipient _ts _nonce body_b64 _mac extra <<<"$ENVELOPE"
+    if [[ "$magic" == "DUX2" && -n "$body_b64" && -z "$extra" ]]; then
+      body_is_b64=1
+    else
+      body="$ENVELOPE"
+    fi
+  elif [[ "$ENVELOPE" == DUX1$'\t'* ]]; then
     rest="${ENVELOPE#DUX1$'\t'}"
     # Skip 5 more fields: sender, recipient, ts, nonce, mac.
     for _ in 1 2 3 4 5; do
@@ -141,10 +149,9 @@ else
   fi
 fi
 
-# Strip the trailing newline emitted by `amq-receive-verify` (strict
-# mode) or any LF the upstream attached (skip mode). Bash parameter
-# expansion `${var%$'\n'}` removes exactly one trailing LF.
-send_body="${body%$'\n'}"
+if (( body_is_b64 == 0 )); then
+  send_body="$body"
+fi
 
 # `amq wake` sends an interrupt command before the human-readable
 # interrupt notice for urgent interrupt-labeled messages. Under dux the
@@ -152,21 +159,9 @@ send_body="${body%$'\n'}"
 # interrupt the agent; it only creates an invalid queue file that the
 # Rust drainer must reject. Drop that transport-only signal and let the
 # following interrupt notice carry the actionable prompt.
-if [[ "$send_body" == $'\003' ]]; then
+if (( body_is_b64 == 0 )) && [[ "$send_body" == $'\003' ]]; then
   exit 0
 fi
-
-# Resolve receiver from $AM_ME, applying the same sanitisation the
-# wrappers use to produce the AMQ handle. This keeps the queue path
-# disjoint from any directory traversal attempt: only [a-z0-9_-] can
-# survive, and we strip leading/trailing dashes.
-sanitised_receiver=""
-if [[ -n "${AM_ME:-}" ]]; then
-  sanitised_receiver=$(printf '%s' "$AM_ME" \
-    | tr '[:upper:]' '[:lower:]' \
-    | sed 's|[^a-z0-9_-]|-|g; s|^-\+||; s|-\+$||')
-fi
-RECEIVER="${sanitised_receiver:-_unrouted}"
 
 # Step 2a — under dux, always go to the queue.
 #
@@ -197,7 +192,8 @@ fi
 # output, then queue that output for the dux-side drainer to submit to
 # the agent. This keeps `inbox/new` from accumulating when an agent sees
 # a wake prompt but does not follow the "run amq drain" instruction.
-if (( under_dux == 1 )) && [[ -n "${AM_ROOT:-${AMQ_GLOBAL_ROOT:-}}" ]] && command -v amq >/dev/null 2>&1; then
+if (( under_dux == 1 )) && [[ "$VERIFY_MODE" != "1" ]] &&
+  [[ -n "${AM_ROOT:-${AMQ_GLOBAL_ROOT:-}}" ]] && command -v amq >/dev/null 2>&1; then
   ROOT="${AM_ROOT:-${AMQ_GLOBAL_ROOT:-/data/state/amq}}"
   drain_limit="${DUX_AMQ_DRAIN_LIMIT:-20}"
   if drain_out=$(amq drain --root "$ROOT" --me "$RECEIVER" --include-body --limit "$drain_limit" 2>&1); then
@@ -207,6 +203,7 @@ if (( under_dux == 1 )) && [[ -n "${AM_ROOT:-${AMQ_GLOBAL_ROOT:-}}" ]] && comman
       exit 0
     fi
     send_body="$drain_out"$'\n''Act on these AMQ messages now. Reply over AMQ when needed.'
+    body_is_b64=0
   else
     printf '[inject-bridge] amq drain failed for %s: %s\n' "$RECEIVER" "$drain_out" >&2
   fi
@@ -215,7 +212,9 @@ fi
 # The Rust drainer rejects unsafe control bytes. AMQ message bodies are
 # peer-authored, so strip transport/control bytes before queueing the
 # drain output; preserve TAB and LF because they are useful formatting.
-send_body=$(printf '%s' "$send_body" | LC_ALL=C tr -d '\000-\010\013\014\015\016-\037\177')
+if (( body_is_b64 == 0 )); then
+  send_body=$(printf '%s' "$send_body" | LC_ALL=C tr -d '\000-\010\013\014\015\016-\037\177')
+fi
 
 # Step 2b — outside dux, prefer tmux send-keys when available.
 #
@@ -223,6 +222,9 @@ send_body=$(printf '%s' "$send_body" | LC_ALL=C tr -d '\000-\010\013\014\015\016
 # `mywindow:0.1`); the default of empty means "current pane of current
 # window" — the same pane the wrapper is running in.
 if (( under_dux == 0 )) && [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
+  if (( body_is_b64 == 1 )); then
+    send_body=$(printf '%s' "$body_b64" | openssl base64 -d -A) || exit 0
+  fi
   TARGET="${DUX_TMUX_TARGET:-}"
   if [[ -n "$TARGET" ]]; then
     tmux send-keys -t "$TARGET" -- "$send_body" Enter
@@ -254,7 +256,14 @@ fi
 # pattern the dux drainer uses for its own in-flight reservation,
 # letting both sides agree on what to skip during scans.
 tmp=$(mktemp "$QUEUE_DIR/.inflight.XXXXXX") || exit 0
-printf '%s\n' "$send_body" >"$tmp"
+if (( body_is_b64 == 1 )); then
+  if ! printf '%s' "$body_b64" | openssl base64 -d -A >"$tmp"; then
+    rm -f "$tmp"
+    exit 0
+  fi
+else
+  printf '%s' "$send_body" >"$tmp"
+fi
 # Derive the final name from the temp's random suffix to stay unique.
 suffix="${tmp##*.inflight.}"
 target="$QUEUE_DIR/${ts}-${suffix}.msg"

@@ -20,6 +20,7 @@
 //! deliberately thin and pure-ish so it's easy to unit-test in
 //! isolation.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,7 +42,7 @@ const DEFAULT_QUEUE_REL: &str = ".local/share/dux-amq/inject-queue";
 /// or sanitises to empty. The drainer treats this directory specially:
 /// messages here are delivered to the currently-selected session with
 /// a status warning.
-pub const UNROUTED_RECEIVER: &str = "_unrouted";
+pub const UNROUTED_RECEIVER: &str = ".unrouted";
 
 /// Filename prefix marking an in-flight file. The bridge uses
 /// `.inflight.XXXXXX` for its own staging temp; the drainer uses
@@ -55,11 +56,9 @@ const INFLIGHT_PREFIX: &str = ".inflight.";
 pub struct QueuedMessage {
     /// The receiver name (subdirectory of the queue root). Already
     /// validated to match `[a-z0-9_-]+` or to be the literal
-    /// `_unrouted` sentinel.
+    /// `.unrouted` sentinel.
     pub receiver: String,
-    /// Body bytes as written by the bridge, with the bridge's single
-    /// trailing newline stripped. Multi-line bodies retain their
-    /// interior newlines.
+    /// Body text exactly as written by the bridge.
     pub body: String,
     /// Path to the in-flight file (i.e. the file *after* the
     /// `.inflight.` rename). The drainer must `unlink` this on
@@ -182,7 +181,7 @@ pub fn scan_queue_dir(queue_dir: &Path) -> Result<ScanOutcome> {
 /// Limited variant of [`scan_queue_dir`]. Used by the live TUI so a large
 /// AMQ backlog cannot make one scan claim/load an unbounded number of files.
 pub fn scan_queue_dir_limited(queue_dir: &Path, max_messages: usize) -> Result<ScanOutcome> {
-    let mut messages = Vec::new();
+    let mut by_receiver: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
     let mut rejections = Vec::new();
     let entries = match fs::read_dir(queue_dir) {
         Ok(it) => it,
@@ -219,9 +218,6 @@ pub fn scan_queue_dir_limited(queue_dir: &Path, max_messages: usize) -> Result<S
             Err(_) => continue,
         };
         for file_entry in inner.flatten() {
-            if messages.len() >= max_messages {
-                break;
-            }
             let file_name = file_entry.file_name();
             let Some(file_str) = file_name.to_str() else {
                 continue;
@@ -232,20 +228,44 @@ pub fn scan_queue_dir_limited(queue_dir: &Path, max_messages: usize) -> Result<S
             if !file_str.ends_with(".msg") {
                 continue;
             }
-            messages.push(PendingFile {
-                receiver: name_str.to_string(),
-                path: file_entry.path(),
-            });
+            by_receiver
+                .entry(name_str.to_string())
+                .or_default()
+                .push(file_entry.path());
         }
-        if messages.len() >= max_messages {
+    }
+
+    // Sort each receiver by arrival filename, then take one from each receiver
+    // in lexical receiver order. A deep first directory can no longer consume
+    // the global cap before another receiver gets a claim.
+    let mut queues: Vec<(String, VecDeque<PathBuf>)> = by_receiver
+        .into_iter()
+        .map(|(receiver, mut paths)| {
+            paths.sort();
+            (receiver, paths.into())
+        })
+        .collect();
+    let mut messages = Vec::with_capacity(
+        max_messages.min(queues.iter().map(|(_, paths)| paths.len()).sum::<usize>()),
+    );
+    while messages.len() < max_messages {
+        let mut progressed = false;
+        for (receiver, paths) in &mut queues {
+            if messages.len() == max_messages {
+                break;
+            }
+            if let Some(path) = paths.pop_front() {
+                messages.push(PendingFile {
+                    receiver: receiver.clone(),
+                    path,
+                });
+                progressed = true;
+            }
+        }
+        if !progressed {
             break;
         }
     }
-    // Stable order: by receiver, then filename. The bridge generates
-    // filenames from `+%s%N` so lexical order also matches arrival
-    // order. Without the sort, two scans of the same directory could
-    // deliver messages in different orders depending on FS behaviour.
-    messages.sort_by(|a, b| (&a.receiver, &a.path).cmp(&(&b.receiver, &b.path)));
     Ok(ScanOutcome {
         messages,
         rejections,
@@ -644,8 +664,7 @@ pub fn quarantine_rejected(inflight_path: &Path) -> Result<PathBuf> {
 
 /// Read and validate a queue file by path. Caller is expected to have
 /// already called [`claim`] so the path here is the `.inflight.` form.
-/// Returns the body with one trailing `\n` stripped (mirroring the
-/// bridge's `printf '%s\n'`). Rejects symlinks and oversized files.
+/// Returns the body exactly as stored. Rejects symlinks and oversized files.
 pub fn read_validated(inflight_path: &Path, max_bytes: u64) -> Result<String, InjectRejection> {
     let metadata = fs::symlink_metadata(inflight_path).map_err(|e| InjectRejection::Io {
         msg: format!("stat {}: {e}", inflight_path.display()),
@@ -663,9 +682,7 @@ pub fn read_validated(inflight_path: &Path, max_bytes: u64) -> Result<String, In
     let raw = fs::read_to_string(inflight_path).map_err(|e| InjectRejection::Io {
         msg: format!("read {}: {e}", inflight_path.display()),
     })?;
-    // The bridge writes `printf '%s\n'`. Strip exactly one trailing
-    // LF so multi-line bodies aren't extended.
-    let body = raw.strip_suffix('\n').unwrap_or(&raw).to_string();
+    let body = raw;
     if let Some(ch) = body
         .chars()
         .find(|&ch| ch.is_control() && ch != '\n' && ch != '\t')
@@ -798,6 +815,7 @@ mod tests {
         assert!(is_valid_receiver("alice"));
         assert!(is_valid_receiver("watch-rules-phase3"));
         assert!(is_valid_receiver("a1b2_c3"));
+        assert!(is_valid_receiver("_unrouted"));
         assert!(is_valid_receiver(UNROUTED_RECEIVER));
     }
 
@@ -868,6 +886,26 @@ mod tests {
     }
 
     #[test]
+    fn scan_cap_is_oldest_first_and_fair_across_receivers() {
+        let dir = tempdir().unwrap();
+        let alice = dir.path().join("alice");
+        let bob = dir.path().join("bob");
+        fs::create_dir_all(&alice).unwrap();
+        fs::create_dir_all(&bob).unwrap();
+        for name in ["003.msg", "001.msg", "002.msg"] {
+            fs::write(alice.join(name), name).unwrap();
+        }
+        fs::write(bob.join("000.msg"), "bob").unwrap();
+
+        let outcome = scan_queue_dir_limited(dir.path(), 2).unwrap();
+        assert_eq!(outcome.messages.len(), 2);
+        assert_eq!(outcome.messages[0].receiver, "alice");
+        assert_eq!(outcome.messages[0].path.file_name().unwrap(), "001.msg");
+        assert_eq!(outcome.messages[1].receiver, "bob");
+        assert_eq!(outcome.messages[1].path.file_name().unwrap(), "000.msg");
+    }
+
+    #[test]
     fn scan_queue_dir_rejects_bad_receiver_dirs() {
         let dir = tempdir().unwrap();
         let queue = dir.path().to_path_buf();
@@ -885,13 +923,13 @@ mod tests {
     }
 
     #[test]
-    fn read_validated_strips_single_trailing_newline() {
+    fn read_validated_preserves_single_trailing_newline() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("msg.msg");
         fs::write(&path, b"hello world\n").unwrap();
         assert_eq!(
             read_validated(&path, 1024).unwrap(),
-            "hello world".to_string()
+            "hello world\n".to_string()
         );
     }
 
@@ -902,7 +940,7 @@ mod tests {
         fs::write(&path, b"line one\nline two\nline three\n").unwrap();
         assert_eq!(
             read_validated(&path, 1024).unwrap(),
-            "line one\nline two\nline three".to_string()
+            "line one\nline two\nline three\n".to_string()
         );
     }
 
@@ -925,7 +963,7 @@ mod tests {
         fs::write(&path, b"line\tone\nline two\n").unwrap();
         assert_eq!(
             read_validated(&path, 1024).unwrap(),
-            "line\tone\nline two".to_string()
+            "line\tone\nline two\n".to_string()
         );
     }
 

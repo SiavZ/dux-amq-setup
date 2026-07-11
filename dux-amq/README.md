@@ -151,7 +151,7 @@ Each step is described in the subsections below.
 
 ### Bridge: verify mode
 
-1. **Skip mode (default)** — transparently unwraps a `DUX1\t...` envelope when present (so legacy `amq-send-signed` callers still interop) and treats plain `amq send` bodies as raw. No HMAC check. Per the trust model in [SECURITY.md](../SECURITY.md), same-UID peers share `$HOME` and can read the HMAC secret directly, so verification doesn't add a defensible boundary against peers — insisting on it just silently dropped every legacy unsigned message in production.
+1. **Skip mode (default)** — byte-safely decodes a `DUX2\t...` envelope when present (and retains DUX1 compatibility for already queued messages), while treating plain `amq send` bodies as raw. No HMAC check. Per the trust model in [SECURITY.md](../SECURITY.md), same-UID peers share `$HOME` and can read the HMAC secret directly, so verification doesn't add a defensible boundary against peers — insisting on it just silently dropped every legacy unsigned message in production.
 2. **Strict mode (opt-in)** — set `[amq.inject].verify_envelope = true` in dux's `config.toml`. dux exports `DUX_AMQ_VERIFY=1` to spawned PTYs at bootstrap; the bridge calls `amq-receive-verify`; unsigned, replayed, stale, or MAC-mismatched envelopes are dropped silently. Outside dux, set `DUX_AMQ_VERIFY=1` directly in the shell that runs `amq wake`. Reserved for environments that genuinely cross a trust boundary (e.g. proxying wakes across hosts).
 
 ### Bridge: delivery strategy
@@ -167,7 +167,7 @@ After unwrap (or verify), the bridge drops raw Ctrl+C interrupt transport bytes 
 
 The auto-drain step is deliberate: dux should inject the actual unread AMQ content, not a reminder that depends on the model choosing to run `amq drain`. The bridge appends a short instruction to act on the drained messages and strips unsafe control bytes before queueing so the Rust drainer will not reject peer-authored bodies.
 
-`<receiver>` is the sanitised `$AM_ME` exported by the wrapper (`[a-z0-9_-]` only). The wrapper derives `$AM_ME` from `basename($PWD)` of the dux worktree directory, falling back to `git branch --show-current` then `<provider>-<pid>`. When sanitisation collapses to empty, the bridge writes to the literal `_unrouted/` subdirectory; the drainer routes those messages to the currently-selected dux session with a status warning.
+`<receiver>` is the sanitised `$AM_ME` exported by the wrapper (`[a-z0-9_-]` only). The wrapper derives `$AM_ME` from `basename($PWD)` of the dux worktree directory, falling back to the symbolic Git branch then `<provider>-<pid>`. When sanitisation collapses to empty, the bridge writes to the reserved `.unrouted/` subdirectory; the drainer routes those messages to the currently-selected dux session with a status warning. A real `_unrouted` handle remains an ordinary routable identity.
 
 ### Drainer (`crate::amq_inject` in the dux source)
 

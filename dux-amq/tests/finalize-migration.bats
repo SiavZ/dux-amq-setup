@@ -25,26 +25,18 @@ SCRIPT="$(realpath "$BATS_TEST_DIRNAME/../scripts/finalize-claude-migration.sh")
 setup() {
   setup_isolated_home
 
-  # Some assertions need to know where the persistent-disk root lives.
-  # We can't use /data/state/ in tests (host-owned, may not exist), so we
-  # redirect everything under TEST_HOME/state/ and patch the script via
-  # an HOME=$TEST_HOME shim later. The script hardcodes /data/state — so
-  # we instead bind-mount-style redirect by running the script with a
-  # `--root` shim. Simpler: copy the script to a temp file with the path
-  # rewritten. This keeps the production script untouched.
+  # The production script must honor STATE_ROOT for every migration target.
+  # Only the global lock filename is rewritten so parallel test runs cannot
+  # contend with each other.
   STATE_ROOT="$TEST_HOME/state"
   export STATE_ROOT
   mkdir -p "$STATE_ROOT"
 
-  # Build a per-test copy of the script with /data/state replaced by
-  # $STATE_ROOT and /tmp/dux-amq-finalize.lock replaced by a per-test
-  # lock file. This is the cleanest way to test without modifying the
-  # production script's filesystem assumptions.
+  # Build a per-test copy with a private lock path.
   TEST_SCRIPT="$TEST_HOME/finalize.sh"
   LOCK_FILE="$TEST_HOME/finalize.lock"
   export LOCK_FILE
   sed \
-    -e "s|/data/state|$STATE_ROOT|g" \
     -e "s|/tmp/dux-amq-finalize.lock|$LOCK_FILE|g" \
     "$SCRIPT" > "$TEST_SCRIPT"
   chmod +x "$TEST_SCRIPT"

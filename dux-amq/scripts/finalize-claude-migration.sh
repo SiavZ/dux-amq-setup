@@ -27,6 +27,8 @@
 
 set -euo pipefail
 
+STATE_ROOT="${STATE_ROOT:-/data/state}"
+
 # --- 11.1: single-instance guard --------------------------------------------
 # `flock -n` returns immediately if another process holds the lock. The fd
 # stays open for the lifetime of the script; closing it (script exit) drops
@@ -130,18 +132,18 @@ migrate_dir() {
 # Initial gate. Re-checks happen inside migrate_dir before each mutate.
 ensure_no_claude
 
-migrate_dir "$HOME/.claude"  "/data/state/claude"
-migrate_dir "$HOME/.agents"  "/data/state/agents"
+migrate_dir "$HOME/.claude"  "$STATE_ROOT/claude"
+migrate_dir "$HOME/.agents"  "$STATE_ROOT/agents"
 
 # The skills CLI creates RELATIVE symlinks under ~/.claude/skills/ pointing
 # to ~/.agents/skills/ via "../../.agents/...". After migration, ~/.claude
 # is a symlink to /data/state/claude, so the relative path resolves to
 # /data/state/.agents/... — which doesn't exist. Solve once with a sibling
 # symlink so present and future skill installs Just Work.
-if [[ ! -e /data/state/.agents ]]; then
-  echo "[finalize] creating /data/state/.agents -> /data/state/agents (relative-path bridge for skills)"
-  ln -s /data/state/agents /data/state/.agents
+if [[ ! -e "$STATE_ROOT/.agents" ]]; then
+  echo "[finalize] creating $STATE_ROOT/.agents -> $STATE_ROOT/agents (relative-path bridge for skills)"
+  ln -s "$STATE_ROOT/agents" "$STATE_ROOT/.agents"
 fi
 
 echo
-echo "[finalize] done. ~/.claude and ~/.agents now live on /data/state."
+echo "[finalize] done. ~/.claude and ~/.agents now live under $STATE_ROOT."

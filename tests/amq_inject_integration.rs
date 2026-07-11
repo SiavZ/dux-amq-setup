@@ -65,9 +65,9 @@ fn drainer_delivers_body_to_pty_and_unlinks_file() {
     assert!(inflight.exists());
     assert!(!original.exists());
 
-    // Read+validate strips the trailing LF.
+    // Read+validate preserves the exact queued body bytes.
     let body = read_validated(&inflight, 65_536).expect("validated read");
-    assert_eq!(body, "please continue working");
+    assert_eq!(body, "please continue working\n");
 
     // Deliver: body + CR. `cat` echoes everything we write so we can
     // see it land in the PTY snapshot.
@@ -181,7 +181,7 @@ fn reclaim_then_deliver_recovers_orphan() {
     assert_eq!(outcome.messages.len(), 1);
     let inflight = claim(&outcome.messages[0].path).expect("claim");
     let body = read_validated(&inflight, 65_536).expect("validated read");
-    assert_eq!(body, "recovered orphan body");
+    assert_eq!(body, "recovered orphan body\n");
 
     let mut payload = body.into_bytes();
     payload.push(b'\r');

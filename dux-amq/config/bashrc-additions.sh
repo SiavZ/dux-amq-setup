@@ -10,16 +10,21 @@ case ":$PATH:" in
   *":$HOME/.local/bin:"*) ;;
   *) export PATH="$HOME/.local/bin:$PATH" ;;
 esac
-export DUX_HOME="${DUX_HOME:-/data/state/dux}"
-export AMQ_GLOBAL_ROOT="${AMQ_GLOBAL_ROOT:-/data/state/amq}"
+if [[ -z "${STATE_ROOT:-}" ]]; then
+  export STATE_ROOT=REPLACE_STATE_ROOT
+else
+  export STATE_ROOT
+fi
+export DUX_HOME="${DUX_HOME:-$STATE_ROOT/dux}"
+export AMQ_GLOBAL_ROOT="${AMQ_GLOBAL_ROOT:-$STATE_ROOT/amq}"
 # Audit01 P1-8: pinned amq binary path + recorded sha256. The guard below
 # refuses to `eval` shell-setup output if the on-disk binary no longer
 # matches the install-time hash — `eval` runs every interactive shell, so
 # this is a meaningful trust narrowing even though we already pin at
 # install time.
-export AMQ_BIN="${AMQ_BIN:-/data/state/amq-bin/amq}"
+export AMQ_BIN="${AMQ_BIN:-$STATE_ROOT/amq-bin/amq}"
 _amq_shell_setup_guarded() {
-  local rec="${AMQ_GLOBAL_ROOT:-/data/state/amq}/binary.sha256"
+  local rec="${AMQ_GLOBAL_ROOT:-$STATE_ROOT/amq}/binary.sha256"
   # No binary yet → install hasn't run, nothing to guard. Quietly skip.
   if [[ ! -x "$AMQ_BIN" ]]; then
     return 0

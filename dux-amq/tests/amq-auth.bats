@@ -5,7 +5,7 @@
 # in `dux-amq/scripts/`:
 #
 #   amq-secret-init.sh   — generates the per-VM secret (mode 0600)
-#   amq-send-signed      — wraps a body in a signed DUX1 envelope
+#   amq-send-signed      — wraps a body in a signed DUX2 envelope
 #   amq-receive-verify   — validates the envelope on stdin and emits
 #                          the clean body on stdout, dropping unsigned
 #                          / replayed / MAC-mismatched messages
@@ -32,6 +32,7 @@ setup() {
   # nonce dedup file (XDG_RUNTIME_DIR or /tmp/dux-amq) starts empty.
   export XDG_RUNTIME_DIR="$TEST_HOME/run"
   mkdir -p "$XDG_RUNTIME_DIR"
+  export AM_ME="bob"
   # Seed the secret unconditionally — every test needs it.
   "$SCRIPTS_DIR/amq-secret-init.sh" >/dev/null 2>&1
 }
@@ -95,8 +96,12 @@ teardown() {
 @test "amq-receive-verify rejects MAC-mismatched envelopes" {
   local msg bad
   msg=$(amq-send-signed --me alice --to bob --body "hi" --print-only)
-  # Replace the body field with a different value, leaving the MAC intact.
-  bad=${msg/hi/EVIL}
+  local -a fields
+  IFS=$'\t' read -ra fields <<<"$msg"
+  fields[5]="RVZJTA=="
+  bad=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+    "${fields[0]}" "${fields[1]}" "${fields[2]}" "${fields[3]}" \
+    "${fields[4]}" "${fields[5]}" "${fields[6]}")
   run bash -c "printf '%s\n' \"$bad\" | amq-receive-verify 2>&1 1>/dev/null"
   [[ "$status" -eq 0 ]]
   [[ "$output" == *"HMAC mismatch"* ]]
@@ -159,4 +164,47 @@ teardown() {
   run bash -c "amq-receive-verify \"$msg\" < <(:)"
   [[ "$status" -eq 0 ]]
   [[ "$output" == "stdin-empty-argv-wins" ]]
+}
+
+@test "DUX2 round-trips tabs, Unicode, and trailing newlines byte-for-byte" {
+  local body msg expected actual
+  body=$'line one\t中\nline two\n'
+  msg=$(amq-send-signed --me alice --to bob --body "$body" --print-only)
+  expected="$BATS_TEST_TMPDIR/expected.body"
+  actual="$BATS_TEST_TMPDIR/actual.body"
+  printf '%s' "$body" >"$expected"
+  printf '%s\n' "$msg" | amq-receive-verify >"$actual"
+  cmp "$expected" "$actual"
+}
+
+@test "amq-receive-verify rejects an envelope signed for another receiver" {
+  local msg
+  msg=$(amq-send-signed --me alice --to bob --body "private" --print-only)
+  AM_ME=mallory run bash -c "printf '%s\n' \"$msg\" | amq-receive-verify 2>&1 1>/dev/null"
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"wrong recipient"* ]]
+  AM_ME=mallory run bash -c "printf '%s\n' \"$msg\" | amq-receive-verify 2>/dev/null"
+  [[ -z "$output" ]]
+}
+
+@test "simultaneous replay verification accepts exactly one process" {
+  local msg first second errors accepted
+  msg=$(amq-send-signed --me alice --to bob --body "one-owner" --print-only)
+  first="$BATS_TEST_TMPDIR/first.body"
+  second="$BATS_TEST_TMPDIR/second.body"
+  errors="$BATS_TEST_TMPDIR/replay.errors"
+
+  local first_pid second_pid
+  amq-receive-verify "$msg" </dev/null >"$first" 2>>"$errors" &
+  first_pid=$!
+  amq-receive-verify "$msg" </dev/null >"$second" 2>>"$errors" &
+  second_pid=$!
+  wait "$first_pid"
+  wait "$second_pid"
+
+  accepted=0
+  [[ "$(cat "$first")" == "one-owner" ]] && accepted=$((accepted + 1))
+  [[ "$(cat "$second")" == "one-owner" ]] && accepted=$((accepted + 1))
+  [[ "$accepted" -eq 1 ]]
+  grep -Fq -- "replay rejected" "$errors"
 }

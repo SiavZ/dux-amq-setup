@@ -180,6 +180,8 @@ setup_parent_and_worktree_with_unreadable_file() {
     git -c commit.gpgsign=false commit -q -m init
     git worktree add -q -b feature "$wt" >/dev/null
   )
+  repo=$(realpath "$repo")
+  wt=$(realpath "$wt")
   ENC_PARENT=$(encode-claude-project-dir "$repo")
   ENC_CHILD=$(encode-claude-project-dir "$wt")
   PARENT_SESS_DIR="$HOME/.claude/projects/$ENC_PARENT"
@@ -201,7 +203,7 @@ setup_parent_and_worktree_with_unreadable_file() {
   if [[ "$(id -u)" == "0" ]]; then skip "root bypasses chmod 000"; fi
   setup_parent_and_worktree_with_unreadable_file
   cd "$CHILD_WT"
-  CLAUDE_AMQ_SEED_FROM_PARENT=1 run "$WRAPPERS_DIR/claude-amq"
+  DUX_AMQ_INJECT_MODE=via CLAUDE_AMQ_SEED_FROM_PARENT=1 run "$WRAPPERS_DIR/claude-amq"
   # restore mode so teardown can rm -rf cleanly
   chmod 644 "$PARENT_SESS_DIR/unreadable.jsonl" 2>/dev/null || true
   [ "$status" -eq 0 ]
@@ -231,12 +233,14 @@ setup_parent_and_worktree_with_unreadable_file() {
     git -c commit.gpgsign=false commit -q -m init
     git worktree add -q -b feature "$wt" >/dev/null
   )
+  repo=$(realpath "$repo")
+  wt=$(realpath "$wt")
   ENC_PARENT=$(encode-claude-project-dir "$repo")
   ENC_CHILD=$(encode-claude-project-dir "$wt")
   mkdir -p "$HOME/.claude/projects/$ENC_PARENT"
   echo '{"role":"system","content":"hi"}' >"$HOME/.claude/projects/$ENC_PARENT/sample.jsonl"
   cd "$wt"
-  CLAUDE_AMQ_SEED_FROM_PARENT=1 run "$WRAPPERS_DIR/claude-amq"
+  DUX_AMQ_INJECT_MODE=via CLAUDE_AMQ_SEED_FROM_PARENT=1 run "$WRAPPERS_DIR/claude-amq"
   [ "$status" -eq 0 ]
   # No warnings expected — the original "seeded N past sessions" path
   # must still fire on the clean case.
@@ -267,8 +271,8 @@ setup_parent_and_worktree_with_unreadable_file() {
   # Make the binary strictly newer than the record. `touch -t` with a
   # past time on the record is the most portable way; some filesystems
   # don't support sub-second mtimes, so a 60-second gap is required.
-  touch -d "@$(($(date +%s) - 120))" "$rec_dir/binary.sha256"
-  touch -d "@$(date +%s)"             "$amq_bin"
+  touch_epoch "$(($(date +%s) - 120))" "$rec_dir/binary.sha256"
+  touch_epoch "$(date +%s)" "$amq_bin"
 
   run env \
     AMQ_BIN="$amq_bin" \
@@ -298,8 +302,8 @@ setup_parent_and_worktree_with_unreadable_file() {
   chmod 0755 "$amq_bin"
   sha256sum "$amq_bin" >"$rec_dir/binary.sha256"
   # Record strictly newer than binary.
-  touch -d "@$(($(date +%s) - 120))" "$amq_bin"
-  touch -d "@$(date +%s)"             "$rec_dir/binary.sha256"
+  touch_epoch "$(($(date +%s) - 120))" "$amq_bin"
+  touch_epoch "$(date +%s)" "$rec_dir/binary.sha256"
 
   run env \
     AMQ_BIN="$amq_bin" \
@@ -395,4 +399,88 @@ setup_parent_and_worktree_with_unreadable_file() {
   run "$WRAPPERS_DIR/gemini-amq"
   [ "$status" -ne 0 ]
   [[ "$output" == *"identity collision"* ]]
+}
+
+@test "P1-F: simultaneous wrappers produce one owner and one launcher" {
+  mkdir -p "$TEST_HOME/first" "$TEST_HOME/second"
+  export DUX_AMQ_INJECT_MODE=via
+  local first_rc="$TEST_HOME/first.rc" second_rc="$TEST_HOME/second.rc"
+  local first_out="$TEST_HOME/first.out" second_out="$TEST_HOME/second.out"
+  local first_pid second_pid
+  (
+    cd "$TEST_HOME/first"
+    set +e
+    "$WRAPPERS_DIR/claude-amq" >"$first_out" 2>&1
+    printf '%s\n' "$?" >"$first_rc"
+  ) &
+  first_pid=$!
+  (
+    cd "$TEST_HOME/second"
+    set +e
+    "$WRAPPERS_DIR/claude-amq" >"$second_out" 2>&1
+    printf '%s\n' "$?" >"$second_rc"
+  ) &
+  second_pid=$!
+  wait "$first_pid"
+  wait "$second_pid"
+
+  local rc1 rc2
+  rc1=$(cat "$first_rc")
+  rc2=$(cat "$second_rc")
+  [[ "$rc1:$rc2" == "0:1" || "$rc1:$rc2" == "1:0" ]]
+  local launches
+  launches=$(grep -c '^ARGV$' "$ARGV_FILE" || true)
+  [ "$launches" -eq 1 ] || {
+    printf 'expected one launch, got %s\nfirst:\n%s\nsecond:\n%s\nargv:\n%s\n' \
+      "$launches" "$(cat "$first_out")" "$(cat "$second_out")" "$(cat "$ARGV_FILE")" >&2
+    return 1
+  }
+  local marker="$AMQ_GLOBAL_ROOT/agents/p1pane/.dux-amq-source"
+  [ -L "$marker" ]
+  local owner
+  owner=$(readlink "$marker")
+  [[ "$owner" == "$TEST_HOME/first" || "$owner" == "$TEST_HOME/second" ]]
+}
+
+@test "provider wrappers reject versions below every reviewed floor" {
+  local old_bin="$TEST_HOME/old-provider-bin"
+  mkdir -p "$old_bin"
+  local provider
+  for provider in claude codex gemini; do
+    cat >"$old_bin/$provider" <<'EOF'
+#!/usr/bin/env bash
+case "${0##*/}" in
+  claude) printf '2.1.162\n' ;;
+  codex) printf '0.38.9\n' ;;
+  gemini) printf '0.39.0\n' ;;
+esac
+EOF
+    chmod 0755 "$old_bin/$provider"
+  done
+
+  PATH="$old_bin:$PATH" run "$WRAPPERS_DIR/claude-amq"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"upgrade to >= 2.1.163"* ]]
+  PATH="$old_bin:$PATH" run "$WRAPPERS_DIR/codex-amq"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"upgrade to >= 0.39.0"* ]]
+  PATH="$old_bin:$PATH" run "$WRAPPERS_DIR/gemini-amq"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"upgrade to >= 0.39.1"* ]]
+
+  printf '#!/usr/bin/env bash\nprintf "unknown-version\\n"\n' >"$old_bin/claude"
+  chmod 0755 "$old_bin/claude"
+  PATH="$old_bin:$PATH" run "$WRAPPERS_DIR/claude-amq"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"version could not be parsed"* ]]
+}
+
+@test "wrapper derives all state from a custom STATE_ROOT" {
+  unset AMQ_GLOBAL_ROOT DUX_HOME
+  export AM_ME="custom-root"
+  cd "$TEST_HOME"
+  run "$WRAPPERS_DIR/codex-amq"
+  [ "$status" -eq 0 ]
+  [ -L "$STATE_ROOT/amq/agents/custom-root/.dux-amq-source" ]
+  [[ "$(readlink "$STATE_ROOT/amq/agents/custom-root/.dux-amq-source")" == "$TEST_HOME" ]]
 }

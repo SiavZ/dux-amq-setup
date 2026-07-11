@@ -40,3 +40,12 @@ teardown_isolated_home() {
   fi
   unset TEST_HOME
 }
+
+touch_epoch() {
+  local epoch="$1" path="$2" stamp
+  if touch -d "@$epoch" "$path" 2>/dev/null; then
+    return 0
+  fi
+  stamp=$(date -r "$epoch" +%Y%m%d%H%M.%S)
+  touch -t "$stamp" "$path"
+}

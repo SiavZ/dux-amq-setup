@@ -3,7 +3,7 @@
 # audit02 Phase 13 (audit01 P1-1): TIOCSTI fallback bridge.
 #
 # Validates that `dux-amq-inject-bridge`:
-#   * Defaults to SKIP mode: transparently unwraps a `DUX1\t...`
+#   * Defaults to SKIP mode: transparently unwraps a `DUX2\t...`
 #     envelope when present (so signed senders interop), and delivers
 #     plain bodies as-is otherwise. No HMAC check. This matches the
 #     trust model in SECURITY.md: same-UID peers share $HOME so an
@@ -21,7 +21,7 @@
 #     "stuck in input field" failure where Claude Code's Ink input
 #     drops a trailing Enter received during streaming.
 #   * Routes queue files to a per-receiver subdirectory keyed off
-#     $AM_ME (sanitised), with `_unrouted/` as the fallback when
+#     $AM_ME (sanitised), with `.unrouted/` as the fallback when
 #     $AM_ME is missing.
 #
 # `tmux` is shimmed via tests/fakes/ so tests can record what the
@@ -112,6 +112,14 @@ EOF
   export PATH
 }
 
+collect_queue_files() {
+  QUEUE_FILES=()
+  local file
+  while IFS= read -r file; do
+    [[ -n "$file" ]] && QUEUE_FILES+=("$file")
+  done < <(compgen -G "$1" || true)
+}
+
 # 13.1 — happy path with tmux (no DUX_PANE): verified body → send-keys.
 @test "dux-amq-inject-bridge sends verified body via tmux send-keys when not under dux" {
   install_fake_tmux
@@ -146,6 +154,7 @@ EOF
   install_fake_tmux
   export TMUX="/tmp/fake-tmux-socket,1234,0"
   export DUX_AMQ_VERIFY=1
+  export AM_ME="bob"
   run dux-amq-inject-bridge "plain-spoofed-text"
   [ "$status" -eq 0 ]
   # tmux must NOT have been called at all.
@@ -159,28 +168,50 @@ EOF
   install_fake_tmux
   export TMUX="/tmp/fake-tmux-socket,1234,0"
   export DUX_AMQ_VERIFY=1
+  export AM_ME="bob"
   local msg bad
   msg=$(amq-send-signed --me alice --to bob --body "real" --print-only)
-  bad=${msg/real/EVIL}
+  local -a fields
+  IFS=$'\t' read -ra fields <<<"$msg"
+  fields[5]="RVZJTA=="
+  bad=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+    "${fields[0]}" "${fields[1]}" "${fields[2]}" "${fields[3]}" \
+    "${fields[4]}" "${fields[5]}" "${fields[6]}")
   run dux-amq-inject-bridge "$bad"
   [ "$status" -eq 0 ]
   [ ! -s "$TMUX_LOG" ]
 }
 
-# 13.5 — fallback (no TMUX, no AM_ME): body lands in `_unrouted/`.
-@test "dux-amq-inject-bridge falls back to _unrouted queue without TMUX or AM_ME" {
+# 13.5 — fallback (no TMUX, no AM_ME): body lands in `.unrouted/`.
+@test "dux-amq-inject-bridge falls back to .unrouted queue without TMUX or AM_ME" {
   unset TMUX
   local msg
   msg=$(amq-send-signed --me alice --to bob --body "queued-msg" --print-only)
   run dux-amq-inject-bridge "$msg"
   [ "$status" -eq 0 ]
-  # Exactly one file under `_unrouted/`, containing the body.
+  # Exactly one file under `.unrouted/`, containing the body.
   local files
-  mapfile -t files < <(compgen -G "$HOME/.local/share/dux-amq/inject-queue/_unrouted/*.msg")
+  collect_queue_files "$HOME/.local/share/dux-amq/inject-queue/.unrouted/*.msg"
+  files=("${QUEUE_FILES[@]}")
   [ "${#files[@]}" -eq 1 ]
   grep -Fxq -- "queued-msg" "${files[0]}"
   # No file at the legacy flat path (no top-level *.msg).
   ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*.msg" >/dev/null
+}
+
+@test "_unrouted remains a legitimate addressed receiver" {
+  unset TMUX
+  export AM_ME="_unrouted"
+  local msg
+  msg=$(amq-send-signed --me alice --to _unrouted --body "addressed" --print-only)
+  run dux-amq-inject-bridge "$msg"
+  [ "$status" -eq 0 ]
+  local files
+  collect_queue_files "$HOME/.local/share/dux-amq/inject-queue/_unrouted/*.msg"
+  files=("${QUEUE_FILES[@]}")
+  [ "${#files[@]}" -eq 1 ]
+  grep -Fxq -- "addressed" "${files[0]}"
+  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/.unrouted/*.msg" >/dev/null
 }
 
 # 13.6 — empty argv: bridge must exit 0 silently (verify dropped it).
@@ -203,9 +234,10 @@ EOF
   [ "$status" -eq 0 ]
   # tmux must NOT have been called — DUX_PANE wins over $TMUX.
   [ ! -s "$TMUX_LOG" ]
-  # Body must be queued under bob/, not _unrouted/.
+  # Body must be queued under bob/, not `.unrouted/`.
   local files
-  mapfile -t files < <(compgen -G "$HOME/.local/share/dux-amq/inject-queue/bob/*.msg")
+  collect_queue_files "$HOME/.local/share/dux-amq/inject-queue/bob/*.msg"
+  files=("${QUEUE_FILES[@]}")
   [ "${#files[@]}" -eq 1 ]
   grep -Fxq -- "under-dux" "${files[0]}"
 }
@@ -246,13 +278,37 @@ EOF
   grep -Fxq -- "bob" "$AMQ_DRAIN_ARGV_LOG"
 
   local files
-  mapfile -t files < <(compgen -G "$HOME/.local/share/dux-amq/inject-queue/bob/*.msg")
+  collect_queue_files "$HOME/.local/share/dux-amq/inject-queue/bob/*.msg"
+  files=("${QUEUE_FILES[@]}")
   [ "${#files[@]}" -eq 1 ]
   grep -Fq -- "[AMQ] 1 new message(s) for bob" "${files[0]}"
   grep -Fq -- "drained-body" "${files[0]}"
   grep -Fq -- "Act on these AMQ messages now" "${files[0]}"
   # Unsafe Ctrl+C from the peer body was stripped before queueing.
   ! LC_ALL=C grep -q $'\003' "${files[0]}"
+}
+
+@test "strict signed delivery bypasses AMQ drain and queues the exact body" {
+  install_fake_drain_amq
+  export DUX_PANE="1"
+  export DUX_AMQ_VERIFY="1"
+  export AM_ME="bob"
+  export AM_ROOT="$TEST_HOME/amq-root"
+  AMQ_DRAIN_ARGV_LOG="$TEST_HOME/amq-drain.argv"
+  export AMQ_DRAIN_ARGV_LOG
+  local body msg files expected
+  body=$'signed\tbody\nsecond line'
+  msg=$(amq-send-signed --me alice --to bob --body "$body" --print-only)
+
+  run dux-amq-inject-bridge "$msg"
+  [ "$status" -eq 0 ]
+  [ ! -s "$AMQ_DRAIN_ARGV_LOG" ]
+  collect_queue_files "$HOME/.local/share/dux-amq/inject-queue/bob/*.msg"
+  files=("${QUEUE_FILES[@]}")
+  [ "${#files[@]}" -eq 1 ]
+  expected="$BATS_TEST_TMPDIR/strict.expected"
+  printf '%s' "$body" >"$expected"
+  cmp "$expected" "${files[0]}"
 }
 
 # 13.7c — under dux: raw Ctrl+C interrupt transport signals are a no-op.
@@ -273,7 +329,8 @@ EOF
   run dux-amq-inject-bridge "$msg"
   [ "$status" -eq 0 ]
   local files
-  mapfile -t files < <(compgen -G "$HOME/.local/share/dux-amq/inject-queue/bob/*.msg")
+  collect_queue_files "$HOME/.local/share/dux-amq/inject-queue/bob/*.msg"
+  files=("${QUEUE_FILES[@]}")
   [ "${#files[@]}" -eq 1 ]
   grep -Fxq -- "addressed" "${files[0]}"
 }
@@ -291,7 +348,8 @@ EOF
   run dux-amq-inject-bridge "$msg"
   [ "$status" -eq 0 ]
   local files
-  mapfile -t files < <(compgen -G "$HOME/.local/share/dux-amq/inject-queue/feature-login-v2/*.msg")
+  collect_queue_files "$HOME/.local/share/dux-amq/inject-queue/feature-login-v2/*.msg"
+  files=("${QUEUE_FILES[@]}")
   [ "${#files[@]}" -eq 1 ]
   # The unsanitised value MUST NOT exist as a directory — defence
   # against `..` or absolute paths sneaking in through AM_ME.
@@ -302,7 +360,7 @@ EOF
 @test "dux-amq-inject-bridge rejects path-traversal AM_ME" {
   unset TMUX
   # `..` would map to `--` after sed, which then has leading dashes
-  # stripped to empty. Empty receivers fall back to `_unrouted/`.
+  # stripped to empty. Empty receivers fall back to `.unrouted/`.
   export AM_ME="../../etc"
   local msg
   msg=$(amq-send-signed --me alice --to bob --body "traversal" --print-only)
@@ -326,20 +384,17 @@ EOF
   grep -Fxq -- "Enter" "$TMUX_LOG"
 }
 
-# 13.12 — skip mode: DUX1 envelope is unwrapped without MAC check.
-@test "dux-amq-inject-bridge (skip mode) unwraps DUX1 envelope without verifying MAC" {
+# 13.12 — skip mode: DUX2 envelope is unwrapped without MAC check.
+@test "dux-amq-inject-bridge (skip mode) unwraps DUX2 envelope without verifying MAC" {
   install_fake_tmux
   export TMUX="/tmp/fake-tmux-socket,1234,0"
   local msg bad
   msg=$(amq-send-signed --me alice --to bob --body "unwrap-me" --print-only)
   # Mangle the MAC so amq-receive-verify (in strict mode) WOULD reject
   # it. Skip mode must still deliver the inner body.
-  bad=${msg/unwrap-me/unwrap-me}  # body untouched; force a body-substr match below
-  # Tamper with the MAC: replace any one base64 char in the 6th field.
-  # Simpler approach: just append junk to the MAC in field 6. Splitting
-  # on TAB:
+  # Tamper with the MAC in field 7. Skip mode must still decode field 6.
   IFS=$'\t' read -ra fields <<<"$msg"
-  fields[5]="${fields[5]}TAMPERED"
+  fields[6]="${fields[6]}TAMPERED"
   bad=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' "${fields[0]}" "${fields[1]}" "${fields[2]}" "${fields[3]}" "${fields[4]}" "${fields[5]}" "${fields[6]}")
   run dux-amq-inject-bridge "$bad"
   [ "$status" -eq 0 ]
@@ -347,18 +402,18 @@ EOF
   grep -Fxq -- "unwrap-me" "$TMUX_LOG"
 }
 
-# 13.13 — skip mode: malformed DUX1 (too few fields) falls back to raw.
-@test "dux-amq-inject-bridge (skip mode) treats malformed DUX1 as raw body" {
+# 13.13 — skip mode: malformed DUX2 (too few fields) falls back to raw.
+@test "dux-amq-inject-bridge (skip mode) treats malformed DUX2 as raw body" {
   install_fake_tmux
   export TMUX="/tmp/fake-tmux-socket,1234,0"
-  # `DUX1\t<sender>` only — five missing fields. Bridge should treat
+  # `DUX2\t<sender>` only — five missing fields. Bridge should treat
   # the whole thing as a raw body rather than panic or drop.
-  local broken=$'DUX1\talice'
+  local broken=$'DUX2\talice'
   run dux-amq-inject-bridge "$broken"
   [ "$status" -eq 0 ]
   grep -Fxq -- "send-keys" "$TMUX_LOG"
   # Whole envelope visible in the log (skip mode delivered raw).
-  grep -Fq -- "DUX1" "$TMUX_LOG"
+  grep -Fq -- "DUX2" "$TMUX_LOG"
   grep -Fq -- "alice" "$TMUX_LOG"
 }
 
@@ -371,21 +426,13 @@ EOF
   [ ! -s "$TMUX_LOG" ]
 }
 
-# 13.15 — skip mode: body containing internal TABs survives unwrap.
-@test "dux-amq-inject-bridge (skip mode) preserves internal TABs in DUX1 body" {
+# 13.15 — skip mode: body containing internal TABs survives DUX2 decode.
+@test "dux-amq-inject-bridge (skip mode) preserves internal TABs in DUX2 body" {
   install_fake_tmux
   export TMUX="/tmp/fake-tmux-socket,1234,0"
-  # The signed envelope's body field happens to be the LAST field —
-  # any internal TABs inside the body will appear as additional
-  # tab-separated fields. The bridge must reassemble them.
-  #
-  # We can't easily generate a signed envelope with an internal TAB
-  # via amq-send-signed (it explicitly forbids that). So construct a
-  # syntactically-valid envelope by hand and assert the bridge keeps
-  # the trailing fields concatenated.
-  local hand_made
-  hand_made=$'DUX1\talice\tbob\t2026-05-05T00:00:00Z\tnonceXYZ\tMACABC\tline1\tline2'
-  run dux-amq-inject-bridge "$hand_made"
+  local msg
+  msg=$(amq-send-signed --me alice --to bob --body $'line1\tline2' --print-only)
+  run dux-amq-inject-bridge "$msg"
   [ "$status" -eq 0 ]
   # Both halves of the body should land in tmux send-keys.
   grep -Fq -- "line1" "$TMUX_LOG"

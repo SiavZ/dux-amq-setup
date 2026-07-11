@@ -177,6 +177,8 @@ setup_parent_and_worktree() {
     git -c commit.gpgsign=false commit -q -m init
     git worktree add -q -b feature "$wt" >/dev/null
   )
+  repo=$(realpath "$repo")
+  wt=$(realpath "$wt")
   # Phase 12: encoding is now done by the shared encode-claude-project-dir
   # script (single source of truth). It replaces every non-[A-Za-z0-9-]
   # char with `-`, including `.` (the old inline sed kept `.`). Calling
@@ -196,7 +198,7 @@ setup_parent_and_worktree() {
   setup_parent_and_worktree
   (
     cd "$CHILD_WT"
-    "$WRAPPERS_DIR/claude-amq"
+    DUX_AMQ_INJECT_MODE=via "$WRAPPERS_DIR/claude-amq"
   )
   [ ! -e "$CHILD_SESS_DIR/sample.jsonl" ] \
     || { printf 'seed happened without opt-in (file: %s)\n' "$CHILD_SESS_DIR/sample.jsonl" >&2; return 1; }
@@ -207,7 +209,7 @@ setup_parent_and_worktree() {
   setup_parent_and_worktree
   (
     cd "$CHILD_WT"
-    CLAUDE_AMQ_SEED_FROM_PARENT=1 "$WRAPPERS_DIR/claude-amq"
+    DUX_AMQ_INJECT_MODE=via CLAUDE_AMQ_SEED_FROM_PARENT=1 "$WRAPPERS_DIR/claude-amq"
   )
   [ -f "$CHILD_SESS_DIR/sample.jsonl" ] \
     || { printf 'seed did not happen (missing: %s)\n' "$CHILD_SESS_DIR/sample.jsonl" >&2; return 1; }
