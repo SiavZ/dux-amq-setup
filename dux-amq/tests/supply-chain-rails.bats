@@ -7,7 +7,9 @@ setup() {
 @test "Claude Peers install checks out and verifies one exact commit" {
   local installer="$REPO_ROOT/dux-amq/install.sh"
   local revision
-  revision=$(sed -n 's/^CLAUDE_PEERS_REV="\([0-9a-f]*\)"$/\1/p' "$installer")
+  # The pin is env-overridable: CLAUDE_PEERS_REV="${CLAUDE_PEERS_REV:-<sha>}".
+  # Extract the 40-char default SHA regardless of the ${VAR:-...} wrapper.
+  revision=$(grep -m1 '^CLAUDE_PEERS_REV=' "$installer" | grep -oE '[0-9a-f]{40}')
   [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
   grep -Fq -- 'git -C "$CLAUDE_PEERS_DIR" checkout --detach "$CLAUDE_PEERS_REV"' "$installer"
   grep -Fq -- 'peers_head=$(git -C "$CLAUDE_PEERS_DIR" rev-parse HEAD' "$installer"
