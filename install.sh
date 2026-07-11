@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="patrickdappollonio/dux"
+REPO="${DUX_REPO:-SiavZ/dux-amq-setup}"
 BINARY="dux"
 
 # Allow overriding the version and install directory via environment variables.
@@ -55,6 +55,27 @@ http_download() {
     fi
 }
 
+sha256_file() {
+    if has_cmd sha256sum; then
+        sha256sum "$1" | awk '{print $1}'
+    elif has_cmd shasum; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        err "Either sha256sum or shasum is required to verify the release archive."
+    fi
+}
+
+verify_archive() {
+    local archive_path="$1" sums_path="$2" archive_name="$3"
+    local expected actual
+    expected="$(awk -v name="$archive_name" '$2 == name || $2 == "*" name { print $1; exit }' "$sums_path")"
+    [ -n "$expected" ] || err "SHA256SUMS has no entry for ${archive_name}."
+    actual="$(sha256_file "$archive_path")"
+    [ "$actual" = "$expected" ] || \
+        err "Checksum mismatch for ${archive_name}: got ${actual}, expected ${expected}."
+    log "Verified ${archive_name} (${actual})"
+}
+
 resolve_version() {
     if [ -n "$VERSION" ]; then
         # Ensure the version starts with 'v'.
@@ -97,7 +118,7 @@ resolve_install_dir() {
 }
 
 main() {
-    local os arch version install_dir archive url tmpdir
+    local os arch version install_dir archive url sums_url tmpdir cleanup_cmd
 
     os="$(detect_os)"
     arch="$(detect_arch)"
@@ -105,14 +126,20 @@ main() {
     install_dir="$(resolve_install_dir)"
     archive="${BINARY}-${os}-${arch}.tar.gz"
     url="https://github.com/${REPO}/releases/download/${version}/${archive}"
+    sums_url="https://github.com/${REPO}/releases/download/${version}/SHA256SUMS"
 
     log "Installing ${BINARY} ${version} (${os}/${arch}) to ${install_dir}"
 
     tmpdir="$(mktemp -d)"
-    trap 'rm -rf "$tmpdir"' EXIT
+    printf -v cleanup_cmd 'rm -rf -- %q' "$tmpdir"
+    # Expand now: `tmpdir` is local to main and is out of scope at EXIT.
+    # shellcheck disable=SC2064
+    trap "$cleanup_cmd" EXIT
 
     log "Downloading ${url}..."
     http_download "$url" "${tmpdir}/${archive}"
+    http_download "$sums_url" "${tmpdir}/SHA256SUMS"
+    verify_archive "${tmpdir}/${archive}" "${tmpdir}/SHA256SUMS" "$archive"
 
     tar xzf "${tmpdir}/${archive}" -C "$tmpdir"
 

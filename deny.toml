@@ -25,13 +25,14 @@ ignore = [
   # ceased development after a doxxing/harassment incident; v1 is
   # considered "complete", no security issue). Pulled transitively by
   # `syntect` for syntax-set serialization. Tracking syntect's migration
-  # to postcard/wincode upstream; no safe in-tree replacement today.
-  # Review: 2026-08-01.
+  # to postcard/wincode upstream; the advisory has no patched version.
+  # Reviewed: 2026-07-11. Next review: 2026-08-01.
   { id = "RUSTSEC-2025-0141", reason = "transitive via syntect; no upstream replacement yet" },
   # RUSTSEC-2024-0384 — `instant` 0.1.13 is unmaintained; author points
   # users at `web-time`. Pulled transitively by `notify-types` →
   # `notify`. Not exploitable (it's a wall-clock helper); waiting on
-  # `notify` to migrate. Review: 2026-08-01.
+  # `notify` to migrate; the advisory has no patched version.
+  # Reviewed: 2026-07-11. Next review: 2026-08-01.
   { id = "RUSTSEC-2024-0384", reason = "transitive via notify; waiting upstream migration to web-time" },
 ]
 

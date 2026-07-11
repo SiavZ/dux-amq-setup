@@ -38,6 +38,7 @@ AMQ_VERSION="${AMQ_VERSION:-0.34.0}"
 AMQ_SHA256="${AMQ_SHA256:-cba940987d00a3d072f395c7ec7a648e47d652f1ff503abf46da538595510d7a}"
 SKILLS_PIN="${SKILLS_PIN:-1.5.3}"
 SKILLS_REV="${SKILLS_REV:-6a9417d40cc8b9d9f71e9fbb1e39c872d0763b54}"
+CLAUDE_PEERS_REV="${CLAUDE_PEERS_REV:-640183fa7048443bf0a6592de45579e813df4587}"
 
 # Expected sha256 of the extracted amq binary (audit01 P1-8). Cross-checked
 # against the file inside amq_${AMQ_VERSION}_linux_amd64.tar.gz at install
@@ -343,13 +344,21 @@ if command -v bun >/dev/null 2>&1 && command -v claude >/dev/null 2>&1; then
   esac
   say "installing Claude Peers MCP into $CLAUDE_PEERS_DIR"
   if [[ -d "$CLAUDE_PEERS_DIR/.git" ]]; then
-    git -C "$CLAUDE_PEERS_DIR" pull --ff-only || warn "Claude Peers update failed"
+    git -C "$CLAUDE_PEERS_DIR" fetch --force origin "$CLAUDE_PEERS_REV" || \
+      warn "Claude Peers pinned commit fetch failed"
   else
     rm -rf "$CLAUDE_PEERS_DIR"
     git clone https://github.com/louislva/claude-peers-mcp.git "$CLAUDE_PEERS_DIR" || \
       warn "Claude Peers clone failed"
   fi
-  if [[ -f "$CLAUDE_PEERS_DIR/server.ts" ]]; then
+  peers_head=""
+  if [[ -d "$CLAUDE_PEERS_DIR/.git" ]] &&
+    git -C "$CLAUDE_PEERS_DIR" checkout --detach "$CLAUDE_PEERS_REV" >/dev/null 2>&1; then
+    peers_head=$(git -C "$CLAUDE_PEERS_DIR" rev-parse HEAD 2>/dev/null || true)
+  fi
+  if [[ "$peers_head" != "$CLAUDE_PEERS_REV" ]]; then
+    warn "Claude Peers identity verification failed (got ${peers_head:-<none>}, expected $CLAUDE_PEERS_REV); skipping registration"
+  elif [[ -f "$CLAUDE_PEERS_DIR/server.ts" ]]; then
     if [[ -f "$CLAUDE_PEERS_DIR/package.json" ]]; then
       (cd "$CLAUDE_PEERS_DIR" && "$BUN_BIN" install) || warn "Claude Peers bun install failed"
     fi
@@ -428,7 +437,11 @@ sed -i --follow-symlinks \
 say "rewriting ~/.bashrc dux-amq stanza (v$DUX_AMQ_VERSION)"
 touch "$HOME/.bashrc"
 strip_block "$HOME/.bashrc" sh
-sed "s|REPLACE_AT_INSTALL|$DUX_AMQ_VERSION|g" "$HERE/config/bashrc-additions.sh" >> "$HOME/.bashrc"
+bashrc_block=$(<"$HERE/config/bashrc-additions.sh")
+printf -v state_root_quoted '%q' "$STATE_ROOT"
+bashrc_block="${bashrc_block//REPLACE_AT_INSTALL/$DUX_AMQ_VERSION}"
+bashrc_block="${bashrc_block//REPLACE_STATE_ROOT/$state_root_quoted}"
+printf '%s\n' "$bashrc_block" >> "$HOME/.bashrc"
 
 # 8. global CLAUDE.md --------------------------------------------------------
 mkdir -p "$HOME/.claude"

@@ -88,20 +88,20 @@ jobs:
           cache-on-failure: false
 
       - name: Install cargo-edit
-        run: cargo install cargo-edit --locked
+        run: cargo install cargo-edit --locked --version 0.13.8
 
       # audit02 P0-I — cargo-auditable embeds the dependency tree in the
       # binary so post-publication scans (`cargo audit bin`, trivy, grype)
       # can re-check release artefacts. ~4 KB overhead.
       - name: Install cargo-auditable
-        run: cargo install --locked cargo-auditable
+        run: cargo install --locked cargo-auditable --version 0.7.5
 
       # audit02 P0-I — cargo-cyclonedx generates a CycloneDX SBOM per
       # build target. Limitation: bundled C/C++ deps (rusqlite's vendored
       # SQLite) are not enumerated; downstream consumers should treat the
       # SBOM as Rust-deps-only.
       - name: Install cargo-cyclonedx
-        run: cargo install --locked cargo-cyclonedx
+        run: cargo install --locked cargo-cyclonedx --version 0.5.9
 
       - name: Set version from tag
         run: |
@@ -118,6 +118,9 @@ jobs:
       - name: Strip binary
         run: strip target/${{ matrix.target }}/release/dux
 
+      - name: Pin source timestamp
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
       # audit02 P0-I §7.4 — SBOM filename includes the matrix target so
       # all four end up in the release alongside the tarballs. The
       # `--override-filename` flag tells cargo-cyclonedx to write
@@ -127,17 +130,21 @@ jobs:
           cargo cyclonedx --format json --override-filename "sbom-${{ matrix.target }}.cdx"
           ls -la sbom-*.cdx.json
 
-      # audit02 P0-I §7.7 — reproducible tar so two reruns of the same
-      # tag produce byte-identical archives. `--mtime=@<release.created_at>`
-      # pins the timestamp to the release event time (stable across reruns
-      # of the same release). GNU tar required (`gtar` on macOS).
+      # audit02 P0-I §7.7 — pin metadata to source identity, then package
+      # twice and compare before upload so the reproducibility claim is
+      # exercised on every release runner. GNU tar is `gtar` on macOS.
       - name: Package (reproducible)
         run: |
           if command -v gtar >/dev/null 2>&1; then TAR=gtar; else TAR=tar; fi
-          "$TAR" --sort=name --owner=0 --group=0 --numeric-owner \
-            --mtime='@${{ github.event.release.created_at }}' \
-            -czf "${{ matrix.archive }}" \
-            -C "target/${{ matrix.target }}/release" dux
+          package() {
+            "$TAR" --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime="@${SOURCE_DATE_EPOCH}" \
+              -czf "$1" -C "target/${{ matrix.target }}/release" dux
+          }
+          package "${{ matrix.archive }}.first"
+          package "${{ matrix.archive }}"
+          cmp "${{ matrix.archive }}.first" "${{ matrix.archive }}"
+          rm "${{ matrix.archive }}.first"
 
       # audit02 P0-I §7.5 — OIDC-keyless build provenance attestation.
       # Verifiable downstream via:

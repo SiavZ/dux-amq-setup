@@ -23,13 +23,8 @@ profiling:
 # Run before pushing changes that touch dux-amq/.
 overlay-shellcheck:
 	@command -v shellcheck >/dev/null 2>&1 || { echo "Error: 'shellcheck' not found (apt-get install shellcheck)"; exit 1; }
-	shellcheck \
-	  install.sh \
-	  dux-amq/install.sh \
-	  dux-amq/wrappers/* \
-	  dux-amq/scripts/*.sh \
-	  dux-amq/scripts/dux-amq-doctor \
-	  dux-amq/config/bashrc-additions.sh
+	find install.sh dux-amq -type f -perm -111 -print0 | xargs -0 shellcheck
+	shellcheck dux-amq/config/bashrc-additions.sh
 
 overlay-bats:
 	@command -v bats >/dev/null 2>&1 || { echo "Error: 'bats' not found (apt-get install bats)"; exit 1; }
