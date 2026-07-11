@@ -385,7 +385,13 @@ pub fn reclaim_stale_inflight_with_max_age(
                 }
                 continue;
             }
-            match fs::rename(&inflight_path, &original_path) {
+            match rustix::fs::renameat_with(
+                rustix::fs::CWD,
+                &inflight_path,
+                rustix::fs::CWD,
+                &original_path,
+                rustix::fs::RenameFlags::NOREPLACE,
+            ) {
                 Ok(()) => {
                     reclaimed += 1;
                     tracing::info!(
@@ -1071,11 +1077,11 @@ mod tests {
         fs::write(alice.join("001.msg"), b"existing").unwrap(); // collision target
         fs::write(alice.join(".inflight.002.msg"), b"b").unwrap();
         let n = reclaim_stale_inflight(&queue).unwrap();
-        // POSIX `rename` overwrites the destination, so collision
-        // produces a successful rename. Both reclaim. Document this
-        // explicitly so a future change to e.g. `renameat2(NOREPLACE)`
-        // surfaces here.
-        assert_eq!(n, 2);
+        assert_eq!(n, 1);
+        assert_eq!(fs::read(alice.join("001.msg")).unwrap(), b"existing");
+        assert_eq!(fs::read(alice.join(".inflight.001.msg")).unwrap(), b"a");
+        assert_eq!(fs::read(alice.join("002.msg")).unwrap(), b"b");
+        assert!(!alice.join(".inflight.002.msg").exists());
     }
 
     #[test]
