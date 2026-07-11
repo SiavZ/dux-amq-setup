@@ -61,7 +61,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 
-use crate::config::DuxPaths;
+use crate::config::{DuxPaths, LoggingConfig};
 use crate::model::AgentSession;
 use crate::purge_encoding;
 use crate::sanitize;
@@ -86,14 +86,21 @@ pub struct PurgeConfig {
     /// lives at `<amq_root>/agents/<branch>`. Defaults to
     /// `/data/state/amq`.
     pub amq_root: PathBuf,
+    /// Resolved live log prefix (absolute or relative-to-Dux root exactly as
+    /// the logger resolves it). Rotated siblings share this prefix.
+    pub log_path: PathBuf,
 }
 
 impl PurgeConfig {
     /// Build a sensible default `PurgeConfig` for the production layout
     /// described in `dux-amq/README.md`. Tests override this with a
     /// scratch directory.
-    pub fn default_layout() -> Self {
-        let state = PathBuf::from("/data/state");
+    pub fn default_layout(paths: &DuxPaths, logging: &LoggingConfig) -> Self {
+        let state = std::env::var_os("STATE_ROOT")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| paths.root.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| paths.root.clone());
         Self {
             provider_data_dirs: vec![
                 ("claude".to_string(), state.join("claude")),
@@ -101,6 +108,7 @@ impl PurgeConfig {
                 ("gemini".to_string(), state.join("gemini")),
             ],
             amq_root: state.join("amq"),
+            log_path: crate::logger::resolve_log_path(logging, paths),
         }
     }
 }
@@ -131,6 +139,7 @@ pub enum PurgeItem {
         /// audit trail shows the cut-over point if a future revision
         /// wants to skip pre-baseline lines.
         since: DateTime<Utc>,
+        path: PathBuf,
     },
 }
 
@@ -145,8 +154,12 @@ impl PurgeItem {
                 format!("{provider} chat history {}", safe_path(path))
             }
             Self::AmqInbox(p) => format!("amq inbox {}", safe_path(p)),
-            Self::LogScopedRedact { since } => {
-                format!("redact log records since {}", since.to_rfc3339())
+            Self::LogScopedRedact { since, path } => {
+                format!(
+                    "redact {} records since {}",
+                    safe_path(path),
+                    since.to_rfc3339()
+                )
             }
         }
     }
@@ -285,22 +298,33 @@ pub fn plan_for_session(
         });
     }
 
-    // 3. AMQ inbox. Branch may be empty for malformed rows; skip in
-    //    that case by emitting a Worktree-only plan.
-    if !session.branch_name.is_empty() {
-        let branch = Path::new(&session.branch_name);
-        if branch.is_absolute()
-            || branch
-                .components()
-                .any(|component| !matches!(component, std::path::Component::Normal(_)))
-        {
-            bail!(
-                "refusing unsafe AMQ branch path {:?}",
-                sanitize::for_terminal(&session.branch_name)
-            );
-        }
+    // 3. AMQ inbox. Reject malformed persisted branch paths even when the
+    // runtime identity resolves from the worktree basename instead.
+    let branch_path = Path::new(&session.branch_name);
+    if session.branch_name.is_empty()
+        || branch_path.is_absolute()
+        || branch_path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::CurDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        bail!(
+            "unsafe AMQ branch path: {}",
+            sanitize::for_terminal(&session.branch_name)
+        );
+    }
+
+    // Use the exact runtime identity priority (sanitised worktree basename,
+    // then branch, then id), not the raw DB branch.
+    let handle = crate::peer::amq_handle_for_session(session);
+    if !handle.is_empty() {
         let agents_root = config.amq_root.join("agents");
-        let inbox = validate_delete_target(&agents_root, &agents_root.join(branch), "AMQ inbox")?;
+        let inbox = validate_delete_target(&agents_root, &agents_root.join(&handle), "AMQ inbox")?;
         items.push(PurgeItem::AmqInbox(inbox));
     }
 
@@ -310,6 +334,7 @@ pub fn plan_for_session(
     //    short-circuit older files cheaply.
     items.push(PurgeItem::LogScopedRedact {
         since: session.created_at,
+        path: config.log_path.clone(),
     });
 
     // 5. Sqlite row LAST.
@@ -416,7 +441,7 @@ fn static_provider_name(name: &str) -> &'static str {
 pub fn execute(
     plan: &PurgePlan,
     storage: &SessionStore,
-    paths: &DuxPaths,
+    _paths: &DuxPaths,
     dry_run: bool,
 ) -> Result<PurgeReport> {
     let safe_session_id = sanitize::for_terminal(&plan.session_id);
@@ -440,7 +465,7 @@ pub fn execute(
                 "prior purge step failed; session row retained for retry".to_string(),
             )
         } else {
-            execute_item(item, storage, paths, &plan.session_id, dry_run)
+            execute_item(item, storage, &plan.session_id, dry_run)
         };
         match &outcome {
             PurgeOutcome::Error(why) => {
@@ -484,7 +509,6 @@ pub fn execute(
 fn execute_item(
     item: &PurgeItem,
     storage: &SessionStore,
-    paths: &DuxPaths,
     session_id: &str,
     dry_run: bool,
 ) -> PurgeOutcome {
@@ -492,7 +516,7 @@ fn execute_item(
         PurgeItem::Worktree(p) => execute_remove_dir(p, dry_run),
         PurgeItem::ProviderDir { path, .. } => execute_remove_dir(path, dry_run),
         PurgeItem::AmqInbox(p) => execute_remove_dir(p, dry_run),
-        PurgeItem::LogScopedRedact { .. } => execute_redact_logs(paths, session_id, dry_run),
+        PurgeItem::LogScopedRedact { path, .. } => execute_redact_logs(path, session_id, dry_run),
         PurgeItem::SqliteRow => execute_delete_row(storage, session_id, dry_run),
     }
 }
@@ -538,29 +562,36 @@ fn execute_delete_row(storage: &SessionStore, session_id: &str, dry_run: bool) -
 ///
 /// Returns `Done` even when no records match — the audit trail is the
 /// fact that the rewrite ran, not the count of redacted lines.
-fn execute_redact_logs(paths: &DuxPaths, session_id: &str, dry_run: bool) -> PurgeOutcome {
-    let log_root = match fs::metadata(&paths.root) {
-        Ok(_) => paths.root.clone(),
+fn execute_redact_logs(log_path: &Path, session_id: &str, dry_run: bool) -> PurgeOutcome {
+    let Some(log_root) = log_path.parent() else {
+        return PurgeOutcome::Error(format!("log path has no parent: {}", safe_path(log_path)));
+    };
+    let log_root = match fs::metadata(log_root) {
+        Ok(_) => log_root.to_path_buf(),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return PurgeOutcome::Skipped(format!(
                 "log root {} does not exist",
-                paths.root.display()
+                safe_path(log_root)
             ));
         }
         Err(err) => {
-            return PurgeOutcome::Error(format!(
-                "inspect log root {}: {err}",
-                paths.root.display()
-            ));
+            return PurgeOutcome::Error(format!("inspect log root {}: {err}", safe_path(log_root)));
         }
     };
 
-    let log_files = match collect_log_files(&log_root) {
+    let log_files = match collect_log_files(log_path) {
         Ok(v) => v,
         Err(e) => return PurgeOutcome::Error(format!("scan {log_root:?}: {e}")),
     };
     if log_files.is_empty() {
-        return PurgeOutcome::Skipped(format!("no dux.log* files under {}", log_root.display()));
+        return PurgeOutcome::Skipped(format!(
+            "no {} log files under {}",
+            log_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("configured"),
+            safe_path(&log_root)
+        ));
     }
 
     if dry_run {
@@ -583,16 +614,23 @@ fn execute_redact_logs(paths: &DuxPaths, session_id: &str, dry_run: bool) -> Pur
 /// Collect every file under `root` whose name starts with `dux.log`.
 /// This matches the live `dux.log` plus all rotated `dux.log.YYYY-MM-DD`
 /// children that `tracing-appender` produces.
-fn collect_log_files(root: &Path) -> Result<Vec<PathBuf>> {
+fn collect_log_files(log_path: &Path) -> Result<Vec<PathBuf>> {
+    let root = log_path
+        .parent()
+        .ok_or_else(|| anyhow!("log path has no parent: {}", safe_path(log_path)))?;
+    let prefix = log_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("log filename is not UTF-8: {}", safe_path(log_path)))?;
     let mut out = Vec::new();
-    walk_collect_log_files(root, &mut out)?;
+    walk_collect_log_files(root, prefix, &mut out)?;
     Ok(out)
 }
 
-fn walk_collect_log_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    let entries = fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))?;
+fn walk_collect_log_files(dir: &Path, prefix: &str, out: &mut Vec<PathBuf>) -> Result<()> {
+    let entries = fs::read_dir(dir).with_context(|| format!("read_dir {}", safe_path(dir)))?;
     for entry in entries {
-        let entry = entry.with_context(|| format!("read_dir entry under {}", dir.display()))?;
+        let entry = entry.with_context(|| format!("read_dir entry under {}", safe_path(dir)))?;
         let ty = entry
             .file_type()
             .with_context(|| format!("file_type {}", entry.path().display()))?;
@@ -600,7 +638,7 @@ fn walk_collect_log_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
             && entry
                 .file_name()
                 .to_str()
-                .is_some_and(|n| n.starts_with("dux.log"))
+                .is_some_and(|name| name == prefix || name.starts_with(&format!("{prefix}.")))
         {
             out.push(entry.path());
         }
@@ -875,6 +913,7 @@ mod tests {
                 .map(|(n, p)| ((*n).to_string(), p.clone()))
                 .collect(),
             amq_root,
+            log_path: PathBuf::from("/tmp/dux.log"),
         }
     }
 
@@ -933,6 +972,38 @@ mod tests {
         assert!(matches!(plan.items[2], PurgeItem::AmqInbox(_)));
         assert!(matches!(plan.items[3], PurgeItem::LogScopedRedact { .. }));
         assert_eq!(plan.items[4], PurgeItem::SqliteRow);
+    }
+
+    #[test]
+    fn plan_uses_runtime_amq_handle_and_configured_absolute_log_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = fixture_paths(tmp.path());
+        let amq_root = tmp.path().join("custom-state/amq");
+        let log_path = tmp.path().join("external-logs/custom-dux.jsonl");
+        let mut config = fixture_config(amq_root.clone(), &[]);
+        config.log_path = log_path.clone();
+        let worktree = paths.worktrees_root.join("runtime-handle");
+        let session = fixture_session("sid-runtime", "feature/different", &worktree);
+        let expected_inbox =
+            resolve_for_containment(&amq_root.join("agents/runtime-handle")).unwrap();
+
+        let plan = plan_for_session(&session, &paths, &config).expect("plan");
+        assert!(plan.items.iter().any(|item| {
+            matches!(
+                item,
+                PurgeItem::AmqInbox(path)
+                    if path == &expected_inbox
+            )
+        }));
+        assert!(plan.items.iter().any(|item| {
+            matches!(
+                item,
+                PurgeItem::LogScopedRedact { path, .. } if path == &log_path
+            )
+        }));
+        assert!(!plan.items.iter().any(|item| {
+            matches!(item, PurgeItem::AmqInbox(path) if path.ends_with("feature-different"))
+        }));
     }
 
     #[test]

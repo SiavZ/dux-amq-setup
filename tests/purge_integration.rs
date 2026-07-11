@@ -84,6 +84,7 @@ impl PurgeHarness {
                 ("codex".to_string(), codex_root.clone()),
             ],
             amq_root: amq_root.clone(),
+            log_path: root.join("dux.log"),
         };
 
         // Pick a worktree path. Use a constant suffix so encoded path
@@ -501,12 +502,13 @@ fn purge_retains_row_after_log_failure_and_retries() {
     let log_root_fault = h.tmp.path().join("log-root-fault");
     fs::write(&log_root_fault, b"not a directory").unwrap();
     let mut faulty_paths = h.paths.clone();
-    faulty_paths.root = log_root_fault;
+    faulty_paths.root = log_root_fault.clone();
 
     assert_failure_retains_row_and_retry_succeeds(
         &h,
         PurgeItem::LogScopedRedact {
             since: h.session.created_at,
+            path: log_root_fault.join("dux.log"),
         },
         &faulty_paths,
         "log",

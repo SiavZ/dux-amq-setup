@@ -52,12 +52,12 @@ JSON
   done
   # alpha: one fresh message
   : > "$AMQ_GLOBAL_ROOT/agents/alpha/inbox/new/2026-05-03T00-00-00.000Z_pid1_a.md"
-  touch -d '5 minutes ago' "$AMQ_GLOBAL_ROOT/agents/alpha/inbox/new/2026-05-03T00-00-00.000Z_pid1_a.md"
+  touch_epoch "$(($(date +%s) - 300))" "$AMQ_GLOBAL_ROOT/agents/alpha/inbox/new/2026-05-03T00-00-00.000Z_pid1_a.md"
   # charlie: three messages including an old one
   : > "$AMQ_GLOBAL_ROOT/agents/charlie/inbox/new/2026-05-03T00-00-00.000Z_pid1_c1.md"
   : > "$AMQ_GLOBAL_ROOT/agents/charlie/inbox/new/2026-05-03T00-00-00.000Z_pid1_c2.md"
   : > "$AMQ_GLOBAL_ROOT/agents/charlie/inbox/new/2026-05-03T00-00-00.000Z_pid1_c3.md"
-  touch -d '2 hours ago' "$AMQ_GLOBAL_ROOT/agents/charlie/inbox/new/2026-05-03T00-00-00.000Z_pid1_c1.md"
+  touch_epoch "$(($(date +%s) - 7200))" "$AMQ_GLOBAL_ROOT/agents/charlie/inbox/new/2026-05-03T00-00-00.000Z_pid1_c1.md"
 
   # The shell-setup guard refuses to load when a binary is present but
   # binary.sha256 isn't; we don't ship a binary in fixtures, so this
@@ -167,6 +167,48 @@ EOF
   # we know the output parses; these are structural assertions.
   run bash -c "'$DOCTOR' --json | jq -er '.versions, .binary_integrity, .amq, .symlinks, .kernel, .sessions_db, .runtime, .recent_errors | type'"
   [ "$status" -eq 0 ]
+}
+
+@test "doctor --json --anonymize redacts paths and structured agent names" {
+  seed_amq_state
+  seed_worktree "feature-x"
+  local output_file="$BATS_TEST_TMPDIR/doctor.json"
+  "$DOCTOR" --json --anonymize >"$output_file"
+  jq -e . "$output_file" >/dev/null
+  ! grep -Fq -- "$HOME" "$output_file"
+  ! grep -Fq -- '"alpha"' "$output_file"
+  ! grep -Fq -- '"bravo"' "$output_file"
+  grep -Fq -- 'agent-1' "$output_file"
+}
+
+@test "doctor opens sessions sqlite read-only without changing bytes or schema" {
+  command -v sqlite3 >/dev/null 2>&1 || skip "sqlite3 CLI unavailable"
+  mkdir -p "$DUX_HOME"
+  local db="$DUX_HOME/sessions.sqlite3"
+  sqlite3 "$db" \
+    'create table agent_sessions (id text primary key, status text); pragma user_version=77;'
+  local before_hash before_schema before_version after_hash after_schema after_version
+  if command -v sha256sum >/dev/null 2>&1; then
+    before_hash=$(sha256sum "$db" | awk '{print $1}')
+  else
+    before_hash=$(shasum -a 256 "$db" | awk '{print $1}')
+  fi
+  before_schema=$(sqlite3 -readonly "$db" '.schema')
+  before_version=$(sqlite3 -readonly "$db" 'pragma user_version;')
+
+  run "$DOCTOR" --json
+  [ "$status" -eq 0 ]
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    after_hash=$(sha256sum "$db" | awk '{print $1}')
+  else
+    after_hash=$(shasum -a 256 "$db" | awk '{print $1}')
+  fi
+  after_schema=$(sqlite3 -readonly "$db" '.schema')
+  after_version=$(sqlite3 -readonly "$db" 'pragma user_version;')
+  [ "$before_hash" = "$after_hash" ]
+  [ "$before_schema" = "$after_schema" ]
+  [ "$before_version" = "$after_version" ]
 }
 
 # ============================================================================

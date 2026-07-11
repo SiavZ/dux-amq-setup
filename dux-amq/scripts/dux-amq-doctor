@@ -20,18 +20,6 @@
 #   - MUST exit 0 even when AMQ is uninitialized — operators run this
 #     *because* something is broken; bailing on a missing queue defeats
 #     the purpose.
-if (( BASH_VERSINFO[0] < 4 )); then
-  if [[ "${DUX_AMQ_DOCTOR_BASH_REEXEC:-0}" != 1 ]]; then
-    for _bash in /opt/homebrew/bin/bash /usr/local/bin/bash; do
-      if [[ -x "$_bash" ]] && "$_bash" -c '(( BASH_VERSINFO[0] >= 4 ))' 2>/dev/null; then
-        DUX_AMQ_DOCTOR_BASH_REEXEC=1 exec "$_bash" "${BASH_SOURCE[0]}" "$@"
-      fi
-    done
-  fi
-  printf 'doctor: Bash 4+ required; running %s. Install bash at /opt/homebrew/bin/bash or /usr/local/bin/bash.\n' "${BASH_VERSION:-unknown}" >&2
-  exit 1
-fi
-
 set -euo pipefail
 
 # ----- argv parsing ---------------------------------------------------------
@@ -134,18 +122,18 @@ fi
 
 # ----- anonymizer -----------------------------------------------------------
 #
-# Each kind has its own counter and lookup table (associative array).
+# Each kind has its own counter and parallel indexed lookup arrays.
 # Iteration order is *first-seen-first-numbered* — i.e. whichever branch
 # the agent enumerator hits first becomes branch-1. This is stable
 # within a single doctor run but not across runs (filesystem listing
 # order isn't stable).
 
-declare -A _BRANCHES _AGENTS
+declare -a _BRANCH_NAMES=("") _BRANCH_ALIASES=("") _AGENT_NAMES=("") _AGENT_ALIASES=("")
 _BRANCH_N=0
 _AGENT_N=0
 
 # IMPORTANT: anon_branch / anon_agent / anon_text mutate process-global
-# associative arrays (_BRANCHES, _AGENTS) via the counter side-effect.
+# lookup arrays via the counter side-effect.
 # Bash subshells (created by `$(...)`, pipelines on the right of |, etc.)
 # do not propagate variable mutations back to the parent. Callers
 # therefore set a local via `<varname>` parameter, never via command
@@ -154,7 +142,7 @@ _AGENT_N=0
 # but JSON-mode callers must pass `-v <var>` so the counter increment
 # survives.
 anon_branch() {
-  local _name="$1" _outvar="${2:-}"
+  local _name="$1" _outvar="${2:-}" _alias="" _i
   if [[ "$ANON" -eq 0 ]]; then
     if [[ -n "$_outvar" ]]; then
       printf -v "$_outvar" '%s' "$_name"
@@ -163,19 +151,27 @@ anon_branch() {
     fi
     return 0
   fi
-  if [[ -z "${_BRANCHES[$_name]:-}" ]]; then
+  for ((_i = 1; _i < ${#_BRANCH_NAMES[@]}; _i++)); do
+    if [[ "${_BRANCH_NAMES[$_i]}" == "$_name" ]]; then
+      _alias="${_BRANCH_ALIASES[$_i]}"
+      break
+    fi
+  done
+  if [[ -z "$_alias" ]]; then
     _BRANCH_N=$((_BRANCH_N + 1))
-    _BRANCHES[$_name]="branch-$_BRANCH_N"
+    _alias="branch-$_BRANCH_N"
+    _BRANCH_NAMES+=("$_name")
+    _BRANCH_ALIASES+=("$_alias")
   fi
   if [[ -n "$_outvar" ]]; then
-    printf -v "$_outvar" '%s' "${_BRANCHES[$_name]}"
+    printf -v "$_outvar" '%s' "$_alias"
   else
-    printf '%s' "${_BRANCHES[$_name]}"
+    printf '%s' "$_alias"
   fi
 }
 
 anon_agent() {
-  local _name="$1" _outvar="${2:-}"
+  local _name="$1" _outvar="${2:-}" _alias="" _i
   if [[ "$ANON" -eq 0 ]]; then
     if [[ -n "$_outvar" ]]; then
       printf -v "$_outvar" '%s' "$_name"
@@ -184,14 +180,22 @@ anon_agent() {
     fi
     return 0
   fi
-  if [[ -z "${_AGENTS[$_name]:-}" ]]; then
+  for ((_i = 1; _i < ${#_AGENT_NAMES[@]}; _i++)); do
+    if [[ "${_AGENT_NAMES[$_i]}" == "$_name" ]]; then
+      _alias="${_AGENT_ALIASES[$_i]}"
+      break
+    fi
+  done
+  if [[ -z "$_alias" ]]; then
     _AGENT_N=$((_AGENT_N + 1))
-    _AGENTS[$_name]="agent-$_AGENT_N"
+    _alias="agent-$_AGENT_N"
+    _AGENT_NAMES+=("$_name")
+    _AGENT_ALIASES+=("$_alias")
   fi
   if [[ -n "$_outvar" ]]; then
-    printf -v "$_outvar" '%s' "${_AGENTS[$_name]}"
+    printf -v "$_outvar" '%s' "$_alias"
   else
-    printf '%s' "${_AGENTS[$_name]}"
+    printf '%s' "$_alias"
   fi
 }
 
@@ -280,16 +284,11 @@ sec_versions() {
   section "Versions"
   local dux_v amq_v claude_v codex_v gemini_v overlay_v
 
-  # `dux --version` is not implemented in patrickdappollonio/dux v0.4.0
-  # (it tries to acquire the single-instance lock instead — see
-  # src/main.rs). Fall back to scraping the first line of `--help`,
-  # which is the binary's own banner. Same trick install.sh uses on a
-  # fresh install.
-  dux_v="$(to dux --version)"
-  if is_err "$dux_v" || [[ "$dux_v" == *"already running"* ]]; then
-    dux_v="$(to bash -c 'dux --help 2>&1 | head -1')"
-    is_err "$dux_v" && dux_v="(unknown)"
-  fi
+  # `dux --version` is not implemented: it enters normal startup and can
+  # migrate sessions.sqlite3. `--help` exits during CLI parsing, before App
+  # or storage initialization, so the doctor's read-only promise holds.
+  dux_v="$(to bash -c 'dux --help 2>&1 | head -1')"
+  is_err "$dux_v" && dux_v="(unknown)"
   amq_v="$(to amq --version)"
   is_err "$amq_v" && amq_v="(unknown)"
   claude_v="$(to claude --version)"
@@ -318,6 +317,13 @@ sec_versions() {
     ' "$INSTALL_SH" 2>/dev/null || true)"
   fi
   [[ -z "$overlay_v" ]] && overlay_v="(unknown)"
+
+  anon_text "$dux_v" dux_v
+  anon_text "$amq_v" amq_v
+  anon_text "$claude_v" claude_v
+  anon_text "$codex_v" codex_v
+  anon_text "$gemini_v" gemini_v
+  anon_text "$overlay_v" overlay_v
 
   kv "dux"     "$dux_v"
   kv "amq"     "$amq_v"
@@ -393,15 +399,16 @@ sec_binary_integrity() {
 # ============================================================================
 sec_persistent_disk() {
   section "Persistent disk"
-  local df_out disk_target
+  local df_out df_disp disk_target
   disk_target="$STATE_ROOT"
   if [[ -d "$disk_target" ]]; then
     df_out="$(to df -h "$disk_target" | tail -n +2 | head -1)"
   else
     df_out="($disk_target missing)"
   fi
-  kv "df state" "$(anon_text "$df_out")"
-  j_set disk.df "$df_out"
+  anon_text "$df_out" df_disp
+  kv "df state" "$df_disp"
+  j_set disk.df "$df_disp"
 
   if [[ -d "$STATE_ROOT" ]]; then
     # `du -sh` on a populated /data/state tree is the slowest call in
@@ -465,22 +472,26 @@ sec_amq() {
     j_set amq.agent_count 0 num
     return
   fi
-  local -a agent_list=()
+  local -a agent_list=("")
   local d
   for d in "$agents_dir"/*; do
     [[ -d "$d" ]] || continue
     agent_list+=("$(basename "$d")")
   done
-  j_set amq.agent_count "${#agent_list[@]}" num
+  local agent_count
+  agent_count=$((${#agent_list[@]} - 1))
+  j_set amq.agent_count "$agent_count" num
 
   if (( JSON == 0 )); then
-    printf 'agents (%d):\n' "${#agent_list[@]}"
+    printf 'agents (%d):\n' "$agent_count"
   fi
 
   # Build a JSON array of {name,depth,oldest_age_min} entries.
   local agents_json="[]"
   local agent depth oldest_age oldest_min display_name
-  for agent in "${agent_list[@]}"; do
+  local agent_index
+  for ((agent_index = 1; agent_index < ${#agent_list[@]}; agent_index++)); do
+    agent="${agent_list[$agent_index]}"
     local inbox_new="$agents_dir/$agent/inbox/new"
     if [[ ! -d "$inbox_new" ]]; then
       depth=0
@@ -643,8 +654,8 @@ sec_sessions_db() {
     return
   fi
   local journal integ
-  journal="$(to sqlite3 "$db" 'PRAGMA journal_mode;')"
-  integ="$(to sqlite3 "$db" 'PRAGMA integrity_check;')"
+  journal="$(to sqlite3 -readonly "$db" 'PRAGMA journal_mode;')"
+  integ="$(to sqlite3 -readonly "$db" 'PRAGMA integrity_check;')"
   kv "journal_mode" "$journal"
   kv "integrity"    "$integ"
   j_set sessions_db.journal_mode "$journal"
@@ -653,7 +664,7 @@ sec_sessions_db() {
   # Per-status counts. Tolerate a missing table (fresh install before
   # first session) by swallowing sqlite errors via `to`.
   local counts
-  counts="$(to sqlite3 "$db" "select status, count(*) from agent_sessions group by status;")"
+  counts="$(to sqlite3 -readonly "$db" "select status, count(*) from agent_sessions group by status;")"
   if [[ -n "$counts" && "$counts" != "(error)" && "$counts" != "(timeout)" ]]; then
     if (( JSON == 0 )); then
       printf 'sessions:\n'
@@ -703,9 +714,13 @@ sec_runtime() {
 sec_recent_errors() {
   section "Recent errors (top 5 from dux.log)"
   shopt -s nullglob
-  local -a logs=("$DUX_HOME"/dux.log "$DUX_HOME"/dux.log.*)
+  local -a logs=("")
+  local log_candidate
+  for log_candidate in "$DUX_HOME"/dux.log "$DUX_HOME"/dux.log.*; do
+    logs+=("$log_candidate")
+  done
   shopt -u nullglob
-  if [[ ${#logs[@]} -eq 0 ]]; then
+  if [[ ${#logs[@]} -eq 1 ]]; then
     local home_disp
     anon_text "$DUX_HOME" home_disp
     kv "log" "(no dux.log under $home_disp)"
@@ -717,8 +732,9 @@ sec_recent_errors() {
   # log format). The `cat` list is built up in shell so each path goes
   # through `printf '%q'`, defeating word-splitting on names with spaces.
   local errors files=""
-  local f
-  for f in "${logs[@]}"; do
+  local f log_index
+  for ((log_index = 1; log_index < ${#logs[@]}; log_index++)); do
+    f="${logs[$log_index]}"
     files+=" $(printf '%q' "$f")"
   done
   errors="$(to bash -c "
@@ -746,18 +762,17 @@ sec_recent_errors() {
   # Build JSON array, anonymizing each .fields.message inline.
   local arr
   if [[ "$ANON" -eq 1 ]]; then
-    # Re-emit each record with .fields.message rewritten. We can't do
-    # the path-walk inside jq, so iterate in bash.
+    # Emit only the documented diagnostic fields. Keeping arbitrary fields
+    # from attacker-influenced log records would bypass path anonymization.
     local out_lines=""
     while IFS= read -r line; do
       [[ -z "$line" ]] && continue
-      local m m_disp
+      local ts m m_disp
+      ts="$(timeout 5 jq -r '.timestamp // .ts // ""' <<<"$line" 2>/dev/null)"
       m="$(timeout 5 jq -r '.fields.message // .message // ""' <<<"$line" 2>/dev/null)"
       anon_text "$m" m_disp
-      out_lines+="$(timeout 5 jq -c --arg new "$m_disp" \
-        'if .fields and .fields.message then .fields.message = $new
-         elif .message            then .message            = $new
-         else . end' <<<"$line" 2>/dev/null)"$'\n'
+      out_lines+="$(timeout 5 jq -nc --arg timestamp "$ts" --arg message "$m_disp" \
+        '{timestamp: $timestamp, message: $message}' 2>/dev/null)"$'\n'
     done <<<"$errors"
     arr="$(timeout 5 jq -s '.' <<<"$out_lines" 2>/dev/null || printf '[]')"
   else
