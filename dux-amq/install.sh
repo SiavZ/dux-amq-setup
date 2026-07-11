@@ -409,7 +409,7 @@ if [[ ! -e "$STATE_ROOT/dux/config.toml" && ! -L "$STATE_ROOT/dux/config.toml" ]
   DUX_HOME="$STATE_ROOT/dux" dux config regenerate --yes >/dev/null
 fi
 say "patching $STATE_ROOT/dux/config.toml"
-sed -i \
+sed -i --follow-symlinks \
   -e '1,/^\[/ s|^prompt_for_name = false$|prompt_for_name = true|' \
   -e '/^\[providers\.claude\]$/,/^\[/ s|^command = "claude"$|command = "claude-amq"|' \
   -e '/^\[providers\.codex\]$/,/^\[/ s|^command = "codex"$|command = "codex-amq"|' \

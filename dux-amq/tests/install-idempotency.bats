@@ -76,7 +76,8 @@ printf 'dux fixture\n'
 SH
   chmod +x "$fake_bin/dux"
 
-  cat >"$STATE_ROOT/dux/config.toml" <<'TOML'
+  local config_target="$STATE_ROOT/dux/user-config.toml"
+  cat >"$config_target" <<'TOML'
 # user-owned header comment
 prompt_for_name = true
 
@@ -113,7 +114,8 @@ command = "claude"
 args = ["--custom", "preserve"]
 resume_args = ["--continue"]
 TOML
-  cp "$STATE_ROOT/dux/config.toml" "$STATE_ROOT/dux/config.toml.expected"
+  ln -s "$config_target" "$STATE_ROOT/dux/config.toml"
+  cp "$config_target" "$STATE_ROOT/dux/config.toml.expected"
   printf '{"agents":[]}\n' >"$STATE_ROOT/amq/meta/config.json"
 
   # Keep the production script on normal Linux tools while hiding optional
@@ -127,7 +129,8 @@ TOML
     return 1
   }
 
-  cmp "$STATE_ROOT/dux/config.toml.expected" "$STATE_ROOT/dux/config.toml"
+  [ -L "$STATE_ROOT/dux/config.toml" ]
+  cmp "$STATE_ROOT/dux/config.toml.expected" "$config_target"
 }
 
 @test "P0-F/P0-01: second install preserves AMQ and user-owned Dux config" {
