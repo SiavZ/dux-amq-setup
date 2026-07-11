@@ -584,7 +584,16 @@ pub fn release(inflight_path: &Path) -> Result<PathBuf> {
         Some(rest) => parent.join(rest),
         None => return Err(anyhow!("not an inflight file: {basename}")),
     };
-    fs::rename(inflight_path, &original).with_context(|| {
+    // NOREPLACE to mirror `claim`: if a producer recreated the original
+    // basename while this file was inflight, requeueing must not clobber it.
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        inflight_path,
+        rustix::fs::CWD,
+        &original,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .with_context(|| {
         format!(
             "release {} -> {}",
             inflight_path.display(),
@@ -1158,6 +1167,21 @@ mod tests {
         assert_eq!(restored, original);
         assert!(original.exists());
         assert!(!inflight.exists());
+    }
+
+    #[test]
+    fn release_fails_closed_when_a_producer_recreated_the_original() {
+        let dir = tempdir().unwrap();
+        let receiver = dir.path().join("alice");
+        fs::create_dir_all(&receiver).unwrap();
+        let original = receiver.join("001.msg");
+        let inflight = receiver.join(".inflight.001.msg");
+        fs::write(&inflight, b"inflight").unwrap();
+        fs::write(&original, b"producer").unwrap();
+
+        assert!(release(&inflight).is_err());
+        assert_eq!(fs::read(&original).unwrap(), b"producer");
+        assert_eq!(fs::read(&inflight).unwrap(), b"inflight");
     }
 
     #[test]
