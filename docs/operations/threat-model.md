@@ -35,7 +35,9 @@ sandbox bypasses; an operator who knowingly accepts the risk opts in
 via `CLAUDE_AMQ_YOLO=1` or `CODEX_AMQ_YOLO=1`. Codex hook trust review
 is a separate control and remains enabled even in YOLO mode. Disabling
 that review requires the explicit `CODEX_AMQ_BYPASS_HOOK_TRUST=1`
-opt-in in `dux-amq/wrappers/codex-amq`.
+opt-in in `dux-amq/wrappers/codex-amq`. The wrappers also fail closed
+below the reviewed provider-CLI floors (Claude 2.1.163, Codex 0.39.0,
+Gemini 0.39.1), including when a version string cannot be parsed.
 
 **Residual risk.** Operators who set the YOLO or hook-trust-bypass env
 vars globally (e.g. in `~/.bashrc`) re-create the affected part of the
@@ -46,6 +48,8 @@ sandbox-bypass primitives is out of our control.
 **Detection.** Each wrapper prints a warning when its dangerous opt-in
 is active. The Codex warning distinguishes sandbox bypass from hook
 trust review bypass so the operator can see which control was disabled.
+An unsupported or unknown provider version is refused with the required
+minimum in the error message.
 
 ---
 
@@ -71,9 +75,11 @@ this surface.** Phase 08 added an HMAC-signed envelope: each
 `amq send` (via `dux-amq/scripts/amq-send-signed`) reads a per-VM
 secret from `$AMQ_SECRET_PATH` (default
 `$HOME/.local/share/dux-amq/amq-secret`, mode 0600) and signs the
-payload + a monotonic nonce. Receivers verify via
-`amq-receive-verify` and reject replays. Implementation-wise this
-works as designed.
+payload + a nonce. The current DUX2 format binds the sender, recipient,
+UTC timestamp, 96-bit nonce, and base64 body. Receivers bind the signed
+recipient to their actual handle, preserve body bytes, and use atomic
+directory creation so simultaneous replay checks have one winner.
+Implementation-wise this works as designed.
 
 But the trust model in [SECURITY.md](../../SECURITY.md) explicitly
 states: *"dux runs as a single-user, single-Linux-account TUI. All
@@ -106,15 +112,14 @@ adding a meaningful defense.
 
 **Mitigation in code (current).**
 
-- The bridge defaults to **skip mode**: it transparently unwraps a
-  `DUX1\t...` envelope when present (so legacy `amq-send-signed`
-  callers still interop) and treats plain bodies as raw. No HMAC
-  check.
+- The bridge defaults to **skip mode**: it byte-safely decodes a
+  `DUX2\t...` envelope when present, retains DUX1 compatibility for
+  already queued messages, and treats plain bodies as raw. No HMAC check.
 - Strict mode is opt-in via `[amq.inject].verify_envelope = true`
   in dux's `config.toml`. dux exports `DUX_AMQ_VERIFY=1` to
   spawned PTYs at bootstrap; the bridge calls
-  `amq-receive-verify`; unsigned/replayed/MAC-mismatched envelopes
-  are dropped silently. Reserved for environments that genuinely
+  `amq-receive-verify`; unsigned, misaddressed, replayed, stale, and
+  MAC-mismatched envelopes are dropped silently. Reserved for environments that genuinely
   cross a trust boundary — proxying wakes across hosts, mixed-trust
   agents under the same UID via setuid shims, etc.
 - The `amq-send-signed` and `amq-receive-verify` tooling is kept
