@@ -11551,6 +11551,45 @@ cyan = "#00ffff"
         app
     }
 
+    #[test]
+    fn macro_list_renders_cjk_and_emoji_at_narrow_width() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_app(default_bindings());
+        app.config.macros.entries.insert(
+            "界🙂".to_string(),
+            crate::config::MacroEntry {
+                text: "🙂界🙂界🙂界🙂界🙂界🙂界🙂界🙂界".to_string(),
+                surface: crate::config::MacroSurface::Agent,
+            },
+        );
+        app.open_edit_macros();
+
+        let backend = TestBackend::new(40, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render narrow macro list");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(rendered.contains('界'), "CJK macro name was not rendered");
+        assert!(
+            rendered.contains('🙂'),
+            "emoji macro content was not rendered"
+        );
+        assert!(
+            rendered.contains('…'),
+            "long macro preview was not truncated"
+        );
+    }
+
     fn pending_delete_state(app: &App) -> Option<(&str, bool)> {
         if let PromptState::EditMacros {
             pending_delete: Some(pending),

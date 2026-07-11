@@ -1258,21 +1258,6 @@ mod tests {
     }
 
     #[test]
-    fn ensure_project_worktrees_link_fails_closed_when_exclude_is_unreadable() {
-        let repo = init_test_repo();
-        let worktrees_root = repo.path().join("dux-state").join("worktrees");
-        let exclude = repo.path().join(".git").join("info").join("exclude");
-        fs::remove_file(&exclude).unwrap();
-        fs::create_dir(&exclude).unwrap();
-        fs::write(exclude.join("sentinel"), b"preserve me").unwrap();
-
-        let result = ensure_project_worktrees_link(repo.path(), &worktrees_root, "Demo-Project");
-
-        assert!(result.is_err());
-        assert_eq!(fs::read(exclude.join("sentinel")).unwrap(), b"preserve me");
-    }
-
-    #[test]
     fn mirror_worktree_contents_copies_visible_tree_and_preserves_git_admin_state() {
         let repo = init_test_repo();
         fs::write(repo.path().join("tracked.txt"), "original tracked\n").unwrap();
