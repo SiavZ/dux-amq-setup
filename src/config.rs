@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Write;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -481,7 +483,7 @@ pub struct AmqInjectConfig {
     pub max_message_bytes: u64,
     /// Strict HMAC verification of incoming wake envelopes by the
     /// inject-bridge. When `false` (the default), the bridge skips
-    /// `amq-receive-verify`: signed `DUX1\t...` envelopes are still
+    /// `amq-receive-verify`: signed `DUX2\t...` envelopes are still
     /// transparently unwrapped, but plain `amq send` bodies pass
     /// through as-is. When `true`, the bridge runs the verifier and
     /// drops any unsigned/replayed/MAC-mismatched envelope.
@@ -510,10 +512,10 @@ pub struct AmqInjectConfig {
     /// most operators consider themselves "still typing" between
     /// keystrokes. Set to `0` to disable the quiet window entirely
     /// (= old behaviour: always skip whenever interactive mode is
-    /// on); set to a very large value (e.g. `u64::MAX`) to escape-
-    /// hatch into "always deliver, never skip" — though that's
-    /// rarely what you want because it WILL corrupt a half-typed
-    /// prompt.
+    /// on); set to a very large value (any window of ten years or
+    /// more, e.g. `u64::MAX`) to escape-hatch into "always deliver,
+    /// never skip" — though that's rarely what you want because it
+    /// WILL corrupt a half-typed prompt.
     #[serde(default = "default_amq_inject_active_session_quiet_secs")]
     pub active_session_quiet_secs: u64,
     /// Minimum delay in milliseconds between phase 1 (place body) and
@@ -827,8 +829,8 @@ impl Default for EditorConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            left_width_pct: 17,
-            right_width_pct: 19,
+            left_width_pct: 20,
+            right_width_pct: 23,
             terminal_pane_height_pct: 35,
             staged_pane_height_pct: 50,
             commit_pane_height_pct: 40,
@@ -929,8 +931,7 @@ impl DuxPaths {
 pub fn ensure_config(paths: &DuxPaths) -> Result<Config> {
     paths.ensure_dirs()?;
     if !paths.config_path.exists() {
-        fs::write(&paths.config_path, render_default_config())
-            .with_context(|| format!("failed to write {}", paths.config_path.display()))?;
+        write_config_atomic(&paths.config_path, &render_default_config())?;
     }
 
     let raw = fs::read_to_string(&paths.config_path)
@@ -939,8 +940,7 @@ pub fn ensure_config(paths: &DuxPaths) -> Result<Config> {
         .parse()
         .with_context(|| format!("failed to parse {}", paths.config_path.display()))?;
     if apply_config_deprecations(&mut doc)? {
-        fs::write(&paths.config_path, doc.to_string())
-            .with_context(|| format!("failed to write {}", paths.config_path.display()))?;
+        write_config_atomic(&paths.config_path, &doc.to_string())?;
     }
 
     let parsed: Config = toml::from_str(&doc.to_string())
@@ -1498,7 +1498,7 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             key: "verify_envelope",
             comment: Some(CommentSource::Static(
                 "# Strict HMAC verification of incoming wake envelopes by the\n\
-                 # inject-bridge. When false (the default), `DUX1\\t...` envelopes\n\
+                 # inject-bridge. When false (the default), `DUX2\\t...` envelopes\n\
                  # from `amq-send-signed` are transparently unwrapped, and plain\n\
                  # `amq send` bodies pass through as-is. When true, dux exports\n\
                  # DUX_AMQ_VERIFY=1 to spawned PTYs and the bridge drops any\n\
@@ -1720,8 +1720,7 @@ pub fn save_config(
             // No existing file — write the full canonical config.
             let bindings = crate::keybindings::RuntimeBindings::from_keys_config(&config.keys);
             let body = render_config(config, &bindings);
-            fs::write(config_path, body)
-                .with_context(|| format!("failed to write {}", config_path.display()))?;
+            write_config_atomic(config_path, &body)?;
             return Ok(());
         }
         Err(e) => {
@@ -1854,9 +1853,64 @@ pub fn save_config(
     // --- [macros] ---
     patch_macros(&mut doc, &config.macros);
 
-    fs::write(config_path, doc.to_string())
-        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    write_config_atomic(config_path, &doc.to_string())?;
     Ok(())
+}
+
+/// Durably replace a configuration file without exposing a truncated live
+/// path. The temporary is created in the destination directory, synced, and
+/// renamed over the old file; the directory metadata is then synced too.
+pub fn write_config_atomic(path: &Path, contents: &str) -> Result<()> {
+    atomic_write_with(path, contents.as_bytes(), |tmp, destination| {
+        fs::rename(tmp, destination)
+    })
+}
+
+fn atomic_write_with<F>(path: &Path, contents: &[u8], replace: F) -> Result<()>
+where
+    F: FnOnce(&Path, &Path) -> std::io::Result<()>,
+{
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("config path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    let temp_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        let mut temp = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .with_context(|| format!("failed to create {}", temp_path.display()))?;
+        if let Ok(metadata) = fs::metadata(path) {
+            fs::set_permissions(&temp_path, metadata.permissions()).with_context(|| {
+                format!("failed to preserve permissions for {}", path.display())
+            })?;
+        }
+        temp.write_all(contents)
+            .with_context(|| format!("failed to write {}", temp_path.display()))?;
+        temp.sync_all()
+            .with_context(|| format!("failed to sync {}", temp_path.display()))?;
+        drop(temp);
+        replace(&temp_path, path).with_context(|| {
+            format!(
+                "failed to replace {} with {}",
+                path.display(),
+                temp_path.display()
+            )
+        })?;
+        fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .with_context(|| format!("failed to sync {}", parent.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -3991,6 +4045,29 @@ args = [\"-l\"]
         assert_eq!(reloaded.editor.default, "zed");
     }
 
+    #[test]
+    fn atomic_config_replace_failure_preserves_previous_bytes() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "valid = true\n").expect("seed");
+
+        let err = atomic_write_with(&path, b"valid = false\n", |_tmp, _destination| {
+            Err(std::io::Error::other("injected replacement failure"))
+        })
+        .expect_err("replacement must fail");
+
+        assert!(format!("{err:#}").contains("injected replacement failure"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "valid = true\n");
+        assert_eq!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .count(),
+            1,
+            "failed replacement must clean its sibling temporary"
+        );
+    }
+
     /// Branch-name auto-sync must default to OFF (opt-in only).
     ///
     /// Users complained that the setting "re-enables itself on reboot".
@@ -4005,6 +4082,16 @@ args = [\"-l\"]
             c.ui.branch_sync_interval, 0,
             "branch_sync_interval default must be 0 (off) — opt-in only"
         );
+    }
+
+    #[test]
+    fn partial_ui_deserialization_matches_config_default_widths() {
+        let config_default = Config::default();
+        let parsed: Config = toml::from_str("[ui]\ntheme = \"dux_dark\"\n").unwrap();
+        assert_eq!(parsed.ui.left_width_pct, config_default.ui.left_width_pct);
+        assert_eq!(parsed.ui.right_width_pct, config_default.ui.right_width_pct);
+        assert_eq!(UiConfig::default().left_width_pct, 20);
+        assert_eq!(UiConfig::default().right_width_pct, 23);
     }
 
     /// The canonical rendered config must also reflect the OFF default,
