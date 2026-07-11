@@ -10,8 +10,8 @@ use crate::git;
 use crate::keybindings::RuntimeBindings;
 use crate::logger;
 use crate::purge::{
-    self, PurgeConfig, PurgePlan, PurgeReport, build_plan, build_plans_for_all,
-    confirm_interactive, execute, notify_amq_peers_of_purge,
+    self, PurgeConfig, PurgePlan, build_plan, build_plans_for_all, confirm_interactive, execute,
+    notify_amq_peers_of_purge,
 };
 use crate::storage::SessionStore;
 
@@ -279,17 +279,6 @@ fn format_plan(plan: &PurgePlan, dry_run: bool) -> String {
         s.push('\n');
     }
     s
-}
-
-// Re-export PurgeReport so external tests can inspect outcomes via
-// `dux::cli` if useful. The struct itself lives in `crate::purge`.
-#[allow(dead_code)]
-type _PurgeReportPubReexport = PurgeReport;
-#[allow(dead_code)]
-fn _purge_used_re_exports() {
-    // Touch every imported symbol so a future refactor that drops one
-    // gets a compiler nag instead of a silent dead-code warning.
-    let _ = purge::PurgeOutcome::Done;
 }
 
 fn print_config_help() {

@@ -26,12 +26,12 @@ pub(crate) const MIN_BUTTON_WIDTH: u16 = 16;
 
 /// Width that fits `label` between two rounded borders with one column of
 /// padding on each side, never narrower than [`MIN_BUTTON_WIDTH`]. The
-/// formula is `label_chars + 1 left pad + 1 right pad + 2 borders`. Uses
-/// `chars().count()` so multi-byte characters (CJK, emoji, box-drawing)
-/// measure by visible width rather than UTF-8 byte length.
+/// formula is `label_width + 1 left pad + 1 right pad + 2 borders`. Uses
+/// the renderer's terminal-cell width (`Line::width`) so double-width CJK,
+/// emoji, and combining marks size the button by the columns they occupy.
 pub(crate) fn button_width_for(label: &str) -> u16 {
-    let label_chars = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
-    MIN_BUTTON_WIDTH.max(label_chars.saturating_add(4))
+    let label_width = u16::try_from(Line::from(label).width()).unwrap_or(u16::MAX);
+    MIN_BUTTON_WIDTH.max(label_width.saturating_add(4))
 }
 
 /// Largest [`button_width_for`] across `labels`. Use this when several
@@ -236,10 +236,17 @@ mod tests {
     }
 
     #[test]
-    fn button_width_for_uses_visible_width_not_bytes() {
-        // CJK character "世" is 3 UTF-8 bytes but 1 visible char.
-        // Helper must measure by visible width, not byte length.
-        assert_eq!(button_width_for("世界"), MIN_BUTTON_WIDTH);
+    fn button_width_for_uses_terminal_display_width() {
+        // Each CJK char occupies two terminal columns. A short ASCII label
+        // stays at the minimum, but enough double-width glyphs must grow the
+        // button by columns, not scalar count. "世界日本語" = 5 chars but 10
+        // display columns → 10 + 4 = 14, still under the 16 minimum...
+        assert_eq!(button_width_for("世界日本語"), MIN_BUTTON_WIDTH);
+        // ...while seven CJK chars = 14 columns → 14 + 4 = 18 > minimum.
+        assert_eq!(button_width_for("一二三四五六七"), 18);
+        // Emoji and combining marks measure by columns too: a base letter
+        // plus a combining acute accent is one column, not two chars.
+        assert_eq!(button_width_for("e\u{301}"), MIN_BUTTON_WIDTH);
     }
 
     #[test]
