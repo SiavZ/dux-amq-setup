@@ -66,6 +66,7 @@ impl TerminalSnapshot {
 /// redraw anyway because pause is only active during scrollback sessions with
 /// TUI-style providers.
 const PAUSE_BUFFER_CAP: usize = 4 * 1024 * 1024;
+const READER_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const READER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A PTY-based client that spawns a CLI tool in a pseudo-terminal and keeps a
@@ -658,39 +659,65 @@ impl PtyClient {
 impl Drop for PtyClient {
     fn drop(&mut self) {
         // portable-pty creates a new session whose process-group id is the
-        // spawned child's pid. Kill the whole group so background descendants
-        // cannot keep the slave end open after the direct child exits.
-        if let Some(pid) = self
-            .child
-            .process_id()
-            .and_then(|pid| i32::try_from(pid).ok())
-            .and_then(rustix::process::Pid::from_raw)
-        {
-            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        // spawned child's pid. A successful try_wait means portable-pty has
+        // reaped that pid, so it may already belong to an unrelated process.
+        let child_state = self.child.try_wait();
+        let child_exited = matches!(&child_state, Ok(Some(_)));
+        let process_group = if matches!(&child_state, Ok(None)) {
+            self.child
+                .process_id()
+                .and_then(|pid| i32::try_from(pid).ok())
+                .and_then(rustix::process::Pid::from_raw)
+        } else {
+            None
+        };
+        if let Err(err) = &child_state {
+            tracing::warn!(
+                target: "dux::pty",
+                err = %err,
+                "could not verify PTY child state; skipping process-group signal",
+            );
         }
-        let _ = self.child.kill();
+        if let Some(pid) = process_group {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::HUP);
+        }
         // Touch `master` so dead-code analysis sees a use here too — its
         // presence is load-bearing for the `BorrowedFd` constructed in
         // `foreground_process_name`. See the field-level doc comment.
         let _ = &self.master;
         if let Some(handle) = self.reader_handle.take() {
-            match self.reader_done.recv_timeout(READER_SHUTDOWN_TIMEOUT) {
-                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    if let Err(panic) = handle.join() {
-                        tracing::warn!(
-                            target: "dux::pty",
-                            panic = ?panic,
-                            "reader thread panicked during shutdown",
-                        );
-                    }
+            let mut reader_stopped = matches!(
+                self.reader_done
+                    .recv_timeout(READER_GRACEFUL_SHUTDOWN_TIMEOUT),
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected)
+            );
+            if !reader_stopped {
+                if let Some(pid) = process_group {
+                    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
+                if !child_exited {
+                    let _ = self.child.kill();
+                }
+                reader_stopped = matches!(
+                    self.reader_done.recv_timeout(READER_SHUTDOWN_TIMEOUT),
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected)
+                );
+            }
+            if reader_stopped {
+                if let Err(panic) = handle.join() {
                     tracing::warn!(
                         target: "dux::pty",
-                        timeout_ms = READER_SHUTDOWN_TIMEOUT.as_millis(),
-                        "PTY reader did not stop before shutdown deadline; detaching thread",
+                        panic = ?panic,
+                        "reader thread panicked during shutdown",
                     );
                 }
+            } else {
+                tracing::warn!(
+                    target: "dux::pty",
+                    timeout_ms = (READER_GRACEFUL_SHUTDOWN_TIMEOUT + READER_SHUTDOWN_TIMEOUT)
+                        .as_millis(),
+                    "PTY reader did not stop before shutdown deadline; detaching thread",
+                );
             }
         }
     }
@@ -1328,6 +1355,33 @@ fn append_with_cap(pending: &mut PendingIngest, data: &[u8], cap: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct ReapedChildReportingPid(u32);
+
+    impl portable_pty::ChildKiller for ReapedChildReportingPid {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(Self(self.0))
+        }
+    }
+
+    impl portable_pty::Child for ReapedChildReportingPid {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(Some(portable_pty::ExitStatus::with_exit_code(0)))
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Ok(portable_pty::ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(self.0)
+        }
+    }
     use portable_pty::CommandBuilder;
 
     fn viewport_lines(snapshot: &TerminalSnapshot) -> Vec<String> {
@@ -1939,6 +1993,79 @@ mod tests {
         });
         rx.recv_timeout(std::time::Duration::from_secs(2))
             .expect("dropping PtyClient should not hang");
+    }
+
+    #[test]
+    fn dropping_reaped_pty_client_returns_without_signalling_its_old_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut unrelated = PtyClient::spawn(
+            "/bin/sh",
+            &["-c".to_string(), "sleep 30".to_string()],
+            tmp.path(),
+            24,
+            80,
+            100,
+        )
+        .unwrap();
+        let unrelated_pid = unrelated.child_process_id().unwrap();
+
+        let mut client = PtyClient::spawn(
+            "/bin/sh",
+            &["-c".to_string(), "exit 0".to_string()],
+            tmp.path(),
+            24,
+            80,
+            100,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while client.try_wait().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            client.try_wait().is_some(),
+            "test child must be reaped before Drop exercises the recycled-pid branch"
+        );
+        client.child = Box::new(ReapedChildReportingPid(unrelated_pid));
+
+        drop(client);
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            unrelated.try_wait().is_none(),
+            "Drop signalled the process group reported by an already-reaped child"
+        );
+    }
+
+    #[test]
+    fn dropping_pty_client_allows_hup_handler_to_flush() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = PtyClient::spawn(
+            "/bin/sh",
+            &[
+                "-c".to_string(),
+                "trap 'printf flushed > hup.marker; exit 0' HUP; : > ready; while :; do sleep 30; done"
+                    .to_string(),
+            ],
+            tmp.path(),
+            24,
+            80,
+            100,
+        )
+        .unwrap();
+        let ready = tmp.path().join("ready");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !ready.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "test child did not install its HUP handler");
+
+        drop(client);
+
+        assert_eq!(
+            std::fs::read(tmp.path().join("hup.marker")).unwrap(),
+            b"flushed"
+        );
     }
 
     #[test]
