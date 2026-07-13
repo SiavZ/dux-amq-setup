@@ -729,12 +729,17 @@ impl App {
                         Err(err) => self.set_error(format!("Commit failed: {err}")),
                     }
                 }
-                WorkerEvent::AutoResumeSpawned {
-                    session_id,
+                WorkerEvent::AutoResumeSpawnOnMain {
+                    session,
                     used_resume_args,
-                    result,
+                    ack,
                 } => {
-                    self.handle_auto_resume_spawned(session_id, used_resume_args, result);
+                    // The fork MUST happen here on the main thread (macOS
+                    // fork-safety) — see the WorkerEvent variant docs.
+                    self.spawn_auto_resume_on_main(*session, used_resume_args);
+                    // Release the scheduler's throttle slot regardless of
+                    // outcome; it only bounds provider boots in flight.
+                    let _ = ack.send(());
                 }
                 WorkerEvent::DiskUsage(pct) => {
                     self.handle_disk_usage_event(pct);

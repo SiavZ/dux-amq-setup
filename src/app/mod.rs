@@ -1265,16 +1265,20 @@ pub(crate) enum WorkerEvent {
     /// "add project" path. The synchronous `add_project` entry point was
     /// turned into a kickoff that resolves the metadata in a worker, so
     /// the UI thread never blocks waiting for git.
-    /// One auto-resume spawn job finished in a worker thread. The PTY
-    /// child process is already running; the UI thread inserts the
-    /// returned [`PtyClient`] into `self.runtime.providers` and updates the
-    /// session's status. Errors are logged and the session stays
-    /// detached. Bounded by `[auto_resume]` config (concurrency, stagger,
-    /// staleness filter) — see [`crate::auto_resume::run_scheduler`].
-    AutoResumeSpawned {
-        session_id: String,
+    /// A throttled auto-resume slot is ready. The actual PTY `fork`+`exec`
+    /// MUST run on the main (UI) thread: on macOS, forking from a worker
+    /// thread races libsystem_notify's `atfork` handler and corrupts an
+    /// `os_once` gate, SIGKILLing the child *before* it can `exec` the
+    /// provider wrapper (the "crashed on child side of fork pre-exec"
+    /// class). The scheduler worker sends this event and blocks on `ack`
+    /// until the main thread has forked, so the `[auto_resume]`
+    /// concurrency/stagger throttle still bounds concurrent provider boots
+    /// — see [`crate::auto_resume::run_scheduler`]. `session` is boxed to
+    /// keep the `WorkerEvent` enum small.
+    AutoResumeSpawnOnMain {
+        session: Box<AgentSession>,
         used_resume_args: bool,
-        result: Result<PtyClient, String>,
+        ack: std::sync::mpsc::Sender<()>,
     },
     AddProjectMetaReady {
         path: PathBuf,
@@ -1817,16 +1821,15 @@ impl App {
     /// shared-workspace sessions and interrupted spawns, which both remain
     /// visible for an explicit retry, plus sessions whose worktree no longer
     /// exists or has not been touched within `[auto_resume].stale_days` days.
-    /// Spawns are fanned out across worker threads with at most
-    /// `[auto_resume].concurrency` running in parallel and a
-    /// `[auto_resume].stagger_ms` gap between dispatches so we don't open
-    /// N provider TLS handshakes at once.
+    /// A worker scheduler enforces the throttle — at most
+    /// `[auto_resume].concurrency` boots in flight and a
+    /// `[auto_resume].stagger_ms` gap between dispatches so we don't open N
+    /// provider TLS handshakes at once — but the actual `fork` is marshalled
+    /// back to the main thread via [`WorkerEvent::AutoResumeSpawnOnMain`]
+    /// (macOS fork-from-worker-thread safety; see that variant's docs).
     ///
     /// Failures are logged but don't abort startup — a single bad session
-    /// shouldn't stop the others. Results land as
-    /// [`WorkerEvent::AutoResumeSpawned`] so the UI thread can install the
-    /// returned `PtyClient` into `self.runtime.providers` and update session
-    /// status.
+    /// shouldn't stop the others.
     fn auto_resume_all_sessions(&mut self) {
         if !self.config.defaults.auto_resume_on_start {
             return;
@@ -1849,8 +1852,9 @@ impl App {
 
         // Build (session, use_resume) pairs on the UI thread because
         // `should_resume_session` reads `self.config.providers`. After
-        // this point the worker scheduler owns the data and emits one
-        // WorkerEvent::AutoResumeSpawned per job.
+        // this point the worker scheduler owns the data and, for each job,
+        // marshals a WorkerEvent::AutoResumeSpawnOnMain back to the UI
+        // thread (which does the actual `fork` — see that variant's docs).
         let jobs: Vec<(AgentSession, bool)> = candidates
             .into_iter()
             .map(|s| {
@@ -1860,14 +1864,6 @@ impl App {
             .collect();
 
         let cfg_auto_resume = self.config.auto_resume.clone();
-        let cfg_full = self.config.clone();
-        let last_pty_size = if self.last_pty_size != (0, 0) {
-            self.last_pty_size
-        } else {
-            (24, 80)
-        };
-        let scrollback_lines = self.config.ui.agent_scrollback_lines;
-        let store_id = self.store_id.clone();
         let tx = self.runtime.worker_tx.clone();
 
         thread::Builder::new()
@@ -1877,29 +1873,70 @@ impl App {
                     jobs,
                     &cfg_auto_resume,
                     move |(session, use_resume)| {
-                        let result = sessions::spawn_pty_for_auto_resume(
-                            &cfg_full,
-                            &session,
-                            use_resume,
-                            last_pty_size,
-                            scrollback_lines,
-                            &store_id,
-                        )
-                        .map_err(|e| format!("{e:#}"));
-                        let _ = tx.send(WorkerEvent::AutoResumeSpawned {
-                            session_id: session.id.clone(),
-                            used_resume_args: use_resume,
-                            result,
-                        });
+                        // The scheduler owns the concurrency/stagger
+                        // throttle, but the fork itself must happen on the
+                        // main thread. Send the request and block on `ack`
+                        // so this throttle slot stays occupied for the
+                        // provider-boot window (matching the old semantics
+                        // where the worker held the slot across the spawn).
+                        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+                        if tx
+                            .send(WorkerEvent::AutoResumeSpawnOnMain {
+                                session: Box::new(session),
+                                used_resume_args: use_resume,
+                                ack: ack_tx,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        // A recv error means the UI loop is gone (shutdown);
+                        // just release the permit and let the scheduler wind
+                        // down.
+                        let _ = ack_rx.recv();
                     },
                 );
             })
             .ok();
     }
 
-    /// Receive one [`WorkerEvent::AutoResumeSpawned`] result. Installs the
-    /// PTY client when the spawn succeeded; otherwise logs and leaves the
-    /// session detached.
+    /// Spawn one auto-resume session's PTY **on the main (UI) thread**.
+    /// Called from `drain_events` for [`WorkerEvent::AutoResumeSpawnOnMain`].
+    /// This MUST NOT run on a worker thread — see that variant's docs for
+    /// the macOS fork-from-worker-thread crash it avoids. `fork`+`exec` of
+    /// the provider wrapper is fast (the provider's own TLS handshake
+    /// happens in the child), so doing it inline on the main loop is cheap;
+    /// the `[auto_resume]` throttle already spreads these out.
+    pub(crate) fn spawn_auto_resume_on_main(
+        &mut self,
+        session: AgentSession,
+        used_resume_args: bool,
+    ) {
+        // Skip the fork entirely if the session already reconnected (e.g.
+        // the user clicked it) while this slot was queued.
+        if self.session_has_pty(&session.id) {
+            return;
+        }
+        let last_pty_size = if self.last_pty_size != (0, 0) {
+            self.last_pty_size
+        } else {
+            (24, 80)
+        };
+        let result = sessions::spawn_pty_for_auto_resume(
+            &self.config,
+            &session,
+            used_resume_args,
+            last_pty_size,
+            self.config.ui.agent_scrollback_lines,
+            &self.store_id,
+        )
+        .map_err(|e| format!("{e:#}"));
+        self.handle_auto_resume_spawned(session.id.clone(), used_resume_args, result);
+    }
+
+    /// Install the PTY produced by [`Self::spawn_auto_resume_on_main`] (or
+    /// log the failure and leave the session detached). Kept separate so
+    /// the duplicate-spawn guard and install path stay in one place.
     pub(crate) fn handle_auto_resume_spawned(
         &mut self,
         session_id: String,
