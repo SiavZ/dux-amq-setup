@@ -83,7 +83,6 @@ impl App {
             );
             return Ok(());
         }
-
         // Probe is_git_repo + current_branch + remote_default_branch on a
         // worker thread. The result lands as
         // `WorkerEvent::AddProjectMetaReady`, which decides whether to
@@ -95,7 +94,13 @@ impl App {
             "Validating \"{}\" as a git repository\u{2026}",
             path.display()
         ));
-        workers::dispatch_add_project_meta(self.runtime.worker_tx.clone(), path, name);
+        workers::dispatch_add_project_meta(
+            self.runtime.worker_tx.clone(),
+            path,
+            name,
+            self.config.default_workspace_mode(),
+            self.paths.clone(),
+        );
         Ok(())
     }
 
@@ -106,9 +111,14 @@ impl App {
         &mut self,
         path: PathBuf,
         name: String,
+        workspace_mode: WorkspaceMode,
         meta: AddProjectMeta,
     ) -> Result<()> {
         let branch = meta.current_branch;
+
+        if workspace_mode == WorkspaceMode::Shared {
+            return self.finish_add_project(path.to_string_lossy().to_string(), name, branch);
+        }
 
         // Check whether the current branch matches the remote default branch.
         // Two-tier warning: confident when origin/HEAD is available, heuristic
@@ -169,6 +179,7 @@ impl App {
             name: Some(display_name.clone()),
             default_provider: None,
             commit_prompt: None,
+            workspace_mode: None,
         });
         self.git.projects.push(Project {
             id: project_id,
@@ -179,9 +190,6 @@ impl App {
             path_missing: false,
             meta_loaded: true,
         });
-        if let Some(project) = self.git.projects.last() {
-            self.ensure_project_worktree_link_logged(project);
-        }
         self.rebuild_left_items();
         logger::info(&format!("registered project {}", path_buf.display()));
         self.queue_config_save(
@@ -193,7 +201,14 @@ impl App {
 
     pub(crate) fn ensure_project_worktree_links(&self) {
         for project in &self.git.projects {
-            self.ensure_project_worktree_link_logged(project);
+            if self
+                .git
+                .sessions
+                .iter()
+                .any(|session| session.project_id == project.id && !session.shared_workspace())
+            {
+                self.ensure_project_worktree_link_logged(project);
+            }
         }
     }
 
@@ -244,13 +259,22 @@ impl App {
             return Ok(());
         }
 
-        self.open_name_new_agent_prompt(CreateAgentRequest::NewProject {
-            provider: project.default_provider.clone(),
-            settings: SessionSettings::default(),
-            project,
-            custom_name: None,
-            use_existing_branch: false,
-        })
+        if self.config.workspace_mode_for_project_id(&project.id) == WorkspaceMode::Shared {
+            self.open_name_new_agent_prompt(CreateAgentRequest::SharedWorkspace {
+                provider: project.default_provider.clone(),
+                settings: SessionSettings::default(),
+                project,
+                agent_handle: None,
+            })
+        } else {
+            self.open_name_new_agent_prompt(CreateAgentRequest::NewProject {
+                provider: project.default_provider.clone(),
+                settings: SessionSettings::default(),
+                project,
+                custom_name: None,
+                use_existing_branch: false,
+            })
+        }
     }
 
     pub(crate) fn fork_selected_session(&mut self) -> Result<()> {
@@ -275,7 +299,9 @@ impl App {
     }
 
     fn open_name_new_agent_prompt(&mut self, request: CreateAgentRequest) -> Result<()> {
-        let randomize_name = self.config.defaults.enable_randomized_pet_name_by_default;
+        let shared_workspace = matches!(request, CreateAgentRequest::SharedWorkspace { .. });
+        let randomize_name =
+            shared_workspace || self.config.defaults.enable_randomized_pet_name_by_default;
         let mut input = TextInput::new().with_char_map(crate::git::agent_name_char_map);
         let mut randomized_name = None;
         if randomize_name {
@@ -288,10 +314,12 @@ impl App {
         self.ui.fullscreen_overlay = FullscreenOverlay::None;
         let provider = match &request {
             CreateAgentRequest::NewProject { provider, .. }
+            | CreateAgentRequest::SharedWorkspace { provider, .. }
             | CreateAgentRequest::ForkSession { provider, .. } => provider.clone(),
         };
         let settings = match &request {
             CreateAgentRequest::NewProject { settings, .. }
+            | CreateAgentRequest::SharedWorkspace { settings, .. }
             | CreateAgentRequest::ForkSession { settings, .. } => settings.clone(),
         };
         let provider_options = self.provider_options_for_prompt(&provider);
@@ -369,6 +397,12 @@ impl App {
         name: String,
         target_branch: String,
     ) {
+        if self.config.default_workspace_mode() == WorkspaceMode::Shared {
+            self.set_error(
+                "Shared-workspace project registration never switches the real checkout; add the project as-is or choose worktree mode.",
+            );
+            return;
+        }
         self.set_busy(format!(
             "Checking out \"{target_branch}\" in {path} before adding the project..."
         ));
@@ -519,6 +553,9 @@ impl App {
     }
 
     pub(crate) fn should_resume_session(&self, session: &AgentSession) -> bool {
+        if session.shared_workspace() {
+            return false;
+        }
         let cfg = provider_config(&self.config, &session.provider);
         cfg.supports_session_resume() && session.has_started_provider(&session.provider)
     }
@@ -821,6 +858,7 @@ impl App {
             branch_name: session.branch_name.clone(),
             focus: DeleteAgentFocus::Cancel, // Cancel is the safe default
             delete_worktree: false,          // Opt-in destructive action
+            shared_workspace: session.shared_workspace(),
             worktree_shared,
         };
         Ok(())
@@ -854,6 +892,7 @@ impl App {
         else {
             return;
         };
+        let delete_worktree = delete_worktree && !session.shared_workspace();
         let Some(project) = self
             .git
             .projects
@@ -1542,6 +1581,38 @@ impl App {
         Ok(())
     }
 
+    fn queue_shared_reconnect_validation(
+        &mut self,
+        session: &AgentSession,
+        force_fresh: bool,
+    ) -> Result<()> {
+        if !self
+            .git
+            .reconnect_validations_in_flight
+            .insert(session.id.clone())
+        {
+            self.set_warning("This shared workspace is already being validated for reconnect.");
+            return Ok(());
+        }
+        let operation = if force_fresh {
+            "a fresh restart"
+        } else {
+            "reconnect"
+        };
+        self.set_busy(format!(
+            "Validating the shared workspace before {operation} for agent \"{}\"...",
+            self.session_label(session)
+        ));
+        workers::dispatch_shared_reconnect_validation(
+            self.runtime.worker_tx.clone(),
+            session.id.clone(),
+            session.worktree_path.clone(),
+            self.paths.clone(),
+            force_fresh,
+        );
+        Ok(())
+    }
+
     /// Restart the selected agent with a fresh session, bypassing `--continue`
     /// or equivalent resume args. Works on both active and detached agents.
     pub(crate) fn force_reconnect_agent(&mut self) -> Result<()> {
@@ -1549,7 +1620,27 @@ impl App {
             self.set_error("Select an agent first.");
             return Ok(());
         };
-        if !Path::new(&session.worktree_path).exists() {
+        if session.shared_workspace() {
+            return self.queue_shared_reconnect_validation(&session, true);
+        }
+        self.continue_force_reconnect(&session.id, false)
+    }
+
+    pub(crate) fn continue_force_reconnect(
+        &mut self,
+        session_id: &str,
+        shared_path_validated: bool,
+    ) -> Result<()> {
+        let Some(session) = self
+            .git
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        if !shared_path_validated && !Path::new(&session.worktree_path).exists() {
             self.set_error(format!(
                 "Worktree for agent \"{}\" no longer exists. Delete and re-create the agent.",
                 session.branch_name
@@ -1620,10 +1711,30 @@ impl App {
             self.set_error("Select a stopped agent first to reconnect.");
             return Ok(());
         };
+        if session.shared_workspace() {
+            return self.queue_shared_reconnect_validation(&session, false);
+        }
+        self.continue_reconnect(&session.id, false)
+    }
+
+    pub(crate) fn continue_reconnect(
+        &mut self,
+        session_id: &str,
+        shared_path_validated: bool,
+    ) -> Result<()> {
+        let Some(session) = self
+            .git
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
+        else {
+            return Ok(());
+        };
         tracing::info!(
             target: "dux::sessions",
             session_id = %session.id,
-            branch = %session.branch_name,
+            branch = %crate::sanitize::for_terminal(&session.branch_name),
             provider = %session.provider.as_str(),
             "reconnecting session",
         );
@@ -1634,7 +1745,7 @@ impl App {
             ));
             return Ok(());
         }
-        if !Path::new(&session.worktree_path).exists() {
+        if !shared_path_validated && !Path::new(&session.worktree_path).exists() {
             self.set_error(format!(
                 "Worktree for agent \"{}\" no longer exists. Delete and re-create the agent.",
                 session.branch_name
@@ -2134,11 +2245,25 @@ impl App {
         worktree_path: &str,
         exclude_id: &str,
     ) -> Option<String> {
+        if self
+            .git
+            .sessions
+            .iter()
+            .find(|session| session.id == exclude_id)
+            .is_some_and(AgentSession::shared_workspace)
+        {
+            return None;
+        }
         let conflicting = self
             .git
             .sessions
             .iter()
-            .find(|s| s.id != exclude_id && s.worktree_path == worktree_path && s.state.has_pty())
+            .find(|s| {
+                s.id != exclude_id
+                    && s.worktree_path == worktree_path
+                    && !s.shared_workspace()
+                    && s.state.has_pty()
+            })
             .cloned()?;
 
         let label = self.session_label(&conflicting);
@@ -2545,15 +2670,20 @@ mod tests {
             commit_in_flight: false,
             staged_diff_in_flight: false,
             add_project_in_flight: false,
+            reconnect_validations_in_flight: std::collections::HashSet::new(),
             resume_fallback_candidates: std::collections::HashMap::new(),
             pending_deletions: std::collections::HashSet::new(),
             deletion_busy_messages: std::collections::HashMap::new(),
         };
+        let mut config = Config::default();
+        config.workspace = Some(crate::config::WorkspaceConfig {
+            default_mode: WorkspaceMode::Worktree,
+        });
         let mut app = App {
             ui,
             runtime,
             git,
-            config: Config::default(),
+            config,
             paths,
             bindings,
             session_store,
@@ -2832,6 +2962,138 @@ mod tests {
             .push("codex".to_string());
         let session = app.git.sessions[0].clone();
         assert!(app.should_resume_session(&session));
+
+        app.git.sessions[0].shared_workspace = true;
+        let session = app.git.sessions[0].clone();
+        assert!(
+            !app.should_resume_session(&session),
+            "shared reconnects must always launch fresh"
+        );
+    }
+
+    #[test]
+    fn conflict_detach_is_noop_when_either_session_is_shared() {
+        for shared_id in ["s1", "s2"] {
+            let mut s1 = make_session("s1", "claude", "/tmp/wt/shared");
+            let mut s2 = make_session("s2", "codex", "/tmp/wt/shared");
+            if shared_id == "s1" {
+                s1.shared_workspace = true;
+            } else {
+                s2.shared_workspace = true;
+            }
+            let project = make_project("project-1", "claude");
+            let mut app = test_app_with_sessions(vec![s1, s2], vec![project]);
+            mark_active(&mut app, "s1");
+
+            assert_eq!(
+                app.detach_conflicting_worktree_session("/tmp/wt/shared", "s2"),
+                None
+            );
+            assert!(app.session_has_pty("s1"));
+        }
+    }
+
+    #[test]
+    fn shared_registration_does_not_switch_real_checkout_or_create_link() {
+        let repo = tempdir().expect("repo");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-b", "main"])
+                .arg(repo.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(["switch", "-c", "feature"])
+                .status()
+                .expect("git switch")
+                .success()
+        );
+        let mut app = test_app_with_sessions(Vec::new(), Vec::new());
+        app.config.workspace = Some(crate::config::WorkspaceConfig {
+            default_mode: WorkspaceMode::Shared,
+        });
+
+        app.resume_add_project_after_meta(
+            repo.path().to_path_buf(),
+            "demo".to_string(),
+            WorkspaceMode::Shared,
+            AddProjectMeta {
+                current_branch: "feature".to_string(),
+                remote_default: Some("main".to_string()),
+            },
+        )
+        .expect("register shared project");
+
+        assert!(matches!(app.ui.prompt, PromptState::None));
+        assert_eq!(git::current_branch(repo.path()).unwrap(), "feature");
+        assert!(!repo.path().join(git::PROJECT_WORKTREES_LINK_NAME).exists());
+    }
+
+    #[test]
+    fn shared_only_project_skips_link_but_isolated_fork_creates_it() {
+        let repo = tempdir().expect("repo");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-b", "main"])
+                .arg(repo.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        let project = make_project_at("project-1", "codex", &repo.path().to_string_lossy());
+        let mut session = make_session("shared", "codex", &repo.path().to_string_lossy());
+        session.shared_workspace = true;
+        let mut app = test_app_with_sessions(vec![session], vec![project]);
+        app.config.workspace = Some(crate::config::WorkspaceConfig {
+            default_mode: WorkspaceMode::Shared,
+        });
+
+        app.ensure_project_worktree_links();
+        assert!(!repo.path().join(git::PROJECT_WORKTREES_LINK_NAME).exists());
+
+        // A Fork is an isolated session even under a shared project default.
+        app.git.sessions[0].shared_workspace = false;
+        app.ensure_project_worktree_links();
+        assert!(
+            repo.path()
+                .join(git::PROJECT_WORKTREES_LINK_NAME)
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn reconnect_rejects_shared_project_inside_managed_root() {
+        let mut app = test_app_with_sessions(Vec::new(), Vec::new());
+        let mut session = make_session(
+            "shared",
+            "codex",
+            &app.paths.worktrees_root.to_string_lossy(),
+        );
+        session.shared_workspace = true;
+        app.git.sessions.push(session);
+        app.git.projects.push(make_project("project-1", "codex"));
+        app.rebuild_left_items();
+        app.selected_left = app
+            .left_items()
+            .iter()
+            .position(|item| matches!(item, LeftItem::Session(_)))
+            .expect("session row");
+
+        app.reconnect_selected_session().expect("reconnect gate");
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while !app.git.reconnect_validations_in_flight.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            app.drain_events();
+        }
+
+        assert!(app.status.text().contains("not eligible for reconnect"));
+        assert!(app.git.reconnect_validations_in_flight.is_empty());
+        assert!(!app.session_has_pty("shared"));
     }
 
     #[test]
@@ -2913,6 +3175,40 @@ mod tests {
         assert!(
             worktree_dir.path().exists(),
             "worktree directory must be preserved when the flag is off",
+        );
+    }
+
+    #[test]
+    fn begin_delete_session_never_removes_shared_workspace() {
+        let worktree_dir = tempdir().expect("shared workspace tempdir");
+        let worktree_path = worktree_dir.path().to_string_lossy().to_string();
+        let sentinel = worktree_dir.path().join("uncommitted.txt");
+        std::fs::write(&sentinel, "keep me").expect("shared workspace data");
+
+        let mut session = make_session("shared-delete-guard", "claude", &worktree_path);
+        session.project_id = "project-1".to_string();
+        session.shared_workspace = true;
+        let project = make_project_at("project-1", "claude", &worktree_path);
+        let mut app = test_app_with_sessions(vec![session.clone()], vec![project]);
+        app.session_store
+            .upsert_session(&session)
+            .expect("seed shared session");
+
+        app.begin_delete_session(&session.id, true);
+
+        assert!(app.git.pending_deletions.is_empty());
+        assert!(worktree_dir.path().exists());
+        assert_eq!(
+            std::fs::read_to_string(sentinel).expect("shared workspace data retained"),
+            "keep me"
+        );
+        assert!(app.session_store.load_sessions().unwrap().is_empty());
+        assert_eq!(
+            app.session_store
+                .load_sessions_including_deleted()
+                .unwrap()
+                .len(),
+            1
         );
     }
 

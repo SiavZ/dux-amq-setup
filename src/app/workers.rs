@@ -2,6 +2,8 @@
 
 use super::*;
 
+const DETACHED_HEAD_LABEL: &str = "(detached HEAD)";
+
 impl App {
     pub(crate) fn drain_events(&mut self) {
         while let Ok(event) = self.runtime.worker_rx.try_recv() {
@@ -16,11 +18,13 @@ impl App {
                     } = *boxed;
                     self.create_agent_in_flight = false;
                     self.last_pty_size = pty_size;
-                    self.detach_conflicting_worktree_session(
-                        &session.worktree_path,
-                        &session.id,
-                    );
-                    self.ensure_project_worktree_link_for_project_id(&session.project_id);
+                    if !session.shared_workspace() {
+                        self.detach_conflicting_worktree_session(
+                            &session.worktree_path,
+                            &session.id,
+                        );
+                        self.ensure_project_worktree_link_for_project_id(&session.project_id);
+                    }
                     let session_id = session.id.clone();
                     self.git.sessions.insert(0, session);
                     self.install_pty_for_session(
@@ -48,7 +52,9 @@ impl App {
                 WorkerEvent::CreateAgentRecoverable { session, message } => {
                     self.create_agent_in_flight = false;
                     let session = *session;
-                    self.ensure_project_worktree_link_for_project_id(&session.project_id);
+                    if !session.shared_workspace() {
+                        self.ensure_project_worktree_link_for_project_id(&session.project_id);
+                    }
                     let session_id = session.id.clone();
                     self.git.sessions.retain(|candidate| candidate.id != session_id);
                     self.git.sessions.insert(0, session);
@@ -212,43 +218,7 @@ impl App {
                     }
                 }
                 WorkerEvent::BranchSyncReady(updates) => {
-                    let mut changed = false;
-                    for (session_id, actual_branch) in updates {
-                        let Some(index) = self
-                            .git
-                            .sessions
-                            .iter()
-                            .position(|session| session.id == session_id)
-                        else {
-                            continue;
-                        };
-                        if self.git.sessions[index].branch_name == actual_branch {
-                            continue;
-                        }
-                        let mut candidate = self.git.sessions[index].clone();
-                        candidate.branch_name = actual_branch;
-                        candidate.updated_at = Utc::now();
-                        if let Err(err) = self.session_store.upsert_session(&candidate) {
-                            self.set_error(format!(
-                                "Couldn't persist branch sync for session {}: {err}",
-                                crate::sanitize::for_terminal(&session_id)
-                            ));
-                            continue;
-                        }
-                        logger::info(&format!(
-                            "branch sync: session {} branch changed {} -> {}",
-                            session_id,
-                            self.git.sessions[index].branch_name,
-                            candidate.branch_name,
-                        ));
-                        self.git.sessions[index].branch_name = candidate.branch_name;
-                        self.git.sessions[index].updated_at = candidate.updated_at;
-                        changed = true;
-                    }
-                    if changed {
-                        self.update_branch_sync_sessions();
-                        self.rebuild_left_items();
-                    }
+                    self.apply_branch_sync_updates(updates);
                 }
                 WorkerEvent::GhStatusChecked(status) => {
                     self.runtime.gh_status = status;
@@ -513,21 +483,53 @@ impl App {
                     path,
                     is_git,
                     current_branch,
+                    head_detached,
                     remote_default: _,
                 } => {
                     let path_str = path.to_string_lossy().to_string();
-                    if let Some(proj) = self.git
+                    if let Some(index) = self
+                        .git
                         .projects
-                        .iter_mut()
-                        .find(|p| Path::new(&p.path) == path.as_path())
+                        .iter()
+                        .position(|project| Path::new(&project.path) == path.as_path())
                     {
-                        proj.path_missing = !is_git;
-                        proj.current_branch = if is_git {
+                        let project_id = self.git.projects[index].id.clone();
+                        let shared_project = self
+                            .config
+                            .workspace_mode_for_project_id(&project_id)
+                            == WorkspaceMode::Shared
+                            || self.git.sessions.iter().any(|session| {
+                                session.project_id == project_id && session.shared_workspace()
+                            });
+                        let head_resolved = head_detached || current_branch.is_some();
+                        let branch = if is_git && shared_project && head_detached {
+                            DETACHED_HEAD_LABEL.to_string()
+                        } else if is_git {
                             current_branch.unwrap_or_else(|| "main".to_string())
                         } else {
                             String::new()
                         };
+                        let proj = &mut self.git.projects[index];
+                        proj.path_missing = !is_git;
+                        proj.current_branch = branch.clone();
                         proj.meta_loaded = true;
+                        if is_git
+                            && head_resolved
+                            && shared_project
+                        {
+                            let updates = self
+                                .git
+                                .sessions
+                                .iter()
+                                .filter(|session| {
+                                    session.project_id == project_id
+                                        && session.shared_workspace()
+                                        && session.branch_name != branch
+                                })
+                                .map(|session| (session.id.clone(), branch.clone()))
+                                .collect();
+                            self.apply_branch_sync_updates(updates);
+                        }
                     } else {
                         logger::info(&format!(
                             "ProjectMetaReady arrived for unknown project path {path_str}; \
@@ -743,11 +745,21 @@ impl App {
                 WorkerEvent::AmqInjectScanRequested => {
                     self.drain_inject_queue_dir();
                 }
-                WorkerEvent::AddProjectMetaReady { path, name, result } => {
+                WorkerEvent::AddProjectMetaReady {
+                    path,
+                    name,
+                    workspace_mode,
+                    result,
+                } => {
                     self.git.add_project_in_flight = false;
                     match result {
                         Ok(meta) => {
-                            if let Err(e) = self.resume_add_project_after_meta(path, name, meta) {
+                            if let Err(e) = self.resume_add_project_after_meta(
+                                path,
+                                name,
+                                workspace_mode,
+                                meta,
+                            ) {
                                 self.set_error(format!("{e:#}"));
                             }
                         }
@@ -758,6 +770,27 @@ impl App {
                             ));
                             self.set_error(err);
                         }
+                    }
+                }
+                WorkerEvent::SharedReconnectValidated {
+                    session_id,
+                    force_fresh,
+                    result,
+                } => {
+                    self.git
+                        .reconnect_validations_in_flight
+                        .remove(&session_id);
+                    if let Err(message) = result {
+                        self.set_error(message);
+                        continue;
+                    }
+                    let reconnect = if force_fresh {
+                        self.continue_force_reconnect(&session_id, true)
+                    } else {
+                        self.continue_reconnect(&session_id, true)
+                    };
+                    if let Err(err) = reconnect {
+                        self.set_error(crate::sanitize::for_terminal(&format!("{err:#}")));
                     }
                 }
             }
@@ -1165,36 +1198,87 @@ impl App {
 
     pub(crate) fn spawn_branch_sync_worker(&self) {
         let interval_secs = self.config.ui.branch_sync_interval;
-        if interval_secs == 0 {
-            return; // disabled by config
+        let shared_only = interval_secs == 0;
+        if shared_only {
+            let shared_configured = self.config.default_workspace_mode() == WorkspaceMode::Shared
+                || self.config.projects.iter().any(|project| {
+                    self.config.workspace_mode_for_project(project) == WorkspaceMode::Shared
+                })
+                || self.git.sessions.iter().any(AgentSession::shared_workspace);
+            if !shared_configured {
+                return;
+            }
         }
         let tx = self.runtime.worker_tx.clone();
         let sessions = Arc::clone(&self.runtime.branch_sync_sessions);
         let shutdown = Arc::clone(&self.runtime.shutdown);
         thread::spawn(move || {
-            let interval = Duration::from_secs(u64::from(interval_secs));
+            let interval = Duration::from_secs(if shared_only {
+                45
+            } else {
+                u64::from(interval_secs)
+            });
             while !shutdown.load(Ordering::Relaxed) {
                 thread::sleep(interval);
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
-                let snapshot = match sessions.lock() {
+                let mut snapshot = match sessions.lock() {
                     Ok(guard) => guard.clone(),
                     Err(_) => continue,
                 };
-                let mut updates = Vec::new();
-                for entry in &snapshot {
-                    if let Ok(actual) = git::current_branch(Path::new(&entry.worktree_path))
-                        && actual != entry.branch_name
-                    {
-                        updates.push((entry.session_id.clone(), actual));
-                    }
+                if shared_only {
+                    snapshot.retain(|entry| entry.shared_workspace);
                 }
+                let updates = Self::collect_branch_sync_updates_with(&snapshot, git::head_branch);
                 if !updates.is_empty() && tx.send(WorkerEvent::BranchSyncReady(updates)).is_err() {
                     break; // receiver dropped, app is shutting down
                 }
             }
         });
+    }
+
+    fn collect_branch_sync_updates_with<F>(
+        snapshot: &[BranchSyncEntry],
+        mut head_branch: F,
+    ) -> Vec<(String, String)>
+    where
+        F: FnMut(&Path) -> Result<Option<String>>,
+    {
+        let mut updates = Vec::new();
+        let mut shared_groups: Vec<(PathBuf, Vec<&BranchSyncEntry>)> = Vec::new();
+        for entry in snapshot {
+            if !entry.shared_workspace {
+                if let Ok(Some(actual)) = head_branch(Path::new(&entry.worktree_path))
+                    && actual != entry.branch_name
+                {
+                    updates.push((entry.session_id.clone(), actual));
+                }
+                continue;
+            }
+            let path = PathBuf::from(&entry.worktree_path);
+            let canonical = path.canonicalize().unwrap_or(path);
+            if let Some((_, entries)) = shared_groups
+                .iter_mut()
+                .find(|(candidate, _)| *candidate == canonical)
+            {
+                entries.push(entry);
+            } else {
+                shared_groups.push((canonical, vec![entry]));
+            }
+        }
+        for (path, entries) in shared_groups {
+            let Ok(branch) = head_branch(&path) else {
+                continue;
+            };
+            let actual = branch.unwrap_or_else(|| DETACHED_HEAD_LABEL.to_string());
+            for entry in entries {
+                if entry.branch_name != actual {
+                    updates.push((entry.session_id.clone(), actual.clone()));
+                }
+            }
+        }
+        updates
     }
 
     // -- Git refs watcher for push detection --
@@ -1361,6 +1445,7 @@ impl App {
                     session_id: s.id.clone(),
                     branch_name: s.branch_name.clone(),
                     worktree_path: s.worktree_path.clone(),
+                    shared_workspace: s.shared_workspace(),
                     known_pr: known_map.get(&s.id).cloned(),
                     agent_exited: !s.state.has_pty(),
                 })
@@ -1380,8 +1465,19 @@ impl App {
                 if !enabled.load(Ordering::Relaxed) {
                     break;
                 }
-                let results = run_pr_sync(&sessions);
-                if !results.is_empty() && tx.send(WorkerEvent::PrStatusReady(results)).is_err() {
+                let output = run_pr_sync(&sessions);
+                if !output.branch_updates.is_empty()
+                    && tx
+                        .send(WorkerEvent::BranchSyncReady(output.branch_updates))
+                        .is_err()
+                {
+                    break;
+                }
+                if !output.pr_results.is_empty()
+                    && tx
+                        .send(WorkerEvent::PrStatusReady(output.pr_results))
+                        .is_err()
+                {
                     break;
                 }
             }
@@ -1392,9 +1488,12 @@ impl App {
         let tx = self.runtime.worker_tx.clone();
         let sessions = Arc::clone(&self.runtime.pr_sync_sessions);
         thread::spawn(move || {
-            let results = run_pr_sync(&sessions);
-            if !results.is_empty() {
-                let _ = tx.send(WorkerEvent::PrStatusReady(results));
+            let output = run_pr_sync(&sessions);
+            if !output.branch_updates.is_empty() {
+                let _ = tx.send(WorkerEvent::BranchSyncReady(output.branch_updates));
+            }
+            if !output.pr_results.is_empty() {
+                let _ = tx.send(WorkerEvent::PrStatusReady(output.pr_results));
             }
         });
     }
@@ -1429,24 +1528,56 @@ impl App {
         let Some(session) = self.git.sessions.iter().find(|s| s.id == session_id) else {
             return;
         };
-        let known_pr = self
-            .session_store
-            .load_prs(session_id)
-            .ok()
-            .and_then(|prs| prs.into_iter().next());
-        let entry = PrSyncEntry {
-            session_id: session.id.clone(),
-            branch_name: session.branch_name.clone(),
-            worktree_path: session.worktree_path.clone(),
-            known_pr,
-            agent_exited: !self.session_has_pty(session_id),
+        let entries = if session.shared_workspace() {
+            let known_prs = self.session_store.load_all_latest_prs().unwrap_or_default();
+            let known_map: HashMap<String, crate::storage::StoredPr> = known_prs
+                .into_iter()
+                .map(|pr| (pr.session_id.clone(), pr))
+                .collect();
+            self.git
+                .sessions
+                .iter()
+                .filter(|candidate| candidate.shared_workspace())
+                .map(|candidate| PrSyncEntry {
+                    session_id: candidate.id.clone(),
+                    branch_name: candidate.branch_name.clone(),
+                    worktree_path: candidate.worktree_path.clone(),
+                    shared_workspace: true,
+                    known_pr: known_map.get(&candidate.id).cloned(),
+                    agent_exited: !candidate.state.has_pty(),
+                })
+                .collect()
+        } else {
+            let known_pr = self
+                .session_store
+                .load_prs(session_id)
+                .ok()
+                .and_then(|prs| prs.into_iter().next());
+            vec![PrSyncEntry {
+                session_id: session.id.clone(),
+                branch_name: session.branch_name.clone(),
+                worktree_path: session.worktree_path.clone(),
+                shared_workspace: false,
+                known_pr,
+                agent_exited: !self.session_has_pty(session_id),
+            }]
         };
         let tx = self.runtime.worker_tx.clone();
         let in_flight = Arc::clone(&self.runtime.pr_checks_in_flight);
         in_flight.fetch_add(1, Ordering::Relaxed);
         thread::spawn(move || {
-            let result = check_pr_for_entry(&entry);
-            let _ = tx.send(WorkerEvent::PrStatusReady(vec![(entry.session_id, result)]));
+            let output = run_pr_sync_snapshot_with(
+                &entries,
+                git::head_branch,
+                check_pr_for_entry,
+                check_pr_for_shared_entry,
+            );
+            if !output.branch_updates.is_empty() {
+                let _ = tx.send(WorkerEvent::BranchSyncReady(output.branch_updates));
+            }
+            if !output.pr_results.is_empty() {
+                let _ = tx.send(WorkerEvent::PrStatusReady(output.pr_results));
+            }
             in_flight.fetch_sub(1, Ordering::Relaxed);
         });
     }
@@ -1544,6 +1675,47 @@ impl App {
         }
     }
 
+    fn apply_branch_sync_updates(&mut self, updates: Vec<(String, String)>) {
+        let mut changed = false;
+        for (session_id, actual_branch) in updates {
+            let Some(index) = self
+                .git
+                .sessions
+                .iter()
+                .position(|session| session.id == session_id)
+            else {
+                continue;
+            };
+            if self.git.sessions[index].branch_name == actual_branch {
+                continue;
+            }
+            let mut candidate = self.git.sessions[index].clone();
+            candidate.branch_name = actual_branch;
+            candidate.updated_at = Utc::now();
+            if let Err(err) = self.session_store.upsert_session(&candidate) {
+                self.set_error(format!(
+                    "Couldn't persist branch sync for session {}: {err}",
+                    crate::sanitize::for_terminal(&session_id)
+                ));
+                continue;
+            }
+            tracing::info!(
+                target: "dux::workers",
+                session_id = %crate::sanitize::for_terminal(&session_id),
+                old_branch = %crate::sanitize::for_terminal(&self.git.sessions[index].branch_name),
+                new_branch = %crate::sanitize::for_terminal(&candidate.branch_name),
+                "session branch synchronized",
+            );
+            self.git.sessions[index].branch_name = candidate.branch_name;
+            self.git.sessions[index].updated_at = candidate.updated_at;
+            changed = true;
+        }
+        if changed {
+            self.update_branch_sync_sessions();
+            self.rebuild_left_items();
+        }
+    }
+
     pub(crate) fn queue_config_save(
         &self,
         success: impl Into<String>,
@@ -1591,11 +1763,13 @@ pub(crate) fn run_create_agent_job(
         provider,
         settings,
         source_branch,
-        status_message,
+        mut status_message,
         branch_name,
         worktree_path,
         owns_worktree,
         owns_branch,
+        requested_handle,
+        shared_workspace,
     ) = match request {
         CreateAgentRequest::NewProject {
             project,
@@ -1695,6 +1869,65 @@ pub(crate) fn run_create_agent_job(
                 worktree_path,
                 true,
                 !attach_existing,
+                None,
+                false,
+            )
+        }
+        CreateAgentRequest::SharedWorkspace {
+            project,
+            agent_handle,
+            provider,
+            settings,
+        } => {
+            if let Err(err) = crate::config::validate_shared_workspace_path(&project.path, &paths) {
+                let safe_err = crate::sanitize::for_terminal(&format!("{err:#}"));
+                let _ = worker_tx.send(WorkerEvent::CreateAgentFailed(format!(
+                    "Shared workspace is not eligible: {safe_err}"
+                )));
+                return;
+            }
+            let handle = agent_handle.unwrap_or_else(git::docker_style_name);
+            if !crate::model::is_valid_agent_handle(&handle) {
+                let _ = worker_tx.send(WorkerEvent::CreateAgentFailed(
+                    "Shared agent handle must be 1–64 lowercase letters, digits, dashes, or underscores."
+                        .to_string(),
+                ));
+                return;
+            }
+            let repo_path = PathBuf::from(&project.path);
+            let safe_project_name = crate::sanitize::for_terminal(&project.name);
+            let branch_name = match git::head_branch(&repo_path) {
+                Ok(Some(branch)) => branch,
+                Ok(None) => DETACHED_HEAD_LABEL.to_string(),
+                Err(err) => {
+                    let safe_err = crate::sanitize::for_terminal(&format!("{err:#}"));
+                    let _ = worker_tx.send(WorkerEvent::CreateAgentFailed(format!(
+                        "Failed to inspect the shared workspace HEAD: {safe_err}"
+                    )));
+                    return;
+                }
+            };
+            let _ = worker_tx.send(WorkerEvent::CreateAgentProgress(format!(
+                "Preparing shared workspace for project \"{safe_project_name}\"..."
+            )));
+            let status_message = format!(
+                "Created shared {} agent \"{}\" in project \"{}\". It is running in the registered checkout.",
+                provider.as_str(),
+                handle,
+                safe_project_name
+            );
+            (
+                project,
+                provider,
+                settings,
+                branch_name.clone(),
+                status_message,
+                branch_name,
+                repo_path,
+                false,
+                false,
+                Some(handle),
+                true,
             )
         }
         CreateAgentRequest::ForkSession {
@@ -1774,10 +2007,20 @@ pub(crate) fn run_create_agent_job(
                 worktree_path,
                 true,
                 true,
+                None,
+                false,
             )
         }
     };
-    if owns_worktree {
+    if shared_workspace {
+        tracing::info!(
+            target: "dux::workers",
+            project_id = %crate::sanitize::for_terminal(&project.id),
+            workspace = %crate::sanitize::for_terminal(&worktree_path.display().to_string()),
+            branch = %crate::sanitize::for_terminal(&branch_name),
+            "using registered checkout for shared session",
+        );
+    } else if owns_worktree {
         logger::info(&format!(
             "created worktree {} on branch {}",
             worktree_path.display(),
@@ -1792,7 +2035,9 @@ pub(crate) fn run_create_agent_job(
     }
     let id = Uuid::new_v4().to_string();
     let worktree_path_string = worktree_path.to_string_lossy().to_string();
-    let agent_handle = crate::model::derive_agent_handle(&worktree_path_string, &branch_name, &id);
+    let agent_handle = requested_handle.unwrap_or_else(|| {
+        crate::model::derive_agent_handle(&worktree_path_string, &branch_name, &id)
+    });
     let mut session = AgentSession {
         id,
         project_id: project.id.clone(),
@@ -1802,7 +2047,7 @@ pub(crate) fn run_create_agent_job(
         branch_name,
         worktree_path: worktree_path_string,
         agent_handle,
-        shared_workspace: false,
+        shared_workspace,
         deleted_at: None,
         title: None,
         started_providers: Vec::new(),
@@ -1858,6 +2103,28 @@ pub(crate) fn run_create_agent_job(
         }
         return;
     }
+    if session.shared_workspace() {
+        session.title = Some(session.agent_handle().to_string());
+        session.updated_at = Utc::now();
+        if let Err(err) = store.upsert_session(&session) {
+            let safe_err = crate::sanitize::for_terminal(&format!("{err:#}"));
+            fail_recoverable_create(
+                &store,
+                session,
+                format!(
+                    "Shared session reserved but its display title could not be saved: {safe_err}"
+                ),
+                &worker_tx,
+            );
+            return;
+        }
+        status_message = format!(
+            "Created shared {} agent \"{}\" in project \"{}\". It is running in the registered checkout.",
+            session.provider.as_str(),
+            session.agent_handle(),
+            crate::sanitize::for_terminal(&project.name)
+        );
+    }
     let provider_cfg = provider_config(&config, &session.provider);
     if let Err(hint) = check_provider_available(&provider_cfg) {
         tracing::error!(
@@ -1900,7 +2167,7 @@ pub(crate) fn run_create_agent_job(
                 target: "dux::workers",
                 session_id = %session.id,
                 command = %provider_cfg.command,
-                worktree = %worktree_path.display(),
+                worktree = %crate::sanitize::for_terminal(&worktree_path.display().to_string()),
                 err = %err,
                 "pty spawn failed",
             );
@@ -1972,11 +2239,13 @@ pub(crate) fn dispatch_project_meta(tx: Sender<WorkerEvent>, paths: Vec<PathBuf>
             .spawn(move || {
                 let exists = path.exists();
                 let is_git = exists && git::is_git_repo(&path);
-                let current_branch = if is_git {
-                    git::current_branch(&path).ok()
+                let head = if is_git {
+                    git::head_branch(&path).ok()
                 } else {
                     None
                 };
+                let current_branch = head.as_ref().and_then(|branch| branch.clone());
+                let head_detached = matches!(head, Some(None));
                 let remote_default = if is_git {
                     git::remote_default_branch(&path)
                 } else {
@@ -1986,6 +2255,7 @@ pub(crate) fn dispatch_project_meta(tx: Sender<WorkerEvent>, paths: Vec<PathBuf>
                     path,
                     is_git,
                     current_branch,
+                    head_detached,
                     remote_default,
                 });
             });
@@ -2420,14 +2690,32 @@ pub(crate) fn fail_next_config_save(path: PathBuf, message: impl Into<String>) {
 /// Results land as [`WorkerEvent::AddProjectMetaReady`] so the main loop
 /// can either show the branch-mismatch warning, surface a non-repo error,
 /// or proceed to `finish_add_project`.
-pub(crate) fn dispatch_add_project_meta(tx: Sender<WorkerEvent>, path: PathBuf, name: String) {
+pub(crate) fn dispatch_add_project_meta(
+    tx: Sender<WorkerEvent>,
+    path: PathBuf,
+    name: String,
+    workspace_mode: WorkspaceMode,
+    paths: DuxPaths,
+) {
     let _ = thread::Builder::new()
         .name(format!("add-project-meta-{}", path.display()))
         .spawn(move || {
-            let result = if !path.exists() {
+            let result = if workspace_mode == WorkspaceMode::Shared
+                && let Err(err) =
+                    crate::config::validate_shared_workspace_path(&path.to_string_lossy(), &paths)
+            {
+                Err(crate::sanitize::for_terminal(&format!("{err:#}")))
+            } else if !path.exists() {
                 Err(format!("\"{}\" does not exist.", path.display()))
             } else if !git::is_git_repo(&path) {
                 Err(format!("\"{}\" is not a git repository.", path.display()))
+            } else if workspace_mode == WorkspaceMode::Shared {
+                git::head_branch(&path)
+                    .map(|branch| AddProjectMeta {
+                        current_branch: branch.unwrap_or_else(|| DETACHED_HEAD_LABEL.to_string()),
+                        remote_default: None,
+                    })
+                    .map_err(|err| format!("{err:#}"))
             } else {
                 match git::current_branch(&path) {
                     Ok(branch) => {
@@ -2440,8 +2728,60 @@ pub(crate) fn dispatch_add_project_meta(tx: Sender<WorkerEvent>, path: PathBuf, 
                     Err(err) => Err(format!("{err:#}")),
                 }
             };
-            let _ = tx.send(WorkerEvent::AddProjectMetaReady { path, name, result });
+            let _ = tx.send(WorkerEvent::AddProjectMetaReady {
+                path,
+                name,
+                workspace_mode,
+                result,
+            });
         });
+}
+
+pub(crate) fn dispatch_shared_reconnect_validation(
+    tx: Sender<WorkerEvent>,
+    session_id: String,
+    workspace_path: String,
+    paths: DuxPaths,
+    force_fresh: bool,
+) {
+    let worker_tx = tx.clone();
+    let worker_session_id = session_id.clone();
+    let spawn = thread::Builder::new()
+        .name("shared-reconnect-validation".to_string())
+        .spawn(move || {
+            let result = crate::config::validate_shared_workspace_path(&workspace_path, &paths)
+                .map_err(|err| {
+                    format!(
+                        "Shared workspace is not eligible for reconnect: {}",
+                        crate::sanitize::for_terminal(&format!("{err:#}"))
+                    )
+                })
+                .and_then(|()| {
+                    if Path::new(&workspace_path).exists() {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "Shared workspace {} no longer exists. Restore it or delete and re-create the agent.",
+                            crate::sanitize::for_terminal(&workspace_path)
+                        ))
+                    }
+                });
+            let _ = worker_tx.send(WorkerEvent::SharedReconnectValidated {
+                session_id: worker_session_id,
+                force_fresh,
+                result,
+            });
+        });
+    if let Err(err) = spawn {
+        let _ = tx.send(WorkerEvent::SharedReconnectValidated {
+            session_id,
+            force_fresh,
+            result: Err(format!(
+                "Couldn't start shared-workspace reconnect validation: {}",
+                crate::sanitize::for_terminal(&err.to_string())
+            )),
+        });
+    }
 }
 
 pub(crate) fn browser_entries(dir: &Path) -> Result<Vec<BrowserEntry>, String> {
@@ -2529,20 +2869,88 @@ pub(crate) fn sample_disk_usage_pct(path: &Path) -> Option<u8> {
 
 // -- GitHub PR sync helpers (run on background threads) --
 
-fn run_pr_sync(
-    sessions: &Arc<Mutex<Vec<PrSyncEntry>>>,
-) -> Vec<(String, Option<crate::model::PrInfo>)> {
+#[derive(Default)]
+struct PrSyncOutput {
+    branch_updates: Vec<(String, String)>,
+    pr_results: Vec<(String, Option<crate::model::PrInfo>)>,
+}
+
+fn run_pr_sync(sessions: &Arc<Mutex<Vec<PrSyncEntry>>>) -> PrSyncOutput {
     let snapshot = match sessions.lock() {
         Ok(guard) => guard.clone(),
-        Err(_) => return Vec::new(),
+        Err(_) => return PrSyncOutput::default(),
     };
-    snapshot
-        .iter()
-        .map(|entry| {
-            let result = check_pr_for_entry(entry);
-            (entry.session_id.clone(), result)
-        })
-        .collect()
+    run_pr_sync_snapshot_with(
+        &snapshot,
+        git::head_branch,
+        check_pr_for_entry,
+        check_pr_for_shared_entry,
+    )
+}
+
+fn run_pr_sync_snapshot_with<H, R, S>(
+    snapshot: &[PrSyncEntry],
+    mut head_branch: H,
+    mut check_regular: R,
+    mut check_shared: S,
+) -> PrSyncOutput
+where
+    H: FnMut(&Path) -> Result<Option<String>>,
+    R: FnMut(&PrSyncEntry) -> Option<crate::model::PrInfo>,
+    S: FnMut(&PrSyncEntry, &str) -> Option<crate::model::PrInfo>,
+{
+    let mut output = PrSyncOutput::default();
+    let mut shared_groups: Vec<(PathBuf, Vec<&PrSyncEntry>)> = Vec::new();
+    for entry in snapshot {
+        if !entry.shared_workspace {
+            output
+                .pr_results
+                .push((entry.session_id.clone(), check_regular(entry)));
+            continue;
+        }
+        let path = PathBuf::from(&entry.worktree_path);
+        let canonical = path.canonicalize().unwrap_or(path);
+        if let Some((_, entries)) = shared_groups
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == canonical)
+        {
+            entries.push(entry);
+        } else {
+            shared_groups.push((canonical, vec![entry]));
+        }
+    }
+
+    for (path, entries) in shared_groups {
+        let Ok(branch) = head_branch(&path) else {
+            continue;
+        };
+        let (branch_label, pr) = match branch {
+            Some(branch) => {
+                let pr = check_shared(entries[0], &branch);
+                (branch, pr)
+            }
+            None => (DETACHED_HEAD_LABEL.to_string(), None),
+        };
+        for entry in entries {
+            if entry.branch_name != branch_label {
+                output
+                    .branch_updates
+                    .push((entry.session_id.clone(), branch_label.clone()));
+            }
+            output
+                .pr_results
+                .push((entry.session_id.clone(), pr.clone()));
+        }
+    }
+    output
+}
+
+fn check_pr_for_shared_entry(
+    entry: &PrSyncEntry,
+    live_branch: &str,
+) -> Option<crate::model::PrInfo> {
+    let owner_repo = git::remote_owner_repo(Path::new(&entry.worktree_path))?;
+    discover_pr_by_branch(live_branch, &owner_repo, &entry.session_id)
 }
 
 /// Determine the current PR state for a session. The check strategy depends on
@@ -2765,6 +3173,403 @@ pub fn spawn_backup_worker(
             crate::logger::warn(&format!("[storage] failed to spawn backup worker: {e}"));
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod shared_workspace_create_tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    fn init_repo(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.name", "test"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["commit", "--allow-empty", "-m", "initial"]);
+    }
+
+    fn test_paths(root: PathBuf) -> DuxPaths {
+        DuxPaths {
+            config_path: root.join("config.toml"),
+            sessions_db_path: root.join("sessions.sqlite3"),
+            worktrees_root: root.join("worktrees"),
+            lock_path: root.join("dux.lock"),
+            root,
+        }
+    }
+
+    fn project(path: &Path) -> Project {
+        Project {
+            id: "project".to_string(),
+            name: "demo".to_string(),
+            path: path.to_string_lossy().to_string(),
+            default_provider: ProviderKind::from_str("codex"),
+            current_branch: "main".to_string(),
+            path_missing: false,
+            meta_loaded: true,
+        }
+    }
+
+    #[test]
+    fn shared_create_subprocess_helper() {
+        let Some(mode) = std::env::var_os("DUX_SHARED_CREATE_TEST_MODE") else {
+            return;
+        };
+        let dux_home = PathBuf::from(std::env::var_os("DUX_SHARED_CREATE_HOME").unwrap());
+        let repo = PathBuf::from(std::env::var_os("DUX_SHARED_CREATE_REPO").unwrap());
+        let output = PathBuf::from(std::env::var_os("DUX_SHARED_CREATE_OUTPUT").unwrap());
+        let paths = test_paths(dux_home);
+        fs::create_dir_all(&paths.worktrees_root).unwrap();
+        let mut config = Config::default();
+        config.providers.commands["codex"].command = "dux-provider-does-not-exist".to_string();
+        let provider = ProviderKind::from_str("codex");
+        let request = if mode == "fork" {
+            let now = Utc::now();
+            CreateAgentRequest::ForkSession {
+                project: project(&repo),
+                source_session: Box::new(AgentSession {
+                    id: "source".to_string(),
+                    project_id: "project".to_string(),
+                    project_path: Some(repo.to_string_lossy().to_string()),
+                    provider: provider.clone(),
+                    source_branch: "main".to_string(),
+                    branch_name: "main".to_string(),
+                    worktree_path: repo.to_string_lossy().to_string(),
+                    agent_handle: "source".to_string(),
+                    shared_workspace: true,
+                    deleted_at: None,
+                    title: Some("source".to_string()),
+                    started_providers: Vec::new(),
+                    state: SessionState::Created { created_at: now },
+                    settings: SessionSettings::default(),
+                    created_at: now,
+                    updated_at: now,
+                }),
+                source_label: "source".to_string(),
+                custom_name: Some("fork-agent".to_string()),
+                provider,
+                settings: SessionSettings::default(),
+            }
+        } else {
+            CreateAgentRequest::SharedWorkspace {
+                project: project(&repo),
+                agent_handle: Some("shared-agent".to_string()),
+                provider,
+                settings: SessionSettings::default(),
+            }
+        };
+        let (tx, rx) = mpsc::channel();
+        run_create_agent_job(
+            request,
+            paths,
+            config,
+            "store-test".to_string(),
+            tx,
+            (80, 24),
+        );
+        let outcome = rx
+            .into_iter()
+            .find_map(|event| match event {
+                WorkerEvent::CreateAgentRecoverable { .. } => Some("recoverable"),
+                WorkerEvent::CreateAgentFailed(_) => Some("failed"),
+                WorkerEvent::CreateAgentReady(_) => Some("ready"),
+                _ => None,
+            })
+            .unwrap_or("missing");
+        fs::write(output, outcome).unwrap();
+    }
+
+    fn run_helper(mode: &str, root: &Path, repo: &Path) -> String {
+        let output = root.join(format!("{mode}.out"));
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("shared_create_subprocess_helper")
+            .arg("--nocapture")
+            .env("DUX_SHARED_CREATE_TEST_MODE", mode)
+            .env("DUX_SHARED_CREATE_HOME", root.join("dux"))
+            .env("DUX_SHARED_CREATE_REPO", repo)
+            .env("DUX_SHARED_CREATE_OUTPUT", &output)
+            .env("AMQ_GLOBAL_ROOT", root.join("amq"))
+            .env_remove("AM_ROOT")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        fs::read_to_string(output).unwrap()
+    }
+
+    #[test]
+    fn shared_create_uses_real_checkout_without_worktree_or_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("project");
+        init_repo(&repo);
+        let exclude = fs::read(repo.join(".git/info/exclude")).unwrap();
+
+        assert_eq!(run_helper("shared", dir.path(), &repo), "recoverable");
+
+        let paths = test_paths(dir.path().join("dux"));
+        let rows = SessionStore::open(&paths.sessions_db_path)
+            .unwrap()
+            .load_sessions()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let session = &rows[0];
+        assert!(session.shared_workspace());
+        assert_eq!(Path::new(&session.worktree_path), repo);
+        assert_eq!(session.agent_handle(), "shared-agent");
+        assert_eq!(session.title.as_deref(), Some("shared-agent"));
+        assert!(session.state.is_retryable());
+        assert_eq!(fs::read(repo.join(".git/info/exclude")).unwrap(), exclude);
+        assert!(!repo.join(git::PROJECT_WORKTREES_LINK_NAME).exists());
+        assert_eq!(fs::read_dir(&paths.worktrees_root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn shared_create_rejects_managed_root_before_persisting() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("dux/worktrees/project");
+        init_repo(&repo);
+
+        assert_eq!(run_helper("managed", dir.path(), &repo), "failed");
+
+        let paths = test_paths(dir.path().join("dux"));
+        let rows = SessionStore::open(&paths.sessions_db_path)
+            .unwrap()
+            .load_sessions()
+            .unwrap();
+        assert!(rows.is_empty());
+        assert!(!dir.path().join("amq/agents/shared-agent").exists());
+    }
+
+    #[test]
+    fn shared_registration_accepts_detached_head_without_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("project");
+        init_repo(&repo);
+        let head = git::head_commit(&repo).unwrap();
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["checkout", "--detach", &head])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let (tx, rx) = mpsc::channel();
+
+        dispatch_add_project_meta(
+            tx,
+            repo.clone(),
+            "demo".to_string(),
+            WorkspaceMode::Shared,
+            test_paths(dir.path().join("dux")),
+        );
+
+        let event = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let WorkerEvent::AddProjectMetaReady { result, .. } = event else {
+            panic!("unexpected registration event");
+        };
+        let meta = result.expect("detached shared checkout is eligible");
+        assert_eq!(meta.current_branch, DETACHED_HEAD_LABEL);
+        assert!(meta.remote_default.is_none());
+        assert_eq!(git::head_branch(&repo).unwrap(), None);
+    }
+
+    #[test]
+    fn fork_from_shared_session_still_creates_isolated_worktree_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("project");
+        init_repo(&repo);
+
+        assert_eq!(run_helper("fork", dir.path(), &repo), "recoverable");
+
+        let paths = test_paths(dir.path().join("dux"));
+        let rows = SessionStore::open(&paths.sessions_db_path)
+            .unwrap()
+            .load_sessions()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].shared_workspace());
+        assert_ne!(Path::new(&rows[0].worktree_path), repo);
+        assert!(
+            Path::new(&rows[0].worktree_path)
+                .canonicalize()
+                .unwrap()
+                .starts_with(paths.worktrees_root.canonicalize().unwrap())
+        );
+        assert!(Path::new(&rows[0].worktree_path).exists());
+    }
+}
+
+#[cfg(test)]
+mod shared_workspace_sync_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn branch_entry(id: &str, path: &Path, branch: &str, shared: bool) -> BranchSyncEntry {
+        BranchSyncEntry {
+            session_id: id.to_string(),
+            worktree_path: path.to_string_lossy().to_string(),
+            branch_name: branch.to_string(),
+            shared_workspace: shared,
+        }
+    }
+
+    fn pr_entry(id: &str, path: &Path, branch: &str, shared: bool) -> PrSyncEntry {
+        PrSyncEntry {
+            session_id: id.to_string(),
+            branch_name: branch.to_string(),
+            worktree_path: path.to_string_lossy().to_string(),
+            shared_workspace: shared,
+            known_pr: None,
+            agent_exited: false,
+        }
+    }
+
+    #[test]
+    fn shared_branch_sync_queries_canonical_path_once_and_fans_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        let worktree = dir.path().join("worktree");
+        fs::create_dir_all(&shared).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        let alias = dir.path().join("shared-alias");
+        std::os::unix::fs::symlink(&shared, &alias).unwrap();
+        let snapshot = vec![
+            branch_entry("shared-a", &shared, "old", true),
+            branch_entry("shared-b", &alias, "old", true),
+            branch_entry("worktree", &worktree, "old", false),
+        ];
+        let calls = Cell::new(0);
+
+        let updates = App::collect_branch_sync_updates_with(&snapshot, |path| {
+            calls.set(calls.get() + 1);
+            Ok(Some(if path == worktree {
+                "worktree-live".to_string()
+            } else {
+                "shared-live".to_string()
+            }))
+        });
+
+        assert_eq!(
+            calls.get(),
+            2,
+            "one shared path query plus one worktree query"
+        );
+        assert_eq!(
+            updates,
+            vec![
+                ("worktree".to_string(), "worktree-live".to_string()),
+                ("shared-a".to_string(), "shared-live".to_string()),
+                ("shared-b".to_string(), "shared-live".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_pr_sync_discovers_once_per_path_and_ignores_known_session_shortcuts() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        let worktree = dir.path().join("worktree");
+        fs::create_dir_all(&shared).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        let mut snapshot = vec![
+            pr_entry("shared-a", &shared, "stored-a", true),
+            pr_entry("shared-b", &shared, "stored-b", true),
+            pr_entry("worktree", &worktree, "stored-worktree", false),
+        ];
+        snapshot[0].known_pr = Some(crate::storage::StoredPr {
+            session_id: "shared-a".to_string(),
+            pr_number: 7,
+            owner_repo: "old/repo".to_string(),
+            state: "MERGED".to_string(),
+            title: "stale shortcut".to_string(),
+        });
+        let head_calls = Cell::new(0);
+        let regular_calls = Cell::new(0);
+        let shared_calls = Cell::new(0);
+
+        let output = run_pr_sync_snapshot_with(
+            &snapshot,
+            |_| {
+                head_calls.set(head_calls.get() + 1);
+                Ok(Some("live-shared".to_string()))
+            },
+            |_| {
+                regular_calls.set(regular_calls.get() + 1);
+                None
+            },
+            |_, branch| {
+                shared_calls.set(shared_calls.get() + 1);
+                assert_eq!(branch, "live-shared");
+                Some(crate::model::PrInfo {
+                    number: 42,
+                    state: crate::model::PrState::Open,
+                    title: "shared PR".to_string(),
+                    owner_repo: "owner/repo".to_string(),
+                })
+            },
+        );
+
+        assert_eq!(head_calls.get(), 1);
+        assert_eq!(shared_calls.get(), 1);
+        assert_eq!(
+            regular_calls.get(),
+            1,
+            "worktree behavior stays per-session"
+        );
+        assert_eq!(output.branch_updates.len(), 2);
+        assert_eq!(
+            output
+                .pr_results
+                .iter()
+                .filter(|(id, pr)| id.starts_with("shared-") && pr.is_some())
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn detached_shared_head_fans_out_label_and_skips_pr_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = vec![
+            pr_entry("shared-a", dir.path(), "main", true),
+            pr_entry("shared-b", dir.path(), "main", true),
+        ];
+        let discoveries = Cell::new(0);
+
+        let output = run_pr_sync_snapshot_with(
+            &snapshot,
+            |_| Ok(None),
+            |_| unreachable!("no worktree entry"),
+            |_, _| {
+                discoveries.set(discoveries.get() + 1);
+                None
+            },
+        );
+
+        assert_eq!(discoveries.get(), 0);
+        assert_eq!(
+            output.branch_updates,
+            vec![
+                ("shared-a".to_string(), DETACHED_HEAD_LABEL.to_string()),
+                ("shared-b".to_string(), DETACHED_HEAD_LABEL.to_string()),
+            ]
+        );
+        assert!(output.pr_results.iter().all(|(_, pr)| pr.is_none()));
     }
 }
 

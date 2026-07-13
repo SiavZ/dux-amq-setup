@@ -29,8 +29,8 @@ use uuid::Uuid;
 
 use crate::clipboard::Clipboard;
 use crate::config::{
-    Config, DuxPaths, MacroSurface, ProjectConfig, ProviderCommandConfig, check_provider_available,
-    ensure_config, validate_keys,
+    Config, DuxPaths, MacroSurface, ProjectConfig, ProviderCommandConfig, WorkspaceMode,
+    check_provider_available, ensure_config, validate_keys,
 };
 use crate::editor::DetectedEditor;
 use crate::git;
@@ -130,6 +130,7 @@ pub(crate) struct BranchSyncEntry {
     pub(crate) session_id: String,
     pub(crate) worktree_path: String,
     pub(crate) branch_name: String,
+    pub(crate) shared_workspace: bool,
 }
 
 /// Snapshot of session data shared with the PR-sync background worker.
@@ -138,8 +139,9 @@ pub(crate) struct PrSyncEntry {
     pub(crate) session_id: String,
     pub(crate) branch_name: String,
     pub(crate) worktree_path: String,
-    /// If we already know a PR for this session, the worker can use `gh pr view`
-    /// (works even after branch deletion) and skip terminal states (merged/closed).
+    pub(crate) shared_workspace: bool,
+    /// Isolated sessions may refresh this exact PR via `gh pr view`. Shared
+    /// sessions deliberately ignore it and discover from the checkout's live HEAD.
     pub(crate) known_pr: Option<crate::storage::StoredPr>,
     /// Whether the agent process has exited. Used to skip PR discovery calls
     /// for sessions that are both exited and in a terminal PR state — nobody
@@ -485,6 +487,9 @@ pub(crate) enum PromptState {
         branch_name: String,
         focus: DeleteAgentFocus,
         delete_worktree: bool,
+        /// Shared sessions run in the registered checkout, which dux must
+        /// never remove as part of session deletion.
+        shared_workspace: bool,
         /// True when one or more other sessions share this worktree. In that
         /// case the worktree is always preserved regardless of the user's
         /// choice, so the checkbox is hidden and a note is shown instead.
@@ -1094,6 +1099,12 @@ pub(crate) enum CreateAgentRequest {
         provider: ProviderKind,
         settings: SessionSettings,
     },
+    SharedWorkspace {
+        project: Project,
+        agent_handle: Option<String>,
+        provider: ProviderKind,
+        settings: SessionSettings,
+    },
     ForkSession {
         project: Project,
         source_session: Box<AgentSession>,
@@ -1184,6 +1195,7 @@ pub(crate) enum WorkerEvent {
         path: PathBuf,
         is_git: bool,
         current_branch: Option<String>,
+        head_detached: bool,
         remote_default: Option<String>,
     },
     /// Background `git status --porcelain` for the staged/unstaged file
@@ -1233,7 +1245,13 @@ pub(crate) enum WorkerEvent {
     AddProjectMetaReady {
         path: PathBuf,
         name: String,
+        workspace_mode: WorkspaceMode,
         result: Result<AddProjectMeta, String>,
+    },
+    SharedReconnectValidated {
+        session_id: String,
+        force_fresh: bool,
+        result: Result<(), String>,
     },
     /// Persistent-disk usage sample emitted ~every 60 s by
     /// [`crate::app::workers::App::spawn_disk_watchdog`]. Drives the
@@ -1491,6 +1509,7 @@ impl App {
             commit_in_flight: false,
             staged_diff_in_flight: false,
             add_project_in_flight: false,
+            reconnect_validations_in_flight: HashSet::new(),
             resume_fallback_candidates: HashMap::new(),
             pending_deletions: HashSet::new(),
             deletion_busy_messages: HashMap::new(),
@@ -1552,8 +1571,8 @@ impl App {
         let project_paths = project_paths_for_meta(&app.git.projects);
         workers::dispatch_project_meta(app.runtime.worker_tx.clone(), project_paths);
 
-        app.ensure_project_worktree_links();
         app.restore_sessions();
+        app.ensure_project_worktree_links();
         app.auto_resume_all_sessions();
         app.seed_pr_statuses_from_db();
         app.rebuild_left_items();
@@ -1752,10 +1771,10 @@ impl App {
 
     /// If `defaults.auto_resume_on_start` is enabled, eagerly reconnect every
     /// detached session so all panes are live as soon as dux opens. Skips
-    /// interrupted spawns, which remain visible for an explicit retry, and
-    /// sessions whose worktree no longer exists or whose worktree has not
-    /// been touched within `[auto_resume].stale_days` days. Spawns are
-    /// fanned out across worker threads with at most
+    /// shared-workspace sessions and interrupted spawns, which both remain
+    /// visible for an explicit retry, plus sessions whose worktree no longer
+    /// exists or has not been touched within `[auto_resume].stale_days` days.
+    /// Spawns are fanned out across worker threads with at most
     /// `[auto_resume].concurrency` running in parallel and a
     /// `[auto_resume].stagger_ms` gap between dispatches so we don't open
     /// N provider TLS handshakes at once.
@@ -1770,23 +1789,8 @@ impl App {
             return;
         }
         let stale_days = self.config.auto_resume.stale_days;
-        let mut skipped_stale = 0usize;
-        let candidates: Vec<AgentSession> = self
-            .git
-            .sessions
-            .iter()
-            .filter(|s| Path::new(&s.worktree_path).exists())
-            .filter(|s| !s.state.has_pty())
-            .filter(|s| !s.state.is_retryable())
-            .filter(|s| {
-                let stale = crate::auto_resume::is_stale(Path::new(&s.worktree_path), stale_days);
-                if stale {
-                    skipped_stale += 1;
-                }
-                !stale
-            })
-            .cloned()
-            .collect();
+        let (candidates, skipped_stale) =
+            collect_auto_resume_candidates(&self.git.sessions, stale_days);
         logger::info(&format!(
             "auto_resume_on_start: spawning {} agent session(s) (skipped {skipped_stale} stale, concurrency={}, stagger={}ms)",
             candidates.len(),
@@ -1892,7 +1896,17 @@ impl App {
             return;
         }
         let stored = self.session_store.load_all_latest_prs().unwrap_or_default();
+        let shared_session_ids: HashSet<&str> = self
+            .git
+            .sessions
+            .iter()
+            .filter(|session| session.shared_workspace())
+            .map(|session| session.id.as_str())
+            .collect();
         for pr in stored {
+            if shared_session_ids.contains(pr.session_id.as_str()) {
+                continue;
+            }
             use crate::model::{PrInfo, PrState};
             let state = match pr.state.as_str() {
                 "OPEN" => PrState::Open,
@@ -2786,6 +2800,19 @@ impl App {
         new_name: String,
         rename_branch: bool,
     ) {
+        if rename_branch
+            && self
+                .git
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .is_some_and(AgentSession::shared_workspace)
+        {
+            self.set_error(
+                "Shared-workspace agents can rename their display title, but Dux never renames the real checkout branch.",
+            );
+            return;
+        }
         let name = new_name.trim().to_string();
         if name.is_empty() {
             self.set_error("Name cannot be empty.");
@@ -3585,6 +3612,7 @@ impl App {
                     session_id: s.id.clone(),
                     worktree_path: s.worktree_path.clone(),
                     branch_name: s.branch_name.clone(),
+                    shared_workspace: s.shared_workspace(),
                 })
                 .collect();
         }
@@ -3797,6 +3825,29 @@ pub(crate) fn project_paths_for_meta(projects: &[Project]) -> Vec<PathBuf> {
     projects.iter().map(|p| PathBuf::from(&p.path)).collect()
 }
 
+fn collect_auto_resume_candidates(
+    sessions: &[AgentSession],
+    stale_days: u32,
+) -> (Vec<AgentSession>, usize) {
+    let mut skipped_stale = 0;
+    let candidates = sessions
+        .iter()
+        .filter(|session| !session.shared_workspace())
+        .filter(|session| Path::new(&session.worktree_path).exists())
+        .filter(|session| !session.state.has_pty())
+        .filter(|session| !session.state.is_retryable())
+        .filter(|session| {
+            let stale = crate::auto_resume::is_stale(Path::new(&session.worktree_path), stale_days);
+            if stale {
+                skipped_stale += 1;
+            }
+            !stale
+        })
+        .cloned()
+        .collect();
+    (candidates, skipped_stale)
+}
+
 // ── Resource monitor helpers ───────────────────────────────────────────────
 
 /// Collect CPU and memory stats for dux itself plus each labeled target
@@ -3949,6 +4000,28 @@ pub(crate) fn provider_config(config: &Config, provider: &ProviderKind) -> Provi
 mod tests {
     use super::*;
 
+    fn auto_resume_fixture(id: &str, path: &Path, shared_workspace: bool) -> AgentSession {
+        let now = Utc::now();
+        AgentSession {
+            id: id.to_string(),
+            project_id: "project".to_string(),
+            project_path: Some(path.to_string_lossy().to_string()),
+            provider: ProviderKind::from_str("codex"),
+            source_branch: "main".to_string(),
+            branch_name: "main".to_string(),
+            worktree_path: path.to_string_lossy().to_string(),
+            agent_handle: id.to_string(),
+            shared_workspace,
+            deleted_at: None,
+            title: None,
+            started_providers: Vec::new(),
+            state: SessionState::Created { created_at: now },
+            settings: SessionSettings::default(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
     #[test]
     fn bootstrap_amq_sync_degrades_on_corrupt_shared_config() {
         let dir = tempfile::tempdir().unwrap();
@@ -3970,6 +4043,24 @@ mod tests {
         assert_eq!(
             fs::read(amq_root.join("meta/config.json")).unwrap(),
             b"{not-json"
+        );
+    }
+
+    #[test]
+    fn startup_auto_resume_excludes_shared_sessions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = auto_resume_fixture("shared", dir.path(), true);
+        let worktree = auto_resume_fixture("worktree", dir.path(), false);
+
+        let (candidates, skipped_stale) = collect_auto_resume_candidates(&[shared, worktree], 0);
+
+        assert_eq!(skipped_stale, 0);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["worktree"]
         );
     }
 
