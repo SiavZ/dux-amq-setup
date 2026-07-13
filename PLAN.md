@@ -1,61 +1,103 @@
-# Plan: audit03 — full fresh sweep + autonomous remediation
-_Locked via grill — by Claude + Siavash. Revised after Codex review round 1._
-
-## Naming note
-
-This is **audit03 in the `docs/audits/` series** (audit01.md, audit02.md → audit03/). It is unrelated to the `docs/plans/audits/audit03/` plan series ("Audit03 Phase 01 — session settings modal", already implemented and landed). The report summary will state this disambiguation explicitly, and cross-reference that plan where findings touch the session-settings surface.
+# Plan: shared main-workspace mode for dux agents
+_Locked via grill — by Claude + Siavash. Revised after Codex review rounds 1–4._
 
 ## Goal
 
-Run a from-scratch, full-coverage audit (audit03) of the entire dux-amq-setup working tree — the ~58k-line Rust `src/` tree, the `dux-amq/` shell/install/wrapper chain, CI/CD, and architecture — across all five dimensions used in prior audits: correctness, performance/efficiency, security, architecture/structure, and modernity. Prior audits (audit01/02) are input evidence but not the frame: every finding is re-derived against today's code, including the 11 files with uncommitted changes. The deliverable is a ranked findings report written into `docs/audits/audit03/` (multi-file: summary + per-subsystem), followed immediately by autonomous remediation of **all** tiers (P0→P1→P2) with a maximum-security stance, staged as stacked branches per tier.
+Let dux agents run directly in a project's **main workspace** (`Project.path`) instead of each getting its own `git worktree` clone. New default for freshly-configured installs; existing installs keep worktree isolation until they opt in (§C). Motivation: usually one agent per codebase, and per-agent worktrees make files drift out of sync.
+
+**Scoped invariants (honest):**
+1. dux's **automatic lifecycle/workspace-management** operations (worktree create/remove, session cleanup, purge, reset, orphan cleanup) never mutate or delete the user's real repo. *User-initiated* actions (stage, discard, pull, commit) still mutate the checkout by design — that is what an agent workspace is for.
+2. Every place that used a session's *path* as identity now uses a durable per-session key, so identity, messaging, resume, purge, branch, and callbacks stay correct when sessions share a directory.
+3. The multi-writer warning reflects **current-store** visibility only; agents under another `DUX_HOME` or unmanaged processes sharing the checkout are **undetectable** and documented as such.
+
+## Core defect — path as identity (rounds 1–2)
+
+`session.worktree_path` is a de-facto identity key across Peers routing (`peer.rs:554`), AMQ handle/env (`peer.rs:78,603`), inject match (`inject_runtime.rs:176`), purge target (`purge.rs:238`) + provider-dir encoding (`purge.rs:278`), commit-msg callback (`input.rs:1055`), refs watcher (`workers.rs:1191`), branch/PR metadata (`workers.rs:1339`), and three deletion paths. **Fix:** persisted immutable `agent_handle` + `session.id` are identity; path-keyed lookups survive only for workspace-wide state (current branch, changed files), fanned to all sessions on that path.
+
+## Verified facts (code + research)
+
+- Wrappers `flock` **`meta/config.lock`** (stable), not `config.json`, and run **unlocked if `flock` is absent** (`claude-amq:189`); Rust reconciliation currently takes no lock (`peer.rs:673`). AMQ root is shared across panes/agents (and potentially `DUX_HOME`s) → `agents/<handle>` is a **global** namespace; two stores minting `alice` collide physically. Peer loading drops exited sessions before reconciliation (`peer.rs:299`). Wake daemon is disowned via `setsid` and its stale check keys on app-wide `DUX_PID` (`claude-amq:374`, `dux-amq-inject-bridge:179`).
+- `storage.rs` delete physically removes the row (`storage.rs:411`); migration runner is SQL-only and bumps `user_version` in-tx (`storage.rs:54,117`). `ALTER TABLE ADD COLUMN` can't add `NOT NULL`/`CHECK` and a unique index permits multiple NULLs — enforcing the contract needs a **table rebuild**.
+- Provider wrapper claims the handle before `CreateAgentReady` persists the row (`workers.rs:1833` then `:19`); a `Spawning` state exists to persist-first.
+- Project **registration** default-checks-out the remote default branch (`sessions.rs:111`, `input.rs:4568`). `session_prs` stores no branch; PR sync prefers the stored PR (`workers.rs:2512`). Startup auto-spawns non-stale path-existing sessions (`mod.rs:1760`).
+- `reset_agent_data` warns-and-continues on DB load failure, then wipes `worktrees_root` + DB (`cli.rs:504,524`). `StatusLine` holds one replaceable message (`statusline.rs:11`). Untracked-dir discard legitimately `remove_dir_all`s inside a project (`git.rs:736`). Hard-purge advertises GDPR erasure (`README.md:315`).
 
 ## Approach
 
-1. **Baseline**:
-   a. Review the uncommitted WIP diff for secrets and stray generated files; commit the intentional WIP on `main` as a descriptive commit. The working tree currently shows `docs/audits/audit01.md`/`audit02.md` as tracked deletions with untracked replacement directories (`docs/audits/audit01/`, `audit02/`) — both rename destinations are staged together with the deletions so the prior audits are preserved as moves, and the cached diff is verified to show them as such before committing. Only `PLAN.md` and `PLAN-REVIEW-LOG.md` are excluded. Record the resulting baseline SHA — every audit citation pins to it.
-   b. Capture a **pre-change health record** at the baseline SHA before any auditing, using the repo's exact CI invocations: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`, `cargo audit --deny warnings --ignore RUSTSEC-2025-0141 --ignore RUSTSEC-2024-0384` (kept in sync with `deny.toml`), `cargo deny --all-features check`, and `make overlay-test` (ShellCheck + bats, including root installer and extensionless scripts). Pre-existing failures are recorded in the report so they can't be misattributed to audit fixes.
-2. **Coverage manifest**: enumerate every in-scope file (all of `src/` including `purge.rs`, `provider.rs`, `watch/`, all of `dux-amq/`, root installers/manifests, `.github/`, integration tests, `SECURITY.md` + `docs/operations/threat-model.md`). Every file is assigned to exactly one reviewer agent. The report states per-file coverage (read vs skimmed); nothing is silently dropped.
-3. **Audit sweep** (parallel read-only agents + live web research):
-   - Fan out reviewer agents by subsystem per the manifest: `src/app/` (input/render/sessions/workers/state), `src/` core (pty, storage, git, amq_inject, inject_runtime, config, tracing/sanitize, purge, provider, watch), `dux-amq/` (wrappers, install.sh, scripts, bats tests, root installers), CI/CD + supply chain (`.github/`, Cargo dependency tree), architecture/modernity (module structure, dead code, idioms, threat-model docs).
-   - All reviewer agents are **read-only** and cite `baseline-SHA + path:line + symbol/snippet` for every finding.
-   - Web research pass: **all currently-open** RustSec advisories for the exact `Cargo.lock` set (no date cutoff), GitHub Actions advisories, terminal-injection/agent-CLI CVEs; plus an inventory of shipped non-Cargo components (downloaded binaries, pinned installer hashes) checked against their upstream advisories. Each supply-chain subsystem report carries a **reproducibility evidence table**: component + version, advisory source URL, query date, and retained raw tool output (`cargo audit`/`cargo deny` JSON where available). If a mandatory feed is unreachable, the report's summary marks the supply-chain section **incomplete** — not a footnote.
-   - Adversarial verification: every candidate finding gets a refute-style check before entering the report.
-4. **Severity thresholds** (a finding is only *fixable* if it meets its tier's bar):
-   - **P0**: exploitable security defect within the documented threat model, data-loss path, or panic/crash reachable in normal operation. (CI-gate failures are merge blockers handled in the fix workflow, but severity always derives from the underlying defect — a formatting violation is not a P0.)
-   - **P1**: reproducible defect, measured or clearly-reasoned bottleneck on a hot path, violation of a CLAUDE.md tenet, or missing safety rail with a concrete failure scenario.
-   - **P2**: modernity/structure improvements — only fixable when the change is a safe deletion, a mechanical idiom upgrade, or has test coverage proving no behavior change. Subjective taste without one of those is *documented, not fixed*.
-5. **Security stance**: maximum security **within the documented threat model** (`SECURITY.md`: single-user, single-UID VM). Controls are evaluated against named assets, adversaries, and trust boundaries — no same-UID security theater. Where a fix tightens or contradicts a documented accepted risk, the fix updates `SECURITY.md`/`docs/operations/threat-model.md` in the same commit as an explicit, reviewed threat-model change. Workflow-affecting defaults (YOLO flags, auto-accept, seeding) become secure-by-default at full strength per the user's explicit instruction; every behavior change is listed prominently in the report summary.
-6. **Report**: write `docs/audits/audit03/` — `00-summary.md` (executive summary, disambiguation note, ranked P0/P1/P2 table, coverage statement, pre-change health record, behavior-change list, audit01/02 cross-reference) plus one file per subsystem. Baseline findings are frozen evidence; a **disposition ledger** (`99-disposition.md`) is maintained through the fix phase recording each finding as confirmed / refuted-during-fix / fixed (with commit SHA) / deferred (with reason). **Publication timing**: the repo is public, so the report is written and versioned locally but **not pushed** while its findings are unfixed — tier PRs contain fix commits only. The report (with completed ledger) is committed and pushed on the final `audit03/p2` tip once remediation is done; any finding still open at that point that is exploitable-in-the-wild is withheld from the pushed report and handled via a private security advisory instead.
-7. **Fix phase — fully autonomous, maximum security**:
-   - **Stacked branches**: `main` (baseline) ← `audit03/p0` ← `audit03/p1` ← `audit03/p2`. Each tier branches from the previous tier's verified tip; the user merges `audit03/p2` to take everything, or a lower branch to take less. Commit per finding (or per tight cluster), referencing finding IDs.
-   - Each tier must pass the **full CI-parity gate** before the next tier starts, using the exact CI invocations from step 1b (including `cargo audit --deny warnings` with the synced ignores, and `make overlay-test` when shell files changed). A final combined gate runs on the `audit03/p2` tip.
-   - **Independent fix review**: before a tier is declared done and the next branch stacks on it, an independent read-only reviewer agent reviews the tier's full diff adversarially (correctness, security regressions, unintended behavior change). Findings feed back as fix commits on the same tier.
-   - **Linux CI legs**: branch pushes trigger only `test.yml` (test + security matrix); fmt/clippy/overlay checks run on pull requests only. Therefore each tier branch is pushed and a **draft PR** is opened for it, and the tier is not declared green until all PR checks pass on GitHub. **PR bases**: `audit03/p0 → main`, `audit03/p1 → audit03/p0`, `audit03/p2 → audit03/p1` for per-tier review; after the final gate, one integration PR `audit03/p2 → main` carries the whole stack (plus the report). Draft PRs are review artifacts; merging remains the user's call.
-   - Fixes to non-trivial logic include unit tests per CLAUDE.md. Performance fixes require evidence: a measurement, profile, or benchmark (micro-benchmark or timed test) demonstrating the claim — no speculative optimization. Runtime behavior that unit tests can't reach (PTY spawn/reconnect, AMQ delivery) gets a targeted local smoke on macOS. Linux-only runtime behavior (live TIOCSTI wake, installer upgrade paths, PTY reconnect under Linux) is **not** covered by existing CI or local smokes: the disposition ledger marks affected fixes' verification explicitly **incomplete (Linux runtime)** rather than merely noting a gap.
-8. **Wrap-up**: final summary of what was found, fixed, refuted, and deferred; behavior changes highlighted; branches left for the user to merge.
+### A. Schema, identity, soft-delete
+1. **Migration 0005 = atomic table rebuild.** In one transaction: create `agent_sessions_new` with all existing columns plus `shared_workspace BOOLEAN NOT NULL DEFAULT 0`, `agent_handle TEXT NOT NULL UNIQUE CHECK(length ≤ N and matches [a-z0-9_-]+)`, and `deleted_at` (soft-delete); backfill `agent_handle` in Rust (normalized basename derivation, deterministic `-2/-3` suffixing by stable row order, **globally** deconflicted per §B); recreate all indexes and the `session_prs` foreign keys; `DROP` old, `RENAME` new; set `user_version = 5`. Crash-atomic — no version-5-with-nulls window.
+2. **Immutable, fail-closed handles.** Normalization only at migration/creation. DB boundary enforces NOT NULL/UNIQUE/CHECK. Loads **fail closed** on invalid/duplicate (corruption), never silently repair.
+3. **Soft-delete + tombstone.** Ordinary session delete sets `deleted_at`, hides the row from active UI/routing/auto-resume queries, and **retains the full row** (provider path, handle, `store_id`, `session_id`) so a later hard purge can still erase everything. Physical row removal happens **only** after hard purge succeeds.
+4. **Single accessor** `session.agent_handle()` through AMQ export, `DUX_AMQ_HANDLE`, sync, inject match, purge target. No path-derived handles.
+
+### B. AMQ ownership, global handles, locking, wake (shared root aware)
+5. **Global handle reservation under the shared lock.** Handles are unique across the **whole** shared AMQ root, not per-store. Reservation is atomic: acquire `flock` on `meta/config.lock` → verify the physical `agents/<handle>` key is free or owned by this `{store_id, session_id}` → reserve → release. Backfill/creation that hits a foreign-owned handle deconflicts with a suffix (immutable thereafter). Explicit migration policy for pre-existing foreign collisions.
+6. **Persist-first ownership (use `Spawning`).** Persist UUID + reserved handle (soft-row) and reserve the AMQ handle under lock **before** spawning the provider; then spawn. Every spawn/persist failure leaves a recoverable row — never an owner marker/inbox with no row.
+7. **Ownership marker `{store_id, session_id}`; own-store pruning only.** The wrapper records `{store_id, session_id}` atomically with registration. Reconciliation considers only its own store's rows, matched against **all unfiltered** rows (not the exited-filtered peer set); foreign-store and standalone-wrapper registrations are **never pruned**. `store_id` is persisted in durable `DUX_HOME` metadata (a file), so it survives and is recoverable.
+8. **Mandatory shared lock everywhere.** All three provider wrappers **and** Rust reconciliation must lock `meta/config.lock` (via `rustix::flock`) for the complete read-modify-rename; a missing `flock` is a hard error, not a silent bypass.
+9. **Delete/purge stops the wake daemon.** Record each session's disowned wake PID at spawn; before tombstoning or purging, terminate + verify that PID and remove its live registry entry under the AMQ lock, so a retained inbox is not drained after delete.
+10. **Deletion vs purge:** tombstone (soft-row + retained inbox + reserved handle) on ordinary delete; **hard purge is the only op** that removes the inbox dir, frees the global handle (after exact-owner verification), and physically deletes the row.
+
+### C. Config + consent
+11. **Presence sentinel.** `[workspace] default_mode` (global) + `ProjectConfig.workspace_mode` (per-project). Preserve section presence: **absent ⇒ `worktree`** (legacy consent); fresh render writes `shared`. Shared-mode badge + real path in the create modal. **Eligibility (shared project not under a dux-managed root) is validated at config load, create, and reconnect** — not only registration.
+
+### D. Messaging routing
+12. **Shared → always AMQ.** If **either** resolved endpoint (sender or target) is shared, route via AMQ using `agent_handle`; **reject explicit `--transport claude-peers`** when either endpoint is shared. Worktree↔worktree keeps Peers-preferred. Test both directions.
+13. **Sender identity + no ambiguous cwd.** Export `DUX_SESSION_ID` + `agent_handle` to companion terminals (`sessions.rs:610`); `session_for_cwd` rejects ambiguity and requires `--from <handle>`.
+
+### E. Lifecycle & branch
+14. **Create-agent (keep modal).** `CreateAgentRequest::SharedWorkspace`; modal settings apply; relabel branch→handle, autofill, skip branch checks, dir = `Project.path`, `shared_workspace = true`, `owns_worktree = owns_branch = false`. **Fork always isolates** (worktree) even inside a shared-default project.
+15. **Registration honors mode.** Resolve effective mode at registration; **prohibit the default-branch checkout** (`sessions.rs:111`, `input.rs:4568`) for shared projects. Bar shared projects under any dux-managed root.
+16. **Branch + PR = live workspace state.** For shared sessions ignore stored `branch_name` and the per-session known-PR shortcut (`workers.rs:2512`); query live `HEAD` **once per canonical path**, fan the branch + a single PR discovery to every session on that path, and **skip PR discovery while detached**.
+17. **No startup auto-spawn** for shared sessions; manual reconnect through the §F gate. Auto-resume disabled for shared (fresh only).
+18. **Worktree-link gated on owned-worktree presence** — not the project's default mode. Every call site (project-add `sessions.rs:180`, startup `mod.rs:1540`, create-agent `workers.rs:47`) creates the symlink / `.git/info/exclude` mutation only when the project actually has (or is creating) a worktree-mode session. So a shared-default project that spawns an isolated Fork still gets the link; a shared-only project stays byte-untouched.
+19. **Conflict-detach** no-op for shared; handle immutable; rename = display title only; branch-rename hidden for shared.
+
+### F. Deletion safety (scoped) + abort-on-incomplete
+20. **Protected-workspace guard at whole-worktree/root entry points only** (`remove_worktree`, `reset_agent_data`'s `worktrees_root` wipe, session-delete/purge worktree steps): refuse when the canonical target is an ancestor/descendant of any registered project path. **Not** applied to contained-file ops (untracked-dir discard `git.rs:736`, mirroring).
+21. **Abort before any mutation** in `reset_agent_data` and the orphan cleaner whenever config, sessions, tombstones, `store_id`, or the protected-path inventory cannot load completely — an invalid handle (fail-closed) must not fall through to the warn-and-delete path. Reset also purges every exactly-owned AMQ dir (or retains metadata) before deleting the DB, so tombstones aren't stranded.
+22. **Honest shared hard-purge (GDPR).** Per-session purge cannot delete the shared provider dir without erasing siblings, so it reports provider history as **incomplete/error** and retains the (soft-deleted) row unless the operator accepts residual data or confirms a **workspace-wide** provider-history purge. Never a false "erased."
+
+### G. Concurrency UI
+23. Second live writer → confirmation; the warning renders as a **separately-derived header/sidebar segment** (not the replaceable `StatusLine`), labeled **current-store** visibility (foreign-`DUX_HOME`/unmanaged writers are undetectable — documented). Full Git-state cross-talk documented in `SECURITY.md` + threat model.
+
+### H. Migration cleanup (opt-in, safe)
+24. Cleaner admits **only canonical descendants of `worktrees_root` that are git-registered worktrees with no session row**, excludes the main worktree, shows dirty/untracked status per item, per-item confirmation, preserves the branch by default, never automatic, aborts on incomplete inventory (§F21).
+
+### I. Docs & proof matrix
+25. Update `README.md`, threat model, header summaries + module trees.
+26. **Unit tests — two-sessions/one-path for every formerly path-keyed site, plus:** interrupted-migration durability + table-rebuild constraint enforcement (NOT NULL/UNIQUE/CHECK, FK preservation); global handle collision across two stores + foreign-registration non-pruning + exact-owner purge; persist-first spawn failure leaves a recoverable row; concurrent wrapper+Rust claim under `meta/config.lock`; wake-PID termination on delete; config absent/shared/worktree/fresh; routing AMQ-fallback + `--transport claude-peers` rejection **both directions**; ambiguous companion sender → `--from`; startup skip; commit-msg callback + refs fan-out + exact inbound injection by handle; live-HEAD branch + single PR fan-out incl. detached; soft-delete-then-hard-purge erases everything; reset abort-on-incomplete + owned-AMQ purge; deletion overlap guard at scoped entry points; shared create/delete leaves the repo untouched; cleaner restricted to `worktrees_root`.
 
 ## Key decisions & tradeoffs
 
-- **Full fresh sweep, not a delta audit** — re-derives everything rather than triaging audit02's 62 items; costs more, but validates prior findings instead of trusting them.
-- **Working tree as-is, not HEAD** — the audit covers uncommitted in-flight changes because that's what ships next.
-- **WIP committed to `main` by Claude first** — explicit user decision from the grill (overrides PR-only convention for this baseline commit); secrets/artifact review happens before the commit.
-- **Maximum security within the documented threat model** — secure fixes at full strength, including workflow-affecting defaults, but scoped to real trust boundaries; threat-model changes are explicit and documented, never silent.
-- **Everything autonomous** — no sign-off gates between tiers; only truly irreversible decisions stop the run.
-- **Stacked branch per tier** — review boundaries without merge ambiguity; one final gate on the stack tip.
-- **Frozen findings + live disposition ledger** — baseline evidence never mutates, but implementation learnings (refuted/merged findings) are recorded with fix SHAs instead of preserving false claims.
-- **Severity bars gate fixability** — P2 taste findings without a safety proof are documented, not auto-refactored; bounds regression risk on an autonomous run.
+- **Invariant scoped to automatic operations; user edits still mutate the checkout; badge is current-store only** — honest about what "iron-clad" can mean here.
+- **Path is never identity; handles are globally unique + immutable + fail-closed; table-rebuild migration** — correct under a shared AMQ root.
+- **Persist-first + `Spawning`, global reservation under mandatory `meta/config.lock`, own-store pruning, wake-PID kill on delete** — no orphaned owners, no cross-store clobber, no zombie drainers.
+- **Soft-delete/tombstone; hard purge is the only free-and-erase** — later GDPR erasure stays possible; contradiction removed.
+- **Shared → always AMQ (either endpoint); branch + PR from live HEAD; link gated on owned-worktree presence; eligibility re-checked at load/create/reconnect.**
+- **Deletion guard scoped to worktree/root entry points; reset aborts on incomplete load and purges owned AMQ first; honest GDPR purge.**
 
 ## Risks / open questions
 
-- Web research quality depends on live source availability; unreachable mandatory feeds mark the supply-chain section incomplete in the summary.
-- Findings in the 11 WIP files may be against code the user intends to rewrite anyway.
-- P0 fixes requiring upstream AMQ coordination (e.g. peer auth) get an in-repo mitigation plus a documented upstream ask, not a fork of AMQ.
-- ~58k lines + shell + CI is a large surface; the coverage manifest makes depth explicit per file rather than claiming uniform depth.
-- Local verification runs on macOS; Linux-specific **compile- and test-visible** regressions surface via the PR CI matrix. Linux-only *runtime* behavior (TIOCSTI wake, installer upgrades, Linux PTY reconnect) is not exercised by any gate in this engagement and stays marked "incomplete (Linux runtime)" in the ledger.
+- **Scope reality:** genuinely large and cross-cutting — schema rebuild, wrapper protocol + global handle namespacing, wake-daemon lifecycle, soft-delete, PR identity, reset atomicity. Must land in sequenced phases behind the config default (dark until opted in): migration/identity → ownership/locking/wake → routing → lifecycle/branch → deletion/purge → UI/cleaner → docs.
+- **Global handle collisions with pre-existing foreign registrations** need a one-time migration policy; document the deconflict behavior.
+- **Foreign-`DUX_HOME` writers are undetectable** — accepted and documented, not solved.
+- **AMQ-only routing for shared Claude agents** changes transport in the multi-agent case; observable via reject + badge; smoke-test two Claude agents in one repo.
+
+## Implementation refinements (round 5 — non-blocking, fold in during build)
+
+- Pick a concrete `agent_handle` length bound `N` (e.g. 64) and run `PRAGMA foreign_key_check` around the table rebuild to prove the `session_prs` FKs survived.
+- Upgrade a legacy path-based AMQ marker (`claude-amq:222`) to `{store_id, session_id}` **only** when it maps unambiguously to one local row; otherwise preserve it as foreign and suffix the new handle.
+- On startup, convert an interrupted PTY-less `Spawning` row into a **visible retryable** state while retaining its reservation (don't strand or auto-spawn it).
+- Export `DUX_STORE_ID` to the PTY env; make the recorded wake PID **optional** and surface reduced delivery observability for providers launched without an AMQ wrapper.
+- Reset follows the owned-AMQ-purge branch before deleting the DB; soft-deleted purge targets resolve by **UUID/handle**, rejecting ambiguous branch aliases.
+- Document that a **workspace-wide** provider-history purge also removes **non-Dux** conversations stored under that workspace path (they share the provider dir).
 
 ## Out of scope
 
-- AMQ binary internals (`avivsinai/agent-message-queue` Go source) beyond its interface contract with dux wrappers — separate engagement, consistent with audit02.
-- Server-side GitHub configuration (branch protection, org policies) — documented as expected settings only.
-- Multi-tenant hardening — the deployment model remains single-user-on-a-VM.
-- Merging the fix branches to main — user's call after review.
+- Coordination/locking for concurrent agent *edits* (only the AMQ-registry lock is in scope).
+- Changing the Claude Peers broker / broker-side session id.
+- Persisting provider conversation IDs for precise shared resume (future).
+- Cross-`DUX_HOME` writer detection.
+- Auto-migrating/auto-deleting worktrees (cleaner is opt-in, `worktrees_root`-only).
+- Multi-branch-in-one-directory; rewriting the worktree path.
