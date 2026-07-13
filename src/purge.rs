@@ -5,7 +5,7 @@
 //! and the sqlite database holistically but cannot target a single
 //! session, and never touches the per-session provider chat history under
 //! `<provider_root>/projects/<encoded>/` or the AMQ inbox under
-//! `<amq_root>/agents/<branch>/`. Without those paths a real "delete this
+//! `<amq_root>/agents/<agent_handle>/`. Without those paths a real "delete this
 //! customer's data" request is impossible.
 //!
 //! ## What gets purged
@@ -19,8 +19,8 @@
 //! 2. The Claude / Codex / Gemini chat-history dirs at
 //!    `<provider_root>/<provider>/projects/<encoded>` where
 //!    `<encoded>` is computed by `crate::purge_encoding`.
-//! 3. The session's AMQ inbox at `<amq_root>/agents/<branch>` (we only
-//!    delete the branch-named directory, never the parent — peers'
+//! 3. The session's AMQ inbox at `<amq_root>/agents/<agent_handle>` (we only
+//!    delete the handle-named directory, never the parent — peers'
 //!    inboxes must remain untouched).
 //! 4. Log records tagged with this `session_id`. These are *redacted*
 //!    rather than deleted: every JSON Lines record in `dux.log*` is
@@ -298,8 +298,8 @@ pub fn plan_for_session(
         });
     }
 
-    // 3. AMQ inbox. Reject malformed persisted branch paths even when the
-    // runtime identity resolves from the worktree basename instead.
+    // 3. AMQ inbox. Reject malformed persisted branch paths before building
+    // the destructive cascade.
     let branch_path = Path::new(&session.branch_name);
     if session.branch_name.is_empty()
         || branch_path.is_absolute()
@@ -319,12 +319,12 @@ pub fn plan_for_session(
         );
     }
 
-    // Use the exact runtime identity priority (sanitised worktree basename,
-    // then branch, then id), not the raw DB branch.
-    let handle = crate::peer::amq_handle_for_session(session);
+    // ponytail: Phase 5 replaces this path-only deletion with exact-owner
+    // verification; Phase 2 still uses the immutable handle as the safe target.
+    let handle = session.agent_handle();
     if !handle.is_empty() {
         let agents_root = config.amq_root.join("agents");
-        let inbox = validate_delete_target(&agents_root, &agents_root.join(&handle), "AMQ inbox")?;
+        let inbox = validate_delete_target(&agents_root, &agents_root.join(handle), "AMQ inbox")?;
         items.push(PurgeItem::AmqInbox(inbox));
     }
 
@@ -978,7 +978,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_uses_runtime_amq_handle_and_configured_absolute_log_path() {
+    fn plan_targets_deconflicted_agent_handle_not_worktree_basename() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = fixture_paths(tmp.path());
         let amq_root = tmp.path().join("custom-state/amq");
@@ -986,9 +986,10 @@ mod tests {
         let mut config = fixture_config(amq_root.clone(), &[]);
         config.log_path = log_path.clone();
         let worktree = paths.worktrees_root.join("runtime-handle");
-        let session = fixture_session("sid-runtime", "feature/different", &worktree);
+        let mut session = fixture_session("sid-runtime", "feature/different", &worktree);
+        session.agent_handle = "runtime-handle-2".to_string();
         let expected_inbox =
-            resolve_for_containment(&amq_root.join("agents/runtime-handle")).unwrap();
+            resolve_for_containment(&amq_root.join("agents/runtime-handle-2")).unwrap();
 
         let plan = plan_for_session(&session, &paths, &config).expect("plan");
         assert!(plan.items.iter().any(|item| {
@@ -1005,7 +1006,7 @@ mod tests {
             )
         }));
         assert!(!plan.items.iter().any(|item| {
-            matches!(item, PurgeItem::AmqInbox(path) if path.ends_with("feature-different"))
+            matches!(item, PurgeItem::AmqInbox(path) if path.ends_with("runtime-handle"))
         }));
     }
 

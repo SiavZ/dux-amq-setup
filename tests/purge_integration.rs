@@ -106,8 +106,8 @@ impl PurgeHarness {
         fs::write(claude_dir.join("history.jsonl"), b"chat\n").expect("claude history");
         fs::write(codex_dir.join("history.jsonl"), b"chat\n").expect("codex history");
 
-        // Fake AMQ inbox under <amq_root>/agents/<branch>/inbox.
-        let amq_inbox = amq_root.join("agents").join("audit02-x");
+        // Fake AMQ inbox under <amq_root>/agents/<agent_handle>/inbox.
+        let amq_inbox = amq_root.join("agents").join("sid-target");
         fs::create_dir_all(amq_inbox.join("inbox")).expect("amq inbox");
         fs::write(amq_inbox.join("inbox/00001.json"), b"{}\n").expect("amq msg");
 
