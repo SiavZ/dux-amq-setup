@@ -269,6 +269,13 @@ impl WorkspaceMode {
 #[serde(default)]
 pub struct WorkspaceConfig {
     pub default_mode: WorkspaceMode,
+    /// Whether shared-workspace sessions auto-resume on startup alongside
+    /// worktree sessions. Off by default: shared agents run in the real
+    /// checkout, so a boot would otherwise fire every shared agent into the
+    /// live repo at once. Turn on for a fleet that intentionally auto-starts
+    /// shared agents on `auto_resume_on_start`.
+    #[serde(default)]
+    pub auto_resume_shared: bool,
 }
 
 fn deserialize_workspace_mode_override<'de, D>(
@@ -908,6 +915,15 @@ impl Config {
             .unwrap_or(WorkspaceMode::Worktree)
     }
 
+    /// Whether shared-workspace sessions participate in startup auto-resume.
+    /// Absent `[workspace]` section ⇒ false (the isolation-era default).
+    pub fn auto_resume_shared(&self) -> bool {
+        self.workspace
+            .as_ref()
+            .map(|workspace| workspace.auto_resume_shared)
+            .unwrap_or(false)
+    }
+
     pub fn workspace_mode_for_project(&self, project: &ProjectConfig) -> WorkspaceMode {
         project
             .workspace_mode
@@ -1355,6 +1371,16 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
                  # Override one project with workspace_mode in its [[projects]] entry.",
             )),
             value_fn: |c| FieldValue::Str(c.default_workspace_mode().as_str().to_string()),
+        },
+        ConfigEntry::Field {
+            key: "auto_resume_shared",
+            comment: Some(CommentSource::Static(
+                "# When true, shared-workspace sessions also auto-resume on startup\n\
+                 # (with auto_resume_on_start). Default false: shared agents run in the\n\
+                 # real checkout, so a boot would otherwise fire every shared agent into\n\
+                 # the live repo at once. Turn on for a fleet that auto-starts shared agents.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.auto_resume_shared()),
         },
         ConfigEntry::Blank,
         ConfigEntry::Providers,
@@ -1953,6 +1979,12 @@ pub fn save_config(
             "workspace",
             "default_mode",
             workspace.default_mode.as_str(),
+        );
+        patch_table_bool(
+            &mut doc,
+            "workspace",
+            "auto_resume_shared",
+            workspace.auto_resume_shared,
         );
     }
 

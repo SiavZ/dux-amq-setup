@@ -6307,6 +6307,7 @@ mod tests {
         let mut config = Config::default();
         config.workspace = Some(crate::config::WorkspaceConfig {
             default_mode: WorkspaceMode::Worktree,
+            auto_resume_shared: false,
         });
         let mut app = App {
             ui,
@@ -7281,6 +7282,7 @@ mod tests {
         let mut app = test_app(default_bindings());
         app.config.workspace = Some(crate::config::WorkspaceConfig {
             default_mode: WorkspaceMode::Shared,
+            auto_resume_shared: false,
         });
 
         app.create_agent_for_selected_project().unwrap();
@@ -7313,6 +7315,7 @@ mod tests {
             let mut app = test_app(default_bindings());
             app.config.workspace = Some(crate::config::WorkspaceConfig {
                 default_mode: global,
+                auto_resume_shared: false,
             });
             app.config.projects.push(ProjectConfig {
                 id: app.git.projects[0].id.clone(),
@@ -7340,6 +7343,7 @@ mod tests {
         let mut app = test_app(default_bindings());
         app.config.workspace = Some(crate::config::WorkspaceConfig {
             default_mode: WorkspaceMode::Shared,
+            auto_resume_shared: false,
         });
 
         app.fork_selected_session().unwrap();

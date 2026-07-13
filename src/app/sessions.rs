@@ -2835,6 +2835,7 @@ mod tests {
         let mut config = Config::default();
         config.workspace = Some(crate::config::WorkspaceConfig {
             default_mode: WorkspaceMode::Worktree,
+            auto_resume_shared: false,
         });
         let mut app = App {
             ui,
@@ -3245,6 +3246,7 @@ mod tests {
         let mut app = test_app_with_sessions(Vec::new(), Vec::new());
         app.config.workspace = Some(crate::config::WorkspaceConfig {
             default_mode: WorkspaceMode::Shared,
+            auto_resume_shared: false,
         });
 
         app.resume_add_project_after_meta(
@@ -3280,6 +3282,7 @@ mod tests {
         let mut app = test_app_with_sessions(vec![session], vec![project]);
         app.config.workspace = Some(crate::config::WorkspaceConfig {
             default_mode: WorkspaceMode::Shared,
+            auto_resume_shared: false,
         });
 
         app.ensure_project_worktree_links();

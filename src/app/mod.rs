@@ -1832,8 +1832,11 @@ impl App {
             return;
         }
         let stale_days = self.config.auto_resume.stale_days;
-        let (candidates, skipped_stale) =
-            collect_auto_resume_candidates(&self.git.sessions, stale_days);
+        let (candidates, skipped_stale) = collect_auto_resume_candidates(
+            &self.git.sessions,
+            stale_days,
+            self.config.auto_resume_shared(),
+        );
         logger::info(&format!(
             "auto_resume_on_start: spawning {} agent session(s) (skipped {skipped_stale} stale, concurrency={}, stagger={}ms)",
             candidates.len(),
@@ -3872,11 +3875,12 @@ pub(crate) fn project_paths_for_meta(projects: &[Project]) -> Vec<PathBuf> {
 fn collect_auto_resume_candidates(
     sessions: &[AgentSession],
     stale_days: u32,
+    include_shared: bool,
 ) -> (Vec<AgentSession>, usize) {
     let mut skipped_stale = 0;
     let candidates = sessions
         .iter()
-        .filter(|session| !session.shared_workspace())
+        .filter(|session| include_shared || !session.shared_workspace())
         .filter(|session| Path::new(&session.worktree_path).exists())
         .filter(|session| !session.state.has_pty())
         .filter(|session| !session.state.is_retryable())
@@ -4091,12 +4095,14 @@ mod tests {
     }
 
     #[test]
-    fn startup_auto_resume_excludes_shared_sessions() {
+    fn startup_auto_resume_excludes_shared_sessions_by_default() {
         let dir = tempfile::tempdir().expect("tempdir");
         let shared = auto_resume_fixture("shared", dir.path(), true);
         let worktree = auto_resume_fixture("worktree", dir.path(), false);
 
-        let (candidates, skipped_stale) = collect_auto_resume_candidates(&[shared, worktree], 0);
+        // include_shared = false (the default): only worktree sessions resume.
+        let (candidates, skipped_stale) =
+            collect_auto_resume_candidates(&[shared, worktree], 0, false);
 
         assert_eq!(skipped_stale, 0);
         assert_eq!(
@@ -4106,6 +4112,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["worktree"]
         );
+    }
+
+    #[test]
+    fn startup_auto_resume_includes_shared_sessions_when_opted_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = auto_resume_fixture("shared", dir.path(), true);
+        let worktree = auto_resume_fixture("worktree", dir.path(), false);
+
+        // include_shared = true ([workspace].auto_resume_shared): both resume.
+        let (candidates, _) = collect_auto_resume_candidates(&[shared, worktree], 0, true);
+
+        let mut ids: Vec<&str> = candidates.iter().map(|s| s.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["shared", "worktree"]);
     }
 
     #[test]

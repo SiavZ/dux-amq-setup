@@ -194,6 +194,7 @@ mod tests {
         let mut config = Config {
             workspace: Some(WorkspaceConfig {
                 default_mode: WorkspaceMode::Worktree,
+                auto_resume_shared: false,
             }),
             ..Config::default()
         };
