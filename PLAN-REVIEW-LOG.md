@@ -319,3 +319,29 @@ Small/well-specified, so fixed directly (audit takeover precedent):
 ### Phase 1 — committed & verified
 
 Re-review fixes applied, all 5 cargo gates green. Committed 4bc947b..0d03ab1 (5 per-item commits) on branch shared-workspace. Foundation is DARK: schema v5 + immutable handles + soft-delete + Retryable exist and are tested; no routing/purge/identity behavior changed yet. Next: Phase 2 (§B — AMQ ownership, global handle reservation, mandatory meta/config.lock, wake-daemon lifecycle) which begins wiring identity into the AMQ registry + wrappers.
+
+### Phase 2 — Codex build (§B: AMQ ownership, global handles, locking, wake)
+
+Codex implemented §B5–B10 across 17 files (+1584/-704; peer.rs +918): durable per-DUX_HOME store_id (atomic create, fail-closed), global agent_handle reservation under a mandatory rustix::flock on meta/config.lock, {store_id,session_id,wake_pid} ownership markers, own-store-only pruning (foreign/standalone never pruned), persist-first spawn ordering (reserve+persist before spawn, Retryable on failure), wake-PID termination on delete, tombstone-on-delete/free-on-hard-purge, all three wrappers updated to lock + write the marker atomically, plus a tests/fakes/flock shim so the concurrency bats run on macOS. 11 new Rust tests + new bats. Still DARK. Documented deviation: the very-first SQLite insert failure leaves no row (nothing to recover) and cleans up the worktree; every later failure leaves a recoverable Retryable row.
+
+### Claude's verdict (Phase 2) — pre-review
+
+Independent gates: all 5 cargo gates + shellcheck exit 0; bats only the 2 known macOS finalize failures (pass on Linux CI). Read the load-bearing core: AmqRegistryLock holds flock on meta/config.lock across the whole read-modify-write and fails closed; reserve_and_persist checks local-used AND physical-marker claimability then persists+markers under the lock; marker_state classifies Free/Owner/Legacy/Foreign with Foreign as the safe default; reconcile prunes only own-store handles with no live session and keeps tombstoned ones; legacy-path upgrade requires the unambiguous single-session match. Launched independent adversarial review focused on lock correctness, reservation races, marker misclassification, persist-first ordering, wake-pid reuse, and the wrapper protocol before committing.
+
+### Phase 2 review — independent adversarial
+
+Verdict: ISSUES. Lock correctness + persist-first ordering + marker classification VERIFIED SOUND (same-inode flock mutual exclusion Rust↔wrappers, hard-fail on missing flock, foreign as safe default, fake flock uses real ruby File.flock so serialize tests are real). 5 should-fix + 3 applied nits:
+- S1: session undeletable when its marker isn't exactly ours (store_id regenerated / transient error / worktree already removed) — delete must skip foreign AMQ cleanup, not fail.
+- S2: bootstrap hard-fails on any sync_amq error; the shared meta/config.json is machine-writable → one corrupt shared file bricks dux for every DUX_HOME. Must log-and-degrade at boot.
+- S3: global config.lock held during the ~1.5s wake SIGTERM→KILL loop stalls all stores; drop the lock before the kill/wait.
+- S4: pid-reuse guard only matches "amq"+"wake" in cmdline → could SIGKILL another store's wake daemon; also require --me <handle> + --root <root>.
+- S5: purge still targets agents/<basename> but inbox is now keyed by agent_handle → deconflicted/renamed session purges a possibly-FOREIGN inbox; derive the target from session.agent_handle() now.
+- N1 char-slice next_global_handle; N2 add true concurrent same-handle contention test; N3 ensure_owner_marker partial-failure leaves empty dir → clean up.
+
+### Claude's response + Codex fix round 1
+
+All 5 should-fix + 3 nits routed to the same Codex session. S1/S2 are the important shared-machine availability fixes (deletion always succeeds locally; boot degrades AMQ instead of bricking every DUX_HOME). store_id-loss orphaning nit acknowledged as mitigated by S1.
+
+### Phase 2 fix round 1 + commit
+
+Codex fixed all 5 should-fix + 3 nits (S1 delete-skips-foreign, S2 boot-degrades, S3 lock-released-before-wake-kill, S4 pid guard requires --me+--root, S5 purge targets agent_handle, N1 char-slice, N2 concurrent-same-handle race test, N3 partial-marker-write cleanup), each with a test; 970 tests + all cargo gates + shellcheck green; bats only the 2 tolerated macOS finalize failures. Claude verified S1/S2/S3/S4/S5 logic directly (tombstone returns Ok on non-owned markers + caller logs-and-continues; bootstrap sync is now ()-returning log-and-degrade; wake kill runs after the lock block; is_amq_wake_process gates the kill on handle+root; purge targets agents/<agent_handle>). Given the localized fixes + test-per-item + direct verification, did not run a second full agent review of the fix round. Committed bd6e107..8c3cd93 (5 per-item commits). Phase 2 done — still DARK. Next: Phase 3 (§D routing — shared→always-AMQ, reject Peers when either endpoint shared, companion-terminal identity, no-ambiguous-cwd sender).
