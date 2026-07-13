@@ -1,4 +1,4 @@
-//! Peer routing plus globally locked AMQ ownership and registry lifecycle.
+//! Peer routing, shared-workspace safeguards, and globally locked AMQ lifecycle.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
@@ -226,8 +226,8 @@ dux peer - route messages between Dux agent sessions
 
 Subcommands:
   dux peer send [--from <handle>] [--transport auto|amq|claude-peers] <target> <message...>
-                       Send through the Dux router. Auto uses Claude Peers for
-                       Claude targets and AMQ for non-Claude targets.
+                       Send through the Dux router. Auto uses AMQ when either
+                       endpoint is shared; otherwise Claude targets use Peers.
   dux peer list        List Dux sessions and transport health.
   dux peer sync-amq    Reconcile AMQ's agent registry from sessions.sqlite3.
 
@@ -327,6 +327,16 @@ fn infer_sender(from: Option<&str>, sessions: &[AgentSession]) -> Result<SenderC
         if handle.is_empty() {
             bail!("--from normalizes to an empty AMQ handle");
         }
+        if let Some(session) = sessions
+            .iter()
+            .find(|session| session.agent_handle() == handle)
+            .cloned()
+        {
+            return Ok(SenderContext {
+                handle,
+                session: Some(session),
+            });
+        }
         let session = sessions
             .iter()
             .find(|session| {
@@ -360,7 +370,7 @@ fn infer_sender(from: Option<&str>, sessions: &[AgentSession]) -> Result<SenderC
     }
 
     if let Ok(cwd) = env::current_dir()
-        && let Some(session) = session_for_cwd(&cwd, sessions)
+        && let Some(session) = session_for_cwd(&cwd, sessions)?
     {
         return Ok(SenderContext {
             handle: amq_handle_for_session(session),
@@ -411,9 +421,26 @@ fn resolve_target(target: &str, sessions: &[AgentSession]) -> Result<PeerTarget>
 
 fn choose_transport(
     preference: TransportPreference,
-    _sender: &SenderContext,
+    sender: &SenderContext,
     target: &PeerTarget,
 ) -> Result<ChosenTransport> {
+    let shared_endpoint = sender
+        .session
+        .as_ref()
+        .is_some_and(AgentSession::shared_workspace)
+        || target
+            .session
+            .as_ref()
+            .is_some_and(AgentSession::shared_workspace);
+    if shared_endpoint {
+        if preference == TransportPreference::ClaudePeers {
+            bail!(
+                "Claude Peers cannot route shared-workspace sessions; use --transport amq or omit --transport"
+            );
+        }
+        return Ok(ChosenTransport::Amq);
+    }
+
     match preference {
         TransportPreference::Amq => Ok(ChosenTransport::Amq),
         TransportPreference::ClaudePeers => {
@@ -569,20 +596,33 @@ fn claude_peer_id_for_session(session: &AgentSession, peers: &[ClaudePeer]) -> O
         .map(|peer| peer.id.clone())
 }
 
-fn session_for_cwd<'a>(cwd: &Path, sessions: &'a [AgentSession]) -> Option<&'a AgentSession> {
+fn session_for_cwd<'a>(
+    cwd: &Path,
+    sessions: &'a [AgentSession],
+) -> Result<Option<&'a AgentSession>> {
     let cwd = canonical_or_raw(cwd);
-    sessions
-        .iter()
-        .filter_map(|session| {
-            let path = canonical_or_raw(Path::new(&session.worktree_path));
-            if cwd == path || cwd.starts_with(&path) {
-                Some((path.components().count(), session))
-            } else {
-                None
+    let mut nearest = None;
+    let mut ambiguous = false;
+    for session in sessions {
+        let path = canonical_or_raw(Path::new(&session.worktree_path));
+        if cwd == path || cwd.starts_with(&path) {
+            let depth = path.components().count();
+            match nearest {
+                Some((nearest_depth, _)) if depth < nearest_depth => {}
+                Some((nearest_depth, _)) if depth == nearest_depth => ambiguous = true,
+                _ => {
+                    nearest = Some((depth, session));
+                    ambiguous = false;
+                }
             }
-        })
-        .max_by_key(|(depth, _)| *depth)
-        .map(|(_, session)| session)
+        }
+    }
+    if ambiguous {
+        bail!(
+            "cannot infer sender because multiple Dux sessions share this workspace; pass --from <agent_handle>"
+        );
+    }
+    Ok(nearest.map(|(_, session)| session))
 }
 
 fn canonical_or_raw(path: &Path) -> PathBuf {
@@ -1395,7 +1435,67 @@ mod tests {
     }
 
     #[test]
-    fn auto_uses_claude_peers_for_claude_targets_from_any_sender() {
+    fn shared_sender_to_worktree_target_routes_via_amq() {
+        let dir = tempdir().unwrap();
+        let mut sender_session = session("s1", "claude", "sender", dir.path());
+        sender_session.shared_workspace = true;
+        let sender = SenderContext {
+            handle: "sender".to_string(),
+            session: Some(sender_session),
+        };
+        let target = PeerTarget {
+            handle: "target".to_string(),
+            session: Some(session("s2", "claude", "target", dir.path())),
+        };
+
+        let transport = choose_transport(TransportPreference::Auto, &sender, &target).unwrap();
+
+        assert_eq!(transport, ChosenTransport::Amq);
+    }
+
+    #[test]
+    fn worktree_sender_to_shared_target_routes_via_amq() {
+        let dir = tempdir().unwrap();
+        let sender = SenderContext {
+            handle: "sender".to_string(),
+            session: Some(session("s1", "claude", "sender", dir.path())),
+        };
+        let mut target_session = session("s2", "claude", "target", dir.path());
+        target_session.shared_workspace = true;
+        let target = PeerTarget {
+            handle: target_session.agent_handle().to_string(),
+            session: Some(target_session),
+        };
+
+        let transport = choose_transport(TransportPreference::Auto, &sender, &target).unwrap();
+
+        assert_eq!(transport, ChosenTransport::Amq);
+        assert_eq!(target.handle, "target");
+    }
+
+    #[test]
+    fn shared_sender_to_shared_target_routes_via_amq() {
+        let dir = tempdir().unwrap();
+        let mut sender_session = session("s1", "claude", "sender", dir.path());
+        sender_session.shared_workspace = true;
+        let mut target_session = session("s2", "claude", "target", dir.path());
+        target_session.shared_workspace = true;
+        let sender = SenderContext {
+            handle: "sender".to_string(),
+            session: Some(sender_session),
+        };
+        let target = PeerTarget {
+            handle: "target".to_string(),
+            session: Some(target_session),
+        };
+
+        let transport = choose_transport(TransportPreference::Auto, &sender, &target).unwrap();
+
+        assert_eq!(transport, ChosenTransport::Amq);
+    }
+
+    #[test]
+    fn worktree_endpoints_still_prefer_claude_peers() {
         let dir = tempdir().unwrap();
         let sender_wt = dir.path().join("sender");
         let target_wt = dir.path().join("target");
@@ -1413,6 +1513,95 @@ mod tests {
         let transport = choose_transport(TransportPreference::Auto, &sender, &target).unwrap();
 
         assert_eq!(transport, ChosenTransport::ClaudePeers);
+    }
+
+    #[test]
+    fn explicit_claude_peers_rejects_shared_sender() {
+        let dir = tempdir().unwrap();
+        let mut sender_session = session("s1", "claude", "sender", dir.path());
+        sender_session.shared_workspace = true;
+        let sender = SenderContext {
+            handle: "sender".to_string(),
+            session: Some(sender_session),
+        };
+        let target = PeerTarget {
+            handle: "target".to_string(),
+            session: Some(session("s2", "claude", "target", dir.path())),
+        };
+
+        let err = choose_transport(TransportPreference::ClaudePeers, &sender, &target)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("shared-workspace"));
+        assert!(err.contains("--transport amq"));
+    }
+
+    #[test]
+    fn explicit_claude_peers_rejects_shared_target() {
+        let dir = tempdir().unwrap();
+        let sender = SenderContext {
+            handle: "sender".to_string(),
+            session: Some(session("s1", "claude", "sender", dir.path())),
+        };
+        let mut target_session = session("s2", "claude", "target", dir.path());
+        target_session.shared_workspace = true;
+        let target = PeerTarget {
+            handle: "target".to_string(),
+            session: Some(target_session),
+        };
+
+        let err = choose_transport(TransportPreference::ClaudePeers, &sender, &target)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("shared-workspace"));
+        assert!(err.contains("--transport amq"));
+    }
+
+    #[test]
+    fn ambiguous_cwd_sender_is_rejected_with_from_hint() {
+        let dir = tempdir().unwrap();
+        let sessions = vec![
+            session("s1", "claude", "sender-one", dir.path()),
+            session("s2", "claude", "sender-two", dir.path()),
+        ];
+
+        let err = session_for_cwd(dir.path(), &sessions)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("multiple Dux sessions share this workspace"));
+        assert!(err.contains("--from <agent_handle>"));
+    }
+
+    #[test]
+    fn cwd_sender_still_prefers_the_deepest_worktree() {
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        let child = nested.join("src");
+        fs::create_dir_all(&child).unwrap();
+        let sessions = vec![
+            session("parent", "claude", "parent", dir.path()),
+            session("nested", "claude", "nested", &nested),
+        ];
+
+        let sender = session_for_cwd(&child, &sessions).unwrap().unwrap();
+
+        assert_eq!(sender.id, "nested");
+    }
+
+    #[test]
+    fn explicit_from_resolves_exact_agent_handle_before_aliases() {
+        let dir = tempdir().unwrap();
+        let mut alias = session("s1", "claude", "other-handle", dir.path());
+        alias.branch_name = "stable-handle".to_string();
+        let exact = session("s2", "claude", "stable-handle", dir.path());
+
+        let sender = infer_sender(Some("stable-handle"), &[alias, exact]).unwrap();
+
+        assert_eq!(sender.handle, "stable-handle");
+        assert_eq!(sender.session.unwrap().id, "s2");
     }
 
     #[test]
