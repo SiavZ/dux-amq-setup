@@ -997,7 +997,7 @@ impl App {
         // untouched and the session remains visible in the UI. If we cleared
         // in-memory state first and the DB call then failed, the session
         // would vanish from the UI but reappear on restart.
-        self.session_store.delete_session(&session.id)?;
+        self.session_store.soft_delete_session(&session.id)?;
 
         // Drop the PTY (kills child + joins reader) before removing
         // the session from the in-memory list. `take_session_pty`
@@ -2608,6 +2608,9 @@ mod tests {
             source_branch: "main".to_string(),
             branch_name: format!("branch-{id}"),
             worktree_path: worktree.to_string(),
+            agent_handle: crate::model::normalize_agent_handle(id),
+            shared_workspace: false,
+            deleted_at: None,
             title: None,
             started_providers: Vec::new(),
             state: SessionState::Created { created_at: now },
@@ -2884,6 +2887,34 @@ mod tests {
         // Second call must not panic or return Err even though session is gone.
         app.finish_delete_session("s1", false, None, true)
             .expect("second finish is a no-op");
+    }
+
+    #[test]
+    fn ui_delete_soft_deletes_session() {
+        let mut session = make_session("s1", "claude", "/tmp/wt/a");
+        session.project_id = "project-1".to_string();
+        let project = make_project("project-1", "claude");
+        let mut app = test_app_with_sessions(vec![session.clone()], vec![project]);
+        app.session_store
+            .upsert_session(&session)
+            .expect("seed persisted session");
+
+        app.finish_delete_session("s1", false, None, true)
+            .expect("UI delete succeeds");
+
+        assert!(
+            app.session_store
+                .load_sessions()
+                .expect("active rows")
+                .is_empty()
+        );
+        let retained = app
+            .session_store
+            .load_sessions_including_deleted()
+            .expect("retained tombstone");
+        assert_eq!(retained.len(), 1);
+        assert!(retained[0].deleted_at.is_some());
+        assert_eq!(retained[0].agent_handle(), session.agent_handle());
     }
 
     /// Kicking off the async delete path should mark the session as

@@ -7,7 +7,7 @@ impl App {
                 WorkerEvent::CreateAgentProgress(message) => self.set_busy(message),
                 WorkerEvent::CreateAgentReady(boxed) => {
                     let AgentReadyData {
-                        session,
+                        mut session,
                         client,
                         pty_size,
                         status_message,
@@ -16,7 +16,15 @@ impl App {
                     } = *boxed;
                     self.create_agent_in_flight = false;
                     self.last_pty_size = pty_size;
-                    if let Err(err) = self.session_store.upsert_session(&session) {
+                    // The free-handle read in assign_unique_agent_handle and the
+                    // upsert are separate lock acquisitions; uniqueness holds
+                    // because sessions are only ever written from this UI thread.
+                    // A background write path would need an atomic reserve-insert.
+                    let persist_result = self
+                        .session_store
+                        .assign_unique_agent_handle(&mut session)
+                        .and_then(|()| self.session_store.upsert_session(&session));
+                    if let Err(err) = persist_result {
                         let safe_session_id = crate::sanitize::for_terminal(&session.id);
                         let safe_err = crate::sanitize::for_terminal(&format!("{err:#}"));
                         tracing::error!(
@@ -1774,14 +1782,20 @@ pub(crate) fn run_create_agent_job(
             branch_name
         ));
     }
+    let id = Uuid::new_v4().to_string();
+    let worktree_path_string = worktree_path.to_string_lossy().to_string();
+    let agent_handle = crate::model::derive_agent_handle(&worktree_path_string, &branch_name, &id);
     let session = AgentSession {
-        id: Uuid::new_v4().to_string(),
+        id,
         project_id: project.id.clone(),
         project_path: Some(project.path.clone()),
         provider,
         source_branch,
         branch_name,
-        worktree_path: worktree_path.to_string_lossy().to_string(),
+        worktree_path: worktree_path_string,
+        agent_handle,
+        shared_workspace: false,
+        deleted_at: None,
         title: None,
         started_providers: Vec::new(),
         // The session is brand-new and has no PTY yet; the spawn
