@@ -1,12 +1,17 @@
-//! Crash-atomic SQLite migrations and session persistence.
+//! Crash-atomic SQLite migrations, durable store identity, and session persistence.
 
 use std::collections::HashSet;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
+use rustix::fs::{FlockOperation, flock};
 
 use crate::model::{
     AGENT_HANDLE_MAX_LEN, AgentSession, SessionSettings, SessionState, derive_agent_handle,
@@ -14,6 +19,75 @@ use crate::model::{
 };
 
 const HANDLE_BACKFILL_MARKER: &str = "-- rust-backfill-agent-handles";
+const STORE_ID_FILE: &str = "store-id";
+const STORE_ID_LOCK: &str = ".store-id.lock";
+
+/// Load the stable identifier for one DUX_HOME, creating it atomically on
+/// first use. The lock covers both the first write and readers so no process
+/// can observe a partially-written identifier.
+pub fn load_or_create_store_id(dux_home: &Path) -> Result<String> {
+    fs::create_dir_all(dux_home)
+        .with_context(|| format!("failed to create {}", dux_home.display()))?;
+    let lock_path = dux_home.join(STORE_ID_LOCK);
+    let mut lock_options = OpenOptions::new();
+    lock_options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    lock_options.mode(0o600);
+    let lock_file = lock_options
+        .open(&lock_path)
+        .with_context(|| format!("failed to open {}", lock_path.display()))?;
+    crate::io_retry::retry_on_interrupt_errno(|| flock(&lock_file, FlockOperation::LockExclusive))
+        .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+
+    let path = dux_home.join(STORE_ID_FILE);
+    let result = if path.exists() {
+        read_store_id(&path)
+    } else {
+        let id = uuid::Uuid::new_v4().to_string();
+        let tmp = dux_home.join(format!(
+            ".{STORE_ID_FILE}.tmp.{}.{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&tmp)
+            .with_context(|| format!("failed to create {}", tmp.display()))?;
+        file.write_all(format!("{id}\n").as_bytes())
+            .with_context(|| format!("failed to write {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", tmp.display()))?;
+        fs::rename(&tmp, &path).with_context(|| {
+            format!(
+                "failed to replace {} with {}",
+                path.display(),
+                tmp.display()
+            )
+        })?;
+        File::open(dux_home)
+            .and_then(|dir| dir.sync_all())
+            .with_context(|| format!("failed to sync {}", dux_home.display()))?;
+        Ok(id)
+    };
+    let _ = crate::io_retry::retry_on_interrupt_errno(|| flock(&lock_file, FlockOperation::Unlock));
+    result
+}
+
+fn read_store_id(path: &Path) -> Result<String> {
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let value = raw.trim();
+    let parsed = uuid::Uuid::parse_str(value).with_context(|| {
+        format!(
+            "DUX_HOME metadata corruption: {} does not contain a valid store id",
+            path.display()
+        )
+    })?;
+    Ok(parsed.to_string())
+}
 
 /// Ordered list of schema migrations. Each entry is `(version, sql)`.
 ///
@@ -453,6 +527,32 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Complete the one-time global AMQ ownership backfill for a v5 row.
+    /// Normal upserts still reject every handle change; this narrow compare-
+    /// and-swap is called only while the shared AMQ lock proves the old handle
+    /// is occupied by a foreign owner and the replacement is free.
+    pub(crate) fn reassign_agent_handle_for_global_backfill(
+        &self,
+        id: &str,
+        expected: &str,
+        replacement: &str,
+    ) -> Result<()> {
+        ensure!(
+            is_valid_agent_handle(replacement),
+            "refusing invalid global agent handle replacement"
+        );
+        let conn = self.conn();
+        let changed = conn.execute(
+            "update agent_sessions set agent_handle = ?1 where id = ?2 and agent_handle = ?3",
+            params![replacement, id, expected],
+        )?;
+        ensure!(
+            changed == 1,
+            "session changed while completing global handle backfill"
+        );
+        Ok(())
+    }
+
     pub fn upsert_session(&self, session: &AgentSession) -> Result<()> {
         let conn = self.conn();
         ensure!(
@@ -539,10 +639,8 @@ impl SessionStore {
         self.load_sessions_impl(false)
     }
 
-    /// Load active sessions and tombstones. Reserved for destructive
-    /// maintenance paths that must finish erasing a previously soft-deleted
-    /// session.
-    #[allow(dead_code)] // Phase 5 hard purge is the first production caller.
+    /// Load active sessions and tombstones for AMQ ownership reconciliation
+    /// and destructive maintenance.
     pub fn load_sessions_including_deleted(&self) -> Result<Vec<AgentSession>> {
         self.load_sessions_impl(true)
     }
@@ -814,6 +912,33 @@ fn test_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn store_id_is_durable_and_reused() {
+        let dir = tempdir().unwrap();
+
+        let first = load_or_create_store_id(dir.path()).unwrap();
+        let second = load_or_create_store_id(dir.path()).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            fs::read_to_string(dir.path().join(STORE_ID_FILE))
+                .unwrap()
+                .trim(),
+            first
+        );
+    }
+
+    #[test]
+    fn corrupt_store_id_fails_closed() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(STORE_ID_FILE), "not-a-uuid\n").unwrap();
+
+        let error = load_or_create_store_id(dir.path()).unwrap_err().to_string();
+
+        assert!(error.contains("metadata corruption"));
+    }
 
     #[test]
     fn failed_migration_rolls_back_ddl_and_version_then_retries() {

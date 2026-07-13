@@ -1,16 +1,21 @@
-use std::collections::{BTreeSet, HashSet};
+//! Peer routing plus globally locked AMQ ownership and registry lifecycle.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
-use std::fs;
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
-use serde::Deserialize;
+use rustix::fs::{FlockOperation, flock};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::config::DuxPaths;
 use crate::model::AgentSession;
@@ -18,6 +23,7 @@ use crate::pty::PerSessionEnv;
 use crate::storage::SessionStore;
 
 const DEFAULT_CLAUDE_PEERS_PORT: u16 = 7899;
+const OWNER_MARKER: &str = ".dux-amq-source";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TransportPreference {
@@ -49,9 +55,8 @@ pub struct AmqSyncReport {
     pub root: Option<PathBuf>,
     pub configured_agents_added: usize,
     pub stale_config_agents_removed: usize,
-    pub source_links_created: usize,
-    pub source_links_replaced: usize,
-    pub source_link_conflicts: Vec<String>,
+    pub ownership_markers_created: usize,
+    pub handles_deconflicted: usize,
     pub skipped: bool,
 }
 
@@ -75,33 +80,42 @@ pub fn run_peer(args: &[String], paths: &DuxPaths) -> Result<()> {
     }
 }
 
-pub fn append_session_env(env: &mut PerSessionEnv, session: &AgentSession) {
+pub fn append_session_env(env: &mut PerSessionEnv, session: &AgentSession, store_id: &str) {
     env.vars
         .push(("DUX_SESSION_ID".to_string(), session.id.clone()));
+    env.vars
+        .push(("DUX_STORE_ID".to_string(), store_id.to_string()));
     env.vars.push((
         "DUX_PROVIDER".to_string(),
         session.provider.as_str().to_string(),
     ));
     env.vars.push((
         "DUX_AMQ_HANDLE".to_string(),
-        amq_handle_for_session(session),
+        session.agent_handle().to_string(),
     ));
 }
 
-pub fn sync_amq_agents(paths: &DuxPaths, sessions: &[AgentSession]) -> Result<AmqSyncReport> {
+pub fn sync_amq_agents(paths: &DuxPaths) -> Result<AmqSyncReport> {
     let Some(root) = optional_amq_root(paths) else {
         return Ok(AmqSyncReport {
             skipped: true,
             ..AmqSyncReport::default()
         });
     };
-    reconcile_amq_root(&root, sessions)
+    let store_id = crate::storage::load_or_create_store_id(&paths.root)?;
+    if !paths.sessions_db_path.exists() {
+        return reconcile_amq_root(&root, &store_id, None, &mut []);
+    }
+    let store = SessionStore::open(&paths.sessions_db_path)
+        .with_context(|| format!("failed to open {}", paths.sessions_db_path.display()))?;
+    let mut sessions = store.load_sessions_including_deleted()?;
+    reconcile_amq_root(&root, &store_id, Some(&store), &mut sessions)
 }
 
 fn run_peer_send(args: &[String], paths: &DuxPaths) -> Result<()> {
     let parsed = parse_send_args(args)?;
+    let _ = sync_amq_agents(paths)?;
     let sessions = load_sessions_if_present(paths)?;
-    let _ = sync_amq_agents(paths, &sessions)?;
 
     let sender = infer_sender(parsed.from.as_deref(), &sessions)?;
     let target = resolve_target(&parsed.target, &sessions)?;
@@ -143,8 +157,8 @@ fn run_peer_send(args: &[String], paths: &DuxPaths) -> Result<()> {
 
 fn run_peer_list(args: &[String], paths: &DuxPaths) -> Result<()> {
     reject_unknown_peer_flags(args)?;
+    let report = sync_amq_agents(paths)?;
     let sessions = load_sessions_if_present(paths)?;
-    let report = sync_amq_agents(paths, &sessions)?;
 
     println!("Dux peers:");
     if sessions.is_empty() {
@@ -164,11 +178,11 @@ fn run_peer_list(args: &[String], paths: &DuxPaths) -> Result<()> {
         println!("AMQ registry: skipped (no configured AMQ root found)");
     } else if let Some(root) = report.root {
         println!(
-            "AMQ registry: {} (added {}, removed stale {}, link conflicts {})",
+            "AMQ registry: {} (added {}, removed stale {}, deconflicted {})",
             root.display(),
             report.configured_agents_added,
             report.stale_config_agents_removed,
-            report.source_link_conflicts.len()
+            report.handles_deconflicted
         );
     }
 
@@ -182,8 +196,7 @@ fn run_peer_list(args: &[String], paths: &DuxPaths) -> Result<()> {
 
 fn run_peer_sync_amq(args: &[String], paths: &DuxPaths) -> Result<()> {
     reject_unknown_peer_flags(args)?;
-    let sessions = load_sessions_if_present(paths)?;
-    let report = sync_amq_agents(paths, &sessions)?;
+    let report = sync_amq_agents(paths)?;
     if report.skipped {
         println!("AMQ sync skipped: no configured AMQ root found");
         return Ok(());
@@ -198,14 +211,11 @@ fn run_peer_sync_amq(args: &[String], paths: &DuxPaths) -> Result<()> {
         "  stale config agents removed: {}",
         report.stale_config_agents_removed
     );
-    println!("  source links created: {}", report.source_links_created);
-    println!("  source links replaced: {}", report.source_links_replaced);
-    if !report.source_link_conflicts.is_empty() {
-        println!("  source link conflicts:");
-        for conflict in report.source_link_conflicts {
-            println!("    {conflict}");
-        }
-    }
+    println!(
+        "  ownership markers created: {}",
+        report.ownership_markers_created
+    );
+    println!("  handles deconflicted: {}", report.handles_deconflicted);
     Ok(())
 }
 
@@ -601,21 +611,7 @@ fn session_aliases(session: &AgentSession) -> HashSet<String> {
 }
 
 pub(crate) fn amq_handle_for_session(session: &AgentSession) -> String {
-    if let Some(name) = Path::new(&session.worktree_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-    {
-        let handle = sanitise_handle(name);
-        if !handle.is_empty() {
-            return handle;
-        }
-    }
-    let handle = sanitise_handle(&session.branch_name);
-    if handle.is_empty() {
-        sanitise_handle(&session.id)
-    } else {
-        handle
-    }
+    session.agent_handle().to_string()
 }
 
 fn sanitise_handle(name: &str) -> String {
@@ -635,41 +631,205 @@ fn optional_amq_root(paths: &DuxPaths) -> Option<PathBuf> {
     None
 }
 
+pub(crate) fn amq_cleanup_requires_worker(
+    paths: &DuxPaths,
+    store_id: &str,
+    session: &AgentSession,
+) -> bool {
+    let Some(root) = optional_amq_root(paths) else {
+        return false;
+    };
+    match marker_state(&root, session.agent_handle()) {
+        Ok(MarkerState::Owner(owner)) => {
+            owner.store_id == store_id && owner.session_id == session.id
+        }
+        Ok(MarkerState::Free) => false,
+        Ok(MarkerState::Legacy(_) | MarkerState::Foreign) | Err(_) => true,
+    }
+}
+
 fn require_amq_root(paths: &DuxPaths) -> Result<PathBuf> {
     optional_amq_root(paths).ok_or_else(|| {
         anyhow!("AMQ root is not configured; set AMQ_GLOBAL_ROOT or install dux-amq")
     })
 }
 
-fn reconcile_amq_root(root: &Path, sessions: &[AgentSession]) -> Result<AmqSyncReport> {
-    fs::create_dir_all(root.join("meta"))
-        .with_context(|| format!("failed to create {}", root.join("meta").display()))?;
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct OwnerMarker {
+    store_id: String,
+    session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wake_pid: Option<u32>,
+}
+
+enum MarkerState {
+    Free,
+    Owner(OwnerMarker),
+    Legacy(PathBuf),
+    Foreign,
+}
+
+struct AmqRegistryLock {
+    file: File,
+}
+
+impl AmqRegistryLock {
+    fn acquire(root: &Path) -> Result<Self> {
+        let meta = root.join("meta");
+        fs::create_dir_all(&meta)
+            .with_context(|| format!("failed to create {}", meta.display()))?;
+        let path = meta.join("config.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("failed to open mandatory AMQ lock {}", path.display()))?;
+        crate::io_retry::retry_on_interrupt_errno(|| flock(&file, FlockOperation::LockExclusive))
+            .with_context(|| format!("failed to acquire mandatory AMQ lock {}", path.display()))?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for AmqRegistryLock {
+    fn drop(&mut self) {
+        let _ =
+            crate::io_retry::retry_on_interrupt_errno(|| flock(&self.file, FlockOperation::Unlock));
+    }
+}
+
+/// Persist a new row and reserve its global AMQ identity before provider
+/// launch. A failed reservation can leave the row for retry, but never an
+/// owner marker without its row.
+pub(crate) fn reserve_and_persist_session(
+    paths: &DuxPaths,
+    store_id: &str,
+    store: &SessionStore,
+    session: &mut AgentSession,
+) -> Result<()> {
+    let Some(root) = optional_amq_root(paths) else {
+        store.assign_unique_agent_handle(session)?;
+        return store.upsert_session(session);
+    };
+    reserve_and_persist_session_at_root(&root, store_id, store, session)
+}
+
+fn reserve_and_persist_session_at_root(
+    root: &Path,
+    store_id: &str,
+    store: &SessionStore,
+    session: &mut AgentSession,
+) -> Result<()> {
+    let _lock = AmqRegistryLock::acquire(root)?;
     fs::create_dir_all(root.join("agents"))
         .with_context(|| format!("failed to create {}", root.join("agents").display()))?;
+    let owner = OwnerMarker {
+        store_id: store_id.to_string(),
+        session_id: session.id.clone(),
+        wake_pid: None,
+    };
+    let used = store
+        .load_sessions_including_deleted()?
+        .into_iter()
+        .map(|row| row.agent_handle().to_string())
+        .collect::<HashSet<_>>();
+    let base = crate::model::normalize_agent_handle(session.agent_handle());
+    if base.is_empty() {
+        bail!("new session has an empty agent handle");
+    }
+    let handle = if !used.contains(&base) && marker_is_claimable(root, &base, &owner)? {
+        base
+    } else {
+        next_global_handle(root, &base, &used, &owner)?
+    };
+    session.agent_handle = handle.clone();
+    store.upsert_session(session)?;
+    ensure_owner_marker(root, &handle, &owner)?;
+    register_config_handle(root, &handle)?;
+    Ok(())
+}
 
+fn reconcile_amq_root(
+    root: &Path,
+    store_id: &str,
+    store: Option<&SessionStore>,
+    sessions: &mut [AgentSession],
+) -> Result<AmqSyncReport> {
+    fs::create_dir_all(root.join("agents"))
+        .with_context(|| format!("failed to create {}", root.join("agents").display()))?;
+    let _lock = AmqRegistryLock::acquire(root)?;
     let mut report = AmqSyncReport {
         root: Some(root.to_path_buf()),
         ..AmqSyncReport::default()
     };
+    let mut order = (0..sessions.len()).collect::<Vec<_>>();
+    order.sort_by(|left, right| sessions[*left].id.cmp(&sessions[*right].id));
+    let mut used = sessions
+        .iter()
+        .map(|session| session.agent_handle().to_string())
+        .collect::<HashSet<_>>();
 
-    let mut desired = BTreeSet::new();
-    for session in sessions {
-        let handle = amq_handle_for_session(session);
-        if handle.is_empty() {
-            continue;
+    for index in order {
+        let owner = OwnerMarker {
+            store_id: store_id.to_string(),
+            session_id: sessions[index].id.clone(),
+            wake_pid: None,
+        };
+        let current = sessions[index].agent_handle().to_string();
+        let claimable = match marker_state(root, &current)? {
+            MarkerState::Free => true,
+            MarkerState::Owner(existing) => same_owner(&existing, &owner),
+            MarkerState::Legacy(path) => {
+                let matches = sessions
+                    .iter()
+                    .filter(|candidate| {
+                        paths_equivalent(Path::new(&candidate.worktree_path), &path)
+                    })
+                    .count();
+                matches == 1 && paths_equivalent(Path::new(&sessions[index].worktree_path), &path)
+            }
+            MarkerState::Foreign => false,
+        };
+        let handle = if claimable {
+            current.clone()
+        } else {
+            let replacement = next_global_handle(root, &current, &used, &owner)?;
+            let Some(store) = store else {
+                bail!("cannot deconflict an AMQ handle without a session store");
+            };
+            store.reassign_agent_handle_for_global_backfill(
+                &sessions[index].id,
+                &current,
+                &replacement,
+            )?;
+            used.insert(replacement.clone());
+            sessions[index].agent_handle = replacement.clone();
+            report.handles_deconflicted += 1;
+            replacement
+        };
+        match marker_state(root, &handle)? {
+            MarkerState::Owner(existing) if same_owner(&existing, &owner) => {}
+            MarkerState::Free | MarkerState::Legacy(_) => {
+                ensure_owner_marker(root, &handle, &owner)?;
+                report.ownership_markers_created += 1;
+            }
+            MarkerState::Owner(_) | MarkerState::Foreign => {
+                bail!("AMQ handle changed owner while the registry lock was held")
+            }
         }
-        desired.insert(handle.clone());
-        let agent_dir = root.join("agents").join(&handle);
-        fs::create_dir_all(&agent_dir)
-            .with_context(|| format!("failed to create {}", agent_dir.display()))?;
-        reconcile_source_link(
-            &agent_dir,
-            Path::new(&session.worktree_path),
-            &handle,
-            &mut report,
-        )?;
     }
 
+    let desired = sessions
+        .iter()
+        .filter(|session| session.deleted_at.is_none())
+        .map(|session| session.agent_handle().to_string())
+        .collect::<BTreeSet<_>>();
+    let sessions_by_id = sessions
+        .iter()
+        .map(|session| (session.id.as_str(), session))
+        .collect::<HashMap<_, _>>();
+    let inventory_complete = store.is_some();
     let config_path = root.join("meta/config.json");
     let mut config = read_or_create_amq_config(&config_path)?;
     let agents_value = config
@@ -682,17 +842,22 @@ fn reconcile_amq_root(root: &Path, sessions: &[AgentSession]) -> Result<AmqSyncR
         .filter_map(Value::as_str)
         .map(ToOwned::to_owned)
         .collect::<BTreeSet<_>>();
-
     let before = agents.len();
-    for handle in &desired {
-        agents.insert(handle.clone());
-    }
+    agents.extend(desired);
     report.configured_agents_added = agents.len().saturating_sub(before);
-
     let before_prune = agents.len();
-    agents.retain(|handle| desired.contains(handle) || !is_stale_dux_owned_agent(root, handle));
+    agents.retain(|handle| match marker_state(root, handle) {
+        Ok(MarkerState::Owner(owner)) if owner.store_id == store_id => {
+            !inventory_complete
+                || sessions_by_id
+                    .get(owner.session_id.as_str())
+                    .is_some_and(|session| {
+                        session.deleted_at.is_none() && session.agent_handle() == handle
+                    })
+        }
+        _ => true,
+    });
     report.stale_config_agents_removed = before_prune.saturating_sub(agents.len());
-
     *agents_value = Value::Array(agents.into_iter().map(Value::String).collect());
     write_json_atomic(&config_path, &config)?;
     Ok(report)
@@ -714,84 +879,106 @@ fn read_or_create_amq_config(path: &Path) -> Result<Value> {
 }
 
 fn write_json_atomic(path: &Path, value: &Value) -> Result<()> {
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     let body = serde_json::to_string_pretty(value)?;
-    fs::write(&tmp, format!("{body}\n"))
-        .with_context(|| format!("failed to write {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| {
-        format!(
-            "failed to replace {} with {}",
-            path.display(),
-            tmp.display()
-        )
-    })?;
-    Ok(())
+    write_atomic(path, format!("{body}\n").as_bytes())
 }
 
-fn reconcile_source_link(
-    agent_dir: &Path,
-    worktree: &Path,
+fn same_owner(left: &OwnerMarker, right: &OwnerMarker) -> bool {
+    left.store_id == right.store_id && left.session_id == right.session_id
+}
+
+fn marker_state(root: &Path, handle: &str) -> Result<MarkerState> {
+    let agent_dir = root.join("agents").join(handle);
+    let Ok(metadata) = fs::symlink_metadata(&agent_dir) else {
+        return Ok(MarkerState::Free);
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(MarkerState::Foreign);
+    }
+    let marker = agent_dir.join(OWNER_MARKER);
+    let Ok(metadata) = fs::symlink_metadata(&marker) else {
+        return Ok(MarkerState::Foreign);
+    };
+    if metadata.file_type().is_symlink() {
+        return fs::read_link(&marker)
+            .map(MarkerState::Legacy)
+            .with_context(|| format!("failed to read legacy marker {}", marker.display()));
+    }
+    if !metadata.is_file() {
+        return Ok(MarkerState::Foreign);
+    }
+    let raw = fs::read_to_string(&marker)
+        .with_context(|| format!("failed to read {}", marker.display()))?;
+    match serde_json::from_str::<OwnerMarker>(&raw) {
+        Ok(owner) => Ok(MarkerState::Owner(owner)),
+        Err(_) if !raw.trim().is_empty() => Ok(MarkerState::Legacy(PathBuf::from(raw.trim()))),
+        Err(_) => Ok(MarkerState::Foreign),
+    }
+}
+
+fn marker_is_claimable(root: &Path, handle: &str, owner: &OwnerMarker) -> Result<bool> {
+    Ok(match marker_state(root, handle)? {
+        MarkerState::Free => true,
+        MarkerState::Owner(existing) => same_owner(&existing, owner),
+        MarkerState::Legacy(_) | MarkerState::Foreign => false,
+    })
+}
+
+fn ensure_owner_marker(root: &Path, handle: &str, owner: &OwnerMarker) -> Result<()> {
+    ensure_owner_marker_with(root, handle, owner, write_atomic)
+}
+
+fn ensure_owner_marker_with(
+    root: &Path,
     handle: &str,
-    report: &mut AmqSyncReport,
+    owner: &OwnerMarker,
+    write_marker: impl FnOnce(&Path, &[u8]) -> Result<()>,
 ) -> Result<()> {
-    let marker = agent_dir.join(".dux-amq-source");
-    let desired = worktree.to_path_buf();
-    if path_exists_or_symlink(&marker) {
-        let previous = read_source_marker(&marker)?;
-        if paths_equivalent(&previous, &desired) {
-            return Ok(());
+    let agent_dir = root.join("agents").join(handle);
+    let body = serde_json::to_vec(owner)?;
+    let created = match marker_state(root, handle)? {
+        MarkerState::Owner(existing) if same_owner(&existing, owner) => return Ok(()),
+        MarkerState::Free => {
+            fs::create_dir(&agent_dir)
+                .with_context(|| format!("failed to reserve {}", agent_dir.display()))?;
+            true
         }
-        if previous.is_absolute() && !previous.exists() {
-            fs::remove_file(&marker)
-                .with_context(|| format!("failed to remove stale {}", marker.display()))?;
-            create_source_marker(&marker, &desired)?;
-            report.source_links_replaced += 1;
-            return Ok(());
+        MarkerState::Legacy(_) => false,
+        MarkerState::Owner(_) | MarkerState::Foreign => {
+            bail!("AMQ handle is owned by another session")
         }
-        report.source_link_conflicts.push(format!(
-            "{handle}: {} already points to {}",
-            marker.display(),
-            previous.display()
-        ));
-        return Ok(());
+    };
+    let result = write_marker(&agent_dir.join(OWNER_MARKER), &body);
+    if let Err(err) = result {
+        if created {
+            fs::remove_dir(&agent_dir).with_context(|| {
+                format!(
+                    "failed to remove partial AMQ reservation {}",
+                    agent_dir.display()
+                )
+            })?;
+        }
+        return Err(err);
     }
-
-    create_source_marker(&marker, &desired)?;
-    report.source_links_created += 1;
     Ok(())
 }
 
-fn read_source_marker(path: &Path) -> Result<PathBuf> {
-    if path.symlink_metadata()?.file_type().is_symlink() {
-        return fs::read_link(path)
-            .with_context(|| format!("failed to read symlink {}", path.display()));
+fn next_global_handle(
+    root: &Path,
+    base: &str,
+    used: &HashSet<String>,
+    owner: &OwnerMarker,
+) -> Result<String> {
+    for suffix_number in 2u64.. {
+        let suffix = format!("-{suffix_number}");
+        let prefix_len = crate::model::AGENT_HANDLE_MAX_LEN.saturating_sub(suffix.len());
+        let prefix = base.chars().take(prefix_len).collect::<String>();
+        let candidate = format!("{prefix}{suffix}");
+        if !used.contains(&candidate) && marker_is_claimable(root, &candidate, owner)? {
+            return Ok(candidate);
+        }
     }
-    let text =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(PathBuf::from(text.trim()))
-}
-
-fn create_source_marker(path: &Path, target: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(target, path).with_context(|| {
-            format!(
-                "failed to symlink {} -> {}",
-                path.display(),
-                target.display()
-            )
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, target.display().to_string()).with_context(|| {
-            format!(
-                "failed to write {} for target {}",
-                path.display(),
-                target.display()
-            )
-        })
-    }
+    unreachable!("u64 handle suffix space exhausted")
 }
 
 fn paths_equivalent(a: &Path, b: &Path) -> bool {
@@ -804,19 +991,246 @@ fn paths_equivalent(a: &Path, b: &Path) -> bool {
     }
 }
 
-fn is_stale_dux_owned_agent(root: &Path, handle: &str) -> bool {
-    let marker = root.join("agents").join(handle).join(".dux-amq-source");
-    if !path_exists_or_symlink(&marker) {
-        return false;
+fn register_config_handle(root: &Path, handle: &str) -> Result<()> {
+    fs::create_dir_all(root.join("meta"))
+        .with_context(|| format!("failed to create {}", root.join("meta").display()))?;
+    let path = root.join("meta/config.json");
+    let mut config = read_or_create_amq_config(&path)?;
+    let agents = config
+        .get_mut("agents")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| anyhow!("AMQ config agents is not an array"))?;
+    if !agents.iter().any(|value| value.as_str() == Some(handle)) {
+        agents.push(Value::String(handle.to_string()));
+        agents.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
     }
-    let Ok(previous) = read_source_marker(&marker) else {
-        return false;
-    };
-    previous.is_absolute() && !previous.exists()
+    write_json_atomic(&path, &config)
 }
 
-fn path_exists_or_symlink(path: &Path) -> bool {
-    path.exists() || fs::symlink_metadata(path).is_ok()
+fn remove_config_handle(root: &Path, handle: &str) -> Result<()> {
+    fs::create_dir_all(root.join("meta"))
+        .with_context(|| format!("failed to create {}", root.join("meta").display()))?;
+    let path = root.join("meta/config.json");
+    let mut config = read_or_create_amq_config(&path)?;
+    let agents = config
+        .get_mut("agents")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| anyhow!("AMQ config agents is not an array"))?;
+    agents.retain(|value| value.as_str() != Some(handle));
+    write_json_atomic(&path, &config)
+}
+
+fn write_atomic(path: &Path, body: &[u8]) -> Result<()> {
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let result = (|| {
+        let mut file =
+            File::create(&tmp).with_context(|| format!("failed to create {}", tmp.display()))?;
+        file.write_all(body)
+            .with_context(|| format!("failed to write {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", tmp.display()))?;
+        fs::rename(&tmp, path).with_context(|| {
+            format!(
+                "failed to replace {} with {}",
+                path.display(),
+                tmp.display()
+            )
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Stop delivery and remove a session from the live registry while retaining
+/// its inbox and exact owner marker as an ordinary-delete tombstone.
+pub(crate) fn tombstone_amq_session(
+    paths: &DuxPaths,
+    store_id: &str,
+    session: &AgentSession,
+) -> Result<()> {
+    let Some(root) = optional_amq_root(paths) else {
+        return Ok(());
+    };
+    if let Err(err) = tombstone_amq_session_at_root(&root, store_id, session) {
+        tracing::warn!(
+            target: "dux::peer",
+            session_id = %crate::sanitize::for_terminal(&session.id),
+            agent_handle = %crate::sanitize::for_terminal(session.agent_handle()),
+            error = %crate::sanitize::for_terminal(&format!("{err:#}")),
+            "AMQ cleanup failed during session deletion; continuing with the local tombstone"
+        );
+    }
+    Ok(())
+}
+
+fn tombstone_amq_session_at_root(
+    root: &Path,
+    store_id: &str,
+    session: &AgentSession,
+) -> Result<()> {
+    let wake_pid = {
+        let _lock = AmqRegistryLock::acquire(root)?;
+        let owner = match marker_state(root, session.agent_handle()) {
+            Ok(MarkerState::Owner(owner))
+                if owner.store_id == store_id && owner.session_id == session.id =>
+            {
+                owner
+            }
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                tracing::warn!(
+                    target: "dux::peer",
+                    session_id = %crate::sanitize::for_terminal(&session.id),
+                    agent_handle = %crate::sanitize::for_terminal(session.agent_handle()),
+                    error = %crate::sanitize::for_terminal(&format!("{err:#}")),
+                    "could not verify the AMQ owner marker during deletion; leaving it untouched"
+                );
+                return Ok(());
+            }
+        };
+        let wake_pid = owner.wake_pid;
+        let mut tombstone = owner;
+        tombstone.wake_pid = None;
+        write_atomic(
+            &root
+                .join("agents")
+                .join(session.agent_handle())
+                .join(OWNER_MARKER),
+            &serde_json::to_vec(&tombstone)?,
+        )?;
+        remove_config_handle(root, session.agent_handle())?;
+        wake_pid
+    };
+    if let Some(pid) = wake_pid {
+        terminate_wake_pid(pid, root, session.agent_handle())?;
+    }
+    Ok(())
+}
+
+/// Verify exact ownership, stop wake delivery, remove the inbox, and release
+/// a global handle. Phase 5 hard purge is the first production caller.
+#[allow(dead_code)] // Intentionally exposed now so Phase 5 can wire it without changing the protocol.
+pub fn free_amq_handle(paths: &DuxPaths, store_id: &str, session: &AgentSession) -> Result<()> {
+    let Some(root) = optional_amq_root(paths) else {
+        return Ok(());
+    };
+    free_amq_handle_at_root(&root, store_id, session)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn free_amq_handle_at_root(root: &Path, store_id: &str, session: &AgentSession) -> Result<()> {
+    let wake_pid = {
+        let _lock = AmqRegistryLock::acquire(root)?;
+        let owner = exact_owner(root, store_id, session)?;
+        let wake_pid = owner.wake_pid;
+        let mut stopped = owner;
+        stopped.wake_pid = None;
+        write_atomic(
+            &root
+                .join("agents")
+                .join(session.agent_handle())
+                .join(OWNER_MARKER),
+            &serde_json::to_vec(&stopped)?,
+        )?;
+        remove_config_handle(root, session.agent_handle())?;
+        wake_pid
+    };
+    if let Some(pid) = wake_pid {
+        terminate_wake_pid(pid, root, session.agent_handle())?;
+    }
+    let _lock = AmqRegistryLock::acquire(root)?;
+    exact_owner(root, store_id, session)?;
+    let agent_dir = root.join("agents").join(session.agent_handle());
+    fs::remove_dir_all(&agent_dir)
+        .with_context(|| format!("failed to remove owned AMQ inbox {}", agent_dir.display()))
+}
+
+fn exact_owner(root: &Path, store_id: &str, session: &AgentSession) -> Result<OwnerMarker> {
+    match marker_state(root, session.agent_handle())? {
+        MarkerState::Owner(owner)
+            if owner.store_id == store_id && owner.session_id == session.id =>
+        {
+            Ok(owner)
+        }
+        MarkerState::Owner(_) | MarkerState::Legacy(_) | MarkerState::Foreign => bail!(
+            "refusing AMQ cleanup for handle {:?}: ownership does not match store/session",
+            crate::sanitize::for_terminal(session.agent_handle())
+        ),
+        MarkerState::Free => bail!(
+            "refusing AMQ cleanup for handle {:?}: ownership marker is missing",
+            crate::sanitize::for_terminal(session.agent_handle())
+        ),
+    }
+}
+
+fn terminate_wake_pid(pid: u32, root: &Path, handle: &str) -> Result<()> {
+    let Some(rustix_pid) = rustix::process::Pid::from_raw(pid as i32) else {
+        bail!("invalid recorded AMQ wake PID {pid}");
+    };
+    if rustix::process::test_kill_process(rustix_pid).is_err() {
+        return Ok(());
+    }
+    if !is_amq_wake_process(pid, root, handle) {
+        tracing::warn!(
+            target: "dux::peer",
+            wake_pid = pid,
+            "recorded wake PID no longer identifies an AMQ wake process; leaving it untouched"
+        );
+        return Ok(());
+    }
+    rustix::process::kill_process(rustix_pid, rustix::process::Signal::TERM)
+        .with_context(|| format!("failed to terminate AMQ wake PID {pid}"))?;
+    if wait_for_process_exit(rustix_pid, Duration::from_millis(750)) {
+        return Ok(());
+    }
+    rustix::process::kill_process(rustix_pid, rustix::process::Signal::KILL)
+        .with_context(|| format!("failed to kill AMQ wake PID {pid}"))?;
+    if wait_for_process_exit(rustix_pid, Duration::from_millis(750)) {
+        Ok(())
+    } else {
+        bail!("AMQ wake PID {pid} remained alive after SIGKILL")
+    }
+}
+
+fn is_amq_wake_process(pid: u32, root: &Path, handle: &str) -> bool {
+    let sys_pid = sysinfo::Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[sys_pid]),
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    let Some(process) = system.process(sys_pid) else {
+        return false;
+    };
+    amq_wake_command_matches(process.cmd(), root, handle)
+}
+
+fn amq_wake_command_matches(command: &[OsString], root: &Path, handle: &str) -> bool {
+    let has_pair = |flag: &str, value: &OsStr| {
+        command
+            .windows(2)
+            .any(|pair| pair[0] == OsStr::new(flag) && pair[1] == value)
+    };
+    command
+        .iter()
+        .any(|part| part.to_string_lossy().contains("amq"))
+        && command.iter().any(|part| part == OsStr::new("wake"))
+        && has_pair("--me", OsStr::new(handle))
+        && has_pair("--root", root.as_os_str())
+}
+
+fn wait_for_process_exit(pid: rustix::process::Pid, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if rustix::process::test_kill_process(pid).is_err() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    rustix::process::test_kill_process(pid).is_err()
 }
 
 #[cfg(test)]
@@ -836,7 +1250,7 @@ mod tests {
             source_branch: "main".to_string(),
             branch_name: branch.to_string(),
             worktree_path: worktree.display().to_string(),
-            agent_handle: crate::model::normalize_agent_handle(id),
+            agent_handle: crate::model::normalize_agent_handle(branch),
             shared_workspace: false,
             deleted_at: None,
             title: None,
@@ -851,16 +1265,91 @@ mod tests {
     }
 
     #[test]
-    fn target_resolution_matches_sanitized_worktree_basename() {
+    fn subprocess_helper() {
+        let Some(mode) = std::env::var_os("DUX_AMQ_TEST_HELPER_MODE") else {
+            return;
+        };
+        let path = |name| PathBuf::from(std::env::var_os(name).expect(name));
+        match mode.to_string_lossy().as_ref() {
+            "claim" => {
+                let root = path("DUX_AMQ_TEST_ROOT");
+                let database = path("DUX_AMQ_TEST_DATABASE");
+                let worktree = path("DUX_AMQ_TEST_WORKTREE");
+                let ready = path("DUX_AMQ_TEST_READY");
+                let start = path("DUX_AMQ_TEST_START");
+                let output = path("DUX_AMQ_TEST_OUTPUT");
+                let store_id = std::env::var("DUX_AMQ_TEST_STORE_ID").unwrap();
+                let session_id = std::env::var("DUX_AMQ_TEST_SESSION_ID").unwrap();
+                fs::create_dir_all(&worktree).unwrap();
+                fs::write(&ready, b"ready").unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !start.exists() {
+                    assert!(Instant::now() < deadline, "claim start signal timed out");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let store = SessionStore::open(&database).unwrap();
+                let mut candidate = session(&session_id, "claude", "agent", &worktree);
+                candidate.state = SessionState::Spawning { since: Utc::now() };
+                reserve_and_persist_session_at_root(&root, &store_id, &store, &mut candidate)
+                    .unwrap();
+                fs::write(output, candidate.agent_handle()).unwrap();
+            }
+            "probe-lock" => {
+                let root = path("DUX_AMQ_TEST_ROOT");
+                let output = path("DUX_AMQ_TEST_OUTPUT");
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(root.join("meta/config.lock"))
+                    .unwrap();
+                let result = flock(&file, FlockOperation::NonBlockingLockExclusive);
+                let message = match result {
+                    Ok(()) => {
+                        flock(&file, FlockOperation::Unlock).unwrap();
+                        "acquired".to_string()
+                    }
+                    Err(err) => format!("blocked: {err}"),
+                };
+                fs::write(output, message).unwrap();
+            }
+            other => panic!("unknown subprocess helper mode: {other}"),
+        }
+    }
+
+    #[test]
+    fn target_resolution_uses_persisted_agent_handle() {
         let dir = tempdir().unwrap();
         let worktree = dir.path().join("Feature Login");
         fs::create_dir_all(&worktree).unwrap();
         let s = session("s1", "claude", "renamed", &worktree);
 
-        let target = resolve_target("feature-login", &[s]).unwrap();
+        let target = resolve_target("renamed", &[s]).unwrap();
 
-        assert_eq!(target.handle, "feature-login");
+        assert_eq!(target.handle, "renamed");
         assert_eq!(target.session.unwrap().id, "s1");
+    }
+
+    #[test]
+    fn pty_env_exports_store_session_and_immutable_handle() {
+        let dir = tempdir().unwrap();
+        let worktree = dir.path().join("different-path-name");
+        let s = session("session-a", "claude", "stable-handle", &worktree);
+        let mut env = PerSessionEnv::empty();
+
+        append_session_env(&mut env, &s, "store-a");
+
+        assert!(
+            env.vars
+                .contains(&("DUX_STORE_ID".to_string(), "store-a".to_string()))
+        );
+        assert!(
+            env.vars
+                .contains(&("DUX_SESSION_ID".to_string(), "session-a".to_string()))
+        );
+        assert!(
+            env.vars
+                .contains(&("DUX_AMQ_HANDLE".to_string(), "stable-handle".to_string()))
+        );
     }
 
     #[test]
@@ -964,42 +1453,518 @@ mod tests {
     fn amq_sync_adds_session_handles_to_config_and_agent_dirs() {
         let dir = tempdir().unwrap();
         let root = dir.path().join("amq");
+        let store = SessionStore::open(&dir.path().join("sessions.sqlite3")).unwrap();
         let worktree = dir.path().join("worktrees/Agent One");
         fs::create_dir_all(&worktree).unwrap();
         let s = session("s1", "claude", "agent-one", &worktree);
+        store.upsert_session(&s).unwrap();
+        let mut sessions = vec![s];
 
-        let report = reconcile_amq_root(&root, &[s]).unwrap();
+        let report = reconcile_amq_root(&root, "store-a", Some(&store), &mut sessions).unwrap();
 
         assert_eq!(report.configured_agents_added, 1);
         assert!(root.join("agents/agent-one").is_dir());
         let raw = fs::read_to_string(root.join("meta/config.json")).unwrap();
         assert!(raw.contains("\"agent-one\""));
-        assert!(root.join("agents/agent-one/.dux-amq-source").exists());
+        let owner: OwnerMarker = serde_json::from_str(
+            &fs::read_to_string(root.join("agents/agent-one/.dux-amq-source")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(owner.store_id, "store-a");
+        assert_eq!(owner.session_id, "s1");
     }
 
     #[test]
-    fn amq_sync_prunes_stale_dux_owned_config_agents_only() {
+    fn amq_sync_prunes_only_missing_rows_from_its_own_store() {
         let dir = tempdir().unwrap();
         let root = dir.path().join("amq");
+        let store = SessionStore::open(&dir.path().join("sessions.sqlite3")).unwrap();
         fs::create_dir_all(root.join("meta")).unwrap();
-        fs::create_dir_all(root.join("agents/stale")).unwrap();
         fs::create_dir_all(root.join("agents/manual")).unwrap();
         fs::write(
             root.join("meta/config.json"),
-            r#"{"version":1,"created_utc":"now","agents":["manual","stale"]}"#,
+            r#"{"version":1,"created_utc":"now","agents":["foreign","manual","stale"]}"#,
         )
         .unwrap();
-        create_source_marker(
-            &root.join("agents/stale/.dux-amq-source"),
-            &dir.path().join("missing"),
+        ensure_owner_marker(
+            &root,
+            "foreign",
+            &OwnerMarker {
+                store_id: "store-b".to_string(),
+                session_id: "foreign-session".to_string(),
+                wake_pid: None,
+            },
+        )
+        .unwrap();
+        ensure_owner_marker(
+            &root,
+            "stale",
+            &OwnerMarker {
+                store_id: "store-a".to_string(),
+                session_id: "missing-session".to_string(),
+                wake_pid: None,
+            },
         )
         .unwrap();
 
-        let report = reconcile_amq_root(&root, &[]).unwrap();
+        let report = reconcile_amq_root(&root, "store-a", Some(&store), &mut []).unwrap();
         let raw = fs::read_to_string(root.join("meta/config.json")).unwrap();
 
         assert_eq!(report.stale_config_agents_removed, 1);
         assert!(raw.contains("\"manual\""));
+        assert!(raw.contains("\"foreign\""));
         assert!(!raw.contains("\"stale\""));
+    }
+
+    #[test]
+    fn global_handle_collision_across_two_stores_gets_suffix() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("amq");
+        let store_a = SessionStore::open(&dir.path().join("a.sqlite3")).unwrap();
+        let store_b = SessionStore::open(&dir.path().join("b.sqlite3")).unwrap();
+        let worktree_a = dir.path().join("a/agent");
+        let worktree_b = dir.path().join("b/agent");
+        fs::create_dir_all(&worktree_a).unwrap();
+        fs::create_dir_all(&worktree_b).unwrap();
+        let mut first = session("a-session", "claude", "agent", &worktree_a);
+        let mut second = session("b-session", "codex", "agent", &worktree_b);
+        first.state = SessionState::Spawning { since: Utc::now() };
+        second.state = SessionState::Spawning { since: Utc::now() };
+
+        reserve_and_persist_session_at_root(&root, "store-a", &store_a, &mut first).unwrap();
+        reserve_and_persist_session_at_root(&root, "store-b", &store_b, &mut second).unwrap();
+
+        assert_eq!(first.agent_handle(), "agent");
+        assert_eq!(second.agent_handle(), "agent-2");
+        assert_eq!(
+            store_b.load_sessions().unwrap()[0].agent_handle(),
+            "agent-2"
+        );
+        assert!(root.join("agents/agent").is_dir());
+        assert!(root.join("agents/agent-2").is_dir());
+    }
+
+    #[test]
+    fn concurrent_same_handle_claims_deconflict_under_the_shared_lock() {
+        use std::process::Stdio;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("amq");
+        let start = dir.path().join("start");
+        let gate = AmqRegistryLock::acquire(&root).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        let mut databases = Vec::new();
+        let mut ready_paths = Vec::new();
+        let mut output_paths = Vec::new();
+        for label in ["a", "b"] {
+            let database = dir.path().join(format!("{label}.sqlite3"));
+            let worktree = dir.path().join(format!("{label}/agent"));
+            let ready = dir.path().join(format!("{label}.ready"));
+            let output = dir.path().join(format!("{label}.handle"));
+            let child = Command::new(&executable)
+                .arg("subprocess_helper")
+                .arg("--nocapture")
+                .env("DUX_AMQ_TEST_HELPER_MODE", "claim")
+                .env("DUX_AMQ_TEST_ROOT", &root)
+                .env("DUX_AMQ_TEST_DATABASE", &database)
+                .env("DUX_AMQ_TEST_WORKTREE", &worktree)
+                .env("DUX_AMQ_TEST_READY", &ready)
+                .env("DUX_AMQ_TEST_START", &start)
+                .env("DUX_AMQ_TEST_OUTPUT", &output)
+                .env("DUX_AMQ_TEST_STORE_ID", format!("store-{label}"))
+                .env("DUX_AMQ_TEST_SESSION_ID", format!("session-{label}"))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            children.push(child);
+            databases.push(database);
+            ready_paths.push(ready);
+            output_paths.push(output);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ready_paths.iter().any(|path| !path.exists()) {
+            assert!(
+                Instant::now() < deadline,
+                "claim helpers did not become ready"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        fs::write(&start, b"start").unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        for child in &mut children {
+            assert!(child.try_wait().unwrap().is_none());
+        }
+        assert!(output_paths.iter().all(|path| !path.exists()));
+        drop(gate);
+        for mut child in children {
+            assert!(child.wait().unwrap().success());
+        }
+
+        let mut handles = output_paths
+            .iter()
+            .map(|path| fs::read_to_string(path).unwrap())
+            .collect::<Vec<_>>();
+        handles.sort();
+        assert_eq!(handles, ["agent", "agent-2"]);
+        let mut persisted = databases
+            .iter()
+            .map(|path| {
+                SessionStore::open(path).unwrap().load_sessions().unwrap()[0]
+                    .agent_handle()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        persisted.sort();
+        assert_eq!(persisted, handles);
+        assert!(root.join("agents/agent/.dux-amq-source").is_file());
+        assert!(root.join("agents/agent-2/.dux-amq-source").is_file());
+    }
+
+    #[test]
+    fn suffixed_global_handle_stays_within_the_length_bound() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("amq");
+        fs::create_dir_all(root.join("agents")).unwrap();
+        let base = "a".repeat(crate::model::AGENT_HANDLE_MAX_LEN);
+        let owner = OwnerMarker {
+            store_id: "store-a".to_string(),
+            session_id: "session-a".to_string(),
+            wake_pid: None,
+        };
+
+        let handle = next_global_handle(&root, &base, &HashSet::new(), &owner).unwrap();
+
+        assert_eq!(handle.chars().count(), crate::model::AGENT_HANDLE_MAX_LEN);
+        assert!(handle.ends_with("-2"));
+    }
+
+    #[test]
+    fn failed_owner_marker_write_removes_the_new_reservation_dir() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("amq");
+        fs::create_dir_all(root.join("agents")).unwrap();
+        let owner = OwnerMarker {
+            store_id: "store-a".to_string(),
+            session_id: "session-a".to_string(),
+            wake_pid: None,
+        };
+
+        let result = ensure_owner_marker_with(&root, "agent", &owner, |_, _| {
+            Err(anyhow!("injected marker write failure"))
+        });
+
+        assert!(result.is_err());
+        assert!(!root.join("agents/agent").exists());
+    }
+
+    #[test]
+    fn unambiguous_legacy_path_marker_upgrades_to_exact_owner() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("amq");
+        let store = SessionStore::open(&dir.path().join("sessions.sqlite3")).unwrap();
+        let worktree = dir.path().join("worktree/agent");
+        fs::create_dir_all(root.join("agents/agent")).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        std::os::unix::fs::symlink(&worktree, root.join("agents/agent/.dux-amq-source")).unwrap();
+        let s = session("session-a", "claude", "agent", &worktree);
+        store.upsert_session(&s).unwrap();
+        let mut rows = vec![s];
+
+        reconcile_amq_root(&root, "store-a", Some(&store), &mut rows).unwrap();
+
+        assert_eq!(rows[0].agent_handle(), "agent");
+        let owner = match marker_state(&root, "agent").unwrap() {
+            MarkerState::Owner(owner) => owner,
+            _ => panic!("legacy marker was not upgraded"),
+        };
+        assert_eq!(owner.store_id, "store-a");
+        assert_eq!(owner.session_id, "session-a");
+    }
+
+    #[test]
+    fn ambiguous_legacy_path_is_preserved_and_local_handle_is_suffixed() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("amq");
+        let store = SessionStore::open(&dir.path().join("sessions.sqlite3")).unwrap();
+        let worktree = dir.path().join("shared-worktree");
+        fs::create_dir_all(root.join("agents/agent")).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        std::os::unix::fs::symlink(&worktree, root.join("agents/agent/.dux-amq-source")).unwrap();
+        let first = session("a-session", "claude", "agent", &worktree);
+        let second = session("b-session", "codex", "other", &worktree);
+        store.upsert_session(&first).unwrap();
+        store.upsert_session(&second).unwrap();
+        let mut rows = vec![first, second];
+
+        reconcile_amq_root(&root, "store-a", Some(&store), &mut rows).unwrap();
+
+        assert_eq!(rows[0].agent_handle(), "agent-2");
+        assert!(root.join("agents/agent/.dux-amq-source").is_symlink());
+        let owner = match marker_state(&root, "agent-2").unwrap() {
+            MarkerState::Owner(owner) => owner,
+            _ => panic!("replacement owner marker missing"),
+        };
+        assert_eq!(owner.session_id, "a-session");
+    }
+
+    #[test]
+    fn exact_owner_free_rejects_foreign_then_removes_owned_inbox() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("amq");
+        fs::create_dir_all(root.join("agents")).unwrap();
+        let worktree = dir.path().join("agent");
+        fs::create_dir_all(&worktree).unwrap();
+        let s = session("session-a", "claude", "agent", &worktree);
+        ensure_owner_marker(
+            &root,
+            "agent",
+            &OwnerMarker {
+                store_id: "store-a".to_string(),
+                session_id: s.id.clone(),
+                wake_pid: None,
+            },
+        )
+        .unwrap();
+        register_config_handle(&root, "agent").unwrap();
+
+        assert!(free_amq_handle_at_root(&root, "store-b", &s).is_err());
+        assert!(root.join("agents/agent").exists());
+        free_amq_handle_at_root(&root, "store-a", &s).unwrap();
+        assert!(!root.join("agents/agent").exists());
+        assert!(
+            !fs::read_to_string(root.join("meta/config.json"))
+                .unwrap()
+                .contains("\"agent\"")
+        );
+    }
+
+    #[test]
+    fn spawn_failure_after_persist_leaves_retryable_owned_row() {
+        let dir = tempdir().unwrap();
+        let dux_home = dir.path().join("store");
+        let amq_root = dir.path().join("amq");
+        fs::create_dir_all(&amq_root).unwrap();
+        fs::create_dir_all(&dux_home).unwrap();
+        let paths = DuxPaths {
+            config_path: dux_home.join("config.toml"),
+            sessions_db_path: dux_home.join("sessions.sqlite3"),
+            worktrees_root: dux_home.join("worktrees"),
+            lock_path: dux_home.join("dux.lock"),
+            root: dux_home,
+        };
+        let store = SessionStore::open(&paths.sessions_db_path).unwrap();
+        let worktree = dir.path().join("worktree/agent");
+        fs::create_dir_all(&worktree).unwrap();
+        let mut s = session("session-a", "claude", "agent", &worktree);
+        s.state = SessionState::Spawning { since: Utc::now() };
+
+        reserve_and_persist_session_at_root(&amq_root, "store-a", &store, &mut s).unwrap();
+        s.state = SessionState::Retryable {
+            interrupted_at: Utc::now(),
+        };
+        store.upsert_session(&s).unwrap();
+
+        let loaded = store.load_sessions().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].state.is_retryable());
+        let owner = match marker_state(&amq_root, loaded[0].agent_handle()).unwrap() {
+            MarkerState::Owner(owner) => owner,
+            _ => panic!("reserved owner marker missing"),
+        };
+        assert_eq!(owner.store_id, "store-a");
+        assert_eq!(owner.session_id, "session-a");
+    }
+
+    #[test]
+    fn rust_and_wrapper_claims_serialize_on_config_lock() {
+        use std::process::Stdio;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("amq");
+        let home = dir.path().join("home");
+        let worktree = dir.path().join("worktree");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        let lock = AmqRegistryLock::acquire(&root).unwrap();
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let tests = manifest.join("dux-amq/tests");
+        let path = format!(
+            "{}:{}:{}",
+            tests.join("fakes").display(),
+            manifest.join("dux-amq/scripts").display(),
+            env::var("PATH").unwrap_or_default()
+        );
+        let mut child = Command::new(manifest.join("dux-amq/wrappers/claude-amq"))
+            .current_dir(&worktree)
+            .env("PATH", path)
+            .env("HOME", &home)
+            .env("STATE_ROOT", dir.path().join("state"))
+            .env("AMQ_GLOBAL_ROOT", &root)
+            .env("AM_ME", "wrapper-agent")
+            .env("DUX_AMQ_INJECT_MODE", "via")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(!root.join("agents/wrapper-agent/.dux-amq-source").exists());
+
+        drop(lock);
+        assert!(child.wait().unwrap().success());
+        assert!(root.join("agents/wrapper-agent/.dux-amq-source").exists());
+    }
+
+    #[test]
+    fn wake_pid_guard_requires_the_recorded_handle_and_root() {
+        let root = Path::new("/tmp/shared-amq");
+        let command = [
+            OsString::from("/usr/local/bin/amq"),
+            OsString::from("wake"),
+            OsString::from("--me"),
+            OsString::from("agent"),
+            OsString::from("--root"),
+            root.as_os_str().to_os_string(),
+        ];
+
+        assert!(amq_wake_command_matches(&command, root, "agent"));
+        assert!(!amq_wake_command_matches(&command, root, "other-agent"));
+        assert!(!amq_wake_command_matches(
+            &command,
+            Path::new("/tmp/other-amq"),
+            "agent"
+        ));
+    }
+
+    #[test]
+    fn tombstone_releases_the_registry_lock_before_waiting_for_wake_exit() {
+        use std::process::Stdio;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("amq");
+        fs::create_dir_all(root.join("agents")).unwrap();
+        let term_seen = dir.path().join("term-seen");
+        let child = Command::new("perl")
+            .arg("-e")
+            .arg(
+                "$SIG{TERM}=sub { open(my $f, '>', $ENV{WAKE_TERM_FILE}) or die $!; close($f); }; while (1) { select(undef, undef, undef, 0.05); }",
+            )
+            .arg("amq")
+            .arg("wake")
+            .arg("--me")
+            .arg("agent")
+            .arg("--root")
+            .arg(&root)
+            .env("WAKE_TERM_FILE", &term_seen)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let wake_pid = child.id();
+        let reaper = std::thread::spawn(move || child.wait_with_output());
+        let worktree = dir.path().join("agent");
+        fs::create_dir_all(&worktree).unwrap();
+        let session = session("session-a", "claude", "agent", &worktree);
+        ensure_owner_marker(
+            &root,
+            "agent",
+            &OwnerMarker {
+                store_id: "store-a".to_string(),
+                session_id: session.id.clone(),
+                wake_pid: Some(wake_pid),
+            },
+        )
+        .unwrap();
+        register_config_handle(&root, "agent").unwrap();
+        let tombstone_root = root.clone();
+        let tombstone_session = session.clone();
+        let tombstone = std::thread::spawn(move || {
+            tombstone_amq_session_at_root(&tombstone_root, "store-a", &tombstone_session)
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !term_seen.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "wake process never received SIGTERM"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let probe_output = dir.path().join("probe-output");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("subprocess_helper")
+            .arg("--nocapture")
+            .env("DUX_AMQ_TEST_HELPER_MODE", "probe-lock")
+            .env("DUX_AMQ_TEST_ROOT", &root)
+            .env("DUX_AMQ_TEST_OUTPUT", &probe_output)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(fs::read_to_string(probe_output).unwrap(), "acquired");
+
+        tombstone.join().unwrap().unwrap();
+        let _ = reaper.join().unwrap();
+    }
+
+    #[test]
+    fn tombstone_terminates_recorded_wake_pid_and_keeps_inbox() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Stdio;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("amq");
+        fs::create_dir_all(root.join("agents")).unwrap();
+        let fake_amq = dir.path().join("amq-wake-test");
+        fs::write(
+            &fake_amq,
+            "#!/bin/sh\ntrap 'exit 0' TERM\nwhile :; do :; done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_amq, fs::Permissions::from_mode(0o755)).unwrap();
+        let child = Command::new(&fake_amq)
+            .arg("wake")
+            .arg("--me")
+            .arg("agent")
+            .arg("--root")
+            .arg(&root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let reaper = std::thread::spawn(move || child.wait_with_output());
+        let worktree = dir.path().join("agent");
+        fs::create_dir_all(&worktree).unwrap();
+        let s = session("session-a", "claude", "agent", &worktree);
+        ensure_owner_marker(
+            &root,
+            "agent",
+            &OwnerMarker {
+                store_id: "store-a".to_string(),
+                session_id: s.id.clone(),
+                wake_pid: Some(pid),
+            },
+        )
+        .unwrap();
+        register_config_handle(&root, "agent").unwrap();
+
+        tombstone_amq_session_at_root(&root, "store-a", &s).unwrap();
+        let _ = reaper.join().unwrap();
+
+        assert!(root.join("agents/agent").is_dir());
+        let owner = match marker_state(&root, "agent").unwrap() {
+            MarkerState::Owner(owner) => owner,
+            _ => panic!("owner marker missing"),
+        };
+        assert_eq!(owner.wake_pid, None);
+        assert!(
+            !fs::read_to_string(root.join("meta/config.json"))
+                .unwrap()
+                .contains("\"agent\"")
+        );
     }
 }
