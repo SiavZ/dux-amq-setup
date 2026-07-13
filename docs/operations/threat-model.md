@@ -285,35 +285,32 @@ the operator can use as a GDPR audit trail.
 
 ---
 
-## T7 — Wrapper identity collision (`feat/foo` ≡ `feat-foo`)
+## T7 — Cross-store or normalized wrapper identity collision
 
-**Attack scenario.** The wrappers normalize identities with
-`sed 's/[^a-z0-9_-]/-/g'` (`claude-amq:75`, `codex-amq:19`).
-Branches `feat/foo` and `feat-foo` both collapse to the handle
-`feat-foo`. An attacker creates a branch
-`feat-bob` while a legitimate `feat/bob` already exists — or vice
-versa — and AMQ messages addressed to `bob` (or to `feat/bob`'s
-handle) silently land in the attacker's inbox. The recipient has
-no way to tell.
+**Attack scenario.** Two DUX_HOME stores share one AMQ root and independently
+allocate the same normalized handle, or a standalone wrapper/path marker
+already occupies that physical `agents/<handle>` key. An unlocked
+read-modify-write can also lose one writer's `config.json` registration. Either
+case can redirect delivery or let one store prune another store's identity.
 
-**Mitigation in code.** Phase 22 makes the wrapper detect the
-collision: before launch it lists existing AMQ identities and, if
-the normalized handle already exists for a different branch, the
-wrapper exits with `error: identity 'feat-bob' is already
-registered to branch 'feat/bob' — choose a different branch
-name`. The check runs in
-`dux-amq/wrappers/claude-amq` and `codex-amq` before any
-`amq init` or `amq wake` call.
+**Mitigation in code.** Every DUX_HOME has a durable `store-id`. Dux persists
+the session UUID and handle before provider launch, then Rust and all three
+wrappers use the same mandatory `flock` on `meta/config.lock` for complete
+owner-marker and registry updates. The atomic marker binds `store_id` and
+`session_id`; reconciliation prunes only missing/deleted rows owned by its own
+store. Foreign, standalone, malformed, ownerless, and ambiguous legacy keys
+are never reclaimed. Creation/backfill instead allocates a bounded `-2`,
+`-3`, … suffix while the lock is held.
 
-**Residual risk.** If two branches with conflicting names are
-created on different VMs and only later synced, the conflict only
-surfaces when both panes start. The wrapper detects on second
-launch but the first launcher has already registered.
+**Residual risk.** This is coordination, not an authorization boundary:
+same-UID code can edit the shared root or lock it indefinitely. That remains
+inside the declared single-user VM threat model. A provider launched outside
+an AMQ wrapper has no wake PID, so deletion can reserve/remove its registry
+identity but has no daemon process to terminate.
 
-**Detection.** Collision attempts log `wrapper: identity
-collision <handle> ↔ <branch>` at ERROR. The pane refuses to
-start, so the operator sees the error before any AMQ traffic
-flows.
+**Detection.** Missing lock support and owner mismatches fail closed with an
+explicit wrapper or `dux::peer` error. A recycled wake PID that no longer
+identifies `amq wake` is logged and left untouched.
 
 ---
 

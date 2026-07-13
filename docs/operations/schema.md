@@ -30,3 +30,30 @@ work succeeds.
 `session_prs(session_id)` references `agent_sessions(id) ON DELETE CASCADE`.
 Migration 0005 rebuilds this table inside the same transaction so PR rows and
 the foreign key survive the parent-table rebuild.
+
+## AMQ ownership metadata
+
+Each DUX_HOME has a stable UUID in `store-id`. Creation is serialized by
+`.store-id.lock`; the UUID is written and synced once, then reused across
+restarts.
+
+Under a configured shared AMQ root, `agents/<agent_handle>/.dux-amq-source`
+is an atomic JSON ownership record containing `store_id`, `session_id`, and an
+optional `wake_pid`. Rust and all provider wrappers hold
+`meta/config.lock` with `flock` for the complete owner/config read-modify-write.
+If that mandatory lock cannot be acquired, registration fails closed.
+
+Pre-existing path/symlink markers are upgraded only when the path maps to
+exactly one row in the current store. Ambiguous paths, malformed markers,
+ownerless agent directories, and markers owned by another store are preserved
+as foreign. A v5 backfill or new session that encounters one receives the next
+available `-2`, `-3`, … handle under the shared lock; after that reservation,
+the handle is immutable.
+
+Ordinary deletion performs AMQ cleanup only for an exact owner match; foreign,
+legacy, missing, or unreadable markers are left untouched and never block the
+local session tombstone. Exact-owner cleanup removes the handle from AMQ's live
+`config.json`, clears and then terminates the optional recorded wake PID, and
+keeps the inbox plus owner record reserved. The legacy hard-purge cascade now
+targets the persisted `agent_handle` rather than a worktree basename; Phase 5
+wires the exposed exact-owner free primitive into that cascade.
