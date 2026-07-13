@@ -1,3 +1,5 @@
+//! TUI application state, bootstrap, rendering, and runtime lifecycle.
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::stdout;
@@ -61,6 +63,7 @@ pub struct App {
     pub(crate) paths: DuxPaths,
     pub(crate) bindings: RuntimeBindings,
     pub(crate) session_store: SessionStore,
+    pub(crate) store_id: String,
     pub(crate) selected_left: usize,
     pub(crate) left_scroll_offset: usize,
     pub(crate) left_section: LeftSection,
@@ -1080,8 +1083,6 @@ pub(crate) struct AgentReadyData {
     pub client: PtyClient,
     pub pty_size: (u16, u16), // (rows, cols) the PTY was spawned with
     pub status_message: String,
-    pub owns_worktree: bool,
-    pub owns_branch: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1107,9 +1108,9 @@ pub(crate) enum WorkerEvent {
     CreateAgentProgress(String),
     CreateAgentReady(Box<AgentReadyData>),
     CreateAgentFailed(String),
-    UnpersistedAgentCleanupCompleted {
-        worktree: PathBuf,
-        result: Result<(), String>,
+    CreateAgentRecoverable {
+        session: Box<AgentSession>,
+        message: String,
     },
     ChangedFilesReady {
         staged: Vec<ChangedFile>,
@@ -1158,6 +1159,12 @@ pub(crate) enum WorkerEvent {
     WorktreeRemoveCompleted {
         session_id: String,
         result: Result<bool, String>,
+    },
+    AmqDeleteCompleted {
+        session_id: String,
+        delete_worktree: bool,
+        remove_outcome: Option<bool>,
+        result: Result<(), String>,
     },
     /// Background `git switch <target_branch>` run from the "Add Project"
     /// warning modal has finished. On `Ok`, the main loop proceeds with
@@ -1308,6 +1315,37 @@ mod sessions;
 pub(crate) mod text_input;
 mod workers;
 
+fn sync_amq_agents_for_bootstrap(paths: &DuxPaths) {
+    match crate::peer::sync_amq_agents(paths) {
+        Ok(report) if report.skipped => {
+            tracing::debug!(
+                target: "dux::peer",
+                "AMQ registry sync skipped; no AMQ root configured"
+            );
+        }
+        Ok(report) => {
+            tracing::debug!(
+                target: "dux::peer",
+                root = %crate::sanitize::for_terminal(
+                    &report.root.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+                ),
+                configured_agents_added = report.configured_agents_added,
+                stale_config_agents_removed = report.stale_config_agents_removed,
+                ownership_markers_created = report.ownership_markers_created,
+                handles_deconflicted = report.handles_deconflicted,
+                "AMQ registry synced from Dux sessions"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "dux::peer",
+                error = %crate::sanitize::for_terminal(&format!("{err:#}")),
+                "AMQ startup reconciliation failed; continuing without changing the shared registry"
+            );
+        }
+    }
+}
+
 impl App {
     /// Bootstrap the TUI. The caller must have already resolved `paths`,
     /// created its directories, and acquired the single-instance lock.
@@ -1353,35 +1391,11 @@ impl App {
         let sigwinch_flag = Arc::new(AtomicBool::new(false));
         signal_hook::flag::register(signal_hook::consts::SIGWINCH, Arc::clone(&sigwinch_flag))?;
 
+        let store_id = crate::storage::load_or_create_store_id(&paths.root)?;
         let session_store = SessionStore::open(&paths.sessions_db_path)?;
         let projects = load_projects(&config);
+        sync_amq_agents_for_bootstrap(&paths);
         let sessions = session_store.load_sessions()?;
-        match crate::peer::sync_amq_agents(&paths, &sessions) {
-            Ok(report) if report.skipped => {
-                tracing::debug!(
-                    target: "dux::peer",
-                    "AMQ registry sync skipped; no AMQ root configured"
-                );
-            }
-            Ok(report) => {
-                tracing::debug!(
-                    target: "dux::peer",
-                    root = %report.root.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
-                    configured_agents_added = report.configured_agents_added,
-                    stale_config_agents_removed = report.stale_config_agents_removed,
-                    source_links_created = report.source_links_created,
-                    source_links_replaced = report.source_links_replaced,
-                    source_link_conflicts = report.source_link_conflicts.len(),
-                    "AMQ registry synced from Dux sessions"
-                );
-                for conflict in report.source_link_conflicts {
-                    tracing::warn!(target: "dux::peer", conflict = %conflict, "AMQ source link conflict");
-                }
-            }
-            Err(err) => {
-                tracing::warn!(target: "dux::peer", err = %err, "AMQ registry sync failed");
-            }
-        }
         let (worker_tx, worker_rx) = mpsc::channel();
         let watched_worktree: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
         let initial_status = format!(
@@ -1495,6 +1509,7 @@ impl App {
             config,
             paths,
             session_store,
+            store_id,
             selected_left: 0,
             left_scroll_offset: 0,
             left_section: LeftSection::Projects,
@@ -1802,6 +1817,7 @@ impl App {
             (24, 80)
         };
         let scrollback_lines = self.config.ui.agent_scrollback_lines;
+        let store_id = self.store_id.clone();
         let tx = self.runtime.worker_tx.clone();
 
         thread::Builder::new()
@@ -1817,6 +1833,7 @@ impl App {
                             use_resume,
                             last_pty_size,
                             scrollback_lines,
+                            &store_id,
                         )
                         .map_err(|e| format!("{e:#}"));
                         let _ = tx.send(WorkerEvent::AutoResumeSpawned {
@@ -3931,6 +3948,30 @@ pub(crate) fn provider_config(config: &Config, provider: &ProviderKind) -> Provi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_amq_sync_degrades_on_corrupt_shared_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let dux_home = dir.path().join("dux");
+        let amq_root = dir.path().join("amq");
+        fs::create_dir_all(amq_root.join("meta")).unwrap();
+        fs::write(amq_root.join("meta/config.json"), b"{not-json").unwrap();
+        let paths = DuxPaths {
+            config_path: dux_home.join("config.toml"),
+            sessions_db_path: dux_home.join("sessions.sqlite3"),
+            worktrees_root: dux_home.join("worktrees"),
+            lock_path: dux_home.join("dux.lock"),
+            root: dux_home,
+        };
+
+        sync_amq_agents_for_bootstrap(&paths);
+
+        assert!(paths.root.join("store-id").is_file());
+        assert_eq!(
+            fs::read(amq_root.join("meta/config.json")).unwrap(),
+            b"{not-json"
+        );
+    }
 
     #[test]
     fn current_process_is_descendant_of_pid_1() {

@@ -1,3 +1,5 @@
+//! Session creation, PTY launch/reconnect, and deletion lifecycle.
+
 use super::*;
 use crate::editor;
 
@@ -389,10 +391,6 @@ impl App {
             self.set_error(reason);
             return Ok(());
         }
-        if let Some(reason) = self.refuse_agent_spawn_for_amq_collision(&request) {
-            self.set_error(reason);
-            return Ok(());
-        }
         if let Some(warning) = self.soft_warn_for_pane_count() {
             self.set_warning(warning);
         }
@@ -400,10 +398,13 @@ impl App {
         self.set_busy(busy_message);
         let paths = self.paths.clone();
         let config = self.config.clone();
+        let store_id = self.store_id.clone();
         let worker_tx = self.runtime.worker_tx.clone();
         let term_size = crossterm::terminal::size().unwrap_or((80, 24));
         thread::spawn(move || {
-            super::workers::run_create_agent_job(request, paths, config, worker_tx, term_size);
+            super::workers::run_create_agent_job(
+                request, paths, config, store_id, worker_tx, term_size,
+            );
         });
         Ok(())
     }
@@ -442,46 +443,6 @@ impl App {
                  (limits.disk_high_water_pct = {}%). Run `dux session purge` \
                  or extend the volume to recover.",
                 limits.disk_high_water_pct
-            ));
-        }
-        None
-    }
-
-    /// User-created Dux worktrees derive their AMQ identity from the worktree
-    /// directory basename. Refuse duplicate handles before creating a Git
-    /// worktree so the wrapper does not immediately exit with an identity
-    /// collision.
-    pub(crate) fn refuse_agent_spawn_for_amq_collision(
-        &self,
-        request: &CreateAgentRequest,
-    ) -> Option<String> {
-        let requested_name = match request {
-            CreateAgentRequest::NewProject {
-                custom_name: Some(name),
-                ..
-            }
-            | CreateAgentRequest::ForkSession {
-                custom_name: Some(name),
-                ..
-            } => name,
-            _ => return None,
-        };
-        let requested_handle = amq_handle_for_agent_name(requested_name);
-        if requested_handle.is_empty() {
-            return None;
-        }
-
-        for session in &self.git.sessions {
-            if !std::path::Path::new(&session.worktree_path).exists() {
-                continue;
-            }
-            if amq_handle_for_session(session) != requested_handle {
-                continue;
-            }
-            let label = self.session_label(session);
-            let project = self.project_name_for_session(session);
-            return Some(format!(
-                "Refusing new agent: AMQ handle \"{requested_handle}\" is already used by agent \"{label}\" in project \"{project}\". Pick a unique agent name, for example include the project name, so dux-amq can route messages unambiguously.",
             ));
         }
         None
@@ -545,7 +506,7 @@ impl App {
         let mut per_session_env = session
             .settings
             .to_pty_env(&session.provider, self.config.amq.inject.verify_envelope);
-        crate::peer::append_session_env(&mut per_session_env, session);
+        crate::peer::append_session_env(&mut per_session_env, session, &self.store_id);
         PtyClient::spawn_with_env(
             &cfg.command,
             launch_args,
@@ -576,6 +537,7 @@ pub(crate) fn spawn_pty_for_auto_resume(
     resume: bool,
     last_pty_size: (u16, u16),
     scrollback_lines: usize,
+    store_id: &str,
 ) -> Result<PtyClient> {
     let cfg = provider_config(config, &session.provider);
     let launch_args = cfg.interactive_args(resume);
@@ -594,7 +556,7 @@ pub(crate) fn spawn_pty_for_auto_resume(
     let mut per_session_env = session
         .settings
         .to_pty_env(&session.provider, config.amq.inject.verify_envelope);
-    crate::peer::append_session_env(&mut per_session_env, session);
+    crate::peer::append_session_env(&mut per_session_env, session, store_id);
     PtyClient::spawn_with_env(
         &cfg.command,
         launch_args,
@@ -946,10 +908,53 @@ impl App {
                 "deleting session {} at {} (delete_worktree={}, inline)",
                 session.id, session.worktree_path, delete_worktree
             ));
-            if let Err(e) = self.finish_delete_session(session_id, delete_worktree, None, true) {
+            if crate::peer::amq_cleanup_requires_worker(&self.paths, &self.store_id, &session) {
+                self.git.pending_deletions.insert(session.id.clone());
+                let busy_msg = format!(
+                    "Stopping message delivery for agent \"{}\"\u{2026}",
+                    session.branch_name
+                );
+                self.set_busy(&busy_msg);
+                self.git
+                    .deletion_busy_messages
+                    .insert(session.id.clone(), busy_msg);
+                self.dispatch_amq_session_delete(session.id, delete_worktree, None);
+            } else if let Err(e) =
+                self.finish_delete_session(session_id, delete_worktree, None, true)
+            {
                 self.set_error(format!("{e:#}"));
             }
         }
+    }
+
+    pub(crate) fn dispatch_amq_session_delete(
+        &self,
+        session_id: String,
+        delete_worktree: bool,
+        remove_outcome: Option<bool>,
+    ) {
+        let Some(session) = self
+            .git
+            .sessions
+            .iter()
+            .find(|candidate| candidate.id == session_id)
+            .cloned()
+        else {
+            return;
+        };
+        let paths = self.paths.clone();
+        let store_id = self.store_id.clone();
+        let tx = self.runtime.worker_tx.clone();
+        std::thread::spawn(move || {
+            let result = crate::peer::tombstone_amq_session(&paths, &store_id, &session)
+                .map_err(|err| format!("{err:#}"));
+            let _ = tx.send(WorkerEvent::AmqDeleteCompleted {
+                session_id,
+                delete_worktree,
+                remove_outcome,
+                result,
+            });
+        });
     }
 
     /// Remove all local bookkeeping for a session whose git side has already
@@ -966,6 +971,30 @@ impl App {
     /// (push, pull, etc.) to avoid clobbering it. Synchronous callers and
     /// the handler's "our Busy is still showing" path pass `true`.
     pub(crate) fn finish_delete_session(
+        &mut self,
+        session_id: &str,
+        delete_worktree: bool,
+        remove_outcome: Option<bool>,
+        update_status: bool,
+    ) -> Result<()> {
+        if let Some(session) = self
+            .git
+            .sessions
+            .iter()
+            .find(|candidate| candidate.id == session_id)
+            .cloned()
+        {
+            crate::peer::tombstone_amq_session(&self.paths, &self.store_id, &session)?;
+        }
+        self.finish_delete_session_after_amq(
+            session_id,
+            delete_worktree,
+            remove_outcome,
+            update_status,
+        )
+    }
+
+    pub(crate) fn finish_delete_session_after_amq(
         &mut self,
         session_id: &str,
         delete_worktree: bool,
@@ -2354,32 +2383,6 @@ impl App {
     }
 }
 
-fn amq_handle_for_agent_name(name: &str) -> String {
-    let basename = std::path::Path::new(name)
-        .file_name()
-        .and_then(|part| part.to_str())
-        .unwrap_or(name);
-    let handle = crate::app::inject_runtime::sanitise_handle(basename);
-    if handle.is_empty() {
-        crate::app::inject_runtime::sanitise_handle(name)
-    } else {
-        handle
-    }
-}
-
-fn amq_handle_for_session(session: &AgentSession) -> String {
-    let basename = std::path::Path::new(&session.worktree_path)
-        .file_name()
-        .and_then(|part| part.to_str())
-        .unwrap_or(&session.branch_name);
-    let handle = crate::app::inject_runtime::sanitise_handle(basename);
-    if handle.is_empty() {
-        crate::app::inject_runtime::sanitise_handle(&session.branch_name)
-    } else {
-        handle
-    }
-}
-
 /// Build a human-readable summary of which session-settings knobs
 /// changed. Used by [`App::save_session_settings`] to populate the
 /// status line. Pure function so it's easy to unit-test.
@@ -2457,6 +2460,7 @@ mod tests {
         };
         std::fs::create_dir_all(&paths.worktrees_root).expect("worktrees dir");
         let session_store = SessionStore::open(&paths.sessions_db_path).expect("session store");
+        let store_id = crate::storage::load_or_create_store_id(&paths.root).expect("store id");
         let bindings = test_bindings();
         let (worker_tx, worker_rx) = mpsc::channel();
         let single_instance_lock = crate::lockfile::SingleInstanceLock::acquire(&paths.lock_path)
@@ -2550,6 +2554,7 @@ mod tests {
             paths,
             bindings,
             session_store,
+            store_id,
             selected_left: 0,
             left_scroll_offset: 0,
             left_section: crate::app::LeftSection::Projects,
@@ -2917,6 +2922,41 @@ mod tests {
         assert_eq!(retained[0].agent_handle(), session.agent_handle());
     }
 
+    #[test]
+    fn foreign_legacy_and_missing_markers_do_not_block_local_soft_delete() {
+        let sessions = ["foreign", "legacy", "missing"]
+            .map(|id| make_session(id, "claude", &format!("/tmp/wt/{id}")))
+            .to_vec();
+        let project = make_project("project-1", "claude");
+        let mut app = test_app_with_sessions(sessions.clone(), vec![project]);
+        for session in &sessions {
+            app.session_store.upsert_session(session).unwrap();
+        }
+        let parent = app.paths.root.clone();
+        app.paths.root = parent.join("dux-home");
+        let amq_root = parent.join("amq");
+        let foreign_marker = amq_root.join("agents/foreign/.dux-amq-source");
+        let legacy_marker = amq_root.join("agents/legacy/.dux-amq-source");
+        std::fs::create_dir_all(foreign_marker.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(legacy_marker.parent().unwrap()).unwrap();
+        let foreign = br#"{"store_id":"other-store","session_id":"other-session"}"#;
+        let legacy = b"/foreign/worktree\n";
+        std::fs::write(&foreign_marker, foreign).unwrap();
+        std::fs::write(&legacy_marker, legacy).unwrap();
+
+        for id in ["foreign", "legacy", "missing"] {
+            app.finish_delete_session(id, false, None, false).unwrap();
+        }
+
+        assert!(app.session_store.load_sessions().unwrap().is_empty());
+        let retained = app.session_store.load_sessions_including_deleted().unwrap();
+        assert_eq!(retained.len(), 3);
+        assert!(retained.iter().all(|session| session.deleted_at.is_some()));
+        assert_eq!(std::fs::read(foreign_marker).unwrap(), foreign);
+        assert_eq!(std::fs::read(legacy_marker).unwrap(), legacy);
+        assert!(!amq_root.join("agents/missing").exists());
+    }
+
     /// Kicking off the async delete path should mark the session as
     /// pending so the UI can dim the row.
     #[test]
@@ -3202,85 +3242,6 @@ mod tests {
         assert!(
             msg.contains("not a git repository"),
             "error should include the git error, got: {msg}",
-        );
-    }
-
-    #[test]
-    fn refuse_agent_spawn_for_amq_collision_matches_existing_worktree_basename() {
-        let worktree_dir = tempdir().expect("worktree tempdir");
-        let existing_path = worktree_dir.path().join("MurenaOS-gallery-engineer-codex");
-        std::fs::create_dir_all(&existing_path).expect("existing worktree dir");
-        let existing_path = existing_path.to_string_lossy().to_string();
-
-        let mut existing = make_session("s1", "codex", &existing_path);
-        existing.branch_name = "MurenaOS-gallery-engineer-codex".to_string();
-        existing.project_id = "project-1".to_string();
-
-        let existing_project = make_project("project-1", "codex");
-        let mut new_project = make_project("project-2", "codex");
-        new_project.name = "Glimpse".to_string();
-        let app =
-            test_app_with_sessions(vec![existing], vec![existing_project, new_project.clone()]);
-
-        let request = CreateAgentRequest::NewProject {
-            project: new_project,
-            custom_name: Some("MurenaOS-gallery-engineer-codex".to_string()),
-            use_existing_branch: false,
-            provider: ProviderKind::from_str("codex"),
-            settings: crate::model::SessionSettings::default(),
-        };
-
-        let reason = app
-            .refuse_agent_spawn_for_amq_collision(&request)
-            .expect("duplicate AMQ handle should be refused");
-        assert!(
-            reason.contains("murenaos-gallery-engineer-codex"),
-            "message should name the colliding AMQ handle, got: {reason}",
-        );
-        assert!(
-            reason.contains("branch-s1") || reason.contains("MurenaOS-gallery-engineer-codex"),
-            "message should identify the existing agent, got: {reason}",
-        );
-    }
-
-    #[test]
-    fn refuse_agent_spawn_for_amq_collision_uses_worktree_basename_for_slash_names() {
-        let worktree_dir = tempdir().expect("worktree tempdir");
-        let existing_path = worktree_dir.path().join("foo");
-        std::fs::create_dir_all(&existing_path).expect("existing worktree dir");
-        let existing_path = existing_path.to_string_lossy().to_string();
-
-        let mut existing = make_session("s1", "codex", &existing_path);
-        existing.branch_name = "feature/foo".to_string();
-        let project = make_project("project-1", "codex");
-        let app = test_app_with_sessions(vec![existing], vec![project.clone()]);
-
-        let colliding = CreateAgentRequest::NewProject {
-            project: project.clone(),
-            custom_name: Some("other/foo".to_string()),
-            use_existing_branch: false,
-            provider: ProviderKind::from_str("codex"),
-            settings: crate::model::SessionSettings::default(),
-        };
-        let reason = app
-            .refuse_agent_spawn_for_amq_collision(&colliding)
-            .expect("duplicate basename-derived AMQ handle should be refused");
-        assert!(
-            reason.contains("AMQ handle \"foo\""),
-            "message should use the basename-derived handle, got: {reason}",
-        );
-
-        let distinct = CreateAgentRequest::NewProject {
-            project,
-            custom_name: Some("feature/bar".to_string()),
-            use_existing_branch: false,
-            provider: ProviderKind::from_str("codex"),
-            settings: crate::model::SessionSettings::default(),
-        };
-        assert!(
-            app.refuse_agent_spawn_for_amq_collision(&distinct)
-                .is_none(),
-            "distinct basename-derived handle should be allowed",
         );
     }
 

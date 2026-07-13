@@ -5939,6 +5939,7 @@ mod tests {
         };
         std::fs::create_dir_all(&paths.worktrees_root).expect("worktrees dir");
         let session_store = SessionStore::open(&paths.sessions_db_path).expect("session store");
+        let store_id = crate::storage::load_or_create_store_id(&paths.root).expect("store id");
         let now = Utc::now();
         let project = Project {
             id: "project-1".to_string(),
@@ -6059,6 +6060,7 @@ mod tests {
             paths,
             bindings,
             session_store,
+            store_id,
             selected_left: 0,
             left_scroll_offset: 0,
             left_section: crate::app::LeftSection::Projects,
@@ -12414,7 +12416,7 @@ cyan = "#00ffff"
     }
 
     #[test]
-    fn create_agent_db_failure_removes_owned_worktree_without_success() {
+    fn create_agent_ready_consumes_the_already_persisted_row() {
         let mut app = test_app(default_bindings());
         let repo = app.paths.root.clone();
         let run_git = |args: &[&str]| {
@@ -12468,6 +12470,7 @@ cyan = "#00ffff"
             1_000,
         )
         .expect("spawn test provider");
+        app.session_store.upsert_session(&session).unwrap();
         app.session_store
             .conn()
             .execute_batch("pragma query_only = on;")
@@ -12479,31 +12482,20 @@ cyan = "#00ffff"
                 session,
                 client,
                 pty_size: (24, 80),
-                status_message: "must not be shown".to_string(),
-                owns_worktree: true,
-                owns_branch: true,
+                status_message: "ready from persisted row".to_string(),
             })))
             .expect("send ready event");
 
         app.drain_events();
         assert!(!app.create_agent_in_flight);
-        assert!(app.status.message().contains("Failed to persist session"));
-        assert!(!app.status.message().contains("must not be shown"));
+        assert!(app.status.message().contains("ready from persisted row"));
         assert!(
             app.git
                 .sessions
                 .iter()
-                .all(|candidate| candidate.id != "unpersisted-session")
+                .any(|candidate| candidate.id == "unpersisted-session")
         );
-        for _ in 0..200 {
-            app.drain_events();
-            if !worktree.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(!worktree.exists(), "owned worktree was orphaned");
-        assert_eq!(app.status.tone(), crate::statusline::StatusTone::Error);
+        assert!(worktree.exists(), "persisted worktree must be retained");
     }
 
     #[test]

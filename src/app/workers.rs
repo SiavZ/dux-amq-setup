@@ -1,3 +1,5 @@
+//! Worker-event handling and blocking background jobs for the TUI.
+
 use super::*;
 
 impl App {
@@ -7,47 +9,13 @@ impl App {
                 WorkerEvent::CreateAgentProgress(message) => self.set_busy(message),
                 WorkerEvent::CreateAgentReady(boxed) => {
                     let AgentReadyData {
-                        mut session,
+                        session,
                         client,
                         pty_size,
                         status_message,
-                        owns_worktree,
-                        owns_branch,
                     } = *boxed;
                     self.create_agent_in_flight = false;
                     self.last_pty_size = pty_size;
-                    // The free-handle read in assign_unique_agent_handle and the
-                    // upsert are separate lock acquisitions; uniqueness holds
-                    // because sessions are only ever written from this UI thread.
-                    // A background write path would need an atomic reserve-insert.
-                    let persist_result = self
-                        .session_store
-                        .assign_unique_agent_handle(&mut session)
-                        .and_then(|()| self.session_store.upsert_session(&session));
-                    if let Err(err) = persist_result {
-                        let safe_session_id = crate::sanitize::for_terminal(&session.id);
-                        let safe_err = crate::sanitize::for_terminal(&format!("{err:#}"));
-                        tracing::error!(
-                            target: "dux::workers",
-                            session_id = %safe_session_id,
-                            err = %safe_err,
-                            "session store upsert failed",
-                        );
-                        self.set_error(format!("Failed to persist session: {safe_err}"));
-                        if owns_worktree
-                            && let Some(repo_path) = session.project_path.as_ref()
-                        {
-                            dispatch_unpersisted_agent_cleanup(
-                                self.runtime.worker_tx.clone(),
-                                PathBuf::from(repo_path),
-                                PathBuf::from(&session.worktree_path),
-                                session.branch_name.clone(),
-                                owns_branch,
-                            );
-                        }
-                        drop(client);
-                        continue;
-                    }
                     self.detach_conflicting_worktree_session(
                         &session.worktree_path,
                         &session.id,
@@ -77,13 +45,22 @@ impl App {
                     self.create_agent_in_flight = false;
                     self.set_error(message);
                 }
-                WorkerEvent::UnpersistedAgentCleanupCompleted { worktree, result } => {
-                    if let Err(err) = result {
-                        self.set_error(format!(
-                            "Session persistence failed and cleanup of {} also failed: {err}",
-                            crate::sanitize::for_terminal(&worktree.display().to_string())
-                        ));
-                    }
+                WorkerEvent::CreateAgentRecoverable { session, message } => {
+                    self.create_agent_in_flight = false;
+                    let session = *session;
+                    self.ensure_project_worktree_link_for_project_id(&session.project_id);
+                    let session_id = session.id.clone();
+                    self.git.sessions.retain(|candidate| candidate.id != session_id);
+                    self.git.sessions.insert(0, session);
+                    self.update_branch_sync_sessions();
+                    self.rebuild_left_items();
+                    self.selected_left = self
+                        .left_items()
+                        .iter()
+                        .position(|item| matches!(item, LeftItem::Session(index) if self.git.sessions.get(*index).map(|candidate| candidate.id.as_str()) == Some(session_id.as_str())))
+                        .unwrap_or(0);
+                    self.reload_changed_files();
+                    self.set_error(message);
                 }
                 WorkerEvent::ChangedFilesReady { staged, unstaged } => {
                     self.git.staged_files = staged;
@@ -366,53 +343,56 @@ impl App {
                     }
                 }
                 WorkerEvent::WorktreeRemoveCompleted { session_id, result } => {
-                    // Always clear the in-flight guard so the session is
-                    // interactive again — whether we're about to remove it
-                    // (Ok path) or leave it in place for retry (Err path).
-                    self.git.pending_deletions.remove(&session_id);
-
-                    // Retrieve (and remove) the exact Busy message we set
-                    // when the worker was spawned. We compare this against
-                    // the current status-line content rather than checking
-                    // tone alone, because another operation (push, pull,
-                    // refresh, concurrent delete) may have since set its own
-                    // Busy message that we must not clobber.
-                    let our_busy_msg = self.git.deletion_busy_messages.remove(&session_id);
-
                     match result {
                         Ok(branch_already_deleted) => {
-                            // Only update the status line if the current
-                            // content is still the Busy message we set when
-                            // spawning this worker. If another operation
-                            // (push, pull, concurrent delete) has since
-                            // overwritten it, we should not clobber their
-                            // message — the session will visually disappear
-                            // from the list, which is sufficient feedback.
-                            let our_busy_still_showing =
-                                our_busy_msg.as_ref().is_some_and(|msg| {
+                            let needs_amq_worker = self
+                                .git
+                                .sessions
+                                .iter()
+                                .find(|session| session.id == session_id)
+                                .is_some_and(|session| {
+                                    crate::peer::amq_cleanup_requires_worker(
+                                        &self.paths,
+                                        &self.store_id,
+                                        session,
+                                    )
+                                });
+                            if needs_amq_worker {
+                                self.dispatch_amq_session_delete(
+                                    session_id,
+                                    true,
+                                    Some(branch_already_deleted),
+                                );
+                            } else {
+                                self.git.pending_deletions.remove(&session_id);
+                                let our_busy_msg = self
+                                    .git
+                                    .deletion_busy_messages
+                                    .remove(&session_id);
+                                let update_status = our_busy_msg.as_ref().is_some_and(|msg| {
                                     self.status.tone()
                                         == crate::statusline::StatusTone::Busy
                                         && self.status.message() == msg.as_str()
                                 });
-
-                            if self.git.sessions.iter().any(|s| s.id == session_id) {
-                                if let Err(e) = self.finish_delete_session(
-                                    &session_id,
-                                    true,
-                                    Some(branch_already_deleted),
-                                    our_busy_still_showing,
-                                ) {
-                                    self.set_error(format!(
-                                        "Worktree removed but session cleanup failed: {e:#}"
-                                    ));
+                                if self.git.sessions.iter().any(|s| s.id == session_id) {
+                                    if let Err(e) = self.finish_delete_session(
+                                        &session_id,
+                                        true,
+                                        Some(branch_already_deleted),
+                                        update_status,
+                                    ) {
+                                        self.set_error(format!(
+                                            "Worktree removed but session cleanup failed: {e:#}"
+                                        ));
+                                    }
+                                } else if update_status {
+                                    self.set_info("Worktree removal finished.");
                                 }
-                            } else if our_busy_still_showing {
-                                // Session removed by another path; just clear
-                                // the lingering Busy so it doesn't stick.
-                                self.set_info("Worktree removal finished.");
                             }
                         }
                         Err(msg) => {
+                            self.git.pending_deletions.remove(&session_id);
+                            self.git.deletion_busy_messages.remove(&session_id);
                             // Session record is normally still present
                             // because we deferred cleanup until git
                             // succeeded. Look up the session label so the
@@ -436,6 +416,34 @@ impl App {
                                 ));
                             }
                         }
+                    }
+                }
+                WorkerEvent::AmqDeleteCompleted {
+                    session_id,
+                    delete_worktree,
+                    remove_outcome,
+                    result,
+                } => {
+                    self.git.pending_deletions.remove(&session_id);
+                    let our_busy_msg = self.git.deletion_busy_messages.remove(&session_id);
+                    let update_status = our_busy_msg.as_ref().is_some_and(|msg| {
+                        self.status.tone() == crate::statusline::StatusTone::Busy
+                            && self.status.message() == msg.as_str()
+                    });
+                    match result {
+                        Ok(()) => {
+                            if let Err(err) = self.finish_delete_session_after_amq(
+                                &session_id,
+                                delete_worktree,
+                                remove_outcome,
+                                update_status,
+                            ) {
+                                self.set_error(format!("Session cleanup failed: {err:#}"));
+                            }
+                        }
+                        Err(err) => self.set_error(format!(
+                            "Message-delivery cleanup failed; session retained for retry: {err}"
+                        )),
                     }
                 }
                 WorkerEvent::ResourceStatsReady(stats) => {
@@ -1574,6 +1582,7 @@ pub(crate) fn run_create_agent_job(
     request: CreateAgentRequest,
     paths: DuxPaths,
     config: Config,
+    store_id: String,
     worker_tx: Sender<WorkerEvent>,
     term_size: (u16, u16),
 ) {
@@ -1768,7 +1777,6 @@ pub(crate) fn run_create_agent_job(
             )
         }
     };
-    let repo_path = PathBuf::from(&project.path);
     if owns_worktree {
         logger::info(&format!(
             "created worktree {} on branch {}",
@@ -1785,7 +1793,7 @@ pub(crate) fn run_create_agent_job(
     let id = Uuid::new_v4().to_string();
     let worktree_path_string = worktree_path.to_string_lossy().to_string();
     let agent_handle = crate::model::derive_agent_handle(&worktree_path_string, &branch_name, &id);
-    let session = AgentSession {
+    let mut session = AgentSession {
         id,
         project_id: project.id.clone(),
         project_path: Some(project.path.clone()),
@@ -1798,17 +1806,58 @@ pub(crate) fn run_create_agent_job(
         deleted_at: None,
         title: None,
         started_providers: Vec::new(),
-        // The session is brand-new and has no PTY yet; the spawn
-        // pipeline will transition it to `Live` once the PtyClient
-        // is plumbed back to the UI thread (via
-        // `App::install_pty_for_session`).
-        state: crate::model::SessionState::Created {
-            created_at: Utc::now(),
-        },
+        state: crate::model::SessionState::Spawning { since: Utc::now() },
         settings,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
+    let store = match SessionStore::open(&paths.sessions_db_path) {
+        Ok(store) => store,
+        Err(err) => {
+            let safe_err = crate::sanitize::for_terminal(&format!("{err:#}"));
+            if owns_worktree {
+                let _ = git::remove_worktree(
+                    Path::new(&project.path),
+                    Path::new(&session.worktree_path),
+                    &session.branch_name,
+                    owns_branch,
+                );
+            }
+            let _ = worker_tx.send(WorkerEvent::CreateAgentFailed(format!(
+                "Failed to open the session store: {safe_err}"
+            )));
+            return;
+        }
+    };
+    if let Err(err) =
+        crate::peer::reserve_and_persist_session(&paths, &store_id, &store, &mut session)
+    {
+        let safe_err = crate::sanitize::for_terminal(&format!("{err:#}"));
+        let row_exists = store
+            .load_sessions_including_deleted()
+            .is_ok_and(|rows| rows.iter().any(|row| row.id == session.id));
+        if row_exists {
+            fail_recoverable_create(
+                &store,
+                session,
+                format!("Session reserved but AMQ setup failed: {safe_err}"),
+                &worker_tx,
+            );
+        } else {
+            if owns_worktree {
+                let _ = git::remove_worktree(
+                    Path::new(&project.path),
+                    Path::new(&session.worktree_path),
+                    &session.branch_name,
+                    owns_branch,
+                );
+            }
+            let _ = worker_tx.send(WorkerEvent::CreateAgentFailed(format!(
+                "Failed to persist the new session: {safe_err}"
+            )));
+        }
+        return;
+    }
     let provider_cfg = provider_config(&config, &session.provider);
     if let Err(hint) = check_provider_available(&provider_cfg) {
         tracing::error!(
@@ -1819,15 +1868,7 @@ pub(crate) fn run_create_agent_job(
             hint = %hint,
             "provider not found",
         );
-        if owns_worktree {
-            let _ = git::remove_worktree(
-                &repo_path,
-                Path::new(&session.worktree_path),
-                &session.branch_name,
-                owns_branch,
-            );
-        }
-        let _ = worker_tx.send(WorkerEvent::CreateAgentFailed(hint));
+        fail_recoverable_create(&store, session, hint, &worker_tx);
         return;
     }
     let _ = worker_tx.send(WorkerEvent::CreateAgentProgress(format!(
@@ -1843,7 +1884,7 @@ pub(crate) fn run_create_agent_job(
     let mut per_session_env = session
         .settings
         .to_pty_env(&session.provider, config.amq.inject.verify_envelope);
-    crate::peer::append_session_env(&mut per_session_env, &session);
+    crate::peer::append_session_env(&mut per_session_env, &session, &store_id);
     let client = match PtyClient::spawn_with_env(
         &provider_cfg.command,
         &provider_cfg.args,
@@ -1863,18 +1904,12 @@ pub(crate) fn run_create_agent_job(
                 err = %err,
                 "pty spawn failed",
             );
-            if owns_worktree {
-                let _ = git::remove_worktree(
-                    &repo_path,
-                    Path::new(&session.worktree_path),
-                    &session.branch_name,
-                    owns_branch,
-                );
-            }
-            let _ = worker_tx.send(WorkerEvent::CreateAgentFailed(format!(
-                "Failed to start {}: {err}",
-                provider_cfg.command
-            )));
+            fail_recoverable_create(
+                &store,
+                session,
+                format!("Failed to start {}: {err}", provider_cfg.command),
+                &worker_tx,
+            );
             return;
         }
     };
@@ -1891,9 +1926,31 @@ pub(crate) fn run_create_agent_job(
         client,
         pty_size: (rows, cols),
         status_message,
-        owns_worktree,
-        owns_branch,
     })));
+}
+
+fn fail_recoverable_create(
+    store: &SessionStore,
+    mut session: AgentSession,
+    message: String,
+    worker_tx: &Sender<WorkerEvent>,
+) {
+    session.state = SessionState::Retryable {
+        interrupted_at: Utc::now(),
+    };
+    session.updated_at = Utc::now();
+    if let Err(err) = store.upsert_session(&session) {
+        tracing::error!(
+            target: "dux::workers",
+            session_id = %crate::sanitize::for_terminal(&session.id),
+            err = %crate::sanitize::for_terminal(&format!("{err:#}")),
+            "failed to persist retryable create state"
+        );
+    }
+    let _ = worker_tx.send(WorkerEvent::CreateAgentRecoverable {
+        session: Box::new(session),
+        message,
+    });
 }
 
 /// Fan out `git is_git_repo` + `current_branch` + `remote_default_branch`
@@ -2023,23 +2080,6 @@ fn section_after_git_file_op(
         GitFileAction::Unstage if staged <= 1 && unstaged > 0 => Some(RightSection::Unstaged),
         _ => None,
     }
-}
-
-fn dispatch_unpersisted_agent_cleanup(
-    tx: Sender<WorkerEvent>,
-    repo: PathBuf,
-    worktree: PathBuf,
-    branch: String,
-    delete_branch: bool,
-) {
-    let _ = thread::Builder::new()
-        .name("unpersisted-agent-cleanup".to_string())
-        .spawn(move || {
-            let result = git::remove_worktree(&repo, &worktree, &branch, delete_branch)
-                .map(|_| ())
-                .map_err(|err| format!("{err:#}"));
-            let _ = tx.send(WorkerEvent::UnpersistedAgentCleanupCompleted { worktree, result });
-        });
 }
 
 fn dispatch_branch_rename_rollback(
