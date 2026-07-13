@@ -373,3 +373,27 @@ Verified the blocker in code (confirm_delete_selected_session gates only on work
 ### Phase 4 fix round 1 + commit
 
 Codex fixed B1 (delete-worktree data loss for shared) thoroughly: shared_workspace threaded into ConfirmDeleteAgent; begin_delete_session independently coerces delete_worktree=false from the live session row (belt-and-suspenders, verified: `let delete_worktree = delete_worktree && !session.shared_workspace();`); input can't focus/toggle the checkbox for shared; render hides it + states the checkout is preserved. Tests: begin_delete_session_never_removes_shared_workspace (requests delete_worktree=true, asserts no removal + dir survives + tombstoned) and shared_delete_dialog_hides_worktree_checkbox. N1: config-diff renderer uses default_workspace_mode() so legacy shows worktree. 1007 tests + all gates green. Committed be131ef..75e708b (5 per-item commits). Phase 4 done — shared mode is now FUNCTIONAL but consent-safe (legacy=worktree). Next: Phase 5 (§F deletion/purge — protected-workspace guard at whole-worktree/root entry points, abort-on-incomplete reset, honest shared hard-purge/GDPR, exact-owner free wiring).
+
+### Phase 5 — Codex build (§F deletion/purge safety)
+
+Codex implemented §F20-22 across 11 files (+1293/-237; cli.rs +407, purge.rs +413): central guard_whole_workspace_removal (symlink-aware ancestor/descendant overlap, rejects .., resolves absent targets; NOT applied to contained-file discard) enforced at remove_worktree + reset root-wipe + session-delete/purge worktree steps; reset abort-before-mutation on incomplete config/DB/store_id/handle load + exact-owned AMQ freed before DB delete; honest shared purge (excludes worktree, reports provider-history incomplete, retains row absent explicit residual-accept/workspace-wide confirm, frees only exact-owned AMQ inbox+handle, resolves by uuid/handle + rejects ambiguous branch). 6 protected-workspace + 6 reset + 5 shared-purge tests + non-Dux-history README/threat-model warning.
+
+### Claude's verdict (Phase 5) — pre-review
+
+Independent gates: all 5 cargo + shellcheck exit 0. Verified guard_whole_workspace_removal directly (canonicalizes both sides via resolve_for_removal, rejects .., deepest-existing-ancestor+suffix for absent targets, bails on both-direction starts_with; remove_worktree takes registered_projects and guards first; untracked-discard test proves contained-file ops stay unguarded). Launched independent adversarial review (guard applied at every entry point / not contained-file, empty-inventory-disables-guard, symlink-escape, reset abort-completeness + free-before-DB-delete, GDPR no-false-erased, foreign-inbox-free, all remove_worktree callers pass real inventory, worktree-mode byte-identical).
+
+### Phase 5 review — independent adversarial
+
+Verdict: ISSUES, but all safety-critical logic CONFIRMED correct: guard applied at every whole-worktree entry point (all remove_worktree callers pass the real inventory, none pass &[]; contained-file discard correctly unguarded); shared checkout protected because it's itself a registered project (overlap fires); reset aborts before ANY mutation and frees exact-owned AMQ before the DB delete; shared purge honesty (worktree excluded, SharedProviderHistory Error→row-retained→exit 1 without consent, Skipped→row-deleted only with --accept-residual-data, real deletion only WorkspaceWide, no success-while-retaining); exact-owner free verifies {store_id,session_id} under lock and rejects foreign; ambiguous-branch rejected; tests are anti-revert. Found:
+- SHOULD-FIX: purge-all maps every shared session to WorkspaceWide → deletes the shared (incl. non-Dux) provider dir behind only "PURGE ALL", bypassing the explicit "PURGE WORKSPACE" consent the single-session path requires.
+- NIT: peer.rs:1227 unsanitized inbox-removal error path.
+- NIT (deliberate §F21): reset now fail-closed aborts on corrupt config/bad row — needs an actionable recovery message + doc note.
+- accepted-risk (same-UID threat model): TOCTOU guard-canonicalize vs raw-path removal — no fix.
+
+### Claude's response + Codex fix round 1
+
+Routed S1 (purge-all: plan shared as RetainIdentity/incomplete, never delete shared provider history without the explicit per-session PURGE WORKSPACE ack) + N1 (sanitize) + N2 (actionable reset abort message + doc note) to the same Codex session. TOCTOU acknowledged as out of the documented single-UID threat model.
+
+### Phase 5 fix round 1 + commit
+
+Codex fixed S1 (purge-all: removed the bulk WorkspaceWide case → shared sessions use RetainIdentity, so purge-all never deletes shared/non-Dux provider history without the explicit per-session PURGE WORKSPACE ack; frees only exact-owned AMQ + redacts logs + retains identity), N1 (sanitize inbox-removal error path, tested with an OSC-containing root), N2 (actionable reset abort messages naming the failing file/row + recovery docs). 22/22 purge tests; all cargo gates + shellcheck green. Verified S1 directly (no WorkspaceWide mapping in build_plans_for_all). Committed f4f2257..8cb42a2 (4 per-item commits). Phase 5 done. Next: Phase 6 (§G concurrency UI derived-header multi-writer badge + §H opt-in orphan-worktree cleaner) — the final phase.
