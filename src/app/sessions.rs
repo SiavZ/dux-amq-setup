@@ -1,4 +1,4 @@
-//! Session creation, identity-aware PTY launch/reconnect, and deletion lifecycle.
+//! Session creation, shared-writer gating, PTY reconnect, and deletion lifecycle.
 
 use super::*;
 use crate::editor;
@@ -18,6 +18,20 @@ fn watch_rule_display_label(idx: usize, label: &str, pattern: &str) -> String {
 }
 
 impl App {
+    pub(crate) fn open_orphan_worktree_cleaner(&mut self) -> Result<()> {
+        if self.git.orphan_cleanup_in_flight {
+            self.set_warning("Orphan worktree cleanup is already running.");
+            return Ok(());
+        }
+        self.git.orphan_cleanup_in_flight = true;
+        self.set_busy("Loading the complete orphan-worktree inventory...");
+        workers::dispatch_orphan_worktree_inventory(
+            self.runtime.worker_tx.clone(),
+            self.paths.clone(),
+        );
+        Ok(())
+    }
+
     pub(crate) fn open_project_browser(&mut self) -> Result<()> {
         let start_dir = self
             .config
@@ -417,6 +431,28 @@ impl App {
         request: CreateAgentRequest,
         busy_message: String,
     ) -> Result<()> {
+        if !self.create_agent_in_flight
+            && let CreateAgentRequest::SharedWorkspace { project, .. } = &request
+            && let Some(existing) = self.live_shared_writer(&project.path, None)
+        {
+            self.ui.prompt = PromptState::ConfirmSharedWriter {
+                existing_agent: crate::sanitize::for_terminal(&self.session_label(existing)),
+                action: SharedWriterAction::Create {
+                    request: Box::new(request),
+                    busy_message,
+                },
+                confirm_selected: false,
+            };
+            return Ok(());
+        }
+        self.start_create_agent_request(request, busy_message)
+    }
+
+    fn start_create_agent_request(
+        &mut self,
+        request: CreateAgentRequest,
+        busy_message: String,
+    ) -> Result<()> {
         if self.create_agent_in_flight {
             self.set_error("An agent is already being created or forked.");
             return Ok(());
@@ -441,6 +477,50 @@ impl App {
             );
         });
         Ok(())
+    }
+
+    fn live_shared_writer(
+        &self,
+        workspace_path: &str,
+        exclude_session_id: Option<&str>,
+    ) -> Option<&AgentSession> {
+        self.git.sessions.iter().find(|session| {
+            session.shared_workspace()
+                && session.state.has_pty()
+                && session.worktree_path == workspace_path
+                && exclude_session_id != Some(session.id.as_str())
+        })
+    }
+
+    /// Aggregate the persistent warning from current-store runtime state.
+    pub(crate) fn shared_multi_writer_summary(&self) -> Option<(usize, usize)> {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for session in self
+            .git
+            .sessions
+            .iter()
+            .filter(|session| session.shared_workspace() && session.state.has_pty())
+        {
+            *counts.entry(&session.worktree_path).or_default() += 1;
+        }
+        let mut workspaces = 0;
+        let mut writers = 0;
+        for count in counts.into_values().filter(|count| *count > 1) {
+            workspaces += 1;
+            writers += count;
+        }
+        (workspaces > 0).then_some((writers, workspaces))
+    }
+
+    pub(crate) fn shared_multi_writer_badge(&self) -> Option<String> {
+        self.shared_multi_writer_summary()
+            .map(|(writers, workspaces)| {
+                if workspaces == 1 {
+                    format!("CURRENT STORE ONLY · {writers} LIVE WRITERS")
+                } else {
+                    format!("CURRENT STORE ONLY · {writers} LIVE WRITERS / {workspaces} WORKSPACES")
+                }
+            })
     }
 
     /// Resource-cap gate evaluated before any user-initiated agent spawn.
@@ -1730,6 +1810,69 @@ impl App {
         self.continue_reconnect(&session.id, false)
     }
 
+    pub(crate) fn continue_shared_reconnect_after_validation(
+        &mut self,
+        session_id: &str,
+        force_fresh: bool,
+    ) -> Result<()> {
+        let Some(session) = self
+            .git
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        if let Some(existing) = self.live_shared_writer(&session.worktree_path, Some(session_id)) {
+            self.ui.prompt = PromptState::ConfirmSharedWriter {
+                existing_agent: crate::sanitize::for_terminal(&self.session_label(existing)),
+                action: SharedWriterAction::Reconnect {
+                    session_id: session_id.to_string(),
+                    force_fresh,
+                },
+                confirm_selected: false,
+            };
+            return Ok(());
+        }
+        if force_fresh {
+            self.continue_force_reconnect(session_id, true)
+        } else {
+            self.continue_reconnect(session_id, true)
+        }
+    }
+
+    pub(crate) fn resolve_confirm_shared_writer(&mut self, confirm: bool) -> bool {
+        let prompt = std::mem::replace(&mut self.ui.prompt, PromptState::None);
+        let PromptState::ConfirmSharedWriter { action, .. } = prompt else {
+            return false;
+        };
+        if !confirm {
+            self.set_info("Shared-workspace start cancelled.");
+            return false;
+        }
+        let result = match action {
+            SharedWriterAction::Create {
+                request,
+                busy_message,
+            } => self.start_create_agent_request(*request, busy_message),
+            SharedWriterAction::Reconnect {
+                session_id,
+                force_fresh,
+            } => {
+                if force_fresh {
+                    self.continue_force_reconnect(&session_id, true)
+                } else {
+                    self.continue_reconnect(&session_id, true)
+                }
+            }
+        };
+        if let Err(err) = result {
+            self.set_error(crate::sanitize::for_terminal(&format!("{err:#}")));
+        }
+        false
+    }
+
     pub(crate) fn continue_reconnect(
         &mut self,
         session_id: &str,
@@ -2684,6 +2827,7 @@ mod tests {
             staged_diff_in_flight: false,
             add_project_in_flight: false,
             reconnect_validations_in_flight: std::collections::HashSet::new(),
+            orphan_cleanup_in_flight: false,
             resume_fallback_candidates: std::collections::HashMap::new(),
             pending_deletions: std::collections::HashSet::new(),
             deletion_busy_messages: std::collections::HashMap::new(),
@@ -2854,6 +2998,78 @@ mod tests {
             crate::pty::PtyClient::spawn("echo", &[], std::path::Path::new("/tmp"), 24, 80, 1000)
                 .expect("spawn echo for test");
         app.install_pty_for_session(session_id, crate::pty::PtyHandle::new(client));
+    }
+
+    #[test]
+    fn second_shared_writer_requires_confirmation_for_create_and_reconnect() {
+        let mut live = make_session("live", "claude", "/tmp/project");
+        live.shared_workspace = true;
+        live.title = Some("first-writer".to_string());
+        let mut waiting = make_session("waiting", "codex", "/tmp/project");
+        waiting.shared_workspace = true;
+        let project = make_project("project-1", "claude");
+        let mut app = test_app_with_sessions(vec![live, waiting], vec![project.clone()]);
+        mark_active(&mut app, "live");
+
+        app.dispatch_create_agent_request(
+            CreateAgentRequest::SharedWorkspace {
+                project,
+                agent_handle: Some("second-writer".to_string()),
+                provider: ProviderKind::from_str("codex"),
+                settings: crate::model::SessionSettings::default(),
+            },
+            "creating".to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            app.ui.prompt,
+            PromptState::ConfirmSharedWriter {
+                ref existing_agent,
+                action: SharedWriterAction::Create { .. },
+                confirm_selected: false,
+            } if existing_agent == "first-writer"
+        ));
+        assert!(!app.create_agent_in_flight);
+        app.resolve_confirm_shared_writer(false);
+
+        app.continue_shared_reconnect_after_validation("waiting", false)
+            .unwrap();
+        assert!(matches!(
+            app.ui.prompt,
+            PromptState::ConfirmSharedWriter {
+                action: SharedWriterAction::Reconnect {
+                    ref session_id,
+                    force_fresh: false,
+                },
+                confirm_selected: false,
+                ..
+            } if session_id == "waiting"
+        ));
+        assert!(!app.session_has_pty("waiting"));
+    }
+
+    #[test]
+    fn multi_writer_badge_is_derived_and_recomputes_when_writer_exits() {
+        let mut first = make_session("first", "claude", "/tmp/project");
+        first.shared_workspace = true;
+        let mut second = make_session("second", "codex", "/tmp/project");
+        second.shared_workspace = true;
+        let mut isolated = make_session("isolated", "gemini", "/tmp/project");
+        isolated.shared_workspace = false;
+        let mut app = test_app_with_sessions(vec![first, second, isolated], Vec::new());
+
+        mark_active(&mut app, "first");
+        assert_eq!(app.shared_multi_writer_badge(), None);
+        mark_active(&mut app, "isolated");
+        assert_eq!(app.shared_multi_writer_badge(), None);
+        mark_active(&mut app, "second");
+        assert_eq!(
+            app.shared_multi_writer_badge().as_deref(),
+            Some("CURRENT STORE ONLY · 2 LIVE WRITERS")
+        );
+
+        app.mark_session_exited("second", None);
+        assert_eq!(app.shared_multi_writer_badge(), None);
     }
 
     #[test]

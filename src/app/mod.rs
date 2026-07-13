@@ -1,4 +1,4 @@
-//! TUI application state, bootstrap, rendering, and runtime lifecycle.
+//! TUI state, bootstrap, shared-writer prompts, maintenance UI, and runtime lifecycle.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -458,6 +458,25 @@ pub(crate) enum NameNewAgentFocus {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) enum SharedWriterAction {
+    Create {
+        request: Box<CreateAgentRequest>,
+        busy_message: String,
+    },
+    Reconnect {
+        session_id: String,
+        force_fresh: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OrphanRemoveFocus {
+    DeleteBranch,
+    Cancel,
+    Remove,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) enum PromptState {
     None,
     Command {
@@ -557,6 +576,21 @@ pub(crate) enum PromptState {
         branch_name: String,
         location: crate::git::BranchLocation,
         confirm_selected: bool, // false = Cancel (default), true = Use Existing
+    },
+    ConfirmSharedWriter {
+        existing_agent: String,
+        action: SharedWriterAction,
+        confirm_selected: bool,
+    },
+    OrphanWorktrees {
+        candidates: Vec<crate::orphan_worktrees::OrphanWorktreeCandidate>,
+        selected: usize,
+    },
+    ConfirmRemoveOrphanWorktree {
+        candidates: Vec<crate::orphan_worktrees::OrphanWorktreeCandidate>,
+        selected: usize,
+        focus: OrphanRemoveFocus,
+        delete_branch: bool,
     },
     DebugInput {
         lines: Vec<Line<'static>>,
@@ -1253,6 +1287,14 @@ pub(crate) enum WorkerEvent {
         force_fresh: bool,
         result: Result<(), String>,
     },
+    OrphanWorktreesReady(Result<Vec<crate::orphan_worktrees::OrphanWorktreeCandidate>, String>),
+    OrphanWorktreeRemoved {
+        candidate: crate::orphan_worktrees::OrphanWorktreeCandidate,
+        candidates: Vec<crate::orphan_worktrees::OrphanWorktreeCandidate>,
+        selected: usize,
+        delete_branch: bool,
+        result: Result<(), String>,
+    },
     /// Persistent-disk usage sample emitted ~every 60 s by
     /// [`crate::app::workers::App::spawn_disk_watchdog`]. Drives the
     /// warn/high-water status banners and gates new agent spawns when
@@ -1510,6 +1552,7 @@ impl App {
             staged_diff_in_flight: false,
             add_project_in_flight: false,
             reconnect_validations_in_flight: HashSet::new(),
+            orphan_cleanup_in_flight: false,
             resume_fallback_candidates: HashMap::new(),
             pending_deletions: HashSet::new(),
             deletion_busy_messages: HashMap::new(),
@@ -2204,6 +2247,7 @@ impl App {
                 self.open_resource_monitor();
                 Ok(())
             }
+            "prune-orphan-worktrees" => self.open_orphan_worktree_cleaner(),
             "toggle-diff-line-numbers" => {
                 self.show_diff_line_numbers = !self.show_diff_line_numbers;
                 self.config.ui.show_diff_line_numbers = self.show_diff_line_numbers;

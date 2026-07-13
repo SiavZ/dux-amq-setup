@@ -1,8 +1,8 @@
-//! TUI rendering, including shared-workspace creation and rename safeguards.
+//! TUI rendering for shared-workspace warnings, maintenance, and session safeguards.
 
 use super::components::{
-    Button, ButtonKind, ButtonPressedTarget, Checkbox, CheckboxState, button_state_for,
-    shared_button_width,
+    Button, ButtonKind, ButtonPressedTarget, ButtonState, Checkbox, CheckboxState,
+    button_state_for, shared_button_width,
 };
 use super::*;
 
@@ -443,6 +443,16 @@ impl App {
                 Style::default().fg(self.theme.branch_fg).bg(bg),
             ),
         ];
+        if let Some(label) = self.shared_multi_writer_badge() {
+            spans.push(Span::styled(" ╱ ", Style::default().fg(sep_fg).bg(bg)));
+            spans.push(Span::styled(
+                label,
+                Style::default()
+                    .fg(self.theme.warning_fg)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         if let Some(project) = self.selected_project() {
             spans.push(Span::styled(" ╱ ", Style::default().fg(sep_fg).bg(bg)));
             spans.push(Span::styled(
@@ -4311,6 +4321,267 @@ impl App {
                     cancel_button: cancel_area,
                     use_button: use_area,
                 };
+            }
+            PromptState::ConfirmSharedWriter {
+                existing_agent,
+                confirm_selected,
+                ..
+            } => {
+                self.render_dim_overlay(frame);
+                let area = centered_rect(68, 34, frame.area());
+                self.clear_overlay_area(frame, area);
+                let outer = self.themed_overlay_block("Share Live Workspace?");
+                let inner = outer.inner(area);
+                outer.render(area, frame.buffer_mut());
+                let [body_area, _, buttons_area] = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(1),
+                        Constraint::Length(1),
+                        Constraint::Length(3),
+                    ])
+                    .areas(inner);
+                Paragraph::new(vec![
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::raw(" Agent "),
+                        Span::styled(
+                            existing_agent.as_str(),
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(" is already live in this workspace;"),
+                    ]),
+                    Line::from(Span::styled(
+                        " you will share its index, staging, commits, and branch.",
+                        Style::default().fg(self.theme.warning_fg),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        " This warning covers agents visible to this Dux store only.",
+                        Style::default().fg(self.theme.hint_desc_fg),
+                    )),
+                ])
+                .wrap(Wrap { trim: false })
+                .render(body_area, frame.buffer_mut());
+
+                let btn_width = 16u16;
+                let gap = 2u16;
+                let total = btn_width * 2 + gap;
+                let left_offset = buttons_area.width.saturating_sub(total) / 2;
+                let cancel_area =
+                    Rect::new(buttons_area.x + left_offset, buttons_area.y, btn_width, 3);
+                let share_area = Rect::new(
+                    cancel_area.x + btn_width + gap,
+                    buttons_area.y,
+                    btn_width,
+                    3,
+                );
+                Button::new("Cancel")
+                    .kind(ButtonKind::Confirm)
+                    .state(if *confirm_selected {
+                        ButtonState::Normal
+                    } else {
+                        ButtonState::Focused
+                    })
+                    .render(frame, cancel_area, &self.theme);
+                Button::new("Share")
+                    .kind(ButtonKind::Danger)
+                    .state(if *confirm_selected {
+                        ButtonState::Focused
+                    } else {
+                        ButtonState::Normal
+                    })
+                    .render(frame, share_area, &self.theme);
+            }
+            PromptState::OrphanWorktrees {
+                candidates,
+                selected,
+            } => {
+                self.render_dim_overlay(frame);
+                let area = centered_rect(88, 72, frame.area());
+                self.clear_overlay_area(frame, area);
+                let outer = self.themed_overlay_block("Orphan Worktree Cleaner");
+                let inner = outer.inner(area);
+                outer.render(area, frame.buffer_mut());
+                let [intro_area, list_area, hint_area] = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(4),
+                        Constraint::Min(3),
+                        Constraint::Length(2),
+                    ])
+                    .areas(inner);
+                Paragraph::new(vec![
+                    Line::from(format!(
+                        " {} Git-registered worktree{} have no session row or tombstone.",
+                        candidates.len(),
+                        if candidates.len() == 1 { "" } else { "s" }
+                    )),
+                    Line::from(Span::styled(
+                        " Nothing is removed until you confirm an individual item.",
+                        Style::default().fg(self.theme.hint_desc_fg),
+                    )),
+                    Line::from(Span::styled(
+                        " Branches are preserved by default.",
+                        Style::default().fg(self.theme.hint_desc_fg),
+                    )),
+                ])
+                .render(intro_area, frame.buffer_mut());
+
+                let items = candidates
+                    .iter()
+                    .map(|candidate| {
+                        let dirty = if candidate.dirty { "DIRTY" } else { "clean" };
+                        let dirty_style = if candidate.dirty {
+                            Style::default()
+                                .fg(self.theme.warning_fg)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(self.theme.session_detached)
+                        };
+                        let branch = crate::sanitize::for_terminal(
+                            candidate.branch.as_deref().unwrap_or("detached HEAD"),
+                        );
+                        ListItem::new(Line::from(vec![
+                            Span::styled(format!(" {dirty:<5} "), dirty_style),
+                            Span::styled(
+                                format!("{branch}  "),
+                                Style::default().fg(self.theme.branch_fg),
+                            ),
+                            Span::raw(crate::sanitize::for_terminal(
+                                &candidate.worktree_path.display().to_string(),
+                            )),
+                        ]))
+                    })
+                    .collect::<Vec<_>>();
+                let mut state = ListState::default().with_selected(Some(*selected));
+                StatefulWidget::render(
+                    List::new(items)
+                        .highlight_symbol("› ")
+                        .highlight_style(self.theme.selection_style()),
+                    list_area,
+                    frame.buffer_mut(),
+                    &mut state,
+                );
+
+                let confirm_key = self.bindings.label_for(Action::Confirm);
+                let close_key = self.bindings.label_for(Action::CloseOverlay);
+                Paragraph::new(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(confirm_key, Style::default().fg(self.theme.hint_key_fg)),
+                    Span::styled(" review  ", Style::default().fg(self.theme.hint_desc_fg)),
+                    Span::styled(close_key, Style::default().fg(self.theme.hint_key_fg)),
+                    Span::styled(" close", Style::default().fg(self.theme.hint_desc_fg)),
+                ]))
+                .render(hint_area, frame.buffer_mut());
+            }
+            PromptState::ConfirmRemoveOrphanWorktree {
+                candidates,
+                selected,
+                focus,
+                delete_branch,
+            } => {
+                // Clamp defensively: `selected` is kept in range by the worker,
+                // but a stale index must still show the modal (dimming the UI
+                // first) rather than flash the underlying screen.
+                let Some(candidate) = candidates.get(*selected).or_else(|| candidates.last())
+                else {
+                    return;
+                };
+                self.render_dim_overlay(frame);
+                let area = centered_rect(72, 44, frame.area());
+                self.clear_overlay_area(frame, area);
+                let outer = self.themed_overlay_block("Remove Orphan Worktree?");
+                let inner = outer.inner(area);
+                outer.render(area, frame.buffer_mut());
+                let checkbox_height = u16::from(candidate.branch.is_some());
+                let [body_area, checkbox_area, _, buttons_area] = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(6),
+                        Constraint::Length(checkbox_height),
+                        Constraint::Length(1),
+                        Constraint::Length(3),
+                    ])
+                    .areas(inner);
+                let mut lines = vec![
+                    Line::from(""),
+                    Line::from(" Remove this Git-registered worktree?"),
+                    Line::from(Span::styled(
+                        format!(
+                            " {}",
+                            crate::sanitize::for_terminal(
+                                &candidate.worktree_path.display().to_string()
+                            )
+                        ),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                ];
+                if candidate.dirty {
+                    lines.push(Line::from(Span::styled(
+                        " DIRTY: staged, unstaged, or untracked work will be removed.",
+                        Style::default().fg(self.theme.warning_fg),
+                    )));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        " Git reports this worktree clean.",
+                        Style::default().fg(self.theme.hint_desc_fg),
+                    )));
+                }
+                lines.push(Line::from(Span::styled(
+                    " The complete inventory is revalidated before removal.",
+                    Style::default().fg(self.theme.hint_desc_fg),
+                )));
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .render(body_area, frame.buffer_mut());
+
+                if let Some(branch) = &candidate.branch {
+                    let branch = crate::sanitize::for_terminal(branch);
+                    let marker = if *delete_branch { "[x]" } else { "[ ]" };
+                    let style = if *focus == OrphanRemoveFocus::DeleteBranch {
+                        Style::default()
+                            .fg(self.theme.input_cursor_fg)
+                            .bg(self.theme.input_cursor_bg)
+                    } else {
+                        Style::default().fg(self.theme.text_fg)
+                    };
+                    Paragraph::new(Line::from(Span::styled(
+                        format!(" {marker} Also delete branch {branch}"),
+                        style,
+                    )))
+                    .render(checkbox_area, frame.buffer_mut());
+                }
+
+                let btn_width = 16u16;
+                let gap = 2u16;
+                let total = btn_width * 2 + gap;
+                let left_offset = buttons_area.width.saturating_sub(total) / 2;
+                let cancel_area =
+                    Rect::new(buttons_area.x + left_offset, buttons_area.y, btn_width, 3);
+                let remove_area = Rect::new(
+                    cancel_area.x + btn_width + gap,
+                    buttons_area.y,
+                    btn_width,
+                    3,
+                );
+                Button::new("Cancel")
+                    .kind(ButtonKind::Confirm)
+                    .state(if *focus == OrphanRemoveFocus::Cancel {
+                        ButtonState::Focused
+                    } else {
+                        ButtonState::Normal
+                    })
+                    .render(frame, cancel_area, &self.theme);
+                Button::new("Remove")
+                    .kind(ButtonKind::Danger)
+                    .state(if *focus == OrphanRemoveFocus::Remove {
+                        ButtonState::Focused
+                    } else {
+                        ButtonState::Normal
+                    })
+                    .render(frame, remove_area, &self.theme);
             }
             PromptState::RenameSession {
                 session_id,

@@ -1,4 +1,4 @@
-//! Keyboard and mouse handling for mode-aware project and session workflows.
+//! Keyboard and mouse handling for mode-aware sessions and maintenance modals.
 
 use super::components::{ButtonPressedTarget, PressedButton};
 use super::*;
@@ -1878,6 +1878,109 @@ impl App {
             return Ok(false);
         }
 
+        if let PromptState::OrphanWorktrees {
+            candidates,
+            selected,
+        } = &mut self.ui.prompt
+        {
+            match self.bindings.lookup(&key, BindingScope::Palette) {
+                Some(Action::CloseOverlay) => self.ui.prompt = PromptState::None,
+                Some(Action::MoveDown) if *selected + 1 < candidates.len() => {
+                    *selected += 1;
+                }
+                Some(Action::MoveUp) if *selected > 0 => {
+                    *selected -= 1;
+                }
+                Some(Action::Confirm) => {
+                    let old = std::mem::replace(&mut self.ui.prompt, PromptState::None);
+                    if let PromptState::OrphanWorktrees {
+                        candidates,
+                        selected,
+                    } = old
+                    {
+                        self.ui.prompt = PromptState::ConfirmRemoveOrphanWorktree {
+                            candidates,
+                            selected,
+                            focus: OrphanRemoveFocus::Cancel,
+                            delete_branch: false,
+                        };
+                    }
+                }
+                _ if key.code == KeyCode::Char(' ') => {
+                    let old = std::mem::replace(&mut self.ui.prompt, PromptState::None);
+                    if let PromptState::OrphanWorktrees {
+                        candidates,
+                        selected,
+                    } = old
+                    {
+                        self.ui.prompt = PromptState::ConfirmRemoveOrphanWorktree {
+                            candidates,
+                            selected,
+                            focus: OrphanRemoveFocus::Cancel,
+                            delete_branch: false,
+                        };
+                    }
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
+        if let PromptState::ConfirmRemoveOrphanWorktree {
+            candidates,
+            selected,
+            focus,
+            delete_branch,
+        } = &mut self.ui.prompt
+        {
+            let has_branch = candidates
+                .get(*selected)
+                .is_some_and(|candidate| candidate.branch.is_some());
+            if !has_branch {
+                *delete_branch = false;
+                if *focus == OrphanRemoveFocus::DeleteBranch {
+                    *focus = OrphanRemoveFocus::Cancel;
+                }
+            }
+            match self.bindings.lookup(&key, BindingScope::Dialog) {
+                Some(Action::CloseOverlay) => {
+                    let old = std::mem::replace(&mut self.ui.prompt, PromptState::None);
+                    if let PromptState::ConfirmRemoveOrphanWorktree {
+                        candidates,
+                        selected,
+                        ..
+                    } = old
+                    {
+                        self.ui.prompt = PromptState::OrphanWorktrees {
+                            candidates,
+                            selected,
+                        };
+                    }
+                }
+                Some(Action::ToggleSelection) => {
+                    let reverse = matches!(key.code, KeyCode::BackTab);
+                    *focus = match (*focus, has_branch, reverse) {
+                        (OrphanRemoveFocus::Cancel, true, false) => OrphanRemoveFocus::Remove,
+                        (OrphanRemoveFocus::Remove, true, false) => OrphanRemoveFocus::DeleteBranch,
+                        (OrphanRemoveFocus::DeleteBranch, _, false) => OrphanRemoveFocus::Cancel,
+                        (OrphanRemoveFocus::Cancel, true, true) => OrphanRemoveFocus::DeleteBranch,
+                        (OrphanRemoveFocus::Remove, true, true) => OrphanRemoveFocus::Cancel,
+                        (OrphanRemoveFocus::DeleteBranch, _, true) => OrphanRemoveFocus::Remove,
+                        (OrphanRemoveFocus::Cancel, false, _) => OrphanRemoveFocus::Remove,
+                        (OrphanRemoveFocus::Remove, false, _) => OrphanRemoveFocus::Cancel,
+                    };
+                }
+                Some(Action::Confirm) => {
+                    return Ok(self.resolve_confirm_remove_orphan_worktree());
+                }
+                _ if key.code == KeyCode::Char(' ') => {
+                    return Ok(self.resolve_confirm_remove_orphan_worktree());
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
         if matches!(self.ui.prompt, PromptState::KillRunning(..)) {
             let is_searching = matches!(
                 self.ui.prompt,
@@ -2624,6 +2727,28 @@ impl App {
                 _ if key.code == KeyCode::Char(' ') => {
                     let confirm = *confirm_selected;
                     return Ok(self.resolve_confirm_use_existing_branch(confirm));
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
+        if let PromptState::ConfirmSharedWriter {
+            confirm_selected, ..
+        } = &mut self.ui.prompt
+        {
+            match self.bindings.lookup(&key, BindingScope::Dialog) {
+                Some(Action::CloseOverlay) => self.ui.prompt = PromptState::None,
+                Some(Action::ToggleSelection) => {
+                    *confirm_selected = !*confirm_selected;
+                }
+                Some(Action::Confirm) => {
+                    let confirm = *confirm_selected;
+                    return Ok(self.resolve_confirm_shared_writer(confirm));
+                }
+                _ if key.code == KeyCode::Char(' ') => {
+                    let confirm = *confirm_selected;
+                    return Ok(self.resolve_confirm_shared_writer(confirm));
                 }
                 _ => {}
             }
@@ -4662,6 +4787,64 @@ impl App {
         false
     }
 
+    fn resolve_confirm_remove_orphan_worktree(&mut self) -> bool {
+        let old = std::mem::replace(&mut self.ui.prompt, PromptState::None);
+        let PromptState::ConfirmRemoveOrphanWorktree {
+            candidates,
+            selected,
+            focus,
+            mut delete_branch,
+        } = old
+        else {
+            return false;
+        };
+        match focus {
+            OrphanRemoveFocus::DeleteBranch => {
+                delete_branch = !delete_branch;
+                self.ui.prompt = PromptState::ConfirmRemoveOrphanWorktree {
+                    candidates,
+                    selected,
+                    focus,
+                    delete_branch,
+                };
+            }
+            OrphanRemoveFocus::Cancel => {
+                self.ui.prompt = PromptState::OrphanWorktrees {
+                    candidates,
+                    selected,
+                };
+            }
+            OrphanRemoveFocus::Remove => {
+                if self.git.orphan_cleanup_in_flight {
+                    self.ui.prompt = PromptState::OrphanWorktrees {
+                        candidates,
+                        selected,
+                    };
+                    self.set_warning("Orphan worktree cleanup is already running.");
+                    return false;
+                }
+                let Some(candidate) = candidates.get(selected).cloned() else {
+                    self.set_error("The selected orphan worktree is no longer available.");
+                    return false;
+                };
+                self.git.orphan_cleanup_in_flight = true;
+                self.set_busy(format!(
+                    "Revalidating and removing orphan worktree {}...",
+                    crate::sanitize::for_terminal(&candidate.worktree_path.display().to_string())
+                ));
+                workers::dispatch_orphan_worktree_removal(
+                    self.runtime.worker_tx.clone(),
+                    self.paths.clone(),
+                    candidate,
+                    candidates,
+                    selected,
+                    delete_branch,
+                );
+            }
+        }
+        false
+    }
+
     fn set_rename_cursor_from_mouse(&mut self, column: u16) {
         let input_area = match &self.ui.overlay_layout.active {
             OverlayMouseLayout::RenameSession { input, .. } => *input,
@@ -5932,10 +6115,11 @@ mod tests {
         DeleteAgentFocus, FocusPane, FullscreenOverlay, InputTarget, KillRunningAction,
         KillRunningFocus, KillRunningFooterAction, KillRunningPrompt, KillableRuntime,
         KillableRuntimeKind, LeftItem, LeftSection, MacroBarState, MouseClickTarget,
-        MouseLayoutState, NameNewAgentFocus, OverlayCheckbox, OverlayCheckboxId,
+        MouseLayoutState, NameNewAgentFocus, OrphanRemoveFocus, OverlayCheckbox, OverlayCheckboxId,
         OverlayMouseLayout, OverlayMouseLayoutState, ProcessInfo, PromptState, PullTarget,
         ResizeDragState, ResourceStats, RightSection, RuntimeState, RuntimeTargetId,
-        SessionSettingsPrompt, SettingsFocus, TextInput, UiState, WatchRuleSummary, WorkerEvent,
+        SessionSettingsPrompt, SettingsFocus, SharedWriterAction, TextInput, UiState,
+        WatchRuleSummary, WorkerEvent,
     };
     use crate::clipboard::Clipboard;
     use crate::config::{Config, DuxPaths, ProjectConfig, WorkspaceMode};
@@ -6115,6 +6299,7 @@ mod tests {
             staged_diff_in_flight: false,
             add_project_in_flight: false,
             reconnect_validations_in_flight: std::collections::HashSet::new(),
+            orphan_cleanup_in_flight: false,
             resume_fallback_candidates: std::collections::HashMap::new(),
             pending_deletions: std::collections::HashSet::new(),
             deletion_busy_messages: std::collections::HashMap::new(),
@@ -8576,6 +8761,114 @@ mod tests {
             }
             other => panic!("expected command prompt, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn orphan_cleaner_requires_per_item_confirmation_and_preserves_branch_by_default() {
+        let mut app = test_app(default_bindings());
+        let candidate = crate::orphan_worktrees::OrphanWorktreeCandidate {
+            project_path: app.paths.root.clone(),
+            worktree_path: app.paths.worktrees_root.join("orphan"),
+            branch: Some("keep-by-default".to_string()),
+            dirty: true,
+        };
+        app.ui.prompt = PromptState::OrphanWorktrees {
+            candidates: vec![candidate],
+            selected: 0,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(
+            app.ui.prompt,
+            PromptState::ConfirmRemoveOrphanWorktree {
+                focus: OrphanRemoveFocus::Cancel,
+                delete_branch: false,
+                ..
+            }
+        ));
+
+        // Space activates the focused Cancel button; no worker starts.
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(app.ui.prompt, PromptState::OrphanWorktrees { .. }));
+        assert!(!app.git.orphan_cleanup_in_flight);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        if let PromptState::ConfirmRemoveOrphanWorktree { focus, .. } = &mut app.ui.prompt {
+            *focus = OrphanRemoveFocus::DeleteBranch;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(
+            app.ui.prompt,
+            PromptState::ConfirmRemoveOrphanWorktree {
+                delete_branch: true,
+                ..
+            }
+        ));
+
+        if let PromptState::ConfirmRemoveOrphanWorktree { focus, .. } = &mut app.ui.prompt {
+            *focus = OrphanRemoveFocus::Remove;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(app.ui.prompt, PromptState::None));
+        assert!(app.git.orphan_cleanup_in_flight);
+    }
+
+    #[test]
+    fn orphan_cleaner_renders_dirty_and_untracked_warning() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_app(default_bindings());
+        app.ui.prompt = PromptState::OrphanWorktrees {
+            candidates: vec![crate::orphan_worktrees::OrphanWorktreeCandidate {
+                project_path: app.paths.root.clone(),
+                worktree_path: app.paths.worktrees_root.join("dirty-orphan"),
+                branch: Some("keep-this-branch".to_string()),
+                dirty: true,
+            }],
+            selected: 0,
+        };
+
+        let backend = TestBackend::new(200, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render orphan inventory");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(rendered.contains("DIRTY"));
+        assert!(rendered.contains("keep-this-branch"));
+        assert!(rendered.contains("dirty-orphan"));
+    }
+
+    #[test]
+    fn shared_writer_confirmation_space_activates_focused_cancel() {
+        let mut app = test_app(default_bindings());
+        app.ui.prompt = PromptState::ConfirmSharedWriter {
+            existing_agent: "other-agent".to_string(),
+            action: SharedWriterAction::Reconnect {
+                session_id: "session-1".to_string(),
+                force_fresh: false,
+            },
+            confirm_selected: false,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(matches!(app.ui.prompt, PromptState::None));
+        assert!(!app.session_has_pty("session-1"));
     }
 
     #[test]
