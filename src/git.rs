@@ -1,3 +1,5 @@
+//! Conservative Git plumbing for projects, worktrees, and live HEAD state.
+
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
@@ -33,7 +35,8 @@ struct StatusEntry {
 pub const PROJECT_WORKTREES_LINK_NAME: &str = "dux-worktrees";
 const PROJECT_WORKTREES_EXCLUDE_PATTERN: &str = "/dux-worktrees";
 
-pub fn current_branch(repo_path: &Path) -> Result<String> {
+/// Return the symbolic branch for HEAD, or `None` for a detached HEAD.
+pub fn head_branch(repo_path: &Path) -> Result<Option<String>> {
     // audit02 Phase 21 (P2-11) — pass `&Path` directly so non-UTF-8
     // worktree paths (legal on macOS HFS+/APFS and Linux ext4) survive
     // the `Command::arg` round-trip byte-for-byte. `Path: AsRef<OsStr>`,
@@ -46,14 +49,30 @@ pub fn current_branch(repo_path: &Path) -> Result<String> {
         .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
         .output()
         .with_context(|| format!("failed to inspect {}", repo_path.display()))?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "git symbolic-ref failed for {}: {}",
-            repo_path.display(),
-            crate::sanitize::utf8_lossy(&output.stderr)
+    if output.status.success() {
+        return Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    if output.status.code() == Some(1) && output.stderr.is_empty() {
+        return Ok(None);
+    }
+    Err(anyhow!(
+        "git symbolic-ref failed for {}: {}",
+        repo_path.display(),
+        crate::sanitize::utf8_lossy(&output.stderr)
+    ))
+}
+
+pub fn current_branch(repo_path: &Path) -> Result<String> {
+    if let Some(branch) = head_branch(repo_path)? {
+        Ok(branch)
+    } else {
+        Err(anyhow!(
+            "git symbolic-ref failed for {}: ",
+            repo_path.display()
+        ))
+    }
 }
 
 /// Returns the default branch name for the `origin` remote by reading
@@ -1161,6 +1180,23 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         wt
+    }
+
+    #[test]
+    fn head_branch_distinguishes_attached_and_detached_head() {
+        let repo = init_test_repo();
+        assert_eq!(head_branch(repo.path()).unwrap().as_deref(), Some("main"));
+        let head = head_commit(repo.path()).unwrap();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["checkout", "--detach", &head])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+
+        assert_eq!(head_branch(repo.path()).unwrap(), None);
+        assert!(current_branch(repo.path()).is_err());
     }
 
     fn run_git(cwd: &Path, args: &[&str]) {

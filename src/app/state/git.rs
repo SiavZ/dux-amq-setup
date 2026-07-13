@@ -3,9 +3,9 @@
 //! These fields cluster around: project + session lists, change-file caches
 //! (staged/unstaged), the commit-message editor, and the in-flight markers
 //! for git-driven background workers (commit, staged-diff, add-project,
-//! deletions, changed-files dispatch debouncer). Worker callbacks and the
-//! left/right pane render paths are the heaviest readers; input handling
-//! mutates the lists and in-flight flags.
+//! deletions, reconnect validation, changed-files dispatch debouncer). Worker
+//! callbacks and the left/right pane render paths are the heaviest readers;
+//! input handling mutates the lists and in-flight flags.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -47,6 +47,9 @@ pub(crate) struct GitState {
     /// don't queue multiple workers. Cleared by
     /// `WorkerEvent::AddProjectMetaReady`.
     pub(crate) add_project_in_flight: bool,
+    /// Shared sessions are revalidated on a worker before reconnect so
+    /// canonicalization never blocks the UI and duplicate requests cannot race.
+    pub(crate) reconnect_validations_in_flight: HashSet<String>,
     /// Session IDs spawned with resume args and the wall-clock time the resume
     /// attempt began. Used for one-shot fallbacks when resume exits quickly or
     /// hangs without rendering visible output.
