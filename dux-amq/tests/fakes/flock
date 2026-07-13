@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Test-only command-form flock shim for macOS, which does not ship flock(1).
+set -euo pipefail
+
+for native in /usr/bin/flock /bin/flock; do
+  if [[ -x "$native" ]]; then
+    exec "$native" "$@"
+  fi
+done
+
+nonblocking=0
+if [[ "${1:-}" == "-n" ]]; then
+  nonblocking=1
+  shift
+fi
+if [[ $# -eq 1 && "$1" =~ ^[0-9]+$ ]] && command -v ruby >/dev/null 2>&1; then
+  exec ruby -e '
+    fd = ARGV.fetch(0)
+    nonblocking = ARGV.fetch(1) == "1"
+    lock = File.open("/dev/fd/#{fd}", "w")
+    operation = File::LOCK_EX | (nonblocking ? File::LOCK_NB : 0)
+    exit(lock.flock(operation) ? 0 : 1)
+  ' "$1" "$nonblocking"
+fi
+
+[[ "${1:-}" == "-x" && $# -ge 3 ]] || exit 64
+lock_path="$2"
+shift 2
+if command -v ruby >/dev/null 2>&1; then
+  exec ruby -e '
+    lock = File.open(ARGV.shift, File::RDWR | File::CREAT, 0600)
+    exit 75 unless lock.flock(File::LOCK_EX)
+    ok = system(*ARGV)
+    status = $?
+    exit(ok ? 0 : (status&.exitstatus || 1))
+  ' "$lock_path" "$@"
+fi
+
+lock_dir="$lock_path.test-lock"
+for _ in {1..500}; do
+  if mkdir "$lock_dir" 2>/dev/null; then
+    trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT
+    "$@"
+    exit $?
+  fi
+  sleep 0.01
+done
+exit 75

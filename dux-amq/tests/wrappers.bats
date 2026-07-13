@@ -40,6 +40,7 @@ setup() {
   # to unset between tests so a leaked value can't pollute the
   # default-deny baseline that the YOLO/seed assertions depend on.
   unset DUX_SYSTEM_PROMPT
+  unset DUX_STORE_ID DUX_SESSION_ID DUX_AMQ_HANDLE DUX_AMQ_FLOCK
   # Audit02 Phase 13: pin STATE_ROOT under the throwaway $TEST_HOME so
   # wrappers don't pick up a real /data/state/dux/.tiocsti-state from
   # the host VM and silently flip into bridge mode for these tests.

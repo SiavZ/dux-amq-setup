@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # gemini-amq: launch Gemini CLI with AMQ co-op identity (worktree-scoped).
 # Skips AMQ wrapping for oneshot (-p / --print) invocations.
-# Uses the global queue at $AMQ_GLOBAL_ROOT.
+# Uses globally locked store/session ownership at $AMQ_GLOBAL_ROOT.
 set -euo pipefail
 
 STATE_ROOT="${STATE_ROOT:-/data/state}"
@@ -58,7 +58,17 @@ for arg in "$@"; do
   esac
 done
 
-ME="${AM_ME:-}"
+if [[ -n "${DUX_STORE_ID:-}" || -n "${DUX_SESSION_ID:-}" || -n "${DUX_AMQ_HANDLE:-}" ]]; then
+  if [[ -z "${DUX_STORE_ID:-}" || -z "${DUX_SESSION_ID:-}" || -z "${DUX_AMQ_HANDLE:-}" ]]; then
+    printf 'gemini-amq: DUX_STORE_ID, DUX_SESSION_ID, and DUX_AMQ_HANDLE must be set together\n' >&2
+    exit 1
+  fi
+  ME="$DUX_AMQ_HANDLE"
+  MANAGED_IDENTITY=1
+else
+  ME="${AM_ME:-}"
+  MANAGED_IDENTITY=0
+fi
 if [[ -z "$ME" ]] && is_dux_worktree; then
   ME=$(basename "$PWD")
 fi
@@ -66,7 +76,13 @@ if [[ -z "$ME" ]]; then
   ME=$(git -C "$PWD" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
 fi
 [[ -z "$ME" ]] && ME="gemini-$$"
-ME=$(printf '%s' "$ME" | tr '[:upper:]' '[:lower:]' | sed 's|[^a-z0-9_-]|-|g; s|^-\+||; s|-\+$||')
+if (( MANAGED_IDENTITY == 0 )); then
+  ME=$(printf '%s' "$ME" | tr '[:upper:]' '[:lower:]' | sed 's|[^a-z0-9_-]|-|g; s|^-\+||; s|-\+$||')
+fi
+if [[ -z "$ME" || ${#ME} -gt 64 || ! "$ME" =~ ^[a-z0-9_-]+$ ]]; then
+  printf 'gemini-amq: refusing invalid or overlong AMQ handle\n' >&2
+  exit 1
+fi
 
 # Export AM_ME so descendants of `amq wake` (notably the inject-bridge)
 # can identify the receiver. See claude-amq for full rationale.
@@ -75,67 +91,67 @@ export AM_ME="$ME"
 ROOT="${AMQ_GLOBAL_ROOT:-$STATE_ROOT/amq}"
 export AM_ROOT="$ROOT"
 
-register_amq_handle() {
-  local cfg="$ROOT/meta/config.json"
-  local lock="$ROOT/meta/config.lock"
-  local tmp
-
-  mkdir -p "$ROOT/meta" "$ROOT/agents/$ME" 2>/dev/null || true
-  [[ -f "$cfg" ]] || return 0
-  command -v jq >/dev/null 2>&1 || return 0
-
-  (
-    command -v flock >/dev/null 2>&1 && flock 9
-    tmp="$cfg.tmp.$$"
-    if jq --arg me "$ME" '.agents = ((.agents // []) + [$me] | unique)' "$cfg" >"$tmp"; then
-      mv "$tmp" "$cfg"
-    else
-      rm -f "$tmp"
-    fi
-  ) 9>"$lock" 2>/dev/null || true
-}
-
-# Audit02 P1-F: identity collision detection. See claude-amq for full
-# rationale. Uses atomic symlink creation. Stale registrations from
-# deleted/renamed worktrees are replaced automatically.
 ME_REGISTRATION="$ROOT/agents/$ME/.dux-amq-source"
-claim_amq_handle() {
-  local prev current_real prev_real stale
-  mkdir -p "$ROOT/agents/$ME" || {
-    printf '[dux-amq] cannot create AMQ agent directory for %s\n' "$ME" >&2
-    exit 1
-  }
-  while ! ln -sn "$PWD" "$ME_REGISTRATION" 2>/dev/null; do
-    if [[ -L "$ME_REGISTRATION" ]]; then
-      prev=$(readlink "$ME_REGISTRATION" 2>/dev/null || true)
-    elif [[ -f "$ME_REGISTRATION" ]]; then
-      prev=$(cat "$ME_REGISTRATION" 2>/dev/null || true)
+FLOCK_BIN="${DUX_AMQ_FLOCK:-flock}"
+
+claim_and_register_locked() {
+  local cfg="$ROOT/meta/config.json" marker="$ME_REGISTRATION"
+  local agent_dir="$ROOT/agents/$ME" tmp prev current_real prev_real created created_dir=0
+  if [[ -e "$agent_dir" || -L "$agent_dir" ]]; then
+    [[ -d "$agent_dir" && ! -L "$agent_dir" ]] || return 1
+  else
+    mkdir "$agent_dir" || return 1
+    created_dir=1
+  fi
+  if [[ -n "${DUX_STORE_ID:-}" ]]; then
+    if [[ -e "$marker" || -L "$marker" ]]; then
+      if [[ -L "$marker" ]] || ! jq -e --arg store "$DUX_STORE_ID" --arg session "$DUX_SESSION_ID" \
+        '.store_id == $store and .session_id == $session' "$marker" >/dev/null 2>&1; then
+        printf '[dux-amq] identity collision: %s has a foreign ownership marker\n' "$ME" >&2
+        return 1
+      fi
+    elif (( created_dir == 1 )); then
+      tmp=$(mktemp "$agent_dir/.owner.tmp.XXXXXX") || return 1
+      if ! jq -cn --arg store "$DUX_STORE_ID" --arg session "$DUX_SESSION_ID" \
+        '{store_id:$store,session_id:$session}' >"$tmp" || ! mv "$tmp" "$marker"; then
+        rm -f "$tmp"
+        return 1
+      fi
     else
-      continue
+      printf '[dux-amq] identity collision: %s has an ownerless agent directory\n' "$ME" >&2
+      return 1
     fi
+  elif [[ -e "$marker" || -L "$marker" ]]; then
+    if [[ -L "$marker" ]]; then prev=$(readlink "$marker" 2>/dev/null || true); else prev=$(cat "$marker" 2>/dev/null || true); fi
     current_real=$(realpath -- "$PWD" 2>/dev/null || true)
     prev_real=$(realpath -- "$prev" 2>/dev/null || true)
-    if [[ "$prev" == "$PWD" ]] ||
-      [[ -n "$current_real" && -n "$prev_real" && "$prev_real" == "$current_real" ]]; then
-      return 0
+    if [[ "$prev" != "$PWD" && ( -z "$current_real" || -z "$prev_real" || "$prev_real" != "$current_real" ) ]]; then
+      printf '\033[1;31m!\033[0m [dux-amq] identity collision: %s already registered to %s (current: %s).\n' \
+        "$ME" "${prev:-<unknown>}" "$PWD" >&2
+      return 1
     fi
-    if [[ "$prev" = /* && ! -e "$prev" ]]; then
-      stale="${ME_REGISTRATION}.stale.$$.$RANDOM"
-      if mv "$ME_REGISTRATION" "$stale" 2>/dev/null; then
-        rm -f "$stale"
-        printf '[dux-amq] replacing stale registration for %s: %s no longer exists\n' \
-          "$ME" "$prev" >&2
-      fi
-      continue
-    fi
-    printf '\033[1;31m!\033[0m [dux-amq] identity collision: %s already registered to %s (current: %s).\n' \
-      "$ME" "${prev:-<unknown>}" "$PWD" >&2
-    printf '            Rename one branch (avoid normalize-collisions) or set AM_ME explicitly.\n' >&2
-    exit 1
-  done
+  elif (( created_dir == 1 )); then
+    ln -s "$PWD" "$marker" || return 1
+  else
+    printf '[dux-amq] identity collision: %s has an ownerless agent directory\n' "$ME" >&2
+    return 1
+  fi
+  tmp=$(mktemp "$ROOT/meta/config.json.tmp.XXXXXX") || return 1
+  created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if [[ -f "$cfg" ]]; then
+    jq --arg me "$ME" '.agents = ((.agents // []) + [$me] | unique)' "$cfg" >"$tmp"
+  else
+    jq -n --arg me "$ME" --arg created "$created" '{version:1,created_utc:$created,agents:[$me]}' >"$tmp"
+  fi
+  mv "$tmp" "$cfg"
 }
-claim_amq_handle
-register_amq_handle
+
+mkdir -p "$ROOT/meta" "$ROOT/agents" || exit 1
+command -v "$FLOCK_BIN" >/dev/null 2>&1 || { printf 'gemini-amq: mandatory flock utility is unavailable\n' >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { printf 'gemini-amq: jq is required for atomic AMQ registration\n' >&2; exit 1; }
+export ROOT ME ME_REGISTRATION DUX_STORE_ID DUX_SESSION_ID
+export -f claim_and_register_locked
+"$FLOCK_BIN" -x "$ROOT/meta/config.lock" bash -euo pipefail -c claim_and_register_locked
 
 # Audit02 P0-K (T2) + Phase 13 (audit01 P1-1): route through verify+
 # bridge. See claude-amq for the full rationale on TIOCSTI fallback.
@@ -145,6 +161,26 @@ WAKE_LOG="$LOG_DIR/wake-$ME.log"
 WAKE_PID="$LOG_DIR/wake-$ME.pid"
 
 LOCAL_BIN="${LOCAL_BIN:-$HOME/.local/bin}"
+
+record_wake_pid_locked() {
+  local cfg="$ROOT/meta/config.json" marker="$ME_REGISTRATION" tmp
+  jq -e --arg store "$DUX_STORE_ID" --arg session "$DUX_SESSION_ID" \
+    '.store_id == $store and .session_id == $session' "$marker" >/dev/null
+  jq -e --arg me "$ME" '.agents | index($me) != null' "$cfg" >/dev/null
+  tmp=$(mktemp "$ROOT/agents/$ME/.owner.tmp.XXXXXX") || return 1
+  if ! jq --argjson pid "$WAKE_PID_VALUE" '.wake_pid = $pid' "$marker" >"$tmp" || ! mv "$tmp" "$marker"; then
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+record_wake_pid() {
+  local pid="$1"
+  [[ -n "${DUX_STORE_ID:-}" ]] || return 0
+  export WAKE_PID_VALUE="$pid"
+  export -f record_wake_pid_locked
+  "$FLOCK_BIN" -x "$ROOT/meta/config.lock" bash -euo pipefail -c record_wake_pid_locked
+}
 
 # Reap a stale wake daemon from a prior invocation for the same $ME.
 # See claude-amq for full rationale: without this, re-running the wrapper
@@ -187,8 +223,10 @@ case "$INJECT_MODE" in
   raw)
     setsid amq wake --me "$ME" --root "$ROOT" --inject-mode raw \
       </dev/tty >>"$WAKE_LOG" 2>&1 &
+    WAKE_CHILD_PID=$!
     disown
-    echo $! > "$WAKE_PID"
+    echo "$WAKE_CHILD_PID" > "$WAKE_PID"
+    record_wake_pid "$WAKE_CHILD_PID" || { kill "$WAKE_CHILD_PID" 2>/dev/null || true; rm -f "$WAKE_PID"; }
     ;;
   via)
     BRIDGE="$LOCAL_BIN/dux-amq-inject-bridge"
@@ -198,8 +236,10 @@ case "$INJECT_MODE" in
     if [[ -n "$BRIDGE" && -x "$BRIDGE" ]]; then
       setsid amq wake --me "$ME" --root "$ROOT" --inject-via "$BRIDGE" \
         >>"$WAKE_LOG" 2>&1 &
+      WAKE_CHILD_PID=$!
       disown
-      echo $! > "$WAKE_PID"
+      echo "$WAKE_CHILD_PID" > "$WAKE_PID"
+      record_wake_pid "$WAKE_CHILD_PID" || { kill "$WAKE_CHILD_PID" 2>/dev/null || true; rm -f "$WAKE_PID"; }
     else
       printf 'gemini-amq: dux-amq-inject-bridge not found; wake disabled\n' >&2
     fi
@@ -208,8 +248,10 @@ case "$INJECT_MODE" in
     printf 'gemini-amq: DUX_AMQ_INJECT_MODE=%q not understood; using raw\n' "$INJECT_MODE" >&2
     setsid amq wake --me "$ME" --root "$ROOT" --inject-mode raw \
       </dev/tty >>"$WAKE_LOG" 2>&1 &
+    WAKE_CHILD_PID=$!
     disown
-    echo $! > "$WAKE_PID"
+    echo "$WAKE_CHILD_PID" > "$WAKE_PID"
+    record_wake_pid "$WAKE_CHILD_PID" || { kill "$WAKE_CHILD_PID" 2>/dev/null || true; rm -f "$WAKE_PID"; }
     ;;
 esac
 

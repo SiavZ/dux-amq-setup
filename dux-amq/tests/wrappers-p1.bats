@@ -40,6 +40,7 @@ setup() {
   unset CODEX_AMQ_YOLO CODEX_AMQ_BYPASS_HOOK_TRUST
   unset CLAUDE_AMQ_SEED_FROM_PARENT CLAUDE_AMQ_NO_SEED
   unset DUX_AMQ_INJECT_MODE
+  unset DUX_STORE_ID DUX_SESSION_ID DUX_AMQ_HANDLE DUX_AMQ_FLOCK
   export STATE_ROOT="$TEST_HOME/state"
   mkdir -p "$STATE_ROOT/dux"
   # Pin AMQ_GLOBAL_ROOT under $TEST_HOME so the new collision marker
@@ -361,22 +362,15 @@ setup_parent_and_worktree_with_unreadable_file() {
   }
 }
 
-@test "P1-F: stale registration for missing worktree is replaced" {
+@test "P1-F: stale legacy registration is preserved as foreign" {
   mkdir -p "$AMQ_GLOBAL_ROOT/agents/p1pane" "$TEST_HOME/current"
   ln -s "$TEST_HOME/missing-worktree" "$AMQ_GLOBAL_ROOT/agents/p1pane/.dux-amq-source"
 
   cd "$TEST_HOME/current"
   run "$WRAPPERS_DIR/codex-amq"
-  [ "$status" -eq 0 ] || {
-    printf 'expected stale registration replacement; got status %s output:\n%s\n' \
-      "$status" "$output" >&2
-    return 1
-  }
-  [[ "$output" == *"replacing stale registration"* ]] || {
-    printf 'expected stale registration warning; got:\n%s\n' "$output" >&2
-    return 1
-  }
-  [[ "$(readlink "$AMQ_GLOBAL_ROOT/agents/p1pane/.dux-amq-source")" == "$TEST_HOME/current" ]]
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"identity collision"* ]]
+  [[ "$(readlink "$AMQ_GLOBAL_ROOT/agents/p1pane/.dux-amq-source")" == "$TEST_HOME/missing-worktree" ]]
 }
 
 @test "P1-F: codex-amq also enforces collision detection" {
