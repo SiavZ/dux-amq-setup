@@ -12,8 +12,8 @@ use crate::git;
 use crate::keybindings::RuntimeBindings;
 use crate::logger;
 use crate::purge::{
-    self, PurgeConfig, PurgePlan, build_plan, build_plans_for_all, confirm_interactive, execute,
-    notify_amq_peers_of_purge,
+    self, PurgeConfig, PurgePlan, SharedPurgeMode, build_plan, build_plans_for_all,
+    build_plans_for_target, confirm_interactive, execute, notify_amq_peers_of_purge,
 };
 use crate::storage::SessionStore;
 
@@ -76,7 +76,16 @@ pub fn run_session(args: &[String], paths: &DuxPaths) -> Result<()> {
     match sub {
         "purge" => {
             let rest = &args[1..];
-            reject_unknown_flags_and_positional(rest, &["--yes", "--dry-run", "--hard"])?;
+            reject_unknown_flags_and_positional(
+                rest,
+                &[
+                    "--yes",
+                    "--dry-run",
+                    "--hard",
+                    "--accept-residual-data",
+                    "--workspace-wide-provider-history",
+                ],
+            )?;
             run_session_purge(paths, rest)
         }
         "purge-all" => {
@@ -113,17 +122,26 @@ dux session — manage individual sessions
 
 Subcommands:
   dux session purge --hard <target> [--yes] [--dry-run]
-                       Permanently delete a single session and ALL its on-disk
-                       data. <target> is a session uuid or branch name.
-                       Cascades into worktree, provider chat dirs (claude/codex/
-                       gemini), AMQ inbox, log redact (Phase 09), and sqlite row.
+                       [--accept-residual-data | --workspace-wide-provider-history]
+                       Purge an isolated session's on-disk data, or report the
+                       explicit consent needed for shared provider history.
+                       <target> is a session uuid, agent handle, or an
+                       unambiguous branch name. Isolated purges cascade into the
+                       worktree, provider chat dirs, AMQ inbox, logs, and row.
   dux session purge-all [--yes] [--dry-run]
-                       Run purge against every session. Useful for full reset.
+                       Purge owned data for every session. Shared provider
+                       history remains incomplete without workspace consent.
 
 Flags:
   --hard               Required for `purge`. Affirms the destructive intent.
   --yes                Skip the interactive 'PURGE <branch>' confirmation.
   --dry-run            Print the plan and exit without changing anything.
+  --accept-residual-data
+                       Shared sessions only: retain shared provider history but
+                       allow deletion of owned records and durable identity.
+  --workspace-wide-provider-history
+                       Shared sessions only: purge every Dux session sharing the
+                       workspace and its provider history, including non-Dux chats.
 
 Exit codes:
   0  success (or dry-run)
@@ -136,12 +154,25 @@ fn run_session_purge(paths: &DuxPaths, args: &[String]) -> Result<()> {
     let mut yes = false;
     let mut dry_run = false;
     let mut hard = false;
+    let mut shared_mode = SharedPurgeMode::RetainIdentity;
     let mut target: Option<String> = None;
     for arg in args {
         match arg.as_str() {
             "--yes" => yes = true,
             "--dry-run" => dry_run = true,
             "--hard" => hard = true,
+            "--accept-residual-data" => {
+                if shared_mode == SharedPurgeMode::WorkspaceWide {
+                    bail!("shared purge consent flags are mutually exclusive");
+                }
+                shared_mode = SharedPurgeMode::AcceptResidualData;
+            }
+            "--workspace-wide-provider-history" => {
+                if shared_mode == SharedPurgeMode::AcceptResidualData {
+                    bail!("shared purge consent flags are mutually exclusive");
+                }
+                shared_mode = SharedPurgeMode::WorkspaceWide;
+            }
             s if s.starts_with('-') => bail!("unknown flag: {s}"),
             other => {
                 if target.is_some() {
@@ -154,13 +185,14 @@ fn run_session_purge(paths: &DuxPaths, args: &[String]) -> Result<()> {
     if !hard {
         bail!(
             "`dux session purge` requires --hard to affirm the destructive intent.\n\
-             This command permanently deletes worktree bytes, provider chat history,\n\
-             AMQ inbox, log records, and the sqlite row. There is no undo.\n\
+             Isolated purges permanently delete worktree bytes, provider chat history,\n\
+             AMQ inbox, log records, and the sqlite row. Shared provider history\n\
+             requires explicit residual acceptance or workspace-wide confirmation.\n\
              Re-run as: dux session purge --hard <target>"
         );
     }
     let Some(target) = target else {
-        bail!("missing target: dux session purge --hard <session-id-or-branch>");
+        bail!("missing target: dux session purge --hard <session-id-handle-or-branch>");
     };
 
     if !paths.sessions_db_path.exists() {
@@ -171,13 +203,33 @@ fn run_session_purge(paths: &DuxPaths, args: &[String]) -> Result<()> {
     }
 
     let storage = SessionStore::open(&paths.sessions_db_path)?;
-    let purge_config = runtime_purge_config(paths);
-    let plan = build_plan(&storage, paths, &purge_config, &target)?;
+    let purge_config = runtime_purge_config(paths)?;
+    let plans = if shared_mode == SharedPurgeMode::RetainIdentity {
+        vec![build_plan(&storage, paths, &purge_config, &target)?]
+    } else {
+        build_plans_for_target(&storage, paths, &purge_config, &target, shared_mode)?
+    };
 
-    println!("{}", format_plan(&plan, dry_run));
+    for plan in &plans {
+        println!("{}", format_plan(plan, dry_run));
+    }
 
     if !yes && !dry_run {
-        let confirmed = confirm_interactive(&plan)?;
+        let confirmed = if shared_mode == SharedPurgeMode::WorkspaceWide {
+            let branch = &plans[0].branch;
+            eprint!(
+                "Type 'PURGE WORKSPACE {}' to confirm provider-history deletion for every session at this workspace: ",
+                crate::sanitize::for_terminal(branch)
+            );
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            let mut input = String::new();
+            std::io::stdin()
+                .read_line(&mut input)
+                .map_err(|err| anyhow!("failed to read confirmation: {err}"))?;
+            input.trim() == format!("PURGE WORKSPACE {branch}")
+        } else {
+            confirm_interactive(&plans[0])?
+        };
         if !confirmed {
             eprintln!("aborted: confirmation phrase did not match");
             std::process::exit(2);
@@ -186,13 +238,16 @@ fn run_session_purge(paths: &DuxPaths, args: &[String]) -> Result<()> {
 
     // Notify peers BEFORE deleting the AMQ inbox so they have a chance
     // to drain the final message; skipped on dry-run.
-    if !dry_run {
-        notify_amq_peers_of_purge(&plan.branch);
+    let mut any_errors = false;
+    for plan in &plans {
+        if !dry_run {
+            notify_amq_peers_of_purge(&plan.branch);
+        }
+        let report = execute(plan, &storage, paths, &purge_config, dry_run)?;
+        eprint!("{}", report.summary());
+        any_errors |= report.had_errors();
     }
-
-    let report = execute(&plan, &storage, paths, dry_run)?;
-    eprint!("{}", report.summary());
-    if report.had_errors() {
+    if any_errors {
         std::process::exit(1);
     }
     Ok(())
@@ -206,7 +261,7 @@ fn run_session_purge_all(paths: &DuxPaths, yes: bool, dry_run: bool) -> Result<(
         );
     }
     let storage = SessionStore::open(&paths.sessions_db_path)?;
-    let purge_config = runtime_purge_config(paths);
+    let purge_config = runtime_purge_config(paths)?;
     let (plans, planning_failures) = build_plans_for_all(&storage, paths, &purge_config)?;
 
     for failure in &planning_failures {
@@ -245,7 +300,7 @@ fn run_session_purge_all(paths: &DuxPaths, yes: bool, dry_run: bool) -> Result<(
         {
             notify_amq_peers_of_purge(&plan.branch);
         }
-        let report = execute(plan, &storage, paths, dry_run)?;
+        let report = execute(plan, &storage, paths, &purge_config, dry_run)?;
         eprint!("{}", report.summary());
         any_errors |= report.had_errors();
     }
@@ -255,13 +310,9 @@ fn run_session_purge_all(paths: &DuxPaths, yes: bool, dry_run: bool) -> Result<(
     Ok(())
 }
 
-fn runtime_purge_config(paths: &DuxPaths) -> PurgeConfig {
-    let logging = fs::read_to_string(&paths.config_path)
-        .ok()
-        .and_then(|raw| toml::from_str::<Config>(&raw).ok())
-        .map(|config| config.logging)
-        .unwrap_or_default();
-    PurgeConfig::default_layout(paths, &logging)
+fn runtime_purge_config(paths: &DuxPaths) -> Result<PurgeConfig> {
+    let config = config::load_config_read_only(paths)?;
+    PurgeConfig::default_layout(paths, &config)
 }
 
 fn format_plan(plan: &PurgePlan, dry_run: bool) -> String {
@@ -294,6 +345,8 @@ Subcommands:
   dux config diff --raw    Show a unified diff against the default config
   dux config reset         Remove config and logs (keeps agents and worktrees)
   dux config reset --all   Full factory reset: remove config, logs, sessions, and worktrees
+                           Fails closed on corrupt inventory; repair or restore
+                           the named file/row, then retry.
   dux config regenerate    Preview a fresh default config (shows diff)
   dux config regenerate --yes
                            Overwrite the config file with fresh defaults"
@@ -504,47 +557,169 @@ fn print_unified_diff(label_a: &str, label_b: &str, a: &str, b: &str) {
 // ---------------------------------------------------------------------------
 
 fn reset_agent_data(paths: &DuxPaths) -> Result<()> {
-    if paths.sessions_db_path.exists() {
-        match SessionStore::open(&paths.sessions_db_path) {
-            Ok(store) => match store.load_sessions() {
-                Ok(sessions) => {
-                    for session in &sessions {
-                        remove_session_worktree(paths, session);
-                    }
-                    println!("removed {} session worktree(s)", sessions.len());
-                }
-                Err(error) => {
-                    eprintln!("warning: could not load sessions from database: {error}");
-                }
+    reset_agent_data_at_amq_root(paths, None)
+}
+
+fn reset_agent_data_at_amq_root(paths: &DuxPaths, amq_root: Option<&Path>) -> Result<()> {
+    // Complete every read-only inventory before the first destructive step.
+    let config_path = crate::sanitize::for_terminal(&paths.config_path.display().to_string());
+    let database_path =
+        crate::sanitize::for_terminal(&paths.sessions_db_path.display().to_string());
+    let store_id_path =
+        crate::sanitize::for_terminal(&paths.root.join("store-id").display().to_string());
+    let config = config::load_config_read_only(paths).with_context(|| {
+        format!(
+            "reset aborted before mutation: repair {config_path} or run `dux config regenerate --yes`, then retry"
+        )
+    })?;
+    let registered_projects = config::registered_project_paths(&config).with_context(|| {
+        format!(
+            "reset aborted before mutation: repair the project inventory in {config_path}, then retry"
+        )
+    })?;
+    let store_id = crate::storage::load_store_id(&paths.root).with_context(|| {
+        format!(
+            "reset aborted before mutation: restore {store_id_path}, then retry; without it, exact AMQ ownership cannot be proven and those directories require manual verification and removal"
+        )
+    })?;
+    let sessions = if paths.sessions_db_path.exists() {
+        SessionStore::open_read_only(&paths.sessions_db_path)
+            .with_context(|| {
+                format!(
+                    "reset aborted before mutation: repair {database_path} or restore {database_path}.bak, then retry; otherwise inventory its data manually before removal"
+                )
+            })?
+            .load_sessions_including_deleted()
+            .with_context(|| {
+                format!(
+                    "reset aborted before mutation: repair the named row in {database_path} or restore {database_path}.bak, then retry; otherwise inventory its data manually before removal"
+                )
+            })?
+    } else {
+        Vec::new()
+    };
+    git::guard_whole_workspace_removal(&paths.worktrees_root, &registered_projects)
+        .with_context(|| {
+            format!(
+                "reset aborted before mutation: repair overlapping project paths in {config_path}, then retry"
+            )
+        })?;
+    for session in sessions
+        .iter()
+        .filter(|session| !session.shared_workspace())
+    {
+        let worktree = Path::new(&session.worktree_path);
+        let session_id = crate::sanitize::for_terminal(&session.id);
+        if !git::whole_workspace_target_is_within(&paths.worktrees_root, worktree).with_context(
+            || {
+                format!(
+                    "reset aborted before mutation: repair session {session_id:?} in {database_path}, then retry"
+                )
             },
-            Err(error) => {
-                eprintln!("warning: could not open session database: {error}");
+        )? {
+            bail!(
+                "reset aborted before mutation: session {session_id:?} in {database_path} points outside the managed root to {}; repair or remove that row, then retry",
+                crate::sanitize::for_terminal(&session.worktree_path)
+            );
+        }
+        git::guard_whole_workspace_removal(worktree, &registered_projects).with_context(|| {
+            format!(
+                "reset aborted before mutation: repair session {session_id:?} in {database_path} or the project inventory in {config_path}, then retry"
+            )
+        })?;
+    }
+    let owned_amq: Vec<&crate::model::AgentSession> = sessions
+        .iter()
+        .map(|session| {
+            let owned = if let Some(root) = amq_root {
+                crate::peer::amq_handle_is_exact_owner_at_root(root, &store_id, session)
+            } else {
+                crate::peer::amq_handle_is_exact_owner(paths, &store_id, session)
             }
+            .with_context(|| {
+                format!(
+                    "reset aborted before mutation: repair the AMQ ownership marker for session {:?}, then retry; if ownership cannot be restored, verify and remove that inbox manually first",
+                    crate::sanitize::for_terminal(&session.id)
+                )
+            })?;
+            Ok(owned.then_some(session))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    for session in owned_amq {
+        if let Some(root) = amq_root {
+            crate::peer::free_amq_handle_at_root(root, &store_id, session)?;
+        } else {
+            crate::peer::free_amq_handle(paths, &store_id, session)?;
         }
     }
-
+    for session in &sessions {
+        remove_session_worktree(paths, session, &registered_projects)?;
+    }
+    println!(
+        "removed {} session worktree(s)",
+        sessions
+            .iter()
+            .filter(|session| !session.shared_workspace())
+            .count()
+    );
+    git::guard_whole_workspace_removal(&paths.worktrees_root, &registered_projects)?;
     remove_dir_with_message(&paths.worktrees_root)?;
-    remove_file_with_message(&paths.sessions_db_path)?;
+    remove_sqlite_with_message(&paths.sessions_db_path)?;
+    crate::storage::remove_store_identity(&paths.root)?;
     Ok(())
 }
 
-fn remove_session_worktree(paths: &DuxPaths, session: &crate::model::AgentSession) {
-    let worktree = Path::new(&session.worktree_path);
-    if !git::is_under(&paths.worktrees_root, worktree) {
-        eprintln!(
-            "warning: skipping worktree outside of managed root: {}",
-            session.worktree_path
-        );
-        return;
+fn remove_sqlite_with_message(path: &Path) -> Result<()> {
+    remove_file_with_message(path)?;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        remove_file_with_message(Path::new(&sidecar))?;
     }
+    Ok(())
+}
+
+fn remove_session_worktree(
+    paths: &DuxPaths,
+    session: &crate::model::AgentSession,
+    registered_projects: &[PathBuf],
+) -> Result<()> {
+    if session.shared_workspace() {
+        return Ok(());
+    }
+    let worktree = Path::new(&session.worktree_path);
+    if !git::whole_workspace_target_is_within(&paths.worktrees_root, worktree)? {
+        bail!(
+            "refusing reset: session {:?} in {} points outside the managed root to {}; Dux will not touch that path, so repair or remove the database row manually, then retry",
+            crate::sanitize::for_terminal(&session.id),
+            crate::sanitize::for_terminal(&paths.sessions_db_path.display().to_string()),
+            crate::sanitize::for_terminal(&session.worktree_path),
+        );
+    }
+    git::guard_whole_workspace_removal(worktree, registered_projects)?;
 
     if worktree.exists() {
-        let _ = std::process::Command::new("git")
+        std::process::Command::new("git")
             .args(["worktree", "remove", "--force"])
             .arg(worktree)
-            .output();
+            .output()
+            .with_context(|| {
+                format!(
+                    "failed to invoke git for {}",
+                    crate::sanitize::for_terminal(&session.worktree_path)
+                )
+            })?;
         if worktree.exists() {
-            let _ = fs::remove_dir_all(worktree);
+            fs::remove_dir_all(worktree).with_context(|| {
+                format!(
+                    "failed to remove reset worktree {}",
+                    crate::sanitize::for_terminal(&session.worktree_path)
+                )
+            })?;
         }
     }
 
@@ -557,6 +732,7 @@ fn remove_session_worktree(paths: &DuxPaths, session: &crate::model::AgentSessio
             .arg(&session.branch_name)
             .output();
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1106,11 +1282,236 @@ mod tests {
     #[test]
     fn reset_all_removes_worktrees_without_database() {
         let harness = ResetHarness::new();
+        harness.write_config_with_log_path("dux.log");
+        crate::storage::load_or_create_store_id(&harness.paths.root).expect("store id");
         fs::create_dir_all(harness.paths.worktrees_root.join("orphan")).expect("orphan worktree");
 
         run_reset(&harness.paths, true).expect("reset");
 
         assert!(!harness.paths.root.exists());
+    }
+
+    #[test]
+    fn reset_all_preserves_existing_worktree_behavior_for_missing_session_directory() {
+        let harness = ResetHarness::new();
+        harness.write_config_with_log_path("dux.log");
+        let worktree = harness.create_session("already-missing");
+        fs::remove_dir_all(&worktree).unwrap();
+
+        run_reset(&harness.paths, true).expect("reset");
+
+        assert!(!harness.paths.root.exists());
+    }
+
+    #[test]
+    fn reset_all_never_removes_a_shared_registered_checkout() {
+        let harness = ResetHarness::new();
+        let managed_worktree = harness.create_session("shared");
+        let checkout = harness.paths.root.parent().unwrap().join("real-checkout");
+        fs::create_dir_all(&checkout).unwrap();
+        fs::write(checkout.join("uncommitted.txt"), "keep me").unwrap();
+        let store = SessionStore::open(&harness.paths.sessions_db_path).unwrap();
+        let mut session = store.load_sessions().unwrap().remove(0);
+        session.shared_workspace = true;
+        session.worktree_path = checkout.to_string_lossy().into_owned();
+        session.project_path = Some(session.worktree_path.clone());
+        store.upsert_session(&session).unwrap();
+        drop(store);
+        let mut config = Config::default();
+        config.projects.push(crate::config::ProjectConfig {
+            id: session.project_id,
+            path: checkout.to_string_lossy().into_owned(),
+            name: Some("shared".to_string()),
+            default_provider: None,
+            commit_prompt: None,
+            workspace_mode: Some(crate::config::WorkspaceMode::Shared),
+        });
+        harness.write_config(&config);
+
+        run_reset(&harness.paths, true).unwrap();
+
+        assert!(checkout.join("uncommitted.txt").exists());
+        assert!(!managed_worktree.exists());
+    }
+
+    #[test]
+    fn reset_all_aborts_before_mutation_on_incomplete_config_or_database_inventory() {
+        let corrupt_config = ResetHarness::new();
+        let worktree = corrupt_config.create_session("agent-1");
+        fs::write(&corrupt_config.paths.config_path, "not = [valid").unwrap();
+        let error = format!("{:#}", run_reset(&corrupt_config.paths, true).unwrap_err());
+        assert!(error.contains(&corrupt_config.paths.config_path.display().to_string()));
+        assert!(error.contains("dux config regenerate --yes"));
+        assert!(error.contains("retry"));
+        assert!(worktree.exists());
+        assert!(corrupt_config.paths.sessions_db_path.exists());
+        assert!(corrupt_config.paths.root.join("store-id").exists());
+
+        let corrupt_database = ResetHarness::new();
+        corrupt_database.write_config_with_log_path("dux.log");
+        crate::storage::load_or_create_store_id(&corrupt_database.paths.root).unwrap();
+        fs::write(&corrupt_database.paths.sessions_db_path, "not sqlite").unwrap();
+        let orphan = corrupt_database.paths.worktrees_root.join("orphan");
+        fs::create_dir_all(&orphan).unwrap();
+        let error = format!(
+            "{:#}",
+            run_reset(&corrupt_database.paths, true).unwrap_err()
+        );
+        assert!(
+            error.contains(
+                &corrupt_database
+                    .paths
+                    .sessions_db_path
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(error.contains("restore"));
+        assert!(error.contains("sessions.sqlite3.bak"));
+        assert!(error.contains("retry"));
+        assert!(orphan.exists());
+        assert_eq!(
+            fs::read_to_string(&corrupt_database.paths.sessions_db_path).unwrap(),
+            "not sqlite"
+        );
+
+        let missing_store_id = ResetHarness::new();
+        missing_store_id.write_config_with_log_path("dux.log");
+        let worktree = missing_store_id.create_session("agent-1");
+        fs::remove_file(missing_store_id.paths.root.join("store-id")).unwrap();
+        let error = format!(
+            "{:#}",
+            run_reset(&missing_store_id.paths, true).unwrap_err()
+        );
+        assert!(
+            error.contains(
+                &missing_store_id
+                    .paths
+                    .root
+                    .join("store-id")
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(error.contains("exact AMQ ownership cannot be proven"));
+        assert!(error.contains("retry"));
+        assert!(worktree.exists());
+        assert!(missing_store_id.paths.sessions_db_path.exists());
+
+        let invalid_handle = ResetHarness::new();
+        invalid_handle.write_config_with_log_path("dux.log");
+        let worktree = invalid_handle.create_session("agent-1");
+        let store = SessionStore::open(&invalid_handle.paths.sessions_db_path).unwrap();
+        store
+            .conn()
+            .execute_batch(
+                r#"
+                pragma ignore_check_constraints = on;
+                update agent_sessions set agent_handle = 'Bad/handle' where id = 'agent-1';
+                pragma ignore_check_constraints = off;
+                "#,
+            )
+            .unwrap();
+        drop(store);
+        let error = format!("{:#}", run_reset(&invalid_handle.paths, true).unwrap_err());
+        assert!(error.contains("agent-1"));
+        assert!(error.contains(&invalid_handle.paths.sessions_db_path.display().to_string()));
+        assert!(error.contains("named row"));
+        assert!(error.contains("retry"));
+        assert!(worktree.exists());
+        assert!(invalid_handle.paths.sessions_db_path.exists());
+        assert!(invalid_handle.paths.root.join("store-id").exists());
+
+        let outside_root = ResetHarness::new();
+        outside_root.write_config_with_log_path("dux.log");
+        let worktree = outside_root.create_session("agent-1");
+        let store = SessionStore::open(&outside_root.paths.sessions_db_path).unwrap();
+        let mut session = store.load_sessions().unwrap().remove(0);
+        session.worktree_path = outside_root
+            .paths
+            .root
+            .parent()
+            .unwrap()
+            .join("outside")
+            .to_string_lossy()
+            .into_owned();
+        store.upsert_session(&session).unwrap();
+        drop(store);
+        let error = format!("{:#}", run_reset(&outside_root.paths, true).unwrap_err());
+        assert!(error.contains("agent-1"));
+        assert!(error.contains(&outside_root.paths.sessions_db_path.display().to_string()));
+        assert!(error.contains("repair or remove that row"));
+        assert!(error.contains("retry"));
+        assert!(worktree.exists());
+        assert!(outside_root.paths.sessions_db_path.exists());
+    }
+
+    #[test]
+    fn reset_all_frees_exact_owned_amq_before_deleting_database() {
+        let harness = ResetHarness::new();
+        harness.write_config_with_log_path("dux.log");
+        harness.create_session("agent-1");
+        let store = SessionStore::open(&harness.paths.sessions_db_path).unwrap();
+        store.soft_delete_session("agent-1").unwrap();
+        let session = store.load_sessions_including_deleted().unwrap().remove(0);
+        drop(store);
+        let amq_root = harness.paths.root.parent().unwrap().join("amq");
+        let agent_dir = amq_root.join("agents").join(session.agent_handle());
+        fs::create_dir_all(agent_dir.join("inbox")).unwrap();
+        fs::create_dir_all(amq_root.join("meta")).unwrap();
+        fs::write(
+            agent_dir.join(".dux-amq-source"),
+            format!(
+                r#"{{"store_id":"{}","session_id":"{}"}}"#,
+                crate::storage::load_store_id(&harness.paths.root).unwrap(),
+                session.id
+            ),
+        )
+        .unwrap();
+        let amq_config = amq_root.join("meta/config.json");
+        fs::write(&amq_config, "not json").unwrap();
+
+        assert!(reset_agent_data_at_amq_root(&harness.paths, Some(&amq_root)).is_err());
+        assert!(agent_dir.exists());
+        assert!(harness.paths.sessions_db_path.exists());
+
+        fs::write(
+            &amq_config,
+            format!(r#"{{"agents":["{}"]}}"#, session.agent_handle()),
+        )
+        .unwrap();
+
+        reset_agent_data_at_amq_root(&harness.paths, Some(&amq_root)).unwrap();
+
+        assert!(!agent_dir.exists());
+        assert!(!harness.paths.sessions_db_path.exists());
+    }
+
+    #[test]
+    fn reset_root_wipe_rejects_registered_project_overlap_in_both_directions() {
+        for descendant_project in [true, false] {
+            let harness = ResetHarness::new();
+            let worktree = harness.create_session("agent-1");
+            let project_path = if descendant_project {
+                worktree.join("nested-project")
+            } else {
+                harness.paths.root.parent().unwrap().to_path_buf()
+            };
+            let mut config = Config::default();
+            config.projects.push(crate::config::ProjectConfig {
+                id: "protected".to_string(),
+                path: project_path.to_string_lossy().into_owned(),
+                name: Some("protected".to_string()),
+                default_provider: None,
+                commit_prompt: None,
+                workspace_mode: Some(crate::config::WorkspaceMode::Worktree),
+            });
+            harness.write_config(&config);
+
+            assert!(reset_agent_data(&harness.paths).is_err());
+            assert!(worktree.exists());
+            assert!(harness.paths.sessions_db_path.exists());
+        }
     }
 
     #[test]
@@ -1536,8 +1937,12 @@ mod tests {
         fn write_config_with_log_path(&self, log_path: &str) {
             let mut config = Config::default();
             config.logging.path = log_path.to_string();
+            self.write_config(&config);
+        }
+
+        fn write_config(&self, config: &Config) {
             let bindings = RuntimeBindings::from_keys_config(&config.keys);
-            let body = config::render_config_with(&config, &bindings);
+            let body = config::render_config_with(config, &bindings);
             fs::write(&self.paths.config_path, body).expect("config");
         }
 
@@ -1550,6 +1955,7 @@ mod tests {
         }
 
         fn create_session(&self, id: &str) -> PathBuf {
+            crate::storage::load_or_create_store_id(&self.paths.root).expect("store id");
             fs::create_dir_all(&self.paths.worktrees_root).expect("worktrees root");
             let worktree = self.paths.worktrees_root.join(id);
             fs::create_dir_all(&worktree).expect("worktree");

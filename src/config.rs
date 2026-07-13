@@ -1039,6 +1039,44 @@ pub fn ensure_config(paths: &DuxPaths) -> Result<Config> {
     Ok(config)
 }
 
+/// Parse and validate the complete config without creating, migrating, or
+/// rewriting files. Destructive CLI commands use this before their first
+/// mutation so a missing or corrupt project inventory fails closed.
+pub fn load_config_read_only(paths: &DuxPaths) -> Result<Config> {
+    let raw = fs::read_to_string(&paths.config_path)
+        .with_context(|| format!("failed to read {}", paths.config_path.display()))?;
+    let mut doc: DocumentMut = raw
+        .parse()
+        .with_context(|| format!("failed to parse {}", paths.config_path.display()))?;
+    apply_config_deprecations(&mut doc)?;
+    let mut config = migrate_config(
+        toml::from_str(&doc.to_string())
+            .with_context(|| format!("failed to parse {}", paths.config_path.display()))?,
+    );
+    config.providers.ensure_defaults();
+    validate_shared_project_paths(&config, paths)?;
+    Ok(config)
+}
+
+/// Expand every configured project path without dropping malformed entries.
+/// Destructive callers must receive the complete protected-path inventory.
+pub fn registered_project_paths(config: &Config) -> Result<Vec<PathBuf>> {
+    config
+        .projects
+        .iter()
+        .map(|project| {
+            expand_path(&project.path)
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "registered project path is not a safe absolute path: {}",
+                        crate::sanitize::for_terminal(&project.path)
+                    )
+                })
+        })
+        .collect()
+}
+
 /// Shared sessions run in the real checkout, so that checkout must never be
 /// inside Dux's state tree. Canonicalization catches symlink aliases; missing
 /// project paths retain their expanded absolute spelling for startup recovery.

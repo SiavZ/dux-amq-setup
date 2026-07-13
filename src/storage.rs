@@ -76,6 +76,28 @@ pub fn load_or_create_store_id(dux_home: &Path) -> Result<String> {
     result
 }
 
+/// Load an existing store identity without creating metadata. Destructive
+/// reset and purge paths use this to fail closed on missing/corrupt identity.
+pub fn load_store_id(dux_home: &Path) -> Result<String> {
+    read_store_id(&dux_home.join(STORE_ID_FILE))
+}
+
+/// Remove durable store identity only after all exactly-owned AMQ handles are
+/// gone. The caller holds Dux's per-home process lock.
+pub fn remove_store_identity(dux_home: &Path) -> Result<()> {
+    for name in [STORE_ID_FILE, STORE_ID_LOCK] {
+        let path = dux_home.join(name);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to remove {}", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn read_store_id(path: &Path) -> Result<String> {
     let raw =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
