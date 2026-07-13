@@ -1151,18 +1151,58 @@ fn tombstone_amq_session_at_root(
 
 /// Verify exact ownership, stop wake delivery, remove the inbox, and release
 /// a global handle. Phase 5 hard purge is the first production caller.
-#[allow(dead_code)] // Intentionally exposed now so Phase 5 can wire it without changing the protocol.
 pub fn free_amq_handle(paths: &DuxPaths, store_id: &str, session: &AgentSession) -> Result<()> {
     let Some(root) = optional_amq_root(paths) else {
         return Ok(());
     };
+    if !root.exists() {
+        return Ok(());
+    }
     free_amq_handle_at_root(&root, store_id, session)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn free_amq_handle_at_root(root: &Path, store_id: &str, session: &AgentSession) -> Result<()> {
+/// Read-only ownership classification used by reset to inventory every handle
+/// before freeing any of them. Foreign and legacy registrations are preserved.
+pub fn amq_handle_is_exact_owner(
+    paths: &DuxPaths,
+    store_id: &str,
+    session: &AgentSession,
+) -> Result<bool> {
+    let Some(root) = optional_amq_root(paths) else {
+        return Ok(false);
+    };
+    if !root.exists() {
+        return Ok(false);
+    }
+    amq_handle_is_exact_owner_at_root(&root, store_id, session)
+}
+
+pub(crate) fn amq_handle_is_exact_owner_at_root(
+    root: &Path,
+    store_id: &str,
+    session: &AgentSession,
+) -> Result<bool> {
+    let _lock = AmqRegistryLock::acquire(root)?;
+    Ok(matches!(
+        marker_state(root, session.agent_handle())?,
+        MarkerState::Owner(owner)
+            if owner.store_id == store_id && owner.session_id == session.id
+    ))
+}
+
+pub(crate) fn free_amq_handle_at_root(
+    root: &Path,
+    store_id: &str,
+    session: &AgentSession,
+) -> Result<()> {
     let wake_pid = {
         let _lock = AmqRegistryLock::acquire(root)?;
+        if matches!(
+            marker_state(root, session.agent_handle())?,
+            MarkerState::Free
+        ) {
+            return Ok(());
+        }
         let owner = exact_owner(root, store_id, session)?;
         let wake_pid = owner.wake_pid;
         let mut stopped = owner;
@@ -1183,8 +1223,12 @@ fn free_amq_handle_at_root(root: &Path, store_id: &str, session: &AgentSession) 
     let _lock = AmqRegistryLock::acquire(root)?;
     exact_owner(root, store_id, session)?;
     let agent_dir = root.join("agents").join(session.agent_handle());
-    fs::remove_dir_all(&agent_dir)
-        .with_context(|| format!("failed to remove owned AMQ inbox {}", agent_dir.display()))
+    fs::remove_dir_all(&agent_dir).with_context(|| {
+        format!(
+            "failed to remove owned AMQ inbox {}",
+            crate::sanitize::for_terminal(&agent_dir.display().to_string())
+        )
+    })
 }
 
 fn exact_owner(root: &Path, store_id: &str, session: &AgentSession) -> Result<OwnerMarker> {
@@ -1927,6 +1971,38 @@ mod tests {
                 .unwrap()
                 .contains("\"agent\"")
         );
+    }
+
+    #[test]
+    fn exact_owner_free_sanitizes_removal_error_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("amq-\u{1b}]8;;bad\u{7}");
+        let agents = root.join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        let worktree = dir.path().join("agent");
+        fs::create_dir_all(&worktree).unwrap();
+        let session = session("session-a", "claude", "agent", &worktree);
+        ensure_owner_marker(
+            &root,
+            "agent",
+            &OwnerMarker {
+                store_id: "store-a".to_string(),
+                session_id: session.id.clone(),
+                wake_pid: None,
+            },
+        )
+        .unwrap();
+        register_config_handle(&root, "agent").unwrap();
+
+        fs::set_permissions(&agents, fs::Permissions::from_mode(0o500)).unwrap();
+        let error = free_amq_handle_at_root(&root, "store-a", &session).unwrap_err();
+        fs::set_permissions(&agents, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("failed to remove owned AMQ inbox"));
+        assert!(!message.contains('\u{1b}'));
     }
 
     #[test]

@@ -1,27 +1,32 @@
-//! GDPR hard-purge: cascade-delete every byte associated with a session.
+//! Honest GDPR purge planning for isolated sessions and shared workspaces.
 //!
 //! This module implements audit02 Phase 10 (P0-J / GDPR Art 17
 //! right-to-erasure). Today's `dux config reset --all` removes worktrees
 //! and the sqlite database holistically but cannot target a single
 //! session, and never touches the per-session provider chat history under
 //! `<provider_root>/projects/<encoded>/` or the AMQ inbox under
-//! `<amq_root>/agents/<agent_handle>/`. Without those paths a real "delete this
-//! customer's data" request is impossible.
+//! `<amq_root>/agents/<agent_handle>/`. Shared provider history is path-scoped,
+//! so a per-session purge must either retain the recovery row, explicitly accept
+//! that residual, or remove the whole workspace history (including non-Dux chats).
 //!
 //! ## What gets purged
 //!
-//! Given a session identified by uuid OR branch name, this module
+//! Given a session identified by UUID, immutable handle, or an unambiguous
+//! branch name, this module
 //! removes:
 //!
-//! 1. The session's worktree directory (refusing to touch anything
+//! 1. An isolated session's worktree directory (refusing to touch anything
 //!    outside the configured worktrees root — defence in depth against
-//!    a malformed db row pointing at `/`).
+//!    a malformed db row pointing at `/`, or overlapping a registered project).
+//!    Shared sessions never remove their registered checkout.
 //! 2. The Claude / Codex / Gemini chat-history dirs at
 //!    `<provider_root>/<provider>/projects/<encoded>` where
-//!    `<encoded>` is computed by `crate::purge_encoding`.
+//!    `<encoded>` is computed by `crate::purge_encoding`. Shared per-session
+//!    purge reports this category incomplete unless residual data is accepted
+//!    or a workspace-wide purge is confirmed.
 //! 3. The session's AMQ inbox at `<amq_root>/agents/<agent_handle>` (we only
-//!    delete the handle-named directory, never the parent — peers'
-//!    inboxes must remain untouched).
+//!    delete it after exact `{store_id, session_id}` verification under the
+//!    shared lock; peers' inboxes must remain untouched).
 //! 4. Log records tagged with this `session_id`. These are *redacted*
 //!    rather than deleted: every JSON Lines record in `dux.log*` is
 //!    streamed through, and any record whose `fields.session_id`
@@ -32,7 +37,7 @@
 //!
 //! ## Order of operations
 //!
-//! Worktree → providers → AMQ → log redact → sqlite. The sqlite row is
+//! Worktree (isolated only) → providers → AMQ → log redact → sqlite. The row is
 //! deleted **last** so that a crash mid-purge leaves a recoverable
 //! record: the operator can re-run `dux session purge --hard <id>` and
 //! it will resume cleanly. If we deleted the sqlite row first and then
@@ -61,20 +66,19 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 
-use crate::config::{DuxPaths, LoggingConfig};
+use crate::config::{Config, DuxPaths};
 use crate::model::AgentSession;
 use crate::purge_encoding;
 use crate::sanitize;
-use crate::storage::SessionStore;
+use crate::storage::{SessionStore, load_store_id};
+use crate::{git, peer};
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-/// Configuration the purge cascade needs that is not derivable from
-/// `DuxPaths` alone. Today this is purely the per-provider data-dir
-/// roots; future fields (e.g. extra log directories, custom AMQ root)
-/// can grow here without churning the public API.
+/// Configuration the purge cascade cannot derive from `DuxPaths` alone:
+/// provider/AMQ roots, logs, and the protected registered-project inventory.
 #[derive(Clone, Debug)]
 pub struct PurgeConfig {
     /// Per-provider chat-history roots. Each entry maps a logical
@@ -82,35 +86,72 @@ pub struct PurgeConfig {
     /// directory whose `projects/<encoded>` subtree should be purged.
     /// On the dux-amq VM these default to `/data/state/<provider>`.
     pub provider_data_dirs: Vec<(String, PathBuf)>,
-    /// Root of the AMQ file-bus. The session's branch-named inbox
-    /// lives at `<amq_root>/agents/<branch>`. Defaults to
+    /// Root of the AMQ file-bus. The session's immutable-handle inbox
+    /// lives at `<amq_root>/agents/<agent_handle>`. Defaults to
     /// `/data/state/amq`.
     pub amq_root: PathBuf,
     /// Resolved live log prefix (absolute or relative-to-Dux root exactly as
     /// the logger resolves it). Rotated siblings share this prefix.
     pub log_path: PathBuf,
+    /// Complete registered-project inventory used by the whole-worktree guard.
+    pub registered_project_paths: Vec<PathBuf>,
 }
 
 impl PurgeConfig {
     /// Build a sensible default `PurgeConfig` for the production layout
     /// described in `dux-amq/README.md`. Tests override this with a
     /// scratch directory.
-    pub fn default_layout(paths: &DuxPaths, logging: &LoggingConfig) -> Self {
-        let state = std::env::var_os("STATE_ROOT")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .or_else(|| paths.root.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| paths.root.clone());
-        Self {
+    pub fn default_layout(paths: &DuxPaths, config: &Config) -> Result<Self> {
+        let state = match std::env::var_os("STATE_ROOT") {
+            Some(root) => {
+                let root = PathBuf::from(root);
+                if !root.is_absolute() {
+                    bail!("STATE_ROOT must be an absolute path for hard purge");
+                }
+                root
+            }
+            None => paths
+                .root
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| paths.root.clone()),
+        };
+        let amq_root =
+            match std::env::var_os("AMQ_GLOBAL_ROOT").or_else(|| std::env::var_os("AM_ROOT")) {
+                Some(root) => {
+                    let root = PathBuf::from(root);
+                    if !root.is_absolute() {
+                        bail!("AMQ_GLOBAL_ROOT must be an absolute path for hard purge");
+                    }
+                    root
+                }
+                None => state.join("amq"),
+            };
+        Ok(Self {
             provider_data_dirs: vec![
                 ("claude".to_string(), state.join("claude")),
                 ("codex".to_string(), state.join("codex")),
                 ("gemini".to_string(), state.join("gemini")),
             ],
-            amq_root: state.join("amq"),
-            log_path: crate::logger::resolve_log_path(logging, paths),
-        }
+            amq_root,
+            log_path: crate::logger::resolve_log_path(&config.logging, paths),
+            registered_project_paths: crate::config::registered_project_paths(config)?,
+        })
     }
+}
+
+/// Operator consent for provider history shared by every session at one
+/// canonical workspace path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SharedPurgeMode {
+    /// Preserve the durable row and report provider history as incomplete.
+    #[default]
+    RetainIdentity,
+    /// Delete provably session-owned records and the row while explicitly
+    /// acknowledging that shared provider transcripts remain.
+    AcceptResidualData,
+    /// Delete provider history and purge every Dux session sharing the path.
+    WorkspaceWide,
 }
 
 /// One unit of work in a `PurgePlan`. Each variant maps to a single
@@ -127,7 +168,13 @@ pub enum PurgeItem {
         provider: &'static str,
         path: PathBuf,
     },
-    /// Recursive delete of `<amq_root>/agents/<branch>`. The parent
+    /// Provider history cannot be attributed to one shared session.
+    SharedProviderHistory {
+        provider: &'static str,
+        path: PathBuf,
+        residual_accepted: bool,
+    },
+    /// Exact-owner delete of `<amq_root>/agents/<agent_handle>`. The parent
     /// `agents/` dir is never removed.
     AmqInbox(PathBuf),
     /// Streaming JSON-line rewrite of every `dux.log*` file under
@@ -152,6 +199,21 @@ impl PurgeItem {
             Self::Worktree(p) => format!("worktree {}", safe_path(p)),
             Self::ProviderDir { provider, path } => {
                 format!("{provider} chat history {}", safe_path(path))
+            }
+            Self::SharedProviderHistory {
+                provider,
+                path,
+                residual_accepted,
+            } => {
+                let status = if *residual_accepted {
+                    "RESIDUAL ACCEPTED"
+                } else {
+                    "INCOMPLETE"
+                };
+                format!(
+                    "{status}: {provider} shared-workspace chat history retained at {}",
+                    safe_path(path)
+                )
             }
             Self::AmqInbox(p) => format!("amq inbox {}", safe_path(p)),
             Self::LogScopedRedact { since, path } => {
@@ -235,27 +297,100 @@ impl PurgeReport {
 // Plan construction
 // ---------------------------------------------------------------------------
 
-/// Resolve `target` to an `AgentSession` by id or branch name and build
-/// the cascade plan. Errors if no session matches.
+/// Resolve `target` by session id, immutable handle, or an unambiguous branch
+/// and build the safe default cascade plan.
 pub fn build_plan(
     storage: &SessionStore,
     paths: &DuxPaths,
     config: &PurgeConfig,
     target: &str,
 ) -> Result<PurgePlan> {
+    build_plans_for_target(
+        storage,
+        paths,
+        config,
+        target,
+        SharedPurgeMode::RetainIdentity,
+    )?
+    .into_iter()
+    .next()
+    .ok_or_else(|| anyhow!("purge target resolved to no sessions"))
+}
+
+/// Build one target plan, or every shared-workspace sibling plan when the
+/// operator explicitly chose a workspace-wide provider-history purge.
+pub fn build_plans_for_target(
+    storage: &SessionStore,
+    paths: &DuxPaths,
+    config: &PurgeConfig,
+    target: &str,
+    shared_mode: SharedPurgeMode,
+) -> Result<Vec<PurgePlan>> {
     let sessions = storage
-        .load_sessions()
+        .load_sessions_including_deleted()
         .context("failed to load sessions for purge planning")?;
-    let session = sessions
+    let session = resolve_target(&sessions, target)?;
+    if shared_mode == SharedPurgeMode::AcceptResidualData && !session.shared_workspace() {
+        bail!("--accept-residual-data applies only to a shared-workspace target");
+    }
+    if shared_mode == SharedPurgeMode::WorkspaceWide {
+        if !session.shared_workspace() {
+            bail!("--workspace-wide-provider-history requires a shared-workspace target");
+        }
+        let workspace = resolve_for_containment(Path::new(&session.worktree_path))?;
+        return sessions
+            .iter()
+            .filter_map(|candidate| {
+                match resolve_for_containment(Path::new(&candidate.worktree_path)) {
+                    Ok(candidate_path) if candidate_path == workspace => Some(Ok(candidate)),
+                    Ok(_) => None,
+                    Err(err) => Some(Err(err)),
+                }
+            })
+            .map(|candidate| {
+                plan_for_session_with_mode(
+                    candidate?,
+                    paths,
+                    config,
+                    SharedPurgeMode::WorkspaceWide,
+                )
+            })
+            .collect();
+    }
+    Ok(vec![plan_for_session_with_mode(
+        session,
+        paths,
+        config,
+        shared_mode,
+    )?])
+}
+
+fn resolve_target<'a>(sessions: &'a [AgentSession], target: &str) -> Result<&'a AgentSession> {
+    if let Some(session) = sessions.iter().find(|session| session.id == target) {
+        return Ok(session);
+    }
+    if let Some(session) = sessions
         .iter()
-        .find(|s| s.id == target || s.branch_name == target)
-        .ok_or_else(|| {
-            anyhow!(
-                "no session found matching id or branch {:?}",
-                sanitize::for_terminal(target)
-            )
-        })?;
-    plan_for_session(session, paths, config)
+        .find(|session| session.agent_handle() == target)
+    {
+        return Ok(session);
+    }
+    let mut branches = sessions
+        .iter()
+        .filter(|session| session.branch_name == target);
+    let Some(session) = branches.next() else {
+        bail!(
+            "no session found matching id, agent handle, or branch {:?}",
+            sanitize::for_terminal(target)
+        );
+    };
+    if branches.next().is_some() {
+        bail!(
+            "branch {:?} matches more than one session; retry with a session UUID or agent_handle",
+            sanitize::for_terminal(target)
+        );
+    }
+    Ok(session)
 }
 
 /// Lower-level helper used by `build_plan` and by the `purge_all`
@@ -265,15 +400,28 @@ pub fn plan_for_session(
     paths: &DuxPaths,
     config: &PurgeConfig,
 ) -> Result<PurgePlan> {
+    plan_for_session_with_mode(session, paths, config, SharedPurgeMode::RetainIdentity)
+}
+
+fn plan_for_session_with_mode(
+    session: &AgentSession,
+    paths: &DuxPaths,
+    config: &PurgeConfig,
+    shared_mode: SharedPurgeMode,
+) -> Result<PurgePlan> {
     let mut items = Vec::new();
 
-    // 1. Worktree
-    let worktree = validate_delete_target(
-        &paths.worktrees_root,
-        Path::new(&session.worktree_path),
-        "worktree",
-    )?;
-    items.push(PurgeItem::Worktree(worktree));
+    // 1. Worktree. Shared sessions point at the user's real checkout and must
+    // never offer or execute whole-workspace deletion.
+    if !session.shared_workspace() && shared_mode != SharedPurgeMode::WorkspaceWide {
+        let worktree = validate_delete_target(
+            &paths.worktrees_root,
+            Path::new(&session.worktree_path),
+            "worktree",
+        )?;
+        git::guard_whole_workspace_removal(&worktree, &config.registered_project_paths)?;
+        items.push(PurgeItem::Worktree(worktree));
+    }
 
     // 2. Provider dirs — encoded from the worktree's absolute path.
     //    A relative or non-UTF-8 worktree path yields an error: we
@@ -292,35 +440,22 @@ pub fn plan_for_session(
             &provider_projects.join(&encoded),
             "provider history",
         )?;
-        items.push(PurgeItem::ProviderDir {
-            provider: provider_static,
-            path,
-        });
+        if session.shared_workspace() && shared_mode != SharedPurgeMode::WorkspaceWide {
+            items.push(PurgeItem::SharedProviderHistory {
+                provider: provider_static,
+                path,
+                residual_accepted: shared_mode == SharedPurgeMode::AcceptResidualData,
+            });
+        } else {
+            items.push(PurgeItem::ProviderDir {
+                provider: provider_static,
+                path,
+            });
+        }
     }
 
-    // 3. AMQ inbox. Reject malformed persisted branch paths before building
-    // the destructive cascade.
-    let branch_path = Path::new(&session.branch_name);
-    if session.branch_name.is_empty()
-        || branch_path.is_absolute()
-        || branch_path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir
-                    | std::path::Component::CurDir
-                    | std::path::Component::RootDir
-                    | std::path::Component::Prefix(_)
-            )
-        })
-    {
-        bail!(
-            "unsafe AMQ branch path: {}",
-            sanitize::for_terminal(&session.branch_name)
-        );
-    }
-
-    // ponytail: Phase 5 replaces this path-only deletion with exact-owner
-    // verification; Phase 2 still uses the immutable handle as the safe target.
+    // 3. AMQ inbox, keyed only by the immutable handle. Execution performs
+    // exact {store_id, session_id} owner verification under the AMQ lock.
     let handle = session.agent_handle();
     if !handle.is_empty() {
         let agents_root = config.amq_root.join("agents");
@@ -441,9 +576,24 @@ fn static_provider_name(name: &str) -> &'static str {
 pub fn execute(
     plan: &PurgePlan,
     storage: &SessionStore,
-    _paths: &DuxPaths,
+    paths: &DuxPaths,
+    config: &PurgeConfig,
     dry_run: bool,
 ) -> Result<PurgeReport> {
+    let sessions = storage
+        .load_sessions_including_deleted()
+        .context("failed to reload complete session identity before purge")?;
+    let session = sessions
+        .iter()
+        .find(|session| session.id == plan.session_id)
+        .ok_or_else(|| anyhow!("purge session row disappeared before execution"))?;
+    let store_id = plan
+        .items
+        .iter()
+        .any(|item| matches!(item, PurgeItem::AmqInbox(_)))
+        .then(|| load_store_id(&paths.root))
+        .transpose()
+        .context("failed to load durable store identity before purge")?;
     let safe_session_id = sanitize::for_terminal(&plan.session_id);
     let safe_branch = sanitize::for_terminal(&plan.branch);
     tracing::info!(
@@ -465,7 +615,7 @@ pub fn execute(
                 "prior purge step failed; session row retained for retry".to_string(),
             )
         } else {
-            execute_item(item, storage, &plan.session_id, dry_run)
+            execute_item(item, storage, session, config, store_id.as_deref(), dry_run)
         };
         match &outcome {
             PurgeOutcome::Error(why) => {
@@ -509,15 +659,76 @@ pub fn execute(
 fn execute_item(
     item: &PurgeItem,
     storage: &SessionStore,
-    session_id: &str,
+    session: &AgentSession,
+    config: &PurgeConfig,
+    store_id: Option<&str>,
     dry_run: bool,
 ) -> PurgeOutcome {
     match item {
-        PurgeItem::Worktree(p) => execute_remove_dir(p, dry_run),
+        PurgeItem::Worktree(p) => {
+            match git::guard_whole_workspace_removal(p, &config.registered_project_paths) {
+                Ok(()) => execute_remove_dir(p, dry_run),
+                Err(err) => PurgeOutcome::Error(format!("{err:#}")),
+            }
+        }
         PurgeItem::ProviderDir { path, .. } => execute_remove_dir(path, dry_run),
-        PurgeItem::AmqInbox(p) => execute_remove_dir(p, dry_run),
-        PurgeItem::LogScopedRedact { path, .. } => execute_redact_logs(path, session_id, dry_run),
-        PurgeItem::SqliteRow => execute_delete_row(storage, session_id, dry_run),
+        PurgeItem::SharedProviderHistory {
+            residual_accepted, ..
+        } => {
+            if *residual_accepted {
+                PurgeOutcome::Skipped(
+                    "operator explicitly accepted residual shared provider history".to_string(),
+                )
+            } else {
+                PurgeOutcome::Error(
+                    "provider history is shared with sibling and non-Dux conversations; retry with --accept-residual-data or --workspace-wide-provider-history"
+                        .to_string(),
+                )
+            }
+        }
+        PurgeItem::AmqInbox(path) => {
+            execute_amq_inbox(path, &config.amq_root, store_id, session, dry_run)
+        }
+        PurgeItem::LogScopedRedact { path, .. } => execute_redact_logs(path, &session.id, dry_run),
+        PurgeItem::SqliteRow => execute_delete_row(storage, &session.id, dry_run),
+    }
+}
+
+fn execute_amq_inbox(
+    path: &Path,
+    root: &Path,
+    store_id: Option<&str>,
+    session: &AgentSession,
+    dry_run: bool,
+) -> PurgeOutcome {
+    if dry_run {
+        return PurgeOutcome::DryRun;
+    }
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return PurgeOutcome::Skipped(format!("{} does not exist", safe_path(path)));
+        }
+        Err(err) => return PurgeOutcome::Error(format!("{err:#}")),
+    }
+    let expected = root.join("agents").join(session.agent_handle());
+    let matches_expected = resolve_for_containment(path)
+        .and_then(|path| resolve_for_containment(&expected).map(|expected| path == expected));
+    match matches_expected {
+        Ok(true) => {}
+        Ok(false) => {
+            return PurgeOutcome::Error(
+                "AMQ purge item does not match the session's immutable handle".to_string(),
+            );
+        }
+        Err(err) => return PurgeOutcome::Error(format!("{err:#}")),
+    }
+    let Some(store_id) = store_id else {
+        return PurgeOutcome::Error("durable store identity is unavailable".to_string());
+    };
+    match peer::free_amq_handle_at_root(root, store_id, session) {
+        Ok(()) => PurgeOutcome::Done,
+        Err(err) => PurgeOutcome::Error(format!("{err:#}")),
     }
 }
 
@@ -528,15 +739,15 @@ fn execute_remove_dir(path: &Path, dry_run: bool) -> PurgeOutcome {
     match fs::symlink_metadata(path) {
         Ok(_) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return PurgeOutcome::Skipped(format!("{} does not exist", path.display()));
+            return PurgeOutcome::Skipped(format!("{} does not exist", safe_path(path)));
         }
         Err(err) => {
-            return PurgeOutcome::Error(format!("inspect {}: {err}", path.display()));
+            return PurgeOutcome::Error(format!("inspect {}: {err}", safe_path(path)));
         }
     }
     match fs::remove_dir_all(path) {
         Ok(()) => PurgeOutcome::Done,
-        Err(e) => PurgeOutcome::Error(format!("remove_dir_all({}): {e}", path.display())),
+        Err(err) => PurgeOutcome::Error(format!("remove_dir_all({}): {err}", safe_path(path))),
     }
 }
 
@@ -546,7 +757,10 @@ fn execute_delete_row(storage: &SessionStore, session_id: &str, dry_run: bool) -
     }
     match storage.delete_session(session_id) {
         Ok(()) => PurgeOutcome::Done,
-        Err(e) => PurgeOutcome::Error(format!("delete_session({session_id}): {e}")),
+        Err(err) => PurgeOutcome::Error(format!(
+            "delete_session({}): {err}",
+            sanitize::for_terminal(session_id)
+        )),
     }
 }
 
@@ -831,16 +1045,17 @@ pub fn notify_amq_peers_of_purge(branch: &str) {
 // ---------------------------------------------------------------------------
 
 /// Build plans for every session in storage. Used by `dux session
-/// purge-all`. Returns plans in load order (most-recently-updated first) and
-/// one operator-facing warning for each malformed row reduced to a row-only
-/// purge.
+/// purge-all`. Returns plans in load order and one operator-facing warning for
+/// each malformed row retained because a complete safe plan was impossible.
+/// Shared provider history always remains incomplete until the operator uses
+/// the explicitly confirmed workspace-wide single-target flow.
 pub fn build_plans_for_all(
     storage: &SessionStore,
     paths: &DuxPaths,
     config: &PurgeConfig,
 ) -> Result<(Vec<PurgePlan>, Vec<String>)> {
     let sessions = storage
-        .load_sessions()
+        .load_sessions_including_deleted()
         .context("failed to load sessions for bulk purge planning")?;
     if sessions.is_empty() {
         bail!("no sessions found; nothing to purge");
@@ -852,16 +1067,11 @@ pub fn build_plans_for_all(
             Ok(plan) => plans.push(plan),
             Err(err) => {
                 failures.push(format!(
-                    "session {:?} (branch {:?}) has unsafe purge targets: {}; using row-only purge",
+                    "session {:?} (branch {:?}) has unsafe purge targets and was retained: {}",
                     sanitize::for_terminal(&session.id),
                     sanitize::for_terminal(&session.branch_name),
                     sanitize::for_terminal(&format!("{err:#}")),
                 ));
-                plans.push(PurgePlan {
-                    session_id: session.id.clone(),
-                    branch: session.branch_name.clone(),
-                    items: vec![PurgeItem::SqliteRow],
-                });
             }
         }
     }
@@ -917,6 +1127,7 @@ mod tests {
                 .collect(),
             amq_root,
             log_path: PathBuf::from("/tmp/dux.log"),
+            registered_project_paths: Vec::new(),
         }
     }
 

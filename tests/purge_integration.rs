@@ -28,11 +28,11 @@ use chrono::Utc;
 use dux::config::DuxPaths;
 use dux::model::{AgentSession, ProviderKind, SessionState};
 use dux::purge::{
-    self, PurgeConfig, PurgeItem, PurgeOutcome, build_plan, build_plans_for_all,
-    confirm_with_reader, execute, plan_for_session,
+    self, PurgeConfig, PurgeItem, PurgeOutcome, SharedPurgeMode, build_plan, build_plans_for_all,
+    build_plans_for_target, confirm_with_reader, execute, plan_for_session,
 };
 use dux::purge_encoding;
-use dux::storage::SessionStore;
+use dux::storage::{SessionStore, load_or_create_store_id, load_store_id};
 
 // ---------------------------------------------------------------------------
 // Test harness
@@ -85,6 +85,7 @@ impl PurgeHarness {
             ],
             amq_root: amq_root.clone(),
             log_path: root.join("dux.log"),
+            registered_project_paths: Vec::new(),
         };
 
         // Pick a worktree path. Use a constant suffix so encoded path
@@ -110,6 +111,18 @@ impl PurgeHarness {
         let amq_inbox = amq_root.join("agents").join("sid-target");
         fs::create_dir_all(amq_inbox.join("inbox")).expect("amq inbox");
         fs::write(amq_inbox.join("inbox/00001.json"), b"{}\n").expect("amq msg");
+        let store_id = load_or_create_store_id(&root).expect("store id");
+        fs::write(
+            amq_inbox.join(".dux-amq-source"),
+            format!(r#"{{"store_id":"{store_id}","session_id":"sid-target"}}"#),
+        )
+        .expect("owner marker");
+        fs::create_dir_all(amq_root.join("meta")).expect("amq meta");
+        fs::write(
+            amq_root.join("meta/config.json"),
+            r#"{"agents":["sid-target"]}"#,
+        )
+        .expect("amq config");
 
         // Fake live JSON Lines log file. Note: the production code
         // matches files named `dux.log*`, so the live file must be
@@ -182,6 +195,34 @@ fn read_log(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
+fn write_owned_amq_marker(h: &PurgeHarness, session: &AgentSession, handles: &[&str]) {
+    let inbox = h
+        .config
+        .amq_root
+        .join("agents")
+        .join(session.agent_handle());
+    fs::create_dir_all(inbox.join("inbox")).unwrap();
+    fs::write(
+        inbox.join(".dux-amq-source"),
+        format!(
+            r#"{{"store_id":"{}","session_id":"{}"}}"#,
+            load_store_id(&h.paths.root).unwrap(),
+            session.id
+        ),
+    )
+    .unwrap();
+    let agents = handles
+        .iter()
+        .map(|handle| format!(r#""{handle}""#))
+        .collect::<Vec<_>>()
+        .join(",");
+    fs::write(
+        h.config.amq_root.join("meta/config.json"),
+        format!(r#"{{"agents":[{agents}]}}"#),
+    )
+    .unwrap();
+}
+
 fn count_target_records(log_text: &str, target_sid: &str) -> usize {
     log_text
         .lines()
@@ -228,7 +269,8 @@ fn assert_failure_retains_row_and_retry_succeeds(
         branch: h.session.branch_name.clone(),
         items: vec![item, PurgeItem::SqliteRow],
     };
-    let failed = execute(&failed_plan, &h.storage, execution_paths, false).expect("execute");
+    let failed =
+        execute(&failed_plan, &h.storage, execution_paths, &h.config, false).expect("execute");
     assert!(failed.had_errors(), "{category} fault did not fail");
     assert!(matches!(
         failed.entries.last(),
@@ -243,7 +285,7 @@ fn assert_failure_retains_row_and_retry_succeeds(
 
     let retry = build_plan(&h.storage, &h.paths, &h.config, &h.session.id)
         .expect("retained row must remain resolvable");
-    let retried = execute(&retry, &h.storage, &h.paths, false).expect("retry execute");
+    let retried = execute(&retry, &h.storage, &h.paths, &h.config, false).expect("retry execute");
     assert!(
         !retried.had_errors(),
         "{category} retry: {}",
@@ -267,7 +309,7 @@ fn purge_removes_all_known_categories() {
     let h = PurgeHarness::new();
     let plan = build_plan(&h.storage, &h.paths, &h.config, &h.session.id).expect("plan");
 
-    let report = execute(&plan, &h.storage, &h.paths, false).expect("execute");
+    let report = execute(&plan, &h.storage, &h.paths, &h.config, false).expect("execute");
     assert!(!report.had_errors(), "summary:\n{}", report.summary());
 
     // Worktree gone.
@@ -320,7 +362,7 @@ fn purge_dry_run_changes_nothing() {
     let plan = build_plan(&h.storage, &h.paths, &h.config, &h.session.id).expect("plan");
     let log_before = read_log(&h.log_path);
 
-    let report = execute(&plan, &h.storage, &h.paths, true).expect("execute");
+    let report = execute(&plan, &h.storage, &h.paths, &h.config, true).expect("execute");
     assert!(!report.had_errors());
     assert!(report.dry_run);
     assert!(
@@ -389,7 +431,7 @@ fn purge_with_unknown_target_returns_error_not_panic() {
 fn purge_redacts_log_records_for_session() {
     let h = PurgeHarness::new();
     let plan = build_plan(&h.storage, &h.paths, &h.config, &h.session.id).expect("plan");
-    let report = execute(&plan, &h.storage, &h.paths, false).expect("execute");
+    let report = execute(&plan, &h.storage, &h.paths, &h.config, false).expect("execute");
     assert!(!report.had_errors(), "{}", report.summary());
 
     let text = read_log(&h.log_path);
@@ -413,7 +455,7 @@ fn purge_skips_missing_provider_dirs() {
     // Pre-delete the codex dir so the cascade has to skip it cleanly.
     fs::remove_dir_all(&h.codex_dir).expect("pre-delete");
     let plan = build_plan(&h.storage, &h.paths, &h.config, &h.session.id).expect("plan");
-    let report = execute(&plan, &h.storage, &h.paths, false).expect("execute");
+    let report = execute(&plan, &h.storage, &h.paths, &h.config, false).expect("execute");
     assert!(!report.had_errors(), "{}", report.summary());
 
     // The codex outcome should be Skipped, not Error.
@@ -451,6 +493,7 @@ fn purge_executes_in_documented_order() {
         .map(|i| match i {
             PurgeItem::Worktree(_) => "worktree",
             PurgeItem::ProviderDir { .. } => "provider",
+            PurgeItem::SharedProviderHistory { .. } => "shared-provider",
             PurgeItem::AmqInbox(_) => "amq",
             PurgeItem::LogScopedRedact { .. } => "log",
             PurgeItem::SqliteRow => "sqlite",
@@ -477,6 +520,237 @@ fn purge_target_resolvable_by_branch_name() {
     assert_eq!(plan.session_id, h.session.id);
     assert_eq!(plan.branch, "audit02-x");
     let _keep = h.tmp;
+}
+
+#[test]
+fn purge_target_resolves_by_immutable_handle_and_rejects_ambiguous_branch() {
+    let h = PurgeHarness::new();
+    h.storage.soft_delete_session(&h.session.id).unwrap();
+    let by_handle = build_plan(&h.storage, &h.paths, &h.config, h.session.agent_handle())
+        .expect("plan by handle");
+    assert_eq!(by_handle.session_id, h.session.id);
+
+    let mut sibling = h.session.clone();
+    sibling.id = "sid-sibling".to_string();
+    sibling.agent_handle = "sid-sibling".to_string();
+    sibling.worktree_path = h
+        .paths
+        .worktrees_root
+        .join("sibling")
+        .to_string_lossy()
+        .into_owned();
+    h.storage.upsert_session(&sibling).unwrap();
+
+    let error = build_plan(&h.storage, &h.paths, &h.config, &h.session.branch_name)
+        .expect_err("duplicate branch must be ambiguous")
+        .to_string();
+    assert!(error.contains("more than one session"));
+    assert!(error.contains("UUID or agent_handle"));
+}
+
+#[test]
+fn shared_purge_is_honest_and_retains_identity_without_explicit_consent() {
+    let h = PurgeHarness::new();
+    let mut shared = h.session.clone();
+    shared.shared_workspace = true;
+    h.storage.upsert_session(&shared).unwrap();
+
+    let plan = build_plan(&h.storage, &h.paths, &h.config, &shared.id).unwrap();
+    assert!(
+        !plan
+            .items
+            .iter()
+            .any(|item| matches!(item, PurgeItem::Worktree(_)))
+    );
+    assert!(
+        plan.items
+            .iter()
+            .all(|item| { !matches!(item, PurgeItem::ProviderDir { .. }) })
+    );
+    assert!(plan.items.iter().any(|item| matches!(
+        item,
+        PurgeItem::SharedProviderHistory {
+            residual_accepted: false,
+            ..
+        }
+    )));
+
+    let report = execute(&plan, &h.storage, &h.paths, &h.config, false).unwrap();
+    assert!(report.had_errors());
+    assert!(
+        h.worktree().exists(),
+        "the registered checkout must survive"
+    );
+    assert!(
+        h.claude_dir.exists(),
+        "shared provider history must survive"
+    );
+    assert!(!h.amq_inbox.exists(), "exact-owned AMQ data may be erased");
+    assert!(
+        h.storage
+            .load_sessions_including_deleted()
+            .unwrap()
+            .iter()
+            .any(|session| session.id == shared.id)
+    );
+    assert!(report.summary().contains("INCOMPLETE"));
+}
+
+#[test]
+fn purge_all_retains_shared_provider_history_without_workspace_consent() {
+    let h = PurgeHarness::new();
+    let transcript = h.claude_dir.join("non-dux-conversation.jsonl");
+    fs::write(&transcript, "must survive").unwrap();
+    let mut shared = h.session.clone();
+    shared.shared_workspace = true;
+    h.storage.upsert_session(&shared).unwrap();
+
+    let (plans, failures) = build_plans_for_all(&h.storage, &h.paths, &h.config).unwrap();
+    assert!(failures.is_empty());
+    assert_eq!(plans.len(), 1);
+    assert!(plans[0].items.iter().any(|item| matches!(
+        item,
+        PurgeItem::SharedProviderHistory {
+            residual_accepted: false,
+            ..
+        }
+    )));
+    assert!(
+        !plans[0]
+            .items
+            .iter()
+            .any(|item| matches!(item, PurgeItem::ProviderDir { .. }))
+    );
+
+    let report = execute(&plans[0], &h.storage, &h.paths, &h.config, false).unwrap();
+    assert!(report.had_errors());
+    assert!(report.summary().contains("INCOMPLETE"));
+    assert_eq!(fs::read_to_string(transcript).unwrap(), "must survive");
+    assert!(!h.amq_inbox.exists(), "exact-owned AMQ data may be erased");
+    assert_eq!(
+        h.storage.load_sessions_including_deleted().unwrap().len(),
+        1,
+        "the recovery row must remain"
+    );
+}
+
+#[test]
+fn shared_purge_accept_residual_frees_exact_amq_and_deletes_row_only() {
+    let h = PurgeHarness::new();
+    let mut shared = h.session.clone();
+    shared.shared_workspace = true;
+    h.storage.upsert_session(&shared).unwrap();
+
+    let plan = build_plans_for_target(
+        &h.storage,
+        &h.paths,
+        &h.config,
+        &shared.id,
+        SharedPurgeMode::AcceptResidualData,
+    )
+    .unwrap()
+    .remove(0);
+    let report = execute(&plan, &h.storage, &h.paths, &h.config, false).unwrap();
+
+    assert!(!report.had_errors(), "{}", report.summary());
+    assert!(h.worktree().exists());
+    assert!(h.claude_dir.exists());
+    assert!(!h.amq_inbox.exists());
+    assert!(
+        h.storage
+            .load_sessions_including_deleted()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(report.summary().contains("RESIDUAL ACCEPTED"));
+}
+
+#[test]
+fn workspace_wide_shared_purge_includes_every_sibling_and_provider_history() {
+    let h = PurgeHarness::new();
+    let mut shared = h.session.clone();
+    shared.shared_workspace = true;
+    h.storage.upsert_session(&shared).unwrap();
+
+    let mut sibling = shared.clone();
+    sibling.id = "sid-sibling".to_string();
+    sibling.agent_handle = "sid-sibling".to_string();
+    h.storage.upsert_session(&sibling).unwrap();
+    write_owned_amq_marker(&h, &sibling, &["sid-target", "sid-sibling"]);
+
+    let plans = build_plans_for_target(
+        &h.storage,
+        &h.paths,
+        &h.config,
+        &shared.id,
+        SharedPurgeMode::WorkspaceWide,
+    )
+    .unwrap();
+    assert_eq!(plans.len(), 2);
+    assert!(plans.iter().all(|plan| {
+        !plan
+            .items
+            .iter()
+            .any(|item| matches!(item, PurgeItem::Worktree(_)))
+            && plan
+                .items
+                .iter()
+                .any(|item| matches!(item, PurgeItem::ProviderDir { .. }))
+    }));
+
+    for plan in &plans {
+        let report = execute(plan, &h.storage, &h.paths, &h.config, false).unwrap();
+        assert!(!report.had_errors(), "{}", report.summary());
+    }
+    assert!(h.worktree().exists());
+    assert!(!h.claude_dir.exists());
+    assert!(
+        h.storage
+            .load_sessions_including_deleted()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn purge_never_frees_a_foreign_amq_inbox() {
+    let h = PurgeHarness::new();
+    fs::write(
+        h.amq_inbox.join(".dux-amq-source"),
+        r#"{"store_id":"foreign-store","session_id":"sid-target"}"#,
+    )
+    .unwrap();
+    let plan = build_plan(&h.storage, &h.paths, &h.config, &h.session.id).unwrap();
+    let report = execute(&plan, &h.storage, &h.paths, &h.config, false).unwrap();
+
+    assert!(report.had_errors());
+    assert!(h.amq_inbox.exists());
+    assert_eq!(
+        h.storage.load_sessions_including_deleted().unwrap().len(),
+        1
+    );
+}
+
+#[test]
+fn purge_worktree_step_rejects_registered_project_overlap_in_both_directions() {
+    let h = PurgeHarness::new();
+    for project in [h.worktree().join("nested-project"), h.paths.root.clone()] {
+        let mut config = h.config.clone();
+        config.registered_project_paths = vec![project];
+        assert!(build_plan(&h.storage, &h.paths, &config, &h.session.id).is_err());
+        assert!(h.worktree().exists());
+    }
+
+    let plan = build_plan(&h.storage, &h.paths, &h.config, &h.session.id).unwrap();
+    let mut changed_inventory = h.config.clone();
+    changed_inventory.registered_project_paths = vec![h.worktree().join("late-project")];
+    let report = execute(&plan, &h.storage, &h.paths, &changed_inventory, false).unwrap();
+    assert!(report.had_errors());
+    assert!(h.worktree().exists());
+    assert_eq!(
+        h.storage.load_sessions_including_deleted().unwrap().len(),
+        1
+    );
 }
 
 #[test]
@@ -546,14 +820,16 @@ fn purge_rejects_root_parent_and_symlink_worktree_targets() {
 }
 
 #[test]
-fn purge_rejects_absolute_and_traversing_amq_branches() {
+fn purge_amq_target_uses_handle_even_when_branch_is_pathlike() {
     let h = PurgeHarness::new();
     for branch in ["/tmp/audit03-outside", "../../audit03-outside", "."] {
         let mut session = h.session.clone();
         session.branch_name = branch.to_string();
+        let plan = plan_for_session(&session, &h.paths, &h.config).expect("handle-keyed plan");
         assert!(
-            plan_for_session(&session, &h.paths, &h.config).is_err(),
-            "accepted unsafe AMQ branch {branch:?}"
+            plan.items.iter().any(
+                |item| matches!(item, PurgeItem::AmqInbox(path) if path.ends_with("sid-target"))
+            )
         );
     }
 }
@@ -603,7 +879,7 @@ fn purge_allows_missing_descendants_and_reports_validated_paths() {
 }
 
 #[test]
-fn purge_all_continues_with_valid_plans_and_erases_malformed_rows() {
+fn purge_all_retains_rows_whose_full_inventory_cannot_be_planned() {
     let h = PurgeHarness::new();
     let mut relative_worktree = h.session.clone();
     relative_worktree.id = "sid-relative\u{1b}]8;;bad".to_string();
@@ -631,20 +907,13 @@ fn purge_all_continues_with_valid_plans_and_erases_malformed_rows() {
     let (plans, failures) =
         build_plans_for_all(&h.storage, &h.paths, &h.config).expect("bulk plans");
 
-    assert_eq!(plans.len(), 3);
-    assert_eq!(failures.len(), 2);
+    assert_eq!(plans.len(), 2);
+    assert_eq!(failures.len(), 1);
     assert!(failures.iter().all(|failure| !failure.contains('\u{1b}')));
     assert!(
         failures
             .iter()
-            .all(|failure| failure.contains("using row-only purge"))
-    );
-    assert_eq!(
-        plans
-            .iter()
-            .filter(|plan| plan.items == [PurgeItem::SqliteRow])
-            .count(),
-        2
+            .all(|failure| failure.contains("was retained"))
     );
     assert!(
         plans
@@ -654,8 +923,14 @@ fn purge_all_continues_with_valid_plans_and_erases_malformed_rows() {
     );
 
     for plan in &plans {
-        let report = execute(plan, &h.storage, &h.paths, false).expect("execute bulk plan");
+        let report =
+            execute(plan, &h.storage, &h.paths, &h.config, false).expect("execute bulk plan");
         assert!(!report.had_errors(), "{}", report.summary());
     }
-    assert!(h.storage.load_sessions().expect("load rows").is_empty());
+    let remaining = h
+        .storage
+        .load_sessions_including_deleted()
+        .expect("load rows");
+    assert_eq!(remaining.len(), 1);
+    assert!(remaining.iter().all(|session| session.id != h.session.id));
 }
