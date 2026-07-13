@@ -148,6 +148,9 @@ impl PurgeHarness {
             source_branch: "main".to_string(),
             branch_name: "audit02-x".to_string(),
             worktree_path: worktree.to_string_lossy().to_string(),
+            agent_handle: "sid-target".to_string(),
+            shared_workspace: false,
+            deleted_at: None,
             title: None,
             started_providers: Vec::new(),
             state: SessionState::Created { created_at: now },
@@ -604,6 +607,7 @@ fn purge_all_continues_with_valid_plans_and_erases_malformed_rows() {
     let h = PurgeHarness::new();
     let mut relative_worktree = h.session.clone();
     relative_worktree.id = "sid-relative\u{1b}]8;;bad".to_string();
+    relative_worktree.agent_handle = "sid-relative-bad".to_string();
     relative_worktree.branch_name = "relative-row".to_string();
     relative_worktree.worktree_path = "relative/worktree".to_string();
     h.storage
@@ -612,6 +616,7 @@ fn purge_all_continues_with_valid_plans_and_erases_malformed_rows() {
 
     let mut absolute_branch = h.session.clone();
     absolute_branch.id = "sid-absolute-branch".to_string();
+    absolute_branch.agent_handle = "sid-absolute-branch".to_string();
     absolute_branch.branch_name = "/tmp/bad\u{1b}]0;branch".to_string();
     absolute_branch.worktree_path = h
         .paths

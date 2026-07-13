@@ -836,6 +836,9 @@ mod tests {
             source_branch: "main".to_string(),
             branch_name: branch.to_string(),
             worktree_path: worktree.display().to_string(),
+            agent_handle: crate::model::normalize_agent_handle(id),
+            shared_workspace: false,
+            deleted_at: None,
             title: None,
             started_providers: Vec::new(),
             state: SessionState::Created {

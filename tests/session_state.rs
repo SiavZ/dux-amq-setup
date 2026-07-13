@@ -6,7 +6,7 @@
 //! is no longer `Clone`, `PartialEq`, `Serialize`, or `Deserialize`.
 //! These tests pin:
 //!
-//! - the legal-transition matrix on the `Created`/`Spawning`/`Exited`
+//! - the legal-transition matrix on the PTY-less states,
 //!   path (the variants we can construct without a real PTY),
 //! - the JSON round-trip via [`PersistedSessionState`] for those same
 //!   variants, and
@@ -70,8 +70,9 @@ fn valid_transitions_succeed() {
     assert!(matches!(s, SessionState::Spawning { since } if since == t3));
 }
 
-/// `SessionState::to_json` -> `from_json` must round-trip every
-/// PTY-less persistable variant. `Live` and `Detached` carry a
+/// `SessionState::to_json` -> `from_json` must round-trip every stable
+/// PTY-less persistable variant. A persisted `Spawning` deliberately reloads
+/// as `Retryable`; `Live` and `Detached` carry a
 /// `PtyHandle` and so cannot be constructed in this integration
 /// test; they are covered by the in-process runtime tests.
 #[test]
@@ -79,7 +80,9 @@ fn json_round_trip_for_persistable_variants() {
     let now = Utc::now();
     let cases = vec![
         SessionState::Created { created_at: now },
-        SessionState::Spawning { since: now },
+        SessionState::Retryable {
+            interrupted_at: now,
+        },
         SessionState::Exited {
             exit_code: Some(137),
             exited_at: now,
@@ -99,9 +102,10 @@ fn json_round_trip_for_persistable_variants() {
             (SessionState::Created { created_at: a }, SessionState::Created { created_at: b }) => {
                 assert_eq!(a, b)
             }
-            (SessionState::Spawning { since: a }, SessionState::Spawning { since: b }) => {
-                assert_eq!(a, b)
-            }
+            (
+                SessionState::Retryable { interrupted_at: a },
+                SessionState::Retryable { interrupted_at: b },
+            ) => assert_eq!(a, b),
             (
                 SessionState::Exited {
                     exit_code: ea,
@@ -118,6 +122,43 @@ fn json_round_trip_for_persistable_variants() {
             (a, b) => panic!("round-trip mismatch: {a:?} -> {b:?}"),
         }
     }
+}
+
+#[test]
+fn interrupted_spawning_reloads_as_retryable_and_can_reconnect() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = SessionStore::open(&tmp.path().join("interrupted.sqlite3")).expect("open");
+    let now = Utc::now();
+    let session = AgentSession {
+        id: "interrupted".to_string(),
+        project_id: "p".to_string(),
+        project_path: None,
+        provider: ProviderKind::new("claude"),
+        source_branch: "main".to_string(),
+        branch_name: "interrupted".to_string(),
+        worktree_path: "/tmp/interrupted".to_string(),
+        agent_handle: "interrupted".to_string(),
+        shared_workspace: false,
+        deleted_at: None,
+        title: None,
+        started_providers: Vec::new(),
+        state: SessionState::Spawning { since: now },
+        settings: dux::model::SessionSettings::default(),
+        created_at: now,
+        updated_at: now,
+    };
+    store
+        .upsert_session(&session)
+        .expect("persist spawning row");
+
+    let mut loaded = store.load_sessions().expect("reload after interruption");
+    let recovered = loaded.pop().expect("visible recovered session");
+    assert!(recovered.state.is_retryable());
+    let reconnecting = recovered
+        .state
+        .transition("spawning", now)
+        .expect("retryable session can reconnect manually");
+    assert!(matches!(reconnecting, SessionState::Spawning { .. }));
 }
 
 /// `Detached` carries a `PtyHandle` after Phase 18 phase 2; persist +
@@ -192,6 +233,9 @@ fn session_state_persists_round_trip_through_store() {
         source_branch: "main".to_string(),
         branch_name: "feat/phase-18".to_string(),
         worktree_path: "/tmp/rt-1".to_string(),
+        agent_handle: "rt-1".to_string(),
+        shared_workspace: false,
+        deleted_at: None,
         title: None,
         started_providers: Vec::new(),
         state: SessionState::Exited {

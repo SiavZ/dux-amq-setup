@@ -1,5 +1,5 @@
-//! Integration tests for the SQLite session store hardening landed in
-//! audit02 phase 14 (P1-W).
+//! Integration tests for SQLite hardening, immutable session identity, and
+//! soft-delete tombstones.
 //!
 //! These tests live under `tests/` (rather than as `#[cfg(test)]` modules in
 //! `storage.rs`) so they exercise `dux::storage::SessionStore` through the
@@ -19,6 +19,9 @@ fn fixture_session(id: &str) -> AgentSession {
         source_branch: "main".to_string(),
         branch_name: format!("branch-{id}"),
         worktree_path: format!("/tmp/{id}"),
+        agent_handle: dux::model::normalize_agent_handle(id),
+        shared_workspace: false,
+        deleted_at: None,
         title: None,
         started_providers: Vec::new(),
         state: SessionState::Created { created_at: now },
@@ -252,5 +255,154 @@ fn session_settings_default_when_blob_malformed() {
         s.settings,
         SessionSettings::default(),
         "malformed session_settings must load as default()"
+    );
+}
+
+#[test]
+fn session_identity_and_workspace_mode_round_trip() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = SessionStore::open(&dir.path().join("identity.sqlite3")).expect("open");
+    let mut session = fixture_session("identity");
+    session.agent_handle = "durable-handle".to_string();
+    session.shared_workspace = true;
+    store.upsert_session(&session).expect("upsert");
+
+    let loaded = store.load_sessions().expect("load");
+    assert_eq!(loaded[0].agent_handle(), "durable-handle");
+    assert!(loaded[0].shared_workspace());
+
+    let mut changed = loaded[0].clone();
+    changed.agent_handle = "changed-handle".to_string();
+    let err = store
+        .upsert_session(&changed)
+        .expect_err("handle mutation must fail");
+    assert!(format!("{err:#}").contains("immutable agent handle"));
+}
+
+#[test]
+fn session_creation_normalizes_and_suffixes_local_handle_collisions() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = SessionStore::open(&dir.path().join("create-handle.sqlite3")).expect("open");
+
+    let mut first = fixture_session("first");
+    first.agent_handle = "Same Handle".to_string();
+    store
+        .assign_unique_agent_handle(&mut first)
+        .expect("assign first handle");
+    store.upsert_session(&first).expect("insert first");
+    assert_eq!(first.agent_handle(), "same-handle");
+    store
+        .soft_delete_session(&first.id)
+        .expect("tombstone first");
+
+    let mut second = fixture_session("second");
+    second.agent_handle = "Same Handle".to_string();
+    store
+        .assign_unique_agent_handle(&mut second)
+        .expect("assign collision suffix");
+    assert_eq!(second.agent_handle(), "same-handle-2");
+}
+
+#[test]
+fn load_sessions_fails_closed_on_invalid_handle() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = SessionStore::open(&dir.path().join("invalid.sqlite3")).expect("open");
+    store
+        .upsert_session(&fixture_session("invalid"))
+        .expect("upsert");
+    store
+        .conn()
+        .execute_batch(
+            r#"
+            pragma ignore_check_constraints = on;
+            update agent_sessions set agent_handle = 'Bad/handle' where id = 'invalid';
+            pragma ignore_check_constraints = off;
+            "#,
+        )
+        .expect("inject invalid handle");
+
+    let err = store
+        .load_sessions()
+        .expect_err("invalid handle must fail closed");
+    let message = format!("{err:#}");
+    assert!(message.contains("database corruption"));
+    assert!(message.contains("invalid agent_handle"));
+}
+
+#[test]
+fn load_sessions_fails_closed_on_duplicate_handle() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("duplicate.sqlite3");
+    let conn = rusqlite::Connection::open(&path).expect("open raw database");
+    conn.execute_batch(
+        r#"
+        create table agent_sessions (
+            id text, project_id text, provider text, source_branch text,
+            branch_name text, worktree_path text, agent_handle text,
+            shared_workspace integer, deleted_at text, title text,
+            project_path text, started_providers text, status text,
+            state_json text, session_settings text, sort_order integer,
+            created_at text, updated_at text
+        );
+        insert into agent_sessions values
+            ('a', 'p', 'claude', 'main', 'a', '/tmp/a', 'same', 0, null,
+             null, null, '[]', 'detached', null, null, 0,
+             '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+            ('b', 'p', 'claude', 'main', 'b', '/tmp/b', 'same', 0, null,
+             null, null, '[]', 'detached', null, null, 1,
+             '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+        "#,
+    )
+    .expect("seed duplicate handles");
+    drop(conn);
+
+    let store = SessionStore::open_read_only(&path).expect("open corrupt schema read-only");
+    let err = store
+        .load_sessions()
+        .expect_err("duplicate handles must fail closed");
+    assert!(format!("{err:#}").contains("duplicate agent_handle"));
+}
+
+#[test]
+fn soft_delete_hides_active_session_and_retains_tombstone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = SessionStore::open(&dir.path().join("soft-delete.sqlite3")).expect("open");
+    let mut session = fixture_session("soft-delete");
+    session.project_path = Some("/tmp/project".to_string());
+    store.upsert_session(&session).expect("upsert");
+
+    store
+        .soft_delete_session(&session.id)
+        .expect("soft delete session");
+    let raw_deleted_at: String = store
+        .conn()
+        .query_row(
+            "select deleted_at from agent_sessions where id = ?1",
+            rusqlite::params![session.id],
+            |row| row.get(0),
+        )
+        .expect("read tombstone timestamp");
+    chrono::DateTime::parse_from_rfc3339(&raw_deleted_at).expect("deleted_at is RFC 3339");
+    assert!(store.load_sessions().expect("load active").is_empty());
+    let tombstones = store
+        .load_sessions_including_deleted()
+        .expect("load tombstones");
+    assert_eq!(tombstones.len(), 1);
+    assert_eq!(tombstones[0].id, session.id);
+    assert_eq!(tombstones[0].project_id, session.project_id);
+    assert_eq!(tombstones[0].project_path, session.project_path);
+    assert_eq!(tombstones[0].provider, session.provider);
+    assert_eq!(tombstones[0].agent_handle(), session.agent_handle());
+    assert_eq!(tombstones[0].worktree_path, session.worktree_path);
+    assert!(tombstones[0].deleted_at.is_some());
+
+    store
+        .delete_session(&session.id)
+        .expect("hard delete tombstone");
+    assert!(
+        store
+            .load_sessions_including_deleted()
+            .expect("load after hard delete")
+            .is_empty()
     );
 }
