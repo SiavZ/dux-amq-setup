@@ -1,3 +1,5 @@
+//! Configuration loading, consent-preserving workspace modes, and canonical rendering.
+
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Write;
@@ -37,6 +39,10 @@ pub struct Config {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
     pub defaults: Defaults,
+    /// `None` means this config predates workspace modes and must retain
+    /// worktree isolation. Fresh canonical configs always render this section.
+    #[serde(default)]
+    pub workspace: Option<WorkspaceConfig>,
     pub providers: ProvidersConfig,
     pub terminal: TerminalConfig,
     pub logging: LoggingConfig,
@@ -238,6 +244,49 @@ pub struct ProjectConfig {
     pub name: Option<String>,
     pub default_provider: Option<String>,
     pub commit_prompt: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_workspace_mode_override")]
+    pub workspace_mode: Option<WorkspaceMode>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceMode {
+    #[default]
+    Shared,
+    Worktree,
+}
+
+impl WorkspaceMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::Worktree => "worktree",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkspaceConfig {
+    pub default_mode: WorkspaceMode,
+}
+
+fn deserialize_workspace_mode_override<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<WorkspaceMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    match value.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some("shared") => Ok(Some(WorkspaceMode::Shared)),
+        Some("worktree") => Ok(Some(WorkspaceMode::Worktree)),
+        Some(other) => Err(serde::de::Error::unknown_variant(
+            other,
+            &["shared", "worktree", ""],
+        )),
+    }
 }
 
 fn new_project_id() -> String {
@@ -690,6 +739,7 @@ impl Default for Config {
         Self {
             schema_version: CONFIG_SCHEMA_CURRENT,
             defaults: Defaults::default(),
+            workspace: Some(WorkspaceConfig::default()),
             providers: ProvidersConfig::default(),
             terminal: TerminalConfig::default(),
             logging: LoggingConfig {
@@ -850,6 +900,28 @@ impl Config {
         ProviderKind::from_str(&self.defaults.provider)
     }
 
+    /// Resolve the global mode without erasing the legacy absence sentinel.
+    pub fn default_workspace_mode(&self) -> WorkspaceMode {
+        self.workspace
+            .as_ref()
+            .map(|workspace| workspace.default_mode)
+            .unwrap_or(WorkspaceMode::Worktree)
+    }
+
+    pub fn workspace_mode_for_project(&self, project: &ProjectConfig) -> WorkspaceMode {
+        project
+            .workspace_mode
+            .unwrap_or_else(|| self.default_workspace_mode())
+    }
+
+    pub fn workspace_mode_for_project_id(&self, project_id: &str) -> WorkspaceMode {
+        self.projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .map(|project| self.workspace_mode_for_project(project))
+            .unwrap_or_else(|| self.default_workspace_mode())
+    }
+
     /// Returns the effective commit prompt for a project, checking project-level
     /// override first, then system default, then the hardcoded fallback.
     pub fn commit_prompt_for_project(&self, project_path: &str) -> String {
@@ -948,6 +1020,7 @@ pub fn ensure_config(paths: &DuxPaths) -> Result<Config> {
     let original_version = parsed.schema_version;
     let mut config = migrate_config(parsed);
     config.providers.ensure_defaults();
+    validate_shared_project_paths(&config, paths)?;
 
     // If `migrate_config` advanced `schema_version`, persist the
     // upgraded form so the next launch is a no-op. We rewrite via the
@@ -964,6 +1037,71 @@ pub fn ensure_config(paths: &DuxPaths) -> Result<Config> {
     }
 
     Ok(config)
+}
+
+/// Shared sessions run in the real checkout, so that checkout must never be
+/// inside Dux's state tree. Canonicalization catches symlink aliases; missing
+/// project paths retain their expanded absolute spelling for startup recovery.
+pub fn validate_shared_workspace_path(path: &str, paths: &DuxPaths) -> Result<()> {
+    let expanded = expand_path(path).ok_or_else(|| {
+        anyhow!(
+            "shared workspace path is not a safe absolute path: {}",
+            crate::sanitize::for_terminal(path)
+        )
+    })?;
+    let candidate = canonicalize_allow_missing(Path::new(&expanded));
+    let state_root = paths
+        .root
+        .canonicalize()
+        .unwrap_or_else(|_| paths.root.clone());
+    let worktrees_root = paths
+        .worktrees_root
+        .canonicalize()
+        .unwrap_or_else(|_| paths.worktrees_root.clone());
+    if candidate.starts_with(&state_root) || candidate.starts_with(&worktrees_root) {
+        bail!(
+            "shared workspace {} is inside Dux-managed state {}; choose worktree mode or move the project",
+            crate::sanitize::for_terminal(&candidate.display().to_string()),
+            crate::sanitize::for_terminal(&state_root.display().to_string())
+        );
+    }
+    Ok(())
+}
+
+fn canonicalize_allow_missing(path: &Path) -> PathBuf {
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    while !ancestor.exists() {
+        let Some(name) = ancestor.file_name() else {
+            return path.to_path_buf();
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            return path.to_path_buf();
+        };
+        ancestor = parent;
+    }
+    let mut resolved = ancestor
+        .canonicalize()
+        .unwrap_or_else(|_| ancestor.to_path_buf());
+    for component in suffix.iter().rev() {
+        resolved.push(component);
+    }
+    resolved
+}
+
+fn validate_shared_project_paths(config: &Config, paths: &DuxPaths) -> Result<()> {
+    for project in &config.projects {
+        if config.workspace_mode_for_project(project) == WorkspaceMode::Shared {
+            validate_shared_workspace_path(&project.path, paths).with_context(|| {
+                format!(
+                    "invalid shared workspace for project {}",
+                    crate::sanitize::for_terminal(&project.id)
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1169,6 +1307,18 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             value_fn: |c| FieldValue::Bool(c.defaults.auto_resume_on_start),
         },
         ConfigEntry::Blank,
+        ConfigEntry::Section("workspace"),
+        ConfigEntry::Field {
+            key: "default_mode",
+            comment: Some(CommentSource::Static(
+                "# Workspace used for newly-created agents: \"shared\" runs directly in the\n\
+                 # registered project checkout; \"worktree\" creates an isolated git worktree.\n\
+                 # Existing configs without this entire [workspace] section retain worktree mode.\n\
+                 # Override one project with workspace_mode in its [[projects]] entry.",
+            )),
+            value_fn: |c| FieldValue::Str(c.default_workspace_mode().as_str().to_string()),
+        },
+        ConfigEntry::Blank,
         ConfigEntry::Providers,
         ConfigEntry::Terminal,
         ConfigEntry::Section("logging"),
@@ -1233,7 +1383,7 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
         ConfigEntry::Field {
             key: "branch_sync_interval",
             comment: Some(CommentSource::Static(
-                "# Interval in seconds for syncing git branch names in the background.\n# Keeps dux's session titles in sync if a branch is renamed outside the app.\n# Default 0 (disabled); set to e.g. 30 to enable polling every 30s.",
+                "# Interval in seconds for syncing git branch names in isolated worktrees.\n# Default 0 disables isolated-session polling; shared workspaces still refresh\n# their live HEAD every 45 seconds because their stored branch is not authoritative.",
             )),
             value_fn: |c| FieldValue::U16(c.ui.branch_sync_interval),
         },
@@ -1757,6 +1907,17 @@ pub fn save_config(
     );
     remove_table_key(&mut doc, "defaults", "prompt_for_name");
 
+    // Preserve legacy consent: saving an unrelated setting must not add the
+    // section and silently flip an existing install to shared mode.
+    if let Some(workspace) = &config.workspace {
+        patch_table_str(
+            &mut doc,
+            "workspace",
+            "default_mode",
+            workspace.default_mode.as_str(),
+        );
+    }
+
     // --- [logging] ---
     patch_table_str(&mut doc, "logging", "level", &config.logging.level);
     patch_table_str(&mut doc, "logging", "path", &config.logging.path);
@@ -2100,6 +2261,12 @@ fn patch_projects(doc: &mut DocumentMut, projects: &[ProjectConfig]) {
                 tbl["commit_prompt"] = toml_edit::value(prompt.as_str());
             }
         }
+        tbl["workspace_mode"] = toml_edit::value(
+            project
+                .workspace_mode
+                .map(WorkspaceMode::as_str)
+                .unwrap_or(""),
+        );
         arr.push(tbl);
     }
     doc["projects"] = Item::ArrayOfTables(arr);
@@ -2248,11 +2415,16 @@ fn render_projects(out: &mut String, projects: &[ProjectConfig]) {
     );
     out.push_str("# default_provider can override the global default for one project.\n");
     out.push_str(
+        "# workspace_mode may be \"shared\" or \"worktree\"; omit it or leave it empty to\n\
+         # inherit [workspace].default_mode. Shared mode uses the real project checkout.\n",
+    );
+    out.push_str(
         "# Paths support environment variables ($HOME, ${USER}) and tilde (~) expansion.\n",
     );
     if projects.is_empty() {
         out.push_str("# [[projects]]\n");
         out.push_str("# path = \"$HOME/projects/your-repo\"\n");
+        out.push_str("# workspace_mode = \"\"\n");
     } else {
         for project in projects {
             out.push_str("[[projects]]\n");
@@ -2272,6 +2444,14 @@ fn render_projects(out: &mut String, projects: &[ProjectConfig]) {
                 let escaped = escape_toml_multiline(prompt);
                 let _ = writeln!(out, "commit_prompt = \"\"\"\n{escaped}\"\"\"");
             }
+            let _ = writeln!(
+                out,
+                "workspace_mode = \"{}\"",
+                project
+                    .workspace_mode
+                    .map(WorkspaceMode::as_str)
+                    .unwrap_or("")
+            );
             out.push('\n');
         }
     }
@@ -2796,6 +2976,16 @@ fn is_valid_var_name(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn test_paths(root: &Path) -> DuxPaths {
+        DuxPaths {
+            root: root.to_path_buf(),
+            config_path: root.join("config.toml"),
+            sessions_db_path: root.join("sessions.sqlite3"),
+            worktrees_root: root.join("worktrees"),
+            lock_path: root.join("dux.lock"),
+        }
+    }
+
     /// Render config using default keybinding labels (for tests that don't need custom bindings).
     fn render_config_default(config: &Config) -> String {
         let bindings =
@@ -2833,6 +3023,123 @@ mod tests {
         assert!(rendered.contains("quit = "));
         assert!(rendered.contains("commit_prompt = \"\"\""));
         assert!(rendered.contains("Conventional Commits"));
+        assert!(rendered.contains("[workspace]"));
+        assert!(rendered.contains("default_mode = \"shared\""));
+    }
+
+    #[test]
+    fn workspace_mode_absent_section_preserves_worktree_consent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(dir.path());
+        fs::write(&paths.config_path, "schema_version = 1\n").expect("legacy config");
+        let config = ensure_config(&paths).expect("load legacy config");
+        assert!(config.workspace.is_none());
+        assert_eq!(config.default_workspace_mode(), WorkspaceMode::Worktree);
+        assert!(
+            !fs::read_to_string(&paths.config_path)
+                .unwrap()
+                .contains("[workspace]")
+        );
+    }
+
+    #[test]
+    fn workspace_mode_explicit_shared_and_worktree_resolve_exactly() {
+        for (value, expected) in [
+            ("shared", WorkspaceMode::Shared),
+            ("worktree", WorkspaceMode::Worktree),
+        ] {
+            let config: Config = toml::from_str(&format!(
+                "schema_version = 1\n[workspace]\ndefault_mode = \"{value}\"\n"
+            ))
+            .expect("explicit workspace config");
+            assert_eq!(config.default_workspace_mode(), expected);
+        }
+    }
+
+    #[test]
+    fn freshly_created_config_renders_and_loads_shared_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(dir.path());
+        let config = ensure_config(&paths).expect("fresh config");
+
+        assert_eq!(config.default_workspace_mode(), WorkspaceMode::Shared);
+        let written = fs::read_to_string(&paths.config_path).expect("fresh config text");
+        assert!(written.contains("[workspace]"));
+        assert!(written.contains("default_mode = \"shared\""));
+    }
+
+    #[test]
+    fn project_workspace_override_inherits_or_overrides_global() {
+        let mut config = Config::default();
+        let mut project = ProjectConfig {
+            id: "project".to_string(),
+            path: "/tmp/project".to_string(),
+            name: None,
+            default_provider: None,
+            commit_prompt: None,
+            workspace_mode: None,
+        };
+        assert_eq!(
+            config.workspace_mode_for_project(&project),
+            WorkspaceMode::Shared
+        );
+        project.workspace_mode = Some(WorkspaceMode::Worktree);
+        assert_eq!(
+            config.workspace_mode_for_project(&project),
+            WorkspaceMode::Worktree
+        );
+        config.workspace = None;
+        project.workspace_mode = None;
+        assert_eq!(
+            config.workspace_mode_for_project(&project),
+            WorkspaceMode::Worktree
+        );
+
+        let parsed: Config = toml::from_str(
+            "[workspace]\ndefault_mode = \"shared\"\n\n[[projects]]\npath = \"/tmp/project\"\nworkspace_mode = \"\"\n",
+        )
+        .expect("empty project mode");
+        assert_eq!(
+            parsed.workspace_mode_for_project(&parsed.projects[0]),
+            WorkspaceMode::Shared
+        );
+    }
+
+    #[test]
+    fn config_load_rejects_shared_project_inside_managed_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(dir.path());
+        paths.ensure_dirs().expect("state dirs");
+        let project = paths.worktrees_root.join("nested-project");
+        fs::create_dir_all(&project).expect("project dir");
+        fs::write(
+            &paths.config_path,
+            format!(
+                "schema_version = 1\n[workspace]\ndefault_mode = \"shared\"\n\n[[projects]]\nid = \"p\"\npath = \"{}\"\n",
+                escape_toml_string(&project.to_string_lossy())
+            ),
+        )
+        .expect("config");
+
+        let err = ensure_config(&paths).expect_err("managed shared path must fail");
+        assert!(format!("{err:#}").contains("inside Dux-managed state"));
+    }
+
+    #[test]
+    fn shared_eligibility_resolves_existing_symlink_ancestor_for_missing_child() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(&dir.path().join("state"));
+        paths.ensure_dirs().expect("state dirs");
+        let alias = dir.path().join("state-alias");
+        std::os::unix::fs::symlink(&paths.root, &alias).expect("state alias");
+
+        let err = validate_shared_workspace_path(
+            &alias.join("not-created-yet").to_string_lossy(),
+            &paths,
+        )
+        .expect_err("symlinked managed child must fail");
+
+        assert!(format!("{err:#}").contains("inside Dux-managed state"));
     }
 
     #[test]
@@ -2870,6 +3177,7 @@ mod tests {
             name: Some(r#"te"st"#.to_string()),
             default_provider: None,
             commit_prompt: None,
+            workspace_mode: None,
         });
         let rendered = render_config_default(&config);
         let parsed: Config = toml::from_str(&rendered).expect("should parse back");
@@ -2886,6 +3194,7 @@ mod tests {
             name: Some("name\twith\ttabs".to_string()),
             default_provider: None,
             commit_prompt: None,
+            workspace_mode: None,
         });
         let rendered = render_config_default(&config);
         let parsed: Config = toml::from_str(&rendered).expect("should parse back");
@@ -3456,6 +3765,7 @@ oneshot_output = "stdout"
             name: Some("test".to_string()),
             default_provider: None,
             commit_prompt: Some("custom project prompt".to_string()),
+            workspace_mode: None,
         });
 
         // Project override takes precedence.
