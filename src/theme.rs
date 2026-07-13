@@ -605,16 +605,16 @@ impl Theme {
     /// `Live` shows as a filled dot in the active colour; `Spawning`
     /// borrows the same active colour (the user just hit "create"
     /// and is staring at the spawn flicker, so showing it as fully
-    /// active is the right cue); `Detached` and `Created` show as a
-    /// half-circle in the detached colour; `Exited` shows as an open
-    /// circle.
+    /// active is the right cue); `Detached`, `Created`, and `Retryable`
+    /// show as a half-circle in the detached colour; `Exited` shows as
+    /// an open circle.
     pub fn session_dot(&self, state: &crate::model::SessionState) -> (&'static str, Color) {
         use crate::model::SessionState;
         match state {
             SessionState::Live { .. } | SessionState::Spawning { .. } => ("●", self.session_active),
-            SessionState::Created { .. } | SessionState::Detached { .. } => {
-                ("◐", self.session_detached)
-            }
+            SessionState::Created { .. }
+            | SessionState::Retryable { .. }
+            | SessionState::Detached { .. } => ("◐", self.session_detached),
             SessionState::Exited { .. } => ("○", self.session_exited),
         }
     }

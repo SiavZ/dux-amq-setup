@@ -1725,11 +1725,9 @@ impl App {
             .collect();
         for (id, exists) in ids {
             if exists {
-                // Sessions loaded from storage land in `Created` (no
-                // PTY can survive across restarts). Leave that as-is
-                // unless auto-resume picks them up — the fresh
-                // `created_at` was already stamped in
-                // `PersistedSessionState::from`. No transition needed.
+                // No PTY survives restart. Persisted spawns load as
+                // Retryable and are deliberately excluded from auto-resume;
+                // normal detached sessions load as Created and may resume.
                 let _ = id;
             } else {
                 self.mark_session_exited(&id, None);
@@ -1739,6 +1737,7 @@ impl App {
 
     /// If `defaults.auto_resume_on_start` is enabled, eagerly reconnect every
     /// detached session so all panes are live as soon as dux opens. Skips
+    /// interrupted spawns, which remain visible for an explicit retry, and
     /// sessions whose worktree no longer exists or whose worktree has not
     /// been touched within `[auto_resume].stale_days` days. Spawns are
     /// fanned out across worker threads with at most
@@ -1763,6 +1762,7 @@ impl App {
             .iter()
             .filter(|s| Path::new(&s.worktree_path).exists())
             .filter(|s| !s.state.has_pty())
+            .filter(|s| !s.state.is_retryable())
             .filter(|s| {
                 let stale = crate::auto_resume::is_stale(Path::new(&s.worktree_path), stale_days);
                 if stale {
@@ -2949,6 +2949,12 @@ impl App {
                 SessionState::Spawning { since: detached_at },
             ),
             SessionState::Spawning { since } => (None, SessionState::Spawning { since }),
+            SessionState::Retryable { interrupted_at } => (
+                None,
+                SessionState::Spawning {
+                    since: interrupted_at,
+                },
+            ),
             SessionState::Created { created_at } => {
                 (None, SessionState::Spawning { since: created_at })
             }

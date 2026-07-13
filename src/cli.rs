@@ -961,6 +961,18 @@ fn collect_sessions_snapshot(paths: &DuxPaths) -> SessionsSnapshot {
     // bails on failure; treat that as the authoritative result.
     match SessionStore::open_read_only(&paths.sessions_db_path) {
         Ok(store) => {
+            // A read-only handle can't migrate. If the DB predates this build's
+            // schema, `load_sessions` fails on the new columns; report the
+            // staleness instead of silently showing zero sessions.
+            if let Ok(version) = store.schema_version()
+                && version < SessionStore::CURRENT_SCHEMA_VERSION
+            {
+                eprintln!(
+                    "note: session database is at schema v{version} (this build expects v{}); \
+                     launch dux once to migrate before reading a session snapshot",
+                    SessionStore::CURRENT_SCHEMA_VERSION
+                );
+            }
             let sessions = store.load_sessions().unwrap_or_default();
             let mut active = 0usize;
             let mut detached = 0usize;
@@ -973,6 +985,7 @@ fn collect_sessions_snapshot(paths: &DuxPaths) -> SessionsSnapshot {
                     SessionState::Live { .. } => active += 1,
                     SessionState::Created { .. }
                     | SessionState::Spawning { .. }
+                    | SessionState::Retryable { .. }
                     | SessionState::Detached { .. } => detached += 1,
                     SessionState::Exited { .. } => exited += 1,
                 }
@@ -1312,6 +1325,9 @@ mod tests {
             source_branch: "main".to_string(),
             branch_name: format!("b-{id}"),
             worktree_path: wt.to_string(),
+            agent_handle: crate::model::normalize_agent_handle(id),
+            shared_workspace: false,
+            deleted_at: None,
             title: None,
             started_providers: Vec::new(),
             state,
@@ -1426,6 +1442,9 @@ mod tests {
                     source_branch: "main".to_string(),
                     branch_name: format!("branch-{i:02}"),
                     worktree_path: missing.to_string_lossy().to_string(),
+                    agent_handle: id.clone(),
+                    shared_workspace: false,
+                    deleted_at: None,
                     title: None,
                     started_providers: Vec::new(),
                     state: SessionState::Created { created_at: now },
@@ -1529,6 +1548,9 @@ mod tests {
                     source_branch: "main".to_string(),
                     branch_name: format!("branch-{id}"),
                     worktree_path: worktree.to_string_lossy().to_string(),
+                    agent_handle: crate::model::normalize_agent_handle(id),
+                    shared_workspace: false,
+                    deleted_at: None,
                     title: None,
                     started_providers: Vec::new(),
                     state: SessionState::Created { created_at: now },
