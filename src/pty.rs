@@ -1,3 +1,5 @@
+//! PTY process spawning, per-session environments, terminal emulation, and snapshots.
+
 use std::env;
 use std::ffi::OsStr;
 use std::io::Write;
@@ -137,8 +139,8 @@ pub struct PerSessionEnv {
 impl PerSessionEnv {
     /// Empty per-session env. Equivalent to `Default::default()` but
     /// reads better at call sites that need to be explicit about
-    /// "this spawn has no per-session settings" (tests, companion
-    /// terminals).
+    /// "this spawn has no per-session settings" (tests and standalone
+    /// PTYs).
     pub fn empty() -> Self {
         Self::default()
     }
@@ -147,8 +149,9 @@ impl PerSessionEnv {
 impl PtyClient {
     /// Spawn a CLI command in a new PTY with the given size and no
     /// per-session env vars. Convenience for paths that don't have a
-    /// `SessionSettings` (tests, companion terminals); session-bound
-    /// spawns must use [`Self::spawn_with_env`].
+    /// `SessionSettings`, including integration tests. Session-bound
+    /// spawns, including companion terminals, use [`Self::spawn_with_env`].
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn spawn(
         command: &str,
         args: &[String],

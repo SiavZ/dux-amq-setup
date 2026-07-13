@@ -1,4 +1,4 @@
-//! Session creation, PTY launch/reconnect, and deletion lifecycle.
+//! Session creation, identity-aware PTY launch/reconnect, and deletion lifecycle.
 
 use super::*;
 use crate::editor;
@@ -586,13 +586,16 @@ impl App {
             cols,
             rows,
         ));
-        PtyClient::spawn(
+        let mut per_session_env = crate::pty::PerSessionEnv::empty();
+        crate::peer::append_session_env(&mut per_session_env, session, &self.store_id);
+        PtyClient::spawn_with_env(
             &self.config.terminal.command,
             &self.config.terminal.args,
             Path::new(&session.worktree_path),
             rows,
             cols,
             self.config.ui.agent_scrollback_lines,
+            per_session_env,
         )
     }
 
@@ -2634,6 +2637,42 @@ mod tests {
             current_branch: "main".to_string(),
             path_missing: false,
             meta_loaded: true,
+        }
+    }
+
+    #[test]
+    fn companion_terminal_receives_session_identity_env() {
+        let dir = tempdir().expect("tempdir");
+        let mut session = make_session("session-a", "codex", &dir.path().to_string_lossy());
+        session.agent_handle = "stable-handle".to_string();
+        let mut app = test_app_with_sessions(vec![session.clone()], Vec::new());
+        app.config.terminal.command = "/bin/sh".to_string();
+        app.config.terminal.args = vec![
+            "-c".to_string(),
+            "printf '%s|%s|%s\\n' \"$DUX_SESSION_ID\" \"$DUX_STORE_ID\" \"$DUX_AMQ_HANDLE\"; sleep 1"
+                .to_string(),
+        ];
+
+        let client = app
+            .spawn_companion_terminal_for_session(&session)
+            .expect("spawn companion terminal");
+        let expected = format!("session-a|{}|stable-handle", app.store_id);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let rendered: String = client
+                .snapshot()
+                .cells
+                .iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect();
+            if rendered.contains(&expected) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "companion terminal did not receive identity env; got: {rendered:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 
