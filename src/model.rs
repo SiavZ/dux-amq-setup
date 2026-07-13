@@ -1,3 +1,5 @@
+//! Core runtime and persisted models, including immutable session identity.
+
 use std::collections::HashMap;
 
 use anyhow::{Result, anyhow};
@@ -129,6 +131,9 @@ pub enum SessionState {
     Spawning {
         since: DateTime<Utc>,
     },
+    Retryable {
+        interrupted_at: DateTime<Utc>,
+    },
     Live {
         pty_handle: PtyHandle,
         spawned_at: DateTime<Utc>,
@@ -159,6 +164,7 @@ impl SessionState {
         match self {
             Self::Created { .. } => "created",
             Self::Spawning { .. } => "spawning",
+            Self::Retryable { .. } => "retryable",
             Self::Live { .. } => "live",
             Self::Detached { .. } => "detached",
             Self::Exited { .. } => "exited",
@@ -166,7 +172,7 @@ impl SessionState {
     }
 
     /// Returns the embedded [`PtyHandle`], if any. `Live` and `Detached`
-    /// own a handle; the other three variants do not.
+    /// own a handle; the other variants do not.
     pub fn pty_handle(&self) -> Option<&PtyHandle> {
         match self {
             Self::Live { pty_handle, .. } | Self::Detached { pty_handle, .. } => Some(pty_handle),
@@ -198,11 +204,17 @@ impl SessionState {
         matches!(self, Self::Exited { .. })
     }
 
+    /// True when startup recovered a persisted spawn that had no surviving PTY.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Retryable { .. })
+    }
+
     /// Returns `true` if `target` is a legal next state from `self`.
     ///
     /// The legal transitions are deliberately narrow:
     ///
     /// - `Created -> Spawning`
+    /// - `Retryable -> Spawning` (manual retry after an interrupted spawn)
     /// - `Spawning -> Live | Exited` (success or spawn failure)
     /// - `Live -> Detached | Exited`
     /// - `Detached -> Live | Exited` (reattach or child exit while detached)
@@ -219,13 +231,15 @@ impl SessionState {
                 | (Self::Live { .. }, "exited")
                 | (Self::Detached { .. }, "live")
                 | (Self::Detached { .. }, "exited")
+                | (Self::Retryable { .. }, "spawning")
                 | (Self::Exited { .. }, "spawning")
         )
     }
 
     /// Apply a transition that does **not** create or destroy a
     /// [`PtyHandle`]: `Created -> Spawning`, `Live -> Exited`,
-    /// `Detached -> Exited`, `Spawning -> Exited`, `Exited -> Spawning`.
+    /// `Detached -> Exited`, `Spawning -> Exited`, and
+    /// `Created | Retryable | Exited -> Spawning`.
     /// Use the dedicated typed helpers ([`SessionState::on_spawn_succeeded`],
     /// [`SessionState::detach`], [`SessionState::reattach`]) for the
     /// transitions that move a PTY in or out.
@@ -241,7 +255,7 @@ impl SessionState {
             ));
         }
         let next = match (self, target) {
-            (Self::Created { .. } | Self::Exited { .. }, "spawning") => {
+            (Self::Created { .. } | Self::Retryable { .. } | Self::Exited { .. }, "spawning") => {
                 Self::Spawning { since: now }
             }
             (_, "exited") => Self::Exited {
@@ -360,6 +374,9 @@ pub enum PersistedSessionState {
     Spawning {
         since: DateTime<Utc>,
     },
+    Retryable {
+        interrupted_at: DateTime<Utc>,
+    },
     Detached {
         detached_at: DateTime<Utc>,
     },
@@ -376,6 +393,9 @@ impl From<&SessionState> for PersistedSessionState {
                 created_at: *created_at,
             },
             SessionState::Spawning { since } => Self::Spawning { since: *since },
+            SessionState::Retryable { interrupted_at } => Self::Retryable {
+                interrupted_at: *interrupted_at,
+            },
             // Live folds into Detached on persist — see enum doc.
             SessionState::Live { last_active_at, .. } => Self::Detached {
                 detached_at: *last_active_at,
@@ -398,7 +418,12 @@ impl From<PersistedSessionState> for SessionState {
     fn from(persisted: PersistedSessionState) -> Self {
         match persisted {
             PersistedSessionState::Created { created_at } => Self::Created { created_at },
-            PersistedSessionState::Spawning { since } => Self::Spawning { since },
+            PersistedSessionState::Spawning { since } => Self::Retryable {
+                interrupted_at: since,
+            },
+            PersistedSessionState::Retryable { interrupted_at } => {
+                Self::Retryable { interrupted_at }
+            }
             // A persisted `Detached` row had a PTY at write time but
             // cannot have one after a restart — collapse to `Created`
             // so the typestate invariant "Detached has a PtyHandle"
@@ -697,6 +722,37 @@ impl SessionSettings {
 /// "PtyHandle has at most one owner" structurally enforced. Callers
 /// that need the PTY must borrow the canonical session out of
 /// `App::sessions` rather than holding a clone.
+pub const AGENT_HANDLE_MAX_LEN: usize = 64;
+
+/// Normalize a newly-created identity without ever rewriting a stored handle.
+pub fn normalize_agent_handle(candidate: &str) -> String {
+    crate::sanitize::amq_handle(candidate)
+        .chars()
+        .take(AGENT_HANDLE_MAX_LEN)
+        .collect()
+}
+
+/// Derive the legacy basename-first identity used by migration and creation.
+pub fn derive_agent_handle(worktree_path: &str, branch_name: &str, id: &str) -> String {
+    let basename = std::path::Path::new(worktree_path)
+        .file_name()
+        .and_then(|part| part.to_str());
+    basename
+        .into_iter()
+        .chain([branch_name, id])
+        .map(normalize_agent_handle)
+        .find(|handle| !handle.is_empty())
+        .unwrap_or_else(|| "agent".to_string())
+}
+
+/// Validate the exact persisted handle alphabet and length contract.
+pub fn is_valid_agent_handle(handle: &str) -> bool {
+    (1..=AGENT_HANDLE_MAX_LEN).contains(&handle.len())
+        && handle
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte))
+}
+
 #[derive(Debug)]
 pub struct AgentSession {
     pub id: String,
@@ -706,6 +762,10 @@ pub struct AgentSession {
     pub source_branch: String,
     pub branch_name: String,
     pub worktree_path: String,
+    /// Immutable after the first successful insert.
+    pub agent_handle: String,
+    pub shared_workspace: bool,
+    pub deleted_at: Option<DateTime<Utc>>,
     pub title: Option<String>,
     pub started_providers: Vec<String>,
     /// Authoritative session lifecycle state. Owns the PTY when in
@@ -723,6 +783,14 @@ pub struct AgentSession {
 }
 
 impl AgentSession {
+    pub fn agent_handle(&self) -> &str {
+        &self.agent_handle
+    }
+
+    pub fn shared_workspace(&self) -> bool {
+        self.shared_workspace
+    }
+
     pub fn has_started_provider(&self, provider: &ProviderKind) -> bool {
         self.started_providers
             .iter()
@@ -741,15 +809,17 @@ impl AgentSession {
     /// the [`Clone`] impl, and directly in places where the intent
     /// "give me a metadata-only copy" should be obvious to the reader.
     /// The resulting session's `state` mirrors the persisted shape:
-    /// `Created`, `Spawning`, or `Exited` carry over verbatim; `Live`
-    /// and `Detached` collapse to `Created` (their PTY cannot be
-    /// duplicated).
+    /// PTY-less variants carry over verbatim; `Live` and `Detached`
+    /// collapse to `Created` (their PTY cannot be duplicated).
     pub fn metadata_snapshot(&self) -> AgentSession {
         let state = match &self.state {
             SessionState::Created { created_at } => SessionState::Created {
                 created_at: *created_at,
             },
             SessionState::Spawning { since } => SessionState::Spawning { since: *since },
+            SessionState::Retryable { interrupted_at } => SessionState::Retryable {
+                interrupted_at: *interrupted_at,
+            },
             SessionState::Live { last_active_at, .. } => SessionState::Created {
                 created_at: *last_active_at,
             },
@@ -772,6 +842,9 @@ impl AgentSession {
             source_branch: self.source_branch.clone(),
             branch_name: self.branch_name.clone(),
             worktree_path: self.worktree_path.clone(),
+            agent_handle: self.agent_handle.clone(),
+            shared_workspace: self.shared_workspace,
+            deleted_at: self.deleted_at,
             title: self.title.clone(),
             started_providers: self.started_providers.clone(),
             state,
