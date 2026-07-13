@@ -156,7 +156,11 @@ workspace_mode = "worktree" # optional per-project override; "" inherits
 
 Consent is preserved for existing installations: if an existing config has no `[workspace]` section at all, dux continues creating isolated worktrees. Regenerating a fresh config writes the shared default explicitly.
 
-Shared sessions use the project's canonical path, never switch the real checkout during registration, never auto-resume at startup, and reconnect with a fresh provider process. Their branch and PR status follow the checkout's live `HEAD`; detached `HEAD` skips PR discovery. A shared project cannot live inside `DUX_HOME` or its managed worktree tree. Multiple shared agents edit the same files, so use an isolated Fork whenever their changes need to diverge.
+Shared sessions use the project's canonical path, never switch the real checkout during registration, never auto-resume at startup, and reconnect with a fresh provider process. Their branch and PR status follow the checkout's live `HEAD`; detached `HEAD` skips PR discovery. A shared project cannot live inside `DUX_HOME` or its managed worktree tree.
+
+Starting a second live shared agent requires confirmation because both agents share the checkout's files, index, staging area, commits, branch switches, and discard operations. While this Dux store can see multiple live writers, the header shows a persistent `CURRENT STORE ONLY` warning. That warning cannot detect agents launched under another `DUX_HOME` or unmanaged processes using the checkout, so its absence is not proof of exclusive access. Use an isolated Fork whenever changes need to diverge.
+
+The `prune-orphan-worktrees` command-palette action is an opt-in, never-automatic cleanup. It lists only Git-registered linked worktrees canonically inside Dux's worktree root that have no active session row or soft-deleted tombstone, excludes the main checkout and unrelated directories, and reports dirty/untracked state. Every item requires separate confirmation; its branch is preserved unless branch deletion is explicitly selected for that item. Changing workspace mode does not orphan or remove existing worktree sessions.
 
 ### Peer Routing
 

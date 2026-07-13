@@ -695,14 +695,49 @@ explicit isolation boundary and always creates a worktree.
 
 **Residual risk.** Running a provider in a real checkout grants it the same file
 permissions as the operator and is the purpose of shared mode; Dux is not a
-sandbox. Multiple same-UID providers or unmanaged processes can overwrite one
-another's edits, and another `DUX_HOME` cannot be observed reliably. Operators
-who need independent changes must use worktree mode or Fork.
+sandbox. Shared writers use one index and staging area: one writer can stage,
+unstage, commit, discard, or overwrite another's changes and can switch the
+branch beneath every sibling. Another `DUX_HOME` and unmanaged same-UID
+processes cannot be observed reliably. Operators who need independent changes
+must use worktree mode or Fork.
 
 **Detection.** The create modal and completion status identify shared sessions,
-the database retains `shared_workspace = 1`, and eligibility failures are shown
-before provider launch. Branch and PR status are derived from the checkout's
-live HEAD so Dux does not present a stale per-session branch as authoritative.
+and starting a second writer visible to the current store requires an explicit
+confirmation. A persistent header warning is derived from live session state
+on every render and is deliberately labeled `CURRENT STORE ONLY`; it does not
+claim visibility into other stores or unmanaged processes. The database retains
+`shared_workspace = 1`, and eligibility failures are shown before provider
+launch. Branch and PR status are derived from the checkout's live HEAD so Dux
+does not present a stale per-session branch as authoritative.
+
+---
+
+## T17 — Orphan cleaner removes user work
+
+**Attack scenario.** A broad directory scan could mistake a crash residue,
+user-created worktree, main checkout, or worktree still represented by a
+soft-deleted session for an orphan and remove uncommitted work or its branch.
+
+**Mitigation in code.** Cleanup is a command-palette action and never runs at
+startup or when workspace mode changes. Before offering any item it loads the
+complete config and protected-project inventory, durable store identity, all
+session rows including tombstones, and every registered project's
+machine-readable `git worktree list`; any failure aborts before removal. A
+candidate must be a Git-registered non-main worktree whose canonical path is a
+strict descendant of `worktrees_root` and has no matching row. Dirty/untracked
+state is displayed, every item has its own confirmation, and branch deletion is
+off by default. Execution revalidates the complete inventory and calls the
+central protected-workspace guard before `git worktree remove`.
+
+**Residual risk.** Under the single-user, single-UID VM model, the operator or a
+same-UID process can change a worktree after inventory and before Git removes
+it. The per-item warning reports the last inventoried dirty state; operators
+must review it before confirmation.
+
+**Detection.** Inventory and fail-closed errors use the
+`dux::orphan_worktrees` tracing target. The modal displays the exact sanitized
+path, branch, and dirty status and returns to the remaining candidate list after
+each removal.
 
 ---
 
