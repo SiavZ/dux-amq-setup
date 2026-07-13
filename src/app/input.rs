@@ -1,3 +1,5 @@
+//! Keyboard and mouse handling for mode-aware project and session workflows.
+
 use super::components::{ButtonPressedTarget, PressedButton};
 use super::*;
 use chrono::Local;
@@ -2414,19 +2416,25 @@ impl App {
         if let PromptState::ConfirmDeleteAgent {
             focus,
             delete_worktree,
+            shared_workspace,
             worktree_shared,
             ..
         } = &mut self.ui.prompt
         {
-            // When the worktree is shared with another session it is always
-            // preserved, so the checkbox is hidden and the focus cycle skips
-            // over it (Cancel ↔ Delete only).
-            let shared = *worktree_shared;
+            // Protected workspaces never expose the destructive checkbox, so
+            // the focus cycle skips over it (Cancel ↔ Delete only).
+            let preserve_worktree = *shared_workspace || *worktree_shared;
+            if preserve_worktree {
+                *delete_worktree = false;
+                if *focus == DeleteAgentFocus::Checkbox {
+                    *focus = DeleteAgentFocus::Cancel;
+                }
+            }
             match self.bindings.lookup(&key, BindingScope::Dialog) {
                 Some(Action::CloseOverlay) => self.ui.prompt = PromptState::None,
                 Some(Action::ToggleSelection) => {
                     let reverse = matches!(key.code, KeyCode::BackTab);
-                    *focus = match (*focus, shared, reverse) {
+                    *focus = match (*focus, preserve_worktree, reverse) {
                         (DeleteAgentFocus::Cancel, false, false) => DeleteAgentFocus::Delete,
                         (DeleteAgentFocus::Delete, false, false) => DeleteAgentFocus::Checkbox,
                         (DeleteAgentFocus::Checkbox, _, false) => DeleteAgentFocus::Cancel,
@@ -2631,6 +2639,15 @@ impl App {
             return self.handle_name_new_agent_key(key);
         }
 
+        let branch_rename_allowed = match &self.ui.prompt {
+            PromptState::RenameSession { session_id, .. } => self
+                .git
+                .sessions
+                .iter()
+                .find(|session| session.id == *session_id)
+                .is_none_or(|session| !session.shared_workspace()),
+            _ => true,
+        };
         if let PromptState::RenameSession {
             session_id,
             input,
@@ -2656,7 +2673,7 @@ impl App {
                     self.ui.prompt = PromptState::None;
                     self.apply_rename_session(&id, new_name, also_rename_branch);
                 }
-                Some(Action::ToggleSelection) => {
+                Some(Action::ToggleSelection) if branch_rename_allowed => {
                     *rename_branch = !*rename_branch;
                 }
                 _ => {
@@ -2982,16 +2999,30 @@ impl App {
     }
 
     fn submit_name_new_agent_prompt(&mut self) -> Result<bool> {
-        let name = if let PromptState::NameNewAgent { input, .. } = &self.ui.prompt {
-            input.text.trim().to_string()
-        } else {
-            return Ok(false);
-        };
+        let (name, shared_workspace) =
+            if let PromptState::NameNewAgent { input, request, .. } = &self.ui.prompt {
+                (
+                    input.text.trim().to_string(),
+                    matches!(request.as_ref(), CreateAgentRequest::SharedWorkspace { .. }),
+                )
+            } else {
+                return Ok(false);
+            };
         if name.is_empty() {
-            self.set_error("Agent name cannot be empty.");
+            self.set_error(if shared_workspace {
+                "Agent handle cannot be empty."
+            } else {
+                "Agent name cannot be empty."
+            });
             return Ok(false);
         }
-        if !git::is_valid_agent_name(&name) {
+        if shared_workspace && !crate::model::is_valid_agent_handle(&name) {
+            self.set_error(
+                "Agent handle must be 1–64 lowercase letters, digits, dashes, or underscores.",
+            );
+            return Ok(false);
+        }
+        if !shared_workspace && !git::is_valid_agent_name(&name) {
             self.set_error(
                 "Agent name may only contain letters, digits, dashes, underscores, \
                  or slashes. It cannot start with \"-\" or \"/\", end with \"/\", \
@@ -3019,6 +3050,7 @@ impl App {
             .or_else(|| provider_options.first().cloned())
             .unwrap_or_else(|| match &request {
                 CreateAgentRequest::NewProject { provider, .. }
+                | CreateAgentRequest::SharedWorkspace { provider, .. }
                 | CreateAgentRequest::ForkSession { provider, .. } => provider.clone(),
             });
         let trimmed_prompt = draft_system_prompt.text.trim_end().to_string();
@@ -3045,6 +3077,16 @@ impl App {
                 *request_provider = provider.clone();
                 *settings = draft_settings;
             }
+            CreateAgentRequest::SharedWorkspace {
+                agent_handle,
+                provider: request_provider,
+                settings,
+                ..
+            } => {
+                *agent_handle = Some(name.clone());
+                *request_provider = provider.clone();
+                *settings = draft_settings;
+            }
         }
 
         if let CreateAgentRequest::NewProject { ref project, .. } = request {
@@ -3067,6 +3109,16 @@ impl App {
                 format!(
                     "Creating a new {provider} agent worktree \"{name}\" for project \"{}\" and launching a fresh session...",
                     project.name,
+                    provider = provider.as_str()
+                )
+            }
+            CreateAgentRequest::SharedWorkspace {
+                project, provider, ..
+            } => {
+                let project_name = crate::sanitize::for_terminal(&project.name);
+                format!(
+                    "Creating shared {provider} agent \"{name}\" in project \"{}\" and launching a fresh session...",
+                    project_name,
                     provider = provider.as_str()
                 )
             }
@@ -4425,12 +4477,13 @@ impl App {
     }
 
     fn resolve_confirm_delete_agent(&mut self, confirm: bool) -> bool {
-        let (session_id, delete_worktree) = match &self.ui.prompt {
+        let (session_id, delete_worktree, shared_workspace) = match &self.ui.prompt {
             PromptState::ConfirmDeleteAgent {
                 session_id,
                 delete_worktree,
+                shared_workspace,
                 ..
-            } => (session_id.clone(), *delete_worktree),
+            } => (session_id.clone(), *delete_worktree, *shared_workspace),
             _ => return false,
         };
         self.ui.prompt = PromptState::None;
@@ -4438,7 +4491,7 @@ impl App {
             // Dispatches git work to a worker when needed, so the UI stays
             // responsive. Errors arrive asynchronously via
             // `WorkerEvent::WorktreeRemoveCompleted`.
-            self.begin_delete_session(&session_id, delete_worktree);
+            self.begin_delete_session(&session_id, delete_worktree && !shared_workspace);
         }
         false
     }
@@ -4680,9 +4733,11 @@ impl App {
                 if let PromptState::ConfirmDeleteAgent {
                     delete_worktree,
                     focus,
+                    shared_workspace,
                     worktree_shared,
                     ..
                 } = &mut self.ui.prompt
+                    && !*shared_workspace
                     && !*worktree_shared
                 {
                     *delete_worktree = !*delete_worktree;
@@ -4690,7 +4745,18 @@ impl App {
                 }
             }
             OverlayCheckboxId::RenameSessionBranch => {
-                if let PromptState::RenameSession { rename_branch, .. } = &mut self.ui.prompt {
+                let allowed = match &self.ui.prompt {
+                    PromptState::RenameSession { session_id, .. } => self
+                        .git
+                        .sessions
+                        .iter()
+                        .find(|session| session.id == *session_id)
+                        .is_none_or(|session| !session.shared_workspace()),
+                    _ => false,
+                };
+                if allowed
+                    && let PromptState::RenameSession { rename_branch, .. } = &mut self.ui.prompt
+                {
                     *rename_branch = !*rename_branch;
                 }
             }
@@ -5872,7 +5938,7 @@ mod tests {
         SessionSettingsPrompt, SettingsFocus, TextInput, UiState, WatchRuleSummary, WorkerEvent,
     };
     use crate::clipboard::Clipboard;
-    use crate::config::{Config, DuxPaths, ProjectConfig};
+    use crate::config::{Config, DuxPaths, ProjectConfig, WorkspaceMode};
     use crate::editor::{DetectedEditor, EditorKind};
     use crate::keybindings::{Action, BINDING_DEFS, BindingScope, RuntimeBindings};
     use crate::model::{
@@ -6048,15 +6114,20 @@ mod tests {
             commit_in_flight: false,
             staged_diff_in_flight: false,
             add_project_in_flight: false,
+            reconnect_validations_in_flight: std::collections::HashSet::new(),
             resume_fallback_candidates: std::collections::HashMap::new(),
             pending_deletions: std::collections::HashSet::new(),
             deletion_busy_messages: std::collections::HashMap::new(),
         };
+        let mut config = Config::default();
+        config.workspace = Some(crate::config::WorkspaceConfig {
+            default_mode: WorkspaceMode::Worktree,
+        });
         let mut app = App {
             ui,
             runtime,
             git,
-            config: Config::default(),
+            config,
             paths,
             bindings,
             session_store,
@@ -7021,8 +7092,111 @@ mod tests {
     }
 
     #[test]
-    fn create_agent_always_opens_name_prompt_empty_by_default() {
+    fn shared_default_opens_shared_request_with_prefilled_handle() {
         let mut app = test_app(default_bindings());
+        app.config.workspace = Some(crate::config::WorkspaceConfig {
+            default_mode: WorkspaceMode::Shared,
+        });
+
+        app.create_agent_for_selected_project().unwrap();
+
+        match &app.ui.prompt {
+            PromptState::NameNewAgent {
+                request,
+                input,
+                randomize_name,
+                ..
+            } => {
+                assert!(matches!(
+                    request.as_ref(),
+                    CreateAgentRequest::SharedWorkspace { .. }
+                ));
+                assert!(!input.text.is_empty());
+                assert!(crate::model::is_valid_agent_handle(&input.text));
+                assert!(*randomize_name);
+            }
+            other => panic!("expected shared name prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_workspace_override_controls_create_mode() {
+        for (global, project_mode, expect_shared) in [
+            (WorkspaceMode::Worktree, WorkspaceMode::Shared, true),
+            (WorkspaceMode::Shared, WorkspaceMode::Worktree, false),
+        ] {
+            let mut app = test_app(default_bindings());
+            app.config.workspace = Some(crate::config::WorkspaceConfig {
+                default_mode: global,
+            });
+            app.config.projects.push(ProjectConfig {
+                id: app.git.projects[0].id.clone(),
+                path: app.git.projects[0].path.clone(),
+                name: Some(app.git.projects[0].name.clone()),
+                default_provider: None,
+                commit_prompt: None,
+                workspace_mode: Some(project_mode),
+            });
+
+            app.create_agent_for_selected_project().unwrap();
+
+            let PromptState::NameNewAgent { request, .. } = &app.ui.prompt else {
+                panic!("expected create prompt");
+            };
+            assert_eq!(
+                matches!(request.as_ref(), CreateAgentRequest::SharedWorkspace { .. }),
+                expect_shared
+            );
+        }
+    }
+
+    #[test]
+    fn fork_stays_isolated_under_shared_project_default() {
+        let mut app = test_app(default_bindings());
+        app.config.workspace = Some(crate::config::WorkspaceConfig {
+            default_mode: WorkspaceMode::Shared,
+        });
+
+        app.fork_selected_session().unwrap();
+
+        assert!(matches!(
+            app.ui.prompt,
+            PromptState::NameNewAgent { request, .. }
+                if matches!(request.as_ref(), CreateAgentRequest::ForkSession { .. })
+        ));
+    }
+
+    #[test]
+    fn shared_session_rejects_real_branch_rename() {
+        let mut app = test_app(default_bindings());
+        app.git.sessions[0].shared_workspace = true;
+        let original_branch = app.git.sessions[0].branch_name.clone();
+
+        app.apply_rename_session("session-1", "display-title".to_string(), true);
+
+        assert_eq!(app.git.sessions[0].branch_name, original_branch);
+        assert!(app.git.sessions[0].title.is_none());
+        assert!(app.status.text().contains("never renames"));
+    }
+
+    #[test]
+    fn shared_session_rename_changes_only_display_title() {
+        let mut app = test_app(default_bindings());
+        app.git.sessions[0].shared_workspace = true;
+        let original_branch = app.git.sessions[0].branch_name.clone();
+        let original_handle = app.git.sessions[0].agent_handle().to_string();
+
+        app.apply_rename_session("session-1", "display-title".to_string(), false);
+
+        assert_eq!(app.git.sessions[0].title.as_deref(), Some("display-title"));
+        assert_eq!(app.git.sessions[0].branch_name, original_branch);
+        assert_eq!(app.git.sessions[0].agent_handle(), original_handle);
+    }
+
+    #[test]
+    fn legacy_config_create_flow_remains_isolated_and_empty_by_default() {
+        let mut app = test_app(default_bindings());
+        app.config.workspace = None;
 
         app.create_agent_for_selected_project().unwrap();
 
@@ -7951,6 +8125,7 @@ mod tests {
                 name: Some("demo".to_string()),
                 default_provider: None,
                 commit_prompt: None,
+                workspace_mode: None,
             },
             ProjectConfig {
                 id: "project-2".to_string(),
@@ -7958,6 +8133,7 @@ mod tests {
                 name: Some("other".to_string()),
                 default_provider: None,
                 commit_prompt: None,
+                workspace_mode: None,
             },
         ];
         app.git.projects.push(Project {
@@ -8930,6 +9106,7 @@ cyan = "#00ffff"
             branch_name: app.git.sessions[0].branch_name.clone(),
             focus: DeleteAgentFocus::Cancel,
             delete_worktree: false,
+            shared_workspace: false,
             worktree_shared: false,
         };
         install_confirm_delete_overlay(&mut app);
@@ -9654,6 +9831,7 @@ cyan = "#00ffff"
             branch_name: app.git.sessions[0].branch_name.clone(),
             focus: DeleteAgentFocus::Cancel,
             delete_worktree: false,
+            shared_workspace: false,
             worktree_shared: false,
         };
         install_confirm_delete_overlay(&mut app);
@@ -9673,6 +9851,7 @@ cyan = "#00ffff"
             branch_name: app.git.sessions[0].branch_name.clone(),
             focus: DeleteAgentFocus::Cancel,
             delete_worktree: false,
+            shared_workspace: false,
             worktree_shared: false,
         };
         install_confirm_delete_overlay(&mut app);
@@ -9693,6 +9872,47 @@ cyan = "#00ffff"
     }
 
     #[test]
+    fn shared_delete_dialog_hides_worktree_checkbox() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_app(default_bindings());
+        app.git.sessions[0].shared_workspace = true;
+        app.rebuild_left_items();
+        app.selected_left = app
+            .left_items()
+            .iter()
+            .position(|item| matches!(item, LeftItem::Session(_)))
+            .expect("session row exists");
+        app.confirm_delete_selected_session()
+            .expect("open delete dialog");
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render frame");
+
+        match &app.ui.overlay_layout.active {
+            OverlayMouseLayout::ConfirmDeleteAgent { checkbox, .. } => {
+                assert!(checkbox.is_none());
+            }
+            other => panic!("expected delete-agent overlay layout, got {other:?}"),
+        }
+        match &app.ui.prompt {
+            PromptState::ConfirmDeleteAgent {
+                delete_worktree,
+                shared_workspace,
+                ..
+            } => {
+                assert!(!delete_worktree);
+                assert!(*shared_workspace);
+            }
+            other => panic!("expected delete-agent prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn shift_tab_moves_delete_agent_focus_backwards() {
         let mut app = test_app(default_bindings());
         app.ui.prompt = PromptState::ConfirmDeleteAgent {
@@ -9700,6 +9920,7 @@ cyan = "#00ffff"
             branch_name: app.git.sessions[0].branch_name.clone(),
             focus: DeleteAgentFocus::Cancel,
             delete_worktree: false,
+            shared_workspace: false,
             worktree_shared: false,
         };
 
@@ -11914,6 +12135,7 @@ cyan = "#00ffff"
             name: Some(app.git.projects[0].name.clone()),
             default_provider: None,
             commit_prompt: None,
+            workspace_mode: None,
         });
 
         // project-2 pins itself to "gemini" and must not be touched.
@@ -11932,6 +12154,7 @@ cyan = "#00ffff"
             name: Some(pinned.name.clone()),
             default_provider: Some("gemini".to_string()),
             commit_prompt: None,
+            workspace_mode: None,
         });
         app.git.projects.push(pinned);
 

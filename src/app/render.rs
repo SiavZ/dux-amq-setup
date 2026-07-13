@@ -1,3 +1,5 @@
+//! TUI rendering, including shared-workspace creation and rename safeguards.
+
 use super::components::{
     Button, ButtonKind, ButtonPressedTarget, Checkbox, CheckboxState, button_state_for,
     shared_button_width,
@@ -3600,13 +3602,15 @@ impl App {
                 branch_name,
                 focus,
                 delete_worktree,
+                shared_workspace,
                 worktree_shared,
                 ..
             } => {
                 self.render_dim_overlay(frame);
                 let dialog_width = 56.min(frame.area().width.max(1));
                 let inner_width = dialog_width.saturating_sub(2);
-                let checkbox_height = if *worktree_shared {
+                let preserve_worktree = *shared_workspace || *worktree_shared;
+                let checkbox_height = if preserve_worktree {
                     0
                 } else {
                     let state = if *focus == DeleteAgentFocus::Checkbox {
@@ -3641,7 +3645,12 @@ impl App {
                     ]),
                     Line::from(""),
                 ];
-                if *worktree_shared {
+                if *shared_workspace {
+                    body_lines.push(Line::from(Span::styled(
+                        " Shared workspace is the project checkout and will be preserved.",
+                        Style::default().fg(self.theme.hint_desc_fg),
+                    )));
+                } else if *worktree_shared {
                     body_lines.push(Line::from(Span::styled(
                         " Worktree is shared with another agent and will be preserved.",
                         Style::default().fg(self.theme.hint_desc_fg),
@@ -3662,7 +3671,7 @@ impl App {
                     )));
                 }
                 let body_height = wrapped_line_count(&body_lines, inner_width, false);
-                let checkbox_spacing = u16::from(!*worktree_shared);
+                let checkbox_spacing = u16::from(!preserve_worktree);
                 let area = centered_rect_exact(
                     dialog_width,
                     2 + body_height + checkbox_spacing + checkbox_height + 3,
@@ -3687,7 +3696,7 @@ impl App {
                     .wrap(Wrap { trim: false })
                     .render(body_area, frame.buffer_mut());
 
-                let checkbox_rect = if !*worktree_shared {
+                let checkbox_rect = if !preserve_worktree {
                     let checkbox_state = if *focus == DeleteAgentFocus::Checkbox {
                         CheckboxState::Focused
                     } else {
@@ -4304,10 +4313,16 @@ impl App {
                 };
             }
             PromptState::RenameSession {
+                session_id,
                 input,
                 rename_branch,
-                ..
             } => {
+                let shared_workspace = self
+                    .git
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == *session_id)
+                    .is_some_and(AgentSession::shared_workspace);
                 self.render_dim_overlay(frame);
                 let checkbox = Checkbox::new("Also rename the git branch")
                     .checked(*rename_branch)
@@ -4368,20 +4383,33 @@ impl App {
                     .block(input_block)
                     .render(input_area, frame.buffer_mut());
 
-                let (checkbox_rect, _) = self.render_overlay_checkbox(
-                    frame,
-                    checkbox_area,
-                    "Also rename the git branch",
-                    *rename_branch,
-                    CheckboxState::Normal,
-                    Some(Line::from(Span::styled(
-                        format!(
-                            "{}Open PRs will still reference the old branch name",
-                            Checkbox::indent()
-                        ),
-                        Style::default().fg(self.theme.hint_desc_fg),
-                    ))),
-                );
+                let checkbox = if shared_workspace {
+                    Paragraph::new(Line::from(Span::styled(
+                        " Shared workspace: the real git branch is never renamed.",
+                        Style::default().fg(self.theme.warning_fg),
+                    )))
+                    .render(checkbox_area, frame.buffer_mut());
+                    None
+                } else {
+                    let (checkbox_rect, _) = self.render_overlay_checkbox(
+                        frame,
+                        checkbox_area,
+                        "Also rename the git branch",
+                        *rename_branch,
+                        CheckboxState::Normal,
+                        Some(Line::from(Span::styled(
+                            format!(
+                                "{}Open PRs will still reference the old branch name",
+                                Checkbox::indent()
+                            ),
+                            Style::default().fg(self.theme.hint_desc_fg),
+                        ))),
+                    );
+                    Some(OverlayCheckbox {
+                        id: OverlayCheckboxId::RenameSessionBranch,
+                        rect: checkbox_rect,
+                    })
+                };
 
                 let confirm_key = self.bindings.label_for(Action::Confirm);
                 let close_key = self.bindings.label_for(Action::CloseOverlay);
@@ -4392,11 +4420,13 @@ impl App {
                     " confirm  ",
                     Style::default().fg(self.theme.hint_desc_fg),
                 ));
-                hints.extend(self.theme.key_badge_default(&toggle_key));
-                hints.push(Span::styled(
-                    " toggle  ",
-                    Style::default().fg(self.theme.hint_desc_fg),
-                ));
+                if !shared_workspace {
+                    hints.extend(self.theme.key_badge_default(&toggle_key));
+                    hints.push(Span::styled(
+                        " toggle  ",
+                        Style::default().fg(self.theme.hint_desc_fg),
+                    ));
+                }
                 hints.extend(self.theme.key_badge_default(&close_key));
                 hints.push(Span::styled(
                     " cancel",
@@ -4405,10 +4435,7 @@ impl App {
                 Paragraph::new(Line::from(hints)).render(hint_area, frame.buffer_mut());
                 self.ui.overlay_layout.active = OverlayMouseLayout::RenameSession {
                     input: input_inner,
-                    checkbox: Some(OverlayCheckbox {
-                        id: OverlayCheckboxId::RenameSessionBranch,
-                        rect: checkbox_rect,
-                    }),
+                    checkbox,
                 };
             }
             PromptState::EditMacros { .. } => {
@@ -4499,6 +4526,7 @@ impl App {
                 hint_para.render(hint_area, frame.buffer_mut());
             }
             PromptState::NameNewAgent {
+                request,
                 input,
                 randomize_name,
                 focus,
@@ -4511,6 +4539,12 @@ impl App {
                 ..
             } => {
                 self.render_dim_overlay(frame);
+                let shared_path = match request.as_ref() {
+                    CreateAgentRequest::SharedWorkspace { project, .. } => {
+                        Some(crate::sanitize::for_terminal(&project.path))
+                    }
+                    _ => None,
+                };
                 let advanced_rows = if *show_advanced {
                     let rule_rows = (rules.len() as u16).max(1);
                     let system_prompt_editor_rows = if *focus == NameNewAgentFocus::SystemPrompt {
@@ -4522,12 +4556,16 @@ impl App {
                 } else {
                     0
                 };
-                let form_rows = 10 + advanced_rows;
+                let form_rows = 10 + advanced_rows + u16::from(shared_path.is_some()) * 2;
                 let dialog_width = 76.min(frame.area().width.max(1));
                 let area = centered_rect_exact(dialog_width, form_rows + 5, frame.area());
                 self.clear_overlay_area(frame, area);
 
-                let outer = self.themed_overlay_block("New Agent");
+                let outer = self.themed_overlay_block(if shared_path.is_some() {
+                    "New Agent · SHARED WORKSPACE"
+                } else {
+                    "New Agent"
+                });
                 let inner = outer.inner(area);
                 outer.render(area, frame.buffer_mut());
 
@@ -4562,7 +4600,11 @@ impl App {
 
                 draw_line(
                     Line::from(Span::styled(
-                        "Agent name  (branch/worktree name)",
+                        if shared_path.is_some() {
+                            "Agent handle  (permanent messaging address)"
+                        } else {
+                            "Agent name  (branch/worktree name)"
+                        },
                         label_style,
                     )),
                     frame,
@@ -4590,6 +4632,22 @@ impl App {
                     .block(input_block)
                     .render(input_area, frame.buffer_mut());
                 cursor_y = cursor_y.saturating_add(3);
+
+                if let Some(path) = shared_path {
+                    draw_line(
+                        Line::from(Span::styled("Shared checkout", label_style)),
+                        frame,
+                        &mut cursor_y,
+                    );
+                    draw_line(
+                        Line::from(Span::styled(
+                            format!("  {path}"),
+                            Style::default().fg(self.theme.warning_fg),
+                        )),
+                        frame,
+                        &mut cursor_y,
+                    );
+                }
 
                 draw_line(
                     Line::from(Span::styled("Harness", label_style)),
