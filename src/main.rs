@@ -14,6 +14,7 @@ mod keybindings;
 mod lockfile;
 mod logger;
 mod model;
+mod orphan_worktrees;
 mod peer;
 mod provider;
 mod pty;

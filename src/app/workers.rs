@@ -1,4 +1,4 @@
-//! Worker-event handling and blocking background jobs for the TUI.
+//! Worker events and blocking Git, filesystem, and provider jobs for the TUI.
 
 use super::*;
 
@@ -784,13 +784,75 @@ impl App {
                         self.set_error(message);
                         continue;
                     }
-                    let reconnect = if force_fresh {
-                        self.continue_force_reconnect(&session_id, true)
-                    } else {
-                        self.continue_reconnect(&session_id, true)
-                    };
+                    let reconnect = self
+                        .continue_shared_reconnect_after_validation(&session_id, force_fresh);
                     if let Err(err) = reconnect {
                         self.set_error(crate::sanitize::for_terminal(&format!("{err:#}")));
+                    }
+                }
+                WorkerEvent::OrphanWorktreesReady(result) => {
+                    self.git.orphan_cleanup_in_flight = false;
+                    match result {
+                        Ok(candidates) if candidates.is_empty() => {
+                            self.ui.prompt = PromptState::None;
+                            self.set_info("No eligible orphan worktrees found.");
+                        }
+                        Ok(candidates) => {
+                            self.ui.prompt = PromptState::OrphanWorktrees {
+                                candidates,
+                                selected: 0,
+                            };
+                            self.set_info(
+                                "Orphan worktree inventory loaded; review each item before removal.",
+                            );
+                        }
+                        Err(message) => {
+                            self.ui.prompt = PromptState::None;
+                            self.set_error(crate::sanitize::for_terminal(&message));
+                        }
+                    }
+                }
+                WorkerEvent::OrphanWorktreeRemoved {
+                    candidate,
+                    mut candidates,
+                    selected,
+                    delete_branch,
+                    result,
+                } => {
+                    self.git.orphan_cleanup_in_flight = false;
+                    match result {
+                        Ok(()) => {
+                            candidates.retain(|item| {
+                                item.worktree_path != candidate.worktree_path
+                            });
+                            let safe_path = crate::sanitize::for_terminal(
+                                &candidate.worktree_path.display().to_string(),
+                            );
+                            if candidates.is_empty() {
+                                self.ui.prompt = PromptState::None;
+                            } else {
+                                let selected = selected.min(candidates.len() - 1);
+                                self.ui.prompt = PromptState::OrphanWorktrees {
+                                    candidates,
+                                    selected,
+                                };
+                            }
+                            let branch_note = if delete_branch {
+                                " and requested branch deletion"
+                            } else {
+                                "; branch preserved"
+                            };
+                            self.set_info(format!(
+                                "Removed orphan worktree {safe_path}{branch_note}."
+                            ));
+                        }
+                        Err(message) => {
+                            self.ui.prompt = PromptState::OrphanWorktrees {
+                                candidates,
+                                selected,
+                            };
+                            self.set_error(crate::sanitize::for_terminal(&message));
+                        }
                     }
                 }
             }
@@ -1728,6 +1790,96 @@ impl App {
             success.into(),
             rollback,
         );
+    }
+}
+
+pub(crate) fn dispatch_orphan_worktree_inventory(tx: Sender<WorkerEvent>, paths: DuxPaths) {
+    let failure_tx = tx.clone();
+    let spawn = thread::Builder::new()
+        .name("orphan-worktree-inventory".to_string())
+        .spawn(move || {
+            let result = crate::orphan_worktrees::inventory(&paths).map_err(|err| {
+                tracing::warn!(
+                    target: "dux::orphan_worktrees",
+                    error = %crate::sanitize::for_terminal(&format!("{err:#}")),
+                    "orphan worktree inventory failed closed",
+                );
+                format!("{err:#}")
+            });
+            if let Ok(candidates) = &result {
+                tracing::info!(
+                    target: "dux::orphan_worktrees",
+                    candidates = candidates.len(),
+                    "orphan worktree inventory completed",
+                );
+            }
+            let _ = tx.send(WorkerEvent::OrphanWorktreesReady(result));
+        });
+    if let Err(err) = spawn {
+        let _ = failure_tx.send(WorkerEvent::OrphanWorktreesReady(Err(format!(
+            "failed to start orphan-worktree inventory worker: {err}"
+        ))));
+    }
+}
+
+pub(crate) fn dispatch_orphan_worktree_removal(
+    tx: Sender<WorkerEvent>,
+    paths: DuxPaths,
+    candidate: crate::orphan_worktrees::OrphanWorktreeCandidate,
+    candidates: Vec<crate::orphan_worktrees::OrphanWorktreeCandidate>,
+    selected: usize,
+    delete_branch: bool,
+) {
+    let event_candidate = candidate.clone();
+    let failure_candidate = event_candidate.clone();
+    let failure_candidates = candidates.clone();
+    let failure_tx = tx.clone();
+    let spawn = thread::Builder::new()
+        .name("orphan-worktree-remove".to_string())
+        .spawn(move || {
+            let safe_path =
+                crate::sanitize::for_terminal(&candidate.worktree_path.display().to_string());
+            tracing::info!(
+                target: "dux::orphan_worktrees",
+                worktree = %safe_path,
+                delete_branch,
+                "revalidating orphan worktree before removal",
+            );
+            let result =
+                crate::orphan_worktrees::remove(&paths, &candidate.worktree_path, delete_branch)
+                    .map_err(|err| format!("{err:#}"));
+            if let Err(err) = &result {
+                tracing::warn!(
+                    target: "dux::orphan_worktrees",
+                    worktree = %safe_path,
+                    error = %crate::sanitize::for_terminal(err),
+                    "orphan worktree removal failed",
+                );
+            } else {
+                tracing::info!(
+                    target: "dux::orphan_worktrees",
+                    worktree = %safe_path,
+                    "orphan worktree removed",
+                );
+            }
+            let _ = tx.send(WorkerEvent::OrphanWorktreeRemoved {
+                candidate: event_candidate,
+                candidates,
+                selected,
+                delete_branch,
+                result,
+            });
+        });
+    if let Err(err) = spawn {
+        let _ = failure_tx.send(WorkerEvent::OrphanWorktreeRemoved {
+            candidate: failure_candidate,
+            candidates: failure_candidates,
+            selected,
+            delete_branch,
+            result: Err(format!(
+                "failed to start orphan-worktree removal worker: {err}"
+            )),
+        });
     }
 }
 

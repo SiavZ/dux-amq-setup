@@ -1,3 +1,5 @@
+//! Declarative keybinding registry and command-palette action metadata.
+
 use crokey::{KeyCombination, KeyCombinationFormat, key};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -85,6 +87,7 @@ pub enum Action {
     DebugInput,
     ToggleDiffLineNumbers,
     ResourceMonitor,
+    PruneOrphanWorktrees,
     ToggleGithubIntegration,
     ToggleRandomizedPetNameDefault,
     TogglePrBannerPosition,
@@ -257,6 +260,7 @@ impl Action {
             Action::DebugInput => "debug_input",
             Action::ToggleDiffLineNumbers => "toggle_diff_line_numbers",
             Action::ResourceMonitor => "resource_monitor",
+            Action::PruneOrphanWorktrees => "prune_orphan_worktrees",
             Action::ToggleGithubIntegration => "toggle_github_integration",
             Action::ToggleRandomizedPetNameDefault => "toggle_randomized_pet_name_default",
             Action::TogglePrBannerPosition => "toggle_pr_banner_position",
@@ -354,6 +358,9 @@ impl Action {
             Action::DebugInput => "Open input event debugger to inspect keyboard and mouse events.",
             Action::ToggleDiffLineNumbers => "Toggle line numbers in diff view.",
             Action::ResourceMonitor => "Show CPU and memory usage for dux and all running agents.",
+            Action::PruneOrphanWorktrees => {
+                "List Dux-root Git worktrees with no active or tombstoned session."
+            }
             Action::ToggleGithubIntegration => "Toggle GitHub PR integration.",
             Action::ToggleRandomizedPetNameDefault => {
                 "Toggle whether the agent name prompt starts with a random pet name."
@@ -445,6 +452,7 @@ impl Action {
             | Action::DebugInput
             | Action::ToggleDiffLineNumbers
             | Action::ResourceMonitor
+            | Action::PruneOrphanWorktrees
             | Action::ToggleGithubIntegration
             | Action::ToggleRandomizedPetNameDefault
             | Action::TogglePrBannerPosition
@@ -1465,6 +1473,17 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         }),
     },
     BindingDef {
+        action: Action::PruneOrphanWorktrees,
+        default_keys: &[],
+        scopes: &[],
+        help: None,
+        hint_contexts: &[],
+        palette: Some(PaletteEntry {
+            name: "prune-orphan-worktrees",
+            description: "Review and remove Git-registered orphan worktrees",
+        }),
+    },
+    BindingDef {
         action: Action::ToggleGithubIntegration,
         default_keys: &[],
         scopes: &[],
@@ -2301,6 +2320,17 @@ mod tests {
             .filter_map(|binding| binding.palette_name)
             .collect::<Vec<_>>();
         assert!(names.contains(&"resource-monitor"));
+    }
+
+    #[test]
+    fn filtered_palette_includes_orphan_worktree_cleaner() {
+        let bindings = default_bindings();
+        let names = bindings
+            .filtered_palette("orphan")
+            .iter()
+            .filter_map(|binding| binding.palette_name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"prune-orphan-worktrees"));
     }
 
     #[test]

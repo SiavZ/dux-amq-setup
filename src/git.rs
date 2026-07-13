@@ -1,8 +1,10 @@
-//! Conservative Git plumbing for projects, worktrees, and live HEAD state.
+//! Conservative Git plumbing for projects, registered worktrees, and live HEAD state.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -19,6 +21,14 @@ pub enum BranchLocation {
     Local,
     /// The branch exists only as a remote tracking ref (`refs/remotes/origin/`).
     Remote,
+}
+
+/// One entry from Git's machine-readable worktree registry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RegisteredWorktree {
+    pub(crate) path: PathBuf,
+    pub(crate) branch: Option<String>,
+    pub(crate) is_main: bool,
 }
 
 enum DiffStat {
@@ -488,6 +498,12 @@ pub fn whole_workspace_target_is_within(root: &Path, target: &Path) -> Result<bo
     Ok(target != root && target.starts_with(root))
 }
 
+/// Resolve a whole-workspace inventory path with the same symlink-aware rules
+/// used by the destructive guard. Missing leaf components remain representable.
+pub(crate) fn resolve_whole_workspace_path(path: &Path) -> Result<PathBuf> {
+    resolve_for_removal(path)
+}
+
 fn resolve_for_removal(path: &Path) -> Result<PathBuf> {
     if !path.is_absolute() {
         bail!(
@@ -540,6 +556,91 @@ fn resolve_for_removal(path: &Path) -> Result<PathBuf> {
         resolved.push(component);
     }
     Ok(resolved)
+}
+
+/// Load Git's complete registered-worktree inventory for a repository.
+pub(crate) fn registered_worktrees(repo_path: &Path) -> Result<Vec<RegisteredWorktree>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to list worktrees for {}",
+                crate::sanitize::for_terminal(&repo_path.display().to_string())
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "git worktree list failed for {}: {}",
+            crate::sanitize::for_terminal(&repo_path.display().to_string()),
+            crate::sanitize::utf8_lossy(&output.stderr)
+        );
+    }
+    parse_registered_worktrees(&output.stdout)
+}
+
+fn parse_registered_worktrees(raw: &[u8]) -> Result<Vec<RegisteredWorktree>> {
+    let mut entries = Vec::new();
+    let mut current: Option<RegisteredWorktree> = None;
+    for field in raw.split(|byte| *byte == 0) {
+        if field.is_empty() {
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            continue;
+        }
+        if let Some(path) = field.strip_prefix(b"worktree ") {
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            current = Some(RegisteredWorktree {
+                path: PathBuf::from(OsString::from_vec(path.to_vec())),
+                branch: None,
+                is_main: entries.is_empty(),
+            });
+        } else if let Some(branch) = field.strip_prefix(b"branch ")
+            && let Some(entry) = &mut current
+        {
+            let branch = branch.strip_prefix(b"refs/heads/").unwrap_or(branch);
+            entry.branch = Some(
+                String::from_utf8(branch.to_vec())
+                    .with_context(|| "git worktree list returned a non-UTF-8 branch name")?,
+            );
+        }
+    }
+    if let Some(entry) = current {
+        entries.push(entry);
+    }
+    if entries.is_empty() {
+        bail!("git worktree list returned no main worktree");
+    }
+    Ok(entries)
+}
+
+/// Report whether a registered worktree has staged, unstaged, or untracked
+/// changes. Errors are preserved so cleaner inventory can fail closed.
+pub(crate) fn worktree_is_dirty(worktree_path: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to inspect worktree {}",
+                crate::sanitize::for_terminal(&worktree_path.display().to_string())
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "git status failed for {}: {}",
+            crate::sanitize::for_terminal(&worktree_path.display().to_string()),
+            crate::sanitize::utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(!output.stdout.is_empty())
 }
 
 pub fn remove_worktree(

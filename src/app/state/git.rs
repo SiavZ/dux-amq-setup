@@ -3,7 +3,7 @@
 //! These fields cluster around: project + session lists, change-file caches
 //! (staged/unstaged), the commit-message editor, and the in-flight markers
 //! for git-driven background workers (commit, staged-diff, add-project,
-//! deletions, reconnect validation, changed-files dispatch debouncer). Worker
+//! deletions, reconnect validation, orphan cleanup, changed-files dispatch debouncer). Worker
 //! callbacks and the left/right pane render paths are the heaviest readers;
 //! input handling mutates the lists and in-flight flags.
 
@@ -50,6 +50,9 @@ pub(crate) struct GitState {
     /// Shared sessions are revalidated on a worker before reconnect so
     /// canonicalization never blocks the UI and duplicate requests cannot race.
     pub(crate) reconnect_validations_in_flight: HashSet<String>,
+    /// Prevents overlapping orphan-worktree inventory or removal workers.
+    /// Cleared when the corresponding worker event arrives.
+    pub(crate) orphan_cleanup_in_flight: bool,
     /// Session IDs spawned with resume args and the wall-clock time the resume
     /// attempt began. Used for one-shot fallbacks when resume exits quickly or
     /// hangs without rendering visible output.
