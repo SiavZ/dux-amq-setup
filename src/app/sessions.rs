@@ -922,6 +922,18 @@ impl App {
             let project_path = project.path.clone();
             let worktree_path = session.worktree_path.clone();
             let branch_name = session.branch_name.clone();
+            let registered_project_paths =
+                match crate::config::registered_project_paths(&self.config) {
+                    Ok(paths) => paths,
+                    Err(err) => {
+                        self.git.pending_deletions.remove(&session.id);
+                        self.set_error(format!(
+                            "Cannot verify registered projects before deletion: {}",
+                            crate::sanitize::for_terminal(&format!("{err:#}"))
+                        ));
+                        return;
+                    }
+                };
             let tx = self.runtime.worker_tx.clone();
             std::thread::spawn(move || {
                 let result = git::remove_worktree(
@@ -929,6 +941,7 @@ impl App {
                     Path::new(&worktree_path),
                     &branch_name,
                     true,
+                    &registered_project_paths,
                 )
                 .map(|r| r.branch_already_deleted)
                 .map_err(|e| format!("{e:#}"));
@@ -3311,6 +3324,50 @@ mod tests {
             app.git.pending_deletions.contains("s1"),
             "session must be marked pending while async worker runs",
         );
+    }
+
+    #[test]
+    fn begin_delete_session_applies_registered_project_overlap_guard() {
+        for project_is_descendant in [true, false] {
+            let project_dir = tempdir().expect("project tempdir");
+            let root = tempdir().expect("worktree root");
+            let worktree = root.path().join("worktree");
+            std::fs::create_dir_all(&worktree).unwrap();
+            let protected = if project_is_descendant {
+                let nested = worktree.join("nested-project");
+                std::fs::create_dir_all(&nested).unwrap();
+                nested
+            } else {
+                root.path().to_path_buf()
+            };
+            let id = format!("protected-delete-{project_is_descendant}");
+            let mut session = make_session(&id, "claude", &worktree.to_string_lossy());
+            session.project_id = "project-1".to_string();
+            let project =
+                make_project_at("project-1", "claude", &project_dir.path().to_string_lossy());
+            let mut app = test_app_with_sessions(vec![session], vec![project]);
+            app.config.projects.push(crate::config::ProjectConfig {
+                id: "protected".to_string(),
+                path: protected.to_string_lossy().into_owned(),
+                name: Some("protected".to_string()),
+                default_provider: None,
+                commit_prompt: None,
+                workspace_mode: Some(WorkspaceMode::Worktree),
+            });
+
+            app.begin_delete_session(&id, true);
+            let event = app
+                .runtime
+                .worker_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("delete worker response");
+
+            assert!(matches!(
+                event,
+                WorkerEvent::WorktreeRemoveCompleted { result: Err(_), .. }
+            ));
+            assert!(worktree.exists());
+        }
     }
 
     /// The inline (no-git) path completes immediately, so pending_deletions

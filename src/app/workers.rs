@@ -1758,6 +1758,16 @@ pub(crate) fn run_create_agent_job(
     worker_tx: Sender<WorkerEvent>,
     term_size: (u16, u16),
 ) {
+    let registered_project_paths = match crate::config::registered_project_paths(&config) {
+        Ok(paths) => paths,
+        Err(err) => {
+            let _ = worker_tx.send(WorkerEvent::CreateAgentFailed(format!(
+                "Project inventory is invalid: {}",
+                crate::sanitize::for_terminal(&format!("{err:#}"))
+            )));
+            return;
+        }
+    };
     let (
         project,
         provider,
@@ -1984,7 +1994,13 @@ pub(crate) fn run_create_agent_job(
                     source_worktree.display(),
                     worktree_path.display()
                 ));
-                let _ = git::remove_worktree(&repo_path, &worktree_path, &branch_name, true);
+                let _ = git::remove_worktree(
+                    &repo_path,
+                    &worktree_path,
+                    &branch_name,
+                    true,
+                    &registered_project_paths,
+                );
                 let _ = worker_tx.send(WorkerEvent::CreateAgentFailed(format!(
                     "Failed to copy the source worktree contents for agent \"{source_label}\": {err}",
                 )));
@@ -2066,6 +2082,7 @@ pub(crate) fn run_create_agent_job(
                     Path::new(&session.worktree_path),
                     &session.branch_name,
                     owns_branch,
+                    &registered_project_paths,
                 );
             }
             let _ = worker_tx.send(WorkerEvent::CreateAgentFailed(format!(
@@ -2095,6 +2112,7 @@ pub(crate) fn run_create_agent_job(
                     Path::new(&session.worktree_path),
                     &session.branch_name,
                     owns_branch,
+                    &registered_project_paths,
                 );
             }
             let _ = worker_tx.send(WorkerEvent::CreateAgentFailed(format!(

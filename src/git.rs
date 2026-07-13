@@ -7,7 +7,7 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use content_inspector::{ContentType, inspect};
 
 use crate::model::ChangedFile;
@@ -462,12 +462,94 @@ pub struct RemoveResult {
     pub branch_already_deleted: bool,
 }
 
+/// Refuse whole-worktree/root removal when its canonical target overlaps a
+/// registered checkout in either direction. This guard is intentionally not
+/// used by contained-file cleanup such as untracked-directory discard.
+pub fn guard_whole_workspace_removal(target: &Path, registered_projects: &[PathBuf]) -> Result<()> {
+    let target = resolve_for_removal(target)?;
+    for project in registered_projects {
+        let project = resolve_for_removal(project)?;
+        if target.starts_with(&project) || project.starts_with(&target) {
+            bail!(
+                "refusing whole-workspace removal because {} overlaps registered project {}",
+                crate::sanitize::for_terminal(&target.display().to_string()),
+                crate::sanitize::for_terminal(&project.display().to_string())
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Symlink-aware containment for whole-worktree inventory, including targets
+/// that are already absent and therefore cannot be directly canonicalized.
+pub fn whole_workspace_target_is_within(root: &Path, target: &Path) -> Result<bool> {
+    let root = resolve_for_removal(root)?;
+    let target = resolve_for_removal(target)?;
+    Ok(target != root && target.starts_with(root))
+}
+
+fn resolve_for_removal(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!(
+            "whole-workspace removal target must be absolute: {}",
+            crate::sanitize::for_terminal(&path.display().to_string())
+        );
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!(
+            "whole-workspace removal target contains parent traversal: {}",
+            crate::sanitize::for_terminal(&path.display().to_string())
+        );
+    }
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    loop {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) => break,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                suffix.push(
+                    ancestor
+                        .file_name()
+                        .ok_or_else(|| anyhow!("failed to resolve deletion target"))?
+                        .to_os_string(),
+                );
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| anyhow!("failed to resolve deletion target"))?;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to inspect {}",
+                        crate::sanitize::for_terminal(&path.display().to_string())
+                    )
+                });
+            }
+        }
+    }
+    let mut resolved = ancestor.canonicalize().with_context(|| {
+        format!(
+            "failed to resolve {}",
+            crate::sanitize::for_terminal(&path.display().to_string())
+        )
+    })?;
+    for component in suffix.iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
 pub fn remove_worktree(
     repo_path: &Path,
     worktree_path: &Path,
     branch_name: &str,
     delete_branch: bool,
+    registered_projects: &[PathBuf],
 ) -> Result<RemoveResult> {
+    guard_whole_workspace_removal(worktree_path, registered_projects)?;
     // audit02 Phase 21 (P2-11) — `&Path` args, see `current_branch`.
     let output = Command::new("git")
         .arg("-C")
@@ -877,13 +959,6 @@ pub fn file_bytes_at_head(worktree_path: &Path, path: &str) -> Result<Option<Vec
     Ok(Some(output.stdout))
 }
 
-pub fn is_under(base: &Path, candidate: &Path) -> bool {
-    match (base.canonicalize(), candidate.canonicalize()) {
-        (Ok(b), Ok(c)) => c.starts_with(b),
-        _ => false,
-    }
-}
-
 pub fn ellipsize_middle(input: &str, max_width: usize) -> String {
     if input.chars().count() <= max_width {
         return input.to_string();
@@ -1114,21 +1189,6 @@ mod tests {
             ellipsize_middle("src/components/app.rs", 12),
             "src/...pp.rs"
         );
-    }
-
-    #[test]
-    fn is_under_checks_real_paths() {
-        let tmp = std::env::temp_dir();
-        let child = tmp.join("is_under_test_child");
-        std::fs::create_dir_all(&child).unwrap();
-        assert!(is_under(&tmp, &child));
-        std::fs::remove_dir(&child).unwrap();
-    }
-
-    #[test]
-    fn is_under_rejects_nonexistent_candidate() {
-        let tmp = std::env::temp_dir();
-        assert!(!is_under(&tmp, Path::new("/nonexistent/path/xyz")));
     }
 
     #[test]
@@ -1433,7 +1493,7 @@ mod tests {
         let wt = add_worktree(repo.path(), "preexisting");
         assert!(branch_exists(repo.path(), "preexisting").is_some());
 
-        remove_worktree(repo.path(), &wt, "preexisting", false).unwrap();
+        remove_worktree(repo.path(), &wt, "preexisting", false, &[]).unwrap();
 
         assert!(!wt.exists(), "worktree should be removed");
         assert!(
@@ -1450,13 +1510,68 @@ mod tests {
         let wt = add_worktree(repo.path(), "dux-created");
         assert!(branch_exists(repo.path(), "dux-created").is_some());
 
-        remove_worktree(repo.path(), &wt, "dux-created", true).unwrap();
+        remove_worktree(repo.path(), &wt, "dux-created", true, &[]).unwrap();
 
         assert!(!wt.exists(), "worktree should be removed");
         assert!(
             branch_exists(repo.path(), "dux-created").is_none(),
             "owned branch should be deleted"
         );
+    }
+
+    #[test]
+    fn whole_workspace_guard_rejects_project_ancestors_descendants_and_symlink_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let managed = temp.path().join("managed");
+        let project = managed.join("nested/project");
+        fs::create_dir_all(&project).unwrap();
+        let projects = vec![project.clone()];
+
+        assert!(guard_whole_workspace_removal(&managed, &projects).is_err());
+        assert!(guard_whole_workspace_removal(&project.join("corrupt-child"), &projects).is_err());
+
+        let alias = temp.path().join("project-alias");
+        symlink(&project, &alias).unwrap();
+        assert!(guard_whole_workspace_removal(&alias, &projects).is_err());
+        assert!(
+            guard_whole_workspace_removal(&temp.path().join("safe-sibling"), &projects).is_ok()
+        );
+    }
+
+    #[test]
+    fn remove_worktree_entry_point_applies_registered_project_guard() {
+        let repo = init_test_repo();
+        for project_is_descendant in [true, false] {
+            let branch = format!("protected-delete-{project_is_descendant}");
+            let worktree = add_worktree(repo.path(), &branch);
+            let project = if project_is_descendant {
+                let nested = worktree.join("nested-project");
+                fs::create_dir_all(&nested).unwrap();
+                nested
+            } else {
+                repo.path().to_path_buf()
+            };
+
+            let result = remove_worktree(repo.path(), &worktree, &branch, true, &[project]);
+
+            assert!(result.is_err());
+            assert!(worktree.exists());
+            assert!(branch_exists(repo.path(), &branch).is_some());
+        }
+    }
+
+    #[test]
+    fn untracked_directory_discard_inside_registered_project_remains_allowed() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let untracked = project.join("scratch/nested");
+        fs::create_dir_all(&untracked).unwrap();
+        fs::write(untracked.join("notes.txt"), "temporary").unwrap();
+
+        discard_file(&project, "scratch", true).unwrap();
+
+        assert!(!project.join("scratch").exists());
+        assert!(project.exists());
     }
 
     // ── branch_exists tests ────────────────────────────────────
