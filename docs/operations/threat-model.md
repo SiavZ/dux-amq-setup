@@ -663,6 +663,40 @@ which session enabled what.
 
 ---
 
+## T16 — Shared-workspace provider mutates the registered checkout
+
+**Attack scenario.** Shared-workspace mode deliberately launches a provider in
+the user's registered checkout rather than a Dux-owned worktree. A surprising
+default change could expose an existing installation to writes it previously
+expected to be isolated. If Dux later confused that checkout with a managed
+worktree, automatic branch, cleanup, or link operations could also mutate the
+real repository.
+
+**Mitigation in code.** Workspace consent is represented by section presence:
+an existing config with no `[workspace]` table resolves to `worktree`, while a
+fresh canonical config writes `default_mode = "shared"` explicitly. A
+per-project override can restore isolation. Before registration, creation, and
+reconnect, shared paths are canonicalized and rejected when they resolve under
+the Dux state or worktree roots. The creation modal identifies shared mode and
+shows the real checkout path. Persisted `shared_workspace` state, rather than
+path equality or the current project default, gates lifecycle behavior: shared
+sessions set neither worktree nor branch ownership, do not create the repository
+link, never auto-resume, and reconnect with a fresh provider process. Fork is an
+explicit isolation boundary and always creates a worktree.
+
+**Residual risk.** Running a provider in a real checkout grants it the same file
+permissions as the operator and is the purpose of shared mode; Dux is not a
+sandbox. Multiple same-UID providers or unmanaged processes can overwrite one
+another's edits, and another `DUX_HOME` cannot be observed reliably. Operators
+who need independent changes must use worktree mode or Fork.
+
+**Detection.** The create modal and completion status identify shared sessions,
+the database retains `shared_workspace = 1`, and eligibility failures are shown
+before provider launch. Branch and PR status are derived from the checkout's
+live HEAD so Dux does not present a stale per-session branch as authoritative.
+
+---
+
 ## Maintenance
 
 When you add or change attack surface in this codebase, you must
@@ -670,8 +704,8 @@ update both `SECURITY.md` (the table) and this file (the
 paragraph). PRs that touch the surface listed above without
 updating these documents are blocked at review.
 
-The IDs `T1`–`T15` are stable references; new threats append at
-the end (`T16`, `T17`, …) rather than reshuffling. Retired
+The IDs `T1`–`T16` are stable references; new threats append at
+the end (`T17`, `T18`, …) rather than reshuffling. Retired
 threats are kept in the table with a `~~strikethrough~~` and a
 note pointing to the PR that retired them. Threats that move to
 **accepted-risk in single-user-VM mode** keep their original ID,

@@ -2,7 +2,7 @@
 
 <img src="assets/dux-logo.png" width="200" align="right" />
 
-Your AI agents deserve a proper office. **dux** (pronounced "dooks") is a terminal UI that lets you run multiple AI coding agents side by side, each in its own git worktree, with full companion terminals, macros, commit generation, and a command palette that knows more tricks than you do.
+Your AI agents deserve a proper office. **dux** (pronounced "dooks") is a terminal UI that lets you run multiple AI coding agents side by side in either a shared checkout or isolated git worktrees, with full companion terminals, macros, commit generation, and a command palette that knows more tricks than you do.
 
 No protocol layers. No adapters. No JSON-RPC. Just real CLIs running in real terminals.
 
@@ -51,7 +51,7 @@ Grab the latest release for your platform from the [Releases](https://github.com
 
 ## How It Works
 
-dux organizes work around **projects** (git repos) and **agents** (worktree sessions). When you create an agent, dux branches off a new git worktree so the agent has its own isolated copy of the code. No conflicts with your main checkout, no stepping on other agents' changes.
+dux organizes work around **projects** (git repos) and **agents** (provider sessions). Shared-workspace agents run in the registered checkout; worktree agents get an isolated branch and directory. Forking always creates an isolated worktree, even when the project normally uses shared mode.
 
 The interface has three panes:
 
@@ -135,6 +135,23 @@ dux config regenerate    # Preview a fresh default config
 
 Override the config directory with the `DUX_HOME` environment variable.
 
+### Workspace modes
+
+Freshly generated configs default new agents to the registered project checkout:
+
+```toml
+[workspace]
+default_mode = "shared" # or "worktree"
+
+[[projects]]
+path = "$HOME/projects/example"
+workspace_mode = "worktree" # optional per-project override; "" inherits
+```
+
+Consent is preserved for existing installations: if an existing config has no `[workspace]` section at all, dux continues creating isolated worktrees. Regenerating a fresh config writes the shared default explicitly.
+
+Shared sessions use the project's canonical path, never switch the real checkout during registration, never auto-resume at startup, and reconnect with a fresh provider process. Their branch and PR status follow the checkout's live `HEAD`; detached `HEAD` skips PR discovery. A shared project cannot live inside `DUX_HOME` or its managed worktree tree. Multiple shared agents edit the same files, so use an isolated Fork whenever their changes need to diverge.
+
 ### Peer Routing
 
 Agents should send messages through Dux instead of choosing a transport:
@@ -145,7 +162,7 @@ dux peer list
 dux peer sync-amq
 ```
 
-`dux peer send` uses Claude Peers for Claude targets and AMQ for non-Claude targets. Dux refreshes AMQ's agent registry from `sessions.sqlite3` on startup and via `dux peer sync-amq`.
+`dux peer send` prefers Claude Peers only when both endpoints are isolated worktree sessions. If either endpoint uses a shared workspace, dux routes through AMQ by immutable agent handle because cwd-based peer matching would be ambiguous. Dux refreshes AMQ's agent registry from `sessions.sqlite3` on startup and via `dux peer sync-amq`.
 
 ### Themes
 

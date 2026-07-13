@@ -1,3 +1,5 @@
+//! Non-interactive CLI commands for configuration, diagnostics, reset, and purge.
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1039,6 +1041,20 @@ mod tests {
     use crate::model::{AgentSession, ProviderKind, SessionState};
 
     #[test]
+    fn raw_diff_renders_legacy_workspace_consent_as_worktree() {
+        let config = Config {
+            workspace: None,
+            ..Config::default()
+        };
+        let bindings = RuntimeBindings::from_keys_config(&config.keys);
+
+        let rendered = render_config_for_diff(&config, &bindings);
+
+        assert!(rendered.contains("default_mode = \"worktree\""));
+        assert!(!rendered.contains("default_mode = \"shared\""));
+    }
+
+    #[test]
     fn reset_rejects_unknown_flags() {
         let error = reject_unknown_flags(&["--wat".to_string()], &["--all"]).unwrap_err();
         assert!(error.to_string().contains("unknown flag"));
@@ -1151,6 +1167,7 @@ mod tests {
             name: None,
             default_provider: None,
             commit_prompt: None,
+            workspace_mode: None,
         });
         assert_reports(&config, "projects:");
 
