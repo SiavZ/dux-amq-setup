@@ -284,3 +284,38 @@ Converged. Folded all 6 non-blocking refinements into a new "Implementation refi
 ---
 
 Converged after 5 rounds (4 REVISE → 1 APPROVED). The review turned a 1-page "agents share the main workspace" sketch into a hardened, phased spec: it caught that session PATH is used as identity in ~8 places, that a shared AMQ root needs GLOBAL handle uniqueness under a mandatory lock, that three deletion paths (not one) touch the real repo, that migration needs a crash-atomic table rebuild + soft-delete for GDPR, that startup auto-spawn and project registration both mutate the real checkout, and that the original "never touch the real repo" invariant was literally false (user edits mutate it by design). Awaiting user sign-off before any code.
+
+---
+
+## Act 3 — Build
+
+Builder: Codex (gpt-5.6-sol, reasoning max). Phased per the plan; Claude reviews each phase (diff + independent gates + adversarial review) before committing.
+Branch: shared-workspace (off main 5fc4472). Build thread: 019f5957-273c-7251-9c90-38e81c8fc599.
+
+### Phase 1 — Codex build (§A: schema migration, identity, soft-delete) — DARK
+
+Codex implemented migration 0005 (crash-atomic table rebuild + in-transaction Rust handle backfill + foreign_key_check), immutable fail-closed agent_handle, soft-delete tombstones, single accessor, and a Retryable lifecycle state for interrupted spawns. 16 files, +872/-54. 11 new proof tests. Report: no spec deviations; nothing reads shared_workspace/agent_handle for routing yet (Phase 2+ seam).
+
+### Claude's verdict (Phase 1) — pre-commit
+
+Independent gate rerun: all 5 cargo gates exit 0. Traced the load-bearing logic: migration is fully single-transaction (create new + Rust backfill + session_prs rebuild + foreign_key_check + user_version bump, commit-or-rollback); backfill derives basename→branch→id→"agent" (never empty), truncates to 64 (ASCII so char==byte, matches CHECK), dedups deterministically ORDER BY id with suffix-length-safe truncation; fail-closed load via validate_stored_handles; soft-delete + Retryable implemented. Launched an independent adversarial review of the foundation phase before committing (schema migration on real user DBs = highest stakes, per the audit's per-tier review precedent).
+
+### Round 1 review — Phase 1 (independent adversarial)
+
+Verdict: ISSUES — but all load-bearing correctness CONFIRMED clean (single-transaction atomicity, backfill column alignment, FK preservation, fail-closed load, soft-delete filter coverage, Retryable transitions, dark guarantee, no new panics). 1 should-fix + 3 nits:
+- SHOULD-FIX: an FK-orphan session_prs row (session gone without cascade) would abort migration 0005 under foreign_keys=ON, and since App::new opens with `?`, it BRICKS TUI launch with a non-actionable error.
+- nit: read-only CLI snapshot returns empty for the whole v4 user base until the TUI migrates (load_sessions selects agent_handle, fails on v4, swallowed).
+- nit: TOCTOU between assign_unique_agent_handle read and upsert (safe under single-writer invariant).
+- nit: deleted_at parsed-field vs SQL-visibility could diverge in the dead-code include-deleted path.
+
+### Claude's response — Phase 1 fixes (applied directly)
+
+Small/well-specified, so fixed directly (audit takeover precedent):
+- Migration now copies only referentially-valid session_prs rows (`where session_id in (select id from agent_sessions_new)`) — orphans are dropped, migration succeeds, TUI can't be bricked. Repurposed the old orphan-triggers-rollback test into migration_0005_drops_orphan_session_prs_and_succeeds, and added migration_0005_rolls_back_atomically_on_failure with a real failure trigger (leftover agent_sessions_new table) that still proves single-transaction rollback.
+- Added SessionStore::CURRENT_SCHEMA_VERSION + schema_version(); collect_sessions_snapshot now prints a "launch dux to migrate" note instead of silently showing zero sessions on a stale read-only DB.
+- Added the single-writer-invariant comment at the handle assign/upsert seam.
+- Added the deleted_at visibility-vs-parse comment for the future include-deleted caller.
+
+### Phase 1 — committed & verified
+
+Re-review fixes applied, all 5 cargo gates green. Committed 4bc947b..0d03ab1 (5 per-item commits) on branch shared-workspace. Foundation is DARK: schema v5 + immutable handles + soft-delete + Retryable exist and are tested; no routing/purge/identity behavior changed yet. Next: Phase 2 (§B — AMQ ownership, global handle reservation, mandatory meta/config.lock, wake-daemon lifecycle) which begins wiring identity into the AMQ registry + wrappers.
