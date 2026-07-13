@@ -252,31 +252,40 @@ sqlite, and `dux.log`. It does **not** touch
 `/data/state/{codex,gemini}/`. Every prompt and response with
 potential PII survives the delete.
 
-**Mitigation in code.** Phase 10 ships
-`dux session purge --hard <id>`. The command cascades to
-`~/.claude/projects/<encoded>/<session-id>.jsonl`,
-`/data/state/codex/<id>/`, `/data/state/gemini/<id>/`,
-the per-pane AMQ inbox `$STATE_ROOT/amq/<branch>/`, the sqlite
-session row, the worktree directory, and the `dux.log` lines tagged
-with `session_id=<id>`. The last item depends on Phase 09's
-migration to `tracing` for structured fields. Before confirmation,
-every recursive target is resolved through symlinks and must be a
-strict descendant of its configured category root; the root itself,
-absolute/traversing branch values, and escapes are rejected. The
-SQLite row is deleted only after every earlier step completes or is
-confirmed absent, so a handled cleanup failure leaves the identity
-available for a retry. Bulk purge treats a row whose paths cannot be
-safely planned as a per-session failure instead of aborting the entire
-operation: it reports the validation error, continues every valid
-cascade, and deletes only the malformed SQLite identity. Because the
-unsafe filesystem targets are deliberately not touched, that row-only
-case exits non-zero and requires the operator to remove any residual
-data out-of-band from the reported locations.
+**Mitigation in code.** `dux session purge --hard <target>` resolves a UUID or
+immutable agent handle, and accepts a branch only when it maps to exactly one
+row. For isolated sessions it cascades through the managed worktree, encoded
+provider-history directories, the exact-owner AMQ inbox, session-scoped log
+redaction, and finally the SQLite row. Recursive targets are resolved through
+symlinks and must remain strict descendants of their category root. Whole
+worktree/root removal also refuses any target that is an ancestor or descendant
+of a registered project; contained-file cleanup is deliberately outside that
+guard. Any failed step retains the SQLite identity for retry, and bulk purge
+retains rows whose full target inventory cannot be planned.
 
-**Residual risk.** Backups (sqlite `.bak`, OS-level snapshots,
-disk encryption snapshots) still contain the data and must be
-purged out-of-band. The `purge` command logs the manual
-follow-up steps.
+Shared sessions never remove the registered checkout. Per-session provider
+history cannot be honestly attributed because sibling Dux sessions and non-Dux
+conversations use the same provider directory. The default plan therefore
+reports an explicit `INCOMPLETE` item and retains the row, while still erasing
+provably owned AMQ and log records. The operator may explicitly accept residual
+provider data, or confirm a workspace-wide purge that covers every Dux session
+on that canonical path. The latter deletes the shared provider directory and
+therefore also deletes non-Dux conversations stored under the same workspace.
+`PURGE ALL` is not workspace-wide provider-history consent: bulk purge retains
+shared provider history and its recovery rows while reporting them incomplete.
+
+`dux config reset --all` loads config, active rows, tombstones, durable store
+identity, and the complete registered-project inventory before its first
+destructive step. It aborts on any incomplete/corrupt inventory, frees every
+exactly-owned AMQ inbox before deleting SQLite, and never removes a shared
+session's registered checkout. The error names the failed file or row; repair
+or restore it and retry. If identity cannot be restored, associated AMQ and
+filesystem data requires manual ownership verification before metadata removal.
+
+**Residual risk.** Backups (sqlite `.bak`, OS-level snapshots, disk encryption
+snapshots) still contain the data and must be purged out-of-band. A shared
+per-session purge that accepts residual data intentionally leaves provider
+transcripts and reports that fact in its purge summary.
 
 **Detection.** Each successful purge logs `session purged
 session_id=<id> files=<n> bytes=<m>` at INFO. `dux-amq doctor

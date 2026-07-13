@@ -129,11 +129,17 @@ dux config path          # Print the config file path
 dux config diff          # Show what you've changed from defaults
 dux config diff --raw    # Unified diff against the default config
 dux config reset         # Remove config and logs (keeps agents)
-dux config reset --all   # Full factory reset
+dux config reset --all   # Fail-closed full factory reset
 dux config regenerate    # Preview a fresh default config
 ```
 
 Override the config directory with the `DUX_HOME` environment variable.
+`reset --all` requires a loadable config, valid store ID/project inventory, and
+a loadable session/tombstone database when one exists. If it aborts, repair the
+named item: regenerate config, restore `sessions.sqlite3.bak`, or restore the
+original store ID, then retry. If identity cannot be restored, verify and remove
+the associated data manually before deleting metadata; a replacement store ID
+cannot prove old AMQ ownership.
 
 ### Workspace modes
 
@@ -327,23 +333,34 @@ read-only and safe to run while the TUI is open.
 
 ### Data lifecycle
 
-dux stores per-session data in several places: the worktree on disk, a row in `sessions.sqlite3`, the AMQ inbox (`/data/state/amq/agents/<receiver>/`, where `<receiver>` is the sanitised AMQ handle the wrapper derives from the worktree directory basename — typically the same as the original branch name but stable across branch renames inside the worktree), the per-provider chat history (`/data/state/{claude,codex,gemini}/projects/<encoded>/`), and structured log records tagged with the session's `session_id`. Most workflows leave that data in place — `dux config reset --all` is a holistic factory reset, but it does not target an individual session.
+dux stores per-session data in several places: the worktree on disk, a row in `sessions.sqlite3`, the exact-owner AMQ inbox (`/data/state/amq/agents/<agent_handle>/`), the per-provider chat history (`/data/state/{claude,codex,gemini}/projects/<encoded>/`), and structured log records tagged with the session's `session_id`. Most workflows leave that data in place. `dux config reset --all` is a holistic factory reset; it first requires a complete config/session/tombstone/store-identity inventory and frees every exactly-owned AMQ inbox before deleting the database.
 
 For GDPR Art 17 right-to-erasure (or just "delete this customer's data"), use `dux session purge`:
 
 ```bash
 # Preview the cascade — nothing is changed.
-dux session purge --hard <branch-or-id> --dry-run
+dux session purge --hard <uuid-handle-or-branch> --dry-run
 
 # Real run. Asks for the confirmation phrase 'PURGE <branch>'.
-dux session purge --hard <branch-or-id>
+dux session purge --hard <uuid-handle-or-branch>
 
 # Skip the prompt (e.g. from a script).
-dux session purge --hard <branch-or-id> --yes
+dux session purge --hard <uuid-handle-or-branch> --yes
 
-# Bulk: erase every session.
+# Shared workspace: erase owned records and explicitly accept that provider
+# transcripts remain because the provider directory is shared.
+dux session purge --hard <uuid-or-handle> --accept-residual-data
+
+# Shared workspace: confirm a workspace-wide provider-history purge. This
+# purges every Dux session on that checkout.
+dux session purge --hard <uuid-or-handle> --workspace-wide-provider-history
+
+# Bulk: erase owned data for every session. Shared provider history and its
+# recovery row remain until an explicit workspace-wide purge is confirmed.
 dux session purge-all --dry-run
 dux session purge-all --yes
 ```
 
-The cascade runs in a fixed order — worktree → provider chat dirs → AMQ inbox → log redact → sqlite row — so a crash mid-purge leaves a recoverable record in `sessions.sqlite3` and the operator can re-run the same command. Log records are not deleted; their `fields` object is replaced with `{"redacted": true}` so the audit trail (this session was purged on this date) survives without the content.
+For isolated worktree sessions, the cascade runs in a fixed order — worktree → provider chat dirs → exact-owner AMQ inbox → log redact → sqlite row — so a failure leaves a recoverable record in `sessions.sqlite3`. Shared-session purge never removes the registered checkout. Its provider history is reported as `INCOMPLETE` and the row is retained unless the operator explicitly accepts residual transcripts or confirms a workspace-wide purge. A workspace-wide provider-history purge also deletes non-Dux conversations stored by that provider under the same workspace path; providers do not separate them by Dux session. Branch targets that match multiple sessions are rejected—use the UUID or immutable handle instead.
+
+Whole-worktree and reset-root deletion is additionally blocked whenever the canonical target is an ancestor or descendant of any registered project path. This guard does not apply to normal contained-file operations such as discarding an untracked directory.
