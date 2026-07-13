@@ -1,6 +1,5 @@
-//! Integration tests for audit02 P1-Y (Phase 19): explicit schema
-//! versioning for both the SQLite session store and the TOML config
-//! file.
+//! Integration tests for versioned SQLite/config migrations, including the
+//! crash-atomic shared-workspace identity rebuild in migration 0005.
 //!
 //! These tests live under `tests/` so they exercise the public
 //! [`dux::storage::SessionStore`] / [`dux::config::migrate_config`]
@@ -12,6 +11,32 @@
 
 use dux::config::{CONFIG_SCHEMA_CURRENT, Config, migrate_config};
 use dux::storage::SessionStore;
+use rusqlite::{Connection, params};
+
+fn create_v4_database(path: &std::path::Path, seed_sql: &str) {
+    let conn = Connection::open(path).expect("open raw v4 database");
+    conn.pragma_update(None, "foreign_keys", false)
+        .expect("disable foreign keys while constructing legacy fixture");
+    conn.execute_batch(include_str!(
+        "../src/storage/migrations/0001_initial_schema.sql"
+    ))
+    .expect("apply 0001");
+    conn.execute_batch(include_str!(
+        "../src/storage/migrations/0002_session_state_v2.sql"
+    ))
+    .expect("apply 0002");
+    conn.execute_batch(include_str!(
+        "../src/storage/migrations/0003_session_settings.sql"
+    ))
+    .expect("apply 0003");
+    conn.execute_batch(include_str!(
+        "../src/storage/migrations/0004_session_sort_order.sql"
+    ))
+    .expect("apply 0004");
+    conn.execute_batch(seed_sql).expect("seed v4 database");
+    conn.pragma_update(None, "user_version", 4)
+        .expect("stamp v4");
+}
 
 /// Opening a `SessionStore` against a fresh, empty database file must
 /// run every entry in the `MIGRATIONS` slice. Externally we observe
@@ -55,7 +80,12 @@ fn migrate_from_empty_db_runs_all_migrations() {
         "project_path",
         "started_providers",
         "status",
+        "state_json",
+        "session_settings",
         "sort_order",
+        "shared_workspace",
+        "agent_handle",
+        "deleted_at",
         "created_at",
         "updated_at",
     ] {
@@ -65,6 +95,217 @@ fn migrate_from_empty_db_runs_all_migrations() {
              columns = {agent_sessions_columns:?}"
         );
     }
+}
+
+#[test]
+fn migration_0005_backfills_duplicate_handles_deterministically() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("duplicates.sqlite3");
+    create_v4_database(
+        &path,
+        r#"
+        insert into agent_sessions
+            (id, project_id, provider, source_branch, branch_name,
+             worktree_path, status, created_at, updated_at)
+        values
+            ('b', 'p', 'claude', 'main', 'second', '/two/Same Name',
+             'detached', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+            ('a', 'p', 'claude', 'main', 'first', '/one/Same Name',
+             'detached', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+            ('c', 'p', 'claude', 'main', '???', '/three/---',
+             'detached', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+        "#,
+    );
+
+    let store = SessionStore::open(&path).expect("migrate v4 to v5");
+    let version: u32 = store
+        .conn()
+        .query_row("pragma user_version", [], |row| row.get(0))
+        .expect("read v5 version");
+    assert_eq!(version, 5);
+    let handles: Vec<(String, String)> = store
+        .conn()
+        .prepare("select id, agent_handle from agent_sessions order by id")
+        .expect("prepare handles")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query handles")
+        .collect::<rusqlite::Result<_>>()
+        .expect("collect handles");
+    assert_eq!(
+        handles,
+        vec![
+            ("a".to_string(), "same-name".to_string()),
+            ("b".to_string(), "same-name-2".to_string()),
+            ("c".to_string(), "c".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn migration_0005_rebuild_enforces_handle_constraints_and_preserves_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("constraints.sqlite3");
+    let store = SessionStore::open(&path).expect("open v5 store");
+    let conn = store.conn();
+    let insert = |id: &str, handle: Option<&str>| {
+        conn.execute(
+            r#"
+            insert into agent_sessions
+                (id, project_id, provider, source_branch, branch_name,
+                 worktree_path, agent_handle, status, created_at, updated_at)
+            values (?1, 'p', 'claude', 'main', ?1, '/tmp/wt', ?2,
+                    'detached', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+            "#,
+            params![id, handle],
+        )
+    };
+
+    assert!(
+        insert("null", None).is_err(),
+        "agent_handle must be NOT NULL"
+    );
+    insert("valid", Some("valid")).expect("insert valid handle");
+    assert!(
+        insert("duplicate", Some("valid")).is_err(),
+        "agent_handle must be UNIQUE"
+    );
+    for invalid in ["", "Bad/handle", &"x".repeat(65)] {
+        assert!(
+            insert(&format!("invalid-{}", invalid.len()), Some(invalid)).is_err(),
+            "CHECK must reject {invalid:?}"
+        );
+    }
+    let sort_index_count: i64 = conn
+        .query_row(
+            "select count(*) from sqlite_master where type = 'index' and name = 'idx_agent_sessions_sort_order'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sort index");
+    assert_eq!(sort_index_count, 1, "table rebuild must recreate indexes");
+}
+
+#[test]
+fn migration_0005_preserves_session_pr_foreign_key() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("foreign-key.sqlite3");
+    create_v4_database(
+        &path,
+        r#"
+        insert into agent_sessions
+            (id, project_id, provider, source_branch, branch_name,
+             worktree_path, status, created_at, updated_at)
+        values
+            ('session', 'p', 'claude', 'main', 'branch', '/tmp/session',
+             'detached', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+        insert into session_prs (session_id, pr_number, owner_repo)
+        values ('session', 42, 'owner/repo');
+        "#,
+    );
+
+    let store = SessionStore::open(&path).expect("migrate with PR row");
+    assert_eq!(store.load_prs("session").expect("load PRs").len(), 1);
+    let fk: (String, String, String, String) = store
+        .conn()
+        .query_row("pragma foreign_key_list(session_prs)", [], |row| {
+            Ok((row.get(2)?, row.get(3)?, row.get(4)?, row.get(6)?))
+        })
+        .expect("foreign key definition");
+    assert_eq!(
+        fk,
+        (
+            "agent_sessions".to_string(),
+            "session_id".to_string(),
+            "id".to_string(),
+            "CASCADE".to_string(),
+        )
+    );
+    let violations: i64 = store
+        .conn()
+        .query_row("select count(*) from pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .expect("foreign_key_check");
+    assert_eq!(violations, 0);
+    store.delete_session("session").expect("hard delete parent");
+    assert!(
+        store
+            .load_prs("session")
+            .expect("load cascaded PRs")
+            .is_empty()
+    );
+}
+
+#[test]
+fn migration_0005_drops_orphan_session_prs_and_succeeds() {
+    // A legacy DB can hold a session_prs row whose parent session is gone
+    // (cascade didn't fire). The migration must DROP the orphan and succeed,
+    // never abort — aborting would brick TUI launch (App::new opens with `?`).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("orphan.sqlite3");
+    create_v4_database(
+        &path,
+        r#"
+        insert into agent_sessions
+            (id, project_id, provider, source_branch, branch_name,
+             worktree_path, status, created_at, updated_at)
+        values
+            ('live', 'p', 'claude', 'main', 'branch', '/tmp/live',
+             'detached', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+        insert into session_prs (session_id, pr_number, owner_repo)
+        values ('live', 1, 'owner/repo'), ('missing-parent', 7, 'owner/repo');
+        "#,
+    );
+
+    let store = SessionStore::open(&path).expect("migration drops the orphan and succeeds");
+    // The live session's PR survives; the orphan is gone.
+    assert_eq!(store.load_prs("live").expect("live PRs").len(), 1);
+    let total_prs: i64 = store
+        .conn()
+        .query_row("select count(*) from session_prs", [], |row| row.get(0))
+        .expect("count PRs");
+    assert_eq!(total_prs, 1, "orphan session_prs row must be dropped");
+    let version: u32 = store
+        .conn()
+        .query_row("pragma user_version", [], |row| row.get(0))
+        .expect("version");
+    assert_eq!(version, 5);
+}
+
+#[test]
+fn migration_0005_rolls_back_atomically_on_failure() {
+    // Force a genuine mid-migration failure (a leftover agent_sessions_new
+    // table makes `create table agent_sessions_new` fail) and prove the whole
+    // rebuild + version bump rolls back — user_version stays 4, no new column,
+    // no temp table. This would fail if the migration were not one transaction.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("rollback.sqlite3");
+    create_v4_database(
+        &path,
+        r#"
+        create table agent_sessions_new (leftover text);
+        "#,
+    );
+
+    let err = match SessionStore::open(&path) {
+        Ok(_) => panic!("migration must fail"),
+        Err(err) => err,
+    };
+    assert!(format!("{err:#}").contains("migration 5 failed"));
+
+    let conn = Connection::open(&path).expect("reopen rolled-back database");
+    let version: u32 = conn
+        .query_row("pragma user_version", [], |row| row.get(0))
+        .expect("read rolled-back version");
+    assert_eq!(version, 4);
+    let columns: Vec<String> = conn
+        .prepare("pragma table_info(agent_sessions)")
+        .expect("prepare old columns")
+        .query_map([], |row| row.get(1))
+        .expect("query old columns")
+        .collect::<rusqlite::Result<_>>()
+        .expect("collect old columns");
+    assert!(!columns.contains(&"agent_handle".to_string()));
 }
 
 /// Re-running the migration loop on an already-migrated database is a

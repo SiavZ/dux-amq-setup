@@ -1,11 +1,19 @@
+//! Crash-atomic SQLite migrations and session persistence.
+
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
-use crate::model::{AgentSession, SessionSettings, SessionState};
+use crate::model::{
+    AGENT_HANDLE_MAX_LEN, AgentSession, SessionSettings, SessionState, derive_agent_handle,
+    is_valid_agent_handle, normalize_agent_handle,
+};
+
+const HANDLE_BACKFILL_MARKER: &str = "-- rust-backfill-agent-handles";
 
 /// Ordered list of schema migrations. Each entry is `(version, sql)`.
 ///
@@ -38,6 +46,10 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (
         4,
         include_str!("storage/migrations/0004_session_sort_order.sql"),
+    ),
+    (
+        5,
+        include_str!("storage/migrations/0005_shared_workspace.sql"),
     ),
 ];
 
@@ -118,12 +130,141 @@ fn apply_migration(conn: &mut Connection, version: u32, sql: &str) -> Result<()>
     let tx = conn
         .transaction()
         .with_context(|| format!("failed to begin migration {version}"))?;
-    tx.execute_batch(sql)
-        .with_context(|| format!("migration {version} failed"))?;
+    if version == 5 {
+        apply_session_identity_migration(&tx, sql)
+            .with_context(|| format!("migration {version} failed"))?;
+    } else {
+        tx.execute_batch(sql)
+            .with_context(|| format!("migration {version} failed"))?;
+    }
     tx.pragma_update(None, "user_version", version)
         .with_context(|| format!("failed to set user_version = {version}"))?;
     tx.commit()
         .with_context(|| format!("failed to commit migration {version}"))
+}
+
+struct LegacySessionRow {
+    id: String,
+    project_id: String,
+    provider: String,
+    source_branch: String,
+    branch_name: String,
+    worktree_path: String,
+    title: Option<String>,
+    project_path: Option<String>,
+    started_providers: String,
+    status: String,
+    created_at: String,
+    updated_at: String,
+    state_json: Option<String>,
+    session_settings: Option<String>,
+    sort_order: i64,
+}
+
+fn apply_session_identity_migration(tx: &Transaction<'_>, sql: &str) -> Result<()> {
+    let (before_backfill, after_backfill) = sql
+        .split_once(HANDLE_BACKFILL_MARKER)
+        .context("migration 0005 is missing its Rust backfill marker")?;
+    tx.execute_batch(before_backfill)?;
+
+    let rows = {
+        let mut stmt = tx.prepare(
+            r#"
+            select id, project_id, provider, source_branch, branch_name,
+                   worktree_path, title, project_path, started_providers,
+                   status, created_at, updated_at, state_json,
+                   session_settings, sort_order
+            from agent_sessions
+            order by id
+            "#,
+        )?;
+        stmt.query_map([], |row| {
+            Ok(LegacySessionRow {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                provider: row.get(2)?,
+                source_branch: row.get(3)?,
+                branch_name: row.get(4)?,
+                worktree_path: row.get(5)?,
+                title: row.get(6)?,
+                project_path: row.get(7)?,
+                started_providers: row.get(8)?,
+                status: row.get(9)?,
+                created_at: row.get(10)?,
+                updated_at: row.get(11)?,
+                state_json: row.get(12)?,
+                session_settings: row.get(13)?,
+                sort_order: row.get(14)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut used_handles = HashSet::new();
+    for row in rows {
+        let base = derive_agent_handle(&row.worktree_path, &row.branch_name, &row.id);
+        let agent_handle = next_unique_agent_handle(&base, &used_handles);
+        used_handles.insert(agent_handle.clone());
+        tx.execute(
+            r#"
+            insert into agent_sessions_new
+                (id, project_id, provider, source_branch, branch_name,
+                 worktree_path, title, project_path, started_providers,
+                 status, created_at, updated_at, state_json, session_settings,
+                 sort_order, shared_workspace, agent_handle, deleted_at)
+            values
+                (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                 ?13, ?14, ?15, 0, ?16, null)
+            "#,
+            params![
+                row.id,
+                row.project_id,
+                row.provider,
+                row.source_branch,
+                row.branch_name,
+                row.worktree_path,
+                row.title,
+                row.project_path,
+                row.started_providers,
+                row.status,
+                row.created_at,
+                row.updated_at,
+                row.state_json,
+                row.session_settings,
+                row.sort_order,
+                agent_handle,
+            ],
+        )?;
+    }
+
+    tx.execute_batch(after_backfill)?;
+    let has_foreign_key_violation = {
+        let mut stmt = tx.prepare("pragma foreign_key_check")?;
+        stmt.exists([])?
+    };
+    ensure!(
+        !has_foreign_key_violation,
+        "migration 0005 foreign_key_check reported violations"
+    );
+    Ok(())
+}
+
+fn next_unique_agent_handle(base: &str, used: &HashSet<String>) -> String {
+    if !used.contains(base) {
+        return base.to_string();
+    }
+    for ordinal in 2usize.. {
+        let suffix = format!("-{ordinal}");
+        let prefix: String = base
+            .chars()
+            .take(AGENT_HANDLE_MAX_LEN - suffix.len())
+            .collect();
+        let candidate = format!("{prefix}{suffix}");
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded handle suffix search")
 }
 
 /// A stored PR association loaded from the database.
@@ -165,6 +306,22 @@ impl SessionStore {
 
     /// Open an existing sessions database without running PRAGMAs or schema
     /// migrations. Intended for diagnostics that promise not to mutate state.
+    /// The schema version this build expects (highest entry in `MIGRATIONS`).
+    pub const CURRENT_SCHEMA_VERSION: u32 = match MIGRATIONS.last() {
+        Some((version, _)) => *version,
+        None => 0,
+    };
+
+    /// Read `PRAGMA user_version` without migrating. Lets read-only callers
+    /// detect a database that predates this build's schema (a read-only handle
+    /// cannot migrate, so `load_sessions` would fail on new columns) and report
+    /// staleness instead of silently returning an empty list.
+    pub fn schema_version(&self) -> Result<u32> {
+        self.conn()
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))
+            .context("failed to read PRAGMA user_version")
+    }
+
     pub fn open_read_only(path: &Path) -> Result<Self> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("failed to open {} read-only", path.display()))?;
@@ -281,8 +438,42 @@ impl SessionStore {
         Ok(result)
     }
 
+    /// Assign a locally unique handle to a brand-new session before its
+    /// first insert. Tombstones participate so ordinary deletion never frees
+    /// an identity that a later purge still needs.
+    pub fn assign_unique_agent_handle(&self, session: &mut AgentSession) -> Result<()> {
+        let base = normalize_agent_handle(session.agent_handle());
+        ensure!(!base.is_empty(), "new session has an empty agent handle");
+        let conn = self.conn();
+        let mut stmt = conn.prepare("select agent_handle from agent_sessions")?;
+        let used = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<HashSet<String>>>()?;
+        session.agent_handle = next_unique_agent_handle(&base, &used);
+        Ok(())
+    }
+
     pub fn upsert_session(&self, session: &AgentSession) -> Result<()> {
         let conn = self.conn();
+        ensure!(
+            is_valid_agent_handle(session.agent_handle()),
+            "refusing to persist invalid agent handle {:?}",
+            crate::sanitize::for_terminal(session.agent_handle())
+        );
+        let stored_handle: Option<String> = conn
+            .query_row(
+                "select agent_handle from agent_sessions where id = ?1",
+                params![session.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(stored_handle) = stored_handle {
+            ensure!(
+                stored_handle == session.agent_handle(),
+                "refusing to change immutable agent handle for session {:?}",
+                crate::sanitize::for_terminal(&session.id)
+            );
+        }
         // audit02 P1-Z phase 2: `SessionState` is the single source of
         // truth. The legacy `status` column is still written so that
         // a Phase 18-aware binary downgrading to a Phase-17 binary can
@@ -296,12 +487,16 @@ impl SessionStore {
         conn.execute(
             r#"
             insert into agent_sessions
-                (id, project_id, project_path, provider, source_branch, branch_name, worktree_path, title, started_providers, status, state_json, session_settings, sort_order, created_at, updated_at)
+                (id, project_id, project_path, provider, source_branch,
+                 branch_name, worktree_path, agent_handle, shared_workspace,
+                 title, started_providers, status, state_json, session_settings,
+                 deleted_at, sort_order, created_at, updated_at)
             values
                 (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                    ?13, ?14, ?15,
                     coalesce((select max(sort_order) + 1 from agent_sessions), 0),
-                    ?13, ?14
+                    ?16, ?17
                 )
             on conflict(id) do update set
                 project_path=excluded.project_path,
@@ -309,6 +504,7 @@ impl SessionStore {
                 source_branch=excluded.source_branch,
                 branch_name=excluded.branch_name,
                 worktree_path=excluded.worktree_path,
+                shared_workspace=excluded.shared_workspace,
                 title=excluded.title,
                 started_providers=excluded.started_providers,
                 status=excluded.status,
@@ -324,11 +520,14 @@ impl SessionStore {
                 session.source_branch,
                 session.branch_name,
                 session.worktree_path,
+                session.agent_handle(),
+                session.shared_workspace(),
                 session.title,
                 serialize_started_providers(&session.started_providers),
                 legacy_status,
                 state_json,
                 settings_json,
+                session.deleted_at.map(|timestamp| timestamp.to_rfc3339()),
                 session.created_at.to_rfc3339(),
                 session.updated_at.to_rfc3339(),
             ],
@@ -337,21 +536,49 @@ impl SessionStore {
     }
 
     pub fn load_sessions(&self) -> Result<Vec<AgentSession>> {
+        self.load_sessions_impl(false)
+    }
+
+    /// Load active sessions and tombstones. Reserved for destructive
+    /// maintenance paths that must finish erasing a previously soft-deleted
+    /// session.
+    #[allow(dead_code)] // Phase 5 hard purge is the first production caller.
+    pub fn load_sessions_including_deleted(&self) -> Result<Vec<AgentSession>> {
+        self.load_sessions_impl(true)
+    }
+
+    fn load_sessions_impl(&self, include_deleted: bool) -> Result<Vec<AgentSession>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
+        validate_stored_handles(&conn)?;
+        let where_clause = if include_deleted {
+            ""
+        } else {
+            "where deleted_at is null"
+        };
+        let mut stmt = conn.prepare(&format!(
             r#"
-            select id, project_id, provider, source_branch, branch_name, worktree_path, title, project_path, started_providers, status, state_json, session_settings, created_at, updated_at
+            select id, project_id, provider, source_branch, branch_name,
+                   worktree_path, agent_handle, shared_workspace, deleted_at,
+                   title, project_path, started_providers, status, state_json,
+                   session_settings, created_at, updated_at
             from agent_sessions
+            {where_clause}
             order by sort_order asc, updated_at desc, id asc
-            "#,
-        )?;
+            "#
+        ))?;
         let rows = stmt.query_map([], |row| {
-            let started_providers: String = row.get(8)?;
-            let legacy_status_str: String = row.get(9)?;
-            let state_json: Option<String> = row.get(10)?;
-            let session_settings_raw: Option<String> = row.get(11)?;
-            let created_at: String = row.get(12)?;
-            let updated_at: String = row.get(13)?;
+            // Visibility is decided by the SQL `deleted_at is null` filter, not
+            // this parsed field: `soft_delete_session` always writes a valid
+            // RFC3339 stamp, so an unparseable value (→ None here) never makes a
+            // tombstone read as active. If a future include-deleted caller
+            // relies on this field, gate it on the raw NULL, not the parse.
+            let deleted_at: Option<String> = row.get(8)?;
+            let started_providers: String = row.get(11)?;
+            let legacy_status_str: String = row.get(12)?;
+            let state_json: Option<String> = row.get(13)?;
+            let session_settings_raw: Option<String> = row.get(14)?;
+            let created_at: String = row.get(15)?;
+            let updated_at: String = row.get(16)?;
             // audit02 P1-Z phase 2: prefer the new `state_json`
             // column. Fall back to the legacy `status` text if the
             // row pre-dates migration 0002 (or the JSON is corrupt).
@@ -374,8 +601,11 @@ impl SessionStore {
                 source_branch: row.get(3)?,
                 branch_name: row.get(4)?,
                 worktree_path: row.get(5)?,
-                title: row.get(6)?,
-                project_path: row.get(7)?,
+                agent_handle: row.get(6)?,
+                shared_workspace: row.get::<_, i64>(7)? != 0,
+                deleted_at: deleted_at.as_deref().and_then(parse_time),
+                title: row.get(9)?,
+                project_path: row.get(10)?,
                 started_providers: parse_started_providers(&started_providers),
                 state,
                 settings,
@@ -408,11 +638,47 @@ impl SessionStore {
         Ok(())
     }
 
+    pub fn soft_delete_session(&self, id: &str) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "update agent_sessions set deleted_at = ?1 where id = ?2 and deleted_at is null",
+            params![Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(())
+    }
+
+    /// Physically remove a row. Ordinary UI deletion must use
+    /// [`SessionStore::soft_delete_session`]; this remains for hard purge.
     pub fn delete_session(&self, id: &str) -> Result<()> {
         let conn = self.conn();
         conn.execute("delete from agent_sessions where id = ?1", params![id])?;
         Ok(())
     }
+}
+
+fn validate_stored_handles(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("select id, agent_handle from agent_sessions order by id")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut handles = HashSet::new();
+    for row in rows {
+        let (id, handle) = row?;
+        if !is_valid_agent_handle(&handle) {
+            bail!(
+                "session database corruption: invalid agent_handle {:?} for session {:?}",
+                crate::sanitize::for_terminal(&handle),
+                crate::sanitize::for_terminal(&id)
+            );
+        }
+        if !handles.insert(handle.clone()) {
+            bail!(
+                "session database corruption: duplicate agent_handle {:?}",
+                crate::sanitize::for_terminal(&handle)
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Open a SQLite connection at `path` with the dux startup PRAGMAs and a
@@ -475,6 +741,7 @@ fn legacy_status_str_for(state: &SessionState) -> &'static str {
         SessionState::Exited { .. } => "exited",
         SessionState::Created { .. }
         | SessionState::Spawning { .. }
+        | SessionState::Retryable { .. }
         | SessionState::Detached { .. } => "detached",
     }
 }
@@ -532,6 +799,9 @@ fn test_session(
         source_branch: "main".to_string(),
         branch_name: format!("branch-{id}"),
         worktree_path: format!("/tmp/{id}"),
+        agent_handle: id.to_string(),
+        shared_workspace: false,
+        deleted_at: None,
         title: None,
         started_providers: Vec::new(),
         state: SessionState::Created { created_at },
