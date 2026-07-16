@@ -644,6 +644,12 @@ impl App {
         if let Some(session_id) = session.provider_session_id(&session.provider)
             && uuid::Uuid::parse_str(session_id).is_ok()
             && cfg.supports_session_resume_by_id()
+            && (!session.shared_workspace()
+                || session.provider.as_str() != "claude"
+                || crate::resume_recovery::claude_resume_target_exists(
+                    Path::new(&session.worktree_path),
+                    session_id,
+                ))
         {
             return SessionLaunch::ResumeId(session_id.to_string());
         }
@@ -3311,35 +3317,48 @@ mod tests {
     #[test]
     fn shared_agents_in_one_cwd_build_distinct_targeted_resume_argv() {
         let cwd = "/tmp/shared-project";
-        let mut first = make_session("first", "claude", cwd);
-        let mut second = make_session("second", "claude", cwd);
+        let mut first = make_session("first", "codex", cwd);
+        let mut second = make_session("second", "codex", cwd);
         first.shared_workspace = true;
         second.shared_workspace = true;
         let first_id = uuid::Uuid::new_v4().to_string();
         let second_id = uuid::Uuid::new_v4().to_string();
         first
             .provider_session_ids
-            .insert("claude".to_string(), first_id.clone());
+            .insert("codex".to_string(), first_id.clone());
         second
             .provider_session_ids
-            .insert("claude".to_string(), second_id.clone());
-        let project = make_project("project-1", "claude");
+            .insert("codex".to_string(), second_id.clone());
+        let project = make_project("project-1", "codex");
         let app = test_app_with_sessions(vec![first.clone(), second.clone()], vec![project]);
 
         let first_launch = app.should_resume_session(&first);
         let second_launch = app.should_resume_session(&second);
         assert_eq!(first_launch, SessionLaunch::ResumeId(first_id.clone()));
         assert_eq!(second_launch, SessionLaunch::ResumeId(second_id.clone()));
-        let config = provider_config(&app.config, &ProviderKind::from_str("claude"));
-        let provider = ProviderKind::from_str("claude");
+        let config = provider_config(&app.config, &ProviderKind::from_str("codex"));
+        let provider = ProviderKind::from_str("codex");
         let first_argv =
             launch_args(&config, &provider, &first_launch, None, Path::new(cwd)).unwrap();
         let second_argv =
             launch_args(&config, &provider, &second_launch, None, Path::new(cwd)).unwrap();
         assert_ne!(first_argv, second_argv);
-        assert_eq!(first_argv.last(), Some(&first_id));
-        assert_eq!(second_argv.last(), Some(&second_id));
+        assert_eq!(first_argv.get(1), Some(&first_id));
+        assert_eq!(second_argv.get(1), Some(&second_id));
         assert_eq!(first.worktree_path, second.worktree_path);
+    }
+
+    #[test]
+    fn shared_claude_with_missing_transcript_launches_fresh() {
+        let mut session = make_session("missing", "claude", "/tmp/shared-project");
+        session.shared_workspace = true;
+        session
+            .provider_session_ids
+            .insert("claude".to_string(), uuid::Uuid::new_v4().to_string());
+        let project = make_project("project-1", "claude");
+        let app = test_app_with_sessions(vec![session.clone()], vec![project]);
+
+        assert_eq!(app.should_resume_session(&session), SessionLaunch::Fresh);
     }
 
     #[test]

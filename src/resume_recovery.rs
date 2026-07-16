@@ -663,6 +663,17 @@ pub(crate) fn encode_claude_project_dir(path: &Path) -> String {
         .collect()
 }
 
+pub(crate) fn claude_resume_target_exists(cwd: &Path, session_id: &str) -> bool {
+    let Ok(roots) = ProviderDataRoots::from_home() else {
+        return false;
+    };
+    let transcript = roots
+        .claude_projects
+        .join(encode_claude_project_dir(cwd))
+        .join(format!("{session_id}.jsonl"));
+    fs::symlink_metadata(transcript).is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
 fn copy_claude_artifacts(source_jsonl: &Path, destination_dir: &Path) -> Result<usize> {
     ensure_plain_directory(destination_dir)?;
     let mut copied = usize::from(atomic_copy(
