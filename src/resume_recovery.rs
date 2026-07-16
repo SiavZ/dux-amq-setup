@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use chrono::DateTime;
+use notify::{RecursiveMode, Watcher};
 use rustix::fs::{CWD, RenameFlags, renameat_with};
 use serde_json::Value;
 use uuid::Uuid;
@@ -18,10 +19,7 @@ use crate::storage::SessionStore;
 
 const MAX_TRANSCRIPT_FILES: usize = 100_000;
 const MAX_JSON_LINE_BYTES: usize = 16 * 1024 * 1024;
-// ponytail: fixed internal discovery bound; add a provider config knob only if
-// real Codex installs need more than 30 seconds to create their rollout file.
-pub(crate) const CODEX_CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
-pub(crate) const CODEX_CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const CODEX_PROCESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProviderDataRoots {
@@ -181,23 +179,86 @@ impl CodexCapture {
         }
     }
 
-    pub(crate) fn wait_for_id(&self, timeout: Duration, poll: Duration) -> Result<String> {
+    pub(crate) fn wait_for_id(
+        &self,
+        timeout: Option<Duration>,
+        process_id: Option<u32>,
+    ) -> Result<Option<String>> {
+        fs::create_dir_all(&self.sessions_root).with_context(|| {
+            format!(
+                "failed to create Codex sessions directory {}",
+                self.sessions_root.display()
+            )
+        })?;
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |event| {
+            let _ = event_tx.send(event);
+        })
+        .context("failed to start Codex rollout watcher")?;
+        watcher
+            .watch(&self.sessions_root, RecursiveMode::Recursive)
+            .with_context(|| {
+                format!(
+                    "failed to watch Codex sessions directory {}",
+                    self.sessions_root.display()
+                )
+            })?;
+
         let started = Instant::now();
+        let mut paths = codex_rollout_paths(&self.sessions_root)?;
         loop {
-            let mut candidates = scan_codex_rollouts(&self.sessions_root)?
+            let mut candidates = std::mem::take(&mut paths)
                 .into_iter()
-                .filter(|rollout| !self.known_ids.contains(&rollout.id))
-                .filter(|rollout| canonical_or_raw(&rollout.cwd) == self.cwd)
-                .map(|rollout| rollout.id)
+                .filter_map(parse_codex_rollout_identity)
+                .filter(|(id, _)| !self.known_ids.contains(id))
+                .filter(|(_, cwd)| canonical_or_raw(cwd) == self.cwd)
+                .map(|(id, _)| id)
                 .collect::<HashSet<_>>();
             match candidates.len() {
-                1 => return Ok(candidates.drain().next().expect("one candidate")),
+                1 => return Ok(candidates.drain().next()),
                 n if n > 1 => bail!("multiple new Codex rollout candidates matched the workspace"),
-                _ if started.elapsed() >= timeout => {
-                    bail!("timed out waiting for a new Codex rollout")
-                }
-                _ => std::thread::sleep(poll),
+                _ => {}
             }
+
+            if process_id.is_some_and(|pid| !process_is_running(pid)) {
+                return Ok(None);
+            }
+
+            let remaining = match timeout {
+                Some(timeout) => Some(
+                    timeout
+                        .checked_sub(started.elapsed())
+                        .context("timed out waiting for a new Codex rollout")?,
+                ),
+                None => None,
+            };
+            let event = match (remaining, process_id) {
+                (None, None) => event_rx
+                    .recv()
+                    .context("Codex rollout watcher stopped unexpectedly")?,
+                (remaining, process_id) => {
+                    let wait = remaining
+                        .unwrap_or(CODEX_PROCESS_POLL_INTERVAL)
+                        .min(CODEX_PROCESS_POLL_INTERVAL);
+                    match event_rx.recv_timeout(wait) {
+                        Ok(event) => event,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if process_id.is_some_and(|pid| !process_is_running(pid)) {
+                                return Ok(None);
+                            }
+                            if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
+                                bail!("timed out waiting for a new Codex rollout");
+                            }
+                            continue;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            bail!("Codex rollout watcher stopped unexpectedly")
+                        }
+                    }
+                }
+            }
+            .context("Codex rollout watcher failed")?;
+            paths = codex_rollout_paths_from_events(event.paths)?;
         }
     }
 
@@ -218,6 +279,59 @@ impl CodexCapture {
         wake.notify_all();
         self.active = false;
     }
+}
+
+fn codex_rollout_paths(root: &Path) -> Result<Vec<PathBuf>> {
+    recursive_files(root, is_codex_rollout_path)
+}
+
+fn codex_rollout_paths_from_events(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    let mut rollouts = Vec::new();
+    for path in paths {
+        if is_codex_rollout_path(&path) {
+            rollouts.push(path);
+        } else if path.is_dir() {
+            rollouts.extend(codex_rollout_paths(&path)?);
+        }
+    }
+    Ok(rollouts)
+}
+
+fn is_codex_rollout_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+}
+
+fn parse_codex_rollout_identity(path: PathBuf) -> Option<(String, PathBuf)> {
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    let mut reader = BufReader::new(File::open(path).ok()?);
+    let mut line = Vec::new();
+    let read = reader.read_until(b'\n', &mut line).ok()?;
+    if read == 0 || line.len() > MAX_JSON_LINE_BYTES {
+        return None;
+    }
+    let first = serde_json::from_slice::<Value>(&line).ok()?;
+    if first.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let payload = first.get("payload")?;
+    let id = payload.get("id")?.as_str()?.to_string();
+    let cwd = PathBuf::from(payload.get("cwd")?.as_str()?);
+    if Uuid::parse_str(&id).is_err() || !cwd.is_absolute() {
+        return None;
+    }
+    Some((id, cwd))
+}
+
+fn process_is_running(process_id: u32) -> bool {
+    i32::try_from(process_id)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .is_some_and(|pid| rustix::process::test_kill_process(pid).is_ok())
 }
 
 impl Drop for CodexCapture {
@@ -538,34 +652,17 @@ fn parse_claude_transcript(path: PathBuf) -> Option<Transcript> {
 }
 
 fn scan_codex_rollouts(root: &Path) -> Result<Vec<Transcript>> {
-    let paths = recursive_files(root, |path| {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
-    })?;
+    let paths = codex_rollout_paths(root)?;
     Ok(paths.into_iter().filter_map(parse_codex_rollout).collect())
 }
 
 fn parse_codex_rollout(path: PathBuf) -> Option<Transcript> {
-    let mut first = None;
+    let (id, cwd) = parse_codex_rollout_identity(path.clone())?;
     let mut activity_ms = None;
-    let fallback_ms = visit_jsonl(&path, |line_index, value| {
-        if line_index == 0 {
-            first = Some(value.clone());
-        }
+    let fallback_ms = visit_jsonl(&path, |_, value| {
         activity_ms = activity_ms.max(json_timestamp_ms(value));
     })
     .ok()?;
-    let first = first.as_ref()?;
-    if first.get("type").and_then(Value::as_str) != Some("session_meta") {
-        return None;
-    }
-    let payload = first.get("payload")?;
-    let id = payload.get("id")?.as_str()?.to_string();
-    let cwd = PathBuf::from(payload.get("cwd")?.as_str()?);
-    if Uuid::parse_str(&id).is_err() || !cwd.is_absolute() {
-        return None;
-    }
     Some(Transcript {
         provider: "codex".to_string(),
         id,
@@ -1089,20 +1186,43 @@ mod tests {
                 "timestamp": "2026-07-14T12:00:00Z",
             }
         });
-        fs::write(
-            sessions
-                .join("2026/07/14")
-                .join(format!("rollout-test-{id}.jsonl")),
-            format!("{record}\n"),
-        )
-        .unwrap();
+        let rollout = sessions
+            .join("2026/07/14")
+            .join(format!("rollout-test-{id}.jsonl"));
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            fs::write(rollout, format!("{record}\n")).unwrap();
+        });
 
         assert_eq!(
             capture
-                .wait_for_id(Duration::from_secs(1), Duration::from_millis(5))
+                .wait_for_id(Some(Duration::from_secs(2)), None)
                 .unwrap(),
-            id
+            Some(id)
         );
+        writer.join().unwrap();
         capture.resolve();
+    }
+
+    #[test]
+    fn codex_capture_stops_when_the_uncaptured_process_exits() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("cwd");
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        let capture =
+            CodexCapture::begin_with(CodexCaptureCoordinator::default(), &cwd, &sessions).unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let process_id = child.id();
+        child.wait().unwrap();
+
+        assert_eq!(
+            capture
+                .wait_for_id(Some(Duration::from_secs(2)), Some(process_id))
+                .unwrap(),
+            None
+        );
+        capture.abort();
     }
 }

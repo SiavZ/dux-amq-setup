@@ -1914,6 +1914,9 @@ impl App {
         session_id: &str,
         capture: crate::resume_recovery::FreshCapture,
     ) {
+        let process_id = self
+            .find_pty_handle(session_id)
+            .and_then(|pty| pty.child_process_id());
         match capture {
             crate::resume_recovery::FreshCapture::None => {}
             crate::resume_recovery::FreshCapture::Claude {
@@ -1945,6 +1948,7 @@ impl App {
                     self.session_store.clone(),
                     session_id.to_string(),
                     capture,
+                    process_id,
                 );
             }
         }
@@ -2163,17 +2167,15 @@ fn dispatch_codex_session_capture(
     store: SessionStore,
     session_id: String,
     capture: crate::resume_recovery::CodexCapture,
+    process_id: Option<u32>,
 ) {
     let failure_tx = tx.clone();
     let failure_session_id = session_id.clone();
     let spawn = thread::Builder::new()
         .name("codex-session-capture".to_string())
         .spawn(move || {
-            let result = match capture.wait_for_id(
-                crate::resume_recovery::CODEX_CAPTURE_TIMEOUT,
-                crate::resume_recovery::CODEX_CAPTURE_POLL_INTERVAL,
-            ) {
-                Ok(provider_session_id) => {
+            let result = match capture.wait_for_id(None, process_id) {
+                Ok(Some(provider_session_id)) => {
                     match store.set_provider_session_id(&session_id, "codex", &provider_session_id)
                     {
                         Ok(()) => {
@@ -2186,6 +2188,10 @@ fn dispatch_codex_session_capture(
                             Err(message)
                         }
                     }
+                }
+                Ok(None) => {
+                    capture.abort();
+                    return;
                 }
                 Err(err) => {
                     let message = format!("{err:#}");
