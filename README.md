@@ -70,9 +70,13 @@ Any terminal command can be a provider. The four defaults (Claude, Codex, Gemini
 command = "my-cool-agent"
 args = ["--some-flag"]
 resume_args = ["--continue"]
+resume_by_id_args = ["--resume", "{session_id}"]
 ```
 
-Set `resume_args` and dux can reconnect to detached or crashed sessions. Omit it if your CLI doesn't support resuming; dux will just relaunch it.
+`resume_args` is the legacy latest-session path used only for isolated worktrees.
+`resume_by_id_args` resumes one exact provider UUID; `{session_id}` is replaced
+as a literal argv token. Shared agents never use `resume_args`: without a valid
+captured UUID and targeted configuration they start fresh and show a warning.
 
 Switch providers from the command palette. dux sticks to one agent per worktree, so provider changes happen in place:
 
@@ -156,7 +160,7 @@ workspace_mode = "worktree" # optional per-project override; "" inherits
 
 Consent is preserved for existing installations: if an existing config has no `[workspace]` section at all, dux continues creating isolated worktrees. Regenerating a fresh config writes the shared default explicitly.
 
-Shared sessions use the project's canonical path, never switch the real checkout during registration, never auto-resume at startup, and reconnect with a fresh provider process. Their branch and PR status follow the checkout's live `HEAD`; detached `HEAD` skips PR discovery. A shared project cannot live inside `DUX_HOME` or its managed worktree tree.
+Shared sessions use the project's canonical path and never switch the real checkout during registration. Claude and Codex conversations are captured per agent and reconnect by exact provider UUID, so multiple agents in one CWD never select history by recency. Shared startup auto-resume remains off by default (`workspace.auto_resume_shared = false`); when enabled it uses the same exact-ID rule. Existing histories stranded under old Dux worktrees are copied (Claude) or mapped (Codex) once at startup without modifying their originals. Their branch and PR status follow the checkout's live `HEAD`; detached `HEAD` skips PR discovery. A shared project cannot live inside `DUX_HOME` or its managed worktree tree.
 
 Starting a second live shared agent requires confirmation because both agents share the checkout's files, index, staging area, commits, branch switches, and discard operations. While this Dux store can see multiple live writers, the header shows a persistent `CURRENT STORE ONLY` warning. That warning cannot detect agents launched under another `DUX_HOME` or unmanaged processes using the checkout, so its absence is not proof of exclusive access. Use an isolated Fork whenever changes need to diverge.
 

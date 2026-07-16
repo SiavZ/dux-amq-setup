@@ -1122,6 +1122,27 @@ pub(crate) struct AgentReadyData {
     pub client: PtyClient,
     pub pty_size: (u16, u16), // (rows, cols) the PTY was spawned with
     pub status_message: String,
+    pub fresh_capture: crate::resume_recovery::FreshCapture,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SessionLaunch {
+    Fresh,
+    LegacyLatest,
+    ResumeId(String),
+}
+
+impl SessionLaunch {
+    pub(crate) fn is_resume(&self) -> bool {
+        !matches!(self, Self::Fresh)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FreshLaunchContext {
+    pub(crate) success_message: String,
+    pub(crate) failure_prefix: String,
+    pub(crate) show_agent_surface: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1277,9 +1298,21 @@ pub(crate) enum WorkerEvent {
     /// keep the `WorkerEvent` enum small.
     AutoResumeSpawnOnMain {
         session: Box<AgentSession>,
-        used_resume_args: bool,
+        launch: SessionLaunch,
+        fresh_capture: Result<crate::resume_recovery::FreshCapture, String>,
         ack: std::sync::mpsc::Sender<()>,
     },
+    FreshLaunchPrepared {
+        session: Box<AgentSession>,
+        context: FreshLaunchContext,
+        result: Result<crate::resume_recovery::FreshCapture, String>,
+    },
+    ProviderSessionCaptured {
+        session_id: String,
+        provider: String,
+        result: Result<String, String>,
+    },
+    ResumeRecoveryCompleted(Result<crate::resume_recovery::RecoveryReport, String>),
     AddProjectMetaReady {
         path: PathBuf,
         name: String,
@@ -1556,6 +1589,7 @@ impl App {
             staged_diff_in_flight: false,
             add_project_in_flight: false,
             reconnect_validations_in_flight: HashSet::new(),
+            fresh_launches_in_flight: HashSet::new(),
             orphan_cleanup_in_flight: false,
             resume_fallback_candidates: HashMap::new(),
             pending_deletions: HashSet::new(),
@@ -1620,7 +1654,13 @@ impl App {
 
         app.restore_sessions();
         app.ensure_project_worktree_links();
-        app.auto_resume_all_sessions();
+        let _ = workers::dispatch_resume_recovery(
+            app.runtime.worker_tx.clone(),
+            app.git.sessions.clone(),
+            app.git.projects.clone(),
+            app.paths.worktrees_root.clone(),
+            app.session_store.clone(),
+        );
         app.seed_pr_statuses_from_db();
         app.rebuild_left_items();
         app.reload_changed_files();
@@ -1818,9 +1858,9 @@ impl App {
 
     /// If `defaults.auto_resume_on_start` is enabled, eagerly reconnect every
     /// detached session so all panes are live as soon as dux opens. Skips
-    /// shared-workspace sessions and interrupted spawns, which both remain
-    /// visible for an explicit retry, plus sessions whose worktree no longer
-    /// exists or has not been touched within `[auto_resume].stale_days` days.
+    /// shared-workspace sessions unless `[workspace].auto_resume_shared` is
+    /// enabled, and always skips interrupted spawns, missing worktrees, and
+    /// worktrees untouched for more than `[auto_resume].stale_days` days.
     /// A worker scheduler enforces the throttle — at most
     /// `[auto_resume].concurrency` boots in flight and a
     /// `[auto_resume].stagger_ms` gap between dispatches so we don't open N
@@ -1850,29 +1890,48 @@ impl App {
             return;
         }
 
-        // Build (session, use_resume) pairs on the UI thread because
+        // Build (session, launch) pairs on the UI thread because
         // `should_resume_session` reads `self.config.providers`. After
         // this point the worker scheduler owns the data and, for each job,
         // marshals a WorkerEvent::AutoResumeSpawnOnMain back to the UI
         // thread (which does the actual `fork` — see that variant's docs).
-        let jobs: Vec<(AgentSession, bool)> = candidates
+        let jobs: Vec<(AgentSession, SessionLaunch)> = candidates
             .into_iter()
             .map(|s| {
-                let use_resume = self.should_resume_session(&s);
-                (s, use_resume)
+                let launch = self.should_resume_session(&s);
+                (s, launch)
             })
             .collect();
+        let fresh_job_ids = jobs
+            .iter()
+            .filter_map(|(session, launch)| {
+                matches!(launch, SessionLaunch::Fresh).then(|| session.id.clone())
+            })
+            .collect::<Vec<_>>();
+        self.git
+            .fresh_launches_in_flight
+            .extend(fresh_job_ids.iter().cloned());
 
         let cfg_auto_resume = self.config.auto_resume.clone();
         let tx = self.runtime.worker_tx.clone();
+        let session_store = self.session_store.clone();
 
-        thread::Builder::new()
+        let scheduler = thread::Builder::new()
             .name("auto-resume-scheduler".into())
             .spawn(move || {
                 crate::auto_resume::run_scheduler(
                     jobs,
                     &cfg_auto_resume,
-                    move |(session, use_resume)| {
+                    move |(mut session, launch)| {
+                        let fresh_capture = if matches!(launch, SessionLaunch::Fresh) {
+                            crate::resume_recovery::prepare_fresh_capture_from_home(
+                                &mut session,
+                                &session_store,
+                            )
+                            .map_err(|err| format!("{err:#}"))
+                        } else {
+                            Ok(crate::resume_recovery::FreshCapture::None)
+                        };
                         // The scheduler owns the concurrency/stagger
                         // throttle, but the fork itself must happen on the
                         // main thread. Send the request and block on `ack`
@@ -1883,7 +1942,8 @@ impl App {
                         if tx
                             .send(WorkerEvent::AutoResumeSpawnOnMain {
                                 session: Box::new(session),
-                                used_resume_args: use_resume,
+                                launch,
+                                fresh_capture,
                                 ack: ack_tx,
                             })
                             .is_err()
@@ -1896,8 +1956,17 @@ impl App {
                         let _ = ack_rx.recv();
                     },
                 );
-            })
-            .ok();
+            });
+        if let Err(err) = scheduler {
+            for session_id in fresh_job_ids {
+                self.git.fresh_launches_in_flight.remove(&session_id);
+            }
+            tracing::warn!(
+                target: "dux::resume_recovery",
+                error = %crate::sanitize::for_terminal(&err.to_string()),
+                "auto-resume scheduler could not start",
+            );
+        }
     }
 
     /// Spawn one auto-resume session's PTY **on the main (UI) thread**.
@@ -1910,11 +1979,15 @@ impl App {
     pub(crate) fn spawn_auto_resume_on_main(
         &mut self,
         session: AgentSession,
-        used_resume_args: bool,
+        launch: SessionLaunch,
+        fresh_capture: crate::resume_recovery::FreshCapture,
     ) {
+        self.git.fresh_launches_in_flight.remove(&session.id);
+        self.sync_provider_session_ids(&session);
         // Skip the fork entirely if the session already reconnected (e.g.
         // the user clicked it) while this slot was queued.
         if self.session_has_pty(&session.id) {
+            fresh_capture.abort();
             return;
         }
         let last_pty_size = if self.last_pty_size != (0, 0) {
@@ -1925,46 +1998,32 @@ impl App {
         let result = sessions::spawn_pty_for_auto_resume(
             &self.config,
             &session,
-            used_resume_args,
+            &launch,
+            fresh_capture.claude_session_id(),
             last_pty_size,
             self.config.ui.agent_scrollback_lines,
             &self.store_id,
         )
         .map_err(|e| format!("{e:#}"));
-        self.handle_auto_resume_spawned(session.id.clone(), used_resume_args, result);
-    }
-
-    /// Install the PTY produced by [`Self::spawn_auto_resume_on_main`] (or
-    /// log the failure and leave the session detached). Kept separate so
-    /// the duplicate-spawn guard and install path stay in one place.
-    pub(crate) fn handle_auto_resume_spawned(
-        &mut self,
-        session_id: String,
-        used_resume_args: bool,
-        result: Result<PtyClient, String>,
-    ) {
-        // If the user already reconnected this session manually while the
-        // background spawn was still in flight, drop the duplicate client
-        // rather than racing it into self.runtime.providers.
-        if self.session_has_pty(&session_id) {
-            if result.is_ok() {
-                logger::info(&format!(
-                    "auto_resume_on_start: discarding duplicate spawn for {session_id} (already active)"
-                ));
-            }
-            return;
-        }
+        let session_id = session.id.clone();
         match result {
             Ok(client) => {
                 self.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
-                if used_resume_args {
+                if launch.is_resume() {
                     self.git
                         .resume_fallback_candidates
                         .insert(session_id.clone(), Instant::now());
                 }
                 self.mark_session_provider_started(&session_id);
+                self.finish_fresh_capture(&session_id, fresh_capture);
+                if matches!(launch, SessionLaunch::Fresh)
+                    && let Some(warning) = self.shared_targeted_resume_warning(&session_id)
+                {
+                    self.set_warning(warning);
+                }
             }
             Err(e) => {
+                fresh_capture.abort();
                 logger::info(&format!(
                     "auto_resume_on_start: failed to spawn session {session_id}: {e}"
                 ));
@@ -4100,6 +4159,7 @@ mod tests {
             deleted_at: None,
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             state: SessionState::Created { created_at: now },
             settings: SessionSettings::default(),
             created_at: now,

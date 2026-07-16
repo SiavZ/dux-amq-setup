@@ -31,6 +31,7 @@ pub mod pty;
 pub mod purge;
 pub mod purge_encoding;
 pub mod raw_input;
+pub(crate) mod resume_recovery;
 pub mod sanitize;
 pub mod statusline;
 pub mod storage;

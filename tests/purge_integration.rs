@@ -166,6 +166,7 @@ impl PurgeHarness {
             deleted_at: None,
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             state: SessionState::Created { created_at: now },
             settings: dux::model::SessionSettings::default(),
             created_at: now,

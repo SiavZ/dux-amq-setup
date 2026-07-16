@@ -413,10 +413,9 @@ fn resolve_target(target: &str, sessions: &[AgentSession]) -> Result<PeerTarget>
     if sanitized.is_empty() {
         bail!("target normalizes to an empty AMQ handle");
     }
-    Ok(PeerTarget {
-        handle: sanitized,
-        session: None,
-    })
+    bail!(
+        "agent {target:?} does not exist or is not reachable; run `dux peer list` and retry with a listed handle"
+    )
 }
 
 fn choose_transport(
@@ -1339,6 +1338,7 @@ mod tests {
             deleted_at: None,
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             state: SessionState::Created {
                 created_at: Utc::now(),
             },
@@ -1411,6 +1411,17 @@ mod tests {
 
         assert_eq!(target.handle, "renamed");
         assert_eq!(target.session.unwrap().id, "s1");
+    }
+
+    #[test]
+    fn target_resolution_rejects_unknown_agent() {
+        let err = resolve_target("missing-branch", &[])
+            .expect_err("unknown targets must fail before transport selection");
+
+        assert_eq!(
+            err.to_string(),
+            "agent \"missing-branch\" does not exist or is not reachable; run `dux peer list` and retry with a listed handle"
+        );
     }
 
     #[test]

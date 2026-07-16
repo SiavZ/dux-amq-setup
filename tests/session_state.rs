@@ -142,6 +142,7 @@ fn interrupted_spawning_reloads_as_retryable_and_can_reconnect() {
         deleted_at: None,
         title: None,
         started_providers: Vec::new(),
+        provider_session_ids: Default::default(),
         state: SessionState::Spawning { since: now },
         settings: dux::model::SessionSettings::default(),
         created_at: now,
@@ -238,6 +239,7 @@ fn session_state_persists_round_trip_through_store() {
         deleted_at: None,
         title: None,
         started_providers: Vec::new(),
+        provider_session_ids: Default::default(),
         state: SessionState::Exited {
             exit_code: Some(0),
             exited_at: now,

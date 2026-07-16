@@ -79,6 +79,7 @@ fn migrate_from_empty_db_runs_all_migrations() {
         "title",
         "project_path",
         "started_providers",
+        "provider_session_ids",
         "status",
         "state_json",
         "session_settings",
@@ -95,6 +96,53 @@ fn migrate_from_empty_db_runs_all_migrations() {
              columns = {agent_sessions_columns:?}"
         );
     }
+}
+
+#[test]
+fn migration_0006_adds_provider_session_ids_to_v5_database() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("v5.sqlite3");
+    drop(SessionStore::open(&path).expect("create current database"));
+
+    let conn = Connection::open(&path).expect("open raw database");
+    conn.execute_batch(
+        r#"
+        alter table agent_sessions drop column provider_session_ids;
+        pragma user_version = 5;
+        insert into agent_sessions
+            (id, project_id, provider, source_branch, branch_name,
+             worktree_path, agent_handle, status, created_at, updated_at)
+        values
+            ('legacy', 'project', 'claude', 'main', 'legacy',
+             '/tmp/legacy', 'legacy', 'detached',
+             '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+        "#,
+    )
+    .expect("construct v5 fixture");
+    let old_columns: Vec<String> = conn
+        .prepare("pragma table_info(agent_sessions)")
+        .expect("prepare old table_info")
+        .query_map([], |row| row.get(1))
+        .expect("query old table_info")
+        .collect::<rusqlite::Result<_>>()
+        .expect("collect old columns");
+    assert!(!old_columns.contains(&"provider_session_ids".to_string()));
+    drop(conn);
+
+    let store = SessionStore::open(&path).expect("migrate v5 to v6");
+    assert_eq!(
+        store.schema_version().expect("schema version"),
+        SessionStore::CURRENT_SCHEMA_VERSION
+    );
+    let provider_session_ids: String = store
+        .conn()
+        .query_row(
+            "select provider_session_ids from agent_sessions where id = 'legacy'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read migrated provider map");
+    assert_eq!(provider_session_ids, "{}");
 }
 
 #[test]
@@ -117,12 +165,12 @@ fn migration_0005_backfills_duplicate_handles_deterministically() {
         "#,
     );
 
-    let store = SessionStore::open(&path).expect("migrate v4 to v5");
+    let store = SessionStore::open(&path).expect("migrate v4 to current schema");
     let version: u32 = store
         .conn()
         .query_row("pragma user_version", [], |row| row.get(0))
-        .expect("read v5 version");
-    assert_eq!(version, 5);
+        .expect("read current schema version");
+    assert_eq!(version, SessionStore::CURRENT_SCHEMA_VERSION);
     let handles: Vec<(String, String)> = store
         .conn()
         .prepare("select id, agent_handle from agent_sessions order by id")
@@ -269,7 +317,7 @@ fn migration_0005_drops_orphan_session_prs_and_succeeds() {
         .conn()
         .query_row("pragma user_version", [], |row| row.get(0))
         .expect("version");
-    assert_eq!(version, 5);
+    assert_eq!(version, SessionStore::CURRENT_SCHEMA_VERSION);
 }
 
 #[test]

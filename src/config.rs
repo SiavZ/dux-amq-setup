@@ -223,6 +223,7 @@ pub struct ProviderCommandConfig {
     pub command: String,
     pub args: Vec<String>,
     pub resume_args: Option<Vec<String>>,
+    pub resume_by_id_args: Option<Vec<String>>,
     pub resume_wait_timeout_ms: Option<u64>,
     pub oneshot_args: Vec<String>,
     pub oneshot_output: OneshotOutput,
@@ -829,6 +830,7 @@ impl Default for ProviderCommandConfig {
             command: String::new(),
             args: Vec::new(),
             resume_args: None,
+            resume_by_id_args: None,
             resume_wait_timeout_ms: None,
             oneshot_args: Vec::new(),
             oneshot_output: OneshotOutput::Stdout,
@@ -854,6 +856,30 @@ impl ProviderCommandConfig {
             .as_ref()
             .map(|args| !args.is_empty())
             .unwrap_or(false)
+    }
+
+    pub fn resume_by_id_args(&self, session_id: &str) -> Option<Vec<String>> {
+        let args = self
+            .resume_by_id_args
+            .as_ref()
+            .filter(|args| args.iter().any(|arg| arg == "{session_id}"))?;
+        Some(
+            args.iter()
+                .map(|arg| {
+                    if arg == "{session_id}" {
+                        session_id.to_string()
+                    } else {
+                        arg.clone()
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    pub fn supports_session_resume_by_id(&self) -> bool {
+        self.resume_by_id_args
+            .as_ref()
+            .is_some_and(|args| args.iter().any(|arg| arg == "{session_id}"))
     }
 }
 
@@ -970,6 +996,9 @@ impl ProvidersConfig {
                 indexmap::map::Entry::Occupied(mut entry) => {
                     if entry.get().resume_args.is_none() {
                         entry.get_mut().resume_args = config.resume_args;
+                    }
+                    if entry.get().resume_by_id_args.is_none() {
+                        entry.get_mut().resume_by_id_args = config.resume_by_id_args;
                     }
                     if entry.get().resume_wait_timeout_ms.is_none() {
                         entry.get_mut().resume_wait_timeout_ms = config.resume_wait_timeout_ms;
@@ -2277,6 +2306,11 @@ fn patch_providers(doc: &mut DocumentMut, providers: &ProvidersConfig) {
             resume.push(a.as_str());
         }
         tbl["resume_args"] = toml_edit::value(resume);
+        let mut resume_by_id = Array::new();
+        for a in config.resume_by_id_args.as_deref().unwrap_or(&[]) {
+            resume_by_id.push(a.as_str());
+        }
+        tbl["resume_by_id_args"] = toml_edit::value(resume_by_id);
         if let Some(timeout_ms) = config.resume_wait_timeout_ms {
             tbl["resume_wait_timeout_ms"] = toml_edit::value(timeout_ms as i64);
         }
@@ -2583,6 +2617,14 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
                 command: "claude".to_string(),
                 args: Vec::new(),
                 resume_args: Some(vec!["--continue".to_string()]),
+                resume_by_id_args: Some(vec![
+                    "--settings".to_string(),
+                    r#"{"ultracode":true}"#.to_string(),
+                    "--effort".to_string(),
+                    "high".to_string(),
+                    "--resume".to_string(),
+                    "{session_id}".to_string(),
+                ]),
                 resume_wait_timeout_ms: None,
                 oneshot_args: vec![
                     "--bare".to_string(),
@@ -2605,6 +2647,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
                 command: "codex".to_string(),
                 args: Vec::new(),
                 resume_args: Some(vec!["resume".to_string(), "--last".to_string()]),
+                resume_by_id_args: Some(vec!["resume".to_string(), "{session_id}".to_string()]),
                 resume_wait_timeout_ms: None,
                 oneshot_args: vec![
                     "exec".to_string(),
@@ -2628,6 +2671,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
                 command: "gemini".to_string(),
                 args: Vec::new(),
                 resume_args: Some(vec!["--resume".to_string()]),
+                resume_by_id_args: None,
                 resume_wait_timeout_ms: None,
                 oneshot_args: vec!["-p".to_string(), "{prompt}".to_string()],
                 oneshot_output: OneshotOutput::Stdout,
@@ -2642,6 +2686,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
                 command: "opencode".to_string(),
                 args: Vec::new(),
                 resume_args: Some(vec!["--continue".to_string()]),
+                resume_by_id_args: None,
                 resume_wait_timeout_ms: Some(3_000),
                 oneshot_args: vec!["run".to_string(), "{prompt}".to_string()],
                 oneshot_output: OneshotOutput::Stdout,
@@ -2660,6 +2705,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
                 // Unlike claude/codex/gemini/opencode, there is no flag
                 // to limit resume to the CWD, so we disable it.
                 resume_args: None,
+                resume_by_id_args: None,
                 resume_wait_timeout_ms: None,
                 oneshot_args: vec![
                     "-p".to_string(),
@@ -2717,6 +2763,15 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
     out.push_str(&format!(
         "resume_args = {}\n",
         render_string_list(config.resume_args.as_deref().unwrap_or(&[]))
+    ));
+    out.push_str(
+        "# Optional args for resuming one exact provider session.\n\
+         # `{session_id}` is replaced as one literal argv token; no shell expansion occurs.\n\
+         # Shared-workspace agents use only this targeted form and never `resume_args`.\n",
+    );
+    out.push_str(&format!(
+        "resume_by_id_args = {}\n",
+        render_string_list(config.resume_by_id_args.as_deref().unwrap_or(&[]))
     ));
     out.push_str(
         "# Optional timeout for resumed sessions that produce no visible output.\n\
@@ -3554,6 +3609,18 @@ dangerous = true
             Some(vec!["--continue".to_string()])
         );
         assert!(claude.supports_session_resume());
+        assert_eq!(
+            claude.resume_by_id_args.clone(),
+            Some(vec![
+                "--settings".to_string(),
+                r#"{"ultracode":true}"#.to_string(),
+                "--effort".to_string(),
+                "high".to_string(),
+                "--resume".to_string(),
+                "{session_id}".to_string(),
+            ])
+        );
+        assert!(claude.supports_session_resume_by_id());
 
         let codex = config
             .providers
@@ -3564,6 +3631,29 @@ dangerous = true
             Some(vec!["resume".to_string(), "--last".to_string()])
         );
         assert!(codex.supports_session_resume());
+        assert_eq!(
+            codex.resume_by_id_args.clone(),
+            Some(vec!["resume".to_string(), "{session_id}".to_string()])
+        );
+        assert!(codex.supports_session_resume_by_id());
+    }
+
+    #[test]
+    fn targeted_resume_substitutes_only_the_exact_session_id_token() {
+        let cfg = ProviderCommandConfig {
+            resume_by_id_args: Some(vec![
+                "resume".to_string(),
+                "{session_id}".to_string(),
+                "prefix-{session_id}".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+
+        assert_eq!(
+            cfg.resume_by_id_args(&id).unwrap(),
+            vec!["resume".to_string(), id, "prefix-{session_id}".to_string()]
+        );
     }
 
     #[test]
@@ -3572,6 +3662,7 @@ dangerous = true
             command: "example".to_string(),
             args: vec!["--interactive".to_string()],
             resume_args: Some(vec!["--resume".to_string(), "--last".to_string()]),
+            resume_by_id_args: None,
             resume_wait_timeout_ms: Some(2_000),
             oneshot_args: Vec::new(),
             oneshot_output: OneshotOutput::Stdout,
@@ -3586,6 +3677,7 @@ dangerous = true
             command: "example".to_string(),
             args: vec!["--interactive".to_string()],
             resume_args: None,
+            resume_by_id_args: None,
             resume_wait_timeout_ms: None,
             oneshot_args: Vec::new(),
             oneshot_output: OneshotOutput::Stdout,
@@ -3606,6 +3698,7 @@ dangerous = true
                     command: "claude".to_string(),
                     args: Vec::new(),
                     resume_args: None,
+                    resume_by_id_args: None,
                     resume_wait_timeout_ms: None,
                     oneshot_args: Vec::new(),
                     oneshot_output: OneshotOutput::Stdout,
@@ -3625,6 +3718,7 @@ dangerous = true
             claude.resume_args.clone(),
             Some(vec!["--continue".to_string()])
         );
+        assert!(claude.supports_session_resume_by_id());
     }
 
     #[test]
@@ -3636,6 +3730,7 @@ dangerous = true
                     command: "claude".to_string(),
                     args: Vec::new(),
                     resume_args: Some(Vec::new()),
+                    resume_by_id_args: Some(Vec::new()),
                     resume_wait_timeout_ms: None,
                     oneshot_args: Vec::new(),
                     oneshot_output: OneshotOutput::Stdout,
@@ -3652,7 +3747,9 @@ dangerous = true
             .get("claude")
             .expect("claude provider should still exist");
         assert_eq!(claude.resume_args, Some(Vec::new()));
+        assert_eq!(claude.resume_by_id_args, Some(Vec::new()));
         assert!(!claude.supports_session_resume());
+        assert!(!claude.supports_session_resume_by_id());
     }
 
     #[test]
@@ -3984,6 +4081,7 @@ oneshot_output = "stdout"
                     command: "claude".to_string(),
                     args: Vec::new(),
                     resume_args: Some(vec!["--continue".to_string()]),
+                    resume_by_id_args: None,
                     resume_wait_timeout_ms: None,
                     oneshot_args: vec!["-p".to_string(), "{prompt}".to_string()],
                     oneshot_output: OneshotOutput::Stdout,
@@ -4342,6 +4440,46 @@ oneshot_output = "stdout"
         assert!(
             claude.watch.iter().any(|r| r.pattern == "my custom error"),
             "user rule lost on reload"
+        );
+    }
+
+    #[test]
+    fn save_config_preserves_targeted_resume_args_and_adjacent_comment() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let mut body = render_default_config();
+        let default_line = body
+            .lines()
+            .find(|line| line.starts_with("resume_by_id_args = "))
+            .expect("Claude targeted resume line")
+            .to_string();
+        body = body.replacen(
+            &default_line,
+            "# keep my exact provider flags\nresume_by_id_args = [\"--resume\", \"{session_id}\", \"--custom\"]",
+            1,
+        );
+        fs::write(&config_path, &body).expect("write config");
+
+        let mut config: Config = toml::from_str(&body).expect("parse config");
+        config.ui.right_width_pct = 31;
+        let bindings = crate::keybindings::RuntimeBindings::from_keys_config(&config.keys);
+        save_config(&config_path, &config, &bindings).expect("save config");
+
+        let saved = fs::read_to_string(&config_path).expect("read config");
+        assert!(saved.contains("# keep my exact provider flags"));
+        let reloaded: Config = toml::from_str(&saved).expect("reload config");
+        assert_eq!(
+            reloaded
+                .providers
+                .get("claude")
+                .expect("Claude config")
+                .resume_by_id_args
+                .clone(),
+            Some(vec![
+                "--resume".to_string(),
+                "{session_id}".to_string(),
+                "--custom".to_string(),
+            ])
         );
     }
 

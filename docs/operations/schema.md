@@ -1,7 +1,7 @@
 # Session database schema
 
 dux stores session metadata in `sessions.sqlite3`. `PRAGMA user_version` is
-currently `5`; startup applies each numbered migration in one transaction with
+currently `6`; startup applies each numbered migration in one transaction with
 its version bump.
 
 ## `agent_sessions`
@@ -9,8 +9,8 @@ its version bump.
 Migration `0005_shared_workspace.sql` rebuilds the table and retains every
 pre-v5 column. It adds:
 
-- `shared_workspace INTEGER NOT NULL DEFAULT 0` — dark in Phase 1; no runtime
-  subsystem changes behavior based on it yet.
+- `shared_workspace INTEGER NOT NULL DEFAULT 0` — durable lifecycle mode;
+  shared rows use the registered checkout and never own a worktree or branch.
 - `agent_handle TEXT NOT NULL UNIQUE` — immutable local session identity,
   limited to 1–64 lowercase ASCII letters, digits, `_`, and `-`.
 - `deleted_at TEXT` — nullable RFC 3339 tombstone timestamp.
@@ -19,6 +19,13 @@ Existing handles are derived from the worktree-path basename in primary-key
 order. Collisions receive deterministic `-2`, `-3`, … suffixes. The rebuild,
 Rust backfill, `session_prs` copy, index recreation, `foreign_key_check`, and
 `user_version = 5` commit or roll back together.
+
+Migration `0006_provider_session_ids.sql` adds
+`provider_session_ids TEXT NOT NULL DEFAULT '{}'`. The JSON object maps a
+provider name to that agent's exact provider conversation UUID. SQLite remains
+the sole durable authority; startup recovery and fresh-launch capture update
+this column, and shared sessions never substitute a latest/recency selector for
+a missing or invalid UUID.
 
 Normal session loads return only rows where `deleted_at IS NULL`. UI deletion
 sets the tombstone and retains the complete row. Destructive maintenance can

@@ -1,6 +1,6 @@
 //! Core runtime and persisted models, including immutable session identity.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -768,6 +768,7 @@ pub struct AgentSession {
     pub deleted_at: Option<DateTime<Utc>>,
     pub title: Option<String>,
     pub started_providers: Vec<String>,
+    pub provider_session_ids: BTreeMap<String, String>,
     /// Authoritative session lifecycle state. Owns the PTY when in
     /// `Live` or `Detached`. Direct mutation is allowed inside the
     /// `dux` crate but should go through `App::transition_*` helpers
@@ -803,6 +804,12 @@ impl AgentSession {
         }
         self.started_providers.push(provider.as_str().to_string());
         true
+    }
+
+    pub fn provider_session_id(&self, provider: &ProviderKind) -> Option<&str> {
+        self.provider_session_ids
+            .get(provider.as_str())
+            .map(String::as_str)
     }
 
     /// Produce a PTY-less clone of this session's metadata. Used by
@@ -847,6 +854,7 @@ impl AgentSession {
             deleted_at: self.deleted_at,
             title: self.title.clone(),
             started_providers: self.started_providers.clone(),
+            provider_session_ids: self.provider_session_ids.clone(),
             state,
             settings: self.settings.clone(),
             created_at: self.created_at,

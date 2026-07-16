@@ -6117,7 +6117,7 @@ mod tests {
         KillableRuntimeKind, LeftItem, LeftSection, MacroBarState, MouseClickTarget,
         MouseLayoutState, NameNewAgentFocus, OrphanRemoveFocus, OverlayCheckbox, OverlayCheckboxId,
         OverlayMouseLayout, OverlayMouseLayoutState, ProcessInfo, PromptState, PullTarget,
-        ResizeDragState, ResourceStats, RightSection, RuntimeState, RuntimeTargetId,
+        ResizeDragState, ResourceStats, RightSection, RuntimeState, RuntimeTargetId, SessionLaunch,
         SessionSettingsPrompt, SettingsFocus, SharedWriterAction, TextInput, UiState,
         WatchRuleSummary, WorkerEvent,
     };
@@ -6213,6 +6213,7 @@ mod tests {
             deleted_at: None,
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             state: SessionState::Created { created_at: now },
             settings: crate::model::SessionSettings::default(),
             created_at: now,
@@ -6299,6 +6300,7 @@ mod tests {
             staged_diff_in_flight: false,
             add_project_in_flight: false,
             reconnect_validations_in_flight: std::collections::HashSet::new(),
+            fresh_launches_in_flight: std::collections::HashSet::new(),
             orphan_cleanup_in_flight: false,
             resume_fallback_candidates: std::collections::HashMap::new(),
             pending_deletions: std::collections::HashSet::new(),
@@ -7131,6 +7133,7 @@ mod tests {
             deleted_at: None,
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             state: SessionState::Created { created_at: now },
             settings: crate::model::SessionSettings::default(),
             created_at: now,
@@ -8380,6 +8383,7 @@ mod tests {
             deleted_at: None,
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             state: SessionState::Created { created_at: now },
             settings: crate::model::SessionSettings::default(),
             created_at: now,
@@ -8431,6 +8435,7 @@ mod tests {
             deleted_at: None,
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             state: SessionState::Created { created_at: now },
             settings: crate::model::SessionSettings::default(),
             created_at: now,
@@ -9679,7 +9684,10 @@ cyan = "#00ffff"
         // should_resume_session uses started_providers + config's resume_args.
         let session = app.git.sessions[0].clone();
         assert!(
-            app.should_resume_session(&session),
+            matches!(
+                app.should_resume_session(&session),
+                SessionLaunch::LegacyLatest
+            ),
             "codex was launched on this worktree earlier, so resume must be active"
         );
         assert!(
@@ -10616,15 +10624,16 @@ cyan = "#00ffff"
     #[test]
     fn resume_fallback_retries_with_fresh_session_on_quick_exit() {
         let mut app = test_app(default_bindings());
-        // Override the "codex" provider to use /bin/sh so the fallback spawn
-        // works on CI where codex is not installed.
+        // Use a non-capturing provider backed by /bin/sh so the fallback
+        // works on CI without touching real provider session directories.
         app.config.providers.commands.insert(
-            "codex".to_string(),
+            "opencode".to_string(),
             crate::config::ProviderCommandConfig {
                 command: "/bin/sh".to_string(),
                 ..Default::default()
             },
         );
+        app.git.sessions[0].provider = ProviderKind::from_str("opencode");
         let session_id = app.git.sessions[0].id.clone();
         let worktree = std::path::Path::new(&app.git.sessions[0].worktree_path);
         // Spawn a process that exits immediately without producing output.
@@ -10704,15 +10713,16 @@ cyan = "#00ffff"
     #[test]
     fn resume_fallback_triggers_on_one_liner_output() {
         let mut app = test_app(default_bindings());
-        // Override the "codex" provider to use /bin/sh so the fallback spawn
-        // works on CI where codex is not installed.
+        // Use a non-capturing provider backed by /bin/sh so the fallback
+        // works on CI without touching real provider session directories.
         app.config.providers.commands.insert(
-            "codex".to_string(),
+            "opencode".to_string(),
             crate::config::ProviderCommandConfig {
                 command: "/bin/sh".to_string(),
                 ..Default::default()
             },
         );
+        app.git.sessions[0].provider = ProviderKind::from_str("opencode");
         let session_id = app.git.sessions[0].id.clone();
         let worktree = std::path::Path::new(&app.git.sessions[0].worktree_path);
         // Spawn a process that prints a single line (like a failed --continue)
@@ -10786,7 +10796,7 @@ cyan = "#00ffff"
     }
 
     #[test]
-    fn hung_resume_falls_back_to_fresh_session_once() {
+    fn targeted_resume_timeout_falls_back_to_fresh_session_once() {
         let mut app = test_app(default_bindings());
         app.config.providers.commands.insert(
             "opencode".to_string(),
@@ -10794,11 +10804,20 @@ cyan = "#00ffff"
                 command: "/bin/sh".to_string(),
                 args: vec!["-c".to_string(), "sleep 5".to_string()],
                 resume_args: Some(vec!["-c".to_string(), "sleep 5".to_string()]),
+                resume_by_id_args: Some(vec!["resume".to_string(), "{session_id}".to_string()]),
                 resume_wait_timeout_ms: Some(10),
                 ..Default::default()
             },
         );
         app.git.sessions[0].provider = ProviderKind::from_str("opencode");
+        let provider_session_id = uuid::Uuid::new_v4().to_string();
+        app.git.sessions[0]
+            .provider_session_ids
+            .insert("opencode".to_string(), provider_session_id.clone());
+        assert_eq!(
+            app.should_resume_session(&app.git.sessions[0]),
+            SessionLaunch::ResumeId(provider_session_id)
+        );
         let session_id = app.git.sessions[0].id.clone();
         let worktree = std::path::Path::new(&app.git.sessions[0].worktree_path);
         let args = vec!["-c".to_string(), "sleep 5".to_string()];
@@ -12976,6 +12995,7 @@ cyan = "#00ffff"
             deleted_at: None,
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             state: SessionState::Created { created_at: now },
             settings: crate::model::SessionSettings::default(),
             created_at: now,
@@ -13003,6 +13023,7 @@ cyan = "#00ffff"
                 client,
                 pty_size: (24, 80),
                 status_message: "ready from persisted row".to_string(),
+                fresh_capture: crate::resume_recovery::FreshCapture::None,
             })))
             .expect("send ready event");
 
@@ -13056,6 +13077,7 @@ cyan = "#00ffff"
             deleted_at: None,
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             state: SessionState::Created { created_at: now },
             settings: crate::model::SessionSettings::default(),
             created_at: now,

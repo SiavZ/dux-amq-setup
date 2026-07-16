@@ -1,7 +1,7 @@
 # Threat Model — long-form companion
 
 This document is the long-form companion to the STRIDE table in
-[`/SECURITY.md`](../../SECURITY.md). For each row T1–T14 we capture
+[`/SECURITY.md`](../../SECURITY.md). For each row T1–T18 we capture
 the concrete attack scenario, the mitigation in code (with
 file:line references taken from `docs/audits/audit02.md`), the
 residual risk after mitigation, and the detection mechanism — what
@@ -690,7 +690,9 @@ the Dux state or worktree roots. The creation modal identifies shared mode and
 shows the real checkout path. Persisted `shared_workspace` state, rather than
 path equality or the current project default, gates lifecycle behavior: shared
 sessions set neither worktree nor branch ownership, do not create the repository
-link, never auto-resume, and reconnect with a fresh provider process. Fork is an
+link. Shared auto-resume remains opt-in; when enabled it selects only the exact
+captured provider UUID and never a latest/recency selector. A missing or invalid
+UUID starts fresh and is captured before it can become resumable. Fork is an
 explicit isolation boundary and always creates a worktree.
 
 **Residual risk.** Running a provider in a real checkout grants it the same file
@@ -741,6 +743,51 @@ each removal.
 
 ---
 
+## T18 — Provider-history recovery assigns or copies the wrong conversation
+
+**Attack scenario.** Startup recovery and fresh Codex capture read JSONL files
+outside `$STATE_ROOT`, under `~/.claude/projects` and `~/.codex/sessions`. A
+forged transcript could claim another worktree CWD so Dux associates one
+agent's conversation with another. A symlink or special file could redirect a
+Claude copy, an existing destination could be overwritten, or a large provider
+tree could exhaust memory, CPU, or inodes. Concurrent fresh Codex launches in
+one shared CWD could also race and swap their newly-created rollout UUIDs.
+
+**Mitigation in code.** `src/resume_recovery.rs` reads provider originals and
+never moves, edits, or deletes them. Recovery accepts only regular JSONLs with
+valid UUIDs and an absolute recorded CWD that is exactly
+`<historical-worktrees-root>/<registered-project-name>/<agent-dir>`. It checks
+the session's stored project path against the registered project, normalizes the
+old basename with the same immutable agent-handle rules used at creation, and
+requires the provider/project/handle match to be unique. Ambiguous matches are
+reported and left unmapped. Scans have file-count and per-line size bounds.
+
+For Claude, only matched `<uuid>.jsonl` files and their matching `<uuid>/`
+companion directories are copied. Sources and recursive children must be plain
+files/directories; symlinks and special files fail closed. Each destination is
+built under a unique temporary name, flushed, and installed with a no-replace
+atomic rename, so an existing history is never overwritten and originals are
+retained. For Codex, fresh capture snapshots all existing rollout UUIDs before
+launch and accepts one new UUID only when its first `session_meta` record has
+the expected canonical CWD. Uncaptured launches are serialized per canonical
+CWD; zero or multiple candidates time out or fail closed and block another
+uncaptured launch in that CWD rather than guessing. All diagnostics sanitize
+provider-controlled fields under the `dux::resume_recovery` tracing target.
+
+**Residual risk.** The documented trust model grants same-UID processes access
+to both provider roots. Such a process can race filesystem names or forge one
+otherwise-valid transcript during the capture window; Dux is not a security
+boundary against a fully compromised Unix account. Ancestor symlink replacement
+under `~/.claude` remains the broader T11 gap. The generous scan bounds limit,
+but do not eliminate, startup I/O from a very large legitimate history.
+
+**Detection.** Startup logs the number of recovered mappings, copied artifacts,
+and refused candidates. Capture timeout, ambiguity, persistence failure, and
+blocked-CWD events emit warnings and a status-line warning; SQLite retains the
+exact provider UUID used for future resumes.
+
+---
+
 ## Maintenance
 
 When you add or change attack surface in this codebase, you must
@@ -748,8 +795,8 @@ update both `SECURITY.md` (the table) and this file (the
 paragraph). PRs that touch the surface listed above without
 updating these documents are blocked at review.
 
-The IDs `T1`–`T16` are stable references; new threats append at
-the end (`T17`, `T18`, …) rather than reshuffling. Retired
+The IDs `T1`–`T18` are stable references; new threats append at
+the end (`T19`, `T20`, …) rather than reshuffling. Retired
 threats are kept in the table with a `~~strikethrough~~` and a
 note pointing to the PR that retired them. Threats that move to
 **accepted-risk in single-user-VM mode** keep their original ID,
