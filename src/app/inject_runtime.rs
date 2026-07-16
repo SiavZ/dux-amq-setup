@@ -160,43 +160,47 @@ pub(crate) fn sanitise_handle(name: &str) -> String {
     crate::sanitize::amq_handle(name)
 }
 
-/// Pure helper that does the receiver→session-id resolution given a
-/// flat list of `(session_id, branch_name, worktree_path)` triples and
-/// a sanitised receiver. Mirrors the AMQ wrapper's ME-derivation
-/// priority: worktree dir basename first (the path the wrappers
-/// actually take inside a dux pane), then branch name (legacy
-/// fallback), then exact session id (operator escape hatch). See the
-/// docstring on `App::find_session_for_receiver` for the full
-/// rationale.
-///
-/// Returns `None` when no session matches. Stops at the first match
-/// in priority order — if two sessions both sanitise to the same
-/// receiver, the one whose worktree basename matches wins regardless
-/// of declaration order.
+/// Resolve an AMQ receiver by its immutable handle. Worktree and branch aliases
+/// remain as legacy fallbacks only when they identify exactly one session.
 pub(crate) fn match_receiver<'a, I>(sessions: I, receiver: &str) -> Option<&'a str>
 where
-    I: Clone + IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+    I: Clone + IntoIterator<Item = (&'a str, &'a str, &'a str, &'a str)>,
 {
-    for (id, _branch, worktree) in sessions.clone() {
-        if let Some(basename) = std::path::Path::new(worktree)
-            .file_name()
-            .and_then(|n| n.to_str())
-            && sanitise_handle(basename) == receiver
-        {
+    for (id, handle, _branch, _worktree) in sessions.clone() {
+        if handle == receiver {
             return Some(id);
         }
     }
-    for (id, branch, _worktree) in sessions.clone() {
-        if sanitise_handle(branch) == receiver {
-            return Some(id);
-        }
-    }
-    for (id, _branch, _worktree) in sessions {
+    for (id, _handle, _branch, _worktree) in sessions.clone() {
         if id == receiver {
             return Some(id);
         }
     }
-    None
+    exactly_one(
+        sessions
+            .clone()
+            .into_iter()
+            .filter_map(|(id, _handle, _branch, worktree)| {
+                std::path::Path::new(worktree)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| sanitise_handle(name) == receiver)
+                    .map(|_| id)
+            }),
+    )
+    .or_else(|| {
+        exactly_one(
+            sessions
+                .into_iter()
+                .filter(|(_, _handle, branch, _worktree)| sanitise_handle(branch) == receiver)
+                .map(|(id, _, _, _)| id),
+        )
+    })
+}
+
+fn exactly_one<'a>(mut matches: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
 }
 
 impl App {
@@ -760,28 +764,27 @@ impl App {
     /// pushes a feature branch, switches to a hotfix, etc.); the
     /// directory name does not follow.
     ///
-    /// So the receiver "front-end-qa" can correspond to a session
+    /// So the legacy receiver "front-end-qa" can correspond to a session
     /// whose `branch_name` is now `fix/qa-s45-charge-schema-paymentmethod`
     /// but whose `worktree_path` ends in `Front-end-QA`. We try the
-    /// directory basename first (matching the primary path the
-    /// wrappers actually use), then fall back to branch name (matching
-    /// the legacy fallback path), and finally settle for an exact
-    /// match against the session id (so an operator can address by id
-    /// when the worktree dir name is ambiguous).
+    /// The immutable `agent_handle` is authoritative. Directory and branch
+    /// aliases are accepted only when unambiguous; the session id remains an
+    /// operator escape hatch.
     fn find_session_for_receiver(&self, receiver: &str) -> Option<String> {
-        let triples: Vec<(&str, &str, &str)> = self
+        let identities: Vec<(&str, &str, &str, &str)> = self
             .git
             .sessions
             .iter()
             .map(|s| {
                 (
                     s.id.as_str(),
+                    s.agent_handle(),
                     s.branch_name.as_str(),
                     s.worktree_path.as_str(),
                 )
             })
             .collect();
-        match_receiver(triples.iter().copied(), receiver).map(|s| s.to_string())
+        match_receiver(identities.iter().copied(), receiver).map(|s| s.to_string())
     }
 
     /// Phase 1 of two-phase delivery: place the body into the session's PTY
@@ -1441,6 +1444,7 @@ mod tests {
     fn match_receiver_matches_worktree_basename_when_branch_diverges() {
         let sessions = [(
             "session-uuid-1",
+            "worker-1",
             "fix/qa-s45-charge-schema-paymentmethod",
             "/data/state/dux/worktrees/Jobzy-Front-end/Front-end-QA",
         )];
@@ -1454,6 +1458,7 @@ mod tests {
     fn match_receiver_falls_back_to_branch_name_when_basename_does_not_match() {
         let sessions = [(
             "session-uuid-2",
+            "worker-2",
             "feature-login",
             "/some/path/legacy-name-from-creation",
         )];
@@ -1465,7 +1470,7 @@ mod tests {
 
     #[test]
     fn match_receiver_falls_back_to_session_id_for_operator_addressing() {
-        let sessions = [("af882c2d", "fix/foo", "/wt/Bar")];
+        let sessions = [("af882c2d", "worker-3", "fix/foo", "/wt/Bar")];
         // Receiver = exact session id.
         assert_eq!(
             match_receiver(sessions.iter().copied(), "af882c2d"),
@@ -1475,7 +1480,10 @@ mod tests {
 
     #[test]
     fn match_receiver_returns_none_when_nothing_matches() {
-        let sessions = [("id1", "main", "/wt/main"), ("id2", "dev", "/wt/dev")];
+        let sessions = [
+            ("id1", "worker-1", "main", "/wt/main"),
+            ("id2", "worker-2", "dev", "/wt/dev"),
+        ];
         assert_eq!(
             match_receiver(sessions.iter().copied(), "front-end-qa"),
             None
@@ -1488,8 +1496,8 @@ mod tests {
         // is "alice". Worktree basename wins because the wrapper's
         // primary path inside dux is basename($PWD).
         let sessions = [
-            ("idA", "fix/random", "/wt/Alice"),     // basename → alice
-            ("idB", "alice", "/wt/something-else"), // branch → alice
+            ("idA", "worker-a", "fix/random", "/wt/Alice"), // basename → alice
+            ("idB", "worker-b", "alice", "/wt/something-else"), // branch → alice
         ];
         assert_eq!(
             match_receiver(sessions.iter().copied(), "alice"),
@@ -1501,7 +1509,7 @@ mod tests {
     fn match_receiver_branch_match_wins_when_no_basename_match() {
         // Session A's branch matches but basename does not; with no
         // sessions matching by basename, we fall through to branch.
-        let sessions = [("idA", "alice", "/wt/random-dir")];
+        let sessions = [("idA", "worker-a", "alice", "/wt/random-dir")];
         assert_eq!(
             match_receiver(sessions.iter().copied(), "alice"),
             Some("idA"),
@@ -1510,8 +1518,28 @@ mod tests {
 
     #[test]
     fn match_receiver_handles_empty_session_list() {
-        let sessions: Vec<(&str, &str, &str)> = vec![];
+        let sessions: Vec<(&str, &str, &str, &str)> = vec![];
         assert_eq!(match_receiver(sessions.iter().copied(), "anything"), None);
+    }
+
+    #[test]
+    fn shared_workspace_routes_by_handle_and_rejects_ambiguous_legacy_aliases() {
+        let sessions = [
+            ("idA", "frontend-a", "development", "/repo/Jobzy-Front-end"),
+            ("idB", "frontend-b", "development", "/repo/Jobzy-Front-end"),
+        ];
+        assert_eq!(
+            match_receiver(sessions.iter().copied(), "frontend-b"),
+            Some("idB")
+        );
+        assert_eq!(
+            match_receiver(sessions.iter().copied(), "jobzy-front-end"),
+            None
+        );
+        assert_eq!(
+            match_receiver(sessions.iter().copied(), "development"),
+            None
+        );
     }
 
     /// audit03 Phase 5: Worker-mode receivers get a sentinel-required
