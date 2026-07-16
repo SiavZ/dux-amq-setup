@@ -1174,7 +1174,8 @@ fn timeout_warning_due(
 }
 
 /// audit03 Phase 5: apply the Worker-mode postscript to an AMQ wake
-/// body. Worker sessions get a sentinel-required note appended;
+/// body. Worker sessions get an authoritative role update and a
+/// sentinel-required note appended;
 /// Attended/Orchestrator sessions get the body verbatim. Pure
 /// function: no I/O, no global state, easy to unit-test.
 ///
@@ -1187,7 +1188,7 @@ pub(crate) fn apply_inject_postscript(body: &str, mode: crate::model::ContextMod
     match mode {
         crate::model::ContextMode::Worker => {
             format!(
-                "{body}\n\n[Orchestrator note] When this task is complete, end your reply with the literal token {sentinel} so the orchestration layer knows to clean up.",
+                "{body}\n\n[Dux Worker mode] The operator currently designates this session as a Worker. This supersedes any earlier Dux Orchestrator-mode instruction in this conversation. Execute the assigned task directly instead of orchestrating or delegating it. When this task is complete, end your reply with the literal token {sentinel} so the orchestration layer knows to clean up.",
                 sentinel = crate::watch::builtin::TASK_DONE_SENTINEL,
             )
         }
@@ -1556,8 +1557,9 @@ mod tests {
             "postscript must include the literal sentinel; got: {out}"
         );
         assert!(
-            out.contains("[Orchestrator note]"),
-            "postscript must be clearly labelled so the agent treats it as instructions"
+            out.contains("[Dux Worker mode]")
+                && out.contains("supersedes any earlier Dux Orchestrator-mode instruction"),
+            "postscript must make the current role authoritative; got: {out}"
         );
         assert!(out.len() > body.len(), "postscript must actually add bytes");
     }
