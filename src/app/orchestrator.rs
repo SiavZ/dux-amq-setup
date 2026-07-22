@@ -73,6 +73,21 @@ Push stale or blocked agents with a concrete next checkpoint. Demand scoped diff
     out
 }
 
+/// Pick the periodic checkpoint text: the operator's configured
+/// `[amq.orchestrator].checkpoint_prompt` when non-blank, otherwise the
+/// built-in template listing live workers and polling instructions.
+pub(crate) fn resolve_orchestrator_checkpoint_prompt(
+    custom: &str,
+    peers: &[OrchestratorPeer],
+) -> String {
+    let trimmed = custom.trim();
+    if trimmed.is_empty() {
+        build_orchestrator_checkpoint_prompt(peers)
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn context_mode_label(mode: ContextMode) -> &'static str {
     match mode {
         ContextMode::Attended => "attended",
@@ -205,7 +220,10 @@ impl App {
                 if peers.is_empty() {
                     continue;
                 }
-                build_orchestrator_checkpoint_prompt(&peers)
+                resolve_orchestrator_checkpoint_prompt(
+                    &self.config.amq.orchestrator.checkpoint_prompt,
+                    &peers,
+                )
             };
 
             if self.runtime.watch_pending_enters.contains_key(&session_id) {
@@ -351,6 +369,46 @@ mod tests {
         assert!(prompt.contains("Do not do their implementation work yourself"));
         assert!(prompt.contains("dux peer send <handle>"));
         assert!(prompt.contains("status, blockers, ETA"));
+    }
+
+    #[test]
+    fn custom_checkpoint_prompt_replaces_builtin_template() {
+        let prompt = resolve_orchestrator_checkpoint_prompt(
+            "Checkpoint from the operator: keep the goal moving.\n",
+            &[OrchestratorPeer {
+                handle: "front-end-qa".to_string(),
+                label: "QA".to_string(),
+                provider: "codex".to_string(),
+                mode: ContextMode::Worker,
+                branch: "feature/qa".to_string(),
+                worktree: "/tmp/Front-end-QA".to_string(),
+            }],
+        );
+
+        assert_eq!(
+            prompt,
+            "Checkpoint from the operator: keep the goal moving."
+        );
+        assert!(!prompt.contains("Dux Orchestrator checkpoint"));
+        assert!(!prompt.contains("front-end-qa"));
+    }
+
+    #[test]
+    fn blank_custom_checkpoint_prompt_falls_back_to_builtin() {
+        let peers = [OrchestratorPeer {
+            handle: "front-end-qa".to_string(),
+            label: "QA".to_string(),
+            provider: "codex".to_string(),
+            mode: ContextMode::Worker,
+            branch: "feature/qa".to_string(),
+            worktree: "/tmp/Front-end-QA".to_string(),
+        }];
+
+        for blank in ["", "   ", "\n\t "] {
+            let prompt = resolve_orchestrator_checkpoint_prompt(blank, &peers);
+            assert!(prompt.contains("Dux Orchestrator checkpoint"));
+            assert!(prompt.contains("front-end-qa"));
+        }
     }
 
     #[test]
