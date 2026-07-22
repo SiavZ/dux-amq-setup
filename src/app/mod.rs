@@ -1420,7 +1420,7 @@ impl App {
         logger::init(&config.logging, &paths);
         tracing::info!(
             target: "dux::app",
-            version = env!("CARGO_PKG_VERSION"),
+            version = %crate::version::long(),
             config_path = %paths.config_path.display(),
             "bootstrapping dux",
         );
