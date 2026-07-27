@@ -2789,6 +2789,7 @@ pub(crate) fn run_create_agent_job(
         &session.provider,
         &SessionLaunch::Fresh,
         fresh_capture.claude_session_id(),
+        session.settings.yolo_permissions,
         &worktree_path,
     ) {
         Ok(args) => args,

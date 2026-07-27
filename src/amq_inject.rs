@@ -79,9 +79,9 @@ pub struct QueuedMessage {
     /// contains body bytes + trailing CR into a paste-like buffer; the
     /// trailing `\r` ends up appended to the input field rather than
     /// firing as a submit keystroke. The configurable `phase_delay_ms`
-    /// enforces a minimum time gap between the two writes. Codex uses
-    /// explicit bracketed paste for phase 1 and still reuses the same
-    /// phase-2 submit state.
+    /// enforces a minimum time gap between the two writes. Claude and
+    /// Codex use explicit bracketed paste for phase 1 and still reuse
+    /// the same phase-2 submit state.
     /// See `App::tick_amq_inject` for the state machine.
     pub body_typed: bool,
     /// Wall-clock instant when phase 1 completed. Phase 2 waits until

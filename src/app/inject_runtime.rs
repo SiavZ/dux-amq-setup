@@ -64,10 +64,8 @@ const MAX_INJECT_PENDING_PER_RECEIVER: usize = 32;
 /// no longer monopolise the event loop when many receivers have backlogs.
 const MAX_INJECT_ACTIONS_PER_TICK: usize = 16;
 
-/// Bracketed paste markers used by Codex's crossterm TUI. Sending AMQ bodies
-/// as explicit paste events bypasses Codex's rapid-typing paste-burst
-/// heuristic, where a following Enter is intentionally treated as a pasted
-/// newline instead of a submit key.
+/// Bracketed paste markers used by Claude and Codex. Explicit paste events
+/// avoid Claude's rapid-typing paste cache and Codex's paste-burst heuristic.
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
@@ -89,8 +87,8 @@ const WATCH_SUPPRESS_AFTER_INJECT: Duration = Duration::from_secs(10);
 ///
 /// Values below this have repeatedly proven too small for typed-body
 /// harnesses under load: the body and CR can still be read as a single
-/// paste-shaped buffer, leaving the text in the input field. Codex now
-/// receives an explicit bracketed-paste body but still uses the same
+/// paste-shaped buffer, leaving the text in the input field. Claude and Codex
+/// receive an explicit bracketed-paste body but still use the same
 /// submit delay. `0` remains an explicit debugging escape hatch for the
 /// old next-tick behavior.
 pub(crate) const MIN_ENTER_PHASE_DELAY_MS: u64 = 250;
@@ -788,10 +786,10 @@ impl App {
     }
 
     /// Phase 1 of two-phase delivery: place the body into the session's PTY
-    /// without the trailing submit key. Codex receives an explicit bracketed
-    /// paste event so its paste-burst heuristic does not capture the later
-    /// Enter as a newline. Other harnesses keep the existing macro payload
-    /// encoding where embedded newlines become Alt-Enter.
+    /// without the trailing submit key. Claude and Codex receive an explicit
+    /// bracketed paste event so their paste-burst handling cannot drop or capture text.
+    /// Other harnesses keep the existing macro payload encoding where embedded
+    /// newlines become Alt-Enter.
     /// The inflight file stays on disk; phase 2 unlinks it.
     ///
     /// audit03 Phase 5: when the receiving session is in
@@ -1200,16 +1198,18 @@ pub(crate) fn apply_inject_postscript(body: &str, mode: crate::model::ContextMod
 
 /// Return the PTY bytes that place prompt text into a provider input field.
 ///
-/// Codex handles explicit bracketed paste as `Event::Paste`, which directly
-/// inserts the full text and clears paste-burst state. Raw rapid typing can
-/// trigger Codex's paste-burst protection; if Enter follows that burst, Codex
-/// correctly treats it as a pasted newline instead of submit.
+/// Claude and Codex handle explicit bracketed paste without routing rapid text
+/// through their typing heuristics. Claude's heuristic can otherwise move a
+/// long burst to its paste cache without incorporating it into the submitted
+/// prompt; Codex can capture the later Enter as a pasted newline.
 pub(crate) fn inject_body_bytes_for_provider(
     body: &str,
     provider: Option<&ProviderKind>,
 ) -> Vec<u8> {
     match provider.map(ProviderKind::as_str) {
-        Some(name) if name.eq_ignore_ascii_case("codex") => bracketed_paste_payload_bytes(body),
+        Some(name) if name.eq_ignore_ascii_case("claude") || name.eq_ignore_ascii_case("codex") => {
+            bracketed_paste_payload_bytes(body)
+        }
         _ => crate::app::input::macro_payload_bytes(body),
     }
 }
@@ -1355,6 +1355,16 @@ mod tests {
     }
 
     #[test]
+    fn claude_long_body_uses_bracketed_paste() {
+        let provider = ProviderKind::from_str("claude");
+        let body = "x".repeat(1537);
+        let payload = inject_body_bytes_for_provider(&body, Some(&provider));
+        assert_eq!(&payload[..6], b"\x1b[200~");
+        assert_eq!(&payload[6..payload.len() - 6], body.as_bytes());
+        assert_eq!(&payload[payload.len() - 6..], b"\x1b[201~");
+    }
+
+    #[test]
     fn codex_body_normalizes_crlf_inside_bracketed_paste() {
         let provider = ProviderKind::from_str("codex");
         assert_eq!(
@@ -1373,8 +1383,8 @@ mod tests {
     }
 
     #[test]
-    fn non_codex_body_uses_macro_payload_newline_encoding() {
-        for name in ["claude", "gemini", "custom"] {
+    fn non_bracketed_paste_body_uses_macro_payload_newline_encoding() {
+        for name in ["gemini", "custom"] {
             let provider = ProviderKind::from_str(name);
             assert_eq!(
                 inject_body_bytes_for_provider("a\nb", Some(&provider)),

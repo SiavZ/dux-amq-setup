@@ -3428,14 +3428,12 @@ impl App {
     }
 
     /// Drive every loaded watch engine one tick. Called from the main run
-    /// loop right after `poll_pty_activity`. Skips sessions where the
-    /// user is currently typing interactively (`InputTarget::Agent` and
-    /// the session is the selected one), so an auto-action does not
-    /// arrive in the middle of the user's prompt.
+    /// loop right after `poll_pty_activity`. Selected sessions are held only
+    /// while the user has typed recently, matching AMQ delivery semantics.
     pub(crate) fn tick_watch_engines(&mut self) {
         // Phase 2 of two-phase SendText delivery: flush any deferred
-        // submit keys from the previous tick. Codex receives phase-1
-        // text as explicit bracketed paste; other harnesses rely on
+        // submit keys from the previous tick. Claude and Codex receive
+        // phase-1 text as explicit bracketed paste; other harnesses rely on
         // the time split to keep the submit key separate from the body.
         // See `apply_watch_effect` for the matching write side.
         self.flush_pending_watch_enters();
@@ -3452,7 +3450,14 @@ impl App {
         let session_ids: Vec<String> = self.runtime.watch_engines.keys().cloned().collect();
         for session_id in session_ids {
             if active_session.as_deref() == Some(session_id.as_str()) {
-                continue;
+                // Watch rules react to terminal states, so they only need a
+                // brief typing guard; AMQ delivery can keep its longer window.
+                let quiet =
+                    Duration::from_secs(self.config.amq.inject.active_session_quiet_secs.min(5));
+                let last = self.runtime.last_user_keystroke.get(&session_id).copied();
+                if crate::app::inject_runtime::should_hold_for_quiet_window(last, now, quiet) {
+                    continue;
+                }
             }
             // AMQ inject suppression: skip sessions within the
             // suppression window. When the window expires, rebaseline
@@ -3673,8 +3678,8 @@ impl App {
         match effect {
             crate::watch::WatchEffect::SendText { text, append_enter } => {
                 // Phase 1 of two-phase delivery: write body bytes only
-                // and DEFER the trailing submit key to a later tick. Codex
-                // receives an explicit bracketed paste body; other harnesses
+                // and DEFER the trailing submit key to a later tick. Claude and
+                // Codex receive an explicit bracketed paste body; other harnesses
                 // receive the same macro payload encoding used by manual
                 // macros. The discrete submit key lands via
                 // `flush_pending_watch_enters`, matching the AMQ drainer.

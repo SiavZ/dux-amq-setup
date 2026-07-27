@@ -1237,6 +1237,7 @@ impl App {
             poll(&mut pollfd, Some(&timeout))
         })?;
         if ready == 0 {
+            self.flush_pending_bare_escape();
             return Ok(false);
         }
 
@@ -1338,6 +1339,26 @@ impl App {
         }
 
         Ok(false)
+    }
+
+    /// Forward a standalone Escape after the 100 ms input poll proves it is
+    /// not the prefix of an arrow, function-key, or Alt sequence.
+    fn flush_pending_bare_escape(&mut self) {
+        if self.raw_input_buf.as_slice() != b"\x1b" {
+            return;
+        }
+        self.raw_input_buf.clear();
+        if self
+            .selected_terminal_surface_client()
+            .is_some_and(|provider| provider.scrollback_offset() > 0)
+        {
+            return;
+        }
+        self.terminal_selection = None;
+        if let Some(provider) = self.selected_terminal_surface_client() {
+            let _ = provider.write_bytes(b"\x1b");
+            self.record_user_keystroke_for_active_session();
+        }
     }
 
     /// Process raw bytes that have already been read from stdin.
@@ -11052,6 +11073,39 @@ cyan = "#00ffff"
         // Feed a regular character — should be forwarded without error.
         let result = app.process_raw_input_bytes(b"x").unwrap();
         assert!(!result);
+    }
+
+    #[test]
+    fn bare_escape_flushes_to_pty_after_ambiguity_timeout() {
+        let mut app = test_app(default_bindings());
+        let output_dir = tempdir().expect("tempdir");
+        let output = output_dir.path().join("byte");
+        let args = vec![
+            "-c".to_string(),
+            "stty raw -echo; dd bs=1 count=1 2>/dev/null | od -An -tu1 > \"$1\"".to_string(),
+            "sh".to_string(),
+            output.to_string_lossy().into_owned(),
+        ];
+        let client = PtyClient::spawn("sh", &args, std::path::Path::new("."), 5, 40, 100)
+            .expect("spawn pty");
+        let session_id = app.git.sessions[0].id.clone();
+        app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
+        app.ui.input_target = InputTarget::Agent;
+        app.session_surface = SessionSurface::Agent;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        app.process_raw_input_bytes(b"\x1b").unwrap();
+        assert_eq!(app.raw_input_buf, b"\x1b");
+        app.flush_pending_bare_escape();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !std::fs::read_to_string(&output).is_ok_and(|value| value.trim() == "27")
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(output).unwrap().trim(), "27");
+        assert!(app.raw_input_buf.is_empty());
     }
 
     #[test]

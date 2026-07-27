@@ -1,7 +1,7 @@
 # Threat Model — long-form companion
 
 This document is the long-form companion to the STRIDE table in
-[`/SECURITY.md`](../../SECURITY.md). For each row T1–T18 we capture
+[`/SECURITY.md`](../../SECURITY.md). For each row T1–T19 we capture
 the concrete attack scenario, the mitigation in code (with
 file:line references taken from `docs/audits/audit02.md`), the
 residual risk after mitigation, and the detection mechanism — what
@@ -30,14 +30,17 @@ worst-case configuration for the entire 2025–2026 CVE class
 (CVE-2025-59536, CVE-2026-21852, CVE-2026-25723, CVE-2026-33068,
 CVE-2026-35020/35021/35022).
 
-**Mitigation in code.** The wrappers ship without the permission or
-sandbox bypasses; an operator who knowingly accepts the risk opts in
-via `CLAUDE_AMQ_YOLO=1` or `CODEX_AMQ_YOLO=1`. Codex hook trust review
-is a separate control and remains enabled even in YOLO mode. Disabling
-that review requires the explicit `CODEX_AMQ_BYPASS_HOOK_TRUST=1`
-opt-in in `dux-amq/wrappers/codex-amq`. The wrappers also fail closed
-below the reviewed provider-CLI floors (Claude 2.1.163, Codex 0.39.0,
-Gemini 0.39.1), including when a version string cannot be parsed.
+**Mitigation in code.** Permission and sandbox bypasses are off by
+default. An operator who knowingly accepts the risk enables the
+per-session `yolo_permissions` setting. Dux maps that setting to
+`CLAUDE_AMQ_YOLO=1` or `CODEX_AMQ_YOLO=1` for wrapper providers and to
+OpenCode's native `--auto` launch argument; OpenCode receives no such
+argument when the setting is false. Codex hook trust review is a
+separate control and remains enabled even in YOLO mode. Disabling that
+review requires the explicit `CODEX_AMQ_BYPASS_HOOK_TRUST=1` opt-in in
+`dux-amq/wrappers/codex-amq`. The wrappers also fail closed below the
+reviewed provider-CLI floors (Claude 2.1.163, Codex 0.39.0, Gemini
+0.39.1), including when a version string cannot be parsed.
 
 **Residual risk.** Operators who set the YOLO or hook-trust-bypass env
 vars globally (e.g. in `~/.bashrc`) re-create the affected part of the
@@ -48,8 +51,10 @@ sandbox-bypass primitives is out of our control.
 **Detection.** Each wrapper prints a warning when its dangerous opt-in
 is active. The Codex warning distinguishes sandbox bypass from hook
 trust review bypass so the operator can see which control was disabled.
-An unsupported or unknown provider version is refused with the required
-minimum in the error message.
+For OpenCode, the enabled YOLO checkbox remains visible in session
+settings and the PTY launch debug log includes `--auto`. An unsupported
+or unknown wrapper-provider version is refused with the required minimum
+in the error message.
 
 ---
 
@@ -612,10 +617,10 @@ malformed JSON value into `agent_sessions.session_settings`, or
 crafts one that explicitly enables `yolo_permissions: true` /
 `mode: worker` / `auto_clear_on_task_done: true` for a session the
 operator never opted in. On the next dux launch — or the next time
-that session re-spawns — those settings would normally drive PTY
-env propagation (`CLAUDE_AMQ_YOLO=1`), AMQ postscript injection
-(asking the agent to emit `[task-done]`), and the built-in
-auto-clear watch rule.
+that session re-spawns — those settings would normally drive a
+provider bypass (`CLAUDE_AMQ_YOLO=1` or OpenCode's `--auto`), AMQ
+postscript injection (asking the agent to emit `[task-done]`), and
+the built-in auto-clear watch rule.
 
 The attacker model is the same as T1 / T14: same-UID code with
 write access to `~/.dux/sessions.sqlite3`. The novelty is that the
@@ -788,6 +793,31 @@ exact provider UUID used for future resumes.
 
 ---
 
+## T19 — Selected NTL provider can send prompts off-host or act as the operator
+
+**Attack scenario.** An operator selects the built-in NTL provider. The
+third-party CLI can send prompts and workspace context to its service, and
+agent mode can request file writes or commands with the same Unix permissions
+as Dux.
+
+**Mitigation in code.** NTL is only a default configuration entry: Dux neither
+installs it nor launches it until the operator selects it. Interactive sessions
+invoke the official executable as `ntl --agent`; one-shot commit-message work
+uses `ntl --chat --no-color -p <prompt>` so it cannot inherit agent mode from
+the CLI's persisted preferences. Dux has no NTL adapter, private API access, or
+credential handling, and declares no unsupported resume behavior.
+
+**Residual risk.** Dux is not a sandbox. Once selected, NTL and its remote
+service receive whatever the official CLI sends and any approved agent action
+runs as the operator. NTL's binary, service, authentication, approvals, and
+data handling remain upstream responsibilities.
+
+**Detection.** NTL appears by name in the provider selector and generated
+configuration. It is never selected silently; the session header shows the
+active provider, and removing or overriding `[providers.ntl]` disables it.
+
+---
+
 ## Maintenance
 
 When you add or change attack surface in this codebase, you must
@@ -795,8 +825,8 @@ update both `SECURITY.md` (the table) and this file (the
 paragraph). PRs that touch the surface listed above without
 updating these documents are blocked at review.
 
-The IDs `T1`–`T18` are stable references; new threats append at
-the end (`T19`, `T20`, …) rather than reshuffling. Retired
+The IDs `T1`–`T19` are stable references; new threats append at
+the end (`T20`, `T21`, …) rather than reshuffling. Retired
 threats are kept in the table with a `~~strikethrough~~` and a
 note pointing to the PR that retired them. Threats that move to
 **accepted-risk in single-user-VM mode** keep their original ID,

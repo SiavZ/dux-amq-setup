@@ -523,7 +523,7 @@ pub struct AmqInjectConfig {
     /// injecting it into an agent. This applies both to plain `.msg`
     /// files left while dux was offline and to `.inflight.*.msg` files
     /// reclaimed after a crash/restart. Set to 0 to disable expiry and
-    /// replay all queued wake files. Default 600 (10 minutes).
+    /// replay all queued wake files. Default 0 (expiry disabled).
     #[serde(default = "default_amq_inject_max_message_age_secs")]
     pub max_message_age_secs: u64,
     /// Polling fallback interval (milliseconds) for filesystems where
@@ -576,11 +576,11 @@ pub struct AmqInjectConfig {
     #[serde(default = "default_amq_inject_active_session_quiet_secs")]
     pub active_session_quiet_secs: u64,
     /// Minimum delay in milliseconds between phase 1 (place body) and
-    /// phase 2 (send Enter) of AMQ inject delivery. Non-Codex
+    /// phase 2 (send Enter) of AMQ inject delivery. Other
     /// harnesses use the time split to keep a typed body and trailing
-    /// Enter from coalescing into one paste-like stdin read. Codex
-    /// bodies are sent as explicit bracketed paste, but still share
-    /// this delay before the submit key.
+    /// Enter from coalescing into one paste-like stdin read. Claude and
+    /// Codex bodies are sent as explicit bracketed paste, but still
+    /// share this delay before the submit key.
     ///
     /// The default (250 ms) is long enough for Ink-based harnesses to
     /// drain the typed body before Enter arrives. Runtime delivery uses
@@ -630,7 +630,7 @@ fn default_amq_inject_delivery_timeout_secs() -> u64 {
 }
 
 fn default_amq_inject_max_message_age_secs() -> u64 {
-    600
+    0
 }
 
 fn default_amq_inject_poll_interval_ms() -> u64 {
@@ -1714,7 +1714,7 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
                  # receiver's .expired/ directory instead of injecting them.\n\
                  # Applies to stale .msg files and crash-left .inflight.*.msg\n\
                  # files on startup, and to held in-memory messages. Set 0 to\n\
-                 # replay all queued wake files. Default 600 (10 minutes).",
+                 # replay all queued wake files. Default 0 (expiry disabled).",
             )),
             value_fn: |c| FieldValue::U64(c.amq.inject.max_message_age_secs),
         },
@@ -1777,9 +1777,9 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             comment: Some(CommentSource::Static(
                 "# Minimum delay in milliseconds between phase 1 (place body) and\n\
                  # phase 2 (send Enter) of AMQ inject delivery and watch-rule\n\
-                 # SendText actions. Non-Codex harnesses use the time split to\n\
-                 # avoid coalescing body+CR into a paste buffer; Codex bodies are\n\
-                 # sent as explicit bracketed paste before this submit delay.\n\
+                 # SendText actions. Other harnesses use the time split to avoid\n\
+                 # coalescing body+CR into a paste buffer; Claude and Codex bodies\n\
+                 # are sent as explicit bracketed paste before this submit delay.\n\
                  # Default 250. Non-zero values below 250 are raised to 250 at\n\
                  # runtime; set 0 only as a debugging escape hatch for old next-tick\n\
                  # behaviour.",
@@ -2609,7 +2609,7 @@ fn default_terminal_args() -> Vec<String> {
     vec!["-l".to_string()]
 }
 
-fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
+fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8] {
     [
         (
             "claude",
@@ -2637,6 +2637,21 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
                 ],
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("curl -fsSL https://claude.ai/install.sh | bash".to_string()),
+                forward_scroll: true,
+                watch: Vec::new(),
+            },
+        ),
+        (
+            "cline",
+            ProviderCommandConfig {
+                command: "cline".to_string(),
+                args: vec!["--tui".to_string()],
+                resume_args: None,
+                resume_by_id_args: None,
+                resume_wait_timeout_ms: None,
+                oneshot_args: vec!["{prompt}".to_string()],
+                oneshot_output: OneshotOutput::Stdout,
+                install_hint: Some("npm install -g cline".to_string()),
                 forward_scroll: true,
                 watch: Vec::new(),
             },
@@ -2692,6 +2707,43 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("curl -fsSL https://opencode.ai/install | bash".to_string()),
                 forward_scroll: true,
+                watch: Vec::new(),
+            },
+        ),
+        (
+            "kilocode",
+            ProviderCommandConfig {
+                command: "kilo".to_string(),
+                args: Vec::new(),
+                resume_args: Some(vec!["--continue".to_string()]),
+                resume_by_id_args: None,
+                resume_wait_timeout_ms: Some(3_000),
+                oneshot_args: vec!["run".to_string(), "{prompt}".to_string()],
+                oneshot_output: OneshotOutput::Stdout,
+                install_hint: Some("npm install -g @kilocode/cli".to_string()),
+                forward_scroll: true,
+                watch: Vec::new(),
+            },
+        ),
+        (
+            "ntl",
+            ProviderCommandConfig {
+                command: "ntl".to_string(),
+                args: vec!["--agent".to_string()],
+                resume_args: None,
+                resume_by_id_args: None,
+                resume_wait_timeout_ms: None,
+                oneshot_args: vec![
+                    "--chat".to_string(),
+                    "--no-color".to_string(),
+                    "-p".to_string(),
+                    "{prompt}".to_string(),
+                ],
+                oneshot_output: OneshotOutput::Stdout,
+                install_hint: Some(
+                    "curl -fsSL https://notokenlimit.com/install.sh | bash".to_string(),
+                ),
+                forward_scroll: false,
                 watch: Vec::new(),
             },
         ),
@@ -3384,7 +3436,7 @@ mod tests {
         assert!(cfg.queue_dir.is_empty());
         assert_eq!(cfg.busy_scan_lines, 5);
         assert_eq!(cfg.delivery_timeout_secs, 600);
-        assert_eq!(cfg.max_message_age_secs, 600);
+        assert_eq!(cfg.max_message_age_secs, 0);
         assert_eq!(cfg.poll_interval_ms, 5_000);
         assert_eq!(cfg.max_message_bytes, 65_536);
         assert!(
@@ -3763,9 +3815,9 @@ dangerous = true
     }
 
     #[test]
-    fn providers_use_host_scrollback_by_default_except_claude_and_opencode() {
+    fn providers_use_expected_scrollback_defaults() {
         let config = Config::default();
-        for name in ["codex", "gemini", "copilot"] {
+        for name in ["codex", "gemini", "ntl", "copilot"] {
             let cfg = config
                 .providers
                 .get(name)
@@ -3776,7 +3828,7 @@ dangerous = true
             );
         }
 
-        for name in ["claude", "opencode"] {
+        for name in ["claude", "cline", "opencode", "kilocode"] {
             let cfg = config
                 .providers
                 .get(name)
@@ -4036,14 +4088,39 @@ oneshot_output = "stdout"
     }
 
     #[test]
-    fn default_opencode_oneshot_uses_run_subcommand() {
+    fn default_opencode_and_kilocode_oneshot_use_run_subcommand() {
         let providers = default_provider_commands();
-        let opencode = providers.iter().find(|(n, _)| *n == "opencode").unwrap();
-        let cfg = &opencode.1;
-        assert_eq!(cfg.command, "opencode");
-        assert_eq!(cfg.oneshot_args, vec!["run", "{prompt}"]);
+        for (name, command) in [("opencode", "opencode"), ("kilocode", "kilo")] {
+            let cfg = &providers.iter().find(|(n, _)| *n == name).unwrap().1;
+            assert_eq!(cfg.command, command);
+            assert_eq!(cfg.oneshot_args, vec!["run", "{prompt}"]);
+            assert!(matches!(cfg.oneshot_output, OneshotOutput::Stdout));
+            assert!(cfg.resume_args.is_some());
+        }
+    }
+
+    #[test]
+    fn default_cline_uses_tui_and_plain_prompt() {
+        let providers = default_provider_commands();
+        let cfg = &providers.iter().find(|(n, _)| *n == "cline").unwrap().1;
+        assert_eq!(cfg.command, "cline");
+        assert_eq!(cfg.args, vec!["--tui"]);
+        assert_eq!(cfg.oneshot_args, vec!["{prompt}"]);
+        assert!(!cfg.supports_session_resume());
+    }
+
+    #[test]
+    fn default_ntl_uses_agent_repl_and_chat_oneshot() {
+        let providers = default_provider_commands();
+        let cfg = &providers.iter().find(|(n, _)| *n == "ntl").unwrap().1;
+        assert_eq!(cfg.command, "ntl");
+        assert_eq!(cfg.args, vec!["--agent"]);
+        assert_eq!(
+            cfg.oneshot_args,
+            vec!["--chat", "--no-color", "-p", "{prompt}"]
+        );
         assert!(matches!(cfg.oneshot_output, OneshotOutput::Stdout));
-        assert!(cfg.resume_args.is_some());
+        assert!(!cfg.supports_session_resume());
     }
 
     #[test]
@@ -4073,7 +4150,7 @@ oneshot_output = "stdout"
     }
 
     #[test]
-    fn ensure_defaults_adds_opencode_and_gemini() {
+    fn ensure_defaults_adds_builtin_providers() {
         let mut providers = ProvidersConfig {
             commands: indexmap::IndexMap::from([(
                 "claude".to_string(),
@@ -4100,11 +4177,20 @@ oneshot_output = "stdout"
         );
         assert!(providers.get("gemini").is_some(), "gemini should be added");
         assert!(providers.get("codex").is_some(), "codex should be added");
+        assert!(providers.get("cline").is_some(), "cline should be added");
+        assert!(
+            providers.get("kilocode").is_some(),
+            "kilocode should be added"
+        );
         assert!(
             providers.get("copilot").is_some(),
             "copilot should be added"
         );
+        assert!(providers.get("ntl").is_some(), "ntl should be added");
         assert_eq!(providers.get("opencode").unwrap().command, "opencode");
+        assert_eq!(providers.get("cline").unwrap().command, "cline");
+        assert_eq!(providers.get("kilocode").unwrap().command, "kilo");
+        assert_eq!(providers.get("ntl").unwrap().command, "ntl");
         assert_eq!(providers.get("gemini").unwrap().command, "gemini");
         assert_eq!(providers.get("copilot").unwrap().command, "copilot");
     }

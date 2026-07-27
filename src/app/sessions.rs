@@ -604,6 +604,7 @@ impl App {
             &session.provider,
             launch,
             fresh_session_id,
+            session.settings.yolo_permissions,
             Path::new(&session.worktree_path),
         )?;
         let (rows, cols) = if self.last_pty_size != (0, 0) {
@@ -669,6 +670,7 @@ pub(crate) fn launch_args(
     provider: &ProviderKind,
     launch: &SessionLaunch,
     fresh_session_id: Option<&str>,
+    yolo_permissions: bool,
     cwd: &Path,
 ) -> Result<Vec<String>> {
     let mut args = match launch {
@@ -691,6 +693,12 @@ pub(crate) fn launch_args(
     }?;
     if provider.as_str() == "codex" && matches!(launch, SessionLaunch::ResumeId(_)) {
         args.extend(["-C".to_string(), cwd.to_string_lossy().into_owned()]);
+    }
+    if provider.as_str() == "opencode"
+        && yolo_permissions
+        && !args.iter().any(|arg| arg == "--auto")
+    {
+        args.push("--auto".to_string());
     }
     Ok(args)
 }
@@ -717,6 +725,7 @@ pub(crate) fn spawn_pty_for_auto_resume(
         &session.provider,
         launch,
         fresh_session_id,
+        session.settings.yolo_permissions,
         Path::new(&session.worktree_path),
     )?;
     let (rows, cols) = last_pty_size;
@@ -3338,10 +3347,24 @@ mod tests {
         assert_eq!(second_launch, SessionLaunch::ResumeId(second_id.clone()));
         let config = provider_config(&app.config, &ProviderKind::from_str("codex"));
         let provider = ProviderKind::from_str("codex");
-        let first_argv =
-            launch_args(&config, &provider, &first_launch, None, Path::new(cwd)).unwrap();
-        let second_argv =
-            launch_args(&config, &provider, &second_launch, None, Path::new(cwd)).unwrap();
+        let first_argv = launch_args(
+            &config,
+            &provider,
+            &first_launch,
+            None,
+            false,
+            Path::new(cwd),
+        )
+        .unwrap();
+        let second_argv = launch_args(
+            &config,
+            &provider,
+            &second_launch,
+            None,
+            false,
+            Path::new(cwd),
+        )
+        .unwrap();
         assert_ne!(first_argv, second_argv);
         assert_eq!(first_argv.get(1), Some(&first_id));
         assert_eq!(second_argv.get(1), Some(&second_id));
@@ -3371,6 +3394,7 @@ mod tests {
             &ProviderKind::from_str("claude"),
             &SessionLaunch::Fresh,
             Some(&session_id),
+            false,
             Path::new("/tmp/shared-project"),
         )
         .unwrap();
@@ -3379,6 +3403,30 @@ mod tests {
             argv[argv.len() - 2..],
             ["--session-id".to_string(), session_id]
         );
+    }
+
+    #[test]
+    fn opencode_yolo_launch_adds_auto() {
+        let provider = ProviderKind::from_str("opencode");
+        let config = provider_config(&Config::default(), &provider);
+        let cwd = Path::new("/tmp/shared-project");
+
+        let normal =
+            launch_args(&config, &provider, &SessionLaunch::Fresh, None, false, cwd).unwrap();
+        let yolo = launch_args(&config, &provider, &SessionLaunch::Fresh, None, true, cwd).unwrap();
+        let resumed = launch_args(
+            &config,
+            &provider,
+            &SessionLaunch::LegacyLatest,
+            None,
+            true,
+            cwd,
+        )
+        .unwrap();
+
+        assert!(normal.is_empty());
+        assert_eq!(yolo, vec!["--auto"]);
+        assert_eq!(resumed, vec!["--continue", "--auto"]);
     }
 
     #[test]
@@ -3405,6 +3453,7 @@ mod tests {
                     &session.provider,
                     &launch,
                     None,
+                    false,
                     Path::new(&session.worktree_path),
                 )
                 .unwrap();
@@ -3429,6 +3478,7 @@ mod tests {
             &provider,
             &SessionLaunch::ResumeId(session_id.clone()),
             None,
+            false,
             cwd,
         )
         .unwrap();

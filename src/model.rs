@@ -487,11 +487,9 @@ pub struct SessionSettings {
     #[serde(default)]
     pub mode: ContextMode,
 
-    /// `--dangerously-skip-permissions` (claude) /
-    /// `--sandbox-bypass` (codex) for this session. When `true`, dux
-    /// sets `CLAUDE_AMQ_YOLO=1` (and the codex equivalent) in the PTY
-    /// child env at spawn time; the `claude-amq` / `codex-amq`
-    /// wrappers translate that into the appropriate CLI flag.
+    /// Permission/approval bypass for this session. Claude and Codex
+    /// receive wrapper env vars; OpenCode receives its native
+    /// `--auto` launch argument.
     /// Default: `false` — operator must opt in.
     #[serde(default)]
     pub yolo_permissions: bool,
@@ -647,6 +645,10 @@ impl SessionSettings {
                 }
                 "codex" => {
                     vars.push(("CODEX_AMQ_YOLO".into(), "1".into()));
+                }
+                "opencode" => {
+                    // Applied directly as `--auto` by the shared
+                    // provider launch-argument builder.
                 }
                 "gemini" => {
                     // Gemini wrapper has no YOLO flag today; document

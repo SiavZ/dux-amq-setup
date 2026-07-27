@@ -14,7 +14,7 @@ Oh, and it's fast and consumes low resources: more RAM is left for Claude, Codex
 
 Most AI coding tools give you one agent in one directory. dux gives you **unlimited agents across unlimited worktrees**, all visible at once. Spawn five agents on five branches and let them work in parallel. Fork a session to try a different approach without losing the original. Open companion terminals next to your agents for builds, tests, or just poking around.
 
-Every agent runs through a PTY, the same pseudo-terminal your shell uses. That means the CLI tool (Claude, Codex, Gemini, OpenCode, or literally anything else) runs exactly like it would in your regular terminal. Your MCP servers, hooks, skills, slash commands, and permission dialogs all work. We don't mess with your setup.
+Every agent runs through a PTY, the same pseudo-terminal your shell uses. That means the CLI tool (Claude, Cline, Codex, Gemini, OpenCode, Kilo Code, NTL, or literally anything else) runs exactly like it would in your regular terminal. Your MCP servers, hooks, skills, slash commands, and permission dialogs all work. We don't mess with your setup.
 
 ## Install
 
@@ -63,7 +63,7 @@ Tab between panes. Resize them with keyboard or mouse. Collapse the sidebar or g
 
 ### Bring Any CLI
 
-Any terminal command can be a provider. The four defaults (Claude, Codex, Gemini, and OpenCode) are pre-configured, but adding your own is a config-only change:
+Any terminal command can be a provider. Claude, Cline, Codex, Gemini, OpenCode, Kilo Code, NTL, and Copilot are pre-configured, but adding your own is a config-only change:
 
 ```toml
 [providers.my-agent]
@@ -114,7 +114,7 @@ Each agent gets its own companion terminal: a separate shell session in the same
 
 ### Per-Session Settings
 
-Every agent session has its own settings drawer (open via the `session-settings` palette command, or its keybinding) covering context mode (Attended / Orchestrator / Worker), YOLO permissions, per-rule arm/disarm for watch rules, auto-clear after task done, and an AMQ verify-envelope override. Defaults are intentionally cautious — a missing or corrupt settings blob always loads as Attended/no-YOLO/no-auto-clear, so an attacker who tampers with the database can't escalate a session into autonomous mode. Settings persist to sqlite and follow the agent across detach + reconnect.
+Every agent session has its own settings drawer (open via the `session-settings` palette command, or its keybinding) covering context mode (Attended / Orchestrator / Worker), YOLO permissions (including OpenCode's `--auto` mode), per-rule arm/disarm for watch rules, auto-clear after task done, and an AMQ verify-envelope override. Defaults are intentionally cautious — a missing or corrupt settings blob always loads as Attended/no-YOLO/no-auto-clear, so an attacker who tampers with the database can't escalate a session into autonomous mode. Settings persist to sqlite and follow the agent across detach + reconnect.
 
 ### Forking Sessions
 
