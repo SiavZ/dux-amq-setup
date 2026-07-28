@@ -235,6 +235,9 @@ pub struct ProviderCommandConfig {
     pub oneshot_output: OneshotOutput,
     pub install_hint: Option<String>,
     pub forward_scroll: bool,
+    /// Whether non-scroll mouse events are forwarded when the provider
+    /// enables terminal mouse mode. `None` preserves the legacy default.
+    pub forward_mouse: Option<bool>,
     /// Optional watch rules. Each rule pairs a regex against the agent's
     /// terminal output with an action (currently `send_text`) and a
     /// backoff schedule. See [`crate::watch`] for the engine, and the
@@ -842,6 +845,7 @@ impl Default for ProviderCommandConfig {
             oneshot_output: OneshotOutput::Stdout,
             install_hint: None,
             forward_scroll: false,
+            forward_mouse: None,
             watch: Vec::new(),
         }
     }
@@ -862,6 +866,10 @@ impl ProviderCommandConfig {
             .as_ref()
             .map(|args| !args.is_empty())
             .unwrap_or(false)
+    }
+
+    pub fn forwards_mouse(&self) -> bool {
+        self.forward_mouse.unwrap_or(true)
     }
 
     pub fn resume_by_id_args(&self, session_id: &str) -> Option<Vec<String>> {
@@ -1008,6 +1016,9 @@ impl ProvidersConfig {
                     }
                     if entry.get().resume_wait_timeout_ms.is_none() {
                         entry.get_mut().resume_wait_timeout_ms = config.resume_wait_timeout_ms;
+                    }
+                    if entry.get().forward_mouse.is_none() {
+                        entry.get_mut().forward_mouse = config.forward_mouse;
                     }
                 }
             }
@@ -2338,6 +2349,7 @@ fn patch_providers(doc: &mut DocumentMut, providers: &ProvidersConfig) {
         }
 
         tbl["forward_scroll"] = toml_edit::value(config.forward_scroll);
+        tbl["forward_mouse"] = toml_edit::value(config.forwards_mouse());
     }
 }
 
@@ -2644,6 +2656,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8] {
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("curl -fsSL https://claude.ai/install.sh | bash".to_string()),
                 forward_scroll: true,
+                forward_mouse: None,
                 watch: Vec::new(),
             },
         ),
@@ -2659,6 +2672,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8] {
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("npm install -g cline".to_string()),
                 forward_scroll: true,
+                forward_mouse: None,
                 watch: Vec::new(),
             },
         ),
@@ -2683,6 +2697,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8] {
                 oneshot_output: OneshotOutput::Tempfile,
                 install_hint: Some("brew install --cask codex".to_string()),
                 forward_scroll: false,
+                forward_mouse: None,
                 watch: Vec::new(),
             },
         ),
@@ -2698,6 +2713,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8] {
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("brew install gemini-cli".to_string()),
                 forward_scroll: false,
+                forward_mouse: None,
                 watch: Vec::new(),
             },
         ),
@@ -2713,6 +2729,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8] {
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("curl -fsSL https://opencode.ai/install | bash".to_string()),
                 forward_scroll: true,
+                forward_mouse: Some(false),
                 watch: Vec::new(),
             },
         ),
@@ -2728,6 +2745,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8] {
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("npm install -g @kilocode/cli".to_string()),
                 forward_scroll: true,
+                forward_mouse: None,
                 watch: Vec::new(),
             },
         ),
@@ -2750,6 +2768,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8] {
                     "curl -fsSL https://notokenlimit.com/install.sh | bash".to_string(),
                 ),
                 forward_scroll: false,
+                forward_mouse: None,
                 watch: Vec::new(),
             },
         ),
@@ -2773,6 +2792,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8] {
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("curl -fsSL https://gh.io/copilot-install | bash".to_string()),
                 forward_scroll: false,
+                forward_mouse: None,
                 watch: Vec::new(),
             },
         ),
@@ -2865,6 +2885,11 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
          # own scrollback buffer (e.g. opencode).\n",
     );
     out.push_str(&format!("forward_scroll = {}\n", config.forward_scroll));
+    out.push_str(
+        "# When true, non-scroll mouse events are forwarded to providers that enable\n\
+         # mouse mode. Disable this to reserve click-drag for dux text selection.\n",
+    );
+    out.push_str(&format!("forward_mouse = {}\n", config.forwards_mouse()));
 
     // Watch rules. Documented for every provider; Claude ships with a
     // copy-pasteable commented example tailored to Anthropic's transient
@@ -3726,6 +3751,7 @@ dangerous = true
             oneshot_output: OneshotOutput::Stdout,
             install_hint: None,
             forward_scroll: false,
+            forward_mouse: None,
             watch: Vec::new(),
         };
         assert_eq!(cfg.interactive_args(false), ["--interactive"]);
@@ -3741,6 +3767,7 @@ dangerous = true
             oneshot_output: OneshotOutput::Stdout,
             install_hint: None,
             forward_scroll: false,
+            forward_mouse: None,
             watch: Vec::new(),
         };
         assert_eq!(unsupported.interactive_args(true), ["--interactive"]);
@@ -3762,6 +3789,7 @@ dangerous = true
                     oneshot_output: OneshotOutput::Stdout,
                     install_hint: None,
                     forward_scroll: false,
+                    forward_mouse: None,
                     watch: Vec::new(),
                 },
             )]),
@@ -3794,6 +3822,7 @@ dangerous = true
                     oneshot_output: OneshotOutput::Stdout,
                     install_hint: None,
                     forward_scroll: false,
+                    forward_mouse: None,
                     watch: Vec::new(),
                 },
             )]),
@@ -4170,6 +4199,7 @@ oneshot_output = "stdout"
                     oneshot_output: OneshotOutput::Stdout,
                     install_hint: None,
                     forward_scroll: false,
+                    forward_mouse: None,
                     watch: Vec::new(),
                 },
             )]),

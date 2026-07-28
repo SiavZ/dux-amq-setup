@@ -116,6 +116,7 @@ mod tests {
             oneshot_output: OneshotOutput::Stdout,
             install_hint: None,
             forward_scroll: false,
+            forward_mouse: None,
             watch: Vec::new(),
         }
     }
@@ -131,6 +132,7 @@ mod tests {
             oneshot_output: OneshotOutput::Tempfile,
             install_hint: None,
             forward_scroll: false,
+            forward_mouse: None,
             watch: Vec::new(),
         }
     }
@@ -209,6 +211,7 @@ mod tests {
             oneshot_output: OneshotOutput::Stdout,
             install_hint: None,
             forward_scroll: false,
+            forward_mouse: None,
             watch: Vec::new(),
         };
         let prov = create_provider("bad", config);
@@ -234,6 +237,7 @@ mod tests {
             oneshot_output: OneshotOutput::Stdout,
             install_hint: None,
             forward_scroll: false,
+            forward_mouse: None,
             watch: Vec::new(),
         };
         let prov = create_provider("custom", config);

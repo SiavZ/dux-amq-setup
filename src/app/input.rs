@@ -1647,7 +1647,11 @@ impl App {
 
                         let child_wants_mouse = self
                             .selected_terminal_surface_client()
-                            .is_some_and(|p| p.has_mouse_mode());
+                            .is_some_and(|p| p.has_mouse_mode())
+                            && (!matches!(self.ui.input_target, InputTarget::Agent)
+                                || self.selected_session().is_none_or(|s| {
+                                    provider_config(&self.config, &s.provider).forwards_mouse()
+                                }));
                         let shift_held = mouse_ev
                             .modifiers
                             .contains(crossterm::event::KeyModifiers::SHIFT);
@@ -12027,14 +12031,20 @@ cyan = "#00ffff"
     }
 
     #[test]
-    fn forwarded_mouse_scroll_uses_terminal_relative_coordinates() {
+    fn opencode_selects_text_and_forwards_scroll() {
         let mut app = test_app(default_bindings());
-        app.config
+        let opencode = app
+            .config
             .providers
             .commands
-            .get_mut("codex")
-            .expect("codex provider")
-            .forward_scroll = true;
+            .get_mut("opencode")
+            .expect("opencode provider");
+        opencode.forward_mouse = None;
+        app.config.providers.ensure_defaults();
+        let opencode = app.config.providers.get("opencode").unwrap();
+        assert!(opencode.forward_scroll);
+        assert!(!opencode.forwards_mouse());
+        app.git.sessions[0].provider = ProviderKind::from_str("opencode");
         app.ui.input_target = InputTarget::Agent;
         app.ui.fullscreen_overlay = FullscreenOverlay::Agent;
         app.ui.mouse_layout.agent_term = Some(Rect::new(5, 3, 40, 10));
@@ -12042,7 +12052,10 @@ cyan = "#00ffff"
         let session_id = app.git.sessions[0].id.clone();
         let client = PtyClient::spawn(
             "sh",
-            &["-c".to_string(), "stty raw -echo; exec cat -v".to_string()],
+            &[
+                "-c".to_string(),
+                "printf '\\033[?1000h'; stty raw -echo; exec cat -v".to_string(),
+            ],
             std::path::Path::new("."),
             5,
             80,
@@ -12051,6 +12064,22 @@ cyan = "#00ffff"
         .expect("spawn pty");
         app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
         std::thread::sleep(std::time::Duration::from_millis(250));
+        assert!(
+            app.selected_terminal_surface_client()
+                .unwrap()
+                .has_mouse_mode(),
+            "fixture must emulate OpenCode mouse capture"
+        );
+
+        app.process_raw_input_bytes(&sgr_mouse_down(10, 5))
+            .expect("start selection");
+        app.process_raw_input_bytes(&sgr_mouse_drag(20, 6))
+            .expect("drag selection");
+        let selection = app
+            .terminal_selection
+            .as_ref()
+            .expect("plain drag should select in Dux");
+        assert_ne!(selection.anchor, selection.end);
 
         app.process_raw_input_bytes(b"\x1b[<64;20;10M")
             .expect("process scroll");
