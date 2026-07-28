@@ -1647,18 +1647,49 @@ impl App {
 
                         let child_wants_mouse = self
                             .selected_terminal_surface_client()
-                            .is_some_and(|p| p.has_mouse_mode())
-                            && (!matches!(self.ui.input_target, InputTarget::Agent)
-                                || self.selected_session().is_none_or(|s| {
-                                    provider_config(&self.config, &s.provider).forwards_mouse()
-                                }));
+                            .is_some_and(|p| p.has_mouse_mode());
+                        let forward_mouse = !matches!(self.ui.input_target, InputTarget::Agent)
+                            || self.selected_session().is_none_or(|s| {
+                                provider_config(&self.config, &s.provider).forwards_mouse()
+                            });
                         let shift_held = mouse_ev
                             .modifiers
                             .contains(crossterm::event::KeyModifiers::SHIFT);
-                        let should_select = !child_wants_mouse || shift_held;
+                        let select_plain_drag = child_wants_mouse
+                            && !forward_mouse
+                            && matches!(
+                                mouse_ev.kind,
+                                MouseEventKind::Down(MouseButton::Left)
+                                    | MouseEventKind::Drag(MouseButton::Left)
+                                    | MouseEventKind::Up(MouseButton::Left)
+                            );
+                        let should_select = !child_wants_mouse || shift_held || select_plain_drag;
+                        let forward_click = select_plain_drag
+                            && !shift_held
+                            && matches!(mouse_ev.kind, MouseEventKind::Up(MouseButton::Left))
+                            && self.terminal_selection.as_ref().is_some_and(|selection| {
+                                selection.dragging && selection.anchor == selection.end
+                            });
 
                         if should_select {
                             self.handle_terminal_selection_mouse(mouse_ev);
+                            if forward_click
+                                && !is_scrolled_back
+                                && let Some(provider) = self.selected_terminal_surface_client()
+                                && let Some(term_area) = self.ui.mouse_layout.agent_term
+                                && let Some(release) = crate::raw_input::translate_sgr_mouse(
+                                    &raw,
+                                    term_area.x,
+                                    term_area.y,
+                                )
+                            {
+                                let mut press = release.clone();
+                                if let Some(final_byte) = press.last_mut() {
+                                    *final_byte = b'M';
+                                    let _ = provider.write_bytes(&press);
+                                    let _ = provider.write_bytes(&release);
+                                }
+                            }
                         } else if child_wants_mouse
                             && !is_scrolled_back
                             && let Some(provider) = self.selected_terminal_surface_client()
@@ -12031,7 +12062,7 @@ cyan = "#00ffff"
     }
 
     #[test]
-    fn opencode_selects_text_and_forwards_scroll() {
+    fn opencode_clicks_selects_text_and_forwards_scroll() {
         let mut app = test_app(default_bindings());
         let opencode = app
             .config
@@ -12080,7 +12111,13 @@ cyan = "#00ffff"
             .as_ref()
             .expect("plain drag should select in Dux");
         assert_ne!(selection.anchor, selection.end);
+        app.process_raw_input_bytes(&sgr_mouse_up(20, 6))
+            .expect("finish selection");
 
+        app.process_raw_input_bytes(&sgr_mouse_down(12, 5))
+            .expect("start click");
+        app.process_raw_input_bytes(&sgr_mouse_up(12, 5))
+            .expect("finish click");
         app.process_raw_input_bytes(b"\x1b[<64;20;10M")
             .expect("process scroll");
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -12089,6 +12126,10 @@ cyan = "#00ffff"
             .find_pty_handle(&session_id)
             .expect("provider")
             .scan_recent_lines(5);
+        assert!(
+            rendered.contains("^[[<0;7;2M^[[<0;7;2m"),
+            "click should be translated and forwarded on release; got: {rendered:?}"
+        );
         assert!(
             rendered.contains("^[[<64;15;7M"),
             "scroll coordinates should be translated before forwarding; got: {rendered:?}"

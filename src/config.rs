@@ -235,8 +235,8 @@ pub struct ProviderCommandConfig {
     pub oneshot_output: OneshotOutput,
     pub install_hint: Option<String>,
     pub forward_scroll: bool,
-    /// Whether non-scroll mouse events are forwarded when the provider
-    /// enables terminal mouse mode. `None` preserves the legacy default.
+    /// Whether left-button drags are forwarded when the provider enables
+    /// terminal mouse mode. When false, clicks still forward on release.
     pub forward_mouse: Option<bool>,
     /// Optional watch rules. Each rule pairs a regex against the agent's
     /// terminal output with an action (currently `send_text`) and a
@@ -2886,8 +2886,8 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
     );
     out.push_str(&format!("forward_scroll = {}\n", config.forward_scroll));
     out.push_str(
-        "# When true, non-scroll mouse events are forwarded to providers that enable\n\
-         # mouse mode. Disable this to reserve click-drag for dux text selection.\n",
+        "# When true, left-button drags are forwarded to providers that enable mouse\n\
+         # mode. Disable this to select text in dux while retaining provider clicks.\n",
     );
     out.push_str(&format!("forward_mouse = {}\n", config.forwards_mouse()));
 
