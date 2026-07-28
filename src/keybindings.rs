@@ -699,7 +699,7 @@ pub const BINDING_DEFS: &[BindingDef] = &[
     },
     BindingDef {
         action: Action::OpenWorktreeInEditor,
-        default_keys: &[key!(o)],
+        default_keys: &[],
         scopes: &[BindingScope::Left],
         help: Some(HelpEntry {
             section: "Projects pane",
@@ -2124,6 +2124,13 @@ mod tests {
             Some(Action::MoveDown)
         );
         assert_eq!(bindings.lookup(&key, BindingScope::Center), None);
+    }
+
+    #[test]
+    fn open_worktree_is_not_bound_to_plain_o_by_default() {
+        let bindings = default_bindings();
+        let key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE);
+        assert_eq!(bindings.lookup(&key, BindingScope::Left), None);
     }
 
     #[test]

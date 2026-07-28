@@ -60,7 +60,7 @@ pub struct Config {
 /// Current canonical config schema version. Increment whenever a new
 /// migration arm is added to [`migrate_config`]; see
 /// `docs/contributing/schema-policy.md`.
-pub const CONFIG_SCHEMA_CURRENT: u32 = 1;
+pub const CONFIG_SCHEMA_CURRENT: u32 = 2;
 
 /// Default value for [`Config::schema_version`] when the field is
 /// missing from `config.toml` (i.e. the file predates this field). A
@@ -90,10 +90,16 @@ pub fn migrate_config(mut c: Config) -> Config {
                 // serde defaults via `#[serde(default)]`.
                 c.schema_version = 1;
             }
-            // TODO(audit02 Phases 15/16): when `[limits]` and the
-            // `[auto_resume]` section land, bump
-            // `CONFIG_SCHEMA_CURRENT` to 2 and add an arm that rewrites
-            // `c.schema_version = 1` to fill those defaults explicitly.
+            1 => {
+                let action = keybindings::Action::OpenWorktreeInEditor.config_name();
+                if let Some(keys) = c.keys.bindings.get_mut(action)
+                    && keys.len() == 1
+                    && keys[0] == "o"
+                {
+                    keys.clear();
+                }
+                c.schema_version = 2;
+            }
             _ => break,
         }
     }
