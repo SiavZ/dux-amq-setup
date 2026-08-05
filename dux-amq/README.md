@@ -125,7 +125,7 @@ that `--continue` refuses.
 ```
 
 - dux creates a git worktree per pane; each pane gets its own CWD and Claude session storage.
-- The `claude-amq` wrapper sets `AM_ME = <branch>`, ensures `--no-init`, and uses the shared `AMQ_GLOBAL_ROOT` queue.
+- The `claude-amq` wrapper sets `AM_ME = <branch>`, ensures `--no-init`, and uses the shared `AMQ_GLOBAL_ROOT` queue. It safely recovers a dead exact-owner claim before `amq coop exec --require-wake`; AMQ refuses recovery when the recorded owner is still live, and the wrapper refuses to launch if wake is unavailable.
 - `--continue --fork-session` lets a worktree pick up the parent repo's most-recent chat as context, forking off cleanly so deferred-tool markers don't block resume.
 - Agents should use `dux peer send <peer> "..."`. The router uses Claude Peers for Claude targets and AMQ for non-Claude targets. If Claude Peers is unavailable for a Claude target, the send fails loudly instead of silently falling back to AMQ.
 
@@ -141,7 +141,7 @@ that `--continue` refuses.
 | `0`          | Compiled in but disabled at runtime    | present (via mode)                        |
 | (file absent)| Compiled out — no runtime toggle helps | present (via mode)                        |
 
-When the sentinel is present, the wrappers switch `amq wake` to `--inject-via "$LOCAL_BIN/dux-amq-inject-bridge"`. The bridge then runs end-to-end as:
+When the sentinel is present, the wrappers pass `--wake-inject-via "$LOCAL_BIN/dux-amq-inject-bridge"` to `amq coop exec`. The bridge then runs end-to-end as:
 
 ```
 amq send → AMQ inbox → wake daemon → bridge auto-drain → file queue → dux drainer → agent PTY
@@ -192,7 +192,7 @@ DUX_TMUX_TARGET=<pane>     # specific tmux target for the bridge (default: curre
 DUX_AMQ_VERIFY=1           # opt into strict HMAC verification at the bridge
 ```
 
-Inspect at runtime: `cat $STATE_ROOT/dux/.tiocsti-state` (absent → raw mode active). Wake stderr lands in `~/.local/share/dux-amq/wake-<me>.log` — verify-drop reasons are visible there. Drainer activity is in dux's main JSON log under `target: "dux::amq_inject"`; grep for `delivered AMQ wake to session` for a per-message audit trail.
+Inspect at runtime: `cat $STATE_ROOT/dux/.tiocsti-state` (absent → raw mode active) and `amq doctor --ops`. Wake stderr lands in `$AMQ_GLOBAL_ROOT/agents/<me>/.wake.log` — verify-drop reasons are visible there. Drainer activity is in dux's main JSON log under `target: "dux::amq_inject"`; grep for `delivered AMQ wake to session` for a per-message audit trail.
 
 A native upstream fix (HMAC envelope + stdin piping inside AMQ itself) is tracked in `docs/plans/audits/audit02/artifacts/13-upstream-issue.txt`. Upstream AMQ v0.34.0 also added `--defer-while-input` / `--input-quiet-for` flags that gate TIOCSTI on terminal activity heuristics — a coarser version of what dux's drainer does with PTY-snapshot scanning.
 

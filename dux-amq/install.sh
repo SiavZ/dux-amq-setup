@@ -11,13 +11,13 @@
 #     tarball: dux-linux-amd64.tar.gz
 #     sha256:  a1c449989e9c4dd53b260d75d29d0d5d6832b3852cf5327f3725b5e7bb881102
 #
-#   amq        v0.34.0   (commit 6a9417d40cc8b9d9f71e9fbb1e39c872d0763b54)
-#     tarball: amq_0.34.0_linux_amd64.tar.gz
-#     sha256:  cba940987d00a3d072f395c7ec7a648e47d652f1ff503abf46da538595510d7a
+#   amq        v0.52.2   (commit a9e92bd9619185cea159fedd5ec89fb827192818)
+#     tarball: amq_0.52.2_linux_amd64.tar.gz
+#     sha256:  5992112837621648d80a888d29da7b4b435ac4df664e0e2f0f57da632d554245
 #
 #   skills     1.5.3 (npm)
 #     skills-rev (avivsinai/agent-message-queue commit pinned for `skills add`)
-#                6a9417d40cc8b9d9f71e9fbb1e39c872d0763b54
+#                a9e92bd9619185cea159fedd5ec89fb827192818
 set -euo pipefail
 
 STATE_ROOT="${STATE_ROOT:-/data/state}"
@@ -33,18 +33,18 @@ HERE="$(cd "$HERE" && pwd)"
 # Pinned versions + sha256 (overrideable for testing only; CI must use defaults).
 DUX_TAG="${DUX_TAG:-v0.4.0}"
 DUX_SHA256="${DUX_SHA256:-a1c449989e9c4dd53b260d75d29d0d5d6832b3852cf5327f3725b5e7bb881102}"
-AMQ_TAG="${AMQ_TAG:-v0.34.0}"
-AMQ_VERSION="${AMQ_VERSION:-0.34.0}"
-AMQ_SHA256="${AMQ_SHA256:-cba940987d00a3d072f395c7ec7a648e47d652f1ff503abf46da538595510d7a}"
+AMQ_TAG="${AMQ_TAG:-v0.52.2}"
+AMQ_VERSION="${AMQ_VERSION:-0.52.2}"
+AMQ_SHA256="${AMQ_SHA256:-5992112837621648d80a888d29da7b4b435ac4df664e0e2f0f57da632d554245}"
 SKILLS_PIN="${SKILLS_PIN:-1.5.3}"
-SKILLS_REV="${SKILLS_REV:-6a9417d40cc8b9d9f71e9fbb1e39c872d0763b54}"
+SKILLS_REV="${SKILLS_REV:-a9e92bd9619185cea159fedd5ec89fb827192818}"
 CLAUDE_PEERS_REV="${CLAUDE_PEERS_REV:-640183fa7048443bf0a6592de45579e813df4587}"
 
 # Expected sha256 of the extracted amq binary (audit01 P1-8). Cross-checked
 # against the file inside amq_${AMQ_VERSION}_linux_amd64.tar.gz at install
 # time so a tampered-with binary already in $PATH is rejected before being
 # pinned at $STATE_ROOT/amq-bin/amq.
-AMQ_BINARY_SHA256="${AMQ_BINARY_SHA256:-eb78901f3dd13534884923e02ad9c6852be1b0a4c7f452fe52b8bcd795e3556b}"
+AMQ_BINARY_SHA256="${AMQ_BINARY_SHA256:-a7b4f74ce8d42f2f1c0d82ae6a2bcd4369373e482c0f2a243884021068632a3c}"
 
 # AUDIT01-VERSION — overlay version; gates idempotent config-block rewrites
 # (Phase 12). Phase 15's release pipeline rewrites this line on tag.
@@ -56,7 +56,7 @@ ok()   { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
 
 # Audit02 Phase 13 (audit01 P1-1): detect kernel-side TIOCSTI support.
 #
-# AMQ v0.34.0's `--inject-mode raw` uses `unix.Syscall(SYS_IOCTL, fd,
+# AMQ's `--inject-mode raw` uses `unix.Syscall(SYS_IOCTL, fd,
 # unix.TIOCSTI, ...)` with no PTY-master fallback. Linux 6.2 (Nov 2022)
 # made `CONFIG_LEGACY_TIOCSTI` default-off, and Ubuntu 24.04 LTS /
 # Debian 12+ ship the option built out entirely (the sysctl key is
@@ -254,7 +254,7 @@ fi
 # Audit02 P0-F: don't wipe queue config on re-install. AMQ writes its
 # state under $STATE_ROOT/amq; the presence of `meta/config.json` (the
 # file `amq init --force` overwrites — confirmed via `amq init --help`
-# against pinned v0.34.0) tells us init has already run. Probing a fresh
+# against the pinned AMQ version) tells us init has already run. Probing a fresh
 # `amq init` shows the layout is `meta/config.json`, `agents/<handle>/`,
 # `threads/` — *not* a top-level `agents.json` as earlier audit notes
 # assumed.

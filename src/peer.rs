@@ -6,6 +6,8 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -976,9 +978,18 @@ fn ensure_owner_marker_with(
     let agent_dir = root.join("agents").join(handle);
     let body = serde_json::to_vec(owner)?;
     let created = match marker_state(root, handle)? {
-        MarkerState::Owner(existing) if same_owner(&existing, owner) => return Ok(()),
+        MarkerState::Owner(existing) if same_owner(&existing, owner) => {
+            #[cfg(unix)]
+            fs::set_permissions(&agent_dir, fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("failed to secure {}", agent_dir.display()))?;
+            return Ok(());
+        }
         MarkerState::Free => {
-            fs::create_dir(&agent_dir)
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            builder.mode(0o700);
+            builder
+                .create(&agent_dir)
                 .with_context(|| format!("failed to reserve {}", agent_dir.display()))?;
             true
         }
@@ -987,6 +998,9 @@ fn ensure_owner_marker_with(
             bail!("AMQ handle is owned by another session")
         }
     };
+    #[cfg(unix)]
+    fs::set_permissions(&agent_dir, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to secure {}", agent_dir.display()))?;
     let result = write_marker(&agent_dir.join(OWNER_MARKER), &body);
     if let Err(err) = result {
         if created {
@@ -1707,7 +1721,13 @@ mod tests {
         let report = reconcile_amq_root(&root, "store-a", Some(&store), &mut sessions).unwrap();
 
         assert_eq!(report.configured_agents_added, 1);
-        assert!(root.join("agents/agent-one").is_dir());
+        let agent_dir = root.join("agents/agent-one");
+        assert!(agent_dir.is_dir());
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&agent_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         let raw = fs::read_to_string(root.join("meta/config.json")).unwrap();
         assert!(raw.contains("\"agent-one\""));
         let owner: OwnerMarker = serde_json::from_str(

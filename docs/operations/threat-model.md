@@ -143,7 +143,7 @@ risk is the original Phase 08 risk: attackers with read access to
 `$AMQ_SECRET_PATH` can still forge.
 
 **Detection.** When strict mode is active, rejected envelopes are
-written to `~/.local/share/dux-amq/wake-<me>.log` by
+written to `$AMQ_GLOBAL_ROOT/agents/<me>/.wake.log` by
 `amq-receive-verify`'s stderr. dux's main JSON log records every
 delivered wake under `target: "dux::amq_inject"` for the
 post-bridge half of the path; the bridge itself stays silent on
@@ -314,17 +314,20 @@ owner-marker and registry updates. The atomic marker binds `store_id` and
 `session_id`; reconciliation prunes only missing/deleted rows owned by its own
 store. Foreign, standalone, malformed, ownerless, and ambiguous legacy keys
 are never reclaimed. Creation/backfill instead allocates a bounded `-2`,
-`-3`, … suffix while the lock is held.
+`-3`, … suffix while the lock is held. Wrappers use AMQ's guarded
+`wake recover-owner` before launch so a dead exact-owner claim cannot make a
+restart permanently fail; AMQ refuses that operation while the owner is live.
 
 **Residual risk.** This is coordination, not an authorization boundary:
 same-UID code can edit the shared root or lock it indefinitely. That remains
 inside the declared single-user VM threat model. A provider launched outside
-an AMQ wrapper has no wake PID, so deletion can reserve/remove its registry
-identity but has no daemon process to terminate.
+an AMQ wrapper has no owner-bound wake, so deletion can reserve/remove its
+registry identity but has no notifier process to manage.
 
 **Detection.** Missing lock support and owner mismatches fail closed with an
-explicit wrapper or `dux::peer` error. A recycled wake PID that no longer
-identifies `amq wake` is logged and left untouched.
+explicit wrapper or `dux::peer` error. `amq doctor --ops` reports managed-wake
+health. A recycled legacy wake PID that no longer identifies `amq wake` is
+logged and left untouched.
 
 ---
 

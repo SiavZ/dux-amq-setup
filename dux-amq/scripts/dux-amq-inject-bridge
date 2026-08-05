@@ -83,6 +83,41 @@ ENVELOPE="${1:-}"
 # default = skip.
 VERIFY_MODE="${DUX_AMQ_VERIFY:-0}"
 
+# `coop exec` deliberately baselines mail that predates wake startup. Dux
+# instead wants downtime mail delivered after the provider is ready, so the
+# wrappers launch one bounded bridge process that waits for this exact owner
+# generation, then drains once. ponytail: remove when AMQ exposes a coop
+# no-baseline or post-ready hook.
+STARTUP_OWNER_PID="${DUX_AMQ_STARTUP_OWNER_PID:-}"
+if [[ -n "$STARTUP_OWNER_PID" ]]; then
+  if [[ ! "$STARTUP_OWNER_PID" =~ ^[0-9]+$ || -z "${AM_ROOT:-${AMQ_GLOBAL_ROOT:-}}" ||
+    ! "${AM_ME:-}" =~ ^[a-z0-9_-]+$ ]]; then
+    printf '[inject-bridge] invalid startup-drain owner or AMQ identity; skipping backlog recovery\n' >&2
+    exit 0
+  fi
+  ROOT="${AM_ROOT:-${AMQ_GLOBAL_ROOT}}"
+  LOCK="$ROOT/agents/$AM_ME/.wake.lock"
+  PREPARED="$ROOT/agents/$AM_ME/.wake.prepared"
+  ready=0
+  for _ in {1..50}; do
+    kill -0 "$STARTUP_OWNER_PID" 2>/dev/null || exit 0
+    generation=$(jq -er --argjson owner "$STARTUP_OWNER_PID" \
+      'select(.owner.pid == $owner) | .generation' "$LOCK" 2>/dev/null || true)
+    if [[ -n "$generation" ]] &&
+      jq -e --arg generation "$generation" '.generation == $generation' \
+        "$PREPARED" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 0.1
+  done
+  if (( ready == 0 )); then
+    printf '[inject-bridge] managed wake was not ready within 5s; backlog remains unread\n' >&2
+    exit 0
+  fi
+  ENVELOPE='[AMQ] startup backlog recovery'
+fi
+
 # Empty envelope is always a no-op regardless of mode. Stays exit 0
 # because retrying empty input would just produce another empty input.
 if [[ -z "$ENVELOPE" ]]; then
@@ -167,7 +202,7 @@ fi
 #
 # `DUX_PANE` is set by dux when it spawns the agent's PTY (see
 # `apply_terminal_env` in src/pty.rs). Children of that PTY (the
-# wrapper, then `setsid amq wake`, then the inject-bridge spawned
+# wrapper, then AMQ's owner-bound wake, then the inject-bridge spawned
 # by AMQ) inherit it. When present, we skip tmux entirely and let
 # the dux-side drainer deliver the body — it knows when the agent
 # is idle and can type the body + submit reliably.
@@ -176,11 +211,8 @@ if [[ -n "${DUX_PANE:-}" ]]; then
   under_dux=1
 fi
 
-# Dux-spawned panes export DUX_PID. `amq wake` is intentionally started
-# with setsid/disown, so it can outlive the provider process and the Dux
-# UI. If this bridge is later invoked by one of those stale daemons, do
-# not drain AMQ or queue a file for a dead Dux instance; the next live
-# Dux run will spawn a fresh wake daemon and handle new notifications.
+# Dux-spawned panes export DUX_PID. Owner-bound wake exits with its provider,
+# but this check closes the shutdown race: never queue into a dead Dux instance.
 if (( under_dux == 1 )) && [[ -n "${DUX_PID:-}" ]]; then
   if ! [[ "$DUX_PID" =~ ^[0-9]+$ ]] || ! kill -0 "$DUX_PID" 2>/dev/null; then
     exit 0
@@ -196,16 +228,20 @@ if (( under_dux == 1 )) && [[ "$VERIFY_MODE" != "1" ]] &&
   [[ -n "${AM_ROOT:-${AMQ_GLOBAL_ROOT:-}}" ]] && command -v amq >/dev/null 2>&1; then
   ROOT="${AM_ROOT:-${AMQ_GLOBAL_ROOT:-/data/state/amq}}"
   drain_limit="${DUX_AMQ_DRAIN_LIMIT:-20}"
-  if drain_out=$(amq drain --root "$ROOT" --me "$RECEIVER" --include-body --limit "$drain_limit" 2>&1); then
-    if [[ -z "$drain_out" ]]; then
+  if drain_out=$(amq drain --root "$ROOT" --me "$RECEIVER" --include-body --json --limit "$drain_limit"); then
+    if jq -e '.count == 0' >/dev/null 2>&1 <<<"$drain_out"; then
       # Another wake/drain path already consumed the message. Avoid
       # injecting stale "Drain with..." notices that create confusion.
       exit 0
     fi
-    send_body="$drain_out"$'\n''Act on these AMQ messages now. Reply over AMQ when needed.'
+    if ! jq -e '.count > 0 and (.drained | type == "array")' >/dev/null 2>&1 <<<"$drain_out"; then
+      printf '[inject-bridge] amq drain returned invalid JSON for %s; dropping\n' "$RECEIVER" >&2
+      exit 0
+    fi
+    send_body=$'[AMQ] Drained messages (JSON):\n'"$drain_out"$'\nAct on these AMQ messages now. Reply over AMQ when needed.'
     body_is_b64=0
   else
-    printf '[inject-bridge] amq drain failed for %s: %s\n' "$RECEIVER" "$drain_out" >&2
+    printf '[inject-bridge] amq drain failed for %s\n' "$RECEIVER" >&2
   fi
 fi
 

@@ -13,9 +13,8 @@
 #   8. claude-amq does NOT seed parent session history by default.
 #   9. claude-amq DOES seed when CLAUDE_AMQ_SEED_FROM_PARENT=1.
 #
-# Implementation: tests/fakes/amq records argv to $AMQ_FAKE_ARGV_FILE
-# (and is a no-op for `amq wake` so the background daemon spawn doesn't
-# pollute the recording). The wrappers `exec amq coop exec ... claude --
+# Implementation: tests/fakes/amq records argv to $AMQ_FAKE_ARGV_FILE.
+# The wrappers `exec amq coop exec ... claude --
 # <flags> <user-args>`, so asserting the presence/absence of a flag in
 # the recorded argv is equivalent to asserting what reaches the provider.
 
