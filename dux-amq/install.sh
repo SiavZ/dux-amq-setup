@@ -11,13 +11,13 @@
 #     tarball: dux-linux-amd64.tar.gz
 #     sha256:  a1c449989e9c4dd53b260d75d29d0d5d6832b3852cf5327f3725b5e7bb881102
 #
-#   amq        v0.52.2   (commit a9e92bd9619185cea159fedd5ec89fb827192818)
-#     tarball: amq_0.52.2_linux_amd64.tar.gz
-#     sha256:  5992112837621648d80a888d29da7b4b435ac4df664e0e2f0f57da632d554245
+#   amq        v0.61.0   (commit ad3f9341724822326dcab01f27b09343766246c2)
+#     tarball: amq_0.61.0_linux_amd64.tar.gz
+#     sha256:  36edf7f1f08ab12e845916ebafd5a3e633d5d055e6ee0b8b437298c99c83038c
 #
 #   skills     1.5.3 (npm)
 #     skills-rev (avivsinai/agent-message-queue commit pinned for `skills add`)
-#                a9e92bd9619185cea159fedd5ec89fb827192818
+#                ad3f9341724822326dcab01f27b09343766246c2
 set -euo pipefail
 
 STATE_ROOT="${STATE_ROOT:-/data/state}"
@@ -33,18 +33,18 @@ HERE="$(cd "$HERE" && pwd)"
 # Pinned versions + sha256 (overrideable for testing only; CI must use defaults).
 DUX_TAG="${DUX_TAG:-v0.4.0}"
 DUX_SHA256="${DUX_SHA256:-a1c449989e9c4dd53b260d75d29d0d5d6832b3852cf5327f3725b5e7bb881102}"
-AMQ_TAG="${AMQ_TAG:-v0.52.2}"
-AMQ_VERSION="${AMQ_VERSION:-0.52.2}"
-AMQ_SHA256="${AMQ_SHA256:-5992112837621648d80a888d29da7b4b435ac4df664e0e2f0f57da632d554245}"
+AMQ_TAG="${AMQ_TAG:-v0.61.0}"
+AMQ_VERSION="${AMQ_VERSION:-0.61.0}"
+AMQ_SHA256="${AMQ_SHA256:-36edf7f1f08ab12e845916ebafd5a3e633d5d055e6ee0b8b437298c99c83038c}"
 SKILLS_PIN="${SKILLS_PIN:-1.5.3}"
-SKILLS_REV="${SKILLS_REV:-a9e92bd9619185cea159fedd5ec89fb827192818}"
+SKILLS_REV="${SKILLS_REV:-ad3f9341724822326dcab01f27b09343766246c2}"
 CLAUDE_PEERS_REV="${CLAUDE_PEERS_REV:-640183fa7048443bf0a6592de45579e813df4587}"
 
 # Expected sha256 of the extracted amq binary (audit01 P1-8). Cross-checked
 # against the file inside amq_${AMQ_VERSION}_linux_amd64.tar.gz at install
 # time so a tampered-with binary already in $PATH is rejected before being
 # pinned at $STATE_ROOT/amq-bin/amq.
-AMQ_BINARY_SHA256="${AMQ_BINARY_SHA256:-a7b4f74ce8d42f2f1c0d82ae6a2bcd4369373e482c0f2a243884021068632a3c}"
+AMQ_BINARY_SHA256="${AMQ_BINARY_SHA256:-3b10af9f245b04d26ed110fdcedb1fee6fbb7dbab620f1fd3eefeacdb8f8d3c3}"
 
 # AUDIT01-VERSION — overlay version; gates idempotent config-block rewrites
 # (Phase 12). Phase 15's release pipeline rewrites this line on tag.
