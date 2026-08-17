@@ -3484,11 +3484,14 @@ impl App {
                     }
                 }
             }
-            let snapshot = match self.find_pty_handle(&session_id) {
-                Some(handle) => handle.scan_recent_lines(30),
+            let (snapshot, busy_snapshot) = match self.find_pty_handle(&session_id) {
+                Some(handle) => (
+                    handle.scan_recent_lines(30),
+                    handle.scan_recent_lines(self.config.amq.inject.busy_scan_lines),
+                ),
                 None => continue,
             };
-            if self.should_suppress_auto_clear_for_collaboration(&session_id)
+            if self.should_suppress_auto_clear(&session_id, &busy_snapshot)
                 && let Some(engine) = self.runtime.watch_engines.get_mut(&session_id)
             {
                 engine.rebaseline_kind(
@@ -3506,12 +3509,20 @@ impl App {
         }
     }
 
-    fn should_suppress_auto_clear_for_collaboration(&self, session_id: &str) -> bool {
+    fn should_suppress_auto_clear(&self, session_id: &str, busy_snapshot: &str) -> bool {
         let Some(session) = self.git.sessions.iter().find(|s| s.id == session_id) else {
             return true;
         };
         if !matches!(session.settings.mode, ContextMode::Worker)
             || !session.settings.auto_clear_on_task_done
+        {
+            return true;
+        }
+        if crate::amq_inject::snapshot_busy_marker(
+            busy_snapshot,
+            &self.config.amq.inject.busy_markers,
+        )
+        .is_some()
         {
             return true;
         }
