@@ -3366,8 +3366,8 @@ mod tests {
         )
         .unwrap();
         assert_ne!(first_argv, second_argv);
-        assert_eq!(first_argv.get(1), Some(&first_id));
-        assert_eq!(second_argv.get(1), Some(&second_id));
+        assert_eq!(first_argv.get(2), Some(&first_id));
+        assert_eq!(second_argv.get(2), Some(&second_id));
         assert_eq!(first.worktree_path, second.worktree_path);
     }
 
@@ -3486,6 +3486,7 @@ mod tests {
         assert_eq!(
             argv,
             vec![
+                "--no-alt-screen".to_string(),
                 "resume".to_string(),
                 session_id,
                 "-C".to_string(),

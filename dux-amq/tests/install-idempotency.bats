@@ -89,8 +89,8 @@ forward_scroll = true
 
 [providers.codex]
 command = "codex-amq"
-args = ["--model", "audit03-custom"]
-forward_scroll = true
+args = ["--no-alt-screen", "--model", "audit03-custom"]
+forward_scroll = false
 
 [providers.gemini]
 command = "gemini-amq"
@@ -167,8 +167,12 @@ with open(p) as fh:
 start = text.index("[providers.codex]")
 end = text.find("\n[", start + 1)
 section = text[start:] if end == -1 else text[start:end]
-assert "args = []" in section
-custom = section.replace("args = []", 'args = ["--model", "audit03-custom"]', 1)
+assert 'args = ["--no-alt-screen"]' in section
+custom = section.replace(
+    'args = ["--no-alt-screen"]',
+    'args = ["--no-alt-screen", "--model", "audit03-custom"]',
+    1,
+)
 text = text[:start] + custom + ("" if end == -1 else text[end:])
 
 assert "[macros]\n" in text

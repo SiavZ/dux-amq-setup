@@ -595,3 +595,46 @@ fn config_v1_removes_only_the_legacy_open_worktree_binding() {
         vec!["ctrl-o"]
     );
 }
+
+#[test]
+fn config_v2_moves_default_codex_scrollback_into_dux() {
+    let mut old = Config {
+        schema_version: 2,
+        ..Config::default()
+    };
+    let codex = old
+        .providers
+        .commands
+        .get_mut("codex")
+        .expect("codex provider");
+    codex.command = "codex-amq".into();
+    codex.args.clear();
+    codex.resume_args = Some(vec!["resume".into(), "--last".into()]);
+    codex.resume_by_id_args = Some(vec!["resume".into(), "{session_id}".into()]);
+    codex.forward_scroll = true;
+
+    let mut customized = old.clone();
+    customized.providers.commands["codex"].args = vec!["--model".into(), "o3".into()];
+
+    let migrated = migrate_config(old);
+    let codex = &migrated.providers.commands["codex"];
+    assert_eq!(codex.args, ["--no-alt-screen"]);
+    assert_eq!(
+        codex.resume_args.as_deref().expect("resume args"),
+        ["--no-alt-screen", "resume", "--last"]
+    );
+    assert_eq!(
+        codex
+            .resume_by_id_args
+            .as_deref()
+            .expect("resume-by-id args"),
+        ["--no-alt-screen", "resume", "{session_id}"]
+    );
+    assert!(!codex.forward_scroll);
+
+    let customized = migrate_config(customized);
+    assert_eq!(
+        customized.providers.commands["codex"].args,
+        ["--model", "o3"]
+    );
+}

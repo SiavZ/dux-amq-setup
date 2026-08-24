@@ -60,7 +60,7 @@ pub struct Config {
 /// Current canonical config schema version. Increment whenever a new
 /// migration arm is added to [`migrate_config`]; see
 /// `docs/contributing/schema-policy.md`.
-pub const CONFIG_SCHEMA_CURRENT: u32 = 2;
+pub const CONFIG_SCHEMA_CURRENT: u32 = 3;
 
 /// Default value for [`Config::schema_version`] when the field is
 /// missing from `config.toml` (i.e. the file predates this field). A
@@ -99,6 +99,40 @@ pub fn migrate_config(mut c: Config) -> Config {
                     keys.clear();
                 }
                 c.schema_version = 2;
+            }
+            2 => {
+                if let Some(codex) = c.providers.commands.get_mut("codex") {
+                    let legacy_resume = vec!["resume".to_string(), "--last".to_string()];
+                    let legacy_resume_by_id =
+                        vec!["resume".to_string(), "{session_id}".to_string()];
+                    let uses_legacy_defaults =
+                        matches!(codex.command.as_str(), "codex" | "codex-amq")
+                            && codex.args.is_empty()
+                            && codex
+                                .resume_args
+                                .as_ref()
+                                .is_none_or(|args| args == &legacy_resume)
+                            && codex
+                                .resume_by_id_args
+                                .as_ref()
+                                .is_none_or(|args| args == &legacy_resume_by_id);
+
+                    if uses_legacy_defaults {
+                        codex.args = vec!["--no-alt-screen".to_string()];
+                        codex.resume_args = Some(vec![
+                            "--no-alt-screen".to_string(),
+                            "resume".to_string(),
+                            "--last".to_string(),
+                        ]);
+                        codex.resume_by_id_args = Some(vec![
+                            "--no-alt-screen".to_string(),
+                            "resume".to_string(),
+                            "{session_id}".to_string(),
+                        ]);
+                        codex.forward_scroll = false;
+                    }
+                }
+                c.schema_version = 3;
             }
             _ => break,
         }
@@ -2680,9 +2714,17 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8] {
             "codex",
             ProviderCommandConfig {
                 command: "codex".to_string(),
-                args: Vec::new(),
-                resume_args: Some(vec!["resume".to_string(), "--last".to_string()]),
-                resume_by_id_args: Some(vec!["resume".to_string(), "{session_id}".to_string()]),
+                args: vec!["--no-alt-screen".to_string()],
+                resume_args: Some(vec![
+                    "--no-alt-screen".to_string(),
+                    "resume".to_string(),
+                    "--last".to_string(),
+                ]),
+                resume_by_id_args: Some(vec![
+                    "--no-alt-screen".to_string(),
+                    "resume".to_string(),
+                    "{session_id}".to_string(),
+                ]),
                 resume_wait_timeout_ms: None,
                 oneshot_args: vec![
                     "exec".to_string(),
@@ -3709,14 +3751,23 @@ dangerous = true
             .providers
             .get("codex")
             .expect("codex provider should exist");
+        assert_eq!(codex.args, ["--no-alt-screen"]);
         assert_eq!(
             codex.resume_args.clone(),
-            Some(vec!["resume".to_string(), "--last".to_string()])
+            Some(vec![
+                "--no-alt-screen".to_string(),
+                "resume".to_string(),
+                "--last".to_string(),
+            ])
         );
         assert!(codex.supports_session_resume());
         assert_eq!(
             codex.resume_by_id_args.clone(),
-            Some(vec!["resume".to_string(), "{session_id}".to_string()])
+            Some(vec![
+                "--no-alt-screen".to_string(),
+                "resume".to_string(),
+                "{session_id}".to_string(),
+            ])
         );
         assert!(codex.supports_session_resume_by_id());
     }
