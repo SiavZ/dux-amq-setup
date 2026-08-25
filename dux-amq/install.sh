@@ -425,10 +425,12 @@ sed -i --follow-symlinks \
   -e '/^\[providers\.gemini\]$/,/^\[/ s|^command = "gemini"$|command = "gemini-amq"|' \
   -e '/^\[providers\.claude\]$/,/^\[/ s|^resume_args = \["--continue"\]$|resume_args = ["--continue", "--fork-session"]|' \
   -e '/^\[providers\.claude\]$/,/^\[/ s|^forward_scroll = false$|forward_scroll = true|' \
+  -e '/^\[providers\.claude\]$/,/^\[/ s|^forward_mouse = true$|forward_mouse = false|' \
   -e '/^\[providers\.codex\]$/,/^\[/ s|^args = \[\]$|args = ["--no-alt-screen"]|' \
   -e '/^\[providers\.codex\]$/,/^\[/ s|^resume_args = \["resume", "--last"\]$|resume_args = ["--no-alt-screen", "resume", "--last"]|' \
   -e '/^\[providers\.codex\]$/,/^\[/ s|^resume_by_id_args = \["resume", "{session_id}"\]$|resume_by_id_args = ["--no-alt-screen", "resume", "{session_id}"]|' \
   -e '/^\[providers\.codex\]$/,/^\[/ s|^forward_scroll = true$|forward_scroll = false|' \
+  -e '/^\[providers\.codex\]$/,/^\[/ s|^forward_mouse = true$|forward_mouse = false|' \
   -e '/^\[providers\.gemini\]$/,/^\[/ s|^forward_scroll = false$|forward_scroll = true|' \
   "$STATE_ROOT/dux/config.toml"
 

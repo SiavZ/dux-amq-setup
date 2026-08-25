@@ -81,7 +81,9 @@ impl Clipboard {
 }
 
 fn no_display() -> bool {
-    std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none()
+    cfg!(target_os = "linux")
+        && std::env::var_os("DISPLAY").is_none()
+        && std::env::var_os("WAYLAND_DISPLAY").is_none()
 }
 
 /// Minimal RFC 4648 base64 encoder so we don't pull in a dep just for this.
@@ -251,5 +253,11 @@ mod tests {
         assert!(s.ends_with('\x07'));
         let payload = &s[7..s.len() - 1];
         assert_eq!(payload, "aGk=");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_does_not_require_x11_display_variables() {
+        assert!(!no_display());
     }
 }

@@ -86,11 +86,13 @@ command = "claude-amq"
 args = ["--custom-claude-arg"]
 resume_args = ["--continue", "--fork-session"]
 forward_scroll = true
+forward_mouse = false
 
 [providers.codex]
 command = "codex-amq"
 args = ["--no-alt-screen", "--model", "audit03-custom"]
 forward_scroll = false
+forward_mouse = false
 
 [providers.gemini]
 command = "gemini-amq"

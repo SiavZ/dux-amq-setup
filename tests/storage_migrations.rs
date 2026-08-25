@@ -638,3 +638,25 @@ fn config_v2_moves_default_codex_scrollback_into_dux() {
         ["--model", "o3"]
     );
 }
+
+#[test]
+fn config_v3_keeps_claude_and_codex_drags_in_dux() {
+    let mut old = Config {
+        schema_version: 3,
+        ..Config::default()
+    };
+    old.providers.commands["claude"].command = "claude-amq".into();
+    old.providers.commands["claude"].forward_mouse = Some(true);
+    old.providers.commands["codex"].command = "codex-amq".into();
+    old.providers.commands["codex"].forward_mouse = Some(true);
+    let mut customized = old.clone();
+    customized.providers.commands["claude"].command = "my-claude-wrapper".into();
+
+    let migrated = migrate_config(old);
+    assert_eq!(migrated.schema_version, CONFIG_SCHEMA_CURRENT);
+    assert!(!migrated.providers.commands["claude"].forwards_mouse());
+    assert!(!migrated.providers.commands["codex"].forwards_mouse());
+
+    let customized = migrate_config(customized);
+    assert!(customized.providers.commands["claude"].forwards_mouse());
+}

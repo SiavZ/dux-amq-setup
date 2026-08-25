@@ -60,7 +60,7 @@ pub struct Config {
 /// Current canonical config schema version. Increment whenever a new
 /// migration arm is added to [`migrate_config`]; see
 /// `docs/contributing/schema-policy.md`.
-pub const CONFIG_SCHEMA_CURRENT: u32 = 3;
+pub const CONFIG_SCHEMA_CURRENT: u32 = 4;
 
 /// Default value for [`Config::schema_version`] when the field is
 /// missing from `config.toml` (i.e. the file predates this field). A
@@ -133,6 +133,19 @@ pub fn migrate_config(mut c: Config) -> Config {
                     }
                 }
                 c.schema_version = 3;
+            }
+            3 => {
+                for (name, commands) in [
+                    ("claude", ["claude", "claude-amq"]),
+                    ("codex", ["codex", "codex-amq"]),
+                ] {
+                    if let Some(provider) = c.providers.commands.get_mut(name)
+                        && commands.contains(&provider.command.as_str())
+                    {
+                        provider.forward_mouse = Some(false);
+                    }
+                }
+                c.schema_version = 4;
             }
             _ => break,
         }
@@ -2690,7 +2703,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8] {
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("curl -fsSL https://claude.ai/install.sh | bash".to_string()),
                 forward_scroll: true,
-                forward_mouse: None,
+                forward_mouse: Some(false),
                 watch: Vec::new(),
             },
         ),
@@ -2739,7 +2752,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8] {
                 oneshot_output: OneshotOutput::Tempfile,
                 install_hint: Some("brew install --cask codex".to_string()),
                 forward_scroll: false,
-                forward_mouse: None,
+                forward_mouse: Some(false),
                 watch: Vec::new(),
             },
         ),
@@ -3746,6 +3759,7 @@ dangerous = true
             ])
         );
         assert!(claude.supports_session_resume_by_id());
+        assert!(!claude.forwards_mouse());
 
         let codex = config
             .providers
@@ -3770,6 +3784,7 @@ dangerous = true
             ])
         );
         assert!(codex.supports_session_resume_by_id());
+        assert!(!codex.forwards_mouse());
     }
 
     #[test]
