@@ -768,7 +768,27 @@ pub(crate) fn claude_resume_target_exists(cwd: &Path, session_id: &str) -> bool 
         .claude_projects
         .join(encode_claude_project_dir(cwd))
         .join(format!("{session_id}.jsonl"));
-    fs::symlink_metadata(transcript).is_ok_and(|metadata| metadata.file_type().is_file())
+    is_resumable_claude_transcript(&transcript)
+}
+
+fn is_resumable_claude_transcript(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.file_type().is_file() {
+        return false;
+    }
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let mut first_line = Vec::new();
+    let Ok(read) = BufReader::new(file).read_until(b'\n', &mut first_line) else {
+        return false;
+    };
+    read > 0
+        && first_line.len() <= MAX_JSON_LINE_BYTES
+        && serde_json::from_slice::<Value>(&first_line)
+            .is_ok_and(|value| value.get("type").and_then(Value::as_str) != Some("bridge-session"))
 }
 
 fn copy_claude_artifacts(source_jsonl: &Path, destination_dir: &Path) -> Result<usize> {
@@ -1069,6 +1089,18 @@ mod tests {
             encode_claude_project_dir(Path::new("/Users/A B/repo_name")),
             "-Users-A-B-repo-name"
         );
+    }
+
+    #[test]
+    fn claude_bridge_stub_is_not_a_resume_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session.jsonl");
+
+        fs::write(&transcript, br#"{"type":"bridge-session"}"#).unwrap();
+        assert!(!is_resumable_claude_transcript(&transcript));
+
+        fs::write(&transcript, br#"{"type":"mode"}"#).unwrap();
+        assert!(is_resumable_claude_transcript(&transcript));
     }
 
     #[test]
