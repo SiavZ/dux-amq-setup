@@ -1594,6 +1594,10 @@ impl App {
                         &mut needs_selection_clear,
                         self.selected_terminal_surface_client(),
                     );
+                    if needs_selection_clear {
+                        self.terminal_selection = None;
+                        needs_selection_clear = false;
+                    }
                     let is_scroll = matches!(
                         mouse_ev.kind,
                         MouseEventKind::ScrollUp
@@ -11301,6 +11305,23 @@ cyan = "#00ffff"
         app.last_pty_size = (5, 40);
         install_mouse_layout(&mut app);
         app
+    }
+
+    #[test]
+    fn pending_escape_does_not_swallow_claude_mouse_selection() {
+        let mut app = app_with_interactive_agent_pty();
+        app.git.sessions[0].provider = ProviderKind::from_str("claude");
+
+        app.process_raw_input_bytes(b"\x1b").unwrap();
+        let mut drag = sgr_mouse_down(30, 5);
+        drag.extend_from_slice(&sgr_mouse_drag(35, 6));
+        app.process_raw_input_bytes(&drag).unwrap();
+
+        let selection = app
+            .terminal_selection
+            .as_ref()
+            .expect("mouse drag after Escape should start a selection");
+        assert_ne!(selection.anchor, selection.end);
     }
 
     #[test]
