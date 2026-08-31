@@ -1,6 +1,6 @@
 //! Crash-atomic SQLite migrations, durable store identity, and session persistence.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 #[cfg(unix)]
@@ -146,6 +146,10 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (
         5,
         include_str!("storage/migrations/0005_shared_workspace.sql"),
+    ),
+    (
+        6,
+        include_str!("storage/migrations/0006_provider_session_ids.sql"),
     ),
 ];
 
@@ -606,19 +610,38 @@ impl SessionStore {
         let state_json = session.state.to_json().ok();
         let legacy_status = legacy_status_str_for(&session.state);
         let settings_json = session.settings.to_json();
+        // Provider UUID capture runs in workers while ordinary lifecycle
+        // changes still upsert the whole row. Preserve any mapping already
+        // committed by a capture worker so a stale in-memory snapshot cannot
+        // erase or roll it back before its completion event reaches the UI.
+        let mut provider_session_ids = session.provider_session_ids.clone();
+        let stored_provider_session_ids: Option<String> = conn
+            .query_row(
+                "select provider_session_ids from agent_sessions where id = ?1",
+                params![session.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(stored) = stored_provider_session_ids {
+            let stored: BTreeMap<String, String> = serde_json::from_str(&stored)
+                .context("stored provider_session_ids is not valid JSON")?;
+            provider_session_ids.extend(stored);
+        }
+        let provider_session_ids = serde_json::to_string(&provider_session_ids)
+            .context("failed to serialize provider session ids")?;
         conn.execute(
             r#"
             insert into agent_sessions
                 (id, project_id, project_path, provider, source_branch,
                  branch_name, worktree_path, agent_handle, shared_workspace,
-                 title, started_providers, status, state_json, session_settings,
-                 deleted_at, sort_order, created_at, updated_at)
+                 title, started_providers, provider_session_ids, status, state_json,
+                 session_settings, deleted_at, sort_order, created_at, updated_at)
             values
                 (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                    ?13, ?14, ?15,
+                    ?13, ?14, ?15, ?16,
                     coalesce((select max(sort_order) + 1 from agent_sessions), 0),
-                    ?16, ?17
+                    ?17, ?18
                 )
             on conflict(id) do update set
                 project_path=excluded.project_path,
@@ -629,6 +652,7 @@ impl SessionStore {
                 shared_workspace=excluded.shared_workspace,
                 title=excluded.title,
                 started_providers=excluded.started_providers,
+                provider_session_ids=excluded.provider_session_ids,
                 status=excluded.status,
                 state_json=excluded.state_json,
                 session_settings=excluded.session_settings,
@@ -646,6 +670,7 @@ impl SessionStore {
                 session.shared_workspace(),
                 session.title,
                 serialize_started_providers(&session.started_providers),
+                provider_session_ids,
                 legacy_status,
                 state_json,
                 settings_json,
@@ -655,6 +680,53 @@ impl SessionStore {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn set_provider_session_id(
+        &self,
+        session_id: &str,
+        provider: &str,
+        provider_session_id: &str,
+    ) -> Result<()> {
+        self.write_provider_session_id(session_id, provider, provider_session_id, false)?;
+        Ok(())
+    }
+
+    pub fn set_provider_session_id_if_missing(
+        &self,
+        session_id: &str,
+        provider: &str,
+        provider_session_id: &str,
+    ) -> Result<bool> {
+        self.write_provider_session_id(session_id, provider, provider_session_id, true)
+    }
+
+    fn write_provider_session_id(
+        &self,
+        session_id: &str,
+        provider: &str,
+        provider_session_id: &str,
+        only_if_missing: bool,
+    ) -> Result<bool> {
+        let conn = self.conn();
+        let raw: String = conn
+            .query_row(
+                "select provider_session_ids from agent_sessions where id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("session {session_id:?} was not found"))?;
+        let mut ids: BTreeMap<String, String> =
+            serde_json::from_str(&raw).context("stored provider_session_ids is not valid JSON")?;
+        if only_if_missing && ids.contains_key(provider) {
+            return Ok(false);
+        }
+        ids.insert(provider.to_string(), provider_session_id.to_string());
+        conn.execute(
+            "update agent_sessions set provider_session_ids = ?1 where id = ?2",
+            params![serde_json::to_string(&ids)?, session_id],
+        )?;
+        Ok(true)
     }
 
     pub fn load_sessions(&self) -> Result<Vec<AgentSession>> {
@@ -679,8 +751,8 @@ impl SessionStore {
             r#"
             select id, project_id, provider, source_branch, branch_name,
                    worktree_path, agent_handle, shared_workspace, deleted_at,
-                   title, project_path, started_providers, status, state_json,
-                   session_settings, created_at, updated_at
+                   title, project_path, started_providers, provider_session_ids,
+                   status, state_json, session_settings, created_at, updated_at
             from agent_sessions
             {where_clause}
             order by sort_order asc, updated_at desc, id asc
@@ -694,11 +766,12 @@ impl SessionStore {
             // relies on this field, gate it on the raw NULL, not the parse.
             let deleted_at: Option<String> = row.get(8)?;
             let started_providers: String = row.get(11)?;
-            let legacy_status_str: String = row.get(12)?;
-            let state_json: Option<String> = row.get(13)?;
-            let session_settings_raw: Option<String> = row.get(14)?;
-            let created_at: String = row.get(15)?;
-            let updated_at: String = row.get(16)?;
+            let provider_session_ids: String = row.get(12)?;
+            let legacy_status_str: String = row.get(13)?;
+            let state_json: Option<String> = row.get(14)?;
+            let session_settings_raw: Option<String> = row.get(15)?;
+            let created_at: String = row.get(16)?;
+            let updated_at: String = row.get(17)?;
             // audit02 P1-Z phase 2: prefer the new `state_json`
             // column. Fall back to the legacy `status` text if the
             // row pre-dates migration 0002 (or the JSON is corrupt).
@@ -727,6 +800,7 @@ impl SessionStore {
                 title: row.get(9)?,
                 project_path: row.get(10)?,
                 started_providers: parse_started_providers(&started_providers),
+                provider_session_ids: parse_provider_session_ids(&provider_session_ids),
                 state,
                 settings,
                 created_at: parse_time(&created_at).unwrap_or_else(Utc::now),
@@ -898,6 +972,20 @@ fn parse_started_providers(value: &str) -> Vec<String> {
     }
 }
 
+fn parse_provider_session_ids(value: &str) -> BTreeMap<String, String> {
+    match serde_json::from_str(value) {
+        Ok(ids) => ids,
+        Err(err) => {
+            tracing::warn!(
+                target: "dux::storage",
+                error = %crate::sanitize::for_terminal(&err.to_string()),
+                "provider_session_ids parse failed; defaulting to empty map",
+            );
+            BTreeMap::new()
+        }
+    }
+}
+
 /// Opens an in-memory session store for tests.
 #[cfg(test)]
 fn test_store() -> SessionStore {
@@ -924,6 +1012,7 @@ fn test_session(
         deleted_at: None,
         title: None,
         started_providers: Vec::new(),
+        provider_session_ids: Default::default(),
         state: SessionState::Created { created_at },
         settings: crate::model::SessionSettings::default(),
         created_at,
@@ -1073,6 +1162,41 @@ mod tests {
             loaded[0].started_providers,
             vec!["claude".to_string(), "codex".to_string()]
         );
+    }
+
+    #[test]
+    fn provider_session_ids_round_trip() {
+        let store = test_store();
+        let now = Utc::now();
+        let mut session = test_session("provider-ids", now, now);
+        session.provider_session_ids = BTreeMap::from([
+            ("claude".to_string(), uuid::Uuid::new_v4().to_string()),
+            ("codex".to_string(), uuid::Uuid::new_v4().to_string()),
+        ]);
+
+        store.upsert_session(&session).unwrap();
+
+        let loaded = store.load_sessions().unwrap();
+        assert_eq!(loaded[0].provider_session_ids, session.provider_session_ids);
+    }
+
+    #[test]
+    fn stale_whole_row_upsert_cannot_erase_captured_provider_uuid() {
+        let store = test_store();
+        let now = Utc::now();
+        let mut stale = test_session("capture-race", now, now);
+        store.upsert_session(&stale).unwrap();
+        let captured = uuid::Uuid::new_v4().to_string();
+        store
+            .set_provider_session_id(&stale.id, "codex", &captured)
+            .unwrap();
+
+        stale.title = Some("unrelated lifecycle update".to_string());
+        store.upsert_session(&stale).unwrap();
+
+        let loaded = store.load_sessions().unwrap();
+        assert_eq!(loaded[0].provider_session_ids.get("codex"), Some(&captured));
+        assert_eq!(loaded[0].title.as_deref(), stale.title.as_deref());
     }
 }
 

@@ -14,35 +14,46 @@ Oh, and it's fast and consumes low resources: more RAM is left for Claude, Codex
 
 Most AI coding tools give you one agent in one directory. dux gives you **unlimited agents across unlimited worktrees**, all visible at once. Spawn five agents on five branches and let them work in parallel. Fork a session to try a different approach without losing the original. Open companion terminals next to your agents for builds, tests, or just poking around.
 
-Every agent runs through a PTY, the same pseudo-terminal your shell uses. That means the CLI tool (Claude, Codex, Gemini, OpenCode, or literally anything else) runs exactly like it would in your regular terminal. Your MCP servers, hooks, skills, slash commands, and permission dialogs all work. We don't mess with your setup.
+Every agent runs through a PTY, the same pseudo-terminal your shell uses. That means the CLI tool (Claude, Cline, Codex, Gemini, OpenCode, Kilo Code, NTL, or literally anything else) runs exactly like it would in your regular terminal. Your MCP servers, hooks, skills, slash commands, and permission dialogs all work. We don't mess with your setup.
 
 ## Install
 
-**Homebrew:**
-
-```bash
-brew install patrickdappollonio/tap/dux
-```
+> This is a fork of [patrickdappollonio/dux](https://github.com/patrickdappollonio/dux) that
+> adds multi-agent messaging (AMQ), peer routing, watch rules, session resume, and the
+> `dux-amq` overlay. Installing upstream's `dux` will **not** give you those features.
+> Fork releases are tagged `dux-amq-vX.Y.Z` so they never collide with upstream's tags.
 
 **Shell:**
 
 ```bash
-curl -sSfL https://github.com/patrickdappollonio/dux/releases/latest/download/install.sh | bash
+curl -sSfL https://github.com/SiavZ/dux-amq-setup/releases/latest/download/install.sh | bash
 ```
 
 By default, the script installs to `~/.local/bin` if it exists and is in your `PATH`, otherwise `/usr/local/bin`. You can override the install directory or pin a specific version:
 
 ```bash
 # Custom install directory
-curl -sSfL https://github.com/patrickdappollonio/dux/releases/latest/download/install.sh | DUX_INSTALL_DIR=~/.bin bash
+curl -sSfL https://github.com/SiavZ/dux-amq-setup/releases/latest/download/install.sh | DUX_INSTALL_DIR=~/.bin bash
 
 # Specific version
-curl -sSfL https://github.com/patrickdappollonio/dux/releases/latest/download/install.sh | DUX_VERSION=v0.1.0 bash
+curl -sSfL https://github.com/SiavZ/dux-amq-setup/releases/latest/download/install.sh | DUX_VERSION=dux-amq-v0.1.0 bash
 ```
+
+Every release ships `linux-amd64`, `linux-arm64`, `darwin-amd64`, and `darwin-arm64` builds. The script verifies the archive against the release's `SHA256SUMS` before extracting and refuses to install on a mismatch.
 
 **Binary download:**
 
-Grab the latest release for your platform from the [Releases](https://github.com/patrickdappollonio/dux/releases) page. Extract it, drop the `dux` binary somewhere on your `PATH`, and run it. On first launch, dux creates a fully commented config file. That file *is* the documentation.
+Grab the latest release for your platform from the [Releases](https://github.com/SiavZ/dux-amq-setup/releases) page. Extract it, drop the `dux` binary somewhere on your `PATH`, and run it. On first launch, dux creates a fully commented config file. That file *is* the documentation.
+
+Each release also carries a CycloneDX SBOM per target and a keyless build-provenance attestation, verifiable with:
+
+```bash
+gh attestation verify dux-linux-amd64.tar.gz --owner SiavZ
+```
+
+**The AMQ overlay** (multi-agent wrappers, message queue, doctor tooling) is installed separately — see [`dux-amq/README.md`](dux-amq/README.md).
+
+**Homebrew:** not currently published for this fork. Use the shell installer above. (`brew install patrickdappollonio/tap/dux` installs *upstream* dux, which lacks the AMQ features this repo documents.)
 
 ## Prerequisites
 
@@ -63,16 +74,20 @@ Tab between panes. Resize them with keyboard or mouse. Collapse the sidebar or g
 
 ### Bring Any CLI
 
-Any terminal command can be a provider. The four defaults (Claude, Codex, Gemini, and OpenCode) are pre-configured, but adding your own is a config-only change:
+Any terminal command can be a provider. Claude, Cline, Codex, Gemini, OpenCode, Kilo Code, NTL, and Copilot are pre-configured, but adding your own is a config-only change:
 
 ```toml
 [providers.my-agent]
 command = "my-cool-agent"
 args = ["--some-flag"]
 resume_args = ["--continue"]
+resume_by_id_args = ["--resume", "{session_id}"]
 ```
 
-Set `resume_args` and dux can reconnect to detached or crashed sessions. Omit it if your CLI doesn't support resuming; dux will just relaunch it.
+`resume_args` is the legacy latest-session path used only for isolated worktrees.
+`resume_by_id_args` resumes one exact provider UUID; `{session_id}` is replaced
+as a literal argv token. Shared agents never use `resume_args`: without a valid
+captured UUID and targeted configuration they start fresh and show a warning.
 
 Switch providers from the command palette. dux sticks to one agent per worktree, so provider changes happen in place:
 
@@ -110,7 +125,7 @@ Each agent gets its own companion terminal: a separate shell session in the same
 
 ### Per-Session Settings
 
-Every agent session has its own settings drawer (open via the `session-settings` palette command, or its keybinding) covering context mode (Attended / Orchestrator / Worker), YOLO permissions, per-rule arm/disarm for watch rules, auto-clear after task done, and an AMQ verify-envelope override. Defaults are intentionally cautious — a missing or corrupt settings blob always loads as Attended/no-YOLO/no-auto-clear, so an attacker who tampers with the database can't escalate a session into autonomous mode. Settings persist to sqlite and follow the agent across detach + reconnect.
+Every agent session has its own settings drawer (open via the `session-settings` palette command, or its keybinding) covering context mode (Attended / Orchestrator / Worker), YOLO permissions (including OpenCode's `--auto` mode), per-rule arm/disarm for watch rules, auto-clear after task done, and an AMQ verify-envelope override. Defaults are intentionally cautious — a missing or corrupt settings blob always loads as Attended/no-YOLO/no-auto-clear, so an attacker who tampers with the database can't escalate a session into autonomous mode. Settings persist to sqlite and follow the agent across detach + reconnect.
 
 ### Forking Sessions
 
@@ -156,7 +171,7 @@ workspace_mode = "worktree" # optional per-project override; "" inherits
 
 Consent is preserved for existing installations: if an existing config has no `[workspace]` section at all, dux continues creating isolated worktrees. Regenerating a fresh config writes the shared default explicitly.
 
-Shared sessions use the project's canonical path, never switch the real checkout during registration, never auto-resume at startup, and reconnect with a fresh provider process. Their branch and PR status follow the checkout's live `HEAD`; detached `HEAD` skips PR discovery. A shared project cannot live inside `DUX_HOME` or its managed worktree tree.
+Shared sessions use the project's canonical path and never switch the real checkout during registration. Claude and Codex conversations are captured per agent and reconnect by exact provider UUID, so multiple agents in one CWD never select history by recency. Shared startup auto-resume remains off by default (`workspace.auto_resume_shared = false`); when enabled it uses the same exact-ID rule. Existing histories stranded under old Dux worktrees are copied (Claude) or mapped (Codex) once at startup without modifying their originals. Their branch and PR status follow the checkout's live `HEAD`; detached `HEAD` skips PR discovery. A shared project cannot live inside `DUX_HOME` or its managed worktree tree.
 
 Starting a second live shared agent requires confirmation because both agents share the checkout's files, index, staging area, commits, branch switches, and discard operations. While this Dux store can see multiple live writers, the header shows a persistent `CURRENT STORE ONLY` warning. That warning cannot detect agents launched under another `DUX_HOME` or unmanaged processes using the checkout, so its absence is not proof of exclusive access. Use an isolated Fork whenever changes need to diverge.
 

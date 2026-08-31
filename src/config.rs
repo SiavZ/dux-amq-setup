@@ -60,7 +60,7 @@ pub struct Config {
 /// Current canonical config schema version. Increment whenever a new
 /// migration arm is added to [`migrate_config`]; see
 /// `docs/contributing/schema-policy.md`.
-pub const CONFIG_SCHEMA_CURRENT: u32 = 1;
+pub const CONFIG_SCHEMA_CURRENT: u32 = 4;
 
 /// Default value for [`Config::schema_version`] when the field is
 /// missing from `config.toml` (i.e. the file predates this field). A
@@ -90,10 +90,63 @@ pub fn migrate_config(mut c: Config) -> Config {
                 // serde defaults via `#[serde(default)]`.
                 c.schema_version = 1;
             }
-            // TODO(audit02 Phases 15/16): when `[limits]` and the
-            // `[auto_resume]` section land, bump
-            // `CONFIG_SCHEMA_CURRENT` to 2 and add an arm that rewrites
-            // `c.schema_version = 1` to fill those defaults explicitly.
+            1 => {
+                let action = keybindings::Action::OpenWorktreeInEditor.config_name();
+                if let Some(keys) = c.keys.bindings.get_mut(action)
+                    && keys.len() == 1
+                    && keys[0] == "o"
+                {
+                    keys.clear();
+                }
+                c.schema_version = 2;
+            }
+            2 => {
+                if let Some(codex) = c.providers.commands.get_mut("codex") {
+                    let legacy_resume = vec!["resume".to_string(), "--last".to_string()];
+                    let legacy_resume_by_id =
+                        vec!["resume".to_string(), "{session_id}".to_string()];
+                    let uses_legacy_defaults =
+                        matches!(codex.command.as_str(), "codex" | "codex-amq")
+                            && codex.args.is_empty()
+                            && codex
+                                .resume_args
+                                .as_ref()
+                                .is_none_or(|args| args == &legacy_resume)
+                            && codex
+                                .resume_by_id_args
+                                .as_ref()
+                                .is_none_or(|args| args == &legacy_resume_by_id);
+
+                    if uses_legacy_defaults {
+                        codex.args = vec!["--no-alt-screen".to_string()];
+                        codex.resume_args = Some(vec![
+                            "--no-alt-screen".to_string(),
+                            "resume".to_string(),
+                            "--last".to_string(),
+                        ]);
+                        codex.resume_by_id_args = Some(vec![
+                            "--no-alt-screen".to_string(),
+                            "resume".to_string(),
+                            "{session_id}".to_string(),
+                        ]);
+                        codex.forward_scroll = false;
+                    }
+                }
+                c.schema_version = 3;
+            }
+            3 => {
+                for (name, commands) in [
+                    ("claude", ["claude", "claude-amq"]),
+                    ("codex", ["codex", "codex-amq"]),
+                ] {
+                    if let Some(provider) = c.providers.commands.get_mut(name)
+                        && commands.contains(&provider.command.as_str())
+                    {
+                        provider.forward_mouse = Some(false);
+                    }
+                }
+                c.schema_version = 4;
+            }
             _ => break,
         }
     }
@@ -223,11 +276,15 @@ pub struct ProviderCommandConfig {
     pub command: String,
     pub args: Vec<String>,
     pub resume_args: Option<Vec<String>>,
+    pub resume_by_id_args: Option<Vec<String>>,
     pub resume_wait_timeout_ms: Option<u64>,
     pub oneshot_args: Vec<String>,
     pub oneshot_output: OneshotOutput,
     pub install_hint: Option<String>,
     pub forward_scroll: bool,
+    /// Whether left-button drags are forwarded when the provider enables
+    /// terminal mouse mode. When false, clicks still forward on release.
+    pub forward_mouse: Option<bool>,
     /// Optional watch rules. Each rule pairs a regex against the agent's
     /// terminal output with an action (currently `send_text`) and a
     /// backoff schedule. See [`crate::watch`] for the engine, and the
@@ -269,6 +326,13 @@ impl WorkspaceMode {
 #[serde(default)]
 pub struct WorkspaceConfig {
     pub default_mode: WorkspaceMode,
+    /// Whether shared-workspace sessions auto-resume on startup alongside
+    /// worktree sessions. Off by default: shared agents run in the real
+    /// checkout, so a boot would otherwise fire every shared agent into the
+    /// live repo at once. Turn on for a fleet that intentionally auto-starts
+    /// shared agents on `auto_resume_on_start`.
+    #[serde(default)]
+    pub auto_resume_shared: bool,
 }
 
 fn deserialize_workspace_mode_override<'de, D>(
@@ -515,7 +579,7 @@ pub struct AmqInjectConfig {
     /// injecting it into an agent. This applies both to plain `.msg`
     /// files left while dux was offline and to `.inflight.*.msg` files
     /// reclaimed after a crash/restart. Set to 0 to disable expiry and
-    /// replay all queued wake files. Default 600 (10 minutes).
+    /// replay all queued wake files. Default 0 (expiry disabled).
     #[serde(default = "default_amq_inject_max_message_age_secs")]
     pub max_message_age_secs: u64,
     /// Polling fallback interval (milliseconds) for filesystems where
@@ -568,11 +632,11 @@ pub struct AmqInjectConfig {
     #[serde(default = "default_amq_inject_active_session_quiet_secs")]
     pub active_session_quiet_secs: u64,
     /// Minimum delay in milliseconds between phase 1 (place body) and
-    /// phase 2 (send Enter) of AMQ inject delivery. Non-Codex
+    /// phase 2 (send Enter) of AMQ inject delivery. Other
     /// harnesses use the time split to keep a typed body and trailing
-    /// Enter from coalescing into one paste-like stdin read. Codex
-    /// bodies are sent as explicit bracketed paste, but still share
-    /// this delay before the submit key.
+    /// Enter from coalescing into one paste-like stdin read. Claude and
+    /// Codex bodies are sent as explicit bracketed paste, but still
+    /// share this delay before the submit key.
     ///
     /// The default (250 ms) is long enough for Ink-based harnesses to
     /// drain the typed body before Enter arrives. Runtime delivery uses
@@ -622,7 +686,7 @@ fn default_amq_inject_delivery_timeout_secs() -> u64 {
 }
 
 fn default_amq_inject_max_message_age_secs() -> u64 {
-    600
+    0
 }
 
 fn default_amq_inject_poll_interval_ms() -> u64 {
@@ -822,11 +886,13 @@ impl Default for ProviderCommandConfig {
             command: String::new(),
             args: Vec::new(),
             resume_args: None,
+            resume_by_id_args: None,
             resume_wait_timeout_ms: None,
             oneshot_args: Vec::new(),
             oneshot_output: OneshotOutput::Stdout,
             install_hint: None,
             forward_scroll: false,
+            forward_mouse: None,
             watch: Vec::new(),
         }
     }
@@ -847,6 +913,34 @@ impl ProviderCommandConfig {
             .as_ref()
             .map(|args| !args.is_empty())
             .unwrap_or(false)
+    }
+
+    pub fn forwards_mouse(&self) -> bool {
+        self.forward_mouse.unwrap_or(true)
+    }
+
+    pub fn resume_by_id_args(&self, session_id: &str) -> Option<Vec<String>> {
+        let args = self
+            .resume_by_id_args
+            .as_ref()
+            .filter(|args| args.iter().any(|arg| arg == "{session_id}"))?;
+        Some(
+            args.iter()
+                .map(|arg| {
+                    if arg == "{session_id}" {
+                        session_id.to_string()
+                    } else {
+                        arg.clone()
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    pub fn supports_session_resume_by_id(&self) -> bool {
+        self.resume_by_id_args
+            .as_ref()
+            .is_some_and(|args| args.iter().any(|arg| arg == "{session_id}"))
     }
 }
 
@@ -908,6 +1002,15 @@ impl Config {
             .unwrap_or(WorkspaceMode::Worktree)
     }
 
+    /// Whether shared-workspace sessions participate in startup auto-resume.
+    /// Absent `[workspace]` section ⇒ false (the isolation-era default).
+    pub fn auto_resume_shared(&self) -> bool {
+        self.workspace
+            .as_ref()
+            .map(|workspace| workspace.auto_resume_shared)
+            .unwrap_or(false)
+    }
+
     pub fn workspace_mode_for_project(&self, project: &ProjectConfig) -> WorkspaceMode {
         project
             .workspace_mode
@@ -955,8 +1058,14 @@ impl ProvidersConfig {
                     if entry.get().resume_args.is_none() {
                         entry.get_mut().resume_args = config.resume_args;
                     }
+                    if entry.get().resume_by_id_args.is_none() {
+                        entry.get_mut().resume_by_id_args = config.resume_by_id_args;
+                    }
                     if entry.get().resume_wait_timeout_ms.is_none() {
                         entry.get_mut().resume_wait_timeout_ms = config.resume_wait_timeout_ms;
+                    }
+                    if entry.get().forward_mouse.is_none() {
+                        entry.get_mut().forward_mouse = config.forward_mouse;
                     }
                 }
             }
@@ -1356,6 +1465,16 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             )),
             value_fn: |c| FieldValue::Str(c.default_workspace_mode().as_str().to_string()),
         },
+        ConfigEntry::Field {
+            key: "auto_resume_shared",
+            comment: Some(CommentSource::Static(
+                "# When true, shared-workspace sessions also auto-resume on startup\n\
+                 # (with auto_resume_on_start). Default false: shared agents run in the\n\
+                 # real checkout, so a boot would otherwise fire every shared agent into\n\
+                 # the live repo at once. Turn on for a fleet that auto-starts shared agents.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.auto_resume_shared()),
+        },
         ConfigEntry::Blank,
         ConfigEntry::Providers,
         ConfigEntry::Terminal,
@@ -1659,7 +1778,7 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
                  # receiver's .expired/ directory instead of injecting them.\n\
                  # Applies to stale .msg files and crash-left .inflight.*.msg\n\
                  # files on startup, and to held in-memory messages. Set 0 to\n\
-                 # replay all queued wake files. Default 600 (10 minutes).",
+                 # replay all queued wake files. Default 0 (expiry disabled).",
             )),
             value_fn: |c| FieldValue::U64(c.amq.inject.max_message_age_secs),
         },
@@ -1722,9 +1841,9 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             comment: Some(CommentSource::Static(
                 "# Minimum delay in milliseconds between phase 1 (place body) and\n\
                  # phase 2 (send Enter) of AMQ inject delivery and watch-rule\n\
-                 # SendText actions. Non-Codex harnesses use the time split to\n\
-                 # avoid coalescing body+CR into a paste buffer; Codex bodies are\n\
-                 # sent as explicit bracketed paste before this submit delay.\n\
+                 # SendText actions. Other harnesses use the time split to avoid\n\
+                 # coalescing body+CR into a paste buffer; Claude and Codex bodies\n\
+                 # are sent as explicit bracketed paste before this submit delay.\n\
                  # Default 250. Non-zero values below 250 are raised to 250 at\n\
                  # runtime; set 0 only as a debugging escape hatch for old next-tick\n\
                  # behaviour.",
@@ -1953,6 +2072,12 @@ pub fn save_config(
             "workspace",
             "default_mode",
             workspace.default_mode.as_str(),
+        );
+        patch_table_bool(
+            &mut doc,
+            "workspace",
+            "auto_resume_shared",
+            workspace.auto_resume_shared,
         );
     }
 
@@ -2245,6 +2370,11 @@ fn patch_providers(doc: &mut DocumentMut, providers: &ProvidersConfig) {
             resume.push(a.as_str());
         }
         tbl["resume_args"] = toml_edit::value(resume);
+        let mut resume_by_id = Array::new();
+        for a in config.resume_by_id_args.as_deref().unwrap_or(&[]) {
+            resume_by_id.push(a.as_str());
+        }
+        tbl["resume_by_id_args"] = toml_edit::value(resume_by_id);
         if let Some(timeout_ms) = config.resume_wait_timeout_ms {
             tbl["resume_wait_timeout_ms"] = toml_edit::value(timeout_ms as i64);
         }
@@ -2266,6 +2396,7 @@ fn patch_providers(doc: &mut DocumentMut, providers: &ProvidersConfig) {
         }
 
         tbl["forward_scroll"] = toml_edit::value(config.forward_scroll);
+        tbl["forward_mouse"] = toml_edit::value(config.forwards_mouse());
     }
 }
 
@@ -2543,7 +2674,7 @@ fn default_terminal_args() -> Vec<String> {
     vec!["-l".to_string()]
 }
 
-fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
+fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8] {
     [
         (
             "claude",
@@ -2551,6 +2682,14 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
                 command: "claude".to_string(),
                 args: Vec::new(),
                 resume_args: Some(vec!["--continue".to_string()]),
+                resume_by_id_args: Some(vec![
+                    "--settings".to_string(),
+                    r#"{"ultracode":true}"#.to_string(),
+                    "--effort".to_string(),
+                    "high".to_string(),
+                    "--resume".to_string(),
+                    "{session_id}".to_string(),
+                ]),
                 resume_wait_timeout_ms: None,
                 oneshot_args: vec![
                     "--bare".to_string(),
@@ -2564,6 +2703,23 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("curl -fsSL https://claude.ai/install.sh | bash".to_string()),
                 forward_scroll: true,
+                forward_mouse: Some(false),
+                watch: Vec::new(),
+            },
+        ),
+        (
+            "cline",
+            ProviderCommandConfig {
+                command: "cline".to_string(),
+                args: vec!["--tui".to_string()],
+                resume_args: None,
+                resume_by_id_args: None,
+                resume_wait_timeout_ms: None,
+                oneshot_args: vec!["{prompt}".to_string()],
+                oneshot_output: OneshotOutput::Stdout,
+                install_hint: Some("npm install -g cline".to_string()),
+                forward_scroll: true,
+                forward_mouse: None,
                 watch: Vec::new(),
             },
         ),
@@ -2571,8 +2727,17 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
             "codex",
             ProviderCommandConfig {
                 command: "codex".to_string(),
-                args: Vec::new(),
-                resume_args: Some(vec!["resume".to_string(), "--last".to_string()]),
+                args: vec!["--no-alt-screen".to_string()],
+                resume_args: Some(vec![
+                    "--no-alt-screen".to_string(),
+                    "resume".to_string(),
+                    "--last".to_string(),
+                ]),
+                resume_by_id_args: Some(vec![
+                    "--no-alt-screen".to_string(),
+                    "resume".to_string(),
+                    "{session_id}".to_string(),
+                ]),
                 resume_wait_timeout_ms: None,
                 oneshot_args: vec![
                     "exec".to_string(),
@@ -2587,6 +2752,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
                 oneshot_output: OneshotOutput::Tempfile,
                 install_hint: Some("brew install --cask codex".to_string()),
                 forward_scroll: false,
+                forward_mouse: Some(false),
                 watch: Vec::new(),
             },
         ),
@@ -2596,11 +2762,13 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
                 command: "gemini".to_string(),
                 args: Vec::new(),
                 resume_args: Some(vec!["--resume".to_string()]),
+                resume_by_id_args: None,
                 resume_wait_timeout_ms: None,
                 oneshot_args: vec!["-p".to_string(), "{prompt}".to_string()],
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("brew install gemini-cli".to_string()),
                 forward_scroll: false,
+                forward_mouse: None,
                 watch: Vec::new(),
             },
         ),
@@ -2610,11 +2778,52 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
                 command: "opencode".to_string(),
                 args: Vec::new(),
                 resume_args: Some(vec!["--continue".to_string()]),
+                resume_by_id_args: None,
                 resume_wait_timeout_ms: Some(3_000),
                 oneshot_args: vec!["run".to_string(), "{prompt}".to_string()],
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("curl -fsSL https://opencode.ai/install | bash".to_string()),
                 forward_scroll: true,
+                forward_mouse: Some(false),
+                watch: Vec::new(),
+            },
+        ),
+        (
+            "kilocode",
+            ProviderCommandConfig {
+                command: "kilo".to_string(),
+                args: Vec::new(),
+                resume_args: Some(vec!["--continue".to_string()]),
+                resume_by_id_args: None,
+                resume_wait_timeout_ms: Some(3_000),
+                oneshot_args: vec!["run".to_string(), "{prompt}".to_string()],
+                oneshot_output: OneshotOutput::Stdout,
+                install_hint: Some("npm install -g @kilocode/cli".to_string()),
+                forward_scroll: true,
+                forward_mouse: None,
+                watch: Vec::new(),
+            },
+        ),
+        (
+            "ntl",
+            ProviderCommandConfig {
+                command: "ntl".to_string(),
+                args: vec!["--agent".to_string()],
+                resume_args: None,
+                resume_by_id_args: None,
+                resume_wait_timeout_ms: None,
+                oneshot_args: vec![
+                    "--chat".to_string(),
+                    "--no-color".to_string(),
+                    "-p".to_string(),
+                    "{prompt}".to_string(),
+                ],
+                oneshot_output: OneshotOutput::Stdout,
+                install_hint: Some(
+                    "curl -fsSL https://notokenlimit.com/install.sh | bash".to_string(),
+                ),
+                forward_scroll: false,
+                forward_mouse: None,
                 watch: Vec::new(),
             },
         ),
@@ -2628,6 +2837,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
                 // Unlike claude/codex/gemini/opencode, there is no flag
                 // to limit resume to the CWD, so we disable it.
                 resume_args: None,
+                resume_by_id_args: None,
                 resume_wait_timeout_ms: None,
                 oneshot_args: vec![
                     "-p".to_string(),
@@ -2637,6 +2847,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("curl -fsSL https://gh.io/copilot-install | bash".to_string()),
                 forward_scroll: false,
+                forward_mouse: None,
                 watch: Vec::new(),
             },
         ),
@@ -2687,6 +2898,15 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
         render_string_list(config.resume_args.as_deref().unwrap_or(&[]))
     ));
     out.push_str(
+        "# Optional args for resuming one exact provider session.\n\
+         # `{session_id}` is replaced as one literal argv token; no shell expansion occurs.\n\
+         # Shared-workspace agents use only this targeted form and never `resume_args`.\n",
+    );
+    out.push_str(&format!(
+        "resume_by_id_args = {}\n",
+        render_string_list(config.resume_by_id_args.as_deref().unwrap_or(&[]))
+    ));
+    out.push_str(
         "# Optional timeout for resumed sessions that produce no visible output.\n\
          # If resume hangs before rendering anything, dux kills it and retries fresh after this many milliseconds.\n\
          # Set to 0 to disable the timeout.\n",
@@ -2720,6 +2940,11 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
          # own scrollback buffer (e.g. opencode).\n",
     );
     out.push_str(&format!("forward_scroll = {}\n", config.forward_scroll));
+    out.push_str(
+        "# When true, left-button drags are forwarded to providers that enable mouse\n\
+         # mode. Disable this to select text in dux while retaining provider clicks.\n",
+    );
+    out.push_str(&format!("forward_mouse = {}\n", config.forwards_mouse()));
 
     // Watch rules. Documented for every provider; Claude ships with a
     // copy-pasteable commented example tailored to Anthropic's transient
@@ -3297,7 +3522,7 @@ mod tests {
         assert!(cfg.queue_dir.is_empty());
         assert_eq!(cfg.busy_scan_lines, 5);
         assert_eq!(cfg.delivery_timeout_secs, 600);
-        assert_eq!(cfg.max_message_age_secs, 600);
+        assert_eq!(cfg.max_message_age_secs, 0);
         assert_eq!(cfg.poll_interval_ms, 5_000);
         assert_eq!(cfg.max_message_bytes, 65_536);
         assert!(
@@ -3522,16 +3747,62 @@ dangerous = true
             Some(vec!["--continue".to_string()])
         );
         assert!(claude.supports_session_resume());
+        assert_eq!(
+            claude.resume_by_id_args.clone(),
+            Some(vec![
+                "--settings".to_string(),
+                r#"{"ultracode":true}"#.to_string(),
+                "--effort".to_string(),
+                "high".to_string(),
+                "--resume".to_string(),
+                "{session_id}".to_string(),
+            ])
+        );
+        assert!(claude.supports_session_resume_by_id());
+        assert!(!claude.forwards_mouse());
 
         let codex = config
             .providers
             .get("codex")
             .expect("codex provider should exist");
+        assert_eq!(codex.args, ["--no-alt-screen"]);
         assert_eq!(
             codex.resume_args.clone(),
-            Some(vec!["resume".to_string(), "--last".to_string()])
+            Some(vec![
+                "--no-alt-screen".to_string(),
+                "resume".to_string(),
+                "--last".to_string(),
+            ])
         );
         assert!(codex.supports_session_resume());
+        assert_eq!(
+            codex.resume_by_id_args.clone(),
+            Some(vec![
+                "--no-alt-screen".to_string(),
+                "resume".to_string(),
+                "{session_id}".to_string(),
+            ])
+        );
+        assert!(codex.supports_session_resume_by_id());
+        assert!(!codex.forwards_mouse());
+    }
+
+    #[test]
+    fn targeted_resume_substitutes_only_the_exact_session_id_token() {
+        let cfg = ProviderCommandConfig {
+            resume_by_id_args: Some(vec![
+                "resume".to_string(),
+                "{session_id}".to_string(),
+                "prefix-{session_id}".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+
+        assert_eq!(
+            cfg.resume_by_id_args(&id).unwrap(),
+            vec!["resume".to_string(), id, "prefix-{session_id}".to_string()]
+        );
     }
 
     #[test]
@@ -3540,11 +3811,13 @@ dangerous = true
             command: "example".to_string(),
             args: vec!["--interactive".to_string()],
             resume_args: Some(vec!["--resume".to_string(), "--last".to_string()]),
+            resume_by_id_args: None,
             resume_wait_timeout_ms: Some(2_000),
             oneshot_args: Vec::new(),
             oneshot_output: OneshotOutput::Stdout,
             install_hint: None,
             forward_scroll: false,
+            forward_mouse: None,
             watch: Vec::new(),
         };
         assert_eq!(cfg.interactive_args(false), ["--interactive"]);
@@ -3554,11 +3827,13 @@ dangerous = true
             command: "example".to_string(),
             args: vec!["--interactive".to_string()],
             resume_args: None,
+            resume_by_id_args: None,
             resume_wait_timeout_ms: None,
             oneshot_args: Vec::new(),
             oneshot_output: OneshotOutput::Stdout,
             install_hint: None,
             forward_scroll: false,
+            forward_mouse: None,
             watch: Vec::new(),
         };
         assert_eq!(unsupported.interactive_args(true), ["--interactive"]);
@@ -3574,11 +3849,13 @@ dangerous = true
                     command: "claude".to_string(),
                     args: Vec::new(),
                     resume_args: None,
+                    resume_by_id_args: None,
                     resume_wait_timeout_ms: None,
                     oneshot_args: Vec::new(),
                     oneshot_output: OneshotOutput::Stdout,
                     install_hint: None,
                     forward_scroll: false,
+                    forward_mouse: None,
                     watch: Vec::new(),
                 },
             )]),
@@ -3593,6 +3870,7 @@ dangerous = true
             claude.resume_args.clone(),
             Some(vec!["--continue".to_string()])
         );
+        assert!(claude.supports_session_resume_by_id());
     }
 
     #[test]
@@ -3604,11 +3882,13 @@ dangerous = true
                     command: "claude".to_string(),
                     args: Vec::new(),
                     resume_args: Some(Vec::new()),
+                    resume_by_id_args: Some(Vec::new()),
                     resume_wait_timeout_ms: None,
                     oneshot_args: Vec::new(),
                     oneshot_output: OneshotOutput::Stdout,
                     install_hint: None,
                     forward_scroll: false,
+                    forward_mouse: None,
                     watch: Vec::new(),
                 },
             )]),
@@ -3620,7 +3900,9 @@ dangerous = true
             .get("claude")
             .expect("claude provider should still exist");
         assert_eq!(claude.resume_args, Some(Vec::new()));
+        assert_eq!(claude.resume_by_id_args, Some(Vec::new()));
         assert!(!claude.supports_session_resume());
+        assert!(!claude.supports_session_resume_by_id());
     }
 
     #[test]
@@ -3634,9 +3916,9 @@ dangerous = true
     }
 
     #[test]
-    fn providers_use_host_scrollback_by_default_except_claude_and_opencode() {
+    fn providers_use_expected_scrollback_defaults() {
         let config = Config::default();
-        for name in ["codex", "gemini", "copilot"] {
+        for name in ["codex", "gemini", "ntl", "copilot"] {
             let cfg = config
                 .providers
                 .get(name)
@@ -3647,7 +3929,7 @@ dangerous = true
             );
         }
 
-        for name in ["claude", "opencode"] {
+        for name in ["claude", "cline", "opencode", "kilocode"] {
             let cfg = config
                 .providers
                 .get(name)
@@ -3907,14 +4189,39 @@ oneshot_output = "stdout"
     }
 
     #[test]
-    fn default_opencode_oneshot_uses_run_subcommand() {
+    fn default_opencode_and_kilocode_oneshot_use_run_subcommand() {
         let providers = default_provider_commands();
-        let opencode = providers.iter().find(|(n, _)| *n == "opencode").unwrap();
-        let cfg = &opencode.1;
-        assert_eq!(cfg.command, "opencode");
-        assert_eq!(cfg.oneshot_args, vec!["run", "{prompt}"]);
+        for (name, command) in [("opencode", "opencode"), ("kilocode", "kilo")] {
+            let cfg = &providers.iter().find(|(n, _)| *n == name).unwrap().1;
+            assert_eq!(cfg.command, command);
+            assert_eq!(cfg.oneshot_args, vec!["run", "{prompt}"]);
+            assert!(matches!(cfg.oneshot_output, OneshotOutput::Stdout));
+            assert!(cfg.resume_args.is_some());
+        }
+    }
+
+    #[test]
+    fn default_cline_uses_tui_and_plain_prompt() {
+        let providers = default_provider_commands();
+        let cfg = &providers.iter().find(|(n, _)| *n == "cline").unwrap().1;
+        assert_eq!(cfg.command, "cline");
+        assert_eq!(cfg.args, vec!["--tui"]);
+        assert_eq!(cfg.oneshot_args, vec!["{prompt}"]);
+        assert!(!cfg.supports_session_resume());
+    }
+
+    #[test]
+    fn default_ntl_uses_agent_repl_and_chat_oneshot() {
+        let providers = default_provider_commands();
+        let cfg = &providers.iter().find(|(n, _)| *n == "ntl").unwrap().1;
+        assert_eq!(cfg.command, "ntl");
+        assert_eq!(cfg.args, vec!["--agent"]);
+        assert_eq!(
+            cfg.oneshot_args,
+            vec!["--chat", "--no-color", "-p", "{prompt}"]
+        );
         assert!(matches!(cfg.oneshot_output, OneshotOutput::Stdout));
-        assert!(cfg.resume_args.is_some());
+        assert!(!cfg.supports_session_resume());
     }
 
     #[test]
@@ -3944,7 +4251,7 @@ oneshot_output = "stdout"
     }
 
     #[test]
-    fn ensure_defaults_adds_opencode_and_gemini() {
+    fn ensure_defaults_adds_builtin_providers() {
         let mut providers = ProvidersConfig {
             commands: indexmap::IndexMap::from([(
                 "claude".to_string(),
@@ -3952,11 +4259,13 @@ oneshot_output = "stdout"
                     command: "claude".to_string(),
                     args: Vec::new(),
                     resume_args: Some(vec!["--continue".to_string()]),
+                    resume_by_id_args: None,
                     resume_wait_timeout_ms: None,
                     oneshot_args: vec!["-p".to_string(), "{prompt}".to_string()],
                     oneshot_output: OneshotOutput::Stdout,
                     install_hint: None,
                     forward_scroll: false,
+                    forward_mouse: None,
                     watch: Vec::new(),
                 },
             )]),
@@ -3970,11 +4279,20 @@ oneshot_output = "stdout"
         );
         assert!(providers.get("gemini").is_some(), "gemini should be added");
         assert!(providers.get("codex").is_some(), "codex should be added");
+        assert!(providers.get("cline").is_some(), "cline should be added");
+        assert!(
+            providers.get("kilocode").is_some(),
+            "kilocode should be added"
+        );
         assert!(
             providers.get("copilot").is_some(),
             "copilot should be added"
         );
+        assert!(providers.get("ntl").is_some(), "ntl should be added");
         assert_eq!(providers.get("opencode").unwrap().command, "opencode");
+        assert_eq!(providers.get("cline").unwrap().command, "cline");
+        assert_eq!(providers.get("kilocode").unwrap().command, "kilo");
+        assert_eq!(providers.get("ntl").unwrap().command, "ntl");
         assert_eq!(providers.get("gemini").unwrap().command, "gemini");
         assert_eq!(providers.get("copilot").unwrap().command, "copilot");
     }
@@ -4310,6 +4628,46 @@ oneshot_output = "stdout"
         assert!(
             claude.watch.iter().any(|r| r.pattern == "my custom error"),
             "user rule lost on reload"
+        );
+    }
+
+    #[test]
+    fn save_config_preserves_targeted_resume_args_and_adjacent_comment() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let mut body = render_default_config();
+        let default_line = body
+            .lines()
+            .find(|line| line.starts_with("resume_by_id_args = "))
+            .expect("Claude targeted resume line")
+            .to_string();
+        body = body.replacen(
+            &default_line,
+            "# keep my exact provider flags\nresume_by_id_args = [\"--resume\", \"{session_id}\", \"--custom\"]",
+            1,
+        );
+        fs::write(&config_path, &body).expect("write config");
+
+        let mut config: Config = toml::from_str(&body).expect("parse config");
+        config.ui.right_width_pct = 31;
+        let bindings = crate::keybindings::RuntimeBindings::from_keys_config(&config.keys);
+        save_config(&config_path, &config, &bindings).expect("save config");
+
+        let saved = fs::read_to_string(&config_path).expect("read config");
+        assert!(saved.contains("# keep my exact provider flags"));
+        let reloaded: Config = toml::from_str(&saved).expect("reload config");
+        assert_eq!(
+            reloaded
+                .providers
+                .get("claude")
+                .expect("Claude config")
+                .resume_by_id_args
+                .clone(),
+            Some(vec![
+                "--resume".to_string(),
+                "{session_id}".to_string(),
+                "--custom".to_string(),
+            ])
         );
     }
 

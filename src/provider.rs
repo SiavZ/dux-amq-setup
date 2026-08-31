@@ -110,11 +110,13 @@ mod tests {
             command: "echo".to_string(),
             args: Vec::new(),
             resume_args: None,
+            resume_by_id_args: None,
             resume_wait_timeout_ms: None,
             oneshot_args: vec!["-p".to_string(), "{prompt}".to_string()],
             oneshot_output: OneshotOutput::Stdout,
             install_hint: None,
             forward_scroll: false,
+            forward_mouse: None,
             watch: Vec::new(),
         }
     }
@@ -124,11 +126,13 @@ mod tests {
             command: "bash".to_string(),
             args: Vec::new(),
             resume_args: None,
+            resume_by_id_args: None,
             resume_wait_timeout_ms: None,
             oneshot_args: vec!["-c".to_string(), "echo {prompt} > {tempfile}".to_string()],
             oneshot_output: OneshotOutput::Tempfile,
             install_hint: None,
             forward_scroll: false,
+            forward_mouse: None,
             watch: Vec::new(),
         }
     }
@@ -201,11 +205,13 @@ mod tests {
             command: "false".to_string(),
             args: Vec::new(),
             resume_args: None,
+            resume_by_id_args: None,
             resume_wait_timeout_ms: None,
             oneshot_args: Vec::new(),
             oneshot_output: OneshotOutput::Stdout,
             install_hint: None,
             forward_scroll: false,
+            forward_mouse: None,
             watch: Vec::new(),
         };
         let prov = create_provider("bad", config);
@@ -221,6 +227,7 @@ mod tests {
             command: "echo".to_string(),
             args: Vec::new(),
             resume_args: None,
+            resume_by_id_args: None,
             resume_wait_timeout_ms: None,
             oneshot_args: vec![
                 "--format".to_string(),
@@ -230,6 +237,7 @@ mod tests {
             oneshot_output: OneshotOutput::Stdout,
             install_hint: None,
             forward_scroll: false,
+            forward_mouse: None,
             watch: Vec::new(),
         };
         let prov = create_provider("custom", config);

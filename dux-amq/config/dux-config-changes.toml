@@ -13,10 +13,15 @@ prompt_for_name = true   # branch name == AMQ identity
 command     = "claude-amq"
 resume_args = ["--continue", "--fork-session"]
 forward_scroll = true
+forward_mouse = false
 
 [providers.codex]
 command = "codex-amq"
-forward_scroll = true
+args = ["--no-alt-screen"]
+resume_args = ["--no-alt-screen", "resume", "--last"]
+resume_by_id_args = ["--no-alt-screen", "resume", "{session_id}"]
+forward_scroll = false
+forward_mouse = false
 
 [providers.gemini]
 command = "gemini-amq"

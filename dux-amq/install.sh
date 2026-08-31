@@ -11,13 +11,13 @@
 #     tarball: dux-linux-amd64.tar.gz
 #     sha256:  a1c449989e9c4dd53b260d75d29d0d5d6832b3852cf5327f3725b5e7bb881102
 #
-#   amq        v0.34.0   (commit 6a9417d40cc8b9d9f71e9fbb1e39c872d0763b54)
-#     tarball: amq_0.34.0_linux_amd64.tar.gz
-#     sha256:  cba940987d00a3d072f395c7ec7a648e47d652f1ff503abf46da538595510d7a
+#   amq        v0.61.0   (commit ad3f9341724822326dcab01f27b09343766246c2)
+#     tarball: amq_0.61.0_linux_amd64.tar.gz
+#     sha256:  36edf7f1f08ab12e845916ebafd5a3e633d5d055e6ee0b8b437298c99c83038c
 #
 #   skills     1.5.3 (npm)
 #     skills-rev (avivsinai/agent-message-queue commit pinned for `skills add`)
-#                6a9417d40cc8b9d9f71e9fbb1e39c872d0763b54
+#                ad3f9341724822326dcab01f27b09343766246c2
 set -euo pipefail
 
 STATE_ROOT="${STATE_ROOT:-/data/state}"
@@ -33,18 +33,18 @@ HERE="$(cd "$HERE" && pwd)"
 # Pinned versions + sha256 (overrideable for testing only; CI must use defaults).
 DUX_TAG="${DUX_TAG:-v0.4.0}"
 DUX_SHA256="${DUX_SHA256:-a1c449989e9c4dd53b260d75d29d0d5d6832b3852cf5327f3725b5e7bb881102}"
-AMQ_TAG="${AMQ_TAG:-v0.34.0}"
-AMQ_VERSION="${AMQ_VERSION:-0.34.0}"
-AMQ_SHA256="${AMQ_SHA256:-cba940987d00a3d072f395c7ec7a648e47d652f1ff503abf46da538595510d7a}"
+AMQ_TAG="${AMQ_TAG:-v0.61.0}"
+AMQ_VERSION="${AMQ_VERSION:-0.61.0}"
+AMQ_SHA256="${AMQ_SHA256:-36edf7f1f08ab12e845916ebafd5a3e633d5d055e6ee0b8b437298c99c83038c}"
 SKILLS_PIN="${SKILLS_PIN:-1.5.3}"
-SKILLS_REV="${SKILLS_REV:-6a9417d40cc8b9d9f71e9fbb1e39c872d0763b54}"
+SKILLS_REV="${SKILLS_REV:-ad3f9341724822326dcab01f27b09343766246c2}"
 CLAUDE_PEERS_REV="${CLAUDE_PEERS_REV:-640183fa7048443bf0a6592de45579e813df4587}"
 
 # Expected sha256 of the extracted amq binary (audit01 P1-8). Cross-checked
 # against the file inside amq_${AMQ_VERSION}_linux_amd64.tar.gz at install
 # time so a tampered-with binary already in $PATH is rejected before being
 # pinned at $STATE_ROOT/amq-bin/amq.
-AMQ_BINARY_SHA256="${AMQ_BINARY_SHA256:-eb78901f3dd13534884923e02ad9c6852be1b0a4c7f452fe52b8bcd795e3556b}"
+AMQ_BINARY_SHA256="${AMQ_BINARY_SHA256:-3b10af9f245b04d26ed110fdcedb1fee6fbb7dbab620f1fd3eefeacdb8f8d3c3}"
 
 # AUDIT01-VERSION — overlay version; gates idempotent config-block rewrites
 # (Phase 12). Phase 15's release pipeline rewrites this line on tag.
@@ -56,7 +56,7 @@ ok()   { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
 
 # Audit02 Phase 13 (audit01 P1-1): detect kernel-side TIOCSTI support.
 #
-# AMQ v0.34.0's `--inject-mode raw` uses `unix.Syscall(SYS_IOCTL, fd,
+# AMQ's `--inject-mode raw` uses `unix.Syscall(SYS_IOCTL, fd,
 # unix.TIOCSTI, ...)` with no PTY-master fallback. Linux 6.2 (Nov 2022)
 # made `CONFIG_LEGACY_TIOCSTI` default-off, and Ubuntu 24.04 LTS /
 # Debian 12+ ship the option built out entirely (the sysctl key is
@@ -254,7 +254,7 @@ fi
 # Audit02 P0-F: don't wipe queue config on re-install. AMQ writes its
 # state under $STATE_ROOT/amq; the presence of `meta/config.json` (the
 # file `amq init --force` overwrites — confirmed via `amq init --help`
-# against pinned v0.34.0) tells us init has already run. Probing a fresh
+# against the pinned AMQ version) tells us init has already run. Probing a fresh
 # `amq init` shows the layout is `meta/config.json`, `agents/<handle>/`,
 # `threads/` — *not* a top-level `agents.json` as earlier audit notes
 # assumed.
@@ -425,7 +425,12 @@ sed -i --follow-symlinks \
   -e '/^\[providers\.gemini\]$/,/^\[/ s|^command = "gemini"$|command = "gemini-amq"|' \
   -e '/^\[providers\.claude\]$/,/^\[/ s|^resume_args = \["--continue"\]$|resume_args = ["--continue", "--fork-session"]|' \
   -e '/^\[providers\.claude\]$/,/^\[/ s|^forward_scroll = false$|forward_scroll = true|' \
-  -e '/^\[providers\.codex\]$/,/^\[/ s|^forward_scroll = false$|forward_scroll = true|' \
+  -e '/^\[providers\.claude\]$/,/^\[/ s|^forward_mouse = true$|forward_mouse = false|' \
+  -e '/^\[providers\.codex\]$/,/^\[/ s|^args = \[\]$|args = ["--no-alt-screen"]|' \
+  -e '/^\[providers\.codex\]$/,/^\[/ s|^resume_args = \["resume", "--last"\]$|resume_args = ["--no-alt-screen", "resume", "--last"]|' \
+  -e '/^\[providers\.codex\]$/,/^\[/ s|^resume_by_id_args = \["resume", "{session_id}"\]$|resume_by_id_args = ["--no-alt-screen", "resume", "{session_id}"]|' \
+  -e '/^\[providers\.codex\]$/,/^\[/ s|^forward_scroll = true$|forward_scroll = false|' \
+  -e '/^\[providers\.codex\]$/,/^\[/ s|^forward_mouse = true$|forward_mouse = false|' \
   -e '/^\[providers\.gemini\]$/,/^\[/ s|^forward_scroll = false$|forward_scroll = true|' \
   "$STATE_ROOT/dux/config.toml"
 

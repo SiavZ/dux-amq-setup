@@ -1237,6 +1237,7 @@ impl App {
             poll(&mut pollfd, Some(&timeout))
         })?;
         if ready == 0 {
+            self.flush_pending_bare_escape();
             return Ok(false);
         }
 
@@ -1338,6 +1339,26 @@ impl App {
         }
 
         Ok(false)
+    }
+
+    /// Forward a standalone Escape after the 100 ms input poll proves it is
+    /// not the prefix of an arrow, function-key, or Alt sequence.
+    fn flush_pending_bare_escape(&mut self) {
+        if self.raw_input_buf.as_slice() != b"\x1b" {
+            return;
+        }
+        self.raw_input_buf.clear();
+        if self
+            .selected_terminal_surface_client()
+            .is_some_and(|provider| provider.scrollback_offset() > 0)
+        {
+            return;
+        }
+        self.terminal_selection = None;
+        if let Some(provider) = self.selected_terminal_surface_client() {
+            let _ = provider.write_bytes(b"\x1b");
+            self.record_user_keystroke_for_active_session();
+        }
     }
 
     /// Process raw bytes that have already been read from stdin.
@@ -1573,6 +1594,10 @@ impl App {
                         &mut needs_selection_clear,
                         self.selected_terminal_surface_client(),
                     );
+                    if needs_selection_clear {
+                        self.terminal_selection = None;
+                        needs_selection_clear = false;
+                    }
                     let is_scroll = matches!(
                         mouse_ev.kind,
                         MouseEventKind::ScrollUp
@@ -1627,13 +1652,48 @@ impl App {
                         let child_wants_mouse = self
                             .selected_terminal_surface_client()
                             .is_some_and(|p| p.has_mouse_mode());
+                        let forward_mouse = !matches!(self.ui.input_target, InputTarget::Agent)
+                            || self.selected_session().is_none_or(|s| {
+                                provider_config(&self.config, &s.provider).forwards_mouse()
+                            });
                         let shift_held = mouse_ev
                             .modifiers
                             .contains(crossterm::event::KeyModifiers::SHIFT);
-                        let should_select = !child_wants_mouse || shift_held;
+                        let select_plain_drag = child_wants_mouse
+                            && !forward_mouse
+                            && matches!(
+                                mouse_ev.kind,
+                                MouseEventKind::Down(MouseButton::Left)
+                                    | MouseEventKind::Drag(MouseButton::Left)
+                                    | MouseEventKind::Up(MouseButton::Left)
+                            );
+                        let should_select = !child_wants_mouse || shift_held || select_plain_drag;
+                        let forward_click = select_plain_drag
+                            && !shift_held
+                            && matches!(mouse_ev.kind, MouseEventKind::Up(MouseButton::Left))
+                            && self.terminal_selection.as_ref().is_some_and(|selection| {
+                                selection.dragging && selection.anchor == selection.end
+                            });
 
                         if should_select {
                             self.handle_terminal_selection_mouse(mouse_ev);
+                            if forward_click
+                                && !is_scrolled_back
+                                && let Some(provider) = self.selected_terminal_surface_client()
+                                && let Some(term_area) = self.ui.mouse_layout.agent_term
+                                && let Some(release) = crate::raw_input::translate_sgr_mouse(
+                                    &raw,
+                                    term_area.x,
+                                    term_area.y,
+                                )
+                            {
+                                let mut press = release.clone();
+                                if let Some(final_byte) = press.last_mut() {
+                                    *final_byte = b'M';
+                                    let _ = provider.write_bytes(&press);
+                                    let _ = provider.write_bytes(&release);
+                                }
+                            }
                         } else if child_wants_mouse
                             && !is_scrolled_back
                             && let Some(provider) = self.selected_terminal_surface_client()
@@ -6117,7 +6177,7 @@ mod tests {
         KillableRuntimeKind, LeftItem, LeftSection, MacroBarState, MouseClickTarget,
         MouseLayoutState, NameNewAgentFocus, OrphanRemoveFocus, OverlayCheckbox, OverlayCheckboxId,
         OverlayMouseLayout, OverlayMouseLayoutState, ProcessInfo, PromptState, PullTarget,
-        ResizeDragState, ResourceStats, RightSection, RuntimeState, RuntimeTargetId,
+        ResizeDragState, ResourceStats, RightSection, RuntimeState, RuntimeTargetId, SessionLaunch,
         SessionSettingsPrompt, SettingsFocus, SharedWriterAction, TextInput, UiState,
         WatchRuleSummary, WorkerEvent,
     };
@@ -6213,6 +6273,7 @@ mod tests {
             deleted_at: None,
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             state: SessionState::Created { created_at: now },
             settings: crate::model::SessionSettings::default(),
             created_at: now,
@@ -6299,6 +6360,7 @@ mod tests {
             staged_diff_in_flight: false,
             add_project_in_flight: false,
             reconnect_validations_in_flight: std::collections::HashSet::new(),
+            fresh_launches_in_flight: std::collections::HashSet::new(),
             orphan_cleanup_in_flight: false,
             resume_fallback_candidates: std::collections::HashMap::new(),
             pending_deletions: std::collections::HashSet::new(),
@@ -6307,6 +6369,7 @@ mod tests {
         let mut config = Config::default();
         config.workspace = Some(crate::config::WorkspaceConfig {
             default_mode: WorkspaceMode::Worktree,
+            auto_resume_shared: false,
         });
         let mut app = App {
             ui,
@@ -7130,6 +7193,7 @@ mod tests {
             deleted_at: None,
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             state: SessionState::Created { created_at: now },
             settings: crate::model::SessionSettings::default(),
             created_at: now,
@@ -7281,6 +7345,7 @@ mod tests {
         let mut app = test_app(default_bindings());
         app.config.workspace = Some(crate::config::WorkspaceConfig {
             default_mode: WorkspaceMode::Shared,
+            auto_resume_shared: false,
         });
 
         app.create_agent_for_selected_project().unwrap();
@@ -7313,6 +7378,7 @@ mod tests {
             let mut app = test_app(default_bindings());
             app.config.workspace = Some(crate::config::WorkspaceConfig {
                 default_mode: global,
+                auto_resume_shared: false,
             });
             app.config.projects.push(ProjectConfig {
                 id: app.git.projects[0].id.clone(),
@@ -7340,6 +7406,7 @@ mod tests {
         let mut app = test_app(default_bindings());
         app.config.workspace = Some(crate::config::WorkspaceConfig {
             default_mode: WorkspaceMode::Shared,
+            auto_resume_shared: false,
         });
 
         app.fork_selected_session().unwrap();
@@ -8376,6 +8443,7 @@ mod tests {
             deleted_at: None,
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             state: SessionState::Created { created_at: now },
             settings: crate::model::SessionSettings::default(),
             created_at: now,
@@ -8427,6 +8495,7 @@ mod tests {
             deleted_at: None,
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             state: SessionState::Created { created_at: now },
             settings: crate::model::SessionSettings::default(),
             created_at: now,
@@ -9675,7 +9744,10 @@ cyan = "#00ffff"
         // should_resume_session uses started_providers + config's resume_args.
         let session = app.git.sessions[0].clone();
         assert!(
-            app.should_resume_session(&session),
+            matches!(
+                app.should_resume_session(&session),
+                SessionLaunch::LegacyLatest
+            ),
             "codex was launched on this worktree earlier, so resume must be active"
         );
         assert!(
@@ -10612,15 +10684,16 @@ cyan = "#00ffff"
     #[test]
     fn resume_fallback_retries_with_fresh_session_on_quick_exit() {
         let mut app = test_app(default_bindings());
-        // Override the "codex" provider to use /bin/sh so the fallback spawn
-        // works on CI where codex is not installed.
+        // Use a non-capturing provider backed by /bin/sh so the fallback
+        // works on CI without touching real provider session directories.
         app.config.providers.commands.insert(
-            "codex".to_string(),
+            "opencode".to_string(),
             crate::config::ProviderCommandConfig {
                 command: "/bin/sh".to_string(),
                 ..Default::default()
             },
         );
+        app.git.sessions[0].provider = ProviderKind::from_str("opencode");
         let session_id = app.git.sessions[0].id.clone();
         let worktree = std::path::Path::new(&app.git.sessions[0].worktree_path);
         // Spawn a process that exits immediately without producing output.
@@ -10700,15 +10773,16 @@ cyan = "#00ffff"
     #[test]
     fn resume_fallback_triggers_on_one_liner_output() {
         let mut app = test_app(default_bindings());
-        // Override the "codex" provider to use /bin/sh so the fallback spawn
-        // works on CI where codex is not installed.
+        // Use a non-capturing provider backed by /bin/sh so the fallback
+        // works on CI without touching real provider session directories.
         app.config.providers.commands.insert(
-            "codex".to_string(),
+            "opencode".to_string(),
             crate::config::ProviderCommandConfig {
                 command: "/bin/sh".to_string(),
                 ..Default::default()
             },
         );
+        app.git.sessions[0].provider = ProviderKind::from_str("opencode");
         let session_id = app.git.sessions[0].id.clone();
         let worktree = std::path::Path::new(&app.git.sessions[0].worktree_path);
         // Spawn a process that prints a single line (like a failed --continue)
@@ -10782,7 +10856,7 @@ cyan = "#00ffff"
     }
 
     #[test]
-    fn hung_resume_falls_back_to_fresh_session_once() {
+    fn targeted_resume_timeout_falls_back_to_fresh_session_once() {
         let mut app = test_app(default_bindings());
         app.config.providers.commands.insert(
             "opencode".to_string(),
@@ -10790,11 +10864,20 @@ cyan = "#00ffff"
                 command: "/bin/sh".to_string(),
                 args: vec!["-c".to_string(), "sleep 5".to_string()],
                 resume_args: Some(vec!["-c".to_string(), "sleep 5".to_string()]),
+                resume_by_id_args: Some(vec!["resume".to_string(), "{session_id}".to_string()]),
                 resume_wait_timeout_ms: Some(10),
                 ..Default::default()
             },
         );
         app.git.sessions[0].provider = ProviderKind::from_str("opencode");
+        let provider_session_id = uuid::Uuid::new_v4().to_string();
+        app.git.sessions[0]
+            .provider_session_ids
+            .insert("opencode".to_string(), provider_session_id.clone());
+        assert_eq!(
+            app.should_resume_session(&app.git.sessions[0]),
+            SessionLaunch::ResumeId(provider_session_id)
+        );
         let session_id = app.git.sessions[0].id.clone();
         let worktree = std::path::Path::new(&app.git.sessions[0].worktree_path);
         let args = vec!["-c".to_string(), "sleep 5".to_string()];
@@ -11032,6 +11115,39 @@ cyan = "#00ffff"
     }
 
     #[test]
+    fn bare_escape_flushes_to_pty_after_ambiguity_timeout() {
+        let mut app = test_app(default_bindings());
+        let output_dir = tempdir().expect("tempdir");
+        let output = output_dir.path().join("byte");
+        let args = vec![
+            "-c".to_string(),
+            "stty raw -echo; dd bs=1 count=1 2>/dev/null | od -An -tu1 > \"$1\"".to_string(),
+            "sh".to_string(),
+            output.to_string_lossy().into_owned(),
+        ];
+        let client = PtyClient::spawn("sh", &args, std::path::Path::new("."), 5, 40, 100)
+            .expect("spawn pty");
+        let session_id = app.git.sessions[0].id.clone();
+        app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
+        app.ui.input_target = InputTarget::Agent;
+        app.session_surface = SessionSurface::Agent;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        app.process_raw_input_bytes(b"\x1b").unwrap();
+        assert_eq!(app.raw_input_buf, b"\x1b");
+        app.flush_pending_bare_escape();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !std::fs::read_to_string(&output).is_ok_and(|value| value.trim() == "27")
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(output).unwrap().trim(), "27");
+        assert!(app.raw_input_buf.is_empty());
+    }
+
+    #[test]
     fn codex_page_up_at_bottom_uses_host_scrollback() {
         let mut app = app_with_scrolled_back_pty();
 
@@ -11189,6 +11305,23 @@ cyan = "#00ffff"
         app.last_pty_size = (5, 40);
         install_mouse_layout(&mut app);
         app
+    }
+
+    #[test]
+    fn pending_escape_does_not_swallow_claude_mouse_selection() {
+        let mut app = app_with_interactive_agent_pty();
+        app.git.sessions[0].provider = ProviderKind::from_str("claude");
+
+        app.process_raw_input_bytes(b"\x1b").unwrap();
+        let mut drag = sgr_mouse_down(30, 5);
+        drag.extend_from_slice(&sgr_mouse_drag(35, 6));
+        app.process_raw_input_bytes(&drag).unwrap();
+
+        let selection = app
+            .terminal_selection
+            .as_ref()
+            .expect("mouse drag after Escape should start a selection");
+        assert_ne!(selection.anchor, selection.end);
     }
 
     #[test]
@@ -11950,14 +12083,20 @@ cyan = "#00ffff"
     }
 
     #[test]
-    fn forwarded_mouse_scroll_uses_terminal_relative_coordinates() {
+    fn opencode_clicks_selects_text_and_forwards_scroll() {
         let mut app = test_app(default_bindings());
-        app.config
+        let opencode = app
+            .config
             .providers
             .commands
-            .get_mut("codex")
-            .expect("codex provider")
-            .forward_scroll = true;
+            .get_mut("opencode")
+            .expect("opencode provider");
+        opencode.forward_mouse = None;
+        app.config.providers.ensure_defaults();
+        let opencode = app.config.providers.get("opencode").unwrap();
+        assert!(opencode.forward_scroll);
+        assert!(!opencode.forwards_mouse());
+        app.git.sessions[0].provider = ProviderKind::from_str("opencode");
         app.ui.input_target = InputTarget::Agent;
         app.ui.fullscreen_overlay = FullscreenOverlay::Agent;
         app.ui.mouse_layout.agent_term = Some(Rect::new(5, 3, 40, 10));
@@ -11965,7 +12104,10 @@ cyan = "#00ffff"
         let session_id = app.git.sessions[0].id.clone();
         let client = PtyClient::spawn(
             "sh",
-            &["-c".to_string(), "stty raw -echo; exec cat -v".to_string()],
+            &[
+                "-c".to_string(),
+                "printf '\\033[?1000h'; stty raw -echo; exec cat -v".to_string(),
+            ],
             std::path::Path::new("."),
             5,
             80,
@@ -11974,7 +12116,29 @@ cyan = "#00ffff"
         .expect("spawn pty");
         app.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
         std::thread::sleep(std::time::Duration::from_millis(250));
+        assert!(
+            app.selected_terminal_surface_client()
+                .unwrap()
+                .has_mouse_mode(),
+            "fixture must emulate OpenCode mouse capture"
+        );
 
+        app.process_raw_input_bytes(&sgr_mouse_down(10, 5))
+            .expect("start selection");
+        app.process_raw_input_bytes(&sgr_mouse_drag(20, 6))
+            .expect("drag selection");
+        let selection = app
+            .terminal_selection
+            .as_ref()
+            .expect("plain drag should select in Dux");
+        assert_ne!(selection.anchor, selection.end);
+        app.process_raw_input_bytes(&sgr_mouse_up(20, 6))
+            .expect("finish selection");
+
+        app.process_raw_input_bytes(&sgr_mouse_down(12, 5))
+            .expect("start click");
+        app.process_raw_input_bytes(&sgr_mouse_up(12, 5))
+            .expect("finish click");
         app.process_raw_input_bytes(b"\x1b[<64;20;10M")
             .expect("process scroll");
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -11983,6 +12147,10 @@ cyan = "#00ffff"
             .find_pty_handle(&session_id)
             .expect("provider")
             .scan_recent_lines(5);
+        assert!(
+            rendered.contains("^[[<0;7;2M^[[<0;7;2m"),
+            "click should be translated and forwarded on release; got: {rendered:?}"
+        );
         assert!(
             rendered.contains("^[[<64;15;7M"),
             "scroll coordinates should be translated before forwarding; got: {rendered:?}"
@@ -12972,6 +13140,7 @@ cyan = "#00ffff"
             deleted_at: None,
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             state: SessionState::Created { created_at: now },
             settings: crate::model::SessionSettings::default(),
             created_at: now,
@@ -12999,6 +13168,7 @@ cyan = "#00ffff"
                 client,
                 pty_size: (24, 80),
                 status_message: "ready from persisted row".to_string(),
+                fresh_capture: crate::resume_recovery::FreshCapture::None,
             })))
             .expect("send ready event");
 
@@ -13052,6 +13222,7 @@ cyan = "#00ffff"
             deleted_at: None,
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             state: SessionState::Created { created_at: now },
             settings: crate::model::SessionSettings::default(),
             created_at: now,

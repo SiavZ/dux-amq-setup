@@ -1,6 +1,6 @@
 //! Core runtime and persisted models, including immutable session identity.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -487,11 +487,9 @@ pub struct SessionSettings {
     #[serde(default)]
     pub mode: ContextMode,
 
-    /// `--dangerously-skip-permissions` (claude) /
-    /// `--sandbox-bypass` (codex) for this session. When `true`, dux
-    /// sets `CLAUDE_AMQ_YOLO=1` (and the codex equivalent) in the PTY
-    /// child env at spawn time; the `claude-amq` / `codex-amq`
-    /// wrappers translate that into the appropriate CLI flag.
+    /// Permission/approval bypass for this session. Claude and Codex
+    /// receive wrapper env vars; OpenCode receives its native
+    /// `--auto` launch argument.
     /// Default: `false` — operator must opt in.
     #[serde(default)]
     pub yolo_permissions: bool,
@@ -648,6 +646,10 @@ impl SessionSettings {
                 "codex" => {
                     vars.push(("CODEX_AMQ_YOLO".into(), "1".into()));
                 }
+                "opencode" => {
+                    // Applied directly as `--auto` by the shared
+                    // provider launch-argument builder.
+                }
                 "gemini" => {
                     // Gemini wrapper has no YOLO flag today; document
                     // the no-op rather than silently dropping it.
@@ -768,6 +770,7 @@ pub struct AgentSession {
     pub deleted_at: Option<DateTime<Utc>>,
     pub title: Option<String>,
     pub started_providers: Vec<String>,
+    pub provider_session_ids: BTreeMap<String, String>,
     /// Authoritative session lifecycle state. Owns the PTY when in
     /// `Live` or `Detached`. Direct mutation is allowed inside the
     /// `dux` crate but should go through `App::transition_*` helpers
@@ -803,6 +806,12 @@ impl AgentSession {
         }
         self.started_providers.push(provider.as_str().to_string());
         true
+    }
+
+    pub fn provider_session_id(&self, provider: &ProviderKind) -> Option<&str> {
+        self.provider_session_ids
+            .get(provider.as_str())
+            .map(String::as_str)
     }
 
     /// Produce a PTY-less clone of this session's metadata. Used by
@@ -847,6 +856,7 @@ impl AgentSession {
             deleted_at: self.deleted_at,
             title: self.title.clone(),
             started_providers: self.started_providers.clone(),
+            provider_session_ids: self.provider_session_ids.clone(),
             state,
             settings: self.settings.clone(),
             created_at: self.created_at,

@@ -50,6 +50,10 @@ pub(crate) struct GitState {
     /// Shared sessions are revalidated on a worker before reconnect so
     /// canonicalization never blocks the UI and duplicate requests cannot race.
     pub(crate) reconnect_validations_in_flight: HashSet<String>,
+    /// Session IDs whose fresh provider identity is being prepared. Prevents
+    /// duplicate Claude UUID assignment and duplicate Codex capture snapshots
+    /// while the worker result is pending.
+    pub(crate) fresh_launches_in_flight: HashSet<String>,
     /// Prevents overlapping orphan-worktree inventory or removal workers.
     /// Cleared when the corresponding worker event arrives.
     pub(crate) orphan_cleanup_in_flight: bool,

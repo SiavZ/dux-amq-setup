@@ -98,7 +98,7 @@ claim_and_register_locked() {
   if [[ -e "$agent_dir" || -L "$agent_dir" ]]; then
     [[ -d "$agent_dir" && ! -L "$agent_dir" ]] || return 1
   else
-    mkdir "$agent_dir" || return 1
+    mkdir -m 0700 "$agent_dir" || return 1
     created_dir=1
   fi
   if [[ -n "${DUX_STORE_ID:-}" ]]; then
@@ -134,6 +134,7 @@ claim_and_register_locked() {
     printf '[dux-amq] identity collision: %s has an ownerless agent directory\n' "$ME" >&2
     return 1
   fi
+  chmod 0700 "$agent_dir" || return 1
   tmp=$(mktemp "$ROOT/meta/config.json.tmp.XXXXXX") || return 1
   created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   if [[ -f "$cfg" ]]; then
@@ -151,60 +152,13 @@ export ROOT ME ME_REGISTRATION DUX_STORE_ID DUX_SESSION_ID
 export -f claim_and_register_locked
 "$FLOCK_BIN" -x "$ROOT/meta/config.lock" bash -euo pipefail -c claim_and_register_locked
 
-# Audit02 P0-K (T2) + Phase 13 (audit01 P1-1): route through verify+
-# bridge. See claude-amq for the full rationale on TIOCSTI fallback.
-LOG_DIR="$HOME/.local/share/dux-amq"
-mkdir -p "$LOG_DIR" 2>/dev/null || true
-WAKE_LOG="$LOG_DIR/wake-$ME.log"
-WAKE_PID="$LOG_DIR/wake-$ME.pid"
-
+# Route through AMQ's owner-bound co-op wake. See claude-amq for the
+# full rationale on TIOCSTI fallback.
 LOCAL_BIN="${LOCAL_BIN:-$HOME/.local/bin}"
-
-record_wake_pid_locked() {
-  local cfg="$ROOT/meta/config.json" marker="$ME_REGISTRATION" tmp
-  jq -e --arg store "$DUX_STORE_ID" --arg session "$DUX_SESSION_ID" \
-    '.store_id == $store and .session_id == $session' "$marker" >/dev/null
-  jq -e --arg me "$ME" '.agents | index($me) != null' "$cfg" >/dev/null
-  tmp=$(mktemp "$ROOT/agents/$ME/.owner.tmp.XXXXXX") || return 1
-  if ! jq --argjson pid "$WAKE_PID_VALUE" '.wake_pid = $pid' "$marker" >"$tmp" || ! mv "$tmp" "$marker"; then
-    rm -f "$tmp"
-    return 1
-  fi
-}
-
-record_wake_pid() {
-  local pid="$1"
-  [[ -n "${DUX_STORE_ID:-}" ]] || return 0
-  export WAKE_PID_VALUE="$pid"
-  export -f record_wake_pid_locked
-  "$FLOCK_BIN" -x "$ROOT/meta/config.lock" bash -euo pipefail -c record_wake_pid_locked
-}
-
-# Reap a stale wake daemon from a prior invocation for the same $ME.
-# See claude-amq for full rationale: without this, re-running the wrapper
-# spawns a duplicate daemon causing double-delivery of wake notifications.
-reap_stale_wake() {
-  [[ -f "$WAKE_PID" ]] || return 0
-  local old_pid
-  old_pid=$(cat "$WAKE_PID" 2>/dev/null) || return 0
-  [[ -z "$old_pid" ]] && return 0
-  if kill -0 "$old_pid" 2>/dev/null; then
-    local cmdline=""
-    if [[ -r "/proc/$old_pid/cmdline" ]]; then
-      cmdline=$(tr '\0' ' ' < "/proc/$old_pid/cmdline" 2>/dev/null || true)
-    fi
-    if [[ "$cmdline" == *amq*wake* ]]; then
-      kill "$old_pid" 2>/dev/null || true
-      local i=0
-      while (( i < 5 )) && kill -0 "$old_pid" 2>/dev/null; do
-        sleep 0.1
-        (( i++ )) || true
-      done
-    fi
-  fi
-  rm -f "$WAKE_PID"
-}
-reap_stale_wake
+BRIDGE="$LOCAL_BIN/dux-amq-inject-bridge"
+if [[ ! -x "$BRIDGE" ]]; then
+  BRIDGE=$(command -v dux-amq-inject-bridge 2>/dev/null || true)
+fi
 
 INJECT_MODE="${DUX_AMQ_INJECT_MODE:-}"
 if [[ -z "$INJECT_MODE" ]]; then
@@ -215,41 +169,21 @@ if [[ -z "$INJECT_MODE" ]]; then
   fi
 fi
 
-# Audit02 P1-B: setsid + disown + PID file so wake survives parent
-# shell hangup. See claude-amq for full rationale.
+WAKE_ARGS=(--require-wake -y)
 case "$INJECT_MODE" in
   raw)
-    setsid amq wake --me "$ME" --root "$ROOT" --inject-mode raw \
-      </dev/tty >>"$WAKE_LOG" 2>&1 &
-    WAKE_CHILD_PID=$!
-    disown
-    echo "$WAKE_CHILD_PID" > "$WAKE_PID"
-    record_wake_pid "$WAKE_CHILD_PID" || { kill "$WAKE_CHILD_PID" 2>/dev/null || true; rm -f "$WAKE_PID"; }
+    WAKE_ARGS+=(--wake-inject-mode raw)
     ;;
   via)
-    BRIDGE="$LOCAL_BIN/dux-amq-inject-bridge"
-    if [[ ! -x "$BRIDGE" ]]; then
-      BRIDGE=$(command -v dux-amq-inject-bridge 2>/dev/null || true)
+    if [[ -z "$BRIDGE" || ! -x "$BRIDGE" ]]; then
+      printf 'codex-amq: dux-amq-inject-bridge not found; refusing to start without wake\n' >&2
+      exit 1
     fi
-    if [[ -n "$BRIDGE" && -x "$BRIDGE" ]]; then
-      setsid amq wake --me "$ME" --root "$ROOT" --inject-via "$BRIDGE" \
-        >>"$WAKE_LOG" 2>&1 &
-      WAKE_CHILD_PID=$!
-      disown
-      echo "$WAKE_CHILD_PID" > "$WAKE_PID"
-      record_wake_pid "$WAKE_CHILD_PID" || { kill "$WAKE_CHILD_PID" 2>/dev/null || true; rm -f "$WAKE_PID"; }
-    else
-      printf 'codex-amq: dux-amq-inject-bridge not found; wake disabled\n' >&2
-    fi
+    WAKE_ARGS+=(--wake-inject-via "$BRIDGE")
     ;;
   *)
     printf 'codex-amq: DUX_AMQ_INJECT_MODE=%q not understood; using raw\n' "$INJECT_MODE" >&2
-    setsid amq wake --me "$ME" --root "$ROOT" --inject-mode raw \
-      </dev/tty >>"$WAKE_LOG" 2>&1 &
-    WAKE_CHILD_PID=$!
-    disown
-    echo "$WAKE_CHILD_PID" > "$WAKE_PID"
-    record_wake_pid "$WAKE_CHILD_PID" || { kill "$WAKE_CHILD_PID" 2>/dev/null || true; rm -f "$WAKE_PID"; }
+    WAKE_ARGS+=(--wake-inject-mode raw)
     ;;
 esac
 
@@ -287,8 +221,22 @@ if [[ -n "${DUX_SYSTEM_PROMPT:-}" ]]; then
   printf 'codex-amq: DUX_SYSTEM_PROMPT set but codex has no system-prompt flag; dux will inject orchestrator policy after startup when applicable\n' >&2
 fi
 
+# AMQ leaves exact owner claims after an unclean exit. Recover only that
+# format; ownerless legacy locks are retired by coop's `-y` migration path.
+if jq -e '.owner.pid | numbers' "$ROOT/agents/$ME/.wake.lock" >/dev/null 2>&1; then
+  amq wake recover-owner --root "$ROOT" --me "$ME" --strict >/dev/null
+fi
+
+if [[ -n "${DUX_PANE:-}" && "${DUX_AMQ_VERIFY:-0}" != "1" ]]; then
+  if [[ -z "$BRIDGE" || ! -x "$BRIDGE" ]]; then
+    printf 'codex-amq: dux-amq-inject-bridge not found; refusing to start without backlog recovery\n' >&2
+    exit 1
+  fi
+  DUX_AMQ_STARTUP_OWNER_PID="$$" "$BRIDGE" &
+fi
+
 if (( ${#CODEX_ARGS[@]} > 0 )); then
-  exec amq coop exec --no-wake --no-init --root "$ROOT" --me "$ME" codex -- "${CODEX_ARGS[@]}"
+  exec amq coop exec --no-init --root "$ROOT" --me "$ME" "${WAKE_ARGS[@]}" codex -- "${CODEX_ARGS[@]}"
 else
-  exec amq coop exec --no-wake --no-init --root "$ROOT" --me "$ME" codex --
+  exec amq coop exec --no-init --root "$ROOT" --me "$ME" "${WAKE_ARGS[@]}" codex --
 fi

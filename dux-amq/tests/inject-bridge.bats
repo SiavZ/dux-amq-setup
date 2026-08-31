@@ -57,6 +57,9 @@ setup() {
   unset AM_ROOT
   unset AMQ_GLOBAL_ROOT
   unset DUX_AMQ_VERIFY
+  unset DUX_AMQ_STARTUP_OWNER_PID
+  unset DUX_PID
+  unset AMQ_DRAIN_EMPTY
 }
 
 teardown() {
@@ -98,11 +101,12 @@ if [[ "${1:-}" == "drain" ]]; then
     done
     printf 'END\n'
   } >>"${AMQ_DRAIN_ARGV_LOG:?}"
-  printf '[AMQ] 1 new message(s) for bob:\n\n'
-  printf -- '- From: alice\n'
-  printf '  Subject: hello\n'
-  printf '  Body:\n'
-  printf 'drained-body\003\n'
+  if [[ "${AMQ_DRAIN_EMPTY:-0}" == "1" ]]; then
+    printf 'note: pending in a sibling session\n' >&2
+    printf '{"drained":[],"count":0}\n'
+  else
+    printf '{"drained":[{"id":"message-1","from":"alice","to":["bob"],"thread":"p2p/alice__bob","subject":"hello","body":"drained-body\\u0003\\n","moved_to_cur":true}],"count":1}\n'
+  fi
   exit 0
 fi
 exit 99
@@ -276,16 +280,56 @@ collect_queue_files() {
   grep -Fxq -- "$AM_ROOT" "$AMQ_DRAIN_ARGV_LOG"
   grep -Fxq -- "--me" "$AMQ_DRAIN_ARGV_LOG"
   grep -Fxq -- "bob" "$AMQ_DRAIN_ARGV_LOG"
+  grep -Fxq -- "--json" "$AMQ_DRAIN_ARGV_LOG"
 
   local files
   collect_queue_files "$HOME/.local/share/dux-amq/inject-queue/bob/*.msg"
   files=("${QUEUE_FILES[@]}")
   [ "${#files[@]}" -eq 1 ]
-  grep -Fq -- "[AMQ] 1 new message(s) for bob" "${files[0]}"
+  grep -Fq -- "[AMQ] Drained messages (JSON):" "${files[0]}"
   grep -Fq -- "drained-body" "${files[0]}"
   grep -Fq -- "Act on these AMQ messages now" "${files[0]}"
   # Unsafe Ctrl+C from the peer body was stripped before queueing.
   ! LC_ALL=C grep -q $'\003' "${files[0]}"
+}
+
+@test "dux-amq-inject-bridge ignores an empty JSON drain with advisory stderr" {
+  install_fake_drain_amq
+  export DUX_PANE="1"
+  export AM_ME="bob"
+  export AM_ROOT="$TEST_HOME/amq-root"
+  export AMQ_DRAIN_ARGV_LOG="$TEST_HOME/amq-drain.argv"
+  export AMQ_DRAIN_EMPTY=1
+
+  run dux-amq-inject-bridge "AMQ wake notification"
+
+  [ "$status" -eq 0 ]
+  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*/*.msg" >/dev/null
+}
+
+@test "dux-amq-inject-bridge drains downtime mail after the exact managed wake is ready" {
+  install_fake_drain_amq
+  export DUX_PANE="1"
+  export DUX_PID="$$"
+  export DUX_AMQ_STARTUP_OWNER_PID="$$"
+  export AM_ME="bob"
+  export AM_ROOT="$TEST_HOME/amq-root"
+  export AMQ_DRAIN_ARGV_LOG="$TEST_HOME/amq-drain.argv"
+  mkdir -p "$AM_ROOT/agents/bob"
+  printf '{"owner":{"pid":%s},"generation":"ready-generation"}\n' "$$" \
+    >"$AM_ROOT/agents/bob/.wake.lock"
+  printf '{"generation":"ready-generation"}\n' \
+    >"$AM_ROOT/agents/bob/.wake.prepared"
+
+  run dux-amq-inject-bridge
+
+  [ "$status" -eq 0 ]
+  grep -Fxq -- "drain" "$AMQ_DRAIN_ARGV_LOG"
+  local files
+  collect_queue_files "$HOME/.local/share/dux-amq/inject-queue/bob/*.msg"
+  files=("${QUEUE_FILES[@]}")
+  [ "${#files[@]}" -eq 1 ]
+  grep -Fq -- "drained-body" "${files[0]}"
 }
 
 @test "strict signed delivery bypasses AMQ drain and queues the exact body" {

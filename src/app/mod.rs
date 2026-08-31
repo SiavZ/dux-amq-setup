@@ -1122,6 +1122,27 @@ pub(crate) struct AgentReadyData {
     pub client: PtyClient,
     pub pty_size: (u16, u16), // (rows, cols) the PTY was spawned with
     pub status_message: String,
+    pub fresh_capture: crate::resume_recovery::FreshCapture,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SessionLaunch {
+    Fresh,
+    LegacyLatest,
+    ResumeId(String),
+}
+
+impl SessionLaunch {
+    pub(crate) fn is_resume(&self) -> bool {
+        !matches!(self, Self::Fresh)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FreshLaunchContext {
+    pub(crate) success_message: String,
+    pub(crate) failure_prefix: String,
+    pub(crate) show_agent_surface: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1265,17 +1286,33 @@ pub(crate) enum WorkerEvent {
     /// "add project" path. The synchronous `add_project` entry point was
     /// turned into a kickoff that resolves the metadata in a worker, so
     /// the UI thread never blocks waiting for git.
-    /// One auto-resume spawn job finished in a worker thread. The PTY
-    /// child process is already running; the UI thread inserts the
-    /// returned [`PtyClient`] into `self.runtime.providers` and updates the
-    /// session's status. Errors are logged and the session stays
-    /// detached. Bounded by `[auto_resume]` config (concurrency, stagger,
-    /// staleness filter) — see [`crate::auto_resume::run_scheduler`].
-    AutoResumeSpawned {
-        session_id: String,
-        used_resume_args: bool,
-        result: Result<PtyClient, String>,
+    /// A throttled auto-resume slot is ready. The actual PTY `fork`+`exec`
+    /// MUST run on the main (UI) thread: on macOS, forking from a worker
+    /// thread races libsystem_notify's `atfork` handler and corrupts an
+    /// `os_once` gate, SIGKILLing the child *before* it can `exec` the
+    /// provider wrapper (the "crashed on child side of fork pre-exec"
+    /// class). The scheduler worker sends this event and blocks on `ack`
+    /// until the main thread has forked, so the `[auto_resume]`
+    /// concurrency/stagger throttle still bounds concurrent provider boots
+    /// — see [`crate::auto_resume::run_scheduler`]. `session` is boxed to
+    /// keep the `WorkerEvent` enum small.
+    AutoResumeSpawnOnMain {
+        session: Box<AgentSession>,
+        launch: SessionLaunch,
+        fresh_capture: Result<crate::resume_recovery::FreshCapture, String>,
+        ack: std::sync::mpsc::Sender<()>,
     },
+    FreshLaunchPrepared {
+        session: Box<AgentSession>,
+        context: FreshLaunchContext,
+        result: Result<crate::resume_recovery::FreshCapture, String>,
+    },
+    ProviderSessionCaptured {
+        session_id: String,
+        provider: String,
+        result: Result<String, String>,
+    },
+    ResumeRecoveryCompleted(Result<crate::resume_recovery::RecoveryReport, String>),
     AddProjectMetaReady {
         path: PathBuf,
         name: String,
@@ -1552,6 +1589,7 @@ impl App {
             staged_diff_in_flight: false,
             add_project_in_flight: false,
             reconnect_validations_in_flight: HashSet::new(),
+            fresh_launches_in_flight: HashSet::new(),
             orphan_cleanup_in_flight: false,
             resume_fallback_candidates: HashMap::new(),
             pending_deletions: HashSet::new(),
@@ -1616,7 +1654,13 @@ impl App {
 
         app.restore_sessions();
         app.ensure_project_worktree_links();
-        app.auto_resume_all_sessions();
+        let _ = workers::dispatch_resume_recovery(
+            app.runtime.worker_tx.clone(),
+            app.git.sessions.clone(),
+            app.git.projects.clone(),
+            app.paths.worktrees_root.clone(),
+            app.session_store.clone(),
+        );
         app.seed_pr_statuses_from_db();
         app.rebuild_left_items();
         app.reload_changed_files();
@@ -1814,26 +1858,28 @@ impl App {
 
     /// If `defaults.auto_resume_on_start` is enabled, eagerly reconnect every
     /// detached session so all panes are live as soon as dux opens. Skips
-    /// shared-workspace sessions and interrupted spawns, which both remain
-    /// visible for an explicit retry, plus sessions whose worktree no longer
-    /// exists or has not been touched within `[auto_resume].stale_days` days.
-    /// Spawns are fanned out across worker threads with at most
-    /// `[auto_resume].concurrency` running in parallel and a
-    /// `[auto_resume].stagger_ms` gap between dispatches so we don't open
-    /// N provider TLS handshakes at once.
+    /// shared-workspace sessions unless `[workspace].auto_resume_shared` is
+    /// enabled, and always skips interrupted spawns, missing worktrees, and
+    /// worktrees untouched for more than `[auto_resume].stale_days` days.
+    /// A worker scheduler enforces the throttle — at most
+    /// `[auto_resume].concurrency` boots in flight and a
+    /// `[auto_resume].stagger_ms` gap between dispatches so we don't open N
+    /// provider TLS handshakes at once — but the actual `fork` is marshalled
+    /// back to the main thread via [`WorkerEvent::AutoResumeSpawnOnMain`]
+    /// (macOS fork-from-worker-thread safety; see that variant's docs).
     ///
     /// Failures are logged but don't abort startup — a single bad session
-    /// shouldn't stop the others. Results land as
-    /// [`WorkerEvent::AutoResumeSpawned`] so the UI thread can install the
-    /// returned `PtyClient` into `self.runtime.providers` and update session
-    /// status.
+    /// shouldn't stop the others.
     fn auto_resume_all_sessions(&mut self) {
         if !self.config.defaults.auto_resume_on_start {
             return;
         }
         let stale_days = self.config.auto_resume.stale_days;
-        let (candidates, skipped_stale) =
-            collect_auto_resume_candidates(&self.git.sessions, stale_days);
+        let (candidates, skipped_stale) = collect_auto_resume_candidates(
+            &self.git.sessions,
+            stale_days,
+            self.config.auto_resume_shared(),
+        );
         logger::info(&format!(
             "auto_resume_on_start: spawning {} agent session(s) (skipped {skipped_stale} stale, concurrency={}, stagger={}ms)",
             candidates.len(),
@@ -1844,87 +1890,140 @@ impl App {
             return;
         }
 
-        // Build (session, use_resume) pairs on the UI thread because
+        // Build (session, launch) pairs on the UI thread because
         // `should_resume_session` reads `self.config.providers`. After
-        // this point the worker scheduler owns the data and emits one
-        // WorkerEvent::AutoResumeSpawned per job.
-        let jobs: Vec<(AgentSession, bool)> = candidates
+        // this point the worker scheduler owns the data and, for each job,
+        // marshals a WorkerEvent::AutoResumeSpawnOnMain back to the UI
+        // thread (which does the actual `fork` — see that variant's docs).
+        let jobs: Vec<(AgentSession, SessionLaunch)> = candidates
             .into_iter()
             .map(|s| {
-                let use_resume = self.should_resume_session(&s);
-                (s, use_resume)
+                let launch = self.should_resume_session(&s);
+                (s, launch)
             })
             .collect();
+        let fresh_job_ids = jobs
+            .iter()
+            .filter_map(|(session, launch)| {
+                matches!(launch, SessionLaunch::Fresh).then(|| session.id.clone())
+            })
+            .collect::<Vec<_>>();
+        self.git
+            .fresh_launches_in_flight
+            .extend(fresh_job_ids.iter().cloned());
 
         let cfg_auto_resume = self.config.auto_resume.clone();
-        let cfg_full = self.config.clone();
-        let last_pty_size = if self.last_pty_size != (0, 0) {
-            self.last_pty_size
-        } else {
-            (24, 80)
-        };
-        let scrollback_lines = self.config.ui.agent_scrollback_lines;
-        let store_id = self.store_id.clone();
         let tx = self.runtime.worker_tx.clone();
+        let session_store = self.session_store.clone();
 
-        thread::Builder::new()
+        let scheduler = thread::Builder::new()
             .name("auto-resume-scheduler".into())
             .spawn(move || {
                 crate::auto_resume::run_scheduler(
                     jobs,
                     &cfg_auto_resume,
-                    move |(session, use_resume)| {
-                        let result = sessions::spawn_pty_for_auto_resume(
-                            &cfg_full,
-                            &session,
-                            use_resume,
-                            last_pty_size,
-                            scrollback_lines,
-                            &store_id,
-                        )
-                        .map_err(|e| format!("{e:#}"));
-                        let _ = tx.send(WorkerEvent::AutoResumeSpawned {
-                            session_id: session.id.clone(),
-                            used_resume_args: use_resume,
-                            result,
-                        });
+                    move |(mut session, launch)| {
+                        let fresh_capture = if matches!(launch, SessionLaunch::Fresh) {
+                            crate::resume_recovery::prepare_fresh_capture_from_home(
+                                &mut session,
+                                &session_store,
+                            )
+                            .map_err(|err| format!("{err:#}"))
+                        } else {
+                            Ok(crate::resume_recovery::FreshCapture::None)
+                        };
+                        // The scheduler owns the concurrency/stagger
+                        // throttle, but the fork itself must happen on the
+                        // main thread. Send the request and block on `ack`
+                        // so this throttle slot stays occupied for the
+                        // provider-boot window (matching the old semantics
+                        // where the worker held the slot across the spawn).
+                        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+                        if tx
+                            .send(WorkerEvent::AutoResumeSpawnOnMain {
+                                session: Box::new(session),
+                                launch,
+                                fresh_capture,
+                                ack: ack_tx,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        // A recv error means the UI loop is gone (shutdown);
+                        // just release the permit and let the scheduler wind
+                        // down.
+                        let _ = ack_rx.recv();
                     },
                 );
-            })
-            .ok();
+            });
+        if let Err(err) = scheduler {
+            for session_id in fresh_job_ids {
+                self.git.fresh_launches_in_flight.remove(&session_id);
+            }
+            tracing::warn!(
+                target: "dux::resume_recovery",
+                error = %crate::sanitize::for_terminal(&err.to_string()),
+                "auto-resume scheduler could not start",
+            );
+        }
     }
 
-    /// Receive one [`WorkerEvent::AutoResumeSpawned`] result. Installs the
-    /// PTY client when the spawn succeeded; otherwise logs and leaves the
-    /// session detached.
-    pub(crate) fn handle_auto_resume_spawned(
+    /// Spawn one auto-resume session's PTY **on the main (UI) thread**.
+    /// Called from `drain_events` for [`WorkerEvent::AutoResumeSpawnOnMain`].
+    /// This MUST NOT run on a worker thread — see that variant's docs for
+    /// the macOS fork-from-worker-thread crash it avoids. `fork`+`exec` of
+    /// the provider wrapper is fast (the provider's own TLS handshake
+    /// happens in the child), so doing it inline on the main loop is cheap;
+    /// the `[auto_resume]` throttle already spreads these out.
+    pub(crate) fn spawn_auto_resume_on_main(
         &mut self,
-        session_id: String,
-        used_resume_args: bool,
-        result: Result<PtyClient, String>,
+        session: AgentSession,
+        launch: SessionLaunch,
+        fresh_capture: crate::resume_recovery::FreshCapture,
     ) {
-        // If the user already reconnected this session manually while the
-        // background spawn was still in flight, drop the duplicate client
-        // rather than racing it into self.runtime.providers.
-        if self.session_has_pty(&session_id) {
-            if result.is_ok() {
-                logger::info(&format!(
-                    "auto_resume_on_start: discarding duplicate spawn for {session_id} (already active)"
-                ));
-            }
+        self.git.fresh_launches_in_flight.remove(&session.id);
+        self.sync_provider_session_ids(&session);
+        // Skip the fork entirely if the session already reconnected (e.g.
+        // the user clicked it) while this slot was queued.
+        if self.session_has_pty(&session.id) {
+            fresh_capture.abort();
             return;
         }
+        let last_pty_size = if self.last_pty_size != (0, 0) {
+            self.last_pty_size
+        } else {
+            (24, 80)
+        };
+        let result = sessions::spawn_pty_for_auto_resume(
+            &self.config,
+            &session,
+            &launch,
+            fresh_capture.claude_session_id(),
+            last_pty_size,
+            self.config.ui.agent_scrollback_lines,
+            &self.store_id,
+        )
+        .map_err(|e| format!("{e:#}"));
+        let session_id = session.id.clone();
         match result {
             Ok(client) => {
                 self.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
-                if used_resume_args {
+                if launch.is_resume() {
                     self.git
                         .resume_fallback_candidates
                         .insert(session_id.clone(), Instant::now());
                 }
                 self.mark_session_provider_started(&session_id);
+                self.finish_fresh_capture(&session_id, fresh_capture);
+                if matches!(launch, SessionLaunch::Fresh)
+                    && let Some(warning) = self.shared_targeted_resume_warning(&session_id)
+                {
+                    self.set_warning(warning);
+                }
             }
             Err(e) => {
+                fresh_capture.abort();
                 logger::info(&format!(
                     "auto_resume_on_start: failed to spawn session {session_id}: {e}"
                 ));
@@ -3329,14 +3428,12 @@ impl App {
     }
 
     /// Drive every loaded watch engine one tick. Called from the main run
-    /// loop right after `poll_pty_activity`. Skips sessions where the
-    /// user is currently typing interactively (`InputTarget::Agent` and
-    /// the session is the selected one), so an auto-action does not
-    /// arrive in the middle of the user's prompt.
+    /// loop right after `poll_pty_activity`. Selected sessions are held only
+    /// while the user has typed recently, matching AMQ delivery semantics.
     pub(crate) fn tick_watch_engines(&mut self) {
         // Phase 2 of two-phase SendText delivery: flush any deferred
-        // submit keys from the previous tick. Codex receives phase-1
-        // text as explicit bracketed paste; other harnesses rely on
+        // submit keys from the previous tick. Claude and Codex receive
+        // phase-1 text as explicit bracketed paste; other harnesses rely on
         // the time split to keep the submit key separate from the body.
         // See `apply_watch_effect` for the matching write side.
         self.flush_pending_watch_enters();
@@ -3353,7 +3450,14 @@ impl App {
         let session_ids: Vec<String> = self.runtime.watch_engines.keys().cloned().collect();
         for session_id in session_ids {
             if active_session.as_deref() == Some(session_id.as_str()) {
-                continue;
+                // Watch rules react to terminal states, so they only need a
+                // brief typing guard; AMQ delivery can keep its longer window.
+                let quiet =
+                    Duration::from_secs(self.config.amq.inject.active_session_quiet_secs.min(5));
+                let last = self.runtime.last_user_keystroke.get(&session_id).copied();
+                if crate::app::inject_runtime::should_hold_for_quiet_window(last, now, quiet) {
+                    continue;
+                }
             }
             // AMQ inject suppression: skip sessions within the
             // suppression window. When the window expires, rebaseline
@@ -3380,11 +3484,14 @@ impl App {
                     }
                 }
             }
-            let snapshot = match self.find_pty_handle(&session_id) {
-                Some(handle) => handle.scan_recent_lines(30),
+            let (snapshot, busy_snapshot) = match self.find_pty_handle(&session_id) {
+                Some(handle) => (
+                    handle.scan_recent_lines(30),
+                    handle.scan_recent_lines(self.config.amq.inject.busy_scan_lines),
+                ),
                 None => continue,
             };
-            if self.should_suppress_auto_clear_for_collaboration(&session_id)
+            if self.should_suppress_auto_clear(&session_id, &busy_snapshot)
                 && let Some(engine) = self.runtime.watch_engines.get_mut(&session_id)
             {
                 engine.rebaseline_kind(
@@ -3402,12 +3509,20 @@ impl App {
         }
     }
 
-    fn should_suppress_auto_clear_for_collaboration(&self, session_id: &str) -> bool {
+    fn should_suppress_auto_clear(&self, session_id: &str, busy_snapshot: &str) -> bool {
         let Some(session) = self.git.sessions.iter().find(|s| s.id == session_id) else {
             return true;
         };
         if !matches!(session.settings.mode, ContextMode::Worker)
             || !session.settings.auto_clear_on_task_done
+        {
+            return true;
+        }
+        if crate::amq_inject::snapshot_busy_marker(
+            busy_snapshot,
+            &self.config.amq.inject.busy_markers,
+        )
+        .is_some()
         {
             return true;
         }
@@ -3574,8 +3689,8 @@ impl App {
         match effect {
             crate::watch::WatchEffect::SendText { text, append_enter } => {
                 // Phase 1 of two-phase delivery: write body bytes only
-                // and DEFER the trailing submit key to a later tick. Codex
-                // receives an explicit bracketed paste body; other harnesses
+                // and DEFER the trailing submit key to a later tick. Claude and
+                // Codex receive an explicit bracketed paste body; other harnesses
                 // receive the same macro payload encoding used by manual
                 // macros. The discrete submit key lands via
                 // `flush_pending_watch_enters`, matching the AMQ drainer.
@@ -3872,11 +3987,12 @@ pub(crate) fn project_paths_for_meta(projects: &[Project]) -> Vec<PathBuf> {
 fn collect_auto_resume_candidates(
     sessions: &[AgentSession],
     stale_days: u32,
+    include_shared: bool,
 ) -> (Vec<AgentSession>, usize) {
     let mut skipped_stale = 0;
     let candidates = sessions
         .iter()
-        .filter(|session| !session.shared_workspace())
+        .filter(|session| include_shared || !session.shared_workspace())
         .filter(|session| Path::new(&session.worktree_path).exists())
         .filter(|session| !session.state.has_pty())
         .filter(|session| !session.state.is_retryable())
@@ -4059,6 +4175,7 @@ mod tests {
             deleted_at: None,
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             state: SessionState::Created { created_at: now },
             settings: SessionSettings::default(),
             created_at: now,
@@ -4091,12 +4208,14 @@ mod tests {
     }
 
     #[test]
-    fn startup_auto_resume_excludes_shared_sessions() {
+    fn startup_auto_resume_excludes_shared_sessions_by_default() {
         let dir = tempfile::tempdir().expect("tempdir");
         let shared = auto_resume_fixture("shared", dir.path(), true);
         let worktree = auto_resume_fixture("worktree", dir.path(), false);
 
-        let (candidates, skipped_stale) = collect_auto_resume_candidates(&[shared, worktree], 0);
+        // include_shared = false (the default): only worktree sessions resume.
+        let (candidates, skipped_stale) =
+            collect_auto_resume_candidates(&[shared, worktree], 0, false);
 
         assert_eq!(skipped_stale, 0);
         assert_eq!(
@@ -4106,6 +4225,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["worktree"]
         );
+    }
+
+    #[test]
+    fn startup_auto_resume_includes_shared_sessions_when_opted_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = auto_resume_fixture("shared", dir.path(), true);
+        let worktree = auto_resume_fixture("worktree", dir.path(), false);
+
+        // include_shared = true ([workspace].auto_resume_shared): both resume.
+        let (candidates, _) = collect_auto_resume_candidates(&[shared, worktree], 0, true);
+
+        let mut ids: Vec<&str> = candidates.iter().map(|s| s.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["shared", "worktree"]);
     }
 
     #[test]

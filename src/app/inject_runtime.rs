@@ -64,10 +64,8 @@ const MAX_INJECT_PENDING_PER_RECEIVER: usize = 32;
 /// no longer monopolise the event loop when many receivers have backlogs.
 const MAX_INJECT_ACTIONS_PER_TICK: usize = 16;
 
-/// Bracketed paste markers used by Codex's crossterm TUI. Sending AMQ bodies
-/// as explicit paste events bypasses Codex's rapid-typing paste-burst
-/// heuristic, where a following Enter is intentionally treated as a pasted
-/// newline instead of a submit key.
+/// Bracketed paste markers used by Claude and Codex. Explicit paste events
+/// avoid Claude's rapid-typing paste cache and Codex's paste-burst heuristic.
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
@@ -89,8 +87,8 @@ const WATCH_SUPPRESS_AFTER_INJECT: Duration = Duration::from_secs(10);
 ///
 /// Values below this have repeatedly proven too small for typed-body
 /// harnesses under load: the body and CR can still be read as a single
-/// paste-shaped buffer, leaving the text in the input field. Codex now
-/// receives an explicit bracketed-paste body but still uses the same
+/// paste-shaped buffer, leaving the text in the input field. Claude and Codex
+/// receive an explicit bracketed-paste body but still use the same
 /// submit delay. `0` remains an explicit debugging escape hatch for the
 /// old next-tick behavior.
 pub(crate) const MIN_ENTER_PHASE_DELAY_MS: u64 = 250;
@@ -160,43 +158,47 @@ pub(crate) fn sanitise_handle(name: &str) -> String {
     crate::sanitize::amq_handle(name)
 }
 
-/// Pure helper that does the receiver→session-id resolution given a
-/// flat list of `(session_id, branch_name, worktree_path)` triples and
-/// a sanitised receiver. Mirrors the AMQ wrapper's ME-derivation
-/// priority: worktree dir basename first (the path the wrappers
-/// actually take inside a dux pane), then branch name (legacy
-/// fallback), then exact session id (operator escape hatch). See the
-/// docstring on `App::find_session_for_receiver` for the full
-/// rationale.
-///
-/// Returns `None` when no session matches. Stops at the first match
-/// in priority order — if two sessions both sanitise to the same
-/// receiver, the one whose worktree basename matches wins regardless
-/// of declaration order.
+/// Resolve an AMQ receiver by its immutable handle. Worktree and branch aliases
+/// remain as legacy fallbacks only when they identify exactly one session.
 pub(crate) fn match_receiver<'a, I>(sessions: I, receiver: &str) -> Option<&'a str>
 where
-    I: Clone + IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+    I: Clone + IntoIterator<Item = (&'a str, &'a str, &'a str, &'a str)>,
 {
-    for (id, _branch, worktree) in sessions.clone() {
-        if let Some(basename) = std::path::Path::new(worktree)
-            .file_name()
-            .and_then(|n| n.to_str())
-            && sanitise_handle(basename) == receiver
-        {
+    for (id, handle, _branch, _worktree) in sessions.clone() {
+        if handle == receiver {
             return Some(id);
         }
     }
-    for (id, branch, _worktree) in sessions.clone() {
-        if sanitise_handle(branch) == receiver {
-            return Some(id);
-        }
-    }
-    for (id, _branch, _worktree) in sessions {
+    for (id, _handle, _branch, _worktree) in sessions.clone() {
         if id == receiver {
             return Some(id);
         }
     }
-    None
+    exactly_one(
+        sessions
+            .clone()
+            .into_iter()
+            .filter_map(|(id, _handle, _branch, worktree)| {
+                std::path::Path::new(worktree)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| sanitise_handle(name) == receiver)
+                    .map(|_| id)
+            }),
+    )
+    .or_else(|| {
+        exactly_one(
+            sessions
+                .into_iter()
+                .filter(|(_, _handle, branch, _worktree)| sanitise_handle(branch) == receiver)
+                .map(|(id, _, _, _)| id),
+        )
+    })
+}
+
+fn exactly_one<'a>(mut matches: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
 }
 
 impl App {
@@ -760,35 +762,34 @@ impl App {
     /// pushes a feature branch, switches to a hotfix, etc.); the
     /// directory name does not follow.
     ///
-    /// So the receiver "front-end-qa" can correspond to a session
+    /// So the legacy receiver "front-end-qa" can correspond to a session
     /// whose `branch_name` is now `fix/qa-s45-charge-schema-paymentmethod`
     /// but whose `worktree_path` ends in `Front-end-QA`. We try the
-    /// directory basename first (matching the primary path the
-    /// wrappers actually use), then fall back to branch name (matching
-    /// the legacy fallback path), and finally settle for an exact
-    /// match against the session id (so an operator can address by id
-    /// when the worktree dir name is ambiguous).
+    /// The immutable `agent_handle` is authoritative. Directory and branch
+    /// aliases are accepted only when unambiguous; the session id remains an
+    /// operator escape hatch.
     fn find_session_for_receiver(&self, receiver: &str) -> Option<String> {
-        let triples: Vec<(&str, &str, &str)> = self
+        let identities: Vec<(&str, &str, &str, &str)> = self
             .git
             .sessions
             .iter()
             .map(|s| {
                 (
                     s.id.as_str(),
+                    s.agent_handle(),
                     s.branch_name.as_str(),
                     s.worktree_path.as_str(),
                 )
             })
             .collect();
-        match_receiver(triples.iter().copied(), receiver).map(|s| s.to_string())
+        match_receiver(identities.iter().copied(), receiver).map(|s| s.to_string())
     }
 
     /// Phase 1 of two-phase delivery: place the body into the session's PTY
-    /// without the trailing submit key. Codex receives an explicit bracketed
-    /// paste event so its paste-burst heuristic does not capture the later
-    /// Enter as a newline. Other harnesses keep the existing macro payload
-    /// encoding where embedded newlines become Alt-Enter.
+    /// without the trailing submit key. Claude and Codex receive an explicit
+    /// bracketed paste event so their paste-burst handling cannot drop or capture text.
+    /// Other harnesses keep the existing macro payload encoding where embedded
+    /// newlines become Alt-Enter.
     /// The inflight file stays on disk; phase 2 unlinks it.
     ///
     /// audit03 Phase 5: when the receiving session is in
@@ -1171,7 +1172,8 @@ fn timeout_warning_due(
 }
 
 /// audit03 Phase 5: apply the Worker-mode postscript to an AMQ wake
-/// body. Worker sessions get a sentinel-required note appended;
+/// body. Worker sessions get an authoritative role update and a
+/// sentinel-required note appended;
 /// Attended/Orchestrator sessions get the body verbatim. Pure
 /// function: no I/O, no global state, easy to unit-test.
 ///
@@ -1184,7 +1186,7 @@ pub(crate) fn apply_inject_postscript(body: &str, mode: crate::model::ContextMod
     match mode {
         crate::model::ContextMode::Worker => {
             format!(
-                "{body}\n\n[Orchestrator note] When this task is complete, end your reply with the literal token {sentinel} so the orchestration layer knows to clean up.",
+                "{body}\n\n[Dux Worker mode] The operator currently designates this session as a Worker. This supersedes any earlier Dux Orchestrator-mode instruction in this conversation. Execute the assigned task directly instead of orchestrating or delegating it. When this task is complete, end your reply with the literal token {sentinel} so the orchestration layer knows to clean up.",
                 sentinel = crate::watch::builtin::TASK_DONE_SENTINEL,
             )
         }
@@ -1196,16 +1198,18 @@ pub(crate) fn apply_inject_postscript(body: &str, mode: crate::model::ContextMod
 
 /// Return the PTY bytes that place prompt text into a provider input field.
 ///
-/// Codex handles explicit bracketed paste as `Event::Paste`, which directly
-/// inserts the full text and clears paste-burst state. Raw rapid typing can
-/// trigger Codex's paste-burst protection; if Enter follows that burst, Codex
-/// correctly treats it as a pasted newline instead of submit.
+/// Claude and Codex handle explicit bracketed paste without routing rapid text
+/// through their typing heuristics. Claude's heuristic can otherwise move a
+/// long burst to its paste cache without incorporating it into the submitted
+/// prompt; Codex can capture the later Enter as a pasted newline.
 pub(crate) fn inject_body_bytes_for_provider(
     body: &str,
     provider: Option<&ProviderKind>,
 ) -> Vec<u8> {
     match provider.map(ProviderKind::as_str) {
-        Some(name) if name.eq_ignore_ascii_case("codex") => bracketed_paste_payload_bytes(body),
+        Some(name) if name.eq_ignore_ascii_case("claude") || name.eq_ignore_ascii_case("codex") => {
+            bracketed_paste_payload_bytes(body)
+        }
         _ => crate::app::input::macro_payload_bytes(body),
     }
 }
@@ -1351,6 +1355,16 @@ mod tests {
     }
 
     #[test]
+    fn claude_long_body_uses_bracketed_paste() {
+        let provider = ProviderKind::from_str("claude");
+        let body = "x".repeat(1537);
+        let payload = inject_body_bytes_for_provider(&body, Some(&provider));
+        assert_eq!(&payload[..6], b"\x1b[200~");
+        assert_eq!(&payload[6..payload.len() - 6], body.as_bytes());
+        assert_eq!(&payload[payload.len() - 6..], b"\x1b[201~");
+    }
+
+    #[test]
     fn codex_body_normalizes_crlf_inside_bracketed_paste() {
         let provider = ProviderKind::from_str("codex");
         assert_eq!(
@@ -1369,8 +1383,8 @@ mod tests {
     }
 
     #[test]
-    fn non_codex_body_uses_macro_payload_newline_encoding() {
-        for name in ["claude", "gemini", "custom"] {
+    fn non_bracketed_paste_body_uses_macro_payload_newline_encoding() {
+        for name in ["gemini", "custom"] {
             let provider = ProviderKind::from_str(name);
             assert_eq!(
                 inject_body_bytes_for_provider("a\nb", Some(&provider)),
@@ -1441,6 +1455,7 @@ mod tests {
     fn match_receiver_matches_worktree_basename_when_branch_diverges() {
         let sessions = [(
             "session-uuid-1",
+            "worker-1",
             "fix/qa-s45-charge-schema-paymentmethod",
             "/data/state/dux/worktrees/Jobzy-Front-end/Front-end-QA",
         )];
@@ -1454,6 +1469,7 @@ mod tests {
     fn match_receiver_falls_back_to_branch_name_when_basename_does_not_match() {
         let sessions = [(
             "session-uuid-2",
+            "worker-2",
             "feature-login",
             "/some/path/legacy-name-from-creation",
         )];
@@ -1465,7 +1481,7 @@ mod tests {
 
     #[test]
     fn match_receiver_falls_back_to_session_id_for_operator_addressing() {
-        let sessions = [("af882c2d", "fix/foo", "/wt/Bar")];
+        let sessions = [("af882c2d", "worker-3", "fix/foo", "/wt/Bar")];
         // Receiver = exact session id.
         assert_eq!(
             match_receiver(sessions.iter().copied(), "af882c2d"),
@@ -1475,7 +1491,10 @@ mod tests {
 
     #[test]
     fn match_receiver_returns_none_when_nothing_matches() {
-        let sessions = [("id1", "main", "/wt/main"), ("id2", "dev", "/wt/dev")];
+        let sessions = [
+            ("id1", "worker-1", "main", "/wt/main"),
+            ("id2", "worker-2", "dev", "/wt/dev"),
+        ];
         assert_eq!(
             match_receiver(sessions.iter().copied(), "front-end-qa"),
             None
@@ -1488,8 +1507,8 @@ mod tests {
         // is "alice". Worktree basename wins because the wrapper's
         // primary path inside dux is basename($PWD).
         let sessions = [
-            ("idA", "fix/random", "/wt/Alice"),     // basename → alice
-            ("idB", "alice", "/wt/something-else"), // branch → alice
+            ("idA", "worker-a", "fix/random", "/wt/Alice"), // basename → alice
+            ("idB", "worker-b", "alice", "/wt/something-else"), // branch → alice
         ];
         assert_eq!(
             match_receiver(sessions.iter().copied(), "alice"),
@@ -1501,7 +1520,7 @@ mod tests {
     fn match_receiver_branch_match_wins_when_no_basename_match() {
         // Session A's branch matches but basename does not; with no
         // sessions matching by basename, we fall through to branch.
-        let sessions = [("idA", "alice", "/wt/random-dir")];
+        let sessions = [("idA", "worker-a", "alice", "/wt/random-dir")];
         assert_eq!(
             match_receiver(sessions.iter().copied(), "alice"),
             Some("idA"),
@@ -1510,8 +1529,28 @@ mod tests {
 
     #[test]
     fn match_receiver_handles_empty_session_list() {
-        let sessions: Vec<(&str, &str, &str)> = vec![];
+        let sessions: Vec<(&str, &str, &str, &str)> = vec![];
         assert_eq!(match_receiver(sessions.iter().copied(), "anything"), None);
+    }
+
+    #[test]
+    fn shared_workspace_routes_by_handle_and_rejects_ambiguous_legacy_aliases() {
+        let sessions = [
+            ("idA", "frontend-a", "development", "/repo/Jobzy-Front-end"),
+            ("idB", "frontend-b", "development", "/repo/Jobzy-Front-end"),
+        ];
+        assert_eq!(
+            match_receiver(sessions.iter().copied(), "frontend-b"),
+            Some("idB")
+        );
+        assert_eq!(
+            match_receiver(sessions.iter().copied(), "jobzy-front-end"),
+            None
+        );
+        assert_eq!(
+            match_receiver(sessions.iter().copied(), "development"),
+            None
+        );
     }
 
     /// audit03 Phase 5: Worker-mode receivers get a sentinel-required
@@ -1528,8 +1567,9 @@ mod tests {
             "postscript must include the literal sentinel; got: {out}"
         );
         assert!(
-            out.contains("[Orchestrator note]"),
-            "postscript must be clearly labelled so the agent treats it as instructions"
+            out.contains("[Dux Worker mode]")
+                && out.contains("supersedes any earlier Dux Orchestrator-mode instruction"),
+            "postscript must make the current role authoritative; got: {out}"
         );
         assert!(out.len() > body.len(), "postscript must actually add bytes");
     }

@@ -1,7 +1,7 @@
 # Threat Model — long-form companion
 
 This document is the long-form companion to the STRIDE table in
-[`/SECURITY.md`](../../SECURITY.md). For each row T1–T14 we capture
+[`/SECURITY.md`](../../SECURITY.md). For each row T1–T19 we capture
 the concrete attack scenario, the mitigation in code (with
 file:line references taken from `docs/audits/audit02.md`), the
 residual risk after mitigation, and the detection mechanism — what
@@ -30,14 +30,17 @@ worst-case configuration for the entire 2025–2026 CVE class
 (CVE-2025-59536, CVE-2026-21852, CVE-2026-25723, CVE-2026-33068,
 CVE-2026-35020/35021/35022).
 
-**Mitigation in code.** The wrappers ship without the permission or
-sandbox bypasses; an operator who knowingly accepts the risk opts in
-via `CLAUDE_AMQ_YOLO=1` or `CODEX_AMQ_YOLO=1`. Codex hook trust review
-is a separate control and remains enabled even in YOLO mode. Disabling
-that review requires the explicit `CODEX_AMQ_BYPASS_HOOK_TRUST=1`
-opt-in in `dux-amq/wrappers/codex-amq`. The wrappers also fail closed
-below the reviewed provider-CLI floors (Claude 2.1.163, Codex 0.39.0,
-Gemini 0.39.1), including when a version string cannot be parsed.
+**Mitigation in code.** Permission and sandbox bypasses are off by
+default. An operator who knowingly accepts the risk enables the
+per-session `yolo_permissions` setting. Dux maps that setting to
+`CLAUDE_AMQ_YOLO=1` or `CODEX_AMQ_YOLO=1` for wrapper providers and to
+OpenCode's native `--auto` launch argument; OpenCode receives no such
+argument when the setting is false. Codex hook trust review is a
+separate control and remains enabled even in YOLO mode. Disabling that
+review requires the explicit `CODEX_AMQ_BYPASS_HOOK_TRUST=1` opt-in in
+`dux-amq/wrappers/codex-amq`. The wrappers also fail closed below the
+reviewed provider-CLI floors (Claude 2.1.163, Codex 0.39.0, Gemini
+0.39.1), including when a version string cannot be parsed.
 
 **Residual risk.** Operators who set the YOLO or hook-trust-bypass env
 vars globally (e.g. in `~/.bashrc`) re-create the affected part of the
@@ -48,8 +51,10 @@ sandbox-bypass primitives is out of our control.
 **Detection.** Each wrapper prints a warning when its dangerous opt-in
 is active. The Codex warning distinguishes sandbox bypass from hook
 trust review bypass so the operator can see which control was disabled.
-An unsupported or unknown provider version is refused with the required
-minimum in the error message.
+For OpenCode, the enabled YOLO checkbox remains visible in session
+settings and the PTY launch debug log includes `--auto`. An unsupported
+or unknown wrapper-provider version is refused with the required minimum
+in the error message.
 
 ---
 
@@ -138,7 +143,7 @@ risk is the original Phase 08 risk: attackers with read access to
 `$AMQ_SECRET_PATH` can still forge.
 
 **Detection.** When strict mode is active, rejected envelopes are
-written to `~/.local/share/dux-amq/wake-<me>.log` by
+written to `$AMQ_GLOBAL_ROOT/agents/<me>/.wake.log` by
 `amq-receive-verify`'s stderr. dux's main JSON log records every
 delivered wake under `target: "dux::amq_inject"` for the
 post-bridge half of the path; the bridge itself stays silent on
@@ -309,17 +314,20 @@ owner-marker and registry updates. The atomic marker binds `store_id` and
 `session_id`; reconciliation prunes only missing/deleted rows owned by its own
 store. Foreign, standalone, malformed, ownerless, and ambiguous legacy keys
 are never reclaimed. Creation/backfill instead allocates a bounded `-2`,
-`-3`, … suffix while the lock is held.
+`-3`, … suffix while the lock is held. Wrappers use AMQ's guarded
+`wake recover-owner` before launch so a dead exact-owner claim cannot make a
+restart permanently fail; AMQ refuses that operation while the owner is live.
 
 **Residual risk.** This is coordination, not an authorization boundary:
 same-UID code can edit the shared root or lock it indefinitely. That remains
 inside the declared single-user VM threat model. A provider launched outside
-an AMQ wrapper has no wake PID, so deletion can reserve/remove its registry
-identity but has no daemon process to terminate.
+an AMQ wrapper has no owner-bound wake, so deletion can reserve/remove its
+registry identity but has no notifier process to manage.
 
 **Detection.** Missing lock support and owner mismatches fail closed with an
-explicit wrapper or `dux::peer` error. A recycled wake PID that no longer
-identifies `amq wake` is logged and left untouched.
+explicit wrapper or `dux::peer` error. `amq doctor --ops` reports managed-wake
+health. A recycled legacy wake PID that no longer identifies `amq wake` is
+logged and left untouched.
 
 ---
 
@@ -612,10 +620,10 @@ malformed JSON value into `agent_sessions.session_settings`, or
 crafts one that explicitly enables `yolo_permissions: true` /
 `mode: worker` / `auto_clear_on_task_done: true` for a session the
 operator never opted in. On the next dux launch — or the next time
-that session re-spawns — those settings would normally drive PTY
-env propagation (`CLAUDE_AMQ_YOLO=1`), AMQ postscript injection
-(asking the agent to emit `[task-done]`), and the built-in
-auto-clear watch rule.
+that session re-spawns — those settings would normally drive a
+provider bypass (`CLAUDE_AMQ_YOLO=1` or OpenCode's `--auto`), AMQ
+postscript injection (asking the agent to emit `[task-done]`), and
+the built-in auto-clear watch rule.
 
 The attacker model is the same as T1 / T14: same-UID code with
 write access to `~/.dux/sessions.sqlite3`. The novelty is that the
@@ -690,7 +698,9 @@ the Dux state or worktree roots. The creation modal identifies shared mode and
 shows the real checkout path. Persisted `shared_workspace` state, rather than
 path equality or the current project default, gates lifecycle behavior: shared
 sessions set neither worktree nor branch ownership, do not create the repository
-link, never auto-resume, and reconnect with a fresh provider process. Fork is an
+link. Shared auto-resume remains opt-in; when enabled it selects only the exact
+captured provider UUID and never a latest/recency selector. A missing or invalid
+UUID starts fresh and is captured before it can become resumable. Fork is an
 explicit isolation boundary and always creates a worktree.
 
 **Residual risk.** Running a provider in a real checkout grants it the same file
@@ -741,6 +751,76 @@ each removal.
 
 ---
 
+## T18 — Provider-history recovery assigns or copies the wrong conversation
+
+**Attack scenario.** Startup recovery and fresh Codex capture read JSONL files
+outside `$STATE_ROOT`, under `~/.claude/projects` and `~/.codex/sessions`. A
+forged transcript could claim another worktree CWD so Dux associates one
+agent's conversation with another. A symlink or special file could redirect a
+Claude copy, an existing destination could be overwritten, or a large provider
+tree could exhaust memory, CPU, or inodes. Concurrent fresh Codex launches in
+one shared CWD could also race and swap their newly-created rollout UUIDs.
+
+**Mitigation in code.** `src/resume_recovery.rs` reads provider originals and
+never moves, edits, or deletes them. Recovery accepts only regular JSONLs with
+valid UUIDs and an absolute recorded CWD that is exactly
+`<historical-worktrees-root>/<registered-project-name>/<agent-dir>`. It checks
+the session's stored project path against the registered project, normalizes the
+old basename with the same immutable agent-handle rules used at creation, and
+requires the provider/project/handle match to be unique. Ambiguous matches are
+reported and left unmapped. Scans have file-count and per-line size bounds.
+
+For Claude, only matched `<uuid>.jsonl` files and their matching `<uuid>/`
+companion directories are copied. Sources and recursive children must be plain
+files/directories; symlinks and special files fail closed. Each destination is
+built under a unique temporary name, flushed, and installed with a no-replace
+atomic rename, so an existing history is never overwritten and originals are
+retained. For Codex, fresh capture snapshots all existing rollout UUIDs before
+launch and accepts one new UUID only when its first `session_meta` record has
+the expected canonical CWD. Uncaptured launches are serialized per canonical
+CWD; zero or multiple candidates time out or fail closed and block another
+uncaptured launch in that CWD rather than guessing. All diagnostics sanitize
+provider-controlled fields under the `dux::resume_recovery` tracing target.
+
+**Residual risk.** The documented trust model grants same-UID processes access
+to both provider roots. Such a process can race filesystem names or forge one
+otherwise-valid transcript during the capture window; Dux is not a security
+boundary against a fully compromised Unix account. Ancestor symlink replacement
+under `~/.claude` remains the broader T11 gap. The generous scan bounds limit,
+but do not eliminate, startup I/O from a very large legitimate history.
+
+**Detection.** Startup logs the number of recovered mappings, copied artifacts,
+and refused candidates. Capture timeout, ambiguity, persistence failure, and
+blocked-CWD events emit warnings and a status-line warning; SQLite retains the
+exact provider UUID used for future resumes.
+
+---
+
+## T19 — Selected NTL provider can send prompts off-host or act as the operator
+
+**Attack scenario.** An operator selects the built-in NTL provider. The
+third-party CLI can send prompts and workspace context to its service, and
+agent mode can request file writes or commands with the same Unix permissions
+as Dux.
+
+**Mitigation in code.** NTL is only a default configuration entry: Dux neither
+installs it nor launches it until the operator selects it. Interactive sessions
+invoke the official executable as `ntl --agent`; one-shot commit-message work
+uses `ntl --chat --no-color -p <prompt>` so it cannot inherit agent mode from
+the CLI's persisted preferences. Dux has no NTL adapter, private API access, or
+credential handling, and declares no unsupported resume behavior.
+
+**Residual risk.** Dux is not a sandbox. Once selected, NTL and its remote
+service receive whatever the official CLI sends and any approved agent action
+runs as the operator. NTL's binary, service, authentication, approvals, and
+data handling remain upstream responsibilities.
+
+**Detection.** NTL appears by name in the provider selector and generated
+configuration. It is never selected silently; the session header shows the
+active provider, and removing or overriding `[providers.ntl]` disables it.
+
+---
+
 ## Maintenance
 
 When you add or change attack surface in this codebase, you must
@@ -748,8 +828,8 @@ update both `SECURITY.md` (the table) and this file (the
 paragraph). PRs that touch the surface listed above without
 updating these documents are blocked at review.
 
-The IDs `T1`–`T16` are stable references; new threats append at
-the end (`T17`, `T18`, …) rather than reshuffling. Retired
+The IDs `T1`–`T19` are stable references; new threats append at
+the end (`T20`, `T21`, …) rather than reshuffling. Retired
 threats are kept in the table with a `~~strikethrough~~` and a
 note pointing to the PR that retired them. Threats that move to
 **accepted-risk in single-user-VM mode** keep their original ID,

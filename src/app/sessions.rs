@@ -595,10 +595,18 @@ impl App {
     pub(crate) fn spawn_pty_for_session(
         &self,
         session: &AgentSession,
-        resume: bool,
+        launch: &SessionLaunch,
+        fresh_session_id: Option<&str>,
     ) -> Result<PtyClient> {
         let cfg = provider_config(&self.config, &session.provider);
-        let launch_args = cfg.interactive_args(resume);
+        let launch_args = launch_args(
+            &cfg,
+            &session.provider,
+            launch,
+            fresh_session_id,
+            session.settings.yolo_permissions,
+            Path::new(&session.worktree_path),
+        )?;
         let (rows, cols) = if self.last_pty_size != (0, 0) {
             self.last_pty_size
         } else {
@@ -607,7 +615,7 @@ impl App {
         logger::debug(&format!(
             "spawning PTY {:?} {:?} in {} ({}x{}, resume_supported={})",
             cfg.command,
-            launch_args,
+            &launch_args,
             session.worktree_path,
             cols,
             rows,
@@ -623,7 +631,7 @@ impl App {
         crate::peer::append_session_env(&mut per_session_env, session, &self.store_id);
         PtyClient::spawn_with_env(
             &cfg.command,
-            launch_args,
+            &launch_args,
             Path::new(&session.worktree_path),
             rows,
             cols,
@@ -632,13 +640,67 @@ impl App {
         )
     }
 
-    pub(crate) fn should_resume_session(&self, session: &AgentSession) -> bool {
-        if session.shared_workspace() {
-            return false;
-        }
+    pub(crate) fn should_resume_session(&self, session: &AgentSession) -> SessionLaunch {
         let cfg = provider_config(&self.config, &session.provider);
-        cfg.supports_session_resume() && session.has_started_provider(&session.provider)
+        if let Some(session_id) = session.provider_session_id(&session.provider)
+            && uuid::Uuid::parse_str(session_id).is_ok()
+            && cfg.supports_session_resume_by_id()
+            && (!session.shared_workspace()
+                || session.provider.as_str() != "claude"
+                || crate::resume_recovery::claude_resume_target_exists(
+                    Path::new(&session.worktree_path),
+                    session_id,
+                ))
+        {
+            return SessionLaunch::ResumeId(session_id.to_string());
+        }
+        if session.shared_workspace() {
+            return SessionLaunch::Fresh;
+        }
+        if cfg.supports_session_resume() && session.has_started_provider(&session.provider) {
+            SessionLaunch::LegacyLatest
+        } else {
+            SessionLaunch::Fresh
+        }
     }
+}
+
+pub(crate) fn launch_args(
+    config: &ProviderCommandConfig,
+    provider: &ProviderKind,
+    launch: &SessionLaunch,
+    fresh_session_id: Option<&str>,
+    yolo_permissions: bool,
+    cwd: &Path,
+) -> Result<Vec<String>> {
+    let mut args = match launch {
+        SessionLaunch::Fresh => {
+            let mut args = config.interactive_args(false).to_vec();
+            if let Some(session_id) = fresh_session_id {
+                args.extend(["--session-id".to_string(), session_id.to_string()]);
+            }
+            Ok(args)
+        }
+        SessionLaunch::LegacyLatest if config.supports_session_resume() => {
+            Ok(config.interactive_args(true).to_vec())
+        }
+        SessionLaunch::LegacyLatest => {
+            Err(anyhow::anyhow!("legacy session resume is not configured"))
+        }
+        SessionLaunch::ResumeId(session_id) => config
+            .resume_by_id_args(session_id)
+            .ok_or_else(|| anyhow::anyhow!("targeted session resume is not configured")),
+    }?;
+    if provider.as_str() == "codex" && matches!(launch, SessionLaunch::ResumeId(_)) {
+        args.extend(["-C".to_string(), cwd.to_string_lossy().into_owned()]);
+    }
+    if provider.as_str() == "opencode"
+        && yolo_permissions
+        && !args.iter().any(|arg| arg == "--auto")
+    {
+        args.push("--auto".to_string());
+    }
+    Ok(args)
 }
 
 /// Worker-thread variant of [`App::spawn_pty_for_session`].
@@ -651,18 +713,26 @@ impl App {
 pub(crate) fn spawn_pty_for_auto_resume(
     config: &Config,
     session: &AgentSession,
-    resume: bool,
+    launch: &SessionLaunch,
+    fresh_session_id: Option<&str>,
     last_pty_size: (u16, u16),
     scrollback_lines: usize,
     store_id: &str,
 ) -> Result<PtyClient> {
     let cfg = provider_config(config, &session.provider);
-    let launch_args = cfg.interactive_args(resume);
+    let launch_args = launch_args(
+        &cfg,
+        &session.provider,
+        launch,
+        fresh_session_id,
+        session.settings.yolo_permissions,
+        Path::new(&session.worktree_path),
+    )?;
     let (rows, cols) = last_pty_size;
     logger::debug(&format!(
         "spawning PTY {:?} {:?} in {} ({}x{}, resume_supported={})",
         cfg.command,
-        launch_args,
+        &launch_args,
         session.worktree_path,
         cols,
         rows,
@@ -676,7 +746,7 @@ pub(crate) fn spawn_pty_for_auto_resume(
     crate::peer::append_session_env(&mut per_session_env, session, store_id);
     PtyClient::spawn_with_env(
         &cfg.command,
-        launch_args,
+        &launch_args,
         Path::new(&session.worktree_path),
         rows,
         cols,
@@ -1755,47 +1825,47 @@ impl App {
             "restarting agent \"{}\" with fresh session (no resume args)",
             session.branch_name
         ));
-        match self.spawn_pty_for_session(&session, false) {
-            Ok(client) => {
-                self.install_pty_for_session(&session.id, crate::pty::PtyHandle::new(client));
-                self.mark_session_provider_started(&session.id);
-                self.show_agent_surface();
-                self.ui.input_target = InputTarget::Agent;
-                self.ui.fullscreen_overlay = FullscreenOverlay::Agent;
-                let proj_name = self.project_name_for_session(&session);
-                let mut msg = format!(
-                    "Started fresh {} session for agent \"{}\" in project \"{}\". Use /sessions inside the agent to restore a prior conversation.",
-                    session.provider.as_str(),
-                    session.branch_name,
-                    proj_name,
-                );
-                if let Some(detached) = &detached_label {
-                    msg.push_str(&format!(
-                        " Agent \"{detached}\" was detached to avoid worktree conflicts.",
-                    ));
-                }
-                if let Some(project) = self
-                    .git
-                    .projects
-                    .iter()
-                    .find(|p| p.id == session.project_id)
-                    && project.default_provider != session.provider
-                {
-                    msg.push_str(&format!(
-                        " Note: this agent uses {}. Your current default provider is {}.",
-                        session.provider.as_str(),
-                        project.default_provider.as_str(),
-                    ));
-                }
-                self.set_info(msg);
-            }
-            Err(err) => {
-                self.set_error(format!(
-                    "Fresh restart failed for agent \"{}\": {err}",
-                    session.branch_name
-                ));
-            }
+        let proj_name = self.project_name_for_session(&session);
+        let mut message = format!(
+            "Started fresh {} session for agent \"{}\" in project \"{}\". Use /sessions inside the agent to restore a prior conversation.",
+            session.provider.as_str(),
+            session.branch_name,
+            proj_name,
+        );
+        if let Some(detached) = &detached_label {
+            message.push_str(&format!(
+                " Agent \"{detached}\" was detached to avoid worktree conflicts.",
+            ));
         }
+        if let Some(project) = self
+            .git
+            .projects
+            .iter()
+            .find(|project| project.id == session.project_id)
+            && project.default_provider != session.provider
+        {
+            message.push_str(&format!(
+                " Note: this agent uses {}. Your current default provider is {}.",
+                session.provider.as_str(),
+                project.default_provider.as_str(),
+            ));
+        }
+        self.set_busy(format!(
+            "Preparing a fresh {} session for agent \"{}\"...",
+            session.provider.as_str(),
+            session.branch_name,
+        ));
+        self.launch_fresh_with_capture(
+            session.clone(),
+            FreshLaunchContext {
+                success_message: message,
+                failure_prefix: format!(
+                    "Fresh restart failed for agent \"{}\"",
+                    session.branch_name
+                ),
+                show_agent_surface: true,
+            },
+        );
         Ok(())
     }
 
@@ -1911,11 +1981,55 @@ impl App {
         let detached_label =
             self.detach_conflicting_worktree_session(&session.worktree_path, &session.id);
 
-        let use_resume = self.should_resume_session(&session);
-        match self.spawn_pty_for_session(&session, use_resume) {
+        let launch = self.should_resume_session(&session);
+        if matches!(launch, SessionLaunch::Fresh) {
+            let proj_name = self.project_name_for_session(&session);
+            let mut message = format!(
+                "Started fresh {} session for agent \"{}\" in project \"{}\". Use /sessions inside the agent to restore a prior conversation.",
+                session.provider.as_str(),
+                session.branch_name,
+                proj_name,
+            );
+            if let Some(detached) = &detached_label {
+                message.push_str(&format!(
+                    " Agent \"{detached}\" was detached to avoid worktree conflicts.",
+                ));
+            }
+            if let Some(project) = self
+                .git
+                .projects
+                .iter()
+                .find(|project| project.id == session.project_id)
+                && project.default_provider != session.provider
+            {
+                message.push_str(&format!(
+                    " Note: this agent uses {}. Your current default provider is {}.",
+                    session.provider.as_str(),
+                    project.default_provider.as_str(),
+                ));
+            }
+            self.set_busy(format!(
+                "Preparing a fresh {} session for agent \"{}\"...",
+                session.provider.as_str(),
+                session.branch_name,
+            ));
+            self.launch_fresh_with_capture(
+                session.clone(),
+                FreshLaunchContext {
+                    success_message: message,
+                    failure_prefix: format!(
+                        "Reconnect failed for agent \"{}\"",
+                        session.branch_name
+                    ),
+                    show_agent_surface: true,
+                },
+            );
+            return Ok(());
+        }
+        match self.spawn_pty_for_session(&session, &launch, None) {
             Ok(client) => {
                 self.install_pty_for_session(&session.id, crate::pty::PtyHandle::new(client));
-                if use_resume {
+                if launch.is_resume() {
                     self.git
                         .resume_fallback_candidates
                         .insert(session.id.clone(), Instant::now());
@@ -1925,7 +2039,7 @@ impl App {
                 self.ui.input_target = InputTarget::Agent;
                 self.ui.fullscreen_overlay = FullscreenOverlay::Agent;
                 let proj_name = self.project_name_for_session(&session);
-                let mut msg = if use_resume {
+                let mut msg = if launch.is_resume() {
                     format!(
                         "Resumed {} agent \"{}\" in project \"{}\".",
                         session.provider.as_str(),
@@ -2386,7 +2500,7 @@ impl App {
         (killed_agents, killed_terminals)
     }
 
-    fn session_label(&self, session: &AgentSession) -> String {
+    pub(crate) fn session_label(&self, session: &AgentSession) -> String {
         session
             .title
             .clone()
@@ -2827,6 +2941,7 @@ mod tests {
             staged_diff_in_flight: false,
             add_project_in_flight: false,
             reconnect_validations_in_flight: std::collections::HashSet::new(),
+            fresh_launches_in_flight: std::collections::HashSet::new(),
             orphan_cleanup_in_flight: false,
             resume_fallback_candidates: std::collections::HashMap::new(),
             pending_deletions: std::collections::HashSet::new(),
@@ -2835,6 +2950,7 @@ mod tests {
         let mut config = Config::default();
         config.workspace = Some(crate::config::WorkspaceConfig {
             default_mode: WorkspaceMode::Worktree,
+            auto_resume_shared: false,
         });
         let mut app = App {
             ui,
@@ -2908,6 +3024,7 @@ mod tests {
             deleted_at: None,
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             state: SessionState::Created { created_at: now },
             settings: crate::model::SessionSettings::default(),
             created_at: now,
@@ -3180,24 +3297,216 @@ mod tests {
         let project = make_project("project-1", "claude");
         let mut app = test_app_with_sessions(vec![session.clone()], vec![project]);
 
-        assert!(app.should_resume_session(&session));
+        assert_eq!(
+            app.should_resume_session(&session),
+            SessionLaunch::LegacyLatest
+        );
 
         app.git.sessions[0].provider = ProviderKind::from_str("codex");
         let session = app.git.sessions[0].clone();
-        assert!(!app.should_resume_session(&session));
+        assert_eq!(app.should_resume_session(&session), SessionLaunch::Fresh);
 
         app.git.sessions[0]
             .started_providers
             .push("codex".to_string());
         let session = app.git.sessions[0].clone();
-        assert!(app.should_resume_session(&session));
+        assert_eq!(
+            app.should_resume_session(&session),
+            SessionLaunch::LegacyLatest
+        );
 
         app.git.sessions[0].shared_workspace = true;
         let session = app.git.sessions[0].clone();
         assert!(
-            !app.should_resume_session(&session),
-            "shared reconnects must always launch fresh"
+            matches!(app.should_resume_session(&session), SessionLaunch::Fresh),
+            "shared reconnects without an exact UUID must launch fresh"
         );
+    }
+
+    #[test]
+    fn shared_agents_in_one_cwd_build_distinct_targeted_resume_argv() {
+        let cwd = "/tmp/shared-project";
+        let mut first = make_session("first", "codex", cwd);
+        let mut second = make_session("second", "codex", cwd);
+        first.shared_workspace = true;
+        second.shared_workspace = true;
+        let first_id = uuid::Uuid::new_v4().to_string();
+        let second_id = uuid::Uuid::new_v4().to_string();
+        first
+            .provider_session_ids
+            .insert("codex".to_string(), first_id.clone());
+        second
+            .provider_session_ids
+            .insert("codex".to_string(), second_id.clone());
+        let project = make_project("project-1", "codex");
+        let app = test_app_with_sessions(vec![first.clone(), second.clone()], vec![project]);
+
+        let first_launch = app.should_resume_session(&first);
+        let second_launch = app.should_resume_session(&second);
+        assert_eq!(first_launch, SessionLaunch::ResumeId(first_id.clone()));
+        assert_eq!(second_launch, SessionLaunch::ResumeId(second_id.clone()));
+        let config = provider_config(&app.config, &ProviderKind::from_str("codex"));
+        let provider = ProviderKind::from_str("codex");
+        let first_argv = launch_args(
+            &config,
+            &provider,
+            &first_launch,
+            None,
+            false,
+            Path::new(cwd),
+        )
+        .unwrap();
+        let second_argv = launch_args(
+            &config,
+            &provider,
+            &second_launch,
+            None,
+            false,
+            Path::new(cwd),
+        )
+        .unwrap();
+        assert_ne!(first_argv, second_argv);
+        assert_eq!(first_argv.get(2), Some(&first_id));
+        assert_eq!(second_argv.get(2), Some(&second_id));
+        assert_eq!(first.worktree_path, second.worktree_path);
+    }
+
+    #[test]
+    fn shared_claude_with_missing_transcript_launches_fresh() {
+        let mut session = make_session("missing", "claude", "/tmp/shared-project");
+        session.shared_workspace = true;
+        session
+            .provider_session_ids
+            .insert("claude".to_string(), uuid::Uuid::new_v4().to_string());
+        let project = make_project("project-1", "claude");
+        let app = test_app_with_sessions(vec![session.clone()], vec![project]);
+
+        assert_eq!(app.should_resume_session(&session), SessionLaunch::Fresh);
+    }
+
+    #[test]
+    fn fresh_claude_launch_appends_preassigned_session_uuid() {
+        let config = provider_config(&Config::default(), &ProviderKind::from_str("claude"));
+        let session_id = uuid::Uuid::new_v4().to_string();
+
+        let argv = launch_args(
+            &config,
+            &ProviderKind::from_str("claude"),
+            &SessionLaunch::Fresh,
+            Some(&session_id),
+            false,
+            Path::new("/tmp/shared-project"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            argv[argv.len() - 2..],
+            ["--session-id".to_string(), session_id]
+        );
+    }
+
+    #[test]
+    fn opencode_yolo_launch_adds_auto() {
+        let provider = ProviderKind::from_str("opencode");
+        let config = provider_config(&Config::default(), &provider);
+        let cwd = Path::new("/tmp/shared-project");
+
+        let normal =
+            launch_args(&config, &provider, &SessionLaunch::Fresh, None, false, cwd).unwrap();
+        let yolo = launch_args(&config, &provider, &SessionLaunch::Fresh, None, true, cwd).unwrap();
+        let resumed = launch_args(
+            &config,
+            &provider,
+            &SessionLaunch::LegacyLatest,
+            None,
+            true,
+            cwd,
+        )
+        .unwrap();
+
+        assert!(normal.is_empty());
+        assert_eq!(yolo, vec!["--auto"]);
+        assert_eq!(resumed, vec!["--continue", "--auto"]);
+    }
+
+    #[test]
+    fn shared_mode_never_emits_a_latest_selector() {
+        for provider in ["claude", "codex"] {
+            let mut session = make_session("shared", provider, "/tmp/shared-project");
+            session.shared_workspace = true;
+            session.started_providers = vec![provider.to_string()];
+            let project = make_project("project-1", provider);
+            let app = test_app_with_sessions(vec![session.clone()], vec![project]);
+            let config = provider_config(&app.config, &session.provider);
+
+            for stored_id in [None, Some("not-a-uuid")] {
+                let mut candidate = session.clone();
+                if let Some(stored_id) = stored_id {
+                    candidate
+                        .provider_session_ids
+                        .insert(provider.to_string(), stored_id.to_string());
+                }
+                let launch = app.should_resume_session(&candidate);
+                assert_eq!(launch, SessionLaunch::Fresh);
+                let argv = launch_args(
+                    &config,
+                    &session.provider,
+                    &launch,
+                    None,
+                    false,
+                    Path::new(&session.worktree_path),
+                )
+                .unwrap();
+                assert!(
+                    !argv
+                        .iter()
+                        .any(|arg| matches!(arg.as_str(), "--continue" | "--last"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_targeted_resume_pins_the_current_workspace() {
+        let provider = ProviderKind::from_str("codex");
+        let config = provider_config(&Config::default(), &provider);
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let cwd = Path::new("/tmp/shared-project");
+
+        let argv = launch_args(
+            &config,
+            &provider,
+            &SessionLaunch::ResumeId(session_id.clone()),
+            None,
+            false,
+            cwd,
+        )
+        .unwrap();
+
+        assert_eq!(
+            argv,
+            vec![
+                "--no-alt-screen".to_string(),
+                "resume".to_string(),
+                session_id,
+                "-C".to_string(),
+                cwd.to_string_lossy().into_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_provider_without_targeted_resume_gets_clear_warning() {
+        let mut session = make_session("shared", "gemini", "/tmp/shared-project");
+        session.shared_workspace = true;
+        let project = make_project("project-1", "gemini");
+        let app = test_app_with_sessions(vec![session], vec![project]);
+
+        let warning = app
+            .shared_targeted_resume_warning("shared")
+            .expect("shared provider without exact resume must warn");
+        assert!(warning.contains("resume_by_id_args is not configured"));
+        assert!(warning.contains("never use a latest-session selector"));
     }
 
     #[test]
@@ -3245,6 +3554,7 @@ mod tests {
         let mut app = test_app_with_sessions(Vec::new(), Vec::new());
         app.config.workspace = Some(crate::config::WorkspaceConfig {
             default_mode: WorkspaceMode::Shared,
+            auto_resume_shared: false,
         });
 
         app.resume_add_project_after_meta(
@@ -3280,6 +3590,7 @@ mod tests {
         let mut app = test_app_with_sessions(vec![session], vec![project]);
         app.config.workspace = Some(crate::config::WorkspaceConfig {
             default_mode: WorkspaceMode::Shared,
+            auto_resume_shared: false,
         });
 
         app.ensure_project_worktree_links();

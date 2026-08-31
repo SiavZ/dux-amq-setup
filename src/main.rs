@@ -21,6 +21,7 @@ mod pty;
 mod purge;
 mod purge_encoding;
 mod raw_input;
+mod resume_recovery;
 mod sanitize;
 mod statusline;
 mod storage;

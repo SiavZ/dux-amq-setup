@@ -194,6 +194,7 @@ mod tests {
         let mut config = Config {
             workspace: Some(WorkspaceConfig {
                 default_mode: WorkspaceMode::Worktree,
+                auto_resume_shared: false,
             }),
             ..Config::default()
         };
@@ -232,6 +233,7 @@ mod tests {
             deleted_at: None,
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             state: SessionState::Created { created_at: now },
             settings: SessionSettings::default(),
             created_at: now,

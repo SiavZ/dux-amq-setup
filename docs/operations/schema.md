@@ -1,7 +1,7 @@
 # Session database schema
 
 dux stores session metadata in `sessions.sqlite3`. `PRAGMA user_version` is
-currently `5`; startup applies each numbered migration in one transaction with
+currently `6`; startup applies each numbered migration in one transaction with
 its version bump.
 
 ## `agent_sessions`
@@ -9,8 +9,8 @@ its version bump.
 Migration `0005_shared_workspace.sql` rebuilds the table and retains every
 pre-v5 column. It adds:
 
-- `shared_workspace INTEGER NOT NULL DEFAULT 0` — dark in Phase 1; no runtime
-  subsystem changes behavior based on it yet.
+- `shared_workspace INTEGER NOT NULL DEFAULT 0` — durable lifecycle mode;
+  shared rows use the registered checkout and never own a worktree or branch.
 - `agent_handle TEXT NOT NULL UNIQUE` — immutable local session identity,
   limited to 1–64 lowercase ASCII letters, digits, `_`, and `-`.
 - `deleted_at TEXT` — nullable RFC 3339 tombstone timestamp.
@@ -19,6 +19,13 @@ Existing handles are derived from the worktree-path basename in primary-key
 order. Collisions receive deterministic `-2`, `-3`, … suffixes. The rebuild,
 Rust backfill, `session_prs` copy, index recreation, `foreign_key_check`, and
 `user_version = 5` commit or roll back together.
+
+Migration `0006_provider_session_ids.sql` adds
+`provider_session_ids TEXT NOT NULL DEFAULT '{}'`. The JSON object maps a
+provider name to that agent's exact provider conversation UUID. SQLite remains
+the sole durable authority; startup recovery and fresh-launch capture update
+this column, and shared sessions never substitute a latest/recency selector for
+a missing or invalid UUID.
 
 Normal session loads return only rows where `deleted_at IS NULL`. UI deletion
 sets the tombstone and retains the complete row. Destructive maintenance can
@@ -39,7 +46,11 @@ restarts.
 
 Under a configured shared AMQ root, `agents/<agent_handle>/.dux-amq-source`
 is an atomic JSON ownership record containing `store_id`, `session_id`, and an
-optional `wake_pid`. Rust and all provider wrappers hold
+optional legacy `wake_pid` left by pre-managed-wake installs. New wrappers let
+AMQ bind wake to the provider process and record its lifecycle in `.wake.lock`
+instead. Before relaunch they call AMQ's guarded `wake recover-owner`, which
+removes a dead exact-owner claim but refuses to steal one from a live owner.
+Rust and all provider wrappers hold
 `meta/config.lock` with `flock` for the complete owner/config read-modify-write.
 If that mandatory lock cannot be acquired, registration fails closed.
 
@@ -53,7 +64,8 @@ the handle is immutable.
 Ordinary deletion performs AMQ cleanup only for an exact owner match; foreign,
 legacy, missing, or unreadable markers are left untouched and never block the
 local session tombstone. Exact-owner cleanup removes the handle from AMQ's live
-`config.json`, clears and then terminates the optional recorded wake PID, and
-keeps the inbox plus owner record reserved. The legacy hard-purge cascade now
+`config.json`, clears and then terminates any legacy recorded wake PID, and
+keeps the inbox plus owner record reserved; owner-bound wake exits with its
+provider. The legacy hard-purge cascade now
 targets the persisted `agent_handle` rather than a worktree basename; Phase 5
 wires the exposed exact-owner free primitive into that cascade.

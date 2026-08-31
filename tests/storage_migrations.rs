@@ -9,7 +9,7 @@
 //! no-op, and that an old `Config` parses and is upgraded to the
 //! current schema by [`migrate_config`].
 
-use dux::config::{CONFIG_SCHEMA_CURRENT, Config, migrate_config};
+use dux::config::{CONFIG_SCHEMA_CURRENT, Config, DuxPaths, ensure_config, migrate_config};
 use dux::storage::SessionStore;
 use rusqlite::{Connection, params};
 
@@ -79,6 +79,7 @@ fn migrate_from_empty_db_runs_all_migrations() {
         "title",
         "project_path",
         "started_providers",
+        "provider_session_ids",
         "status",
         "state_json",
         "session_settings",
@@ -95,6 +96,53 @@ fn migrate_from_empty_db_runs_all_migrations() {
              columns = {agent_sessions_columns:?}"
         );
     }
+}
+
+#[test]
+fn migration_0006_adds_provider_session_ids_to_v5_database() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("v5.sqlite3");
+    drop(SessionStore::open(&path).expect("create current database"));
+
+    let conn = Connection::open(&path).expect("open raw database");
+    conn.execute_batch(
+        r#"
+        alter table agent_sessions drop column provider_session_ids;
+        pragma user_version = 5;
+        insert into agent_sessions
+            (id, project_id, provider, source_branch, branch_name,
+             worktree_path, agent_handle, status, created_at, updated_at)
+        values
+            ('legacy', 'project', 'claude', 'main', 'legacy',
+             '/tmp/legacy', 'legacy', 'detached',
+             '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+        "#,
+    )
+    .expect("construct v5 fixture");
+    let old_columns: Vec<String> = conn
+        .prepare("pragma table_info(agent_sessions)")
+        .expect("prepare old table_info")
+        .query_map([], |row| row.get(1))
+        .expect("query old table_info")
+        .collect::<rusqlite::Result<_>>()
+        .expect("collect old columns");
+    assert!(!old_columns.contains(&"provider_session_ids".to_string()));
+    drop(conn);
+
+    let store = SessionStore::open(&path).expect("migrate v5 to v6");
+    assert_eq!(
+        store.schema_version().expect("schema version"),
+        SessionStore::CURRENT_SCHEMA_VERSION
+    );
+    let provider_session_ids: String = store
+        .conn()
+        .query_row(
+            "select provider_session_ids from agent_sessions where id = 'legacy'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read migrated provider map");
+    assert_eq!(provider_session_ids, "{}");
 }
 
 #[test]
@@ -117,12 +165,12 @@ fn migration_0005_backfills_duplicate_handles_deterministically() {
         "#,
     );
 
-    let store = SessionStore::open(&path).expect("migrate v4 to v5");
+    let store = SessionStore::open(&path).expect("migrate v4 to current schema");
     let version: u32 = store
         .conn()
         .query_row("pragma user_version", [], |row| row.get(0))
-        .expect("read v5 version");
-    assert_eq!(version, 5);
+        .expect("read current schema version");
+    assert_eq!(version, SessionStore::CURRENT_SCHEMA_VERSION);
     let handles: Vec<(String, String)> = store
         .conn()
         .prepare("select id, agent_handle from agent_sessions order by id")
@@ -269,7 +317,7 @@ fn migration_0005_drops_orphan_session_prs_and_succeeds() {
         .conn()
         .query_row("pragma user_version", [], |row| row.get(0))
         .expect("version");
-    assert_eq!(version, 5);
+    assert_eq!(version, SessionStore::CURRENT_SCHEMA_VERSION);
 }
 
 #[test]
@@ -493,4 +541,122 @@ fn config_v0_loads_and_migrates_to_current() {
     // Running the migration twice is a no-op (the loop guard exits).
     let migrated_again = migrate_config(migrated);
     assert_eq!(migrated_again.schema_version, CONFIG_SCHEMA_CURRENT);
+}
+
+#[test]
+fn config_v1_removes_only_the_legacy_open_worktree_binding() {
+    let mut old = Config {
+        schema_version: 1,
+        ..Config::default()
+    };
+    old.keys
+        .bindings
+        .insert("open_worktree_in_editor".into(), vec!["o".into()]);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let paths = DuxPaths {
+        config_path: root.join("config.toml"),
+        sessions_db_path: root.join("sessions.sqlite3"),
+        worktrees_root: root.join("worktrees"),
+        lock_path: root.join("dux.lock"),
+        root,
+    };
+    std::fs::write(
+        &paths.config_path,
+        toml::to_string(&old).expect("serialize v1 config"),
+    )
+    .expect("write v1 config");
+
+    let migrated = ensure_config(&paths).expect("load and persist migration");
+    assert_eq!(migrated.schema_version, CONFIG_SCHEMA_CURRENT);
+    assert_eq!(
+        migrated.keys.bindings["open_worktree_in_editor"],
+        Vec::<String>::new()
+    );
+    let persisted: Config =
+        toml::from_str(&std::fs::read_to_string(&paths.config_path).expect("read migrated config"))
+            .expect("parse migrated config");
+    assert_eq!(persisted.schema_version, CONFIG_SCHEMA_CURRENT);
+    assert!(persisted.keys.bindings["open_worktree_in_editor"].is_empty());
+
+    let mut customized = Config {
+        schema_version: 1,
+        ..Config::default()
+    };
+    customized
+        .keys
+        .bindings
+        .insert("open_worktree_in_editor".into(), vec!["ctrl-o".into()]);
+
+    let migrated = migrate_config(customized);
+    assert_eq!(
+        migrated.keys.bindings["open_worktree_in_editor"],
+        vec!["ctrl-o"]
+    );
+}
+
+#[test]
+fn config_v2_moves_default_codex_scrollback_into_dux() {
+    let mut old = Config {
+        schema_version: 2,
+        ..Config::default()
+    };
+    let codex = old
+        .providers
+        .commands
+        .get_mut("codex")
+        .expect("codex provider");
+    codex.command = "codex-amq".into();
+    codex.args.clear();
+    codex.resume_args = Some(vec!["resume".into(), "--last".into()]);
+    codex.resume_by_id_args = Some(vec!["resume".into(), "{session_id}".into()]);
+    codex.forward_scroll = true;
+
+    let mut customized = old.clone();
+    customized.providers.commands["codex"].args = vec!["--model".into(), "o3".into()];
+
+    let migrated = migrate_config(old);
+    let codex = &migrated.providers.commands["codex"];
+    assert_eq!(codex.args, ["--no-alt-screen"]);
+    assert_eq!(
+        codex.resume_args.as_deref().expect("resume args"),
+        ["--no-alt-screen", "resume", "--last"]
+    );
+    assert_eq!(
+        codex
+            .resume_by_id_args
+            .as_deref()
+            .expect("resume-by-id args"),
+        ["--no-alt-screen", "resume", "{session_id}"]
+    );
+    assert!(!codex.forward_scroll);
+
+    let customized = migrate_config(customized);
+    assert_eq!(
+        customized.providers.commands["codex"].args,
+        ["--model", "o3"]
+    );
+}
+
+#[test]
+fn config_v3_keeps_claude_and_codex_drags_in_dux() {
+    let mut old = Config {
+        schema_version: 3,
+        ..Config::default()
+    };
+    old.providers.commands["claude"].command = "claude-amq".into();
+    old.providers.commands["claude"].forward_mouse = Some(true);
+    old.providers.commands["codex"].command = "codex-amq".into();
+    old.providers.commands["codex"].forward_mouse = Some(true);
+    let mut customized = old.clone();
+    customized.providers.commands["claude"].command = "my-claude-wrapper".into();
+
+    let migrated = migrate_config(old);
+    assert_eq!(migrated.schema_version, CONFIG_SCHEMA_CURRENT);
+    assert!(!migrated.providers.commands["claude"].forwards_mouse());
+    assert!(!migrated.providers.commands["codex"].forwards_mouse());
+
+    let customized = migrate_config(customized);
+    assert!(customized.providers.commands["claude"].forwards_mouse());
 }

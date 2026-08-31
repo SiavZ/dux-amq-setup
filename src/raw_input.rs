@@ -167,6 +167,13 @@ pub fn split_sequences(buf: &[u8]) -> (Vec<&[u8]>, &[u8]) {
             }
 
             let next = buf[i + 1];
+            if next == 0x1b {
+                // Keep the first bare Escape separate so the second can
+                // still prefix a CSI/OSC/SS3 sequence such as a mouse report.
+                i += 1;
+                sequences.push(&buf[start..i]);
+                continue;
+            }
             match next {
                 b'[' => {
                     // CSI sequence: ESC [ <params> <final byte 0x40-0x7e>

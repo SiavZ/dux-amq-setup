@@ -125,7 +125,7 @@ that `--continue` refuses.
 ```
 
 - dux creates a git worktree per pane; each pane gets its own CWD and Claude session storage.
-- The `claude-amq` wrapper sets `AM_ME = <branch>`, ensures `--no-init`, and uses the shared `AMQ_GLOBAL_ROOT` queue.
+- The `claude-amq` wrapper sets `AM_ME = <branch>`, ensures `--no-init`, and uses the shared `AMQ_GLOBAL_ROOT` queue. It safely recovers a dead exact-owner claim before `amq coop exec --require-wake`; AMQ refuses recovery when the recorded owner is still live, and the wrapper refuses to launch if wake is unavailable.
 - `--continue --fork-session` lets a worktree pick up the parent repo's most-recent chat as context, forking off cleanly so deferred-tool markers don't block resume.
 - Agents should use `dux peer send <peer> "..."`. The router uses Claude Peers for Claude targets and AMQ for non-Claude targets. If Claude Peers is unavailable for a Claude target, the send fails loudly instead of silently falling back to AMQ.
 
@@ -141,7 +141,7 @@ that `--continue` refuses.
 | `0`          | Compiled in but disabled at runtime    | present (via mode)                        |
 | (file absent)| Compiled out — no runtime toggle helps | present (via mode)                        |
 
-When the sentinel is present, the wrappers switch `amq wake` to `--inject-via "$LOCAL_BIN/dux-amq-inject-bridge"`. The bridge then runs end-to-end as:
+When the sentinel is present, the wrappers pass `--wake-inject-via "$LOCAL_BIN/dux-amq-inject-bridge"` to `amq coop exec`. The bridge then runs end-to-end as:
 
 ```
 amq send → AMQ inbox → wake daemon → bridge auto-drain → file queue → dux drainer → agent PTY
@@ -175,7 +175,7 @@ The drainer is a tick-driven worker inside the dux process. It owns the queue an
 
 - **Receiver→session mapping** (see `match_receiver` in `src/app/inject_runtime.rs`) mirrors the wrapper's identity-derivation priority: try `sanitise(basename(worktree_path))` first, then `sanitise(branch_name)`, then exact session id. This is necessary because dux sessions can change `branch_name` after worktree creation while the directory name is fixed — without basename matching, every queued message for those sessions would orphan in `.inflight`.
 - **Idle detection.** Before delivering, the drainer scans the last `[amq.inject].busy_scan_lines` rows of the agent's PTY (default 5) for any of `[amq.inject].busy_markers` (default `["esc to interrupt", "ctrl+c to interrupt"]`). If a marker matches, the body stays queued. The same `InputTarget::Agent` guard the watch engine uses also applies, so a user typing in a session is never interrupted.
-- **Two-phase delivery.** Once idle, the drainer types the body in **tick N** then writes a discrete `\r` in **tick N+1**. The ~16 ms gap between ticks gives Ink (Claude Code's TUI framework) time to flush the body chunk on its stdin before the `\r` arrives, so the `\r` is interpreted as a separate Enter keystroke rather than coalesced into a paste-shaped buffer that ignores it. Multi-line bodies have their interior newlines converted to Alt-Enter (`\e\r`) so they don't submit early — same chokepoint watch effects use.
+- **Two-phase delivery.** Once idle, the drainer sends the body in **phase 1** and a discrete `\r` in **phase 2** after the configured delay. Claude and Codex receive the body as explicit bracketed paste so rapid-input heuristics cannot strip or capture it; Gemini and custom providers keep Alt-Enter (`\e\r`) encoding for interior newlines. The separate `\r` then submits the complete prompt.
 - **Auto-clear collaboration guard.** Worker-mode `auto_clear_on_task_done` never fires while that agent has unread AMQ mail, pending outbox drafts, pending dux inject files, or recent AMQ inbox/outbox/receipt activity. The recent-activity window is `[amq.inject].auto_clear_collaboration_quiet_secs` (default 1800 seconds). This keeps back-and-forth collaboration threads from losing context between replies; orchestrator and attended modes still never auto-clear.
 - **Atomic claim.** On scan, each `<ts>.msg` file is renamed to `.inflight.<ts>.msg` before reading. Once delivered, the inflight file is unlinked. This pattern is the read-side mirror of the bridge's own `mktemp + mv -f` write pattern, and the shared `.inflight.` prefix means a single scan filter excludes both sides' in-flight files.
 - **Crash recovery with expiry.** At drainer startup (see `reclaim_stale_inflight_with_max_age`), fresh `.inflight.<ts>.msg` files left behind by a prior dux instance are renamed back to `<ts>.msg`. Files older than `[amq.inject].max_message_age_secs` (default 600 seconds) are moved to the receiver's `.expired/` directory instead of being replayed into restored agents. Plain `.msg` files older than the same TTL are also expired before the startup scan, so messages accumulated while dux was offline do not flood sessions on reboot. Set the value to `0` to restore replay-all behavior. Bridge-format `mktemp .inflight.XXXXXX` files (no `.msg` suffix) are skipped on purpose — they may belong to a concurrent in-progress write.
@@ -192,7 +192,7 @@ DUX_TMUX_TARGET=<pane>     # specific tmux target for the bridge (default: curre
 DUX_AMQ_VERIFY=1           # opt into strict HMAC verification at the bridge
 ```
 
-Inspect at runtime: `cat $STATE_ROOT/dux/.tiocsti-state` (absent → raw mode active). Wake stderr lands in `~/.local/share/dux-amq/wake-<me>.log` — verify-drop reasons are visible there. Drainer activity is in dux's main JSON log under `target: "dux::amq_inject"`; grep for `delivered AMQ wake to session` for a per-message audit trail.
+Inspect at runtime: `cat $STATE_ROOT/dux/.tiocsti-state` (absent → raw mode active) and `amq doctor --ops`. Wake stderr lands in `$AMQ_GLOBAL_ROOT/agents/<me>/.wake.log` — verify-drop reasons are visible there. Drainer activity is in dux's main JSON log under `target: "dux::amq_inject"`; grep for `delivered AMQ wake to session` for a per-message audit trail.
 
 A native upstream fix (HMAC envelope + stdin piping inside AMQ itself) is tracked in `docs/plans/audits/audit02/artifacts/13-upstream-issue.txt`. Upstream AMQ v0.34.0 also added `--defer-while-input` / `--input-quiet-for` flags that gate TIOCSTI on terminal activity heuristics — a coarser version of what dux's drainer does with PTY-snapshot scanning.
 

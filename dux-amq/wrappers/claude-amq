@@ -212,7 +212,7 @@ claim_and_register_locked() {
   if [[ -e "$agent_dir" || -L "$agent_dir" ]]; then
     [[ -d "$agent_dir" && ! -L "$agent_dir" ]] || return 1
   else
-    mkdir "$agent_dir" || return 1
+    mkdir -m 0700 "$agent_dir" || return 1
     created_dir=1
   fi
   if [[ -n "${DUX_STORE_ID:-}" ]]; then
@@ -252,6 +252,7 @@ claim_and_register_locked() {
     printf '[dux-amq] identity collision: %s has an ownerless agent directory\n' "$ME" >&2
     return 1
   fi
+  chmod 0700 "$agent_dir" || return 1
 
   tmp=$(mktemp "$ROOT/meta/config.json.tmp.XXXXXX") || return 1
   created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -319,8 +320,8 @@ if [[ -n "${CLAUDE_AMQ_SAFE:-}" ]]; then
   printf 'claude-amq: CLAUDE_AMQ_SAFE is deprecated; YOLO is now opt-in via CLAUDE_AMQ_YOLO\n' >&2
 fi
 
-# Audit02 P0-K (T2) + Phase 13 (audit01 P1-1): route incoming messages
-# through verify-then-bridge. Two transports are wired:
+# Route incoming messages through AMQ's owner-bound co-op wake. Two
+# transports are wired:
 #
 #   raw  → `amq wake --inject-mode raw` — uses `ioctl(TIOCSTI)` to push
 #          characters into the controlling TTY. Fast, in-process, but
@@ -339,68 +340,11 @@ fi
 #      when it detects a TIOCSTI-disabled kernel) → via.
 #   3. Default → raw (preserves the legacy fast path on TIOCSTI-OK hosts).
 #
-# Stderr is captured to a per-pane log (audit01 P1-2 hygiene) instead of
-# being dropped to /dev/null — `>2>/dev/null` previously hid the
-# "[amq-verify] dropping unsigned" lines that are the entire signal of
-# this phase actually doing its job.
-LOG_DIR="$HOME/.local/share/dux-amq"
-mkdir -p "$LOG_DIR" 2>/dev/null || true
-WAKE_LOG="$LOG_DIR/wake-$ME.log"
-WAKE_PID="$LOG_DIR/wake-$ME.pid"
-
 LOCAL_BIN="${LOCAL_BIN:-$HOME/.local/bin}"
-
-record_wake_pid_locked() {
-  local cfg="$ROOT/meta/config.json" marker="$ME_REGISTRATION" tmp
-  jq -e --arg store "$DUX_STORE_ID" --arg session "$DUX_SESSION_ID" \
-    '.store_id == $store and .session_id == $session' "$marker" >/dev/null
-  jq -e --arg me "$ME" '.agents | index($me) != null' "$cfg" >/dev/null
-  tmp=$(mktemp "$ROOT/agents/$ME/.owner.tmp.XXXXXX") || return 1
-  if ! jq --argjson pid "$WAKE_PID_VALUE" '.wake_pid = $pid' "$marker" >"$tmp" || \
-    ! mv "$tmp" "$marker"; then
-    rm -f "$tmp"
-    return 1
-  fi
-}
-
-record_wake_pid() {
-  local pid="$1"
-  [[ -n "${DUX_STORE_ID:-}" ]] || return 0
-  export WAKE_PID_VALUE="$pid"
-  export -f record_wake_pid_locked
-  "$FLOCK_BIN" -x "$ROOT/meta/config.lock" bash -euo pipefail -c record_wake_pid_locked
-}
-
-# Reap a stale wake daemon from a prior invocation for the same $ME.
-# Without this, re-running the wrapper (session restart, reconnect)
-# spawns a duplicate daemon — both race to deliver wake notifications,
-# causing double-delivery. The PID file written by the prior run lets us
-# kill-then-replace cleanly.
-reap_stale_wake() {
-  [[ -f "$WAKE_PID" ]] || return 0
-  local old_pid
-  old_pid=$(cat "$WAKE_PID" 2>/dev/null) || return 0
-  [[ -z "$old_pid" ]] && return 0
-  # Verify the PID is actually an `amq` process before killing — a
-  # recycled PID could belong to an unrelated process.
-  if kill -0 "$old_pid" 2>/dev/null; then
-    local cmdline=""
-    if [[ -r "/proc/$old_pid/cmdline" ]]; then
-      cmdline=$(tr '\0' ' ' < "/proc/$old_pid/cmdline" 2>/dev/null || true)
-    fi
-    if [[ "$cmdline" == *amq*wake* ]]; then
-      kill "$old_pid" 2>/dev/null || true
-      # Brief wait for clean shutdown; don't block the wrapper.
-      local i=0
-      while (( i < 5 )) && kill -0 "$old_pid" 2>/dev/null; do
-        sleep 0.1
-        (( i++ )) || true
-      done
-    fi
-  fi
-  rm -f "$WAKE_PID"
-}
-reap_stale_wake
+BRIDGE="$LOCAL_BIN/dux-amq-inject-bridge"
+if [[ ! -x "$BRIDGE" ]]; then
+  BRIDGE=$(command -v dux-amq-inject-bridge 2>/dev/null || true)
+fi
 
 INJECT_MODE="${DUX_AMQ_INJECT_MODE:-}"
 if [[ -z "$INJECT_MODE" ]]; then
@@ -411,76 +355,39 @@ if [[ -z "$INJECT_MODE" ]]; then
   fi
 fi
 
-# Audit02 P1-B: replace bare `&` with `setsid … & disown` and a PID
-# file. The bare-`&` form left `amq wake` as a child of the wrapper's
-# bash; if the parent shell hung up (SSH disconnect, terminal closed),
-# the wake daemon got SIGHUP and exited silently — every queued message
-# from peers was then dropped until the next interactive launch.
-#
-# `setsid` puts wake in its own session+process group, decoupled from
-# the controlling TTY. `disown` removes it from bash's job table so
-# `set -e` and shell exit don't reap it. The PID file under
-# $LOG_DIR/wake-$ME.pid lets the doctor tool (Phase 20) check liveness
-# without scanning /proc.
-#
-# Linux note: `setsid(1)` here is util-linux. macOS ships a different
-# implementation that lacks some flags but the bare invocation we use
-# is portable. dux-amq is Linux-only per the README, so this is mostly
-# documentary.
-#
-# Stderr is captured to $WAKE_LOG (audit01 P1-2 hygiene). stdout was
-# previously dropped; we now also append it so the doctor tool can
-# diff the log to spot wake-side errors.
+WAKE_ARGS=(--require-wake -y)
 case "$INJECT_MODE" in
   raw)
-    setsid amq wake --me "$ME" --root "$ROOT" --inject-mode raw \
-      </dev/tty >>"$WAKE_LOG" 2>&1 &
-    WAKE_CHILD_PID=$!
-    disown
-    echo "$WAKE_CHILD_PID" > "$WAKE_PID"
-    record_wake_pid "$WAKE_CHILD_PID" || {
-      kill "$WAKE_CHILD_PID" 2>/dev/null || true
-      rm -f "$WAKE_PID"
-      printf 'claude-amq: wake PID ownership recording failed; wake disabled\n' >&2
-    }
+    WAKE_ARGS+=(--wake-inject-mode raw)
     ;;
   via)
     # The bridge MUST be a single executable — AMQ doesn't support
     # shell-pipeline strings as `--inject-via`. The bridge wraps verify
     # and the inject strategy; see dux-amq/scripts/dux-amq-inject-bridge.
-    BRIDGE="$LOCAL_BIN/dux-amq-inject-bridge"
-    if [[ ! -x "$BRIDGE" ]]; then
-      # Fall back to PATH lookup (test environments / unpinned installs).
-      BRIDGE=$(command -v dux-amq-inject-bridge 2>/dev/null || true)
+    if [[ -z "$BRIDGE" || ! -x "$BRIDGE" ]]; then
+      printf 'claude-amq: dux-amq-inject-bridge not found; refusing to start without wake\n' >&2
+      exit 1
     fi
-    if [[ -n "$BRIDGE" && -x "$BRIDGE" ]]; then
-      setsid amq wake --me "$ME" --root "$ROOT" --inject-via "$BRIDGE" \
-        >>"$WAKE_LOG" 2>&1 &
-      WAKE_CHILD_PID=$!
-      disown
-      echo "$WAKE_CHILD_PID" > "$WAKE_PID"
-      record_wake_pid "$WAKE_CHILD_PID" || {
-        kill "$WAKE_CHILD_PID" 2>/dev/null || true
-        rm -f "$WAKE_PID"
-        printf 'claude-amq: wake PID ownership recording failed; wake disabled\n' >&2
-      }
-    else
-      printf 'claude-amq: dux-amq-inject-bridge not found; wake disabled\n' >&2
-    fi
+    WAKE_ARGS+=(--wake-inject-via "$BRIDGE")
     ;;
   *)
     printf 'claude-amq: DUX_AMQ_INJECT_MODE=%q not understood; using raw\n' "$INJECT_MODE" >&2
-    setsid amq wake --me "$ME" --root "$ROOT" --inject-mode raw \
-      </dev/tty >>"$WAKE_LOG" 2>&1 &
-    WAKE_CHILD_PID=$!
-    disown
-    echo "$WAKE_CHILD_PID" > "$WAKE_PID"
-    record_wake_pid "$WAKE_CHILD_PID" || {
-      kill "$WAKE_CHILD_PID" 2>/dev/null || true
-      rm -f "$WAKE_PID"
-      printf 'claude-amq: wake PID ownership recording failed; wake disabled\n' >&2
-    }
+    WAKE_ARGS+=(--wake-inject-mode raw)
     ;;
 esac
 
-exec amq coop exec --no-wake --no-init --root "$ROOT" --me "$ME" claude -- ${EXTRA[@]+"${EXTRA[@]}"} "$@"
+# AMQ leaves exact owner claims after an unclean exit. Recover only that
+# format; ownerless legacy locks are retired by coop's `-y` migration path.
+if jq -e '.owner.pid | numbers' "$ROOT/agents/$ME/.wake.lock" >/dev/null 2>&1; then
+  amq wake recover-owner --root "$ROOT" --me "$ME" --strict >/dev/null
+fi
+
+if [[ -n "${DUX_PANE:-}" && "${DUX_AMQ_VERIFY:-0}" != "1" ]]; then
+  if [[ -z "$BRIDGE" || ! -x "$BRIDGE" ]]; then
+    printf 'claude-amq: dux-amq-inject-bridge not found; refusing to start without backlog recovery\n' >&2
+    exit 1
+  fi
+  DUX_AMQ_STARTUP_OWNER_PID="$$" "$BRIDGE" &
+fi
+
+exec amq coop exec --no-init --root "$ROOT" --me "$ME" "${WAKE_ARGS[@]}" claude -- ${EXTRA[@]+"${EXTRA[@]}"} "$@"

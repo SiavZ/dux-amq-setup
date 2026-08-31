@@ -20,8 +20,8 @@ teardown() {
   teardown_isolated_home
 }
 
-@test "managed wrappers atomically record store, session, and optional wake PID" {
-  local provider wrapper handle session marker
+@test "managed wrappers atomically record store and session without a detached wake PID" {
+  local provider wrapper handle session marker mode
   for provider in claude codex gemini; do
     wrapper="$WRAPPERS_DIR/$provider-amq"
     handle="$provider-managed"
@@ -30,8 +30,10 @@ teardown() {
     [ "$status" -eq 0 ]
     marker="$AMQ_GLOBAL_ROOT/agents/$handle/.dux-amq-source"
     jq -e --arg session "$session" \
-      '.store_id == "store-a" and .session_id == $session and (.wake_pid | type == "number")' \
+      '.store_id == "store-a" and .session_id == $session and (has("wake_pid") | not)' \
       "$marker" >/dev/null
+    mode=$(stat -c '%a' "${marker%/*}" 2>/dev/null || stat -f '%Lp' "${marker%/*}")
+    [ "$mode" = "700" ]
   done
 }
 

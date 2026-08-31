@@ -3,7 +3,7 @@
 # audit02 phase 22: wrapper P1 hygiene bundle.
 #
 # Verifies the five fixes in the bundle:
-#   P1-B  setsid + disown + PID file → wake survives parent shell hangup.
+#   P1-B  owner-bound `coop exec` wake → notifier follows the provider.
 #   P1-C  install.sh preflight collects ALL missing tools in one pass.
 #   P1-D  claude-amq seed reports rsync warning count when non-zero
 #         (previously swallowed errors with `2>/dev/null || true`).
@@ -15,11 +15,8 @@
 # Implementation notes:
 #   - We use the same `tests/fakes/amq` as wrappers.bats so the wrapper
 #     can run end-to-end without hitting the real provider.
-#   - For P1-B, the fake `amq wake` exits 0 immediately on its own; we
-#     instead test that the wrapper writes a PID file and the file
-#     contains a numeric pid. Verifying actual SIGHUP-survival would
-#     require a much heavier integration harness (real `amq wake` +
-#     real PTY); the cheap proof is "the structural change happened".
+#   - For P1-B, the fake records `coop exec` argv so the test proves wake
+#     is required and is not disabled by the wrapper.
 #   - For P1-C we drive install.sh with a stripped PATH so EVERY tool
 #     is missing, then assert the output reports the full list, not
 #     just the first miss.
@@ -41,6 +38,7 @@ setup() {
   unset CLAUDE_AMQ_SEED_FROM_PARENT CLAUDE_AMQ_NO_SEED
   unset DUX_AMQ_INJECT_MODE
   unset DUX_STORE_ID DUX_SESSION_ID DUX_AMQ_HANDLE DUX_AMQ_FLOCK
+  unset AMQ_FAKE_FAIL_RECOVER_OWNER
   export STATE_ROOT="$TEST_HOME/state"
   mkdir -p "$STATE_ROOT/dux"
   # Pin AMQ_GLOBAL_ROOT under $TEST_HOME so the new collision marker
@@ -54,37 +52,71 @@ teardown() {
 }
 
 # ---------------------------------------------------------------------------
-# P1-B: wake durability — setsid + PID file
+# P1-B: wake durability — AMQ-owned lifecycle
 # ---------------------------------------------------------------------------
 
-@test "P1-B: claude-amq writes wake-\$ME.pid under \$LOG_DIR" {
-  run "$WRAPPERS_DIR/claude-amq"
-  [ "$status" -eq 0 ]
-  pid_file="$HOME/.local/share/dux-amq/wake-p1pane.pid"
-  [ -f "$pid_file" ] || {
-    printf 'expected pid file at %s; ls:\n' "$pid_file" >&2
-    ls -la "$HOME/.local/share/dux-amq/" >&2 || true
-    return 1
-  }
-  pid=$(cat "$pid_file")
-  # Pid file must contain a positive integer.
-  [[ "$pid" =~ ^[0-9]+$ ]] || {
-    printf 'pid file did not contain numeric pid: %q\n' "$pid" >&2
-    return 1
-  }
-  [ "$pid" -gt 0 ]
+@test "P1-B: wrappers require AMQ-managed raw wake" {
+  local provider
+  for provider in claude codex gemini; do
+    : >"$ARGV_FILE"
+    run "$WRAPPERS_DIR/$provider-amq"
+    [ "$status" -eq 0 ]
+    grep -Fxq -- "--require-wake" "$ARGV_FILE"
+    grep -Fxq -- "-y" "$ARGV_FILE"
+    grep -Fxq -- "--wake-inject-mode" "$ARGV_FILE"
+    grep -Fxq -- "raw" "$ARGV_FILE"
+    ! grep -Fxq -- "--no-wake" "$ARGV_FILE"
+  done
 }
 
-@test "P1-B: codex-amq writes wake-\$ME.pid under \$LOG_DIR" {
+@test "P1-B: bridge mode is delegated to AMQ-managed wake" {
+  DUX_AMQ_INJECT_MODE=via run "$WRAPPERS_DIR/codex-amq"
+  [ "$status" -eq 0 ]
+  grep -Fxq -- "--require-wake" "$ARGV_FILE"
+  grep -Fxq -- "--wake-inject-via" "$ARGV_FILE"
+  grep -Fxq -- "$BATS_TEST_DIRNAME/../scripts/dux-amq-inject-bridge" "$ARGV_FILE"
+}
+
+@test "P1-B: wrappers recover a dead exact owner before managed coop" {
+  local provider commands
+  for provider in claude codex gemini; do
+    run "$WRAPPERS_DIR/$provider-amq"
+    [ "$status" -eq 0 ]
+    printf '{"pid":12345,"owner":{"pid":1234}}\n' \
+      >"$AMQ_GLOBAL_ROOT/agents/p1pane/.wake.lock"
+    : >"$ARGV_FILE"
+    run "$WRAPPERS_DIR/$provider-amq"
+    [ "$status" -eq 0 ]
+    commands=$(awk '/^ARGV$/{getline; print}' "$ARGV_FILE")
+    [ "$commands" = $'wake\ncoop' ]
+    grep -Fxq -- "recover-owner" "$ARGV_FILE"
+    rm "$AMQ_GLOBAL_ROOT/agents/p1pane/.wake.lock"
+  done
+}
+
+@test "P1-B: wrapper fails closed when exact-owner recovery is refused" {
   run "$WRAPPERS_DIR/codex-amq"
   [ "$status" -eq 0 ]
-  [ -f "$HOME/.local/share/dux-amq/wake-p1pane.pid" ]
+  printf '{"pid":12345,"owner":{"pid":1234}}\n' \
+    >"$AMQ_GLOBAL_ROOT/agents/p1pane/.wake.lock"
+  : >"$ARGV_FILE"
+  AMQ_FAKE_FAIL_RECOVER_OWNER=1 run "$WRAPPERS_DIR/codex-amq"
+  [ "$status" -eq 42 ]
+  [ "$(awk '/^ARGV$/{getline; print}' "$ARGV_FILE")" = "wake" ]
 }
 
-@test "P1-B: gemini-amq writes wake-\$ME.pid under \$LOG_DIR" {
-  run "$WRAPPERS_DIR/gemini-amq"
+@test "P1-B: ownerless legacy wake is left for coop migration" {
+  run "$WRAPPERS_DIR/codex-amq"
   [ "$status" -eq 0 ]
-  [ -f "$HOME/.local/share/dux-amq/wake-p1pane.pid" ]
+  printf '{"pid":12345,"wake_mode":"generic"}\n' \
+    >"$AMQ_GLOBAL_ROOT/agents/p1pane/.wake.lock"
+  : >"$ARGV_FILE"
+
+  run "$WRAPPERS_DIR/codex-amq"
+
+  [ "$status" -eq 0 ]
+  [ "$(awk '/^ARGV$/{getline; print}' "$ARGV_FILE")" = "coop" ]
+  grep -Fxq -- "-y" "$ARGV_FILE"
 }
 
 @test "P1-F: wrappers register dynamic handles in AMQ config.json" {
@@ -423,7 +455,7 @@ setup_parent_and_worktree_with_unreadable_file() {
   rc2=$(cat "$second_rc")
   [[ "$rc1:$rc2" == "0:1" || "$rc1:$rc2" == "1:0" ]]
   local launches
-  launches=$(grep -c '^ARGV$' "$ARGV_FILE" || true)
+  launches=$(awk '/^ARGV$/{getline; if ($0 == "coop") launches++} END{print launches + 0}' "$ARGV_FILE")
   [ "$launches" -eq 1 ] || {
     printf 'expected one launch, got %s\nfirst:\n%s\nsecond:\n%s\nargv:\n%s\n' \
       "$launches" "$(cat "$first_out")" "$(cat "$second_out")" "$(cat "$ARGV_FILE")" >&2

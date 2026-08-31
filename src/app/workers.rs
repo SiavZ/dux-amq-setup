@@ -15,6 +15,7 @@ impl App {
                         client,
                         pty_size,
                         status_message,
+                        fresh_capture,
                     } = *boxed;
                     self.create_agent_in_flight = false;
                     self.last_pty_size = pty_size;
@@ -32,6 +33,7 @@ impl App {
                         crate::pty::PtyHandle::new(client),
                     );
                     self.mark_session_provider_started(&session_id);
+                    self.finish_fresh_capture(&session_id, fresh_capture);
                     self.update_branch_sync_sessions();
                     self.rebuild_left_items();
                     self.selected_left = self
@@ -43,7 +45,11 @@ impl App {
                     self.show_agent_surface();
                     self.ui.input_target = InputTarget::Agent;
                     self.ui.fullscreen_overlay = FullscreenOverlay::Agent;
-                    self.set_info(status_message);
+                    if let Some(warning) = self.shared_targeted_resume_warning(&session_id) {
+                        self.set_warning(warning);
+                    } else {
+                        self.set_info(status_message);
+                    }
                 }
                 WorkerEvent::CreateAgentFailed(message) => {
                     self.create_agent_in_flight = false;
@@ -729,12 +735,50 @@ impl App {
                         Err(err) => self.set_error(format!("Commit failed: {err}")),
                     }
                 }
-                WorkerEvent::AutoResumeSpawned {
-                    session_id,
-                    used_resume_args,
-                    result,
+                WorkerEvent::AutoResumeSpawnOnMain {
+                    session,
+                    launch,
+                    fresh_capture,
+                    ack,
                 } => {
-                    self.handle_auto_resume_spawned(session_id, used_resume_args, result);
+                    // The fork MUST happen here on the main thread (macOS
+                    // fork-safety) — see the WorkerEvent variant docs.
+                    match fresh_capture {
+                        Ok(capture) => self.spawn_auto_resume_on_main(*session, launch, capture),
+                        Err(err) => {
+                            self.git
+                                .fresh_launches_in_flight
+                                .remove(&session.id);
+                            tracing::warn!(
+                                target: "dux::resume_recovery",
+                                session_id = %crate::sanitize::for_terminal(&session.id),
+                                provider = %crate::sanitize::for_terminal(session.provider.as_str()),
+                                error = %crate::sanitize::for_terminal(&err),
+                                "auto-resume fresh-session capture preparation failed",
+                            );
+                            self.set_warning(format!(
+                                "Could not auto-start agent \"{}\": exact {} conversation capture could not be prepared: {err}",
+                                self.session_label(&session),
+                                session.provider.as_str(),
+                            ));
+                        }
+                    }
+                    // Release the scheduler's throttle slot regardless of
+                    // outcome; it only bounds provider boots in flight.
+                    let _ = ack.send(());
+                }
+                WorkerEvent::FreshLaunchPrepared {
+                    session,
+                    context,
+                    result,
+                } => self.handle_prepared_fresh_launch(*session, context, result),
+                WorkerEvent::ProviderSessionCaptured {
+                    session_id,
+                    provider,
+                    result,
+                } => self.handle_provider_session_captured(&session_id, &provider, result),
+                WorkerEvent::ResumeRecoveryCompleted(result) => {
+                    self.handle_resume_recovery_completed(result);
                 }
                 WorkerEvent::DiskUsage(pct) => {
                     self.handle_disk_usage_event(pct);
@@ -910,26 +954,24 @@ impl App {
                 "resume args exited without output for agent \"{}\", retrying with regular args",
                 session.branch_name
             ));
-            match self.spawn_pty_for_session(&session, false) {
-                Ok(client) => {
-                    self.install_pty_for_session(session_id, crate::pty::PtyHandle::new(client));
-                    self.mark_session_provider_started(session_id);
-                    let proj_name = self.project_name_for_session(&session);
-                    self.set_info(format!(
-                            "No prior session to resume for agent \"{}\". Started a fresh {} session in project \"{}\".",
-                            session.branch_name,
+            let proj_name = self.project_name_for_session(&session);
+            self.launch_fresh_with_capture(
+                session.clone(),
+                FreshLaunchContext {
+                    success_message: format!(
+                        "No prior session to resume for agent \"{}\". Started a fresh {} session in project \"{}\".",
+                        session.branch_name,
                         session.provider.as_str(),
                         proj_name,
-                    ));
-                    retried.insert(session_id.clone());
-                }
-                Err(err) => {
-                    logger::error(&format!(
-                        "fallback PTY spawn also failed for {session_id}: {err}",
-                    ));
-                    self.mark_session_exited(session_id, None);
-                }
-            }
+                    ),
+                    failure_prefix: format!(
+                        "Fallback PTY spawn failed for agent \"{}\"",
+                        session.branch_name
+                    ),
+                    show_agent_surface: false,
+                },
+            );
+            retried.insert(session_id.clone());
         }
 
         for session_id in &exited {
@@ -1715,25 +1757,23 @@ impl App {
                 "resume args produced no visible output for agent \"{}\" within timeout, retrying with regular args",
                 session.branch_name
             ));
-            match self.spawn_pty_for_session(&session, false) {
-                Ok(client) => {
-                    self.install_pty_for_session(&session_id, crate::pty::PtyHandle::new(client));
-                    self.mark_session_provider_started(&session_id);
-                    let proj_name = self.project_name_for_session(&session);
-                    self.set_info(format!(
+            let proj_name = self.project_name_for_session(&session);
+            self.launch_fresh_with_capture(
+                session.clone(),
+                FreshLaunchContext {
+                    success_message: format!(
                         "Resume timed out for agent \"{}\" with no visible output. Started a fresh {} session in project \"{}\".",
                         session.branch_name,
                         session.provider.as_str(),
                         proj_name,
-                    ));
-                }
-                Err(err) => {
-                    logger::error(&format!(
-                        "timeout fallback PTY spawn failed for {session_id}: {err}",
-                    ));
-                    self.mark_session_exited(&session_id, None);
-                }
-            }
+                    ),
+                    failure_prefix: format!(
+                        "Timeout fallback PTY spawn failed for agent \"{}\"",
+                        session.branch_name
+                    ),
+                    show_agent_surface: false,
+                },
+            );
         }
     }
 
@@ -1778,6 +1818,268 @@ impl App {
         }
     }
 
+    pub(crate) fn handle_prepared_fresh_launch(
+        &mut self,
+        session: AgentSession,
+        context: FreshLaunchContext,
+        result: Result<crate::resume_recovery::FreshCapture, String>,
+    ) {
+        self.git.fresh_launches_in_flight.remove(&session.id);
+        let capture = match result {
+            Ok(capture) => capture,
+            Err(err) => {
+                tracing::warn!(
+                    target: "dux::resume_recovery",
+                    session_id = %crate::sanitize::for_terminal(&session.id),
+                    provider = %crate::sanitize::for_terminal(session.provider.as_str()),
+                    error = %crate::sanitize::for_terminal(&err),
+                    "fresh-session capture preparation failed",
+                );
+                self.set_error(format!("{}: {err}", context.failure_prefix));
+                return;
+            }
+        };
+
+        self.sync_provider_session_ids(&session);
+        if self.session_has_pty(&session.id) {
+            capture.abort();
+            return;
+        }
+
+        match self.spawn_pty_for_session(
+            &session,
+            &SessionLaunch::Fresh,
+            capture.claude_session_id(),
+        ) {
+            Ok(client) => {
+                self.install_pty_for_session(&session.id, crate::pty::PtyHandle::new(client));
+                self.mark_session_provider_started(&session.id);
+                self.finish_fresh_capture(&session.id, capture);
+                if context.show_agent_surface {
+                    self.show_agent_surface();
+                    self.ui.input_target = InputTarget::Agent;
+                    self.ui.fullscreen_overlay = FullscreenOverlay::Agent;
+                }
+                if let Some(warning) = self.shared_targeted_resume_warning(&session.id) {
+                    self.set_warning(warning);
+                } else {
+                    self.set_info(context.success_message);
+                }
+            }
+            Err(err) => {
+                capture.abort();
+                tracing::error!(
+                    target: "dux::resume_recovery",
+                    session_id = %crate::sanitize::for_terminal(&session.id),
+                    provider = %crate::sanitize::for_terminal(session.provider.as_str()),
+                    error = %crate::sanitize::for_terminal(&format!("{err:#}")),
+                    "fresh PTY spawn failed after capture preparation",
+                );
+                self.set_error(format!("{}: {err}", context.failure_prefix));
+            }
+        }
+    }
+
+    pub(crate) fn launch_fresh_with_capture(
+        &mut self,
+        session: AgentSession,
+        context: FreshLaunchContext,
+    ) {
+        if !self.git.fresh_launches_in_flight.insert(session.id.clone()) {
+            self.set_warning(format!(
+                "A fresh {} session is already being prepared for agent \"{}\".",
+                session.provider.as_str(),
+                self.session_label(&session),
+            ));
+            return;
+        }
+        if matches!(session.provider.as_str(), "claude" | "codex") {
+            let _ = dispatch_fresh_launch_preparation(
+                self.runtime.worker_tx.clone(),
+                self.session_store.clone(),
+                session,
+                context,
+            );
+        } else {
+            self.handle_prepared_fresh_launch(
+                session,
+                context,
+                Ok(crate::resume_recovery::FreshCapture::None),
+            );
+        }
+    }
+
+    pub(crate) fn finish_fresh_capture(
+        &mut self,
+        session_id: &str,
+        capture: crate::resume_recovery::FreshCapture,
+    ) {
+        let process_id = self
+            .find_pty_handle(session_id)
+            .and_then(|pty| pty.child_process_id());
+        match capture {
+            crate::resume_recovery::FreshCapture::None => {}
+            crate::resume_recovery::FreshCapture::Claude {
+                session_id: provider_session_id,
+                persist_after_spawn,
+            } => {
+                if persist_after_spawn {
+                    dispatch_provider_session_id_persist(
+                        self.runtime.worker_tx.clone(),
+                        self.session_store.clone(),
+                        session_id.to_string(),
+                        "claude".to_string(),
+                        provider_session_id,
+                    );
+                } else if let Some(session) = self
+                    .git
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == session_id)
+                {
+                    session
+                        .provider_session_ids
+                        .insert("claude".to_string(), provider_session_id);
+                }
+            }
+            crate::resume_recovery::FreshCapture::Codex(capture) => {
+                dispatch_codex_session_capture(
+                    self.runtime.worker_tx.clone(),
+                    self.session_store.clone(),
+                    session_id.to_string(),
+                    capture,
+                    process_id,
+                );
+            }
+        }
+    }
+
+    pub(crate) fn sync_provider_session_ids(&mut self, prepared: &AgentSession) {
+        if let Some(session) = self
+            .git
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == prepared.id)
+        {
+            session.provider_session_ids = prepared.provider_session_ids.clone();
+        }
+    }
+
+    pub(crate) fn shared_targeted_resume_warning(&self, session_id: &str) -> Option<String> {
+        let session = self
+            .git
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)?;
+        if !session.shared_workspace()
+            || provider_config(&self.config, &session.provider).supports_session_resume_by_id()
+        {
+            return None;
+        }
+        Some(format!(
+            "Started shared {} agent \"{}\" fresh. Exact per-agent resume is unavailable because providers.{}.resume_by_id_args is not configured; dux will never use a latest-session selector in shared mode.",
+            session.provider.as_str(),
+            self.session_label(session),
+            session.provider.as_str(),
+        ))
+    }
+
+    fn handle_provider_session_captured(
+        &mut self,
+        session_id: &str,
+        provider: &str,
+        result: Result<String, String>,
+    ) {
+        match result {
+            Ok(provider_session_id) => {
+                if let Some(session) = self
+                    .git
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == session_id)
+                {
+                    session
+                        .provider_session_ids
+                        .insert(provider.to_string(), provider_session_id);
+                }
+                tracing::info!(
+                    target: "dux::resume_recovery",
+                    session_id = %crate::sanitize::for_terminal(session_id),
+                    provider = %crate::sanitize::for_terminal(provider),
+                    "provider session UUID captured and persisted",
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "dux::resume_recovery",
+                    session_id = %crate::sanitize::for_terminal(session_id),
+                    provider = %crate::sanitize::for_terminal(provider),
+                    error = %crate::sanitize::for_terminal(&err),
+                    "provider session UUID capture failed closed",
+                );
+                if provider == "codex" {
+                    self.set_warning(format!(
+                        "Could not capture the exact Codex conversation for this agent: {err}. Another uncaptured Codex launch in this workspace is blocked until dux restarts."
+                    ));
+                } else {
+                    self.set_warning(format!(
+                        "Could not persist the replacement {provider} conversation UUID: {err}. The prior UUID was retained; retry a fresh restart."
+                    ));
+                }
+            }
+        }
+    }
+
+    fn handle_resume_recovery_completed(
+        &mut self,
+        result: Result<crate::resume_recovery::RecoveryReport, String>,
+    ) {
+        match result {
+            Ok(report) => {
+                for update in &report.updates {
+                    if let Some(session) = self
+                        .git
+                        .sessions
+                        .iter_mut()
+                        .find(|session| session.id == update.session_id)
+                    {
+                        session
+                            .provider_session_ids
+                            .insert(update.provider.clone(), update.provider_session_id.clone());
+                    }
+                }
+                tracing::info!(
+                    target: "dux::resume_recovery",
+                    recovered_sessions = report.updates.len(),
+                    copied_artifacts = report.copied_artifacts,
+                    warning_count = report.warnings.len(),
+                    "provider session recovery completed",
+                );
+                for warning in &report.warnings {
+                    tracing::warn!(
+                        target: "dux::resume_recovery",
+                        warning = %crate::sanitize::for_terminal(warning),
+                        "provider session recovery warning",
+                    );
+                }
+                if let Some(warning) = report.warnings.first() {
+                    self.set_warning(warning.clone());
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "dux::resume_recovery",
+                    error = %crate::sanitize::for_terminal(&err),
+                    "provider session recovery failed; continuing startup",
+                );
+                self.set_warning(format!(
+                    "Existing provider conversation recovery did not complete: {err}"
+                ));
+            }
+        }
+        self.auto_resume_all_sessions();
+    }
+
     pub(crate) fn queue_config_save(
         &self,
         success: impl Into<String>,
@@ -1791,6 +2093,158 @@ impl App {
             rollback,
         );
     }
+}
+
+pub(crate) fn dispatch_fresh_launch_preparation(
+    tx: Sender<WorkerEvent>,
+    store: SessionStore,
+    mut session: AgentSession,
+    context: FreshLaunchContext,
+) -> Result<()> {
+    let failure_tx = tx.clone();
+    let failure_session = session.clone();
+    let failure_context = context.clone();
+    thread::Builder::new()
+        .name("provider-session-prepare".to_string())
+        .spawn(move || {
+            let result =
+                crate::resume_recovery::prepare_fresh_capture_from_home(&mut session, &store)
+                    .map_err(|err| format!("{err:#}"));
+            let _ = tx.send(WorkerEvent::FreshLaunchPrepared {
+                session: Box::new(session),
+                context,
+                result,
+            });
+        })
+        .map(|_| ())
+        .map_err(|err| {
+            let message = format!("could not start fresh-session preparation worker: {err}");
+            let _ = failure_tx.send(WorkerEvent::FreshLaunchPrepared {
+                session: Box::new(failure_session),
+                context: failure_context,
+                result: Err(message.clone()),
+            });
+            anyhow::anyhow!(message)
+        })
+}
+
+fn dispatch_provider_session_id_persist(
+    tx: Sender<WorkerEvent>,
+    store: SessionStore,
+    session_id: String,
+    provider: String,
+    provider_session_id: String,
+) {
+    let failure_tx = tx.clone();
+    let failure_session_id = session_id.clone();
+    let failure_provider = provider.clone();
+    let spawn = thread::Builder::new()
+        .name("provider-session-persist".to_string())
+        .spawn(move || {
+            let result = store
+                .set_provider_session_id(&session_id, &provider, &provider_session_id)
+                .map(|()| provider_session_id)
+                .map_err(|err| format!("{err:#}"));
+            let _ = tx.send(WorkerEvent::ProviderSessionCaptured {
+                session_id,
+                provider,
+                result,
+            });
+        });
+    if let Err(err) = spawn {
+        let _ = failure_tx.send(WorkerEvent::ProviderSessionCaptured {
+            session_id: failure_session_id,
+            provider: failure_provider,
+            result: Err(format!(
+                "could not start provider-session persistence worker: {err}"
+            )),
+        });
+    }
+}
+
+fn dispatch_codex_session_capture(
+    tx: Sender<WorkerEvent>,
+    store: SessionStore,
+    session_id: String,
+    capture: crate::resume_recovery::CodexCapture,
+    process_id: Option<u32>,
+) {
+    let failure_tx = tx.clone();
+    let failure_session_id = session_id.clone();
+    let spawn = thread::Builder::new()
+        .name("codex-session-capture".to_string())
+        .spawn(move || {
+            let result = match capture.wait_for_id(None, process_id) {
+                Ok(Some(provider_session_id)) => {
+                    match store.set_provider_session_id(&session_id, "codex", &provider_session_id)
+                    {
+                        Ok(()) => {
+                            capture.resolve();
+                            Ok(provider_session_id)
+                        }
+                        Err(err) => {
+                            let message = format!("failed to persist captured Codex UUID: {err:#}");
+                            capture.block(&message);
+                            Err(message)
+                        }
+                    }
+                }
+                Ok(None) => {
+                    capture.abort();
+                    return;
+                }
+                Err(err) => {
+                    let message = format!("{err:#}");
+                    capture.block(&message);
+                    Err(message)
+                }
+            };
+            let _ = tx.send(WorkerEvent::ProviderSessionCaptured {
+                session_id,
+                provider: "codex".to_string(),
+                result,
+            });
+        });
+    if let Err(err) = spawn {
+        // Dropping the still-active capture fails closed in its coordinator.
+        let _ = failure_tx.send(WorkerEvent::ProviderSessionCaptured {
+            session_id: failure_session_id,
+            provider: "codex".to_string(),
+            result: Err(format!("could not start Codex capture worker: {err}")),
+        });
+    }
+}
+
+pub(crate) fn dispatch_resume_recovery(
+    tx: Sender<WorkerEvent>,
+    sessions: Vec<AgentSession>,
+    projects: Vec<Project>,
+    worktrees_root: PathBuf,
+    store: SessionStore,
+) -> Result<()> {
+    let failure_tx = tx.clone();
+    thread::Builder::new()
+        .name("provider-session-recovery".to_string())
+        .spawn(move || {
+            let result = crate::resume_recovery::ProviderDataRoots::from_home()
+                .and_then(|roots| {
+                    crate::resume_recovery::recover_stranded_histories(
+                        &sessions,
+                        &projects,
+                        &worktrees_root,
+                        &roots,
+                        &store,
+                    )
+                })
+                .map_err(|err| format!("{err:#}"));
+            let _ = tx.send(WorkerEvent::ResumeRecoveryCompleted(result));
+        })
+        .map(|_| ())
+        .map_err(|err| {
+            let message = format!("could not start provider-session recovery worker: {err}");
+            let _ = failure_tx.send(WorkerEvent::ResumeRecoveryCompleted(Err(message.clone())));
+            anyhow::anyhow!(message)
+        })
 }
 
 pub(crate) fn dispatch_orphan_worktree_inventory(tx: Sender<WorkerEvent>, paths: DuxPaths) {
@@ -2219,6 +2673,7 @@ pub(crate) fn run_create_agent_job(
         deleted_at: None,
         title: None,
         started_providers: Vec::new(),
+        provider_session_ids: Default::default(),
         state: crate::model::SessionState::Spawning { since: Utc::now() },
         settings,
         created_at: Utc::now(),
@@ -2312,6 +2767,43 @@ pub(crate) fn run_create_agent_job(
         "Launching {} in a fresh session...",
         session.provider.as_str()
     )));
+    let fresh_capture =
+        match crate::resume_recovery::prepare_fresh_capture_from_home(&mut session, &store) {
+            Ok(capture) => capture,
+            Err(err) => {
+                let safe_err = crate::sanitize::for_terminal(&format!("{err:#}"));
+                fail_recoverable_create(
+                    &store,
+                    session,
+                    format!(
+                        "Failed to prepare exact {} conversation capture: {safe_err}",
+                        provider_cfg.command
+                    ),
+                    &worker_tx,
+                );
+                return;
+            }
+        };
+    let launch_args = match sessions::launch_args(
+        &provider_cfg,
+        &session.provider,
+        &SessionLaunch::Fresh,
+        fresh_capture.claude_session_id(),
+        session.settings.yolo_permissions,
+        &worktree_path,
+    ) {
+        Ok(args) => args,
+        Err(err) => {
+            fresh_capture.abort();
+            fail_recoverable_create(
+                &store,
+                session,
+                format!("Failed to build provider launch arguments: {err}"),
+                &worker_tx,
+            );
+            return;
+        }
+    };
     // crossterm::terminal::size() returns (cols, rows).
     let (cols, rows) = term_size;
     // audit03 Phase 3: thread per-session env (YOLO, verify
@@ -2324,7 +2816,7 @@ pub(crate) fn run_create_agent_job(
     crate::peer::append_session_env(&mut per_session_env, &session, &store_id);
     let client = match PtyClient::spawn_with_env(
         &provider_cfg.command,
-        &provider_cfg.args,
+        &launch_args,
         &worktree_path,
         rows,
         cols,
@@ -2333,6 +2825,7 @@ pub(crate) fn run_create_agent_job(
     ) {
         Ok(client) => client,
         Err(err) => {
+            fresh_capture.abort();
             tracing::error!(
                 target: "dux::workers",
                 session_id = %session.id,
@@ -2363,6 +2856,7 @@ pub(crate) fn run_create_agent_job(
         client,
         pty_size: (rows, cols),
         status_message,
+        fresh_capture,
     })));
 }
 
@@ -3424,6 +3918,7 @@ mod shared_workspace_create_tests {
                     deleted_at: None,
                     title: Some("source".to_string()),
                     started_providers: Vec::new(),
+                    provider_session_ids: Default::default(),
                     state: SessionState::Created { created_at: now },
                     settings: SessionSettings::default(),
                     created_at: now,
