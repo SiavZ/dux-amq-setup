@@ -271,11 +271,16 @@ jobs:
           sha256sum *.tar.gz | LC_ALL=C sort > SHA256SUMS
           cat SHA256SUMS
 
+      # This job never checks out the repository, so `gh` cannot infer the
+      # target from a git remote — without `--repo` it fails with
+      # "failed to run git: fatal: not a git repository". The download step
+      # above already passes it; the upload step did not.
       - name: Upload SHA256SUMS
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${{ github.event.release.tag_name }}" \
+            --repo "${{ github.repository }}" \
             dist/SHA256SUMS --clobber
 
   # rustport Phase 03 — the check whose absence produced finding F1.
