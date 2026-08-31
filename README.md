@@ -18,31 +18,42 @@ Every agent runs through a PTY, the same pseudo-terminal your shell uses. That m
 
 ## Install
 
-**Homebrew:**
-
-```bash
-brew install patrickdappollonio/tap/dux
-```
+> This is a fork of [patrickdappollonio/dux](https://github.com/patrickdappollonio/dux) that
+> adds multi-agent messaging (AMQ), peer routing, watch rules, session resume, and the
+> `dux-amq` overlay. Installing upstream's `dux` will **not** give you those features.
+> Fork releases are tagged `dux-amq-vX.Y.Z` so they never collide with upstream's tags.
 
 **Shell:**
 
 ```bash
-curl -sSfL https://github.com/patrickdappollonio/dux/releases/latest/download/install.sh | bash
+curl -sSfL https://github.com/SiavZ/dux-amq-setup/releases/latest/download/install.sh | bash
 ```
 
 By default, the script installs to `~/.local/bin` if it exists and is in your `PATH`, otherwise `/usr/local/bin`. You can override the install directory or pin a specific version:
 
 ```bash
 # Custom install directory
-curl -sSfL https://github.com/patrickdappollonio/dux/releases/latest/download/install.sh | DUX_INSTALL_DIR=~/.bin bash
+curl -sSfL https://github.com/SiavZ/dux-amq-setup/releases/latest/download/install.sh | DUX_INSTALL_DIR=~/.bin bash
 
 # Specific version
-curl -sSfL https://github.com/patrickdappollonio/dux/releases/latest/download/install.sh | DUX_VERSION=v0.1.0 bash
+curl -sSfL https://github.com/SiavZ/dux-amq-setup/releases/latest/download/install.sh | DUX_VERSION=dux-amq-v0.1.0 bash
 ```
+
+Every release ships `linux-amd64`, `linux-arm64`, `darwin-amd64`, and `darwin-arm64` builds. The script verifies the archive against the release's `SHA256SUMS` before extracting and refuses to install on a mismatch.
 
 **Binary download:**
 
-Grab the latest release for your platform from the [Releases](https://github.com/patrickdappollonio/dux/releases) page. Extract it, drop the `dux` binary somewhere on your `PATH`, and run it. On first launch, dux creates a fully commented config file. That file *is* the documentation.
+Grab the latest release for your platform from the [Releases](https://github.com/SiavZ/dux-amq-setup/releases) page. Extract it, drop the `dux` binary somewhere on your `PATH`, and run it. On first launch, dux creates a fully commented config file. That file *is* the documentation.
+
+Each release also carries a CycloneDX SBOM per target and a keyless build-provenance attestation, verifiable with:
+
+```bash
+gh attestation verify dux-linux-amd64.tar.gz --owner SiavZ
+```
+
+**The AMQ overlay** (multi-agent wrappers, message queue, doctor tooling) is installed separately — see [`dux-amq/README.md`](dux-amq/README.md).
+
+**Homebrew:** not currently published for this fork. Use the shell installer above. (`brew install patrickdappollonio/tap/dux` installs *upstream* dux, which lacks the AMQ features this repo documents.)
 
 ## Prerequisites
 

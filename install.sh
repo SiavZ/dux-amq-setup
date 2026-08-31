@@ -76,25 +76,56 @@ verify_archive() {
     log "Verified ${archive_name} (${actual})"
 }
 
+# Parse the first tag_name out of a GitHub API response without requiring jq.
+# Works for both the single-object shape (/releases/latest) and the array
+# shape (/releases), where the newest release is first.
+parse_tag() {
+    printf '%s' "${1:-}" \
+        | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' \
+        | head -1 \
+        | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/'
+}
+
 resolve_version() {
     if [ -n "$VERSION" ]; then
-        # Ensure the version starts with 'v'.
+        # Fork releases are tagged `dux-amq-vX.Y.Z`; a bare `X.Y.Z` is also
+        # accepted and gets the `v` prefix for backward compatibility.
         case "$VERSION" in
-            v*) echo "$VERSION" ;;
-            *)  echo "v$VERSION" ;;
+            dux-amq-*|v*) echo "$VERSION" ;;
+            *)            echo "v$VERSION" ;;
         esac
         return
     fi
 
     log "Fetching latest release version..."
-    local response
-    response="$(http_get "https://api.github.com/repos/${REPO}/releases/latest")" \
-        || err "Failed to fetch latest release from GitHub API. Set DUX_VERSION to install a specific version."
+    local response tag
 
-    # Parse the tag_name from the JSON response without requiring jq.
-    local tag
-    tag="$(echo "$response" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')"
-    [ -n "$tag" ] || err "Could not determine latest release version. Set DUX_VERSION to install a specific version."
+    # `/releases/latest` excludes prereleases and returns 404 when a repository
+    # has only prereleases — which is exactly the state this repo was in before
+    # its first stable release. Fall back to the full list (newest first) so a
+    # prerelease-only repo still installs rather than dying with a bare error.
+    if response="$(http_get "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null)"; then
+        tag="$(parse_tag "$response")"
+    fi
+
+    if [ -z "${tag:-}" ]; then
+        log "No stable release found; falling back to the most recent release..."
+        response="$(http_get "https://api.github.com/repos/${REPO}/releases?per_page=1" 2>/dev/null)" || true
+        tag="$(parse_tag "${response:-}")"
+    fi
+
+    if [ -z "${tag:-}" ]; then
+        err "Could not determine the latest release for ${REPO}." \
+            "" \
+            "The repository may have no releases yet, or the GitHub API may be" \
+            "unreachable from this host (rate limit, proxy, or no network)." \
+            "" \
+            "Install a specific version instead:" \
+            "  curl -sSfL https://raw.githubusercontent.com/${REPO}/main/install.sh \\" \
+            "    | DUX_VERSION=dux-amq-v0.1.0 bash" \
+            "" \
+            "Available releases: https://github.com/${REPO}/releases"
+    fi
     echo "$tag"
 }
 

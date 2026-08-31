@@ -103,10 +103,20 @@ jobs:
       - name: Install cargo-cyclonedx
         run: cargo install --locked cargo-cyclonedx --version 0.5.9
 
+      # Fork tags are namespaced `dux-amq-vX.Y.Z` so they never collide with
+      # upstream's `vX.Y.Z` sequence (upstream owns v0.1.0…v0.6.0 and counting).
+      # `cargo set-version` needs bare semver, so strip both prefixes.
       - name: Set version from tag
         run: |
           VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${VERSION#dux-amq-}"
           VERSION="${VERSION#v}"
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "Tag '${{ github.event.release.tag_name }}' does not yield a semver" >&2
+            echo "after stripping 'dux-amq-' and 'v' prefixes (got '$VERSION')." >&2
+            echo "Tag releases as 'dux-amq-vX.Y.Z'." >&2
+            exit 1
+          fi
           cargo set-version "$VERSION"
 
       # audit02 P0-I §7.3 — replaces plain `cargo build --release`. The
@@ -216,6 +226,69 @@ jobs:
         run: |
           gh release upload "${{ github.event.release.tag_name }}" \
             dist/SHA256SUMS --clobber
+
+  # rustport Phase 03 — the check whose absence produced finding F1.
+  #
+  # Every `v*` tag in this repository is an ancestor of upstream/main, so
+  # `release.yml` had only ever built UPSTREAM code: no `peer.rs`, no
+  # `amq_inject.rs`, no `purge.rs`, no `watch/`. Released artifacts therefore
+  # contained none of the AMQ/peer/watch features the README advertises, and
+  # none of the Rust-side threat-model mitigations.
+  #
+  # `dux --help` enumerates the top-level subcommands (src/main.rs::print_help).
+  # `peer` and `session purge` exist only in this fork, so asserting they are
+  # present proves the artifact was built from fork lineage. An upstream-lineage
+  # tag fails this job instead of shipping silently.
+  verify-release:
+    name: Verify artifact is fork lineage
+    runs-on: ubuntu-24.04
+    needs: [build, sha256sums]
+    permissions:
+      contents: read
+    steps:
+      - name: Download linux-amd64 tarball and SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ github.event.release.tag_name }}" \
+            --repo "${{ github.repository }}" \
+            --pattern 'dux-linux-amd64.tar.gz' \
+            --pattern 'SHA256SUMS' \
+            --dir dist
+
+      - name: Verify checksum
+        run: |
+          cd dist
+          grep ' dux-linux-amd64.tar.gz$' SHA256SUMS | sha256sum -c -
+
+      - name: Extract and smoke-test
+        run: |
+          cd dist
+          tar -xzf dux-linux-amd64.tar.gz
+          chmod +x dux
+          ./dux --help > help.txt
+          cat help.txt
+
+          fail=0
+          for sub in "dux peer" "dux session" "dux doctor" "dux config"; do
+            if ! grep -q -- "$sub" help.txt; then
+              echo "MISSING subcommand in --help: $sub" >&2
+              fail=1
+            fi
+          done
+
+          # `peer` and `session purge` are fork-only. Their absence means this
+          # release was cut from an upstream-lineage ref.
+          if ! grep -q 'Route messages between Dux agent sessions' help.txt; then
+            echo "FATAL: 'dux peer' description absent — artifact is not fork lineage." >&2
+            fail=1
+          fi
+          if ! grep -q 'session purge' help.txt; then
+            echo "FATAL: 'dux session purge' absent — artifact is not fork lineage." >&2
+            fail=1
+          fi
+
+          exit $fail
 
   update-release-notes:
     name: Append install instructions
