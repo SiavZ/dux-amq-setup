@@ -87,9 +87,6 @@ jobs:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           cache-on-failure: false
 
-      - name: Install cargo-edit
-        run: cargo install cargo-edit --locked --version 0.13.8
-
       # audit02 P0-I — cargo-auditable embeds the dependency tree in the
       # binary so post-publication scans (`cargo audit bin`, trivy, grype)
       # can re-check release artefacts. ~4 KB overhead.
@@ -105,7 +102,16 @@ jobs:
 
       # Fork tags are namespaced `dux-amq-vX.Y.Z` so they never collide with
       # upstream's `vX.Y.Z` sequence (upstream owns v0.1.0…v0.6.0 and counting).
-      # `cargo set-version` needs bare semver, so strip both prefixes.
+      # Strip both prefixes to get the bare semver the manifest needs.
+      #
+      # This used to run `cargo set-version` from cargo-edit, which cannot be
+      # installed on the pinned toolchain: cargo-edit 0.13.8 pulls
+      # smol_str 0.3.4, which requires rustc >= 1.89 while rust-toolchain.toml
+      # pins 1.88.0. That broke every build job on this workflow's first-ever
+      # run. `Cargo.toml` is a single package with exactly one top-level
+      # `version =` line (asserted below), so an in-place edit is equivalent
+      # and drops a build-time dependency entirely. Cargo.lock's own `dux`
+      # entry is refreshed by the build step, which does not pass `--locked`.
       - name: Set version from tag
         run: |
           VERSION="${{ github.event.release.tag_name }}"
@@ -117,7 +123,26 @@ jobs:
             echo "Tag releases as 'dux-amq-vX.Y.Z'." >&2
             exit 1
           fi
-          cargo set-version "$VERSION"
+
+          # Refuse to guess if the manifest ever gains a workspace or a second
+          # top-level version key — better a failed release than a wrong one.
+          n=$(grep -c '^version = ' Cargo.toml)
+          if [ "$n" != "1" ]; then
+            echo "Expected exactly one top-level 'version =' in Cargo.toml, found $n." >&2
+            echo "The manifest shape changed; update this step deliberately." >&2
+            exit 1
+          fi
+
+          # -i.bak keeps this portable across GNU sed (Linux) and BSD sed (macOS).
+          sed -i.bak -E "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          rm -f Cargo.toml.bak
+
+          actual=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "(.*)"/\1/')
+          if [ "$actual" != "$VERSION" ]; then
+            echo "Version rewrite failed: wanted '$VERSION', manifest reads '$actual'." >&2
+            exit 1
+          fi
+          echo "Cargo.toml version set to $actual"
 
       # audit02 P0-I §7.3 — replaces plain `cargo build --release`. The
       # produced binary is byte-compatible (same compiler flags) but
