@@ -11,6 +11,11 @@ INSTALL_DIR="${DUX_INSTALL_DIR:-}"
 log() { printf '%s\n' "$@"; }
 err() { log "$@" >&2; exit 1; }
 
+# Progress output from a function whose stdout is captured by command
+# substitution MUST go to stderr, or it lands in the captured value.
+# `resolve_version` is called as `version="$(resolve_version)"`.
+note() { log "$@" >&2; }
+
 detect_os() {
     local os
     os="$(uname -s | tr '[:upper:]' '[:lower:]')"
@@ -97,7 +102,7 @@ resolve_version() {
         return
     fi
 
-    log "Fetching latest release version..."
+    note "Fetching latest release version..."
     local response tag
 
     # `/releases/latest` excludes prereleases and returns 404 when a repository
@@ -109,7 +114,7 @@ resolve_version() {
     fi
 
     if [ -z "${tag:-}" ]; then
-        log "No stable release found; falling back to the most recent release..."
+        note "No stable release found; falling back to the most recent release..."
         response="$(http_get "https://api.github.com/repos/${REPO}/releases?per_page=1" 2>/dev/null)" || true
         tag="$(parse_tag "${response:-}")"
     fi
