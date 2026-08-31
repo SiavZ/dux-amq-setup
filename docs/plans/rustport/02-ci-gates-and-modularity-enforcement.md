@@ -12,15 +12,36 @@ claim are required.
 
 ## Evidence
 
-- **Branch protection has never enforced a single required status check.** The
+- **CORRECTED 2026-08-31 (live API read, supersedes the audit02 artifact).** The
   audit02 evidence artifact
-  (`git show HEAD^:docs/plans/audits/audit02/artifacts/27-branch-protection.json`)
-  contains **no `required_status_checks` key at all** — only
-  `required_pull_request_reviews`, `allow_force_pushes: false`,
-  `allow_deletions: false`, `required_signatures: false`, `enforce_admins: false`.
-- `.github/BRANCH_PROTECTION.md:5` calls itself "the source of truth" and claims four
-  required contexts. `:21-26` explicitly lists `Format` and `Clippy` as **not**
-  required — directly contradicting `CLAUDE.md:164`.
+  (`git show 562419e^:docs/plans/audits/audit02/artifacts/27-branch-protection.json`)
+  contains **no `required_status_checks` key**, which the research reported as "zero
+  required checks were ever enforced." **That is no longer true of the live
+  repository.** `gh api repos/SiavZ/dux-amq-setup/branches/main/protection` returns:
+
+  ```text
+  required_status_checks.strict:   true
+  required_status_checks.contexts: Security, Test (macos-14), Test (ubuntu-24.04), shell
+  required_pull_request_reviews:   1 approval, dismiss_stale: true,
+                                   require_code_owner_reviews: true
+  enforce_admins:      false        <- still a real gap
+  required_signatures: false
+  allow_force_pushes:  false
+  allow_deletions:     false
+  ```
+
+  So four contexts **are** enforced and the review requirement is live and effective
+  (verified: PR #56 was blocked with `mergeStateStatus: BLOCKED`,
+  `reviewDecision: REVIEW_REQUIRED`). The audit02 artifact captured an earlier state.
+- **The remaining real gaps** are narrower than reported: `Format` and
+  `Clippy (ubuntu-24.04)` / `Clippy (macos-14)` are **not** in the required contexts
+  — matching `.github/BRANCH_PROTECTION.md:21-26` but directly contradicting
+  `CLAUDE.md:164`, which calls Clippy a gate that "fails the PR". And
+  `enforce_admins: false` still means an admin can bypass everything, including the
+  review requirement.
+- `.github/BRANCH_PROTECTION.md:5` calls itself "the source of truth" while being a
+  document that nothing verifies against the server — which is how it drifted out of
+  date in the first place. Work item 8 replaces it with a drift check.
 - **Duplicate check-run names:** `test.yml:13` and `pr.yml:66` both define a job named
   `Test (${{ matrix.os }})`. On a same-repo PR both report the same context against
   the same head SHA, so a required context can be satisfied by whichever run reports.
