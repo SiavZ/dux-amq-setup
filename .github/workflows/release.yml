@@ -177,14 +177,34 @@ jobs:
       - name: Package (reproducible)
         run: |
           if command -v gtar >/dev/null 2>&1; then TAR=gtar; else TAR=tar; fi
+          # `--mtime` normalises the tar MEMBER timestamps, but `-z` pipes the
+          # stream through gzip on stdin, and gzip then stamps WALL-CLOCK time
+          # into bytes 5-8 of its own header. The two archives below were
+          # therefore only ever byte-identical when both packagings happened to
+          # land inside the same second -- which is exactly how this check
+          # passed on three runners and failed on the slower Intel one with
+          # "differ: char 5". `gzip -n` zeroes that header timestamp, making the
+          # archive genuinely reproducible across time rather than by luck.
           package() {
             "$TAR" --sort=name --owner=0 --group=0 --numeric-owner \
               --mtime="@${SOURCE_DATE_EPOCH}" \
-              -czf "$1" -C "target/${{ matrix.target }}/release" dux
+              --use-compress-program='gzip -n' \
+              -cf "$1" -C "target/${{ matrix.target }}/release" dux
           }
           package "${{ matrix.archive }}.first"
+          # Deliberately straddle a second boundary. Without this the two
+          # packagings usually complete within the same second and `cmp`
+          # passes whether or not the output is actually time-independent,
+          # which is what let the gzip-header bug above go unnoticed.
+          sleep 2
           package "${{ matrix.archive }}"
-          cmp "${{ matrix.archive }}.first" "${{ matrix.archive }}"
+          if ! cmp "${{ matrix.archive }}.first" "${{ matrix.archive }}"; then
+            echo "Reproducibility check FAILED: two identical packagings differ." >&2
+            echo "First 16 bytes of each (gzip header is bytes 1-10):" >&2
+            od -An -tx1 -N16 "${{ matrix.archive }}.first" >&2
+            od -An -tx1 -N16 "${{ matrix.archive }}" >&2
+            exit 1
+          fi
           rm "${{ matrix.archive }}.first"
 
       # audit02 P0-I §7.5 — OIDC-keyless build provenance attestation.
