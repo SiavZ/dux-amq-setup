@@ -2674,7 +2674,7 @@ fn default_terminal_args() -> Vec<String> {
     vec!["-l".to_string()]
 }
 
-fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8] {
+fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 9] {
     [
         (
             "claude",
@@ -2846,6 +2846,48 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8] {
                 ],
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("curl -fsSL https://gh.io/copilot-install | bash".to_string()),
+                forward_scroll: false,
+                forward_mouse: None,
+                watch: Vec::new(),
+            },
+        ),
+        (
+            "jcode",
+            ProviderCommandConfig {
+                command: "jcode".to_string(),
+                // `--no-update` pins the running binary for the life of the
+                // pane. jcode auto-updates by default on release builds
+                // (`--auto-update` documents "default: true"), and a provider
+                // that replaces its own binary mid-session does not belong on
+                // a long-lived PTY.
+                args: vec!["--no-update".to_string()],
+                // jcode has no "resume the most recent session" selector:
+                // `--resume` with no argument LISTS sessions and waits on a
+                // picker, which would hang the PTY spawn. Leave it unset so
+                // dux starts a fresh session instead.
+                resume_args: None,
+                // `--resume <ID>` is the correct targeted-resume form, but
+                // `should_resume_session` gates ResumeId behind
+                // `uuid::Uuid::parse_str(id).is_ok()` and jcode session ids
+                // are `session_<name>_<epoch_ms>_<hex>` (for example
+                // `session_cactus_1788156095921_18c33bc3e9ed4d80`), not
+                // UUIDs. Configured so it works the moment that gate learns
+                // about non-UUID provider ids.
+                resume_by_id_args: Some(vec!["--resume".to_string(), "{session_id}".to_string()]),
+                resume_wait_timeout_ms: None,
+                // `jcode run` sends one message and exits; `--quiet`
+                // suppresses status output. Caveat: jcode still writes a
+                // trailing `[Tokens] upload: ...` line to stdout, so it lands
+                // in generated commit messages. `--json` returns a clean
+                // `{"text": ...}` object, but dux has no JSON extraction for
+                // oneshot output.
+                oneshot_args: vec![
+                    "run".to_string(),
+                    "--quiet".to_string(),
+                    "{prompt}".to_string(),
+                ],
+                oneshot_output: OneshotOutput::Stdout,
+                install_hint: Some("brew tap 1jehuang/jcode && brew install jcode".to_string()),
                 forward_scroll: false,
                 forward_mouse: None,
                 watch: Vec::new(),
@@ -4225,6 +4267,34 @@ oneshot_output = "stdout"
     }
 
     #[test]
+    fn default_jcode_pins_binary_and_disables_latest_resume() {
+        let providers = default_provider_commands();
+        let cfg = &providers.iter().find(|(n, _)| *n == "jcode").unwrap().1;
+        assert_eq!(cfg.command, "jcode");
+        // jcode auto-updates by default on release builds; a provider that
+        // swaps its own binary mid-session must not run on a long-lived PTY.
+        assert!(
+            cfg.args.iter().any(|a| a == "--no-update"),
+            "jcode must be launched with --no-update so the pane's binary is pinned",
+        );
+        // `--resume` with no argument LISTS sessions and waits on a picker,
+        // which would hang the PTY spawn. There is no "resume latest" form.
+        assert!(
+            !cfg.supports_session_resume(),
+            "jcode has no cwd-scoped resume-latest selector",
+        );
+        // Targeted resume is configured even though `should_resume_session`
+        // cannot reach it yet (it requires a UUID, and jcode ids are
+        // `session_<name>_<epoch_ms>_<hex>`).
+        assert_eq!(
+            cfg.resume_by_id_args.as_deref(),
+            Some(["--resume".to_string(), "{session_id}".to_string()].as_slice()),
+        );
+        assert_eq!(cfg.oneshot_args, vec!["run", "--quiet", "{prompt}"]);
+        assert!(matches!(cfg.oneshot_output, OneshotOutput::Stdout));
+    }
+
+    #[test]
     fn default_gemini_oneshot_uses_prompt_flag() {
         let providers = default_provider_commands();
         let gemini = providers.iter().find(|(n, _)| *n == "gemini").unwrap();
@@ -4289,6 +4359,7 @@ oneshot_output = "stdout"
             "copilot should be added"
         );
         assert!(providers.get("ntl").is_some(), "ntl should be added");
+        assert!(providers.get("jcode").is_some(), "jcode should be added");
         assert_eq!(providers.get("opencode").unwrap().command, "opencode");
         assert_eq!(providers.get("cline").unwrap().command, "cline");
         assert_eq!(providers.get("kilocode").unwrap().command, "kilo");

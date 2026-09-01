@@ -23,7 +23,7 @@ Principles that guide every decision in dux. If a change conflicts with a tenet,
 
 - **A provider is supported if and only if it supports PTY and oneshot mode.** PTY for interactive sessions; oneshot (headless: send a prompt, get one response) for automated tasks like commit message generation.
 - **Any CLI tool can be a provider.** Configure `command` in `config.toml` and dux spawns it. No adapters, no protocol layer. Adding a new provider is a config-only change, not a code change.
-- **Claude, Cline, Codex, Gemini, OpenCode, Kilo Code, NTL, and Copilot CLI are the defaults.**
+- **Claude, Cline, Codex, Gemini, OpenCode, Kilo Code, NTL, Copilot CLI, and jcode are the defaults.**
 - **No protocol layer.** No JSON-RPC, no custom message format, no adapter binaries. The CLI runs exactly as it would in a normal terminal.
 
 ### Git and Data Safety
