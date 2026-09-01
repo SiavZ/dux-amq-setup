@@ -1938,6 +1938,13 @@ impl App {
             }
         };
         if let Err(err) = result {
+            // Status-line-only reporting makes prompt-driven failures
+            // invisible in dux.log; log before showing.
+            tracing::error!(
+                target: "dux::sessions",
+                err = %crate::sanitize::for_terminal(&format!("{err:#}")),
+                "prompt action failed",
+            );
             self.set_error(crate::sanitize::for_terminal(&format!("{err:#}")));
         }
         false
@@ -2075,6 +2082,21 @@ impl App {
                 self.set_info(msg);
             }
             Err(err) => {
+                // Also log: `set_error` only reaches the status line, which is
+                // transient and often overwritten before it can be read. A
+                // reconnect that fails during auto-resume is then completely
+                // unobservable after the fact — dux.log shows the "reconnecting
+                // session" line and nothing explaining why it did not stick.
+                tracing::error!(
+                    target: "dux::sessions",
+                    session_id = %session.id,
+                    provider = %session.provider.as_str(),
+                    branch = %crate::sanitize::for_terminal(&session.branch_name),
+                    worktree = %crate::sanitize::for_terminal(&session.worktree_path),
+                    launch = ?launch,
+                    err = %crate::sanitize::for_terminal(&format!("{err:#}")),
+                    "reconnect failed",
+                );
                 self.set_error(format!(
                     "Reconnect failed for agent \"{}\": {err}",
                     session.branch_name
