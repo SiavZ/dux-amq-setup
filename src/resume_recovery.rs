@@ -37,6 +37,94 @@ impl ProviderDataRoots {
     }
 }
 
+/// Minimum size for a jcode session file to count as resumable. A pane that
+/// spawned fresh and sat idle leaves a near-empty session (~1-3 KB); real
+/// working sessions start around 50 KB. Resuming an idle shell would hide
+/// the session the operator actually wants back.
+const MIN_RESUMABLE_JCODE_SESSION_BYTES: u64 = 4096;
+
+/// How many newest metadata rows to consider per worktree. Bounds the
+/// filesystem probes when a directory has accumulated many stray sessions.
+const MAX_JCODE_RESUME_CANDIDATES: usize = 10;
+
+/// True iff `id` has the exact shape of a jcode session id
+/// (`session_<alnum>_<epoch-ms>_<hex>`, e.g.
+/// `session_cactus_1788156095921_18c33bc3e9ed4d80`). jcode ids are not
+/// UUIDs, and the id flows into a `--resume` CLI argument, so the shape
+/// check doubles as an injection guard.
+pub(crate) fn jcode_session_id_is_valid(id: &str) -> bool {
+    let Some(rest) = id.strip_prefix("session_") else {
+        return false;
+    };
+    let mut parts = rest.split('_');
+    let (Some(name), Some(epoch), Some(hex), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric())
+        && !epoch.is_empty()
+        && epoch.chars().all(|c| c.is_ascii_digit())
+        && !hex.is_empty()
+        && hex.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Resolve the newest resumable jcode session for `worktree` from jcode's
+/// own metadata database (`recent_sessions` in
+/// `~/.jcode/session-metadata-v1.sqlite3`). dux cannot assign jcode ids at
+/// spawn the way it does for Claude, and jcode has no rollout files to
+/// diff the way Codex does — but every jcode session records its
+/// `working_dir`, and dux agents own their directory, so "newest non-empty
+/// session for this directory" is the session the operator would pick from
+/// jcode's `/resume` menu. Any failure resolves to `None`, which keeps the
+/// fresh-launch behavior.
+pub(crate) fn resolve_latest_jcode_session(
+    metadata_db: &Path,
+    sessions_dir: &Path,
+    worktree: &Path,
+) -> Option<String> {
+    let conn = rusqlite::Connection::open_with_flags(
+        metadata_db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+    let canonical = fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+    let mut stmt = conn
+        .prepare(
+            "SELECT session_id FROM recent_sessions WHERE working_dir IN (?1, ?2) \
+             ORDER BY updated_at_ms DESC",
+        )
+        .ok()?;
+    let ids = stmt
+        .query_map(
+            rusqlite::params![worktree.to_string_lossy(), canonical.to_string_lossy()],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()?;
+    for id in ids.flatten().take(MAX_JCODE_RESUME_CANDIDATES) {
+        if !jcode_session_id_is_valid(&id) {
+            continue;
+        }
+        let session_file = sessions_dir.join(format!("{id}.json"));
+        match fs::metadata(&session_file) {
+            Ok(meta) if meta.len() >= MIN_RESUMABLE_JCODE_SESSION_BYTES => return Some(id),
+            _ => continue,
+        }
+    }
+    None
+}
+
+/// [`resolve_latest_jcode_session`] against the real `~/.jcode` layout.
+pub(crate) fn resolve_latest_jcode_session_from_home(worktree: &Path) -> Option<String> {
+    let root = home::home_dir()?.join(".jcode");
+    resolve_latest_jcode_session(
+        &root.join("session-metadata-v1.sqlite3"),
+        &root.join("sessions"),
+        worktree,
+    )
+}
+
 pub(crate) enum FreshCapture {
     None,
     Claude {
@@ -1329,5 +1417,109 @@ mod tests {
             None
         );
         capture.abort();
+    }
+
+    #[test]
+    fn jcode_session_id_shape_validation() {
+        assert!(jcode_session_id_is_valid(
+            "session_cactus_1788156095921_18c33bc3e9ed4d80"
+        ));
+        assert!(jcode_session_id_is_valid("session_guppy2_1_a"));
+        // Not UUIDs, wrong prefixes, missing segments, or shell-hostile
+        // characters must all be rejected before reaching `--resume`.
+        assert!(!jcode_session_id_is_valid(
+            "0b8dbb64-92a4-4bc1-a62c-27b6f6e2dc9f"
+        ));
+        assert!(!jcode_session_id_is_valid("session_cactus_1788156095921"));
+        assert!(!jcode_session_id_is_valid("session__1788156095921_18c3"));
+        assert!(!jcode_session_id_is_valid("session_cactus_17x8_18c3"));
+        assert!(!jcode_session_id_is_valid("session_cactus_1_zz; rm -rf"));
+        assert!(!jcode_session_id_is_valid(
+            "session_cactus_1_a_extra-segment"
+        ));
+        assert!(!jcode_session_id_is_valid("rollout_cactus_1_a"));
+        assert!(!jcode_session_id_is_valid(""));
+    }
+
+    fn write_jcode_metadata(db: &Path, rows: &[(&str, &str, i64)]) {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        // Only the columns the resolver queries; jcode's real table carries
+        // more, which SELECT-by-name is indifferent to.
+        conn.execute(
+            "CREATE TABLE recent_sessions (
+                session_id TEXT, working_dir TEXT, updated_at_ms INTEGER)",
+            [],
+        )
+        .unwrap();
+        for (id, dir, updated) in rows {
+            conn.execute(
+                "INSERT INTO recent_sessions VALUES (?1, ?2, ?3)",
+                rusqlite::params![id, dir, updated],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn resolve_latest_jcode_session_picks_newest_nonempty_for_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("wt");
+        let other = dir.path().join("elsewhere");
+        fs::create_dir_all(&worktree).unwrap();
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let db = dir.path().join("meta.sqlite3");
+
+        let wt = worktree.to_string_lossy().to_string();
+        write_jcode_metadata(
+            &db,
+            &[
+                // Newest for the worktree, but a near-empty idle shell.
+                ("session_ant_30_aa", &wt, 30),
+                // Metadata row whose id shape is wrong: skipped.
+                ("not-a-jcode-id", &wt, 25),
+                // The one that should win: newest resumable match.
+                ("session_bee_20_bb", &wt, 20),
+                // Even older resumable match: shadowed by session_bee.
+                ("session_cow_10_cc", &wt, 10),
+                // Newer than everything but belongs to another directory.
+                ("session_owl_99_dd", &other.to_string_lossy(), 99),
+            ],
+        );
+        let big = vec![b'x'; MIN_RESUMABLE_JCODE_SESSION_BYTES as usize];
+        fs::write(sessions.join("session_ant_30_aa.json"), b"{}").unwrap();
+        fs::write(sessions.join("session_bee_20_bb.json"), &big).unwrap();
+        fs::write(sessions.join("session_cow_10_cc.json"), &big).unwrap();
+        fs::write(sessions.join("session_owl_99_dd.json"), &big).unwrap();
+
+        assert_eq!(
+            resolve_latest_jcode_session(&db, &sessions, &worktree),
+            Some("session_bee_20_bb".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_latest_jcode_session_absent_state_is_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("wt");
+        fs::create_dir_all(&worktree).unwrap();
+        let sessions = dir.path().join("sessions");
+
+        // No metadata database at all.
+        assert_eq!(
+            resolve_latest_jcode_session(&dir.path().join("missing.sqlite3"), &sessions, &worktree),
+            None
+        );
+
+        // Metadata rows exist but every session file is missing or tiny.
+        let db = dir.path().join("meta.sqlite3");
+        write_jcode_metadata(
+            &db,
+            &[("session_ant_30_aa", &worktree.to_string_lossy(), 30)],
+        );
+        assert_eq!(
+            resolve_latest_jcode_session(&db, &sessions, &worktree),
+            None
+        );
     }
 }
