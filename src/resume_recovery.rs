@@ -319,7 +319,24 @@ fn parse_codex_rollout_identity(path: PathBuf) -> Option<(String, PathBuf)> {
         return None;
     }
     let payload = first.get("payload")?;
-    let id = payload.get("id")?.as_str()?.to_string();
+    // Prefer the resumable THREAD id over the rollout's own id.
+    //
+    // When a codex session is forked, `payload.id` is the sub-agent's own
+    // identifier and `codex resume <that id>` fails with:
+    //
+    //   thread/resume failed: cannot resume an unloaded multi-agent v2
+    //   sub-agent through its parent; resume the parent first (code -32600)
+    //
+    // `payload.session_id` is the thread codex will actually resume, and
+    // equals `parent_thread_id` on a forked rollout. On a non-forked rollout
+    // the two are identical, so preferring `session_id` is a no-op there.
+    // Rollouts written by older codex builds omit `session_id` entirely, so
+    // fall back to `id` for those.
+    let id = payload
+        .get("session_id")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("id").and_then(Value::as_str))?
+        .to_string();
     let cwd = PathBuf::from(payload.get("cwd")?.as_str()?);
     if Uuid::parse_str(&id).is_err() || !cwd.is_absolute() {
         return None;
@@ -932,6 +949,62 @@ mod tests {
             project_name: "project-one".to_string(),
             destination_cwd: PathBuf::from("/shared/project-one"),
         }
+    }
+
+    fn write_rollout(dir: &Path, name: &str, meta: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("{meta}\n")).unwrap();
+        path
+    }
+
+    /// A forked codex session records the SUB-AGENT under `payload.id` and the
+    /// resumable thread under `payload.session_id`. Storing `id` makes
+    /// `codex resume <id>` fail with "cannot resume an unloaded multi-agent v2
+    /// sub-agent through its parent", which presents in dux as an agent that
+    /// silently refuses to start.
+    #[test]
+    fn codex_rollout_identity_prefers_thread_id_over_forked_subagent_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_rollout(
+            dir.path(),
+            "rollout-2026-08-21T09-30-33-01a02303.jsonl",
+            r#"{"type":"session_meta","payload":{"session_id":"01a00ed0-a960-7f10-9902-0bb44545408f","id":"01a02303-98ed-7ed0-bb20-7bdbd90393d9","forked_from_id":"01a00ed0-a960-7f10-9902-0bb44545408f","parent_thread_id":"01a00ed0-a960-7f10-9902-0bb44545408f","cwd":"/Users/dev/Projects/PuzzleBook"}}"#,
+        );
+        let (id, cwd) = parse_codex_rollout_identity(path).expect("identity");
+        assert_eq!(
+            id, "01a00ed0-a960-7f10-9902-0bb44545408f",
+            "must record the resumable parent thread, not the sub-agent id",
+        );
+        assert_eq!(cwd, PathBuf::from("/Users/dev/Projects/PuzzleBook"));
+    }
+
+    /// Non-forked rollouts carry identical `session_id` and `id`, so preferring
+    /// `session_id` must be a no-op there.
+    #[test]
+    fn codex_rollout_identity_unchanged_when_not_forked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_rollout(
+            dir.path(),
+            "rollout-2026-08-17T11-22-31-01a00ed0.jsonl",
+            r#"{"type":"session_meta","payload":{"session_id":"01a00ed0-a960-7f10-9902-0bb44545408f","id":"01a00ed0-a960-7f10-9902-0bb44545408f","cwd":"/Users/dev/Projects/PuzzleBook"}}"#,
+        );
+        let (id, _) = parse_codex_rollout_identity(path).expect("identity");
+        assert_eq!(id, "01a00ed0-a960-7f10-9902-0bb44545408f");
+    }
+
+    /// Older codex builds omit `session_id` entirely; those must still resolve
+    /// via `id` rather than being dropped from recovery.
+    #[test]
+    fn codex_rollout_identity_falls_back_to_id_when_session_id_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_rollout(
+            dir.path(),
+            "rollout-2026-01-01T00-00-00-legacy.jsonl",
+            r#"{"type":"session_meta","payload":{"id":"019efa0b-925c-7660-8091-64af45e3e8e2","cwd":"/Users/dev/Projects/Legacy"}}"#,
+        );
+        let (id, cwd) = parse_codex_rollout_identity(path).expect("identity");
+        assert_eq!(id, "019efa0b-925c-7660-8091-64af45e3e8e2");
+        assert_eq!(cwd, PathBuf::from("/Users/dev/Projects/Legacy"));
     }
 
     fn capture_session(id: &str, provider: &str, cwd: &Path) -> AgentSession {
