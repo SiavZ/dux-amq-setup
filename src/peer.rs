@@ -66,6 +66,13 @@ pub struct AmqSyncReport {
 struct ClaudePeer {
     id: String,
     cwd: String,
+    /// Peer process id. Absent on brokers that predate the field; the
+    /// selector then falls back to recency instead of process ancestry.
+    #[serde(default)]
+    pid: Option<u32>,
+    /// Broker heartbeat, ISO-8601. Lexicographically sortable.
+    #[serde(default)]
+    last_seen: Option<String>,
 }
 
 pub fn run_peer(args: &[String], paths: &DuxPaths) -> Result<()> {
@@ -134,13 +141,15 @@ fn run_peer_send(args: &[String], paths: &DuxPaths) -> Result<()> {
                  Restart Claude agents after installing claude-peers, or pass --transport amq \
                  explicitly for a manual override",
             )?;
-            let to_id = claude_peer_id_for_session(target_session, &peers).ok_or_else(|| {
-                anyhow!(
-                    "Claude Peers is not registered for target {}",
-                    amq_handle_for_session(target_session)
-                )
-            })?;
-            let (from_id, message) = claude_peers_sender(&sender, &peers, &parsed.message);
+            let dux_pid = dux_tui_pid(paths);
+            let to_id =
+                claude_peer_id_for_session(target_session, &peers, dux_pid).ok_or_else(|| {
+                    anyhow!(
+                        "Claude Peers is not registered for target {}",
+                        amq_handle_for_session(target_session)
+                    )
+                })?;
+            let (from_id, message) = claude_peers_sender(&sender, &peers, &parsed.message, dux_pid);
             claude_peers_send(&from_id, &to_id, &message)?;
             println!(
                 "sent via claude-peers: {} -> {}",
@@ -527,10 +536,11 @@ fn claude_peers_sender(
     sender: &SenderContext,
     peers: &[ClaudePeer],
     message: &str,
+    dux_pid: Option<u32>,
 ) -> (String, String) {
     if let Some(session) = sender.session.as_ref()
         && is_claude_session(Some(session))
-        && let Some(id) = claude_peer_id_for_session(session, peers)
+        && let Some(id) = claude_peer_id_for_session(session, peers, dux_pid)
     {
         return (id, message.to_string());
     }
@@ -589,12 +599,99 @@ fn claude_peers_post(path: &str, body: &Value) -> Result<Value> {
     serde_json::from_str(response_body).context("Claude Peers broker returned non-JSON response")
 }
 
-fn claude_peer_id_for_session(session: &AgentSession, peers: &[ClaudePeer]) -> Option<String> {
+/// Depth cap when walking a process's ancestry looking for the dux TUI.
+/// Panes sit a handful of levels below dux; the cap only stops a walk that
+/// a pid-reuse cycle would otherwise make unbounded.
+const MAX_ANCESTRY_DEPTH: usize = 32;
+
+fn claude_peer_id_for_session(
+    session: &AgentSession,
+    peers: &[ClaudePeer],
+    dux_pid: Option<u32>,
+) -> Option<String> {
+    select_claude_peer_id(session, peers, dux_descendant_checker(dux_pid))
+}
+
+/// Choose which Claude Peers registration owns `session`.
+///
+/// The working directory alone is not a key: the Claude Code daemon keeps
+/// pre-warmed `bg-spare` sessions and background jobs that register from
+/// the same worktree, so an agent's cwd routinely has several live peers.
+/// Picking the first match made delivery a coin flip — a message could land
+/// in a spare session nobody reads while the real pane sat idle.
+///
+/// Process ancestry is the discriminator: the pane dux spawned is a
+/// descendant of the running dux TUI, and daemon spares are not. Recency
+/// breaks any remaining tie so the choice stays deterministic.
+fn select_claude_peer_id(
+    session: &AgentSession,
+    peers: &[ClaudePeer],
+    is_dux_descendant: impl Fn(u32) -> bool,
+) -> Option<String> {
     let session_path = canonical_or_raw(Path::new(&session.worktree_path));
-    peers
+    let candidates: Vec<&ClaudePeer> = peers
         .iter()
-        .find(|peer| canonical_or_raw(Path::new(&peer.cwd)) == session_path)
+        .filter(|peer| canonical_or_raw(Path::new(&peer.cwd)) == session_path)
+        .collect();
+    if candidates.len() <= 1 {
+        return candidates.first().map(|peer| peer.id.clone());
+    }
+
+    let owned: Vec<&ClaudePeer> = candidates
+        .iter()
+        .copied()
+        .filter(|peer| peer.pid.is_some_and(&is_dux_descendant))
+        .collect();
+    // Nothing traceable to this dux instance (TUI not running, or a broker
+    // without pids) leaves recency as the only signal.
+    let pool = if owned.is_empty() {
+        &candidates
+    } else {
+        &owned
+    };
+
+    pool.iter()
+        .max_by(|a, b| a.last_seen.cmp(&b.last_seen))
         .map(|peer| peer.id.clone())
+}
+
+/// Snapshot the process table once and return a predicate answering
+/// "is this pid a descendant of the dux TUI?".
+fn dux_descendant_checker(dux_pid: Option<u32>) -> impl Fn(u32) -> bool {
+    let mut system = System::new();
+    if dux_pid.is_some() {
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+    }
+    move |pid: u32| {
+        let Some(dux_pid) = dux_pid else {
+            return false;
+        };
+        let mut current = sysinfo::Pid::from_u32(pid);
+        for _ in 0..MAX_ANCESTRY_DEPTH {
+            if current.as_u32() == dux_pid {
+                return true;
+            }
+            match system.process(current).and_then(|proc| proc.parent()) {
+                Some(parent) => current = parent,
+                None => return false,
+            }
+        }
+        false
+    }
+}
+
+/// PID of the dux TUI holding this config directory, from its lockfile.
+fn dux_tui_pid(paths: &DuxPaths) -> Option<u32> {
+    fs::read_to_string(&paths.lock_path)
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 fn session_for_cwd<'a>(
@@ -1338,6 +1435,84 @@ mod tests {
 
     use crate::model::{ProviderKind, SessionSettings, SessionState};
 
+    fn peer(id: &str, cwd: &Path, pid: Option<u32>, last_seen: &str) -> ClaudePeer {
+        ClaudePeer {
+            id: id.to_string(),
+            cwd: cwd.to_string_lossy().to_string(),
+            pid,
+            last_seen: Some(last_seen.to_string()),
+        }
+    }
+
+    /// The Claude Code daemon keeps pre-warmed `bg-spare` sessions and
+    /// background jobs registered from an agent's own worktree, so a cwd
+    /// routinely resolves to several live peers. Delivery must land in the
+    /// pane dux spawned, not whichever registration the broker listed first.
+    #[test]
+    fn peer_selection_prefers_the_pane_dux_spawned() {
+        let dir = tempdir().unwrap();
+        let wt = dir.path().join("worktree");
+        std::fs::create_dir_all(&wt).unwrap();
+        let session = session("s1", "claude", "feature", &wt);
+
+        // Spare listed first and seen most recently: both tie-breaks that
+        // would otherwise win point at the wrong peer.
+        let peers = vec![
+            peer("spare", &wt, Some(4242), "2026-09-02T00:00:09Z"),
+            peer("pane", &wt, Some(1001), "2026-09-02T00:00:01Z"),
+        ];
+        let owned = |pid: u32| pid == 1001;
+
+        assert_eq!(
+            select_claude_peer_id(&session, &peers, owned),
+            Some("pane".to_string()),
+        );
+    }
+
+    #[test]
+    fn peer_selection_falls_back_to_recency_without_ancestry() {
+        let dir = tempdir().unwrap();
+        let wt = dir.path().join("worktree");
+        std::fs::create_dir_all(&wt).unwrap();
+        let session = session("s1", "claude", "feature", &wt);
+        let peers = vec![
+            peer("older", &wt, Some(10), "2026-09-02T00:00:01Z"),
+            peer("newer", &wt, None, "2026-09-02T00:00:09Z"),
+        ];
+
+        // No dux TUI to trace (lockfile stale, or a broker without pids):
+        // stay deterministic rather than picking list order.
+        assert_eq!(
+            select_claude_peer_id(&session, &peers, |_| false),
+            Some("newer".to_string()),
+        );
+    }
+
+    #[test]
+    fn peer_selection_ignores_other_worktrees_and_reports_no_match() {
+        let dir = tempdir().unwrap();
+        let wt = dir.path().join("worktree");
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let session = session("s1", "claude", "feature", &wt);
+
+        let peers = vec![peer(
+            "elsewhere",
+            &other,
+            Some(1001),
+            "2026-09-02T00:00:09Z",
+        )];
+        assert_eq!(select_claude_peer_id(&session, &peers, |_| true), None);
+
+        // A single match needs no disambiguation at all.
+        let peers = vec![peer("only", &wt, None, "2026-09-02T00:00:01Z")];
+        assert_eq!(
+            select_claude_peer_id(&session, &peers, |_| false),
+            Some("only".to_string()),
+        );
+    }
+
     fn session(id: &str, provider: &str, branch: &str, worktree: &Path) -> AgentSession {
         AgentSession {
             id: id.to_string(),
@@ -1683,7 +1858,7 @@ mod tests {
             session: Some(session("s1", "codex", "sender", &sender_wt)),
         };
 
-        let (from_id, message) = claude_peers_sender(&sender, &[], "status?");
+        let (from_id, message) = claude_peers_sender(&sender, &[], "status?", None);
 
         assert_eq!(from_id, "sender");
         assert!(message.contains("dux peer send sender"));
