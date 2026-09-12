@@ -472,13 +472,14 @@ setup_parent_and_worktree_with_unreadable_file() {
   local old_bin="$TEST_HOME/old-provider-bin"
   mkdir -p "$old_bin"
   local provider
-  for provider in claude codex gemini; do
+  for provider in claude codex gemini jcode; do
     cat >"$old_bin/$provider" <<'EOF'
 #!/usr/bin/env bash
 case "${0##*/}" in
   claude) printf '2.1.162\n' ;;
   codex) printf '0.38.9\n' ;;
   gemini) printf '0.39.0\n' ;;
+  jcode) printf 'jcode v0.81.3 (deadbeef)\n' ;;
 esac
 EOF
     chmod 0755 "$old_bin/$provider"
@@ -493,6 +494,9 @@ EOF
   PATH="$old_bin:$PATH" run "$WRAPPERS_DIR/gemini-amq"
   [ "$status" -ne 0 ]
   [[ "$output" == *"upgrade to >= 0.39.1"* ]]
+  PATH="$old_bin:$PATH" run "$WRAPPERS_DIR/jcode-amq"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"upgrade to >= 0.81.4"* ]]
 
   printf '#!/usr/bin/env bash\nprintf "unknown-version\\n"\n' >"$old_bin/claude"
   chmod 0755 "$old_bin/claude"

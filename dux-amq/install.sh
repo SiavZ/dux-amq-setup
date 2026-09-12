@@ -376,6 +376,7 @@ say "installing wrappers to $LOCAL_BIN"
 install -m 0755 "$HERE/wrappers/claude-amq"  "$LOCAL_BIN/claude-amq"
 install -m 0755 "$HERE/wrappers/codex-amq"   "$LOCAL_BIN/codex-amq"
 install -m 0755 "$HERE/wrappers/gemini-amq"  "$LOCAL_BIN/gemini-amq"
+install -m 0755 "$HERE/wrappers/jcode-amq"   "$LOCAL_BIN/jcode-amq"
 # The encoder is the single source of truth for Claude Code's on-disk
 # project-dir naming (audit01 P0-5, audit02 Phase 12). It must be on
 # $PATH so claude-amq's seed step (and Phase 10's purge job) can find it.
@@ -423,6 +424,7 @@ sed -i --follow-symlinks \
   -e '/^\[providers\.claude\]$/,/^\[/ s|^command = "claude"$|command = "claude-amq"|' \
   -e '/^\[providers\.codex\]$/,/^\[/ s|^command = "codex"$|command = "codex-amq"|' \
   -e '/^\[providers\.gemini\]$/,/^\[/ s|^command = "gemini"$|command = "gemini-amq"|' \
+  -e '/^\[providers\.jcode\]$/,/^\[/ s|^command = "jcode"$|command = "jcode-amq"|' \
   -e '/^\[providers\.claude\]$/,/^\[/ s|^resume_args = \["--continue"\]$|resume_args = ["--continue", "--fork-session"]|' \
   -e '/^\[providers\.claude\]$/,/^\[/ s|^forward_scroll = false$|forward_scroll = true|' \
   -e '/^\[providers\.claude\]$/,/^\[/ s|^forward_mouse = true$|forward_mouse = false|' \

@@ -317,6 +317,37 @@ assert_argv_sequence() {
     || { printf 'expected warn-and-drop message; got:\n%s\n' "$output" >&2; return 1; }
 }
 
+@test "jcode-amq warns and drops when DUX_SYSTEM_PROMPT is set" {
+  DUX_SYSTEM_PROMPT="ignored" run "$WRAPPERS_DIR/jcode-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_missing "ignored"
+  [[ "$output" == *"jcode-amq: DUX_SYSTEM_PROMPT set but jcode has no verified equivalent flag"* ]] \
+    || { printf 'expected warn-and-drop message; got:\n%s\n' "$output" >&2; return 1; }
+}
+
+@test "jcode-amq wraps interactive launches and pins the binary with --no-update" {
+  run "$WRAPPERS_DIR/jcode-amq" --resume session_cactus_1788156095921_18c33bc3e9ed4d80
+  [ "$status" -eq 0 ]
+  # The fake amq records one argv token per line.
+  # Wrapped: the AMQ co-op exec ran with our identity...
+  grep -qx -- 'coop' "$ARGV_FILE" && grep -qx -- 'testpane' "$ARGV_FILE" \
+    || { printf 'expected coop exec with --me testpane; argv:\n%s\n' "$(cat "$ARGV_FILE")" >&2; return 1; }
+  # ...the session id was NOT mistaken for a subcommand (it is a flag value)...
+  grep -qx -- 'session_cactus_1788156095921_18c33bc3e9ed4d80' "$ARGV_FILE"
+  # ...and --no-update was injected even though the caller omitted it.
+  grep -qx -- '--no-update' "$ARGV_FILE" \
+    || { printf 'expected --no-update injected; argv:\n%s\n' "$(cat "$ARGV_FILE")" >&2; return 1; }
+}
+
+@test "jcode-amq bypasses AMQ for subcommand (oneshot) invocations" {
+  run "$WRAPPERS_DIR/jcode-amq" run --quiet "say hi"
+  [ "$status" -eq 0 ]
+  [[ "$output" == "ok" ]]
+  # No coop exec, no identity claim: the fake amq must not have been invoked.
+  [ ! -s "$ARGV_FILE" ] \
+    || { printf 'oneshot must not touch AMQ; argv:\n%s\n' "$(cat "$ARGV_FILE")" >&2; return 1; }
+}
+
 @test "gemini-amq is silent when DUX_SYSTEM_PROMPT is unset" {
   unset DUX_SYSTEM_PROMPT
   run "$WRAPPERS_DIR/gemini-amq"
