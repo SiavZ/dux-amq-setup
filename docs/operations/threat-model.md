@@ -1,7 +1,7 @@
 # Threat Model — long-form companion
 
 This document is the long-form companion to the STRIDE table in
-[`/SECURITY.md`](../../SECURITY.md). For each row T1–T19 we capture
+[`/SECURITY.md`](../../SECURITY.md). For each row T1–T20 we capture
 the concrete attack scenario, the mitigation in code (with
 file:line references taken from `docs/audits/audit02.md`), the
 residual risk after mitigation, and the detection mechanism — what
@@ -821,6 +821,53 @@ active provider, and removing or overriding `[providers.ntl]` disables it.
 
 ---
 
+## T20 — jcode provider self-updates, swarms, or reaches fleet messaging via inherited MCP
+
+**Attack scenario.** An operator selects the built-in jcode provider. The
+third-party CLI auto-updates its own binary by default on release builds,
+spawns headless sub-agent swarms and a shared background `serve` daemon that
+outlives individual panes, and loads the operator's user-scope MCP servers —
+including fleet-messaging servers such as claude-peers — giving the agent a
+path to message other agents under the operator's identity.
+
+**Mitigation in code.** jcode is only a default configuration entry: Dux
+neither installs nor launches it until selected. The `jcode-amq` wrapper fails
+closed below a reviewed version floor and probes the version with
+`--no-update` so the probe itself cannot swap the binary. Every wrapped launch
+has `--no-update` force-injected (and `resume_by_id_args` repeats it, since
+resume args replace base args), pinning the pane's binary for the PTY's
+lifetime. Subcommand invocations (`run`, `usage`, `telemetry`, ...) bypass
+identity and wake claims, so oneshot work cannot register or hold an AMQ
+handle. Wrapped sessions use the same owner-bound co-op wake, flock-guarded
+registration, and inject-bridge verification path as the other wrappers.
+
+The inject-bridge can deliver AMQ wakes through each provider's own push
+channel instead of typing into the PTY: claude panes via the claude-peers
+channel (`dux peer send --transport claude-peers`, live pane resolved by
+process ancestry) and jcode panes via the daemon's client protocol
+(`jcode debug client:message`). This is **opt-in** (`DUX_AMQ_NATIVE_DELIVERY=1`)
+and requires jcode's `display.debug_socket = true`; a stock install keeps the
+file-queue/drainer path. When enabled, readiness is checked before the inbox
+is drained so a held message is retried rather than lost, an unreachable
+daemon falls back to the queue, and every jcode delivery attempt is logged to
+`~/.local/state/inject-bridge-jcode.log`.
+
+**Residual risk.** Dux is not a sandbox. The `serve` daemon, swarm sub-agents,
+and inherited MCP servers run with the operator's Unix permissions and
+identity; enabling jcode's debug socket for native delivery exposes a
+same-UID control surface (message submission, session listing) that the
+single-user-VM trust model already accepts under T2; killing a pane does not stop the shared daemon, and a swarm's
+resource use is bounded only by jcode itself and by host-level limits. jcode's
+binary, backends, authentication, and data handling remain upstream
+responsibilities.
+
+**Detection.** jcode appears by name in the provider selector, generated
+configuration, and the session header. The wake watcher and `serve` daemon are
+visible in the process table (`amq wake --me <handle>`, `jcode ... serve`);
+removing or overriding `[providers.jcode]` disables the provider.
+
+---
+
 ## Maintenance
 
 When you add or change attack surface in this codebase, you must
@@ -828,8 +875,8 @@ update both `SECURITY.md` (the table) and this file (the
 paragraph). PRs that touch the surface listed above without
 updating these documents are blocked at review.
 
-The IDs `T1`–`T19` are stable references; new threats append at
-the end (`T20`, `T21`, …) rather than reshuffling. Retired
+The IDs `T1`–`T20` are stable references; new threats append at
+the end (`T21`, `T22`, …) rather than reshuffling. Retired
 threats are kept in the table with a `~~strikethrough~~` and a
 note pointing to the PR that retired them. Threats that move to
 **accepted-risk in single-user-VM mode** keep their original ID,
