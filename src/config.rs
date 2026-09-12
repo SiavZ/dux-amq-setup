@@ -2866,14 +2866,16 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 9] {
                 // picker, which would hang the PTY spawn. Leave it unset so
                 // dux starts a fresh session instead.
                 resume_args: None,
-                // `--resume <ID>` is the correct targeted-resume form, but
-                // `should_resume_session` gates ResumeId behind
-                // `uuid::Uuid::parse_str(id).is_ok()` and jcode session ids
-                // are `session_<name>_<epoch_ms>_<hex>` (for example
-                // `session_cactus_1788156095921_18c33bc3e9ed4d80`), not
-                // UUIDs. Configured so it works the moment that gate learns
-                // about non-UUID provider ids.
-                resume_by_id_args: Some(vec!["--resume".to_string(), "{session_id}".to_string()]),
+                // `--resume <ID>` is the targeted-resume form;
+                // `should_resume_session` accepts jcode's native
+                // `session_<name>_<epoch_ms>_<hex>` ids. `--no-update` must
+                // repeat here because resume args replace the base args and
+                // an unpinned resumed pane would self-update mid-session.
+                resume_by_id_args: Some(vec![
+                    "--no-update".to_string(),
+                    "--resume".to_string(),
+                    "{session_id}".to_string(),
+                ]),
                 resume_wait_timeout_ms: None,
                 // `jcode run` sends one message and exits; `--quiet`
                 // suppresses status output. Caveat: jcode still writes a
@@ -2888,7 +2890,10 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 9] {
                 ],
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("brew tap 1jehuang/jcode && brew install jcode".to_string()),
-                forward_scroll: false,
+                // jcode is an alt-screen TUI with its own scrollback (like
+                // claude/gemini): forward wheel events to it. Host scrollback
+                // is empty for alt-screen apps and reads as a dead wheel.
+                forward_scroll: true,
                 forward_mouse: None,
                 watch: Vec::new(),
             },
@@ -4283,15 +4288,24 @@ oneshot_output = "stdout"
             !cfg.supports_session_resume(),
             "jcode has no cwd-scoped resume-latest selector",
         );
-        // Targeted resume is configured even though `should_resume_session`
-        // cannot reach it yet (it requires a UUID, and jcode ids are
-        // `session_<name>_<epoch_ms>_<hex>`).
+        // Targeted resume repeats --no-update: resume args replace the base
+        // args, and an unpinned resumed pane would self-update mid-session.
         assert_eq!(
             cfg.resume_by_id_args.as_deref(),
-            Some(["--resume".to_string(), "{session_id}".to_string()].as_slice()),
+            Some(
+                [
+                    "--no-update".to_string(),
+                    "--resume".to_string(),
+                    "{session_id}".to_string(),
+                ]
+                .as_slice()
+            ),
         );
         assert_eq!(cfg.oneshot_args, vec!["run", "--quiet", "{prompt}"]);
         assert!(matches!(cfg.oneshot_output, OneshotOutput::Stdout));
+        // Alt-screen TUI with its own scrollback: the wheel must forward to
+        // jcode or scrolling reads as dead inside the pane.
+        assert!(cfg.forward_scroll);
     }
 
     #[test]
