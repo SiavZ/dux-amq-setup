@@ -762,6 +762,13 @@ pub struct AmqOrchestratorConfig {
     /// Default 900 (15 minutes).
     #[serde(default = "default_amq_orchestrator_poll_interval_secs")]
     pub poll_interval_secs: u64,
+    /// Replacement text for the periodic checkpoint prompt. When non-empty
+    /// (after trimming), it is injected verbatim instead of the built-in
+    /// template that lists live same-project workers and polling
+    /// instructions. The launch-time Orchestrator policy prompt is
+    /// unaffected. Default empty (use the built-in template).
+    #[serde(default)]
+    pub checkpoint_prompt: String,
 }
 
 fn default_amq_orchestrator_enabled() -> bool {
@@ -777,6 +784,7 @@ impl Default for AmqOrchestratorConfig {
         Self {
             enabled: default_amq_orchestrator_enabled(),
             poll_interval_secs: default_amq_orchestrator_poll_interval_secs(),
+            checkpoint_prompt: String::new(),
         }
     }
 }
@@ -1911,6 +1919,20 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
                  # Orchestrator policy prompt. Default 900 (15 minutes).",
             )),
             value_fn: |c| FieldValue::U64(c.amq.orchestrator.poll_interval_secs),
+        },
+        ConfigEntry::Field {
+            key: "checkpoint_prompt",
+            comment: Some(CommentSource::Static(
+                "# Custom checkpoint text. When non-empty it is injected verbatim\n\
+                 # in place of the built-in checkpoint template (the one that lists\n\
+                 # live workers and polling instructions). The launch-time\n\
+                 # Orchestrator policy prompt is unaffected. Default: empty (use\n\
+                 # the built-in template).",
+            )),
+            value_fn: |c| {
+                let s = c.amq.orchestrator.checkpoint_prompt.clone();
+                FieldValue::MultilineStr(if s.is_empty() { None } else { Some(s) })
+            },
         },
         ConfigEntry::Blank,
         ConfigEntry::Keys,
@@ -3536,6 +3558,8 @@ mod tests {
         config.amq.inject.auto_clear_collaboration_quiet_secs = 2_222;
         config.amq.orchestrator.enabled = false;
         config.amq.orchestrator.poll_interval_secs = 333;
+        config.amq.orchestrator.checkpoint_prompt =
+            "Keep the goal moving.\nUnblock stalled workers.".to_string();
         let rendered = render_config_default(&config);
         let parsed: Config = toml::from_str(&rendered).expect("config should parse");
         assert!(!parsed.amq.inject.enabled);
@@ -3551,6 +3575,10 @@ mod tests {
         assert_eq!(parsed.amq.inject.auto_clear_collaboration_quiet_secs, 2_222);
         assert!(!parsed.amq.orchestrator.enabled);
         assert_eq!(parsed.amq.orchestrator.poll_interval_secs, 333);
+        assert_eq!(
+            parsed.amq.orchestrator.checkpoint_prompt,
+            "Keep the goal moving.\nUnblock stalled workers."
+        );
         assert_eq!(
             parsed.amq.inject.busy_markers,
             vec!["thinking…".to_string(), "ctrl-c to cancel".to_string()]
