@@ -55,6 +55,7 @@ function installBootStubs() {
 installBootStubs()
 const {
   armTheaterToggleFocus,
+  usePhoneChromeGesture,
   useTheaterEscape,
   useTheaterGesture,
   useTheaterPillFocus,
@@ -77,6 +78,11 @@ function Gesture() {
 
 function Escape() {
   useTheaterEscape()
+  return null
+}
+
+function ChromeGesture({ hidden }: { hidden: boolean }) {
+  usePhoneChromeGesture(hidden)
   return null
 }
 
@@ -129,6 +135,31 @@ describe("the one refit per toggle", () => {
       vi.advanceTimersByTime(THEATER_TRANSITION_MS)
     })
     expect(pane.release).toHaveBeenCalledTimes(1)
+    off()
+  })
+
+  it("pays the same one refit when a cover moves the phone's chrome", () => {
+    // The mode never moves here, so the gesture above never sees this one: a
+    // full-pane cover brings the header back and the terminal's box shrinks.
+    const pane = { hold: vi.fn(), release: vi.fn() }
+    const off = registerLayoutGestureHolder(pane)
+    const { rerender } = render(<ChromeGesture hidden={true} />)
+    expect(pane.hold).not.toHaveBeenCalled()
+    rerender(<ChromeGesture hidden={false} />)
+    expect(pane.hold).toHaveBeenCalledTimes(1)
+    act(() => {
+      vi.advanceTimersByTime(THEATER_TRANSITION_MS)
+    })
+    expect(pane.release).toHaveBeenCalledTimes(1)
+    off()
+  })
+
+  it("buys no refit for a cover that leaves the chrome where it was", () => {
+    const pane = { hold: vi.fn(), release: vi.fn() }
+    const off = registerLayoutGestureHolder(pane)
+    const { rerender } = render(<ChromeGesture hidden={false} />)
+    rerender(<ChromeGesture hidden={false} />)
+    expect(pane.hold).not.toHaveBeenCalled()
     off()
   })
 

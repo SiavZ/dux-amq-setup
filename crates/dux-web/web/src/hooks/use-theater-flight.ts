@@ -2,7 +2,7 @@ import * as React from "react"
 
 import { usePrefersReducedMotion } from "@/hooks/use-reduced-motion"
 import { useDux } from "@/lib/store"
-import { theaterTransitionMs } from "@/lib/theater"
+import { theaterTransitionMs, topChromeHidden } from "@/lib/theater"
 import {
   flightForModeFrom,
   flightHoldMs,
@@ -23,9 +23,15 @@ import {
  * A mode that flips back mid-gesture is asked of the stage in flight (`flightForModeFrom`),
  * and reduced motion is read through a ref rather than a dependency, so a system setting
  * changing mid-page cannot restart a gesture over a mode that never moved.
+ *
+ * A full-pane cover arriving or leaving moves the chrome too, and that one is deliberately
+ * an instant swap: there is nothing to fly, because the pill the cluster would travel as is
+ * withheld under such a cover, and half a flight with neither end painted is worse than the
+ * flap simply being there.
  */
-export function useTheaterFlight(): FlightPhase {
+export function useTheaterFlight(coverOwnsPane: boolean): FlightPhase {
   const { theater } = useDux()
+  const hidden = topChromeHidden({ theater, coverOwnsPane })
   const reducedMotion = usePrefersReducedMotion()
   const chromeMs = React.useRef(theaterTransitionMs(reducedMotion))
   React.useEffect(() => {
@@ -33,15 +39,23 @@ export function useTheaterFlight(): FlightPhase {
   }, [reducedMotion])
 
   const [phase, setPhase] = React.useState<FlightPhase>(() =>
-    theater ? "floating" : "docked",
+    hidden ? "floating" : "docked",
   )
   const wasTheater = React.useRef(theater)
+  const wasHidden = React.useRef(hidden)
 
   React.useEffect(() => {
-    if (wasTheater.current === theater) return
+    if (wasHidden.current === hidden) {
+      wasTheater.current = theater
+      return
+    }
+    // The mode moving is the user's gesture and flies; the chrome moving while
+    // the mode stands still is the cover, and that one swaps.
+    const ms = wasTheater.current === theater ? 0 : chromeMs.current
     wasTheater.current = theater
-    setPhase((live) => flightForModeFrom(live, theater, chromeMs.current))
-  }, [theater])
+    wasHidden.current = hidden
+    setPhase((live) => flightForModeFrom(live, hidden, ms))
+  }, [theater, hidden])
 
   React.useEffect(() => {
     const hold = flightHoldMs(phase, chromeMs.current)

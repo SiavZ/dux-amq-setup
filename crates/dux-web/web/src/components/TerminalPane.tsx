@@ -61,8 +61,11 @@ import type { PtySocket } from "@/lib/ptySocket"
 import { matchOwner, ownerProjectId, ownerSessionId } from "@/lib/terminalOwner"
 import { terminalsForOwner } from "@/lib/terminals"
 import { DEFAULT_ATTENTION_GRACE_SECONDS } from "@/lib/viewedPing"
-import { attachCover, type AttachCover } from "@/lib/attachCover"
-import { assertNever } from "@/lib/assertNever"
+import {
+  attachCover,
+  coverOwnsThePane,
+  type AttachCover,
+} from "@/lib/attachCover"
 import { replayWaitMs } from "@/lib/connectionTiming"
 import { createVisibleClock, type VisibleClock } from "@/lib/visibleClock"
 import { DEFAULT_SCROLLBACK_LINES } from "@/lib/types"
@@ -80,6 +83,7 @@ import {
 } from "@/components/terminal/viewerGrid"
 import { REPLAY_WAIT_POLL_MS } from "@/components/terminal/constants"
 import { suspendTerminalTabStop } from "@/components/terminal/inputWiring"
+import { registerPaneCover } from "@/lib/paneCover"
 import { registerPaneInputGroup } from "@/lib/paneInputGroup"
 import {
   focusTypingSurfaceIn,
@@ -525,6 +529,12 @@ export function TerminalPane(props: TerminalPaneProps) {
     isOwner,
     firstAttach: appliedEpoch === null,
   })
+
+  // Publish whether the cover speaks for the whole pane, under this pane's pty
+  // id, for the chrome outside it. The phone's header comes back on this while
+  // theater stays on, since the pill it would otherwise offer is withheld here.
+  const coverOwnsPane = coverOwnsThePane(cover)
+  useEffect(() => registerPaneCover(id, coverOwnsPane), [id, coverOwnsPane])
 
   const pane = (
     <TerminalPaneSurface
@@ -994,21 +1004,6 @@ function TerminalPaneSurface({
       {coverOwnsThePane(cover) ? null : overlay}
     </div>
   )
-}
-
-/// Whether the cover speaks for the whole pane. A card or a box is full-pane and
-/// opaque, so the theater pill is withheld; the transparent spinner keeps it.
-function coverOwnsThePane(cover: AttachCover): boolean {
-  switch (cover.kind) {
-    case "card":
-    case "box":
-      return true
-    case "spinner":
-    case "none":
-      return false
-    default:
-      return assertNever(cover)
-  }
 }
 
 function FileDropOverlay({ kind }: { kind: TerminalPaneProps["kind"] }) {

@@ -19,6 +19,9 @@ import { TheaterChrome } from "@/components/TheaterChrome"
 import { TheaterPill } from "@/components/TheaterPill"
 import { Button } from "@/components/ui/button"
 import { useTheaterFlight } from "@/hooks/use-theater-flight"
+import { usePhoneChromeGesture } from "@/hooks/use-theater"
+import { usePaneCoverOwned } from "@/lib/paneCover"
+import { topChromeHidden } from "@/lib/theater"
 import { flapMounted, flapVisible, pillMounted } from "@/lib/theaterFlight"
 import {
   dormantTabNeedsCard,
@@ -137,16 +140,23 @@ function AgentlessTerminalScreen({
   const terminal = ownedTerminals.find((t) => t.id === terminalId)
   // On the phone shell the app header is the chrome stack theater takes away,
   // and theater is deliberately the only way to hide it: two flows for one
-  // intent could disagree about what is on screen.
-  const theater = duxState.theater
+  // intent could disagree about what is on screen. Its one exception is a
+  // full-pane cover, which withholds the pill and would otherwise leave this
+  // screen with no way back at all. Desktop is untouched: it has Escape.
+  const coverOwnsPane = usePaneCoverOwned(terminalId)
+  const chromeHidden = topChromeHidden({
+    theater: duxState.theater,
+    coverOwnsPane,
+  })
+  usePhoneChromeGesture(chromeHidden)
   // The one phase both clusters render from, so the handoff cannot land in the
   // gap between two controls each deciding for itself.
-  const flight = useTheaterFlight()
+  const flight = useTheaterFlight(coverOwnsPane)
   const target: SelectedTarget = { kind: "terminal", terminalId, owner }
   const subject: PaneMenuSubject = { kind: "terminal", terminalId, owner }
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden">
-      <TheaterChrome hidden={theater}>
+      <TheaterChrome hidden={chromeHidden}>
         <header className="flex h-11 shrink-0 items-center gap-2 border-b px-3">
           {/* Up to the hub, by name: a relative history step walks out of the
             * app whenever this screen is the entry the browser opened on. */}
@@ -169,9 +179,10 @@ function AgentlessTerminalScreen({
       </TheaterChrome>
       <div className="relative min-h-0 flex-1">
         {/* The flap is a sibling of the pane, not part of its overlay, which is
-          * withheld while a full-pane cover owns the terminal; these are the
-          * only controls the phone has left. The band is always plain here,
-          * since only an agent can have a strip to hang from. */}
+          * withheld while a full-pane cover owns the terminal; under such a
+          * cover it rides the returned chrome, docked rather than half flown.
+          * The band is always plain here, since only an agent can have a strip
+          * to hang from. */}
         {flapMounted(flight) ? (
           <MobileActionFlap
             target={target}
@@ -465,12 +476,21 @@ function AgentTerminalScreen({
   const duxState = useDux()
   const { spine, bootstrap, terminalEpoch, startedDormantTabs, pendingSlotTab } =
     duxState
-  const flight = useTheaterFlight()
 
   const targetId =
     selectedTarget.kind === "terminal"
       ? selectedTarget.terminalId
       : selectedTarget.tabId
+  // Theater's one exception, phone only (desktop has Escape): a full-pane cover
+  // withholds the pill, so the header is the only way back and comes back with
+  // it. Nothing writes the mode; the chrome leaves again once the cover goes.
+  const coverOwnsPane = usePaneCoverOwned(targetId)
+  const chromeHidden = topChromeHidden({
+    theater: duxState.theater,
+    coverOwnsPane,
+  })
+  usePhoneChromeGesture(chromeHidden)
+  const flight = useTheaterFlight(coverOwnsPane)
   const paneKey =
     selectedTarget.kind === "agent" ? `${targetId}:${terminalEpoch}` : targetId
   const tabs = session.tabs ?? []
@@ -492,7 +512,7 @@ function AgentTerminalScreen({
         * leave together on the one flag. The actions beside them are in the flap
         * below, which detaches into the floating pill rather than leaving.
         * Theater is the only thing that hides them. */}
-      <TheaterChrome hidden={duxState.theater}>
+      <TheaterChrome hidden={chromeHidden}>
         <TerminalHeader
           session={session}
           focusedTab={focusedTab}
@@ -508,7 +528,8 @@ function AgentTerminalScreen({
       </TheaterChrome>
       <div className="relative min-h-0 flex-1">
         {/* The flap is a sibling of the pane, not part of its overlay, which is
-          * withheld while a full-pane cover owns the terminal. */}
+          * withheld while a full-pane cover owns the terminal; under such a
+          * cover it rides the returned chrome, docked rather than half flown. */}
         {flapMounted(flight) ? (
           <MobileActionFlap
             target={selectedTarget}

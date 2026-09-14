@@ -1,6 +1,13 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react"
 
 import type { DuxState } from "@/lib/store"
 import {
@@ -88,14 +95,14 @@ vi.mock("@/hooks/use-theater-flight", async (importOriginal) => {
   const React = await import("react")
   return {
     ...actual,
-    useTheaterFlight: () => {
+    useTheaterFlight: (coverOwnsPane: boolean) => {
       const key = React.useRef({})
       React.useEffect(() => {
         const mine = key.current
         flightMachines.add(mine)
         return () => void flightMachines.delete(mine)
       }, [])
-      return actual.useTheaterFlight()
+      return actual.useTheaterFlight(coverOwnsPane)
     },
   }
 })
@@ -104,6 +111,7 @@ const { MobileShell } = await import("./MobileShell")
 const { registerPaneInputGroup, resetPaneInputGroups } = await import(
   "@/lib/paneInputGroup"
 )
+const { registerPaneCover, resetPaneCovers } = await import("@/lib/paneCover")
 const { NewAgentPickerDialog } = await import("./NewAgentPickerDialog")
 
 function makeState(overrides: Partial<DuxState> = {}): DuxState {
@@ -179,6 +187,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  resetPaneCovers()
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
 })
@@ -571,6 +580,63 @@ describe("MobileShell in theater", () => {
     const pill = screen.getByTestId("theater-pill")
     expect(screen.getByTestId("terminal-pane-stub").contains(pill)).toBe(true)
     expect(screen.getByTestId("theater-pill-grip")).toBeTruthy()
+  })
+
+  // THE TRAP THIS PINS: the take-over card and the Reconnect box withhold the
+  // pane's overlay, so the pill goes with it. Theater had already taken the
+  // header, and the phone was left with the browser's Back button as its only
+  // way out of a terminal somebody else was driving.
+  function coveredAgentState(): DuxState {
+    return makeState({
+      spine: makeSessionSpine(1),
+      bootstrap: {
+        title: "dux",
+        dux_version: "v1",
+        available_providers: ["claude"],
+      },
+      selectedTarget: { kind: "agent", sessionId: "s1", tabId: "s1" },
+      selectedSessionId: "s1",
+      mobileScreen: "terminal",
+      changes: { sessionId: "s1", phase: "loaded", staged: [], unstaged: [] },
+      startedDormantTabs: [],
+      pendingSlotTab: {},
+      terminalEpoch: 0,
+      theater: true,
+    } as unknown as Partial<DuxState>)
+  }
+
+  it("brings the header back while a full-pane cover owns the pane", () => {
+    registerPaneCover("s1", true)
+    mockState = coveredAgentState()
+    render(<MobileShell />)
+    expect(screen.getByLabelText("Back")).toBeTruthy()
+    // The flap is docked in the returned chrome rather than half flown: its ⋯
+    // is the way to the pane's own actions while the pill is withheld.
+    expect(screen.getByTestId("mobile-action-flap")).toBeTruthy()
+  })
+
+  it("resumes theater once the cover goes, with no navigation", () => {
+    const retire = registerPaneCover("s1", true)
+    mockState = coveredAgentState()
+    render(<MobileShell />)
+    act(() => retire())
+    // The pill is back at once; the header is on its way out on the chrome's
+    // own collapse, which is why this waits for it rather than reading it now.
+    expect(screen.getByTestId("theater-pill")).toBeTruthy()
+    return waitFor(() => {
+      expect(screen.queryByLabelText("Back")).toBeNull()
+      expect(navigateUpMock).not.toHaveBeenCalled()
+    })
+  })
+
+  it("keeps the header away under the transparent spinner cover", () => {
+    // A spinner flashes on every short reconnect, so it is deliberately not a
+    // cover that owns the pane: theater stands.
+    registerPaneCover("s1", false)
+    mockState = coveredAgentState()
+    render(<MobileShell />)
+    expect(screen.queryByLabelText("Back")).toBeNull()
+    expect(screen.getByTestId("theater-pill")).toBeTruthy()
   })
 })
 

@@ -13,6 +13,51 @@ import {
 } from "@/lib/theater"
 
 /**
+ * The same one refit, for the other thing that moves the phone's chrome: a
+ * full-pane cover arriving or leaving while theater stays on. The mode does not
+ * move, so `useTheaterGesture` above never sees it, and the chrome stack still
+ * animates a height the terminal's box is measured against.
+ *
+ * Mounted by the phone's pane screens, which are the only surfaces where a cover
+ * moves the chrome at all, and watching the chrome's own state so a cover that
+ * changes nothing on screen buys no refit. Overlapping the mode's own gesture is
+ * safe: the layout hold is depth counted.
+ */
+export function usePhoneChromeGesture(chromeHidden: boolean): void {
+  const reducedMotion = usePrefersReducedMotion()
+  const reducedRef = React.useRef(reducedMotion)
+  React.useEffect(() => {
+    reducedRef.current = reducedMotion
+  }, [reducedMotion])
+  const first = React.useRef(true)
+  const gesture = React.useRef<LayoutGestureHandle | null>(null)
+
+  React.useEffect(() => {
+    if (first.current) {
+      first.current = false
+      return
+    }
+    const ms = theaterTransitionMs(reducedRef.current)
+    const running = gesture.current
+    if (running) {
+      running.restart(ms)
+      return
+    }
+    gesture.current = holdLayoutForGesture(ms, () => {
+      gesture.current = null
+    })
+  }, [chromeHidden])
+
+  React.useEffect(
+    () => () => {
+      gesture.current?.cancel()
+      gesture.current = null
+    },
+    [],
+  )
+}
+
+/**
  * One PTY refit per toggle.
  *
  * Mounted once per shell, above every piece of chrome that animates, and it
