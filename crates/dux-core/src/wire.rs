@@ -1229,13 +1229,84 @@ pub fn wire_statuses_from_reaction(reaction: &EventReaction) -> Vec<WireStatus> 
     }
 }
 
+/// Everything a delete report names about the agent it is about.
+///
+/// An explicit input rather than the session record, because the web vanishes
+/// that record when it dispatches the removal and authors the report later: the
+/// facts are read while they exist and carried to the completion.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DeleteReportFacts {
+    /// What every surface calls the agent.
+    pub label: String,
+    /// The provider behind it, empty only when the record could not be read.
+    pub provider: String,
+    /// The owning project, absent for a standalone agent and for one whose
+    /// project went first.
+    pub project_name: Option<String>,
+    /// The branch the worktree was on. Empty for a standalone agent, whose
+    /// removal arm names no branch at all.
+    pub branch_name: String,
+    /// The branch the agent was born on, for the drift note.
+    pub initial_branch: String,
+    /// Where the worktree is, named by the arms that leave it there.
+    pub directory: String,
+}
+
+impl DeleteReportFacts {
+    /// Read the facts off a live session record. The project name comes from
+    /// the caller, which is the side holding the project list.
+    pub fn from_session(
+        session: &crate::model::AgentSession,
+        project_name: Option<String>,
+    ) -> Self {
+        Self {
+            label: session.display_label(),
+            provider: session.provider.as_str().to_string(),
+            project_name,
+            // A standalone agent has no branch and reaches only the arms that
+            // name none, so the empty fallbacks never render.
+            branch_name: session.branch_name().unwrap_or_default().to_string(),
+            initial_branch: session.initial_branch().unwrap_or_default().to_string(),
+            directory: session.directory().to_string(),
+        }
+    }
+
+    /// The same read off a finished delete cascade, which already carries the
+    /// project it resolved.
+    pub fn from_finish_outcome(outcome: &FinishDeleteSessionOutcome) -> Self {
+        Self::from_session(
+            &outcome.session,
+            outcome.project.as_ref().map(|p| p.name.clone()),
+        )
+    }
+
+    /// How every delete report opens: what went, with the facts that tell one
+    /// agent from another. Either half is dropped when it is not known rather
+    /// than printed as a gap.
+    fn agent_phrase(&self) -> String {
+        let agent = if self.provider.is_empty() {
+            format!("Deleted agent \"{}\"", self.label)
+        } else {
+            format!("Deleted {} agent \"{}\"", self.provider, self.label)
+        };
+        match &self.project_name {
+            Some(project) => format!("{agent} from project \"{project}\""),
+            None => agent,
+        }
+    }
+}
+
 /// User-facing message for a completed session deletion, varying by what
 /// happened to the worktree.
+///
+/// The one author of this sentence: both surfaces call it, so a delete cannot
+/// be reported one way in the browser and another in the terminal.
 pub fn delete_session_status_message(
-    outcome: &FinishDeleteSessionOutcome,
+    facts: &DeleteReportFacts,
     removal: &WorktreeRemoval,
 ) -> String {
-    let name = outcome.session.display_label();
+    let opening = facts.agent_phrase();
+    let branch = facts.branch_name.as_str();
     match removal {
         // A standalone agent: dux's record of it is gone and the user's folder
         // is exactly as it was. Said explicitly rather than left implied,
@@ -1243,67 +1314,68 @@ pub fn delete_session_status_message(
         // disk went with it.
         WorktreeRemoval::NothingToRemove { folder_label } => {
             format!(
-                "Deleted agent \"{name}\". Its folder \"{folder_label}\" was left untouched: \
-                 dux never creates, moves or removes a standalone agent's folder. Anything \
-                 the agent wrote there is still there."
+                "{opening}. Its folder \"{folder_label}\" was left untouched: dux never \
+                 creates, moves or removes a standalone agent's folder. Anything the agent \
+                 wrote there is still there."
             )
         }
         // The worktree went and the branches stayed, because they were not dux's
         // to delete. The wording names every kept branch with its own reason and
         // how to remove one by hand: once the worktree is gone, no dux surface
-        // can reach the branch any more. The `unwrap_or_default` branch reads
-        // below are unreachable placeholders, since a standalone agent has no
-        // branch and can only take the `NothingToRemove` arm above.
+        // can reach the branch any more.
         WorktreeRemoval::Performed {
             branches: crate::engine::RemovedBranches::Kept(reason),
         } => {
             format!(
-                "Deleted agent \"{name}\" and removed its worktree. {}",
-                reason.kept_branches_note(
-                    outcome.session.branch_name().unwrap_or_default(),
-                    outcome.session.initial_branch().unwrap_or_default(),
-                )
+                "{opening} and removed its worktree. {}",
+                reason.kept_branches_note(branch, &facts.initial_branch)
             )
         }
         WorktreeRemoval::Performed {
             branches: crate::engine::RemovedBranches::Deleted(branches),
         } => {
-            let branch = outcome.session.branch_name().unwrap_or_default();
             let mut message = match &branches.branch {
-                crate::git::BranchDeletion::Deleted => format!(
-                    "Deleted agent \"{name}\", removed its worktree and deleted its branch \"{branch}\"."
-                ),
+                crate::git::BranchDeletion::Deleted => {
+                    format!("{opening}, removed its worktree and deleted its branch \"{branch}\".")
+                }
                 crate::git::BranchDeletion::AlreadyGone => format!(
-                    "Deleted agent \"{name}\" and removed its worktree. Its branch \"{branch}\" was already gone."
+                    "{opening} and removed its worktree. Its branch \"{branch}\" was already gone."
                 ),
                 // A branch git REFUSED to delete is still there, so the line
                 // must not claim otherwise: it names the branch, gives git's
                 // reason, and says what the user can do about it.
                 crate::git::BranchDeletion::Refused { reason } => format!(
-                    "Deleted agent \"{name}\" and removed its worktree, but its branch \
-                     \"{branch}\" is still there. {}",
+                    "{opening} and removed its worktree, but its branch \"{branch}\" is still \
+                     there. {}",
                     crate::git::branch_refusal_note(branch, reason)
                 ),
             };
             // Said only when the agent DRIFTED off the branch it was born on,
             // so the ordinary case still reads as one branch and the drifted
             // case never leaves the user guessing what became of the other.
-            if let Some(note) =
-                branches.initial_branch_note(outcome.session.initial_branch().unwrap_or_default())
-            {
+            if let Some(note) = branches.initial_branch_note(&facts.initial_branch) {
                 message.push(' ');
                 message.push_str(&note);
             }
             message
         }
         WorktreeRemoval::PreservedShared => {
-            format!("Deleted agent \"{name}\". Worktree kept (shared with other agents).")
+            format!("{opening}. Its worktree was kept because other agents share it.")
         }
         WorktreeRemoval::SkippedForSiblings => {
-            format!("Deleted agent \"{name}\". Worktree kept (still used by other agents).")
+            format!(
+                "{opening}. Its worktree was kept even though you asked for it to go, because \
+                 other agents still use it."
+            )
         }
+        // The user did not ask for the worktree to go, so it is still on disk and
+        // the line says where: no dux surface can reach it once the agent is gone.
         WorktreeRemoval::PreservedOrphan => {
-            format!("Deleted agent \"{name}\". Worktree left on disk.")
+            format!(
+                "{opening}. Its worktree was left on disk at \"{}\"; remove it yourself if you \
+                 no longer need it.",
+                facts.directory
+            )
         }
     }
 }
@@ -3618,8 +3690,8 @@ impl Engine {
                         // Mint a keyed HandlerStatusOp whose opaque id correlates
                         // this busy to the final resolved when the git-removal
                         // worker reports back, and stash it keyed by session id.
-                        // The resolver reproduces the web's exact wording for every
-                        // terminal `WebDeleteOutcome`.
+                        // The resolver picks the tone for every terminal
+                        // `WebDeleteOutcome`; the words come from the core formatter.
                         let op = crate::engine::status_op(busy_message.clone()).resolve_in_handler(
                             |o: &crate::engine::WebDeleteOutcome| {
                                 use crate::engine::{Final, WebDeleteOutcome};
@@ -3662,13 +3734,20 @@ impl Engine {
                         self.pending_delete_ops_web
                             .insert(view.session_id.clone(), op);
                         // Snapshot the agent BEFORE it is vanished below: the
-                        // completion authors the branch report from it, and by
-                        // then there is no record left to read.
+                        // completion authors the report from these facts, and by
+                        // then there is no record left to read. The project is
+                        // resolved here for the same reason.
                         if let Some(session) =
                             self.sessions.iter().find(|s| s.id == view.session_id)
                         {
-                            self.pending_delete_reports_web
-                                .insert(view.session_id.clone(), session.clone());
+                            let project_name = session
+                                .project_id()
+                                .and_then(|id| self.projects.iter().find(|p| p.id == id))
+                                .map(|p| p.name.clone());
+                            self.pending_delete_reports_web.insert(
+                                view.session_id.clone(),
+                                DeleteReportFacts::from_session(session, project_name),
+                            );
                         }
                         // Vanish the session now: its PTY and terminals are
                         // already SIGTERMed and held for a background reap.
@@ -3710,18 +3789,12 @@ impl Engine {
                     // no op is stashed (the TUI path, or a synthetic event),
                     // emit nothing.
                     let outcome = match self.pending_delete_reports_web.remove(session_id) {
-                        Some(session) => {
+                        Some(facts) => {
                             let removal = WorktreeRemoval::Performed {
                                 branches: branches.clone(),
                             };
-                            let outcome = FinishDeleteSessionOutcome {
-                                session,
-                                project: None,
-                                other_sessions_on_worktree: false,
-                                project_still_has_sessions: false,
-                            };
                             crate::engine::WebDeleteOutcome::Succeeded {
-                                message: delete_session_status_message(&outcome, &removal),
+                                message: delete_session_status_message(&facts, &removal),
                                 refused: removal.refused_a_branch(),
                             }
                         }
@@ -3955,7 +4028,10 @@ impl Engine {
             update_status: true,
         }) {
             Ok(EventReaction::FinishDeleteSessionView(view)) => {
-                let message = delete_session_status_message(&view.outcome, &view.removal);
+                let message = delete_session_status_message(
+                    &DeleteReportFacts::from_finish_outcome(&view.outcome),
+                    &view.removal,
+                );
                 match self.pending_delete_ops_web.remove(session_id) {
                     Some(op) => wire_statuses_from_reaction(
                         &op.resolve(&crate::engine::WebDeleteOutcome::Succeeded {
@@ -4996,7 +5072,10 @@ mod tests {
             Ok(None) => panic!("the session existed"),
             Err(err) => panic!("delete must succeed: {err}"),
         };
-        let message = delete_session_status_message(&outcome.finish, &outcome.removal);
+        let message = delete_session_status_message(
+            &DeleteReportFacts::from_finish_outcome(&outcome.finish),
+            &outcome.removal,
+        );
 
         assert!(
             message.contains("folder"),
@@ -5066,7 +5145,7 @@ mod tests {
                 project_still_has_sessions: false,
             };
             delete_session_status_message(
-                &outcome,
+                &DeleteReportFacts::from_finish_outcome(&outcome),
                 &WorktreeRemoval::Performed {
                     branches: crate::engine::RemovedBranches::Deleted(branches),
                 },
@@ -5076,7 +5155,7 @@ mod tests {
         // No drift: one branch, named.
         assert_eq!(
             message("feat", "feat", crate::git::RemoveResult::default()),
-            "Deleted agent \"agent-one\", removed its worktree and deleted its branch \"feat\"."
+            "Deleted claude agent \"agent-one\", removed its worktree and deleted its branch \"feat\"."
         );
         // Drifted: the birth branch went too, and the line says so.
         assert_eq!(
@@ -5088,7 +5167,7 @@ mod tests {
                     initial_branch: Some(crate::git::BranchDeletion::Deleted),
                 },
             ),
-            "Deleted agent \"agent-one\", removed its worktree and deleted its branch \
+            "Deleted claude agent \"agent-one\", removed its worktree and deleted its branch \
              \"drifted\". Its original branch \"born-here\" was deleted too."
         );
         // Neither branch was dux's to delete: the message must not claim it did.
@@ -5101,7 +5180,7 @@ mod tests {
                     initial_branch: Some(crate::git::BranchDeletion::AlreadyGone),
                 },
             ),
-            "Deleted agent \"agent-one\" and removed its worktree. Its branch \"drifted\" was \
+            "Deleted claude agent \"agent-one\" and removed its worktree. Its branch \"drifted\" was \
              already gone. Its original branch \"born-here\" was already gone."
         );
     }
@@ -5131,7 +5210,7 @@ mod tests {
                 project_still_has_sessions: false,
             };
             delete_session_status_message(
-                &outcome,
+                &DeleteReportFacts::from_finish_outcome(&outcome),
                 &WorktreeRemoval::Performed {
                     branches: crate::engine::RemovedBranches::Kept(
                         crate::model::BranchKeptReason::NotDuxs(provenance),
@@ -5146,7 +5225,7 @@ mod tests {
                 "develop",
                 crate::model::BranchProvenance::AttachedExisting
             ),
-            "Deleted agent \"agent-one\" and removed its worktree. Its branch \"develop\" \
+            "Deleted claude agent \"agent-one\" and removed its worktree. Its branch \"develop\" \
              existed before this agent and was kept. Delete it yourself with \
              git branch -D \"develop\" if you no longer need it."
         );
@@ -5158,7 +5237,7 @@ mod tests {
                 "develop",
                 crate::model::BranchProvenance::AttachedExisting
             ),
-            "Deleted agent \"agent-one\" and removed its worktree. Its branch \"feature-x\" \
+            "Deleted claude agent \"agent-one\" and removed its worktree. Its branch \"feature-x\" \
              was created inside this agent's worktree and was kept, and its branch \
              \"develop\" existed before this agent and was kept. Delete either yourself \
              with git branch -D \"feature-x\" or git branch -D \"develop\" if you no longer \
@@ -5168,7 +5247,7 @@ mod tests {
         // sentence from "existed before this agent".
         assert_eq!(
             message("main", "main", crate::model::BranchProvenance::Adopted),
-            "Deleted agent \"agent-one\" and removed its worktree. Its branch \"main\" \
+            "Deleted claude agent \"agent-one\" and removed its worktree. Its branch \"main\" \
              came with the worktree this agent adopted and was kept. Delete it yourself \
              with git branch -D \"main\" if you no longer need it."
         );
@@ -8852,7 +8931,7 @@ mod tests {
             .expect("apply_wire");
         let status = outcome.status.expect("status");
         assert!(
-            status.message.contains("Deleted agent"),
+            status.message.contains("Deleted claude agent \"s1-title\""),
             "unexpected status: {}",
             status.message
         );
@@ -9691,7 +9770,9 @@ mod tests {
         assert_eq!(statuses.len(), 1, "expected one status: {statuses:?}");
         assert_eq!(statuses[0].tone, "info");
         assert!(
-            statuses[0].message.contains("Deleted agent")
+            statuses[0]
+                .message
+                .contains("Deleted claude agent \"s1-title\"")
                 && statuses[0].message.contains("removed its worktree"),
             "unexpected status: {}",
             statuses[0].message
@@ -9865,7 +9946,7 @@ mod tests {
         // and keeps a keyed busy op for the deferred worktree removal. By the time
         // WorktreeRemoveCompleted reports back the session is gone from the spine,
         // so the final is authored from the snapshot taken when the removal was
-        // dispatched: the agent and its branches are still named.
+        // dispatched: the agent, its project and its branches are still named.
         let (mut engine, _tmp) = test_engine();
         engine.projects.push(sample_project("p1", "/tmp/p1"));
         let session = sample_session("s1", "p1", "feat");
@@ -9898,7 +9979,8 @@ mod tests {
         assert_eq!(statuses[0].tone, "info");
         assert_eq!(
             statuses[0].message,
-            "Deleted agent \"s1-title\", removed its worktree and deleted its branch \"feat\"."
+            "Deleted claude agent \"s1-title\" from project \"p1-name\", removed its worktree \
+             and deleted its branch \"feat\"."
         );
         assert!(
             engine.pending_delete_ops_web.is_empty(),

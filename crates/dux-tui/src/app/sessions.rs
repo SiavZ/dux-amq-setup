@@ -1969,87 +1969,41 @@ impl App {
 
     /// Build the keyed status op for an async worktree deletion.
     ///
-    /// The resolver captures the dispatch-time session facts (provider, project
-    /// name, branch name, display name), which are still present because cleanup
-    /// is deferred until git succeeds, and reproduces the TUI's wording for every
-    /// terminal [`TuiDeleteOutcome`].
+    /// The resolver captures the dispatch-time facts of the agent, still present
+    /// because cleanup is deferred until git succeeds, and hands them to the one
+    /// core formatter both surfaces report a delete through.
     pub(super) fn build_delete_status_op(
         &self,
         session_id: &str,
         busy_message: String,
     ) -> dux_core::engine::HandlerStatusOp<TuiDeleteOutcome> {
-        let (provider, branch_name, initial_branch, name, project_name) = self
+        // The default is unreachable in practice: the op is built while the
+        // agent is still here, which is the whole reason it is built at dispatch.
+        let facts = self
             .engine
             .sessions
             .iter()
             .find(|s| s.id == session_id)
-            .map(|s| {
-                let provider = s.provider.as_str().to_string();
-                // A standalone agent has no branch and none of the branch-naming
-                // arms below is reachable for one, so an empty string here is an
-                // unreachable placeholder rather than a value a sentence renders.
-                let branch_name = s.branch_name().unwrap_or_default().to_string();
-                // Captured here, with the session still present, because the
-                // removal's report can name a SECOND branch (the one the agent
-                // was born on) and the session is gone by the time it lands.
-                let initial_branch = s.initial_branch().unwrap_or_default().to_string();
-                let name = s.display_label();
-                let project_name = s
+            .map(|session| {
+                let project_name = session
                     .project_id()
                     .and_then(|project_id| self.engine.projects.iter().find(|p| p.id == project_id))
-                    .map(|p| p.name.clone())
-                    .unwrap_or_else(|| "<unknown>".to_string());
-                (provider, branch_name, initial_branch, name, project_name)
+                    .map(|p| p.name.clone());
+                dux_core::wire::DeleteReportFacts::from_session(session, project_name)
             })
-            .unwrap_or_else(|| {
-                (
-                    String::new(),
-                    String::new(),
-                    String::new(),
-                    String::new(),
-                    "<unknown>".to_string(),
-                )
-            });
-        dux_core::engine::status_op(busy_message).resolve_in_handler(
-            move |o: &TuiDeleteOutcome| match o {
-                // Nothing was deleted, so the line names the branches that stayed,
-                // why, and the manual way out: the worktree is gone, so no dux
-                // surface can reach them now. The reason is not always "not dux's
-                // to delete"; a branch dux made and the user unticked is kept too.
-                TuiDeleteOutcome::SucceededPresent {
-                    branches: dux_core::engine::RemovedBranches::Kept(kept_reason),
-                } => dux_core::engine::Final::info(format!(
-                    "Deleted {provider} agent \"{branch_name}\" and removed its worktree. {}",
-                    kept_reason.kept_branches_note(&branch_name, &initial_branch)
-                )),
-                TuiDeleteOutcome::SucceededPresent {
-                    branches: dux_core::engine::RemovedBranches::Deleted(branches),
-                } => {
-                    let base = match &branches.branch {
-                        dux_core::git::BranchDeletion::Deleted => format!(
-                            "Deleted {provider} agent from project \"{project_name}\" with branch \"{branch_name}\"."
-                        ),
-                        dux_core::git::BranchDeletion::AlreadyGone => format!(
-                            "Deleted agent (branch \"{branch_name}\" was already removed)."
-                        ),
-                        // git refused, so the branch is STILL THERE: say so,
-                        // give git's reason, and name the way out.
-                        dux_core::git::BranchDeletion::Refused { reason } => format!(
-                            "Deleted agent, but its branch \"{branch_name}\" is still there. {}",
-                            dux_core::git::branch_refusal_note(&branch_name, reason)
-                        ),
+            .unwrap_or_default();
+        dux_core::engine::status_op(busy_message).resolve_in_handler(move |o: &TuiDeleteOutcome| {
+            match o {
+                TuiDeleteOutcome::SucceededPresent { branches } => {
+                    let removal = dux_core::engine::WorktreeRemoval::Performed {
+                        branches: branches.clone(),
                     };
-                    // Only when the agent drifted off its birth branch, which is
-                    // deleted too; see `git::RemoveResult::initial_branch_note`.
-                    let message = match branches.initial_branch_note(&initial_branch) {
-                        Some(note) => format!("{base} {note}"),
-                        None => base,
-                    };
+                    let message = dux_core::wire::delete_session_status_message(&facts, &removal);
                     // A surviving branch is a leftover the user has to act on, so
                     // it is a warning rather than the ordinary info line. The web
                     // makes that warning sticky; this surface has no such flag and
                     // answers with warning retention, which is three windows.
-                    if branches.refused_a_branch() {
+                    if removal.refused_a_branch() {
                         dux_core::engine::Final::warning(message)
                     } else {
                         dux_core::engine::Final::info(message)
@@ -2064,14 +2018,17 @@ impl App {
                         dux_core::engine::Final::clear()
                     }
                 }
-                TuiDeleteOutcome::FailedNamed { message } => dux_core::engine::Final::error(
-                    format!("Worktree delete failed for {provider} agent \"{name}\": {message}"),
-                ),
+                TuiDeleteOutcome::FailedNamed { message } => {
+                    dux_core::engine::Final::error(format!(
+                        "Worktree delete failed for {} agent \"{}\": {message}",
+                        facts.provider, facts.label
+                    ))
+                }
                 TuiDeleteOutcome::FailedBare { message } => {
                     dux_core::engine::Final::error(format!("Worktree delete failed: {message}"))
                 }
-            },
-        )
+            }
+        })
     }
 
     pub(crate) fn begin_delete_session(
@@ -2147,102 +2104,18 @@ impl App {
         self.reload_changed_files();
 
         if update_status {
-            // The branch identity these lines name, when there is one. A
-            // standalone agent takes the `NothingToRemove` arm below, which is
-            // the only one that reaches it, so the empty fallbacks here are
-            // unreachable placeholders rather than values any sentence renders.
-            let branch_name = session.branch_name().unwrap_or_default().to_string();
-            let initial_branch = session.initial_branch().unwrap_or_default().to_string();
-            match removal {
-                // A standalone agent: dux's record is gone and the user's
-                // folder is exactly as it was. Said out loud, because "Deleted
-                // agent X." on its own reads as though something on disk went
-                // with it.
-                WorktreeRemoval::NothingToRemove { folder_label } => {
-                    self.set_info(format!(
-                        "Deleted {} agent \"{}\". Its folder \"{folder_label}\" was left untouched: \
-                         dux never creates, moves or removes a standalone agent's folder.",
-                        session.provider.as_str(),
-                        session.display_label(),
-                    ));
-                }
-                WorktreeRemoval::SkippedForSiblings => {
-                    self.set_info(format!(
-                        "Deleted {} agent \"{}\". Worktree preserved because other sessions still use it.",
-                        session.provider.as_str(),
-                        branch_name,
-                    ));
-                }
-                WorktreeRemoval::PreservedShared => {
-                    self.set_info(format!(
-                        "Deleted {} session for agent \"{}\". Worktree preserved for remaining sessions.",
-                        session.provider.as_str(),
-                        branch_name,
-                    ));
-                }
-                WorktreeRemoval::PreservedOrphan => {
-                    self.set_info(format!(
-                        "Deleted {} agent \"{}\". Worktree preserved at {}.",
-                        session.provider.as_str(),
-                        branch_name,
-                        session.directory(),
-                    ));
-                }
-                // The worktree went and the branches stayed, either because
-                // they were not dux's to delete or because the user unticked a
-                // box for one that was. Every kept branch is named with its own
-                // reason, and the line says how to remove one by hand.
-                WorktreeRemoval::Performed {
-                    branches: dux_core::engine::RemovedBranches::Kept(kept_reason),
-                } => {
-                    self.set_info(format!(
-                        "Deleted {} agent \"{}\" and removed its worktree. {}",
-                        session.provider.as_str(),
-                        branch_name,
-                        kept_reason.kept_branches_note(&branch_name, &initial_branch),
-                    ));
-                }
-                WorktreeRemoval::Performed {
-                    branches: dux_core::engine::RemovedBranches::Deleted(branches),
-                } => {
-                    let mut message = match &branches.branch {
-                        dux_core::git::BranchDeletion::Deleted => {
-                            let project_name = project
-                                .as_ref()
-                                .map(|p| p.name.as_str())
-                                .unwrap_or("<unknown>");
-                            format!(
-                                "Deleted {} agent from project \"{}\" with branch \"{}\".",
-                                session.provider.as_str(),
-                                project_name,
-                                branch_name,
-                            )
-                        }
-                        dux_core::git::BranchDeletion::AlreadyGone => format!(
-                            "Deleted agent (branch \"{}\" was already removed).",
-                            branch_name,
-                        ),
-                        // Refused means the branch SURVIVED; the message must
-                        // say so.
-                        dux_core::git::BranchDeletion::Refused { reason } => format!(
-                            "Deleted agent, but its branch \"{}\" is still there. {}",
-                            branch_name,
-                            dux_core::git::branch_refusal_note(&branch_name, reason),
-                        ),
-                    };
-                    // Only when the agent DRIFTED off the branch it was born on:
-                    // that second branch is deleted too and the line must say so
-                    // rather than leaving the user to discover it.
-                    if let Some(note) = branches.initial_branch_note(&initial_branch) {
-                        message.push(' ');
-                        message.push_str(&note);
-                    }
-                    if branches.refused_a_branch() {
-                        self.set_warning(message);
-                    } else {
-                        self.set_info(message);
-                    }
-                }
+            let facts = dux_core::wire::DeleteReportFacts::from_session(
+                &session,
+                project.as_ref().map(|p| p.name.clone()),
+            );
+            let message = dux_core::wire::delete_session_status_message(&facts, &removal);
+            // A branch git refused to delete is still on disk and only the user
+            // can clear it, so the line is a warning. The web makes the same one
+            // sticky; this surface answers with warning retention instead.
+            if removal.refused_a_branch() {
+                self.set_warning(message);
+            } else {
+                self.set_info(message);
             }
         }
     }
@@ -7178,19 +7051,21 @@ mod tests {
         );
     }
 
-    /// The async success path (session still present at completion) now resolves
-    /// the keyed delete op rather than letting `apply_finish_delete_session_outcome`
-    /// author the line. The wording must stay byte-identical to the legacy path.
+    /// The async success path (session still present at completion) resolves the
+    /// keyed delete op rather than letting `apply_finish_delete_session_outcome`
+    /// author the line, and both say what the one core formatter says.
     #[test]
     fn async_delete_success_resolves_op_with_exact_wording() {
         for (branch, expected) in [
             (
                 dux_core::git::BranchDeletion::Deleted,
-                "Deleted claude agent from project \"demo\" with branch \"branch-s1\".",
+                "Deleted claude agent \"branch-s1\" from project \"demo\", removed its \
+                 worktree and deleted its branch \"branch-s1\".",
             ),
             (
                 dux_core::git::BranchDeletion::AlreadyGone,
-                "Deleted agent (branch \"branch-s1\" was already removed).",
+                "Deleted claude agent \"branch-s1\" from project \"demo\" and removed its \
+                 worktree. Its branch \"branch-s1\" was already gone.",
             ),
         ] {
             let mut s1 = make_session("s1", "claude", "/tmp/wt");
@@ -7286,15 +7161,18 @@ mod tests {
         let cases = [
             (
                 WorktreeRemoval::SkippedForSiblings,
-                "Deleted claude agent \"branch-s1\". Worktree preserved because other sessions still use it.",
+                "Deleted claude agent \"branch-s1\" from project \"demo\". Its worktree was \
+                 kept even though you asked for it to go, because other agents still use it.",
             ),
             (
                 WorktreeRemoval::PreservedShared,
-                "Deleted claude session for agent \"branch-s1\". Worktree preserved for remaining sessions.",
+                "Deleted claude agent \"branch-s1\" from project \"demo\". Its worktree was \
+                 kept because other agents share it.",
             ),
             (
                 WorktreeRemoval::PreservedOrphan,
-                "Deleted claude agent \"branch-s1\". Worktree preserved at /tmp/wt.",
+                "Deleted claude agent \"branch-s1\" from project \"demo\". Its worktree was \
+                 left on disk at \"/tmp/wt\"; remove it yourself if you no longer need it.",
             ),
             (
                 WorktreeRemoval::Performed {
@@ -7305,7 +7183,8 @@ mod tests {
                         },
                     ),
                 },
-                "Deleted agent (branch \"branch-s1\" was already removed).",
+                "Deleted claude agent \"branch-s1\" from project \"demo\" and removed its \
+                 worktree. Its branch \"branch-s1\" was already gone.",
             ),
             (
                 WorktreeRemoval::Performed {
@@ -7313,7 +7192,8 @@ mod tests {
                         dux_core::git::RemoveResult::default(),
                     ),
                 },
-                "Deleted claude agent from project \"demo\" with branch \"branch-s1\".",
+                "Deleted claude agent \"branch-s1\" from project \"demo\", removed its \
+                 worktree and deleted its branch \"branch-s1\".",
             ),
         ];
 
@@ -7369,8 +7249,9 @@ mod tests {
 
         assert_eq!(
             app.status.message(),
-            "Deleted claude agent from project \"demo\" with branch \"branch-s1\". \
-             Its original branch \"born-here\" was deleted too."
+            "Deleted claude agent \"branch-s1\" from project \"demo\", removed its worktree \
+             and deleted its branch \"branch-s1\". Its original branch \"born-here\" was \
+             deleted too."
         );
     }
 
@@ -7414,11 +7295,11 @@ mod tests {
 
         assert_eq!(
             app.status.message(),
-            "Deleted claude agent \"branch-s1\" and removed its worktree. Its branch \
-             \"branch-s1\" was created inside this agent's worktree and was kept, and its \
-             branch \"develop\" existed before this agent and was kept. Delete either \
-             yourself with git branch -D \"branch-s1\" or git branch -D \"develop\" if you \
-             no longer need them."
+            "Deleted claude agent \"branch-s1\" from project \"demo\" and removed its \
+             worktree. Its branch \"branch-s1\" was created inside this agent's worktree and \
+             was kept, and its branch \"develop\" existed before this agent and was kept. \
+             Delete either yourself with git branch -D \"branch-s1\" or git branch -D \
+             \"develop\" if you no longer need them."
         );
     }
 
@@ -7450,9 +7331,10 @@ mod tests {
         };
         assert_eq!(
             status.message,
-            "Deleted claude agent \"branch-s1\" and removed its worktree. Its branch \
-             \"branch-s1\" came with the worktree this agent adopted and was kept. Delete \
-             it yourself with git branch -D \"branch-s1\" if you no longer need it."
+            "Deleted claude agent \"branch-s1\" from project \"demo\" and removed its \
+             worktree. Its branch \"branch-s1\" came with the worktree this agent adopted and \
+             was kept. Delete it yourself with git branch -D \"branch-s1\" if you no longer \
+             need it."
         );
     }
 

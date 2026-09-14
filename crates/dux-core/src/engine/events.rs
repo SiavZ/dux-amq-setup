@@ -4036,7 +4036,10 @@ mod tests {
         );
         // And the message names both, with a reason each: "existed before this
         // agent" is false of the branch the drift created.
-        let message = crate::wire::delete_session_status_message(&outcome.finish, &outcome.removal);
+        let message = crate::wire::delete_session_status_message(
+            &crate::wire::DeleteReportFacts::from_finish_outcome(&outcome.finish),
+            &outcome.removal,
+        );
         assert!(
             message.contains("\"feature-x\" was created inside this agent's worktree and was kept")
                 && message.contains("\"develop\" existed before this agent and was kept"),

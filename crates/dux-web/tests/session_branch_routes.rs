@@ -312,9 +312,9 @@ where
 /// it carries git's own words when git REFUSED to delete one, so a refusal fails
 /// a test with its reason rather than with a bare list.
 ///
-/// Every final variant opens with the agent's name, the busy that precedes it
-/// ("Removing worktree for agent …") does not, so matching the opening picks the
-/// final whatever it went on to say.
+/// Every final variant opens with "Deleted" and names the agent, the busy that
+/// precedes it ("Removing worktree for agent …") does neither, so matching that
+/// opening picks the final whatever it went on to say.
 async fn wait_for_delete_status<S>(ws: &mut S, name: &str) -> String
 where
     S: StreamExt<
@@ -324,12 +324,12 @@ where
             >,
         > + Unpin,
 {
-    let opening = format!("Deleted agent \"{name}\"");
+    let names_agent = format!("agent \"{name}\"");
     let frame = next_frame(ws, |v| {
         v["event"] == "status"
-            && v["message"]
-                .as_str()
-                .is_some_and(|message| message.starts_with(&opening))
+            && v["message"].as_str().is_some_and(|message| {
+                message.starts_with("Deleted ") && message.contains(&names_agent)
+            })
     })
     .await
     .unwrap_or_else(|| panic!("the delete of {name} must report its outcome on the events socket"));

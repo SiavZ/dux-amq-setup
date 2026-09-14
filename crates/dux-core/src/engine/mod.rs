@@ -673,7 +673,7 @@ pub struct Engine {
     /// is dispatched because the web vanishes the row at that moment and the
     /// completion still has to name the agent and its branches. Keyed and
     /// cleared exactly like `pending_delete_ops_web`.
-    pub pending_delete_reports_web: HashMap<String, AgentSession>,
+    pub pending_delete_reports_web: HashMap<String, crate::wire::DeleteReportFacts>,
 
     /// Create-agent ops: the create busy and its progress re-emits, shared by
     /// every surface because the busy is emitted engine-side and its final
