@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from "react"
+import { createKeyedRegistry } from "./keyedRegistry"
 
 // Which mounted pane can attach a file, keyed by PTY id. A row menu is not a pane,
 // and an upload must travel the pane's own gated socket into the pane's own sink,
@@ -12,16 +12,7 @@ import { useSyncExternalStore } from "react"
 /// Open the picker and upload whatever is chosen into this pane's own sink.
 type AttachFn = () => void
 
-const capabilities = new Map<string, AttachFn>()
-const listeners = new Set<() => void>()
-// A monotonic counter is the snapshot: `useSyncExternalStore` compares snapshots by
-// value, and a Map's identity either never changes or changes on every read.
-let version = 0
-
-function publish(): void {
-  version++
-  for (const listener of listeners) listener()
-}
+const capabilities = createKeyedRegistry<AttachFn>()
 
 /**
  * Publish this pane's attach capability. Returns the retirement.
@@ -34,27 +25,12 @@ export function registerAttachCapability(
   ptyId: string,
   attach: AttachFn,
 ): () => void {
-  capabilities.set(ptyId, attach)
-  publish()
-  return () => {
-    if (capabilities.get(ptyId) !== attach) return
-    capabilities.delete(ptyId)
-    publish()
-  }
+  return capabilities.register(ptyId, attach)
 }
 
 /** The capability for one PTY id, or null when no mounted owner pane has it. */
 export function attachCapabilityFor(ptyId: string): AttachFn | null {
-  return capabilities.get(ptyId) ?? null
-}
-
-function subscribe(listener: () => void): () => void {
-  listeners.add(listener)
-  return () => void listeners.delete(listener)
-}
-
-function snapshot(): number {
-  return version
+  return capabilities.read(ptyId) ?? null
 }
 
 /**
@@ -62,9 +38,9 @@ function snapshot(): number {
  * session-slot id plus every tab id, since any of its panes may be the mounted one.
  */
 export function useAttachCapability(ptyIds: string[]): AttachFn | null {
-  useSyncExternalStore(subscribe, snapshot, snapshot)
+  capabilities.useVersion()
   for (const id of ptyIds) {
-    const attach = capabilities.get(id)
+    const attach = capabilities.read(id)
     if (attach) return attach
   }
   return null
@@ -72,6 +48,5 @@ export function useAttachCapability(ptyIds: string[]): AttachFn | null {
 
 /** Test-only: forget every registration between cases. */
 export function resetAttachCapabilities(): void {
-  capabilities.clear()
-  publish()
+  capabilities.reset()
 }

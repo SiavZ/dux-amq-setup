@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from "react"
+import { createKeyedRegistry } from "./keyedRegistry"
 
 // What one pane's input group would say, keyed by pty id, for whichever top menu
 // is on screen above it. Only the pane knows the answers, and every menu that
@@ -30,16 +30,7 @@ export interface PaneInputGroupGates {
   keysToggle: boolean
 }
 
-const groups = new Map<string, PaneInputGroupGates>()
-const listeners = new Set<() => void>()
-// A monotonic counter IS the snapshot, for the same reason `attachRegistry`
-// uses one: `useSyncExternalStore` compares snapshots by value.
-let version = 0
-
-function publish(): void {
-  version++
-  for (const listener of listeners) listener()
-}
+const groups = createKeyedRegistry<PaneInputGroupGates>()
 
 /**
  * Publish this pane's input group and return its retirement. Last write wins,
@@ -50,22 +41,7 @@ export function registerPaneInputGroup(
   ptyId: string,
   gates: PaneInputGroupGates,
 ): () => void {
-  groups.set(ptyId, gates)
-  publish()
-  return () => {
-    if (groups.get(ptyId) !== gates) return
-    groups.delete(ptyId)
-    publish()
-  }
-}
-
-function subscribe(listener: () => void): () => void {
-  listeners.add(listener)
-  return () => void listeners.delete(listener)
-}
-
-function snapshot(): number {
-  return version
+  return groups.register(ptyId, gates)
 }
 
 /**
@@ -75,7 +51,7 @@ function snapshot(): number {
  * act behind it cannot come from different panes.
  */
 export function usePaneInputGroup(ptyIds: string[]): PaneInputGroupGates | null {
-  useSyncExternalStore(subscribe, snapshot, snapshot)
+  groups.useVersion()
   return paneInputGroupFor(ptyIds)
 }
 
@@ -85,7 +61,7 @@ export function paneInputGroupFor(
   ptyIds: string[],
 ): PaneInputGroupGates | null {
   for (const id of ptyIds) {
-    const gates = groups.get(id)
+    const gates = groups.read(id)
     if (gates) return gates
   }
   return null
@@ -104,6 +80,5 @@ export function paneInputGroupHasItems(
 
 /** Test-only: forget every registration between cases. */
 export function resetPaneInputGroups(): void {
-  groups.clear()
-  publish()
+  groups.reset()
 }
