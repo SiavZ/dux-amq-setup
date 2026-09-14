@@ -40,6 +40,7 @@ pub mod model;
 pub mod palette;
 pub mod pr_reference;
 pub mod project_browser;
+pub mod project_order;
 pub mod provider;
 pub mod pty;
 pub mod pty_owners;
