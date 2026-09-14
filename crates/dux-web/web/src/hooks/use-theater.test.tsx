@@ -55,7 +55,7 @@ function installBootStubs() {
 installBootStubs()
 const {
   armTheaterToggleFocus,
-  usePhoneChromeGesture,
+  useChromeGesture,
   useTheaterEscape,
   useTheaterGesture,
   useTheaterPillFocus,
@@ -88,7 +88,7 @@ function ChromeGesture({
   hidden: boolean
   armed?: boolean
 }) {
-  usePhoneChromeGesture(hidden, armed)
+  useChromeGesture(hidden, armed)
   return null
 }
 

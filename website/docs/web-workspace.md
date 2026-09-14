@@ -210,13 +210,16 @@ into the terminal, the message box goes and the keys stay, with their `⋯` on t
 keys as well and there is nothing below the terminal at all, and the pill's `⋯` is the way
 back.
 
-One thing does bring the top bar back on a phone without asking you to leave the mode: a
-card over the whole terminal, because another device took the driving seat, because nobody
-is driving it yet (it is running in the background and this device has not claimed it), or
-because the connection is being put back together. The pill goes with the terminal underneath it, so
-the header returns with **Back** and the agent's name and you are never stuck staring at a
-card you cannot walk away from. The moment the card goes, theater picks up where it left
-off. A brief spinner during a quick reconnect is not a card and changes nothing.
+One thing does bring the top bar back on either surface without asking you to leave the
+mode: a card over the whole terminal, because another device took the driving seat, because
+nobody is driving it yet (it is running in the background and this device has not claimed
+it), or because the connection is being put back together. The pill goes with the terminal
+underneath it, so the header returns with **Back** and the agent's name and you are never
+stuck staring at a card you cannot walk away from. On a computer the top bar comes back the
+same way, with the **Theater** button in it, since a tablet gets that layout on width alone
+and has no Escape key to leave with; the side panels stay away. The moment the card goes,
+theater picks up where it left off. A brief spinner during a quick reconnect is not a card
+and changes nothing.
 
 The pill carries no tab status. What the other tabs are doing is in the agents list and
 the tab strip, and one copy of that is enough. Theater on a phone hides both, so a tab

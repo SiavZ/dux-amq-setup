@@ -210,7 +210,7 @@ export function isTypingSurfaceElement(
 // The accepted cost is that in theater on a phone, where both are off screen, a
 // hidden tab needing attention has no on-screen signal until the mode is left.
 
-/// What the phone's top chrome reads to decide whether it is on screen.
+/// What a shell's top chrome reads to decide whether it is on screen.
 export interface TopChromeInputs {
   /// The mode itself, as the address and the store hold it.
   theater: boolean
@@ -220,10 +220,14 @@ export interface TopChromeInputs {
 }
 
 /**
- * Is the phone's top chrome hidden? Theater hides it, except while a full-pane
+ * Is a shell's top chrome hidden? Theater hides it, except while a full-pane
  * cover owns the terminal: a covered terminal is not one anybody is looking at,
  * and the pill that would carry the way out is withheld under such a cover, so
- * the header is the only route back to the agent list.
+ * the top bar is the only route left.
+ *
+ * Both surfaces ask it. A computer is reached by width alone, so a tablet with
+ * no keyboard lands there with no Escape either; only its TOP bar comes back,
+ * since its side panels are not a way out of anything.
  *
  * Nothing here writes the mode: the address stays in theater throughout, and
  * the chrome leaves again by itself once the cover goes.

@@ -13,25 +13,22 @@ import {
 } from "@/lib/theater"
 
 /**
- * The same one refit, for the other thing that moves the phone's chrome: a
+ * The same one refit, for the other thing that moves a shell's top chrome: a
  * full-pane cover arriving or leaving while theater stays on. The mode does not
  * move, so `useTheaterGesture` above never sees it, and the chrome stack still
  * animates a height the terminal's box is measured against.
  *
- * Mounted by the phone's pane screens, which are the only surfaces where a cover
- * moves the chrome at all, and watching the chrome's own state so a cover that
- * changes nothing on screen buys no refit. Overlapping the mode's own gesture is
- * safe: the layout hold is depth counted.
+ * Mounted by every shell whose top chrome a cover can move (the phone's pane
+ * screens and the computer's own shell), and watching the chrome's own state so
+ * a cover that changes nothing on screen buys no refit. Overlapping the mode's
+ * own gesture is safe: the layout hold is depth counted.
  *
  * `armed` is the pane having published a verdict at all. A pane screen mounts
  * before its lazy pane resolves, so until then the chrome reads a default rather
  * than an answer, and the pane's first publish would otherwise buy a hold and a
  * refit for what the user only ever saw as initial state.
  */
-export function usePhoneChromeGesture(
-  chromeHidden: boolean,
-  armed: boolean,
-): void {
+export function useChromeGesture(chromeHidden: boolean, armed: boolean): void {
   const reducedMotion = usePrefersReducedMotion()
   const reducedRef = React.useRef(reducedMotion)
   React.useEffect(() => {

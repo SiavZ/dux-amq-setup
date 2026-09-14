@@ -22,6 +22,15 @@ export type TerminalAreaModel = {
   dormant: boolean
 }
 
+/**
+ * The id of the PTY behind a selected target: an agent's FOCUSED TAB, or the
+ * terminal itself. It is the key every per-pane registry is written under, so
+ * chrome outside the pane resolves it the same way the pane's own model does.
+ */
+export function targetPtyId(target: SelectedTarget): string {
+  return target.kind === "agent" ? target.tabId : target.terminalId
+}
+
 export function terminalAreaModel(ctx: {
   target: SelectedTarget
   spine: DuxState["spine"]
@@ -38,7 +47,7 @@ export function terminalAreaModel(ctx: {
   // pane remounts and re-subscribes to the freshly launched provider; terminals
   // don't reconnect, so the epoch only affects the agent key.
   const isAgent = target.kind === "agent"
-  const targetId = isAgent ? target.tabId : target.terminalId
+  const targetId = targetPtyId(target)
   const ownerSessionId = isAgent
     ? target.sessionId
     : terminalOwnerSessionId(target.owner)

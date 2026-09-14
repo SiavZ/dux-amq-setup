@@ -43,6 +43,7 @@ import { CustomizeWebappDialog } from "@/components/CustomizeWebappDialog"
 import { InsetHeader } from "@/components/InsetHeader"
 import { TheaterChrome } from "@/components/TheaterChrome"
 import { TerminalArea } from "@/components/TerminalArea"
+import { targetPtyId } from "@/components/terminalAreaModel"
 import {
   ResizableHandle,
   ResizablePanel,
@@ -54,7 +55,11 @@ import {
 } from "@/components/ui/sidebar"
 import { Toaster } from "@/components/ui/sonner"
 import { useIsMobile } from "@/hooks/use-mobile"
-import { useTheaterEscape, useTheaterGesture } from "@/hooks/use-theater"
+import {
+  useChromeGesture,
+  useTheaterEscape,
+  useTheaterGesture,
+} from "@/hooks/use-theater"
 import { useVisualViewportHeight } from "@/hooks/use-visual-viewport"
 import { useChangesPaneController } from "@/hooks/use-changes-pane-controller"
 import {
@@ -64,6 +69,8 @@ import {
   TERMINAL_PANE_MIN_PERCENT,
   useDux,
 } from "@/lib/store"
+import { usePaneCoverKnown, usePaneCoverOwned } from "@/lib/paneCover"
+import { topChromeHidden } from "@/lib/theater"
 import { keyboardLikelyOpen } from "@/lib/viewport"
 
 // Every dialog and the toaster, rendered once above whichever shell is active.
@@ -125,7 +132,17 @@ export { CHANGES_PANE_HEAL_FRAMES } from "@/hooks/use-changes-pane-controller"
 // below is still the only production caller.
 export function DesktopShell() {
   const dux = useDux()
-  const { sidebarWidth, sidebarOpen, theater } = dux
+  const { sidebarWidth, sidebarOpen, theater, selectedTarget } = dux
+  // Theater's cover exception, on this layout too. A tablet with no keyboard
+  // reaches the computer layout by width alone and has no Escape, so a
+  // full-pane cover brings the top bar back with the Theater button in it. The
+  // side panels stay where the mode put them: the cover is about the pane.
+  const selectedPtyId = selectedTarget ? targetPtyId(selectedTarget) : null
+  const coverOwnsPane = usePaneCoverOwned(selectedPtyId)
+  const topChrome = topChromeHidden({ theater, coverOwnsPane })
+  // The header moving changes the terminal's height, and the mode never moved,
+  // so this is the only gesture that pays for that refit.
+  useChromeGesture(topChrome, usePaneCoverKnown(selectedPtyId))
   // Theater suppresses the pane without writing the preference every other
   // hide/show control persists: the mode is transient, and a write here would
   // hide the pane for good and for every client. Derived rather than stored, so
@@ -158,7 +175,7 @@ export function DesktopShell() {
             on the same flag, so the gesture above pays for one refit between
             them. The hidden Changes pane's reopen control lives in this header
             and goes with it; the floating pill is the chrome theater leaves. */}
-        <TheaterChrome hidden={theater}>
+        <TheaterChrome hidden={topChrome}>
           <InsetHeader />
         </TheaterChrome>
         <div className="min-h-0 flex-1">
