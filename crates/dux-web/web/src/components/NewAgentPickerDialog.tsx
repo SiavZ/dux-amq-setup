@@ -28,7 +28,7 @@ import {
 import { cn } from "@/lib/utils"
 import type { ProjectView } from "@/lib/types"
 import { workspaceProjectId } from "@/lib/agentWorkspace"
-import { orderProjectsByRecency } from "@/lib/projectOrder"
+import { applyFrozenOrder, orderProjectsByRecency } from "@/lib/projectOrder"
 import { formatRegularCount } from "@/lib/formatRegularCount"
 
 // The New-agent picker: the home for agent creation and every project action,
@@ -92,20 +92,30 @@ function PickerBody() {
   // Default to "new" so a missing value (older state, a test that only sets
   // newAgentPickerOpen) still renders the standard create flow.
   const intent = newAgentPickerIntent ?? "new"
+  const sessions = useMemo(() => spine?.sessions ?? [], [spine])
   // Narrowed to a candidate set when a pull-request reference matched several
   // projects: showing every project there would bury the two that are actually
   // checkouts of that repository.
-  const sessions = useMemo(() => spine?.sessions ?? [], [spine])
-  // Ordered most-recently-touched first through the rule dux-core owns, the
-  // narrowed candidate set included.
-  const projects = useMemo(() => {
+  const candidates = useMemo(() => {
     const all = spine?.projects ?? []
-    const only = newAgentPickerOnlyIds ? new Set(newAgentPickerOnlyIds) : null
-    const candidates = only
-      ? all.filter((project) => only.has(project.id))
-      : all
-    return orderProjectsByRecency(candidates, sessions)
-  }, [spine, newAgentPickerOnlyIds, sessions])
+    if (!newAgentPickerOnlyIds) return all
+    const only = new Set(newAgentPickerOnlyIds)
+    return all.filter((project) => only.has(project.id))
+  }, [spine, newAgentPickerOnlyIds])
+  // The recency order is snapshotted at open, the way the terminal UI snapshots
+  // its chooser: a list that re-sorts under the pointer lands a click on the
+  // wrong project. This body mounts only while the dialog is open, so a mount is
+  // an open, and the narrowed set is read once here too, since a pull-request
+  // reference is not expected to change while its picker is up.
+  const [frozenIds] = useState(() =>
+    orderProjectsByRecency(candidates, sessions).map((project) => project.id),
+  )
+  // The rows are the live spine's own objects, so names and agent counts keep
+  // updating inside the frozen order.
+  const projects = useMemo(
+    () => applyFrozenOrder(frozenIds, candidates),
+    [frozenIds, candidates],
+  )
 
   const [query, setQuery] = useState("")
 

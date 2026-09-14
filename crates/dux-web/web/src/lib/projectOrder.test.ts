@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { orderProjectsByRecency } from "@/lib/projectOrder"
+import { applyFrozenOrder, orderProjectsByRecency } from "@/lib/projectOrder"
 import type { ProjectView, SessionView } from "@/lib/types"
 
 function at(day: number): string {
@@ -115,5 +115,43 @@ describe("orderProjectsByRecency", () => {
   it("keeps the incoming order on ties", () => {
     const projects = [project("one", at(3)), project("two", at(3)), project("three", at(3))]
     expect(ids(projects, [])).toEqual(["one", "two", "three"])
+  })
+})
+
+describe("applyFrozenOrder", () => {
+  it("keeps the frozen order whatever order the live list arrives in", () => {
+    const frozen = ["a", "b", "c"]
+    const live = [project("c", at(1)), project("a", at(2)), project("b", at(3))]
+    expect(applyFrozenOrder(frozen, live).map((p) => p.id)).toEqual([
+      "a",
+      "b",
+      "c",
+    ])
+  })
+
+  it("skips a project that has gone", () => {
+    const frozen = ["a", "b", "c"]
+    const live = [project("a", at(1)), project("c", at(1))]
+    expect(applyFrozenOrder(frozen, live).map((p) => p.id)).toEqual(["a", "c"])
+  })
+
+  it("appends a project the frozen order never saw, at the end", () => {
+    const frozen = ["a", "b"]
+    const live = [project("new", at(9)), project("a", at(1)), project("b", at(2))]
+    expect(applyFrozenOrder(frozen, live).map((p) => p.id)).toEqual([
+      "a",
+      "b",
+      "new",
+    ])
+  })
+
+  it("appends several newcomers in incoming order", () => {
+    const frozen = ["a"]
+    const live = [project("x", at(1)), project("a", at(1)), project("y", at(1))]
+    expect(applyFrozenOrder(frozen, live).map((p) => p.id)).toEqual([
+      "a",
+      "x",
+      "y",
+    ])
   })
 })

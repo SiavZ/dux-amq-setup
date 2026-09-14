@@ -186,6 +186,109 @@ describe("NewAgentPickerDialog", () => {
     expect(names[1]).toContain("beta")
   })
 
+  // The order is snapshotted at open, so a spine update while the picker is up
+  // cannot slide a row out from under the pointer.
+  describe("the order frozen at open", () => {
+    function projectRows(): string[] {
+      return screen
+        .getAllByRole("button")
+        .map((button) => button.textContent ?? "")
+        .filter((text) => /acme|beta|gamma/.test(text))
+    }
+
+    function stateWith(
+      projects: unknown[],
+      sessions: unknown[] = [],
+    ): DuxState {
+      return {
+        newAgentPickerOpen: true,
+        newAgentPickerIntent: "new",
+        spine: { projects, sessions },
+      } as unknown as DuxState
+    }
+
+    const acme = {
+      id: "p1",
+      name: "acme",
+      default_provider: "claude",
+      created_at: "2026-07-01T09:00:00Z",
+    }
+    const beta = {
+      id: "p2",
+      name: "beta",
+      default_provider: "codex",
+      created_at: "2026-07-02T09:00:00Z",
+    }
+    const agentOnAcme = {
+      id: "a1",
+      workspace: { kind: "managed", project_id: "p1" },
+      created_at: "2026-07-05T09:00:00Z",
+    }
+
+    it("does not move a row when a newer agent would re-sort the list", () => {
+      mockState = stateWith([beta, acme], [agentOnAcme])
+      const { rerender } = render(<NewAgentPickerDialog />)
+      expect(projectRows()[0]).toContain("acme")
+
+      // beta now holds the newest agent, so a live sort would lift it.
+      mockState = stateWith(
+        [beta, acme],
+        [
+          agentOnAcme,
+          {
+            id: "a2",
+            workspace: { kind: "managed", project_id: "p2" },
+            created_at: "2026-07-09T09:00:00Z",
+          },
+        ],
+      )
+      rerender(<NewAgentPickerDialog />)
+
+      const rows = projectRows()
+      expect(rows[0]).toContain("acme")
+      expect(rows[1]).toContain("beta")
+    })
+
+    it("drops a project that is removed while the picker is open", () => {
+      mockState = stateWith([beta, acme], [agentOnAcme])
+      const { rerender } = render(<NewAgentPickerDialog />)
+
+      mockState = stateWith([beta], [])
+      rerender(<NewAgentPickerDialog />)
+
+      expect(projectRows().map((text) => text.replace(/\s+/g, " "))).toHaveLength(
+        1,
+      )
+      expect(projectRows()[0]).toContain("beta")
+    })
+
+    it("puts a project added while the picker is open at the bottom", () => {
+      mockState = stateWith([beta, acme], [agentOnAcme])
+      const { rerender } = render(<NewAgentPickerDialog />)
+
+      // Freshly added, so a live sort would put it first.
+      mockState = stateWith(
+        [
+          beta,
+          acme,
+          {
+            id: "p3",
+            name: "gamma",
+            default_provider: "claude",
+            created_at: "2026-07-20T09:00:00Z",
+          },
+        ],
+        [agentOnAcme],
+      )
+      rerender(<NewAgentPickerDialog />)
+
+      const rows = projectRows()
+      expect(rows[0]).toContain("acme")
+      expect(rows[1]).toContain("beta")
+      expect(rows[2]).toContain("gamma")
+    })
+  })
+
   it("gives the results list a fixed height so the modal does not resize as you type", () => {
     // Content-shift fix: the scroll region is a fixed h-72 (not max-h-72), so the
     // modal occupies the same space at 0, 1, or many results.

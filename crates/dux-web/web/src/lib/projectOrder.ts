@@ -56,3 +56,23 @@ export function orderProjectsByRecency(
     return right - left
   })
 }
+
+/** A frozen order applied to a live list: the projects named by `frozenIds`, in
+ * that order, skipping ids that are gone, then every other project at the end in
+ * incoming order. */
+export function applyFrozenOrder(
+  frozenIds: string[],
+  projects: ProjectView[],
+): ProjectView[] {
+  const byId = new Map(projects.map((project) => [project.id, project]))
+  const frozen = new Set(frozenIds)
+  const ordered: ProjectView[] = []
+  for (const id of frozenIds) {
+    const project = byId.get(id)
+    if (project) ordered.push(project)
+  }
+  for (const project of projects) {
+    if (!frozen.has(project.id)) ordered.push(project)
+  }
+  return ordered
+}
