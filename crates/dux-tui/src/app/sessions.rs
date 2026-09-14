@@ -6322,6 +6322,34 @@ mod tests {
         assert_eq!(ids, vec!["has-agent", "newest-added", "oldest"]);
     }
 
+    /// A pull-request reference that matched several projects narrows the
+    /// chooser, and the survivors keep the recency order.
+    #[test]
+    fn a_narrowed_project_chooser_keeps_the_recency_order() {
+        use chrono::TimeZone;
+        let at = |day: u32| chrono::Utc.with_ymd_and_hms(2026, 7, day, 9, 0, 0).unwrap();
+
+        let mut oldest = make_project("oldest", "codex");
+        oldest.created_at = Some(at(1));
+        let mut middle = make_project("middle", "codex");
+        middle.created_at = Some(at(5));
+        let mut newest = make_project("newest", "codex");
+        newest.created_at = Some(at(9));
+
+        let mut app = test_app_with_sessions(vec![], vec![oldest, middle, newest]);
+        let only = vec!["oldest".to_string(), "middle".to_string()];
+        app.open_project_chooser_over(ProjectChooserIntent::FromPr, Some(&only))
+            .unwrap();
+
+        let ids: Vec<String> = match &app.prompt {
+            PromptState::PickProject { entries, .. } => {
+                entries.iter().map(|entry| entry.id.clone()).collect()
+            }
+            other => panic!("the chooser must be open, got {other:?}"),
+        };
+        assert_eq!(ids, vec!["middle", "oldest"]);
+    }
+
     #[test]
     fn detach_finds_conflict_on_same_worktree() {
         let s1 = make_session("s1", "claude", "/tmp/wt/a");

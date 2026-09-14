@@ -186,6 +186,47 @@ describe("NewAgentPickerDialog", () => {
     expect(names[1]).toContain("beta")
   })
 
+  it("keeps the recency order inside a narrowed candidate set", () => {
+    // A pull-request reference matched acme and beta; gamma is out of the set,
+    // and the two that remain lead with the one touched most recently.
+    mockState = {
+      newAgentPickerOpen: true,
+      newAgentPickerIntent: "from_pr",
+      newAgentPickerOnlyIds: ["p1", "p2"],
+      spine: {
+        projects: [
+          {
+            id: "p1",
+            name: "acme",
+            default_provider: "claude",
+            created_at: "2026-07-01T09:00:00Z",
+          },
+          {
+            id: "p2",
+            name: "beta",
+            default_provider: "codex",
+            created_at: "2026-07-06T09:00:00Z",
+          },
+          {
+            id: "p3",
+            name: "gamma",
+            default_provider: "claude",
+            created_at: "2026-07-20T09:00:00Z",
+          },
+        ],
+        sessions: [],
+      },
+    } as unknown as DuxState
+    render(<NewAgentPickerDialog />)
+    const names = screen
+      .getAllByRole("button")
+      .map((button) => button.textContent ?? "")
+      .filter((text) => /acme|beta|gamma/.test(text))
+    expect(names).toHaveLength(2)
+    expect(names[0]).toContain("beta")
+    expect(names[1]).toContain("acme")
+  })
+
   // The order is snapshotted at open, so a spine update while the picker is up
   // cannot slide a row out from under the pointer.
   describe("the order frozen at open", () => {
