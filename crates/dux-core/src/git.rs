@@ -1549,6 +1549,16 @@ fn clean_git_reason(reason: &str) -> String {
 }
 
 impl RemoveResult {
+    /// Whether git refused either branch, which leaves it on disk for the user
+    /// to remove by hand. The one copy of the question every surface asks.
+    pub fn refused_a_branch(&self) -> bool {
+        self.branch.refused_reason().is_some()
+            || self
+                .initial_branch
+                .as_ref()
+                .is_some_and(|deletion| deletion.refused_reason().is_some())
+    }
+
     /// A sentence naming what happened to the agent's ORIGINAL branch, for the
     /// status message. `None` when the agent never drifted, so the message says
     /// nothing extra rather than mentioning a branch the user never saw.
@@ -6215,6 +6225,42 @@ mod tests {
         assert!(
             note.contains("still there") && note.contains("git branch -D \"born-here\""),
             "the note must be honest and actionable: {note}"
+        );
+        assert!(
+            result.refused_a_branch(),
+            "a refusal on the BIRTH branch alone still leaves something on disk"
+        );
+    }
+
+    /// The one predicate every surface asks before choosing a warning over an
+    /// info, pinned on each branch slot so a rewrite cannot quietly drop one.
+    #[test]
+    fn refused_a_branch_answers_for_either_branch_slot() {
+        let refused = BranchDeletion::Refused {
+            reason: "error: cannot delete branch".to_string(),
+        };
+        assert!(!RemoveResult::default().refused_a_branch());
+        assert!(
+            !RemoveResult {
+                branch: BranchDeletion::AlreadyGone,
+                initial_branch: Some(BranchDeletion::Deleted),
+            }
+            .refused_a_branch(),
+            "nothing was left behind, so nothing is refused"
+        );
+        assert!(
+            RemoveResult {
+                branch: refused.clone(),
+                initial_branch: None,
+            }
+            .refused_a_branch()
+        );
+        assert!(
+            RemoveResult {
+                branch: BranchDeletion::Deleted,
+                initial_branch: Some(refused),
+            }
+            .refused_a_branch()
         );
     }
 

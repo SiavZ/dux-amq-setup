@@ -2049,13 +2049,7 @@ impl App {
                     // it is a warning rather than the ordinary info line. The web
                     // makes that warning sticky; this surface has no such flag and
                     // answers with warning retention, which is three windows.
-                    if branches.branch.refused_reason().is_some()
-                        || branches
-                            .initial_branch
-                            .as_ref()
-                            .and_then(|b| b.refused_reason())
-                            .is_some()
-                    {
+                    if branches.refused_a_branch() {
                         dux_core::engine::Final::warning(message)
                     } else {
                         dux_core::engine::Final::info(message)
@@ -2243,13 +2237,7 @@ impl App {
                         message.push(' ');
                         message.push_str(&note);
                     }
-                    let refused = branches.branch.refused_reason().is_some()
-                        || branches
-                            .initial_branch
-                            .as_ref()
-                            .and_then(|b| b.refused_reason())
-                            .is_some();
-                    if refused {
+                    if branches.refused_a_branch() {
                         self.set_warning(message);
                     } else {
                         self.set_info(message);
