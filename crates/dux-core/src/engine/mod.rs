@@ -669,10 +669,9 @@ pub struct Engine {
     /// against a [`WebDeleteOutcome`]. The TUI drives the same worker chain but
     /// keeps its own op in the App layer, so this registry stays empty for it.
     pub pending_delete_ops_web: HashMap<String, HandlerStatusOp<WebDeleteOutcome>>,
-    /// The agent record each of those ops is about, snapshotted as the removal
-    /// is dispatched because the web vanishes the row at that moment and the
-    /// completion still has to name the agent and its branches. Keyed and
-    /// cleared exactly like `pending_delete_ops_web`.
+    /// Snapshot of the agent a deferred WEB delete is about, because the web vanishes the
+    /// record at dispatch: inserted there, consumed by the completion either way, unread by
+    /// the TUI path, which still holds the record when its own completion lands.
     pub pending_delete_reports_web: HashMap<String, crate::wire::DeleteReportFacts>,
 
     /// Create-agent ops: the create busy and its progress re-emits, shared by
