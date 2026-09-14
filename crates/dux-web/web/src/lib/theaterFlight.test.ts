@@ -70,6 +70,16 @@ describe("the phone's theater flight, stage by stage", () => {
     expect(flightForModeFrom("docked", true, CHROME_MS)).toBe("collapsing")
   })
 
+  it("rests rather than sticking when an instant swap lands mid-flight", () => {
+    // A cover arriving passes ms 0 (there is nothing to fly to under one), and
+    // it can land on a stage that really is in the air. Every answer is a
+    // RESTING phase, so the cluster is painted at one end or the other rather
+    // than held halfway with a timer nobody armed.
+    expect(flightForModeFrom("detaching", false, 0)).toBe("docked")
+    expect(flightForModeFrom("returning", true, 0)).toBe("floating")
+    expect(flightForModeFrom("attaching", false, 0)).toBe("docked")
+  })
+
   it("still cuts straight to the resting state for reduced motion", () => {
     expect(flightForModeFrom("collapsing", true, 0)).toBe("floating")
     expect(flightForModeFrom("docked", true, 0)).toBe("floating")
