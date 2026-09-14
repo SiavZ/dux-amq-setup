@@ -281,7 +281,8 @@ impl App {
 
     /// Build one chooser row per project from the live engine state, counting the
     /// sessions that belong to each. Ordered most-recently-touched first through
-    /// the core rule the web picker mirrors. Runtime-derived, display-only.
+    /// the core rule the web picker mirrors, and every chooser intent is built
+    /// here, so they all share that order. Runtime-derived, display-only.
     pub(crate) fn build_project_chooser_entries(&self) -> Vec<ProjectChooserEntry> {
         let order = dux_core::project_order::order_projects_by_recency(
             &self.engine.projects,
@@ -6348,6 +6349,31 @@ mod tests {
             other => panic!("the chooser must be open, got {other:?}"),
         };
         assert_eq!(ids, vec!["middle", "oldest"]);
+    }
+
+    /// Every intent is built from the one entry builder, so a chooser opened for
+    /// a project action lists the same recency order the new-agent one does.
+    #[test]
+    fn the_manage_project_chooser_comes_out_in_recency_order() {
+        use chrono::TimeZone;
+        let at = |day: u32| chrono::Utc.with_ymd_and_hms(2026, 7, day, 9, 0, 0).unwrap();
+
+        let mut oldest = make_project("oldest", "codex");
+        oldest.created_at = Some(at(1));
+        let mut newest = make_project("newest", "codex");
+        newest.created_at = Some(at(9));
+
+        let mut app = test_app_with_sessions(vec![], vec![oldest, newest]);
+        app.open_project_chooser(ProjectChooserIntent::Manage)
+            .unwrap();
+
+        let ids: Vec<String> = match &app.prompt {
+            PromptState::PickProject { entries, .. } => {
+                entries.iter().map(|entry| entry.id.clone()).collect()
+            }
+            other => panic!("the chooser must be open, got {other:?}"),
+        };
+        assert_eq!(ids, vec!["newest", "oldest"]);
     }
 
     #[test]
