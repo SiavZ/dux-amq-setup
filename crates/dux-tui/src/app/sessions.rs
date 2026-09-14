@@ -280,11 +280,16 @@ impl App {
     }
 
     /// Build one chooser row per project from the live engine state, counting the
-    /// sessions that belong to each. Runtime-derived, display-only.
+    /// sessions that belong to each. Ordered most-recently-touched first through
+    /// the core rule the web picker mirrors. Runtime-derived, display-only.
     pub(crate) fn build_project_chooser_entries(&self) -> Vec<ProjectChooserEntry> {
-        self.engine
-            .projects
-            .iter()
+        let order = dux_core::project_order::order_projects_by_recency(
+            &self.engine.projects,
+            &self.engine.sessions,
+        );
+        order
+            .into_iter()
+            .filter_map(|index| self.engine.projects.get(index))
             .map(|project| {
                 let agent_count = self
                     .engine
@@ -6279,6 +6284,42 @@ mod tests {
         // though "beta" is index 1 in `entries`, the visible-index resolution
         // must land on it, not on `entries[0]`.
         assert_eq!(app.project_chooser_context.as_deref(), Some("beta"));
+    }
+
+    /// The chooser lists projects by what was touched most recently: the project
+    /// holding the newest agent first, then the rest by the date they were added.
+    #[test]
+    fn project_chooser_entries_come_out_in_recency_order() {
+        use chrono::TimeZone;
+        let at = |day: u32| chrono::Utc.with_ymd_and_hms(2026, 7, day, 9, 0, 0).unwrap();
+
+        let mut oldest = make_project("oldest", "codex");
+        oldest.created_at = Some(at(1));
+        let mut newest_added = make_project("newest-added", "codex");
+        newest_added.created_at = Some(at(5));
+        let mut has_agent = make_project("has-agent", "codex");
+        has_agent.created_at = Some(at(2));
+
+        let mut session = make_session("s1", "codex", "/tmp/wt/a");
+        session.created_at = at(9);
+        session.workspace =
+            dux_core::model::AgentWorkspace::Managed(dux_core::model::ManagedWorkspace {
+                project_id: "has-agent".to_string(),
+                project_path: Some("/tmp/project".to_string()),
+                source_branch: "main".to_string(),
+                branch_name: "branch-s1".to_string(),
+                initial_branch: "branch-s1".to_string(),
+                branch_provenance: dux_core::model::BranchProvenance::CreatedByDux,
+                worktree_path: "/tmp/wt/a".to_string(),
+            });
+
+        let app = test_app_with_sessions(vec![session], vec![oldest, newest_added, has_agent]);
+        let ids: Vec<String> = app
+            .build_project_chooser_entries()
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect();
+        assert_eq!(ids, vec!["has-agent", "newest-added", "oldest"]);
     }
 
     #[test]
