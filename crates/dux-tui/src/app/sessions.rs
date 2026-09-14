@@ -2045,8 +2045,10 @@ impl App {
                         Some(note) => format!("{base} {note}"),
                         None => base,
                     };
-                    // A surviving branch is a leftover the user has to act on,
-                    // so it is a warning rather than the ordinary info line.
+                    // A surviving branch is a leftover the user has to act on, so
+                    // it is a warning rather than the ordinary info line. The web
+                    // makes that warning sticky; this surface has no such flag and
+                    // answers with warning retention, which is three windows.
                     if branches.branch.refused_reason().is_some()
                         || branches
                             .initial_branch

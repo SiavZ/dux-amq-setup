@@ -3624,14 +3624,15 @@ impl Engine {
                             |o: &crate::engine::WebDeleteOutcome| {
                                 use crate::engine::{Final, WebDeleteOutcome};
                                 match o {
-                                    // A branch git refused to delete is still
-                                    // there, so the line is a warning: the user
-                                    // has something left to clean up. Matches
-                                    // what the terminal UI says for it.
+                                    // STICKY: a branch git refused to delete is
+                                    // still on disk and only the user can clear
+                                    // it, and the worktree that named it is gone,
+                                    // so a toast that timed out would take the
+                                    // last mention of it with it.
                                     WebDeleteOutcome::Succeeded {
                                         message,
                                         refused: true,
-                                    } => Final::warning(message.clone()),
+                                    } => Final::warning(message.clone()).sticky(),
                                     WebDeleteOutcome::Succeeded { message, .. } => {
                                         Final::info(message.clone())
                                     }
@@ -3963,10 +3964,10 @@ impl Engine {
                         })
                         .into_reaction(),
                     ),
-                    None => vec![WireStatus::new(
-                        if refused { "warning" } else { "info" },
-                        message,
-                    )],
+                    // Sticky for the same reason as the keyed warning above: a
+                    // branch git refused to delete waits for the user to clear it.
+                    None if refused => vec![WireStatus::new("warning", message).sticky()],
+                    None => vec![WireStatus::new("info", message)],
                 }
             }
             Ok(_) => vec![],
@@ -9957,6 +9958,11 @@ mod tests {
             statuses[0].message.contains("is still there"),
             "the line must not claim the branch went: {}",
             statuses[0].message
+        );
+        assert!(
+            statuses[0].sticky,
+            "a branch git left on disk is something the user must clean up by hand, so the \
+             toast waits for them rather than timing out"
         );
     }
 
