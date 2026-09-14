@@ -1,7 +1,8 @@
 //! The recency ordering of the project lists, core-owned and mirrored by hand in
-//! the web's `crates/dux-web/web/src/lib/projectOrder.ts`. The rule lives here;
-//! the mirror is pinned by the same cases in `projectOrder.test.ts`, so an
-//! unmirrored change fails a test.
+//! the web's `crates/dux-web/web/src/lib/projectOrder.ts`. The rule lives here
+//! and the mirror is kept in step by hand: both test files carry the same cases,
+//! and nothing links the two suites, so a change to the rule is made in both
+//! places.
 //!
 //! Both screens that list every project (the web's New-agent picker and the
 //! TUI's project chooser) ask the same question: what did the user touch most

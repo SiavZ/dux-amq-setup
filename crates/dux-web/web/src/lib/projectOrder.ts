@@ -1,7 +1,7 @@
 // The recency ordering of the project lists, a hand mirror of the core-owned
-// `dux_core::project_order::order_projects_by_recency`. The rule lives there;
-// the same cases are pinned here in `projectOrder.test.ts`, so an unmirrored
-// change fails a test.
+// `dux_core::project_order::order_projects_by_recency`. The rule lives there and
+// this mirror is kept in step by hand: both test files carry the same cases, and
+// nothing links the two suites, so a change to the rule is made in both places.
 //
 // A project's instant is the later of when it was added and when its newest
 // agent was created; a standalone agent belongs to no project and counts for
