@@ -659,6 +659,69 @@ describe("MobileShell in theater", () => {
     expect(screen.queryByLabelText("Back")).toBeNull()
     expect(screen.getByTestId("theater-pill")).toBeTruthy()
   })
+
+  // The same rule on the screen with no agent behind it. It is the same
+  // component running the same flight, and its terminal is just as takeable, so
+  // the exception has to be keyed on the TERMINAL's id there.
+  function coveredTerminalState(): DuxState {
+    return makeState({
+      spine: {
+        projects: [
+          { id: "p1", name: "Repo", path: "/tmp/p1", default_provider: "claude" },
+        ],
+        sessions: [],
+        terminals: [
+          {
+            id: "pt-1",
+            owner: { kind: "project", project_id: "p1" },
+            label: "Terminal 2",
+            has_output: true,
+            foreground_cmd: null,
+          },
+        ],
+        sidebar: { groups: [], agentless_start: null },
+      },
+      selectedTarget: {
+        kind: "terminal",
+        terminalId: "pt-1",
+        owner: { kind: "project", projectId: "p1" },
+      },
+      selectedSessionId: null,
+      mobileScreen: "terminal",
+      startedDormantTabs: [],
+      pendingSlotTab: {},
+      terminalEpoch: 0,
+      theater: true,
+    } as unknown as Partial<DuxState>)
+  }
+
+  it("brings a project terminal's header back under its own cover", () => {
+    registerPaneCover("pt-1", true)
+    mockState = coveredTerminalState()
+    render(<MobileShell />)
+    expect(screen.getByLabelText("Back")).toBeTruthy()
+    expect(screen.getByTestId("mobile-action-flap")).toBeTruthy()
+  })
+
+  it("resumes theater on a terminal screen once its cover goes", () => {
+    const retire = registerPaneCover("pt-1", true)
+    mockState = coveredTerminalState()
+    render(<MobileShell />)
+    act(() => retire())
+    expect(screen.getByTestId("theater-pill")).toBeTruthy()
+    return waitFor(() => {
+      expect(screen.queryByLabelText("Back")).toBeNull()
+      expect(navigateUpMock).not.toHaveBeenCalled()
+    })
+  })
+
+  it("keeps a terminal screen in theater under the spinner cover", () => {
+    registerPaneCover("pt-1", false)
+    mockState = coveredTerminalState()
+    render(<MobileShell />)
+    expect(screen.queryByLabelText("Back")).toBeNull()
+    expect(screen.getByTestId("theater-pill")).toBeTruthy()
+  })
 })
 
 // The phone reads the same rule as the desktop, through the same helper: a
