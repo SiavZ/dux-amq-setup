@@ -691,6 +691,22 @@ pub enum WorktreeRemoval {
 }
 
 impl WorktreeRemoval {
+    /// Whether git refused to delete one of the branches, which leaves it on
+    /// disk for the user to remove by hand.
+    pub fn refused_a_branch(&self) -> bool {
+        let WorktreeRemoval::Performed {
+            branches: RemovedBranches::Deleted(result),
+        } = self
+        else {
+            return false;
+        };
+        result.branch.refused_reason().is_some()
+            || result
+                .initial_branch
+                .as_ref()
+                .is_some_and(|deletion| deletion.refused_reason().is_some())
+    }
+
     /// Derive the removal outcome for a synchronous (inline / `do_delete`)
     /// decision, given user intent and whether siblings share the worktree.
     /// `performed` is `Some(result)` when git actually removed the worktree,

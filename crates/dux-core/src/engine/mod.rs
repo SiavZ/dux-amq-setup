@@ -669,6 +669,11 @@ pub struct Engine {
     /// against a [`WebDeleteOutcome`]. The TUI drives the same worker chain but
     /// keeps its own op in the App layer, so this registry stays empty for it.
     pub pending_delete_ops_web: HashMap<String, HandlerStatusOp<WebDeleteOutcome>>,
+    /// The agent record each of those ops is about, snapshotted as the removal
+    /// is dispatched because the web vanishes the row at that moment and the
+    /// completion still has to name the agent and its branches. Keyed and
+    /// cleared exactly like `pending_delete_ops_web`.
+    pub pending_delete_reports_web: HashMap<String, AgentSession>,
 
     /// Create-agent ops: the create busy and its progress re-emits, shared by
     /// every surface because the busy is emitted engine-side and its final
@@ -814,9 +819,13 @@ pub fn launch_outcome_final(o: &LaunchOutcome) -> Final {
 /// already-gone fallback). The resolver (declared at dispatch) maps this to the
 /// final user message, byte-identical to the pre-op web wording.
 pub enum WebDeleteOutcome {
-    /// Git removal succeeded and the session was still present: the
-    /// `FinishDeleteSession` cascade ran and produced this status message.
-    Succeeded { message: String },
+    /// Git removal succeeded and a report could be authored for it: either the
+    /// session was still present and the `FinishDeleteSession` cascade produced
+    /// this message, or the web's deferred delete had vanished it and the
+    /// message came from the snapshot it left behind. `refused` is true when git
+    /// would not delete one of the branches, which leaves the user something to
+    /// clean up and is the difference between an info and a warning.
+    Succeeded { message: String, refused: bool },
     /// Git removal succeeded but the session was already gone (e.g. its project
     /// was removed) before the worker reported back.
     SucceededGone,
