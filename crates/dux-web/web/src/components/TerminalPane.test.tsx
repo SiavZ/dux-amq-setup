@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { useLayoutEffect } from "react"
 
 import { COMPOSE_SUBMIT_DELAY_MS } from "@/lib/composebar"
 import {
@@ -26,6 +27,7 @@ import {
 } from "@/test/matchMedia"
 import { GLYPH_SPINNER_CLASS, SPINNER_FRAMES } from "@/lib/spinnerFrames"
 import { usePaneInputGroup } from "@/lib/paneInputGroup"
+import { paneCoverOwnedFor, resetPaneCovers } from "@/lib/paneCover"
 
 // TerminalPane embeds xterm.js, whose canvas rendering jsdom cannot back (see the
 // note in TerminalArea.test.tsx). So we mount the REAL TerminalPane, exercising
@@ -5088,6 +5090,55 @@ describe("TerminalPane gates its floating overlay on the cover", () => {
     expect(screen.getByText("Connection lost.")).toBeTruthy()
     expect(screen.queryByTestId("pane-overlay")).toBeNull()
     expect(mounted).not.toHaveBeenCalled()
+  })
+})
+
+// WHAT THE PANE TELLS THE COVER REGISTRY, which the chrome outside the pane
+// reads: the phone's header comes back under a full-pane cover, because the
+// pill that would carry the way out is withheld under one.
+describe("TerminalPane publishes its cover verdict", () => {
+  afterEach(() => resetPaneCovers())
+
+  /// Records the registry as it stood in the LAYOUT phase of each commit,
+  /// mounted after the pane so the pane's own layout effect has already run.
+  /// A verdict published from a passive effect is not there yet at this point,
+  /// which is a frame of the wrong chrome in a real browser.
+  function CoverProbe({ id, seen }: { id: string; seen: (v: boolean) => void }) {
+    useLayoutEffect(() => {
+      seen(paneCoverOwnedFor(id))
+    })
+    return null
+  }
+
+  function hidden<T>(run: () => T): T {
+    Object.defineProperty(document, "visibilityState", {
+      value: "hidden",
+      configurable: true,
+    })
+    try {
+      return run()
+    } finally {
+      Object.defineProperty(document, "visibilityState", {
+        value: "visible",
+        configurable: true,
+      })
+    }
+  }
+
+  it("has published a card cover before anything is painted", () => {
+    // A backgrounded pane never guesses it owns the pty, so the card is there
+    // on the very first commit and the shell must see it on that one.
+    const commits: boolean[] = []
+    hidden(() =>
+      render(
+        <>
+          <TerminalPane kind="agent" id="s1" sessionId="s1" />
+          <CoverProbe id="s1" seen={(v) => commits.push(v)} />
+        </>,
+      ),
+    )
+    expect(screen.getByText(/Active on|Running in the background/)).toBeTruthy()
+    expect(commits[0]).toBe(true)
   })
 })
 

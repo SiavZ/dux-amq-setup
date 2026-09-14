@@ -20,7 +20,7 @@ import { TheaterPill } from "@/components/TheaterPill"
 import { Button } from "@/components/ui/button"
 import { useTheaterFlight } from "@/hooks/use-theater-flight"
 import { usePhoneChromeGesture } from "@/hooks/use-theater"
-import { usePaneCoverOwned } from "@/lib/paneCover"
+import { usePaneCoverKnown, usePaneCoverOwned } from "@/lib/paneCover"
 import { topChromeHidden } from "@/lib/theater"
 import { flapMounted, flapVisible, pillMounted } from "@/lib/theaterFlight"
 import {
@@ -148,7 +148,9 @@ function AgentlessTerminalScreen({
     theater: duxState.theater,
     coverOwnsPane,
   })
-  usePhoneChromeGesture(chromeHidden)
+  // Armed on the pane's first published verdict: this screen mounts before the
+  // lazy pane resolves, and that first answer is initial state, not a change.
+  usePhoneChromeGesture(chromeHidden, usePaneCoverKnown(terminalId))
   // The one phase both clusters render from, so the handoff cannot land in the
   // gap between two controls each deciding for itself.
   const flight = useTheaterFlight(coverOwnsPane)
@@ -489,7 +491,9 @@ function AgentTerminalScreen({
     theater: duxState.theater,
     coverOwnsPane,
   })
-  usePhoneChromeGesture(chromeHidden)
+  // See the sibling screen: the pane's first verdict is initial state, because
+  // this screen is on screen before the lazy pane it reads has resolved.
+  usePhoneChromeGesture(chromeHidden, usePaneCoverKnown(targetId))
   const flight = useTheaterFlight(coverOwnsPane)
   const paneKey =
     selectedTarget.kind === "agent" ? `${targetId}:${terminalEpoch}` : targetId

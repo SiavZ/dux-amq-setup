@@ -8,6 +8,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react"
+import { Profiler } from "react"
 
 import type { DuxState } from "@/lib/store"
 import {
@@ -613,6 +614,26 @@ describe("MobileShell in theater", () => {
     // The flap is docked in the returned chrome rather than half flown: its ⋯
     // is the way to the pane's own actions while the pill is withheld.
     expect(screen.getByTestId("mobile-action-flap")).toBeTruthy()
+  })
+
+  it("shows the header on the FIRST committed render, never a frame late", () => {
+    // The pane publishes from a layout effect so the verdict is in the registry
+    // before anything is painted. A shell that learned it a commit later
+    // flashed the theater layout over a card nobody could walk away from.
+    registerPaneCover("s1", true)
+    mockState = coveredAgentState()
+    const commits: boolean[] = []
+    render(
+      <Profiler
+        id="shell"
+        onRender={() =>
+          commits.push(document.querySelector('[aria-label="Back"]') !== null)
+        }
+      >
+        <MobileShell />
+      </Profiler>,
+    )
+    expect(commits[0]).toBe(true)
   })
 
   it("resumes theater once the cover goes, with no navigation", () => {

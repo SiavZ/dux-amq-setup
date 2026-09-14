@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type ReactNode,
@@ -533,8 +534,12 @@ export function TerminalPane(props: TerminalPaneProps) {
   // Publish whether the cover speaks for the whole pane, under this pane's pty
   // id, for the chrome outside it. The phone's header comes back on this while
   // theater stays on, since the pill it would otherwise offer is withheld here.
+  // A layout effect, so a mounted pane's true verdict is in the registry before
+  // the first paint and the shell never paints one frame of the wrong chrome.
+  // The window while the lazy chunk resolves remains, and costs nothing: no
+  // pane is painted then either.
   const coverOwnsPane = coverOwnsThePane(cover)
-  useEffect(() => registerPaneCover(id, coverOwnsPane), [id, coverOwnsPane])
+  useLayoutEffect(() => registerPaneCover(id, coverOwnsPane), [id, coverOwnsPane])
 
   const pane = (
     <TerminalPaneSurface

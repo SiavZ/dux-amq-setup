@@ -81,8 +81,14 @@ function Escape() {
   return null
 }
 
-function ChromeGesture({ hidden }: { hidden: boolean }) {
-  usePhoneChromeGesture(hidden)
+function ChromeGesture({
+  hidden,
+  armed = true,
+}: {
+  hidden: boolean
+  armed?: boolean
+}) {
+  usePhoneChromeGesture(hidden, armed)
   return null
 }
 
@@ -146,6 +152,28 @@ describe("the one refit per toggle", () => {
     const { rerender } = render(<ChromeGesture hidden={true} />)
     expect(pane.hold).not.toHaveBeenCalled()
     rerender(<ChromeGesture hidden={false} />)
+    expect(pane.hold).toHaveBeenCalledTimes(1)
+    act(() => {
+      vi.advanceTimersByTime(THEATER_TRANSITION_MS)
+    })
+    expect(pane.release).toHaveBeenCalledTimes(1)
+    off()
+  })
+
+  it("stays still until the pane has answered, then pays for the first real change", () => {
+    // THE TRAP: a pane screen is on screen before its lazy pane resolves, so
+    // the pane's first publish arrives as a change to chrome the user has only
+    // ever seen one way. Unarmed that publish bought a hold and a refit.
+    const pane = { hold: vi.fn(), release: vi.fn() }
+    const off = registerLayoutGestureHolder(pane)
+    const { rerender } = render(<ChromeGesture hidden={true} armed={false} />)
+    rerender(<ChromeGesture hidden={false} armed={false} />)
+    expect(pane.hold).not.toHaveBeenCalled()
+    // The pane publishes. Whatever it says is where this screen started.
+    rerender(<ChromeGesture hidden={false} armed={true} />)
+    expect(pane.hold).not.toHaveBeenCalled()
+    // A cover arriving after that is a change the user watches happen.
+    rerender(<ChromeGesture hidden={true} armed={true} />)
     expect(pane.hold).toHaveBeenCalledTimes(1)
     act(() => {
       vi.advanceTimersByTime(THEATER_TRANSITION_MS)

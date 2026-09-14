@@ -22,21 +22,30 @@ import {
  * moves the chrome at all, and watching the chrome's own state so a cover that
  * changes nothing on screen buys no refit. Overlapping the mode's own gesture is
  * safe: the layout hold is depth counted.
+ *
+ * `armed` is the pane having published a verdict at all. A pane screen mounts
+ * before its lazy pane resolves, so until then the chrome reads a default rather
+ * than an answer, and the pane's first publish would otherwise buy a hold and a
+ * refit for what the user only ever saw as initial state.
  */
-export function usePhoneChromeGesture(chromeHidden: boolean): void {
+export function usePhoneChromeGesture(
+  chromeHidden: boolean,
+  armed: boolean,
+): void {
   const reducedMotion = usePrefersReducedMotion()
   const reducedRef = React.useRef(reducedMotion)
   React.useEffect(() => {
     reducedRef.current = reducedMotion
   }, [reducedMotion])
-  const first = React.useRef(true)
+  // The last state the user could have SEEN, null until the pane has answered.
+  const seen = React.useRef<boolean | null>(null)
   const gesture = React.useRef<LayoutGestureHandle | null>(null)
 
   React.useEffect(() => {
-    if (first.current) {
-      first.current = false
-      return
-    }
+    if (!armed) return
+    const previous = seen.current
+    seen.current = chromeHidden
+    if (previous === null || previous === chromeHidden) return
     const ms = theaterTransitionMs(reducedRef.current)
     const running = gesture.current
     if (running) {
@@ -46,7 +55,7 @@ export function usePhoneChromeGesture(chromeHidden: boolean): void {
     gesture.current = holdLayoutForGesture(ms, () => {
       gesture.current = null
     })
-  }, [chromeHidden])
+  }, [armed, chromeHidden])
 
   React.useEffect(
     () => () => {

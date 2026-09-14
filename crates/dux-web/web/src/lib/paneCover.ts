@@ -56,6 +56,23 @@ function snapshot(): number {
  */
 export function usePaneCoverOwned(ptyId: string | null): boolean {
   useSyncExternalStore(subscribe, snapshot, snapshot)
+  return paneCoverOwnedFor(ptyId)
+}
+
+/**
+ * Has the pane behind this id published a verdict at all? "Uncovered" and "no
+ * pane has answered yet" read the same through `usePaneCoverOwned`, and chrome
+ * that animates on a change must tell them apart: a pane mounting late turns
+ * its first publish into a change the user never saw.
+ */
+export function usePaneCoverKnown(ptyId: string | null): boolean {
+  useSyncExternalStore(subscribe, snapshot, snapshot)
+  return ptyId !== null && covered.has(ptyId)
+}
+
+/// The same verdict without the subscription, for a caller that is not a
+/// component and so needs no re-render.
+export function paneCoverOwnedFor(ptyId: string | null): boolean {
   return ptyId === null ? false : (covered.get(ptyId)?.ownsPane ?? false)
 }
 
