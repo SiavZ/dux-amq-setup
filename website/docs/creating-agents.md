@@ -69,6 +69,9 @@ run `new-agent` and pick a project from the chooser (every project is listed, in
 ones with no agents yet). Either way dux checks that project's
 current branch, then opens the naming prompt.
 
+On both surfaces the project list is ordered by what you touched most recently, so a
+project you just added, or one that just received an agent, sits at the top.
+
 The terminal UI's chooser lists every project, how many agents each one has, and where it
 lives, and its footer carries the way out to a standalone agent:
 
