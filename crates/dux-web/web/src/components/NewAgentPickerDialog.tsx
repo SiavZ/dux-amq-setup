@@ -28,6 +28,7 @@ import {
 import { cn } from "@/lib/utils"
 import type { ProjectView } from "@/lib/types"
 import { workspaceProjectId } from "@/lib/agentWorkspace"
+import { orderProjectsByRecency } from "@/lib/projectOrder"
 import { formatRegularCount } from "@/lib/formatRegularCount"
 
 // The New-agent picker: the home for agent creation and every project action,
@@ -94,13 +95,17 @@ function PickerBody() {
   // Narrowed to a candidate set when a pull-request reference matched several
   // projects: showing every project there would bury the two that are actually
   // checkouts of that repository.
+  const sessions = useMemo(() => spine?.sessions ?? [], [spine])
+  // Ordered most-recently-touched first through the rule dux-core owns, the
+  // narrowed candidate set included.
   const projects = useMemo(() => {
     const all = spine?.projects ?? []
-    if (!newAgentPickerOnlyIds) return all
-    const only = new Set(newAgentPickerOnlyIds)
-    return all.filter((project) => only.has(project.id))
-  }, [spine, newAgentPickerOnlyIds])
-  const sessions = useMemo(() => spine?.sessions ?? [], [spine])
+    const only = newAgentPickerOnlyIds ? new Set(newAgentPickerOnlyIds) : null
+    const candidates = only
+      ? all.filter((project) => only.has(project.id))
+      : all
+    return orderProjectsByRecency(candidates, sessions)
+  }, [spine, newAgentPickerOnlyIds, sessions])
 
   const [query, setQuery] = useState("")
 

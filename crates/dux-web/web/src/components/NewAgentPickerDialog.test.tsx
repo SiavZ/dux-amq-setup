@@ -147,6 +147,45 @@ describe("NewAgentPickerDialog", () => {
     )
   })
 
+  it("lists projects most recently touched first", () => {
+    // acme is stored second and was added first, but it just received an agent,
+    // so it leads the more recently added beta.
+    mockState = {
+      newAgentPickerOpen: true,
+      newAgentPickerIntent: "new",
+      spine: {
+        projects: [
+          {
+            id: "p2",
+            name: "beta",
+            default_provider: "codex",
+            created_at: "2026-07-02T09:00:00Z",
+          },
+          {
+            id: "p1",
+            name: "acme",
+            default_provider: "claude",
+            created_at: "2026-07-01T09:00:00Z",
+          },
+        ],
+        sessions: [
+          {
+            id: "a1",
+            workspace: { kind: "managed", project_id: "p1" },
+            created_at: "2026-07-05T09:00:00Z",
+          },
+        ],
+      },
+    } as unknown as DuxState
+    render(<NewAgentPickerDialog />)
+    const names = screen
+      .getAllByRole("button")
+      .map((button) => button.textContent ?? "")
+      .filter((text) => text.includes("acme") || text.includes("beta"))
+    expect(names[0]).toContain("acme")
+    expect(names[1]).toContain("beta")
+  })
+
   it("gives the results list a fixed height so the modal does not resize as you type", () => {
     // Content-shift fix: the scroll region is a fixed h-72 (not max-h-72), so the
     // modal occupies the same space at 0, 1, or many results.
