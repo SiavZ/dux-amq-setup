@@ -829,7 +829,8 @@ pub enum WebDeleteOutcome {
     /// Git removal succeeded but the session was already gone (e.g. its project
     /// was removed) before the worker reported back.
     SucceededGone,
-    /// Git removal failed; `message` is the git error.
+    /// Git removal failed; `message` is the authored failure sentence, which
+    /// names the agent when the dispatch-time snapshot was still there to name it.
     Failed { message: String },
     /// Git removal succeeded but the post-removal `FinishDeleteSession` cascade
     /// failed; `message` is the formatted error.

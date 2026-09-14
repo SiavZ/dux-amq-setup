@@ -1284,14 +1284,20 @@ impl DeleteReportFacts {
     /// agent from another. Either half is dropped when it is not known rather
     /// than printed as a gap.
     fn agent_phrase(&self) -> String {
-        let agent = if self.provider.is_empty() {
-            format!("Deleted agent \"{}\"", self.label)
-        } else {
-            format!("Deleted {} agent \"{}\"", self.provider, self.label)
-        };
+        let agent = format!("Deleted {}", self.agent_noun());
         match &self.project_name {
             Some(project) => format!("{agent} from project \"{project}\""),
             None => agent,
+        }
+    }
+
+    /// Which agent this is, in the words both surfaces use for it. The provider
+    /// is dropped when the record could not be read rather than left as a gap.
+    fn agent_noun(&self) -> String {
+        if self.provider.is_empty() {
+            format!("agent \"{}\"", self.label)
+        } else {
+            format!("{} agent \"{}\"", self.provider, self.label)
         }
     }
 }
@@ -1377,6 +1383,21 @@ pub fn delete_session_status_message(
                 facts.directory
             )
         }
+    }
+}
+
+/// User-facing message for a delete whose worktree removal FAILED.
+///
+/// The other half of the delete report, and the one author of this sentence for
+/// both surfaces. It names the agent whenever the facts are known, because the
+/// row is already gone from the browser by then and a worktree is still on disk;
+/// with nothing to name it falls back to the bare line.
+pub fn delete_session_failure_message(facts: Option<&DeleteReportFacts>, error: &str) -> String {
+    match facts {
+        Some(facts) if !facts.label.is_empty() => {
+            format!("Worktree delete failed for {}: {error}", facts.agent_noun())
+        }
+        _ => format!("Worktree delete failed: {error}"),
     }
 }
 
@@ -3714,10 +3735,11 @@ impl Engine {
                                     // STICKY: the agent row is already gone from
                                     // the UI but its worktree is still on disk, so
                                     // the user is left with an orphaned directory
-                                    // only `git worktree remove` will clear.
+                                    // only `git worktree remove` will clear. The
+                                    // sentence is authored at the call site, which
+                                    // is the side that still holds the snapshot.
                                     WebDeleteOutcome::Failed { message } => {
-                                        Final::error(format!("Worktree delete failed: {message}"))
-                                            .sticky()
+                                        Final::error(message.clone()).sticky()
                                     }
                                     // STICKY: same half-done delete from the other
                                     // side, the worktree went but the records did
@@ -3806,12 +3828,17 @@ impl Engine {
             EventReaction::WorktreeRemoveFailed {
                 session_id,
                 message,
-            } => self.resolve_web_delete_op(
-                session_id,
-                &crate::engine::WebDeleteOutcome::Failed {
-                    message: message.clone(),
-                },
-            ),
+            } => {
+                // Read the snapshot before resolving, which consumes it: the
+                // failure names the agent whose worktree is still on disk.
+                let facts = self.pending_delete_reports_web.get(session_id).cloned();
+                self.resolve_web_delete_op(
+                    session_id,
+                    &crate::engine::WebDeleteOutcome::Failed {
+                        message: delete_session_failure_message(facts.as_ref(), message),
+                    },
+                )
+            }
             _ => vec![],
         }
     }
@@ -10046,12 +10073,18 @@ mod tests {
             "a branch git left on disk is something the user must clean up by hand, so the \
              toast waits for them rather than timing out"
         );
+        assert!(
+            engine.pending_delete_reports_web.is_empty(),
+            "the snapshot must be consumed with the op"
+        );
     }
 
+    /// A delete that never removed the worktree must say WHICH agent it was
+    /// about: the row is already gone from the browser, so an unnamed failure
+    /// leaves the user with a worktree on disk and no idea whose it was. Same
+    /// words as the terminal UI's named failure, from the same formatter.
     #[test]
-    fn drive_delete_followup_resolves_op_on_failure() {
-        // The async failure path resolves the keyed op into a same-key error with
-        // the byte-identical "Worktree delete failed: …" wording.
+    fn drive_delete_followup_names_the_agent_when_the_removal_fails() {
         let (mut engine, _tmp) = test_engine();
         engine.projects.push(sample_project("p1", "/tmp/p1"));
         let session = sample_session("s1", "p1", "feat");
@@ -10078,6 +10111,46 @@ mod tests {
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].key.as_deref(), Some(busy_key.as_str()));
         assert_eq!(statuses[0].tone, "error");
+        assert_eq!(
+            statuses[0].message,
+            "Worktree delete failed for claude agent \"s1-title\": fatal: not a git repository",
+        );
+        assert!(
+            statuses[0].sticky,
+            "a half-done delete leaves a worktree on disk, so the toast waits for the user"
+        );
+        assert!(
+            engine.pending_delete_reports_web.is_empty(),
+            "the snapshot must be consumed on the failure path too"
+        );
+    }
+
+    /// With no snapshot behind it there is nothing to name, and the line falls
+    /// back to the bare sentence rather than inventing an agent.
+    #[test]
+    fn drive_delete_followup_falls_back_to_the_bare_failure_without_a_snapshot() {
+        let (mut engine, _tmp) = test_engine();
+        engine.projects.push(sample_project("p1", "/tmp/p1"));
+        let session = sample_session("s1", "p1", "feat");
+        engine.sessions.push(session);
+
+        let begin = EventReaction::BeginDeleteSessionView(Box::new(
+            crate::engine::BeginDeleteSessionView {
+                session_id: "s1".to_string(),
+                outcome: BeginDeleteSessionOutcome::AsyncStarted {
+                    busy_message: "Removing worktree for agent \"feat\"\u{2026}".to_string(),
+                },
+            },
+        ));
+        let _ = engine.drive_delete_followup(&begin);
+        engine.pending_delete_reports_web.clear();
+
+        let reaction = EventReaction::WorktreeRemoveFailed {
+            session_id: "s1".to_string(),
+            message: "fatal: not a git repository".to_string(),
+        };
+        let statuses = engine.drive_delete_followup(&reaction);
+        assert_eq!(statuses.len(), 1);
         assert_eq!(
             statuses[0].message,
             "Worktree delete failed: fatal: not a git repository",

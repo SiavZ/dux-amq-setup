@@ -2018,15 +2018,14 @@ impl App {
                         dux_core::engine::Final::clear()
                     }
                 }
-                TuiDeleteOutcome::FailedNamed { message } => {
-                    dux_core::engine::Final::error(format!(
-                        "Worktree delete failed for {} agent \"{}\": {message}",
-                        facts.provider, facts.label
-                    ))
-                }
-                TuiDeleteOutcome::FailedBare { message } => {
-                    dux_core::engine::Final::error(format!("Worktree delete failed: {message}"))
-                }
+                TuiDeleteOutcome::FailedNamed { message } => dux_core::engine::Final::error(
+                    dux_core::wire::delete_session_failure_message(Some(&facts), message),
+                ),
+                // The session was already gone when the failure landed, so there
+                // is nothing to name and the formatter says the bare line.
+                TuiDeleteOutcome::FailedBare { message } => dux_core::engine::Final::error(
+                    dux_core::wire::delete_session_failure_message(None, message),
+                ),
             }
         })
     }
