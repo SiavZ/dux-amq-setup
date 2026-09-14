@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest"
 
-import { attachCover, type AttachCoverInputs } from "./attachCover"
+import {
+  attachCover,
+  coverOwnsThePane,
+  type AttachCoverInputs,
+} from "./attachCover"
 
 /// The healthy steady state: owner, socket open, replay on screen, output seen.
 /// Every case below is this with one or two facts moved.
@@ -149,5 +153,22 @@ describe("a dead socket and a watched pty", () => {
     expect(
       attachCover({ ...settled, isOwner: false, replayApplied: false }),
     ).toEqual({ kind: "card" })
+  })
+})
+
+describe("coverOwnsThePane", () => {
+  it("gives the whole pane to the card and the Reconnect box", () => {
+    expect(coverOwnsThePane({ kind: "card" })).toBe(true)
+    expect(coverOwnsThePane({ kind: "box", reason: "lost" })).toBe(true)
+    expect(coverOwnsThePane({ kind: "box", reason: "no-screen" })).toBe(true)
+  })
+
+  it("leaves the pane to the terminal under a spinner and under nothing", () => {
+    // The spinner flashes on every short reconnect, so counting it would flick
+    // the phone's chrome in and out on a blip.
+    expect(coverOwnsThePane({ kind: "spinner", wording: "attaching" })).toBe(
+      false,
+    )
+    expect(coverOwnsThePane({ kind: "none" })).toBe(false)
   })
 })

@@ -13,6 +13,7 @@ import {
   splitTheaterHash,
   theaterMemoryKey,
   theaterSerializable,
+  topChromeHidden,
   withTheaterHash,
   writeTheaterMemory,
 } from "./theater"
@@ -312,5 +313,22 @@ describe("isTypingSurfaceElement", () => {
   it("says no for an ordinary element and for nothing at all", () => {
     expect(isTypingSurfaceElement({ tagName: "DIV" })).toBe(false)
     expect(isTypingSurfaceElement(null)).toBe(false)
+  })
+})
+
+describe("topChromeHidden", () => {
+  it("hides the phone's top chrome for an uncovered pane in theater", () => {
+    expect(topChromeHidden({ theater: true, coverOwnsPane: false })).toBe(true)
+  })
+
+  it("brings the chrome back while a full-pane cover owns the pane", () => {
+    // The bug this pins: the card said another device was driving, the pill was
+    // withheld under it, and the phone had nothing left but the browser's Back.
+    expect(topChromeHidden({ theater: true, coverOwnsPane: true })).toBe(false)
+  })
+
+  it("leaves the chrome up outside theater, covered or not", () => {
+    expect(topChromeHidden({ theater: false, coverOwnsPane: false })).toBe(false)
+    expect(topChromeHidden({ theater: false, coverOwnsPane: true })).toBe(false)
   })
 })

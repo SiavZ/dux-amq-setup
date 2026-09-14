@@ -210,6 +210,28 @@ export function isTypingSurfaceElement(
 // The accepted cost is that in theater on a phone, where both are off screen, a
 // hidden tab needing attention has no on-screen signal until the mode is left.
 
+/// What the phone's top chrome reads to decide whether it is on screen.
+export interface TopChromeInputs {
+  /// The mode itself, as the address and the store hold it.
+  theater: boolean
+  /// A full-pane cover (the take-over card, the Reconnect box) speaks for the
+  /// pane. The transparent spinner is not one of them.
+  coverOwnsPane: boolean
+}
+
+/**
+ * Is the phone's top chrome hidden? Theater hides it, except while a full-pane
+ * cover owns the terminal: a covered terminal is not one anybody is looking at,
+ * and the pill that would carry the way out is withheld under such a cover, so
+ * the header is the only route back to the agent list.
+ *
+ * Nothing here writes the mode: the address stays in theater throughout, and
+ * the chrome leaves again by itself once the cover goes.
+ */
+export function topChromeHidden(input: TopChromeInputs): boolean {
+  return input.theater && !input.coverOwnsPane
+}
+
 /**
  * How long the chrome takes to leave, in milliseconds. The PTY refit lands when
  * this elapses, so under reduced motion it must be zero: there is no transition

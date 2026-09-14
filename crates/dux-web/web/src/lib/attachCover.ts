@@ -1,5 +1,6 @@
 // The cover remains until the current attach replay is applied. A visible-time
 // replay timeout becomes an explicit reconnect affordance rather than a blank pane.
+import { assertNever } from "./assertNever"
 import type { ConnState } from "./types"
 
 /// Everything the decision reads. Each is a fact somebody else owns: the socket
@@ -88,4 +89,20 @@ export function attachCover(input: AttachCoverInputs): AttachCover {
   // still starting up. The oldest cover in the pane, and unrelated to attaching.
   if (!input.everReady) return { kind: "spinner", wording: "starting" }
   return { kind: "none" }
+}
+
+/// Whether the cover speaks for the whole pane. A card or a box is full-pane and
+/// opaque, so the theater pill is withheld and the phone's top chrome comes back;
+/// the transparent spinner keeps both, because it flashes on short reconnects.
+export function coverOwnsThePane(cover: AttachCover): boolean {
+  switch (cover.kind) {
+    case "card":
+    case "box":
+      return true
+    case "spinner":
+    case "none":
+      return false
+    default:
+      return assertNever(cover)
+  }
 }
