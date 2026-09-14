@@ -27,7 +27,11 @@ import {
 } from "@/test/matchMedia"
 import { GLYPH_SPINNER_CLASS, SPINNER_FRAMES } from "@/lib/spinnerFrames"
 import { usePaneInputGroup } from "@/lib/paneInputGroup"
-import { paneCoverOwnedFor, resetPaneCovers } from "@/lib/paneCover"
+import {
+  paneCoverOwnedFor,
+  resetPaneCovers,
+  usePaneCoverKnown,
+} from "@/lib/paneCover"
 
 // TerminalPane embeds xterm.js, whose canvas rendering jsdom cannot back (see the
 // note in TerminalArea.test.tsx). So we mount the REAL TerminalPane, exercising
@@ -5139,6 +5143,46 @@ describe("TerminalPane publishes its cover verdict", () => {
     )
     expect(screen.getByText(/Active on|Running in the background/)).toBeTruthy()
     expect(commits[0]).toBe(true)
+  })
+
+  it("says the take-over card owns the pane, under the pane's own id", () => {
+    render(<TerminalPane kind="agent" id="s1" sessionId="s1" />)
+    act(() => last().onConnected("conn-self", "conn-other"))
+    expect(screen.getByText("Active on another device")).toBeTruthy()
+    expect(paneCoverOwnedFor("s1")).toBe(true)
+    // Keyed, so a second pane's chrome reads its own answer and not this one.
+    expect(paneCoverOwnedFor("other-tab")).toBe(false)
+  })
+
+  it("says the Reconnect box owns the pane", () => {
+    render(<TerminalPane kind="agent" id="s1" sessionId="s1" />)
+    act(() => last().emit("failed"))
+    expect(screen.getByText("Connection lost.")).toBeTruthy()
+    expect(paneCoverOwnedFor("s1")).toBe(true)
+  })
+
+  it("says the transparent spinner does not, so a blip keeps the mode", () => {
+    render(<TerminalPane kind="agent" id="s1" sessionId="s1" />)
+    expect(screen.getByText("Starting claude\u2026")).toBeTruthy()
+    expect(paneCoverOwnedFor("s1")).toBe(false)
+  })
+
+  it("retires the entry when the pane goes, rather than leaving it uncovered", () => {
+    // Uncovered and unpublished are different answers: the chrome gesture arms
+    // on the second, so an entry left behind would make the next pane's first
+    // verdict read as a change.
+    function KnownProbe({ id }: { id: string }) {
+      return (
+        <div data-testid="known">
+          {usePaneCoverKnown(id) ? "known" : "unpublished"}
+        </div>
+      )
+    }
+    const pane = render(<TerminalPane kind="agent" id="s1" sessionId="s1" />)
+    render(<KnownProbe id="s1" />)
+    expect(screen.getByTestId("known").textContent).toBe("known")
+    pane.unmount()
+    expect(screen.getByTestId("known").textContent).toBe("unpublished")
   })
 })
 
