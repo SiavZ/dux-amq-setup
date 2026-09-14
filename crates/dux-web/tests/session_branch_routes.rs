@@ -13,6 +13,7 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::time::Duration;
 
 use axum::Router;
 use dux_core::config::{DuxPaths, ProjectConfig};
@@ -20,6 +21,7 @@ use dux_core::storage::SessionStore;
 use dux_web::bootstrap::bootstrap_engine;
 use dux_web::engine_actor::spawn_engine_thread;
 use dux_web::server::{AppState, RouterParams, build_app};
+use futures_util::StreamExt;
 
 fn git(dir: &Path, args: &[&str]) {
     let out = std::process::Command::new("git")
@@ -232,14 +234,106 @@ async fn branch_unpushed(addr: SocketAddr, id: &str) -> (u16, serde_json::Value)
     (status, body)
 }
 
-async fn delete(addr: SocketAddr, id: &str, query: &str) -> u16 {
+/// The delete, scoped to an events connection so its outcome message comes back
+/// on that socket.
+async fn delete(addr: SocketAddr, id: &str, query: &str, connection: &str) -> u16 {
     reqwest::Client::new()
         .delete(format!("http://{addr}/api/v1/sessions/{id}?{query}"))
+        .header("x-connection-id", connection)
         .send()
         .await
         .unwrap()
         .status()
         .as_u16()
+}
+
+/// An open `/ws/events` connection and the id that scopes a request's statuses
+/// to it, read off the handshake's `connected` first frame.
+async fn events_socket(
+    addr: SocketAddr,
+) -> (
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    String,
+) {
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/events"))
+        .await
+        .unwrap();
+    let frame = next_frame(&mut ws, |v| v["event"] == "connected")
+        .await
+        .expect("a /ws/events connection must send a `connected` first frame");
+    let id = frame["id"]
+        .as_str()
+        .expect("the connected frame carries a string id")
+        .to_string();
+    (ws, id)
+}
+
+/// Read frames until one satisfies `pred`, or give up after ten seconds.
+async fn next_frame<S>(
+    ws: &mut S,
+    pred: impl Fn(&serde_json::Value) -> bool,
+) -> Option<serde_json::Value>
+where
+    S: StreamExt<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        let Ok(Some(Ok(message))) =
+            tokio::time::timeout(Duration::from_millis(200), ws.next()).await
+        else {
+            continue;
+        };
+        let Ok(text) = message.into_text() else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if pred(&value) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// The delete's own final status message, and THE SETTLEMENT SIGNAL for every
+/// assertion about branches.
+///
+/// The route answers 204 while a worker is still removing the worktree and
+/// running the two `git branch -D` calls, so the agent's record is already gone
+/// from the workspace (a 404 on its id) while the branches have not settled: a
+/// list read then can catch the delete exactly between its two branch removals.
+/// This message is emitted when that worker completes, and unlike a branch list
+/// it carries git's own words when git REFUSED to delete one, so a refusal fails
+/// a test with its reason rather than with a bare list.
+///
+/// Every final variant opens with the agent's name, the busy that precedes it
+/// ("Removing worktree for agent …") does not, so matching the opening picks the
+/// final whatever it went on to say.
+async fn wait_for_delete_status<S>(ws: &mut S, name: &str) -> String
+where
+    S: StreamExt<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + Unpin,
+{
+    let opening = format!("Deleted agent \"{name}\"");
+    let frame = next_frame(ws, |v| {
+        v["event"] == "status"
+            && v["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with(&opening))
+    })
+    .await
+    .unwrap_or_else(|| panic!("the delete of {name} must report its outcome on the events socket"));
+    frame["message"].as_str().unwrap().to_string()
 }
 
 fn branches(repo: &Path) -> Vec<String> {
@@ -254,19 +348,19 @@ fn branches(repo: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Wait until the session is gone from the workspace, which is the signal that
-/// the deferred worktree removal has finished and the branches have settled.
-async fn wait_until_deleted(addr: SocketAddr, id: &str) {
-    for _ in 0..200 {
-        let resp = reqwest::get(format!("http://{addr}/api/v1/sessions/{id}"))
-            .await
-            .unwrap();
-        if resp.status().as_u16() == 404 {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    panic!("session {id} was still present after the delete");
+/// The session is dropped from the workspace before the removal worker is
+/// dispatched, so by the time its outcome message lands this is a plain
+/// assertion rather than something to wait for.
+async fn assert_session_gone(addr: SocketAddr, id: &str) {
+    let status = reqwest::get(format!("http://{addr}/api/v1/sessions/{id}"))
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(
+        status, 404,
+        "session {id} was still present after the delete"
+    );
 }
 
 /// The route names every branch the delete would remove, and counts them as one
@@ -312,16 +406,26 @@ async fn branch_unpushed_refuses_a_session_that_does_not_exist() {
 #[tokio::test]
 async fn an_absent_branch_answer_keeps_the_provenance_default() {
     let f = boot().await;
-    assert_eq!(delete(f.addr, "drifted", "delete_worktree=true").await, 204);
-    wait_until_deleted(f.addr, "drifted").await;
+    let (mut ws, connection) = events_socket(f.addr).await;
+    assert_eq!(
+        delete(f.addr, "drifted", "delete_worktree=true", &connection).await,
+        204
+    );
+    let status = wait_for_delete_status(&mut ws, "drifted").await;
+    assert!(
+        status.contains("\"develop-next\" was created inside this agent's worktree and was kept")
+            && status.contains("\"develop\" existed before this agent and was kept"),
+        "the outcome must name both kept branches with their reasons: {status}"
+    );
+    assert_session_gone(f.addr, "drifted").await;
     let listed = branches(&f.repo);
     assert!(
         listed.contains(&"develop".to_string()),
-        "a branch that predates the agent is not dux's to delete: {listed:?}"
+        "a branch that predates the agent is not dux's to delete: {listed:?} ({status})"
     );
     assert!(
         listed.contains(&"develop-next".to_string()),
-        "and neither is the one the worktree drifted onto: {listed:?}"
+        "and neither is the one the worktree drifted onto: {listed:?} ({status})"
     );
 }
 
@@ -331,14 +435,26 @@ async fn an_absent_branch_answer_keeps_the_provenance_default() {
 #[tokio::test]
 async fn an_explicit_false_spares_a_branch_dux_created() {
     let f = boot().await;
+    let (mut ws, connection) = events_socket(f.addr).await;
     assert_eq!(
-        delete(f.addr, "duxs", "delete_worktree=true&delete_branch=false").await,
+        delete(
+            f.addr,
+            "duxs",
+            "delete_worktree=true&delete_branch=false",
+            &connection
+        )
+        .await,
         204
     );
-    wait_until_deleted(f.addr, "duxs").await;
+    let status = wait_for_delete_status(&mut ws, "duxs").await;
+    assert!(
+        status.contains("\"dux/made-this\" was kept because you left the branch box unticked"),
+        "the outcome must say the answer is what spared the branch: {status}"
+    );
+    assert_session_gone(f.addr, "duxs").await;
     assert!(
         branches(&f.repo).contains(&"dux/made-this".to_string()),
-        "the answer must override the provenance default: {:?}",
+        "the answer must override the provenance default: {:?} ({status})",
         branches(&f.repo)
     );
 }
@@ -358,11 +474,26 @@ async fn an_explicit_true_removes_every_branch_the_route_named() {
         .collect();
     let before = branches(&f.repo);
 
+    let (mut ws, connection) = events_socket(f.addr).await;
     assert_eq!(
-        delete(f.addr, "drifted", "delete_worktree=true&delete_branch=true").await,
+        delete(
+            f.addr,
+            "drifted",
+            "delete_worktree=true&delete_branch=true",
+            &connection
+        )
+        .await,
         204
     );
-    wait_until_deleted(f.addr, "drifted").await;
+    // The outcome message first: it settles the branches AND says in git's own
+    // words when git refused one, which the list below cannot.
+    let status = wait_for_delete_status(&mut ws, "drifted").await;
+    assert!(
+        status.contains("deleted its branch \"develop-next\"")
+            && status.contains("Its original branch \"develop\" was deleted too"),
+        "the outcome must report both branches deleted: {status}"
+    );
+    assert_session_gone(f.addr, "drifted").await;
 
     let after = branches(&f.repo);
     let mut gone: Vec<String> = before
@@ -375,6 +506,6 @@ async fn an_explicit_true_removes_every_branch_the_route_named() {
     named.sort();
     assert_eq!(
         gone, named,
-        "the route must remove exactly the branches it named"
+        "the route must remove exactly the branches it named ({status})"
     );
 }
