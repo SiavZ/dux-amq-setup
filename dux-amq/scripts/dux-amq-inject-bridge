@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# amq prints its "update available" banner on stderr, which the drain calls
+# below merge into the message body; the documented env switch silences it
+# without changing argv (the test fakes dispatch on argv).
+export AMQ_NO_UPDATE_CHECK=1
 # dux-amq-inject-bridge — TIOCSTI-disabled fallback for `amq wake`
 # (audit02 Phase 13, audit01 P1-1; receiver-keyed queue rev added when
 # the dux-side drainer was implemented; verify-opt-in rev added when
@@ -267,13 +271,35 @@ if (( under_dux == 1 )) && [[ "${DUX_AMQ_NATIVE_DELIVERY:-0}" == "1" ]] \
   jc_log="${DUX_AMQ_JCODE_LOG:-$HOME/.local/state/inject-bridge-jcode.log}"
   # stdin/stdout detached: under the wake they are the pane's TTY, and a
   # CLI that touches a terminal it does not own stalls or fails.
-  jc_clients=$("${jc_ctl[@]}" clients:map </dev/null 2>/dev/null | grep -o '"count":[0-9]*' | grep -o '[0-9]*$' || true)
+  jc_map=$("${jc_ctl[@]}" clients:map </dev/null 2>/dev/null || true)
+  jc_clients=$(printf '%s' "$jc_map" | grep -o '"count":[0-9]*' | grep -o '[0-9]*$' || true)
+  jc_sid=""
+  if [[ -n "$jc_clients" ]]; then
+    # Several jcode panes share one daemon; a bare client:message would land
+    # in whichever client the daemon picks. Target the session whose working
+    # directory is this receiver's worktree (the wake runs from it), falling
+    # back to a handle == directory-basename match, then to the sole client.
+    jc_here=$(realpath -- "$PWD" 2>/dev/null || printf '%s' "$PWD")
+    while IFS= read -r jc_entry; do
+      jc_esid=$(printf '%s' "$jc_entry" | grep -o '"session_id":"[^"]*"' | cut -d'"' -f4)
+      jc_ewd=$(printf '%s' "$jc_entry" | grep -o '"working_dir":"[^"]*"' | cut -d'"' -f4)
+      [[ -n "$jc_esid" && -n "$jc_ewd" ]] || continue
+      jc_ewd_real=$(realpath -- "$jc_ewd" 2>/dev/null || printf '%s' "$jc_ewd")
+      if [[ "$jc_ewd_real" == "$jc_here" || "${jc_ewd##*/}" == "$RECEIVER" ]]; then
+        jc_sid="$jc_esid"
+        break
+      fi
+    done < <(printf '%s' "$jc_map" | tr '}' '\n')
+    if [[ -z "$jc_sid" && "$jc_clients" == "1" ]]; then
+      jc_sid=$(printf '%s' "$jc_map" | grep -o '"session_id":"[^"]*"' | head -1 | cut -d'"' -f4)
+    fi
+  fi
   if [[ -z "$jc_clients" ]]; then
     # Daemon socket unreachable or debug control disabled: use the queue.
     printf '[inject-bridge] jcode daemon not reachable for %s; using file queue\n' "$RECEIVER" >&2
     jc_native=0
-  elif [[ "$jc_clients" != "1" ]]; then
-    printf '[inject-bridge] jcode delivery held for %s: connected jcode clients=%s (need exactly 1)\n' \
+  elif [[ -z "$jc_sid" ]]; then
+    printf '[inject-bridge] jcode delivery held for %s: %s connected clients, none in this worktree\n' \
       "$RECEIVER" "$jc_clients" >&2
     exit 1
   else
@@ -294,8 +320,8 @@ if (( under_dux == 1 )) && [[ "${DUX_AMQ_NATIVE_DELIVERY:-0}" == "1" ]] \
     jc_body="$send_body"
   fi
   jc_body=$(printf '%s' "$jc_body" | LC_ALL=C tr -d '\000-\010\013\014\015\016-\037\177')
-  jc_out=$("${jc_ctl[@]}" "client:message:$jc_body" </dev/null 2>&1) || true
-  printf '%s %s clients=%s result=%s\n' "$(date -u +%FT%TZ)" "$RECEIVER" "$jc_clients" "${jc_out:0:120}" >>"$jc_log" 2>/dev/null || true
+  jc_out=$("${jc_ctl[@]}" -S "$jc_sid" "client:message:$jc_body" </dev/null 2>&1) || true
+  printf '%s %s clients=%s session=%s result=%s\n' "$(date -u +%FT%TZ)" "$RECEIVER" "$jc_clients" "$jc_sid" "${jc_out:0:120}" >>"$jc_log" 2>/dev/null || true
   if [[ "$jc_out" == OK:* ]]; then
     # `client:message` records the delivery in the TUI's prompt history like
     # a typed prompt. The live session keeps that in memory (no knob), but
