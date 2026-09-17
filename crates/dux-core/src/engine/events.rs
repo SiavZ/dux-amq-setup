@@ -5062,6 +5062,7 @@ mod tests {
             additions: 1,
             deletions: 0,
             binary: false,
+            renamed_from: None,
         }
     }
 

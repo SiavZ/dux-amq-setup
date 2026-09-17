@@ -913,6 +913,11 @@ pub struct ChangedFileView {
     pub additions: usize,
     pub deletions: usize,
     pub binary: bool,
+    /// Where a rename came from, so a browser can tell that the source
+    /// directory's listing moved too. Omitted for every other status, which
+    /// leaves the payload every other consumer reads exactly as it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renamed_from: Option<String>,
 }
 
 /// One process inside a sampled tree, projected for web clients.

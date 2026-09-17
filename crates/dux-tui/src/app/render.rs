@@ -13019,6 +13019,7 @@ mod tests {
                 additions: 1,
                 deletions: 0,
                 binary: false,
+                renamed_from: None,
             })
             .collect();
         app.files_index = 1500;
@@ -23948,6 +23949,7 @@ mod tests {
             additions: 12,
             deletions: 3,
             binary: false,
+            renamed_from: None,
         }];
         app.focus = FocusPane::Files;
         app.right_section = RightSection::Unstaged;
@@ -24137,6 +24139,7 @@ mod tests {
             additions,
             deletions,
             binary,
+            renamed_from: None,
         }
     }
 
@@ -24246,6 +24249,7 @@ mod tests {
                 additions: 10,
                 deletions: 1,
                 binary: false,
+                renamed_from: None,
             })
             .collect();
         let title = recap_title(&app, &files);
@@ -24266,6 +24270,7 @@ mod tests {
                 additions: 12,
                 deletions: 3,
                 binary: false,
+                renamed_from: None,
             },
             ChangedFile {
                 path: "logo.png".to_string(),
@@ -24273,6 +24278,7 @@ mod tests {
                 additions: 0,
                 deletions: 0,
                 binary: true,
+                renamed_from: None,
             },
         ];
         app.right_hidden = false;

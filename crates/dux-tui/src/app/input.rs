@@ -12124,6 +12124,7 @@ mod tests {
             additions: 1,
             deletions: 0,
             binary: false,
+            renamed_from: None,
         });
         app.engine.staged_files.push(ChangedFile {
             path: "staged.txt".into(),
@@ -12131,6 +12132,7 @@ mod tests {
             additions: 1,
             deletions: 0,
             binary: false,
+            renamed_from: None,
         });
         assert_eq!(
             app.mouse_target(overlap.x, overlap.y),
@@ -12843,6 +12845,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            renamed_from: None,
         }];
         app.right_section = RightSection::Unstaged;
         app.files_index = 0;
@@ -12892,6 +12895,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            renamed_from: None,
         }];
         app.right_section = RightSection::Unstaged;
         app.files_index = 0;
@@ -15604,6 +15608,7 @@ not_a_real_action = ["x"]
             additions: 0,
             deletions: 0,
             binary: false,
+            renamed_from: None,
         };
         app.engine.staged_files = vec![ghost.clone()];
         app.engine.unstaged_files = vec![ghost];
@@ -16596,6 +16601,7 @@ not_a_real_action = ["x"]
                 additions: 1,
                 deletions: 0,
                 binary: false,
+                renamed_from: None,
             },
             ChangedFile {
                 path: "src/main.rs".into(),
@@ -16603,6 +16609,7 @@ not_a_real_action = ["x"]
                 additions: 2,
                 deletions: 1,
                 binary: false,
+                renamed_from: None,
             },
         ];
         app.engine.staged_files = vec![ChangedFile {
@@ -16611,6 +16618,7 @@ not_a_real_action = ["x"]
             additions: 3,
             deletions: 0,
             binary: false,
+            renamed_from: None,
         }];
 
         app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
@@ -16651,6 +16659,7 @@ not_a_real_action = ["x"]
             additions: 2,
             deletions: 1,
             binary: false,
+            renamed_from: None,
         }];
 
         app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
@@ -16685,6 +16694,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 1,
             binary: false,
+            renamed_from: None,
         }];
         app.selected_left = 1;
         app.focus = FocusPane::Files;
@@ -16746,6 +16756,7 @@ not_a_real_action = ["x"]
                 additions: 1,
                 deletions: 0,
                 binary: false,
+                renamed_from: None,
             },
             ChangedFile {
                 path: "b.txt".into(),
@@ -16753,6 +16764,7 @@ not_a_real_action = ["x"]
                 additions: 2,
                 deletions: 1,
                 binary: false,
+                renamed_from: None,
             },
         ];
         app.focus = FocusPane::Center;
@@ -16776,6 +16788,7 @@ not_a_real_action = ["x"]
                 additions: 1,
                 deletions: 0,
                 binary: false,
+                renamed_from: None,
             },
             ChangedFile {
                 path: "b.txt".into(),
@@ -16783,6 +16796,7 @@ not_a_real_action = ["x"]
                 additions: 2,
                 deletions: 1,
                 binary: false,
+                renamed_from: None,
             },
         ];
         app.focus = FocusPane::Center;
@@ -16805,6 +16819,7 @@ not_a_real_action = ["x"]
                 additions: 1,
                 deletions: 0,
                 binary: false,
+                renamed_from: None,
             })
             .collect();
         app.files_index = 0;
@@ -20518,6 +20533,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            renamed_from: None,
         }];
         app.engine.staged_files = vec![ChangedFile {
             path: "b.txt".into(),
@@ -20525,6 +20541,7 @@ not_a_real_action = ["x"]
             additions: 3,
             deletions: 0,
             binary: false,
+            renamed_from: None,
         }];
 
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 79, 1));
@@ -20555,6 +20572,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 1,
             binary: false,
+            renamed_from: None,
         }];
         app.selected_left = 1;
         app.focus = FocusPane::Files;
@@ -20586,6 +20604,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 1,
             binary: false,
+            renamed_from: None,
         }];
         app.selected_left = 1;
 
@@ -21052,6 +21071,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            renamed_from: None,
         }];
         app.engine.staged_files = vec![ChangedFile {
             path: "b.txt".into(),
@@ -21059,6 +21079,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            renamed_from: None,
         }];
         let original = app.staged_pane_height_pct;
 
@@ -21103,6 +21124,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            renamed_from: None,
         }];
         app.engine.staged_files = vec![ChangedFile {
             path: "b.txt".into(),
@@ -21110,6 +21132,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            renamed_from: None,
         }];
         let original = app.staged_pane_height_pct;
 
@@ -21137,6 +21160,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            renamed_from: None,
         }];
         let original = app.commit_pane_height_pct;
 
@@ -21180,6 +21204,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            renamed_from: None,
         }];
         let original = app.commit_pane_height_pct;
 
@@ -26025,6 +26050,7 @@ cyan = "#00ffff"
             additions: 1,
             deletions: 1,
             binary: false,
+            renamed_from: None,
         }];
         app.prompt = PromptState::ConfirmDiscardFile {
             file_path: "src/main.rs".to_string(),
@@ -26089,6 +26115,7 @@ cyan = "#00ffff"
             additions: 1,
             deletions: 0,
             binary: false,
+            renamed_from: None,
         }];
         app.selected_left = 1;
         app.right_section = RightSection::Unstaged;
@@ -26166,6 +26193,7 @@ cyan = "#00ffff"
             additions: 1,
             deletions: 0,
             binary: false,
+            renamed_from: None,
         }];
         app.selected_left = 1;
         app.commit_input.text = "a real message".to_string();
@@ -35680,6 +35708,7 @@ cyan = "#00ffff"
                     additions: 1,
                     deletions: 0,
                     binary: false,
+                    renamed_from: None,
                 }];
                 app.right_section = RightSection::Unstaged;
                 app.files_index = 0;

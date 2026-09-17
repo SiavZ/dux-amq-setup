@@ -787,6 +787,9 @@ pub struct ChangedFile {
     pub additions: usize,
     pub deletions: usize,
     pub binary: bool,
+    /// Where a rename or copy came from, for the surfaces that have to know
+    /// which OTHER directory also changed. None for every other status.
+    pub renamed_from: Option<String>,
 }
 
 /// Who a companion terminal belongs to. A terminal is owned by exactly one

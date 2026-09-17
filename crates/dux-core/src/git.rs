@@ -76,6 +76,9 @@ struct StatusEntry {
     index_status: char,
     worktree_status: char,
     path: String,
+    /// Where a rename or copy came from, as git reports it in the record that
+    /// follows. None for every other kind of change.
+    renamed_from: Option<String>,
 }
 
 const NULL_DEVICE: &str = "/dev/null";
@@ -1993,6 +1996,16 @@ pub fn list_dir(worktree: &Path, rel_dir: &str) -> Result<Vec<DirEntryInfo>> {
     Ok(entries)
 }
 
+/// The source path a row carries, which is only ever a rename's or a copy's:
+/// the other side of the same record may be an ordinary modification.
+fn rename_source(status: char, source: &Option<String>) -> Option<String> {
+    if matches!(status, 'R' | 'C') {
+        source.clone()
+    } else {
+        None
+    }
+}
+
 pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<ChangedFile>)> {
     let wt = worktree_path.to_string_lossy();
 
@@ -2020,6 +2033,7 @@ pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<Chan
         let index_status = entry.index_status;
         let worktree_status = entry.worktree_status;
         let path = entry.path;
+        let source = entry.renamed_from;
 
         if index_status == '?' && worktree_status == '?' {
             unstaged.push(ChangedFile {
@@ -2028,6 +2042,7 @@ pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<Chan
                 additions: 0,
                 deletions: 0,
                 binary: false,
+                renamed_from: None,
             });
             continue;
         }
@@ -2039,6 +2054,7 @@ pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<Chan
                 additions: 0,
                 deletions: 0,
                 binary: false,
+                renamed_from: rename_source(index_status, &source),
             });
         }
 
@@ -2049,6 +2065,7 @@ pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<Chan
                 additions: 0,
                 deletions: 0,
                 binary: false,
+                renamed_from: rename_source(worktree_status, &source),
             });
         }
     }
@@ -2431,9 +2448,18 @@ fn parse_status_porcelain_z(raw: &[u8]) -> Vec<StatusEntry> {
         // past it unconditionally so the next record is not misparsed as a
         // top-level status, even when we end up dropping this entry below.
         let is_rename = matches!(index_status, 'R' | 'C') || matches!(worktree_status, 'R' | 'C');
-        if is_rename {
-            records.next();
-        }
+        // A non-UTF-8 source path is dropped the way a destination one is,
+        // leaving the entry itself intact: the source is extra information
+        // about a change that is reported either way.
+        let renamed_from = if is_rename {
+            records
+                .next()
+                .and_then(|old| std::str::from_utf8(old).ok())
+                .filter(|old| !old.is_empty())
+                .map(|old| old.to_string())
+        } else {
+            None
+        };
 
         // Strict UTF-8: lossy conversion silently substitutes U+FFFD for any
         // non-UTF-8 bytes in a path. The resulting "string" is then used as
@@ -2453,6 +2479,7 @@ fn parse_status_porcelain_z(raw: &[u8]) -> Vec<StatusEntry> {
             index_status,
             worktree_status,
             path,
+            renamed_from,
         });
     }
 
@@ -6862,6 +6889,32 @@ mod tests {
         assert_eq!(entries[0].index_status, 'R');
         assert_eq!(entries[0].worktree_status, ' ');
         assert_eq!(entries[0].path, "new name.txt");
+        assert_eq!(entries[0].renamed_from.as_deref(), Some("old name.txt"));
+    }
+
+    #[test]
+    fn parse_status_porcelain_z_reports_no_source_for_an_ordinary_change() {
+        let entries = parse_status_porcelain_z(b"M  file.txt\0");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].renamed_from, None);
+    }
+
+    #[test]
+    fn changed_files_reports_the_path_a_rename_came_from() {
+        let repo = init_test_repo();
+        fs::create_dir_all(repo.path().join("src")).unwrap();
+        fs::write(repo.path().join("src/old.txt"), "hello\n").unwrap();
+        commit_all(repo.path(), "seed");
+        fs::create_dir_all(repo.path().join("docs")).unwrap();
+        run_git(repo.path(), &["mv", "src/old.txt", "docs/new.txt"]);
+
+        let (staged, _unstaged) = changed_files(repo.path()).unwrap();
+        let moved = staged
+            .iter()
+            .find(|f| f.path == "docs/new.txt")
+            .expect("the rename destination is staged");
+        assert_eq!(moved.renamed_from.as_deref(), Some("src/old.txt"));
     }
 
     #[test]
@@ -6957,6 +7010,7 @@ mod tests {
                 additions: 0,
                 deletions: 0,
                 binary: false,
+                renamed_from: None,
             },
             ChangedFile {
                 status: "M".to_string(),
@@ -6964,6 +7018,7 @@ mod tests {
                 additions: 0,
                 deletions: 0,
                 binary: false,
+                renamed_from: None,
             },
         ];
 
@@ -6995,6 +7050,7 @@ mod tests {
                 additions: 0,
                 deletions: 0,
                 binary: false,
+                renamed_from: None,
             },
             ChangedFile {
                 status: "M".to_string(),
@@ -7002,6 +7058,7 @@ mod tests {
                 additions: 0,
                 deletions: 0,
                 binary: false,
+                renamed_from: None,
             },
         ];
         let tracked = HashMap::from([("tracked.txt".to_string(), DiffStat::Text(7, 4))]);

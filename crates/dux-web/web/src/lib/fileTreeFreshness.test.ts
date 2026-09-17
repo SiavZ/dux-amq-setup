@@ -4,9 +4,16 @@ import { changedPathsFrom, dirsToRefetch } from "./fileTreeFreshness"
 import type { ChangesSliceView } from "./editorBuffers"
 
 const LOADED = new Set(["", "src", "src/app"])
+const LOADED_WITH_DOCS = new Set(["", "docs", "src"])
 
-function row(path: string, status = "??") {
-  return { path, status, additions: 0, deletions: 0 }
+function row(path: string, status = "??", renamedFrom?: string) {
+  return {
+    path,
+    status,
+    additions: 0,
+    deletions: 0,
+    ...(renamedFrom ? { renamed_from: renamedFrom } : {}),
+  }
 }
 
 function slice(
@@ -68,6 +75,14 @@ describe("dirsToRefetch", () => {
     expect(dirsToRefetch(paths, paths, LOADED)).toEqual([])
   })
 
+  // A file moved between two loaded folders empties one listing and fills the
+  // other, and only the destination is the record's own path.
+  it("refetches both ends of a rename", () => {
+    expect(
+      dirsToRefetch([], ["docs/new.txt", "src/old.txt"], LOADED_WITH_DOCS),
+    ).toEqual(["docs", "src"])
+  })
+
   it("returns each affected directory once, sorted", () => {
     expect(
       dirsToRefetch(["src/gone.ts"], ["a.ts", "src/new.ts"], LOADED),
@@ -78,6 +93,15 @@ describe("dirsToRefetch", () => {
 describe("changedPathsFrom", () => {
   it("is empty without a slice", () => {
     expect(changedPathsFrom(null)).toEqual([])
+  })
+
+  it("includes the path a rename came from", () => {
+    const moved: ChangesSliceView = {
+      phase: "loaded",
+      unstaged: [],
+      staged: [row("docs/new.txt", "R", "src/old.txt")],
+    }
+    expect(changedPathsFrom(moved)).toEqual(["docs/new.txt", "src/old.txt"])
   })
 
   it("unions the staged and unstaged paths, sorted and deduplicated", () => {

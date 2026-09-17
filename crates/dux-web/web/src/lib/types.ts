@@ -267,6 +267,9 @@ export interface ChangedFileView {
   additions: number
   deletions: number
   binary: boolean
+  /** Where a rename came from. Absent for every other status: the source
+   * directory's listing lost an entry and nothing else on the wire says so. */
+  renamed_from?: string
 }
 
 export interface ChangedFiles {

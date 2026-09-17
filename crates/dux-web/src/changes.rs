@@ -758,6 +758,7 @@ fn view_from(f: &ChangedFile) -> ChangedFileView {
         additions: f.additions,
         deletions: f.deletions,
         binary: f.binary,
+        renamed_from: f.renamed_from.clone(),
     }
 }
 
@@ -779,6 +780,34 @@ mod tests {
 
     fn now() -> chrono::DateTime<chrono::Utc> {
         chrono::Utc::now()
+    }
+
+    fn changed(path: &str, status: &str, renamed_from: Option<&str>) -> ChangedFile {
+        ChangedFile {
+            status: status.to_string(),
+            path: path.to_string(),
+            additions: 0,
+            deletions: 0,
+            binary: false,
+            renamed_from: renamed_from.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_rename_view_carries_the_path_it_came_from() {
+        let views = sorted_views(&[changed("docs/new.txt", "R", Some("src/old.txt"))]);
+
+        assert_eq!(views[0].renamed_from.as_deref(), Some("src/old.txt"));
+        let json = serde_json::to_string(&views[0]).unwrap();
+        assert!(json.contains("\"renamed_from\":\"src/old.txt\""), "{json}");
+    }
+
+    #[test]
+    fn an_ordinary_change_serializes_without_the_rename_field() {
+        let views = sorted_views(&[changed("notes.md", "M", None)]);
+
+        let json = serde_json::to_string(&views[0]).unwrap();
+        assert!(!json.contains("renamed_from"), "{json}");
     }
 
     fn sample_session(id: &str, worktree: &str) -> dux_core::model::AgentSession {

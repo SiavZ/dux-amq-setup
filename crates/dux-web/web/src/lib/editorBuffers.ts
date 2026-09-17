@@ -34,6 +34,7 @@ export interface ChangedRowView {
   status: string
   additions: number
   deletions: number
+  renamed_from?: string
 }
 
 // One tab's Monaco buffer and diff cache, keyed by tab id. A preview-replace

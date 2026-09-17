@@ -7,12 +7,15 @@ import type { ChangesSliceView } from "@/lib/editorBuffers"
 import type { DirEntry } from "@/lib/fileTree"
 
 // Every path git reports for the worktree, staged and unstaged alike, sorted so
-// two reads of the same slice compare equal as strings.
+// two reads of the same slice compare equal as strings. A rename contributes
+// both of its ends: the listing it left is as stale as the one it arrived in.
 export function changedPathsFrom(slice: ChangesSliceView | null): string[] {
   if (!slice) return []
   const paths = new Set<string>()
-  for (const f of slice.unstaged) paths.add(f.path)
-  for (const f of slice.staged) paths.add(f.path)
+  for (const f of [...slice.unstaged, ...slice.staged]) {
+    paths.add(f.path)
+    if (f.renamed_from) paths.add(f.renamed_from)
+  }
   return [...paths].sort()
 }
 
