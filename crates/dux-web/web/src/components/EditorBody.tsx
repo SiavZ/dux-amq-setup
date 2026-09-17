@@ -1455,7 +1455,11 @@ export function EditorBody({ root, standalone = false }: EditorBodyProps) {
                 divider. A border here doubles the editor content's left edge
                 while its bottom and right have none. */}
             <div className="flex h-full min-w-0 flex-col">
-              <div className="flex items-center gap-1 border-b p-2">
+              {/* gap-2 (8px) is the repo's measured misclick spacing between
+                  adjacent icon squares, and this bar has two of them: New file
+                  and the explorer `⋯`, both 28px on both axes, with the search
+                  field as the third interactive neighbour on the row. */}
+              <div className="flex items-center gap-2 border-b p-2">
                 <div className="relative flex-1">
                   <Search className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground" />
                   <Input
@@ -1477,17 +1481,16 @@ export function EditorBody({ root, standalone = false }: EditorBodyProps) {
                 </SimpleTooltip>
                 {/* The explorer's own menu, on every surface: the tree keeps
                     itself fresh on events, and this is the way to ask it
-                    anyway. `icon-sm` rather than the 40px floor to match its
-                    two neighbours in this bar, the search field and New file,
-                    which set the row's one height token; the bar carries
-                    nothing else a stray tap could reach. */}
+                    anyway. Under the 40px floor on both axes to match New file
+                    beside it, which sets this bar's density; the exemption is
+                    paid for by the gap above rather than by the size. */}
                 <DropdownMenu>
                   <DropdownMenuTrigger
                     render={
                       <Button
                         size="icon-sm"
                         variant="ghost"
-                        aria-label="More explorer actions"
+                        aria-label="Explorer actions"
                       />
                     }
                   >

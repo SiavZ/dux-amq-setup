@@ -60,8 +60,9 @@ interface FileTreeProps {
   // with, so the caller can hold the next one of the same kind until this one
   // is done.
   onRefreshSettled?: (nonce: number) => void
-  // The directories currently in the lazy cache, reported up so the caller can
-  // decide WHICH of them to refresh without owning the cache itself.
+  // The directories whose listings are LOADED, reported up so the caller can
+  // decide WHICH of them to refresh without owning the cache itself. One still
+  // loading, or errored, has no listing a background refetch could keep.
   onLoadedDirsChange?: (dirs: string[]) => void
   // Whether the server accepts uploads at all (`file_drop_max_bytes > 0`). With
   // it off the tree does not highlight, accept a drop, or pretend it would work.

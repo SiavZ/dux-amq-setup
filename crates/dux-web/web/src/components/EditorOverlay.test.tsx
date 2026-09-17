@@ -2387,6 +2387,38 @@ describe("when the file changes on disk underneath the editor", () => {
   })
 })
 
+// The explorer bar puts two 28px icon squares side by side, which is under the
+// touch floor: the spacing between them is what pays for that.
+describe("the explorer bar's controls", () => {
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    installBootStubs()
+    const { getSnapshot } = await import("@/lib/store")
+    mockState = {
+      ...getSnapshot(),
+      editorTarget: { root: agentRoot(SESSION), initialPath: null },
+      editorTabs: {
+        [rootKey(agentRoot(SESSION))]: { tabs: [], activeId: null },
+      },
+    } as unknown as DuxState
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+  })
+
+  it("keeps misclick spacing between New file and the explorer menu", async () => {
+    const { EditorOverlay } = await import("@/components/EditorOverlay")
+    render(<EditorOverlay />)
+
+    const newFile = await screen.findByRole("button", { name: "New file" })
+    const menu = screen.getByRole("button", { name: "Explorer actions" })
+    expect(newFile.parentElement).toBe(menu.parentElement)
+    expect(newFile.parentElement!.className).toContain("gap-2")
+  })
+})
+
 // The same three triggers, one layer out: the TREE. A folder the agent creates
 // at the worktree root cannot be revealed by collapsing and re-expanding (the
 // root has no toggle), so before this the only way to see it was a page reload.
@@ -2515,7 +2547,7 @@ describe("the file tree follows what the agent writes", () => {
     await mountTree()
     rootEntries = [entry("notes.md", false), entry("fresh.ts", false)]
     fireEvent.click(
-      screen.getByRole("button", { name: /more explorer actions/i }),
+      screen.getByRole("button", { name: "Explorer actions" }),
     )
     fireEvent.click(await screen.findByText("Refresh files"))
     expect(await screen.findByText("fresh.ts")).toBeTruthy()
