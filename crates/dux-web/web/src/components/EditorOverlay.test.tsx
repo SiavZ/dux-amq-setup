@@ -2370,3 +2370,115 @@ describe("when the file changes on disk underneath the editor", () => {
     expect(editor().value).toBe(TYPED)
   })
 })
+
+// The same three triggers, one layer out: the TREE. A folder the agent creates
+// at the worktree root cannot be revealed by collapsing and re-expanding (the
+// root has no toggle), so before this the only way to see it was a page reload.
+describe("the file tree follows what the agent writes", () => {
+  let Overlay: () => React.ReactElement
+  // The root listing the server would answer with right now, mutated mid-test
+  // to stand in for the agent creating something.
+  let rootEntries: Array<Record<string, unknown>>
+
+  function entry(path: string, isDir: boolean) {
+    return {
+      name: path.replace(/\/$/, "").split("/").pop() ?? path,
+      path: path.replace(/\/$/, ""),
+      is_dir: isDir,
+      is_symlink: false,
+      expandable: isDir,
+    }
+  }
+
+  function changes(paths: string[]) {
+    return {
+      sessionId: SESSION,
+      phase: "loaded" as const,
+      rev: 1,
+      staged: [],
+      unstaged: paths.map((path) => ({
+        path,
+        status: "??",
+        additions: 0,
+        deletions: 0,
+        staged: false,
+      })),
+      error: null,
+    }
+  }
+
+  async function mountTree(initialChanges: string[] = []) {
+    const { getSnapshot } = await import("@/lib/store")
+    mockState = {
+      ...getSnapshot(),
+      changes: changes(initialChanges),
+      editorTarget: { root: agentRoot(SESSION), initialPath: null },
+      editorTabs: {
+        [rootKey(agentRoot(SESSION))]: { tabs: [], activeId: null },
+      },
+    } as unknown as DuxState
+    const view = render(<Overlay />)
+    await screen.findByText("notes.md")
+    return view
+  }
+
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    installBootStubs()
+    Overlay = (await import("@/components/EditorOverlay")).EditorOverlay
+    rootEntries = [entry("notes.md", false)]
+    treeMock.mockImplementation(
+      async (..._a: unknown[]) =>
+        ({
+          dir: "",
+          entries: String(_a[1] ?? "") === "" ? rootEntries : [],
+        }) as unknown as { dir: string; entries: unknown[] },
+    )
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+    treeMock.mockImplementation(async () => ({ dir: "", entries: [] }))
+  })
+
+  it("shows a directory the agent created once the changed-files slice reports it", async () => {
+    const view = await mountTree()
+    // The agent writes newdir/file.ts; git reports the untracked DIRECTORY.
+    rootEntries = [entry("newdir", true), entry("notes.md", false)]
+    mockState = { ...mockState, changes: changes(["newdir/"]) } as DuxState
+    view.rerender(<Overlay />)
+
+    expect(await screen.findByText("newdir")).toBeTruthy()
+    // In place: the row that was already there did not go anywhere.
+    expect(screen.getByText("notes.md")).toBeTruthy()
+  })
+
+  it("refetches the loaded dirs when the window comes back, once per return", async () => {
+    await mountTree()
+    const afterMount = treeMock.mock.calls.length
+    rootEntries = [entry("notes.md", false), entry("ignored.log", false)]
+
+    // Two triggers in the same breath are one refetch: the second finds the
+    // first still in flight.
+    fireEvent(window, new Event("focus"))
+    fireEvent(window, new Event("focus"))
+    expect(await screen.findByText("ignored.log")).toBeTruthy()
+    expect(treeMock.mock.calls.length).toBe(afterMount + 1)
+
+    // And a later return refetches again, so the gate is not a latch.
+    rootEntries = [entry("notes.md", false)]
+    fireEvent(window, new Event("focus"))
+    await waitFor(() => expect(screen.queryByText("ignored.log")).toBeNull())
+  })
+
+  it("refetches on demand from the explorer menu's Refresh files", async () => {
+    await mountTree()
+    rootEntries = [entry("notes.md", false), entry("fresh.ts", false)]
+    fireEvent.click(
+      screen.getByRole("button", { name: /more explorer actions/i }),
+    )
+    fireEvent.click(await screen.findByText("Refresh files"))
+    expect(await screen.findByText("fresh.ts")).toBeTruthy()
+  })
+})

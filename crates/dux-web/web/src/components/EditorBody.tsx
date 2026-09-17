@@ -22,6 +22,7 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Pencil,
+  RefreshCw,
   RotateCw,
   Save,
   Search,
@@ -112,6 +113,7 @@ import { FileStatusIcon } from "@/components/FileStatusIcon"
 import { Button } from "@/components/ui/button"
 import { ChunkBoundary } from "@/components/ChunkBoundary"
 import { FileTree } from "@/components/FileTree"
+import { useFileTreeFreshness } from "@/components/useFileTreeFreshness"
 import { FileInfoDialog } from "@/components/FileInfoDialog"
 import type { FileInfoTarget } from "@/components/FileInfoDialog"
 import { MoveEntryDialog } from "@/components/MoveEntryDialog"
@@ -356,6 +358,9 @@ export function EditorBody({ root, standalone = false }: EditorBodyProps) {
     // before React flushes a render between them both survive.
     setTreeRevalidate((prev) => unionRevalidateBatch(prev, dirs, nonce))
   }
+  // The tree's loaded directories, as it last reported them. A ref, not state:
+  // only the freshness triggers read it, and nothing on screen depends on it.
+  const loadedTreeDirsRef = useRef<readonly string[]>([])
   // The flat file list backing the "Search files…" box (fetched from the
   // editor's session directly, independent of the changed-files watch). The
   // TREE does not consume this: it browses lazily via fileApi.tree.
@@ -560,6 +565,15 @@ export function EditorBody({ root, standalone = false }: EditorBodyProps) {
   useEffect(() => {
     sliceRef.current = slice
   })
+
+  // The tree's own freshness, on the same three triggers the open buffers use:
+  // the changed-files broadcast, the window regaining focus, and this tab
+  // becoming visible. Nothing polls.
+  const {
+    refresh: treeRefresh,
+    onRefreshSettled: treeRefreshSettled,
+    refreshAllLoadedDirs,
+  } = useFileTreeFreshness({ slice, loadedDirsRef: loadedTreeDirsRef })
 
   const { raiseDiskBanner, dismissDiskBanner } =
     createEditorDiskBannerActions(setBuffers)
@@ -1444,6 +1458,31 @@ export function EditorBody({ root, standalone = false }: EditorBodyProps) {
                     <FilePlus />
                   </Button>
                 </SimpleTooltip>
+                {/* The explorer's own menu, on every surface: the tree keeps
+                    itself fresh on events, and this is the way to ask it
+                    anyway. `icon-sm` rather than the 40px floor to match its
+                    two neighbours in this bar, the search field and New file,
+                    which set the row's one height token; the bar carries
+                    nothing else a stray tap could reach. */}
+                <DropdownMenu>
+                  <DropdownMenuTrigger
+                    render={
+                      <Button
+                        size="icon-sm"
+                        variant="ghost"
+                        aria-label="More explorer actions"
+                      />
+                    }
+                  >
+                    <Ellipsis />
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    <DropdownMenuItem onClick={refreshAllLoadedDirs}>
+                      <RefreshCw />
+                      Refresh files
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
               </div>
               {/* The tree owns its own ScrollArea (it virtualizes against its
                   viewport, so it must be the element that scrolls); this outer one
@@ -1510,6 +1549,11 @@ export function EditorBody({ root, standalone = false }: EditorBodyProps) {
                     setDeleteEntryTarget({ path, isDir })
                   }
                   revalidate={treeRevalidate}
+                  refresh={treeRefresh}
+                  onRefreshSettled={treeRefreshSettled}
+                  onLoadedDirsChange={(dirs) => {
+                    loadedTreeDirsRef.current = dirs
+                  }}
                   // NOT YET KNOWN is NOT ENABLED, exactly as on the pane: the
                   // bootstrap document and the workspace load in parallel, and
                   // an older server never sends the field, so a drag arriving
