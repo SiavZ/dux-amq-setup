@@ -207,8 +207,16 @@ export function FileTree({
           if (unmountedRef.current || requestTokenRef.current.get(dir) !== token)
             return
           const before = dirsRef.current.get(dir)
-          if (before?.status !== "loaded") return
-          const gone = vanishedDirPaths(before.entries, result.entries)
+          // Gone from the cache means a collapse evicted it while this was in
+          // flight, and re-adding it would resurrect a subtree the user shut.
+          // Any other state takes the listing: this request superseded
+          // whatever was fetching the same dir, so dropping it would leave one
+          // still reading "Loading…" with nothing on its way.
+          if (!before) return
+          const gone =
+            before.status === "loaded"
+              ? vanishedDirPaths(before.entries, result.entries)
+              : []
           const evict = gone.flatMap((d) => [
             d,
             ...descendantDirPaths(dirsRef.current, d),
@@ -228,9 +236,24 @@ export function FileTree({
             })
           }
         })
-        .catch(() => {
-          // Deliberately silent: the listing on screen is still the best answer
-          // the tree has, and nobody pressed anything to provoke this.
+        .catch((e) => {
+          if (unmountedRef.current || requestTokenRef.current.get(dir) !== token)
+            return
+          // Deliberately silent while there is a listing on screen: it is still
+          // the best answer the tree has, and nobody pressed anything to
+          // provoke this. A dir that was still LOADING has nothing to fall back
+          // on, and this request superseded the one it was waiting for, so it
+          // gets the ordinary Retry row rather than a spinner forever.
+          if (dirsRef.current.get(dir)?.status !== "loading") return
+          setDirs((prev) => {
+            const next = new Map(prev)
+            next.set(dir, {
+              status: "error",
+              message:
+                e instanceof Error ? e.message : "could not list directory",
+            })
+            return next
+          })
         })
     },
     [root],
