@@ -124,10 +124,12 @@ the same status icon as the [Changes pane](/docs/web-git).
 > `.git/` opens read-only.
 
 The tree keeps up with files you did not create yourself, which is most of them when an
-agent is working in the worktree: it picks them up whenever the changed-file list moves,
-and whenever you come back to the window or to the editor's tab. For anything else, and
-for a file git never mentions, **Refresh files** in the explorer's `⋯` menu fetches the
-listing again on the spot.
+agent is working in the worktree. It picks them up whenever the changed-file list moves,
+whenever you come back to the window or to dux's browser tab, and whenever you switch
+editor tabs. **Search files…** is refreshed on the same occasions, so anything the tree
+has just shown you can also be found by name. For anything else, and for a file git never
+mentions, **Refresh files** in the explorer's `⋯` menu fetches the listing again on the
+spot.
 
 Each row carries a monochrome file-type icon on the left, so it never competes with the
 git-status marker on the right: folders differ open, closed and empty, and files get an
