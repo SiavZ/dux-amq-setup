@@ -16,6 +16,21 @@ vi.mock("@/lib/fileApi", () => ({
   },
 }))
 
+// Nothing in this component may raise a toast for work nobody asked for. The
+// module is mocked wholesale so the assertion is "no export was called", not
+// "the one I remembered to spy on was not called".
+const notifyMocks = {
+  notify: vi.fn(),
+  notifyInfo: vi.fn(),
+  notifySuccess: vi.fn(),
+  notifyWarning: vi.fn(),
+  notifyError: vi.fn(),
+  notifyBusy: vi.fn(),
+  notifyStatus: vi.fn(),
+  dismissNotification: vi.fn(),
+}
+vi.mock("@/lib/notify", () => notifyMocks)
+
 vi.stubGlobal(
   "ResizeObserver",
   class {
@@ -32,6 +47,16 @@ if (!Element.prototype.getAnimations) {
 }
 
 const { FileTree } = await import("./FileTree")
+const { vanishedDirPaths } = await import("@/lib/fileTreeFreshness")
+
+// A promise the test resolves when it wants the response to land.
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((r) => {
+    resolve = r
+  })
+  return { promise, resolve }
+}
 
 function file(path: string): DirEntry {
   const name = path.split("/").pop() ?? path
@@ -45,6 +70,7 @@ function dir(path: string): DirEntry {
 
 beforeEach(() => {
   treeMock.mockReset()
+  for (const spy of Object.values(notifyMocks)) spy.mockClear()
 })
 
 afterEach(() => {
@@ -1065,5 +1091,168 @@ describe("FileTree", () => {
       })
       expect(onRefreshSettled).toHaveBeenCalledWith(7)
     })
+
+    it("drops a directory that vanished, with its expansion and its cache", async () => {
+      let rootEntries = [dir("src"), file("keep.ts")]
+      treeMock.mockImplementation((_sid, d) =>
+        Promise.resolve({
+          dir: d,
+          entries: d === "" ? rootEntries : d === "src" ? [file("src/a.ts")] : [],
+        }),
+      )
+      const { rerender } = renderTree()
+      fireEvent.click(await screen.findByText("src"))
+      expect(await screen.findByText("a.ts")).toBeTruthy()
+
+      rootEntries = [file("keep.ts")]
+      const callsBefore = treeMock.mock.calls.length
+      rerender(
+        <FileTree
+          root={agentRoot("s1")}
+          openPath={null}
+          changed={new Map()}
+          initialPath={null}
+          onOpen={() => {}}
+          refresh={{ dirs: [""], nonce: 1 }}
+        />,
+      )
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 20))
+      })
+
+      expect(screen.queryByText("src")).toBeNull()
+      expect(screen.queryByText("a.ts")).toBeNull()
+      // Pruned, not merely hidden: nothing re-requests the directory that left.
+      const after = treeMock.mock.calls.slice(callsBefore)
+      expect(after.some(([, d]) => d === "src")).toBe(false)
+
+      // And it comes back shut, holding none of the old listing.
+      rootEntries = [dir("src"), file("keep.ts")]
+      rerender(
+        <FileTree
+          root={agentRoot("s1")}
+          openPath={null}
+          changed={new Map()}
+          initialPath={null}
+          onOpen={() => {}}
+          refresh={{ dirs: [""], nonce: 2 }}
+        />,
+      )
+      expect(await screen.findByText("src")).toBeTruthy()
+      expect(screen.queryByText("a.ts")).toBeNull()
+    })
+
+    it("leaves the scroll position exactly where the reader left it", async () => {
+      const many = Array.from({ length: 80 }, (_, i) => file(`f${i}.ts`))
+      treeMock.mockImplementation((_sid, d) =>
+        Promise.resolve({ dir: d, entries: d === "" ? many : [] }),
+      )
+      const { rerender } = renderTree()
+      expect(await screen.findByText("f0.ts")).toBeTruthy()
+
+      const viewport = document.querySelector(
+        '[data-slot="scroll-area-viewport"]',
+      ) as HTMLDivElement
+      viewport.scrollTop = 200
+      fireEvent.scroll(viewport)
+
+      rerender(
+        <FileTree
+          root={agentRoot("s1")}
+          openPath={null}
+          changed={new Map()}
+          initialPath={null}
+          onOpen={() => {}}
+          refresh={{ dirs: [""], nonce: 1 }}
+        />,
+      )
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 20))
+      })
+
+      expect(viewport.scrollTop).toBe(200)
+    })
+
+    it("raises no notification when the refetch fails", async () => {
+      let fail = false
+      treeMock.mockImplementation((_sid, d) =>
+        fail
+          ? Promise.reject(new Error("no"))
+          : Promise.resolve({ dir: d, entries: d === "" ? [file("a.ts")] : [] }),
+      )
+      const { rerender } = renderTree()
+      expect(await screen.findByText("a.ts")).toBeTruthy()
+
+      fail = true
+      rerender(
+        <FileTree
+          root={agentRoot("s1")}
+          openPath={null}
+          changed={new Map()}
+          initialPath={null}
+          onOpen={() => {}}
+          refresh={{ dirs: [""], nonce: 1 }}
+        />,
+      )
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 20))
+      })
+
+      for (const [name, spy] of Object.entries(notifyMocks)) {
+        expect(spy, name).not.toHaveBeenCalled()
+      }
+    })
+
+    it("adopts its own listing when it overtakes a first fetch", async () => {
+      const first = deferred<{ dir: string; entries: DirEntry[] }>()
+      const second = deferred<{ dir: string; entries: DirEntry[] }>()
+      let srcCalls = 0
+      treeMock.mockImplementation((_sid, d) => {
+        if (d === "") return Promise.resolve({ dir: "", entries: [dir("src")] })
+        srcCalls += 1
+        return srcCalls === 1 ? first.promise : second.promise
+      })
+      const { rerender } = renderTree()
+      fireEvent.click(await screen.findByText("src"))
+      expect(screen.getByText("Loading…")).toBeTruthy()
+
+      rerender(
+        <FileTree
+          root={agentRoot("s1")}
+          openPath={null}
+          changed={new Map()}
+          initialPath={null}
+          onOpen={() => {}}
+          refresh={{ dirs: ["src"], nonce: 1 }}
+        />,
+      )
+      // The first fetch answers with what it was told; the refresh, which
+      // superseded it, answers with what is there now.
+      first.resolve({ dir: "src", entries: [file("src/stale.ts")] })
+      second.resolve({ dir: "src", entries: [file("src/fresh.ts")] })
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 20))
+      })
+
+      expect(screen.getByText("fresh.ts")).toBeTruthy()
+      expect(screen.queryByText("stale.ts")).toBeNull()
+      expect(screen.queryByText("Loading…")).toBeNull()
+    })
+  })
+})
+
+describe("vanishedDirPaths", () => {
+  it("names the directories the new listing no longer has", () => {
+    expect(
+      vanishedDirPaths(
+        [dir("src"), dir("docs"), file("a.ts")],
+        [dir("src"), file("a.ts"), file("b.ts")],
+      ),
+    ).toEqual(["docs"])
+  })
+
+  it("ignores a file that left, and a directory that became a file", () => {
+    expect(vanishedDirPaths([file("a.ts")], [])).toEqual([])
+    expect(vanishedDirPaths([dir("thing")], [file("thing")])).toEqual(["thing"])
   })
 })
