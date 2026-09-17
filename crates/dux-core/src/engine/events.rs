@@ -7999,7 +7999,7 @@ mod tests {
         assert!(secs > 120, "rate-limit backoff should be long, got {secs}s");
         match rx.try_recv() {
             Ok(WorkerEvent::CommandWorkerStarted(s)) => {
-                assert_eq!(s.tone, crate::statusline::StatusTone::Info);
+                assert_eq!(s.tone, crate::statusline::StatusTone::Warning);
                 assert!(
                     s.message.to_lowercase().contains("rate-limiting"),
                     "got: {}",

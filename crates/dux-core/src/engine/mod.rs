@@ -1219,6 +1219,82 @@ const PR_HARD_FAILURE_BACKOFF_SECS: u64 = 60;
 /// (secondary) rate limit takes a while to clear and re-hitting it just extends it.
 const PR_RATE_LIMIT_BACKOFF_SECS: u64 = 300;
 
+/// One per-host pull-request pause notice: how long the host is left alone, and
+/// the status both surfaces raise for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrPauseNotice {
+    pub pause: Duration,
+    pub tone: crate::statusline::StatusTone,
+    pub message: String,
+}
+
+/// Decide whether a host's sync signal pauses its pull-request checks, and how
+/// to say so. Priority: approaching the GraphQL points limit (the reset time is
+/// known) is an info, because dux is budgeting rather than failing; GitHub
+/// rate-limiting us (a 403 or secondary limit, checked on its own so a healthy
+/// host cannot mask it) and a plain network or gh failure are warnings, because
+/// pull-request state has stopped updating; a healthy host pauses nothing.
+/// Every tone self-dismisses on both surfaces, so a warning here never sits on
+/// screen once the pause is over. Messages carry no markup: a toast and the
+/// status line both show them verbatim.
+pub fn pr_pause_notice(
+    sig: &crate::gh::HostSignal,
+    now: chrono::DateTime<Utc>,
+) -> Option<PrPauseNotice> {
+    use crate::statusline::StatusTone;
+    if let Some(r) = sig
+        .rate
+        .as_ref()
+        .filter(|r| r.remaining < crate::gh::RATE_LIMIT_BACKOFF_FLOOR)
+    {
+        let secs_until = r
+            .reset_at
+            .map(|t| (t - now).num_seconds().clamp(0, 3600) as u64)
+            .unwrap_or(PR_RATE_LIMIT_BACKOFF_SECS);
+        let when = r
+            .reset_at
+            .map(|t| {
+                format!(
+                    " around {}",
+                    t.with_timezone(&chrono::Local).format("%H:%M")
+                )
+            })
+            .unwrap_or_default();
+        return Some(PrPauseNotice {
+            pause: Duration::from_secs(secs_until),
+            tone: StatusTone::Info,
+            message: format!(
+                "GitHub's API rate limit for {} is nearly used up ({} points left). dux \
+                 paused PR status checks; they resume automatically{when}.",
+                sig.host, r.remaining,
+            ),
+        });
+    }
+    if sig.rate_limited {
+        return Some(PrPauseNotice {
+            pause: Duration::from_secs(PR_RATE_LIMIT_BACKOFF_SECS),
+            tone: StatusTone::Warning,
+            message: format!(
+                "GitHub is rate-limiting API requests on {}. dux paused PR status checks; \
+                 they resume automatically once the limit clears.",
+                sig.host,
+            ),
+        });
+    }
+    if sig.hard_failed {
+        return Some(PrPauseNotice {
+            pause: Duration::from_secs(PR_HARD_FAILURE_BACKOFF_SECS),
+            tone: StatusTone::Warning,
+            message: format!(
+                "dux could not reach GitHub for PR status on {} (a network or gh error); \
+                 it will retry shortly.",
+                sig.host,
+            ),
+        });
+    }
+    None
+}
+
 /// The PR-sync loop sleeps in slices of this length so a disable or an interval
 /// change is observed within a few seconds rather than after a full (up to
 /// multi-hour) interval elapses.
@@ -3031,14 +3107,11 @@ impl Engine {
     }
 
     /// Update the shared per-host PR-check backoff from a sync's per-host signals
-    /// and surface a keyed, per-host status. Rate-limiting (approaching the points
-    /// limit, or a 403/secondary limit) and plain network/`gh` errors each pause
-    /// that host with an appropriately-worded, INFO-toned notice that auto-clears
-    /// (the pause is temporary and self-resolving, so it must not sit on screen as
-    /// a stuck warning); a healthy signal clears the host's pause silently. The
-    /// notice fires once per pause window (`already_active`). Only queried hosts
-    /// appear in `signals`, so a skipped/backed-off host is never spuriously
-    /// touched.
+    /// and surface a keyed, per-host status. The wording and the tone of each
+    /// notice come from [`pr_pause_notice`]; a healthy signal clears the host's
+    /// pause silently. The notice fires once per pause window (`already_active`).
+    /// Only queried hosts appear in `signals`, so a skipped/backed-off host is
+    /// never spuriously touched.
     fn apply_pr_backoff(
         shared: &Arc<Mutex<crate::gh::BackoffSnapshot>>,
         signals: &[crate::gh::HostSignal],
@@ -3046,82 +3119,31 @@ impl Engine {
     ) {
         for sig in signals {
             let key = format!("{PR_QUOTA_STATUS_KEY}:{}", sig.host);
-            // Decide (pause-window, message). Priority: approaching the GraphQL
-            // points limit (we know the reset time) → GitHub rate-limiting us (a
-            // 403/secondary limit, checked independently so a healthy host can't
-            // mask it) → a plain network/`gh` error → healthy (clear).
-            let decision: Option<(Instant, String)> = if let Some(r) = sig
-                .rate
-                .as_ref()
-                .filter(|r| r.remaining < crate::gh::RATE_LIMIT_BACKOFF_FLOOR)
-            {
-                let secs_until = r
-                    .reset_at
-                    .map(|t| (t - Utc::now()).num_seconds().clamp(0, 3600) as u64)
-                    .unwrap_or(PR_RATE_LIMIT_BACKOFF_SECS);
-                let when = r
-                    .reset_at
-                    .map(|t| {
-                        format!(
-                            " around {}",
-                            t.with_timezone(&chrono::Local).format("%H:%M")
-                        )
-                    })
-                    .unwrap_or_default();
-                Some((
-                    Instant::now() + Duration::from_secs(secs_until),
-                    format!(
-                        "GitHub's API rate limit for {} is nearly used up ({} points left). dux \
-                         paused PR status checks; they resume automatically{when}.",
-                        sig.host, r.remaining,
-                    ),
-                ))
-            } else if sig.rate_limited {
-                Some((
-                    Instant::now() + Duration::from_secs(PR_RATE_LIMIT_BACKOFF_SECS),
-                    format!(
-                        "GitHub is rate-limiting API requests on {}. dux paused PR status checks; \
-                         they resume automatically once the limit clears.",
-                        sig.host,
-                    ),
-                ))
-            } else if sig.hard_failed {
-                Some((
-                    Instant::now() + Duration::from_secs(PR_HARD_FAILURE_BACKOFF_SECS),
-                    format!(
-                        "dux couldn't reach GitHub for PR status on {} (network or `gh` error); \
-                         it will retry shortly.",
-                        sig.host,
-                    ),
-                ))
-            } else {
-                None
-            };
-
-            match decision {
-                Some((until, message)) => {
+            match pr_pause_notice(sig, Utc::now()) {
+                Some(notice) => {
+                    let until = Instant::now() + notice.pause;
                     let already_active = {
                         let mut map = shared.lock().unwrap_or_else(|e| e.into_inner());
                         let already = map.get(&sig.host).is_some_and(|u| Instant::now() < *u);
                         map.insert(sig.host.clone(), until);
                         already
                     };
-                    // Info-toned (not a persistent warning) so it self-dismisses:
-                    // the pause is temporary and resolves on its own, so the notice
-                    // auto-clears instead of sitting on screen. Emitted once per
-                    // pause window (the `already_active` gate), keyed per host.
+                    // Emitted once per pause window (the `already_active` gate),
+                    // keyed per host. Every tone here self-dismisses on both
+                    // surfaces, so a pause that resolves on its own never sits on
+                    // screen as a stuck notice.
                     if !already_active {
                         let _ = tx.send(WorkerEvent::CommandWorkerStarted(StatusUpdate::keyed(
                             key,
-                            crate::statusline::StatusTone::Info,
-                            message,
+                            notice.tone,
+                            notice.message,
                         )));
                     }
                 }
                 None => {
                     // Host is healthy again: clear its backoff so it is queried
-                    // normally. No "resumed" message: the Info-toned pause notice
-                    // already auto-cleared, so a fresh toast now would be stale.
+                    // normally. No "resumed" message: the pause notice already
+                    // auto-cleared, so a fresh toast now would be stale.
                     let mut map = shared.lock().unwrap_or_else(|e| e.into_inner());
                     map.remove(&sig.host);
                 }
@@ -11053,5 +11075,113 @@ mod resource_monitor_targets_tests {
         let (rows, _) = collector.sample(Vec::new());
         let kinds: Vec<ResourceKind> = rows.iter().map(|r| r.kind).collect();
         assert_eq!(kinds, vec![ResourceKind::Dux, ResourceKind::Total]);
+    }
+}
+
+#[cfg(test)]
+mod pr_pause_notice_tests {
+    use super::{PR_HARD_FAILURE_BACKOFF_SECS, PR_RATE_LIMIT_BACKOFF_SECS, pr_pause_notice};
+    use crate::gh::{HostSignal, RateLimitInfo};
+    use crate::statusline::StatusTone;
+    use chrono::Utc;
+    use std::time::Duration;
+
+    fn signal(host: &str) -> HostSignal {
+        HostSignal {
+            host: host.to_string(),
+            rate: None,
+            hard_failed: false,
+            rate_limited: false,
+        }
+    }
+
+    #[test]
+    fn a_healthy_host_pauses_nothing() {
+        assert_eq!(pr_pause_notice(&signal("github.com"), Utc::now()), None);
+    }
+
+    /// Budgeting is not failing: the points-limit pause is an info, and it says
+    /// when the checks come back.
+    #[test]
+    fn nearly_used_up_points_pause_as_an_info_until_the_reset() {
+        let now = Utc::now();
+        let mut sig = signal("github.com");
+        sig.rate = Some(RateLimitInfo {
+            remaining: 5,
+            reset_at: Some(now + chrono::Duration::seconds(120)),
+            cost: None,
+        });
+        let notice = pr_pause_notice(&sig, now).expect("a pause");
+        assert_eq!(notice.tone, StatusTone::Info);
+        assert_eq!(notice.pause, Duration::from_secs(120));
+        assert!(notice.message.contains("nearly used up (5 points left)"));
+        assert!(notice.message.contains("resume automatically around"));
+    }
+
+    /// Being rate-limited means pull-request state stopped updating, which is a
+    /// warning on both surfaces, not a green tick.
+    #[test]
+    fn rate_limiting_is_a_warning() {
+        let mut sig = signal("github.com");
+        sig.rate_limited = true;
+        let notice = pr_pause_notice(&sig, Utc::now()).expect("a pause");
+        assert_eq!(notice.tone, StatusTone::Warning);
+        assert_eq!(
+            notice.pause,
+            Duration::from_secs(PR_RATE_LIMIT_BACKOFF_SECS)
+        );
+        assert!(
+            notice
+                .message
+                .starts_with("GitHub is rate-limiting API requests on github.com.")
+        );
+    }
+
+    /// A host dux cannot reach is a warning, and the sentence carries no
+    /// markup: toasts and the status line show it verbatim, so a backtick would
+    /// be printed rather than rendered.
+    #[test]
+    fn an_unreachable_host_is_a_warning_with_no_markup() {
+        let mut sig = signal("ghe.example.com");
+        sig.hard_failed = true;
+        let notice = pr_pause_notice(&sig, Utc::now()).expect("a pause");
+        assert_eq!(notice.tone, StatusTone::Warning);
+        assert_eq!(
+            notice.pause,
+            Duration::from_secs(PR_HARD_FAILURE_BACKOFF_SECS)
+        );
+        assert_eq!(
+            notice.message,
+            "dux could not reach GitHub for PR status on ghe.example.com (a network or gh error); \
+             it will retry shortly."
+        );
+        assert!(!notice.message.contains('`'));
+    }
+
+    /// Rate-limiting outranks a hard failure on the same host, and the points
+    /// budget outranks both.
+    #[test]
+    fn the_points_budget_outranks_rate_limiting_which_outranks_a_hard_failure() {
+        let now = Utc::now();
+        let mut sig = signal("github.com");
+        sig.hard_failed = true;
+        sig.rate_limited = true;
+        assert!(
+            pr_pause_notice(&sig, now)
+                .unwrap()
+                .message
+                .starts_with("GitHub is rate-limiting")
+        );
+        sig.rate = Some(RateLimitInfo {
+            remaining: 1,
+            reset_at: None,
+            cost: None,
+        });
+        assert!(
+            pr_pause_notice(&sig, now)
+                .unwrap()
+                .message
+                .starts_with("GitHub's API rate limit")
+        );
     }
 }
