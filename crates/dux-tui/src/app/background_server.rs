@@ -207,7 +207,7 @@ impl App {
     pub(crate) fn start_background_server(&mut self, trigger: BackgroundServerStart) {
         if self.companion.is_none() {
             self.set_error(
-                "This build of dux cannot serve the web UI in the background. Run `dux server` \
+                "This build of dux cannot serve the web UI in the background. Run dux server \
                  for the web UI, or the start-web-server command to hand this terminal over to \
                  it."
                 .to_string(),

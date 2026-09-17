@@ -298,7 +298,7 @@ impl CreatePlanContext<'_> {
             use_existing_branch || git::branch_exists(&repo_path, &resolved_name).is_some();
         if !attach_existing && git::repo_commit_state(&repo_path) == git::CommitState::Unborn {
             self.send_failure(format!(
-                "Cannot create agent for \"{}\": the repository at {} has no commits yet. Create an initial commit (for example `git commit --allow-empty -m \"Initial commit\"`), then try again.",
+                "Cannot create agent for \"{}\": the repository at {} has no commits yet. Create an initial commit (for example with git commit --allow-empty -m \"Initial commit\"), then try again.",
                 project.name,
                 repo_path.display()
             ));
