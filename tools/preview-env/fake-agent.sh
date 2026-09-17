@@ -45,6 +45,33 @@ case "$fixture" in
     printf '%s\n' 'Error: the fixture dependency could not be resolved.' >&2
     exit 2
     ;;
+  burst)
+    # Measurement fixture: print a known number of lines of a known width as
+    # fast as the PTY will take them, then idle. The live fixture streams at
+    # under two lines a second, which is fine for looking at a working pane and
+    # useless for filling a 10,000-line scrollback. Not a screenshot scene: it
+    # exists so a memory measurement can put a terminal into a stated state.
+    #   DUX_FAKE_BURST_LINES  how many lines to print (default 10000)
+    #   DUX_FAKE_BURST_COLS   printed width of each line (default 80)
+    #   DUX_FAKE_BURST_DELAY  seconds to idle first, so a measurement can put
+    #                         the terminal at a chosen width before anything is
+    #                         printed into it (default 0)
+    lines="${DUX_FAKE_BURST_LINES:-10000}"
+    cols="${DUX_FAKE_BURST_COLS:-80}"
+    sleep "${DUX_FAKE_BURST_DELAY:-0}"
+    awk -v n="$lines" -v w="$cols" 'BEGIN {
+      filler = "abcdefghijklmnopqrstuvwxyz0123456789"
+      while (length(filler) < w) filler = filler filler
+      for (i = 0; i < n; i++) {
+        pre = sprintf("burst %08d ", i)
+        pad = w - length(pre)
+        if (pad < 1) pad = 1
+        printf "%s%s\n", pre, substr(filler, 1, pad)
+      }
+    }'
+    echo "fake-agent: burst of $lines lines at $cols columns complete."
+    while :; do sleep 60; done
+    ;;
   live)
     i=0
     echo "fake-agent: streaming output so this session reads as Working."
