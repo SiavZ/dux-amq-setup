@@ -59,7 +59,8 @@ export function useFileTreeFreshness({
   const [refresh, setRefresh] = useState<FileTreeRefresh | null>(null)
   const nonceRef = useRef(0)
   // The nonce of the revisit refresh still in flight, so a second revisit
-  // arriving behind it asks for nothing.
+  // arriving behind it asks for nothing. Released on the settle, on a newer
+  // request replacing it, and on the tree unmounting with it outstanding.
   const revisitNonceRef = useRef<number | null>(null)
   // The changed paths as of the last slice seen. Null until one arrives: the
   // first slice is the baseline the tree was already fetched against.
@@ -68,6 +69,10 @@ export function useFileTreeFreshness({
   function request(dirs: readonly string[]): number {
     nonceRef.current += 1
     const nonce = nonceRef.current
+    // A newer batch replaces the one the gate is holding, which the tree may
+    // never have seen at all: the settle that eventually arrives names this
+    // nonce, so holding the older one would arm the gate for good.
+    revisitNonceRef.current = null
     setRefresh({ dirs: [...dirs], nonce })
     return nonce
   }

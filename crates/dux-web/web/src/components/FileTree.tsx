@@ -134,9 +134,16 @@ export function FileTree({
   // the render that armed it.
   const dirsRef = useRef<Map<string, DirState>>(new Map())
 
+  // The refresh batch this tree has taken on and not yet reported back, so an
+  // unmount can report it rather than leaving a caller gating the next one on
+  // a component that is gone.
+  const pendingRefreshRef = useRef<number | null>(null)
+
   useEffect(() => {
     return () => {
       unmountedRef.current = true
+      const pending = pendingRefreshRef.current
+      if (pending !== null) onRefreshSettledRef.current?.(pending)
     }
   }, [])
 
@@ -293,8 +300,11 @@ export function FileTree({
   useEffect(() => {
     if (!refresh) return
     const nonce = refresh.nonce
+    pendingRefreshRef.current = nonce
     void Promise.all(refresh.dirs.map((d) => refetchInPlace(d))).then(() => {
-      if (!unmountedRef.current) onRefreshSettledRef.current?.(nonce)
+      if (unmountedRef.current) return
+      if (pendingRefreshRef.current === nonce) pendingRefreshRef.current = null
+      onRefreshSettledRef.current?.(nonce)
     })
     // Only the nonce may retrigger this, exactly as for `revalidate` above.
     // eslint-disable-next-line react-hooks/exhaustive-deps

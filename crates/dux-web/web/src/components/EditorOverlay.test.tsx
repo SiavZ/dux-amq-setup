@@ -2422,18 +2422,27 @@ describe("the file tree follows what the agent writes", () => {
     return view
   }
 
+  type Listing = { dir: string; entries: unknown[] }
+
+  function listingFor(dir: string): Listing {
+    return {
+      dir: "",
+      entries: dir === "" ? rootEntries : [],
+    } as unknown as Listing
+  }
+
+  function serveRootListing() {
+    treeMock.mockImplementation(async (..._a: unknown[]) =>
+      listingFor(String(_a[1] ?? "")),
+    )
+  }
+
   beforeEach(async () => {
     vi.clearAllMocks()
     installBootStubs()
     Overlay = (await import("@/components/EditorOverlay")).EditorOverlay
     rootEntries = [entry("notes.md", false)]
-    treeMock.mockImplementation(
-      async (..._a: unknown[]) =>
-        ({
-          dir: "",
-          entries: String(_a[1] ?? "") === "" ? rootEntries : [],
-        }) as unknown as { dir: string; entries: unknown[] },
-    )
+    serveRootListing()
   })
 
   afterEach(() => {
@@ -2480,5 +2489,44 @@ describe("the file tree follows what the agent writes", () => {
     )
     fireEvent.click(await screen.findByText("Refresh files"))
     expect(await screen.findByText("fresh.ts")).toBeTruthy()
+  })
+
+  // Typing in the search box swaps the tree out for the flat results, so a
+  // revisit fired while it is open has nobody to report back. These two cases
+  // are the gate wedging: the revisit it was holding is superseded before the
+  // tree ever sees it, and the settle that arrives names the newer batch.
+  it("keeps revisiting when the broadcast supersedes an unheard revisit", async () => {
+    const view = await mountTree()
+    const box = screen.getByPlaceholderText("Search files…")
+    fireEvent.change(box, { target: { value: "notes" } })
+    fireEvent(window, new Event("focus"))
+
+    mockState = {
+      ...mockState,
+      changes: changes(["newdir/one.txt"]),
+    } as DuxState
+    view.rerender(<Overlay />)
+    fireEvent.change(box, { target: { value: "" } })
+    expect(await screen.findByText("notes.md")).toBeTruthy()
+
+    rootEntries = [entry("notes.md", false), entry("later.ts", false)]
+    fireEvent(window, new Event("focus"))
+    expect(await screen.findByText("later.ts")).toBeTruthy()
+  })
+
+  it("keeps revisiting when Refresh files supersedes an unheard revisit", async () => {
+    await mountTree()
+    const box = screen.getByPlaceholderText("Search files…")
+    fireEvent.change(box, { target: { value: "notes" } })
+    fireEvent(window, new Event("focus"))
+
+    fireEvent.click(screen.getByRole("button", { name: /explorer actions/i }))
+    fireEvent.click(await screen.findByText("Refresh files"))
+    fireEvent.change(box, { target: { value: "" } })
+    expect(await screen.findByText("notes.md")).toBeTruthy()
+
+    rootEntries = [entry("notes.md", false), entry("later.ts", false)]
+    fireEvent(window, new Event("focus"))
+    expect(await screen.findByText("later.ts")).toBeTruthy()
   })
 })
