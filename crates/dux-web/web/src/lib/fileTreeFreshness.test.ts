@@ -37,8 +37,26 @@ describe("dirsToRefetch", () => {
     expect(dirsToRefetch([], ["NOTES.md"], LOADED)).toEqual([""])
   })
 
-  it("ignores a path whose directory is not loaded", () => {
-    expect(dirsToRefetch([], ["docs/deep/new.ts"], LOADED)).toEqual([])
+  it("refetches the nearest loaded ancestor of a file in a new folder", () => {
+    expect(dirsToRefetch([], ["new-folder/nested/two.txt"], LOADED)).toEqual([
+      "",
+    ])
+  })
+
+  it("refetches a loaded folder for a file added straight into it", () => {
+    expect(dirsToRefetch([], ["src/app/deep.ts"], LOADED)).toEqual(["src/app"])
+  })
+
+  it("asks for the shared ancestor once for two files in one new folder", () => {
+    expect(dirsToRefetch([], ["src/new/a.ts", "src/new/b.ts"], LOADED)).toEqual(
+      ["src"],
+    )
+  })
+
+  it("asks for nothing when no ancestor of the path is loaded", () => {
+    expect(dirsToRefetch([], ["docs/deep/new.ts"], new Set(["src"]))).toEqual(
+      [],
+    )
   })
 
   it("refetches the parent of a path that left the slice", () => {

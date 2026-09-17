@@ -16,18 +16,36 @@ export function changedPathsFrom(slice: ChangesSliceView | null): string[] {
   return [...paths].sort()
 }
 
-// The directory a changed path lives in, "" for the worktree root. A trailing
-// slash is stripped first: git reports an untracked DIRECTORY as "newdir/", and
-// what gained an entry is its parent, not the directory itself.
+// The directory a changed path lives in, "" for the worktree root. Stripping a
+// trailing slash is defensive: dux reads git status with `--untracked-files=all`,
+// which reports a new folder as its files rather than as "newdir/".
 function parentDirOf(path: string): string {
   const trimmed = path.endsWith("/") ? path.slice(0, -1) : path
   const cut = trimmed.lastIndexOf("/")
   return cut === -1 ? "" : trimmed.slice(0, cut)
 }
 
+// The deepest loaded directory at or above `dir`, or null when not even the
+// root is loaded. A file in a folder git has only just seen has no loaded
+// parent of its own, and the listing that gained an entry is its nearest
+// loaded ancestor's.
+function nearestLoadedDir(
+  dir: string,
+  loadedDirs: ReadonlySet<string>,
+): string | null {
+  let current = dir
+  for (;;) {
+    if (loadedDirs.has(current)) return current
+    if (current === "") return null
+    const cut = current.lastIndexOf("/")
+    current = cut === -1 ? "" : current.slice(0, cut)
+  }
+}
+
 // Which loaded directories may list something new or missing, given the changed
 // paths before and after the slice moved. Only paths that ENTERED or LEFT count:
 // a modified file's content change leaves every listing exactly as it was.
+// Each such path is charged to the nearest loaded directory at or above it.
 //
 // `previousPaths` is null before any slice has been seen, which is a baseline
 // rather than a change: the tree was just fetched.
@@ -42,8 +60,8 @@ export function dirsToRefetch(
   const dirs = new Set<string>()
   for (const path of [...previousPaths, ...nextPaths]) {
     if (before.has(path) && after.has(path)) continue
-    const parent = parentDirOf(path)
-    if (loadedDirs.has(parent)) dirs.add(parent)
+    const dir = nearestLoadedDir(parentDirOf(path), loadedDirs)
+    if (dir !== null) dirs.add(dir)
   }
   return [...dirs].sort()
 }
