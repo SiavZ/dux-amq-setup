@@ -1925,6 +1925,15 @@ describe("when the file changes on disk underneath the editor", () => {
     await waitFor(() => expect(editor().value).toBe(AGENT_TEXT))
   })
 
+  // The same revisit, arriving as the page becoming visible again: on a phone
+  // returning to the browser is a visibility change and not always a focus.
+  it("catches a change when the page becomes visible again", async () => {
+    await mountOne()
+    put(PATH, AGENT_TEXT, "2026-02-02T00:00:00+00:00")
+    fireEvent(document, new Event("visibilitychange"))
+    await waitFor(() => expect(editor().value).toBe(AGENT_TEXT))
+  })
+
   it("deduplicates freshness triggers while one check is in flight", async () => {
     const view = await mountOne()
     let releaseInfo: (() => void) | null = null

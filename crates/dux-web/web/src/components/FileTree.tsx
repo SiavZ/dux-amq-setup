@@ -142,8 +142,6 @@ export function FileTree({
   useEffect(() => {
     return () => {
       unmountedRef.current = true
-      const pending = pendingRefreshRef.current
-      if (pending !== null) onRefreshSettledRef.current?.(pending)
     }
   }, [])
 
@@ -295,6 +293,15 @@ export function FileTree({
   useEffect(() => {
     onLoadedDirsChangeRef.current?.(JSON.parse(loadedDirsKey) as string[])
   }, [loadedDirsKey])
+
+  // Report a refresh still outstanding at unmount: a caller gating its next
+  // refresh on this one must not be left waiting for a component that is gone.
+  useEffect(() => {
+    return () => {
+      const pending = pendingRefreshRef.current
+      if (pending !== null) onRefreshSettledRef.current?.(pending)
+    }
+  }, [])
 
   // The background refresh: exactly the dirs the caller named, in place.
   useEffect(() => {

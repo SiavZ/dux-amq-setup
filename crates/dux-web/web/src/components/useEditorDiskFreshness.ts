@@ -18,6 +18,7 @@ import type {
 import type { EditorRoot } from "@/lib/editorRoot"
 import type { EditorTab } from "@/lib/editorTabs"
 import type { MonacoInstance } from "@/components/CodeEditor"
+import { useRevisit } from "@/hooks/use-revisit"
 
 type RaiseDiskBanner = (
   tabId: string,
@@ -228,15 +229,10 @@ export function useEditorDiskFreshness({
     activeBuffer?.loadedPath,
   ])
 
-  useEffect(() => {
+  useRevisit(() => {
     if (!activeTab || activeTab.mode !== "file") return
-    const tabId = activeTab.id
-    const path = activeTab.path
-    const revalidate = () => checkDiskFreshness(tabId, path)
-    window.addEventListener("focus", revalidate)
-    return () => window.removeEventListener("focus", revalidate)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab?.mode, activeTab?.id, activeTab?.path])
+    checkDiskFreshness(activeTab.id, activeTab.path)
+  })
 
   useEffect(() => {
     if (!activeTab || activeTab.mode !== "file") return

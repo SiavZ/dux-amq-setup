@@ -3,6 +3,7 @@ import type { RefObject } from "react"
 
 import type { ChangesSliceView } from "@/lib/editorBuffers"
 import { changedPathsFrom, dirsToRefetch } from "@/lib/fileTreeFreshness"
+import { useRevisit } from "@/hooks/use-revisit"
 
 // A batch of directories the tree should refetch in place, identified by a
 // nonce so a repeat of the same set still lands.
@@ -26,28 +27,6 @@ interface FileTreeFreshness {
   onRefreshSettled: (nonce: number) => void
   // The explorer menu's Refresh files: every loaded directory, on demand.
   refreshAllLoadedDirs: () => void
-}
-
-// The two revisit triggers the open buffers already ride: the window regaining
-// focus, and this tab becoming the visible one. Both funnel into one handler,
-// because coming back to a backgrounded tab commonly fires both.
-function useRevisit(onRevisit: () => void): void {
-  const handlerRef = useRef(onRevisit)
-  useEffect(() => {
-    handlerRef.current = onRevisit
-  })
-  useEffect(() => {
-    const fire = () => handlerRef.current()
-    const onVisibility = () => {
-      if (document.visibilityState === "visible") fire()
-    }
-    window.addEventListener("focus", fire)
-    document.addEventListener("visibilitychange", onVisibility)
-    return () => {
-      window.removeEventListener("focus", fire)
-      document.removeEventListener("visibilitychange", onVisibility)
-    }
-  }, [])
 }
 
 // Keeps the editor's file tree in step with files nobody in this browser wrote,
