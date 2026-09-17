@@ -947,4 +947,123 @@ describe("FileTree", () => {
       expect(screen.queryByText("Upload here…")).toBeNull()
     })
   })
+
+  // The background refresh, which runs for files somebody else wrote: it must
+  // read as the same tree, only newer.
+  describe("a background refresh", () => {
+    function renderTree(
+      props: Partial<{
+        refresh: { dirs: readonly string[]; nonce: number } | null
+        onRefreshSettled: (nonce: number) => void
+        onLoadedDirsChange: (dirs: string[]) => void
+      }> = {},
+    ) {
+      return render(
+        <FileTree
+          root={agentRoot("s1")}
+          openPath={null}
+          changed={new Map()}
+          initialPath={null}
+          onOpen={() => {}}
+          {...props}
+        />,
+      )
+    }
+
+    it("keeps the expanded set, expands nothing new, and swaps the entries in place", async () => {
+      let rootEntries = [dir("src"), file("keep.ts"), file("gone.ts")]
+      let srcEntries = [file("src/a.ts")]
+      treeMock.mockImplementation((_sid, d) =>
+        Promise.resolve({
+          dir: d,
+          entries: d === "" ? rootEntries : d === "src" ? srcEntries : [],
+        }),
+      )
+      const { rerender } = renderTree()
+      fireEvent.click(await screen.findByText("src"))
+      expect(await screen.findByText("a.ts")).toBeTruthy()
+
+      rootEntries = [dir("src"), dir("newdir"), file("keep.ts")]
+      srcEntries = [file("src/a.ts")]
+      rerender(
+        <FileTree
+          root={agentRoot("s1")}
+          openPath={null}
+          changed={new Map()}
+          initialPath={null}
+          onOpen={() => {}}
+          refresh={{ dirs: ["", "src"], nonce: 1 }}
+        />,
+      )
+
+      expect(await screen.findByText("newdir")).toBeTruthy()
+      expect(screen.queryByText("gone.ts")).toBeNull()
+      expect(screen.getByText("keep.ts")).toBeTruthy()
+      // src stays open (its child is still rendered) and the new dir stays shut.
+      expect(screen.getByText("a.ts")).toBeTruthy()
+      expect(
+        screen.getByText("newdir").closest("button")?.getAttribute("aria-expanded"),
+      ).toBe("false")
+    })
+
+    it("keeps the old listing when the refetch fails, and says nothing", async () => {
+      let fail = false
+      treeMock.mockImplementation((_sid, d) =>
+        fail
+          ? Promise.reject(new Error("no"))
+          : Promise.resolve({ dir: d, entries: d === "" ? [file("a.ts")] : [] }),
+      )
+      const { rerender } = renderTree()
+      expect(await screen.findByText("a.ts")).toBeTruthy()
+
+      fail = true
+      rerender(
+        <FileTree
+          root={agentRoot("s1")}
+          openPath={null}
+          changed={new Map()}
+          initialPath={null}
+          onOpen={() => {}}
+          refresh={{ dirs: [""], nonce: 1 }}
+        />,
+      )
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 20))
+      })
+      expect(screen.getByText("a.ts")).toBeTruthy()
+      expect(screen.queryByText("Failed to load. Retry")).toBeNull()
+    })
+
+    it("reports the loaded dirs up and answers with the nonce it was given", async () => {
+      treeMock.mockImplementation((_sid, d) =>
+        Promise.resolve({ dir: d, entries: d === "" ? [dir("src")] : [] }),
+      )
+      const onLoadedDirsChange = vi.fn()
+      const onRefreshSettled = vi.fn()
+      const { rerender } = renderTree({ onLoadedDirsChange, onRefreshSettled })
+      await screen.findByText("src")
+      fireEvent.click(screen.getByText("src"))
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 20))
+      })
+      expect(onLoadedDirsChange).toHaveBeenLastCalledWith(["", "src"])
+
+      rerender(
+        <FileTree
+          root={agentRoot("s1")}
+          openPath={null}
+          changed={new Map()}
+          initialPath={null}
+          onOpen={() => {}}
+          onLoadedDirsChange={onLoadedDirsChange}
+          onRefreshSettled={onRefreshSettled}
+          refresh={{ dirs: ["", "src"], nonce: 7 }}
+        />,
+      )
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 20))
+      })
+      expect(onRefreshSettled).toHaveBeenCalledWith(7)
+    })
+  })
 })

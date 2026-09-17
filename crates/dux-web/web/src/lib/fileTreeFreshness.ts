@@ -1,0 +1,60 @@
+// Pure planner for keeping the editor's file tree fresh off the changed-files
+// broadcast, the same signal the open buffers are questioned by. A path that
+// entered or left the slice may have changed a directory LISTING; a path that
+// merely changed content did not.
+
+import type { ChangesSliceView } from "@/lib/editorBuffers"
+import type { DirEntry } from "@/lib/fileTree"
+
+// Every path git reports for the worktree, staged and unstaged alike, sorted so
+// two reads of the same slice compare equal as strings.
+export function changedPathsFrom(slice: ChangesSliceView | null): string[] {
+  if (!slice) return []
+  const paths = new Set<string>()
+  for (const f of slice.unstaged) paths.add(f.path)
+  for (const f of slice.staged) paths.add(f.path)
+  return [...paths].sort()
+}
+
+// The directory a changed path lives in, "" for the worktree root. A trailing
+// slash is stripped first: git reports an untracked DIRECTORY as "newdir/", and
+// what gained an entry is its parent, not the directory itself.
+function parentDirOf(path: string): string {
+  const trimmed = path.endsWith("/") ? path.slice(0, -1) : path
+  const cut = trimmed.lastIndexOf("/")
+  return cut === -1 ? "" : trimmed.slice(0, cut)
+}
+
+// Which loaded directories may list something new or missing, given the changed
+// paths before and after the slice moved. Only paths that ENTERED or LEFT count:
+// a modified file's content change leaves every listing exactly as it was.
+//
+// `previousPaths` is null before any slice has been seen, which is a baseline
+// rather than a change: the tree was just fetched.
+export function dirsToRefetch(
+  previousPaths: readonly string[] | null,
+  nextPaths: readonly string[],
+  loadedDirs: ReadonlySet<string>,
+): string[] {
+  if (previousPaths === null) return []
+  const before = new Set(previousPaths)
+  const after = new Set(nextPaths)
+  const dirs = new Set<string>()
+  for (const path of [...previousPaths, ...nextPaths]) {
+    if (before.has(path) && after.has(path)) continue
+    const parent = parentDirOf(path)
+    if (loadedDirs.has(parent)) dirs.add(parent)
+  }
+  return [...dirs].sort()
+}
+
+// The subdirectories a refetched listing no longer has. Their cached listings
+// are dropped with them, so a directory deleted and later recreated under the
+// same name does not come back holding the old one's children.
+export function vanishedDirPaths(
+  before: readonly DirEntry[],
+  after: readonly DirEntry[],
+): string[] {
+  const kept = new Set(after.filter((e) => e.is_dir).map((e) => e.path))
+  return before.filter((e) => e.is_dir && !kept.has(e.path)).map((e) => e.path)
+}

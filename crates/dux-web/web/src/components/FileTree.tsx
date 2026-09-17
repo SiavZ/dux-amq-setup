@@ -20,6 +20,7 @@ import {
   flattenLazy,
 } from "@/lib/fileTree"
 import type { DirState } from "@/lib/fileTree"
+import { vanishedDirPaths } from "@/lib/fileTreeFreshness"
 import type { EditorRoot } from "@/lib/editorRoot"
 
 const noop = () => {}
@@ -50,6 +51,18 @@ interface FileTreeProps {
   // Bump the nonce (with the affected dir(s)) to force a refetch of those
   // directories after a create/rename/delete mutation lands.
   revalidate?: { dirs: string[]; nonce: number } | null
+  // A BACKGROUND refetch of already-loaded directories, for changes the tree
+  // did not make (an agent writing in the worktree). Unlike `revalidate` it
+  // expands nothing, shows no spinner, and a failure keeps the old listing:
+  // nobody asked for it, so nothing may move under the reader.
+  refresh?: { dirs: readonly string[]; nonce: number } | null
+  // Fires when a `refresh` batch has settled, with the nonce it was armed
+  // with, so the caller can hold the next one of the same kind until this one
+  // is done.
+  onRefreshSettled?: (nonce: number) => void
+  // The directories currently in the lazy cache, reported up so the caller can
+  // decide WHICH of them to refresh without owning the cache itself.
+  onLoadedDirsChange?: (dirs: string[]) => void
   // Whether the server accepts uploads at all (`file_drop_max_bytes > 0`). With
   // it off the tree does not highlight, accept a drop, or pretend it would work.
   fileDropEnabled?: boolean
@@ -80,6 +93,9 @@ export function FileTree({
   onDelete = noop,
   onInfo = noop,
   revalidate = null,
+  refresh = null,
+  onRefreshSettled,
+  onLoadedDirsChange,
   fileDropEnabled = false,
   onFilesDropped,
 }: FileTreeProps) {
@@ -113,6 +129,10 @@ export function FileTree({
   // overwrites fresher state.
   const unmountedRef = useRef(false)
   const requestTokenRef = useRef<Map<string, number>>(new Map())
+  // The cache as of the last render, for the background refresh: it compares a
+  // fresh listing against the one it is replacing, and it resolves long after
+  // the render that armed it.
+  const dirsRef = useRef<Map<string, DirState>>(new Map())
 
   useEffect(() => {
     return () => {
@@ -172,6 +192,90 @@ export function FileTree({
     },
     [root],
   )
+
+  // Refetch one already-loaded directory WITHOUT disturbing it: no loading
+  // sentinel (the old rows stay on screen and the scroll position with them),
+  // no expansion, and a failure leaves the listing exactly as it was, because
+  // this runs for changes the user did not ask about.
+  const refetchInPlace = useCallback(
+    (dir: string) => {
+      const token = (requestTokenRef.current.get(dir) ?? 0) + 1
+      requestTokenRef.current.set(dir, token)
+      return fileApi
+        .tree(root, dir)
+        .then((result) => {
+          if (unmountedRef.current || requestTokenRef.current.get(dir) !== token)
+            return
+          const before = dirsRef.current.get(dir)
+          if (before?.status !== "loaded") return
+          const gone = vanishedDirPaths(before.entries, result.entries)
+          const evict = gone.flatMap((d) => [
+            d,
+            ...descendantDirPaths(dirsRef.current, d),
+          ])
+          for (const d of evict) requestedRef.current.delete(d)
+          setDirs((prev) => {
+            const next = new Map(prev)
+            next.set(dir, { status: "loaded", entries: result.entries })
+            for (const d of evict) next.delete(d)
+            return next
+          })
+          if (evict.length > 0) {
+            setExpanded((prev) => {
+              const next = new Set(prev)
+              for (const d of evict) next.delete(d)
+              return next
+            })
+          }
+        })
+        .catch(() => {
+          // Deliberately silent: the listing on screen is still the best answer
+          // the tree has, and nobody pressed anything to provoke this.
+        })
+    },
+    [root],
+  )
+
+  useEffect(() => {
+    dirsRef.current = dirs
+  })
+
+  // The loaded directories, reported up for the caller's refresh policy. Only
+  // the resolved ones: a dir still loading, or errored, has no listing that a
+  // background refetch could keep.
+  const loadedDirsKey = useMemo(
+    () =>
+      JSON.stringify(
+        [...dirs]
+          .filter(([, state]) => state.status === "loaded")
+          .map(([dir]) => dir)
+          .sort(),
+      ),
+    [dirs],
+  )
+  // Both callbacks are read through refs so an inline arrow from the caller
+  // cannot re-fire these effects on every render of the editor.
+  const onLoadedDirsChangeRef = useRef(onLoadedDirsChange)
+  const onRefreshSettledRef = useRef(onRefreshSettled)
+  useEffect(() => {
+    onLoadedDirsChangeRef.current = onLoadedDirsChange
+    onRefreshSettledRef.current = onRefreshSettled
+  })
+
+  useEffect(() => {
+    onLoadedDirsChangeRef.current?.(JSON.parse(loadedDirsKey) as string[])
+  }, [loadedDirsKey])
+
+  // The background refresh: exactly the dirs the caller named, in place.
+  useEffect(() => {
+    if (!refresh) return
+    const nonce = refresh.nonce
+    void Promise.all(refresh.dirs.map((d) => refetchInPlace(d))).then(() => {
+      if (!unmountedRef.current) onRefreshSettledRef.current?.(nonce)
+    })
+    // Only the nonce may retrigger this, exactly as for `revalidate` above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refresh?.nonce])
 
   // Mount: fetch the root; when a deep-link target is present, also fetch and
   // expand its ancestor chain so the opened file is revealed without clicks.
