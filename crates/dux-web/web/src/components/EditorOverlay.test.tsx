@@ -2407,15 +2407,29 @@ describe("the file tree follows what the agent writes", () => {
     }
   }
 
-  async function mountTree(initialChanges: string[] = []) {
+  function tab(id: string, path: string) {
+    return { id, path, mode: "file" as const, preview: false, dirty: false }
+  }
+
+  function tabsState(open: Array<{ id: string; path: string }>, activeId: string | null) {
+    return {
+      [rootKey(agentRoot(SESSION))]: {
+        tabs: open.map((t) => tab(t.id, t.path)),
+        activeId,
+      },
+    }
+  }
+
+  async function mountTree(
+    initialChanges: string[] = [],
+    tabs: ReturnType<typeof tabsState> = tabsState([], null),
+  ) {
     const { getSnapshot } = await import("@/lib/store")
     mockState = {
       ...getSnapshot(),
       changes: changes(initialChanges),
       editorTarget: { root: agentRoot(SESSION), initialPath: null },
-      editorTabs: {
-        [rootKey(agentRoot(SESSION))]: { tabs: [], activeId: null },
-      },
+      editorTabs: tabs,
     } as unknown as DuxState
     const view = render(<Overlay />)
     await screen.findByText("notes.md")
@@ -2489,6 +2503,32 @@ describe("the file tree follows what the agent writes", () => {
     )
     fireEvent.click(await screen.findByText("Refresh files"))
     expect(await screen.findByText("fresh.ts")).toBeTruthy()
+  })
+
+  it("refetches the loaded directories when another editor tab is activated", async () => {
+    const open = [
+      { id: "tab-a", path: "alpha.md" },
+      { id: "tab-b", path: "beta.md" },
+    ]
+    // Both tab paths are in the listing already, so activating one is the only
+    // thing that can provoke a refetch: revealing a file the tree does not
+    // have would refetch its parent on its own.
+    const present = [
+      entry("notes.md", false),
+      entry("alpha.md", false),
+      entry("beta.md", false),
+    ]
+    rootEntries = present
+    const view = await mountTree([], tabsState(open, "tab-a"))
+
+    rootEntries = [...present, entry("later.ts", false)]
+    mockState = {
+      ...mockState,
+      editorTabs: tabsState(open, "tab-b"),
+    } as unknown as DuxState
+    view.rerender(<Overlay />)
+
+    expect(await screen.findByText("later.ts")).toBeTruthy()
   })
 
   // Typing in the search box swaps the tree out for the flat results, so a

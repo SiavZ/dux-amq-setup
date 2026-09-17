@@ -566,14 +566,18 @@ export function EditorBody({ root, standalone = false }: EditorBodyProps) {
     sliceRef.current = slice
   })
 
-  // The tree's own freshness, on the same three triggers the open buffers use:
-  // the changed-files broadcast, the window regaining focus, and this tab
-  // becoming visible. Nothing polls.
+  // The tree's own freshness, on the same triggers the open buffers use: the
+  // changed-files broadcast, the window regaining focus, the page becoming
+  // visible, and switching editor tabs. Nothing polls.
   const {
     refresh: treeRefresh,
     onRefreshSettled: treeRefreshSettled,
     refreshAllLoadedDirs,
-  } = useFileTreeFreshness({ slice, loadedDirsRef: loadedTreeDirsRef })
+  } = useFileTreeFreshness({
+    slice,
+    loadedDirsRef: loadedTreeDirsRef,
+    activeTabKey: `${activeTab?.id ?? ""}:${activeTab?.path ?? ""}`,
+  })
 
   const { raiseDiskBanner, dismissDiskBanner } =
     createEditorDiskBannerActions(setBuffers)

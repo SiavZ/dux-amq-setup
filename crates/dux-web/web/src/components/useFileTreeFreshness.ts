@@ -16,6 +16,9 @@ interface UseFileTreeFreshnessOptions {
   slice: ChangesSliceView | null
   // The tree's loaded directories, as the tree last reported them.
   loadedDirsRef: RefObject<readonly string[]>
+  // The active editor tab's identity, "" when there is none. Switching tabs is
+  // the third trigger the open buffers ride, and the tree rides it too.
+  activeTabKey: string
 }
 
 interface FileTreeFreshness {
@@ -55,6 +58,7 @@ function useRevisit(onRevisit: () => void): void {
 export function useFileTreeFreshness({
   slice,
   loadedDirsRef,
+  activeTabKey,
 }: UseFileTreeFreshnessOptions): FileTreeFreshness {
   const [refresh, setRefresh] = useState<FileTreeRefresh | null>(null)
   const nonceRef = useRef(0)
@@ -86,6 +90,16 @@ export function useFileTreeFreshness({
   }
 
   useRevisit(() => refreshLoadedDirs(true))
+
+  // Tab activation, the buffers' third trigger. The first render is skipped:
+  // the tree is fetching its directories for the first time anyway.
+  const seenTabKeyRef = useRef<string | null>(null)
+  useEffect(() => {
+    const previous = seenTabKeyRef.current
+    seenTabKeyRef.current = activeTabKey
+    if (previous !== null) refreshLoadedDirs(true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTabKey])
 
   const changedPathsKey = useMemo(
     () => JSON.stringify(changedPathsFrom(slice)),
