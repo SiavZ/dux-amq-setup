@@ -20,6 +20,10 @@ interface UseFileTreeFreshnessOptions {
   // The active editor tab's identity, "" when there is none. Switching tabs is
   // the third trigger the open buffers ride, and the tree rides it too.
   activeTabKey: string
+  // Fires once per batch the tree is asked to refetch, whatever asked for it.
+  // The flat search index answers the same question about the same worktree
+  // off a different endpoint, so it has to be re-walked on the same triggers.
+  onRefreshRequested: () => void
 }
 
 interface FileTreeFreshness {
@@ -38,6 +42,7 @@ export function useFileTreeFreshness({
   slice,
   loadedDirsRef,
   activeTabKey,
+  onRefreshRequested,
 }: UseFileTreeFreshnessOptions): FileTreeFreshness {
   const [refresh, setRefresh] = useState<FileTreeRefresh | null>(null)
   const nonceRef = useRef(0)
@@ -49,6 +54,13 @@ export function useFileTreeFreshness({
   // first slice is the baseline the tree was already fetched against.
   const seenPathsRef = useRef<readonly string[] | null>(null)
 
+  // Read through a ref so an inline arrow from the caller cannot make the
+  // request path depend on render identity.
+  const onRefreshRequestedRef = useRef(onRefreshRequested)
+  useEffect(() => {
+    onRefreshRequestedRef.current = onRefreshRequested
+  })
+
   function request(dirs: readonly string[]): number {
     nonceRef.current += 1
     const nonce = nonceRef.current
@@ -57,6 +69,7 @@ export function useFileTreeFreshness({
     // nonce, so holding the older one would arm the gate for good.
     revisitNonceRef.current = null
     setRefresh({ dirs: [...dirs], nonce })
+    onRefreshRequestedRef.current()
     return nonce
   }
 

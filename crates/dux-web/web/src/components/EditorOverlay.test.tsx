@@ -124,6 +124,12 @@ const treeMock = vi.fn(async () => ({
   dir: "",
   entries: [] as unknown[],
 }))
+// The flat walk behind "Search files…", which follows the tree's own refresh
+// triggers: per-test overrides stand in for what the agent has just written.
+const listMock = vi.fn(async () => ({
+  files: [PATH] as string[],
+  truncated: false,
+}))
 const createFileMock = vi.fn(async (..._a: unknown[]) => {})
 const createDirMock = vi.fn(async (..._a: unknown[]) => {})
 const renameMock = vi.fn(async (..._a: unknown[]) => {})
@@ -135,7 +141,8 @@ const removeMock = vi.fn(async (..._a: unknown[]) => {})
 vi.mock("@/lib/fileApi", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/fileApi")>()),
   fileApi: {
-    list: vi.fn(async () => ({ files: [PATH], truncated: false })),
+    list: (...a: unknown[]) =>
+      (listMock as unknown as (...x: unknown[]) => unknown)(...a),
     info: (...a: unknown[]) => infoMock(...a),
     tree: (...a: unknown[]) => (treeMock as unknown as (...x: unknown[]) => unknown)(...a),
     read: (...a: unknown[]) => readMock(...a),
@@ -2512,6 +2519,38 @@ describe("the file tree follows what the agent writes", () => {
     )
     fireEvent.click(await screen.findByText("Refresh files"))
     expect(await screen.findByText("fresh.ts")).toBeTruthy()
+  })
+
+  // The tree and "Search files…" read two different endpoints, so a file the
+  // tree has picked up is still unfindable until the flat walk runs again.
+  it("re-indexes the search list when the broadcast reports a new file", async () => {
+    const view = await mountTree()
+    listMock.mockResolvedValue({
+      files: ["notes.md", "newdir/one.txt"],
+      truncated: false,
+    })
+
+    mockState = {
+      ...mockState,
+      changes: changes(["newdir/one.txt"]),
+    } as DuxState
+    view.rerender(<Overlay />)
+    await waitFor(() => expect(listMock.mock.calls.length).toBe(2))
+
+    fireEvent.change(screen.getByPlaceholderText("Search files…"), {
+      target: { value: "one.txt" },
+    })
+    expect(await screen.findByText("newdir/one.txt")).toBeTruthy()
+  })
+
+  it("walks the search index once for a revisit, however many events it fires", async () => {
+    await mountTree()
+    expect(listMock.mock.calls.length).toBe(1)
+
+    fireEvent(window, new Event("focus"))
+    fireEvent(window, new Event("focus"))
+    await waitFor(() => expect(treeMock.mock.calls.length).toBeGreaterThan(1))
+    expect(listMock.mock.calls.length).toBe(2)
   })
 
   it("refetches the loaded directories when another editor tab is activated", async () => {

@@ -569,6 +569,17 @@ export function EditorBody({ root, standalone = false }: EditorBodyProps) {
   // The tree's own freshness, on the same triggers the open buffers use: the
   // changed-files broadcast, the window regaining focus, the page becoming
   // visible, and switching editor tabs. Nothing polls.
+  // ONE walk at a time: the triggers can arrive in a burst and a second walk
+  // of the whole worktree would bring back nothing the first one is already
+  // fetching. Dropped rather than queued, for the same reason.
+  const searchWalkRef = useRef<Promise<void> | null>(null)
+  function refreshSearchIndexOnce(): void {
+    if (searchWalkRef.current) return
+    const walk = refreshSearchIndex().finally(() => {
+      if (searchWalkRef.current === walk) searchWalkRef.current = null
+    })
+    searchWalkRef.current = walk
+  }
   const {
     refresh: treeRefresh,
     onRefreshSettled: treeRefreshSettled,
@@ -577,6 +588,7 @@ export function EditorBody({ root, standalone = false }: EditorBodyProps) {
     slice,
     loadedDirsRef: loadedTreeDirsRef,
     activeTabKey: `${activeTab?.id ?? ""}:${activeTab?.path ?? ""}`,
+    onRefreshRequested: refreshSearchIndexOnce,
   })
 
   const { raiseDiskBanner, dismissDiskBanner } =
@@ -667,10 +679,11 @@ export function EditorBody({ root, standalone = false }: EditorBodyProps) {
   }, [search, searchIndex])
 
   // Refetch the search index (a capped flat walk of the worktree). Called on
-  // mount AND after every create/rename/delete mutation so newly-created or
-  // renamed paths become findable via "Search files…" without waiting for the
-  // next overlay open. The TREE never uses this: it browses lazily per
-  // directory via fileApi.tree, revalidated separately (see `revalidateDirs`).
+  // mount, after every create/rename/delete mutation, and on each of the
+  // tree's own freshness triggers, so a file somebody else wrote is findable
+  // in "Search files…" as soon as the tree shows it. The TREE never uses this:
+  // it browses lazily per directory via fileApi.tree, revalidated separately
+  // (see `revalidateDirs`).
   function refreshSearchIndex(): Promise<void> {
     return fileApi
       .list(root)
