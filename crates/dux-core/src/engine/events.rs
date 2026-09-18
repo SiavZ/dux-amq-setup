@@ -3307,6 +3307,14 @@ impl Engine {
         // every first probe and re-arm the watch for nothing.
         let changed = self.folder_repo_status(&session_id) != status;
         self.folder_repo_statuses.insert(session_id.clone(), status);
+        if changed {
+            // Both enumerators gate on this verdict, so a change to it is what
+            // takes an agent out of them or puts it back. Without this the
+            // pollers keep running git in a directory that is gone until
+            // something else happens to rebuild their plans.
+            self.update_branch_sync_sessions();
+            self.update_pr_sync_sessions();
+        }
         if !changed || self.watched_session_id.as_deref() != Some(session_id.as_str()) {
             return EventReaction::Nothing;
         }

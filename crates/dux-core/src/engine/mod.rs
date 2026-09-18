@@ -2280,10 +2280,19 @@ impl Engine {
                 };
                 let mut updates = Vec::new();
                 for entry in &snapshot {
-                    if let Ok(actual) = crate::git::current_branch(Path::new(&entry.worktree_path))
-                        && actual != entry.branch_name
-                    {
-                        updates.push((entry.session_id.clone(), actual));
+                    let worktree = Path::new(&entry.worktree_path);
+                    match crate::git::current_branch(worktree) {
+                        Ok(actual) if actual != entry.branch_name => {
+                            updates.push((entry.session_id.clone(), actual));
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            crate::logger::error(&format!(
+                                "branch sync could not read the branch of {}: {err:#}",
+                                worktree.display()
+                            ));
+                            report_missing_directory(tx, &entry.session_id, worktree);
+                        }
                     }
                 }
                 if !updates.is_empty() && tx.send(WorkerEvent::BranchSyncReady(updates)).is_err() {
@@ -2293,7 +2302,32 @@ impl Engine {
             },
         );
     }
+}
 
+/// Tell the engine a poller found an agent's directory gone.
+///
+/// A background poller's own git failure is the earliest anyone learns a
+/// working copy has been deleted for an agent nobody is watching: the verdict
+/// that would take it out of every enumerator is otherwise only refreshed at
+/// startup, at creation and when the agent is on screen. Sent only for the one
+/// error that means the directory is not there, so a mount that is down neither
+/// wipes the agent's git surface nor offers to recreate a working copy that is
+/// sitting safely where it always was.
+fn report_missing_directory(
+    tx: &std::sync::mpsc::Sender<WorkerEvent>,
+    session_id: &str,
+    directory: &Path,
+) {
+    if crate::git::directory_presence(directory) != crate::git::DirectoryPresence::Missing {
+        return;
+    }
+    let _ = tx.send(WorkerEvent::FolderRepoStatusReady {
+        session_id: session_id.to_string(),
+        status: crate::git::FolderRepoStatus::Missing,
+    });
+}
+
+impl Engine {
     pub fn spawn_refs_watcher(&mut self) {
         use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -3133,6 +3167,30 @@ impl Engine {
                 }
                 if secs == 0 {
                     return LoopControl::Continue;
+                }
+                // A working copy that went away since the plan was built is
+                // reported once and its agent drops out of the plan on the next
+                // rebuild. Without this, every question the sync asks runs git
+                // in a directory that is not there, once per cycle, for as long
+                // as nobody happens to look at the agent.
+                if let Ok(guard) = sessions.lock() {
+                    let gone: Vec<(String, std::path::PathBuf)> = guard
+                        .iter()
+                        .map(|entry| {
+                            (
+                                entry.session_id.clone(),
+                                std::path::PathBuf::from(&entry.worktree_path),
+                            )
+                        })
+                        .filter(|(_, path)| {
+                            crate::git::directory_presence(path)
+                                == crate::git::DirectoryPresence::Missing
+                        })
+                        .collect();
+                    drop(guard);
+                    for (session_id, path) in gone {
+                        report_missing_directory(tx, &session_id, &path);
+                    }
                 }
                 // Backed-off hosts are skipped inside run_pr_sync via this
                 // snapshot (their sessions keep last-known PRs), so no global
@@ -5743,6 +5801,55 @@ mod tests {
             Some("s1"),
             "the panel still shows this agent, it just has nothing to poll"
         );
+    }
+
+    /// A poller that hits a directory that is gone is how dux learns about an
+    /// agent nobody is watching: the verdict is otherwise refreshed only at
+    /// startup, at creation and when the agent is on screen, so branch sync and
+    /// pull-request sync kept running git in a deleted directory every cycle.
+    #[test]
+    fn a_pollers_own_failure_downgrades_the_verdict_and_takes_the_agent_out() {
+        let (mut engine, _tmp, _folder) = engine_with_a_standalone_agent();
+        engine.update_branch_sync_sessions();
+        assert_eq!(
+            engine.branch_sync_sessions.lock().expect("lock").len(),
+            1,
+            "precondition: enrolled while the copy is there"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let gone = _tmp.path().join("never-existed");
+        report_missing_directory(&tx, "s1", &gone);
+        let event = rx.try_recv().expect("the poller reports the directory");
+        let _ = engine.process_worker_event(event);
+
+        assert_eq!(
+            engine.folder_repo_status("s1"),
+            crate::git::FolderRepoStatus::Missing
+        );
+        assert!(
+            engine.branch_sync_sessions.lock().expect("lock").is_empty(),
+            "and the next cycle has nothing to run git in"
+        );
+    }
+
+    /// A stat that failed for any other reason is not a report: wiping an
+    /// agent's git surface because its mount blipped is the loss this guard
+    /// exists for.
+    #[test]
+    fn a_poller_reports_nothing_about_a_directory_it_could_not_stat() {
+        use std::os::unix::fs::PermissionsExt;
+        let holder = tempfile::tempdir().expect("holder");
+        let locked = holder.path().join("locked");
+        std::fs::create_dir_all(locked.join("inner")).expect("inner");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("lock");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        report_missing_directory(&tx, "s1", &locked.join("inner"));
+        let answered = rx.try_recv().is_ok();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("unlock");
+
+        assert!(!answered, "an unreachable directory is not a deleted one");
     }
 
     /// Every background enumerator treats a missing working copy the way it
