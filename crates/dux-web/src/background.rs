@@ -118,9 +118,20 @@ impl BackgroundServer {
         self.connections.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// The addresses this serve is reachable on.
-    pub fn urls(&self) -> &[String] {
-        &self.urls
+    /// The addresses this serve is reachable on right now.
+    ///
+    /// Read from the live leg registry, not from the list the caller bound and
+    /// handed over: the Tailscale leg comes and goes underneath a running serve,
+    /// and the terminal UI shows these addresses for as long as it serves. The
+    /// captured list is the fallback for the one moment the registry cannot
+    /// answer, so a header never goes blank where it had addresses.
+    pub fn urls(&self) -> Vec<String> {
+        let live = self.core.live_urls();
+        if live.is_empty() {
+            self.urls.clone()
+        } else {
+            live
+        }
     }
 
     /// Whether a required leg's accept loop died, so the caller can stop serving
@@ -291,6 +302,30 @@ mod tests {
             .next()
             .map(|line| line.to_string())
             .ok_or_else(|| "the server closed without answering".to_string())
+    }
+
+    /// The address list the terminal UI shows has to follow the legs, not the
+    /// snapshot the flip handed over: the Tailscale leg comes and goes under a
+    /// running serve, and a remembered list keeps naming an address that stopped
+    /// answering (or misses one that started).
+    #[test]
+    fn the_address_list_is_read_from_the_live_legs() {
+        let (mut engine, _tmp) = engine_in_tempdir();
+        let (listener, addr) = loopback_listener();
+        let server = BackgroundServer::start(
+            &mut engine,
+            vec![listener],
+            vec!["http://stale.example:1".to_string()],
+        )
+        .expect("the serve starts");
+
+        assert_eq!(
+            server.urls(),
+            vec![format!("http://{addr}")],
+            "the live leg wins over the list start was handed"
+        );
+
+        server.stop();
     }
 
     /// A start/stop/start cycle: the second serve is a whole new app, and the

@@ -2033,7 +2033,7 @@ pub(crate) enum FollowupRouting {
 }
 
 /// What one call to [`EngineService::drain_requests`] did.
-struct DrainOutcome {
+pub(crate) struct DrainOutcome {
     /// At least one drained request could move the spine, per the exhaustive
     /// [`request_mutates_spine`].
     mutated: bool,
@@ -2602,7 +2602,7 @@ impl EngineService {
     }
 
     /// Drain every queued engine request.
-    fn drain_requests(&mut self, engine: &mut Engine) -> DrainOutcome {
+    pub(crate) fn drain_requests(&mut self, engine: &mut Engine) -> DrainOutcome {
         let mut mutated = false;
         let mut stopped = false;
         loop {

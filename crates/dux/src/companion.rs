@@ -123,10 +123,7 @@ impl BackgroundServeCompanion for WebCompanion {
     }
 
     fn urls(&self) -> Vec<String> {
-        self.server
-            .as_ref()
-            .map(|s| s.urls().to_vec())
-            .unwrap_or_default()
+        self.server.as_ref().map(|s| s.urls()).unwrap_or_default()
     }
 
     fn connections(&self) -> usize {
@@ -150,7 +147,7 @@ impl BackgroundServeCompanion for WebCompanion {
         // releases the addresses again.
         match BackgroundServer::start(engine, listeners, urls) {
             Ok(server) => {
-                let urls = server.urls().to_vec();
+                let urls = server.urls();
                 self.server = Some(server);
                 Ok(urls)
             }

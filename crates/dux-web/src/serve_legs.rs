@@ -134,6 +134,22 @@ impl ServeShutdown {
         }
     }
 
+    /// Every address a leg is serving right now, loopback first and then in
+    /// address order.
+    ///
+    /// The registry is the one live answer, which is what makes it the right
+    /// source for an address list a surface keeps on screen: the list handed to a
+    /// serve at start is a snapshot of that moment, and the Tailscale leg comes
+    /// and goes underneath it.
+    pub(crate) fn leg_addrs(&self) -> Vec<SocketAddr> {
+        let Ok(legs) = self.legs.lock() else {
+            return Vec::new();
+        };
+        let mut addrs: Vec<SocketAddr> = legs.keys().copied().collect();
+        addrs.sort_by_key(|addr| (!addr.ip().is_loopback(), addr.to_string()));
+        addrs
+    }
+
     /// Whether a live leg is registered for `addr`. The registry is the ONE answer
     /// to "is dux actually serving this address", so the serve loop reconciles its
     /// watcher-facing bookkeeping against it rather than keeping a second truth.
@@ -184,12 +200,68 @@ impl ServeShutdown {
     /// server carry on. Deliberately NOT a parent trip and NOT an error: the
     /// whole reason a leg is best-effort is that losing it is not losing the
     /// server, and the Tailscale leg is the one users lose routinely.
-    pub(crate) fn record_best_effort_failure(&self, addr: SocketAddr, err: &anyhow::Error) {
-        dux_core::logger::warn(&format!(
-            "[server] {}",
-            best_effort_death_warning(addr, err, self.tailscale_watched.load(Ordering::SeqCst))
-        ));
+    ///
+    /// Answers with the sentence it logged, because the caller owes the same one
+    /// to the surfaces and computing it twice is how the two drift apart.
+    pub(crate) fn record_best_effort_failure(
+        &self,
+        addr: SocketAddr,
+        err: &anyhow::Error,
+    ) -> String {
+        let warning =
+            best_effort_death_warning(addr, err, self.tailscale_watched.load(Ordering::SeqCst));
+        dux_core::logger::warn(&format!("[server] {warning}"));
         self.forget_leg(addr);
+        warning
+    }
+}
+
+/// The keyed-status key the Tailscale leg's health is reported under.
+///
+/// One key for the whole leg, deliberately: a leg that comes back is the answer
+/// to the warning that it went away, and on one key the good news replaces the
+/// bad rather than sitting under it.
+pub(crate) const TAILSCALE_LEG_KEY: &str = "tailscale-leg";
+
+/// The lane a serve uses to tell BOTH surfaces about its Tailscale leg.
+///
+/// The console is `dux server`'s terminal and nothing else: a leg that died
+/// while the background server serves under a terminal UI wrote to a console
+/// nobody was looking at, and the browsers were never told at all. The engine's
+/// worker lane is the one road to both, so these facts travel it as well as the
+/// console line, which stays exactly as it was.
+#[derive(Clone, Default)]
+pub(crate) struct LegStatus(Option<crate::engine_actor::EngineHandle>);
+
+impl LegStatus {
+    pub(crate) fn new(handle: crate::engine_actor::EngineHandle) -> Self {
+        Self(Some(handle))
+    }
+
+    /// The leg degraded: it could not bind, or it stopped serving. A warning,
+    /// because the address the user may be reaching dux on has gone.
+    pub(crate) fn degraded(&self, message: &str) {
+        self.post(dux_core::engine::StatusUpdate::keyed(
+            TAILSCALE_LEG_KEY,
+            dux_core::statusline::StatusTone::Warning,
+            message,
+        ));
+    }
+
+    /// The leg arrived or left as the interface came and went. An info, for the
+    /// same reason the console says it in the quiet tone: it is expected news.
+    pub(crate) fn changed(&self, message: &str) {
+        self.post(dux_core::engine::StatusUpdate::keyed(
+            TAILSCALE_LEG_KEY,
+            dux_core::statusline::StatusTone::Info,
+            message,
+        ));
+    }
+
+    fn post(&self, status: dux_core::engine::StatusUpdate) {
+        if let Some(handle) = &self.0 {
+            handle.post_status(status);
+        }
     }
 }
 

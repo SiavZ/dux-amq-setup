@@ -77,9 +77,9 @@ use dux_core::tailscale::TailscaleUnavailable;
 use crate::console::{Banner, Console, ListenerRow};
 use crate::engine_actor::LoopControl;
 use crate::serve_legs::{
-    LegCommand, LegStep, ModeStep, ServeShutdown, StartupLeg, TailscaleModeControl, WATCH_PERIOD,
-    desired_leg, plan_leg_step, plan_mode_change, wait_for_leg_shutdown, waiting_note,
-    watch_tailscale_leg,
+    LegCommand, LegStatus, LegStep, ModeStep, ServeShutdown, StartupLeg, TailscaleModeControl,
+    WATCH_PERIOD, desired_leg, plan_leg_step, plan_mode_change, wait_for_leg_shutdown,
+    waiting_note, watch_tailscale_leg,
 };
 use crate::server::RouterParams;
 
@@ -528,6 +528,11 @@ fn run_plain_http(paths: DuxPaths, plan: ServerPlan, version: String) -> Result<
         // Serve every BOUND address, each on its own leg (its own stop lane), so
         // the Tailscale leg can be added and dropped later without disturbing the
         // required one.
+        //
+        // The leg's news goes to the surfaces as well as to the console: the
+        // console is this process's terminal, and a browser reaching dux over
+        // the tailnet is exactly the client that loses the address.
+        let leg_status = LegStatus::new(handle.clone());
         let mut tasks = tokio::task::JoinSet::new();
         for BoundListener {
             listener,
@@ -543,6 +548,7 @@ fn run_plain_http(paths: DuxPaths, plan: ServerPlan, version: String) -> Result<
                 required,
                 &shutdown,
                 console.clone(),
+                leg_status.clone(),
             );
         }
 
@@ -565,6 +571,7 @@ fn run_plain_http(paths: DuxPaths, plan: ServerPlan, version: String) -> Result<
             mode_requests,
             app,
             console.clone(),
+            leg_status,
             tailscale_loop,
         )
         .await;
@@ -622,6 +629,7 @@ const LEG_COMMAND_QUEUE: usize = 8;
 ///
 /// A REQUIRED leg's accept-loop death is fatal for the serve; a BEST-EFFORT leg's
 /// is logged and isolated. That split is the whole reason legs exist.
+#[allow(clippy::too_many_arguments)]
 fn spawn_leg(
     tasks: &mut tokio::task::JoinSet<()>,
     app: Router,
@@ -630,6 +638,7 @@ fn spawn_leg(
     required: bool,
     shutdown: &ServeShutdown,
     console: Console,
+    status: LegStatus,
 ) {
     let leg_lane = shutdown.register_leg(addr);
     let parent_lane = shutdown.subscribe();
@@ -662,10 +671,13 @@ fn spawn_leg(
             }
             (Err(err), false) => {
                 let err = anyhow::anyhow!("{err}");
-                shutdown.record_best_effort_failure(addr, &err);
+                let warning = shutdown.record_best_effort_failure(addr, &err);
                 console.bind_degraded(&format!(
                     "the Tailscale listener on {addr} stopped serving: {err}"
                 ));
+                // The console is `dux server`'s terminal and nothing else, so
+                // the surfaces get the fuller sentence that names the way back.
+                status.degraded(&warning);
             }
         }
     });
@@ -860,6 +872,7 @@ impl TailscaleLoop {
 /// there, but a moment where every task has just been replaced is possible), and
 /// exiting on set-empty would end a server nobody asked to stop. The exit
 /// condition is the shutdown lane and nothing else.
+#[allow(clippy::too_many_arguments)]
 async fn run_serve_loop(
     mut tasks: tokio::task::JoinSet<()>,
     shutdown: ServeShutdown,
@@ -867,6 +880,7 @@ async fn run_serve_loop(
     mut mode_requests: tokio::sync::mpsc::Receiver<crate::serve_legs::ModeRequest>,
     app: Router,
     console: Console,
+    status: LegStatus,
     mut ts: TailscaleLoop,
 ) {
     let mut parent = shutdown.subscribe();
@@ -891,6 +905,7 @@ async fn run_serve_loop(
                             &shutdown,
                             &app,
                             &console,
+                            &status,
                             &mut last_bind_failure,
                         )
                         .await;
@@ -921,6 +936,7 @@ async fn run_serve_loop(
                     &shutdown,
                     &app,
                     &console,
+                    &status,
                     &mut last_bind_failure,
                 )
                 .await;
@@ -936,6 +952,7 @@ async fn run_serve_loop(
                     &shutdown,
                     &app,
                     &console,
+                    &status,
                     &mut last_bind_failure,
                 )
                 .await;
@@ -970,6 +987,7 @@ async fn apply_current_generation_command(
     shutdown: &ServeShutdown,
     app: &Router,
     console: &Console,
+    status: &LegStatus,
     last_bind_failure: &mut Option<SocketAddr>,
 ) {
     let Some((generation, command)) = command else {
@@ -984,6 +1002,7 @@ async fn apply_current_generation_command(
         shutdown,
         app,
         console,
+        status,
         &ts.bound,
         last_bind_failure,
     )
@@ -1032,6 +1051,7 @@ async fn apply_mode_request(
     shutdown: &ServeShutdown,
     app: &Router,
     console: &Console,
+    status: &LegStatus,
     last_bind_failure: &mut Option<SocketAddr>,
 ) {
     let crate::serve_legs::ModeRequest { mode, reply } = request;
@@ -1070,6 +1090,7 @@ async fn apply_mode_request(
                     shutdown,
                     app,
                     console,
+                    status,
                     &ts.bound,
                     last_bind_failure,
                 )
@@ -1130,6 +1151,7 @@ async fn finish_detection(
     shutdown: &ServeShutdown,
     app: &Router,
     console: &Console,
+    status: &LegStatus,
     last_bind_failure: &mut Option<SocketAddr>,
 ) {
     let PendingDetect {
@@ -1169,6 +1191,7 @@ async fn finish_detection(
             shutdown,
             app,
             console,
+            status,
             &ts.bound,
             last_bind_failure,
         )
@@ -1225,12 +1248,14 @@ fn reconcile_bound_tailscale(
 /// Act on one watcher command: bind and start serving the Tailscale leg, or stop
 /// it. Records what is bound so the watcher's next period compares against
 /// reality (which is what makes a failed bind retry rather than vanish).
+#[allow(clippy::too_many_arguments)]
 async fn apply_leg_command(
     command: LegCommand,
     tasks: &mut tokio::task::JoinSet<()>,
     shutdown: &ServeShutdown,
     app: &Router,
     console: &Console,
+    status: &LegStatus,
     bound_tailscale: &Arc<std::sync::Mutex<Option<SocketAddr>>>,
     last_bind_failure: &mut Option<SocketAddr>,
 ) {
@@ -1246,6 +1271,7 @@ async fn apply_leg_command(
                     false,
                     shutdown,
                     console.clone(),
+                    status.clone(),
                 );
                 if let Ok(mut slot) = bound_tailscale.lock() {
                     *slot = Some(addr);
@@ -1256,6 +1282,7 @@ async fn apply_leg_command(
                 );
                 dux_core::logger::info(&format!("[server] {message}"));
                 console.leg_changed(&message);
+                status.changed(&message);
             }
             Err(err) => {
                 // Best-effort: say so and carry on. The watcher compares against
@@ -1268,6 +1295,7 @@ async fn apply_leg_command(
                 } else {
                     dux_core::logger::warn(&format!("[server] {warning}"));
                     console.bind_degraded(&warning);
+                    status.degraded(&warning);
                 }
                 *last_bind_failure = Some(addr);
                 if let Ok(mut slot) = bound_tailscale.lock() {
@@ -1293,6 +1321,7 @@ async fn apply_leg_command(
                 );
                 dux_core::logger::info(&format!("[server] {message}"));
                 console.leg_changed(&message);
+                status.changed(&message);
             }
         }
     }
@@ -1547,6 +1576,9 @@ impl ServeCore {
             let shutdown = shutdown.clone();
             let app = app.clone();
             let console = console.clone();
+            // Cloned before `handle` is dropped below: the leg's news is owed to
+            // the terminal UI beside this serve as much as to the browsers.
+            let leg_status = LegStatus::new(handle.clone());
             let mut legs = tokio::task::JoinSet::new();
             let guard = runtime.enter();
             for tokio_listener in tokio_listeners {
@@ -1578,6 +1610,7 @@ impl ServeCore {
                     required,
                     &shutdown,
                     console.clone(),
+                    leg_status.clone(),
                 );
             }
             drop(guard);
@@ -1588,6 +1621,7 @@ impl ServeCore {
                 mode_requests,
                 app,
                 console,
+                leg_status,
                 tailscale_loop,
             ))
         };
@@ -1620,6 +1654,19 @@ impl ServeCore {
     /// rather than limp on.
     pub(crate) fn is_failed(&self) -> bool {
         self.shutdown.is_failed()
+    }
+
+    /// The addresses this serve is reachable on RIGHT NOW, read from the live leg
+    /// registry rather than remembered from the bind.
+    ///
+    /// The Tailscale leg comes and goes under a running serve, so a list captured
+    /// at start goes stale the first time the interface moves.
+    pub(crate) fn live_urls(&self) -> Vec<String> {
+        self.shutdown
+            .leg_addrs()
+            .into_iter()
+            .map(|addr| format!("http://{addr}"))
+            .collect()
     }
 
     /// Whether this serve installed the process's SIGINT/SIGTERM handlers.
@@ -2009,6 +2056,62 @@ mod tests {
         assert_eq!(streak, Some(ts), "and its failure streak is untouched");
     }
 
+    /// The Tailscale leg leaving is news for whoever is looking at dux, not just
+    /// for `dux server`'s own terminal: a browser on the tailnet is exactly the
+    /// client that loses the address, and a terminal UI serving in the background
+    /// writes its console nowhere at all.
+    #[tokio::test]
+    async fn a_leg_that_goes_away_reaches_the_surfaces_as_well_as_the_console() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        let paths = dux_core::config::DuxPaths {
+            root: root.clone(),
+            config_path: root.join("config.toml"),
+            sessions_db_path: root.join("sessions.sqlite3"),
+            worktrees_root: root.join("worktrees"),
+            lock_path: root.join("dux.lock"),
+        };
+        std::fs::create_dir_all(&paths.worktrees_root).expect("worktrees dir");
+        let mut engine = crate::bootstrap::bootstrap_engine(&paths).expect("engine");
+        let (handle, ends) = crate::engine_actor::build_actor_channels(&engine);
+        let mut svc = crate::engine_actor::EngineService::new(
+            &engine,
+            ends,
+            crate::engine_actor::ShutdownEcho::Silent,
+        );
+
+        let ts: std::net::SocketAddr = "100.64.0.5:8080".parse().unwrap();
+        let shutdown = crate::serve_legs::ServeShutdown::for_watched(true);
+        let _leg = shutdown.register_leg(ts);
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(Some(ts)));
+        let mut streak = None;
+        let mut tasks = tokio::task::JoinSet::new();
+
+        super::apply_leg_command(
+            crate::serve_legs::LegCommand::Unbind(ts),
+            &mut tasks,
+            &shutdown,
+            &axum::Router::new(),
+            &crate::console::Console::noop(),
+            &crate::serve_legs::LegStatus::new(handle),
+            &cell,
+            &mut streak,
+        )
+        .await;
+
+        svc.drain_requests(&mut engine);
+        let posted = engine.worker_rx.try_recv().expect("a status on the lane");
+        let dux_core::worker::WorkerEvent::PollerStatus(status) = posted else {
+            panic!("the leg's news rides the poller-status lane");
+        };
+        assert_eq!(
+            status.key.as_deref(),
+            Some(crate::serve_legs::TAILSCALE_LEG_KEY)
+        );
+        assert_eq!(status.tone, dux_core::statusline::StatusTone::Info);
+        assert!(status.message.contains("went away"), "{}", status.message);
+    }
+
     #[tokio::test]
     async fn an_unbind_ends_the_bind_failure_streak_so_a_flap_warns_again() {
         // The once-per-streak suppression exists for a port somebody else holds
@@ -2029,6 +2132,7 @@ mod tests {
             &shutdown,
             &axum::Router::new(),
             &console,
+            &crate::serve_legs::LegStatus::default(),
             &cell,
             &mut streak,
         )
@@ -2090,6 +2194,7 @@ mod tests {
             mode_rx,
             axum::Router::new(),
             console,
+            crate::serve_legs::LegStatus::default(),
             tailscale_loop,
         ));
 
@@ -2532,6 +2637,7 @@ mod live_tailscale_mode_tests {
                 mode_rx,
                 axum::Router::new(),
                 Console::noop(),
+                LegStatus::default(),
                 ts,
             ));
             Self {
