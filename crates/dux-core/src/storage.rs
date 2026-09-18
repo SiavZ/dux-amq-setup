@@ -1400,6 +1400,41 @@ impl SessionStore {
         Self::upsert_session_in(&self.conn, session)
     }
 
+    /// Record that dux minted this agent's branch itself, after recreating a
+    /// working copy whose branch was gone from the repository too.
+    ///
+    /// The ONE exception to `branch_provenance` being insert-only, and named
+    /// for exactly that case so no other caller can reach for it. The rule
+    /// exists so a re-upsert cannot turn a user's pre-existing `develop` into a
+    /// branch dux believes it owns; here dux really did create the branch, from
+    /// the project's source branch, seconds ago, and the lineage the old
+    /// provenance described no longer exists anywhere. Leaving the row alone
+    /// would have a later delete treat a branch dux minted as the user's and
+    /// leave it behind.
+    ///
+    /// `initial_branch` moves with it for the same reason: the agent was born
+    /// again on this branch, so the drift the old value described is gone.
+    pub fn record_branch_minted_by_recreate(
+        &self,
+        session_id: &str,
+        branch_name: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "update agent_sessions set branch_provenance = ?2, initial_branch = ?3 \
+                 where id = ?1 and workspace_kind = 'managed'",
+                params![
+                    session_id,
+                    crate::model::BranchProvenance::CreatedByDux.as_str(),
+                    branch_name,
+                ],
+            )
+            .with_context(|| {
+                format!("failed to record the recreated branch of agent {session_id}")
+            })?;
+        Ok(())
+    }
+
     /// The body of [`Self::upsert_session`], parameterized over the connection so
     /// [`Self::create_session`] can run it inside its transaction.
     fn upsert_session_in(conn: &Connection, session: &AgentSession) -> Result<()> {

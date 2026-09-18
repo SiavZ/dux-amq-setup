@@ -1788,14 +1788,34 @@ impl Engine {
                     crate::home_path::shorten_home(&failure_path)
                 ))
             });
+        // The status op is closure-only: its resolvers see the typed outcome
+        // but neither the sessions nor the store. What the engine still owes
+        // afterwards (a fresh verdict about the directory, and the provenance of
+        // a branch dux has just minted) therefore travels on its own worker
+        // event, sent from inside the same work closure.
+        let completion_tx = self.worker_tx.clone();
+        let completed_session = session_id.to_string();
         Ok(self.spawn_status_op(op, move || {
-            crate::working_copy::recreate_working_copy(
+            let outcome = crate::working_copy::recreate_working_copy(
                 &repo_path,
                 &worktree_path,
                 &branch_name,
                 &source_branch,
             )
-            .map_err(|err| format!("{err:#}"))
+            .map_err(|err| format!("{err:#}"));
+            if let Ok(recreated) = &outcome {
+                let _ = completion_tx.send(crate::worker::WorkerEvent::WorkingCopyRecreated {
+                    session_id: completed_session,
+                    // Only the source-branch arm: a branch rebuilt from the
+                    // remote still exists there, and a local copy of somebody
+                    // else's branch is not one dux may force-delete.
+                    branch_minted: matches!(
+                        recreated,
+                        crate::working_copy::RecreatedBranch::RecreatedFrom(_)
+                    ),
+                });
+            }
+            outcome
         }))
     }
 }
@@ -1878,6 +1898,88 @@ mod recreate_tests {
         let message = format!("{refusal:#}");
         assert!(message.contains("no longer in dux"), "{message}");
         assert!(message.contains("Add the project back"), "{message}");
+    }
+
+    /// A branch dux minted again from the source branch is dux's: the old
+    /// lineage is gone from the repository, and a delete that read the stale
+    /// provenance would leave behind a branch nobody else ever created.
+    #[test]
+    fn a_branch_minted_by_the_recreate_becomes_a_branch_dux_may_delete() {
+        let (mut engine, _tmp) = engine_with_a_missing_working_copy();
+        {
+            let session = engine.sessions.iter_mut().find(|s| s.id == "s1").unwrap();
+            let managed = session.workspace.as_managed_mut().unwrap();
+            managed.branch_provenance = crate::model::BranchProvenance::AttachedExisting;
+            managed.initial_branch = "an-older-branch".to_string();
+            let session = session.clone();
+            engine.session_store.upsert_session(&session).unwrap();
+        }
+        assert!(
+            !engine.sessions[0]
+                .branch_provenance()
+                .unwrap()
+                .dux_may_delete_branch(),
+            "precondition: dux would leave this branch alone"
+        );
+
+        let reaction =
+            engine.process_worker_event(crate::worker::WorkerEvent::WorkingCopyRecreated {
+                session_id: "s1".to_string(),
+                branch_minted: true,
+            });
+        assert!(matches!(reaction, crate::engine::EventReaction::Nothing));
+
+        let managed = engine.sessions[0].workspace.as_managed().unwrap();
+        assert_eq!(
+            managed.branch_provenance,
+            crate::model::BranchProvenance::CreatedByDux
+        );
+        assert_eq!(
+            managed.initial_branch, "feat",
+            "the agent was born again on this branch, so the old drift is gone"
+        );
+        let stored = engine
+            .session_store
+            .load_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == "s1")
+            .expect("the row");
+        let stored = stored.workspace.as_managed().unwrap().clone();
+        assert_eq!(
+            stored.branch_provenance,
+            crate::model::BranchProvenance::CreatedByDux,
+            "and it survives a restart"
+        );
+        assert_eq!(stored.initial_branch, "feat");
+    }
+
+    /// The other two arms touch nothing: a branch that was simply checked out
+    /// again, or rebuilt from a remote that still holds it, is not one dux
+    /// suddenly owns.
+    #[test]
+    fn a_recreate_that_minted_nothing_leaves_the_provenance_alone() {
+        let (mut engine, _tmp) = engine_with_a_missing_working_copy();
+        {
+            let session = engine.sessions.iter_mut().find(|s| s.id == "s1").unwrap();
+            session
+                .workspace
+                .as_managed_mut()
+                .unwrap()
+                .branch_provenance = crate::model::BranchProvenance::AttachedExisting;
+            let session = session.clone();
+            engine.session_store.upsert_session(&session).unwrap();
+        }
+
+        engine.process_worker_event(crate::worker::WorkerEvent::WorkingCopyRecreated {
+            session_id: "s1".to_string(),
+            branch_minted: false,
+        });
+
+        assert_eq!(
+            engine.sessions[0].branch_provenance().unwrap(),
+            crate::model::BranchProvenance::AttachedExisting
+        );
     }
 
     /// The busy names the agent, and the op is registered, so the spinner is

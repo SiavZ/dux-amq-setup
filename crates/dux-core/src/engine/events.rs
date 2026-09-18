@@ -3243,6 +3243,46 @@ impl Engine {
         }
     }
 
+    /// Settle the engine's own state after a working copy came back.
+    ///
+    /// Two things the status op's closures cannot reach. The verdict about the
+    /// directory is stale the moment the checkout lands, so it is asked again
+    /// rather than left saying the copy is gone; and a branch dux minted again
+    /// from the project's source branch is now dux's, which the record still
+    /// denies. Nothing here is the user's branch: the mint happened because the
+    /// old one was gone from the repository.
+    fn process_working_copy_recreated(
+        &mut self,
+        session_id: &str,
+        branch_minted: bool,
+    ) -> EventReaction {
+        // The copy is back, so the Missing verdict that gated the recreate,
+        // the pollers and the changes panel has to be asked again.
+        self.spawn_folder_repo_probe(session_id);
+        if !branch_minted {
+            return EventReaction::Nothing;
+        }
+        let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) else {
+            return EventReaction::Nothing;
+        };
+        let Some(managed) = session.workspace.as_managed_mut() else {
+            return EventReaction::Nothing;
+        };
+        managed.branch_provenance = crate::model::BranchProvenance::CreatedByDux;
+        managed.initial_branch = managed.branch_name.clone();
+        let branch_name = managed.branch_name.clone();
+        if let Err(err) = self
+            .session_store
+            .record_branch_minted_by_recreate(session_id, &branch_name)
+        {
+            crate::logger::error(&format!(
+                "failed to record that dux minted branch {branch_name} for agent {session_id}: \
+                 {err:#}"
+            ));
+        }
+        EventReaction::Nothing
+    }
+
     fn process_folder_repo_status_ready(
         &mut self,
         session_id: String,
@@ -3274,6 +3314,10 @@ impl Engine {
             WorkerEvent::CommandWorkerStarted(status) | WorkerEvent::PollerStatus(status) => {
                 EventReaction::Status(status)
             }
+            WorkerEvent::WorkingCopyRecreated {
+                session_id,
+                branch_minted,
+            } => self.process_working_copy_recreated(&session_id, branch_minted),
             WorkerEvent::CreateAgentProgress {
                 status_op_id,
                 message,

@@ -405,6 +405,17 @@ pub enum WorkerEvent {
     /// busy status is guaranteed to reach `process_worker_event` ahead of
     /// any event the worker can produce.
     CommandWorkerStarted(StatusUpdate),
+    /// A recreate of an agent's working copy finished, so the verdict about its
+    /// directory is stale and, when the branch was minted again, its provenance
+    /// is too. Rides alongside the recreate's own status op, which is
+    /// closure-only and reaches neither the sessions nor the store.
+    WorkingCopyRecreated {
+        session_id: String,
+        /// True only when dux created the branch again from the project's
+        /// source branch: that is the case where dux now owns a branch its
+        /// record still calls the user's.
+        branch_minted: bool,
+    },
     /// A status a background poller produced, delivered through the worker lane
     /// so it reaches whichever surface is draining rather than only the one
     /// that raised it. The web's changed-files service is the producer today.
