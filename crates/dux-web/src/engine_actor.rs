@@ -171,6 +171,10 @@ pub enum EngineRequest {
         String,
         oneshot::Sender<Option<dux_core::engine::SessionGitAccess>>,
     ),
+    /// The sentence a route owes before it touches an agent's directory, or
+    /// `None` when the directory is there. The one question every door onto that
+    /// directory asks, so none of them answers with a bare ENOENT.
+    SessionMissingDirectoryReason(String, oneshot::Sender<Option<String>>),
     /// What a changed-files read answered for one agent: `None` for a success,
     /// `Some(message)` for a failure. The ENGINE owns the streak and the
     /// sentences, and queues whatever status it owes on its own worker lane, so
@@ -1265,6 +1269,20 @@ impl EngineHandle {
         rx.await.unwrap_or(None)
     }
 
+    /// See [`EngineRequest::SessionMissingDirectoryReason`].
+    pub async fn session_missing_directory_reason(&self, session_id: String) -> Option<String> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .req_tx
+            .send(EngineRequest::SessionMissingDirectoryReason(session_id, tx))
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        rx.await.unwrap_or(None)
+    }
+
     /// See [`EngineRequest::SessionBranchDeleteInputs`].
     pub async fn session_branch_delete_inputs(
         &self,
@@ -1846,6 +1864,7 @@ fn request_mutates_spine(req: &EngineRequest) -> bool {
         | EngineRequest::SessionWorktree(..)
         | EngineRequest::SessionBranchDeleteInputs(..)
         | EngineRequest::SessionGitAccess(..)
+        | EngineRequest::SessionMissingDirectoryReason(..)
         | EngineRequest::PtyKeyForPaneId(..)
         | EngineRequest::FileDropDestination(..)
         | EngineRequest::FileDropTreeDestination(..)
@@ -3700,6 +3719,13 @@ fn handle_request(
         }
         EngineRequest::NoteChangedFilesOutcome(session_id, failure) => {
             engine.post_changed_files_outcome(&session_id, failure.as_deref());
+        }
+        EngineRequest::SessionMissingDirectoryReason(session_id, reply) => {
+            // Refreshed off-thread for the same reason the git access is: this
+            // call answers with the previous verdict and the next one sees the
+            // new answer, with no git subprocess on the engine thread.
+            engine.spawn_folder_repo_probe(&session_id);
+            let _ = reply.send(engine.missing_directory_reason(&session_id));
         }
         EngineRequest::SessionGitAccess(session_id, reply) => {
             // Refresh first: the probe is off-thread, so this call answers with

@@ -133,6 +133,31 @@ pub(crate) async fn resolve_worktree(
     }
 }
 
+/// Resolve the directory the EDITOR may root at for an agent.
+///
+/// The editor's own door onto the filesystem, gated like the git routes rather
+/// than left to open its own hole. A directory that is gone has no tree to
+/// browse, no file to open and nowhere to save, and the ENOENT each request
+/// would otherwise return names no path and offers no way back. `409` rather
+/// than `404`, because the agent exists and the route is real.
+///
+/// Deliberately NOT gated on the repository verdict: editing outside a
+/// repository is a supported thing to do, so only the directory being gone is
+/// refused here.
+pub(crate) async fn resolve_editor_worktree(
+    state: &AppState,
+    session_id: String,
+) -> Result<PathBuf, RouteRejection> {
+    if let Some(reason) = state
+        .engine
+        .session_missing_directory_reason(session_id.clone())
+        .await
+    {
+        return Err((StatusCode::CONFLICT, reason).into_response().into());
+    }
+    resolve_worktree(state, session_id).await
+}
+
 /// Resolve the directory a CHANGES-PANEL route may run git in: a managed worktree,
 /// or a standalone agent's folder when that folder is itself a repository.
 ///

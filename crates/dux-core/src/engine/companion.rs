@@ -32,6 +32,11 @@ impl Engine {
             .find(|s| s.id == session_id)
             .cloned()
             .context("unknown session")?;
+        // A shell cannot start in a directory that is gone, and the error the
+        // spawn would give says nothing about which directory or what to do.
+        if let Some(reason) = self.missing_directory_reason(session_id) {
+            anyhow::bail!("{reason}");
+        }
 
         // A standalone agent belongs to no project, so a terminal opened on it
         // gets the global environment with no project overlay. Falling through
@@ -207,6 +212,13 @@ impl Engine {
             ));
         }
         let session = self.session_behind_pty(pty_id)?;
+        // No destination at all when the agent's directory is gone: the upload
+        // directory lives inside it, so creating one would put a hidden folder
+        // back where the working copy used to be and the paste would name a
+        // path that leads nowhere.
+        if self.missing_directory_reason(&session.id).is_some() {
+            return None;
+        }
         Some(crate::file_drop::FileDropDestination::AgentUploads {
             worktree: session.directory().into(),
             // Normalized on every read rather than trusted, so a config that
@@ -770,6 +782,34 @@ mod tests {
                 "{pty_id} has no agent pane behind it"
             );
         }
+    }
+
+    /// Every door onto an agent's directory says the same thing when it is
+    /// gone, rather than each one answering with whatever the filesystem said.
+    #[test]
+    fn a_missing_directory_closes_the_terminal_and_the_upload_doors() {
+        let (mut engine, _tmp) = test_engine();
+        engine.projects.push(sample_project("p1", "/tmp/p1"));
+        engine.sessions.push(sample_session("s1", "p1", "feat"));
+        engine
+            .folder_repo_statuses
+            .insert("s1".to_string(), crate::git::FolderRepoStatus::Missing);
+
+        let reason = engine
+            .missing_directory_reason("s1")
+            .expect("the one sentence");
+        assert!(reason.contains("/tmp/s1-worktree"), "{reason}");
+        assert!(reason.contains("recreated"), "{reason}");
+
+        let err = engine
+            .create_companion_terminal("s1", 24, 80)
+            .expect_err("a shell cannot start in a directory that is gone");
+        assert_eq!(format!("{err:#}"), reason);
+
+        // And a drop has nowhere to land, so no hidden upload directory is
+        // created where the working copy used to be.
+        let tab = engine.slot_tab_id_of(crate::ids::SessionIdRef::new("s1"));
+        assert!(engine.file_drop_destination(tab.as_str()).is_none());
     }
 
     #[test]

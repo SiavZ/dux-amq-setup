@@ -2727,6 +2727,28 @@ impl Engine {
         }
     }
 
+    /// The sentence a surface owes before it touches an agent's directory, or
+    /// `None` when the directory is there.
+    ///
+    /// One question for every door onto that directory: the editor's file tree,
+    /// a file drop, a companion terminal's spawn, the changes panel. Each of
+    /// them would otherwise open its own hole and answer with whatever the
+    /// filesystem said, which is an ENOENT with no path in it and no way back.
+    /// Both kinds of agent answer, because the remedy differs and neither is
+    /// "try again".
+    pub fn missing_directory_reason(&self, session_id: &str) -> Option<String> {
+        let session = self.sessions.iter().find(|s| s.id == session_id)?;
+        let status = self.folder_repo_status(session_id);
+        if status != crate::git::FolderRepoStatus::Missing {
+            return None;
+        }
+        crate::working_copy::quiet_reason(
+            status,
+            Path::new(session.directory()),
+            session.workspace.as_managed().is_some(),
+        )
+    }
+
     /// Whether a MANAGED agent's working copy is gone from disk.
     ///
     /// Its own question because it has its own answer: a directory that is not
@@ -4643,11 +4665,15 @@ impl Engine {
         // Both kinds have a directory to reconnect into, and both must
         // exist; only the sentence differs, because a standalone agent's
         // directory is the user's folder and dux cannot re-create it.
-        if !std::path::Path::new(session.directory()).exists() {
+        if crate::git::directory_presence(std::path::Path::new(session.directory()))
+            == crate::git::DirectoryPresence::Missing
+        {
             let message = match &session.workspace {
-                crate::model::AgentWorkspace::Managed(_) => format!(
-                    "Worktree for agent \"{}\" no longer exists. Delete and re-create the agent.",
-                    session.display_label()
+                crate::model::AgentWorkspace::Managed(managed) => format!(
+                    "The working copy for agent \"{}\" at {} no longer exists. Recreate the \
+                     working copy to check its branch out there again, or delete this agent.",
+                    session.display_label(),
+                    crate::home_path::shorten_home(Path::new(&managed.worktree_path))
                 ),
                 crate::model::AgentWorkspace::Folder(folder) => format!(
                     "The folder agent \"{}\" runs in ({}) no longer exists. Restore the folder, or delete this agent and create a new one pointing at the folder you want.",
@@ -9906,6 +9932,11 @@ mod tab_ops_tests {
         match engine.reconnect_plan("s1", false, (24, 80)).expect("plan") {
             ReconnectPlan::WorktreeMissing { message } => {
                 assert!(message.contains("no longer exists"), "{message}");
+                assert!(message.contains("/nonexistent/worktree/path"), "{message}");
+                // The way out exists now, so the sentence names it rather than
+                // telling the user to throw the agent away.
+                assert!(message.contains("Recreate the working copy"), "{message}");
+                assert!(!message.contains("re-create the agent"), "{message}");
             }
             other => panic!("expected WorktreeMissing, got {other:?}"),
         }

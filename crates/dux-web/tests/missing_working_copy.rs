@@ -294,3 +294,49 @@ async fn recreating_a_working_copy_that_is_there_is_refused() {
         .unwrap();
     assert_eq!(unknown.status(), 400);
 }
+
+/// The editor is another door onto the same directory. It used to open its own
+/// hole and answer with whatever the filesystem said, which named no path and
+/// offered no way back; it now refuses with the working copy's own sentence.
+#[tokio::test]
+async fn the_editor_refuses_a_directory_that_is_gone_in_the_same_sentence() {
+    let (addr, _tmp, worktree) = boot().await;
+    let client = reqwest::Client::new();
+
+    // Precondition: the tree is browsable while the directory is there.
+    let resp = client
+        .post(format!("http://{addr}/api/v1/sessions/s1/files/list"))
+        .json(&serde_json::json!({ "path": "" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    std::fs::remove_dir_all(&worktree).unwrap();
+    wait_for_missing(addr, true).await;
+
+    let resp = client
+        .post(format!("http://{addr}/api/v1/sessions/s1/files/list"))
+        .json(&serde_json::json!({ "path": "" }))
+        .send()
+        .await
+        .unwrap();
+    // 409 like the git routes: the agent exists and the route is real, and only
+    // the directory cannot answer.
+    assert_eq!(resp.status(), 409);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains(worktree.to_string_lossy().as_ref()),
+        "the refusal names the path: {body}"
+    );
+    assert!(body.contains("recreated"), "and the way back: {body}");
+
+    // The write door is shut too, not only the read one.
+    let resp = client
+        .post(format!("http://{addr}/api/v1/sessions/s1/files/write"))
+        .json(&serde_json::json!({ "path": "seed.txt", "content": "x" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+}

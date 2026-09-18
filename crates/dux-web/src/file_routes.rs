@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 
 use dux_core::model::TerminalRoute;
 
-use crate::git_routes::resolve_worktree;
+use crate::git_routes::resolve_editor_worktree;
 use crate::rest_common::{RouteRejection, id_within_bound, unknown_session};
 use crate::server::AppState;
 
@@ -234,7 +234,7 @@ impl FromRequestParts<AppState> for SessionRoot {
         if !id_within_bound(&id) {
             return Err(unknown_session().into());
         }
-        let worktree = resolve_worktree(state, id.clone()).await?;
+        let worktree = resolve_editor_worktree(state, id.clone()).await?;
         Ok(Self {
             worktree,
             session_id: id,
