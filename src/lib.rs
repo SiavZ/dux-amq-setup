@@ -36,4 +36,5 @@ pub mod sanitize;
 pub mod statusline;
 pub mod storage;
 pub mod theme;
+pub mod version;
 pub mod watch;

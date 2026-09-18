@@ -26,6 +26,7 @@ mod sanitize;
 mod statusline;
 mod storage;
 mod theme;
+mod version;
 mod watch;
 
 use std::path::Path;
@@ -41,6 +42,15 @@ fn main() -> Result<()> {
         .unwrap_or(false)
     {
         print_help();
+        return Ok(());
+    }
+
+    if args
+        .first()
+        .map(|arg| arg == "--version" || arg == "-V")
+        .unwrap_or(false)
+    {
+        println!("dux v{}", version::long());
         return Ok(());
     }
 
@@ -126,7 +136,8 @@ fn print_help() {
           dux config       Manage the configuration file\n\
           dux session      Manage individual sessions (purge for GDPR erasure)\n\
           dux peer         Route messages between Dux agent sessions\n\
-          dux doctor       Print a diagnostic dump (--json, --anonymize)\n\n\
+          dux doctor       Print a diagnostic dump (--json, --anonymize)\n\
+          dux --version    Print the version and the git commit it was built from\n\n\
          Config subcommands:\n\
           dux config path          Print the config file path\n\
           dux config diff          Show settings that differ from defaults\n\
