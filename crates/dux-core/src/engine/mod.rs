@@ -8963,6 +8963,76 @@ mod tests {
         assert!(matches!(event, WorkerEvent::BranchSyncReady(_)));
     }
 
+    /// git falling over in one worktree for a whole streak is said out loud, and
+    /// so is the read working again, on the same key so the good news replaces
+    /// the bad rather than sitting under it.
+    ///
+    /// Driven against a real directory that is not a repository and then made
+    /// into one, because the streak counting lives inside the loop and only a
+    /// real sequence of cycles exercises the crossing and the recovery together.
+    #[test]
+    fn a_branch_read_that_stays_broken_and_then_works_says_both() {
+        let (mut engine, tmp) = test_engine();
+        let (worker_tx, worker_rx) = std::sync::mpsc::channel();
+        engine.worker_tx = worker_tx;
+        engine.branch_sync_wait.slice_ms.store(5, Ordering::Relaxed);
+
+        // A directory that exists but holds no repository: git answers with an
+        // error every cycle, which is the failure the streak counts, and the
+        // missing-directory report stays out of it.
+        let worktree = tmp.path().join("not-a-repo");
+        std::fs::create_dir_all(&worktree).expect("worktree dir");
+        let worktree_path = worktree.to_string_lossy().to_string();
+        engine
+            .branch_sync_sessions
+            .lock()
+            .expect("branch sync sessions")
+            .push(BranchSyncEntry {
+                session_id: "session-1".to_string(),
+                worktree_path: worktree_path.clone(),
+                branch_name: "agent-branch".to_string(),
+            });
+
+        engine.config.ui.branch_sync_interval = 1;
+        engine.spawn_branch_sync_worker();
+
+        let stuck = next_poller_status(&worker_rx, "the streak is reported");
+        assert_eq!(stuck.tone, crate::statusline::StatusTone::Warning);
+        assert_eq!(
+            stuck.key,
+            crate::poller_status::branch_sync_stuck(&worktree_path, "x").key
+        );
+        assert!(
+            stuck.message.contains(&worktree_path),
+            "the warning names the worktree git cannot answer in: {}",
+            stuck.message
+        );
+
+        crate::git::init_repo(&worktree).expect("init repo");
+        let recovered = next_poller_status(&worker_rx, "the recovery is reported");
+        assert_eq!(recovered.tone, crate::statusline::StatusTone::Info);
+        assert_eq!(
+            recovered.key, stuck.key,
+            "the good news lands on the key the warning is standing on"
+        );
+    }
+
+    /// The next poller status on the lane, skipping the sweeps' own events.
+    fn next_poller_status(
+        rx: &std::sync::mpsc::Receiver<WorkerEvent>,
+        what: &str,
+    ) -> crate::engine::StatusUpdate {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            match rx.recv_timeout(remaining) {
+                Ok(WorkerEvent::PollerStatus(status)) => return status,
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        panic!("{what}");
+    }
+
     /// A reload to `0` stops the sweeps without stopping the thread: the loop
     /// naps instead, so a later retune back to N is picked up by this same loop
     /// and `branch_sync_worker_started` keeps meaning "a thread is live".
