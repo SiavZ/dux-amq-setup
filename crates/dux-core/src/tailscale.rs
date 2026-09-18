@@ -15,6 +15,15 @@ use std::net::IpAddr;
 
 use crate::logger;
 
+/// The keyed-status key a mode change reports under when no operation is waiting
+/// on it.
+///
+/// A mode change a surface asked for resolves its own op on its own key; this is
+/// for the answer that arrives after the asking surface has forgotten it (a stop
+/// and start across the request), which is still a listener changing and still
+/// worth saying.
+pub const MODE_CHANGE_STATUS_KEY: &str = "tailscale-mode";
+
 /// Why Tailscale address detection produced no usable address. Carried alongside
 /// `None` so the caller can surface an accurate, actionable warning.
 #[derive(Clone, Debug, PartialEq, Eq)]

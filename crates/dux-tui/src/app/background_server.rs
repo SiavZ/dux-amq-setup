@@ -606,14 +606,24 @@ impl App {
             Some(op) => self.apply_reaction(op.resolve(&outcome).into_reaction()),
             // No op waiting: the serve answered a request this surface no longer
             // remembers (a stop and start across it, say). Say it anyway rather
-            // than swallowing a listener change nobody asked about.
+            // than swallowing a listener change nobody asked about, and say it on
+            // the lane both surfaces drain: with nobody waiting on it this is a
+            // fact about the process rather than an answer owed to this screen,
+            // and a browser reaching dux over the tailnet is as affected as the
+            // terminal in front of it.
             None => {
                 let report = outcome.report(mode);
-                if report.warning {
-                    self.set_warning(report.message);
+                let tone = if report.warning {
+                    dux_core::statusline::StatusTone::Warning
                 } else {
-                    self.set_info(report.message);
-                }
+                    dux_core::statusline::StatusTone::Info
+                };
+                self.engine
+                    .post_status(dux_core::engine::StatusUpdate::keyed(
+                        dux_core::tailscale::MODE_CHANGE_STATUS_KEY,
+                        tone,
+                        report.message,
+                    ));
             }
         }
     }
@@ -2223,6 +2233,32 @@ pub(crate) mod tests {
         assert!(app.pending_tailscale_mode_op.is_none());
         let status = tailscale_status(&app);
         assert!(status.contains("100.64.0.5:8080"), "{status}");
+    }
+
+    /// An answer that arrives with nobody waiting on it is a listener changing
+    /// under the whole process, so it goes on the lane both surfaces drain rather
+    /// than onto this status line alone.
+    #[test]
+    fn a_mode_answer_nobody_is_waiting_for_reaches_both_surfaces() {
+        let mut app = test_app(default_bindings());
+        assert!(app.pending_tailscale_mode_op.is_none());
+
+        app.apply_tailscale_mode_outcome(
+            dux_core::config::TailscaleMode::Yes,
+            dux_core::config::TailscaleModeOutcome::Applied {
+                bound: Some("100.64.0.5:8080".parse().unwrap()),
+            },
+        );
+
+        let event = app.engine.worker_rx.try_recv().expect("a posted status");
+        let dux_core::worker::WorkerEvent::PollerStatus(status) = event else {
+            panic!("an orphaned mode answer rides the poller-status lane");
+        };
+        assert_eq!(
+            status.key.as_deref(),
+            Some(dux_core::tailscale::MODE_CHANGE_STATUS_KEY)
+        );
+        assert!(status.message.contains("100.64.0.5:8080"), "{status:?}");
     }
 
     #[test]
