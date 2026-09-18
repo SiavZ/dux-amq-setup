@@ -948,13 +948,17 @@ async fn run_serve_loop(
             // thing delayed: the console line and the log went out at once. A
             // sleep rather than a tick, so a loop with nothing held waits on
             // nothing.
-            _ = async {
+            due = async {
                 let due = status
                     .pending_deadline()
                     .expect("guarded by the arm's condition");
                 tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
+                due
             }, if status.pending_deadline().is_some() => {
-                status.flush_due(std::time::Instant::now());
+                // The deadline itself, not the clock: a timer that fires a
+                // fraction early would otherwise leave the sentence held and
+                // this arm re-arming on a deadline already past.
+                status.flush_due(due);
             }
             command = commands.recv() => {
                 apply_current_generation_command(
