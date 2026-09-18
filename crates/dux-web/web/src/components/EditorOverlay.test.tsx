@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
   cleanup,
+  configure,
   fireEvent,
   render,
   screen,
@@ -24,6 +25,13 @@ import { OPEN_IN_EDITORS } from "@/lib/editors"
 // is scoped to this file: it buys nothing anywhere else, and a global raise
 // would hide a genuinely hung test in every other file.
 vi.setConfig({ testTimeout: 20_000, hookTimeout: 20_000 })
+// `vi.setConfig` raises the per-TEST clock, which is not the clock the waits
+// below actually run on: every `waitFor` and `findBy*` runs on Testing
+// Library's own `asyncUtilTimeout`, which defaults to 1000ms and is what these
+// cases intermittently fail on. Measured by lowering it here: at 300ms this
+// file fails three cases on an idle machine while the assertions themselves are
+// satisfied. Scoped to this file for the same reason the test window is.
+configure({ asyncUtilTimeout: 10_000 })
 
 // What this file exists for, and it is one property.
 //
