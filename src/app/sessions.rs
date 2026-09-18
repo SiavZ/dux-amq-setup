@@ -643,7 +643,7 @@ impl App {
     pub(crate) fn should_resume_session(&self, session: &AgentSession) -> SessionLaunch {
         let cfg = provider_config(&self.config, &session.provider);
         if let Some(session_id) = session.provider_session_id(&session.provider)
-            && uuid::Uuid::parse_str(session_id).is_ok()
+            && provider_resume_id_is_valid(&session.provider, session_id)
             && cfg.supports_session_resume_by_id()
             && (!session.shared_workspace()
                 || session.provider.as_str() != "claude"
@@ -654,6 +654,26 @@ impl App {
         {
             return SessionLaunch::ResumeId(session_id.to_string());
         }
+        // jcode assigns its own non-UUID ids and dux has no spawn-time
+        // capture for them, but jcode's session metadata records each
+        // session's working_dir. When this agent is the only jcode session
+        // in its directory, the newest non-empty session there is
+        // unambiguously its own — resume it instead of spawning the blank
+        // pane the operator would immediately `/resume` out of.
+        if session.provider.as_str() == "jcode"
+            && cfg.supports_session_resume_by_id()
+            && session.has_started_provider(&session.provider)
+            && !self.git.sessions.iter().any(|s| {
+                s.id != session.id
+                    && s.provider == session.provider
+                    && s.worktree_path == session.worktree_path
+            })
+            && let Some(id) = crate::resume_recovery::resolve_latest_jcode_session_from_home(
+                Path::new(&session.worktree_path),
+            )
+        {
+            return SessionLaunch::ResumeId(id);
+        }
         if session.shared_workspace() {
             return SessionLaunch::Fresh;
         }
@@ -662,6 +682,17 @@ impl App {
         } else {
             SessionLaunch::Fresh
         }
+    }
+}
+
+/// Resume ids flow into provider CLI arguments, so only ids whose shape we
+/// recognize are accepted: UUIDs for every provider except jcode, whose
+/// native `session_<name>_<epoch>_<hex>` ids are validated structurally.
+fn provider_resume_id_is_valid(provider: &ProviderKind, id: &str) -> bool {
+    if provider.as_str() == "jcode" {
+        crate::resume_recovery::jcode_session_id_is_valid(id)
+    } else {
+        uuid::Uuid::parse_str(id).is_ok()
     }
 }
 
@@ -3343,6 +3374,31 @@ mod tests {
             matches!(app.should_resume_session(&session), SessionLaunch::Fresh),
             "shared reconnects without an exact UUID must launch fresh"
         );
+    }
+
+    #[test]
+    fn jcode_stored_native_id_passes_the_resume_gate() {
+        let mut session = make_session("s1", "jcode", "/tmp/wt/jc");
+        let native_id = "session_cactus_1788156095921_18c33bc3e9ed4d80";
+        session
+            .provider_session_ids
+            .insert("jcode".to_string(), native_id.to_string());
+        let project = make_project("project-1", "jcode");
+        let mut app = test_app_with_sessions(vec![session.clone()], vec![project]);
+
+        assert_eq!(
+            app.should_resume_session(&session),
+            SessionLaunch::ResumeId(native_id.to_string())
+        );
+
+        // An id that is neither a UUID nor jcode-shaped must not reach
+        // `--resume`; with no started provider and no metadata for the fake
+        // worktree the launch falls back to Fresh.
+        app.git.sessions[0]
+            .provider_session_ids
+            .insert("jcode".to_string(), "guppy; rm -rf /".to_string());
+        let session = app.git.sessions[0].clone();
+        assert_eq!(app.should_resume_session(&session), SessionLaunch::Fresh);
     }
 
     #[test]
