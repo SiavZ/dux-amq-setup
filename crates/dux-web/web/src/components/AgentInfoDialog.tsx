@@ -15,8 +15,10 @@ import { formatDisplayDate } from "@/lib/projectInfo"
 import { closeAgentInfo, useDux } from "@/lib/store"
 import type { SessionView } from "@/lib/types"
 import {
+  type AgentWorkspaceWire,
   branchDriftOf,
   matchWorkspace,
+  missingDirectoryInfoLine,
   sessionLabel,
   workspaceProjectId,
 } from "@/lib/agentWorkspace"
@@ -25,6 +27,24 @@ import {
 // ("active" | "detached" | "exited"); title-case it for display.
 function statusLabel(status: SessionView["status"]): string {
   return status.charAt(0).toUpperCase() + status.slice(1)
+}
+
+// The directory this agent runs in is gone. Same amber warning treatment as the
+// branch-drift line beside it, and the same words the terminal UI's info panel
+// uses, because it is the same fact about the same agent.
+function MissingDirectoryLine({
+  workspace,
+}: {
+  workspace: AgentWorkspaceWire
+}) {
+  const line = missingDirectoryInfoLine(workspace)
+  if (line === null) return null
+  return (
+    <p className="flex items-center gap-1.5 text-xs text-amber-500">
+      <TriangleAlert className="size-3.5 shrink-0" />
+      {line}
+    </p>
+  )
 }
 
 // Read-only "Agent info…" modal. Pure presentation of existing ViewModel data:
@@ -122,6 +142,7 @@ export function AgentInfoDialog() {
                   {workspace.worktree_path}
                 </span>
               </InfoRow>
+              <MissingDirectoryLine workspace={workspace} />
             </>
           ),
           folder: (workspace) => (
@@ -134,6 +155,7 @@ export function AgentInfoDialog() {
                   </span>
                 </SimpleTooltip>
               </InfoRow>
+              <MissingDirectoryLine workspace={workspace} />
             </>
           ),
         })}

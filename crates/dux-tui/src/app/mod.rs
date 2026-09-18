@@ -1465,6 +1465,7 @@ pub(crate) fn agent_info_lines(
     session: &AgentSession,
     project_default: Option<ProviderKind>,
     pr: Option<(&crate::model::PrInfo, bool)>,
+    directory_missing: bool,
 ) -> Vec<(String, AgentInfoTone)> {
     let name = session.display_label();
     // Mirror the header's "current provider" note: when the agent runs a provider
@@ -1511,6 +1512,12 @@ pub(crate) fn agent_info_lines(
                 format!("Worktree:     {}", managed.worktree_path),
                 AgentInfoTone::Neutral,
             ));
+            if directory_missing {
+                lines.push((
+                    dux_core::working_copy::MISSING_WORKING_COPY_INFO_LINE.to_string(),
+                    AgentInfoTone::Warning,
+                ));
+            }
         }
         dux_core::model::AgentWorkspace::Folder(folder) => {
             lines.push((
@@ -1524,6 +1531,12 @@ pub(crate) fn agent_info_lines(
                 ),
                 AgentInfoTone::Neutral,
             ));
+            if directory_missing {
+                lines.push((
+                    dux_core::working_copy::MISSING_FOLDER_INFO_LINE.to_string(),
+                    AgentInfoTone::Warning,
+                ));
+            }
         }
     }
     lines.push((
@@ -6082,7 +6095,9 @@ impl App {
                 .pr_statuses
                 .get(&session.id)
                 .map(|pr| (pr, self.engine.pr_overrides.contains_key(&session.id)));
-            let lines = agent_info_lines(&session, project_default, pr);
+            let directory_missing = self.engine.folder_repo_status(&session.id)
+                == dux_core::git::FolderRepoStatus::Missing;
+            let lines = agent_info_lines(&session, project_default, pr, directory_missing);
             self.prompt = PromptState::AgentInfo(AgentInfoPrompt {
                 session_label: label,
                 lines,
@@ -7151,7 +7166,7 @@ mod tests {
     #[test]
     fn agent_info_lines_for_a_standalone_agent_name_the_folder_and_no_branches() {
         let s = test_standalone_session("sa1", "/home/someone/notes");
-        let lines = agent_info_lines(&s, None, None);
+        let lines = agent_info_lines(&s, None, None, false);
         let text = lines
             .iter()
             .map(|(l, _)| l.as_str())
@@ -7178,6 +7193,43 @@ mod tests {
         }
     }
 
+    /// The info panel is where a user goes to ask what is wrong with an agent,
+    /// so it says the directory is gone rather than showing a worktree path that
+    /// leads nowhere. Warning-toned, like the drift line, and the browser's
+    /// dialog carries the same words.
+    #[test]
+    fn agent_info_lines_flag_a_directory_that_is_gone() {
+        let managed = test_session("s1", "p1", 0);
+        let lines = agent_info_lines(&managed, None, None, true);
+        let flagged = lines
+            .iter()
+            .find(|(_, tone)| *tone == AgentInfoTone::Warning)
+            .expect("a warning line");
+        assert_eq!(
+            flagged.0,
+            dux_core::working_copy::MISSING_WORKING_COPY_INFO_LINE
+        );
+        assert!(flagged.0.contains("Recreate it"), "{}", flagged.0);
+
+        assert!(
+            !agent_info_lines(&managed, None, None, false)
+                .iter()
+                .any(|(text, _)| text == dux_core::working_copy::MISSING_WORKING_COPY_INFO_LINE),
+            "and nothing is flagged while the copy is there"
+        );
+
+        // dux never puts a standalone agent's folder back, so its line names a
+        // different remedy.
+        let standalone = test_standalone_session("sa1", "/home/someone/notes");
+        let lines = agent_info_lines(&standalone, None, None, true);
+        assert!(
+            lines
+                .iter()
+                .any(|(text, _)| text == dux_core::working_copy::MISSING_FOLDER_INFO_LINE),
+            "{lines:?}"
+        );
+    }
+
     #[test]
     fn agent_info_lines_include_lineage_and_drift() {
         let mut s = test_session("s1", "p1", 0);
@@ -7195,7 +7247,7 @@ mod tests {
             .expect("managed test session")
             .source_branch = "main".into();
 
-        let lines = agent_info_lines(&s, None, None);
+        let lines = agent_info_lines(&s, None, None, false);
         assert!(lines.iter().any(|(l, _)| l.contains("agent-tabs"))); // current branch
         assert!(lines.iter().any(|(l, _)| l.contains("server-mode"))); // original
         assert!(lines.iter().any(|(l, _)| l.contains("main"))); // forked from
@@ -7226,7 +7278,7 @@ mod tests {
             .as_managed_mut()
             .expect("managed test session")
             .initial_branch = "main".into();
-        let lines = agent_info_lines(&s, None, None);
+        let lines = agent_info_lines(&s, None, None, false);
         // Both checks below are shaped so they would pass on an EMPTY list, so
         // pin that there is something to check first. Without this the test
         // passes while reporting nothing at all.
@@ -7258,7 +7310,7 @@ mod tests {
             .as_managed_mut()
             .expect("managed test session")
             .initial_branch = String::new();
-        let lines = agent_info_lines(&s, None, None);
+        let lines = agent_info_lines(&s, None, None, false);
         assert!(
             !lines
                 .iter()
@@ -7280,11 +7332,11 @@ mod tests {
         };
 
         // No PR known: no line at all.
-        let none = agent_info_lines(&s, None, None);
+        let none = agent_info_lines(&s, None, None, false);
         assert!(!none.iter().any(|(l, _)| l.starts_with("Pull request:")));
 
         // Autodetected PR: number, lowercase state, title, no pin marker.
-        let auto = agent_info_lines(&s, None, Some((&pr, false)));
+        let auto = agent_info_lines(&s, None, Some((&pr, false)), false);
         let line = auto
             .iter()
             .find(|(l, _)| l.starts_with("Pull request:"))
@@ -7299,7 +7351,7 @@ mod tests {
 
         // Pinned PR: the same line carries the manual marker. This line is the
         // ONLY TUI cue that a pin exists, so the marker is load-bearing.
-        let pinned = agent_info_lines(&s, None, Some((&pr, true)));
+        let pinned = agent_info_lines(&s, None, Some((&pr, true)), false);
         let line = pinned
             .iter()
             .find(|(l, _)| l.starts_with("Pull request:"))
@@ -7311,7 +7363,7 @@ mod tests {
     fn agent_info_provider_line_notes_a_divergent_project_default() {
         let s = test_session("s1", "p1", 0); // provider "codex"
         // Matching default: plain provider line, no annotation.
-        let same = agent_info_lines(&s, Some(ProviderKind::from_str("codex")), None);
+        let same = agent_info_lines(&s, Some(ProviderKind::from_str("codex")), None, false);
         let provider_same = same
             .iter()
             .find(|(l, _)| l.starts_with("Provider:"))
@@ -7319,7 +7371,7 @@ mod tests {
         assert!(!provider_same.0.contains("project default"));
 
         // Divergent default: the line spells out the project default too.
-        let diff = agent_info_lines(&s, Some(ProviderKind::from_str("claude")), None);
+        let diff = agent_info_lines(&s, Some(ProviderKind::from_str("claude")), None, false);
         let provider_diff = diff
             .iter()
             .find(|(l, _)| l.starts_with("Provider:"))

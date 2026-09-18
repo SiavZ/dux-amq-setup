@@ -136,6 +136,28 @@ export function changesQuietReason(
   })
 }
 
+/** The one line the info panel shows when a managed agent's working copy is
+ * gone. Pinned verbatim against `dux_core::working_copy`, which carries the twin
+ * assertion, so a wording change fails on the side that changed. */
+export const MISSING_WORKING_COPY_INFO_LINE =
+  "The working copy no longer exists on disk. Recreate it to get this agent running again."
+
+/** The same line for a standalone agent, whose folder is the user's own and
+ * which dux will not put back. */
+export const MISSING_FOLDER_INFO_LINE =
+  "The folder no longer exists on disk. Restore it, or delete this agent."
+
+/** The info panel's missing-directory line for this agent, or `null` when its
+ * directory is there. One helper so neither surface nor kind can drift. */
+export function missingDirectoryInfoLine(
+  workspace: AgentWorkspaceWire,
+): string | null {
+  return matchWorkspace(workspace, {
+    managed: (w) => (w.worktree_missing ? MISSING_WORKING_COPY_INFO_LINE : null),
+    folder: (w) => (w.repo_status === "missing" ? MISSING_FOLDER_INFO_LINE : null),
+  })
+}
+
 /** Whether a MANAGED agent's working copy is gone from disk, which is the one
  * state the recreate action exists for. False for a standalone agent, whose
  * folder is the user's: dux never creates, moves or removes that one, so a

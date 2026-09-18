@@ -156,6 +156,21 @@ pub fn missing_folder_reason(folder: &Path) -> String {
 /// for a marker rather than a sentence.
 pub const MISSING_WORKING_COPY_LABEL: &str = "working copy missing";
 
+/// The one line the info panel shows on both surfaces when a MANAGED agent's
+/// working copy is gone.
+///
+/// Short rather than the changes panel's full sentence: the info panel already
+/// names the worktree path on the row above, and a paragraph in a definition
+/// list is a paragraph nobody reads. Pinned verbatim against the browser's copy,
+/// like the confirmation body.
+pub const MISSING_WORKING_COPY_INFO_LINE: &str =
+    "The working copy no longer exists on disk. Recreate it to get this agent running again.";
+
+/// The same line for a STANDALONE agent, whose folder is the user's own and
+/// which dux will not put back.
+pub const MISSING_FOLDER_INFO_LINE: &str =
+    "The folder no longer exists on disk. Restore it, or delete this agent.";
+
 /// Why the changes region is quiet for one agent, or `None` when it is not.
 ///
 /// The one place both surfaces and the wire ask, so a directory that is gone

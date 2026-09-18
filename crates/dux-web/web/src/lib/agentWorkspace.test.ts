@@ -3,7 +3,10 @@ import { describe, expect, it } from "vitest"
 import {
   type AgentWorkspaceWire,
   type FolderRepoStatus,
+  MISSING_FOLDER_INFO_LINE,
+  MISSING_WORKING_COPY_INFO_LINE,
   changesQuietReason,
+  missingDirectoryInfoLine,
   folderWorkspace,
   managedWorkspace,
   matchWorkspace,
@@ -230,5 +233,35 @@ describe("newTerminalLabel", () => {
     ] as FolderRepoStatus[]) {
       expect(newTerminalLabel(folder(status))).not.toMatch(/worktree/)
     }
+  })
+})
+
+describe("missingDirectoryInfoLine", () => {
+  // Pinned against `dux_core::working_copy`, which carries the twin assertion,
+  // so a wording change fails on whichever side changed.
+  it("reads the same as the terminal UI's info panel", () => {
+    expect(MISSING_WORKING_COPY_INFO_LINE).toBe(
+      "The working copy no longer exists on disk. Recreate it to get this agent running again.",
+    )
+    expect(MISSING_FOLDER_INFO_LINE).toBe(
+      "The folder no longer exists on disk. Restore it, or delete this agent.",
+    )
+  })
+
+  it("names the remedy that belongs to the kind, and is silent otherwise", () => {
+    expect(missingDirectoryInfoLine(missingCopy)).toBe(
+      MISSING_WORKING_COPY_INFO_LINE,
+    )
+    expect(
+      missingDirectoryInfoLine({ ...missingCopy, worktree_missing: false }),
+    ).toBeNull()
+    expect(
+      missingDirectoryInfoLine(folder("missing")),
+    ).toBe(MISSING_FOLDER_INFO_LINE)
+    expect(
+      missingDirectoryInfoLine(
+        folder("no_repo"),
+      ),
+    ).toBeNull()
   })
 })
