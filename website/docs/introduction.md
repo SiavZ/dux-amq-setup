@@ -98,6 +98,22 @@ list. In the browser the same three panes are click-driven, with a collapsible s
 and a resizable Changes split; see
 [The workspace in the browser](/docs/web-workspace).
 
+### When an agent deletes its own working copy
+
+An agent works inside a git worktree, and it can remove that worktree from inside it:
+merging its branch and then deleting the branch takes the directory with it. dux cannot
+stop that, so it says so instead. The changed-files pane goes quiet with a sentence naming
+the directory that is gone, and the agent's row says **working copy missing** where it
+would normally name the project.
+
+> [!IMPORTANT]
+> The agent's process, if it was still running, keeps running in a directory that no longer
+> exists. Nothing it does from then on reaches your files. The `recreate-working-copy`
+> command checks the agent's branch out again at the same path, which is what lets the agent
+> resume the same conversation. The code changes that were in the old directory are gone;
+> this puts the directory back, not its contents. Stop the agent and start it again to work
+> in the recreated copy. The browser has the same action in the agent's menu.
+
 ### Very large diffs in the terminal UI
 
 The terminal UI draws its diffs itself, and a large enough file makes that slow. There are

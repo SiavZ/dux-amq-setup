@@ -168,3 +168,23 @@ If a git operation collides with a lock, dux keeps retrying, so a single blip us
 clears itself. If it does not, you get a "Couldn't load changes" card with a Refresh button,
 and a warning toast once the failures persist. A commit you make in the browser is an
 ordinary commit, visible everywhere.
+
+## When an agent deletes its own working copy
+
+An agent works inside a git worktree, and it can remove that worktree from inside it:
+merging its branch and then deleting the branch takes the directory with it. dux cannot
+stop that, so it says so instead. The Changes pane goes quiet with a sentence naming the
+directory that is gone, and the agent's row in the sidebar says **working copy missing**
+where it would normally name the project.
+
+> [!IMPORTANT]
+> The agent's process, if it was still running, keeps running in a directory that no longer
+> exists. Nothing it does from then on reaches your files. **Recreate working copy…** in the
+> agent's `⋯` menu checks the agent's branch out again at the same path, which is what lets
+> the agent resume the same conversation. The code changes that were in the old directory
+> are gone; this puts the directory back, not its contents. Stop the agent and start it
+> again to work in the recreated copy. The terminal UI has the same action as its
+> `recreate-working-copy` command.
+
+If the branch is gone too, dux creates it again from the project's source branch, and says
+so. The commits that branch held are not coming back.
