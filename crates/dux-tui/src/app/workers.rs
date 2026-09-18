@@ -274,8 +274,9 @@ impl App {
     fn apply_selected_agent_exit_status(&mut self, pty: &PrunedPty) {
         let key = self.bindings.label_for(Action::ReconnectAgent);
         if self.session_surface != SessionSurface::Agent {
-            self.set_info(format!(
-                "Agent CLI process exited. Companion terminal is still available; press \"{key}\" to relaunch the agent."
+            self.set_info(dux_core::engine::agent_exit_with_companion_notice(
+                pty,
+                &format!("Press \"{key}\" to relaunch the agent."),
             ));
             return;
         }
@@ -1070,7 +1071,7 @@ impl App {
         self.clamp_terminal_cursor();
         self.rebuild_left_items();
         if let Some(label) = view.label {
-            self.set_info(format!("Deleted terminal \"{label}\""));
+            self.set_info(dux_core::engine::closed_terminal_notice(&label));
         }
     }
 

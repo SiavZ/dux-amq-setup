@@ -1155,7 +1155,7 @@ fn wire_status_from_reaction(reaction: &EventReaction) -> Option<WireStatus> {
         EventReaction::DeleteTerminalView(view) => view
             .label
             .as_ref()
-            .map(|l| WireStatus::new("info", format!("Closed terminal \"{l}\"."))),
+            .map(|l| WireStatus::new("info", crate::engine::closed_terminal_notice(l))),
         _ => None,
     }
 }
@@ -1223,7 +1223,7 @@ pub fn wire_statuses_from_reaction(reaction: &EventReaction) -> Vec<WireStatus> 
         EventReaction::DeleteTerminalView(view) => view
             .label
             .as_ref()
-            .map(|l| WireStatus::new("info", format!("Closed terminal \"{l}\".")))
+            .map(|l| WireStatus::new("info", crate::engine::closed_terminal_notice(l)))
             .into_iter()
             .collect(),
         EventReaction::OpenConfigReloadFailedModal(message) => {

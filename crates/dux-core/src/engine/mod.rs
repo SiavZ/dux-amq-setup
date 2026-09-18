@@ -36,10 +36,10 @@ pub use in_flight::{
 pub use lifecycle::{
     ClosedTabExit, DeferredWorktreeRemoval, DetachSessionOutcome, ForceDetachOutcome,
     GroupWorktreeRemoval, PendingDetach, PrunedPty, PrunedPtyKind, RAPID_EXIT_WINDOW,
-    ReapedTerminations, ShutdownReport, TerminatingPty, clean_exit_closes_tab_row,
-    closed_tab_exit_notice, detach_busy_message, detach_confirm_body, detach_final,
-    detach_not_running_message, detach_status_key, detached_agent_notice, format_shutdown_result,
-    format_shutdown_start,
+    ReapedTerminations, ShutdownReport, TerminatingPty, agent_exit_with_companion_notice,
+    clean_exit_closes_tab_row, closed_tab_exit_notice, closed_terminal_notice, detach_busy_message,
+    detach_confirm_body, detach_final, detach_not_running_message, detach_status_key,
+    detached_agent_notice, format_shutdown_result, format_shutdown_start,
 };
 pub use pr_sync_control::PrSyncControl;
 pub use resume_fallback::ResumeFallbackOutcome;

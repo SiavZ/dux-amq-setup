@@ -375,13 +375,52 @@ pub fn closed_tab_exit_notice(exit: &ClosedTabExit) -> String {
 /// CLI's own last words and names `remedy`, which is the only part that differs
 /// per surface because the way back does.
 pub fn detached_agent_notice(pruned: &PrunedPty, remedy: &str) -> String {
-    pruned
-        .refused_resume_excerpt
-        .as_deref()
-        .and_then(|excerpt| {
-            crate::tab_verdict::refused_resume_warning(&pruned.label, excerpt, remedy)
-        })
-        .unwrap_or_else(|| format!("Agent \"{}\" exited.", pruned.label))
+    refused_resume_notice(pruned, remedy)
+        .unwrap_or_else(|| format!("{}.", agent_exited_head(&pruned.label)))
+}
+
+/// The same notice, for a surface that also knows a companion terminal of the
+/// same session is still running.
+///
+/// Shares its head with [`detached_agent_notice`] rather than writing its own:
+/// the two surfaces used to word this exit differently, one naming the agent and
+/// the other naming neither the agent nor what survived it. A refused resume
+/// still wins, because what the provider said is the more useful sentence and
+/// the terminal is beside the point there.
+pub fn agent_exit_with_companion_notice(pruned: &PrunedPty, remedy: &str) -> String {
+    refused_resume_notice(pruned, remedy).unwrap_or_else(|| {
+        format!(
+            "{}, and its companion terminal is still running. {remedy}",
+            agent_exited_head(&pruned.label)
+        )
+    })
+}
+
+/// The fact itself, with no full stop, so the sentences that continue past it
+/// can.
+fn agent_exited_head(label: &str) -> String {
+    format!("Agent \"{label}\" exited")
+}
+
+/// The provider's own last words, when this exit was a resume it refused.
+fn refused_resume_notice(pruned: &PrunedPty, remedy: &str) -> Option<String> {
+    crate::tab_verdict::refused_resume_warning(
+        &pruned.label,
+        pruned.refused_resume_excerpt.as_deref()?,
+        remedy,
+    )
+}
+
+/// The notice a closed terminal earns, in the one wording both surfaces use.
+///
+/// Closing a terminal is destructive and the row leaving the sidebar is too
+/// small to stand in for the confirmation, so the sentence says what went with
+/// it as well as what was closed.
+pub fn closed_terminal_notice(label: &str) -> String {
+    format!(
+        "Closed terminal \"{label}\". Its shell has stopped, so anything that was running in it \
+         is gone."
+    )
 }
 
 /// Whether an exited agent tab's row should be closed along with the prune: any
@@ -2140,7 +2179,9 @@ mod tests {
     use super::PrunedPtyKind;
     use super::TerminatingPty;
     use super::{ClosedTabExit, clean_exit_closes_tab_row, closed_tab_exit_notice};
-    use super::{PrunedPty, detached_agent_notice};
+    use super::{
+        PrunedPty, agent_exit_with_companion_notice, closed_terminal_notice, detached_agent_notice,
+    };
     use super::{RAPID_EXIT_WINDOW, rapid_exit_ends_run_badly, refused_resume_excerpt};
     use super::{REAPED_DRAIN_GRACE, agent_pty_ready_to_prune};
     use super::{format_shutdown_result, format_shutdown_start};
@@ -2642,6 +2683,14 @@ mod tests {
             "Agent \"server-mode\" exited."
         );
 
+        // The surface that also knows a companion terminal survived says so, on
+        // the same head, so the two cannot word one exit two ways.
+        assert_eq!(
+            agent_exit_with_companion_notice(&pruned, "Press the reconnect key."),
+            "Agent \"server-mode\" exited, and its companion terminal is still running. Press \
+             the reconnect key."
+        );
+
         pruned.refused_resume_excerpt = Some(vec!["No conversation to resume".to_string()]);
         let refusal = detached_agent_notice(&pruned, "Press the reconnect key.");
         assert!(refusal.contains("No conversation to resume"));
@@ -2649,6 +2698,21 @@ mod tests {
             refusal.ends_with("Press the reconnect key."),
             "the way back is the surface's own: {refusal}"
         );
+        assert_eq!(
+            agent_exit_with_companion_notice(&pruned, "Press the reconnect key."),
+            refusal,
+            "what the provider said wins; the terminal is beside the point there"
+        );
+    }
+
+    /// Closing a terminal is destructive and the row leaving the sidebar is too
+    /// small to stand in for the confirmation, so both surfaces say the same
+    /// sentence and it names what went with the shell.
+    #[test]
+    fn a_closed_terminals_notice_names_it_and_what_stopped_with_it() {
+        let notice = closed_terminal_notice("dev server");
+        assert!(notice.starts_with("Closed terminal \"dev server\"."));
+        assert!(notice.contains("Its shell has stopped"));
     }
 
     /// The sentence both surfaces say about a closed tab, in both shapes: with
