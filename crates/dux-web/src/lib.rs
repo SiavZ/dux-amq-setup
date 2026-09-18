@@ -2212,6 +2212,63 @@ mod tests {
         assert_eq!(first.key, settled.key);
     }
 
+    /// A bind that fails is the other half of the leg's news, and it is the half
+    /// a watcher retries: the address is there, the listener will not start, and
+    /// only a warning on the surfaces says why the tailnet cannot reach dux.
+    #[tokio::test]
+    async fn a_bind_that_fails_warns_the_surfaces_and_not_only_the_console() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        let paths = dux_core::config::DuxPaths {
+            root: root.clone(),
+            config_path: root.join("config.toml"),
+            sessions_db_path: root.join("sessions.sqlite3"),
+            worktrees_root: root.join("worktrees"),
+            lock_path: root.join("dux.lock"),
+        };
+        std::fs::create_dir_all(&paths.worktrees_root).expect("worktrees dir");
+        let mut engine = crate::bootstrap::bootstrap_engine(&paths).expect("engine");
+        let (handle, ends) = crate::engine_actor::build_actor_channels(&engine);
+        let mut svc = crate::engine_actor::EngineService::new(
+            &engine,
+            ends,
+            crate::engine_actor::ShutdownEcho::Silent,
+        );
+
+        // Somebody else holds the port, which is the failure the once-per-streak
+        // suppression exists for.
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("occupy a port");
+        let addr = occupied.local_addr().expect("the occupied address");
+        let shutdown = crate::serve_legs::ServeShutdown::for_watched(true);
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut streak = None;
+        let mut tasks = tokio::task::JoinSet::new();
+        let status_lane = crate::serve_legs::LegStatus::new(handle);
+
+        super::apply_leg_command(
+            crate::serve_legs::LegCommand::Bind(addr),
+            &mut tasks,
+            &shutdown,
+            &axum::Router::new(),
+            &crate::console::Console::noop(),
+            &status_lane,
+            &cell,
+            &mut streak,
+        )
+        .await;
+        assert_eq!(streak, Some(addr), "the bind really did fail");
+        status_lane.flush_due(std::time::Instant::now() + crate::serve_legs::LEG_SETTLE_DWELL);
+
+        svc.drain_requests(&mut engine);
+        let status = drain_one_leg_status(&engine);
+        assert_eq!(status.tone, dux_core::statusline::StatusTone::Warning);
+        assert!(
+            status.message.contains(&addr.to_string()),
+            "the warning names the address that would not bind: {}",
+            status.message
+        );
+    }
+
     /// The one leg status on the lane, or a panic naming what came instead.
     fn drain_one_leg_status(engine: &dux_core::engine::Engine) -> dux_core::engine::StatusUpdate {
         let posted = engine.worker_rx.try_recv().expect("a status on the lane");
