@@ -248,11 +248,11 @@ pub struct PrunedPty {
     /// (companion terminal).
     pub label: String,
     /// True when the exit also closed the tab, deleting its `agent_tabs` row: a
-    /// status-0 exit of an extra tab is the user deliberately ending that
-    /// conversation, and its history lives in the worktree rather than the row.
-    /// Always `false` for the session-slot tab, which has no row, for a non-zero
-    /// or unknown exit, whose dormant screen is the crash-diagnosis surface, and
-    /// for a companion terminal.
+    /// status-0 exit is the user deliberately ending that conversation, and its
+    /// history lives in the worktree rather than the row. The slot tab hands the
+    /// slot to a sibling on its way out. Always `false` for the agent's last
+    /// remaining tab, for a non-zero or unknown exit, whose dormant screen is
+    /// the crash-diagnosis surface, and for a companion terminal.
     pub tab_closed: bool,
     /// The reaped child's exit-success (`Some(true)` clean, `Some(false)`
     /// non-zero, `None` when only EOF was observed without a status). Captured
@@ -308,21 +308,26 @@ struct ExitedAgentPty {
     read_error: Option<String>,
 }
 
-/// Whether an exited agent tab's row should be closed along with the prune:
-/// only an extra tab, since the slot tab's row stays so its slot survives, that
-/// exited with status 0 and whose run did not end badly for any other reason.
-/// The one shared rule every surface's exit path consults.
+/// Whether an exited agent tab's row should be closed along with the prune: any
+/// tab but the agent's LAST remaining one, that exited with status 0 and whose
+/// run did not end badly for any other reason. The one shared rule every
+/// surface's exit path consults.
+///
+/// The slot tab is not privileged here: a clean exit closes it and the next tab
+/// in strip order takes the slot, the same promotion a user-initiated close
+/// runs. Only the last remaining tab keeps its row, because an agent always has
+/// a first tab and that exit is the agent's detach instead.
 ///
 /// `ended_badly` is the same verdict the prune records for the tab, asked here
 /// so the two cannot disagree about one exit. Closing the row of a run that
 /// ended badly would throw away both the diagnosis surface the verdict exists
 /// for and the verdict itself, since removing a row clears the recorded failure.
 pub fn clean_exit_closes_tab_row(
-    is_session_slot: bool,
+    is_only_tab: bool,
     exit_success: Option<bool>,
     ended_badly: bool,
 ) -> bool {
-    !is_session_slot && exit_success == Some(true) && !ended_badly
+    !is_only_tab && exit_success == Some(true) && !ended_badly
 }
 
 /// A deferred worktree removal that must wait for a WHOLE GROUP of an agent's
@@ -810,8 +815,12 @@ impl Engine {
             // The verdict decides the row as well as the mark, because closing
             // the row clears the recorded failure: a rapid clean exit must not
             // record a verdict and delete it again in the same breath.
-            let tab_closed = clean_exit_closes_tab_row(is_session_slot, exit_success, ended_badly)
-                && self.remove_agent_tab_row(tab_id.as_str());
+            let is_only_tab = is_session_slot
+                && owning
+                    .as_deref()
+                    .is_none_or(|sid| self.successor_slot_tab(SessionIdRef::new(sid)).is_none());
+            let tab_closed = clean_exit_closes_tab_row(is_only_tab, exit_success, ended_badly)
+                && self.close_exited_tab_row(owning.as_deref(), &tab_id, is_session_slot);
             pruned.push(PrunedPty {
                 kind: PrunedPtyKind::Agent,
                 id: tab_id.as_str().to_string(),
@@ -868,6 +877,44 @@ impl Engine {
         }
 
         pruned
+    }
+
+    /// Close the row of a tab whose clean exit earned it, and report whether a
+    /// row actually went. The slot tab hands its slot to the next tab in strip
+    /// order first (the same one transaction a user-initiated close runs), which
+    /// deletes the outgoing row with the pointer move; an extra tab's row is
+    /// simply removed.
+    ///
+    /// A promotion that cannot land leaves the row alone rather than half-doing
+    /// the close: the agent is mid-delete or its store refused, and a slot
+    /// pointing at a deleted row is worse than a dormant pill.
+    fn close_exited_tab_row(
+        &mut self,
+        session_id: Option<&str>,
+        tab_id: &TabId,
+        is_session_slot: bool,
+    ) -> bool {
+        if !is_session_slot {
+            return self.remove_agent_tab_row(tab_id.as_str());
+        }
+        let Some(session_id) = session_id else {
+            return false;
+        };
+        match self.promote_next_tab_into_slot(SessionIdRef::new(session_id), tab_id.as_ref_id()) {
+            Ok(_) => {
+                // The row is gone, so nothing will read this tab's verdict
+                // again; `remove_agent_tab_row` clears it on the other path.
+                self.clear_tab_run_failure(tab_id.as_ref_id());
+                true
+            }
+            Err(err) => {
+                crate::logger::warn(&format!(
+                    "the cleanly exited tab \"{tab_id}\" could not hand its slot to a sibling, \
+                     so its row stays: {err}"
+                ));
+                false
+            }
+        }
     }
 
     /// The grace an individual delete or close gives a child to exit before the
@@ -1977,6 +2024,207 @@ mod tests {
             engine.sessions[0].status,
             SessionStatus::Detached,
             "a clean exit of the last live tab detaches the agent instead"
+        );
+    }
+
+    /// A clean exit of the SLOT tab while a sibling lives hands the slot to that
+    /// sibling and closes the exited row, exactly as a user-initiated close
+    /// does. Nothing about the survivor is re-keyed, and the agent stays up.
+    #[test]
+    fn prune_promotes_the_sibling_when_the_slot_tab_exits_cleanly() {
+        let (mut engine, _tmp) = test_engine();
+        let worktree = tempfile::tempdir().expect("worktree dir");
+        engine.projects.push(sample_project(
+            "p1",
+            worktree.path().to_string_lossy().as_ref(),
+        ));
+        let mut session = sample_session("s1", "p1", "feat");
+        session
+            .workspace
+            .as_managed_mut()
+            .expect("managed test session")
+            .worktree_path = worktree.path().to_string_lossy().to_string();
+        engine
+            .session_store
+            .create_session(&session)
+            .expect("persist the agent and its first tab");
+        let slot = session.slot_tab_id().to_owned();
+        engine.sessions.push(session);
+        engine.mark_session_status("s1", SessionStatus::Active);
+        let sibling = sample_tab("t2", "s1", "codex", 1);
+        engine
+            .session_store
+            .insert_agent_tab(&sibling)
+            .expect("persist the sibling tab");
+        engine.agent_tabs.insert(TabId::new("t2"), sibling);
+        engine.providers.insert(
+            TabId::new("t2"),
+            PtyClient::spawn_with_env("cat", &[], worktree.path(), 24, 80, 1000, &[])
+                .expect("spawn cat"),
+        );
+        engine.providers.insert(
+            slot.clone(),
+            PtyClient::spawn_with_env(
+                "sh",
+                &["-c".to_string(), "exit 0".to_string()],
+                worktree.path(),
+                24,
+                80,
+                100,
+                &[],
+            )
+            .expect("spawn sh"),
+        );
+        // Somebody typed the provider's own quit command, so this is a
+        // deliberate end rather than a provider that never came up.
+        engine.note_pty_input(slot.as_str());
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let done = engine
+                .providers
+                .get_mut(slot.as_ref_id())
+                .is_some_and(|c| c.is_exited() && c.try_wait().is_some());
+            if done {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the slot tab's PTY never reached end of input"
+            );
+            sleep(Duration::from_millis(20));
+        }
+        let pruned = engine.prune_exited_ptys();
+
+        let entry = pruned
+            .iter()
+            .find(|p| p.id == slot.as_str())
+            .expect("the slot tab pruned");
+        assert!(
+            entry.tab_closed,
+            "a clean exit of the slot tab closes its row once a sibling can take the slot"
+        );
+        assert!(
+            !entry.agent_detached,
+            "a live sibling keeps the agent attached"
+        );
+        let session = &engine.sessions[0];
+        assert_eq!(
+            session.slot_tab_id().as_str(),
+            "t2",
+            "the slot moves to the next tab in strip order"
+        );
+        assert_eq!(
+            session.provider.as_str(),
+            "codex",
+            "the session's provider mirrors whichever tab holds the slot"
+        );
+        assert_eq!(
+            session.status,
+            SessionStatus::Active,
+            "the agent stays up while its sibling tab runs"
+        );
+        assert!(
+            !engine.agent_tabs.contains_key(TabIdRef::new("t2")),
+            "the promoted tab is the slot now, so it must not ALSO be an extra"
+        );
+        assert!(
+            engine.providers.contains_key(TabIdRef::new("t2")),
+            "the promoted tab keeps its process; nothing is re-keyed"
+        );
+        assert_eq!(
+            engine.tab_ids_for_session("s1"),
+            vec![TabId::new("t2")],
+            "the exited tab is gone from the strip"
+        );
+        assert_eq!(
+            engine.session_store.count_agent_tabs("s1").unwrap(),
+            1,
+            "the exited row is deleted, so a restart comes back with one tab"
+        );
+        assert_eq!(
+            engine.session_store.load_sessions().unwrap()[0].slot_tab_id,
+            "t2",
+            "the promotion is persisted"
+        );
+    }
+
+    /// A dormant sibling is still a sibling: the slot moves to it and the row
+    /// closes, and the agent detaches because the exit took its last live
+    /// process. Both halves, because one gesture does both.
+    #[test]
+    fn prune_promotes_a_dormant_sibling_and_still_detaches_the_agent() {
+        let (mut engine, _tmp) = test_engine();
+        let worktree = tempfile::tempdir().expect("worktree dir");
+        engine.projects.push(sample_project(
+            "p1",
+            worktree.path().to_string_lossy().as_ref(),
+        ));
+        let mut session = sample_session("s1", "p1", "feat");
+        session
+            .workspace
+            .as_managed_mut()
+            .expect("managed test session")
+            .worktree_path = worktree.path().to_string_lossy().to_string();
+        engine
+            .session_store
+            .create_session(&session)
+            .expect("persist the agent and its first tab");
+        let slot = session.slot_tab_id().to_owned();
+        engine.sessions.push(session);
+        engine.mark_session_status("s1", SessionStatus::Active);
+        let sibling = sample_tab("t2", "s1", "codex", 1);
+        engine
+            .session_store
+            .insert_agent_tab(&sibling)
+            .expect("persist the sibling tab");
+        engine.agent_tabs.insert(TabId::new("t2"), sibling);
+        engine.providers.insert(
+            slot.clone(),
+            PtyClient::spawn_with_env(
+                "sh",
+                &["-c".to_string(), "exit 0".to_string()],
+                worktree.path(),
+                24,
+                80,
+                100,
+                &[],
+            )
+            .expect("spawn sh"),
+        );
+        engine.note_pty_input(slot.as_str());
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let done = engine
+                .providers
+                .get_mut(slot.as_ref_id())
+                .is_some_and(|c| c.is_exited() && c.try_wait().is_some());
+            if done {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the slot tab's PTY never reached end of input"
+            );
+            sleep(Duration::from_millis(20));
+        }
+        let pruned = engine.prune_exited_ptys();
+
+        let entry = pruned
+            .iter()
+            .find(|p| p.id == slot.as_str())
+            .expect("the slot tab pruned");
+        assert!(entry.tab_closed, "a dormant tab can take the slot");
+        assert!(
+            entry.agent_detached,
+            "nothing of the agent is running any more"
+        );
+        assert_eq!(engine.sessions[0].slot_tab_id().as_str(), "t2");
+        assert_eq!(engine.sessions[0].status, SessionStatus::Detached);
+        assert!(
+            !engine.sessions[0].desired_running,
+            "a clean exit of the slot tab is the deliberate stop, so auto-reopen goes with it"
         );
     }
 
