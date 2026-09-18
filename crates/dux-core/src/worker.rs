@@ -405,16 +405,14 @@ pub enum WorkerEvent {
     /// busy status is guaranteed to reach `process_worker_event` ahead of
     /// any event the worker can produce.
     CommandWorkerStarted(StatusUpdate),
-    /// A recreate of an agent's working copy finished, so the verdict about its
-    /// directory is stale and, when the branch was minted again, its provenance
-    /// is too. Rides alongside the recreate's own status op, which is
-    /// closure-only and reaches neither the sessions nor the store.
+    /// A recreate of an agent's working copy finished, however it ended. Rides
+    /// alongside the recreate's own status op, which is closure-only and reaches
+    /// neither the sessions, the store nor the in-flight registry.
     WorkingCopyRecreated {
         session_id: String,
-        /// True only when dux created the branch again from the project's
-        /// source branch: that is the case where dux now owns a branch its
-        /// record still calls the user's.
-        branch_minted: bool,
+        /// `None` when the recreate failed. The in-flight guard is released
+        /// either way; only a success has a branch outcome to record.
+        outcome: Option<crate::working_copy::RecreatedBranch>,
     },
     /// A status a background poller produced, delivered through the worker lane
     /// so it reaches whichever surface is draining rather than only the one

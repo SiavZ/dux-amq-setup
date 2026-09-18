@@ -41,7 +41,9 @@ export function recreateConfirmBody(
     `puts the directory back, not its contents. The conversation may resume, ` +
     `because the agent's CLI keys its history by directory path and dux ` +
     `recreates the working copy at the same path.\n\n` +
-    `Anything still running keeps working in the deleted directory; stop it and ` +
-    `start the agent again to work in the recreated copy.`
+    `Its tabs are dormant and stay that way, because dux refuses this while ` +
+    `the agent is running. A terminal still open in the old directory keeps ` +
+    `working in a directory that is gone; close it and open one in the ` +
+    `recreated copy.`
   )
 }

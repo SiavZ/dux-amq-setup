@@ -1695,19 +1695,50 @@ pub struct RecreateWorkingCopyInputs {
 }
 
 impl Engine {
+    /// Whether a recreate is refused right now because the agent is still
+    /// running, and the sentence that says so.
+    ///
+    /// Its own question rather than a second meaning for "there is nothing to
+    /// recreate": the remedy is different and the user needs to be told it. The
+    /// predicate is the same any-tab rollup every other per-agent liveness
+    /// question asks.
+    pub fn recreate_working_copy_running_refusal(&self, session_id: &str) -> Option<String> {
+        if !self.any_tab_active(session_id) {
+            return None;
+        }
+        let label = self
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .map(|s| s.display_label())
+            .unwrap_or_else(|| session_id.to_string());
+        Some(format!(
+            "Agent \"{label}\" is still running in the directory that is gone, so dux left its \
+             working copy alone. Stop the agent first, then recreate the working copy and start \
+             it again."
+        ))
+    }
+
     /// What recreating this agent's working copy would involve, or `None` when
     /// there is nothing to recreate.
     ///
     /// Offered only for a MANAGED agent whose directory is gone: a standalone
     /// agent's folder is the user's and dux never creates one, and an agent
     /// whose working copy is there has nothing to put back.
+    ///
+    /// A tab with a live PTY is also `None`. Checking the branch out under a
+    /// process still running in the deleted directory gives that process a
+    /// directory it is not in, and it is what lets the success sentence promise
+    /// that the tabs stay dormant. Callers that raise a dialog ask
+    /// [`Self::recreate_working_copy_running_refusal`] first, so the user hears
+    /// the remedy rather than "there is nothing to recreate".
     pub fn recreate_working_copy_inputs(
         &self,
         session_id: &str,
     ) -> Option<RecreateWorkingCopyInputs> {
         let session = self.sessions.iter().find(|s| s.id == session_id)?;
         let managed = session.workspace.as_managed()?;
-        if !self.working_copy_missing(session_id) {
+        if !self.working_copy_missing(session_id) || self.any_tab_active(session_id) {
             return None;
         }
         Some(RecreateWorkingCopyInputs {
@@ -1725,13 +1756,23 @@ impl Engine {
     /// deliberately left dormant: a restart brings tabs back dormant, and this
     /// is a smaller thing than a restart.
     ///
-    /// Two presses in a row are not guarded: the second finds the directory it
-    /// is about to create already there and refuses out loud, which is a better
-    /// answer than a silent no-op.
+    /// A second press while the first is still working is refused here rather
+    /// than left to git: the verdict that gates the action only refreshes when
+    /// the recreate finishes, so the row stays on screen for the whole of it.
     pub fn begin_recreate_working_copy(
         &mut self,
         session_id: &str,
     ) -> anyhow::Result<crate::engine::EventReaction> {
+        if let Some(refusal) = self.recreate_working_copy_running_refusal(session_id) {
+            return Err(anyhow::anyhow!(refusal));
+        }
+        let in_flight = crate::engine::InFlightKey::RecreateWorkingCopy(session_id.to_string());
+        if self.is_in_flight(&in_flight) {
+            return Err(anyhow::anyhow!(
+                "dux is already recreating this agent's working copy. Wait for that to finish; \
+                 the status line says how it ended."
+            ));
+        }
         let inputs = self
             .recreate_working_copy_inputs(session_id)
             .ok_or_else(|| {
@@ -1795,6 +1836,7 @@ impl Engine {
         // event, sent from inside the same work closure.
         let completion_tx = self.worker_tx.clone();
         let completed_session = session_id.to_string();
+        self.mark_in_flight(in_flight);
         Ok(self.spawn_status_op(op, move || {
             let outcome = crate::working_copy::recreate_working_copy(
                 &repo_path,
@@ -1803,18 +1845,10 @@ impl Engine {
                 &source_branch,
             )
             .map_err(|err| format!("{err:#}"));
-            if let Ok(recreated) = &outcome {
-                let _ = completion_tx.send(crate::worker::WorkerEvent::WorkingCopyRecreated {
-                    session_id: completed_session,
-                    // Only the source-branch arm: a branch rebuilt from the
-                    // remote still exists there, and a local copy of somebody
-                    // else's branch is not one dux may force-delete.
-                    branch_minted: matches!(
-                        recreated,
-                        crate::working_copy::RecreatedBranch::RecreatedFrom(_)
-                    ),
-                });
-            }
+            let _ = completion_tx.send(crate::worker::WorkerEvent::WorkingCopyRecreated {
+                session_id: completed_session,
+                outcome: outcome.as_ref().ok().cloned(),
+            });
             outcome
         }))
     }
@@ -1900,6 +1934,63 @@ mod recreate_tests {
         assert!(message.contains("Add the project back"), "{message}");
     }
 
+    /// Checking a branch out under a process still running in the deleted
+    /// directory gives that process a directory it is not in, and it is what
+    /// lets the success sentence promise the tabs stay dormant.
+    #[test]
+    fn a_running_agent_is_refused_with_the_remedy_rather_than_recreated() {
+        let (mut engine, _tmp) = engine_with_a_missing_working_copy();
+        let tab = engine.slot_tab_id_of(crate::ids::SessionIdRef::new("s1"));
+        engine.mark_in_flight(crate::engine::InFlightKey::AgentLaunch(tab.to_owned()));
+
+        assert!(
+            engine.recreate_working_copy_inputs("s1").is_none(),
+            "the action does not exist while a tab is live"
+        );
+        let refusal = engine
+            .recreate_working_copy_running_refusal("s1")
+            .expect("and the reason is its own sentence");
+        assert!(refusal.contains("Stop the agent first"), "{refusal}");
+        assert!(refusal.contains("s1-title"), "{refusal}");
+
+        let Err(err) = engine.begin_recreate_working_copy("s1") else {
+            panic!("the dispatch refuses it too")
+        };
+        assert!(
+            format!("{err:#}").contains("Stop the agent first"),
+            "{err:#}"
+        );
+    }
+
+    /// The Missing verdict only refreshes when the recreate finishes, so the
+    /// row stays on screen for the whole of it and a second press would
+    /// otherwise reach the checkout.
+    #[test]
+    fn a_second_press_is_refused_while_the_first_recreate_runs() {
+        let (mut engine, _tmp) = engine_with_a_missing_working_copy();
+        engine
+            .begin_recreate_working_copy("s1")
+            .expect("the first press dispatches");
+
+        let Err(err) = engine.begin_recreate_working_copy("s1") else {
+            panic!("the second press is refused")
+        };
+        assert!(format!("{err:#}").contains("already recreating"), "{err:#}");
+
+        // And the guard is released however the recreate ended, so the next
+        // press works.
+        engine.process_worker_event(crate::worker::WorkerEvent::WorkingCopyRecreated {
+            session_id: "s1".to_string(),
+            outcome: None,
+        });
+        assert!(
+            !engine.is_in_flight(&crate::engine::InFlightKey::RecreateWorkingCopy(
+                "s1".to_string()
+            )),
+            "a failed recreate releases the guard too"
+        );
+    }
+
     /// A branch dux minted again from the source branch is dux's: the old
     /// lineage is gone from the repository, and a delete that read the stale
     /// provenance would leave behind a branch nobody else ever created.
@@ -1925,7 +2016,9 @@ mod recreate_tests {
         let reaction =
             engine.process_worker_event(crate::worker::WorkerEvent::WorkingCopyRecreated {
                 session_id: "s1".to_string(),
-                branch_minted: true,
+                outcome: Some(crate::working_copy::RecreatedBranch::RecreatedFrom(
+                    "main".to_string(),
+                )),
             });
         assert!(matches!(reaction, crate::engine::EventReaction::Nothing));
 
@@ -1973,7 +2066,7 @@ mod recreate_tests {
 
         engine.process_worker_event(crate::worker::WorkerEvent::WorkingCopyRecreated {
             session_id: "s1".to_string(),
-            branch_minted: false,
+            outcome: Some(crate::working_copy::RecreatedBranch::CheckedOut),
         });
 
         assert_eq!(

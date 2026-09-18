@@ -28,6 +28,13 @@ pub enum InFlightKey {
     /// question about the folder asks for a refresh, the web's changed-files
     /// poller included. Cleared by the `FolderRepoStatusReady` handler.
     FolderRepoProbe(String),
+    /// A working copy is being checked out again for this agent. Bounds it to
+    /// one at a time: the git work takes seconds, the action stays on screen
+    /// throughout because the Missing verdict only refreshes when the recreate
+    /// finishes, and a second press would otherwise reach the checkout. Cleared
+    /// by the `WorkingCopyRecreated` handler, which the worker sends whether the
+    /// recreate succeeded or failed.
+    RecreateWorkingCopy(String),
     ResourceStats,
     /// A one-shot PR check (foreground/refs-watcher/exit trigger) is running for
     /// this session id. Bounds concurrent `gh` subprocesses for one session (a

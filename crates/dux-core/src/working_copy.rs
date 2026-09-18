@@ -201,9 +201,10 @@ pub fn recreate_confirm_body(worktree: &Path, branch_name: &str, source_branch: 
          the commits that branch held are not coming back.\n\nAny code \
          changes that were in the old directory are gone either way: this puts the directory \
          back, not its contents. The conversation may resume, because the agent's CLI keys its \
-         history by directory path and dux recreates the working copy at the same path.\n\nAnything \
-         still running keeps working in the deleted directory; stop it and start the agent again \
-         to work in the recreated copy.",
+         history by directory path and dux recreates the working copy at the same path.\n\nIts tabs \
+         are dormant and stay that way, because dux refuses this while the agent is running. A \
+         terminal still open in the old directory keeps working in a directory that is gone; close \
+         it and open one in the recreated copy.",
         shorten_home(worktree)
     )
 }
@@ -297,8 +298,9 @@ mod tests {
              back.\n\nAny code changes that were in the old directory are gone either way: this \
              puts the directory back, not its contents. The conversation may resume, because the \
              agent's CLI keys its history by directory path and dux recreates the working copy at \
-             the same path.\n\nAnything still running keeps working in the deleted directory; \
-             stop it and start the agent again to work in the recreated copy."
+             the same path.\n\nIts tabs are dormant and stay that way, because dux refuses this \
+             while the agent is running. A terminal still open in the old directory keeps working \
+             in a directory that is gone; close it and open one in the recreated copy."
         );
     }
 
@@ -311,7 +313,10 @@ mod tests {
         assert!(body.contains("not coming back"), "{body}");
         assert!(body.contains("are gone either way"), "{body}");
         assert!(body.contains("same path"), "{body}");
-        assert!(body.contains("deleted directory"), "{body}");
+        assert!(
+            body.contains("refuses this while the agent is running"),
+            "{body}"
+        );
     }
 
     /// The branch is still in the repository: the working copy comes back at the

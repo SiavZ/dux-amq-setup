@@ -3254,12 +3254,21 @@ impl Engine {
     fn process_working_copy_recreated(
         &mut self,
         session_id: &str,
-        branch_minted: bool,
+        outcome: Option<&crate::working_copy::RecreatedBranch>,
     ) -> EventReaction {
-        // The copy is back, so the Missing verdict that gated the recreate,
-        // the pollers and the changes panel has to be asked again.
+        self.clear_in_flight(&InFlightKey::RecreateWorkingCopy(session_id.to_string()));
+        // The copy may be back, so the Missing verdict that gated the recreate,
+        // the pollers and the changes panel has to be asked again. Asked after
+        // a failure too: it is one stat, and it re-confirms the verdict the
+        // refusal was about.
         self.spawn_folder_repo_probe(session_id);
-        if !branch_minted {
+        // Only the source-branch arm mints a branch. One rebuilt from the
+        // remote still exists there, and a local copy of somebody else's branch
+        // is not one dux may force-delete.
+        if !matches!(
+            outcome,
+            Some(crate::working_copy::RecreatedBranch::RecreatedFrom(_))
+        ) {
             return EventReaction::Nothing;
         }
         let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) else {
@@ -3316,8 +3325,8 @@ impl Engine {
             }
             WorkerEvent::WorkingCopyRecreated {
                 session_id,
-                branch_minted,
-            } => self.process_working_copy_recreated(&session_id, branch_minted),
+                outcome,
+            } => self.process_working_copy_recreated(&session_id, outcome.as_ref()),
             WorkerEvent::CreateAgentProgress {
                 status_op_id,
                 message,

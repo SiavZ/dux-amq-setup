@@ -103,7 +103,7 @@ describe("ConfirmRecreateWorkingCopyDialog", () => {
     expect(body).toContain('from "main"')
     expect(body).toContain("are gone either way")
     expect(body).toContain("same path")
-    expect(body).toContain("keeps working in the deleted directory")
+    expect(body).toContain("refuses this while the agent is running")
   })
 
   it("recreates on confirm and closes itself", () => {

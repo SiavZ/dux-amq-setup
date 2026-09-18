@@ -1843,6 +1843,15 @@ impl App {
             self.set_error("Select an agent first, then run recreate-working-copy on it.");
             return Ok(());
         };
+        // Asked before the inputs, which answer None for a running agent too:
+        // the remedy is different and the user needs to hear it.
+        if let Some(refusal) = self
+            .engine
+            .recreate_working_copy_running_refusal(&session.id)
+        {
+            self.set_warning(refusal);
+            return Ok(());
+        }
         let Some(inputs) = self.engine.recreate_working_copy_inputs(&session.id) else {
             self.set_warning(format!(
                 "There is nothing to recreate for \"{}\": dux only recreates a working copy it \
@@ -5698,9 +5707,38 @@ mod tests {
         assert!(body.contains("are gone either way"), "{body}");
         assert!(body.contains("same path"), "{body}");
         assert!(
-            body.contains("keeps working in the deleted directory"),
+            body.contains("refuses this while the agent is running"),
             "{body}"
         );
+    }
+
+    /// The other refusal: a live tab means the remedy is "stop the agent", not
+    /// "there is nothing to recreate".
+    #[test]
+    fn recreate_working_copy_tells_a_running_agent_to_stop_first() {
+        let mut app =
+            crate::app::test_support::test_app(crate::app::test_support::default_bindings());
+        app.selected_left = 1;
+        let id = app.engine.sessions[0].id.clone();
+        app.engine
+            .folder_repo_statuses
+            .insert(id.clone(), dux_core::git::FolderRepoStatus::Missing);
+        let tab = app
+            .engine
+            .slot_tab_id_of(dux_core::ids::SessionIdRef::new(&id))
+            .to_owned();
+        app.engine
+            .mark_in_flight(dux_core::engine::InFlightKey::AgentLaunch(tab));
+
+        app.confirm_recreate_selected_working_copy()
+            .expect("dispatch");
+
+        assert!(
+            matches!(app.prompt, PromptState::None),
+            "nothing is confirmed while the agent runs"
+        );
+        let status = app.status.message();
+        assert!(status.contains("Stop the agent first"), "{status}");
     }
 
     /// Cancelling leaves the agent exactly as it was, and never touches git.
