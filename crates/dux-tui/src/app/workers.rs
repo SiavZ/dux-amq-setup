@@ -5,6 +5,7 @@ use dux_core::engine::{
     BeginDeleteSessionOutcome, BeginDeleteSessionView, DeleteTerminalView, DispatchAgentLaunchView,
     DoDeleteSessionView, EventReaction, FinishDeleteSessionView, ProjectPersistenceOutcome,
     ProjectPersistenceView, PrunedPty, PrunedPtyKind, StatusUpdate, WorktreeRemoval,
+    closed_tab_exit_notice,
 };
 
 use super::*;
@@ -15,24 +16,14 @@ impl PruneViewContext {
         let focused_tab = selected_session
             .as_ref()
             .map(|session_id| app.focused_tab_id(session_id));
-        // Every tab, slot tabs included: a clean exit hands the slot to a
-        // sibling, so the tab this names may no longer be the slot by the time
-        // the prune is read back and its sentence still has to name a provider.
-        let mut tab_providers: HashMap<String, String> = app
+        // Extra tabs only: a closed tab's sentence comes from the prune itself,
+        // and the slot tab's own exit is the agent's notice rather than a tab's.
+        let tab_providers: HashMap<String, String> = app
             .engine
             .agent_tabs
             .iter()
             .map(|(id, tab)| (id.as_str().to_string(), tab.provider.as_str().to_string()))
             .collect();
-        for session in &app.engine.sessions {
-            tab_providers.insert(
-                session.slot_tab_id().as_str().to_string(),
-                app.engine
-                    .tab_running_provider(session, session.slot_tab_id())
-                    .as_str()
-                    .to_string(),
-            );
-        }
         let selected_slot_tab = selected_session.as_ref().and_then(|session_id| {
             app.engine
                 .sessions
@@ -183,7 +174,7 @@ impl App {
                 .unwrap_or_default()
         });
         if pty.tab_closed {
-            self.apply_closed_agent_tab(pty, session_id, support_provider, was_focused_tab);
+            self.apply_closed_agent_tab(pty, session_id, was_focused_tab);
             true
         } else {
             self.apply_exited_agent_tab(support_provider, was_focused_tab);
@@ -191,15 +182,11 @@ impl App {
         }
     }
 
-    fn apply_closed_agent_tab(
-        &mut self,
-        pty: &PrunedPty,
-        session_id: &str,
-        support_provider: Option<String>,
-        was_focused_tab: bool,
-    ) {
-        if let Some(provider) = support_provider {
-            self.set_info(format!("Tab ({provider}) exited cleanly and was closed."));
+    fn apply_closed_agent_tab(&mut self, pty: &PrunedPty, session_id: &str, was_focused_tab: bool) {
+        // The prune's own account of the close, in the sentence the browser
+        // gets: the row is gone, so nothing here could look these facts up.
+        if let Some(closed) = &pty.closed_tab {
+            self.set_info(closed_tab_exit_notice(closed));
         }
         if !was_focused_tab {
             return;
@@ -1926,20 +1913,54 @@ mod tests {
         }
     }
 
-    /// The exit sentence names the provider of whichever tab went, and a slot
-    /// tab that exits cleanly has handed its slot away by the time the prune is
-    /// read back. Without the slot tab in the context the sentence names nobody.
+    /// A closed tab says the same sentence here as in the browser, out of the
+    /// prune's own account of the close: the row is gone, so the line cannot
+    /// look the tab's provider up again.
     #[test]
-    fn prune_context_names_the_slot_tabs_provider_too() {
-        let app = crate::app::test_support::test_app(crate::app::test_support::default_bindings());
-        let slot = app.engine.sessions[0].slot_tab_id().as_str().to_string();
-
+    fn a_closed_tab_exit_says_the_shared_sentence_on_the_status_line() {
+        let mut app =
+            crate::app::test_support::test_app(crate::app::test_support::default_bindings());
         let context = PruneViewContext::capture(&app);
+        let mut pty = PrunedPty {
+            kind: PrunedPtyKind::Agent,
+            id: "extra".to_string(),
+            owner: Some(dux_core::model::TerminalOwner::Session(
+                "session-1".to_string(),
+            )),
+            agent_detached: false,
+            label: "claude on feat".to_string(),
+            tab_closed: true,
+            exit_success: Some(true),
+            is_minimal: false,
+            output_excerpt: String::new(),
+            read_error: None,
+            refused_resume_excerpt: None,
+            closed_tab: Some(dux_core::engine::ClosedTabExit {
+                provider: "claude".to_string(),
+                agent_label: "feat".to_string(),
+                slot_provider: "codex".to_string(),
+                tabs_remaining: 1,
+            }),
+        };
 
+        app.apply_pruned_agent_tabs(std::slice::from_ref(&pty), &context);
+
+        let (_, message) = app.status.most_recent_tui().expect("a status");
         assert_eq!(
-            context.tab_providers.get(&slot).map(String::as_str),
-            Some("codex"),
-            "the slot tab's provider is in the context like every other tab's"
+            message,
+            "Tab (claude) of agent \"feat\" exited cleanly and was closed; the pane now shows its \
+             codex tab."
+        );
+
+        // A prune with no account of the close (an orphan PTY, whose session
+        // nothing can name) says nothing rather than half a sentence.
+        let mut fresh =
+            crate::app::test_support::test_app(crate::app::test_support::default_bindings());
+        pty.closed_tab = None;
+        fresh.apply_pruned_agent_tabs(std::slice::from_ref(&pty), &context);
+        assert!(
+            fresh.status.most_recent_tui().is_none(),
+            "an unattributable close names no tab and no agent"
         );
     }
 
@@ -1962,6 +1983,7 @@ mod tests {
             output_excerpt: String::new(),
             read_error: None,
             refused_resume_excerpt: None,
+            closed_tab: None,
         };
 
         let held_the_slot = Some("promoted-away");
@@ -3003,6 +3025,7 @@ mod tests {
             output_excerpt: "boom".to_string(),
             read_error: None,
             refused_resume_excerpt: None,
+            closed_tab: None,
         }
     }
 

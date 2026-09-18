@@ -283,6 +283,11 @@ pub struct PrunedPty {
     /// `None` leaves the ordinary exit wording alone. Always `None` for a
     /// companion terminal, which never resumes anything.
     pub refused_resume_excerpt: Option<Vec<String>>,
+    /// What the agent was left with when this exit closed the tab's row, for
+    /// the notice both surfaces word from [`closed_tab_exit_notice`]. `Some`
+    /// exactly when `tab_closed` is, and always `None` for a companion
+    /// terminal.
+    pub closed_tab: Option<ClosedTabExit>,
 }
 
 /// The facts `prune_exited_ptys` reads off a dying agent PTY in its first pass,
@@ -306,6 +311,55 @@ struct ExitedAgentPty {
     verdict_excerpt: Vec<String>,
     run_duration: Option<Duration>,
     read_error: Option<String>,
+}
+
+/// What a clean exit that CLOSED a tab's row left the agent with, captured at
+/// the prune so both surfaces word the same sentence from the same facts.
+///
+/// The exit deletes the row, so nothing downstream can look these up again: the
+/// provider is read before the teardown drops it, and the rest after the
+/// promotion, which is when they are true.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClosedTabExit {
+    /// The provider of the tab that exited.
+    pub provider: String,
+    /// The agent as both surfaces name it, since a tab notice for an agent the
+    /// user is not looking at has to say whose tab went.
+    pub agent_label: String,
+    /// The provider of the tab holding the slot now, which is what the pane
+    /// falls back to.
+    pub slot_provider: String,
+    /// How many tabs the agent has left, which is what decides whether a strip
+    /// is still on screen to show the pill leaving.
+    pub tabs_remaining: usize,
+}
+
+impl ClosedTabExit {
+    /// Whether the strip is the announcement: it renders from two tabs up, so
+    /// the pill leaving is visible and a sentence restating it is noise. Below
+    /// that the strip goes with the pill and nothing on screen says what
+    /// happened.
+    pub fn strip_announces(&self) -> bool {
+        self.tabs_remaining >= 2
+    }
+}
+
+/// The notice a clean exit that closed a row earns, in the one wording both
+/// surfaces use.
+///
+/// The closing clause is only written where it is certainly true: one tab left
+/// means the pane can only be showing that tab, while with siblings still up
+/// the user may be looking at any of them.
+pub fn closed_tab_exit_notice(exit: &ClosedTabExit) -> String {
+    let head = format!(
+        "Tab ({}) of agent \"{}\" exited cleanly and was closed",
+        exit.provider, exit.agent_label
+    );
+    if exit.tabs_remaining == 1 {
+        format!("{head}; the pane now shows its {} tab.", exit.slot_provider)
+    } else {
+        format!("{head}.")
+    }
 }
 
 /// Whether an exited agent tab's row should be closed along with the prune: any
@@ -712,6 +766,18 @@ impl Engine {
                 }
                 None => (None, tab_id.as_str().to_string()),
             };
+            // The agent's name and this tab's own provider, read before the
+            // teardown below drops the provider pin and before a promotion
+            // moves the session's mirror to a sibling.
+            let exited_facts = owning.as_deref().and_then(|sid| {
+                let session = self.sessions.iter().find(|s| s.id == sid)?;
+                Some((
+                    session.display_label(),
+                    self.tab_running_provider(session, tab_id.as_ref_id())
+                        .as_str()
+                        .to_string(),
+                ))
+            });
             // Whether anybody typed into this tab during THIS run, read before
             // the teardown below drops the stamp. `pty_input` is cleared with
             // the rest of a tab's runtime, so an entry here can only have been
@@ -821,6 +887,14 @@ impl Engine {
                     .is_none_or(|sid| self.successor_slot_tab(SessionIdRef::new(sid)).is_none());
             let tab_closed = clean_exit_closes_tab_row(is_only_tab, exit_success, ended_badly)
                 && self.close_exited_tab_row(owning.as_deref(), &tab_id, is_session_slot);
+            // Read AFTER the close, which is when the slot and the tab count
+            // are the ones the user is about to be told about.
+            let closed_tab = tab_closed
+                .then(|| {
+                    let (agent_label, provider) = exited_facts.as_ref()?;
+                    self.closed_tab_exit(owning.as_deref()?, agent_label, provider)
+                })
+                .flatten();
             pruned.push(PrunedPty {
                 kind: PrunedPtyKind::Agent,
                 id: tab_id.as_str().to_string(),
@@ -833,6 +907,7 @@ impl Engine {
                 output_excerpt,
                 read_error,
                 refused_resume_excerpt: refused_resume,
+                closed_tab,
             });
         }
 
@@ -873,10 +948,32 @@ impl Engine {
                 output_excerpt: String::new(),
                 read_error: None,
                 refused_resume_excerpt: None,
+                closed_tab: None,
             });
         }
 
         pruned
+    }
+
+    /// What a closed tab's notice is worded from, read after the row went: the
+    /// slot names whichever tab the pane falls back to, and the count says
+    /// whether a strip is left to show the pill leaving.
+    fn closed_tab_exit(
+        &self,
+        session_id: &str,
+        agent_label: &str,
+        provider: &str,
+    ) -> Option<ClosedTabExit> {
+        let session = self.sessions.iter().find(|s| s.id == session_id)?;
+        Some(ClosedTabExit {
+            provider: provider.to_string(),
+            agent_label: agent_label.to_string(),
+            slot_provider: self
+                .tab_running_provider(session, session.slot_tab_id())
+                .as_str()
+                .to_string(),
+            tabs_remaining: self.tab_ids_for_session(session_id).len(),
+        })
     }
 
     /// Close the row of a tab whose clean exit earned it, and report whether a
@@ -1581,6 +1678,7 @@ mod tests {
 
     use super::PrunedPtyKind;
     use super::TerminatingPty;
+    use super::{ClosedTabExit, closed_tab_exit_notice};
     use super::{RAPID_EXIT_WINDOW, rapid_exit_ends_run_badly, refused_resume_excerpt};
     use super::{REAPED_DRAIN_GRACE, agent_pty_ready_to_prune};
     use super::{format_shutdown_result, format_shutdown_start};
@@ -2027,6 +2125,41 @@ mod tests {
         );
     }
 
+    /// The sentence both surfaces say about a closed tab, in both shapes: with
+    /// one tab left the pane can only be showing it, and with siblings up the
+    /// user may be looking at any of them, so nothing is claimed.
+    #[test]
+    fn a_closed_tabs_notice_names_the_agent_and_what_the_pane_shows() {
+        let alone = ClosedTabExit {
+            provider: "claude".to_string(),
+            agent_label: "server-mode".to_string(),
+            slot_provider: "codex".to_string(),
+            tabs_remaining: 1,
+        };
+        assert_eq!(
+            closed_tab_exit_notice(&alone),
+            "Tab (claude) of agent \"server-mode\" exited cleanly and was closed; the pane now \
+             shows its codex tab."
+        );
+        assert!(
+            !alone.strip_announces(),
+            "one pill is no strip, so the sentence is the only word the user gets"
+        );
+
+        let with_siblings = ClosedTabExit {
+            tabs_remaining: 2,
+            ..alone
+        };
+        assert_eq!(
+            closed_tab_exit_notice(&with_siblings),
+            "Tab (claude) of agent \"server-mode\" exited cleanly and was closed."
+        );
+        assert!(
+            with_siblings.strip_announces(),
+            "the strip is on screen and the pill leaving it is the announcement"
+        );
+    }
+
     /// A clean exit of the SLOT tab while a sibling lives hands the slot to that
     /// sibling and closes the exited row, exactly as a user-initiated close
     /// does. Nothing about the survivor is re-keyed, and the agent stays up.
@@ -2146,6 +2279,16 @@ mod tests {
             engine.session_store.load_sessions().unwrap()[0].slot_tab_id,
             "t2",
             "the promotion is persisted"
+        );
+        assert_eq!(
+            entry.closed_tab,
+            Some(ClosedTabExit {
+                provider: "claude".to_string(),
+                agent_label: "s1-title".to_string(),
+                slot_provider: "codex".to_string(),
+                tabs_remaining: 1,
+            }),
+            "the notice is worded from the tab that went and the tab that took over"
         );
     }
 

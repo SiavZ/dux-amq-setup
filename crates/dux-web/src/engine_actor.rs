@@ -1897,11 +1897,12 @@ fn request_mutates_spine(req: &EngineRequest) -> bool {
 /// drift into telling a browser different things about the same exit.
 ///
 /// `None` is the answer whenever the row itself LEAVES the screen in the same
-/// sweep: the strip and the sidebar are what the user is looking at, and a toast
-/// restating a disappearance they just watched is noise. What survives is the
-/// case where something REMAINS and nothing else says why: a dormant tab whose
-/// row is still sitting there, and the workspace-level warning that the whole
-/// agent detached.
+/// sweep AND the surface it left is still there to have shown it going: the
+/// sidebar is always there, and the tab strip is there from two tabs up. What
+/// survives is the case where nothing else says why: a dormant tab whose row is
+/// still sitting there, the workspace-level warning that the whole agent
+/// detached, and a closed tab whose strip left with it, where the pane silently
+/// changes provider and no pill is on screen to have been seen leaving.
 fn prune_wire_status(pruned: &dux_core::engine::PrunedPty) -> Option<WireStatus> {
     match pruned.kind {
         // A last-tab exit detaches the whole agent, which is a workspace-level
@@ -1928,9 +1929,16 @@ fn prune_wire_status(pruned: &dux_core::engine::PrunedPty) -> Option<WireStatus>
                 })
                 .unwrap_or_else(|| format!("Agent \"{}\" exited.", pruned.label)),
         )),
-        // The tab closed itself on a clean exit, taking its pill out of the
-        // strip. The strip is the announcement.
-        PrunedPtyKind::Agent if pruned.tab_closed => None,
+        // The tab closed itself on a clean exit. Silent while a strip is left to
+        // have shown the pill leaving; otherwise this sentence is the only word
+        // the user gets, so it says which tab the pane holds now.
+        PrunedPtyKind::Agent if pruned.tab_closed => pruned
+            .closed_tab
+            .as_ref()
+            .filter(|closed| !closed.strip_announces())
+            .map(|closed| {
+                WireStatus::new("info", dux_core::engine::closed_tab_exit_notice(closed))
+            }),
         // The tab stays, dormant. Nothing else on screen distinguishes a pill
         // whose process just ended from one that was never launched, so this
         // sentence is the only word the user gets.
@@ -4268,6 +4276,7 @@ mod tests {
             output_excerpt: String::new(),
             read_error: None,
             refused_resume_excerpt: None,
+            closed_tab: None,
         }
     }
 
@@ -4681,6 +4690,14 @@ mod tests {
             output_excerpt: String::new(),
             read_error: None,
             refused_resume_excerpt: None,
+            // Two tabs left, so the strip is still on screen: the shape where a
+            // closed row needs no sentence.
+            closed_tab: tab_closed.then(|| dux_core::engine::ClosedTabExit {
+                provider: "claude".to_string(),
+                agent_label: "feat/x".to_string(),
+                slot_provider: "codex".to_string(),
+                tabs_remaining: 2,
+            }),
         }
     }
 
@@ -4710,6 +4727,30 @@ mod tests {
         assert_eq!(detached.tone, "warning");
         assert!(detached.message.contains("exited."));
         assert!(!detached.quiet_on.web);
+    }
+
+    /// The last pill leaving takes the strip with it, so the toast is the only
+    /// thing that says the tab went and that the pane is on a different
+    /// provider now.
+    #[test]
+    fn a_closed_tab_that_leaves_no_strip_behind_is_announced() {
+        let mut closed = pruned(PrunedPtyKind::Agent, false, true);
+        closed.closed_tab = Some(dux_core::engine::ClosedTabExit {
+            provider: "claude".to_string(),
+            agent_label: "feat/x".to_string(),
+            slot_provider: "codex".to_string(),
+            tabs_remaining: 1,
+        });
+
+        let status = prune_wire_status(&closed).expect("nothing else is left to say it");
+
+        assert_eq!(status.tone, "info");
+        assert_eq!(
+            status.message,
+            "Tab (claude) of agent \"feat/x\" exited cleanly and was closed; the pane now shows \
+             its codex tab."
+        );
+        assert!(!status.quiet_on.web);
     }
 
     /// A refused resume says so, in the provider's own words. The toast is the
