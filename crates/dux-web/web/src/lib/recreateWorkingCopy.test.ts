@@ -43,9 +43,11 @@ describe("recreateConfirmBody", () => {
   it("reads the same as the terminal UI's", () => {
     expect(recreateConfirmBody("~/worktrees/repo/feat", "feat", "main")).toBe(
       "Recreate the working copy for this agent at ~/worktrees/repo/feat?\n\n" +
-        'If branch "feat" still exists, dux checks it out there again. If it is ' +
-        'gone too, dux creates it again from "main", and the commits that branch ' +
-        "held are not coming back.\n\n" +
+        'If branch "feat" still exists locally, dux checks it out there again. ' +
+        'If it is gone locally but still on the remote, dux creates it again ' +
+        'from "origin/feat", holding everything that had been pushed. If it is ' +
+        'gone everywhere, dux creates it again from "main", and the commits ' +
+        "that branch held are not coming back.\n\n" +
         "Any code changes that were in the old directory are gone either way: " +
         "this puts the directory back, not its contents. The conversation may " +
         "resume, because the agent's CLI keys its history by directory path and " +

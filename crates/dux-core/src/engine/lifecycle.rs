@@ -1775,17 +1775,11 @@ impl Engine {
         let failure_path = worktree_path.clone();
         let op = crate::engine::status_op(crate::working_copy::recreate_busy_message(&agent_label))
             .on_success(move |outcome: &crate::working_copy::RecreatedBranch| {
-                let source = match outcome {
-                    crate::working_copy::RecreatedBranch::CheckedOut => None,
-                    crate::working_copy::RecreatedBranch::RecreatedFrom(source) => {
-                        Some(source.as_str())
-                    }
-                };
                 crate::engine::Final::info(crate::working_copy::recreate_success_message(
                     &success_label,
                     &success_path,
                     &success_branch,
-                    source,
+                    outcome,
                 ))
             })
             .on_failure(move |err: &String| {

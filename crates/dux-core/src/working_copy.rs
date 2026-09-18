@@ -22,8 +22,12 @@ pub enum RecreatedBranch {
     /// The branch was still in the repository and is checked out again. The
     /// agent's commits are exactly where it left them.
     CheckedOut,
-    /// The branch was gone too, so it was created again from the project's
-    /// source branch. It holds none of the commits it held before.
+    /// The branch was gone locally but still on the remote, so it was created
+    /// again from the remote-tracking ref. It holds everything that had been
+    /// pushed and nothing after that.
+    RecreatedFromRemote(String),
+    /// The branch was gone everywhere, so it was created again from the
+    /// project's source branch. It holds none of the commits it held before.
     RecreatedFrom(String),
 }
 
@@ -72,17 +76,39 @@ pub fn recreate_working_copy(
     // Only THIS path's registration: a repository-wide prune takes any sibling
     // agent whose directory is unreachable at that instant with it.
     crate::git::forget_missing_worktree_registration(repo_path, worktree_path)?;
-    if crate::git::branch_exists(repo_path, branch_name).is_some() {
-        crate::git::add_worktree_existing_branch_at(repo_path, worktree_path, branch_name)?;
-        return Ok(RecreatedBranch::CheckedOut);
+    // LOCAL only. `branch_exists` also answers Some for a branch that survives
+    // only as a remote-tracking ref, and checking that out would put the agent
+    // on a detached HEAD rather than on its branch. A branch that is gone
+    // locally but still on the remote gets its own arm, because its pushed
+    // commits are recoverable and starting again from the source branch would
+    // throw them away without saying so.
+    match crate::git::branch_exists(repo_path, branch_name) {
+        Some(crate::git::BranchLocation::Local) => {
+            crate::git::add_worktree_existing_branch_at(repo_path, worktree_path, branch_name)?;
+            Ok(RecreatedBranch::CheckedOut)
+        }
+        Some(crate::git::BranchLocation::Remote) => {
+            let remote_ref = format!("refs/remotes/origin/{branch_name}");
+            crate::git::add_worktree_new_branch_at(
+                repo_path,
+                worktree_path,
+                branch_name,
+                Some(&remote_ref),
+            )?;
+            Ok(RecreatedBranch::RecreatedFromRemote(format!(
+                "origin/{branch_name}"
+            )))
+        }
+        None => {
+            crate::git::add_worktree_new_branch_at(
+                repo_path,
+                worktree_path,
+                branch_name,
+                Some(source_branch),
+            )?;
+            Ok(RecreatedBranch::RecreatedFrom(source_branch.to_string()))
+        }
     }
-    crate::git::add_worktree_new_branch_at(
-        repo_path,
-        worktree_path,
-        branch_name,
-        Some(source_branch),
-    )?;
-    Ok(RecreatedBranch::RecreatedFrom(source_branch.to_string()))
 }
 
 /// Why the changes region is quiet for a MANAGED agent whose working copy is
@@ -163,14 +189,16 @@ pub fn quiet_reason(
 /// conversation may survive because the coding CLIs key their history by
 /// directory path, which is the whole reason the working copy is recreated at
 /// the SAME path rather than a fresh one.
-/// Both branch arms are stated because asking git which one applies would run a
-/// subprocess to open a dialog. The final status names the arm that actually
-/// ran.
+/// All three branch arms are stated because asking git which one applies would
+/// run a subprocess to open a dialog. The final status names the arm that
+/// actually ran.
 pub fn recreate_confirm_body(worktree: &Path, branch_name: &str, source_branch: &str) -> String {
     format!(
         "Recreate the working copy for this agent at {}?\n\nIf branch \"{branch_name}\" still \
-         exists, dux checks it out there again. If it is gone too, dux creates it again from \
-         \"{source_branch}\", and the commits that branch held are not coming back.\n\nAny code \
+         exists locally, dux checks it out there again. If it is gone locally but still on the \
+         remote, dux creates it again from \"origin/{branch_name}\", holding everything that had \
+         been pushed. If it is gone everywhere, dux creates it again from \"{source_branch}\", and \
+         the commits that branch held are not coming back.\n\nAny code \
          changes that were in the old directory are gone either way: this puts the directory \
          back, not its contents. The conversation may resume, because the agent's CLI keys its \
          history by directory path and dux recreates the working copy at the same path.\n\nAnything \
@@ -185,20 +213,29 @@ pub fn recreate_busy_message(agent_label: &str) -> String {
     format!("Recreating the working copy for agent \"{agent_label}\"...")
 }
 
-/// The success sentence, naming the path and what happened to the branch.
-/// `source_branch` is `Some` only when the branch had to be created again.
+/// The success sentence, naming the path and what actually happened to the
+/// branch.
+///
+/// Takes the outcome rather than an optional start point so the three arms
+/// cannot collapse into two: a branch rebuilt from the remote holds the agent's
+/// own pushed commits, and a branch rebuilt from the source branch holds none
+/// of them, which is not a difference to leave to a caller's `Option`.
 pub fn recreate_success_message(
     agent_label: &str,
     worktree: &Path,
     branch_name: &str,
-    source_branch: Option<&str>,
+    outcome: &RecreatedBranch,
 ) -> String {
-    let branch_outcome = match source_branch {
-        Some(source) => format!(
+    let branch_outcome = match outcome {
+        RecreatedBranch::RecreatedFrom(source) => format!(
             "branch \"{branch_name}\" was recreated from \"{source}\", so it holds none of the \
              commits it held before"
         ),
-        None => format!("branch \"{branch_name}\" was checked out again"),
+        RecreatedBranch::RecreatedFromRemote(remote) => format!(
+            "branch \"{branch_name}\" was gone locally and was recreated from \"{remote}\", so it \
+             holds what had been pushed there and nothing committed after that"
+        ),
+        RecreatedBranch::CheckedOut => format!("branch \"{branch_name}\" was checked out again"),
     };
     format!(
         "Recreated the working copy for agent \"{agent_label}\" at {}: {branch_outcome}. Its \
@@ -253,8 +290,10 @@ mod tests {
         assert_eq!(
             recreate_confirm_body(Path::new("/worktrees/repo/feat"), "feat", "main"),
             "Recreate the working copy for this agent at /worktrees/repo/feat?\n\n\
-             If branch \"feat\" still exists, dux checks it out there again. If it is gone too, \
-             dux creates it again from \"main\", and the commits that branch held are not coming \
+             If branch \"feat\" still exists locally, dux checks it out there again. If it is \
+             gone locally but still on the remote, dux creates it again from \"origin/feat\", \
+             holding everything that had been pushed. If it is gone everywhere, dux creates it \
+             again from \"main\", and the commits that branch held are not coming \
              back.\n\nAny code changes that were in the old directory are gone either way: this \
              puts the directory back, not its contents. The conversation may resume, because the \
              agent's CLI keys its history by directory path and dux recreates the working copy at \
@@ -267,6 +306,7 @@ mod tests {
     fn the_confirm_says_the_changes_are_gone_on_both_branch_outcomes() {
         let body = recreate_confirm_body(Path::new("/tmp/wt"), "feat", "main");
         assert!(body.contains("checks it out there again"), "{body}");
+        assert!(body.contains("from \"origin/feat\""), "{body}");
         assert!(body.contains("from \"main\""), "{body}");
         assert!(body.contains("not coming back"), "{body}");
         assert!(body.contains("are gone either way"), "{body}");
@@ -344,6 +384,58 @@ mod tests {
             status.status.success(),
             "and its directory still works: {}",
             String::from_utf8_lossy(&status.stderr)
+        );
+    }
+
+    /// A branch that survives only as a remote-tracking ref is NOT checked out:
+    /// `branch_exists` answers Some for one, and taking the checkout arm would
+    /// leave the agent on a detached HEAD rather than on its branch. It gets its
+    /// own arm, because the commits it pushed are recoverable and starting again
+    /// from the source branch would throw them away silently.
+    #[test]
+    fn a_branch_that_survives_only_on_the_remote_is_recreated_from_the_remote() {
+        let (repo, worktree) = repo_with_a_deleted_worktree();
+        // Give the repository an origin pointing at itself, so the agent's
+        // branch has somewhere to have been pushed, then delete it locally.
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", &repo.path().to_string_lossy()],
+        );
+        run_git(repo.path(), &["fetch", "-q", "origin"]);
+        crate::git::forget_missing_worktree_registration(repo.path(), &worktree)
+            .expect("forget the registration");
+        run_git(repo.path(), &["branch", "-D", "--", "feat"]);
+        assert_eq!(
+            crate::git::branch_exists(repo.path(), "feat"),
+            Some(crate::git::BranchLocation::Remote),
+            "precondition: the branch is gone locally and still on the remote"
+        );
+
+        let outcome = recreate_working_copy(repo.path(), &worktree, "feat", "main")
+            .expect("the remote-tracking ref is there");
+        assert_eq!(
+            outcome,
+            RecreatedBranch::RecreatedFromRemote("origin/feat".to_string())
+        );
+        assert!(
+            worktree.join("on-the-branch.txt").exists(),
+            "the pushed commits came back"
+        );
+        let head = crate::git::test_support::git_command()
+            .args([
+                "-C",
+                &worktree.to_string_lossy(),
+                "symbolic-ref",
+                "--quiet",
+                "--short",
+                "HEAD",
+            ])
+            .output()
+            .expect("git runs");
+        assert_eq!(
+            String::from_utf8_lossy(&head.stdout).trim(),
+            "feat",
+            "and the agent is on its branch, not a detached HEAD"
         );
     }
 
@@ -444,11 +536,39 @@ mod tests {
 
     #[test]
     fn the_success_message_names_the_path_and_the_branch_outcome() {
-        let checked_out = recreate_success_message("v0", Path::new("/tmp/wt"), "feat", None);
+        let checked_out = recreate_success_message(
+            "v0",
+            Path::new("/tmp/wt"),
+            "feat",
+            &RecreatedBranch::CheckedOut,
+        );
         assert!(checked_out.contains("/tmp/wt"), "{checked_out}");
         assert!(checked_out.contains("checked out again"), "{checked_out}");
         assert!(checked_out.contains("dormant"), "{checked_out}");
-        let minted = recreate_success_message("v0", Path::new("/tmp/wt"), "feat", Some("main"));
+        let minted = recreate_success_message(
+            "v0",
+            Path::new("/tmp/wt"),
+            "feat",
+            &RecreatedBranch::RecreatedFrom("main".to_string()),
+        );
         assert!(minted.contains("recreated from \"main\""), "{minted}");
+        assert!(minted.contains("none of the"), "{minted}");
+        // The remote arm must not read like either of the other two: the pushed
+        // commits are back, and only what was never pushed is gone.
+        let from_remote = recreate_success_message(
+            "v0",
+            Path::new("/tmp/wt"),
+            "feat",
+            &RecreatedBranch::RecreatedFromRemote("origin/feat".to_string()),
+        );
+        assert!(
+            from_remote.contains("recreated from \"origin/feat\""),
+            "{from_remote}"
+        );
+        assert!(
+            from_remote.contains("what had been pushed"),
+            "{from_remote}"
+        );
+        assert!(!from_remote.contains("none of the"), "{from_remote}");
     }
 }
