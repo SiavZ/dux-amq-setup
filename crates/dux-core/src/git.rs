@@ -1223,6 +1223,22 @@ pub fn create_worktree_existing_branch(
 /// The path-taking half of [`create_worktree_existing_branch`], which derives
 /// its path from the worktrees root. Recreating a working copy has to land on
 /// the path the agent already has, so it needs this one.
+///
+/// The `--` separator makes git read the name as a REF, and that is all it
+/// does: git still declines to ATTACH a dash-leading one. MEASURED on git 2.55
+/// against a `refs/heads/--force` created with `update-ref`:
+///
+/// ```text
+/// $ git worktree add ../wt -- --force
+/// Preparing worktree (detached HEAD 3427328)
+/// ```
+///
+/// Exit 0, right commit, wrong HEAD. The DWIM that turns a commit-ish into a
+/// checked-out branch only fires for a plain name, and a fully qualified
+/// `refs/heads/<name>` does not rescue it: measured the same way, that form
+/// detaches for an ORDINARY branch too, and it also loses the DWIM that gives a
+/// remote-only branch a local tracking branch. So the branch is attached in a
+/// second step, `git switch -- <name>`, whose own separator is enough.
 pub fn add_worktree_existing_branch_at(
     repo_path: &Path,
     worktree_path: &Path,
@@ -1252,6 +1268,12 @@ pub fn add_worktree_existing_branch_at(
             "git worktree add failed: {}",
             String::from_utf8_lossy(&output.stderr)
         ));
+    }
+    // Attach the branch the add left detached. Gated on the local ref so a
+    // commit-ish naming a tag keeps checking out detached, as it does today.
+    let attached = current_branch_opt(worktree_path).unwrap_or(None);
+    if attached.as_deref() != Some(branch_name) && local_branch_exists(repo_path, branch_name) {
+        switch_branch(worktree_path, branch_name)?;
     }
     Ok(worktree_path
         .canonicalize()
@@ -6072,6 +6094,41 @@ mod tests {
             !worktrees_root.join("proj").join("--force").exists(),
             "no worktree should have been created"
         );
+    }
+
+    /// The `--` makes git read the name as a ref, but it does not make git
+    /// ATTACH it. Measured on git 2.55 against a `update-ref`-created
+    /// `refs/heads/--force`: `git worktree add <path> -- --force` prints
+    /// "Preparing worktree (detached HEAD ...)" and exits 0. The recreate path
+    /// decouples the worktree path from the branch name, so this shape is
+    /// reachable and the previous test's path-derived refusal does not cover it.
+    #[test]
+    fn add_worktree_existing_branch_at_attaches_an_option_looking_branch() {
+        let repo = init_test_repo();
+        let head = head_commit(repo.path()).unwrap();
+        // Plumbing, because `git branch` refuses a dash-leading name.
+        run_git(repo.path(), &["update-ref", "refs/heads/--force", &head]);
+        let worktree = repo.path().join("recreated");
+        add_worktree_existing_branch_at(repo.path(), &worktree, "--force").unwrap();
+        assert_eq!(
+            current_branch_opt(&worktree).unwrap().as_deref(),
+            Some("--force"),
+            "the worktree must be ON the branch, not on a detached HEAD"
+        );
+    }
+
+    /// The `-b` slot is positional too, so a dash-leading NEW branch name
+    /// reaches `worktree add`'s internal `git branch` as a flag. Measured on
+    /// git 2.55: exit 255, "unknown switch `x'", and nothing left on disk. Loud
+    /// rather than silent, so there is nothing to fix; pinned so a later git
+    /// that starts obeying the flag is a failing test rather than a surprise.
+    #[test]
+    fn add_worktree_new_branch_at_refuses_an_option_looking_new_branch() {
+        let repo = init_test_repo();
+        let worktree = repo.path().join("minted");
+        let result = add_worktree_new_branch_at(repo.path(), &worktree, "-x", Some("HEAD"));
+        assert!(result.is_err(), "expected a refused add: {result:?}");
+        assert!(!worktree.exists(), "no worktree should have been created");
     }
 
     #[test]
