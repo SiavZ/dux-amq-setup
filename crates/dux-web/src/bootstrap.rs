@@ -172,6 +172,7 @@ pub fn bootstrap_engine(paths: &DuxPaths) -> Result<Engine> {
         resumed_tab_runs: HashSet::new(),
         pending_deletions: HashSet::new(),
         folder_repo_statuses: HashMap::new(),
+        changed_files_failures: Default::default(),
         closing_sessions: HashSet::new(),
         deletion_busy_messages: HashMap::new(),
         watched_worktree: Arc::new(Mutex::new(None::<PathBuf>)),

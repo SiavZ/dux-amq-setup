@@ -2892,6 +2892,40 @@ mod tests {
         assert!(app.pending_reconnect_ops.is_empty());
     }
 
+    /// A standing git failure in the background poller reaches the status line.
+    /// It used to reach nothing at all here while the browser raised a warning
+    /// about the same repository, which is two screens for one fact.
+    #[test]
+    fn a_standing_changed_files_failure_reaches_the_status_line() {
+        let mut app =
+            crate::app::test_support::test_app(crate::app::test_support::default_bindings());
+        let worktree = std::path::PathBuf::from("/tmp/wt-current");
+        let session_id = app.engine.sessions[0].id.clone();
+        *app.engine.watched_worktree.lock().expect("lock") = Some(worktree.clone());
+        app.engine.watched_session_id = Some(session_id.clone());
+
+        for _ in 0..dux_core::changes_status::ERROR_WARN_THRESHOLD {
+            let reaction =
+                app.engine
+                    .process_worker_event(dux_core::worker::WorkerEvent::ChangedFilesReady {
+                        outcome: Err("git status failed: index.lock exists".to_string()),
+                        worktree: worktree.clone(),
+                    });
+            app.apply_reaction(reaction);
+        }
+
+        assert!(
+            app.status.message().contains("temporarily unavailable"),
+            "got {}",
+            app.status.message()
+        );
+        assert!(
+            app.status.snapshot().iter().any(|s| s.key.as_deref()
+                == Some(dux_core::changes_status::warn_key(&session_id).as_str())),
+            "the warning carries the shared key, so the recovery replaces it"
+        );
+    }
+
     /// When no reconnect op is stashed, the ready/failed handlers fall back to an
     /// ANONYMOUS final with byte-identical wording, preserving pre-op behavior.
     #[test]

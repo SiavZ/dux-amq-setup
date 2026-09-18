@@ -180,6 +180,7 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
         resumed_tab_runs: std::collections::HashSet::new(),
         pending_deletions: std::collections::HashSet::new(),
         folder_repo_statuses: std::collections::HashMap::new(),
+        changed_files_failures: Default::default(),
         closing_sessions: std::collections::HashSet::new(),
         deletion_busy_messages: std::collections::HashMap::new(),
         watched_worktree: Arc::new(Mutex::new(None::<PathBuf>)),

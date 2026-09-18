@@ -57,10 +57,6 @@ const POLL_RESTART_BACKOFF: Duration = Duration::from_secs(1);
 /// e.g. a reconnect, does not throw away a still-valid entry).
 const EVICT_GRACE: Duration = Duration::from_secs(30);
 
-/// Consecutive compute errors for one session before a keyed `Warning` status is
-/// raised (cleared by a keyed success on the next good compute).
-const ERROR_WARN_THRESHOLD: usize = 3;
-
 /// Lock a `Mutex` poison-tolerantly. These maps are plain caches whose invariants
 /// the next compute re-establishes, so recovering the inner guard beats
 /// propagating one panic across every interested session.
@@ -125,12 +121,6 @@ pub struct ChangesService {
     /// Single-flight registry: a session id maps to a receiver that flips `true`
     /// when the owning compute finishes (success or cancellation).
     inflight: Mutex<HashMap<String, watch::Receiver<bool>>>,
-    /// Consecutive-error streaks per session, for the keyed `Warning` escalation.
-    error_streak: Mutex<HashMap<String, usize>>,
-    /// Sessions whose error streak reached [`ERROR_WARN_THRESHOLD`] and so emitted a
-    /// keyed `Warning`. Only these get a recovery info on the next good compute, so
-    /// a blip that never warned leaves no orphaned recovery toast.
-    warning_emitted: Mutex<HashSet<String>>,
     /// First time each cache entry was seen with zero interest, for grace eviction.
     uninterested_since: Mutex<HashMap<String, Instant>>,
     /// Monotonic invalidation generation, bumped by [`Self::invalidate`] after a git
@@ -152,8 +142,6 @@ impl ChangesService {
             bus,
             cache: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
-            error_streak: Mutex::new(HashMap::new()),
-            warning_emitted: Mutex::new(HashSet::new()),
             uninterested_since: Mutex::new(HashMap::new()),
             invalidation_gen: AtomicU64::new(0),
             compute_count: AtomicUsize::new(0),
@@ -295,11 +283,6 @@ impl ChangesService {
         }
         // Drop grace timers for sessions whose cache entry is already gone.
         since.retain(|k, _| cache.contains_key(k));
-        // Prune per-session bookkeeping for sessions no longer cached so an evicted
-        // (e.g. deleted) session leaves nothing behind. Bounded to currently-cached
-        // sessions, mirroring the grace-timer retain above.
-        lock(&self.error_streak).retain(|k, _| cache.contains_key(k));
-        lock(&self.warning_emitted).retain(|k| cache.contains_key(k));
     }
 
     /// Serve the cached changed files, computing under single-flight on a miss.
@@ -560,7 +543,7 @@ impl ChangesService {
                     "changed-files compute failed for session {session_id}: {message}"
                 ));
                 // A genuine git failure must replace a now-stale success (`clobber_ok`).
-                self.store_err(session_id, rev, generation, message, true);
+                let _ = self.store_err(session_id, rev, generation, message, true);
             }
             Err(join_err) => {
                 let rev = self.engine.next_changes_rev(session_id.to_string()).await;
@@ -568,7 +551,7 @@ impl ChangesService {
                 dux_core::logger::error(&format!(
                     "changed-files compute task failed for session {session_id}: {join_err}"
                 ));
-                self.store_err(session_id, rev, generation, message, true);
+                let _ = self.store_err(session_id, rev, generation, message, true);
             }
         }
     }
@@ -659,6 +642,8 @@ impl ChangesService {
     /// clobbered by a giving-up timeout, which would surface a spurious 409. A
     /// timeout that thus declines to overwrite a concurrent success is not a real
     /// error for this session and does not escalate the warning streak.
+    /// Answers whether the failure was actually reported to the engine, which
+    /// is what a declined timeout must not do.
     fn store_err(
         self: &Arc<Self>,
         session_id: &str,
@@ -666,7 +651,7 @@ impl ChangesService {
         generation: u64,
         message: String,
         clobber_ok: bool,
-    ) {
+    ) -> bool {
         let stored = {
             let mut cache = lock(&self.cache);
             // Keep the higher rev (a stale error must not clobber a newer entry),
@@ -694,27 +679,21 @@ impl ChangesService {
         // and must not escalate the streak; a real error always does (its streak
         // tracking is independent of whether a higher-rev entry won the store race).
         if !stored && !clobber_ok {
-            return;
+            return false;
         }
 
-        let streak = {
-            let mut streaks = lock(&self.error_streak);
-            let n = streaks.entry(session_id.to_string()).or_insert(0);
-            *n += 1;
-            *n
-        };
-        if streak == ERROR_WARN_THRESHOLD {
-            // Record that a warning was actually shown for this session so the
-            // recovery info only fires for sessions that saw a warning.
-            lock(&self.warning_emitted).insert(session_id.to_string());
-            self.engine.emit_status(WireStatus::keyed(
-                warn_key(session_id),
-                "warning",
-                format!(
-                    "Changed files for this agent are temporarily unavailable (git busy): {message}"
-                ),
-            ));
-        }
+        // The streak, the threshold and the sentence belong to the engine, which
+        // the terminal UI's own poller feeds too: one failing repository must not
+        // produce two different screens. The status it decides to raise travels
+        // the engine's worker lane, so it reaches whichever surface is draining.
+        let engine = self.engine.clone();
+        let session_id = session_id.to_string();
+        tokio::spawn(async move {
+            engine
+                .note_changed_files_outcome(session_id, Some(message))
+                .await;
+        });
+        true
     }
 
     /// Reset a session's error streak; emit the keyed recovery info ONLY when a
@@ -722,19 +701,11 @@ impl ChangesService {
     /// the threshold). A 1-2 error blip that never showed a warning therefore does
     /// not leave an orphaned recovery toast.
     fn reset_error_streak(self: &Arc<Self>, session_id: &str) {
-        lock(&self.error_streak).remove(session_id);
-        let had_warning = lock(&self.warning_emitted).remove(session_id);
-        if had_warning {
-            // Replace the warning with a success on the same key so the toast
-            // resolves and auto-clears instead of lingering.
-            self.engine.emit_status(WireStatus::keyed(
-                warn_key(session_id),
-                "info",
-                "Changed files are back: git had been failing for this worktree and the latest \
-                 check succeeded."
-                    .to_string(),
-            ));
-        }
+        let engine = self.engine.clone();
+        let session_id = session_id.to_string();
+        tokio::spawn(async move {
+            engine.note_changed_files_outcome(session_id, None).await;
+        });
     }
 
     /// Total git computes run (test instrumentation for the single-flight test).
@@ -742,11 +713,6 @@ impl ChangesService {
     pub fn compute_count(&self) -> usize {
         self.compute_count.load(Ordering::SeqCst)
     }
-}
-
-/// The keyed-status key for a session's changed-files error escalation.
-fn warn_key(session_id: &str) -> String {
-    format!("changes-error:{session_id}")
 }
 
 /// Project a `ChangedFile` to its wire view (the `from_file` projection in
@@ -947,8 +913,8 @@ mod tests {
         let svc = ChangesService::new(engine, bus);
         let mut statuses = svc.engine.subscribe_status();
 
-        for rev in 1..=ERROR_WARN_THRESHOLD as u64 {
-            svc.store_err("s1", rev, 0, "git busy".to_string(), true);
+        for rev in 1..=u64::from(dux_core::changes_status::ERROR_WARN_THRESHOLD) {
+            let _ = svc.store_err("s1", rev, 0, "git busy".to_string(), true);
         }
         let warning = loop {
             let status = statuses.recv().await.expect("a status");
@@ -971,7 +937,10 @@ mod tests {
             "Changed files are back: git had been failing for this worktree and the latest \
              check succeeded."
         );
-        assert_eq!(recovery.key.as_deref(), Some(warn_key("s1").as_str()));
+        assert_eq!(
+            recovery.key.as_deref(),
+            Some(dux_core::changes_status::warn_key("s1").as_str())
+        );
     }
 
     #[tokio::test]
@@ -1089,20 +1058,18 @@ mod tests {
         // A poll-tick timeout error mints a HIGHER rev (it ran later) but must NOT
         // overwrite the concurrent success: `clobber_ok = false`. Otherwise a GET
         // would see a spurious 409 over a perfectly good result.
-        svc.store_err("s1", 6, 0, "timed out".to_string(), false);
+        let escalated = svc.store_err("s1", 6, 0, "timed out".to_string(), false);
         match lock(&svc.cache).get("s1") {
             Some(Cached::Ok { rev, .. }) => assert_eq!(*rev, 5, "the fresh Ok must survive"),
             _ => panic!("a timeout error clobbered a concurrent success"),
         }
-        // It also must not escalate the error streak (nothing was actually wrong).
-        assert!(
-            lock(&svc.error_streak).get("s1").copied().unwrap_or(0) == 0,
-            "a declined timeout must not bump the error streak"
-        );
+        // It also must not report a failure (nothing was actually wrong), or the
+        // shared streak would count a timeout that overwrote nothing.
+        assert!(!escalated, "a declined timeout must not report a failure");
 
         // A GENUINE git error (`clobber_ok = true`) with a higher rev DOES replace
         // the stale success, so a real failure still surfaces as 409.
-        svc.store_err("s1", 7, 0, "git failed".to_string(), true);
+        let _ = svc.store_err("s1", 7, 0, "git failed".to_string(), true);
         match lock(&svc.cache).get("s1") {
             Some(Cached::Err { rev, .. }) => assert_eq!(*rev, 7, "a real error must win"),
             _ => panic!("a real git error should replace the stale Ok"),

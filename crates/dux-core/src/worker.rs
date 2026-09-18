@@ -405,6 +405,10 @@ pub enum WorkerEvent {
     /// busy status is guaranteed to reach `process_worker_event` ahead of
     /// any event the worker can produce.
     CommandWorkerStarted(StatusUpdate),
+    /// A status a background poller produced, delivered through the worker lane
+    /// so it reaches whichever surface is draining rather than only the one
+    /// that raised it. The web's changed-files service is the producer today.
+    PollerStatus(StatusUpdate),
     /// A progress update emitted while an agent is being created/forked/attached.
     /// `status_op_id` is the opaque id of the shared create-agent `HandlerStatusOp`
     /// (see `Engine::pending_create_ops`); the handler looks the op up and re-emits

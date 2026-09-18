@@ -473,6 +473,12 @@ pub struct Engine {
     /// mutations. Read it through [`Engine::folder_repo_status`], never
     /// directly, so that default can never be forgotten.
     pub folder_repo_statuses: HashMap<String, crate::git::FolderRepoStatus>,
+    /// The changed-files failure streaks, shared by BOTH pollers.
+    ///
+    /// One tracker so the terminal UI and the web say the same thing about the
+    /// same failing repository. Fed through
+    /// [`Engine::note_changed_files_outcome`], never directly.
+    pub changed_files_failures: crate::changes_status::ChangedFilesFailures,
     /// Session IDs whose worktree-removing delete has committed to tearing down
     /// but whose worktree has not yet been removed (the whole grace window from
     /// `begin_delete_session` through `WorktreeRemoveCompleted`). Unlike
@@ -2649,6 +2655,42 @@ impl Engine {
             .get(session_id)
             .copied()
             .unwrap_or(default)
+    }
+
+    /// Record what a changed-files read answered for one agent, and hand back
+    /// the status it owes, if any.
+    ///
+    /// The ONE place either poller escalates. It returns rather than emits
+    /// because its two callers reach their surfaces differently: the terminal
+    /// UI's poller turns this into an [`EventReaction`], while the web's changes
+    /// service posts it onto the engine's worker lane so whichever surface is
+    /// draining shows it. Both end up saying the same sentence on the same key.
+    pub fn note_changed_files_outcome(
+        &mut self,
+        session_id: &str,
+        failure: Option<&str>,
+    ) -> Option<StatusUpdate> {
+        match failure {
+            Some(message) => self
+                .changed_files_failures
+                .record_failure(session_id, message),
+            None => self.changed_files_failures.record_success(session_id),
+        }
+    }
+
+    /// Record a changed-files outcome for a poller that is not the one draining
+    /// worker events, and queue whatever status it owes on the engine's own
+    /// worker lane.
+    ///
+    /// The web's changes service runs on the tokio side and cannot produce an
+    /// [`EventReaction`]; going out through its own emitter instead would reach
+    /// browsers only, and the terminal UI would never learn that the same
+    /// repository is failing. The worker lane is the one road both surfaces
+    /// already drain.
+    pub fn post_changed_files_outcome(&mut self, session_id: &str, failure: Option<&str>) {
+        if let Some(status) = self.note_changed_files_outcome(session_id, failure) {
+            let _ = self.worker_tx.send(WorkerEvent::PollerStatus(status));
+        }
     }
 
     /// Whether a MANAGED agent's working copy is gone from disk.

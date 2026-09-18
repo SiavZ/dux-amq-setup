@@ -171,6 +171,11 @@ pub enum EngineRequest {
         String,
         oneshot::Sender<Option<dux_core::engine::SessionGitAccess>>,
     ),
+    /// What a changed-files read answered for one agent: `None` for a success,
+    /// `Some(message)` for a failure. The ENGINE owns the streak and the
+    /// sentences, and queues whatever status it owes on its own worker lane, so
+    /// the terminal UI sees the same warning this browser does.
+    NoteChangedFilesOutcome(String, Option<String>),
     /// The runtime PTY key a pane's addressed id names, resolving the bare
     /// per-agent spelling of a slot tab the way the agent PTY socket does.
     /// `None` when nothing answers to the id.
@@ -1235,6 +1240,15 @@ impl EngineHandle {
         rx.await.unwrap_or(None)
     }
 
+    /// See [`EngineRequest::NoteChangedFilesOutcome`]. Fire and forget: the
+    /// status it may produce travels the engine's worker lane, not this call.
+    pub async fn note_changed_files_outcome(&self, session_id: String, failure: Option<String>) {
+        let _ = self
+            .req_tx
+            .send(EngineRequest::NoteChangedFilesOutcome(session_id, failure))
+            .await;
+    }
+
     pub async fn session_git_access(
         &self,
         session_id: String,
@@ -1877,7 +1891,10 @@ fn request_mutates_spine(req: &EngineRequest) -> bool {
         | EngineRequest::ReadRawConfig(..)
         | EngineRequest::WriteRawConfig(..)
         | EngineRequest::FirstLoadInputs(..)
-        | EngineRequest::RefreshChangedFiles(..) => false,
+        | EngineRequest::RefreshChangedFiles(..)
+        // The changed-files failure streak is engine state no `SpineView` field
+        // reads; the status it may raise travels the worker lane.
+        | EngineRequest::NoteChangedFilesOutcome(..) => false,
 
         // Broadcast on the status channels only. Statuses are their own transport
         // (toasts on the web); no spine field carries them.
@@ -3680,6 +3697,9 @@ fn handle_request(
         }
         EngineRequest::SessionBranchDeleteInputs(session_id, reply) => {
             let _ = reply.send(engine.branch_delete_inputs(&session_id));
+        }
+        EngineRequest::NoteChangedFilesOutcome(session_id, failure) => {
+            engine.post_changed_files_outcome(&session_id, failure.as_deref());
         }
         EngineRequest::SessionGitAccess(session_id, reply) => {
             // Refresh first: the probe is off-thread, so this call answers with

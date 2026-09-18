@@ -1550,6 +1550,9 @@ impl Engine {
         // still-exists check; this is the other half, for the verdict already
         // stored.
         self.folder_repo_statuses.remove(&session.id);
+        // So does the changed-files failure streak: an agent that is gone owes
+        // no recovery for a warning about a repository nobody is watching.
+        self.changed_files_failures.forget(&session.id);
         // The detach state goes with the session too, so a later session that
         // reuses the id does not inherit a detach it never asked for.
         self.pr_suppressions.remove(&session.id);
@@ -2373,10 +2376,9 @@ impl Engine {
         >,
         worktree: std::path::PathBuf,
     ) -> EventReaction {
-        let Ok((staged, unstaged)) = outcome else {
-            return EventReaction::Nothing;
-        };
-        // Poll results can outlive their watch and must not replace another worktree's files.
+        // Poll results can outlive their watch and must not replace another
+        // worktree's files, nor report a failure about a watch that has moved
+        // on.
         let still_watched = self
             .watched_worktree
             .lock()
@@ -2386,9 +2388,34 @@ impl Engine {
         if !still_watched {
             return EventReaction::Nothing;
         }
+        let session_id = self.watched_session_id.clone();
+        let (staged, unstaged) = match outcome {
+            Ok(lists) => lists,
+            Err(message) => {
+                // A read git could not answer must not be flattened into "no
+                // changes": blanking the pane would say the worktree is clean
+                // when dux has no idea what is in it. What the user gets
+                // instead is the shared streak's sentence, the same one the
+                // browser gets, on the same key.
+                crate::logger::error(&format!(
+                    "changed-files poll failed for {}: {message}",
+                    worktree.display()
+                ));
+                return session_id
+                    .and_then(|id| self.note_changed_files_outcome(&id, Some(&message)))
+                    .map_or(EventReaction::Nothing, EventReaction::Status);
+            }
+        };
+        let recovery = session_id.and_then(|id| self.note_changed_files_outcome(&id, None));
         self.staged_files = staged;
         self.unstaged_files = unstaged;
-        EventReaction::ClampFilesCursor
+        match recovery {
+            Some(status) => EventReaction::Multi(vec![
+                EventReaction::ClampFilesCursor,
+                EventReaction::Status(status),
+            ]),
+            None => EventReaction::ClampFilesCursor,
+        }
     }
 
     fn process_pull_completed(
@@ -3239,7 +3266,9 @@ impl Engine {
     /// The engine never mutates view state directly.
     pub fn process_worker_event(&mut self, event: WorkerEvent) -> EventReaction {
         match event {
-            WorkerEvent::CommandWorkerStarted(status) => EventReaction::Status(status),
+            WorkerEvent::CommandWorkerStarted(status) | WorkerEvent::PollerStatus(status) => {
+                EventReaction::Status(status)
+            }
             WorkerEvent::CreateAgentProgress {
                 status_op_id,
                 message,
@@ -5090,7 +5119,8 @@ mod tests {
 
     /// A read git could not answer must not be flattened into "no changes":
     /// blanking the pane would tell the user their worktree is clean when dux
-    /// has no idea what is in it.
+    /// has no idea what is in it. A blip is also silent: the streak is what
+    /// says something is actually wrong.
     #[test]
     fn changed_files_ready_failure_leaves_the_lists_alone() {
         let (mut engine, _tmp) = test_engine();
@@ -5107,6 +5137,68 @@ mod tests {
         assert!(matches!(reaction, EventReaction::Nothing));
         assert_eq!(engine.staged_files[0].path, "keep-staged.txt");
         assert_eq!(engine.unstaged_files[0].path, "keep-unstaged.txt");
+    }
+
+    /// The terminal UI's own poller used to go quiet on a standing git failure
+    /// while the browser raised a warning about the same repository. Both now
+    /// come from the one tracker, so they say the same sentence on the same key.
+    #[test]
+    fn a_standing_changed_files_failure_reaches_the_status_line() {
+        let (mut engine, _tmp) = test_engine();
+        let worktree = PathBuf::from("/tmp/wt-current");
+        engine
+            .sessions
+            .push(crate::engine::test_support::sample_session(
+                "s1", "p1", "b1",
+            ));
+        *engine.watched_worktree.lock().unwrap() = Some(worktree.clone());
+        engine.watched_session_id = Some("s1".to_string());
+
+        let mut warnings = Vec::new();
+        for _ in 0..crate::changes_status::ERROR_WARN_THRESHOLD {
+            let reaction = engine.process_worker_event(WorkerEvent::ChangedFilesReady {
+                outcome: Err("git status failed: index.lock exists".to_string()),
+                worktree: worktree.clone(),
+            });
+            if let EventReaction::Status(status) = reaction {
+                warnings.push(status);
+            }
+        }
+
+        assert_eq!(warnings.len(), 1, "a streak warns once, not once per cycle");
+        let warning = &warnings[0];
+        assert_eq!(warning.tone, crate::statusline::StatusTone::Warning);
+        assert_eq!(
+            warning.key.as_deref(),
+            Some(crate::changes_status::warn_key("s1").as_str())
+        );
+        assert!(
+            warning.message.contains("index.lock exists"),
+            "{}",
+            warning.message
+        );
+
+        // And the recovery rides the same key, so the surfaces replace rather
+        // than stack.
+        let reaction = engine.process_worker_event(WorkerEvent::ChangedFilesReady {
+            outcome: Ok((Vec::new(), Vec::new())),
+            worktree,
+        });
+        let EventReaction::Multi(parts) = reaction else {
+            panic!("a recovering read owes both a repaint and a status")
+        };
+        let recovered = parts
+            .iter()
+            .find_map(|part| match part {
+                EventReaction::Status(status) => Some(status),
+                _ => None,
+            })
+            .expect("the recovery status");
+        assert_eq!(recovered.tone, crate::statusline::StatusTone::Info);
+        assert_eq!(
+            recovered.key.as_deref(),
+            Some(crate::changes_status::warn_key("s1").as_str())
+        );
     }
 
     #[test]
