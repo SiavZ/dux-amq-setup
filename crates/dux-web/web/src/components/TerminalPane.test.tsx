@@ -19,7 +19,10 @@ import {
 import { installXtermMouseModel } from "@/lib/xtermMouseModel"
 import { VIEWER_MIN_FONT_SIZE } from "@/lib/viewerFit"
 import { replayWaitMs } from "@/lib/connectionTiming"
-import { REPLAY_WAIT_POLL_MS } from "@/components/terminal/constants"
+import {
+  HANDOFF_GRACE_MS,
+  REPLAY_WAIT_POLL_MS,
+} from "@/components/terminal/constants"
 import {
   COARSE_POINTER_QUERY,
   stubCoarsePointer,
@@ -581,6 +584,22 @@ function installStubs() {
   )
 }
 
+// An agent tab's failed socket holds its picture for `HANDOFF_GRACE_MS` in case
+// a promotion is about to take the pane away, so a test about the box waits that
+// window out. A terminal has no such hold and never needs this.
+async function passHandoffGrace(): Promise<void> {
+  const past = HANDOFF_GRACE_MS + 50
+  if (vi.isFakeTimers()) {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(past)
+    })
+    return
+  }
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, past))
+  })
+}
+
 function last(): FakePtySocket {
   const inst = FakePtySocket.instances.at(-1)
   if (!inst) throw new Error("no PtySocket constructed")
@@ -631,9 +650,10 @@ describe.each([
   { kind: "agent" as const, id: "s1" },
   { kind: "terminal" as const, id: "t1" },
 ])("TerminalPane connectionLost affordance ($kind)", ({ kind, id }) => {
-  it("shows the Reconnect affordance on 'failed' without doubling the spinner", () => {
+  it("shows the Reconnect affordance on 'failed' without doubling the spinner", async () => {
     render(<TerminalPane {...paneProps(kind, id)} />)
     last().emit("failed")
+    await passHandoffGrace()
     expect(screen.getByText("Connection lost.")).toBeTruthy()
     expect(screen.getByText("Reconnect")).toBeTruthy()
     // The connection-lost block replaces (does not stack with) the reconnecting
@@ -641,10 +661,11 @@ describe.each([
     expect(screen.queryByText("Reconnecting…")).toBeNull()
   })
 
-  it("Reconnect calls the pane's OWN socket.connect() (not an epoch no-op)", () => {
+  it("Reconnect calls the pane's OWN socket.connect() (not an epoch no-op)", async () => {
     render(<TerminalPane {...paneProps(kind, id)} />)
     const pty = last()
     pty.emit("failed")
+    await passHandoffGrace()
     // Ignore the connect() the wiring effect already fired on mount; the button
     // must fire a fresh one on THIS socket. For a companion terminal an
     // epoch-only reconnect would never reach here; that is the regression.
@@ -653,10 +674,11 @@ describe.each([
     expect(pty.connect).toHaveBeenCalledTimes(1)
   })
 
-  it("clears the affordance once the socket reopens ('open')", () => {
+  it("clears the affordance once the socket reopens ('open')", async () => {
     render(<TerminalPane {...paneProps(kind, id)} />)
     const pty = last()
     pty.emit("failed")
+    await passHandoffGrace()
     expect(screen.getByText("Connection lost.")).toBeTruthy()
     pty.emit("open")
     expect(screen.queryByText("Connection lost.")).toBeNull()
@@ -1326,7 +1348,7 @@ describe("TerminalPane take-over is a fresh attach", () => {
     expect(SPINNER_FRAMES).toContain(spinner.textContent)
   })
 
-  it("shows the Reconnect affordance, not the take-over card, on a dead socket", () => {
+  it("shows the Reconnect affordance, not the take-over card, on a dead socket", async () => {
     const pty = mountSettled()
     act(() => pty.onConnected("conn-self"))
     act(() => notifyPtyOwner("s1", "conn-other"))
@@ -1337,6 +1359,7 @@ describe("TerminalPane take-over is a fresh attach", () => {
     // socket that is not there.
     act(() => pty.onReconnecting())
     pty.emit("failed")
+    await passHandoffGrace()
     expect(screen.getByText("Connection lost.")).toBeTruthy()
     expect(screen.queryByText("Take over")).toBeNull()
     pty.connect.mockClear()
@@ -5085,12 +5108,13 @@ describe("TerminalPane gates its floating overlay on the cover", () => {
     expect(mounted).not.toHaveBeenCalled()
   })
 
-  it("hides it under a box cover, which owns the whole pane", () => {
+  it("hides it under a box cover, which owns the whole pane", async () => {
     render(
       <TerminalPane kind="agent" id="s1" sessionId="s1" overlay={overlay} />,
     )
     mounted.mockClear()
     last().emit("failed")
+    await passHandoffGrace()
     expect(screen.getByText("Connection lost.")).toBeTruthy()
     expect(screen.queryByTestId("pane-overlay")).toBeNull()
     expect(mounted).not.toHaveBeenCalled()
@@ -5154,9 +5178,10 @@ describe("TerminalPane publishes its cover verdict", () => {
     expect(paneCoverOwnedFor("other-tab")).toBe(false)
   })
 
-  it("says the Reconnect box owns the pane", () => {
+  it("says the Reconnect box owns the pane", async () => {
     render(<TerminalPane kind="agent" id="s1" sessionId="s1" />)
     act(() => last().emit("failed"))
+    await passHandoffGrace()
     expect(screen.getByText("Connection lost.")).toBeTruthy()
     expect(paneCoverOwnedFor("s1")).toBe(true)
   })
@@ -5390,9 +5415,11 @@ describe("a promoted-away slot tab hands its pane over", () => {
     const terminals = TermStub.instances.length
 
     // The provider exited: the server closes this socket with the
-    // provider-gone code, which lands here as `failed`.
+    // provider-gone code, which lands here as `failed`. The box is HELD, because
+    // the spine's promotion is about to take this pane away (measured in the
+    // preview container: the socket closes about 900ms before the spine says so).
     first.emit("failed")
-    expect(screen.getByText("Connection lost.")).toBeTruthy()
+    expect(screen.queryByText("Connection lost.")).toBeNull()
 
     mockState = promotionState(true)
     view.rerender(<TerminalArea />)

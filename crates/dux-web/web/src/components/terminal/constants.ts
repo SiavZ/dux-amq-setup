@@ -25,6 +25,15 @@ export const WHEEL_SCROLL_SENSITIVITY = 3
 /// already fired. The poll exists only while there is something to wait for.
 export const REPLAY_WAIT_POLL_MS = 1000
 
+/// How long an agent tab's failed socket holds the picture it has before the
+/// connection-lost box goes up. A provider that exits takes its socket down at
+/// once and its row a moment later, so for that moment the box is up over a
+/// pane that is about to be replaced by the tab that took the slot. Measured in
+/// the preview container: the promotion reaches the browser about 900ms after
+/// the close, so the hold is comfortably longer and still short enough that a
+/// real disconnection is reported promptly.
+export const HANDOFF_GRACE_MS = 1500
+
 /// How long the container must hold still before its new size goes to the PTY.
 /// A PTY resize is a SIGWINCH, a full child repaint, so it is debounced to one
 /// send with the final dimensions, and the SAME delay is reused when a

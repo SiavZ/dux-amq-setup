@@ -20,6 +20,10 @@ export type AttachCoverInputs = {
   /// replay. Always false when the wait is configured to zero.
   waitExpired: boolean
   isOwner: boolean
+  /// This pane's tab may be on its way out: an agent tab's socket failed moments
+  /// ago, and a provider that exited cleanly hands its slot to a sibling and
+  /// takes this pane with it. False for a terminal, which has no such handover.
+  handoffGrace: boolean
   /// This pane has never had a screen: no replay has been applied on this mount.
   /// It is what "Attaching…" versus "Reconnecting…" turns on, a fact about the
   /// picture rather than about the socket: nothing has appeared yet, or what
@@ -42,6 +46,10 @@ export type AttachCover =
   | { kind: "card" }
 
 export function attachCover(input: AttachCoverInputs): AttachCover {
+  // The picture this pane already has, held for as long as the tab behind it
+  // might be handing over. The box would otherwise go up and be gone again with
+  // the pane, which reads as a fault rather than as a tab that ended.
+  if (input.socket === "failed" && input.handoffGrace) return { kind: "none" }
   // A socket that has given up for good outranks everything, the card included:
   // a watcher whose socket died would otherwise see only "Take over" and never
   // learn the connection is gone. While the app-wide overlay is up it owns this

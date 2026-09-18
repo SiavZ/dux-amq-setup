@@ -82,7 +82,10 @@ import { plainBounce } from "@/components/terminal/plainBounce"
 import {
   useViewerGrid,
 } from "@/components/terminal/viewerGrid"
-import { REPLAY_WAIT_POLL_MS } from "@/components/terminal/constants"
+import {
+  HANDOFF_GRACE_MS,
+  REPLAY_WAIT_POLL_MS,
+} from "@/components/terminal/constants"
 import { suspendTerminalTabStop } from "@/components/terminal/inputWiring"
 import { registerPaneCover } from "@/lib/paneCover"
 import { registerPaneInputGroup } from "@/lib/paneInputGroup"
@@ -521,6 +524,9 @@ export function TerminalPane(props: TerminalPaneProps) {
   // There is one periodic client frame and one timer behind it (`lib/heartbeat.ts`);
   // gaining ownership retimes that timer rather than adding a second sender.
 
+  // Only an agent tab can be handed over; a terminal's socket failing is only
+  // ever a fault, so its box goes up at once.
+  const handoffGrace = useHandoffGrace(kind === "agent" && connectionLost)
   const cover = attachCover({
     socket: connectionLost ? "failed" : reconnecting ? "connecting" : "open",
     replayApplied,
@@ -529,6 +535,7 @@ export function TerminalPane(props: TerminalPaneProps) {
     waitExpired: replayWaitExpired,
     isOwner,
     firstAttach: appliedEpoch === null,
+    handoffGrace,
   })
 
   // Publish whether the cover speaks for the whole pane, under this pane's pty
@@ -800,6 +807,24 @@ function terminalInputLayout(input: TerminalInputLayoutInputs) {
     menuHasItems,
     topInputGates,
   }
+}
+
+// Whether a just-failed agent socket is still inside the window a promotion
+// would land in. Armed during render, so the box never paints for one frame on
+// its way to being held, and released by the clock or by the socket coming back.
+function useHandoffGrace(failing: boolean): boolean {
+  const [holding, setHolding] = useState(false)
+  const [wasFailing, setWasFailing] = useState(failing)
+  if (failing !== wasFailing) {
+    setWasFailing(failing)
+    setHolding(failing)
+  }
+  useEffect(() => {
+    if (!holding) return
+    const timer = setTimeout(() => setHolding(false), HANDOFF_GRACE_MS)
+    return () => clearTimeout(timer)
+  }, [holding])
+  return holding
 }
 
 function useEverReady(hasOutput: boolean): boolean {

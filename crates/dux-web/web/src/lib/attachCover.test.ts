@@ -16,7 +16,30 @@ const settled: AttachCoverInputs = {
   waitExpired: false,
   isOwner: true,
   firstAttach: false,
+  handoffGrace: false,
 }
+
+describe("a socket that failed while its tab may be handing over", () => {
+  const failed: AttachCoverInputs = { ...settled, socket: "failed" }
+
+  it("holds the picture it has rather than painting the box", () => {
+    // A provider that exits cleanly takes its socket down at once and its row a
+    // moment later, so this is what the pane shows for that moment.
+    expect(attachCover({ ...failed, handoffGrace: true })).toEqual({ kind: "none" })
+  })
+
+  it("paints the box once the hold is over and the pane is still here", () => {
+    expect(attachCover(failed)).toEqual({ kind: "box", reason: "lost" })
+  })
+
+  it("holds nothing over a watcher's card while the app is offline", () => {
+    // The offline overlay owns that signal, and the hold has nothing to do with
+    // it: a socket that failed while globally offline was never handing over.
+    expect(attachCover({ ...failed, offline: true, isOwner: false })).toEqual({
+      kind: "card",
+    })
+  })
+})
 
 describe("the settled pane", () => {
   it("is uncovered", () => {
