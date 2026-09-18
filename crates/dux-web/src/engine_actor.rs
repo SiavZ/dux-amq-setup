@@ -2803,7 +2803,14 @@ pub(crate) fn run_engine_loop(
                             control.set_mode_detached(next_tailscale, move |outcome| {
                                 let report = outcome.report(next_tailscale);
                                 let tone = if report.warning { "warning" } else { "info" };
-                                let _ = status.send(WireStatus::new(tone, report.message));
+                                // The same key the terminal UI's mode change
+                                // uses, so one answer per change whichever
+                                // surface asked for it.
+                                let _ = status.send(WireStatus::keyed(
+                                    dux_core::tailscale::MODE_CHANGE_STATUS_KEY,
+                                    tone,
+                                    report.message,
+                                ));
                             });
                         }
                     }
