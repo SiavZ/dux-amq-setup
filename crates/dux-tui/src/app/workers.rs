@@ -3570,4 +3570,75 @@ mod tests {
             app.status.text()
         );
     }
+
+    /// A detach the user ASKED for is not an agent falling over, and must not be
+    /// announced as one while a different agent is selected.
+    ///
+    /// The two travel different roads (a detach moves its processes to the
+    /// terminating set, so the exit prune never sees them), and this is what
+    /// keeps them apart: one deliberate act, one sentence.
+    #[test]
+    fn a_deliberate_detach_of_an_unselected_agent_says_only_that_it_detached() {
+        let worktree = tempdir().expect("worktree");
+        let mut app =
+            crate::app::test_support::test_app(crate::app::test_support::default_bindings());
+        let selected = app
+            .selected_session()
+            .expect("test_app selects an agent")
+            .id
+            .clone();
+        let mut other = test_session(worktree.path());
+        other.id = "session-2".to_string();
+        other.slot_tab_id = "session-2-slot".to_string();
+        other.title = Some("the other agent".to_string());
+        app.engine.sessions.push(other);
+        assert_ne!(
+            selected, "session-2",
+            "the detached agent is not the selected one"
+        );
+        app.engine.providers.insert(
+            dux_core::ids::TabId::new("session-2-slot"),
+            crate::pty::PtyClient::spawn("cat", &[], worktree.path(), 24, 80, 1000)
+                .expect("spawn provider"),
+        );
+
+        let dux_core::engine::DetachSessionOutcome::Started { busy, .. } =
+            app.engine.begin_detach_session("session-2")
+        else {
+            panic!("a live agent detaches");
+        };
+        assert!(
+            !app.engine
+                .providers
+                .contains_key(dux_core::ids::TabIdRef::new("session-2-slot")),
+            "the detach takes the process out of the set the exit prune reads"
+        );
+        app.status.set(
+            std::time::Instant::now(),
+            Some(dux_core::engine::detach_status_key("session-2")),
+            dux_core::statusline::StatusTone::Busy,
+            busy,
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.status.tone() == dux_core::statusline::StatusTone::Busy {
+            app.apply_reaped_terminations();
+            app.apply_pruned_pty_events();
+            assert!(
+                !app.status.text().contains("exited"),
+                "a detach the user asked for is not an exit to report: {}",
+                app.status.text()
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the detach outcome never reached the status line"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            app.status.text().contains("detached"),
+            "the one sentence is the detach's own: {}",
+            app.status.text()
+        );
+    }
 }
