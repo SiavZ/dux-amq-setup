@@ -69,7 +69,9 @@ pub fn recreate_working_copy(
     }
     // git still holds the registration of the directory the agent deleted, and
     // with it the branch as checked out, so both arms below fail without this.
-    crate::git::prune_worktrees(repo_path)?;
+    // Only THIS path's registration: a repository-wide prune takes any sibling
+    // agent whose directory is unreachable at that instant with it.
+    crate::git::forget_missing_worktree_registration(repo_path, worktree_path)?;
     if crate::git::branch_exists(repo_path, branch_name).is_some() {
         crate::git::add_worktree_existing_branch_at(repo_path, worktree_path, branch_name)?;
         return Ok(RecreatedBranch::CheckedOut);
@@ -293,7 +295,8 @@ mod tests {
     #[test]
     fn a_deleted_branch_is_minted_again_from_the_source_branch() {
         let (repo, worktree) = repo_with_a_deleted_worktree();
-        crate::git::prune_worktrees(repo.path()).expect("prune");
+        crate::git::forget_missing_worktree_registration(repo.path(), &worktree)
+            .expect("forget the registration so the branch can be deleted");
         run_git(repo.path(), &["branch", "-D", "feat"]);
 
         let outcome = recreate_working_copy(repo.path(), &worktree, "feat", "main")
@@ -303,6 +306,44 @@ mod tests {
         assert!(
             !worktree.join("on-the-branch.txt").exists(),
             "a branch minted from main holds none of the agent's commits"
+        );
+    }
+
+    /// The regression that made the prune targeted. Measured on git 2.55:
+    /// `git worktree prune` removes EVERY registration whose directory is
+    /// unreachable at that instant, so recreating one agent's working copy while
+    /// a sibling's directory was merely renamed away severed the sibling
+    /// permanently, and moving its directory back left `git status` in it
+    /// answering "not a git repository".
+    #[test]
+    fn recreating_one_working_copy_leaves_a_sibling_on_an_unreachable_path_alone() {
+        let (repo, worktree) = repo_with_a_deleted_worktree();
+        let sibling = repo.path().join("wt").join("v1");
+        crate::git::add_worktree_new_branch_at(repo.path(), &sibling, "other", Some("main"))
+            .expect("the sibling agent's working copy");
+        let stashed = repo.path().join("wt").join("v1-unreachable");
+        std::fs::rename(&sibling, &stashed).expect("the sibling's mount goes away");
+
+        recreate_working_copy(repo.path(), &worktree, "feat", "main").expect("the recreate runs");
+
+        std::fs::rename(&stashed, &sibling).expect("the sibling's mount comes back");
+        let listed = crate::git::test_support::git_command()
+            .args(["-C", &repo.path().to_string_lossy(), "worktree", "list"])
+            .output()
+            .expect("git runs");
+        let listing = String::from_utf8_lossy(&listed.stdout);
+        assert!(
+            listing.contains("[other]"),
+            "the sibling's registration survived: {listing}"
+        );
+        let status = crate::git::test_support::git_command()
+            .args(["-C", &sibling.to_string_lossy(), "status", "--porcelain=v1"])
+            .output()
+            .expect("git runs");
+        assert!(
+            status.status.success(),
+            "and its directory still works: {}",
+            String::from_utf8_lossy(&status.stderr)
         );
     }
 
@@ -356,8 +397,12 @@ mod tests {
         assert!(managed.contains("mounted"), "{managed}");
         assert!(!managed.contains("no longer exists"), "{managed}");
 
-        let folder = quiet_reason(FolderRepoStatus::Indeterminate, Path::new("/mnt/mine"), false)
-            .expect("an unreachable folder is quiet");
+        let folder = quiet_reason(
+            FolderRepoStatus::Indeterminate,
+            Path::new("/mnt/mine"),
+            false,
+        )
+        .expect("an unreachable folder is quiet");
         assert_eq!(folder, FolderRepoStatus::Indeterminate.quiet_reason());
     }
 

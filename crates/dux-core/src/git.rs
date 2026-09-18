@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1257,25 +1258,135 @@ pub fn add_worktree_existing_branch_at(
         .unwrap_or_else(|_| worktree_path.to_path_buf()))
 }
 
-/// Forget the worktree registrations whose directories are gone.
+/// One worktree registration, as `git worktree list --porcelain -z` reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeRegistration {
+    /// The directory git has this worktree registered at.
+    pub path: PathBuf,
+    /// git's own verdict that the directory behind this registration is gone.
+    pub prunable: bool,
+}
+
+/// Parse `git worktree list --porcelain -z` output into registrations.
+///
+/// `-z` rather than plain `--porcelain`, measured rather than assumed: plain
+/// porcelain writes the path raw and separates records with a blank line, so a
+/// worktree whose path contains a newline is indistinguishable from two
+/// records. Under `-z` every attribute is NUL-terminated and an empty attribute
+/// ends the record, which a path cannot forge.
+pub fn parse_worktree_registrations(output: &[u8]) -> Vec<WorktreeRegistration> {
+    let mut registrations = Vec::new();
+    let mut current: Option<WorktreeRegistration> = None;
+    for field in output.split(|byte| *byte == 0) {
+        if field.is_empty() {
+            if let Some(done) = current.take() {
+                registrations.push(done);
+            }
+            continue;
+        }
+        if let Some(path) = field.strip_prefix(b"worktree ") {
+            if let Some(done) = current.take() {
+                registrations.push(done);
+            }
+            current = Some(WorktreeRegistration {
+                path: PathBuf::from(std::ffi::OsString::from_vec(path.to_vec())),
+                prunable: false,
+            });
+        } else if (field == b"prunable" || field.starts_with(b"prunable "))
+            && let Some(entry) = current.as_mut()
+        {
+            entry.prunable = true;
+        }
+    }
+    if let Some(done) = current.take() {
+        registrations.push(done);
+    }
+    registrations
+}
+
+/// Forget the registration of ONE worktree whose directory is already gone.
 ///
 /// Needed before re-adding a worktree at a path whose directory was deleted:
-/// git refuses with "missing but already registered worktree", and it holds the
-/// branch as checked out, so both halves of a recreate fail without this
-/// (measured on git 2.55). It removes only registrations whose directory is
-/// already gone, so it can never take a working copy with it.
-pub fn prune_worktrees(repo_path: &Path) -> Result<()> {
+/// git refuses with "missing but already registered worktree" and holds the
+/// branch as checked out, so both halves of a recreate fail without it.
+///
+/// Deliberately not `git worktree prune`, which is repository-wide. Measured on
+/// git 2.55: with one worktree deleted and a sibling's directory merely renamed
+/// away, a single prune removed BOTH registrations, and moving the sibling's
+/// directory back left it severed, with `git status` in it answering "not a git
+/// repository". A sibling agent on a mount that is down is exactly that case.
+///
+/// So the target is found in the registration list and removed by name, and
+/// only when git itself calls it prunable. `git worktree remove --force` on a
+/// registration whose directory is still there DELETES that directory, also
+/// measured, which is why the prunable check gates the call rather than merely
+/// informing it.
+pub fn forget_missing_worktree_registration(repo_path: &Path, worktree_path: &Path) -> Result<()> {
     let repo = repo_path.to_string_lossy();
+    let listed = Command::new("git")
+        .args(["-C", repo.as_ref(), "worktree", "list", "--porcelain", "-z"])
+        .output()?;
+    if !listed.status.success() {
+        return Err(anyhow!(
+            "git worktree list failed: {}",
+            String::from_utf8_lossy(&listed.stderr).trim()
+        ));
+    }
+    let Some(target) = parse_worktree_registrations(&listed.stdout)
+        .into_iter()
+        .find(|entry| same_worktree_path(&entry.path, worktree_path))
+    else {
+        // Nothing registered here, so nothing to forget and the add below is
+        // free to run.
+        return Ok(());
+    };
+    if !target.prunable {
+        return Err(anyhow!(
+            "git still has a working copy registered at {}, so dux left the registration alone \
+             rather than removing a directory that is in use.",
+            target.path.display()
+        ));
+    }
+    let path = target.path.to_string_lossy();
     let output = Command::new("git")
-        .args(["-C", repo.as_ref(), "worktree", "prune"])
+        .args([
+            "-C",
+            repo.as_ref(),
+            "worktree",
+            "remove",
+            "--force",
+            "--",
+            path.as_ref(),
+        ])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
-            "git worktree prune failed: {}",
+            "git worktree remove failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
     Ok(())
+}
+
+/// Whether a registered worktree path names the same directory dux is asking
+/// about.
+///
+/// A plain comparison first, then one that canonicalizes the PARENT: the
+/// directory itself is gone by the time this is asked, so it cannot be
+/// canonicalized, while a symlinked ancestor (`/tmp` on macOS) makes git's
+/// resolved path and dux's stored one differ by that link alone.
+fn same_worktree_path(registered: &Path, target: &Path) -> bool {
+    if registered == target {
+        return true;
+    }
+    let resolved = |path: &Path| {
+        let parent = path.parent()?.canonicalize().ok()?;
+        Some(parent.join(path.file_name()?))
+    };
+    match (resolved(registered), resolved(target)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
 }
 
 pub fn fetch_pull_request_head(repo_path: &Path, pr_number: u64, branch_name: &str) -> Result<()> {
@@ -9134,6 +9245,47 @@ mod tests {
             FolderRepoStatus::NoRepo,
             "git's own internals are the quiet case, not a working repository"
         );
+    }
+
+    /// The NUL form is what keeps a path from forging a record boundary, which
+    /// is the whole reason the targeted removal can trust the list it reads.
+    #[test]
+    fn worktree_registrations_survive_a_newline_in_a_path() {
+        let raw = b"worktree /repo\0HEAD abc\0branch refs/heads/main\0\0\
+                    worktree /wt/wei rd\nname\0HEAD abc\0branch refs/heads/W\0prunable gitdir file points to non-existent location\0\0";
+        let parsed = parse_worktree_registrations(raw);
+        assert_eq!(parsed.len(), 2, "{parsed:?}");
+        assert_eq!(parsed[0].path, Path::new("/repo"));
+        assert!(!parsed[0].prunable);
+        assert_eq!(parsed[1].path, Path::new("/wt/wei rd\nname"));
+        assert!(parsed[1].prunable);
+    }
+
+    /// A registration whose directory is still there is somebody's working copy:
+    /// `git worktree remove --force` would DELETE it, measured, so the prunable
+    /// verdict gates the call rather than merely informing it.
+    #[test]
+    fn a_live_registration_is_refused_rather_than_removed() {
+        let repo = init_test_repo();
+        let live = repo.path().join("wt-live");
+        add_worktree_new_branch_at(repo.path(), &live, "live", Some("HEAD")).unwrap();
+
+        let err = forget_missing_worktree_registration(repo.path(), &live)
+            .expect_err("a live registration is refused");
+        assert!(
+            format!("{err:#}").contains("still has a working copy"),
+            "{err:#}"
+        );
+        assert!(live.exists(), "and the directory is untouched");
+    }
+
+    /// Nothing registered at the path is not an error: the add that follows is
+    /// free to run.
+    #[test]
+    fn forgetting_an_unregistered_path_is_a_no_op() {
+        let repo = init_test_repo();
+        forget_missing_worktree_registration(repo.path(), &repo.path().join("never-existed"))
+            .expect("nothing to forget");
     }
 
     /// A deleted directory is gone; a directory dux cannot stat is a question
