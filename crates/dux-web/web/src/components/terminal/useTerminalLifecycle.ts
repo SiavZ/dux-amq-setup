@@ -350,7 +350,6 @@ export function useTerminalLifecycle(
       kind,
       id,
       sessionId,
-      slotTabId,
       live,
       connId,
       resize,

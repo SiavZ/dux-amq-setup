@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import {
+  agentTabSocketGone,
   ONLY_TAB_CLOSE_REFUSAL,
   closeDetachesAgent,
   closeTabConsequences,
@@ -10,7 +11,6 @@ import {
   exitEjectsToWelcome,
   isFirstTab,
   isSlotTabTarget,
-  isTabGone,
   resolveFocusedTab,
   shouldRefireFocusPut,
   shouldShowTabStrip,
@@ -293,16 +293,34 @@ describe("dormantTabNeedsCard", () => {
   })
 })
 
-describe("isTabGone", () => {
+describe("agentTabSocketGone", () => {
   it("is false when the tab id is still present in the spine's tab list", () => {
-    expect(isTabGone([extraTab("tab-1", false), extraTab("tab-2", true)], "tab-1")).toBe(
-      false,
-    )
+    expect(
+      agentTabSocketGone(
+        [extraTab("tab-1", false), extraTab("tab-2", true)],
+        "s1",
+        "tab-1",
+      ),
+    ).toBe(false)
   })
 
-  it("is true when the tab id is no longer present (closed elsewhere)", () => {
-    expect(isTabGone([extraTab("tab-2", true)], "tab-1")).toBe(true)
-    expect(isTabGone([], "tab-1")).toBe(true)
+  it("is true for any tab the spine no longer lists, the slot tab included", () => {
+    // Closed elsewhere, and promoted away: a clean exit of the slot tab hands
+    // the slot to the sibling and deletes the exited row.
+    expect(agentTabSocketGone([extraTab("tab-2", true)], "s1", "tab-1")).toBe(true)
+  })
+
+  it("holds its verdict while the spine has said nothing about this session", () => {
+    // Neither answer is evidence of a closed tab, and calling either one gone
+    // would stop a healthy socket reconnecting.
+    expect(agentTabSocketGone(undefined, "s1", "tab-1")).toBe(false)
+    expect(agentTabSocketGone([], "s1", "tab-1")).toBe(false)
+  })
+
+  it("never calls the slot placeholder gone", () => {
+    // The id-only layers address the slot tab by the session id, which stands
+    // for whichever tab holds the slot and so can never leave the list.
+    expect(agentTabSocketGone([extraTab("tab-2", true)], "s1", "s1")).toBe(false)
   })
 })
 

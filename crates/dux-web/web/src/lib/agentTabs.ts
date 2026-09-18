@@ -113,11 +113,21 @@ export function exitEjectsToWelcome(
   return !lastRunFailed
 }
 
-// Whether an extra tab has vanished from the spine's tab list: its socket must
-// stop reconnecting rather than retrying against a route that keeps 404ing.
-// Only meaningful for an extra tab, since the slot tab's disappearance is its
-// whole agent's and is handled separately.
-export function isTabGone(tabs: AgentTabView[], tabId: string): boolean {
+// Whether an agent tab's PTY socket must stop reconnecting: the spine knows
+// this session's tabs and this one is not among them, so the route will keep
+// 404ing. Asked of EVERY tab, the slot's included, because a promotion removes
+// the slot tab while its session stays up.
+//
+// Two answers are deliberately "not gone": an absent tab list is a spine that
+// has not arrived rather than evidence of anything, and the slot placeholder
+// stands for whichever tab holds the slot, so it never names a tab that can go.
+export function agentTabSocketGone(
+  tabs: AgentTabView[] | undefined,
+  sessionId: string,
+  tabId: string,
+): boolean {
+  if (tabs === undefined || tabs.length === 0) return false
+  if (isSlotTabTarget(sessionId, tabId)) return false
   return !tabs.some((t) => t.id === tabId)
 }
 

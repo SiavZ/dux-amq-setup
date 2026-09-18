@@ -1,4 +1,4 @@
-import { isSlotTabTarget, isTabGone } from "@/lib/agentTabs"
+import { agentTabSocketGone } from "@/lib/agentTabs"
 import type { Heartbeat } from "@/lib/heartbeat"
 import type { HandshakeOwner } from "@/lib/ptyOwnership"
 import type { PtySocket } from "@/lib/ptySocket"
@@ -15,9 +15,6 @@ type TerminalSocketCallbackOptions = {
   kind: "agent" | "terminal"
   id: string
   sessionId: string | null
-  /// The agent's slot tab as the spine names it, absent only while the spine
-  /// has not arrived. Slot-ness is decided against this, never the session id.
-  slotTabId?: string
   live: LiveSettings
   connId: ConnectionIdentity
   resize: ResizeCoordinator
@@ -58,7 +55,6 @@ export function registerTerminalSocketCallbacks(
     kind,
     id,
     sessionId,
-    slotTabId,
     live,
     connId,
     resize,
@@ -112,14 +108,13 @@ export function registerTerminalSocketCallbacks(
     notePtyConn(connectionState)
   }
 
-  // Extra tabs only: the slot tab's disappearance is its session's. Slot-ness is
-  // asked of the same helper and `slotTabId` the socket URL was built from, or a
-  // not-yet-arrived tab list reads as "gone" and stops the slot tab reconnecting.
-  if (
-    kind === "agent" &&
-    (sessionId === null || !isSlotTabTarget(sessionId, id, slotTabId))
-  ) {
-    pty.shouldRetry = () => !isTabGone(live.current.sessionTabs ?? [], id)
+  // Every agent tab, the slot's included: a clean exit of the slot tab hands the
+  // slot to a sibling and deletes the exited row, so this socket's own tab can
+  // vanish while its session stays up. Keyed on the LIVE tab list rather than on
+  // slot-ness, which is what keeps a not-yet-arrived spine from reading as gone.
+  if (kind === "agent" && sessionId !== null) {
+    pty.shouldRetry = () =>
+      !agentTabSocketGone(live.current.sessionTabs, sessionId, id)
     pty.onGone = () => handleTabGone(id)
   }
 

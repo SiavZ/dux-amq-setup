@@ -9,7 +9,7 @@ import {
   setComposeInsertSink,
 } from "@/lib/composeInsert"
 import type { DuxState } from "@/lib/store"
-import type { ConnState } from "@/lib/types"
+import type { AgentTabView, ConnState } from "@/lib/types"
 import { notifyPtyOwner, resetPtyOwnerEpochs } from "@/lib/ptyOwnership"
 import {
   beginLayoutGesture,
@@ -5309,5 +5309,103 @@ describe("TerminalPane compose surface belongs to the owner", () => {
     expect(screen.queryByRole("textbox", { name: "Message" })).toBeNull()
     expect(term.options.cursorInactiveStyle).toBe("outline")
     expect(term.textarea.tabIndex).toBe(0)
+  })
+})
+
+const { TerminalArea } = await import("./TerminalArea")
+
+// A clean exit of the agent's FIRST tab hands the slot to a sibling and deletes
+// the exited row, so the tab this pane is watching can vanish while its session
+// stays up. Two things follow: the socket must stop retrying against a route
+// that is gone, and the pane must move to the tab that took the slot rather than
+// parking on Connection lost.
+describe("a promoted-away slot tab hands its pane over", () => {
+  function tabOf(id: string, provider: string): AgentTabView {
+    return {
+      id,
+      provider,
+      order: 0,
+      working: false,
+      has_output: false,
+      has_live_process: true,
+    } as AgentTabView
+  }
+
+  // Before: the slot tab and its sibling. After: the exit closed the slot tab's
+  // row and the sibling holds the slot, with the selection moved by
+  // `pruneSelectionIfGone`, which is what the store does with this spine.
+  function promotionState(promoted: boolean): DuxState {
+    const base = makeState()
+    const session = base.spine!.sessions[0]
+    return {
+      ...base,
+      spine: {
+        ...base.spine!,
+        sessions: [
+          {
+            ...session,
+            slot_tab_id: promoted ? "tab-2" : "tab-1",
+            tabs: promoted
+              ? [tabOf("tab-2", "codex")]
+              : [tabOf("tab-1", "claude"), tabOf("tab-2", "codex")],
+          },
+        ],
+      },
+      selectedSessionId: "s1",
+      selectedTarget: {
+        kind: "agent",
+        sessionId: "s1",
+        tabId: promoted ? "tab-2" : "tab-1",
+      },
+      startedDormantTabs: [],
+      createTabInFlight: [],
+      pendingSlotTab: {},
+      theater: false,
+    } as unknown as DuxState
+  }
+
+  it("stops the socket of a tab the spine no longer lists", () => {
+    mockState = promotionState(false)
+    const view = render(
+      <TerminalPane kind="agent" id="tab-1" sessionId="s1" slotTabId="tab-1" />,
+    )
+    const pty = last()
+    expect(pty.shouldRetry()).toBe(true)
+
+    // The spine has caught up while this pane is still mounted: its tab is not
+    // in the list any more, so a reconnect would retry a route that is gone.
+    mockState = promotionState(true)
+    view.rerender(
+      <TerminalPane kind="agent" id="tab-1" sessionId="s1" slotTabId="tab-1" />,
+    )
+
+    expect(pty.shouldRetry()).toBe(false)
+  })
+
+  it("mounts the sibling's pane instead of leaving Connection lost up", async () => {
+    mockState = promotionState(false)
+    const view = render(<TerminalArea />)
+    await act(async () => {})
+    const first = last()
+    const terminals = TermStub.instances.length
+
+    // The provider exited: the server closes this socket with the
+    // provider-gone code, which lands here as `failed`.
+    first.emit("failed")
+    expect(screen.getByText("Connection lost.")).toBeTruthy()
+
+    mockState = promotionState(true)
+    view.rerender(<TerminalArea />)
+    await act(async () => {})
+
+    expect(screen.queryByText("Connection lost.")).toBeNull()
+    // A whole new pane, not the old one re-pointed: the key is the focused tab
+    // id, so the exited tab's pane is torn down with its socket and its
+    // emulator, and the sibling's opens its own.
+    const second = last()
+    expect(second).not.toBe(first)
+    expect(first.dispose).toHaveBeenCalled()
+    expect(TermStub.instances.length).toBe(terminals + 1)
+    expect(second.connect).toHaveBeenCalled()
   })
 })
