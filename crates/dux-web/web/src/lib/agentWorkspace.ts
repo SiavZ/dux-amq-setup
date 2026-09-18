@@ -37,6 +37,11 @@ export type AgentWorkspaceWire =
       branch_provenance: "created" | "attached" | "adopted" | "unknown"
       source_branch: string
       worktree_path: string
+      /** The same path with the server's home directory collapsed to `~`.
+       * Shortened server-side because the browser is not necessarily on the
+       * same machine. Absent from a server that predates it, where the raw
+       * path is the honest fallback. */
+      worktree_label?: string
       /** Whether that directory is gone from disk. An agent can delete its own
        * working copy from inside it (merging its branch and removing the
        * worktree), and dux cannot prevent that, so it reports it instead.

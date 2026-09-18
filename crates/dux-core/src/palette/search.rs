@@ -430,6 +430,7 @@ mod tests {
                 "close-tab",
                 "read-startup-command-logs",
                 "attach-pull-request",
+                "recreate-working-copy",
                 "toggle-always-show-tabs",
                 "toggle-randomized-pet-name-default",
                 "toggle-pr-banner-position",
@@ -464,6 +465,7 @@ mod tests {
                 "manage-worktrees",
                 "open-worktree",
                 "open-worktree-with",
+                "recreate-working-copy",
                 "fork-agent",
                 "change-agent-provider"
             ]

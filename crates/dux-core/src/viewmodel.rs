@@ -484,6 +484,10 @@ pub enum AgentWorkspaceView {
         /// branch).
         source_branch: String,
         worktree_path: String,
+        /// The same path shortened against the server's home directory, for
+        /// display. Computed here for the same reason the folder's label is:
+        /// the browser may not be on the server's machine.
+        worktree_label: String,
         /// Whether that directory is gone from disk. An agent can delete its own
         /// working copy from inside it, and everything downstream (the changes
         /// panel, the row, the recreate action) turns on this one fact.
@@ -532,6 +536,7 @@ impl AgentWorkspaceView {
                     branch_provenance: managed.branch_provenance.as_str().to_string(),
                     source_branch: managed.source_branch.clone(),
                     worktree_path: managed.worktree_path.clone(),
+                    worktree_label: crate::home_path::shorten_home(worktree),
                     worktree_missing: repo_status == crate::git::FolderRepoStatus::Missing,
                     quiet_reason: crate::working_copy::quiet_reason(repo_status, worktree, true)
                         .unwrap_or_default(),
@@ -1522,6 +1527,7 @@ mod tests {
                 branch_provenance: "created".to_string(),
                 source_branch: "main".to_string(),
                 worktree_path: "/tmp/s1-worktree".to_string(),
+                worktree_label: "/tmp/s1-worktree".to_string(),
                 worktree_missing: false,
                 quiet_reason: String::new(),
             }

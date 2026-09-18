@@ -406,6 +406,17 @@ pub const PALETTE_COMMANDS: &[PaletteCommand] = &[
         // engine entry point and quote the same configured wait.
     },
     PaletteCommand {
+        action: Action::RecreateWorkingCopy,
+        name: "recreate-working-copy",
+        description: "Check the selected agent's branch out again at the path its \
+                      working copy used to occupy, for an agent whose working copy is \
+                      gone from disk",
+        // Per-session, and offered only in the one state it exists for, so the
+        // web counterpart is a ROW action rather than an app-menu entry:
+        // "Recreate working copy…" in the agent's ⋯ menu
+        // (`AgentActionsMenu.tsx`), behind the same confirmation.
+    },
+    PaletteCommand {
         action: Action::NewTerminal,
         name: "new-terminal-for-agent",
         description: "Spawn a new companion terminal in the selected agent's directory",

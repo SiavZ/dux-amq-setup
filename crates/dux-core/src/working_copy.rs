@@ -12,7 +12,61 @@
 
 use std::path::Path;
 
+use anyhow::{Result, anyhow};
+
 use crate::home_path::shorten_home;
+
+/// What recreating a working copy did to the agent's branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecreatedBranch {
+    /// The branch was still in the repository and is checked out again. The
+    /// agent's commits are exactly where it left them.
+    CheckedOut,
+    /// The branch was gone too, so it was created again from the project's
+    /// source branch. It holds none of the commits it held before.
+    RecreatedFrom(String),
+}
+
+/// Put a managed working copy back at the path it already had, from the branch
+/// it already names.
+///
+/// The SAME path is the whole point: the coding CLIs key their conversation
+/// history by directory path, so a working copy recreated anywhere else leaves
+/// the agent unable to resume the conversation the user is trying to get back
+/// to. What is not coming back is the content: this is a checkout, not a
+/// restore, and whatever was uncommitted in the deleted directory is gone.
+///
+/// Refuses rather than overwrites when something already occupies the path.
+/// dux is putting a directory back, and a directory that is already there is
+/// somebody's, whether a working copy that reappeared or an unrelated folder.
+pub fn recreate_working_copy(
+    repo_path: &Path,
+    worktree_path: &Path,
+    branch_name: &str,
+    source_branch: &str,
+) -> Result<RecreatedBranch> {
+    if worktree_path.exists() {
+        return Err(anyhow!(
+            "{} already exists, so dux left it alone. Move or remove it if you want dux to check \
+             the branch out there again.",
+            shorten_home(worktree_path)
+        ));
+    }
+    // git still holds the registration of the directory the agent deleted, and
+    // with it the branch as checked out, so both arms below fail without this.
+    crate::git::prune_worktrees(repo_path)?;
+    if crate::git::branch_exists(repo_path, branch_name).is_some() {
+        crate::git::add_worktree_existing_branch_at(repo_path, worktree_path, branch_name)?;
+        return Ok(RecreatedBranch::CheckedOut);
+    }
+    crate::git::add_worktree_new_branch_at(
+        repo_path,
+        worktree_path,
+        branch_name,
+        Some(source_branch),
+    )?;
+    Ok(RecreatedBranch::RecreatedFrom(source_branch.to_string()))
+}
 
 /// Why the changes region is quiet for a MANAGED agent whose working copy is
 /// gone. Names the path, says what happened to a process still running there,
@@ -70,22 +124,19 @@ pub fn quiet_reason(
 /// conversation may survive because the coding CLIs key their history by
 /// directory path, which is the whole reason the working copy is recreated at
 /// the SAME path rather than a fresh one.
-pub fn recreate_confirm_body(worktree: &Path, branch_name: &str, branch_exists: bool) -> String {
-    let branch_line = if branch_exists {
-        format!("Branch \"{branch_name}\" still exists, so dux checks it out again at that path.")
-    } else {
-        format!(
-            "Branch \"{branch_name}\" is gone too, so dux creates it again from the project's \
-             source branch. The commits that branch held are not coming back."
-        )
-    };
+/// Both branch arms are stated because asking git which one applies would run a
+/// subprocess to open a dialog. The final status names the arm that actually
+/// ran.
+pub fn recreate_confirm_body(worktree: &Path, branch_name: &str, source_branch: &str) -> String {
     format!(
-        "Recreate the working copy for this agent at {}?\n\n{branch_line}\n\nAny code changes \
-         that were in the old directory are gone: this puts the directory back, not its \
-         contents. The conversation may resume, because the agent's CLI keys its history by \
-         directory path and dux recreates the working copy at the same path.\n\nAnything still \
-         running keeps working in the deleted directory; stop it and start the agent again to \
-         work in the recreated copy.",
+        "Recreate the working copy for this agent at {}?\n\nIf branch \"{branch_name}\" still \
+         exists, dux checks it out there again. If it is gone too, dux creates it again from \
+         \"{source_branch}\", and the commits that branch held are not coming back.\n\nAny code \
+         changes that were in the old directory are gone either way: this puts the directory \
+         back, not its contents. The conversation may resume, because the agent's CLI keys its \
+         history by directory path and dux recreates the working copy at the same path.\n\nAnything \
+         still running keeps working in the deleted directory; stop it and start the agent again \
+         to work in the recreated copy.",
         shorten_home(worktree)
     )
 }
@@ -156,16 +207,120 @@ mod tests {
         assert_eq!(no_repo, FolderRepoStatus::NoRepo.quiet_reason());
     }
 
+    /// Pinned verbatim against `lib/recreateWorkingCopy.ts`, which carries the
+    /// twin assertion, so a wording change fails on the side that changed.
+    #[test]
+    fn the_confirm_reads_the_same_on_both_surfaces() {
+        assert_eq!(
+            recreate_confirm_body(Path::new("/worktrees/repo/feat"), "feat", "main"),
+            "Recreate the working copy for this agent at /worktrees/repo/feat?\n\n\
+             If branch \"feat\" still exists, dux checks it out there again. If it is gone too, \
+             dux creates it again from \"main\", and the commits that branch held are not coming \
+             back.\n\nAny code changes that were in the old directory are gone either way: this \
+             puts the directory back, not its contents. The conversation may resume, because the \
+             agent's CLI keys its history by directory path and dux recreates the working copy at \
+             the same path.\n\nAnything still running keeps working in the deleted directory; \
+             stop it and start the agent again to work in the recreated copy."
+        );
+    }
+
     #[test]
     fn the_confirm_says_the_changes_are_gone_on_both_branch_outcomes() {
-        let kept = recreate_confirm_body(Path::new("/tmp/wt"), "feat", true);
-        assert!(kept.contains("checks it out again"), "{kept}");
-        assert!(kept.contains("are gone"), "{kept}");
-        assert!(kept.contains("same path"), "{kept}");
-        let minted = recreate_confirm_body(Path::new("/tmp/wt"), "feat", false);
-        assert!(minted.contains("source branch"), "{minted}");
-        assert!(minted.contains("not coming back"), "{minted}");
-        assert!(minted.contains("deleted directory"), "{minted}");
+        let body = recreate_confirm_body(Path::new("/tmp/wt"), "feat", "main");
+        assert!(body.contains("checks it out there again"), "{body}");
+        assert!(body.contains("from \"main\""), "{body}");
+        assert!(body.contains("not coming back"), "{body}");
+        assert!(body.contains("are gone either way"), "{body}");
+        assert!(body.contains("same path"), "{body}");
+        assert!(body.contains("deleted directory"), "{body}");
+    }
+
+    /// The branch is still in the repository: the working copy comes back at the
+    /// SAME path, which is what lets the CLI find its conversation again.
+    #[test]
+    fn a_surviving_branch_is_checked_out_again_at_the_same_path() {
+        let (repo, worktree) = repo_with_a_deleted_worktree();
+        let outcome = recreate_working_copy(repo.path(), &worktree, "feat", "main")
+            .expect("the branch is still there");
+        assert_eq!(outcome, RecreatedBranch::CheckedOut);
+        assert!(worktree.join("seed.txt").exists(), "the checkout landed");
+        assert!(
+            worktree.join("on-the-branch.txt").exists(),
+            "and it is the agent's branch, with its commits"
+        );
+    }
+
+    /// The agent deleted its branch as well. The working copy still comes back,
+    /// from the project's source branch, and the answer says so rather than
+    /// implying the commits survived.
+    #[test]
+    fn a_deleted_branch_is_minted_again_from_the_source_branch() {
+        let (repo, worktree) = repo_with_a_deleted_worktree();
+        crate::git::prune_worktrees(repo.path()).expect("prune");
+        run_git(repo.path(), &["branch", "-D", "feat"]);
+
+        let outcome = recreate_working_copy(repo.path(), &worktree, "feat", "main")
+            .expect("the source branch is there");
+        assert_eq!(outcome, RecreatedBranch::RecreatedFrom("main".to_string()));
+        assert!(worktree.join("seed.txt").exists());
+        assert!(
+            !worktree.join("on-the-branch.txt").exists(),
+            "a branch minted from main holds none of the agent's commits"
+        );
+    }
+
+    /// Something already occupies the path. dux is putting a directory back, and
+    /// a directory that is already there is somebody's.
+    #[test]
+    fn an_occupied_path_is_refused_rather_than_overwritten() {
+        let (repo, worktree) = repo_with_a_deleted_worktree();
+        std::fs::create_dir_all(&worktree).expect("occupy the path");
+        std::fs::write(worktree.join("mine.txt"), "do not touch").expect("write");
+
+        let err = recreate_working_copy(repo.path(), &worktree, "feat", "main")
+            .expect_err("an occupied path is refused");
+        let message = format!("{err:#}");
+        assert!(message.contains("already exists"), "{message}");
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("mine.txt")).expect("still there"),
+            "do not touch"
+        );
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let out = crate::git::test_support::git_command()
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A repository with a worktree whose directory has been deleted from under
+    /// it, exactly as an agent that merges its branch and removes its own
+    /// worktree leaves things.
+    fn repo_with_a_deleted_worktree() -> (tempfile::TempDir, std::path::PathBuf) {
+        let repo = tempfile::tempdir().expect("repo");
+        run_git(repo.path(), &["init", "-q", "-b", "main", "."]);
+        run_git(repo.path(), &["config", "user.email", "dux@example.com"]);
+        run_git(repo.path(), &["config", "user.name", "dux"]);
+        std::fs::write(repo.path().join("seed.txt"), "seed").expect("seed");
+        run_git(repo.path(), &["add", "seed.txt"]);
+        run_git(repo.path(), &["commit", "-qm", "seed"]);
+
+        let worktree = repo.path().join("wt").join("v0");
+        std::fs::create_dir_all(worktree.parent().expect("parent")).expect("worktrees root");
+        crate::git::add_worktree_new_branch_at(repo.path(), &worktree, "feat", Some("main"))
+            .expect("the agent's working copy");
+        std::fs::write(worktree.join("on-the-branch.txt"), "work").expect("work");
+        run_git(&worktree, &["add", "on-the-branch.txt"]);
+        run_git(&worktree, &["commit", "-qm", "work"]);
+        std::fs::remove_dir_all(&worktree).expect("the agent deletes its own working copy");
+        (repo, worktree)
     }
 
     #[test]

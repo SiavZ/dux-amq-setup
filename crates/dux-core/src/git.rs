@@ -1163,6 +1163,23 @@ pub fn create_worktree_existing_branch(
     let project_root = worktrees_root.join(project_name);
     fs::create_dir_all(&project_root)?;
     let worktree_path = project_root.join(branch_name);
+    let canonical = add_worktree_existing_branch_at(repo_path, &worktree_path, branch_name)?;
+    Ok((branch_name.to_string(), canonical))
+}
+
+/// Check an existing branch out as a worktree at an EXACT path.
+///
+/// The path-taking half of [`create_worktree_existing_branch`], which derives
+/// its path from the worktrees root. Recreating a working copy has to land on
+/// the path the agent already has, so it needs this one.
+pub fn add_worktree_existing_branch_at(
+    repo_path: &Path,
+    worktree_path: &Path,
+    branch_name: &str,
+) -> Result<PathBuf> {
+    if let Some(parent) = worktree_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let repo = repo_path.to_string_lossy();
     let worktree = worktree_path.to_string_lossy();
     let output = Command::new("git")
@@ -1185,8 +1202,30 @@ pub fn create_worktree_existing_branch(
             String::from_utf8_lossy(&output.stderr)
         ));
     }
-    let canonical = worktree_path.canonicalize().unwrap_or(worktree_path);
-    Ok((branch_name.to_string(), canonical))
+    Ok(worktree_path
+        .canonicalize()
+        .unwrap_or_else(|_| worktree_path.to_path_buf()))
+}
+
+/// Forget the worktree registrations whose directories are gone.
+///
+/// Needed before re-adding a worktree at a path whose directory was deleted:
+/// git refuses with "missing but already registered worktree", and it holds the
+/// branch as checked out, so both halves of a recreate fail without this
+/// (measured on git 2.55). It removes only registrations whose directory is
+/// already gone, so it can never take a working copy with it.
+pub fn prune_worktrees(repo_path: &Path) -> Result<()> {
+    let repo = repo_path.to_string_lossy();
+    let output = Command::new("git")
+        .args(["-C", repo.as_ref(), "worktree", "prune"])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git worktree prune failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 pub fn fetch_pull_request_head(repo_path: &Path, pr_number: u64, branch_name: &str) -> Result<()> {
@@ -1217,6 +1256,24 @@ pub fn create_worktree_from_start_point(
     let project_root = worktrees_root.join(project_name);
     fs::create_dir_all(&project_root)?;
     let worktree_path = project_root.join(&branch_name);
+    let canonical =
+        add_worktree_new_branch_at(repo_path, &worktree_path, &branch_name, start_point)?;
+    Ok((branch_name, canonical))
+}
+
+/// Create a branch and check it out as a worktree at an EXACT path.
+///
+/// The path-taking half of [`create_worktree_from_start_point`]. Same start
+/// point discipline, for the same measured reason.
+pub fn add_worktree_new_branch_at(
+    repo_path: &Path,
+    worktree_path: &Path,
+    branch_name: &str,
+    start_point: Option<&str>,
+) -> Result<PathBuf> {
+    if let Some(parent) = worktree_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let repo = repo_path.to_string_lossy();
     let worktree = worktree_path.to_string_lossy();
     // Resolve the start point to an object id BEFORE handing it to
@@ -1247,7 +1304,7 @@ pub fn create_worktree_from_start_point(
         "worktree",
         "add",
         "-b",
-        &branch_name,
+        branch_name,
         worktree.as_ref(),
     ]);
     if let Some(resolved_start) = resolved_start.as_deref() {
@@ -1261,8 +1318,9 @@ pub fn create_worktree_from_start_point(
             String::from_utf8_lossy(&output.stderr)
         ));
     }
-    let canonical = worktree_path.canonicalize().unwrap_or(worktree_path);
-    Ok((branch_name, canonical))
+    Ok(worktree_path
+        .canonicalize()
+        .unwrap_or_else(|_| worktree_path.to_path_buf()))
 }
 
 pub fn head_commit(repo_path: &Path) -> Result<String> {

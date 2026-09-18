@@ -102,6 +102,7 @@ pub enum Action {
     // Palette-only (no direct keybinding)
     KillRunning,
     DetachAgent,
+    RecreateWorkingCopy,
     /// Web-only: open the Monaco config.toml editor, reached from the web app
     /// menu's Configuration submenu. Has no TUI behavior (the TUI edits config
     /// via `dux config` and the configure-* commands) and no palette registry
@@ -296,6 +297,7 @@ impl Action {
             Action::ToggleMarked => "toggle_marked",
             Action::KillRunning => "kill_running",
             Action::DetachAgent => "detach_agent",
+            Action::RecreateWorkingCopy => "recreate_working_copy",
             Action::EditConfig => "edit_config",
             Action::RenameWebInstance => "rename_web_instance",
             Action::NewTerminal => "new_terminal",
@@ -499,6 +501,10 @@ impl Action {
                 "Ask the selected agent to shut down and wait the configured shutdown \
                  timeout before forcing it; it stays listed as Detached and can be resumed."
             }
+            Action::RecreateWorkingCopy => {
+                "Check the selected agent's branch out again at the path its working copy used \
+                 to occupy, for an agent whose working copy is gone from disk."
+            }
             Action::EditConfig => "Edit config.toml in an editor.",
             Action::RenameWebInstance => {
                 "Rename this dux instance (browser tab title + favicon color)."
@@ -690,6 +696,7 @@ impl Action {
             | Action::ClearTextField => Some("Overlays"),
             Action::KillRunning
             | Action::DetachAgent
+            | Action::RecreateWorkingCopy
             | Action::EditConfig
             | Action::RenameWebInstance
             | Action::NewTerminal

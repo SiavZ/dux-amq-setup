@@ -116,6 +116,7 @@ pub(super) fn outside_click_policy(prompt: &PromptState) -> OutsideClickPolicy {
         | PromptState::ConfirmDeleteTerminal { .. }
         | PromptState::ConfirmCloseTab { .. }
         | PromptState::ConfirmDetachAgent { .. }
+        | PromptState::ConfirmRecreateWorkingCopy { .. }
         | PromptState::ConfirmDiscardFile { .. }
         | PromptState::ConfirmQuit { .. }
         | PromptState::ConfirmKillRunning(_)
@@ -306,6 +307,9 @@ impl App {
             }
             PromptState::ConfirmCloseTab { .. } => {
                 self.resolve_confirm_close_tab(false);
+            }
+            PromptState::ConfirmRecreateWorkingCopy { .. } => {
+                self.resolve_confirm_recreate_working_copy(false);
             }
             PromptState::ConfirmDetachAgent { .. } => {
                 self.resolve_confirm_detach_agent(false);

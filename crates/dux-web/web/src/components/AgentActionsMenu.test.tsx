@@ -23,6 +23,7 @@ vi.mock("@/lib/store", async (importOriginal) => {
     detachPullRequest: vi.fn(),
     resumePullRequestAutodetection: vi.fn(),
     openStopAgent: vi.fn(),
+    openRecreateWorkingCopy: vi.fn(),
   }
 })
 
@@ -70,6 +71,7 @@ const resumePullRequestAutodetection = vi.mocked(
   store.resumePullRequestAutodetection,
 )
 const openStopAgent = vi.mocked(store.openStopAgent)
+const openRecreateWorkingCopy = vi.mocked(store.openRecreateWorkingCopy)
 
 function makeSession(over: Partial<SessionView> & { id: string }): SessionView {
   return {
@@ -614,5 +616,83 @@ describe("AgentActionsMenu detach entry", () => {
     await openMenu(session)
     const item = screen.getByText("Detach agent…").closest('[role="menuitem"]')
     expect(item!.getAttribute("aria-disabled")).toBe("true")
+  })
+})
+
+// The way out of a working copy the agent deleted from under itself. The gating
+// is the point: the entry exists ONLY in that state, because it is the way out
+// of it, and never for a standalone agent, whose folder is the user's.
+describe("AgentActionsMenu recreate-working-copy entry", () => {
+  beforeEach(() => {
+    openRecreateWorkingCopy.mockClear()
+  })
+  afterEach(cleanup)
+
+  function missingCopy(id: string): SessionView {
+    const session = makeSession({ id })
+    return {
+      ...session,
+      workspace: {
+        ...session.workspace,
+        worktree_missing: true,
+        worktree_label: `~/worktrees/${id}`,
+        quiet_reason: "The working copy no longer exists on disk.",
+      },
+    } as SessionView
+  }
+
+  it("is absent while the working copy is there", async () => {
+    const session = makeSession({ id: "s1" })
+    seed(session, true)
+    await openMenu(session)
+    expect(screen.queryByText("Recreate working copy…")).toBeNull()
+  })
+
+  it("appears once the working copy is gone", async () => {
+    const session = missingCopy("s1")
+    seed(session, true)
+    await openMenu(session)
+    expect(screen.getByText("Recreate working copy…")).toBeTruthy()
+  })
+
+  it("carries an icon, a trailing ellipsis, and no destructive colour", async () => {
+    const session = missingCopy("s1")
+    seed(session, true)
+    await openMenu(session)
+    const item = screen
+      .getByText("Recreate working copy…")
+      .closest('[role="menuitem"]')
+    expect(item).toBeTruthy()
+    expect(item!.querySelector("svg")).toBeTruthy()
+    expect(item!.textContent?.endsWith("…")).toBe(true)
+    // The ellipsis and the dialog are the danger signal; only Delete is red.
+    expect(item!.getAttribute("data-variant")).not.toBe("destructive")
+  })
+
+  it("opens the dialog and never acts on the click", async () => {
+    const session = missingCopy("s1")
+    seed(session, true)
+    await openMenu(session)
+    fireEvent.click(screen.getByText("Recreate working copy…"))
+    expect(openRecreateWorkingCopy).toHaveBeenCalledWith("s1")
+  })
+
+  // dux never creates, moves or removes a standalone agent's folder, so there
+  // is no recreate to offer however gone that folder is.
+  it("is absent for a standalone agent", async () => {
+    const base = makeSession({ id: "sa1" })
+    const session = {
+      ...base,
+      workspace: {
+        kind: "folder",
+        folder_path: "/home/someone/notes",
+        folder_label: "~/notes",
+        repo_status: "missing",
+        quiet_reason: "The folder no longer exists on disk.",
+      },
+    } as SessionView
+    seed(session, true)
+    await openMenu(session)
+    expect(screen.queryByText("Recreate working copy…")).toBeNull()
   })
 })

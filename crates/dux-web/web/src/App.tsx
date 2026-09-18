@@ -20,6 +20,7 @@ import { ConfirmCloseTabDialog } from "@/components/ConfirmCloseTabDialog"
 import { ConfirmDetachAgentDialog } from "@/components/ConfirmDetachAgentDialog"
 import { ConfirmForceReconnectDialog } from "@/components/ConfirmForceReconnectDialog"
 import { ConfirmForceStopAgentDialog } from "@/components/ConfirmForceStopAgentDialog"
+import { ConfirmRecreateWorkingCopyDialog } from "@/components/ConfirmRecreateWorkingCopyDialog"
 import { ConfirmUseExistingBranchDialog } from "@/components/ConfirmUseExistingBranchDialog"
 import { TaskManagerDialog } from "@/components/TaskManagerDialog"
 import { ConfirmDiscardFileDialog } from "@/components/ConfirmDiscardFileDialog"
@@ -95,6 +96,7 @@ function GlobalOverlays() {
       <ConfirmDetachAgentDialog />
       <ConfirmForceStopAgentDialog />
       <ConfirmForceReconnectDialog />
+      <ConfirmRecreateWorkingCopyDialog />
       <ConfirmUseExistingBranchDialog />
       <TaskManagerDialog />
       <ConfigEditorDialog />

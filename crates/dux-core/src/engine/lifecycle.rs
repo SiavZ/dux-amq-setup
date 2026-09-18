@@ -1678,6 +1678,240 @@ impl Engine {
     }
 }
 
+/// What the recreate action needs, resolved once so the confirmation, the
+/// palette gate, the row menu and the dispatch all read the same facts.
+///
+/// Its existence IS the gate: `None` means the action does not exist for this
+/// agent, and both surfaces leave it out rather than offering a disabled one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecreateWorkingCopyInputs {
+    pub session_id: String,
+    pub agent_label: String,
+    pub worktree_path: std::path::PathBuf,
+    pub branch_name: String,
+    /// The branch the agent was forked from, and the start point for a branch
+    /// that is gone too.
+    pub source_branch: String,
+}
+
+impl Engine {
+    /// What recreating this agent's working copy would involve, or `None` when
+    /// there is nothing to recreate.
+    ///
+    /// Offered only for a MANAGED agent whose directory is gone: a standalone
+    /// agent's folder is the user's and dux never creates one, and an agent
+    /// whose working copy is there has nothing to put back.
+    pub fn recreate_working_copy_inputs(
+        &self,
+        session_id: &str,
+    ) -> Option<RecreateWorkingCopyInputs> {
+        let session = self.sessions.iter().find(|s| s.id == session_id)?;
+        let managed = session.workspace.as_managed()?;
+        if !self.working_copy_missing(session_id) {
+            return None;
+        }
+        Some(RecreateWorkingCopyInputs {
+            session_id: session.id.clone(),
+            agent_label: session.display_label(),
+            worktree_path: std::path::PathBuf::from(&managed.worktree_path),
+            branch_name: managed.branch_name.clone(),
+            source_branch: managed.source_branch.clone(),
+        })
+    }
+
+    /// Put the agent's working copy back where it was, off the engine thread.
+    ///
+    /// Answers with the keyed busy to show, or a refusal sentence. The tabs are
+    /// deliberately left dormant: a restart brings tabs back dormant, and this
+    /// is a smaller thing than a restart.
+    ///
+    /// Two presses in a row are not guarded: the second finds the directory it
+    /// is about to create already there and refuses out loud, which is a better
+    /// answer than a silent no-op.
+    pub fn begin_recreate_working_copy(
+        &mut self,
+        session_id: &str,
+    ) -> anyhow::Result<crate::engine::EventReaction> {
+        let inputs = self
+            .recreate_working_copy_inputs(session_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "There is no working copy to recreate for this agent: dux only recreates a \
+                 working copy it manages, and only when its directory is gone."
+                )
+            })?;
+        let project_id = self
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .and_then(|s| s.project_id())
+            .unwrap_or_default()
+            .to_string();
+        let repo_path = self
+            .projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .map(|p| std::path::PathBuf::from(&p.path))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "The project agent \"{}\" belongs to is no longer in dux, so there is no \
+                     repository to check its branch out from. Add the project back, or delete \
+                     this agent.",
+                    inputs.agent_label
+                )
+            })?;
+
+        let RecreateWorkingCopyInputs {
+            agent_label,
+            worktree_path,
+            branch_name,
+            source_branch,
+            ..
+        } = inputs;
+        let success_label = agent_label.clone();
+        let success_path = worktree_path.clone();
+        let success_branch = branch_name.clone();
+        let failure_label = agent_label.clone();
+        let failure_path = worktree_path.clone();
+        let op = crate::engine::status_op(crate::working_copy::recreate_busy_message(&agent_label))
+            .on_success(move |outcome: &crate::working_copy::RecreatedBranch| {
+                let source = match outcome {
+                    crate::working_copy::RecreatedBranch::CheckedOut => None,
+                    crate::working_copy::RecreatedBranch::RecreatedFrom(source) => {
+                        Some(source.as_str())
+                    }
+                };
+                crate::engine::Final::info(crate::working_copy::recreate_success_message(
+                    &success_label,
+                    &success_path,
+                    &success_branch,
+                    source,
+                ))
+            })
+            .on_failure(move |err: &String| {
+                crate::engine::Final::error(format!(
+                    "Could not recreate the working copy for agent \"{failure_label}\" at {}: {err}",
+                    crate::home_path::shorten_home(&failure_path)
+                ))
+            });
+        Ok(self.spawn_status_op(op, move || {
+            crate::working_copy::recreate_working_copy(
+                &repo_path,
+                &worktree_path,
+                &branch_name,
+                &source_branch,
+            )
+            .map_err(|err| format!("{err:#}"))
+        }))
+    }
+}
+
+#[cfg(test)]
+mod recreate_tests {
+    use super::*;
+    use crate::engine::test_support::{sample_project, sample_session, test_engine};
+
+    /// An engine with one managed agent whose working copy has been deleted.
+    fn engine_with_a_missing_working_copy() -> (Engine, tempfile::TempDir) {
+        let (mut engine, tmp) = test_engine();
+        engine.projects.push(sample_project("p1", "/tmp/p1"));
+        engine.sessions.push(sample_session("s1", "p1", "feat"));
+        engine
+            .folder_repo_statuses
+            .insert("s1".to_string(), crate::git::FolderRepoStatus::Missing);
+        (engine, tmp)
+    }
+
+    /// The action exists only where there is something to put back, so both
+    /// surfaces leave it out rather than offering a disabled row.
+    #[test]
+    fn the_recreate_action_exists_only_for_a_managed_copy_that_is_gone() {
+        let (mut engine, _tmp) = engine_with_a_missing_working_copy();
+        let inputs = engine
+            .recreate_working_copy_inputs("s1")
+            .expect("a managed agent whose copy is gone");
+        assert_eq!(inputs.branch_name, "feat");
+        assert_eq!(
+            inputs.worktree_path,
+            std::path::Path::new("/tmp/s1-worktree")
+        );
+
+        engine
+            .folder_repo_statuses
+            .insert("s1".to_string(), crate::git::FolderRepoStatus::WorkingRepo);
+        assert!(
+            engine.recreate_working_copy_inputs("s1").is_none(),
+            "a working copy that is there has nothing to recreate"
+        );
+        assert!(engine.recreate_working_copy_inputs("nope").is_none());
+    }
+
+    /// dux never creates, moves or removes a standalone agent's folder, so the
+    /// action must not exist for one whatever its folder looks like.
+    #[test]
+    fn a_standalone_agent_is_never_offered_the_recreate() {
+        let (mut engine, _tmp) = test_engine();
+        engine
+            .sessions
+            .push(crate::engine::test_support::sample_standalone_session(
+                "sa1",
+                "/tmp/mine",
+            ));
+        engine
+            .folder_repo_statuses
+            .insert("sa1".to_string(), crate::git::FolderRepoStatus::Missing);
+
+        assert!(engine.recreate_working_copy_inputs("sa1").is_none());
+        let Err(refusal) = engine.begin_recreate_working_copy("sa1") else {
+            panic!("and the dispatch refuses it too")
+        };
+        assert!(
+            format!("{refusal:#}").contains("only recreates a working copy it manages"),
+            "{refusal:#}"
+        );
+    }
+
+    /// The project record is where the branch would be checked out from, so its
+    /// absence is a refusal with a way forward rather than a git error.
+    #[test]
+    fn a_missing_project_refuses_with_a_way_forward() {
+        let (mut engine, _tmp) = engine_with_a_missing_working_copy();
+        engine.projects.clear();
+
+        let Err(refusal) = engine.begin_recreate_working_copy("s1") else {
+            panic!("no repository to check out from")
+        };
+        let message = format!("{refusal:#}");
+        assert!(message.contains("no longer in dux"), "{message}");
+        assert!(message.contains("Add the project back"), "{message}");
+    }
+
+    /// The busy names the agent, and the op is registered, so the spinner is
+    /// heartbeated rather than timed out while git works.
+    #[test]
+    fn the_dispatch_raises_a_keyed_busy_naming_the_agent() {
+        let (mut engine, _tmp) = engine_with_a_missing_working_copy();
+
+        let reaction = engine
+            .begin_recreate_working_copy("s1")
+            .expect("the dispatch runs");
+        let crate::engine::EventReaction::Status(status) = reaction else {
+            panic!("a dispatch owes a busy")
+        };
+        assert_eq!(status.tone, crate::statusline::StatusTone::Busy);
+        assert!(
+            status.message.contains("Recreating the working copy"),
+            "{}",
+            status.message
+        );
+        assert!(status.message.contains("s1-title"), "{}", status.message);
+        let key = status
+            .key
+            .expect("a busy is keyed so its final replaces it");
+        assert!(engine.status_op_is_live(&key));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::ids::{TabId, TabIdRef};

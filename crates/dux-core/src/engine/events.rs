@@ -3252,7 +3252,12 @@ impl Engine {
         if !self.sessions.iter().any(|session| session.id == session_id) {
             return EventReaction::Nothing;
         }
-        let changed = self.folder_repo_statuses.insert(session_id.clone(), status) != Some(status);
+        // Compared against the EFFECTIVE previous verdict, not the raw map
+        // entry: a managed agent answers WorkingRepo before its first probe
+        // lands, so comparing against an absent entry would report a change on
+        // every first probe and re-arm the watch for nothing.
+        let changed = self.folder_repo_status(&session_id) != status;
+        self.folder_repo_statuses.insert(session_id.clone(), status);
         if !changed || self.watched_session_id.as_deref() != Some(session_id.as_str()) {
             return EventReaction::Nothing;
         }

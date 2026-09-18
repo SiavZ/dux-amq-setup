@@ -2290,6 +2290,19 @@ pub(crate) enum PromptState {
         live_tabs: usize,
         focus: ConfirmFocus, // Cancel (default) or Detach
     },
+    /// The way out of a working copy the agent deleted from under itself.
+    ///
+    /// The path, the branch and the source branch are captured when the dialog
+    /// opens, like the detach dialog's wait: the sentence promises a specific
+    /// checkout at a specific path, and a reload behind an open dialog must not
+    /// change what the user is agreeing to.
+    ConfirmRecreateWorkingCopy {
+        session_id: String,
+        worktree_path: std::path::PathBuf,
+        branch_name: String,
+        source_branch: String,
+        focus: ConfirmFocus, // Cancel (default) or Recreate
+    },
     ConfirmQuit {
         agent_count: usize,
         terminal_count: usize,
@@ -3137,6 +3150,10 @@ pub(crate) enum OverlayMouseLayout {
         confirm_button: Rect,
     },
     ConfirmDetachAgent {
+        cancel_button: Rect,
+        confirm_button: Rect,
+    },
+    ConfirmRecreateWorkingCopy {
         cancel_button: Rect,
         confirm_button: Rect,
     },
@@ -4745,6 +4762,13 @@ impl App {
                         .selected_session()
                         .is_some_and(|s| self.engine.pr_suppressions.contains(&s.id))
             }
+            // Offered only in the one state it exists for, and hidden rather
+            // than disabled: a command that exists only while something is
+            // broken would otherwise sit in the palette promising a repair
+            // nothing needs.
+            Action::RecreateWorkingCopy => self
+                .selected_session()
+                .is_some_and(|s| self.engine.recreate_working_copy_inputs(&s.id).is_some()),
             // The terminal-move commands are offered only when a terminal exists;
             // the agent-move commands are always offered (they fall through to
             // `true` and guard at invoke, like the rest of the palette).
@@ -4894,6 +4918,7 @@ impl App {
             "agent-info" => self.open_agent_info(),
             "kill-running" => self.open_kill_running(),
             "detach-agent" => self.confirm_detach_selected_session(),
+            "recreate-working-copy" => self.confirm_recreate_selected_working_copy(),
             "reconnect-agent" => self.reconnect_selected_session(false),
             "force-reconnect-agent" => self.force_reconnect_agent(),
             "refresh-changes" => self.refresh_changed_files_now(),

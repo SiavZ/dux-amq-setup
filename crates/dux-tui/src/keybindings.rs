@@ -1161,6 +1161,13 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         help: None,
         hint_contexts: &[],
     },
+    BindingDef {
+        action: Action::RecreateWorkingCopy,
+        default_keys: &[],
+        scopes: &[],
+        help: None,
+        hint_contexts: &[],
+    },
     // Web-surface action, deliberately inert in the TUI (no key, no scope, no
     // help, no palette row): the web's app menu opens the Monaco config.toml
     // editor for it. The `BindingDef` stays because `config.rs` validates every
@@ -2812,6 +2819,7 @@ mod tests {
                 "open-current-pr",
                 "detach-pull-request",
                 "resume-pull-request-autodetection",
+                "recreate-working-copy",
                 "new-terminal-for-agent",
                 "agent-info",
                 "refresh-changes",
@@ -3225,6 +3233,7 @@ mod tests {
             "read-startup-command-logs",
             "recheck-github",
             "reconnect-agent",
+            "recreate-working-copy",
             "refresh-changes",
             "reload-config",
             "remove-project",

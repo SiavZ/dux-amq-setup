@@ -82,6 +82,10 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/v1/sessions/{id}/kill", post(kill_session))
         .route(
+            "/api/v1/sessions/{id}/recreate-working-copy",
+            post(recreate_working_copy),
+        )
+        .route(
             "/api/v1/sessions/{id}/pull-request",
             put(attach_pull_request).delete(detach_pull_request),
         )
@@ -754,6 +758,34 @@ async fn kill_session(
         Ok(_) => StatusCode::OK.into_response(),
         // The engine returns "unknown session: …" when the row is gone (e.g. a
         // concurrent delete); surface that as 404, not a generic 400.
+        Err(e) if e.contains("unknown session") => (StatusCode::NOT_FOUND, e).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+/// Check a managed agent's branch out again at the path its working copy used
+/// to occupy.
+///
+/// Like the kill route and unlike the git-mutation routes, it calls no
+/// `resolve_worktree`: a directory that is gone is precisely the case this
+/// exists for, and resolving one would refuse every legitimate request.
+async fn recreate_working_copy(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !id_within_bound(&id) {
+        return unknown_session();
+    }
+    match state
+        .engine
+        .apply_wire_scoped(
+            WireCommand::RecreateWorkingCopy { session_id: id },
+            scope_from_headers(&headers, &state.connections),
+        )
+        .await
+    {
+        Ok(_) => StatusCode::OK.into_response(),
         Err(e) if e.contains("unknown session") => (StatusCode::NOT_FOUND, e).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
     }

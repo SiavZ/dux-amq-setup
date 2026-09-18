@@ -234,6 +234,8 @@ enum PromptMouseTarget {
     ConfirmCloseTabConfirm,
     ConfirmDetachAgentCancel,
     ConfirmDetachAgentConfirm,
+    ConfirmRecreateWorkingCopyCancel,
+    ConfirmRecreateWorkingCopyConfirm,
     ConfirmDeleteMacroCancel,
     ConfirmDeleteMacroConfirm,
     ConfirmQuitCancel,
@@ -322,6 +324,12 @@ impl ButtonPressedTarget {
             }
             PromptMouseTarget::ConfirmDetachAgentConfirm => {
                 Some(ButtonPressedTarget::ConfirmDetachAgentConfirm)
+            }
+            PromptMouseTarget::ConfirmRecreateWorkingCopyCancel => {
+                Some(ButtonPressedTarget::ConfirmRecreateWorkingCopyCancel)
+            }
+            PromptMouseTarget::ConfirmRecreateWorkingCopyConfirm => {
+                Some(ButtonPressedTarget::ConfirmRecreateWorkingCopyConfirm)
             }
             PromptMouseTarget::ConfirmDeleteMacroCancel => {
                 Some(ButtonPressedTarget::ConfirmDeleteMacroCancel)
@@ -1858,6 +1866,7 @@ impl App {
             | PromptState::ConfirmDeleteTerminal { .. }
             | PromptState::ConfirmCloseTab { .. }
             | PromptState::ConfirmDetachAgent { .. }
+            | PromptState::ConfirmRecreateWorkingCopy { .. }
             | PromptState::ConfirmQuit { .. }
             | PromptState::ConfirmDiscardFile { .. }
             | PromptState::ConfirmInitRepo { .. }
@@ -4763,6 +4772,23 @@ impl App {
         Some(false)
     }
 
+    fn handle_confirm_recreate_working_copy_prompt_key(&mut self, key: KeyEvent) -> Option<bool> {
+        let PromptState::ConfirmRecreateWorkingCopy { focus, .. } = &mut self.prompt else {
+            return None;
+        };
+        let confirm = focus.is_confirm();
+        let action = self.bindings.lookup(&key, BindingScope::Dialog);
+        match modal_key_step(action, key, false) {
+            ModalKeyStep::Close => self.prompt = PromptState::None,
+            ModalKeyStep::MoveFocus(_) => *focus = focus.toggled(),
+            ModalKeyStep::Confirm | ModalKeyStep::ActivateFocus => {
+                return Some(self.resolve_confirm_recreate_working_copy(confirm));
+            }
+            ModalKeyStep::FallThroughToField => {}
+        }
+        Some(false)
+    }
+
     fn handle_confirm_quit_prompt_key(&mut self, key: KeyEvent) -> Option<bool> {
         let PromptState::ConfirmQuit { focus, .. } = &mut self.prompt else {
             return None;
@@ -4961,6 +4987,9 @@ impl App {
             return Some(exit);
         }
         if let Some(exit) = self.handle_confirm_detach_agent_prompt_key(key) {
+            return Some(exit);
+        }
+        if let Some(exit) = self.handle_confirm_recreate_working_copy_prompt_key(key) {
             return Some(exit);
         }
         if let Some(exit) = self.handle_confirm_quit_prompt_key(key) {
@@ -6449,6 +6478,23 @@ impl App {
                 column,
                 row,
             ),
+            OverlayMouseLayout::ConfirmRecreateWorkingCopy {
+                cancel_button,
+                confirm_button,
+            } => click_target(
+                &[
+                    (
+                        cancel_button,
+                        PromptMouseTarget::ConfirmRecreateWorkingCopyCancel,
+                    ),
+                    (
+                        confirm_button,
+                        PromptMouseTarget::ConfirmRecreateWorkingCopyConfirm,
+                    ),
+                ],
+                column,
+                row,
+            ),
             OverlayMouseLayout::ConfirmDetachAgent {
                 cancel_button,
                 confirm_button,
@@ -7574,6 +7620,27 @@ impl App {
                 );
                 self.rebuild_left_items();
             }
+        }
+        false
+    }
+
+    /// Put the agent's working copy back where it was.
+    ///
+    /// The refusals are the engine's, in its own sentences, because the same
+    /// act is an HTTP route and both surfaces have to say the same thing about
+    /// an agent whose state moved while the dialog was up.
+    pub(super) fn resolve_confirm_recreate_working_copy(&mut self, confirm: bool) -> bool {
+        let session_id = match &self.prompt {
+            PromptState::ConfirmRecreateWorkingCopy { session_id, .. } => session_id.clone(),
+            _ => return false,
+        };
+        self.prompt = PromptState::None;
+        if !confirm {
+            return false;
+        }
+        match self.engine.begin_recreate_working_copy(&session_id) {
+            Ok(reaction) => self.apply_reaction(reaction),
+            Err(err) => self.set_error(format!("{err:#}")),
         }
         false
     }
@@ -8773,6 +8840,8 @@ impl App {
             | PromptMouseTarget::ConfirmCloseTabConfirm
             | PromptMouseTarget::ConfirmDetachAgentCancel
             | PromptMouseTarget::ConfirmDetachAgentConfirm
+            | PromptMouseTarget::ConfirmRecreateWorkingCopyCancel
+            | PromptMouseTarget::ConfirmRecreateWorkingCopyConfirm
             | PromptMouseTarget::ConfirmDeleteMacroCancel
             | PromptMouseTarget::ConfirmDeleteMacroConfirm
             | PromptMouseTarget::MacroCancel
@@ -8884,6 +8953,12 @@ impl App {
             }
             ButtonPressedTarget::ConfirmDetachAgentConfirm => {
                 self.resolve_confirm_detach_agent(true)
+            }
+            ButtonPressedTarget::ConfirmRecreateWorkingCopyCancel => {
+                self.resolve_confirm_recreate_working_copy(false)
+            }
+            ButtonPressedTarget::ConfirmRecreateWorkingCopyConfirm => {
+                self.resolve_confirm_recreate_working_copy(true)
             }
             ButtonPressedTarget::ConfirmDeleteMacroCancel => {
                 self.resolve_confirm_delete_macro(false)
@@ -15715,18 +15790,16 @@ not_a_real_action = ["x"]
     #[test]
     fn refresh_changes_command_reports_a_git_failure_as_a_failure() {
         let mut app = test_app(default_bindings());
-        let missing = app
-            .engine
-            .paths
-            .root
-            .join("no-such-worktree")
-            .to_string_lossy()
-            .into_owned();
+        // A directory that EXISTS and is not a repository, so git answers with
+        // an error. A directory that is GONE is a different thing with a verdict
+        // of its own, and its own refusal. Outside the fixture's own repository,
+        // or git walks up and answers about that one.
+        let not_a_repo = tempfile::tempdir().expect("a plain directory");
         app.engine.sessions[0]
             .workspace
             .as_managed_mut()
             .expect("managed test session")
-            .worktree_path = missing;
+            .worktree_path = not_a_repo.path().to_string_lossy().into_owned();
 
         app.execute_command("refresh-changes".to_string())
             .expect("refresh changes");

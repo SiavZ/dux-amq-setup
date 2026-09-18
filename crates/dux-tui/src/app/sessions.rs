@@ -1833,6 +1833,34 @@ impl App {
         Ok(())
     }
 
+    /// The palette's `recreate-working-copy`: raise the confirmation for the
+    /// selected agent, or say plainly why there is nothing to confirm.
+    ///
+    /// Both refusals are loud, for the same reason the detach's are: the
+    /// palette closed onto an unchanged screen either way.
+    pub(crate) fn confirm_recreate_selected_working_copy(&mut self) -> Result<()> {
+        let Some(session) = self.selected_session().cloned() else {
+            self.set_error("Select an agent first, then run recreate-working-copy on it.");
+            return Ok(());
+        };
+        let Some(inputs) = self.engine.recreate_working_copy_inputs(&session.id) else {
+            self.set_warning(format!(
+                "There is nothing to recreate for \"{}\": dux only recreates a working copy it \
+                 manages, and only when its directory is gone.",
+                session.display_label()
+            ));
+            return Ok(());
+        };
+        self.prompt = PromptState::ConfirmRecreateWorkingCopy {
+            session_id: inputs.session_id,
+            worktree_path: inputs.worktree_path,
+            branch_name: inputs.branch_name,
+            source_branch: inputs.source_branch,
+            focus: ConfirmFocus::Cancel, // Cancel is the safe default
+        };
+        Ok(())
+    }
+
     pub(crate) fn confirm_delete_selected_session(&mut self) -> Result<()> {
         let Some(session) = self.selected_session().cloned() else {
             self.set_error("Select a session first.");
@@ -5606,6 +5634,116 @@ mod tests {
         assert_eq!(combined, "the Tailscale port is busy.");
     }
 
+    /// The way out of a working copy the agent deleted from under itself. It is
+    /// offered only in that state, and hidden rather than disabled elsewhere: a
+    /// command that exists only while something is broken would otherwise sit in
+    /// the palette promising a repair nothing needs.
+    #[test]
+    fn recreate_working_copy_is_offered_only_where_there_is_something_to_recreate() {
+        let mut app =
+            crate::app::test_support::test_app(crate::app::test_support::default_bindings());
+        app.selected_left = 1;
+        let id = app.engine.sessions[0].id.clone();
+
+        let names = |app: &App| -> Vec<String> {
+            app.filtered_palette_commands("")
+                .into_iter()
+                .filter_map(|binding| binding.palette_name.map(str::to_string))
+                .collect()
+        };
+        assert!(
+            !names(&app).contains(&"recreate-working-copy".to_string()),
+            "a working copy that is there has nothing to recreate"
+        );
+
+        app.engine
+            .folder_repo_statuses
+            .insert(id, dux_core::git::FolderRepoStatus::Missing);
+        assert!(
+            names(&app).contains(&"recreate-working-copy".to_string()),
+            "and the way out appears the moment the directory is gone"
+        );
+    }
+
+    /// The confirmation captures what it promises when it opens, and says all
+    /// three things the user has to know before agreeing.
+    #[test]
+    fn recreate_working_copy_confirms_before_it_checks_anything_out() {
+        let mut app =
+            crate::app::test_support::test_app(crate::app::test_support::default_bindings());
+        app.selected_left = 1;
+        let id = app.engine.sessions[0].id.clone();
+        app.engine
+            .folder_repo_statuses
+            .insert(id, dux_core::git::FolderRepoStatus::Missing);
+
+        app.confirm_recreate_selected_working_copy()
+            .expect("dispatch");
+        let PromptState::ConfirmRecreateWorkingCopy {
+            worktree_path,
+            branch_name,
+            source_branch,
+            focus,
+            ..
+        } = &app.prompt
+        else {
+            panic!("a missing working copy raises the confirmation")
+        };
+        assert_eq!(*focus, ConfirmFocus::Cancel, "Cancel is the safe default");
+        let body = dux_core::working_copy::recreate_confirm_body(
+            worktree_path,
+            branch_name,
+            source_branch,
+        );
+        assert!(body.contains("are gone either way"), "{body}");
+        assert!(body.contains("same path"), "{body}");
+        assert!(
+            body.contains("keeps working in the deleted directory"),
+            "{body}"
+        );
+    }
+
+    /// Cancelling leaves the agent exactly as it was, and never touches git.
+    #[test]
+    fn recreate_working_copy_cancel_checks_nothing_out() {
+        let mut app =
+            crate::app::test_support::test_app(crate::app::test_support::default_bindings());
+        app.selected_left = 1;
+        let id = app.engine.sessions[0].id.clone();
+        app.engine
+            .folder_repo_statuses
+            .insert(id.clone(), dux_core::git::FolderRepoStatus::Missing);
+        app.confirm_recreate_selected_working_copy()
+            .expect("dispatch");
+
+        app.resolve_confirm_recreate_working_copy(false);
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert!(
+            app.engine.recreate_working_copy_inputs(&id).is_some(),
+            "nothing was recreated"
+        );
+    }
+
+    /// With nothing to recreate, the refusal is LOUD: the palette closed onto an
+    /// unchanged screen, so silence is indistinguishable from a failure.
+    #[test]
+    fn recreate_working_copy_refuses_out_loud_when_the_copy_is_there() {
+        let mut app =
+            crate::app::test_support::test_app(crate::app::test_support::default_bindings());
+        app.selected_left = 1;
+
+        app.confirm_recreate_selected_working_copy()
+            .expect("dispatch");
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert!(
+            app.status.message().contains("nothing to recreate"),
+            "got {}",
+            app.status.message()
+        );
+    }
+
     #[test]
     fn resume_skips_session_restore_and_rebuilds_view() {
         // A live session arrives from the web server already Running with
@@ -5632,10 +5770,17 @@ mod tests {
             app.engine.providers.is_empty(),
             "resume must not spawn PTYs"
         );
-        assert!(
-            app.engine.worker_rx.try_recv().is_err(),
-            "resume must not post any worker event (no agent relaunch)"
-        );
+        // Arming the changes watch classifies the agent's directory, which is a
+        // read; what must not be here is launch work.
+        while let Ok(event) = app.engine.worker_rx.try_recv() {
+            assert!(
+                matches!(
+                    event,
+                    dux_core::worker::WorkerEvent::FolderRepoStatusReady { .. }
+                ),
+                "resume must post no launch work"
+            );
+        }
         // View state was rebuilt: the session shows up in the left pane cache.
         assert!(
             !app.left_items_cache.is_empty(),

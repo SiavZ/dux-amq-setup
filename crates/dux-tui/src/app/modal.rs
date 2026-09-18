@@ -165,6 +165,7 @@ pub(crate) fn modal_spec(prompt: &PromptState) -> Option<ModalSpec> {
         | PromptState::ConfirmDeleteTerminal { .. }
         | PromptState::ConfirmCloseTab { .. }
         | PromptState::ConfirmDetachAgent { .. }
+        | PromptState::ConfirmRecreateWorkingCopy { .. }
         | PromptState::ConfirmQuit { .. }
         | PromptState::ConfirmDiscardFile { .. }
         | PromptState::ConfirmKillRunning(_)
@@ -263,6 +264,7 @@ pub(crate) fn prompt_text_inputs(prompt: &PromptState) -> Vec<&TextInput> {
         | PromptState::ConfirmDeleteTerminal { .. }
         | PromptState::ConfirmCloseTab { .. }
         | PromptState::ConfirmDetachAgent { .. }
+        | PromptState::ConfirmRecreateWorkingCopy { .. }
         | PromptState::ConfirmQuit { .. }
         | PromptState::ConfirmDiscardFile { .. }
         | PromptState::ConfirmInitRepo { .. }
@@ -360,6 +362,7 @@ pub(crate) fn layout_publishes_confirm_button(layout: &OverlayMouseLayout) -> bo
         | OverlayMouseLayout::ConfirmDeleteTerminal { .. }
         | OverlayMouseLayout::ConfirmCloseTab { .. }
         | OverlayMouseLayout::ConfirmDetachAgent { .. }
+        | OverlayMouseLayout::ConfirmRecreateWorkingCopy { .. }
         | OverlayMouseLayout::ConfirmDeleteMacro { .. }
         | OverlayMouseLayout::ConfirmQuit { .. }
         | OverlayMouseLayout::ConfirmDiscardFile { .. }
@@ -970,6 +973,16 @@ mod tests {
                     label: "feat".to_string(),
                     grace_seconds: 30,
                     live_tabs: 1,
+                    focus: ConfirmFocus::Cancel,
+                },
+            ),
+            (
+                "ConfirmRecreateWorkingCopy",
+                PromptState::ConfirmRecreateWorkingCopy {
+                    session_id: "s1".to_string(),
+                    worktree_path: std::path::PathBuf::from("/tmp/worktrees/repo/feat"),
+                    branch_name: "feat".to_string(),
+                    source_branch: "main".to_string(),
                     focus: ConfirmFocus::Cancel,
                 },
             ),

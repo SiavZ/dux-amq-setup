@@ -186,6 +186,14 @@ export const sessionsApi = {
     request<void>("POST", `/api/v1/sessions/${encodeURIComponent(id)}/kill`, {
       force,
     }),
+  // Check the agent's branch out again at the path its working copy used to
+  // occupy. Answers with a keyed busy on the status stream; a refusal is a 400
+  // and throws.
+  recreateWorkingCopy: (id: string) =>
+    request<void>(
+      "POST",
+      `/api/v1/sessions/${encodeURIComponent(id)}/recreate-working-copy`,
+    ),
   // Attaches a pull request from the raw typed reference. Replies 202 with the keyed
   // status op id, and the outcome rides the status stream; a synchronous refusal is a
   // 400 and throws.

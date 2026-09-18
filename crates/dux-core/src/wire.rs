@@ -294,6 +294,19 @@ pub enum WireCommand {
         #[serde(default)]
         force: bool,
     },
+    /// Check the agent's branch out again at the path its working copy used to
+    /// occupy, for a MANAGED agent whose directory is gone from disk.
+    ///
+    /// The SAME path, deliberately: the coding CLIs key their conversation
+    /// history by directory path, so anywhere else and the conversation the
+    /// user is trying to get back to is unreachable. Refused for any other
+    /// agent, and for one whose working copy is there.
+    ///
+    /// Answers with a keyed BUSY: git runs off the engine thread and the final
+    /// names what happened to the branch.
+    RecreateWorkingCopy {
+        session_id: String,
+    },
     /// Register an existing git repository on the server as a project. `name`
     /// may be empty to derive the display name from the path's basename.
     AddProject {
@@ -1696,6 +1709,12 @@ impl Engine {
                     status,
                 )))
             }
+            WireCommand::RecreateWorkingCopy { session_id } => {
+                let status = self.recreate_working_copy_wire(&session_id)?;
+                Ok(WireDispatch::Handled(WireCommandOutcome::with_status(
+                    status,
+                )))
+            }
             WireCommand::CloseAgentTab { session_id, tab_id } => {
                 let (status, outcome) = self.close_agent_tab_wire(&session_id, &tab_id)?;
                 Ok(WireDispatch::Handled(WireCommandOutcome::with_close_tab(
@@ -2351,6 +2370,17 @@ impl Engine {
                 Ok(WireStatus::keyed(key, "busy", busy))
             }
         }
+    }
+
+    /// Put a managed agent's working copy back at the path it already had.
+    ///
+    /// Refusals are errors rather than a quiet no-op: this is also an HTTP route
+    /// and a palette command, so an id that should never have reached here has
+    /// to be answered in a sentence.
+    fn recreate_working_copy_wire(&mut self, session_id: &str) -> anyhow::Result<WireStatus> {
+        let reaction = self.begin_recreate_working_copy(session_id)?;
+        wire_status_from_reaction(&reaction)
+            .ok_or_else(|| anyhow::anyhow!("recreating the working copy raised no status"))
     }
 
     /// The panic button's arm of [`Self::detach_agent`]: end the agent's
@@ -4634,11 +4664,12 @@ impl Engine {
             | WireCommand::SetTailscaleMode { .. }
             | WireCommand::KillSessionPty { .. }
             | WireCommand::DetachAgent { .. }
+            | WireCommand::RecreateWorkingCopy { .. }
             | WireCommand::CloseAgentTab { .. }
             | WireCommand::ChangeAgentTabProvider { .. }
             | WireCommand::SetLastFocusedTab { .. } => {
                 unreachable!(
-                    "changes commands are mapped before the remaining wire_to_command dispatch; rename/reconnect/rerun-startup-command/checkout-default-branch/add-project-checkout-default/change-provider/create-agent-from-pr/set-changes-pane-visible/set-instance-identity/set-settings/toggle-randomized-pet-name-default/toggle-pr-banner-position/set-agent-sort/toggle-copy-on-select/toggle-github-integration/toggle-always-show-tab-strip/toggle-tab-reaches-agent/kill-session-pty/detach-agent/close-agent-tab/change-agent-tab-provider/set-last-focused-tab are handled in apply_wire before wire_to_command"
+                    "changes commands are mapped before the remaining wire_to_command dispatch; rename/reconnect/rerun-startup-command/checkout-default-branch/add-project-checkout-default/change-provider/create-agent-from-pr/set-changes-pane-visible/set-instance-identity/set-settings/toggle-randomized-pet-name-default/toggle-pr-banner-position/set-agent-sort/toggle-copy-on-select/toggle-github-integration/toggle-always-show-tab-strip/toggle-tab-reaches-agent/kill-session-pty/detach-agent/recreate-working-copy/close-agent-tab/change-agent-tab-provider/set-last-focused-tab are handled in apply_wire before wire_to_command"
                 )
             }
             WireCommand::ReorderSessions {

@@ -71,6 +71,8 @@ pub(crate) enum ButtonPressedTarget {
     ConfirmCloseTabConfirm,
     ConfirmDetachAgentCancel,
     ConfirmDetachAgentConfirm,
+    ConfirmRecreateWorkingCopyCancel,
+    ConfirmRecreateWorkingCopyConfirm,
     ConfirmDeleteMacroCancel,
     ConfirmDeleteMacroConfirm,
     /// The macro EDITOR's own buttons (distinct from the nested delete-confirm

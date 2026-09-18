@@ -6,6 +6,7 @@ import {
   ExternalLink,
   FileCode2,
   Folder,
+  FolderSync,
   GitFork,
   GitPullRequest,
   Info,
@@ -43,6 +44,7 @@ import {
 } from "@/lib/agentWorkspace"
 import { DEFAULT_AGENT_TABS_MAX } from "@/lib/bootstrapApi"
 import { agentIsDetachable } from "@/lib/detachAgent"
+import { canRecreateWorkingCopy } from "@/lib/recreateWorkingCopy"
 import { agentRoot } from "@/lib/editorRoot"
 import { clipboardWorktree } from "@/lib/flatClipboard"
 import {
@@ -58,6 +60,7 @@ import {
   openEditor,
   openForceReconnect,
   openForkAgent,
+  openRecreateWorkingCopy,
   openRename,
   openStartupLogs,
   openStopAgent,
@@ -115,6 +118,7 @@ export function AgentActionsMenu({ session }: { session: SessionView }) {
   // from the same oracle the engine's teardown and the terminal UI's palette
   // gate ask, rather than a scan of the tab rows here.
   const liveProcess = agentIsDetachable(session)
+  const copyMissing = canRecreateWorkingCopy(session.workspace)
 
   return (
     <DropdownMenuGroup>
@@ -147,6 +151,19 @@ export function AgentActionsMenu({ session }: { session: SessionView }) {
         <RotateCcw />
         Force recreate agent…
       </DropdownMenuItem>
+      {/* Absent unless the working copy is actually gone: there is nothing to
+        * put back otherwise, and this is the one control that exists only in
+        * that state, because it IS the way out of it. A standalone agent never
+        * gets it: dux does not create, move or remove the user's own folder. */}
+      {copyMissing ? (
+        <DropdownMenuItem
+          disabled={activeElsewhere}
+          onClick={() => openRecreateWorkingCopy(session.id)}
+        >
+          <FolderSync />
+          Recreate working copy…
+        </DropdownMenuItem>
+      ) : null}
       {/* Absent, not disabled, with nothing running: a detach asks a process to
         * go, so with none there is nothing to ask, and a disabled row would
         * promise an action that is not waiting on the user. Neutral colour like

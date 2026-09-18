@@ -362,6 +362,11 @@ export interface DuxState {
   // different things and both can be reached from the same session. Raised by
   // the Task Manager's row for an agent's first tab.
   forceStopAgentTarget: string | null
+  // The agent pending the recreate-working-copy confirmation, or null. Raised
+  // by the agent row menu, and only for a managed agent whose directory is
+  // gone: the act is destructive about what was in that directory, so it asks
+  // first like every other destructive act.
+  recreateWorkingCopyTarget: string | null
   // Session ids with a tab-create request in flight, so the strip's "+" disables
   // until it resolves (a double-click can't spawn two tabs). The per-agent tab
   // cap still guards the server; this is the common-case UX guard.
@@ -919,6 +924,7 @@ let state: DuxState = {
   deleteTerminalTarget: null,
   closeTabTarget: null,
   stopAgentTarget: null,
+  recreateWorkingCopyTarget: null,
   forceStopAgentTarget: null,
   createTabInFlight: [],
   startedDormantTabs: [],
@@ -3601,6 +3607,15 @@ export function closeStopAgent(): void {
   setState({ stopAgentTarget: null })
 }
 
+// Open the recreate-working-copy confirmation, from the agent's row menu.
+export function openRecreateWorkingCopy(sessionId: string): void {
+  setState({ recreateWorkingCopyTarget: sessionId })
+}
+
+export function closeRecreateWorkingCopy(): void {
+  setState({ recreateWorkingCopyTarget: null })
+}
+
 // Open the FORCED stop confirmation, from the Task Manager's row for an agent's
 // first tab. That row is a Force stop control, not a close: what the user is
 // asking for on a process monitor is to end the process the row is showing
@@ -6217,6 +6232,21 @@ export function saveSettings(
 // Manager, which is the panic surface: both its per-row Force stop and its
 // "Force stop everything" pass it, and the polite detach in the agent's row
 // menu is the only caller that does not.
+// Put a managed agent's working copy back at the path it already had. The
+// outcome rides the status stream, like every other keyed operation; only a
+// synchronous refusal is reported here.
+export function recreateWorkingCopy(sessionId: string): void {
+  sessionsApi
+    .recreateWorkingCopy(sessionId)
+    .catch((e) =>
+      notifyError(
+        e instanceof Error
+          ? e.message
+          : "Could not recreate the working copy.",
+      ),
+    )
+}
+
 export function killSessionPty(sessionId: string, force = false): void {
   sessionsApi
     .kill(sessionId, force)
