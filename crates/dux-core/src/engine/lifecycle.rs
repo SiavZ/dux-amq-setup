@@ -1692,6 +1692,10 @@ pub struct RecreateWorkingCopyInputs {
     /// The branch the agent was forked from, and the start point for a branch
     /// that is gone too.
     pub source_branch: String,
+    /// Whether this agent's provider resumes its prior conversation in the same
+    /// directory. The confirmation promises exactly that, so it has to be asked
+    /// rather than assumed.
+    pub conversation_resumes: bool,
 }
 
 impl Engine {
@@ -1747,6 +1751,8 @@ impl Engine {
             worktree_path: std::path::PathBuf::from(&managed.worktree_path),
             branch_name: managed.branch_name.clone(),
             source_branch: managed.source_branch.clone(),
+            conversation_resumes: crate::config::provider_config(&self.config, &session.provider)
+                .supports_session_resume(),
         })
     }
 

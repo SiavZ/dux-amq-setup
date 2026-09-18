@@ -61,6 +61,7 @@ export function ConfirmRecreateWorkingCopyDialog() {
                   managed.worktree_label ?? managed.worktree_path,
                   managed.branch_name,
                   managed.source_branch,
+                  managed.conversation_resumes === true,
                 )
               : ""}
           </DialogDescription>

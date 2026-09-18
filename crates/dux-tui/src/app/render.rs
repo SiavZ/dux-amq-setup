@@ -7826,6 +7826,7 @@ impl App {
             worktree_path,
             branch_name,
             source_branch,
+            conversation_resumes,
             focus,
             ..
         } = &self.prompt
@@ -7837,6 +7838,7 @@ impl App {
             worktree_path,
             branch_name,
             source_branch,
+            *conversation_resumes,
         );
         let mut lines = vec![Line::from("")];
         lines.extend(

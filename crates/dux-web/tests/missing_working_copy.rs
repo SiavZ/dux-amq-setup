@@ -285,6 +285,8 @@ async fn recreating_a_working_copy_that_is_there_is_refused() {
         "{body}"
     );
 
+    // An id nobody has is a 404, not a sentence about an agent that is not
+    // there.
     let unknown = client
         .post(format!(
             "http://{addr}/api/v1/sessions/nope/recreate-working-copy"
@@ -292,7 +294,7 @@ async fn recreating_a_working_copy_that_is_there_is_refused() {
         .send()
         .await
         .unwrap();
-    assert_eq!(unknown.status(), 400);
+    assert_eq!(unknown.status(), 404);
 }
 
 /// The editor is another door onto the same directory. It used to open its own

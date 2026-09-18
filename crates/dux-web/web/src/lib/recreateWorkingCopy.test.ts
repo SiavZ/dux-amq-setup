@@ -41,7 +41,7 @@ describe("recreateConfirmBody", () => {
   // Mirrors `dux_core::working_copy::recreate_confirm_body`. The Rust side has
   // the twin assertions, so a wording change fails on whichever side changed.
   it("reads the same as the terminal UI's", () => {
-    expect(recreateConfirmBody("~/worktrees/repo/feat", "feat", "main")).toBe(
+    expect(recreateConfirmBody("~/worktrees/repo/feat", "feat", "main", true)).toBe(
       "Recreate the working copy for this agent at ~/worktrees/repo/feat?\n\n" +
         'If branch "feat" still exists locally, dux checks it out there again. ' +
         'If it is gone locally but still on the remote, dux creates it again ' +
@@ -57,5 +57,14 @@ describe("recreateConfirmBody", () => {
         "working in a directory that is gone; close it and open one in the " +
         "recreated copy.",
     )
+  })
+
+  // A provider with no directory-scoped resume (copilot ships with none) is
+  // told so rather than promised a resume the same path cannot buy it.
+  it("says the conversation will not resume when the provider cannot", () => {
+    const body = recreateConfirmBody("~/wt", "feat", "main", false)
+    expect(body).toContain("will not resume")
+    expect(body).not.toContain("may resume")
+    expect(body).toContain("are gone either way")
   })
 })

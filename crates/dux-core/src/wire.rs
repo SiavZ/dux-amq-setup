@@ -2378,6 +2378,13 @@ impl Engine {
     /// and a palette command, so an id that should never have reached here has
     /// to be answered in a sentence.
     fn recreate_working_copy_wire(&mut self, session_id: &str) -> anyhow::Result<WireStatus> {
+        // An id nobody has is a 404, not a refusal about an agent: without this
+        // bail every unknown id fell through to "dux only recreates a working
+        // copy it manages", which is a sentence about an agent that is not
+        // there, and the route's own 404 arm was unreachable.
+        if !self.sessions.iter().any(|s| s.id == session_id) {
+            anyhow::bail!("unknown session: {session_id}");
+        }
         let reaction = self.begin_recreate_working_copy(session_id)?;
         wire_status_from_reaction(&reaction)
             .ok_or_else(|| anyhow::anyhow!("recreating the working copy raised no status"))

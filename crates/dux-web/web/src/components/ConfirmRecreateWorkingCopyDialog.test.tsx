@@ -51,6 +51,8 @@ function session(missing: boolean): SessionView {
       worktree_label: "~/.config/dux/worktrees/repo/feat",
       worktree_missing: missing,
       quiet_reason: missing ? "The working copy no longer exists on disk." : "",
+      // The fixture agent runs claude, which resumes per directory.
+      conversation_resumes: true,
     },
     title: null,
     provider: "claude",

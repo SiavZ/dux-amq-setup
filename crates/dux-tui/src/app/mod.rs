@@ -2314,6 +2314,10 @@ pub(crate) enum PromptState {
         worktree_path: std::path::PathBuf,
         branch_name: String,
         source_branch: String,
+        /// Whether this agent's provider picks its conversation back up in the
+        /// same directory. Captured when the dialog opens, like everything else
+        /// it promises.
+        conversation_resumes: bool,
         focus: ConfirmFocus, // Cancel (default) or Recreate
     },
     ConfirmQuit {

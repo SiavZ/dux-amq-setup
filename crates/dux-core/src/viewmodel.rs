@@ -495,6 +495,12 @@ pub enum AgentWorkspaceView {
         /// The sentence explaining why the changes region is quiet, when it is.
         /// Empty while the working copy is there.
         quiet_reason: String,
+        /// Whether this agent's provider resumes its prior conversation when it
+        /// comes up in the same directory. Carried because the recreate
+        /// confirmation promises exactly that, and a provider with no
+        /// directory-scoped resume (copilot ships with none) would have it
+        /// promising something that cannot happen.
+        conversation_resumes: bool,
     },
     Folder {
         /// The folder as it exists on the SERVER's filesystem.
@@ -525,6 +531,7 @@ impl AgentWorkspaceView {
     pub fn from_workspace(
         workspace: &crate::model::AgentWorkspace,
         repo_status: crate::git::FolderRepoStatus,
+        conversation_resumes: bool,
     ) -> Self {
         match workspace {
             crate::model::AgentWorkspace::Managed(managed) => {
@@ -540,6 +547,7 @@ impl AgentWorkspaceView {
                     worktree_missing: repo_status == crate::git::FolderRepoStatus::Missing,
                     quiet_reason: crate::working_copy::quiet_reason(repo_status, worktree, true)
                         .unwrap_or_default(),
+                    conversation_resumes,
                 }
             }
             crate::model::AgentWorkspace::Folder(folder) => Self::Folder {
@@ -1066,12 +1074,17 @@ impl SessionView {
         needs_attention: bool,
         detachable: bool,
         repo_status: crate::git::FolderRepoStatus,
+        conversation_resumes: bool,
     ) -> Self {
         Self {
             id: s.id.clone(),
             title: s.title.clone(),
             provider: s.provider.as_str().to_string(),
-            workspace: AgentWorkspaceView::from_workspace(&s.workspace, repo_status),
+            workspace: AgentWorkspaceView::from_workspace(
+                &s.workspace,
+                repo_status,
+                conversation_resumes,
+            ),
             status: s.status.as_str().to_string(),
             auto_reopen_enabled: s.auto_reopen_enabled,
             pr: pr.map(|pr| PrView::from_pr(pr, pr_overridden)),
@@ -1309,6 +1322,7 @@ impl Engine {
             needs_attention,
             self.is_detachable(&s.id),
             self.folder_repo_status(&s.id),
+            crate::config::provider_config(&self.config, &s.provider).supports_session_resume(),
         )
     }
 
@@ -1530,6 +1544,8 @@ mod tests {
                 worktree_label: "/tmp/s1-worktree".to_string(),
                 worktree_missing: false,
                 quiet_reason: String::new(),
+                // The fixture agent runs claude, which resumes per directory.
+                conversation_resumes: true,
             }
         );
         assert_eq!(spine.sessions[0].status, "detached");

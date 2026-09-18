@@ -983,6 +983,7 @@ mod tests {
                     worktree_path: std::path::PathBuf::from("/tmp/worktrees/repo/feat"),
                     branch_name: "feat".to_string(),
                     source_branch: "main".to_string(),
+                    conversation_resumes: true,
                     focus: ConfirmFocus::Cancel,
                 },
             ),

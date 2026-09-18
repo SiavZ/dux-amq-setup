@@ -1865,6 +1865,7 @@ impl App {
             worktree_path: inputs.worktree_path,
             branch_name: inputs.branch_name,
             source_branch: inputs.source_branch,
+            conversation_resumes: inputs.conversation_resumes,
             focus: ConfirmFocus::Cancel, // Cancel is the safe default
         };
         Ok(())
@@ -5692,6 +5693,7 @@ mod tests {
             worktree_path,
             branch_name,
             source_branch,
+            conversation_resumes,
             focus,
             ..
         } = &app.prompt
@@ -5699,10 +5701,15 @@ mod tests {
             panic!("a missing working copy raises the confirmation")
         };
         assert_eq!(*focus, ConfirmFocus::Cancel, "Cancel is the safe default");
+        assert!(
+            *conversation_resumes,
+            "the fixture agent runs claude, which resumes per directory"
+        );
         let body = dux_core::working_copy::recreate_confirm_body(
             worktree_path,
             branch_name,
             source_branch,
+            *conversation_resumes,
         );
         assert!(body.contains("are gone either way"), "{body}");
         assert!(body.contains("same path"), "{body}");

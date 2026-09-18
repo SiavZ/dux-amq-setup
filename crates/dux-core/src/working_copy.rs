@@ -207,7 +207,24 @@ pub fn quiet_reason(
 /// All three branch arms are stated because asking git which one applies would
 /// run a subprocess to open a dialog. The final status names the arm that
 /// actually ran.
-pub fn recreate_confirm_body(worktree: &Path, branch_name: &str, source_branch: &str) -> String {
+///
+/// `conversation_resumes` is the agent's provider's own answer rather than a
+/// constant: a provider that keeps no directory-scoped history (copilot ships
+/// with no resume arguments) would have this dialog promising something that
+/// cannot happen, and the same path buys it nothing.
+pub fn recreate_confirm_body(
+    worktree: &Path,
+    branch_name: &str,
+    source_branch: &str,
+    conversation_resumes: bool,
+) -> String {
+    let conversation = if conversation_resumes {
+        "The conversation may resume, because the agent's CLI keys its history by directory path \
+         and dux recreates the working copy at the same path."
+    } else {
+        "The conversation will not resume: this agent's CLI has no way to pick a conversation \
+         back up, so it starts fresh wherever it runs."
+    };
     format!(
         "Recreate the working copy for this agent at {}?\n\nIf branch \"{branch_name}\" still \
          exists locally, dux checks it out there again. If it is gone locally but still on the \
@@ -215,8 +232,7 @@ pub fn recreate_confirm_body(worktree: &Path, branch_name: &str, source_branch: 
          been pushed. If it is gone everywhere, dux creates it again from \"{source_branch}\", and \
          the commits that branch held are not coming back.\n\nAny code \
          changes that were in the old directory are gone either way: this puts the directory \
-         back, not its contents. The conversation may resume, because the agent's CLI keys its \
-         history by directory path and dux recreates the working copy at the same path.\n\nIts tabs \
+         back, not its contents. {conversation}\n\nIts tabs \
          are dormant and stay that way, because dux refuses this while the agent is running. A \
          terminal still open in the old directory keeps working in a directory that is gone; close \
          it and open one in the recreated copy.",
@@ -304,7 +320,7 @@ mod tests {
     #[test]
     fn the_confirm_reads_the_same_on_both_surfaces() {
         assert_eq!(
-            recreate_confirm_body(Path::new("/worktrees/repo/feat"), "feat", "main"),
+            recreate_confirm_body(Path::new("/worktrees/repo/feat"), "feat", "main", true),
             "Recreate the working copy for this agent at /worktrees/repo/feat?\n\n\
              If branch \"feat\" still exists locally, dux checks it out there again. If it is \
              gone locally but still on the remote, dux creates it again from \"origin/feat\", \
@@ -321,7 +337,7 @@ mod tests {
 
     #[test]
     fn the_confirm_says_the_changes_are_gone_on_both_branch_outcomes() {
-        let body = recreate_confirm_body(Path::new("/tmp/wt"), "feat", "main");
+        let body = recreate_confirm_body(Path::new("/tmp/wt"), "feat", "main", true);
         assert!(body.contains("checks it out there again"), "{body}");
         assert!(body.contains("from \"origin/feat\""), "{body}");
         assert!(body.contains("from \"main\""), "{body}");
@@ -332,6 +348,13 @@ mod tests {
             body.contains("refuses this while the agent is running"),
             "{body}"
         );
+
+        // A provider that keeps no directory-scoped history is told so rather
+        // than promised a resume the same path cannot buy it.
+        let no_resume = recreate_confirm_body(Path::new("/tmp/wt"), "feat", "main", false);
+        assert!(no_resume.contains("will not resume"), "{no_resume}");
+        assert!(!no_resume.contains("may resume"), "{no_resume}");
+        assert!(no_resume.contains("are gone either way"), "{no_resume}");
     }
 
     /// The branch is still in the repository: the working copy comes back at the

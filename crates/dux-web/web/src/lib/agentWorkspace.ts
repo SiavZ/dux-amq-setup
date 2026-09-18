@@ -50,6 +50,9 @@ export type AgentWorkspaceWire =
        * `quiet_reason`, and absent must read as "the working copy is there",
        * which is what the Rust side answers before its own probe lands. */
       worktree_missing?: boolean
+      /** Whether this agent's provider picks its conversation back up in the
+       * same directory. The recreate confirmation promises exactly that. */
+      conversation_resumes?: boolean
       /** Why the changes region is quiet, when it is. Empty or absent while the
        * working copy is there. */
       quiet_reason?: string

@@ -23,12 +23,23 @@ export function canRecreateWorkingCopy(workspace: AgentWorkspaceWire): boolean {
  * All three branch arms are stated because asking the server which one applies
  * would cost a round trip to open a dialog; the status that follows names the
  * arm that actually ran. The path is the server's, home-collapsed there,
- * because the browser is not necessarily on the server's machine. */
+ * because the browser is not necessarily on the server's machine.
+ *
+ * `conversationResumes` is the agent's provider's own answer rather than a
+ * constant: a provider that keeps no directory-scoped history (copilot ships
+ * with no resume arguments) would have this dialog promising something that
+ * cannot happen, and the same path buys it nothing. */
 export function recreateConfirmBody(
   worktreeLabel: string,
   branchName: string,
   sourceBranch: string,
+  conversationResumes: boolean,
 ): string {
+  const conversation = conversationResumes
+    ? `The conversation may resume, because the agent's CLI keys its history ` +
+      `by directory path and dux recreates the working copy at the same path.`
+    : `The conversation will not resume: this agent's CLI has no way to pick ` +
+      `a conversation back up, so it starts fresh wherever it runs.`
   return (
     `Recreate the working copy for this agent at ${worktreeLabel}?\n\n` +
     `If branch "${branchName}" still exists locally, dux checks it out there ` +
@@ -38,9 +49,7 @@ export function recreateConfirmBody(
     `"${sourceBranch}", and the commits that branch held are not coming ` +
     `back.\n\n` +
     `Any code changes that were in the old directory are gone either way: this ` +
-    `puts the directory back, not its contents. The conversation may resume, ` +
-    `because the agent's CLI keys its history by directory path and dux ` +
-    `recreates the working copy at the same path.\n\n` +
+    `puts the directory back, not its contents. ${conversation}\n\n` +
     `Its tabs are dormant and stay that way, because dux refuses this while ` +
     `the agent is running. A terminal still open in the old directory keeps ` +
     `working in a directory that is gone; close it and open one in the ` +
