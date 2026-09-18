@@ -2694,11 +2694,16 @@ mod tests {
     // this behavior is pinned by the cross-platform byte-parsing tests.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_real_group_scan_finds_a_live_member_and_calls_itself_complete() {
+    fn a_real_group_scan_finds_a_live_member() {
         // The pure classifier above is only honest if the real scan agrees, so
         // the ordinary case is exercised against real processes: a member in a
-        // group of its own must be found, and a scan of a machine dux can read
-        // must call itself COMPLETE rather than incomplete.
+        // group of its own must be found.
+        //
+        // The scan reads every process on the machine, so whether it calls
+        // itself complete is a fact about the MACHINE at that instant: any
+        // unrelated program dux cannot inspect makes it incomplete, and nothing
+        // here owns those. So the verdict is read for the member rather than
+        // for the completeness flag, which is what the pure tests pin.
         use std::os::unix::process::CommandExt;
 
         let dir = tmp();
@@ -2729,14 +2734,22 @@ mod tests {
         let mut inner_out = inner.stdout.take().expect("stdout");
         inner_out.read_exact(&mut buf).expect("read ready marker");
 
-        match process_group_members(child.id()) {
-            ProcessGroup::Members(pids) => assert!(
-                pids.contains(&inner.id()),
-                "the live member {} was not found in {pids:?}",
-                inner.id()
-            ),
-            other => panic!("a readable /proc must produce a complete scan, got {other:?}"),
-        }
+        let found = match process_group_members(child.id()) {
+            ProcessGroup::Members(pids) | ProcessGroup::Incomplete(pids) => pids,
+            ProcessGroup::Unknown => {
+                panic!("Linux enumerates the group from /proc, so it must answer here")
+            }
+        };
+        assert!(
+            found.contains(&inner.id()),
+            "the live member {} was not found in {found:?}",
+            inner.id()
+        );
+        assert_eq!(
+            scan_entry(inner.id(), child.id()),
+            ScanEntry::Member,
+            "the production classifier must read the live member as one"
+        );
 
         let _ = inner.kill();
         let _ = inner.wait();
@@ -2925,13 +2938,15 @@ mod tests {
         let mut buf = [0u8; 6];
         odd_out.read_exact(&mut buf).expect("read ready marker");
 
-        match process_group_members(4242) {
-            ProcessGroup::Members(_) => {}
-            other => panic!(
-                "a process dux CAN read must not spoil the scan, got {other:?} \
-                 while pid {} is alive",
-                odd.id()
-            ),
+        assert_eq!(
+            scan_entry(odd.id(), 4242),
+            ScanEntry::NotAMember,
+            "a process dux CAN read must be classified rather than spoil the \
+             scan, and pid {} is alive",
+            odd.id()
+        );
+        if let ProcessGroup::Unknown = process_group_members(4242) {
+            panic!("Linux enumerates the group from /proc, so it must answer here");
         }
 
         // And end to end: the foreground job has genuinely ended, so the shell
@@ -2944,6 +2959,7 @@ mod tests {
             shell_pid: Some(shell.id()),
             spawn_dir: spawn.path().to_path_buf(),
         };
+        let odd_pid = odd.id();
         let pinned = plan
             .open_with(
                 |pid| {
@@ -2953,7 +2969,16 @@ mod tests {
                         probe_process_cwd(pid)
                     }
                 },
-                process_group_members,
+                // The real scan over the whole machine, narrowed to the one
+                // process this test owns: the group verdict it produces for the
+                // odd name is the regression, and every other program on the
+                // machine is noise that would make the drop refuse for reasons
+                // that have nothing to do with the name.
+                move |pgid| match scan_entry(odd_pid, pgid) {
+                    ScanEntry::Member => ProcessGroup::Members(vec![odd_pid]),
+                    ScanEntry::NotAMember => ProcessGroup::Members(Vec::new()),
+                    ScanEntry::Unreadable => ProcessGroup::Incomplete(Vec::new()),
+                },
             )
             .expect("an unrelated odd name must not refuse the drop");
         assert_eq!(
@@ -2965,6 +2990,13 @@ mod tests {
         let _ = shell.wait();
         let _ = odd.kill();
         let _ = odd.wait();
+    }
+
+    /// Classify one live process the way the production scan does, straight
+    /// from its own `/proc` entry rather than through a walk of the machine.
+    #[cfg(target_os = "linux")]
+    fn scan_entry(pid: u32, pgid: u32) -> ScanEntry {
+        group_scan_step(std::fs::read(format!("/proc/{pid}/stat")), pgid)
     }
 
     /// Start a process that sits in `dir` until it is killed, and wait until it
