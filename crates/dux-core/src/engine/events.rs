@@ -8759,27 +8759,26 @@ mod tests {
                 feature: "nothing a user can see".into(),
             },
             move |_tx| {
+                // Two panicking iterations, so the once-per-streak rule is what
+                // the count below measures rather than there having been one
+                // panic to report.
                 let n = counter_for_body.fetch_add(1, Ordering::Relaxed);
-                if n == 0 {
-                    panic!("first iteration panics");
+                if n < 2 {
+                    panic!("this iteration panics");
                 }
-                if n == 1 {
-                    LoopControl::Break
-                } else {
-                    LoopControl::Continue
-                }
+                LoopControl::Break
             },
         );
 
-        // Wait until the second iteration has run.
+        // Wait until the iteration after the panics has run.
         for _ in 0..200 {
-            if counter.load(Ordering::Relaxed) >= 2 {
+            if counter.load(Ordering::Relaxed) >= 3 {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(
-            counter.load(Ordering::Relaxed) >= 2,
+            counter.load(Ordering::Relaxed) >= 3,
             "loop did not continue past panic; counter = {}",
             counter.load(Ordering::Relaxed),
         );
@@ -8797,6 +8796,51 @@ mod tests {
         assert_eq!(status.tone, crate::statusline::StatusTone::Warning);
         assert!(status.message.contains("nothing a user can see"));
         assert!(status.message.contains("dux.log"));
+        assert!(
+            engine.worker_rx.try_recv().is_err(),
+            "the second panic of the same streak says nothing more"
+        );
+    }
+
+    /// And the other half of the rule: a worker that ran cleanly for a streak
+    /// and then fell over again is a different failure, so it is reported again
+    /// rather than silenced for the life of the process.
+    #[test]
+    fn loop_worker_reports_a_panic_again_after_a_streak_of_clean_iterations() {
+        use crate::engine::{LoopControl, LoopWorkerSpec};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (engine, _tmp) = test_engine();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_for_body = Arc::clone(&counter);
+        let clean = crate::poller_status::REARM_AFTER_SUCCESSES as usize;
+        engine.spawn_loop_worker(
+            LoopWorkerSpec {
+                label: "rearm-loop-test".into(),
+                feature: "nothing a user can see".into(),
+            },
+            move |_tx| {
+                let n = counter_for_body.fetch_add(1, Ordering::Relaxed);
+                if n == 0 || n == clean + 1 {
+                    panic!("this iteration panics");
+                }
+                if n > clean + 1 {
+                    return LoopControl::Break;
+                }
+                LoopControl::Continue
+            },
+        );
+
+        for _ in 0..2 {
+            let posted = engine
+                .worker_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("a restart status");
+            let WorkerEvent::PollerStatus(status) = posted else {
+                panic!("a caught panic reports on the poller-status lane");
+            };
+            assert_eq!(status.tone, crate::statusline::StatusTone::Warning);
+        }
     }
 
     // ── Panic-safety: worktree-remove worker ─────────────────────────────

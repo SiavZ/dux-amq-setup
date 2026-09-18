@@ -115,6 +115,16 @@ pub fn pr_status_not_saved(session_id: &str, agent_label: &str, error: &str) -> 
 /// signal that something is actually wrong.
 pub const WARN_AFTER_FAILURES: u32 = crate::changes_status::ERROR_WARN_THRESHOLD;
 
+/// Consecutive panic-free iterations after which a loop worker reports its next
+/// panic out loud again.
+///
+/// The mirror of [`FailureStreaks::record_success`], and for the same reason: a
+/// body that panics every iteration reports once, because the surfaces have
+/// already replaced that sentence and the log keeps every one of them, while a
+/// worker that ran cleanly for a streak and then broke for a different reason is
+/// news nobody has heard.
+pub const REARM_AFTER_SUCCESSES: u32 = WARN_AFTER_FAILURES;
+
 /// Per-subject consecutive-failure counting for a poller that repeats the same
 /// question every cycle.
 ///

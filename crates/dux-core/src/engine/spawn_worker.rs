@@ -442,11 +442,16 @@ impl Engine {
             .name(format!("dux-loop-{label_for_thread}"))
             .spawn(move || {
                 // Whether this worker has already said out loud that it fell
-                // over. Only the FIRST panic is reported: the loop retries with
-                // no backoff, so a body that panics every iteration would fill
-                // the worker channel with a sentence the surfaces have already
-                // replaced. The log keeps every one of them.
+                // over. Only the FIRST panic of a streak is reported: the loop
+                // retries with no backoff, so a body that panics every iteration
+                // would fill the worker channel with a sentence the surfaces
+                // have already replaced. The log keeps every one of them.
                 let mut reported = false;
+                // Panic-free iterations since that report. A worker that ran
+                // cleanly for a whole streak and then broke again is a different
+                // failure, and staying silent about it for the life of the
+                // process is how a watcher dies twice and says so once.
+                let mut clean_iterations = 0u32;
                 loop {
                     // AssertUnwindSafe: the body's captured state is owned by
                     // this thread, not shared with the engine, so a panic
@@ -454,9 +459,21 @@ impl Engine {
                     let result =
                         std::panic::catch_unwind(AssertUnwindSafe(|| body(&worker_tx)));
                     match result {
-                        Ok(LoopControl::Continue) => continue,
+                        Ok(LoopControl::Continue) => {
+                            if reported {
+                                clean_iterations += 1;
+                                if clean_iterations
+                                    >= crate::poller_status::REARM_AFTER_SUCCESSES
+                                {
+                                    reported = false;
+                                    clean_iterations = 0;
+                                }
+                            }
+                            continue;
+                        }
                         Ok(LoopControl::Break) => break,
                         Err(payload) => {
+                            clean_iterations = 0;
                             let reason = format_panic_payload(payload);
                             crate::logger::error(&format!(
                                 "spawn_loop_worker[{label}] iteration panicked, continuing: {reason}",
