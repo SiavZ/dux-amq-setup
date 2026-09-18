@@ -362,6 +362,28 @@ pub fn closed_tab_exit_notice(exit: &ClosedTabExit) -> String {
     }
 }
 
+/// The workspace-wide notice an agent's LAST live tab exiting earns, in the one
+/// wording both surfaces use.
+///
+/// It is a fact about the workspace rather than about whatever is on screen, so
+/// neither surface may make it conditional on looking at that agent: the browser
+/// raises it for any agent, and the terminal UI's richer selected-agent line is
+/// an addition to this rather than a replacement for it.
+///
+/// A resume the provider REFUSED is the one exit whose reason is already on
+/// screen and about to be thrown away with the pane, so the notice quotes the
+/// CLI's own last words and names `remedy`, which is the only part that differs
+/// per surface because the way back does.
+pub fn detached_agent_notice(pruned: &PrunedPty, remedy: &str) -> String {
+    pruned
+        .refused_resume_excerpt
+        .as_deref()
+        .and_then(|excerpt| {
+            crate::tab_verdict::refused_resume_warning(&pruned.label, excerpt, remedy)
+        })
+        .unwrap_or_else(|| format!("Agent \"{}\" exited.", pruned.label))
+}
+
 /// Whether an exited agent tab's row should be closed along with the prune: any
 /// tab but the agent's LAST remaining one, that exited with status 0 and whose
 /// run did not end badly for any other reason. The one shared rule every
@@ -2118,6 +2140,7 @@ mod tests {
     use super::PrunedPtyKind;
     use super::TerminatingPty;
     use super::{ClosedTabExit, clean_exit_closes_tab_row, closed_tab_exit_notice};
+    use super::{PrunedPty, detached_agent_notice};
     use super::{RAPID_EXIT_WINDOW, rapid_exit_ends_run_badly, refused_resume_excerpt};
     use super::{REAPED_DRAIN_GRACE, agent_pty_ready_to_prune};
     use super::{format_shutdown_result, format_shutdown_start};
@@ -2593,6 +2616,38 @@ mod tests {
         assert!(
             !clean_exit_closes_tab_row(false, None, false, false),
             "an exit nobody read a status from is not a clean one"
+        );
+    }
+
+    /// The sentence both surfaces say when an agent's last live tab exits, and
+    /// the one part of it that is allowed to differ.
+    #[test]
+    fn a_detached_agents_notice_names_the_agent_and_quotes_a_refusal() {
+        let mut pruned = PrunedPty {
+            kind: PrunedPtyKind::Agent,
+            id: "slot".to_string(),
+            owner: None,
+            agent_detached: true,
+            label: "server-mode".to_string(),
+            tab_closed: false,
+            exit_success: Some(false),
+            is_minimal: false,
+            output_excerpt: String::new(),
+            read_error: None,
+            refused_resume_excerpt: None,
+            closed_tab: None,
+        };
+        assert_eq!(
+            detached_agent_notice(&pruned, "Press the reconnect key."),
+            "Agent \"server-mode\" exited."
+        );
+
+        pruned.refused_resume_excerpt = Some(vec!["No conversation to resume".to_string()]);
+        let refusal = detached_agent_notice(&pruned, "Press the reconnect key.");
+        assert!(refusal.contains("No conversation to resume"));
+        assert!(
+            refusal.ends_with("Press the reconnect key."),
+            "the way back is the surface's own: {refusal}"
         );
     }
 

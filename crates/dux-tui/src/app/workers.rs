@@ -124,7 +124,8 @@ impl App {
             Vec::new()
         };
         self.apply_pruned_agent_tabs(&pruned, &context);
-        self.apply_selected_agent_exit(&pruned, &context);
+        let reported = self.apply_selected_agent_exit(&pruned, &context);
+        self.apply_unselected_agent_exits(&pruned, reported.as_deref());
         self.apply_pruned_terminals(&pruned);
         let foregrounds_changed = self.engine.refresh_terminal_foregrounds();
         if foregrounds_changed {
@@ -217,26 +218,57 @@ impl App {
         }
     }
 
-    fn apply_selected_agent_exit(&mut self, pruned: &[PrunedPty], context: &PruneViewContext) {
-        let Some(current_id) = self.selected_session().map(|session| session.id.clone()) else {
-            return;
-        };
+    /// Report the selected agent's own exit, and answer with the pty it spoke
+    /// for so the workspace-wide sweep does not say it twice.
+    fn apply_selected_agent_exit(
+        &mut self,
+        pruned: &[PrunedPty],
+        context: &PruneViewContext,
+    ) -> Option<String> {
+        let current_id = self.selected_session().map(|session| session.id.clone())?;
         let slot_before_prune = context.selected_slot_tab.as_deref();
-        let Some(pty) = pruned
+        let pty = pruned
             .iter()
-            .find(|pty| is_agent_exit_prune(&self.engine, pty, &current_id, slot_before_prune))
-        else {
-            return;
-        };
+            .find(|pty| is_agent_exit_prune(&self.engine, pty, &current_id, slot_before_prune))?;
         let focused = self.focused_tab_id(&current_id);
         if !self
             .engine
             .is_slot_tab_of(SessionIdRef::new(&current_id), TabIdRef::new(&focused))
             && self.engine.providers.contains_key(TabIdRef::new(&focused))
         {
-            return;
+            return None;
         }
         self.apply_selected_agent_exit_status(pty);
+        Some(pty.id.clone())
+    }
+
+    /// Say that an agent's last live tab exited even when the user is looking at
+    /// a different agent.
+    ///
+    /// An agent detaching is a fact about the workspace, not about the pane in
+    /// front of you, and this surface used to make it conditional on selection:
+    /// a browser was told every time and the terminal UI only when the agent
+    /// happened to be the selected one, so the same exit produced two different
+    /// screens. The sentence is the shared one; the selected agent keeps the
+    /// richer line above, which names the pane's own way back.
+    fn apply_unselected_agent_exits(&mut self, pruned: &[PrunedPty], reported: Option<&str>) {
+        let key = self.bindings.label_for(Action::ReconnectAgent);
+        let remedy = format!(
+            "Select the agent and press \"{key}\" to relaunch it, or run \
+             force-reconnect-agent from the palette to start a fresh session."
+        );
+        let notices: Vec<String> = pruned
+            .iter()
+            .filter(|pty| {
+                pty.kind == PrunedPtyKind::Agent
+                    && pty.agent_detached
+                    && reported != Some(pty.id.as_str())
+            })
+            .map(|pty| dux_core::engine::detached_agent_notice(pty, &remedy))
+            .collect();
+        for notice in notices {
+            self.set_warning(notice);
+        }
     }
 
     fn apply_selected_agent_exit_status(&mut self, pty: &PrunedPty) {
@@ -1893,6 +1925,43 @@ mod tests {
 
     use super::*;
 
+    /// An agent detaching is a fact about the workspace: a browser has always
+    /// been told, and this surface used to speak only for the selected agent.
+    #[test]
+    fn an_agent_that_detaches_while_another_is_selected_still_says_so() {
+        let mut app =
+            crate::app::test_support::test_app(crate::app::test_support::default_bindings());
+        let pty = PrunedPty {
+            kind: PrunedPtyKind::Agent,
+            id: "other-slot".to_string(),
+            owner: Some(dux_core::model::TerminalOwner::Session(
+                "session-other".to_string(),
+            )),
+            agent_detached: true,
+            label: "docs-pass".to_string(),
+            tab_closed: false,
+            exit_success: Some(false),
+            is_minimal: false,
+            output_excerpt: String::new(),
+            read_error: None,
+            refused_resume_excerpt: None,
+            closed_tab: None,
+        };
+
+        app.apply_unselected_agent_exits(std::slice::from_ref(&pty), None);
+
+        let (tone, message) = app.status.most_recent_tui().expect("a status");
+        assert_eq!(tone, dux_core::statusline::StatusTone::Warning);
+        assert_eq!(message, "Agent \"docs-pass\" exited.");
+
+        // The selected agent's own richer line already said it, so the sweep
+        // stays quiet rather than saying it a second time.
+        let mut selected =
+            crate::app::test_support::test_app(crate::app::test_support::default_bindings());
+        selected.apply_unselected_agent_exits(std::slice::from_ref(&pty), Some("other-slot"));
+        assert!(selected.status.most_recent_tui().is_none());
+    }
+
     /// The web announces a reload before the drainer has applied it, so the
     /// apply's answer has to travel the lane both surfaces drain, on the key
     /// that premature sentence was raised under.
@@ -3222,6 +3291,7 @@ mod tests {
         config.server.port += 1;
 
         app.apply_reaction(EventReaction::ApplyReloadedConfig(Box::new(config)));
+        app.drain_worker_events();
 
         let (tone, message) = app.status.most_recent_tui().expect("a status");
         assert_eq!(tone, StatusTone::Warning, "the last word is the warning");
@@ -3239,6 +3309,7 @@ mod tests {
         config.ui.diff_tab_width += 1;
 
         app.apply_reaction(EventReaction::ApplyReloadedConfig(Box::new(config)));
+        app.drain_worker_events();
 
         let (tone, _) = app.status.most_recent_tui().expect("a status");
         assert_eq!(tone, StatusTone::Info, "nothing bound has drifted");
@@ -3255,6 +3326,7 @@ mod tests {
         config.server.color = "never".to_string();
 
         app.apply_reaction(EventReaction::ApplyReloadedConfig(Box::new(config)));
+        app.drain_worker_events();
 
         let (tone, _) = app.status.most_recent_tui().expect("a status");
         assert_eq!(

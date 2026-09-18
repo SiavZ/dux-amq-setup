@@ -1951,19 +1951,12 @@ fn prune_wire_status(pruned: &dux_core::engine::PrunedPty) -> Option<WireStatus>
         // rather than making the user open the agent to find out.
         PrunedPtyKind::Agent if pruned.agent_detached => Some(WireStatus::new(
             "warning",
-            pruned
-                .refused_resume_excerpt
-                .as_deref()
-                .and_then(|excerpt| {
-                    dux_core::tab_verdict::refused_resume_warning(
-                        &pruned.label,
-                        excerpt,
-                        // The browser's own way out: the pane is a click away and
-                        // the agent's menu is where a fresh run is started.
-                        "Open the agent to see the full output, or start a fresh session.",
-                    )
-                })
-                .unwrap_or_else(|| format!("Agent \"{}\" exited.", pruned.label)),
+            dux_core::engine::detached_agent_notice(
+                pruned,
+                // The browser's own way out: the pane is a click away and the
+                // agent's menu is where a fresh run is started.
+                "Open the agent to see the full output, or start a fresh session.",
+            ),
         )),
         // The tab closed itself on a clean exit. Silent while a strip is left to
         // have shown the pill leaving; otherwise this sentence is the only word

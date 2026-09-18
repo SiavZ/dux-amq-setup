@@ -1068,6 +1068,9 @@ pub(crate) mod tests {
         config.server.search_index_max_files = 17;
 
         app.apply_reaction(EventReaction::ApplyReloadedConfig(Box::new(config)));
+        // The apply's answer is owed to both surfaces, so it rides the worker
+        // lane and reaches this status line on the drain.
+        app.drain_events();
 
         let (tone, message) = app.status.most_recent_tui().expect("a status");
         assert_eq!(
