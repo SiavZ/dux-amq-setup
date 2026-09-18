@@ -41,6 +41,18 @@ case "$fixture" in
     printf '\033]9;Review requested for the retry policy\007'
     while :; do sleep 60; done
     ;;
+  quit-on-command)
+    # A clean exit on demand, for measuring what dux does when a provider ends
+    # the way a user quitting one ends it: status 0, after real typed input.
+    echo 'fake-agent: type "quit" and press Enter to end this session cleanly.'
+    while IFS= read -r line; do
+      case "$line" in
+        quit*) exit 0 ;;
+      esac
+      printf 'fake-agent: you typed %s\n' "$line"
+    done
+    exit 0
+    ;;
   failure)
     printf '%s\n' 'Error: the fixture dependency could not be resolved.' >&2
     exit 2

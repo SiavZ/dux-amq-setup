@@ -330,3 +330,4 @@ host (`BASE_IMAGE=<image> ./up.sh`) or use the in-container build.
 | `screens/seed.js` | The one idempotent workspace every browser scene is shot against. |
 | `screens/scenes/` | One committed journey per docs screenshot, named after the PNG. |
 | `screens/fixtures/` | The stand-in `gh` and transcript provider a screenshot run installs. |
+| `measurements/` | One-off scripts that drive a behavior and record what the page actually did, with the notes they produced. Not screenshots: a measurement answers a question about timing or state, and its note is the answer. |
