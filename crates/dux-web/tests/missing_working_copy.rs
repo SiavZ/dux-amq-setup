@@ -14,7 +14,7 @@ use dux_core::storage::SessionStore;
 use dux_web::bootstrap::bootstrap_engine;
 use dux_web::engine_actor::spawn_engine_thread;
 use dux_web::server::{RouterParams, build_app};
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 
 fn run_git(cwd: &Path, args: &[&str]) {
@@ -59,6 +59,18 @@ fn sample_session(id: &str, worktree: &str, branch: &str) -> dux_core::model::Ag
 /// A server with one managed agent in a REAL worktree of a real project
 /// repository, so the recreate has a repository to check the branch out from.
 async fn boot() -> (SocketAddr, tempfile::TempDir, std::path::PathBuf) {
+    let (addr, tmp, worktree, _repo) = boot_with_repo().await;
+    (addr, tmp, worktree)
+}
+
+/// The same server, with the project repository's path handed back too, for the
+/// tests that need to look at what git holds.
+async fn boot_with_repo() -> (
+    SocketAddr,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
 
@@ -118,7 +130,7 @@ async fn boot() -> (SocketAddr, tempfile::TempDir, std::path::PathBuf) {
         .await
         .unwrap();
     });
-    (addr, tmp, worktree)
+    (addr, tmp, worktree, repo)
 }
 
 /// Poll until the server has noticed what is at the agent's directory.
@@ -161,15 +173,18 @@ async fn a_deleted_working_copy_answers_with_its_own_verdict() {
 
     // A browser looking at this agent, which is what makes the poller ask about
     // it every cycle and is exactly the situation the bug was reported from.
-    let (mut events, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/events"))
+    // Read, not merely opened: what the browser is told is half the bug, and a
+    // socket nobody drains proves nothing about what travels on it.
+    let (events, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/events"))
         .await
         .unwrap();
-    events
-        .send(Message::Text(
-            r#"{"subscribe":["session:s1:changes"]}"#.into(),
-        ))
-        .await
-        .unwrap();
+    let (mut sink, stream) = events.split();
+    sink.send(Message::Text(
+        r#"{"subscribe":["session:s1:changes","sessions"]}"#.into(),
+    ))
+    .await
+    .unwrap();
+    let frames = collect_frames(stream);
 
     // Precondition: while the directory is there, everything is ordinary.
     let resp = client
@@ -230,6 +245,69 @@ async fn a_deleted_working_copy_answers_with_its_own_verdict() {
         assert_eq!(resp.status(), 200, "and must stay settled");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    // Several more poll cycles with nobody touching anything: whatever the
+    // browser is told about this agent has to stop too.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let seen = frames.lock().unwrap().clone();
+
+    let statuses: Vec<&serde_json::Value> = seen
+        .iter()
+        .filter(|f| f["event"] == "status" && f["tone"] != "busy")
+        .collect();
+    assert!(
+        statuses.len() <= 1,
+        "a directory that is gone is one transition, not one message per poll \
+         cycle; got {statuses:#?}"
+    );
+    for status in &statuses {
+        let message = status["message"].as_str().unwrap_or_default();
+        assert!(
+            !message.to_lowercase().contains("busy"),
+            "and never calls it a busy repository: {message}"
+        );
+    }
+
+    // And the row marker travels: the browser learns the working copy is gone
+    // from the pushed workspace, not only by asking for it.
+    let marked = seen.iter().any(|f| {
+        f["event"] == "workspace"
+            && f["workspace"]["sessions"]
+                .as_array()
+                .is_some_and(|sessions| {
+                    sessions
+                        .iter()
+                        .any(|s| s["id"] == "s1" && s["workspace"]["worktree_missing"] == true)
+                })
+    });
+    assert!(
+        marked,
+        "the row marker must reach an open browser on the wire; frames: {seen:#?}"
+    );
+}
+
+/// Drain an events socket into a shared list, so a test can look at everything
+/// the server said rather than waiting for one frame it expects.
+fn collect_frames<S>(mut stream: S) -> std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>
+where
+    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin
+        + Send
+        + 'static,
+{
+    let frames = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&frames);
+    tokio::spawn(async move {
+        while let Some(Ok(frame)) = stream.next().await {
+            let Ok(text) = frame.into_text() else {
+                continue;
+            };
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                sink.lock().unwrap().push(value);
+            }
+        }
+    });
+    frames
 }
 
 /// The way out: the branch is still in the repository, so the working copy comes
@@ -341,4 +419,54 @@ async fn the_editor_refuses_a_directory_that_is_gone_in_the_same_sentence() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 409);
+}
+
+/// Recreating one agent's working copy must not sever another's. Measured on
+/// git 2.55: `git worktree prune` removes EVERY registration whose directory is
+/// unreachable at that instant, so a sibling agent on a mount that is down lost
+/// its registration permanently and `git status` in its restored directory
+/// answered that it is not a git repository.
+#[tokio::test]
+async fn recreating_one_working_copy_leaves_an_unreachable_sibling_alone() {
+    let (addr, _tmp, worktree, repo) = boot_with_repo().await;
+    let client = reqwest::Client::new();
+
+    let sibling = worktree.parent().unwrap().join("other");
+    dux_core::git::add_worktree_new_branch_at(&repo, &sibling, "other", Some("main"))
+        .expect("a sibling agent's working copy");
+    let stashed = worktree.parent().unwrap().join("other-unreachable");
+
+    std::fs::remove_dir_all(&worktree).unwrap();
+    std::fs::rename(&sibling, &stashed).expect("the sibling's mount goes away");
+    wait_for_missing(addr, true).await;
+
+    let resp = client
+        .post(format!(
+            "http://{addr}/api/v1/sessions/s1/recreate-working-copy"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    wait_for_missing(addr, false).await;
+
+    std::fs::rename(&stashed, &sibling).expect("the sibling's mount comes back");
+    let listed = std::process::Command::new("git")
+        .args(["-C", &repo.to_string_lossy(), "worktree", "list"])
+        .output()
+        .expect("git runs");
+    let listing = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listing.contains("[other]"),
+        "the sibling's registration survived: {listing}"
+    );
+    let status = std::process::Command::new("git")
+        .args(["-C", &sibling.to_string_lossy(), "status", "--porcelain=v1"])
+        .output()
+        .expect("git runs");
+    assert!(
+        status.status.success(),
+        "and its directory still works: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
 }
