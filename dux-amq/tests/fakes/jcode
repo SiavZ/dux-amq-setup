@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# jcode dispatches subcommands from ARGV[1]; `run` is its oneshot mode.
+# The wrapper probes the version with `--no-update --version`, so accept
+# the flag anywhere in a flag-only argv.
+for arg in "$@"; do
+  if [[ "$arg" == "--version" ]]; then
+    printf 'jcode v0.84.0 (57d587899)\n'
+    exit 0
+  fi
+done
+case "${1:-}" in
+  run) printf 'ok\n' ;;
+esac

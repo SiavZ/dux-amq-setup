@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# jcode-amq: launch jcode with AMQ co-op identity (worktree-scoped).
+# Skips AMQ wrapping for subcommand invocations (run/usage/telemetry/...):
+# jcode's oneshot mode is the `run` subcommand rather than a -p flag, and
+# every other subcommand is likewise non-interactive.
+# Uses globally locked store/session ownership at $AMQ_GLOBAL_ROOT.
+set -euo pipefail
+
+STATE_ROOT="${STATE_ROOT:-/data/state}"
+
+version_at_least() {
+  local actual="$1" minimum="$2"
+  local a_major a_minor a_patch m_major m_minor m_patch
+  IFS=. read -r a_major a_minor a_patch <<<"$actual"
+  IFS=. read -r m_major m_minor m_patch <<<"$minimum"
+  [[ "$a_major" =~ ^[0-9]+$ && "$a_minor" =~ ^[0-9]+$ && "$a_patch" =~ ^[0-9]+$ ]] || return 1
+  (( 10#$a_major > 10#$m_major )) ||
+    (( 10#$a_major == 10#$m_major && 10#$a_minor > 10#$m_minor )) ||
+    (( 10#$a_major == 10#$m_major && 10#$a_minor == 10#$m_minor && 10#$a_patch >= 10#$m_patch ))
+}
+
+require_provider_version() {
+  local provider="$1" minimum="$2" output actual
+  if ! command -v "$provider" >/dev/null 2>&1; then
+    printf '%s-amq: %s is not installed or not on PATH\n' "$provider" "$provider" >&2
+    exit 1
+  fi
+  # --no-update: jcode self-updates by default on release builds; a bare
+  # version probe must never swap the binary out from under the launch.
+  output=$("$provider" --no-update --version 2>&1 || true)
+  actual=$(printf '%s\n' "$output" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+  if [[ -z "$actual" ]]; then
+    printf '%s-amq: refusing %s because its version could not be parsed from %q; minimum supported is %s\n' \
+      "$provider" "$provider" "$output" "$minimum" >&2
+    exit 1
+  fi
+  if ! version_at_least "$actual" "$minimum"; then
+    printf '%s-amq: refusing vulnerable %s %s; upgrade to >= %s\n' \
+      "$provider" "$provider" "$actual" "$minimum" >&2
+    exit 1
+  fi
+}
+
+require_provider_version jcode 0.81.4
+
+# See claude-amq for the full rationale on path-segment vs prefix
+# containment (audit01 P0-5). `realpath --` requires GNU coreutils;
+# install.sh preflights it.
+is_dux_worktree() {
+  local pwd_real worktrees_real
+  pwd_real=$(realpath -- "$PWD" 2>/dev/null)        || return 1
+  worktrees_real=$(realpath -- "${DUX_HOME:-$STATE_ROOT/dux}/worktrees" 2>/dev/null) || return 1
+  case "$pwd_real/" in
+    "$worktrees_real"/*) return 0 ;;
+    *)                   return 1 ;;
+  esac
+}
+
+# jcode dispatches subcommands (run, usage, telemetry, auth, session,
+# server, ...) from ARGV[1] ONLY; all of them are non-interactive, so none
+# of them should own an AMQ identity or a wake. Deliberately inspect just
+# the first argument: later non-flag words are flag VALUES (e.g.
+# `--resume <session-id>` on dux targeted resume), not subcommands —
+# scanning all args here once bypassed the wrapper on every resume.
+case "${1:-}" in
+  ''|-*) : ;;
+  *) exec jcode "$@" ;;
+esac
+# Print-and-exit flags anywhere in a flag-only argv (e.g. after
+# --no-update) never need identity or wake either.
+for arg in "$@"; do
+  case "$arg" in
+    --version|--help|-h|-V) exec jcode "$@" ;;
+  esac
+done
+
+# Pin the binary for the life of the pane regardless of caller args:
+# dux's resume_by_id_args historically omitted --no-update, and a provider
+# that replaces its own binary mid-session does not belong on a PTY.
+HAS_NO_UPDATE=0
+for arg in "$@"; do
+  [[ "$arg" == "--no-update" ]] && { HAS_NO_UPDATE=1; break; }
+done
+if (( HAS_NO_UPDATE == 0 )); then
+  set -- --no-update "$@"
+fi
+
+if [[ -n "${DUX_STORE_ID:-}" || -n "${DUX_SESSION_ID:-}" || -n "${DUX_AMQ_HANDLE:-}" ]]; then
+  if [[ -z "${DUX_STORE_ID:-}" || -z "${DUX_SESSION_ID:-}" || -z "${DUX_AMQ_HANDLE:-}" ]]; then
+    printf 'jcode-amq: DUX_STORE_ID, DUX_SESSION_ID, and DUX_AMQ_HANDLE must be set together\n' >&2
+    exit 1
+  fi
+  ME="$DUX_AMQ_HANDLE"
+  MANAGED_IDENTITY=1
+else
+  ME="${AM_ME:-}"
+  MANAGED_IDENTITY=0
+fi
+if [[ -z "$ME" ]] && is_dux_worktree; then
+  ME=$(basename "$PWD")
+fi
+if [[ -z "$ME" ]]; then
+  ME=$(git -C "$PWD" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+fi
+[[ -z "$ME" ]] && ME="jcode-$$"
+if (( MANAGED_IDENTITY == 0 )); then
+  ME=$(printf '%s' "$ME" | tr '[:upper:]' '[:lower:]' | sed 's|[^a-z0-9_-]|-|g; s|^-\+||; s|-\+$||')
+fi
+if [[ -z "$ME" || ${#ME} -gt 64 || ! "$ME" =~ ^[a-z0-9_-]+$ ]]; then
+  printf 'jcode-amq: refusing invalid or overlong AMQ handle\n' >&2
+  exit 1
+fi
+
+# Export AM_ME so descendants of `amq wake` (notably the inject-bridge)
+# can identify the receiver. See claude-amq for full rationale.
+export AM_ME="$ME"
+
+ROOT="${AMQ_GLOBAL_ROOT:-$STATE_ROOT/amq}"
+export AM_ROOT="$ROOT"
+
+ME_REGISTRATION="$ROOT/agents/$ME/.dux-amq-source"
+FLOCK_BIN="${DUX_AMQ_FLOCK:-flock}"
+
+claim_and_register_locked() {
+  local cfg="$ROOT/meta/config.json" marker="$ME_REGISTRATION"
+  local agent_dir="$ROOT/agents/$ME" tmp prev current_real prev_real created created_dir=0
+  if [[ -e "$agent_dir" || -L "$agent_dir" ]]; then
+    [[ -d "$agent_dir" && ! -L "$agent_dir" ]] || return 1
+  else
+    mkdir -m 0700 "$agent_dir" || return 1
+    created_dir=1
+  fi
+  if [[ -n "${DUX_STORE_ID:-}" ]]; then
+    if [[ -e "$marker" || -L "$marker" ]]; then
+      if [[ -L "$marker" ]] || ! jq -e --arg store "$DUX_STORE_ID" --arg session "$DUX_SESSION_ID" \
+        '.store_id == $store and .session_id == $session' "$marker" >/dev/null 2>&1; then
+        printf '[dux-amq] identity collision: %s has a foreign ownership marker\n' "$ME" >&2
+        return 1
+      fi
+    elif (( created_dir == 1 )); then
+      tmp=$(mktemp "$agent_dir/.owner.tmp.XXXXXX") || return 1
+      if ! jq -cn --arg store "$DUX_STORE_ID" --arg session "$DUX_SESSION_ID" \
+        '{store_id:$store,session_id:$session}' >"$tmp" || ! mv "$tmp" "$marker"; then
+        rm -f "$tmp"
+        return 1
+      fi
+    else
+      printf '[dux-amq] identity collision: %s has an ownerless agent directory\n' "$ME" >&2
+      return 1
+    fi
+  elif [[ -e "$marker" || -L "$marker" ]]; then
+    if [[ -L "$marker" ]]; then prev=$(readlink "$marker" 2>/dev/null || true); else prev=$(cat "$marker" 2>/dev/null || true); fi
+    current_real=$(realpath -- "$PWD" 2>/dev/null || true)
+    prev_real=$(realpath -- "$prev" 2>/dev/null || true)
+    if [[ "$prev" != "$PWD" && ( -z "$current_real" || -z "$prev_real" || "$prev_real" != "$current_real" ) ]]; then
+      printf '\033[1;31m!\033[0m [dux-amq] identity collision: %s already registered to %s (current: %s).\n' \
+        "$ME" "${prev:-<unknown>}" "$PWD" >&2
+      return 1
+    fi
+  elif (( created_dir == 1 )); then
+    ln -s "$PWD" "$marker" || return 1
+  else
+    printf '[dux-amq] identity collision: %s has an ownerless agent directory\n' "$ME" >&2
+    return 1
+  fi
+  chmod 0700 "$agent_dir" || return 1
+  tmp=$(mktemp "$ROOT/meta/config.json.tmp.XXXXXX") || return 1
+  created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if [[ -f "$cfg" ]]; then
+    jq --arg me "$ME" '.agents = ((.agents // []) + [$me] | unique)' "$cfg" >"$tmp"
+  else
+    jq -n --arg me "$ME" --arg created "$created" '{version:1,created_utc:$created,agents:[$me]}' >"$tmp"
+  fi
+  mv "$tmp" "$cfg"
+}
+
+mkdir -p "$ROOT/meta" "$ROOT/agents" || exit 1
+command -v "$FLOCK_BIN" >/dev/null 2>&1 || { printf 'jcode-amq: mandatory flock utility is unavailable\n' >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { printf 'jcode-amq: jq is required for atomic AMQ registration\n' >&2; exit 1; }
+export ROOT ME ME_REGISTRATION DUX_STORE_ID DUX_SESSION_ID
+export -f claim_and_register_locked
+"$FLOCK_BIN" -x "$ROOT/meta/config.lock" bash -euo pipefail -c claim_and_register_locked
+
+# Route through AMQ's owner-bound co-op wake. See claude-amq for the
+# full rationale on TIOCSTI fallback.
+LOCAL_BIN="${LOCAL_BIN:-$HOME/.local/bin}"
+BRIDGE="$LOCAL_BIN/dux-amq-inject-bridge"
+if [[ ! -x "$BRIDGE" ]]; then
+  BRIDGE=$(command -v dux-amq-inject-bridge 2>/dev/null || true)
+fi
+
+INJECT_MODE="${DUX_AMQ_INJECT_MODE:-}"
+if [[ -z "$INJECT_MODE" ]]; then
+  if [[ -f "$STATE_ROOT/dux/.tiocsti-state" ]]; then
+    INJECT_MODE="via"
+  elif [[ -n "$BRIDGE" && -x "$BRIDGE" ]]; then
+    # Divergence from the older wrappers, deliberate: raw TIOCSTI is
+    # silently dropped on CONFIG_LEGACY_TIOCSTI=n kernels (Linux 6.2+,
+    # which includes WSL2 6.6). When the bridge is present, prefer it —
+    # a working slow path beats a silently dead fast path.
+    INJECT_MODE="via"
+  else
+    INJECT_MODE="raw"
+  fi
+fi
+
+WAKE_ARGS=(--require-wake -y)
+case "$INJECT_MODE" in
+  raw)
+    WAKE_ARGS+=(--wake-inject-mode raw)
+    ;;
+  via)
+    if [[ -z "$BRIDGE" || ! -x "$BRIDGE" ]]; then
+      printf 'jcode-amq: dux-amq-inject-bridge not found; refusing to start without wake\n' >&2
+      exit 1
+    fi
+    WAKE_ARGS+=(--wake-inject-via "$BRIDGE")
+    ;;
+  *)
+    printf 'jcode-amq: DUX_AMQ_INJECT_MODE=%q not understood; using raw\n' "$INJECT_MODE" >&2
+    WAKE_ARGS+=(--wake-inject-mode raw)
+    ;;
+esac
+
+# Per-session system-prompt override (audit03 Phase 01 §15): jcode has no
+# verified per-invocation system-prompt flag. Warn-and-drop, same as
+# gemini-amq — never pass an unsupported flag.
+if [[ -n "${DUX_SYSTEM_PROMPT:-}" ]]; then
+  printf 'jcode-amq: DUX_SYSTEM_PROMPT set but jcode has no verified equivalent flag; ignoring\n' >&2
+fi
+
+# AMQ leaves exact owner claims after an unclean exit. Recover only that
+# format; ownerless legacy locks are retired by coop's `-y` migration path.
+if jq -e '.owner.pid | numbers' "$ROOT/agents/$ME/.wake.lock" >/dev/null 2>&1; then
+  amq wake recover-owner --root "$ROOT" --me "$ME" --strict >/dev/null
+fi
+
+if [[ -n "${DUX_PANE:-}" && "${DUX_AMQ_VERIFY:-0}" != "1" ]]; then
+  if [[ -z "$BRIDGE" || ! -x "$BRIDGE" ]]; then
+    printf 'jcode-amq: dux-amq-inject-bridge not found; refusing to start without backlog recovery\n' >&2
+    exit 1
+  fi
+  DUX_AMQ_STARTUP_OWNER_PID="$$" "$BRIDGE" &
+fi
+
+exec amq coop exec --no-init --root "$ROOT" --me "$ME" "${WAKE_ARGS[@]}" jcode -- "$@"
