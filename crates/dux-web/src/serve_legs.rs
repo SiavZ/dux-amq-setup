@@ -231,35 +231,177 @@ pub(crate) const TAILSCALE_LEG_KEY: &str = "tailscale-leg";
 /// worker lane is the one road to both, so these facts travel it as well as the
 /// console line, which stays exactly as it was.
 #[derive(Clone, Default)]
-pub(crate) struct LegStatus(Option<crate::engine_actor::EngineHandle>);
+pub(crate) struct LegStatus {
+    handle: Option<crate::engine_actor::EngineHandle>,
+    /// Shared by every clone, because the clone a leg task carries reports the
+    /// same leg as the serve loop's own and the two must coalesce together.
+    coalescer: Arc<std::sync::Mutex<LegCoalescer>>,
+}
+
+/// How long the leg must hold a new state before dux says it changed.
+///
+/// A little longer than one [`WATCH_PERIOD`], which is what makes it a dwell
+/// rather than a second name for the watcher's cadence: an interface that has
+/// not outlived a whole period is one the watcher is still changing its mind
+/// about. The console line and the log stay immediate; this delays only what the
+/// surfaces are told, because every sentence lands on one key and a toast
+/// re-raised on a fixed id restarts its window instead of expiring.
+pub(crate) const LEG_SETTLE_DWELL: Duration =
+    Duration::from_secs(WATCH_PERIOD.as_secs().saturating_add(2));
+
+/// A leg transition waiting out its dwell.
+struct PendingLegTransition {
+    due: std::time::Instant,
+    tone: dux_core::statusline::StatusTone,
+    message: String,
+}
+
+/// Collapses a flapping leg into one sentence: nothing is said until a state has
+/// held for [`LEG_SETTLE_DWELL`], and a transition that lands inside another's
+/// dwell says once that the interface is unstable.
+#[derive(Default)]
+struct LegCoalescer {
+    pending: Option<PendingLegTransition>,
+    /// Whether the unstable sentence has already gone out for this spell of
+    /// flapping, so the same key is not re-raised every few seconds.
+    unstable: bool,
+}
+
+impl LegCoalescer {
+    /// Record one transition. Answers with what to say right now, which is
+    /// nothing at all unless this is the second transition of a flap.
+    fn record(
+        &mut self,
+        now: std::time::Instant,
+        tone: dux_core::statusline::StatusTone,
+        message: &str,
+    ) -> Option<dux_core::engine::StatusUpdate> {
+        let interrupted = self.pending.is_some();
+        self.pending = Some(PendingLegTransition {
+            due: now + LEG_SETTLE_DWELL,
+            tone,
+            message: message.to_string(),
+        });
+        if !interrupted || self.unstable {
+            return None;
+        }
+        self.unstable = true;
+        Some(leg_status_update(
+            dux_core::statusline::StatusTone::Warning,
+            &leg_unstable_warning(),
+        ))
+    }
+
+    /// Answers with the transition whose dwell has elapsed, if one has.
+    fn due(&mut self, now: std::time::Instant) -> Option<dux_core::engine::StatusUpdate> {
+        if self
+            .pending
+            .as_ref()
+            .is_none_or(|pending| now < pending.due)
+        {
+            return None;
+        }
+        let pending = self.pending.take()?;
+        if std::mem::take(&mut self.unstable) {
+            return Some(leg_status_update(
+                pending.tone,
+                &leg_settled_message(&pending.message),
+            ));
+        }
+        Some(leg_status_update(pending.tone, &pending.message))
+    }
+
+    fn deadline(&self) -> Option<std::time::Instant> {
+        self.pending.as_ref().map(|pending| pending.due)
+    }
+}
+
+fn leg_status_update(
+    tone: dux_core::statusline::StatusTone,
+    message: &str,
+) -> dux_core::engine::StatusUpdate {
+    dux_core::engine::StatusUpdate::keyed(TAILSCALE_LEG_KEY, tone, message)
+}
+
+/// What dux says while the interface is coming and going faster than it can be
+/// reported one change at a time.
+pub(crate) fn leg_unstable_warning() -> String {
+    format!(
+        "The Tailscale interface is going up and down: dux is binding and dropping that address \
+         as it comes and goes, and is still serving on its other address(es). dux says what \
+         happened once it has stayed one way for {}s.",
+        LEG_SETTLE_DWELL.as_secs()
+    )
+}
+
+/// And what it says once the flapping stops, on the same key, so the warning is
+/// answered rather than left standing.
+pub(crate) fn leg_settled_message(message: &str) -> String {
+    format!("The Tailscale interface has settled. {message}")
+}
 
 impl LegStatus {
     pub(crate) fn new(handle: crate::engine_actor::EngineHandle) -> Self {
-        Self(Some(handle))
+        Self {
+            handle: Some(handle),
+            coalescer: Arc::new(std::sync::Mutex::new(LegCoalescer::default())),
+        }
     }
 
     /// The leg degraded: it could not bind, or it stopped serving. A warning,
     /// because the address the user may be reaching dux on has gone.
     pub(crate) fn degraded(&self, message: &str) {
-        self.post(dux_core::engine::StatusUpdate::keyed(
-            TAILSCALE_LEG_KEY,
+        self.record(
+            std::time::Instant::now(),
             dux_core::statusline::StatusTone::Warning,
             message,
-        ));
+        );
     }
 
     /// The leg arrived or left as the interface came and went. An info, for the
     /// same reason the console says it in the quiet tone: it is expected news.
     pub(crate) fn changed(&self, message: &str) {
-        self.post(dux_core::engine::StatusUpdate::keyed(
-            TAILSCALE_LEG_KEY,
+        self.record(
+            std::time::Instant::now(),
             dux_core::statusline::StatusTone::Info,
             message,
-        ));
+        );
+    }
+
+    fn record(
+        &self,
+        now: std::time::Instant,
+        tone: dux_core::statusline::StatusTone,
+        message: &str,
+    ) {
+        let update = self.lock().record(now, tone, message);
+        if let Some(update) = update {
+            self.post(update);
+        }
+    }
+
+    /// Say the transition whose dwell has elapsed. The serve loop calls this on
+    /// its own clock, which is the only thing that ever moves a held sentence.
+    pub(crate) fn flush_due(&self, now: std::time::Instant) {
+        let update = self.lock().due(now);
+        if let Some(update) = update {
+            self.post(update);
+        }
+    }
+
+    /// When the held transition is due, for the serve loop's timer arm.
+    pub(crate) fn pending_deadline(&self) -> Option<std::time::Instant> {
+        self.lock().deadline()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, LegCoalescer> {
+        self.coalescer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn post(&self, status: dux_core::engine::StatusUpdate) {
-        if let Some(handle) = &self.0 {
+        if let Some(handle) = &self.handle {
             handle.post_status(status);
         }
     }

@@ -69,7 +69,9 @@ only debounce, so an interface that flaps faster than dux looks costs at most on
 unbind. Every bind and unbind is written to `dux.log`, printed by `dux server`, listed in
 the flip's activity panel, and said on screen: the terminal UI's status line and the
 browser's toasts both name the address that arrived or went away, and both tell you when a
-bind keeps failing.
+bind keeps failing. On screen the news waits until the interface has stayed one way for a
+few seconds, so an interface that keeps flapping gets one message saying so and one more
+once it settles, rather than a new one every time it moves.
 
 > [!TIP]
 > The mode itself is a live switch: change it from the terminal UI's palette, the

@@ -944,6 +944,18 @@ async fn run_serve_loop(
             Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
                 finish_leg_task(joined, &shutdown, &ts.bound, &mut last_bind_failure);
             }
+            // The dwell a leg transition is held for. The status is the only
+            // thing delayed: the console line and the log went out at once. A
+            // sleep rather than a tick, so a loop with nothing held waits on
+            // nothing.
+            _ = async {
+                let due = status
+                    .pending_deadline()
+                    .expect("guarded by the arm's condition");
+                tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
+            }, if status.pending_deadline().is_some() => {
+                status.flush_due(std::time::Instant::now());
+            }
             command = commands.recv() => {
                 apply_current_generation_command(
                     command,
@@ -2087,17 +2099,21 @@ mod tests {
         let mut streak = None;
         let mut tasks = tokio::task::JoinSet::new();
 
+        let status_lane = crate::serve_legs::LegStatus::new(handle);
         super::apply_leg_command(
             crate::serve_legs::LegCommand::Unbind(ts),
             &mut tasks,
             &shutdown,
             &axum::Router::new(),
             &crate::console::Console::noop(),
-            &crate::serve_legs::LegStatus::new(handle),
+            &status_lane,
             &cell,
             &mut streak,
         )
         .await;
+        // The sentence is held for its dwell, so the serve loop's own clock is
+        // what lets it out; here that clock is this line.
+        status_lane.flush_due(std::time::Instant::now() + crate::serve_legs::LEG_SETTLE_DWELL);
 
         svc.drain_requests(&mut engine);
         let posted = engine.worker_rx.try_recv().expect("a status on the lane");
@@ -2110,6 +2126,100 @@ mod tests {
         );
         assert_eq!(status.tone, dux_core::statusline::StatusTone::Info);
         assert!(status.message.contains("went away"), "{}", status.message);
+    }
+
+    /// An interface that comes and goes inside one dwell is one story, not four.
+    ///
+    /// Every transition lands on the same key, and a toast re-raised on a fixed
+    /// id restarts its window rather than expiring, so a sentence per bind
+    /// pinned the flap's news open for as long as the flapping lasted.
+    #[tokio::test]
+    async fn a_flapping_leg_is_one_sentence_and_one_answer_when_it_settles() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        let paths = dux_core::config::DuxPaths {
+            root: root.clone(),
+            config_path: root.join("config.toml"),
+            sessions_db_path: root.join("sessions.sqlite3"),
+            worktrees_root: root.join("worktrees"),
+            lock_path: root.join("dux.lock"),
+        };
+        std::fs::create_dir_all(&paths.worktrees_root).expect("worktrees dir");
+        let mut engine = crate::bootstrap::bootstrap_engine(&paths).expect("engine");
+        let (handle, ends) = crate::engine_actor::build_actor_channels(&engine);
+        let mut svc = crate::engine_actor::EngineService::new(
+            &engine,
+            ends,
+            crate::engine_actor::ShutdownEcho::Silent,
+        );
+
+        // A real loopback address, so the bind half of the flap genuinely binds
+        // and the unbind half genuinely stops a registered leg.
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let shutdown = crate::serve_legs::ServeShutdown::for_watched(true);
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut streak = None;
+        let mut tasks = tokio::task::JoinSet::new();
+        let status_lane = crate::serve_legs::LegStatus::new(handle);
+
+        for command in [
+            crate::serve_legs::LegCommand::Bind(addr),
+            crate::serve_legs::LegCommand::Unbind(addr),
+            crate::serve_legs::LegCommand::Bind(addr),
+            crate::serve_legs::LegCommand::Unbind(addr),
+        ] {
+            super::apply_leg_command(
+                command,
+                &mut tasks,
+                &shutdown,
+                &axum::Router::new(),
+                &crate::console::Console::noop(),
+                &status_lane,
+                &cell,
+                &mut streak,
+            )
+            .await;
+        }
+
+        svc.drain_requests(&mut engine);
+        let first = drain_one_leg_status(&engine);
+        assert_eq!(first.tone, dux_core::statusline::StatusTone::Warning);
+        assert!(
+            first.message.contains("going up and down"),
+            "{}",
+            first.message
+        );
+        assert!(
+            engine.worker_rx.try_recv().is_err(),
+            "four transitions inside one dwell are one sentence"
+        );
+
+        status_lane.flush_due(std::time::Instant::now() + crate::serve_legs::LEG_SETTLE_DWELL);
+        svc.drain_requests(&mut engine);
+        let settled = drain_one_leg_status(&engine);
+        assert!(
+            settled.message.contains("has settled"),
+            "{}",
+            settled.message
+        );
+        assert!(
+            engine.worker_rx.try_recv().is_err(),
+            "and the settling is one answer, on the same key"
+        );
+        assert_eq!(first.key, settled.key);
+    }
+
+    /// The one leg status on the lane, or a panic naming what came instead.
+    fn drain_one_leg_status(engine: &dux_core::engine::Engine) -> dux_core::engine::StatusUpdate {
+        let posted = engine.worker_rx.try_recv().expect("a status on the lane");
+        let dux_core::worker::WorkerEvent::PollerStatus(status) = posted else {
+            panic!("the leg's news rides the poller-status lane");
+        };
+        assert_eq!(
+            status.key.as_deref(),
+            Some(crate::serve_legs::TAILSCALE_LEG_KEY)
+        );
+        status
     }
 
     #[tokio::test]
