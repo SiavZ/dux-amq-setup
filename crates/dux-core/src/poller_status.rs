@@ -45,16 +45,36 @@ pub fn restarted(label: &str, feature: &str) -> StatusUpdate {
     )
 }
 
-/// A worker could not be started at all, so the feature behind it is gone for
-/// this run of dux.
-pub fn spawn_failed(label: &str, feature: &str, error: &str) -> StatusUpdate {
+// What a user can do about a worker that would not start belongs to the CALL
+// SITE: a worker started once at boot is gone for the run, while one spawned on
+// demand tries again the next time something asks for it.
+
+/// The remedy for a worker spawned once, at startup, that nothing retries.
+pub const REMEDY_RESTART_DUX: &str = "It stays off until you restart dux.";
+
+/// The remedy for the one-shot probe behind a standalone agent's git status,
+/// which every later question about the folder starts again.
+pub const REMEDY_NEXT_LOOK_AT_AGENT: &str =
+    "The next look at this agent asks again, so nothing has to be restarted.";
+
+/// The remedy for the on-demand sweep behind the changed-files list, which the
+/// next refresh starts again.
+pub const REMEDY_NEXT_CHANGED_FILES_REFRESH: &str =
+    "The next refresh of that list asks again, so nothing has to be restarted.";
+
+/// The remedy for the pull-request poller, which is started by a config reload
+/// and by dux re-checking whether the GitHub CLI works.
+pub const REMEDY_PR_SYNC: &str = "dux starts it again when you reload your config; otherwise it stays off until you restart \
+     dux.";
+
+/// A worker could not be started at all, so the feature behind it is off. What
+/// the user can do about that is `remedy`, which the call site chooses from the
+/// constants above because only it knows whether anything retries.
+pub fn spawn_failed(label: &str, feature: &str, error: &str, remedy: &str) -> StatusUpdate {
     StatusUpdate::keyed(
         key(label),
         StatusTone::Warning,
-        format!(
-            "dux could not start the background worker behind {feature}: {error}. It stays off \
-             until you restart dux."
-        ),
+        format!("dux could not start the background worker behind {feature}: {error}. {remedy}"),
     )
 }
 
@@ -251,7 +271,13 @@ mod tests {
     fn both_outcomes_for_one_worker_share_its_key() {
         assert_eq!(
             restarted("pr-sync", "pull request status updates").key,
-            spawn_failed("pr-sync", "pull request status updates", "boom").key
+            spawn_failed(
+                "pr-sync",
+                "pull request status updates",
+                "boom",
+                REMEDY_RESTART_DUX
+            )
+            .key
         );
         assert_ne!(
             restarted("pr-sync", "a").key,
@@ -269,9 +295,34 @@ mod tests {
 
     #[test]
     fn a_failure_to_start_says_the_feature_is_off_until_a_restart() {
-        let status = spawn_failed("branch-sync", "branch status updates", "too many threads");
+        let status = spawn_failed(
+            "branch-sync",
+            "branch status updates",
+            "too many threads",
+            REMEDY_RESTART_DUX,
+        );
         assert!(status.message.contains("branch status updates"));
         assert!(status.message.contains("too many threads"));
         assert!(status.message.contains("until you restart dux"));
+    }
+
+    #[test]
+    fn a_worker_that_retries_does_not_tell_the_user_to_restart_dux() {
+        let status = spawn_failed(
+            "folder-repo-probe:sa1",
+            "this agent's git status",
+            "too many threads",
+            REMEDY_NEXT_LOOK_AT_AGENT,
+        );
+        assert!(
+            status
+                .message
+                .contains("The next look at this agent asks again")
+        );
+        assert!(
+            !status.message.contains("restart dux"),
+            "a probe the next ask starts again must not send the user for a restart: {}",
+            status.message
+        );
     }
 }

@@ -2257,6 +2257,8 @@ impl Engine {
             LoopWorkerSpec {
                 label: "branch-sync".into(),
                 feature: "branch status updates".into(),
+                // Started once, at boot, and nothing asks for it again.
+                remedy: crate::poller_status::REMEDY_RESTART_DUX.into(),
             },
             move |tx| {
                 let secs = interval_secs.load(Ordering::Relaxed);
@@ -2844,6 +2846,9 @@ impl Engine {
             LoopWorkerSpec {
                 label,
                 feature: "this agent's git status".into(),
+                // One-shot: the in-flight key is released below, so the next
+                // question about the folder starts a fresh probe.
+                remedy: crate::poller_status::REMEDY_NEXT_LOOK_AT_AGENT.into(),
             },
             move |tx| {
                 let status = if managed {
@@ -2930,6 +2935,9 @@ impl Engine {
             LoopWorkerSpec {
                 label: "changed-files-refresh".into(),
                 feature: "the changed-files list".into(),
+                // Spawned per request, and the queue flag is released below, so
+                // the next refresh spawns one again.
+                remedy: crate::poller_status::REMEDY_NEXT_CHANGED_FILES_REFRESH.into(),
             },
             move |tx| {
                 let Some(path) = lock_changed_files_queue(&queue_for_worker).next_request() else {
@@ -2992,6 +3000,8 @@ impl Engine {
             LoopWorkerSpec {
                 label: crate::poller_status::CHANGED_FILES_LABEL.into(),
                 feature: crate::poller_status::CHANGED_FILES_FEATURE.into(),
+                // Started once, at boot, behind a test-and-set flag.
+                remedy: crate::poller_status::REMEDY_RESTART_DUX.into(),
             },
             move |tx| {
                 let interval = if has_agent.load(Ordering::Relaxed) {
@@ -3220,6 +3230,9 @@ impl Engine {
             LoopWorkerSpec {
                 label: "pr-sync".into(),
                 feature: "pull request status updates".into(),
+                // The slot is released below, and a config reload or a fresh
+                // `gh` probe arms the poller again.
+                remedy: crate::poller_status::REMEDY_PR_SYNC.into(),
             },
             move |tx| {
                 let secs = interval_secs.load(Ordering::Relaxed);
@@ -6165,7 +6178,14 @@ mod tests {
         };
         assert_eq!(status.tone, crate::statusline::StatusTone::Warning);
         assert!(status.message.contains("this agent's git status"));
-        assert!(status.message.contains("until you restart dux"));
+        assert!(
+            status
+                .message
+                .contains("The next look at this agent asks again"),
+            "the probe really does retry, so the sentence must not send the user \
+             for a restart: {}",
+            status.message
+        );
 
         // And the next ask really does probe, without a restart or an event
         // that can no longer arrive.

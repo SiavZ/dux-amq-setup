@@ -8757,6 +8757,7 @@ mod tests {
             LoopWorkerSpec {
                 label: "panic-loop-test".into(),
                 feature: "nothing a user can see".into(),
+                remedy: crate::poller_status::REMEDY_RESTART_DUX.into(),
             },
             move |_tx| {
                 // Two panicking iterations, so the once-per-streak rule is what
@@ -8818,6 +8819,7 @@ mod tests {
             LoopWorkerSpec {
                 label: "rearm-loop-test".into(),
                 feature: "nothing a user can see".into(),
+                remedy: crate::poller_status::REMEDY_RESTART_DUX.into(),
             },
             move |_tx| {
                 let n = counter_for_body.fetch_add(1, Ordering::Relaxed);

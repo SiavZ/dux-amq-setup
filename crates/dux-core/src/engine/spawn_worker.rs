@@ -386,6 +386,10 @@ pub struct LoopWorkerSpec {
     /// never starts. Carried rather than derived from `label`, which is an
     /// identifier and says nothing to the person reading the status line.
     pub feature: String,
+    /// What the user can do when this worker will not start, from the
+    /// `REMEDY_*` constants in [`crate::poller_status`]. Only the call site
+    /// knows whether anything retries it, so only the call site may answer.
+    pub remedy: String,
 }
 
 /// Per-iteration return value for a `spawn_loop_worker` body. `Continue` runs
@@ -417,6 +421,7 @@ impl Engine {
         let worker_tx = self.worker_tx.clone();
         let label = spec.label;
         let feature = spec.feature;
+        let remedy = spec.remedy;
         let label_for_thread = label.clone();
         let feature_for_spawn = feature.clone();
 
@@ -433,7 +438,12 @@ impl Engine {
                 "spawn_loop_worker[{label}] failed to spawn thread: injected test failure",
             ));
             let _ = worker_tx.send(WorkerEvent::PollerStatus(
-                crate::poller_status::spawn_failed(&label, &feature, "injected test failure"),
+                crate::poller_status::spawn_failed(
+                    &label,
+                    &feature,
+                    "injected test failure",
+                    &remedy,
+                ),
             ));
             return false;
         }
@@ -500,6 +510,7 @@ impl Engine {
                 &label_for_thread,
                 &feature_for_spawn,
                 &err.to_string(),
+                &remedy,
             ));
             return false;
         }
