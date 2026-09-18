@@ -377,9 +377,15 @@ impl Engine {
 /// `Engine::spawn_loop_worker`, which owns the outer loop and per-iteration
 /// panic recovery; the body runs once per tick and decides whether to continue.
 pub struct LoopWorkerSpec {
-    /// Short human-readable label. Used as a thread-name suffix and as the
-    /// log prefix on any per-iteration panic.
+    /// Short human-readable label. Used as a thread-name suffix, as the log
+    /// prefix on any per-iteration panic, and as the status key the worker's
+    /// health is reported under.
     pub label: String,
+    /// The consumer-facing noun phrase for what this worker keeps up to date
+    /// ("branch status updates"), which is what a user loses when it dies or
+    /// never starts. Carried rather than derived from `label`, which is an
+    /// identifier and says nothing to the person reading the status line.
+    pub feature: String,
 }
 
 /// Per-iteration return value for a `spawn_loop_worker` body. `Continue` runs
@@ -410,7 +416,9 @@ impl Engine {
     {
         let worker_tx = self.worker_tx.clone();
         let label = spec.label;
+        let feature = spec.feature;
         let label_for_thread = label.clone();
+        let feature_for_spawn = feature.clone();
 
         // Test-only: take the same exit a synchronous spawn failure takes,
         // without exhausting the machine's process table to provoke a real one.
@@ -424,12 +432,21 @@ impl Engine {
             crate::logger::error(&format!(
                 "spawn_loop_worker[{label}] failed to spawn thread: injected test failure",
             ));
+            let _ = worker_tx.send(WorkerEvent::PollerStatus(
+                crate::poller_status::spawn_failed(&label, &feature, "injected test failure"),
+            ));
             return false;
         }
 
         let spawn_result = thread::Builder::new()
             .name(format!("dux-loop-{label_for_thread}"))
             .spawn(move || {
+                // Whether this worker has already said out loud that it fell
+                // over. Only the FIRST panic is reported: the loop retries with
+                // no backoff, so a body that panics every iteration would fill
+                // the worker channel with a sentence the surfaces have already
+                // replaced. The log keeps every one of them.
+                let mut reported = false;
                 loop {
                     // AssertUnwindSafe: the body's captured state is owned by
                     // this thread, not shared with the engine, so a panic
@@ -444,6 +461,12 @@ impl Engine {
                             crate::logger::error(&format!(
                                 "spawn_loop_worker[{label}] iteration panicked, continuing: {reason}",
                             ));
+                            if !reported {
+                                reported = true;
+                                let _ = worker_tx.send(WorkerEvent::PollerStatus(
+                                    crate::poller_status::restarted(&label, &feature),
+                                ));
+                            }
                         }
                     }
                 }
@@ -452,6 +475,14 @@ impl Engine {
         if let Err(err) = spawn_result {
             crate::logger::error(&format!(
                 "spawn_loop_worker[{label_for_thread}] failed to spawn thread: {err}",
+            ));
+            // The worker is the only thing that would have kept this feature up
+            // to date, and nothing retries it, so the user is told rather than
+            // left watching a list that quietly stopped moving.
+            self.post_status(crate::poller_status::spawn_failed(
+                &label_for_thread,
+                &feature_for_spawn,
+                &err.to_string(),
             ));
             return false;
         }

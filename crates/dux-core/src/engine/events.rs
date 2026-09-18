@@ -8737,6 +8737,7 @@ mod tests {
         engine.spawn_loop_worker(
             LoopWorkerSpec {
                 label: "panic-loop-test".into(),
+                feature: "nothing a user can see".into(),
             },
             move |_tx| {
                 let n = counter_for_body.fetch_add(1, Ordering::Relaxed);
@@ -8763,6 +8764,20 @@ mod tests {
             "loop did not continue past panic; counter = {}",
             counter.load(Ordering::Relaxed),
         );
+
+        // The recovery is also said out loud: a watcher that died and came back
+        // is why a list stopped moving, and the log was the only place that
+        // knew. Exactly one sentence, however many iterations panic.
+        let posted = engine
+            .worker_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a restart status");
+        let WorkerEvent::PollerStatus(status) = posted else {
+            panic!("a caught panic reports on the poller-status lane");
+        };
+        assert_eq!(status.tone, crate::statusline::StatusTone::Warning);
+        assert!(status.message.contains("nothing a user can see"));
+        assert!(status.message.contains("dux.log"));
     }
 
     // ── Panic-safety: worktree-remove worker ─────────────────────────────

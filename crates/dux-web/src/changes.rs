@@ -29,7 +29,6 @@ use tokio::sync::watch;
 
 use dux_core::model::ChangedFile;
 use dux_core::viewmodel::ChangedFileView;
-use dux_core::wire::WireStatus;
 
 use crate::engine_actor::EngineHandle;
 use crate::event_bus::{Event, EventBus};
@@ -164,16 +163,18 @@ impl ChangesService {
                         dux_core::logger::error(&format!(
                             "changed-files poller panicked; restarting after backoff: {join_err}"
                         ));
-                        // Surface the degradation to web clients before the restart,
-                        // keyed so a repeated restart replaces rather than stacks.
+                        // Surface the degradation before the restart, keyed so a
+                        // repeated restart replaces rather than stacks. On the
+                        // WORKER LANE rather than the web's own broadcast: the
+                        // terminal UI runs a poller answering the same question
+                        // and its user is owed the same warning, in the same
+                        // words and under the same key.
                         let Some(svc) = weak.upgrade() else {
                             break;
                         };
-                        svc.engine.emit_status(WireStatus::keyed(
-                            "changes-poller",
-                            "warning",
-                            "Changed-files updates were interrupted and are restarting; \
-                             the file list may briefly lag.",
+                        svc.engine.post_status(dux_core::poller_status::restarted(
+                            dux_core::poller_status::CHANGED_FILES_LABEL,
+                            dux_core::poller_status::CHANGED_FILES_FEATURE,
                         ));
                         tokio::time::sleep(POLL_RESTART_BACKOFF).await;
                     }

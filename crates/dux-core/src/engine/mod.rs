@@ -2252,6 +2252,7 @@ impl Engine {
         self.spawn_loop_worker(
             LoopWorkerSpec {
                 label: "branch-sync".into(),
+                feature: "branch status updates".into(),
             },
             move |tx| {
                 let secs = interval_secs.load(Ordering::Relaxed);
@@ -2805,20 +2806,26 @@ impl Engine {
         self.mark_in_flight(key);
         let label = format!("folder-repo-probe:{session_id}");
         let probed_session = session_id.clone();
-        let started = self.spawn_loop_worker(LoopWorkerSpec { label }, move |tx| {
-            let status = if managed {
-                crate::git::managed_worktree_status(&folder)
-            } else {
-                crate::git::folder_repo_status(&folder)
-            };
-            let _ = tx.send(WorkerEvent::FolderRepoStatusReady {
-                session_id: session_id.clone(),
-                status,
-            });
-            // One-shot: the next question about the folder asks again, and the
-            // in-flight key above is what stops that becoming a loop.
-            LoopControl::Break
-        });
+        let started = self.spawn_loop_worker(
+            LoopWorkerSpec {
+                label,
+                feature: "this agent's git status".into(),
+            },
+            move |tx| {
+                let status = if managed {
+                    crate::git::managed_worktree_status(&folder)
+                } else {
+                    crate::git::folder_repo_status(&folder)
+                };
+                let _ = tx.send(WorkerEvent::FolderRepoStatusReady {
+                    session_id: session_id.clone(),
+                    status,
+                });
+                // One-shot: the next question about the folder asks again, and
+                // the in-flight key above is what stops that becoming a loop.
+                LoopControl::Break
+            },
+        );
         if !started {
             self.release_folder_repo_probe(&probed_session);
         }
@@ -2888,6 +2895,7 @@ impl Engine {
         let spawned = self.spawn_loop_worker(
             LoopWorkerSpec {
                 label: "changed-files-refresh".into(),
+                feature: "the changed-files list".into(),
             },
             move |tx| {
                 let Some(path) = lock_changed_files_queue(&queue_for_worker).next_request() else {
@@ -2948,7 +2956,8 @@ impl Engine {
         let mut last_sweep = Duration::ZERO;
         self.spawn_loop_worker(
             LoopWorkerSpec {
-                label: "changed-files-poller".into(),
+                label: crate::poller_status::CHANGED_FILES_LABEL.into(),
+                feature: crate::poller_status::CHANGED_FILES_FEATURE.into(),
             },
             move |tx| {
                 let interval = if has_agent.load(Ordering::Relaxed) {
@@ -3176,6 +3185,7 @@ impl Engine {
         let spawned = self.spawn_loop_worker(
             LoopWorkerSpec {
                 label: "pr-sync".into(),
+                feature: "pull request status updates".into(),
             },
             move |tx| {
                 let secs = interval_secs.load(Ordering::Relaxed);
@@ -6112,6 +6122,16 @@ mod tests {
             !engine.is_in_flight(&InFlightKey::FolderRepoProbe("sa1".to_string())),
             "a probe that never started must not keep holding its slot"
         );
+
+        // A worker that never started is a feature that is off, so it says so
+        // on the lane both surfaces drain rather than only in the log.
+        let posted = engine.worker_rx.try_recv().expect("a spawn-failure status");
+        let WorkerEvent::PollerStatus(status) = posted else {
+            panic!("a failed spawn reports on the poller-status lane");
+        };
+        assert_eq!(status.tone, crate::statusline::StatusTone::Warning);
+        assert!(status.message.contains("this agent's git status"));
+        assert!(status.message.contains("until you restart dux"));
 
         // And the next ask really does probe, without a restart or an event
         // that can no longer arrive.

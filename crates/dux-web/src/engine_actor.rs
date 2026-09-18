@@ -180,6 +180,12 @@ pub enum EngineRequest {
     /// sentences, and queues whatever status it owes on its own worker lane, so
     /// the terminal UI sees the same warning this browser does.
     NoteChangedFilesOutcome(String, Option<String>),
+    /// A status a web-side producer owes to BOTH surfaces, put onto the
+    /// engine's own worker lane rather than straight onto the web's broadcast.
+    /// [`EngineRequest::EmitStatus`] is the web-only door; this one is for a
+    /// fact about the process (a background worker that died and came back)
+    /// that the terminal UI is owed too.
+    PostStatus(dux_core::engine::StatusUpdate),
     /// The runtime PTY key a pane's addressed id names, resolving the bare
     /// per-agent spelling of a slot tab the way the agent PTY socket does.
     /// `None` when nothing answers to the id.
@@ -818,6 +824,25 @@ impl EngineHandle {
             dux_core::logger::warn(&format!(
                 "engine request channel full: dropped a non-engine status update \
                  (tone={tone}, key={key:?})"
+            ));
+        }
+    }
+
+    /// Publish a status a non-engine producer owes to BOTH surfaces, by putting
+    /// it on the engine's own worker lane rather than on the web's broadcast.
+    ///
+    /// [`Self::emit_status`] is web-only by construction: what it sends reaches
+    /// browsers and nothing else. A fact about the process, such as a background
+    /// worker that fell over and was restarted, is owed to whoever is looking,
+    /// so it goes down this road instead and is drained once by whichever
+    /// surface is draining. Same fire-and-forget semantics as `emit_status`.
+    pub fn post_status(&self, status: dux_core::engine::StatusUpdate) {
+        let key = status.key.clone();
+        if let Err(mpsc::error::TrySendError::Full(_)) =
+            self.req_tx.try_send(EngineRequest::PostStatus(status))
+        {
+            dux_core::logger::warn(&format!(
+                "engine request channel full: dropped a worker-lane status update (key={key:?})"
             ));
         }
     }
@@ -1913,7 +1938,9 @@ fn request_mutates_spine(req: &EngineRequest) -> bool {
         | EngineRequest::RefreshChangedFiles(..)
         // The changed-files failure streak is engine state no `SpineView` field
         // reads; the status it may raise travels the worker lane.
-        | EngineRequest::NoteChangedFilesOutcome(..) => false,
+        | EngineRequest::NoteChangedFilesOutcome(..)
+        // Puts a status on the worker lane and touches nothing else.
+        | EngineRequest::PostStatus(..) => false,
 
         // Broadcast on the status channels only. Statuses are their own transport
         // (toasts on the web); no spine field carries them.
@@ -3716,6 +3743,9 @@ fn handle_request(
         EngineRequest::NoteChangedFilesOutcome(session_id, failure) => {
             engine.post_changed_files_outcome(&session_id, failure.as_deref());
         }
+        EngineRequest::PostStatus(status) => {
+            engine.post_status(status);
+        }
         EngineRequest::SessionMissingDirectoryReason(session_id, reply) => {
             // Refreshed off-thread for the same reason the git access is: this
             // call answers with the previous verdict and the next one sees the
@@ -4185,6 +4215,39 @@ mod tests {
 
         assert_eq!(limits.search_index_max_files(), 9);
         assert!(!limits.access_log());
+    }
+
+    /// A background worker that died and came back is a fact about the process,
+    /// so a web-side producer puts it on the worker lane the terminal UI drains
+    /// too, rather than on the browser-only status broadcast.
+    #[test]
+    fn a_web_side_producer_can_post_onto_the_lane_both_surfaces_drain() {
+        let (_tmp, paths) = temp_paths();
+        let mut engine = bootstrap_engine(&paths).expect("engine");
+        let (handle, ends) = build_actor_channels(&engine);
+        let mut statuses = handle.subscribe_status();
+        let mut svc = EngineService::new(&engine, ends, ShutdownEcho::Silent);
+
+        handle.post_status(dux_core::poller_status::restarted(
+            dux_core::poller_status::CHANGED_FILES_LABEL,
+            dux_core::poller_status::CHANGED_FILES_FEATURE,
+        ));
+        assert!(
+            statuses.try_recv().is_err(),
+            "nothing goes straight onto the browsers' own channel"
+        );
+
+        svc.drain_requests(&mut engine);
+        let posted = engine.worker_rx.try_recv().expect("a status on the lane");
+        let dux_core::worker::WorkerEvent::PollerStatus(status) = posted else {
+            panic!("the restart rides the poller-status lane");
+        };
+        assert_eq!(
+            status.key,
+            Some(dux_core::poller_status::key(
+                dux_core::poller_status::CHANGED_FILES_LABEL
+            ))
+        );
     }
 
     /// The announced sentence is keyed on the reload's own key, which is what
