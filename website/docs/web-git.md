@@ -179,12 +179,18 @@ where it would normally name the project.
 
 > [!IMPORTANT]
 > The agent's process, if it was still running, keeps running in a directory that no longer
-> exists. Nothing it does from then on reaches your files. **Recreate working copy…** in the
-> agent's `⋯` menu checks the agent's branch out again at the same path, which is what lets
-> the agent resume the same conversation. The code changes that were in the old directory
-> are gone; this puts the directory back, not its contents. Stop the agent and start it
-> again to work in the recreated copy. The terminal UI has the same action as its
-> `recreate-working-copy` command.
+> exists. Nothing it does from then on reaches your files. Stop the agent first: dux refuses
+> to recreate a working copy underneath a running one. **Recreate working copy…** in the
+> agent's `⋯` menu then checks the agent's branch out again at the same path, which is what
+> lets an agent whose CLI keeps its history per directory resume the same conversation. The
+> code changes that were in the old directory are gone; this puts the directory back, not
+> its contents. The terminal UI has the same action as its `recreate-working-copy` command.
 
-If the branch is gone too, dux creates it again from the project's source branch, and says
-so. The commits that branch held are not coming back.
+If the branch is gone locally but still on the remote, dux creates it again from
+`origin/<branch>`, holding everything that had been pushed. If it is gone everywhere, dux
+creates it again from the project's source branch, and the commits that branch held are not
+coming back. The confirmation says all three, and the message afterwards names the one that
+actually happened.
+
+While the working copy is gone, the editor and a new terminal for that agent are refused
+with the same sentence: there is no directory for either to open.

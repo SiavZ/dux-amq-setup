@@ -108,11 +108,18 @@ would normally name the project.
 
 > [!IMPORTANT]
 > The agent's process, if it was still running, keeps running in a directory that no longer
-> exists. Nothing it does from then on reaches your files. The `recreate-working-copy`
-> command checks the agent's branch out again at the same path, which is what lets the agent
-> resume the same conversation. The code changes that were in the old directory are gone;
-> this puts the directory back, not its contents. Stop the agent and start it again to work
-> in the recreated copy. The browser has the same action in the agent's menu.
+> exists. Nothing it does from then on reaches your files. Stop the agent first: dux refuses
+> to recreate a working copy underneath a running one. The `recreate-working-copy` command
+> then checks the agent's branch out again at the same path, which is what lets an agent
+> whose CLI keeps its history per directory resume the same conversation. The code changes
+> that were in the old directory are gone; this puts the directory back, not its contents.
+> The browser has the same action in the agent's menu.
+
+If the branch is gone locally but still on the remote, dux creates it again from
+`origin/<branch>`, holding everything that had been pushed. If it is gone everywhere, dux
+creates it again from the project's source branch, and the commits that branch held are not
+coming back. The confirmation says all three, and the message afterwards names the one that
+actually happened.
 
 ### Very large diffs in the terminal UI
 
