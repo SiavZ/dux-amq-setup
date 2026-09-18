@@ -11,6 +11,8 @@
 //! changed-files sweep and the web's changes service) share a key, so a process
 //! running both reports one restart rather than two.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::engine::StatusUpdate;
 use crate::statusline::StatusTone;
 
@@ -56,9 +58,184 @@ pub fn spawn_failed(label: &str, feature: &str, error: &str) -> StatusUpdate {
     )
 }
 
+/// The label the refs watcher's health is reported under.
+pub const REFS_WATCHER_LABEL: &str = "refs-watcher";
+
+/// dux could not build the refs watcher at all, so pull request status falls
+/// back to the timer.
+///
+/// An INFO, not a warning: nothing is lost and nothing has to be done, the
+/// updates simply arrive on the poll interval instead of the moment a branch
+/// moves. Saying it anyway is what stops the slower cadence reading as a bug.
+pub fn refs_watcher_unavailable(error: &str) -> StatusUpdate {
+    StatusUpdate::keyed(
+        key(REFS_WATCHER_LABEL),
+        StatusTone::Info,
+        format!(
+            "dux could not watch this repository's branches for changes: {error}. Pull request \
+             status still updates, on the poll interval rather than the moment a branch moves."
+        ),
+    )
+}
+
+/// One agent's branch could not be watched, and no retry will fix it, so that
+/// agent's pull request status is stuck until dux restarts.
+pub fn refs_watcher_lost_agent(agent_label: &str) -> StatusUpdate {
+    StatusUpdate::keyed(
+        key(&format!("{REFS_WATCHER_LABEL}:{agent_label}")),
+        StatusTone::Warning,
+        format!(
+            "dux cannot watch agent \"{agent_label}\" for branch changes, so its pull request \
+             status stops updating until you restart dux. Every other agent is unaffected."
+        ),
+    )
+}
+
+/// A pull request status was fetched but could not be written to SQLite.
+///
+/// The badge on screen is right, so this is about what survives a restart
+/// rather than about what the user is looking at, and the sentence says so
+/// instead of implying the status itself is wrong.
+pub fn pr_status_not_saved(session_id: &str, agent_label: &str, error: &str) -> StatusUpdate {
+    StatusUpdate::keyed(
+        key(&format!("pr-status-write:{session_id}")),
+        StatusTone::Warning,
+        format!(
+            "dux refreshed the pull request status for agent \"{agent_label}\" but could not save \
+             it: {error}. What you see is correct; after a restart dux has to ask GitHub again."
+        ),
+    )
+}
+
+/// Consecutive failures a poller tolerates before it says anything.
+///
+/// The same number [`crate::changes_status`] uses, and for the same reason: git
+/// fails transiently all the time (an index lock held by the agent's own commit,
+/// a directory mid-rename), so a sentence per blip is noise and a streak is the
+/// signal that something is actually wrong.
+pub const WARN_AFTER_FAILURES: u32 = crate::changes_status::ERROR_WARN_THRESHOLD;
+
+/// Per-subject consecutive-failure counting for a poller that repeats the same
+/// question every cycle.
+///
+/// Answers on the CROSSING only, and owes a recovery only where a warning was
+/// actually shown, so a blip stays silent and a standing failure is reported
+/// once.
+#[derive(Debug, Default)]
+pub struct FailureStreaks {
+    streaks: HashMap<String, u32>,
+    warned: HashSet<String>,
+}
+
+impl FailureStreaks {
+    /// Record one failure. `true` exactly once, on the cycle that crosses
+    /// [`WARN_AFTER_FAILURES`].
+    pub fn record_failure(&mut self, subject: &str) -> bool {
+        let streak = self.streaks.entry(subject.to_string()).or_insert(0);
+        *streak += 1;
+        if *streak != WARN_AFTER_FAILURES {
+            return false;
+        }
+        self.warned.insert(subject.to_string());
+        true
+    }
+
+    /// Record one success. `true` only when a warning was actually shown, so a
+    /// blip that never warned leaves no orphaned "it is back" behind it.
+    pub fn record_success(&mut self, subject: &str) -> bool {
+        self.streaks.remove(subject);
+        self.warned.remove(subject)
+    }
+}
+
+/// Branch sync has failed to read git's current branch in one worktree for a
+/// whole streak, so the branch dux shows for that agent may have drifted.
+pub fn branch_sync_stuck(worktree: &str, error: &str) -> StatusUpdate {
+    StatusUpdate::keyed(
+        key(&format!("branch-sync:{worktree}")),
+        StatusTone::Warning,
+        format!(
+            "dux has failed {WARN_AFTER_FAILURES} times running to read the current branch in \
+             {worktree}: {error}. The branch dux shows for that agent may be out of date until \
+             git can answer there again."
+        ),
+    )
+}
+
+/// And the same read succeeded again, on the same key.
+pub fn branch_sync_recovered(worktree: &str) -> StatusUpdate {
+    StatusUpdate::keyed(
+        key(&format!("branch-sync:{worktree}")),
+        StatusTone::Info,
+        format!(
+            "dux can read the current branch in {worktree} again, so the branch it shows for that \
+             agent is up to date."
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_blip_stays_silent_and_a_streak_speaks_once() {
+        let mut streaks = FailureStreaks::default();
+        for _ in 1..WARN_AFTER_FAILURES {
+            assert!(!streaks.record_failure("/w"));
+        }
+        assert!(streaks.record_failure("/w"), "the crossing speaks");
+        assert!(!streaks.record_failure("/w"), "and only the crossing");
+        assert!(streaks.record_success("/w"), "a warned subject recovers");
+        assert!(!streaks.record_success("/w"), "once");
+    }
+
+    #[test]
+    fn a_recovery_is_owed_only_where_a_warning_was_shown() {
+        let mut streaks = FailureStreaks::default();
+        streaks.record_failure("/w");
+        assert!(!streaks.record_success("/w"));
+    }
+
+    #[test]
+    fn a_stuck_branch_read_and_its_recovery_share_the_worktrees_key() {
+        let stuck = branch_sync_stuck("/tmp/wt", "index.lock exists");
+        assert_eq!(stuck.tone, StatusTone::Warning);
+        assert!(stuck.message.contains("index.lock exists"));
+        assert_eq!(stuck.key, branch_sync_recovered("/tmp/wt").key);
+        assert_ne!(stuck.key, branch_sync_recovered("/tmp/other").key);
+    }
+
+    #[test]
+    fn an_unsaved_pr_status_says_the_badge_is_still_right() {
+        let status = pr_status_not_saved("s1", "feat-login", "database is locked");
+        assert_eq!(status.tone, StatusTone::Warning);
+        assert!(status.message.contains("feat-login"));
+        assert!(status.message.contains("database is locked"));
+        assert!(status.message.contains("What you see is correct"));
+        assert_ne!(
+            status.key,
+            pr_status_not_saved("s2", "feat-login", "x").key,
+            "one agent's failure is not another's"
+        );
+    }
+
+    #[test]
+    fn a_refs_watcher_that_never_built_says_what_the_user_still_gets() {
+        let status = refs_watcher_unavailable("inotify limit reached");
+        assert_eq!(status.tone, StatusTone::Info);
+        assert!(status.message.contains("inotify limit reached"));
+        assert!(status.message.contains("Pull request status still updates"));
+    }
+
+    #[test]
+    fn one_lost_agent_is_keyed_apart_from_the_watcher_itself() {
+        let lost = refs_watcher_lost_agent("feat-login");
+        assert_eq!(lost.tone, StatusTone::Warning);
+        assert!(lost.message.contains("feat-login"));
+        assert_ne!(lost.key, refs_watcher_unavailable("x").key);
+        assert_ne!(lost.key, refs_watcher_lost_agent("other").key);
+    }
 
     #[test]
     fn both_outcomes_for_one_worker_share_its_key() {

@@ -2249,6 +2249,10 @@ impl Engine {
         let interval_secs = Arc::clone(&self.branch_sync_interval_secs);
         let wait = Arc::clone(&self.branch_sync_wait);
         let sessions = Arc::clone(&self.branch_sync_sessions);
+        // Per-worktree consecutive failures, owned by the loop because only the
+        // loop knows what "consecutive" means here: one pass of the snapshot is
+        // one cycle, and a worktree that answers again clears its own count.
+        let mut streaks = crate::poller_status::FailureStreaks::default();
         self.spawn_loop_worker(
             LoopWorkerSpec {
                 label: "branch-sync".into(),
@@ -2283,18 +2287,34 @@ impl Engine {
                 let mut updates = Vec::new();
                 for entry in &snapshot {
                     let worktree = Path::new(&entry.worktree_path);
-                    match crate::git::current_branch(worktree) {
-                        Ok(actual) if actual != entry.branch_name => {
-                            updates.push((entry.session_id.clone(), actual));
-                        }
-                        Ok(_) => {}
-                        Err(err) => {
-                            crate::logger::error(&format!(
-                                "branch sync could not read the branch of {}: {err:#}",
-                                worktree.display()
+                    let read = crate::git::current_branch(worktree);
+                    if let Err(err) = &read {
+                        crate::logger::error(&format!(
+                            "branch sync could not read the branch of {}: {err:#}",
+                            worktree.display()
+                        ));
+                        report_missing_directory(tx, &entry.session_id, worktree);
+                        // A blip is ordinary here (the agent's own commit holds
+                        // the index lock), so only a streak is worth a sentence.
+                        if streaks.record_failure(&entry.worktree_path) {
+                            let _ = tx.send(WorkerEvent::PollerStatus(
+                                crate::poller_status::branch_sync_stuck(
+                                    &entry.worktree_path,
+                                    &format!("{err:#}"),
+                                ),
                             ));
-                            report_missing_directory(tx, &entry.session_id, worktree);
                         }
+                        continue;
+                    }
+                    if streaks.record_success(&entry.worktree_path) {
+                        let _ = tx.send(WorkerEvent::PollerStatus(
+                            crate::poller_status::branch_sync_recovered(&entry.worktree_path),
+                        ));
+                    }
+                    if let Ok(actual) = read
+                        && actual != entry.branch_name
+                    {
+                        updates.push((entry.session_id.clone(), actual));
                     }
                 }
                 if !updates.is_empty() && tx.send(WorkerEvent::BranchSyncReady(updates)).is_err() {
@@ -2388,6 +2408,10 @@ impl Engine {
                 self.refs_watch_paths.clear();
                 // Populate the path map and start watching existing sessions.
                 let mut paths = HashMap::new();
+                // Collected rather than posted in the loop: `post_status` is a
+                // read of the engine and the loop already holds one, and an
+                // agent that cannot be watched is worth one sentence each.
+                let mut lost_agents: Vec<String> = Vec::new();
                 for session in &self.sessions {
                     // The watch exists to notice the AGENT's branch moving, and
                     // a standalone agent has no agent branch. Skipped even when
@@ -2428,9 +2452,13 @@ impl Engine {
                                     session.id,
                                     poison,
                                 ));
+                                lost_agents.push(session.display_label().to_string());
                             }
                         }
                     }
+                }
+                for agent_label in lost_agents {
+                    self.post_status(crate::poller_status::refs_watcher_lost_agent(&agent_label));
                 }
                 self.refs_watch_paths = paths.clone();
                 // Populate the closure's path map so events can route to sessions.
@@ -2446,6 +2474,12 @@ impl Engine {
                 crate::logger::warn(&format!(
                     "[gh-integration] refs watcher: failed to create watcher (falling back to poll-only): {}",
                     e,
+                ));
+                // The fallback is silent otherwise, and a user watching pull
+                // request status arrive a poll interval late has no way to tell
+                // that from dux being broken.
+                self.post_status(crate::poller_status::refs_watcher_unavailable(
+                    &e.to_string(),
                 ));
             }
         }

@@ -38,9 +38,40 @@ pub fn apply_failed(error: &str) -> StatusUpdate {
     )
 }
 
+/// A deferred config write failed, so whatever preference was last changed is
+/// not on disk.
+///
+/// Its own key, not the reload's: nothing asked for this write and nothing is
+/// waiting on its answer, so without a sentence the only sign of it is the
+/// preference reverting the next time dux starts.
+pub fn lazy_write_failed(error: &str) -> StatusUpdate {
+    StatusUpdate::keyed(
+        "config-write-deferred",
+        StatusTone::Warning,
+        format!(
+            "dux could not save your preferences to config.toml: {error}. The setting you just \
+             changed is active now but will be gone after a restart; check that the file is \
+             writable and change it again."
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_deferred_write_says_the_change_will_not_survive_a_restart() {
+        let status = lazy_write_failed("Permission denied (os error 13)");
+        assert_eq!(status.tone, StatusTone::Warning);
+        assert!(status.message.contains("Permission denied"));
+        assert!(status.message.contains("gone after a restart"));
+        assert_ne!(
+            status.key.as_deref(),
+            Some(CONFIG_RELOAD),
+            "a write nobody asked for is not the reload's outcome"
+        );
+    }
 
     #[test]
     fn both_outcomes_share_the_reload_key() {

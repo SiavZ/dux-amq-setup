@@ -127,7 +127,10 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
     let (worker_tx, worker_rx) = mpsc::channel();
     let single_instance_lock = crate::lockfile::SingleInstanceLock::acquire(&paths.lock_path)
         .expect("single-instance lock for test App");
-    let config_writer = dux_core::config_queue::ConfigWriteQueue::new(paths.config_path.clone());
+    let config_writer = dux_core::config_queue::ConfigWriteQueue::with_status_lane(
+        paths.config_path.clone(),
+        worker_tx.clone(),
+    );
     let engine = dux_core::engine::Engine {
         config: Config::default(),
         paths,

@@ -104,7 +104,8 @@ pub fn bootstrap_engine(paths: &DuxPaths) -> Result<Engine> {
         mpsc::channel();
 
     let github_integration_enabled = config.ui.github_integration;
-    let config_writer = ConfigWriteQueue::new(paths.config_path.clone());
+    let config_writer =
+        ConfigWriteQueue::with_status_lane(paths.config_path.clone(), worker_tx.clone());
 
     let mut engine = Engine {
         config,

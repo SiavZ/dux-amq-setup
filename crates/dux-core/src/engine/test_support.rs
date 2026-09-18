@@ -34,7 +34,10 @@ pub(crate) fn test_engine() -> (Engine, TempDir) {
     let single_instance_lock =
         SingleInstanceLock::acquire(&paths.lock_path).expect("single-instance lock");
     let (worker_tx, worker_rx) = mpsc::channel();
-    let config_writer = crate::config_queue::ConfigWriteQueue::new(paths.config_path.clone());
+    let config_writer = crate::config_queue::ConfigWriteQueue::with_status_lane(
+        paths.config_path.clone(),
+        worker_tx.clone(),
+    );
     let engine = Engine {
         config: Config::default(),
         paths,

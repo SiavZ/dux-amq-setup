@@ -2832,6 +2832,23 @@ impl Engine {
         true
     }
 
+    /// Say that a pull request status dux just fetched did not reach SQLite.
+    ///
+    /// The database is the only thing that carries it across a restart, and the
+    /// failure was a log line, so a workspace whose PR badges quietly stopped
+    /// persisting looked exactly like one that had never had any.
+    fn report_unsaved_pr_status(&self, session_id: &str, error: &str) {
+        let label = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| session.display_label().to_string())
+            .unwrap_or_else(|| session_id.to_string());
+        self.post_status(crate::poller_status::pr_status_not_saved(
+            session_id, &label, error,
+        ));
+    }
+
     fn apply_pr_status_result(
         &mut self,
         session_id: String,
@@ -2866,12 +2883,14 @@ impl Engine {
                         logger::error(&format!(
                             "failed to refresh pinned PR for {session_id}: {err}",
                         ));
+                        self.report_unsaved_pr_status(&session_id, &err.to_string());
                     }
                     self.pr_overrides.insert(session_id.clone(), row);
                 } else if let Err(err) = self.session_store.upsert_pr(&row) {
                     logger::error(&format!(
                         "failed to persist PR status for {session_id} (PR #{pr_number}): {err}",
                     ));
+                    self.report_unsaved_pr_status(&session_id, &err.to_string());
                 }
                 self.pr_statuses.insert(session_id, pr);
                 true

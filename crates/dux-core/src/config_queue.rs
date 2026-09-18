@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::config_write::{Durability, save_config_with};
+use crate::worker::WorkerEvent;
 
 const QUIET_WINDOW: Duration = Duration::from_millis(250);
 const EAGER_TIMEOUT: Duration = Duration::from_secs(2);
@@ -70,14 +71,29 @@ impl Drop for QuiesceGuard {
 }
 
 impl ConfigWriteQueue {
+    /// A queue whose failures are only logged. For tests and for callers with
+    /// no engine behind them; every production site uses
+    /// [`Self::with_status_lane`] instead, because a preference that silently
+    /// failed to save is exactly the kind of thing nobody reads a log about.
     pub fn new(config_path: PathBuf) -> Self {
+        Self::build(config_path, None)
+    }
+
+    /// A queue that reports a failed deferred write on the engine's worker
+    /// lane, so whichever surface is draining says the preference was not
+    /// saved.
+    pub fn with_status_lane(config_path: PathBuf, status_lane: Sender<WorkerEvent>) -> Self {
+        Self::build(config_path, Some(status_lane))
+    }
+
+    fn build(config_path: PathBuf, status_lane: Option<Sender<WorkerEvent>>) -> Self {
         let (tx, rx) = mpsc::channel();
         let lazy_inflight = Arc::new(AtomicUsize::new(0));
         let writer = thread::Builder::new()
             .name("config-writer".into())
             .spawn({
                 let lazy_inflight = lazy_inflight.clone();
-                move || writer_loop(rx, config_path, lazy_inflight)
+                move || writer_loop(rx, config_path, lazy_inflight, status_lane)
             })
             .expect("spawn config-writer thread");
         ConfigWriteQueue {
@@ -263,13 +279,18 @@ fn decr_inflight(counter: &AtomicUsize) {
     });
 }
 
-fn writer_loop(rx: Receiver<WriteMsg>, path: PathBuf, lazy_inflight: Arc<AtomicUsize>) {
+fn writer_loop(
+    rx: Receiver<WriteMsg>,
+    path: PathBuf,
+    lazy_inflight: Arc<AtomicUsize>,
+    status_lane: Option<Sender<WorkerEvent>>,
+) {
     // Clone the counter before moving the original into the inner loop, so the
     // panic handler below still has a handle to reset it after the loop exits.
     let counter = lazy_inflight.clone();
     // Note: under panic = "abort" this guard is inert (the process aborts); it is active under the default unwind strategy.
     if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        writer_loop_inner(rx, path, lazy_inflight)
+        writer_loop_inner(rx, path, lazy_inflight, status_lane)
     })) {
         let msg = panic
             .downcast_ref::<&str>()
@@ -292,7 +313,12 @@ enum WriterControl {
     Stop,
 }
 
-fn writer_loop_inner(rx: Receiver<WriteMsg>, path: PathBuf, lazy_inflight: Arc<AtomicUsize>) {
+fn writer_loop_inner(
+    rx: Receiver<WriteMsg>,
+    path: PathBuf,
+    lazy_inflight: Arc<AtomicUsize>,
+    status_lane: Option<Sender<WorkerEvent>>,
+) {
     let mut pending: Option<Config> = None;
     let mut deadline: Option<Instant> = None;
 
@@ -306,6 +332,7 @@ fn writer_loop_inner(rx: Receiver<WriteMsg>, path: PathBuf, lazy_inflight: Arc<A
                 &lazy_inflight,
                 &mut pending,
                 &mut deadline,
+                status_lane.as_ref(),
             ),
             WriterControl::Stop
         ) {
@@ -341,9 +368,10 @@ fn handle_writer_input(
     lazy_inflight: &AtomicUsize,
     pending: &mut Option<Config>,
     deadline: &mut Option<Instant>,
+    status_lane: Option<&Sender<WorkerEvent>>,
 ) -> WriterControl {
     match input {
-        Ok(None) => flush_pending(path, pending, deadline),
+        Ok(None) => flush_pending(path, pending, deadline, status_lane),
         Err(WriterDisconnected) => return WriterControl::Stop,
         Ok(Some(WriteMsg::Lazy(config))) => {
             decr_inflight(lazy_inflight);
@@ -363,11 +391,11 @@ fn handle_writer_input(
             let _ = reply.send(result);
         }
         Ok(Some(WriteMsg::Flush(ack))) => {
-            flush_pending(path, pending, deadline);
+            flush_pending(path, pending, deadline, status_lane);
             let _ = ack.send(());
         }
         Ok(Some(WriteMsg::Pause(ack))) => {
-            flush_pending(path, pending, deadline);
+            flush_pending(path, pending, deadline, status_lane);
             let _ = ack.send(());
             debug_assert!(pending.is_none());
             if !run_paused_writer(rx, lazy_inflight) {
@@ -376,7 +404,7 @@ fn handle_writer_input(
         }
         Ok(Some(WriteMsg::Resume)) => {}
         Ok(Some(WriteMsg::Shutdown)) => {
-            flush_pending(path, pending, deadline);
+            flush_pending(path, pending, deadline, status_lane);
             return WriterControl::Stop;
         }
     }
@@ -413,12 +441,21 @@ fn flush_pending(
     path: &std::path::Path,
     pending: &mut Option<Config>,
     deadline: &mut Option<Instant>,
+    status_lane: Option<&Sender<WorkerEvent>>,
 ) {
     *deadline = None;
     if let Some(cfg) = pending.take()
         && let Err(e) = save_config_with(path, &cfg, Durability::NoFsync)
     {
         crate::logger::error(&format!("lazy config write failed: {e:#}"));
+        // Nothing asked for this write and nothing is waiting on its answer, so
+        // the only sign of the failure is the preference reverting the next time
+        // dux starts. Say so while the user is still here to fix it.
+        if let Some(lane) = status_lane {
+            let _ = lane.send(WorkerEvent::PollerStatus(
+                crate::config_reload_status::lazy_write_failed(&format!("{e:#}")),
+            ));
+        }
     }
 }
 
@@ -444,6 +481,26 @@ mod tests {
         q.save_eager(cfg).expect("eager ok");
 
         assert!(read(&path).contains("FOO = \"bar\""));
+    }
+
+    /// Nobody waits on a lazy write, so a failure has no caller to report to:
+    /// without this the only sign is the preference reverting at the next start.
+    #[test]
+    fn a_failed_lazy_write_reports_on_the_status_lane() {
+        let (tx, rx) = mpsc::channel();
+        let q = ConfigWriteQueue::with_status_lane("/nonexistent/dir/config.toml".into(), tx);
+
+        q.save_lazy(Config::default());
+        q.flush();
+
+        let event = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a status on the lane");
+        let WorkerEvent::PollerStatus(status) = event else {
+            panic!("a failed deferred write rides the poller-status lane");
+        };
+        assert_eq!(status.tone, crate::statusline::StatusTone::Warning);
+        assert!(status.message.contains("gone after a restart"));
     }
 
     #[test]

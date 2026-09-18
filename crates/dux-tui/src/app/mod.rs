@@ -3643,8 +3643,10 @@ impl App {
             theme_warning,
         );
         let gh_integration_val = config.ui.github_integration;
-        let config_writer =
-            dux_core::config_queue::ConfigWriteQueue::new(paths.config_path.clone());
+        let config_writer = dux_core::config_queue::ConfigWriteQueue::with_status_lane(
+            paths.config_path.clone(),
+            worker_tx.clone(),
+        );
         let engine = Engine {
             config,
             paths,
