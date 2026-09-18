@@ -45,12 +45,27 @@ pub fn recreate_working_copy(
     branch_name: &str,
     source_branch: &str,
 ) -> Result<RecreatedBranch> {
-    if worktree_path.exists() {
-        return Err(anyhow!(
-            "{} already exists, so dux left it alone. Move or remove it if you want dux to check \
-             the branch out there again.",
-            shorten_home(worktree_path)
-        ));
+    match crate::git::directory_presence(worktree_path) {
+        crate::git::DirectoryPresence::Missing => {}
+        crate::git::DirectoryPresence::Present => {
+            return Err(anyhow!(
+                "{} already exists, so dux left it alone. Move or remove it if you want dux to \
+                 check the branch out there again.",
+                shorten_home(worktree_path)
+            ));
+        }
+        // The same fail-closed rule the verdict uses: a stat that failed for a
+        // reason other than "nothing is there" means dux does not know whether
+        // the old working copy is still sitting at this path, and checking a
+        // branch out over it is not a guess dux may take.
+        crate::git::DirectoryPresence::Indeterminate => {
+            return Err(anyhow!(
+                "dux could not read {}, so it does not know whether the old working copy is still \
+                 there and left it alone. Check that the path is readable and that whatever it \
+                 lives on is mounted, then try again.",
+                shorten_home(worktree_path)
+            ));
+        }
     }
     // git still holds the registration of the directory the agent deleted, and
     // with it the branch as checked out, so both arms below fail without this.
@@ -76,6 +91,23 @@ pub fn missing_working_copy_reason(worktree: &Path) -> String {
         "The working copy at {} no longer exists on disk, so dux cannot show this agent's \
          changes. Anything still running in it keeps running in a directory that is gone, and \
          this agent cannot restart or resume here until the working copy is recreated.",
+        shorten_home(worktree)
+    )
+}
+
+/// Why the changes region is quiet for a managed agent whose working copy dux
+/// could not stat at all.
+///
+/// Deliberately hedged, and deliberately not the missing sentence: an
+/// unreadable parent, a stale handle and a mount that is down all fail the same
+/// stat a deletion does, and telling the user their working copy was deleted
+/// when it is sitting safely on a mount that is merely down would have them
+/// recreate a branch that never needed recreating.
+pub fn unreachable_working_copy_reason(worktree: &Path) -> String {
+    format!(
+        "dux could not read the working copy at {}, so it cannot say whether this agent has \
+         changes. Check that the path is readable and that whatever it lives on is mounted, then \
+         reopen this panel.",
         shorten_home(worktree)
     )
 }
@@ -113,6 +145,11 @@ pub fn quiet_reason(
     Some(match status {
         crate::git::FolderRepoStatus::Missing if managed => missing_working_copy_reason(directory),
         crate::git::FolderRepoStatus::Missing => missing_folder_reason(directory),
+        // A managed working copy dux could not stat is not "dux could not
+        // consult git about this folder": nothing was asked of git at all.
+        crate::git::FolderRepoStatus::Indeterminate if managed => {
+            unreachable_working_copy_reason(directory)
+        }
         other => other.quiet_reason().to_string(),
     })
 }
@@ -285,6 +322,43 @@ mod tests {
             std::fs::read_to_string(worktree.join("mine.txt")).expect("still there"),
             "do not touch"
         );
+    }
+
+    /// A stat dux could not get an answer to must not be treated as a deletion:
+    /// checking a branch out over a working copy that is merely unreachable is
+    /// exactly the loss this refusal exists to prevent.
+    #[test]
+    fn an_unreadable_path_is_refused_rather_than_checked_out_over() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _worktree) = repo_with_a_deleted_worktree();
+        let locked = repo.path().join("locked");
+        std::fs::create_dir_all(locked.join("inner")).expect("inner");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("lock");
+        let result = recreate_working_copy(repo.path(), &locked.join("inner"), "feat", "main");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("unlock");
+
+        let err = result.expect_err("a path dux cannot read is refused");
+        let message = format!("{err:#}");
+        assert!(message.contains("could not read"), "{message}");
+        assert!(message.contains("mounted"), "{message}");
+    }
+
+    /// The hedged sentence belongs to the managed kind too: a standalone folder
+    /// dux could not stat keeps git's own wording, which is about consulting
+    /// git, while a managed working copy never asked git anything.
+    #[test]
+    fn an_unreachable_directory_gets_the_hedged_sentence_for_its_kind() {
+        use crate::git::FolderRepoStatus;
+        let managed = quiet_reason(FolderRepoStatus::Indeterminate, Path::new("/mnt/wt"), true)
+            .expect("an unreachable working copy is quiet");
+        assert!(managed.contains("/mnt/wt"), "{managed}");
+        assert!(managed.contains("mounted"), "{managed}");
+        assert!(!managed.contains("no longer exists"), "{managed}");
+
+        let folder = quiet_reason(FolderRepoStatus::Indeterminate, Path::new("/mnt/mine"), false)
+            .expect("an unreachable folder is quiet");
+        assert_eq!(folder, FolderRepoStatus::Indeterminate.quiet_reason());
     }
 
     fn run_git(repo: &Path, args: &[&str]) {

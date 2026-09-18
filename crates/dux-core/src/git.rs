@@ -360,6 +360,47 @@ impl FolderRepoStatus {
     }
 }
 
+/// Whether a directory is really gone, still there, or could not be asked
+/// about at all.
+///
+/// The distinction that keeps "gone" honest. `Path::exists()` answers false for
+/// a stat that failed for ANY reason, so an unreadable parent, a stale handle,
+/// a disconnected network mount and a timeout all read as deleted, and dux
+/// would offer to recreate a working copy sitting safely on a mount that is
+/// merely down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectoryPresence {
+    /// The stat succeeded. Something is at this path.
+    Present,
+    /// The stat failed in one of the two ways that mean nothing is there.
+    Missing,
+    /// The stat failed some other way, so dux does not know.
+    Indeterminate,
+}
+
+/// Ask the filesystem whether a directory is there, classifying the failure.
+///
+/// Measured against the standard library actually installed rather than
+/// assumed: a deleted path answers `NotFound`, a path whose parent is a regular
+/// file answers `NotADirectory`, and a path under a parent with mode 000
+/// answers `PermissionDenied`. Only the first two mean the directory is gone.
+///
+/// `metadata` rather than `symlink_metadata`, also measured: a dangling symlink
+/// answers `Ok` for `symlink_metadata`, because the link itself is there, and
+/// `NotFound` for `metadata`. A working copy whose symlink points at nothing is
+/// gone, not present.
+pub fn directory_presence(path: &Path) -> DirectoryPresence {
+    match fs::metadata(path) {
+        Ok(_) => DirectoryPresence::Present,
+        Err(err) => match err.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+                DirectoryPresence::Missing
+            }
+            _ => DirectoryPresence::Indeterminate,
+        },
+    }
+}
+
 /// Classify a standalone agent's folder per [`FolderRepoStatus`].
 ///
 /// A bare repository and git's own internals both answer
@@ -369,8 +410,12 @@ pub fn folder_repo_status(path: &Path) -> FolderRepoStatus {
     // Asked before git, because git walks UP: run in a directory that is gone
     // and the answer is about a parent, or an error the poller would report as
     // "the repository is busy" once per cycle.
-    if !path.exists() {
-        return FolderRepoStatus::Missing;
+    match directory_presence(path) {
+        DirectoryPresence::Present => {}
+        DirectoryPresence::Missing => return FolderRepoStatus::Missing,
+        // A stat that failed any other way is a question dux could not get an
+        // answer to, which is what Indeterminate already says.
+        DirectoryPresence::Indeterminate => return FolderRepoStatus::Indeterminate,
     }
     match repo_path_kind(path) {
         RepoPathKind::WorkTreeRoot => FolderRepoStatus::WorkingRepo,
@@ -389,11 +434,16 @@ pub fn folder_repo_status(path: &Path) -> FolderRepoStatus {
 /// changed is whether the directory is still there. Keeping it to a single stat
 /// is what lets every managed agent be probed on the changed-files cadence
 /// without a git subprocess per cycle.
+///
+/// A stat dux could not get an answer to is Indeterminate rather than Missing:
+/// offering to recreate a working copy because its mount is unreachable would
+/// have dux check the branch out somewhere else while the real one is still
+/// sitting there.
 pub fn managed_worktree_status(path: &Path) -> FolderRepoStatus {
-    if path.exists() {
-        FolderRepoStatus::WorkingRepo
-    } else {
-        FolderRepoStatus::Missing
+    match directory_presence(path) {
+        DirectoryPresence::Present => FolderRepoStatus::WorkingRepo,
+        DirectoryPresence::Missing => FolderRepoStatus::Missing,
+        DirectoryPresence::Indeterminate => FolderRepoStatus::Indeterminate,
     }
 }
 
@@ -9083,6 +9133,59 @@ mod tests {
             folder_repo_status(&git_dir),
             FolderRepoStatus::NoRepo,
             "git's own internals are the quiet case, not a working repository"
+        );
+    }
+
+    /// A deleted directory is gone; a directory dux cannot stat is a question
+    /// it could not answer. `Path::exists()` cannot tell the two apart, and
+    /// calling an unreachable mount "deleted" offers to recreate a working copy
+    /// that is sitting safely where it always was.
+    #[test]
+    fn only_a_stat_that_says_nothing_is_there_reads_as_missing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let holder = tempfile::tempdir().unwrap();
+        let gone = holder.path().join("gone");
+        assert_eq!(directory_presence(&gone), DirectoryPresence::Missing);
+        assert_eq!(folder_repo_status(&gone), FolderRepoStatus::Missing);
+        assert_eq!(managed_worktree_status(&gone), FolderRepoStatus::Missing);
+
+        // A parent that is a regular file: the path cannot exist, so it is gone.
+        let file = holder.path().join("afile");
+        std::fs::write(&file, "x").unwrap();
+        let under_file = file.join("child");
+        assert_eq!(directory_presence(&under_file), DirectoryPresence::Missing);
+        assert_eq!(
+            managed_worktree_status(&under_file),
+            FolderRepoStatus::Missing
+        );
+
+        // A dangling symlink is gone too: `symlink_metadata` would answer Ok
+        // here, which is why the classifier follows links.
+        let dangling = holder.path().join("dangling");
+        std::os::unix::fs::symlink(holder.path().join("nowhere"), &dangling).unwrap();
+        assert_eq!(directory_presence(&dangling), DirectoryPresence::Missing);
+
+        let locked = holder.path().join("locked");
+        std::fs::create_dir_all(locked.join("inner")).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = locked.join("inner");
+        let presence = directory_presence(&unreadable);
+        let folder = folder_repo_status(&unreadable);
+        let managed = managed_worktree_status(&unreadable);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(presence, DirectoryPresence::Indeterminate);
+        assert_eq!(
+            folder,
+            FolderRepoStatus::Indeterminate,
+            "a folder dux cannot stat is the hedged verdict, never the deleted one"
+        );
+        assert_eq!(managed, FolderRepoStatus::Indeterminate);
+        assert!(
+            managed.quiet_reason().contains("readable"),
+            "{}",
+            managed.quiet_reason()
         );
     }
 

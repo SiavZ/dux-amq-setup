@@ -4415,10 +4415,21 @@ impl Engine {
         Some(match &session.workspace {
             crate::model::AgentWorkspace::Managed(managed) => {
                 let worktree = PathBuf::from(&managed.worktree_path);
-                if status == crate::git::FolderRepoStatus::Missing {
-                    SessionGitAccess::WorkingCopyMissing { worktree }
-                } else {
-                    SessionGitAccess::Full { worktree }
+                match status {
+                    crate::git::FolderRepoStatus::Missing => {
+                        SessionGitAccess::WorkingCopyMissing { worktree }
+                    }
+                    // A stat dux could not get an answer to (an unreadable
+                    // parent, a mount that is down) fails closed onto the same
+                    // hedged sentence a standalone folder gets, rather than
+                    // claiming the working copy was deleted.
+                    crate::git::FolderRepoStatus::Indeterminate => SessionGitAccess::NoRepository {
+                        quiet_reason: crate::working_copy::unreachable_working_copy_reason(
+                            &worktree,
+                        ),
+                        directory: worktree,
+                    },
+                    _ => SessionGitAccess::Full { worktree },
                 }
             }
             crate::model::AgentWorkspace::Folder(folder) => {
