@@ -135,19 +135,28 @@ impl ServeShutdown {
     }
 
     /// Every address a leg is serving right now, loopback first and then in
-    /// address order.
+    /// address order. `None` means the registry could NOT be read, which is a
+    /// different answer from an empty list: a serve whose legs have all gone
+    /// really is reachable nowhere, and a caller that treats the two alike shows
+    /// an address nothing is listening on.
     ///
     /// The registry is the one live answer, which is what makes it the right
     /// source for an address list a surface keeps on screen: the list handed to a
     /// serve at start is a snapshot of that moment, and the Tailscale leg comes
     /// and goes underneath it.
-    pub(crate) fn leg_addrs(&self) -> Vec<SocketAddr> {
-        let Ok(legs) = self.legs.lock() else {
-            return Vec::new();
-        };
+    pub(crate) fn leg_addrs(&self) -> Option<Vec<SocketAddr>> {
+        let legs = self.legs.lock().ok()?;
         let mut addrs: Vec<SocketAddr> = legs.keys().copied().collect();
         addrs.sort_by_key(|addr| (!addr.ip().is_loopback(), addr.to_string()));
-        addrs
+        Some(addrs)
+    }
+
+    /// Poison the leg registry's lock, so a test can tell "could not read" from
+    /// "nothing registered" without waiting for a real panic to do it.
+    #[cfg(test)]
+    pub(crate) fn poison_legs_for_test(&self) {
+        let _guard = self.legs.lock();
+        panic!("poisoning the leg registry on purpose");
     }
 
     /// Whether a live leg is registered for `addr`. The registry is the ONE answer

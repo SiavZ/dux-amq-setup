@@ -1669,16 +1669,19 @@ impl ServeCore {
     }
 
     /// The addresses this serve is reachable on RIGHT NOW, read from the live leg
-    /// registry rather than remembered from the bind.
+    /// registry rather than remembered from the bind. `None` means the registry
+    /// could not be read at all, never that nothing is being served.
     ///
     /// The Tailscale leg comes and goes under a running serve, so a list captured
     /// at start goes stale the first time the interface moves.
-    pub(crate) fn live_urls(&self) -> Vec<String> {
-        self.shutdown
-            .leg_addrs()
-            .into_iter()
-            .map(|addr| format!("http://{addr}"))
-            .collect()
+    pub(crate) fn live_urls(&self) -> Option<Vec<String>> {
+        Some(
+            self.shutdown
+                .leg_addrs()?
+                .into_iter()
+                .map(|addr| format!("http://{addr}"))
+                .collect(),
+        )
     }
 
     /// Whether this serve installed the process's SIGINT/SIGTERM handlers.

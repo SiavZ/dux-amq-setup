@@ -51,6 +51,14 @@ pub struct BackgroundServer {
     connections: Arc<AtomicUsize>,
 }
 
+/// Choose between the live address list and the one captured at start.
+///
+/// `None` is the registry saying it could not answer; an empty list is it saying
+/// there is nothing to answer with, and only the first is worth papering over.
+fn urls_to_show(live: Option<Vec<String>>, captured: &[String]) -> Vec<String> {
+    live.unwrap_or_else(|| captured.to_vec())
+}
+
 impl BackgroundServer {
     /// Start serving `engine` on `listeners`, which the caller already bound: a
     /// bind failure is then a status line message, not a half-torn-down process.
@@ -123,15 +131,12 @@ impl BackgroundServer {
     /// Read from the live leg registry, not from the list the caller bound and
     /// handed over: the Tailscale leg comes and goes underneath a running serve,
     /// and the terminal UI shows these addresses for as long as it serves. The
-    /// captured list is the fallback for the one moment the registry cannot
-    /// answer, so a header never goes blank where it had addresses.
+    /// captured list is the fallback for the one case where the registry COULD
+    /// NOT BE READ, and for that case only: a serve whose legs have all gone is
+    /// reachable nowhere, and answering it with the addresses it bound at start
+    /// puts a dead address on screen.
     pub fn urls(&self) -> Vec<String> {
-        let live = self.core.live_urls();
-        if live.is_empty() {
-            self.urls.clone()
-        } else {
-            live
-        }
+        urls_to_show(self.core.live_urls(), &self.urls)
     }
 
     /// Whether a required leg's accept loop died, so the caller can stop serving
@@ -461,5 +466,46 @@ mod tests {
             second > first,
             "a second cycle must issue fresh ids ({first} then {second})"
         );
+    }
+
+    /// An empty live list is an answer: every leg has gone, so the serve really
+    /// is reachable nowhere and the addresses it bound at start are a dead link
+    /// on screen.
+    #[test]
+    fn no_legs_left_shows_no_addresses_rather_than_the_ones_bound_at_start() {
+        let captured = vec!["http://127.0.0.1:8080".to_string()];
+        assert!(super::urls_to_show(Some(Vec::new()), &captured).is_empty());
+        assert_eq!(
+            super::urls_to_show(Some(vec!["http://100.64.0.5:8080".to_string()]), &captured),
+            vec!["http://100.64.0.5:8080".to_string()],
+            "a live list is the answer whenever there is one"
+        );
+    }
+
+    /// And the fallback is for the registry that could not answer at all, which
+    /// is the one case where a header would otherwise go blank for no reason.
+    #[test]
+    fn an_unreadable_registry_falls_back_to_the_captured_list() {
+        let captured = vec!["http://127.0.0.1:8080".to_string()];
+        assert_eq!(super::urls_to_show(None, &captured), captured);
+    }
+
+    /// The registry itself tells those two apart: a poisoned lock answers
+    /// `None`, an empty registry answers an empty list.
+    #[test]
+    fn a_poisoned_leg_registry_answers_that_it_could_not_read() {
+        let shutdown = crate::serve_legs::ServeShutdown::for_watched(false);
+        assert_eq!(
+            shutdown.leg_addrs(),
+            Some(Vec::new()),
+            "an empty registry knows it is empty"
+        );
+
+        let poisoner = shutdown.clone();
+        let _ = std::thread::spawn(move || {
+            poisoner.poison_legs_for_test();
+        })
+        .join();
+        assert_eq!(shutdown.leg_addrs(), None);
     }
 }
