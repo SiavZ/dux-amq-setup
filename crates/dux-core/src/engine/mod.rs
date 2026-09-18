@@ -1116,6 +1116,11 @@ pub(crate) fn pr_attach_in_flight_message(agent_name: &str) -> String {
 pub enum SessionGitAccess {
     /// A managed working copy: the whole git surface, as always.
     Full { worktree: PathBuf },
+    /// A managed working copy whose directory is gone from disk. Its own answer
+    /// rather than an error every poll cycle: there is no directory to run git
+    /// in, so the panel is quiet and says so, and the way out is to recreate the
+    /// working copy at the same path.
+    WorkingCopyMissing { worktree: PathBuf },
     /// A standalone agent whose folder IS a repository's top level: the changes
     /// panel works here exactly as anywhere, and nothing branch-shaped exists.
     ChangesOnly { directory: PathBuf },
@@ -1124,7 +1129,7 @@ pub enum SessionGitAccess {
     /// and never "the repository is busy".
     NoRepository {
         directory: PathBuf,
-        quiet_reason: &'static str,
+        quiet_reason: String,
     },
 }
 
@@ -1132,7 +1137,7 @@ impl SessionGitAccess {
     /// The directory this agent occupies, whichever answer applies.
     pub fn directory(&self) -> &Path {
         match self {
-            Self::Full { worktree } => worktree,
+            Self::Full { worktree } | Self::WorkingCopyMissing { worktree } => worktree,
             Self::ChangesOnly { directory } | Self::NoRepository { directory, .. } => directory,
         }
     }
@@ -1141,7 +1146,7 @@ impl SessionGitAccess {
     pub fn changes_panel_works(&self) -> bool {
         match self {
             Self::Full { .. } | Self::ChangesOnly { .. } => true,
-            Self::NoRepository { .. } => false,
+            Self::WorkingCopyMissing { .. } | Self::NoRepository { .. } => false,
         }
     }
 
@@ -1152,7 +1157,7 @@ impl SessionGitAccess {
     pub fn mutations_allowed(&self) -> bool {
         match self {
             Self::Full { .. } | Self::ChangesOnly { .. } => true,
-            Self::NoRepository { .. } => false,
+            Self::WorkingCopyMissing { .. } | Self::NoRepository { .. } => false,
         }
     }
 
@@ -1160,16 +1165,30 @@ impl SessionGitAccess {
     pub fn supports_branch_git(&self) -> bool {
         match self {
             Self::Full { .. } => true,
+            // A managed agent keeps its branch identity when the directory
+            // goes: the branch is still in the repository, which is exactly what
+            // makes recreating the working copy possible. What the FEATURES do
+            // about a missing directory is their own refusal, not this gate's.
+            Self::WorkingCopyMissing { .. } => true,
             Self::ChangesOnly { .. } | Self::NoRepository { .. } => false,
         }
     }
 
     /// Why the changes region is quiet, or `None` when it is not.
-    pub fn quiet_reason(&self) -> Option<&'static str> {
+    pub fn quiet_reason(&self) -> Option<String> {
         match self {
             Self::Full { .. } | Self::ChangesOnly { .. } => None,
-            Self::NoRepository { quiet_reason, .. } => Some(quiet_reason),
+            Self::WorkingCopyMissing { worktree } => {
+                Some(crate::working_copy::missing_working_copy_reason(worktree))
+            }
+            Self::NoRepository { quiet_reason, .. } => Some(quiet_reason.clone()),
         }
+    }
+
+    /// Whether this agent's working copy is gone from disk, which is the one
+    /// state the recreate action exists for.
+    pub fn working_copy_missing(&self) -> bool {
+        matches!(self, Self::WorkingCopyMissing { .. })
     }
 }
 
@@ -2566,9 +2585,14 @@ impl Engine {
         let resolved = session_id.and_then(|id| {
             let session = self.sessions.iter().find(|s| s.id == id)?;
             match &session.workspace {
-                crate::model::AgentWorkspace::Managed(managed) => {
-                    Some((id.to_string(), PathBuf::from(&managed.worktree_path)))
-                }
+                // Both kinds ask the same verdict: a managed working copy that
+                // is gone is no more pollable than a folder with no repository,
+                // and polling it would report "git is busy" every cycle about a
+                // directory that is not there.
+                crate::model::AgentWorkspace::Managed(managed) => self
+                    .folder_repo_status(id)
+                    .changes_panel_works()
+                    .then(|| (id.to_string(), PathBuf::from(&managed.worktree_path))),
                 crate::model::AgentWorkspace::Folder(folder) => self
                     .folder_repo_status(id)
                     .changes_panel_works()
@@ -2595,12 +2619,16 @@ impl Engine {
         worktree
     }
 
-    /// The live repository verdict for a standalone agent's folder.
+    /// The live repository verdict for the directory an agent lives in.
     ///
-    /// A MANAGED agent answers [`crate::git::FolderRepoStatus::WorkingRepo`]:
-    /// its worktree is a repository by construction, so callers that only want
-    /// "may the changes panel work here" can ask this for any session without
-    /// first sorting out which kind it is.
+    /// A MANAGED agent answers [`crate::git::FolderRepoStatus::WorkingRepo`]
+    /// until a probe says its working copy is gone: the worktree is a repository
+    /// by construction, but the directory can still be deleted out from under
+    /// dux (a CLI that merges its own branch takes the worktree with it). An
+    /// unprobed managed agent therefore answers `WorkingRepo` rather than
+    /// `Unprobed`: the ordinary case is that the directory is there, and
+    /// starting every managed agent at a verdict that fails closed would refuse
+    /// mutations for a moment on every restart.
     ///
     /// An unprobed standalone folder answers
     /// [`crate::git::FolderRepoStatus::Unprobed`] rather than "no repository":
@@ -2613,23 +2641,39 @@ impl Engine {
         let Some(session) = self.sessions.iter().find(|s| s.id == session_id) else {
             return crate::git::FolderRepoStatus::Indeterminate;
         };
-        match &session.workspace {
+        let default = match &session.workspace {
             crate::model::AgentWorkspace::Managed(_) => crate::git::FolderRepoStatus::WorkingRepo,
-            crate::model::AgentWorkspace::Folder(_) => self
-                .folder_repo_statuses
-                .get(session_id)
-                .copied()
-                .unwrap_or(crate::git::FolderRepoStatus::Unprobed),
-        }
+            crate::model::AgentWorkspace::Folder(_) => crate::git::FolderRepoStatus::Unprobed,
+        };
+        self.folder_repo_statuses
+            .get(session_id)
+            .copied()
+            .unwrap_or(default)
     }
 
-    /// Ask git, OFF the engine thread, what a standalone agent's folder is, and
-    /// post the answer back as [`WorkerEvent::FolderRepoStatusReady`].
+    /// Whether a MANAGED agent's working copy is gone from disk.
     ///
-    /// A no-op for a managed agent and for an unknown id: neither has a folder
-    /// whose repository-ness can change under dux. `git::repo_path_kind` runs
-    /// several git subprocesses, so this must never run inline; a folder on a
-    /// stalled network mount would otherwise freeze every client.
+    /// Its own question because it has its own answer: a directory that is not
+    /// there is never "git is busy", and the agent cannot restart or resume
+    /// until it is back. Always false for a standalone agent, whose folder is
+    /// the user's and whose missing-folder sentence names a different remedy.
+    pub fn working_copy_missing(&self, session_id: &str) -> bool {
+        self.sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .is_some_and(|s| s.workspace.as_managed().is_some())
+            && self.folder_repo_status(session_id) == crate::git::FolderRepoStatus::Missing
+    }
+
+    /// Ask, OFF the engine thread, what is at the directory an agent lives in,
+    /// and post the answer back as [`WorkerEvent::FolderRepoStatusReady`].
+    ///
+    /// Two questions behind one door, because both surfaces read one verdict: a
+    /// standalone folder is classified with `git::folder_repo_status` (several
+    /// git subprocesses, which is why this must never run inline; a folder on a
+    /// stalled network mount would otherwise freeze every client), while a
+    /// managed working copy is a repository by construction and only has to be
+    /// checked for existence. A no-op for an unknown id.
     ///
     /// Also a no-op while a probe for the same agent is already running. Every
     /// question about the folder asks for a refresh, the changed-files poll
@@ -2637,15 +2681,11 @@ impl Engine {
     /// loop of threads and git subprocesses. One probe in flight is enough: its
     /// answer is what the next question reads.
     pub fn spawn_folder_repo_probe(&mut self, session_id: &str) {
-        let Some(folder) = self
-            .sessions
-            .iter()
-            .find(|s| s.id == session_id)
-            .and_then(|s| s.folder_path())
-            .map(PathBuf::from)
-        else {
+        let Some(session) = self.sessions.iter().find(|s| s.id == session_id) else {
             return;
         };
+        let managed = session.workspace.as_managed().is_some();
+        let folder = PathBuf::from(session.directory());
         let session_id = session_id.to_string();
         let key = InFlightKey::FolderRepoProbe(session_id.clone());
         if self.is_in_flight(&key) {
@@ -2655,7 +2695,11 @@ impl Engine {
         let label = format!("folder-repo-probe:{session_id}");
         let probed_session = session_id.clone();
         let started = self.spawn_loop_worker(LoopWorkerSpec { label }, move |tx| {
-            let status = crate::git::folder_repo_status(&folder);
+            let status = if managed {
+                crate::git::managed_worktree_status(&folder)
+            } else {
+                crate::git::folder_repo_status(&folder)
+            };
             let _ = tx.send(WorkerEvent::FolderRepoStatusReady {
                 session_id: session_id.clone(),
                 status,
@@ -3457,6 +3501,11 @@ impl Engine {
         {
             return false;
         }
+        // A working copy that is gone is skipped in the same place and for the
+        // same reason: the check runs git in that directory.
+        if self.working_copy_missing(session_id) {
+            return false;
+        }
         // Rate-limit: skip if checked more recently than `min_interval` ago.
         if let Some(last) = self.pr_last_checked.get(session_id)
             && last.elapsed() < min_interval
@@ -3622,10 +3671,13 @@ impl Engine {
             // its folder may not be a repository at all, so it is never
             // enrolled: `filter_map` over the branch identity is the gate and
             // the projection in one, so there is no arm that could enrol one
-            // with an empty branch name.
+            // with an empty branch name. A managed agent whose working copy is
+            // gone is skipped for the same reason a plain folder is: there is
+            // no directory to run in.
             *guard = self
                 .sessions
                 .iter()
+                .filter(|s| !self.working_copy_missing(&s.id))
                 .filter_map(|s| {
                     let managed = s.workspace.as_managed()?;
                     Some(BranchSyncEntry {
@@ -3864,6 +3916,9 @@ impl Engine {
                 // told there is no pull request here, so it neither asks
                 // GitHub nor has anything to answer with.
                 .filter(|s| !self.pr_suppressions.contains(&s.id))
+                // A working copy that is gone is not polled: every question the
+                // sync asks runs git in that directory.
+                .filter(|s| !self.working_copy_missing(&s.id))
                 // A standalone agent has no branch to open a pull request
                 // from, so it is never enrolled. Reading the branch identity
                 // out of the workspace is the gate and the projection at once.
@@ -4314,19 +4369,25 @@ impl Engine {
     /// repository, and refuse when it is not).
     pub fn session_git_access(&self, session_id: &str) -> Option<SessionGitAccess> {
         let session = self.sessions.iter().find(|s| s.id == session_id)?;
+        let status = self.folder_repo_status(session_id);
         Some(match &session.workspace {
-            crate::model::AgentWorkspace::Managed(managed) => SessionGitAccess::Full {
-                worktree: PathBuf::from(&managed.worktree_path),
-            },
+            crate::model::AgentWorkspace::Managed(managed) => {
+                let worktree = PathBuf::from(&managed.worktree_path);
+                if status == crate::git::FolderRepoStatus::Missing {
+                    SessionGitAccess::WorkingCopyMissing { worktree }
+                } else {
+                    SessionGitAccess::Full { worktree }
+                }
+            }
             crate::model::AgentWorkspace::Folder(folder) => {
                 let directory = PathBuf::from(&folder.folder_path);
-                let status = self.folder_repo_status(session_id);
                 if status.changes_panel_works() {
                     SessionGitAccess::ChangesOnly { directory }
                 } else {
                     SessionGitAccess::NoRepository {
+                        quiet_reason: crate::working_copy::quiet_reason(status, &directory, false)
+                            .unwrap_or_else(|| status.quiet_reason().to_string()),
                         directory,
-                        quiet_reason: status.quiet_reason(),
                     }
                 }
             }
@@ -5536,6 +5597,125 @@ mod tests {
             folder.path().to_string_lossy().as_ref(),
         ));
         (engine, tmp, folder)
+    }
+
+    /// A managed working copy that is gone is its OWN verdict, never a git
+    /// error: there is no directory to run git in, so the panel goes quiet and
+    /// says what happened and what it takes to get the agent running again.
+    #[test]
+    fn session_git_access_reports_a_missing_working_copy_rather_than_a_git_error() {
+        let (mut engine, _tmp, _folder) = engine_with_a_standalone_agent();
+        engine
+            .folder_repo_statuses
+            .insert("s1".to_string(), crate::git::FolderRepoStatus::Missing);
+
+        let access = engine.session_git_access("s1").expect("a known agent");
+        assert!(
+            matches!(access, SessionGitAccess::WorkingCopyMissing { .. }),
+            "got {access:?}"
+        );
+        assert!(!access.changes_panel_works());
+        assert!(!access.mutations_allowed());
+        assert!(access.working_copy_missing());
+        let reason = access.quiet_reason().expect("a missing copy is quiet");
+        assert!(reason.contains("/tmp/s1-worktree"), "{reason}");
+        assert!(!reason.to_lowercase().contains("busy"), "{reason}");
+        assert!(reason.contains("recreated"), "{reason}");
+        assert!(engine.working_copy_missing("s1"));
+    }
+
+    /// The same fact about a standalone agent's own folder points at the user
+    /// rather than at a button: dux never creates, moves or removes it.
+    #[test]
+    fn a_missing_standalone_folder_keeps_the_folder_wording() {
+        let (mut engine, _tmp, folder) = engine_with_a_standalone_agent();
+        engine
+            .folder_repo_statuses
+            .insert("sa1".to_string(), crate::git::FolderRepoStatus::Missing);
+
+        match engine.session_git_access("sa1") {
+            Some(SessionGitAccess::NoRepository { quiet_reason, .. }) => {
+                assert!(
+                    quiet_reason.contains(&folder.path().to_string_lossy().to_string()),
+                    "{quiet_reason}"
+                );
+                assert!(
+                    quiet_reason.contains("Restore the folder"),
+                    "{quiet_reason}"
+                );
+                assert!(
+                    !quiet_reason.to_lowercase().contains("busy"),
+                    "{quiet_reason}"
+                );
+            }
+            other => panic!("a missing folder stays folder-shaped, got {other:?}"),
+        }
+        assert!(
+            !engine.working_copy_missing("sa1"),
+            "a standalone folder is never a dux-managed working copy"
+        );
+    }
+
+    /// An unprobed managed agent answers exactly as it always did, so nothing
+    /// is refused for the moment between a restart and the probe landing.
+    #[test]
+    fn an_unprobed_managed_agent_still_has_the_full_git_surface() {
+        let (engine, _tmp, _folder) = engine_with_a_standalone_agent();
+        assert!(!engine.working_copy_missing("s1"));
+        assert!(matches!(
+            engine.session_git_access("s1"),
+            Some(SessionGitAccess::Full { .. })
+        ));
+    }
+
+    /// The changed-files watch declines a working copy that is gone, so the
+    /// poller never runs git there and never reports a busy repository.
+    #[test]
+    fn the_changed_files_watch_declines_a_missing_working_copy() {
+        let (mut engine, _tmp, _folder) = engine_with_a_standalone_agent();
+        assert!(
+            engine.set_watched_session(Some("s1")).is_some(),
+            "precondition: a present working copy is watched"
+        );
+        engine
+            .folder_repo_statuses
+            .insert("s1".to_string(), crate::git::FolderRepoStatus::Missing);
+
+        assert!(
+            engine.set_watched_session(Some("s1")).is_none(),
+            "a directory that is gone is not polled"
+        );
+        assert_eq!(
+            engine.watched_session_id.as_deref(),
+            Some("s1"),
+            "the panel still shows this agent, it just has nothing to poll"
+        );
+    }
+
+    /// Every background enumerator treats a missing working copy the way it
+    /// treats a plain folder: skipped, with no error per cycle.
+    #[test]
+    fn the_background_enumerators_skip_a_missing_working_copy() {
+        let (mut engine, _tmp, _folder) = engine_with_a_standalone_agent();
+        engine.update_branch_sync_sessions();
+        assert_eq!(
+            engine.branch_sync_sessions.lock().expect("lock").len(),
+            1,
+            "precondition: the managed agent is enrolled while its copy is there"
+        );
+
+        engine
+            .folder_repo_statuses
+            .insert("s1".to_string(), crate::git::FolderRepoStatus::Missing);
+        engine.update_branch_sync_sessions();
+        assert!(
+            engine.branch_sync_sessions.lock().expect("lock").is_empty(),
+            "branch sync skips a working copy that is gone"
+        );
+        assert!(
+            !engine.spawn_pr_check_for_session("s1", Duration::from_secs(0)),
+            "the pull-request one-shot skips it too"
+        );
     }
 
     /// The three-way capability, resolved in one engine round trip so a route

@@ -25,6 +25,7 @@ import {
   Search,
   SquarePlus,
   SquareTerminal,
+  TriangleAlert,
 } from "lucide-react"
 import type { ComponentProps, CSSProperties, ReactNode } from "react"
 import { useState } from "react"
@@ -94,6 +95,7 @@ import { partitionProjects } from "@/lib/projects"
 import { moveItem, ordersMatch, reorderById } from "@/lib/reorder"
 import {
   sessionLabel,
+  workingCopyMissing,
   workspaceLocation,
   workspaceProjectId, folderDisplayName } from "@/lib/agentWorkspace"
 import {
@@ -131,6 +133,18 @@ function ProjectTag({ name, query }: { name: string; query: string }) {
       <span className="min-w-0 truncate">
         <HighlightedText text={name} query={query} />
       </span>
+    </span>
+  )
+}
+
+// A managed agent whose working copy is gone from disk. It REPLACES the project
+// tag rather than joining it: the project is healthy and the agent is not, so a
+// row naming the project would say nothing about why the agent cannot run.
+function WorkingCopyMissingTag() {
+  return (
+    <span className="flex min-w-0 shrink items-baseline gap-1 text-destructive">
+      <TriangleAlert className="size-3 shrink-0 self-center" />
+      <span className="min-w-0 truncate">working copy missing</span>
     </span>
   )
 }
@@ -267,6 +281,7 @@ function AgentFlatRow({
   // Which thing this agent is IN: its project, or a standalone agent's folder.
   // Tagged so the row picks the glyph without re-deriving the agent kind.
   const location = workspaceLocation(session.workspace)
+  const copyMissing = workingCopyMissing(session.workspace)
   const tabCount = session.tabs.length
 
   const { changes } = useDux()
@@ -382,7 +397,9 @@ function AgentFlatRow({
               {/* Line two: display-only project + state word + tabs, through the
                   shared RowLineTwo the terminal row uses too. */}
               <RowLineTwo>
-                {location.kind === "folder" ? (
+                {copyMissing ? (
+                  <WorkingCopyMissingTag />
+                ) : location.kind === "folder" ? (
                   <StandaloneTag label={location.label} query={query} />
                 ) : (
                   <ProjectTag name={projectName} query={query} />

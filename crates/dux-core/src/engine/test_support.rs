@@ -231,3 +231,26 @@ pub(crate) fn settle_gh_probe(engine: &mut Engine) {
     }
     panic!("host probe never reported");
 }
+
+/// Take the next `ChangedFilesReady` off the worker lane, applying whatever
+/// else arrives first.
+///
+/// Arming a watch also launches the directory probe, so a bare `recv_timeout`
+/// races the two events. Every drainer in production handles both; a test that
+/// wants one of them says which.
+pub(crate) fn recv_changed_files_ready(engine: &mut Engine) -> crate::worker::WorkerEvent {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        let Ok(event) = engine
+            .worker_rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+        else {
+            continue;
+        };
+        if matches!(event, crate::worker::WorkerEvent::ChangedFilesReady { .. }) {
+            return event;
+        }
+        engine.process_worker_event(event);
+    }
+    panic!("the changed-files refresh never reported");
+}

@@ -13,7 +13,7 @@ import {
   workspaceBranchName,
   workspaceDirectory,
   workspaceLocation,
-  workspaceProjectId, folderDisplayName } from "./agentWorkspace"
+  workspaceProjectId, folderDisplayName, workingCopyMissing } from "./agentWorkspace"
 
 const managed: AgentWorkspaceWire = {
   kind: "managed",
@@ -37,6 +37,43 @@ function folder(
     quiet_reason,
   }
 }
+
+const missingCopy: AgentWorkspaceWire = {
+  ...managed,
+  worktree_missing: true,
+  quiet_reason: "The working copy at /managed/wt no longer exists on disk.",
+}
+
+describe("a working copy that is gone", () => {
+  // Its own verdict, never "git is busy": there is no directory to run git in.
+  it("makes the changes region quiet with the server's own sentence", () => {
+    expect(changesQuietReason(missingCopy)).toBe(missingCopy.quiet_reason)
+    expect(workingCopyMissing(missingCopy)).toBe(true)
+  })
+
+  it("leaves a healthy managed agent exactly as it was", () => {
+    expect(changesQuietReason(managed)).toBeNull()
+    expect(workingCopyMissing(managed)).toBe(false)
+  })
+
+  // A server that predates the field sends neither, and absent must read as
+  // "the working copy is there", which is what the server itself answers before
+  // its own probe lands.
+  it("reads an absent flag as present", () => {
+    const older: AgentWorkspaceWire = { ...managed }
+    expect(workingCopyMissing(older)).toBe(false)
+    expect(changesQuietReason(older)).toBeNull()
+  })
+
+  // dux never creates, moves or removes a standalone agent's folder, so a
+  // missing one is a sentence and never the recreate button.
+  it("is never claimed for a standalone agent's own folder", () => {
+    expect(workingCopyMissing(folder("missing", "the folder is gone"))).toBe(false)
+    expect(changesQuietReason(folder("missing", "the folder is gone"))).toBe(
+      "the folder is gone",
+    )
+  })
+})
 
 describe("agent workspace", () => {
   it("gives a managed agent every git answer", () => {

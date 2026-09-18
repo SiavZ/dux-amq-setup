@@ -21,6 +21,10 @@ export type FolderRepoStatus =
    * `quiet_reason` reads as a wait rather than as a fault, because a freshly
    * created agent in a healthy repository spends a moment here. */
   | "unprobed"
+  /** The directory itself is gone from disk. Never "git is busy": there is
+   * nothing to run git in. Applies to a managed working copy too, where the
+   * way out is to recreate it at the same path. */
+  | "missing"
 
 /** The serialized workspace, exactly as it arrives on `SessionView.workspace`.
  * Field names are the server's (snake_case). */
@@ -33,6 +37,17 @@ export type AgentWorkspaceWire =
       branch_provenance: "created" | "attached" | "adopted" | "unknown"
       source_branch: string
       worktree_path: string
+      /** Whether that directory is gone from disk. An agent can delete its own
+       * working copy from inside it (merging its branch and removing the
+       * worktree), and dux cannot prevent that, so it reports it instead.
+       *
+       * Optional because a server that predates it sends neither this nor
+       * `quiet_reason`, and absent must read as "the working copy is there",
+       * which is what the Rust side answers before its own probe lands. */
+      worktree_missing?: boolean
+      /** Why the changes region is quiet, when it is. Empty or absent while the
+       * working copy is there. */
+      quiet_reason?: string
     }
   | {
       kind: "folder"
@@ -111,8 +126,19 @@ export function changesQuietReason(
   workspace: AgentWorkspaceWire,
 ): string | null {
   return matchWorkspace(workspace, {
-    managed: () => null,
+    managed: (w) => (w.worktree_missing ? (w.quiet_reason ?? null) : null),
     folder: (w) => (w.repo_status === "working_repo" ? null : w.quiet_reason),
+  })
+}
+
+/** Whether a MANAGED agent's working copy is gone from disk, which is the one
+ * state the recreate action exists for. False for a standalone agent, whose
+ * folder is the user's: dux never creates, moves or removes that one, so a
+ * missing folder is a sentence rather than a button. */
+export function workingCopyMissing(workspace: AgentWorkspaceWire): boolean {
+  return matchWorkspace(workspace, {
+    managed: (w) => w.worktree_missing === true,
+    folder: () => false,
   })
 }
 

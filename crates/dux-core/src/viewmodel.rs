@@ -484,6 +484,13 @@ pub enum AgentWorkspaceView {
         /// branch).
         source_branch: String,
         worktree_path: String,
+        /// Whether that directory is gone from disk. An agent can delete its own
+        /// working copy from inside it, and everything downstream (the changes
+        /// panel, the row, the recreate action) turns on this one fact.
+        worktree_missing: bool,
+        /// The sentence explaining why the changes region is quiet, when it is.
+        /// Empty while the working copy is there.
+        quiet_reason: String,
     },
     Folder {
         /// The folder as it exists on the SERVER's filesystem.
@@ -516,21 +523,32 @@ impl AgentWorkspaceView {
         repo_status: crate::git::FolderRepoStatus,
     ) -> Self {
         match workspace {
-            crate::model::AgentWorkspace::Managed(managed) => Self::Managed {
-                project_id: managed.project_id.clone(),
-                branch_name: managed.branch_name.clone(),
-                initial_branch: managed.initial_branch.clone(),
-                branch_provenance: managed.branch_provenance.as_str().to_string(),
-                source_branch: managed.source_branch.clone(),
-                worktree_path: managed.worktree_path.clone(),
-            },
+            crate::model::AgentWorkspace::Managed(managed) => {
+                let worktree = std::path::Path::new(&managed.worktree_path);
+                Self::Managed {
+                    project_id: managed.project_id.clone(),
+                    branch_name: managed.branch_name.clone(),
+                    initial_branch: managed.initial_branch.clone(),
+                    branch_provenance: managed.branch_provenance.as_str().to_string(),
+                    source_branch: managed.source_branch.clone(),
+                    worktree_path: managed.worktree_path.clone(),
+                    worktree_missing: repo_status == crate::git::FolderRepoStatus::Missing,
+                    quiet_reason: crate::working_copy::quiet_reason(repo_status, worktree, true)
+                        .unwrap_or_default(),
+                }
+            }
             crate::model::AgentWorkspace::Folder(folder) => Self::Folder {
                 folder_path: folder.folder_path.clone(),
                 folder_label: crate::home_path::shorten_home(std::path::Path::new(
                     &folder.folder_path,
                 )),
                 repo_status: folder_repo_status_wire(repo_status).to_string(),
-                quiet_reason: repo_status.quiet_reason().to_string(),
+                quiet_reason: crate::working_copy::quiet_reason(
+                    repo_status,
+                    std::path::Path::new(&folder.folder_path),
+                    false,
+                )
+                .unwrap_or_else(|| repo_status.quiet_reason().to_string()),
             },
         }
     }
@@ -546,6 +564,7 @@ fn folder_repo_status_wire(status: crate::git::FolderRepoStatus) -> &'static str
         crate::git::FolderRepoStatus::NoRepo => "no_repo",
         crate::git::FolderRepoStatus::Indeterminate => "indeterminate",
         crate::git::FolderRepoStatus::Unprobed => "unprobed",
+        crate::git::FolderRepoStatus::Missing => "missing",
     }
 }
 
@@ -1503,6 +1522,8 @@ mod tests {
                 branch_provenance: "created".to_string(),
                 source_branch: "main".to_string(),
                 worktree_path: "/tmp/s1-worktree".to_string(),
+                worktree_missing: false,
+                quiet_reason: String::new(),
             }
         );
         assert_eq!(spine.sessions[0].status, "detached");

@@ -241,10 +241,10 @@ pub enum RepoPathKind {
     Indeterminate,
 }
 
-/// What a standalone agent's folder is, as far as a changes panel is concerned.
-/// Derived from [`repo_path_kind`]; deliberately no second detector, because two
-/// would drift and this is the decision that keeps dux from staging into
-/// somebody else's repository.
+/// What the directory an agent lives in is, as far as a changes panel is
+/// concerned. Derived from [`repo_path_kind`]; deliberately no second detector,
+/// because two would drift and this is the decision that keeps dux from staging
+/// into somebody else's repository.
 ///
 /// git answers questions by walking UP parent directories, so a folder INSIDE a
 /// repository would report, stage and commit to the parent. A working repository
@@ -274,6 +274,17 @@ pub enum FolderRepoStatus {
     /// a wait, while "git could not be consulted" accuses a healthy machine of a
     /// fault, and a freshly created agent passes through this window.
     Unprobed,
+    /// The directory itself is gone from disk. Its own verdict rather than a git
+    /// error, because there is nothing to run git in: an agent that deletes its
+    /// own working copy (a CLI merging its branch and removing the worktree from
+    /// inside it) would otherwise report "the repository is busy" once per poll
+    /// cycle about a directory that simply is not there.
+    ///
+    /// Applies to both kinds of agent: a managed working copy and a standalone
+    /// agent's folder can each vanish under dux. The sentence that names the
+    /// path, and the remedy, differ by kind and live in
+    /// [`crate::working_copy`].
+    Missing,
 }
 
 impl FolderRepoStatus {
@@ -284,7 +295,8 @@ impl FolderRepoStatus {
             Self::InsideRepoRootedElsewhere
             | Self::NoRepo
             | Self::Indeterminate
-            | Self::Unprobed => false,
+            | Self::Unprobed
+            | Self::Missing => false,
         }
     }
 
@@ -297,7 +309,8 @@ impl FolderRepoStatus {
             Self::InsideRepoRootedElsewhere
             | Self::NoRepo
             | Self::Indeterminate
-            | Self::Unprobed => false,
+            | Self::Unprobed
+            | Self::Missing => false,
         }
     }
 
@@ -309,7 +322,7 @@ impl FolderRepoStatus {
     pub fn git_can_see_path(self) -> bool {
         match self {
             Self::WorkingRepo | Self::InsideRepoRootedElsewhere => true,
-            Self::NoRepo | Self::Indeterminate | Self::Unprobed => false,
+            Self::NoRepo | Self::Indeterminate | Self::Unprobed | Self::Missing => false,
         }
     }
 
@@ -337,6 +350,12 @@ impl FolderRepoStatus {
                 "dux is still looking at this folder to see whether it is a git repository. \
                  This should take a moment; nothing is wrong."
             }
+            // The kind-neutral fallback. Every user-facing surface reaches the
+            // path-naming sentence through `crate::working_copy::quiet_reason`.
+            Self::Missing => {
+                "The directory this agent runs in no longer exists on disk, so dux cannot show \
+                 any changes for it."
+            }
         }
     }
 }
@@ -347,6 +366,12 @@ impl FolderRepoStatus {
 /// [`FolderRepoStatus::NoRepo`] rather than getting variants of their own: to
 /// the changes panel they are one fact, that there is no work tree to show.
 pub fn folder_repo_status(path: &Path) -> FolderRepoStatus {
+    // Asked before git, because git walks UP: run in a directory that is gone
+    // and the answer is about a parent, or an error the poller would report as
+    // "the repository is busy" once per cycle.
+    if !path.exists() {
+        return FolderRepoStatus::Missing;
+    }
     match repo_path_kind(path) {
         RepoPathKind::WorkTreeRoot => FolderRepoStatus::WorkingRepo,
         RepoPathKind::InsideWorkTree { .. } => FolderRepoStatus::InsideRepoRootedElsewhere,
@@ -354,6 +379,21 @@ pub fn folder_repo_status(path: &Path) -> FolderRepoStatus {
             FolderRepoStatus::NoRepo
         }
         RepoPathKind::Indeterminate => FolderRepoStatus::Indeterminate,
+    }
+}
+
+/// Classify a MANAGED agent's working copy per [`FolderRepoStatus`].
+///
+/// One question, not the folder classifier's several: dux created this worktree,
+/// so it is a repository by construction and the only thing that can have
+/// changed is whether the directory is still there. Keeping it to a single stat
+/// is what lets every managed agent be probed on the changed-files cadence
+/// without a git subprocess per cycle.
+pub fn managed_worktree_status(path: &Path) -> FolderRepoStatus {
+    if path.exists() {
+        FolderRepoStatus::WorkingRepo
+    } else {
+        FolderRepoStatus::Missing
     }
 }
 

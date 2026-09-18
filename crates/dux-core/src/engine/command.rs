@@ -2775,10 +2775,7 @@ mod tests {
         engine.spawn_changed_files_refresh(path);
 
         // The one-shot worker posts ChangedFilesReady tagged with the worktree.
-        let event = engine
-            .worker_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("ChangedFilesReady");
+        let event = crate::engine::test_support::recv_changed_files_ready(&mut engine);
         match event {
             WorkerEvent::ChangedFilesReady { outcome, worktree } => {
                 let (staged, unstaged) = outcome.expect("git read the worktree");

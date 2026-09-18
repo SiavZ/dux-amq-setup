@@ -2763,8 +2763,7 @@ impl App {
             self.set_error(
                 access
                     .quiet_reason()
-                    .unwrap_or("dux cannot work with git in this folder.")
-                    .to_string(),
+                    .unwrap_or_else(|| "dux cannot work with git in this folder.".to_string()),
             );
             return None;
         }

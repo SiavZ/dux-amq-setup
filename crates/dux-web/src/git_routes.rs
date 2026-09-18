@@ -190,8 +190,7 @@ async fn resolve_git_directory(
         StatusCode::CONFLICT,
         access
             .quiet_reason()
-            .unwrap_or("dux cannot work with git in this folder.")
-            .to_string(),
+            .unwrap_or_else(|| "dux cannot work with git in this folder.".to_string()),
     )
         .into_response()
         .into())

@@ -239,6 +239,10 @@ pub(crate) fn project_tag_kind(project: Option<&Project>) -> ProjectTagKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AgentRowOwnerTag {
     Project(ProjectTagKind, String),
+    /// A managed agent whose working copy is gone from disk. It OUTRANKS the
+    /// project tag: the project is fine and the agent is not, so a row naming a
+    /// healthy project would say nothing about why the agent cannot run.
+    WorkingCopyMissing,
     /// A standalone agent's folder, already shortened against the server's home
     /// directory for display.
     Folder {
@@ -251,8 +255,12 @@ pub(crate) enum AgentRowOwnerTag {
 pub(crate) fn agent_row_owner_tag(
     session: &AgentSession,
     project: Option<&Project>,
+    working_copy_missing: bool,
 ) -> AgentRowOwnerTag {
     match &session.workspace {
+        dux_core::model::AgentWorkspace::Managed(_) if working_copy_missing => {
+            AgentRowOwnerTag::WorkingCopyMissing
+        }
         dux_core::model::AgentWorkspace::Managed(_) => AgentRowOwnerTag::Project(
             project_tag_kind(project),
             project.map(|p| p.name.clone()).unwrap_or_default(),
@@ -1597,7 +1605,11 @@ impl App {
         project: Option<&Project>,
         muted: Color,
     ) -> (Span<'static>, Option<Span<'static>>) {
-        match agent_row_owner_tag(session, project) {
+        match agent_row_owner_tag(
+            session,
+            project,
+            self.engine.working_copy_missing(&session.id),
+        ) {
             AgentRowOwnerTag::Project(ProjectTagKind::Healthy, project_name) => (
                 Span::styled("  ※ ", Style::default().fg(muted)),
                 Some(Span::styled(project_name, Style::default().fg(muted))),
@@ -1612,6 +1624,13 @@ impl App {
             AgentRowOwnerTag::Project(ProjectTagKind::Orphan, _) => (
                 Span::styled(
                     "  ⚠ removed project",
+                    Style::default().fg(self.theme.project_missing_fg),
+                ),
+                None,
+            ),
+            AgentRowOwnerTag::WorkingCopyMissing => (
+                Span::styled(
+                    format!("  ⚠ {}", dux_core::working_copy::MISSING_WORKING_COPY_LABEL),
                     Style::default().fg(self.theme.project_missing_fg),
                 ),
                 None,
@@ -2064,11 +2083,15 @@ impl App {
                     });
                     let mut spans = vec![Span::styled(dot, Style::default().fg(dot_color))];
                     if matches!(
-                        agent_row_owner_tag(session, found),
+                        agent_row_owner_tag(
+                            session,
+                            found,
+                            self.engine.working_copy_missing(&session.id)
+                        ),
                         AgentRowOwnerTag::Project(
                             ProjectTagKind::PathMissing | ProjectTagKind::Orphan,
                             _
-                        )
+                        ) | AgentRowOwnerTag::WorkingCopyMissing
                     ) {
                         spans.push(Span::styled(
                             "⚠",
@@ -4496,7 +4519,7 @@ impl App {
             "{}\n\n{folder}",
             access
                 .quiet_reason()
-                .unwrap_or("dux cannot work with git in this folder.")
+                .unwrap_or_else(|| "dux cannot work with git in this folder.".to_string())
         ))
     }
 
@@ -13570,6 +13593,49 @@ mod tests {
         );
     }
 
+    /// A managed agent whose working copy is gone says so on the row itself,
+    /// the way a project with a missing path does, so the user sees it without
+    /// opening the changes pane. It outranks the project tag: the project is
+    /// healthy and the agent is not.
+    #[test]
+    fn a_missing_working_copy_takes_the_agent_rows_second_line() {
+        let mut app = test_app(default_bindings());
+        let id = app.engine.sessions[0].id.clone();
+        app.engine
+            .folder_repo_statuses
+            .insert(id, dux_core::git::FolderRepoStatus::Missing);
+        let session = app.engine.sessions[0].clone();
+        let project = app.engine.projects.first().cloned();
+
+        assert_eq!(
+            agent_row_owner_tag(
+                &session,
+                project.as_ref(),
+                app.engine.working_copy_missing(&session.id)
+            ),
+            AgentRowOwnerTag::WorkingCopyMissing
+        );
+    }
+
+    /// And the changes pane says the same thing in a sentence, through the one
+    /// verdict every other quiet reads, never as a git error.
+    #[test]
+    fn the_changes_pane_explains_a_missing_working_copy_rather_than_a_git_error() {
+        let mut app = test_app(default_bindings());
+        app.selected_left = 1;
+        let id = app.engine.sessions[0].id.clone();
+        app.engine
+            .folder_repo_statuses
+            .insert(id, dux_core::git::FolderRepoStatus::Missing);
+
+        let reason = app
+            .quiet_changes_reason()
+            .expect("a missing working copy makes the region quiet");
+        assert!(reason.contains("no longer exists on disk"), "{reason}");
+        assert!(reason.contains("recreated"), "{reason}");
+        assert!(!reason.to_lowercase().contains("busy"), "{reason}");
+    }
+
     #[test]
     fn project_tag_kind_classifies_healthy_path_missing_and_orphan() {
         let app = test_app(default_bindings());
@@ -13604,7 +13670,7 @@ mod tests {
     #[test]
     fn a_standalone_agents_row_names_its_folder_instead_of_a_project() {
         let session = standalone_row_session("/home/someone/notes");
-        let tag = agent_row_owner_tag(&session, None);
+        let tag = agent_row_owner_tag(&session, None, false);
         match tag {
             AgentRowOwnerTag::Folder { label } => {
                 assert!(label.contains("notes"), "got {label:?}");

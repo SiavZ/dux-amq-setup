@@ -1493,25 +1493,23 @@ impl Engine {
         if moved {
             self.update_pr_sync_sessions();
         }
-        // Classify every restored standalone agent's folder off-thread now. An
-        // unprobed folder reads as Indeterminate, which fails closed for
-        // mutations and for the upload directory's gitignore seed, so waiting
-        // for the changes panel to open would leave a file dropped before then
-        // unseeded in a folder git can see.
-        self.probe_standalone_folders();
+        // Classify every restored agent's directory off-thread now. An unprobed
+        // folder reads as Indeterminate, which fails closed for mutations and
+        // for the upload directory's gitignore seed, so waiting for the changes
+        // panel to open would leave a file dropped before then unseeded in a
+        // folder git can see. A managed working copy that went away while dux
+        // was not running is noticed by the same sweep.
+        self.probe_agent_directories();
     }
 
-    /// Ask git about every standalone agent's folder, one off-thread probe each.
+    /// Classify the directory every agent lives in, one off-thread probe each.
     ///
-    /// A no-op when there are none, which is the ordinary case, so this costs
-    /// nothing for a workspace of project agents.
-    pub fn probe_standalone_folders(&mut self) {
-        let ids: Vec<String> = self
-            .sessions
-            .iter()
-            .filter(|s| s.folder_path().is_some())
-            .map(|s| s.id.clone())
-            .collect();
+    /// Cheap for a managed working copy (one stat, because dux created it and
+    /// it is a repository by construction) and a few git subprocesses for a
+    /// standalone folder, which is why this runs for the whole workspace rather
+    /// than waiting for a panel to open on one agent.
+    pub fn probe_agent_directories(&mut self) {
+        let ids: Vec<String> = self.sessions.iter().map(|s| s.id.clone()).collect();
         for id in ids {
             self.spawn_folder_repo_probe(&id);
         }
@@ -3713,7 +3711,7 @@ mod tests {
     /// a folder up.
     #[test]
     fn restoring_sessions_classifies_every_standalone_folder() {
-        let (mut engine, _tmp) = test_engine();
+        let (mut engine, tmp) = test_engine();
         let repo = tempfile::tempdir().expect("repo");
         init_repo_at(repo.path());
         let plain = tempfile::tempdir().expect("plain");
@@ -3729,15 +3727,24 @@ mod tests {
                 "sa-plain",
                 plain.path().to_string_lossy().as_ref(),
             ));
-        // A managed agent is never probed: its worktree is a repository by
-        // construction, so there is nothing to ask git about.
-        engine.sessions.push(sample_session("s1", "p1", "b1"));
+        // A managed agent is probed too, but only for existence: its worktree
+        // is a repository by construction and the one thing that can change is
+        // whether the directory is still there.
+        let managed_worktree = tmp.path().join("managed");
+        std::fs::create_dir_all(&managed_worktree).expect("managed worktree");
+        let mut managed = sample_session("s1", "p1", "b1");
+        managed
+            .workspace
+            .as_managed_mut()
+            .expect("managed test session")
+            .worktree_path = managed_worktree.to_string_lossy().into_owned();
+        engine.sessions.push(managed);
 
         engine.normalize_restored_sessions();
 
         let mut seen = 0;
         let deadline = Instant::now() + Duration::from_secs(20);
-        while seen < 2 && Instant::now() < deadline {
+        while seen < 3 && Instant::now() < deadline {
             let Ok(event) = engine.worker_rx.recv_timeout(Duration::from_millis(500)) else {
                 continue;
             };
@@ -3749,7 +3756,12 @@ mod tests {
             }
             let _ = engine.process_worker_event(event);
         }
-        assert_eq!(seen, 2, "one probe per standalone agent, and no others");
+        assert_eq!(seen, 3, "one probe per agent, whatever kind it is");
+        assert_eq!(
+            engine.folder_repo_status("s1"),
+            crate::git::FolderRepoStatus::WorkingRepo,
+            "a managed working copy that is on disk stays a working repository"
+        );
         assert_eq!(
             engine.folder_repo_status("sa-repo"),
             crate::git::FolderRepoStatus::WorkingRepo

@@ -4693,7 +4693,7 @@ impl Engine {
                 "{}",
                 access
                     .quiet_reason()
-                    .unwrap_or("dux cannot work with git in this folder.")
+                    .unwrap_or_else(|| "dux cannot work with git in this folder.".to_string())
             );
         }
         Ok(access.directory().to_path_buf())
@@ -9212,10 +9212,7 @@ mod tests {
         assert_eq!(engine.watched_session_id.as_deref(), Some("s1"));
         assert!(engine.unstaged_files.is_empty());
 
-        let event = engine
-            .worker_rx
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("ChangedFilesReady");
+        let event = crate::engine::test_support::recv_changed_files_ready(&mut engine);
         engine.process_worker_event(event);
 
         assert_eq!(engine.watched_session_id.as_deref(), Some("s1"));
@@ -9244,10 +9241,7 @@ mod tests {
             })
             .expect("apply_wire");
         // Drain the off-thread refresh so the lists are populated before we clear.
-        let event = engine
-            .worker_rx
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("ChangedFilesReady");
+        let event = crate::engine::test_support::recv_changed_files_ready(&mut engine);
         engine.process_worker_event(event);
         assert!(!engine.unstaged_files.is_empty());
 
