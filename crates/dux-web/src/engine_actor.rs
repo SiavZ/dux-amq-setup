@@ -4258,7 +4258,12 @@ mod tests {
     }
 
     /// The announced sentence is keyed on the reload's own key, which is what
-    /// lets the drainer's apply outcome replace it rather than stack beside it.
+    /// lets the drainer's apply outcome REPLACE it in the browser rather than
+    /// stack beside it.
+    ///
+    /// Asserted on the status snapshot, which is what a connecting or
+    /// reconnecting tab is replayed: two entries there would be two toasts, one
+    /// of them saying browsers are refreshing for a reload that failed.
     #[test]
     fn announcing_a_reload_keys_it_so_the_apply_outcome_replaces_it() {
         let (_tmp, paths) = temp_paths();
@@ -4281,13 +4286,36 @@ mod tests {
             announced.message,
             dux_core::config_reload_status::REFRESHING
         );
+        let replayed = handle.status_snapshot();
         assert_eq!(
-            dux_core::config_reload_status::apply_failed("boom")
-                .key
-                .as_deref(),
-            announced.key.as_deref(),
-            "the apply's answer lands on the same key"
+            replayed
+                .iter()
+                .filter(|status| status.key.as_deref()
+                    == Some(dux_core::wire::status_keys::CONFIG_RELOAD))
+                .count(),
+            1,
+            "the announce is what a joining tab reads until the apply answers"
         );
+
+        // The apply fails, exactly as the engine loop reports it.
+        let _ = svc.status.send(WireStatus::from_update(
+            &dux_core::config_reload_status::apply_failed("boom"),
+        ));
+
+        let replayed: Vec<_> = handle
+            .status_snapshot()
+            .into_iter()
+            .filter(|status| {
+                status.key.as_deref() == Some(dux_core::wire::status_keys::CONFIG_RELOAD)
+            })
+            .collect();
+        assert_eq!(replayed.len(), 1, "one key holds one status: {replayed:?}");
+        assert_eq!(
+            replayed[0].message,
+            dux_core::config_reload_status::apply_failed("boom").message,
+            "and it is the outcome, not the announcement it answered"
+        );
+        assert_eq!(replayed[0].tone, "error");
     }
 
     /// And the post-apply half is what moves them, with the section the drainer
