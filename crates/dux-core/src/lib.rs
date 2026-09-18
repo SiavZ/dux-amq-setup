@@ -17,6 +17,7 @@ pub mod changes_status;
 pub mod config;
 pub mod config_migrate;
 pub mod config_queue;
+pub mod config_reload_status;
 pub mod config_sync;
 pub mod config_write;
 pub mod device_label;

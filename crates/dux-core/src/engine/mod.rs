@@ -2723,8 +2723,20 @@ impl Engine {
     /// already drain.
     pub fn post_changed_files_outcome(&mut self, session_id: &str, failure: Option<&str>) {
         if let Some(status) = self.note_changed_files_outcome(session_id, failure) {
-            let _ = self.worker_tx.send(WorkerEvent::PollerStatus(status));
+            self.post_status(status);
         }
+    }
+
+    /// Queue a status on the engine's own worker lane, so whichever surface is
+    /// draining shows it.
+    ///
+    /// The one road to both surfaces. A status raised inside a view handler
+    /// reaches only the surface that ran the handler, and one emitted through the
+    /// web's own emitter reaches only browsers; a worker or a poller answers to
+    /// the user rather than to a surface, so its outcome goes here and is drained
+    /// as an [`EventReaction::Status`] exactly once.
+    pub fn post_status(&self, status: StatusUpdate) {
+        let _ = self.worker_tx.send(WorkerEvent::PollerStatus(status));
     }
 
     /// The sentence a surface owes before it touches an agent's directory, or

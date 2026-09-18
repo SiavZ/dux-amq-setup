@@ -792,25 +792,32 @@ impl App {
         }
         if let Some(op) = self.pending_config_reload_op.take() {
             self.apply_reaction(op.resolve(&outcome).into_reaction());
-        } else {
-            self.apply_unkeyed_config_reload_outcome(&outcome);
         }
+        self.post_config_reload_outcome(&outcome);
         if applied && bind_settings_changed {
             let serving = self.background_server_is_serving();
             self.set_pinned_warning(server_restart_warning(serving));
         }
     }
 
-    fn apply_unkeyed_config_reload_outcome(&mut self, outcome: &TuiConfigReloadOutcome) {
-        match outcome {
-            TuiConfigReloadOutcome::Applied => {
-                self.set_info("Configuration reloaded. New settings are active now.");
+    /// Answer the reload on the worker lane, so the browsers that were told to
+    /// refetch learn whether the config actually took.
+    ///
+    /// The web announces the reload pre-consume and cannot know this: its
+    /// sentence is true about the read and silent about the apply. The lane is
+    /// what carries one keyed final to both surfaces, on the key that premature
+    /// sentence was raised under, so a failure replaces it there and reads the
+    /// same words here. A validation failure never reached a browser at all, so
+    /// it keeps the op's own error line and posts nothing.
+    fn post_config_reload_outcome(&mut self, outcome: &TuiConfigReloadOutcome) {
+        let status = match outcome {
+            TuiConfigReloadOutcome::Applied => dux_core::config_reload_status::applied(),
+            TuiConfigReloadOutcome::ApplyFailed(error) => {
+                dux_core::config_reload_status::apply_failed(error)
             }
-            TuiConfigReloadOutcome::ApplyFailed(error) => self.set_error(format!(
-                "Config validation passed, but applying it failed: {error}"
-            )),
-            TuiConfigReloadOutcome::ValidationFailed => {}
-        }
+            TuiConfigReloadOutcome::ValidationFailed => return,
+        };
+        self.engine.post_status(status);
     }
 
     fn apply_open_config_reload_failed_modal(&mut self, message: String) {
@@ -1885,6 +1892,35 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    /// The web announces a reload before the drainer has applied it, so the
+    /// apply's answer has to travel the lane both surfaces drain, on the key
+    /// that premature sentence was raised under.
+    #[test]
+    fn a_failed_config_apply_answers_on_the_lane_both_surfaces_drain() {
+        let mut app =
+            crate::app::test_support::test_app(crate::app::test_support::default_bindings());
+
+        app.post_config_reload_outcome(&TuiConfigReloadOutcome::ApplyFailed(
+            "right_width_pct out of range".to_string(),
+        ));
+
+        let event = app.engine.worker_rx.try_recv().expect("a posted status");
+        let WorkerEvent::PollerStatus(status) = event else {
+            panic!("the apply outcome rides the poller-status lane");
+        };
+        assert_eq!(
+            status.key.as_deref(),
+            Some(dux_core::wire::status_keys::CONFIG_RELOAD)
+        );
+        assert_eq!(status.tone, dux_core::statusline::StatusTone::Error);
+        assert!(status.message.contains("right_width_pct out of range"));
+
+        // A validation failure never reached a browser, so it owes the lane
+        // nothing and keeps this surface's own modal-and-error path.
+        app.post_config_reload_outcome(&TuiConfigReloadOutcome::ValidationFailed);
+        assert!(app.engine.worker_rx.try_recv().is_err());
+    }
 
     fn test_session(worktree: &Path) -> AgentSession {
         AgentSession {

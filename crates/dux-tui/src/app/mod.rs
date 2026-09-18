@@ -791,7 +791,7 @@ pub struct App {
     /// stashes it here (a reload is terminal, so an `Option` suffices). The
     /// matching `ApplyReloadedConfig` (success) or `OpenConfigReloadFailedModal`
     /// (failure) handler pops the op and resolves it against the handler-computed
-    /// [`TuiConfigReloadOutcome`], REPLACING the legacy `set_info`/`set_error`.
+    /// [`TuiConfigReloadOutcome`].
     /// The shared engine `ConfigReloadReady`/`ApplyReloadedConfig` logic (which
     /// also drives the web and replays deferred commands) is untouched: only the
     /// TUI's view-handler final is routed through the op.
@@ -851,13 +851,15 @@ pub enum BackgroundServerOutcome {
 }
 
 /// Handler-resolved outcome for the config-reload op (see
-/// [`App::pending_config_reload_op`]). Each variant carries the exact, byte-
-/// identical message the legacy `set_info`/`set_error` produced.
+/// [`App::pending_config_reload_op`]). The two apply outcomes are answered on
+/// the worker lane so both surfaces read one sentence; a validation failure is
+/// this surface's alone and carries its own line.
 pub enum TuiConfigReloadOutcome {
-    /// The reloaded config applied cleanly. Resolves to the success info line.
+    /// The reloaded config applied cleanly. Dismisses the spinner; the sentence
+    /// comes from [`dux_core::config_reload_status::applied`].
     Applied,
-    /// Validation passed but applying the config failed. Resolves to the
-    /// apply-failure error line, interpolating the error detail.
+    /// Validation passed but applying the config failed. Dismisses the spinner;
+    /// the sentence comes from [`dux_core::config_reload_status::apply_failed`].
     ApplyFailed(String),
     /// Validation failed; the reload-failed modal is opened. Resolves to the
     /// review-the-modal error line.
@@ -5169,16 +5171,18 @@ impl App {
         if spawned {
             // Mint the reload's keyed busy op. The TUI view handler for the shared
             // `ApplyReloadedConfig` (success) / `OpenConfigReloadFailedModal`
-            // (failure) reactions resolves it into the keyed final, REPLACING the
-            // legacy `set_info`/`set_error` (byte-identical messages).
+            // (failure) reactions resolves it: a validation failure into this
+            // surface's own error, an apply outcome into a clear, because that
+            // sentence is owed to both surfaces and travels the worker lane.
             let op = dux_core::engine::status_op("Reloading config.toml.").resolve_in_handler(
                 |o: &TuiConfigReloadOutcome| match o {
-                    TuiConfigReloadOutcome::Applied => dux_core::engine::Final::info(
-                        "Configuration reloaded. New settings are active now.",
-                    ),
-                    TuiConfigReloadOutcome::ApplyFailed(err) => dux_core::engine::Final::error(
-                        format!("Config validation passed, but applying it failed: {err}"),
-                    ),
+                    // Both apply outcomes are authored in `config_reload_status`
+                    // and posted on the worker lane, so both surfaces read the
+                    // same sentence. The op's only job for them is to dismiss
+                    // its own spinner once that final is on its way.
+                    TuiConfigReloadOutcome::Applied | TuiConfigReloadOutcome::ApplyFailed(_) => {
+                        dux_core::engine::Final::clear()
+                    }
                     TuiConfigReloadOutcome::ValidationFailed => dux_core::engine::Final::error(
                         "Config reload failed. Review the modal before retrying.",
                     ),

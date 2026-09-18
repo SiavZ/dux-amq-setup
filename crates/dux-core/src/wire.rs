@@ -1042,7 +1042,10 @@ impl WireStatus {
         self
     }
 
-    fn from_update(update: &StatusUpdate) -> Self {
+    /// Carry an engine status onto the wire unchanged, key, scope and all. What
+    /// a web-side producer uses when the sentence is authored in `dux-core` so
+    /// both surfaces read the same words.
+    pub fn from_update(update: &StatusUpdate) -> Self {
         Self {
             tone: update.tone.as_wire().to_string(),
             message: update.message.clone(),

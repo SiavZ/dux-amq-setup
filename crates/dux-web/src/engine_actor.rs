@@ -2330,9 +2330,14 @@ impl EngineService {
         // "new settings are active" would be a claim about a step that has not
         // run and may still fail. What is true here is that the file was read and
         // that browsers are being told to refetch.
-        let _ = self.status.send(WireStatus::new(
+        //
+        // KEYED on the reload's own key: the drainer posts the apply's answer on
+        // that key through the worker lane, so a failed apply replaces this
+        // sentence here instead of leaving "reloaded" standing in a browser.
+        let _ = self.status.send(WireStatus::keyed(
+            dux_core::wire::status_keys::CONFIG_RELOAD,
             "info",
-            "Configuration reloaded; connected browsers are refreshing.",
+            dux_core::config_reload_status::REFRESHING,
         ));
         if let Some(warning) = restart_warning {
             let _ = self.status.send(WireStatus::new("warning", warning));
@@ -2752,9 +2757,8 @@ pub(crate) fn run_engine_loop(
                         // no forwarder is listening (e.g. the TUI flip), which is
                         // fine.
                         let _ = svc.config_reload_tx.send(());
-                        let _ = svc.status.send(WireStatus::new(
-                            "info",
-                            "Configuration reloaded. New settings are active.",
+                        let _ = svc.status.send(WireStatus::from_update(
+                            &dux_core::config_reload_status::applied(),
                         ));
 
                         // The new config WAS applied to the engine, but the
@@ -2784,9 +2788,8 @@ pub(crate) fn run_engine_loop(
                         }
                     }
                     Err(e) => {
-                        let _ = svc.status.send(WireStatus::new(
-                            "error",
-                            format!("Config reload failed to apply: {e:#}"),
+                        let _ = svc.status.send(WireStatus::from_update(
+                            &dux_core::config_reload_status::apply_failed(&format!("{e:#}")),
                         ));
                     }
                 }
@@ -4189,6 +4192,39 @@ mod tests {
 
         assert_eq!(limits.search_index_max_files(), 9);
         assert!(!limits.access_log());
+    }
+
+    /// The announced sentence is keyed on the reload's own key, which is what
+    /// lets the drainer's apply outcome replace it rather than stack beside it.
+    #[test]
+    fn announcing_a_reload_keys_it_so_the_apply_outcome_replaces_it() {
+        let (_tmp, paths) = temp_paths();
+        let engine = bootstrap_engine(&paths).expect("engine");
+        let (handle, ends) = build_actor_channels(&engine);
+        let mut statuses = handle.subscribe_status();
+        let mut svc = EngineService::new(&engine, ends, ShutdownEcho::Silent);
+
+        svc.announce_config_reload(
+            &engine,
+            &EventReaction::ApplyReloadedConfig(Box::new(engine.config.clone())),
+        );
+
+        let announced = statuses.try_recv().expect("the announce is emitted");
+        assert_eq!(
+            announced.key.as_deref(),
+            Some(dux_core::wire::status_keys::CONFIG_RELOAD)
+        );
+        assert_eq!(
+            announced.message,
+            dux_core::config_reload_status::REFRESHING
+        );
+        assert_eq!(
+            dux_core::config_reload_status::apply_failed("boom")
+                .key
+                .as_deref(),
+            announced.key.as_deref(),
+            "the apply's answer lands on the same key"
+        );
     }
 
     /// And the post-apply half is what moves them, with the section the drainer
