@@ -376,12 +376,19 @@ pub fn closed_tab_exit_notice(exit: &ClosedTabExit) -> String {
 /// so the two cannot disagree about one exit. Closing the row of a run that
 /// ended badly would throw away both the diagnosis surface the verdict exists
 /// for and the verdict itself, since removing a row clears the recorded failure.
+///
+/// `refused_resume` is a row-keeping answer of its own: the provider came up,
+/// said why it would not continue, and quit, and that dormant row is where those
+/// words are readable. The resume-fallback sweep hands such an exit here
+/// deliberately (`ResumeFallbackDecision::DropSpokenExit`) rather than
+/// relaunching, so the row it counts on must survive whatever else is true.
 pub fn clean_exit_closes_tab_row(
     is_only_tab: bool,
     exit_success: Option<bool>,
     ended_badly: bool,
+    refused_resume: bool,
 ) -> bool {
-    !is_only_tab && exit_success == Some(true) && !ended_badly
+    !is_only_tab && exit_success == Some(true) && !ended_badly && !refused_resume
 }
 
 /// A deferred worktree removal that must wait for a WHOLE GROUP of an agent's
@@ -885,8 +892,13 @@ impl Engine {
                 && owning
                     .as_deref()
                     .is_none_or(|sid| self.successor_slot_tab(SessionIdRef::new(sid)).is_none());
-            let tab_closed = clean_exit_closes_tab_row(is_only_tab, exit_success, ended_badly)
-                && self.close_exited_tab_row(owning.as_deref(), &tab_id, is_session_slot);
+            let tab_closed =
+                clean_exit_closes_tab_row(
+                    is_only_tab,
+                    exit_success,
+                    ended_badly,
+                    refused_resume.is_some(),
+                ) && self.close_exited_tab_row(owning.as_deref(), &tab_id, is_session_slot);
             // Read AFTER the close, which is when the slot and the tab count
             // are the ones the user is about to be told about.
             let closed_tab = tab_closed
@@ -1678,7 +1690,7 @@ mod tests {
 
     use super::PrunedPtyKind;
     use super::TerminatingPty;
-    use super::{ClosedTabExit, closed_tab_exit_notice};
+    use super::{ClosedTabExit, clean_exit_closes_tab_row, closed_tab_exit_notice};
     use super::{RAPID_EXIT_WINDOW, rapid_exit_ends_run_badly, refused_resume_excerpt};
     use super::{REAPED_DRAIN_GRACE, agent_pty_ready_to_prune};
     use super::{format_shutdown_result, format_shutdown_start};
@@ -2122,6 +2134,38 @@ mod tests {
             engine.sessions[0].status,
             SessionStatus::Detached,
             "a clean exit of the last live tab detaches the agent instead"
+        );
+    }
+
+    /// Every reason a cleanly exited tab keeps its row, including the one the
+    /// resume-fallback sweep depends on: a refused resume is left here rather
+    /// than relaunched precisely so the provider's own words stay readable on
+    /// that dormant screen, and closing the row would throw them away.
+    #[test]
+    fn a_refused_resume_keeps_its_row_like_a_run_that_ended_badly() {
+        assert!(
+            clean_exit_closes_tab_row(false, Some(true), false, false),
+            "an ordinary clean exit with a sibling to take the slot closes its row"
+        );
+        assert!(
+            !clean_exit_closes_tab_row(false, Some(true), false, true),
+            "a refused resume is a diagnosis surface whoever else is running"
+        );
+        assert!(
+            !clean_exit_closes_tab_row(true, Some(true), false, false),
+            "an agent always has a first tab, so its last one cannot close"
+        );
+        assert!(
+            !clean_exit_closes_tab_row(false, Some(false), false, false),
+            "a non-zero exit keeps the screen that says so"
+        );
+        assert!(
+            !clean_exit_closes_tab_row(false, Some(true), true, false),
+            "a run that ended badly keeps both the screen and the verdict"
+        );
+        assert!(
+            !clean_exit_closes_tab_row(false, None, false, false),
+            "an exit nobody read a status from is not a clean one"
         );
     }
 
