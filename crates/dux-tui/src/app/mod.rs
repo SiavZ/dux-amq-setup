@@ -234,6 +234,9 @@ struct DrainedEventMetadata {
 struct PruneViewContext {
     selected_session: Option<String>,
     focused_tab: Option<String>,
+    /// The selected agent's slot tab as it was BEFORE the sweep, which a clean
+    /// exit of that tab moves.
+    selected_slot_tab: Option<String>,
     tab_providers: HashMap<String, String>,
 }
 

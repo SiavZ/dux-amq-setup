@@ -15,15 +15,35 @@ impl PruneViewContext {
         let focused_tab = selected_session
             .as_ref()
             .map(|session_id| app.focused_tab_id(session_id));
-        let tab_providers = app
+        // Every tab, slot tabs included: a clean exit hands the slot to a
+        // sibling, so the tab this names may no longer be the slot by the time
+        // the prune is read back and its sentence still has to name a provider.
+        let mut tab_providers: HashMap<String, String> = app
             .engine
             .agent_tabs
             .iter()
             .map(|(id, tab)| (id.as_str().to_string(), tab.provider.as_str().to_string()))
             .collect();
+        for session in &app.engine.sessions {
+            tab_providers.insert(
+                session.slot_tab_id().as_str().to_string(),
+                app.engine
+                    .tab_running_provider(session, session.slot_tab_id())
+                    .as_str()
+                    .to_string(),
+            );
+        }
+        let selected_slot_tab = selected_session.as_ref().and_then(|session_id| {
+            app.engine
+                .sessions
+                .iter()
+                .find(|session| &session.id == session_id)
+                .map(|session| session.slot_tab_id().as_str().to_string())
+        });
         Self {
             selected_session,
             focused_tab,
+            selected_slot_tab,
             tab_providers,
         }
     }
@@ -113,7 +133,7 @@ impl App {
             Vec::new()
         };
         self.apply_pruned_agent_tabs(&pruned, &context);
-        self.apply_selected_agent_exit(&pruned);
+        self.apply_selected_agent_exit(&pruned, &context);
         self.apply_pruned_terminals(&pruned);
         let foregrounds_changed = self.engine.refresh_terminal_foregrounds();
         if foregrounds_changed {
@@ -210,13 +230,14 @@ impl App {
         }
     }
 
-    fn apply_selected_agent_exit(&mut self, pruned: &[PrunedPty]) {
+    fn apply_selected_agent_exit(&mut self, pruned: &[PrunedPty], context: &PruneViewContext) {
         let Some(current_id) = self.selected_session().map(|session| session.id.clone()) else {
             return;
         };
+        let slot_before_prune = context.selected_slot_tab.as_deref();
         let Some(pty) = pruned
             .iter()
-            .find(|pty| is_session_slot_prune(&self.engine, pty, &current_id))
+            .find(|pty| is_agent_exit_prune(&self.engine, pty, &current_id, slot_before_prune))
         else {
             return;
         };
@@ -1654,10 +1675,22 @@ fn session_owner_id(pty: &PrunedPty) -> Option<&str> {
     }
 }
 
-fn is_session_slot_prune(engine: &Engine, pty: &PrunedPty, session_id: &str) -> bool {
-    pty.kind == PrunedPtyKind::Agent
-        && engine.is_slot_tab_of(SessionIdRef::new(session_id), TabIdRef::new(&pty.id))
-        && session_owner_id(pty) == Some(session_id)
+/// Whether a pruned PTY is the agent-level exit of `session_id`: the tab
+/// holding the slot, or the tab that held it before this sweep and took the
+/// agent's last live process with it. A clean exit hands the slot to a sibling
+/// before this is read, so the pointer alone would lose the notice for exactly
+/// the exit that ended the agent.
+fn is_agent_exit_prune(
+    engine: &Engine,
+    pty: &PrunedPty,
+    session_id: &str,
+    slot_before_prune: Option<&str>,
+) -> bool {
+    if pty.kind != PrunedPtyKind::Agent || session_owner_id(pty) != Some(session_id) {
+        return false;
+    }
+    engine.is_slot_tab_of(SessionIdRef::new(session_id), TabIdRef::new(&pty.id))
+        || (pty.agent_detached && slot_before_prune == Some(pty.id.as_str()))
 }
 
 fn project_display_name(path: &str, name: &str) -> String {
@@ -1891,6 +1924,84 @@ mod tests {
                 },
             ),
         }
+    }
+
+    /// The exit sentence names the provider of whichever tab went, and a slot
+    /// tab that exits cleanly has handed its slot away by the time the prune is
+    /// read back. Without the slot tab in the context the sentence names nobody.
+    #[test]
+    fn prune_context_names_the_slot_tabs_provider_too() {
+        let app = crate::app::test_support::test_app(crate::app::test_support::default_bindings());
+        let slot = app.engine.sessions[0].slot_tab_id().as_str().to_string();
+
+        let context = PruneViewContext::capture(&app);
+
+        assert_eq!(
+            context.tab_providers.get(&slot).map(String::as_str),
+            Some("codex"),
+            "the slot tab's provider is in the context like every other tab's"
+        );
+    }
+
+    /// A promoted-away tab no longer holds the slot, so the notice that the
+    /// agent is down has to follow the detachment rather than the pointer.
+    #[test]
+    fn a_detaching_tab_exit_is_the_agents_exit_whether_or_not_it_still_holds_the_slot() {
+        let app = crate::app::test_support::test_app(crate::app::test_support::default_bindings());
+        let exit = |id: &str, agent_detached: bool| PrunedPty {
+            kind: PrunedPtyKind::Agent,
+            id: id.to_string(),
+            owner: Some(dux_core::model::TerminalOwner::Session(
+                "session-1".to_string(),
+            )),
+            agent_detached,
+            label: "agent".to_string(),
+            tab_closed: true,
+            exit_success: Some(true),
+            is_minimal: false,
+            output_excerpt: String::new(),
+            read_error: None,
+            refused_resume_excerpt: None,
+        };
+
+        let held_the_slot = Some("promoted-away");
+
+        assert!(
+            is_agent_exit_prune(
+                &app.engine,
+                &exit("promoted-away", true),
+                "session-1",
+                held_the_slot
+            ),
+            "the slot tab whose exit took the agent's last live process is the agent's exit"
+        );
+        assert!(
+            !is_agent_exit_prune(
+                &app.engine,
+                &exit("promoted-away", false),
+                "session-1",
+                held_the_slot
+            ),
+            "a tab exiting while a sibling runs is a tab exit, not the agent's"
+        );
+        assert!(
+            !is_agent_exit_prune(
+                &app.engine,
+                &exit("extra", true),
+                "session-1",
+                held_the_slot
+            ),
+            "an extra tab keeps its own dormant surface even when it detaches the agent"
+        );
+        assert!(
+            is_agent_exit_prune(
+                &app.engine,
+                &exit("session-1-slot", false),
+                "session-1",
+                held_the_slot
+            ),
+            "the tab still holding the slot is the agent's own pane"
+        );
     }
 
     #[test]
