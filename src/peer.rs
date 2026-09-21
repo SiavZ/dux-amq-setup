@@ -67,12 +67,16 @@ struct ClaudePeer {
     id: String,
     cwd: String,
     /// Peer process id. Absent on brokers that predate the field; the
-    /// selector then falls back to recency instead of process ancestry.
+    /// registration then ranks as an ordinary client, decided by recency.
     #[serde(default)]
     pid: Option<u32>,
     /// Broker heartbeat, ISO-8601. Lexicographically sortable.
     #[serde(default)]
     last_seen: Option<String>,
+    /// When this registration was created, ISO-8601. Continuing or forking a
+    /// conversation registers afresh, so among equals the newest is current.
+    #[serde(default)]
+    registered_at: Option<String>,
 }
 
 pub fn run_peer(args: &[String], paths: &DuxPaths) -> Result<()> {
@@ -599,34 +603,53 @@ fn claude_peers_post(path: &str, body: &Value) -> Result<Value> {
     serde_json::from_str(response_body).context("Claude Peers broker returned non-JSON response")
 }
 
-/// Depth cap when walking a process's ancestry looking for the dux TUI.
-/// Panes sit a handful of levels below dux; the cap only stops a walk that
-/// a pid-reuse cycle would otherwise make unbounded.
+/// Depth cap when walking a process's ancestry. Panes and daemon hosts sit a
+/// handful of levels below their owner; the cap only stops a walk that a
+/// pid-reuse cycle would otherwise make unbounded.
 const MAX_ANCESTRY_DEPTH: usize = 32;
+
+/// What kind of process owns a Claude Peers registration, ranked by how
+/// likely it is to be the conversation a human or agent is actually driving.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PeerHost {
+    /// A Claude Code daemon `bg-spare`: pre-warmed, nobody reads it.
+    Spare,
+    /// Anything unrecognised — a plain `claude` in a terminal.
+    Client,
+    /// The process dux spawned in the pane.
+    Pane,
+    /// A daemon-hosted session (`claude bg-pty-host … --session-id`): once
+    /// Claude Code continues or forks a pane's conversation, this is where
+    /// the turns happen while the pane's original process lingers.
+    DaemonSession,
+}
 
 fn claude_peer_id_for_session(
     session: &AgentSession,
     peers: &[ClaudePeer],
     dux_pid: Option<u32>,
 ) -> Option<String> {
-    select_claude_peer_id(session, peers, dux_descendant_checker(dux_pid))
+    select_claude_peer_id(session, peers, peer_host_classifier(dux_pid))
 }
 
 /// Choose which Claude Peers registration owns `session`.
 ///
 /// The working directory alone is not a key: the Claude Code daemon keeps
-/// pre-warmed `bg-spare` sessions and background jobs that register from
-/// the same worktree, so an agent's cwd routinely has several live peers.
-/// Picking the first match made delivery a coin flip — a message could land
-/// in a spare session nobody reads while the real pane sat idle.
+/// pre-warmed `bg-spare` sessions registered from an agent's own worktree,
+/// and when a pane's conversation is continued or forked the daemon hosts
+/// the new session in its own process while the pane's original process
+/// stays registered with a queue nobody drains. Picking by list order, by
+/// heartbeat, or by descent from the dux TUI each landed messages in one of
+/// those dead registrations: sends queued to the pane's old process while
+/// the user kept working in the daemon-hosted copy of the conversation.
 ///
-/// Process ancestry is the discriminator: the pane dux spawned is a
-/// descendant of the running dux TUI, and daemon spares are not. Recency
-/// breaks any remaining tie so the choice stays deterministic.
+/// So rank by host kind (daemon session, then pane, then anything else,
+/// spares last), then by newest registration, then by heartbeat so the
+/// choice stays deterministic.
 fn select_claude_peer_id(
     session: &AgentSession,
     peers: &[ClaudePeer],
-    is_dux_descendant: impl Fn(u32) -> bool,
+    host_of: impl Fn(u32) -> PeerHost,
 ) -> Option<String> {
     let session_path = canonical_or_raw(Path::new(&session.worktree_path));
     let candidates: Vec<&ClaudePeer> = peers
@@ -637,50 +660,62 @@ fn select_claude_peer_id(
         return candidates.first().map(|peer| peer.id.clone());
     }
 
-    let owned: Vec<&ClaudePeer> = candidates
-        .iter()
-        .copied()
-        .filter(|peer| peer.pid.is_some_and(&is_dux_descendant))
-        .collect();
-    // Nothing traceable to this dux instance (TUI not running, or a broker
-    // without pids) leaves recency as the only signal.
-    let pool = if owned.is_empty() {
-        &candidates
-    } else {
-        &owned
+    let key = |peer: &ClaudePeer| {
+        (
+            peer.pid.map(&host_of).unwrap_or(PeerHost::Client),
+            peer.registered_at.clone(),
+            peer.last_seen.clone(),
+        )
     };
-
-    pool.iter()
-        .max_by(|a, b| a.last_seen.cmp(&b.last_seen))
+    candidates
+        .iter()
+        .max_by(|a, b| key(a).cmp(&key(b)))
         .map(|peer| peer.id.clone())
 }
 
-/// Snapshot the process table once and return a predicate answering
-/// "is this pid a descendant of the dux TUI?".
-fn dux_descendant_checker(dux_pid: Option<u32>) -> impl Fn(u32) -> bool {
+/// Snapshot the process table once and classify a registration's owner by
+/// walking its ancestry: the registered pid is the peer's MCP server, whose
+/// parents reveal whether a daemon spare, a daemon session host, or the dux
+/// TUI is behind it.
+fn peer_host_classifier(dux_pid: Option<u32>) -> impl Fn(u32) -> PeerHost {
     let mut system = System::new();
-    if dux_pid.is_some() {
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::nothing(),
-        );
-    }
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
     move |pid: u32| {
-        let Some(dux_pid) = dux_pid else {
-            return false;
-        };
         let mut current = sysinfo::Pid::from_u32(pid);
         for _ in 0..MAX_ANCESTRY_DEPTH {
-            if current.as_u32() == dux_pid {
-                return true;
+            if dux_pid == Some(current.as_u32()) {
+                return PeerHost::Pane;
             }
-            match system.process(current).and_then(|proc| proc.parent()) {
+            let Some(proc) = system.process(current) else {
+                return PeerHost::Client;
+            };
+            if let Some(kind) = daemon_host_kind(proc.cmd()) {
+                return kind;
+            }
+            match proc.parent() {
                 Some(parent) => current = parent,
-                None => return false,
+                None => return PeerHost::Client,
             }
         }
-        false
+        PeerHost::Client
+    }
+}
+
+/// Recognise the Claude Code daemon's process roles from a command line.
+/// `bg-spare` is checked first because a spare runs underneath its own
+/// `bg-pty-host`, and it is the spare that must lose.
+fn daemon_host_kind(command: &[OsString]) -> Option<PeerHost> {
+    let has = |needle: &str| command.iter().any(|arg| arg == needle);
+    if has("bg-spare") || has("--bg-spare") {
+        Some(PeerHost::Spare)
+    } else if has("bg-pty-host") || has("--bg-pty-host") {
+        Some(PeerHost::DaemonSession)
+    } else {
+        None
     }
 }
 
@@ -1435,82 +1470,146 @@ mod tests {
 
     use crate::model::{ProviderKind, SessionSettings, SessionState};
 
-    fn peer(id: &str, cwd: &Path, pid: Option<u32>, last_seen: &str) -> ClaudePeer {
+    fn peer(id: &str, cwd: &Path, pid: u32, registered_at: &str) -> ClaudePeer {
         ClaudePeer {
             id: id.to_string(),
             cwd: cwd.to_string_lossy().to_string(),
-            pid,
-            last_seen: Some(last_seen.to_string()),
+            pid: Some(pid),
+            last_seen: Some("2026-09-16T00:00:00Z".to_string()),
+            registered_at: Some(registered_at.to_string()),
         }
     }
 
-    /// The Claude Code daemon keeps pre-warmed `bg-spare` sessions and
-    /// background jobs registered from an agent's own worktree, so a cwd
-    /// routinely resolves to several live peers. Delivery must land in the
-    /// pane dux spawned, not whichever registration the broker listed first.
-    #[test]
-    fn peer_selection_prefers_the_pane_dux_spawned() {
-        let dir = tempdir().unwrap();
+    fn worktree_session(dir: &tempfile::TempDir) -> (std::path::PathBuf, AgentSession) {
         let wt = dir.path().join("worktree");
         std::fs::create_dir_all(&wt).unwrap();
         let session = session("s1", "claude", "feature", &wt);
+        (wt, session)
+    }
 
-        // Spare listed first and seen most recently: both tie-breaks that
-        // would otherwise win point at the wrong peer.
+    /// Observed live: the pane's original process (a dux child, oldest
+    /// registration) kept queueing channel messages nobody drained after
+    /// Claude Code continued the conversation into a daemon-hosted session.
+    /// A pre-warmed spare in the same worktree was newer than both.
+    #[test]
+    fn peer_selection_prefers_the_daemon_hosted_session() {
+        let dir = tempdir().unwrap();
+        let (wt, session) = worktree_session(&dir);
         let peers = vec![
-            peer("spare", &wt, Some(4242), "2026-09-02T00:00:09Z"),
-            peer("pane", &wt, Some(1001), "2026-09-02T00:00:01Z"),
+            peer("pane-shell", &wt, 100, "2026-09-15T07:24:00Z"),
+            peer("spare", &wt, 200, "2026-09-15T23:00:00Z"),
+            peer("daemon-host", &wt, 300, "2026-09-15T21:13:00Z"),
         ];
-        let owned = |pid: u32| pid == 1001;
-
+        let host_of = |pid: u32| match pid {
+            100 => PeerHost::Pane,
+            200 => PeerHost::Spare,
+            300 => PeerHost::DaemonSession,
+            _ => PeerHost::Client,
+        };
         assert_eq!(
-            select_claude_peer_id(&session, &peers, owned),
+            select_claude_peer_id(&session, &peers, host_of),
+            Some("daemon-host".to_string()),
+        );
+    }
+
+    /// Without a daemon in the picture the pane dux spawned must still beat
+    /// a spare listed first and heartbeating more recently.
+    #[test]
+    fn peer_selection_prefers_the_pane_over_spares_and_strangers() {
+        let dir = tempdir().unwrap();
+        let (wt, session) = worktree_session(&dir);
+        let peers = vec![
+            peer("spare", &wt, 4242, "2026-09-16T00:00:09Z"),
+            peer("stranger", &wt, 7, "2026-09-16T00:00:05Z"),
+            peer("pane", &wt, 1001, "2026-09-16T00:00:01Z"),
+        ];
+        let host_of = |pid: u32| match pid {
+            1001 => PeerHost::Pane,
+            4242 => PeerHost::Spare,
+            _ => PeerHost::Client,
+        };
+        assert_eq!(
+            select_claude_peer_id(&session, &peers, host_of),
             Some("pane".to_string()),
         );
     }
 
     #[test]
-    fn peer_selection_falls_back_to_recency_without_ancestry() {
+    fn peer_selection_takes_newest_registration_among_equal_hosts() {
         let dir = tempdir().unwrap();
-        let wt = dir.path().join("worktree");
-        std::fs::create_dir_all(&wt).unwrap();
-        let session = session("s1", "claude", "feature", &wt);
+        let (wt, session) = worktree_session(&dir);
         let peers = vec![
-            peer("older", &wt, Some(10), "2026-09-02T00:00:01Z"),
-            peer("newer", &wt, None, "2026-09-02T00:00:09Z"),
+            peer("old-host", &wt, 1, "2026-09-15T21:13:00Z"),
+            peer("new-host", &wt, 2, "2026-09-16T01:00:00Z"),
         ];
-
-        // No dux TUI to trace (lockfile stale, or a broker without pids):
-        // stay deterministic rather than picking list order.
         assert_eq!(
-            select_claude_peer_id(&session, &peers, |_| false),
-            Some("newer".to_string()),
+            select_claude_peer_id(&session, &peers, |_| PeerHost::DaemonSession),
+            Some("new-host".to_string()),
+        );
+        // Only spares left (TUI gone, or a broker without pids): still
+        // deterministic rather than list order.
+        assert_eq!(
+            select_claude_peer_id(&session, &peers, |_| PeerHost::Spare),
+            Some("new-host".to_string()),
         );
     }
 
     #[test]
     fn peer_selection_ignores_other_worktrees_and_reports_no_match() {
         let dir = tempdir().unwrap();
-        let wt = dir.path().join("worktree");
+        let (wt, session) = worktree_session(&dir);
         let other = dir.path().join("other");
-        std::fs::create_dir_all(&wt).unwrap();
         std::fs::create_dir_all(&other).unwrap();
-        let session = session("s1", "claude", "feature", &wt);
-
-        let peers = vec![peer(
-            "elsewhere",
-            &other,
-            Some(1001),
-            "2026-09-02T00:00:09Z",
-        )];
-        assert_eq!(select_claude_peer_id(&session, &peers, |_| true), None);
-
-        // A single match needs no disambiguation at all.
-        let peers = vec![peer("only", &wt, None, "2026-09-02T00:00:01Z")];
+        let peers = vec![peer("elsewhere", &other, 1001, "2026-09-16T00:00:09Z")];
         assert_eq!(
-            select_claude_peer_id(&session, &peers, |_| false),
+            select_claude_peer_id(&session, &peers, |_| PeerHost::DaemonSession),
+            None
+        );
+        // A single match needs no disambiguation at all, spare or not.
+        let peers = vec![peer("only", &wt, 1, "2026-09-16T00:00:01Z")];
+        assert_eq!(
+            select_claude_peer_id(&session, &peers, |_| PeerHost::Spare),
             Some("only".to_string()),
         );
+    }
+
+    #[test]
+    fn daemon_roles_are_recognised_from_command_lines() {
+        let cmd = |parts: &[&str]| parts.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            daemon_host_kind(&cmd(&[
+                "claude",
+                "bg-spare",
+                "--bg-spare",
+                "/tmp/x.claim.sock"
+            ])),
+            Some(PeerHost::Spare)
+        );
+        assert_eq!(
+            daemon_host_kind(&cmd(&[
+                "claude",
+                "bg-pty-host",
+                "--bg-pty-host",
+                "/tmp/x.pty.sock",
+                "200",
+                "50",
+                "--",
+                "/x/claude",
+                "--session-id",
+                "11111111-2222-4333-8444-555555555555",
+                "--fork-session",
+            ])),
+            Some(PeerHost::DaemonSession)
+        );
+        assert_eq!(
+            daemon_host_kind(&cmd(&[
+                "claude",
+                "--dangerously-skip-permissions",
+                "--continue"
+            ])),
+            None
+        );
+        assert_eq!(daemon_host_kind(&[]), None);
     }
 
     fn session(id: &str, provider: &str, branch: &str, worktree: &Path) -> AgentSession {
