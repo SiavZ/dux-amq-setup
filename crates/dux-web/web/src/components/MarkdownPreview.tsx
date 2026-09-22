@@ -1,9 +1,13 @@
-import type { MouseEvent } from "react"
+import { useRef, type MouseEvent } from "react"
 import Markdown, { defaultUrlTransform } from "react-markdown"
 import rehypeRaw from "rehype-raw"
 import rehypeSanitize from "rehype-sanitize"
 import remarkGfm from "remark-gfm"
-import { markdownAssetUrl } from "@/lib/markdown"
+import {
+  decodeFragment,
+  markdownAssetUrl,
+  previewFragmentTarget,
+} from "@/lib/markdown"
 import { formatFrontMatterValue, splitFrontMatter } from "@/lib/frontMatter"
 import type { EditorRoot } from "@/lib/editorRoot"
 
@@ -26,6 +30,9 @@ export default function MarkdownPreview({
   root,
   path,
 }: MarkdownPreviewProps) {
+  // The preview's own scroll container, which a fragment link scrolls within.
+  const scrollerRef = useRef<HTMLDivElement>(null)
+
   // Rewrite a relative image `src` to the worktree asset proxy, so it resolves
   // against the markdown file's directory rather than the SPA's URL.
   function transformUrl(url: string, key: string): string {
@@ -37,14 +44,24 @@ export default function MarkdownPreview({
   }
 
   // Open links in a new tab by delegation rather than a custom `a` renderer: a
-  // click in the preview must never navigate the SPA away.
+  // click in the preview must never navigate the SPA away. Keyboard activation
+  // arrives here too, since Enter on a focused link dispatches a click.
   function onLinkClick(e: MouseEvent<HTMLDivElement>): void {
     const anchor = (e.target as HTMLElement).closest("a")
     if (!anchor) return
-    // In-page and href-less anchors stay inert: opening one would spawn a bogus
-    // SPA tab, and react-markdown adds no heading ids to scroll to anyway.
     const href = anchor.getAttribute("href")
-    if (!href || href.startsWith("#")) return
+    if (!href) return
+    if (href.startsWith("#")) {
+      // `location.hash` is the app's whole position, so a fragment link is
+      // scrolled here and the navigation cancelled whether or not it resolves.
+      e.preventDefault()
+      const scroller = scrollerRef.current
+      if (!scroller) return
+      previewFragmentTarget(scroller, decodeFragment(href))?.scrollIntoView({
+        block: "start",
+      })
+      return
+    }
     e.preventDefault()
     window.open(anchor.href, "_blank", "noopener,noreferrer")
   }
@@ -56,7 +73,7 @@ export default function MarkdownPreview({
   const body = front === null ? content : front.body
 
   return (
-    <div className="h-full overflow-auto" onClick={onLinkClick}>
+    <div className="h-full overflow-auto" onClick={onLinkClick} ref={scrollerRef}>
       <div
         className={[
           "mx-auto max-w-3xl px-6 py-5 text-sm leading-relaxed text-foreground",

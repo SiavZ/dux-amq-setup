@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { cleanup, render, screen } from "@testing-library/react"
 import { agentRoot, type EditorRoot } from "@/lib/editorRoot"
 
@@ -101,5 +101,94 @@ describe("MarkdownPreview front matter", () => {
     expect(tableRows()).toEqual([
       ["title", "<img src=x onerror=alert(1)> **bold**"],
     ])
+  })
+})
+
+describe("MarkdownPreview in-document anchors", () => {
+  let scrolled: Element[]
+  let hashChanges: number
+
+  function countHashChange() {
+    hashChanges += 1
+  }
+
+  beforeEach(() => {
+    scrolled = []
+    hashChanges = 0
+    Element.prototype.scrollIntoView = function scrollIntoView(this: Element) {
+      scrolled.push(this)
+    }
+    window.addEventListener("hashchange", countHashChange)
+  })
+
+  afterEach(() => {
+    window.removeEventListener("hashchange", countHashChange)
+    window.location.hash = ""
+  })
+
+  // A real click, so the anchor's own default action is what gets cancelled.
+  // Keyboard activation arrives here too: Enter on a focused link dispatches a
+  // click, which is why the handler needs no key listener of its own.
+  function clickLink(container: HTMLElement, selector: string): MouseEvent {
+    const link = container.querySelector(selector)
+    expect(link).toBeTruthy()
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true })
+    link?.dispatchEvent(event)
+    return event
+  }
+
+  it("scrolls to the heading a fragment link names and leaves the URL alone", () => {
+    window.location.hash = "#/agent/s1/editor/file/notes.md"
+    const { container } = preview("## My Heading\n\n[jump](#my-heading)\n")
+    const event = clickLink(container, 'a[href="#my-heading"]')
+    // jsdom performs no fragment navigation of its own, so cancelling the
+    // event is the load-bearing assertion: uncancelled, the browser would
+    // write `#my-heading` over the app's whole address.
+    expect(event.defaultPrevented).toBe(true)
+    expect(hashChanges).toBe(0)
+    expect(window.location.hash).toBe("#/agent/s1/editor/file/notes.md")
+    expect(scrolled).toEqual([container.querySelector("h2")])
+  })
+
+  it("resolves an id the sanitizer clobber-prefixed", () => {
+    const { container } = preview('<h3 id="manual">M</h3>\n\n[go](#manual)\n')
+    const event = clickLink(container, 'a[href="#manual"]')
+    expect(event.defaultPrevented).toBe(true)
+    expect(scrolled).toEqual([container.querySelector("h3")])
+  })
+
+  it("decodes a percent-encoded fragment", () => {
+    const { container } = preview("## Café\n\n[jump](#caf%C3%A9)\n")
+    clickLink(container, "a")
+    expect(scrolled).toEqual([container.querySelector("h2")])
+  })
+
+  it("numbers repeated headings the way a written anchor expects", () => {
+    const { container } = preview("## Notes\n\n## Notes\n\n[second](#notes-1)\n")
+    clickLink(container, 'a[href="#notes-1"]')
+    expect(scrolled).toEqual([container.querySelectorAll("h2")[1]])
+  })
+
+  it("does nothing at all when the anchor names no target", () => {
+    window.location.hash = "#/agent/s1/editor/file/notes.md"
+    const { container } = preview("[nowhere](#missing)\n")
+    const event = clickLink(container, 'a[href="#missing"]')
+    expect(event.defaultPrevented).toBe(true)
+    expect(scrolled).toEqual([])
+    expect(hashChanges).toBe(0)
+    expect(window.location.hash).toBe("#/agent/s1/editor/file/notes.md")
+  })
+
+  it("still sends an external link to a new tab", () => {
+    const open = vi.spyOn(window, "open").mockImplementation(() => null)
+    const { container } = preview("[out](https://example.com/x)\n")
+    const event = clickLink(container, 'a[href="https://example.com/x"]')
+    expect(event.defaultPrevented).toBe(true)
+    expect(open).toHaveBeenCalledWith(
+      "https://example.com/x",
+      "_blank",
+      "noopener,noreferrer",
+    )
+    open.mockRestore()
   })
 })
