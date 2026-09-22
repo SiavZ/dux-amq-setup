@@ -29,11 +29,14 @@ use dux_core::tailscale::TailscaleUnavailable;
 /// takes to notice a laptop is back and reach for a browser, paying for one bounded
 /// local call per period.
 ///
+/// A look is one `tailscale ip`, measured at 5 to 19 ms on the machine this was
+/// written on, so looking this often costs nothing worth naming.
+///
 /// This period is also the flap debounce, and there is deliberately no second
 /// hysteresis window: an interface appearing and disappearing faster than this
 /// produces at most one transition per period, and one slower than this is not
 /// flapping, it is changing.
-pub(crate) const WATCH_PERIOD: Duration = Duration::from_secs(10);
+pub(crate) const WATCH_PERIOD: Duration = Duration::from_secs(5);
 
 /// How long the watcher parks between checks of the stop flag. Small enough that
 /// serving can end promptly, large enough that waiting costs a wakeup a second
@@ -249,14 +252,17 @@ pub(crate) struct LegStatus {
 
 /// How long the leg must hold a new state before dux says it changed.
 ///
-/// A little longer than one [`WATCH_PERIOD`], which is what makes it a dwell
+/// One second longer than one [`WATCH_PERIOD`], which is what makes it a dwell
 /// rather than a second name for the watcher's cadence: an interface that has
 /// not outlived a whole period is one the watcher is still changing its mind
-/// about. The console line and the log stay immediate; this delays only what the
+/// about. A wedged probe stretches a cycle past the dwell, which only costs the
+/// coalescing, never a wrong sentence.
+///
+/// The console line and the log stay immediate; this delays only what the
 /// surfaces are told, because every sentence lands on one key and a toast
 /// re-raised on a fixed id restarts its window instead of expiring.
 pub(crate) const LEG_SETTLE_DWELL: Duration =
-    Duration::from_secs(WATCH_PERIOD.as_secs().saturating_add(2));
+    Duration::from_secs(WATCH_PERIOD.as_secs().saturating_add(1));
 
 /// A leg transition waiting out its dwell.
 struct PendingLegTransition {
@@ -652,7 +658,7 @@ pub(crate) fn watch_tailscale_leg(
 }
 
 /// Sleep for `period` in slices, returning false as soon as `stop` says to end.
-/// Slicing is what makes a ten-second period compatible with a prompt teardown.
+/// Slicing is what makes a multi-second period compatible with a prompt teardown.
 fn park(period: Duration, stop: &dyn Fn() -> bool) -> bool {
     let deadline = std::time::Instant::now() + period;
     loop {
@@ -1047,6 +1053,48 @@ mod tests {
         );
     }
 
+    /// The cadence and the dwell, pinned: dux looks every five seconds and holds
+    /// a new state for six before it says anything, so a dwell is always longer
+    /// than the period it waits out.
+    #[test]
+    fn the_watch_period_is_five_seconds_and_the_dwell_outlasts_it() {
+        assert_eq!(WATCH_PERIOD, Duration::from_secs(5));
+        assert_eq!(LEG_SETTLE_DWELL, Duration::from_secs(6));
+        assert!(LEG_SETTLE_DWELL > WATCH_PERIOD);
+    }
+
+    /// A probe that outlasts the whole period delays the next look rather than
+    /// running beside it: the watcher parks, probes and acts in one sequence on
+    /// one thread, so a wedged `tailscale ip` can never produce two at once.
+    #[test]
+    fn a_probe_slower_than_the_period_never_overlaps_the_next_one() {
+        let inside = std::sync::atomic::AtomicBool::new(false);
+        let calls = Mutex::new(0usize);
+        watch_tailscale_leg(
+            addr("127.0.0.1:8080"),
+            Duration::from_millis(5),
+            true,
+            &|| {
+                assert!(
+                    !inside.swap(true, Ordering::SeqCst),
+                    "a second look started while the first was still running"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+                *calls.lock().unwrap() += 1;
+                inside.store(false, Ordering::SeqCst);
+                Ok(ip("100.64.0.5"))
+            },
+            &|| None,
+            &|_| *calls.lock().unwrap() < 3,
+            &|| false,
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            3,
+            "three looks, one after the other"
+        );
+    }
+
     #[test]
     fn the_stop_flag_ends_the_watcher_before_it_probes() {
         let calls = Mutex::new(0usize);
@@ -1108,7 +1156,7 @@ mod tests {
         );
 
         // → auto: a watcher whose first probe is immediate, so the command has a
-        // visible outcome rather than one ten seconds later.
+        // visible outcome rather than one a period later.
         assert_eq!(
             plan_mode_change(No, Auto, None, false),
             vec![

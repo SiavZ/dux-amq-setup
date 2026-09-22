@@ -2943,7 +2943,7 @@ mod live_tailscale_mode_tests {
         assert!(h.control.watched().load(Ordering::SeqCst));
         probed_rx
             .recv_timeout(WAIT)
-            .expect("the watcher must probe before its first park, not ten seconds later");
+            .expect("the watcher must probe before its first park, not a period later");
         h.finish().await;
     }
 

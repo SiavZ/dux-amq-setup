@@ -64,7 +64,7 @@ a roaming laptop is several times a day. On `"auto"`:
   scrolled where you left them.
 - **Your Tailscale address changes** and dux moves the listener to the new one.
 
-dux checks roughly every ten seconds, which is not configurable. That interval is also the
+dux checks roughly every five seconds, which is not configurable. That interval is also the
 only debounce, so an interface that flaps faster than dux looks costs at most one bind or
 unbind. Every bind and unbind is written to `dux.log`, printed by `dux server`, listed in
 the flip's activity panel, and said on screen: the terminal UI's status line and the
@@ -124,7 +124,7 @@ tell you what actually happened rather than just "saved".
 - Choosing **`"yes"`** looks for the address right then. If nothing is found you get
   a warning rather than an error, and the value still saves.
 - Choosing **`"auto"`** starts the watcher and probes immediately, so you see the
-  outcome now instead of up to ten seconds later.
+  outcome now instead of up to five seconds later.
 
 If nothing is serving, the choice is simply saved and applied the next time a
 listener starts, and the message says so. A run started with `dux server
