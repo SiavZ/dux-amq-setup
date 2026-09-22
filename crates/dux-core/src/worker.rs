@@ -405,14 +405,15 @@ pub enum WorkerEvent {
     /// busy status is guaranteed to reach `process_worker_event` ahead of
     /// any event the worker can produce.
     CommandWorkerStarted(StatusUpdate),
-    /// A recreate of an agent's working copy finished, however it ended. Rides
-    /// alongside the recreate's own status op, which is closure-only and reaches
-    /// neither the sessions, the store nor the in-flight registry.
+    /// A recreate of an agent's working copy finished, however it ended. It is
+    /// the recreate's only completion: the handler releases the in-flight guard,
+    /// records what the checkout did, and resolves the op that produces the
+    /// final, which needs the engine to see what is running by then.
     WorkingCopyRecreated {
         session_id: String,
-        /// `None` when the recreate failed. The in-flight guard is released
-        /// either way; only a success has a branch outcome to record.
-        outcome: Option<crate::working_copy::RecreatedBranch>,
+        /// The branch arm the checkout took, or the sentence explaining what
+        /// stopped it. The in-flight guard is released either way.
+        outcome: Result<crate::working_copy::RecreatedBranch, String>,
     },
     /// A status a background poller produced, delivered through the worker lane
     /// so it reaches whichever surface is draining rather than only the one

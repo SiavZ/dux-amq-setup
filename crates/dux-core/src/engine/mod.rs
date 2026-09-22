@@ -667,6 +667,13 @@ pub struct Engine {
     /// attach arm. One keyed op spans resolve→attach; the `AttachPullRequest`
     /// wire command itself mints no second busy.
     pub pending_pr_attach_ops: HashMap<String, HandlerStatusOp<PrAttachOutcome>>,
+    /// Recreate-working-copy ops (the "Recreating the working copy for agent …"
+    /// busy), SHARED by both surfaces because the whole flow completes
+    /// engine-side. Keyed by **session id**, which is what the completion
+    /// `WorkingCopyRecreated` event carries, and consumed exactly once by
+    /// `process_working_copy_recreated`, which resolves it against a
+    /// [`RecreateOutcome`] it can only assemble there.
+    pub pending_recreate_ops: HashMap<String, HandlerStatusOp<RecreateOutcome>>,
     /// Web-side async worktree-deletion ops (the "Removing worktree for agent …"
     /// busy). Keyed by **session id** (the completion `WorktreeRemoveCompleted`
     /// event carries `session_id`, so it is the natural correlation handle), not
@@ -816,6 +823,22 @@ pub fn launch_outcome_final(o: &LaunchOutcome) -> Final {
         )),
         LaunchOutcome::Missing => Final::clear(),
     }
+}
+
+/// Handler-computed outcome for a recreate of a working copy (see
+/// [`Engine::pending_recreate_ops`]).
+///
+/// The checkout's own answer travels with what the agent was RUNNING when it
+/// landed, which is why this op resolves in the handler at all: the tab the
+/// confirmation warned about may have been stopped while the checkout ran, and a
+/// final telling the user to stop a process that already ended is a lie the
+/// dispatch could not have avoided.
+pub struct RecreateOutcome {
+    /// The branch arm the checkout took, or the sentence explaining what stopped
+    /// it.
+    pub result: Result<crate::working_copy::RecreatedBranch, String>,
+    /// The providers of the tabs live at completion, empty when none is.
+    pub live_providers: Vec<String>,
 }
 
 /// Handler-computed outcome for a web async worktree-deletion op (see

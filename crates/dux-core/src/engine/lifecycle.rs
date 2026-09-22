@@ -1846,50 +1846,76 @@ impl Engine {
             source_branch,
             ..
         } = inputs;
-        let live_providers = self.live_tab_providers(session_id);
-        let success_label = agent_label.clone();
-        let success_path = worktree_path.clone();
-        let success_branch = branch_name.clone();
-        let failure_label = agent_label.clone();
-        let failure_path = worktree_path.clone();
+        let checkout_path = worktree_path.clone();
+        let checkout_branch = branch_name.clone();
+        // Every sentence the final promises is decided where the outcome lands,
+        // not here: what a tab does with the recreated folder is a fact about
+        // the processes running when the checkout finished, and the one the user
+        // was warned about may have been stopped meanwhile.
         let op = crate::engine::status_op(crate::working_copy::recreate_busy_message(&agent_label))
-            .on_success(move |outcome: &crate::working_copy::RecreatedBranch| {
-                crate::engine::Final::info(crate::working_copy::recreate_success_message(
-                    &success_label,
-                    &success_path,
-                    &success_branch,
-                    outcome,
-                    &live_providers,
-                ))
+            .resolve_in_handler(move |outcome: &crate::engine::RecreateOutcome| {
+                match &outcome.result {
+                    Ok(branch) => {
+                        crate::engine::Final::info(crate::working_copy::recreate_success_message(
+                            &agent_label,
+                            &worktree_path,
+                            &branch_name,
+                            branch,
+                            &outcome.live_providers,
+                        ))
+                    }
+                    Err(err) => crate::engine::Final::error(format!(
+                        "Could not recreate the working copy for agent \"{agent_label}\" at {}: \
+                         {err}",
+                        crate::home_path::shorten_home(&worktree_path)
+                    )),
+                }
             })
-            .on_failure(move |err: &String| {
-                crate::engine::Final::error(format!(
-                    "Could not recreate the working copy for agent \"{failure_label}\" at {}: {err}",
-                    crate::home_path::shorten_home(&failure_path)
-                ))
-            });
-        // The status op is closure-only: its resolvers see the typed outcome
-        // but neither the sessions nor the store. What the engine still owes
-        // afterwards (a fresh verdict about the directory, and the provenance of
-        // a branch dux has just minted) therefore travels on its own worker
-        // event, sent from inside the same work closure.
-        let completion_tx = self.worker_tx.clone();
+            .with_scope(self.current_origin.clone());
+        let pending = self.begin_status_op(&op);
+        let status_key = op.id().to_string();
+        self.pending_recreate_ops.insert(session_id.to_string(), op);
+
         let completed_session = session_id.to_string();
-        self.mark_in_flight(in_flight);
-        Ok(self.spawn_status_op(op, move || {
-            let outcome = crate::working_copy::recreate_working_copy(
-                &repo_path,
-                &worktree_path,
-                &branch_name,
-                &source_branch,
-            )
-            .map_err(|err| format!("{err:#}"));
-            let _ = completion_tx.send(crate::worker::WorkerEvent::WorkingCopyRecreated {
-                session_id: completed_session,
-                outcome: outcome.as_ref().ok().cloned(),
-            });
-            outcome
-        }))
+        let panic_session = completed_session.clone();
+        let spawned = self.spawn_background_worker(
+            crate::engine::BackgroundWorkerSpec {
+                label: "recreate-working-copy".to_string(),
+                in_flight_key: Some(in_flight),
+                // A panicking checkout still has to release the guard and answer
+                // the spinner, which the ordinary failure arm does.
+                panic_event: Some(Box::new(move |reason| {
+                    crate::worker::WorkerEvent::WorkingCopyRecreated {
+                        session_id: panic_session,
+                        outcome: Err(reason),
+                    }
+                })),
+            },
+            move |tx| {
+                let outcome = crate::working_copy::recreate_working_copy(
+                    &repo_path,
+                    &checkout_path,
+                    &checkout_branch,
+                    &source_branch,
+                )
+                .map_err(|err| format!("{err:#}"));
+                let _ = tx.send(crate::worker::WorkerEvent::WorkingCopyRecreated {
+                    session_id: completed_session,
+                    outcome,
+                });
+            },
+        );
+        if spawned != crate::engine::BackgroundSpawn::Spawned {
+            // Nothing will answer the busy that was just registered, so it is
+            // abandoned here rather than left heartbeating forever.
+            self.pending_recreate_ops.remove(session_id);
+            self.abandon_status_op(&status_key);
+            return Err(anyhow::anyhow!(
+                "dux could not start the worker that recreates a working copy. Try again; if it \
+                 keeps failing, restart dux."
+            ));
+        }
+        Ok(crate::engine::EventReaction::Status(pending))
     }
 }
 
@@ -2041,6 +2067,73 @@ mod recreate_tests {
         assert_eq!(inputs.running_providers, vec!["codex".to_string()]);
     }
 
+    /// The final's last sentence is about what is running when the checkout
+    /// LANDS. A tab that was live when the user pressed and has ended by the
+    /// time git answers must not be handed instructions for stopping it.
+    #[test]
+    fn the_final_reads_liveness_when_the_checkout_lands_not_at_dispatch() {
+        let (mut engine, _tmp) = engine_with_a_missing_working_copy();
+        engine.sessions[0].provider = crate::model::ProviderKind::new("codex");
+        let tab = engine
+            .slot_tab_id_of(crate::ids::SessionIdRef::new("s1"))
+            .to_owned();
+        engine.mark_in_flight(crate::engine::InFlightKey::AgentLaunch(tab.clone()));
+        engine
+            .begin_recreate_working_copy("s1")
+            .expect("the press dispatches under a running tab");
+
+        // The tab ends by itself while git works.
+        engine.clear_in_flight(&crate::engine::InFlightKey::AgentLaunch(tab));
+
+        let reaction =
+            engine.process_worker_event(crate::worker::WorkerEvent::WorkingCopyRecreated {
+                session_id: "s1".to_string(),
+                outcome: Ok(crate::working_copy::RecreatedBranch::CheckedOut),
+            });
+        let crate::engine::EventReaction::Status(status) = reaction else {
+            panic!("the checkout answers its own spinner")
+        };
+        assert!(
+            status.message.ends_with(
+                "Its tabs stay dormant; start one when you want the agent running there."
+            ),
+            "{}",
+            status.message
+        );
+    }
+
+    /// The same final with the tab still up names what that tab does next, in
+    /// the provider's own terms.
+    #[test]
+    fn the_final_names_the_provider_of_a_tab_that_is_still_running() {
+        let (mut engine, _tmp) = engine_with_a_missing_working_copy();
+        engine.sessions[0].provider = crate::model::ProviderKind::new("codex");
+        let tab = engine
+            .slot_tab_id_of(crate::ids::SessionIdRef::new("s1"))
+            .to_owned();
+        engine.mark_in_flight(crate::engine::InFlightKey::AgentLaunch(tab));
+        engine
+            .begin_recreate_working_copy("s1")
+            .expect("the press dispatches under a running tab");
+
+        let reaction =
+            engine.process_worker_event(crate::worker::WorkerEvent::WorkingCopyRecreated {
+                session_id: "s1".to_string(),
+                outcome: Ok(crate::working_copy::RecreatedBranch::CheckedOut),
+            });
+        let crate::engine::EventReaction::Status(status) = reaction else {
+            panic!("the checkout answers its own spinner")
+        };
+        assert!(
+            status.message.ends_with(
+                "A running Codex tab cannot follow the folder: stop it and start the agent again \
+                 to continue in the recreated copy."
+            ),
+            "{}",
+            status.message
+        );
+    }
+
     /// The Missing verdict only refreshes when the recreate finishes, so the
     /// row stays on screen for the whole of it and a second press would
     /// otherwise reach the checkout.
@@ -2060,7 +2153,7 @@ mod recreate_tests {
         // press works.
         engine.process_worker_event(crate::worker::WorkerEvent::WorkingCopyRecreated {
             session_id: "s1".to_string(),
-            outcome: None,
+            outcome: Err("the checkout failed".to_string()),
         });
         assert!(
             !engine.is_in_flight(&crate::engine::InFlightKey::RecreateWorkingCopy(
@@ -2095,11 +2188,14 @@ mod recreate_tests {
         let reaction =
             engine.process_worker_event(crate::worker::WorkerEvent::WorkingCopyRecreated {
                 session_id: "s1".to_string(),
-                outcome: Some(crate::working_copy::RecreatedBranch::RecreatedFrom(
+                outcome: Ok(crate::working_copy::RecreatedBranch::RecreatedFrom(
                     "main".to_string(),
                 )),
             });
-        assert!(matches!(reaction, crate::engine::EventReaction::Nothing));
+        assert!(
+            matches!(reaction, crate::engine::EventReaction::Nothing),
+            "nothing showed a spinner for a checkout nobody dispatched"
+        );
 
         let managed = engine.sessions[0].workspace.as_managed().unwrap();
         assert_eq!(
@@ -2145,7 +2241,7 @@ mod recreate_tests {
 
         engine.process_worker_event(crate::worker::WorkerEvent::WorkingCopyRecreated {
             session_id: "s1".to_string(),
-            outcome: Some(crate::working_copy::RecreatedBranch::CheckedOut),
+            outcome: Ok(crate::working_copy::RecreatedBranch::CheckedOut),
         });
 
         assert_eq!(

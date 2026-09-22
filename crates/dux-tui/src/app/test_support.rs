@@ -208,6 +208,7 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
         pending_web_add_project_ops: std::collections::HashMap::new(),
         pending_web_pr_lookup_ops: std::collections::HashMap::new(),
         pending_pr_attach_ops: std::collections::HashMap::new(),
+        pending_recreate_ops: std::collections::HashMap::new(),
         pending_delete_ops_web: std::collections::HashMap::new(),
         pending_delete_reports_web: std::collections::HashMap::new(),
         pending_create_ops: std::collections::HashMap::new(),

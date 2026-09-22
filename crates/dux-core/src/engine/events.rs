@@ -3262,18 +3262,22 @@ impl Engine {
         }
     }
 
-    /// Settle the engine's own state after a working copy came back.
+    /// Settle the engine's own state after a working copy came back, and say
+    /// how it went.
     ///
-    /// Two things the status op's closures cannot reach. The verdict about the
-    /// directory is stale the moment the checkout lands, so it is asked again
-    /// rather than left saying the copy is gone; and a branch dux minted again
-    /// from the project's source branch is now dux's, which the record still
-    /// denies. Nothing here is the user's branch: the mint happened because the
-    /// old one was gone from the repository.
+    /// Three things the worker cannot reach. The verdict about the directory is
+    /// stale the moment the checkout lands, so it is asked again rather than
+    /// left saying the copy is gone; a branch dux minted again from the
+    /// project's source branch is now dux's, which the record still denies
+    /// (nothing here is the user's branch: the mint happened because the old one
+    /// was gone from the repository); and the final's last sentence is about the
+    /// tabs running NOW, which is why the op resolves here rather than at
+    /// dispatch. A tab stopped while the checkout ran must not be handed
+    /// instructions for stopping it.
     fn process_working_copy_recreated(
         &mut self,
         session_id: &str,
-        outcome: Option<&crate::working_copy::RecreatedBranch>,
+        outcome: Result<crate::working_copy::RecreatedBranch, String>,
     ) -> EventReaction {
         self.clear_in_flight(&InFlightKey::RecreateWorkingCopy(session_id.to_string()));
         // The copy may be back, so the Missing verdict that gated the recreate,
@@ -3284,17 +3288,33 @@ impl Engine {
         // Only the source-branch arm mints a branch. One rebuilt from the
         // remote still exists there, and a local copy of somebody else's branch
         // is not one dux may force-delete.
-        if !matches!(
+        if matches!(
             outcome,
-            Some(crate::working_copy::RecreatedBranch::RecreatedFrom(_))
+            Ok(crate::working_copy::RecreatedBranch::RecreatedFrom(_))
         ) {
-            return EventReaction::Nothing;
+            self.record_branch_minted_by_recreate(session_id);
         }
-        let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) else {
+        let live_providers = self.live_tab_providers(session_id);
+        let Some(op) = self.pending_recreate_ops.remove(session_id) else {
+            // No op means no spinner is waiting on this checkout, which only a
+            // synthesised completion reaches. There is nothing to answer.
             return EventReaction::Nothing;
         };
+        op.resolve(&crate::engine::RecreateOutcome {
+            result: outcome,
+            live_providers,
+        })
+        .into_reaction()
+    }
+
+    /// Record that the branch under this agent is one dux minted, in the record
+    /// and in the store.
+    fn record_branch_minted_by_recreate(&mut self, session_id: &str) {
+        let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) else {
+            return;
+        };
         let Some(managed) = session.workspace.as_managed_mut() else {
-            return EventReaction::Nothing;
+            return;
         };
         managed.branch_provenance = crate::model::BranchProvenance::CreatedByDux;
         managed.initial_branch = managed.branch_name.clone();
@@ -3308,7 +3328,6 @@ impl Engine {
                  {err:#}"
             ));
         }
-        EventReaction::Nothing
     }
 
     fn process_folder_repo_status_ready(
@@ -3353,7 +3372,7 @@ impl Engine {
             WorkerEvent::WorkingCopyRecreated {
                 session_id,
                 outcome,
-            } => self.process_working_copy_recreated(&session_id, outcome.as_ref()),
+            } => self.process_working_copy_recreated(&session_id, outcome),
             WorkerEvent::CreateAgentProgress {
                 status_op_id,
                 message,
