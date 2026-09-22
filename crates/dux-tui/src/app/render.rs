@@ -7827,6 +7827,7 @@ impl App {
             branch_name,
             source_branch,
             conversation_resumes,
+            provider,
             focus,
             ..
         } = &self.prompt
@@ -7839,6 +7840,7 @@ impl App {
             branch_name,
             source_branch,
             *conversation_resumes,
+            provider,
         );
         let mut lines = vec![Line::from("")];
         lines.extend(

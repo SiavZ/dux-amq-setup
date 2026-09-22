@@ -179,12 +179,18 @@ where it would normally name the project.
 
 > [!IMPORTANT]
 > The agent's process, if it was still running, keeps running in a directory that no longer
-> exists. Nothing it does from then on reaches your files. Stop the agent first: dux refuses
-> to recreate a working copy underneath a running one. **Recreate working copy…** in the
-> agent's `⋯` menu then checks the agent's branch out again at the same path, which is what
+> exists. Nothing it does from then on reaches your files. **Recreate working copy…** in the
+> agent's `⋯` menu checks the agent's branch out again at the same path, which is what
 > lets an agent whose CLI keeps its history per directory resume the same conversation. The
 > code changes that were in the old directory are gone; this puts the directory back, not
 > its contents. The terminal UI has the same action as its `recreate-working-copy` command.
+>
+> You can do it while the agent is running, and what happens next is the CLI's own answer.
+> A running Claude tab never notices, and carries on in the recreated folder with its
+> conversation intact. Every other CLI is the cautious case: Codex answers every turn with
+> an invalid-directory error from the moment the folder goes and stays stuck after the
+> recreate, so stop the tab and start the agent again to continue there. The confirmation
+> says which of the two you are getting.
 
 If the branch is gone locally but still on the remote, dux creates it again from
 `origin/<branch>`, holding everything that had been pushed. If it is gone everywhere, dux

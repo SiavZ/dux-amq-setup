@@ -20,9 +20,9 @@ import {
 // under itself.
 //
 // Destructive about what was in that directory rather than about the agent: the
-// directory comes back, its contents do not. The body says so, and says the
-// process still running in the deleted directory is left alone, because a user
-// who presses this while their agent is mid-run needs to know it will not move.
+// directory comes back, its contents do not. The body says so, and says what a
+// tab still running in the deleted directory makes of the recreated one, which
+// is the provider's own answer rather than dux's.
 export function ConfirmRecreateWorkingCopyDialog() {
   const { recreateWorkingCopyTarget, spine } = useDux()
 
@@ -62,6 +62,7 @@ export function ConfirmRecreateWorkingCopyDialog() {
                   managed.branch_name,
                   managed.source_branch,
                   managed.conversation_resumes === true,
+                  session?.provider ?? "",
                 )
               : ""}
           </DialogDescription>

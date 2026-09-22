@@ -18,6 +18,26 @@ export function canRecreateWorkingCopy(workspace: AgentWorkspaceWire): boolean {
   })
 }
 
+/** What a tab still running in the deleted directory does once the working copy
+ * is back, mirroring `dux_core::working_copy::recreate_running_tab_clause`.
+ *
+ * Measured against the real CLIs. The Claude CLI never notices its directory
+ * going, and once one exists at the same path again it keeps working in it with
+ * its conversation intact. The Codex CLI answers every turn with "invalid cwd"
+ * from the moment the directory goes and stays stuck there after the recreate,
+ * until it is quit and resumed in the new folder. OpenCode and Copilot have not
+ * been measured, so they get the cautious answer rather than a promise. */
+export function recreateRunningTabClause(provider: string): string {
+  const name = provider.charAt(0).toUpperCase() + provider.slice(1)
+  if (provider.toLowerCase() === "claude") {
+    return `A running ${name} tab keeps working in the recreated copy by itself.`
+  }
+  return (
+    `A running ${name} tab cannot follow the folder: stop it and start the ` +
+    `agent again to continue in the recreated copy.`
+  )
+}
+
 /** The body of the recreate confirmation.
  *
  * All three branch arms are stated because asking the server which one applies
@@ -34,6 +54,7 @@ export function recreateConfirmBody(
   branchName: string,
   sourceBranch: string,
   conversationResumes: boolean,
+  provider: string,
 ): string {
   const conversation = conversationResumes
     ? `The conversation may resume, because the agent's CLI keys its history ` +
@@ -50,8 +71,8 @@ export function recreateConfirmBody(
     `back.\n\n` +
     `Any code changes that were in the old directory are gone either way: this ` +
     `puts the directory back, not its contents. ${conversation}\n\n` +
-    `Its tabs are dormant and stay that way, because dux refuses this while ` +
-    `the agent is running. A terminal still open in the old directory keeps ` +
+    `${recreateRunningTabClause(provider)} ` +
+    `A terminal still open in the old directory keeps ` +
     `working in a directory that is gone; close it and open one in the ` +
     `recreated copy.`
   )

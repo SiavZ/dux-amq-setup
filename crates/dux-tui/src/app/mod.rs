@@ -2320,6 +2320,9 @@ pub(crate) enum PromptState {
         /// same directory. Captured when the dialog opens, like everything else
         /// it promises.
         conversation_resumes: bool,
+        /// The slot tab's provider, which decides what the body says about a tab
+        /// still running in the directory that is gone.
+        provider: String,
         focus: ConfirmFocus, // Cancel (default) or Recreate
     },
     ConfirmQuit {

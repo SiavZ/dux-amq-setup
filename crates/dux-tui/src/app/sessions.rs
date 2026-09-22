@@ -1836,22 +1836,13 @@ impl App {
     /// The palette's `recreate-working-copy`: raise the confirmation for the
     /// selected agent, or say plainly why there is nothing to confirm.
     ///
-    /// Both refusals are loud, for the same reason the detach's are: the
-    /// palette closed onto an unchanged screen either way.
+    /// The refusal is loud, for the same reason the detach's is: the palette
+    /// closed onto an unchanged screen either way.
     pub(crate) fn confirm_recreate_selected_working_copy(&mut self) -> Result<()> {
         let Some(session) = self.selected_session().cloned() else {
             self.set_error("Select an agent first, then run recreate-working-copy on it.");
             return Ok(());
         };
-        // Asked before the inputs, which answer None for a running agent too:
-        // the remedy is different and the user needs to hear it.
-        if let Some(refusal) = self
-            .engine
-            .recreate_working_copy_running_refusal(&session.id)
-        {
-            self.set_warning(refusal);
-            return Ok(());
-        }
         let Some(inputs) = self.engine.recreate_working_copy_inputs(&session.id) else {
             self.set_warning(format!(
                 "There is nothing to recreate for \"{}\": dux only recreates a working copy it \
@@ -1866,6 +1857,7 @@ impl App {
             branch_name: inputs.branch_name,
             source_branch: inputs.source_branch,
             conversation_resumes: inputs.conversation_resumes,
+            provider: inputs.provider,
             focus: ConfirmFocus::Cancel, // Cancel is the safe default
         };
         Ok(())
@@ -5694,6 +5686,7 @@ mod tests {
             branch_name,
             source_branch,
             conversation_resumes,
+            provider,
             focus,
             ..
         } = &app.prompt
@@ -5703,30 +5696,29 @@ mod tests {
         assert_eq!(*focus, ConfirmFocus::Cancel, "Cancel is the safe default");
         assert!(
             *conversation_resumes,
-            "the fixture agent runs claude, which resumes per directory"
+            "the fixture agent runs codex, which resumes per directory"
         );
         let body = dux_core::working_copy::recreate_confirm_body(
             worktree_path,
             branch_name,
             source_branch,
             *conversation_resumes,
+            provider,
         );
         assert!(body.contains("are gone either way"), "{body}");
         assert!(body.contains("same path"), "{body}");
-        assert!(
-            body.contains("refuses this while the agent is running"),
-            "{body}"
-        );
+        assert!(body.contains("A running Codex tab"), "{body}");
     }
 
-    /// The other refusal: a live tab means the remedy is "stop the agent", not
-    /// "there is nothing to recreate".
+    /// A live tab is no longer a refusal: the directory goes back under the
+    /// running process, and the body says what that process makes of it.
     #[test]
-    fn recreate_working_copy_tells_a_running_agent_to_stop_first() {
+    fn recreate_working_copy_confirms_under_a_running_agent() {
         let mut app =
             crate::app::test_support::test_app(crate::app::test_support::default_bindings());
         app.selected_left = 1;
         let id = app.engine.sessions[0].id.clone();
+        app.engine.sessions[0].provider = dux_core::model::ProviderKind::new("claude");
         app.engine
             .folder_repo_statuses
             .insert(id.clone(), dux_core::git::FolderRepoStatus::Missing);
@@ -5740,12 +5732,10 @@ mod tests {
         app.confirm_recreate_selected_working_copy()
             .expect("dispatch");
 
-        assert!(
-            matches!(app.prompt, PromptState::None),
-            "nothing is confirmed while the agent runs"
-        );
-        let status = app.status.message();
-        assert!(status.contains("Stop the agent first"), "{status}");
+        let PromptState::ConfirmRecreateWorkingCopy { provider, .. } = &app.prompt else {
+            panic!("a running agent is confirmed like any other")
+        };
+        assert_eq!(provider, "claude");
     }
 
     /// Cancelling leaves the agent exactly as it was, and never touches git.

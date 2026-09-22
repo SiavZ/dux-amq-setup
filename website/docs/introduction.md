@@ -108,12 +108,16 @@ would normally name the project.
 
 > [!IMPORTANT]
 > The agent's process, if it was still running, keeps running in a directory that no longer
-> exists. Nothing it does from then on reaches your files. Stop the agent first: dux refuses
-> to recreate a working copy underneath a running one. The `recreate-working-copy` command
-> then checks the agent's branch out again at the same path, which is what lets an agent
+> exists. Nothing it does from then on reaches your files. The `recreate-working-copy`
+> command checks the agent's branch out again at the same path, which is what lets an agent
 > whose CLI keeps its history per directory resume the same conversation. The code changes
 > that were in the old directory are gone; this puts the directory back, not its contents.
 > The browser has the same action in the agent's menu.
+>
+> You can run it while the agent is running. A running Claude tab never notices the folder
+> going and carries on in the recreated one with its conversation intact; every other CLI
+> is the cautious case, so stop the tab and start the agent again to continue there. The
+> confirmation says which of the two you are getting.
 
 If the branch is gone locally but still on the remote, dux creates it again from
 `origin/<branch>`, holding everything that had been pushed. If it is gone everywhere, dux

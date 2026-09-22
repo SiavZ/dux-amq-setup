@@ -1747,33 +1747,12 @@ pub struct RecreateWorkingCopyInputs {
     /// directory. The confirmation promises exactly that, so it has to be asked
     /// rather than assumed.
     pub conversation_resumes: bool,
+    /// The slot tab's provider, which is what the confirmation's running-tab
+    /// paragraph is chosen from: the CLIs answer a folder going differently.
+    pub provider: String,
 }
 
 impl Engine {
-    /// Whether a recreate is refused right now because the agent is still
-    /// running, and the sentence that says so.
-    ///
-    /// Its own question rather than a second meaning for "there is nothing to
-    /// recreate": the remedy is different and the user needs to be told it. The
-    /// predicate is the same any-tab rollup every other per-agent liveness
-    /// question asks.
-    pub fn recreate_working_copy_running_refusal(&self, session_id: &str) -> Option<String> {
-        if !self.any_tab_active(session_id) {
-            return None;
-        }
-        let label = self
-            .sessions
-            .iter()
-            .find(|s| s.id == session_id)
-            .map(|s| s.display_label())
-            .unwrap_or_else(|| session_id.to_string());
-        Some(format!(
-            "Agent \"{label}\" is still running in the directory that is gone, so dux left its \
-             working copy alone. Stop the agent first, then recreate the working copy and start \
-             it again."
-        ))
-    }
-
     /// What recreating this agent's working copy would involve, or `None` when
     /// there is nothing to recreate.
     ///
@@ -1781,19 +1760,17 @@ impl Engine {
     /// agent's folder is the user's and dux never creates one, and an agent
     /// whose working copy is there has nothing to put back.
     ///
-    /// A tab with a live PTY is also `None`. Checking the branch out under a
-    /// process still running in the deleted directory gives that process a
-    /// directory it is not in, and it is what lets the success sentence promise
-    /// that the tabs stay dormant. Callers that raise a dialog ask
-    /// [`Self::recreate_working_copy_running_refusal`] first, so the user hears
-    /// the remedy rather than "there is nothing to recreate".
+    /// A live tab is deliberately no bar. The checkout puts a directory back at
+    /// the path the process is already in, and what the process makes of that is
+    /// its own answer, which the confirmation and the final both say per
+    /// provider.
     pub fn recreate_working_copy_inputs(
         &self,
         session_id: &str,
     ) -> Option<RecreateWorkingCopyInputs> {
         let session = self.sessions.iter().find(|s| s.id == session_id)?;
         let managed = session.workspace.as_managed()?;
-        if !self.working_copy_missing(session_id) || self.any_tab_active(session_id) {
+        if !self.working_copy_missing(session_id) {
             return None;
         }
         Some(RecreateWorkingCopyInputs {
@@ -1804,14 +1781,15 @@ impl Engine {
             source_branch: managed.source_branch.clone(),
             conversation_resumes: crate::config::provider_config(&self.config, &session.provider)
                 .supports_session_resume(),
+            provider: session.provider.as_str().to_string(),
         })
     }
 
     /// Put the agent's working copy back where it was, off the engine thread.
     ///
-    /// Answers with the keyed busy to show, or a refusal sentence. The tabs are
-    /// deliberately left dormant: a restart brings tabs back dormant, and this
-    /// is a smaller thing than a restart.
+    /// Answers with the keyed busy to show, or a refusal sentence. Nothing is
+    /// launched and nothing is stopped: a dormant tab stays dormant, and a tab
+    /// that was running is left running, which the final says out loud.
     ///
     /// A second press while the first is still working is refused here rather
     /// than left to git: the verdict that gates the action only refreshes when
@@ -1820,9 +1798,6 @@ impl Engine {
         &mut self,
         session_id: &str,
     ) -> anyhow::Result<crate::engine::EventReaction> {
-        if let Some(refusal) = self.recreate_working_copy_running_refusal(session_id) {
-            return Err(anyhow::anyhow!(refusal));
-        }
         let in_flight = crate::engine::InFlightKey::RecreateWorkingCopy(session_id.to_string());
         if self.is_in_flight(&in_flight) {
             return Err(anyhow::anyhow!(
@@ -1864,8 +1839,13 @@ impl Engine {
             worktree_path,
             branch_name,
             source_branch,
+            provider,
             ..
         } = inputs;
+        // Read now rather than when the checkout answers: the final tells the
+        // user what the tab they left running does next, and by then it may have
+        // ended on its own.
+        let had_live_tabs = self.any_tab_active(session_id);
         let success_label = agent_label.clone();
         let success_path = worktree_path.clone();
         let success_branch = branch_name.clone();
@@ -1878,6 +1858,8 @@ impl Engine {
                     &success_path,
                     &success_branch,
                     outcome,
+                    had_live_tabs,
+                    &provider,
                 ))
             })
             .on_failure(move |err: &String| {
@@ -1991,32 +1973,26 @@ mod recreate_tests {
         assert!(message.contains("Add the project back"), "{message}");
     }
 
-    /// Checking a branch out under a process still running in the deleted
-    /// directory gives that process a directory it is not in, and it is what
-    /// lets the success sentence promise the tabs stay dormant.
+    /// A process still running in the deleted directory is no reason to leave
+    /// that directory gone: the checkout runs, and the provider the inputs carry
+    /// is what the surfaces word the consequence from.
     #[test]
-    fn a_running_agent_is_refused_with_the_remedy_rather_than_recreated() {
-        let (mut engine, _tmp) = engine_with_a_missing_working_copy();
-        let tab = engine.slot_tab_id_of(crate::ids::SessionIdRef::new("s1"));
-        engine.mark_in_flight(crate::engine::InFlightKey::AgentLaunch(tab.to_owned()));
+    fn a_running_agent_is_recreated_under_its_live_tab() {
+        for provider in ["claude", "codex"] {
+            let (mut engine, _tmp) = engine_with_a_missing_working_copy();
+            engine.sessions[0].provider = crate::model::ProviderKind::new(provider);
+            let tab = engine.slot_tab_id_of(crate::ids::SessionIdRef::new("s1"));
+            engine.mark_in_flight(crate::engine::InFlightKey::AgentLaunch(tab.to_owned()));
 
-        assert!(
-            engine.recreate_working_copy_inputs("s1").is_none(),
-            "the action does not exist while a tab is live"
-        );
-        let refusal = engine
-            .recreate_working_copy_running_refusal("s1")
-            .expect("and the reason is its own sentence");
-        assert!(refusal.contains("Stop the agent first"), "{refusal}");
-        assert!(refusal.contains("s1-title"), "{refusal}");
-
-        let Err(err) = engine.begin_recreate_working_copy("s1") else {
-            panic!("the dispatch refuses it too")
-        };
-        assert!(
-            format!("{err:#}").contains("Stop the agent first"),
-            "{err:#}"
-        );
+            let inputs = engine
+                .recreate_working_copy_inputs("s1")
+                .expect("a live tab is no bar to putting the directory back");
+            assert_eq!(inputs.provider, provider);
+            assert!(
+                engine.begin_recreate_working_copy("s1").is_ok(),
+                "and the dispatch runs it"
+            );
+        }
     }
 
     /// The Missing verdict only refreshes when the recreate finishes, so the

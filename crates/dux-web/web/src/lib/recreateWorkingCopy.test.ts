@@ -4,6 +4,7 @@ import type { AgentWorkspaceWire } from "./agentWorkspace"
 import {
   canRecreateWorkingCopy,
   recreateConfirmBody,
+  recreateRunningTabClause,
 } from "./recreateWorkingCopy"
 
 const managed: AgentWorkspaceWire = {
@@ -41,7 +42,9 @@ describe("recreateConfirmBody", () => {
   // Mirrors `dux_core::working_copy::recreate_confirm_body`. The Rust side has
   // the twin assertions, so a wording change fails on whichever side changed.
   it("reads the same as the terminal UI's", () => {
-    expect(recreateConfirmBody("~/worktrees/repo/feat", "feat", "main", true)).toBe(
+    expect(
+      recreateConfirmBody("~/worktrees/repo/feat", "feat", "main", true, "claude"),
+    ).toBe(
       "Recreate the working copy for this agent at ~/worktrees/repo/feat?\n\n" +
         'If branch "feat" still exists locally, dux checks it out there again. ' +
         'If it is gone locally but still on the remote, dux creates it again ' +
@@ -52,8 +55,8 @@ describe("recreateConfirmBody", () => {
         "this puts the directory back, not its contents. The conversation may " +
         "resume, because the agent's CLI keys its history by directory path and " +
         "dux recreates the working copy at the same path.\n\n" +
-        "Its tabs are dormant and stay that way, because dux refuses this while " +
-        "the agent is running. A terminal still open in the old directory keeps " +
+        "A running Claude tab keeps working in the recreated copy by itself. " +
+        "A terminal still open in the old directory keeps " +
         "working in a directory that is gone; close it and open one in the " +
         "recreated copy.",
     )
@@ -62,9 +65,29 @@ describe("recreateConfirmBody", () => {
   // A provider with no directory-scoped resume (copilot ships with none) is
   // told so rather than promised a resume the same path cannot buy it.
   it("says the conversation will not resume when the provider cannot", () => {
-    const body = recreateConfirmBody("~/wt", "feat", "main", false)
+    const body = recreateConfirmBody("~/wt", "feat", "main", false, "copilot")
     expect(body).toContain("will not resume")
     expect(body).not.toContain("may resume")
     expect(body).toContain("are gone either way")
+  })
+
+  // Measured per CLI: Claude follows the folder on its own, Codex is stuck
+  // until it is quit and resumed, and an unmeasured provider gets the cautious
+  // answer.
+  it("says what a running tab does, per provider", () => {
+    expect(recreateConfirmBody("~/wt", "feat", "main", true, "claude")).toContain(
+      "A running Claude tab keeps working in the recreated copy by itself.",
+    )
+    for (const provider of ["codex", "opencode", "copilot"]) {
+      const body = recreateConfirmBody("~/wt", "feat", "main", true, provider)
+      expect(body).toContain(
+        "cannot follow the folder: stop it and start the agent again",
+      )
+      expect(body).not.toContain("keeps working in the recreated copy")
+    }
+    expect(recreateRunningTabClause("codex")).toBe(
+      "A running Codex tab cannot follow the folder: stop it and start the " +
+        "agent again to continue in the recreated copy.",
+    )
   })
 })

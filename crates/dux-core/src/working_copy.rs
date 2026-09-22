@@ -197,6 +197,37 @@ pub fn quiet_reason(
     })
 }
 
+/// The provider as a sentence names it: its own word with the first letter
+/// capitalized, char-safe because a provider block's name is the user's text.
+fn provider_name(provider: &str) -> String {
+    let mut chars = provider.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// What a tab still running in the deleted directory does once the working copy
+/// is back, in the one sentence the confirmation and the final both say.
+///
+/// Measured against the real CLIs. The Claude CLI never notices its directory
+/// going, and once one exists at the same path again it keeps working in it with
+/// its conversation intact. The Codex CLI answers every turn with "invalid cwd"
+/// from the moment the directory goes and stays stuck there after the recreate,
+/// until it is quit and resumed in the new folder. OpenCode and Copilot have not
+/// been measured, so they get the cautious answer rather than a promise.
+pub fn recreate_running_tab_clause(provider: &str) -> String {
+    let name = provider_name(provider);
+    if provider.eq_ignore_ascii_case("claude") {
+        format!("A running {name} tab keeps working in the recreated copy by itself.")
+    } else {
+        format!(
+            "A running {name} tab cannot follow the folder: stop it and start the agent again to \
+             continue in the recreated copy."
+        )
+    }
+}
+
 /// What recreating the working copy costs, said plainly in the confirmation.
 ///
 /// The uncommitted work in the old directory is gone with the directory: dux is
@@ -217,7 +248,9 @@ pub fn recreate_confirm_body(
     branch_name: &str,
     source_branch: &str,
     conversation_resumes: bool,
+    provider: &str,
 ) -> String {
+    let running = recreate_running_tab_clause(provider);
     let conversation = if conversation_resumes {
         "The conversation may resume, because the agent's CLI keys its history by directory path \
          and dux recreates the working copy at the same path."
@@ -232,8 +265,7 @@ pub fn recreate_confirm_body(
          been pushed. If it is gone everywhere, dux creates it again from \"{source_branch}\", and \
          the commits that branch held are not coming back.\n\nAny code \
          changes that were in the old directory are gone either way: this puts the directory \
-         back, not its contents. {conversation}\n\nIts tabs \
-         are dormant and stay that way, because dux refuses this while the agent is running. A \
+         back, not its contents. {conversation}\n\n{running} A \
          terminal still open in the old directory keeps working in a directory that is gone; close \
          it and open one in the recreated copy.",
         shorten_home(worktree)
@@ -252,11 +284,18 @@ pub fn recreate_busy_message(agent_label: &str) -> String {
 /// cannot collapse into two: a branch rebuilt from the remote holds the agent's
 /// own pushed commits, and a branch rebuilt from the source branch holds none
 /// of them, which is not a difference to leave to a caller's `Option`.
+///
+/// `had_live_tabs` is what the agent was doing when the recreate started, read
+/// there rather than now: the tail either tells the user what their running tab
+/// does next or that nothing is running at all, and only the engine knows which
+/// it was.
 pub fn recreate_success_message(
     agent_label: &str,
     worktree: &Path,
     branch_name: &str,
     outcome: &RecreatedBranch,
+    had_live_tabs: bool,
+    provider: &str,
 ) -> String {
     let branch_outcome = match outcome {
         RecreatedBranch::RecreatedFrom(source) => format!(
@@ -269,9 +308,13 @@ pub fn recreate_success_message(
         ),
         RecreatedBranch::CheckedOut => format!("branch \"{branch_name}\" was checked out again"),
     };
+    let tail = if had_live_tabs {
+        recreate_running_tab_clause(provider)
+    } else {
+        "Its tabs stay dormant; start one when you want the agent running there.".to_string()
+    };
     format!(
-        "Recreated the working copy for agent \"{agent_label}\" at {}: {branch_outcome}. Its \
-         tabs stay dormant; start one when you want the agent running there.",
+        "Recreated the working copy for agent \"{agent_label}\" at {}: {branch_outcome}. {tail}",
         shorten_home(worktree)
     )
 }
@@ -320,7 +363,13 @@ mod tests {
     #[test]
     fn the_confirm_reads_the_same_on_both_surfaces() {
         assert_eq!(
-            recreate_confirm_body(Path::new("/worktrees/repo/feat"), "feat", "main", true),
+            recreate_confirm_body(
+                Path::new("/worktrees/repo/feat"),
+                "feat",
+                "main",
+                true,
+                "claude"
+            ),
             "Recreate the working copy for this agent at /worktrees/repo/feat?\n\n\
              If branch \"feat\" still exists locally, dux checks it out there again. If it is \
              gone locally but still on the remote, dux creates it again from \"origin/feat\", \
@@ -329,29 +378,57 @@ mod tests {
              back.\n\nAny code changes that were in the old directory are gone either way: this \
              puts the directory back, not its contents. The conversation may resume, because the \
              agent's CLI keys its history by directory path and dux recreates the working copy at \
-             the same path.\n\nIts tabs are dormant and stay that way, because dux refuses this \
-             while the agent is running. A terminal still open in the old directory keeps working \
+             the same path.\n\nA running Claude tab keeps working in the recreated copy by \
+             itself. A terminal still open in the old directory keeps working \
              in a directory that is gone; close it and open one in the recreated copy."
+        );
+    }
+
+    /// The running-tab paragraph is the measured truth per CLI: Claude follows
+    /// the folder on its own, and every other provider is told to stop and start
+    /// again, because Codex was measured stuck and the rest were not measured.
+    #[test]
+    fn the_confirm_says_what_a_running_tab_does_per_provider() {
+        let claude = recreate_confirm_body(Path::new("/tmp/wt"), "feat", "main", true, "claude");
+        assert!(
+            claude.contains("A running Claude tab keeps working in the recreated copy by itself."),
+            "{claude}"
+        );
+
+        for provider in ["codex", "opencode", "copilot"] {
+            let body = recreate_confirm_body(Path::new("/tmp/wt"), "feat", "main", true, provider);
+            assert!(
+                body.contains("cannot follow the folder: stop it and start the agent again"),
+                "{body}"
+            );
+            assert!(
+                !body.contains("keeps working in the recreated copy"),
+                "{body}"
+            );
+        }
+
+        assert_eq!(
+            recreate_running_tab_clause("codex"),
+            "A running Codex tab cannot follow the folder: stop it and start the agent again to \
+             continue in the recreated copy."
         );
     }
 
     #[test]
     fn the_confirm_says_the_changes_are_gone_on_both_branch_outcomes() {
-        let body = recreate_confirm_body(Path::new("/tmp/wt"), "feat", "main", true);
+        let body = recreate_confirm_body(Path::new("/tmp/wt"), "feat", "main", true, "claude");
         assert!(body.contains("checks it out there again"), "{body}");
         assert!(body.contains("from \"origin/feat\""), "{body}");
         assert!(body.contains("from \"main\""), "{body}");
         assert!(body.contains("not coming back"), "{body}");
         assert!(body.contains("are gone either way"), "{body}");
         assert!(body.contains("same path"), "{body}");
-        assert!(
-            body.contains("refuses this while the agent is running"),
-            "{body}"
-        );
+        assert!(body.contains("A running Claude tab"), "{body}");
 
         // A provider that keeps no directory-scoped history is told so rather
         // than promised a resume the same path cannot buy it.
-        let no_resume = recreate_confirm_body(Path::new("/tmp/wt"), "feat", "main", false);
+        let no_resume =
+            recreate_confirm_body(Path::new("/tmp/wt"), "feat", "main", false, "copilot");
         assert!(no_resume.contains("will not resume"), "{no_resume}");
         assert!(!no_resume.contains("may resume"), "{no_resume}");
         assert!(no_resume.contains("are gone either way"), "{no_resume}");
@@ -584,6 +661,8 @@ mod tests {
             Path::new("/tmp/wt"),
             "feat",
             &RecreatedBranch::CheckedOut,
+            false,
+            "claude",
         );
         assert!(checked_out.contains("/tmp/wt"), "{checked_out}");
         assert!(checked_out.contains("checked out again"), "{checked_out}");
@@ -593,6 +672,8 @@ mod tests {
             Path::new("/tmp/wt"),
             "feat",
             &RecreatedBranch::RecreatedFrom("main".to_string()),
+            false,
+            "claude",
         );
         assert!(minted.contains("recreated from \"main\""), "{minted}");
         assert!(minted.contains("none of the"), "{minted}");
@@ -603,6 +684,8 @@ mod tests {
             Path::new("/tmp/wt"),
             "feat",
             &RecreatedBranch::RecreatedFromRemote("origin/feat".to_string()),
+            false,
+            "claude",
         );
         assert!(
             from_remote.contains("recreated from \"origin/feat\""),
@@ -613,5 +696,60 @@ mod tests {
             "{from_remote}"
         );
         assert!(!from_remote.contains("none of the"), "{from_remote}");
+    }
+
+    /// With something running at recreate time the final says what that tab does
+    /// next, per provider; with nothing running it says the tabs are dormant,
+    /// which is the older sentence and still the true one.
+    #[test]
+    fn the_success_message_answers_for_a_tab_that_was_running() {
+        let claude = recreate_success_message(
+            "v0",
+            Path::new("/tmp/wt"),
+            "feat",
+            &RecreatedBranch::CheckedOut,
+            true,
+            "claude",
+        );
+        assert!(
+            claude.ends_with(
+                "branch \"feat\" was checked out again. A running Claude tab keeps working in the \
+                 recreated copy by itself."
+            ),
+            "{claude}"
+        );
+        assert!(!claude.contains("dormant"), "{claude}");
+
+        let codex = recreate_success_message(
+            "v0",
+            Path::new("/tmp/wt"),
+            "feat",
+            &RecreatedBranch::CheckedOut,
+            true,
+            "codex",
+        );
+        assert!(
+            codex.ends_with(
+                "A running Codex tab cannot follow the folder: stop it and start the agent again \
+                 to continue in the recreated copy."
+            ),
+            "{codex}"
+        );
+
+        let idle = recreate_success_message(
+            "v0",
+            Path::new("/tmp/wt"),
+            "feat",
+            &RecreatedBranch::CheckedOut,
+            false,
+            "codex",
+        );
+        assert!(
+            idle.ends_with(
+                "Its tabs stay dormant; start one when you want the agent running \
+                            there."
+            ),
+            "{idle}"
+        );
     }
 }

@@ -984,6 +984,7 @@ mod tests {
                     branch_name: "feat".to_string(),
                     source_branch: "main".to_string(),
                     conversation_resumes: true,
+                    provider: "claude".to_string(),
                     focus: ConfirmFocus::Cancel,
                 },
             ),

@@ -91,7 +91,7 @@ describe("ConfirmRecreateWorkingCopyDialog", () => {
   })
 
   // The three things a user must know before agreeing: where it lands, that the
-  // code changes are gone, and that the process still running is left alone.
+  // code changes are gone, and what a tab still running makes of the new folder.
   it("says what is lost, what may survive, and what keeps running", () => {
     seed({
       recreateWorkingCopyTarget: "s1",
@@ -105,7 +105,28 @@ describe("ConfirmRecreateWorkingCopyDialog", () => {
     expect(body).toContain('from "main"')
     expect(body).toContain("are gone either way")
     expect(body).toContain("same path")
-    expect(body).toContain("refuses this while the agent is running")
+    expect(body).toContain(
+      "A running Claude tab keeps working in the recreated copy by itself.",
+    )
+  })
+
+  // The paragraph is the provider's own answer, so the dialog has to read the
+  // session's provider rather than a constant.
+  it("warns instead when the provider cannot follow the folder", () => {
+    seed({
+      recreateWorkingCopyTarget: "s1",
+      spine: {
+        sessions: [{ ...session(true), provider: "codex" }],
+        projects: [],
+      },
+    } as unknown as Partial<DuxState>)
+    render(<ConfirmRecreateWorkingCopyDialog />)
+
+    const body = screen.getByText(/Recreate the working copy/).textContent ?? ""
+    expect(body).toContain(
+      "A running Codex tab cannot follow the folder: stop it and start the " +
+        "agent again to continue in the recreated copy.",
+    )
   })
 
   it("recreates on confirm and closes itself", () => {
