@@ -5,6 +5,7 @@
 //! [`super::App`]: callers wire focus state and theme colors in.
 
 pub(crate) mod button;
+pub(crate) mod centered;
 pub(crate) mod checkbox;
 pub(crate) mod focus_ring;
 pub(crate) mod hint_bar;
@@ -17,6 +18,7 @@ pub(crate) use button::{
     Button, ButtonKind, ButtonPressedTarget, PressedButton, button_state_for, button_width_for,
     shared_button_width,
 };
+pub(crate) use centered::render_centered_lines;
 pub(crate) use checkbox::{Checkbox, CheckboxState};
 pub(crate) use focus_ring::next_focus;
 pub(crate) use hint_bar::{Hint, modal_hint_line};

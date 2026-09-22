@@ -12,6 +12,7 @@ use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
+use super::centered::centered_x;
 use crate::theme::Theme;
 
 /// Standard minimum button width used across modal dialogs. Longer labels grow
@@ -224,16 +225,14 @@ impl<'a> Button<'a> {
             .border_style(Style::default().fg(border_color));
         let inner = block.inner(area);
         block.render(area, frame.buffer_mut());
-        // Centred by hand, not by `Alignment::Center`: ratatui halves each width
-        // on its own, so an odd label's offset rounds up and lands one cell right
-        // of centre. Splitting the slack puts the odd column on the right, where
-        // every other centred thing in the app puts it. Measured in chars, the
-        // unit `button_width_for` sizes the button in.
+        // Centred through the shared helper, not `Alignment::Center`, so the odd
+        // column of slack falls on the right like every other centred thing in
+        // the app. Measured in chars, the unit `button_width_for` sizes the
+        // button in.
         let label_w = u16::try_from(self.label.chars().count()).unwrap_or(u16::MAX);
-        let pad = inner.width.saturating_sub(label_w) / 2;
         let label_area = Rect {
-            x: inner.x.saturating_add(pad),
-            width: inner.width.saturating_sub(pad),
+            x: centered_x(inner, label_w),
+            width: label_w.min(inner.width),
             ..inner
         };
         Paragraph::new(Line::from(Span::styled(self.label, label_style)))

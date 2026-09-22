@@ -3,7 +3,8 @@ use super::components::wrap_lines::{char_display_width, display_width};
 use super::components::{
     Button, ButtonKind, ButtonPressedTarget, CardBlockPlan, CardContent, Checkbox, CheckboxState,
     Hint, Modal, PaneCardBlock, button_state_for, button_width_for, modal_hint_line,
-    plan_pane_card, render_scroll_marker, shared_button_width, wrap_styled_lines,
+    plan_pane_card, render_centered_lines, render_scroll_marker, shared_button_width,
+    wrap_styled_lines,
 };
 use super::pty_ownership::PtyTakeoverCard;
 use super::*;
@@ -2891,7 +2892,11 @@ impl App {
                         .render(frame, rect, &self.theme);
                     button_rect = Some(rect);
                 }
-                CardContent::Detail { align, .. } => {
+                CardContent::Detail {
+                    align:
+                        align @ (ratatui::layout::Alignment::Left | ratatui::layout::Alignment::Right),
+                    ..
+                } => {
                     Paragraph::new(cut_card_lines(
                         &wrapped[index],
                         placed.area.height,
@@ -2901,15 +2906,26 @@ impl App {
                     .alignment(*align)
                     .render(placed.area, frame.buffer_mut());
                 }
-                CardContent::Prose(_) | CardContent::KeyHint { .. } => {
-                    Paragraph::new(cut_card_lines(
-                        &wrapped[index],
-                        placed.area.height,
-                        placed.area.width,
-                        placed.truncated,
-                    ))
-                    .alignment(ratatui::layout::Alignment::Center)
-                    .render(placed.area, frame.buffer_mut());
+                // Centred rows go through the shared helper rather than
+                // `Alignment::Center`, whose rounding leaves the odd column
+                // on the left of every row that nearly fills the card.
+                CardContent::Detail {
+                    align: ratatui::layout::Alignment::Center,
+                    ..
+                }
+                | CardContent::Prose(_)
+                | CardContent::KeyHint { .. } => {
+                    render_centered_lines(
+                        frame.buffer_mut(),
+                        placed.area,
+                        &cut_card_lines(
+                            &wrapped[index],
+                            placed.area.height,
+                            placed.area.width,
+                            placed.truncated,
+                        ),
+                        Style::default(),
+                    );
                 }
             }
         }
@@ -3094,13 +3110,12 @@ impl App {
             let tip_x = area.x + (area.width - tip_width) / 2;
             let tip_y = y + logo_h + TIP_GAP;
 
-            Paragraph::new(vec![tip_line])
-                .wrap(Wrap { trim: false })
-                .alignment(ratatui::layout::Alignment::Center)
-                .render(
-                    Rect::new(tip_x, tip_y, tip_width, TIP_MAX_LINES),
-                    frame.buffer_mut(),
-                );
+            render_centered_lines(
+                frame.buffer_mut(),
+                Rect::new(tip_x, tip_y, tip_width, TIP_MAX_LINES),
+                &wrap_styled_lines(&[tip_line], usize::from(tip_width)),
+                Style::default(),
+            );
         }
     }
 
@@ -3154,12 +3169,12 @@ impl App {
 
         let height = lines.len() as u16;
         let y = area.y + area.height.saturating_sub(height) / 2;
-        Paragraph::new(lines)
-            .alignment(ratatui::layout::Alignment::Center)
-            .render(
-                Rect::new(area.x, y, area.width, height.max(1)),
-                frame.buffer_mut(),
-            );
+        render_centered_lines(
+            frame.buffer_mut(),
+            Rect::new(area.x, y, area.width, height.max(1)),
+            &lines,
+            Style::default(),
+        );
     }
 
     /// Provider label for a specific tab of a session (Main resolves to the
@@ -3802,12 +3817,12 @@ impl App {
         let mut y = inner.y;
         if show_prose {
             y += TOP_PADDING;
-            Paragraph::new(prose_lines)
-                .alignment(ratatui::layout::Alignment::Center)
-                .render(
-                    Rect::new(inner.x + SIDE_PADDING, y, prose_w, prose_rows),
-                    frame.buffer_mut(),
-                );
+            render_centered_lines(
+                frame.buffer_mut(),
+                Rect::new(inner.x + SIDE_PADDING, y, prose_w, prose_rows),
+                &prose_lines,
+                Style::default(),
+            );
             y += prose_rows + PROSE_GAP;
         }
         let button_w = button_w.min(inner.width);
@@ -3998,17 +4013,17 @@ impl App {
                 .add_modifier(Modifier::BOLD),
         )];
         spans.extend(label_spans);
-        Paragraph::new(Line::from(spans))
-            .alignment(ratatui::layout::Alignment::Center)
-            .render(
-                Rect::new(
-                    card_inner.x,
-                    card_inner.y + card_inner.height / 2,
-                    card_inner.width,
-                    1,
-                ),
-                frame.buffer_mut(),
-            );
+        render_centered_lines(
+            frame.buffer_mut(),
+            Rect::new(
+                card_inner.x,
+                card_inner.y + card_inner.height / 2,
+                card_inner.width,
+                1,
+            ),
+            &[Line::from(spans)],
+            Style::default(),
+        );
     }
 
     fn render_terminal_grid(
@@ -8814,14 +8829,14 @@ impl App {
             Span::styled("Scroll", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" navigate"),
         ]);
-        let hint_para = Paragraph::new(hint)
-            .alignment(ratatui::layout::Alignment::Center)
-            .style(
-                Style::default()
-                    .fg(self.theme.hint_desc_fg)
-                    .add_modifier(Modifier::DIM),
-            );
-        hint_para.render(hint_area, frame.buffer_mut());
+        render_centered_lines(
+            frame.buffer_mut(),
+            hint_area,
+            &[hint],
+            Style::default()
+                .fg(self.theme.hint_desc_fg)
+                .add_modifier(Modifier::DIM),
+        );
     }
 
     fn render_pull_request_input_prompt(&mut self, frame: &mut Frame) {
@@ -11948,9 +11963,12 @@ impl App {
             "refreshes every ~2s",
             Style::default().fg(self.theme.hint_dim_desc_fg),
         ));
-        let hint_para =
-            Paragraph::new(Line::from(spans)).alignment(ratatui::layout::Alignment::Center);
-        hint_para.render(hint_area, frame.buffer_mut());
+        render_centered_lines(
+            frame.buffer_mut(),
+            hint_area,
+            &[Line::from(spans)],
+            Style::default(),
+        );
     }
 
     fn dim_overlay_area(&self, full: Rect) -> Rect {
@@ -13333,11 +13351,15 @@ mod tests {
                 "row {index} must keep a blank column against the right border; got:\n{}",
                 rows.join("\n")
             );
+            // The odd column of slack falls on the RIGHT: `Alignment::Center`
+            // put it on the left of every row that nearly filled the card, so
+            // the sentence sat one cell right of centre.
             let lead = cells.iter().take_while(|c| **c == ' ').count();
             let trail = cells.iter().rev().take_while(|c| **c == ' ').count();
             assert!(
-                lead.abs_diff(trail) <= 1,
-                "row {index} must be centered (lead {lead}, trail {trail}); got:\n{}",
+                trail == lead || trail == lead + 1,
+                "row {index} must be centered with any odd column on the right \
+                 (lead {lead}, trail {trail}); got:\n{}",
                 rows.join("\n")
             );
         }
