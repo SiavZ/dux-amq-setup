@@ -1747,9 +1747,11 @@ pub struct RecreateWorkingCopyInputs {
     /// directory. The confirmation promises exactly that, so it has to be asked
     /// rather than assumed.
     pub conversation_resumes: bool,
-    /// The slot tab's provider, which is what the confirmation's running-tab
-    /// paragraph is chosen from: the CLIs answer a folder going differently.
-    pub provider: String,
+    /// The providers the confirmation's running-tab paragraph is written from:
+    /// the providers of the tabs that are live, or the slot tab's alone when
+    /// none is. The CLIs answer a folder going differently, and the one that
+    /// answers is the one that is running.
+    pub running_providers: Vec<String>,
 }
 
 impl Engine {
@@ -1781,7 +1783,10 @@ impl Engine {
             source_branch: managed.source_branch.clone(),
             conversation_resumes: crate::config::provider_config(&self.config, &session.provider)
                 .supports_session_resume(),
-            provider: session.provider.as_str().to_string(),
+            running_providers: match self.live_tab_providers(session_id) {
+                live if live.is_empty() => vec![session.provider.as_str().to_string()],
+                live => live,
+            },
         })
     }
 
@@ -1839,13 +1844,9 @@ impl Engine {
             worktree_path,
             branch_name,
             source_branch,
-            provider,
             ..
         } = inputs;
-        // Read now rather than when the checkout answers: the final tells the
-        // user what the tab they left running does next, and by then it may have
-        // ended on its own.
-        let had_live_tabs = self.any_tab_active(session_id);
+        let live_providers = self.live_tab_providers(session_id);
         let success_label = agent_label.clone();
         let success_path = worktree_path.clone();
         let success_branch = branch_name.clone();
@@ -1858,8 +1859,7 @@ impl Engine {
                     &success_path,
                     &success_branch,
                     outcome,
-                    had_live_tabs,
-                    &provider,
+                    &live_providers,
                 ))
             })
             .on_failure(move |err: &String| {
@@ -1987,12 +1987,58 @@ mod recreate_tests {
             let inputs = engine
                 .recreate_working_copy_inputs("s1")
                 .expect("a live tab is no bar to putting the directory back");
-            assert_eq!(inputs.provider, provider);
+            assert_eq!(inputs.running_providers, vec![provider.to_string()]);
             assert!(
                 engine.begin_recreate_working_copy("s1").is_ok(),
                 "and the dispatch runs it"
             );
         }
+    }
+
+    /// The sentence is about the CLI that is RUNNING. A dormant slot tab beside
+    /// a live extra of another provider is the case the session's provider
+    /// mirror gets backwards, in both directions.
+    #[test]
+    fn the_confirmations_providers_follow_the_live_tab_not_the_slot_mirror() {
+        for (slot, extra) in [("claude", "codex"), ("codex", "claude")] {
+            let (mut engine, _tmp) = engine_with_a_missing_working_copy();
+            engine.sessions[0].provider = crate::model::ProviderKind::new(slot);
+            engine.agent_tabs.insert(
+                crate::ids::TabId::new("tab-b"),
+                crate::model::AgentTab {
+                    id: "tab-b".to_string(),
+                    session_id: "s1".to_string(),
+                    provider: crate::model::ProviderKind::new(extra),
+                    sort_order: 1,
+                    created_at: chrono::Utc::now(),
+                },
+            );
+            engine.mark_in_flight(crate::engine::InFlightKey::AgentLaunch(
+                crate::ids::TabId::new("tab-b"),
+            ));
+
+            let inputs = engine
+                .recreate_working_copy_inputs("s1")
+                .expect("a managed agent whose copy is gone");
+            assert_eq!(
+                inputs.running_providers,
+                vec![extra.to_string()],
+                "only the tab that is running has an answer to give"
+            );
+        }
+    }
+
+    /// With nothing running the confirmation still has to say what starting a
+    /// tab would mean, so it falls back to the tab the agent opens on.
+    #[test]
+    fn a_dormant_agents_confirmation_falls_back_to_the_slot_provider() {
+        let (mut engine, _tmp) = engine_with_a_missing_working_copy();
+        engine.sessions[0].provider = crate::model::ProviderKind::new("codex");
+
+        let inputs = engine
+            .recreate_working_copy_inputs("s1")
+            .expect("a managed agent whose copy is gone");
+        assert_eq!(inputs.running_providers, vec!["codex".to_string()]);
     }
 
     /// The Missing verdict only refreshes when the recreate finishes, so the

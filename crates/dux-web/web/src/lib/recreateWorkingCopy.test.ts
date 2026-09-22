@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest"
 
 import type { AgentWorkspaceWire } from "./agentWorkspace"
+import type { SessionView } from "./types"
 import {
   canRecreateWorkingCopy,
   recreateConfirmBody,
+  recreateRunningProviders,
   recreateRunningTabClause,
 } from "./recreateWorkingCopy"
 
@@ -43,7 +45,9 @@ describe("recreateConfirmBody", () => {
   // the twin assertions, so a wording change fails on whichever side changed.
   it("reads the same as the terminal UI's", () => {
     expect(
-      recreateConfirmBody("~/worktrees/repo/feat", "feat", "main", true, "claude"),
+      recreateConfirmBody("~/worktrees/repo/feat", "feat", "main", true, [
+        "claude",
+      ]),
     ).toBe(
       "Recreate the working copy for this agent at ~/worktrees/repo/feat?\n\n" +
         'If branch "feat" still exists locally, dux checks it out there again. ' +
@@ -65,7 +69,7 @@ describe("recreateConfirmBody", () => {
   // A provider with no directory-scoped resume (copilot ships with none) is
   // told so rather than promised a resume the same path cannot buy it.
   it("says the conversation will not resume when the provider cannot", () => {
-    const body = recreateConfirmBody("~/wt", "feat", "main", false, "copilot")
+    const body = recreateConfirmBody("~/wt", "feat", "main", false, ["copilot"])
     expect(body).toContain("will not resume")
     expect(body).not.toContain("may resume")
     expect(body).toContain("are gone either way")
@@ -75,19 +79,79 @@ describe("recreateConfirmBody", () => {
   // until it is quit and resumed, and an unmeasured provider gets the cautious
   // answer.
   it("says what a running tab does, per provider", () => {
-    expect(recreateConfirmBody("~/wt", "feat", "main", true, "claude")).toContain(
-      "A running Claude tab keeps working in the recreated copy by itself.",
-    )
+    expect(
+      recreateConfirmBody("~/wt", "feat", "main", true, ["claude"]),
+    ).toContain("A running Claude tab keeps working in the recreated copy by itself.")
     for (const provider of ["codex", "opencode", "copilot"]) {
-      const body = recreateConfirmBody("~/wt", "feat", "main", true, provider)
+      const body = recreateConfirmBody("~/wt", "feat", "main", true, [provider])
       expect(body).toContain(
         "cannot follow the folder: stop it and start the agent again",
       )
       expect(body).not.toContain("keeps working in the recreated copy")
     }
-    expect(recreateRunningTabClause("codex")).toBe(
+    expect(recreateRunningTabClause(["codex"])).toBe(
       "A running Codex tab cannot follow the folder: stop it and start the " +
         "agent again to continue in the recreated copy.",
     )
+  })
+
+  // One stuck CLI among the running tabs makes the whole sentence the cautious
+  // one, and it names every tab the user has to stop.
+  it("is cautious when any running tab is not claude", () => {
+    expect(recreateRunningTabClause(["claude", "codex"])).toBe(
+      "A running Codex tab cannot follow the folder: stop it and start the " +
+        "agent again to continue in the recreated copy.",
+    )
+    expect(recreateRunningTabClause(["codex", "opencode"])).toBe(
+      "A running Codex or Opencode tab cannot follow the folder: stop it and " +
+        "start the agent again to continue in the recreated copy.",
+    )
+    expect(recreateRunningTabClause(["codex", "opencode", "copilot"])).toBe(
+      "A running Codex, Opencode or Copilot tab cannot follow the folder: " +
+        "stop it and start the agent again to continue in the recreated copy.",
+    )
+    expect(recreateRunningTabClause(["claude"])).toBe(
+      "A running Claude tab keeps working in the recreated copy by itself.",
+    )
+  })
+})
+
+describe("recreateRunningProviders", () => {
+  const session = (
+    tabs: { provider: string; has_live_process: boolean }[],
+  ): SessionView =>
+    ({ provider: "claude", tabs }) as unknown as SessionView
+
+  // The sentence is about the CLI that is running, and the agent's own provider
+  // is only the slot tab's.
+  it("names the live tabs, not the agent's provider mirror", () => {
+    expect(
+      recreateRunningProviders(
+        session([
+          { provider: "claude", has_live_process: false },
+          { provider: "codex", has_live_process: true },
+        ]),
+      ),
+    ).toEqual(["codex"])
+
+    expect(
+      recreateRunningProviders(
+        session([
+          { provider: "claude", has_live_process: true },
+          { provider: "codex", has_live_process: true },
+          { provider: "codex", has_live_process: true },
+        ]),
+      ),
+    ).toEqual(["claude", "codex"])
+  })
+
+  // With nothing running the dialog still says what starting a tab would mean.
+  it("falls back to the agent's own provider when nothing runs", () => {
+    expect(
+      recreateRunningProviders(
+        session([{ provider: "codex", has_live_process: false }]),
+      ),
+    ).toEqual(["claude"])
+    expect(recreateRunningProviders(session([]))).toEqual(["claude"])
   })
 })

@@ -6,6 +6,7 @@
 // one fails on the side that changed.
 
 import { type AgentWorkspaceWire, matchWorkspace } from "./agentWorkspace"
+import type { SessionView } from "./types"
 
 /** Whether the recreate action exists for this agent. Its own helper rather
  * than an inline check, because the menu, the dialog and the test all have to
@@ -18,8 +19,32 @@ export function canRecreateWorkingCopy(workspace: AgentWorkspaceWire): boolean {
   })
 }
 
-/** What a tab still running in the deleted directory does once the working copy
- * is back, mirroring `dux_core::working_copy::recreate_running_tab_clause`.
+/** The providers of the tabs of this agent that are running right now, without
+ * repeats, or the agent's own provider when none is.
+ *
+ * What a recreate does to a process is the running CLI's answer, and the
+ * agent's provider is only the slot tab's: a dormant claude slot beside a live
+ * codex extra is a codex process, and the mirror would promise the opposite. */
+export function recreateRunningProviders(session: SessionView): string[] {
+  const live: string[] = []
+  for (const tab of session.tabs ?? []) {
+    if (!tab.has_live_process) continue
+    if (!live.includes(tab.provider)) live.push(tab.provider)
+  }
+  return live.length > 0 ? live : [session.provider]
+}
+
+/** Several provider names as one subject: "Codex", "Codex or Opencode". */
+function providersJoined(names: string[]): string {
+  if (names.length <= 1) return names[0] ?? ""
+  return `${names.slice(0, -1).join(", ")} or ${names[names.length - 1]}`
+}
+
+/** What the tabs still running in the deleted directory do once the working
+ * copy is back, mirroring `dux_core::working_copy::recreate_running_tab_clause`.
+ *
+ * One non-claude provider among them makes the whole sentence the cautious one,
+ * and it names every such tab, because each is one the user has to stop.
  *
  * Measured against the real CLIs. The Claude CLI never notices its directory
  * going, and once one exists at the same path again it keeps working in it with
@@ -27,14 +52,19 @@ export function canRecreateWorkingCopy(workspace: AgentWorkspaceWire): boolean {
  * from the moment the directory goes and stays stuck there after the recreate,
  * until it is quit and resumed in the new folder. OpenCode and Copilot have not
  * been measured, so they get the cautious answer rather than a promise. */
-export function recreateRunningTabClause(provider: string): string {
-  const name = provider.charAt(0).toUpperCase() + provider.slice(1)
-  if (provider.toLowerCase() === "claude") {
-    return `A running ${name} tab keeps working in the recreated copy by itself.`
+export function recreateRunningTabClause(providers: string[]): string {
+  const name = (provider: string) =>
+    provider.charAt(0).toUpperCase() + provider.slice(1)
+  const cautious = providers
+    .filter((p) => p.toLowerCase() !== "claude")
+    .map(name)
+  if (cautious.length === 0) {
+    const only = providers.length > 0 ? name(providers[0]) : "Claude"
+    return `A running ${only} tab keeps working in the recreated copy by itself.`
   }
   return (
-    `A running ${name} tab cannot follow the folder: stop it and start the ` +
-    `agent again to continue in the recreated copy.`
+    `A running ${providersJoined(cautious)} tab cannot follow the folder: ` +
+    `stop it and start the agent again to continue in the recreated copy.`
   )
 }
 
@@ -48,13 +78,16 @@ export function recreateRunningTabClause(provider: string): string {
  * `conversationResumes` is the agent's provider's own answer rather than a
  * constant: a provider that keeps no directory-scoped history (copilot ships
  * with no resume arguments) would have this dialog promising something that
- * cannot happen, and the same path buys it nothing. */
+ * cannot happen, and the same path buys it nothing.
+ *
+ * `providers` are the providers of the tabs running right now, or the agent's
+ * own when none is, from `recreateRunningProviders`. */
 export function recreateConfirmBody(
   worktreeLabel: string,
   branchName: string,
   sourceBranch: string,
   conversationResumes: boolean,
-  provider: string,
+  providers: string[],
 ): string {
   const conversation = conversationResumes
     ? `The conversation may resume, because the agent's CLI keys its history ` +
@@ -71,7 +104,7 @@ export function recreateConfirmBody(
     `back.\n\n` +
     `Any code changes that were in the old directory are gone either way: this ` +
     `puts the directory back, not its contents. ${conversation}\n\n` +
-    `${recreateRunningTabClause(provider)} ` +
+    `${recreateRunningTabClause(providers)} ` +
     `A terminal still open in the old directory keeps ` +
     `working in a directory that is gone; close it and open one in the ` +
     `recreated copy.`

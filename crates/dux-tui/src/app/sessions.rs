@@ -1857,7 +1857,7 @@ impl App {
             branch_name: inputs.branch_name,
             source_branch: inputs.source_branch,
             conversation_resumes: inputs.conversation_resumes,
-            provider: inputs.provider,
+            running_providers: inputs.running_providers,
             focus: ConfirmFocus::Cancel, // Cancel is the safe default
         };
         Ok(())
@@ -5686,7 +5686,7 @@ mod tests {
             branch_name,
             source_branch,
             conversation_resumes,
-            provider,
+            running_providers,
             focus,
             ..
         } = &app.prompt
@@ -5703,7 +5703,7 @@ mod tests {
             branch_name,
             source_branch,
             *conversation_resumes,
-            provider,
+            running_providers,
         );
         assert!(body.contains("are gone either way"), "{body}");
         assert!(body.contains("same path"), "{body}");
@@ -5732,10 +5732,66 @@ mod tests {
         app.confirm_recreate_selected_working_copy()
             .expect("dispatch");
 
-        let PromptState::ConfirmRecreateWorkingCopy { provider, .. } = &app.prompt else {
+        let PromptState::ConfirmRecreateWorkingCopy {
+            running_providers, ..
+        } = &app.prompt
+        else {
             panic!("a running agent is confirmed like any other")
         };
-        assert_eq!(provider, "claude");
+        assert_eq!(running_providers, &vec!["claude".to_string()]);
+    }
+
+    /// The body follows the tab that is RUNNING: a dormant claude slot beside a
+    /// live codex extra is a codex process, and the reassuring sentence would be
+    /// about a CLI nobody is running.
+    #[test]
+    fn recreate_working_copy_names_the_live_extra_tabs_provider() {
+        let mut app =
+            crate::app::test_support::test_app(crate::app::test_support::default_bindings());
+        app.selected_left = 1;
+        let id = app.engine.sessions[0].id.clone();
+        app.engine.sessions[0].provider = dux_core::model::ProviderKind::new("claude");
+        app.engine
+            .folder_repo_statuses
+            .insert(id.clone(), dux_core::git::FolderRepoStatus::Missing);
+        app.engine.agent_tabs.insert(
+            dux_core::ids::TabId::new("tab-live"),
+            dux_core::model::AgentTab {
+                id: "tab-live".to_string(),
+                session_id: id.clone(),
+                provider: dux_core::model::ProviderKind::new("codex"),
+                sort_order: 1,
+                created_at: chrono::Utc::now(),
+            },
+        );
+        app.engine
+            .mark_in_flight(dux_core::engine::InFlightKey::AgentLaunch(
+                dux_core::ids::TabId::new("tab-live"),
+            ));
+
+        app.confirm_recreate_selected_working_copy()
+            .expect("dispatch");
+
+        let PromptState::ConfirmRecreateWorkingCopy {
+            worktree_path,
+            branch_name,
+            source_branch,
+            conversation_resumes,
+            running_providers,
+            ..
+        } = &app.prompt
+        else {
+            panic!("a running agent is confirmed like any other")
+        };
+        assert_eq!(running_providers, &vec!["codex".to_string()]);
+        let body = dux_core::working_copy::recreate_confirm_body(
+            worktree_path,
+            branch_name,
+            source_branch,
+            *conversation_resumes,
+            running_providers,
+        );
+        assert!(body.contains("A running Codex tab cannot follow"), "{body}");
     }
 
     /// Cancelling leaves the agent exactly as it was, and never touches git.

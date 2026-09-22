@@ -110,13 +110,23 @@ describe("ConfirmRecreateWorkingCopyDialog", () => {
     )
   })
 
-  // The paragraph is the provider's own answer, so the dialog has to read the
-  // session's provider rather than a constant.
-  it("warns instead when the provider cannot follow the folder", () => {
+  // The paragraph is the running CLI's own answer, and a dormant claude slot
+  // beside a live codex extra is a codex process: the mirror would promise the
+  // opposite.
+  it("warns instead when the live tab's provider cannot follow the folder", () => {
     seed({
       recreateWorkingCopyTarget: "s1",
       spine: {
-        sessions: [{ ...session(true), provider: "codex" }],
+        sessions: [
+          {
+            ...session(true),
+            provider: "claude",
+            tabs: [
+              { id: "t1", provider: "claude", has_live_process: false },
+              { id: "t2", provider: "codex", has_live_process: true },
+            ],
+          },
+        ],
         projects: [],
       },
     } as unknown as Partial<DuxState>)

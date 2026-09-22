@@ -9,7 +9,10 @@ import {
 } from "@/components/ui/dialog"
 import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
 import { managedWorkspace } from "@/lib/agentWorkspace"
-import { recreateConfirmBody } from "@/lib/recreateWorkingCopy"
+import {
+  recreateConfirmBody,
+  recreateRunningProviders,
+} from "@/lib/recreateWorkingCopy"
 import {
   closeRecreateWorkingCopy,
   recreateWorkingCopy,
@@ -56,13 +59,13 @@ export function ConfirmRecreateWorkingCopyDialog() {
         <DialogHeader>
           <DialogTitle>Recreate working copy?</DialogTitle>
           <DialogDescription className="whitespace-pre-line">
-            {managed
+            {managed && session
               ? recreateConfirmBody(
                   managed.worktree_label ?? managed.worktree_path,
                   managed.branch_name,
                   managed.source_branch,
                   managed.conversation_resumes === true,
-                  session?.provider ?? "",
+                  recreateRunningProviders(session),
                 )
               : ""}
           </DialogDescription>

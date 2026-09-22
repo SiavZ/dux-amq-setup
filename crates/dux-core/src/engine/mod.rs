@@ -5035,6 +5035,34 @@ impl Engine {
             .any(|id| self.tab_is_live(id.as_ref_id()))
     }
 
+    /// The providers of this session's LIVE tabs, in display order and without
+    /// repeats. Empty when every tab is dormant.
+    ///
+    /// Each tab answers with the provider it is actually RUNNING, which a
+    /// retarget leaves different from the configured one, and the session's
+    /// provider mirror answers for the slot tab alone: a dormant claude slot
+    /// beside a live codex extra is a codex process, and a sentence written from
+    /// the mirror would be about a CLI nobody is running.
+    pub fn live_tab_providers(&self, session_id: &str) -> Vec<String> {
+        let Some(session) = self.session_by_id(session_id) else {
+            return Vec::new();
+        };
+        let mut providers: Vec<String> = Vec::new();
+        for id in self.ordered_tab_ids_for_session(SessionIdRef::new(session_id)) {
+            if !self.tab_is_live(id.as_ref_id()) {
+                continue;
+            }
+            let provider = self
+                .tab_running_provider(session, id.as_ref_id())
+                .as_str()
+                .to_string();
+            if !providers.contains(&provider) {
+                providers.push(provider);
+            }
+        }
+        providers
+    }
+
     /// The first LIVE tab of a session, in display order: the session-slot tab
     /// first, then extra tabs ordered by `(sort_order, created_at, id)` (the
     /// same order the TUI's tab strip renders). A tab counts as live when it has a
@@ -5678,6 +5706,30 @@ mod tests {
             },
         );
         (engine, tmp)
+    }
+
+    /// Liveness is per tab, so the answer follows the tabs that are running
+    /// rather than the session's provider mirror: a dormant slot beside a live
+    /// extra answers with the extra's provider alone.
+    #[test]
+    fn live_tab_providers_names_the_tabs_that_are_running() {
+        let (mut engine, _tmp) = engine_with_an_extra_tab();
+        assert!(
+            engine.live_tab_providers("s1").is_empty(),
+            "nothing is running yet"
+        );
+
+        engine.mark_in_flight(InFlightKey::AgentLaunch(TabId::new("tab-b")));
+        assert_eq!(engine.live_tab_providers("s1"), vec!["codex".to_string()]);
+
+        let slot = engine.slot_tab_id_of(SessionIdRef::new("s1")).to_owned();
+        engine.mark_in_flight(InFlightKey::AgentLaunch(slot));
+        assert_eq!(
+            engine.live_tab_providers("s1"),
+            vec!["claude".to_string(), "codex".to_string()],
+            "the slot tab leads, and each provider is named once"
+        );
+        assert!(engine.live_tab_providers("nope").is_empty());
     }
 
     #[test]
