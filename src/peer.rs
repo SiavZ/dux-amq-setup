@@ -944,6 +944,9 @@ fn reconcile_amq_root(
         .collect::<HashSet<_>>();
 
     for index in order {
+        if sessions[index].deleted_at.is_some() {
+            continue;
+        }
         let owner = OwnerMarker {
             store_id: store_id.to_string(),
             session_id: sessions[index].id.clone(),
@@ -2010,6 +2013,22 @@ mod tests {
         .unwrap();
         assert_eq!(owner.store_id, "store-a");
         assert_eq!(owner.session_id, "s1");
+    }
+
+    #[test]
+    fn amq_sync_does_not_recreate_deleted_session_agent_dirs() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("amq");
+        let worktree = dir.path().join("worktree");
+        let mut deleted = session("deleted", "claude", "deleted-agent", &worktree);
+        deleted.deleted_at = Some(Utc::now());
+
+        let report = reconcile_amq_root(&root, "store-a", None, &mut [deleted]).unwrap();
+
+        assert_eq!(report.ownership_markers_created, 0);
+        assert!(!root.join("agents/deleted-agent").exists());
+        let raw = fs::read_to_string(root.join("meta/config.json")).unwrap();
+        assert!(!raw.contains("\"deleted-agent\""));
     }
 
     #[test]
