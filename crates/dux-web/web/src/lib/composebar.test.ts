@@ -13,6 +13,8 @@ import {
   bottomBarSurvivesDirect,
   terminalKeysApply,
   inputMenuSurfaceSwitchOffered,
+  composeBoxHeight,
+  COMPOSE_MAX_ROWS,
 } from "./composebar"
 import type { ComposeBarMode, TypingSurfaceChoice } from "./composebar"
 
@@ -429,5 +431,74 @@ describe("inactiveCursorStyle", () => {
   // in any real terminal: focus is elsewhere. Leave the convention alone.
   it("keeps the conventional outline when typing goes straight to xterm", () => {
     expect(inactiveCursorStyle(false)).toBe("outline")
+  })
+})
+
+describe("composeBoxHeight", () => {
+  // Under the cap the box hugs its content. `scrollHeight` excludes the border
+  // while a border-box height must cover it, so the delta is added back.
+  it("grows with the content while it fits under the cap", () => {
+    expect(
+      composeBoxHeight({
+        lineHeight: 20,
+        padding: 0,
+        border: 2,
+        scrollHeight: 40,
+      }),
+    ).toEqual({ height: 42, scrolls: false })
+  })
+
+  it("caps at COMPOSE_MAX_ROWS lines and scrolls past it", () => {
+    expect(
+      composeBoxHeight({
+        lineHeight: 20,
+        padding: 0,
+        border: 2,
+        scrollHeight: 400,
+      }),
+    ).toEqual({ height: 20 * COMPOSE_MAX_ROWS + 2, scrolls: true })
+  })
+
+  // The bug this shape exists for: a scrolling box's own vertical padding
+  // scrolls WITH the text, so a scrollport of N lines plus padding shows N
+  // whole lines and a sliver of one more, cut at whichever end the scroll is
+  // not resting on. With no padding on the scrolling element the scrollport is
+  // a whole number of lines at every scroll position.
+  it("leaves a scrollport that is a whole number of lines", () => {
+    const { height } = composeBoxHeight({
+      lineHeight: 20,
+      padding: 0,
+      border: 2,
+      scrollHeight: 400,
+    })
+    expect((height - 2) % 20).toBe(0)
+    expect((height - 2) / 20).toBe(COMPOSE_MAX_ROWS)
+  })
+
+  // A fractional line height (the browser's own font-size preference scales
+  // the rem `leading-5` resolves to) rounds UP, or the last line is a pixel
+  // short and clipped.
+  it("rounds a fractional line height up so the last line still fits", () => {
+    expect(
+      composeBoxHeight({
+        lineHeight: 20.7,
+        padding: 0,
+        border: 2,
+        scrollHeight: 400,
+      }),
+    ).toEqual({ height: Math.ceil(20.7 * COMPOSE_MAX_ROWS) + 2, scrolls: true })
+  })
+
+  // Padding is measured rather than assumed, so a box that does carry some
+  // gets a cap meaning COMPOSE_MAX_ROWS lines of TEXT, not lines minus chrome.
+  it("adds any vertical padding the box does carry to the cap", () => {
+    expect(
+      composeBoxHeight({
+        lineHeight: 20,
+        padding: 16,
+        border: 2,
+        scrollHeight: 400,
+      }).height,
+    ).toBe(20 * COMPOSE_MAX_ROWS + 16 + 2)
   })
 })

@@ -79,6 +79,50 @@ export function insertIntoComposeDraft(
 }
 
 /**
+ * How many lines of text the compose box shows before it starts scrolling.
+ * Three, because with the soft keyboard up the terminal is already down to a
+ * handful of rows and a taller box leaves too little PTY visible.
+ */
+export const COMPOSE_MAX_ROWS = 3
+
+/** One measurement of the compose textarea, in CSS pixels. */
+export interface ComposeBoxMetrics {
+  /** The computed line height: one line of text. */
+  lineHeight: number
+  /** The box's own vertical padding, top plus bottom. */
+  padding: number
+  /** The box's vertical border, top plus bottom (`offsetHeight - clientHeight`). */
+  border: number
+  /** The content's laid-out height, which excludes the border. */
+  scrollHeight: number
+}
+
+/**
+ * The border-box height the compose textarea takes for the content it holds,
+ * and whether that content is taller than the cap and must scroll inside it.
+ *
+ * The cap is a whole number of LINES: the box's scrollable area must never end
+ * part-way through one, because a textarea scrolls its own padding along with
+ * its text, so a scrollport of three lines plus padding shows three whole lines
+ * and a half-cut fourth at whichever end the scroll is not resting on. The
+ * caller keeps the vertical padding off the scrolling element for that reason;
+ * any it does carry is still added here, so the cap always means
+ * [`COMPOSE_MAX_ROWS`] lines of text.
+ *
+ * Border-box is load-bearing (Tailwind preflight sets it): the returned height
+ * must cover content plus padding plus border while `scrollHeight` covers only
+ * the first two, and the shortfall would clip the last line.
+ */
+export function composeBoxHeight(m: ComposeBoxMetrics): {
+  height: number
+  scrolls: boolean
+} {
+  const max = Math.ceil(m.lineHeight * COMPOSE_MAX_ROWS) + m.padding + m.border
+  const needed = m.scrollHeight + m.border
+  return { height: Math.min(needed, max), scrolls: needed > max }
+}
+
+/**
  * The three values `ui.compose_bar` can take, mirroring
  * `dux_core::config::ComposeBarMode`.
  */

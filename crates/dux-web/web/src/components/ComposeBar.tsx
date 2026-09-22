@@ -3,6 +3,7 @@ import { useEffect, useRef } from "react"
 import { CornerDownLeft } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
+import { composeBoxHeight } from "@/lib/composebar"
 import { composeHardwareKeyForwards } from "@/lib/termkeys"
 
 // The phone's typing surface: a real textarea with native keyboard assistance
@@ -59,10 +60,10 @@ interface ComposeBarProps {
   leading?: React.ReactNode
 }
 
-// The textarea grows with its content up to this many lines, then scrolls
-// internally. Three, because with the soft keyboard up the terminal is already
-// down to a handful of rows and a taller box leaves too little PTY visible.
-const MAX_ROWS = 3
+// What one line measures when the computed line-height is not a parseable
+// pixel value ("normal", or empty under jsdom). The `leading-5` class makes it
+// parseable in a real browser.
+const FALLBACK_LINE_HEIGHT = 20
 
 // The default hint: what the bar asks for when nobody says otherwise, and what
 // every terminal surface (companion, project and standalone alike) asks for.
@@ -75,22 +76,13 @@ export const TERMINAL_PLACEHOLDER = "Type a command…"
 export const AGENT_PLACEHOLDER = "Write a message to the agent…"
 
 // Autosize by measurement, not CSS: `field-sizing: content` is unsupported on
-// older iOS Safari. The height is reset, `scrollHeight` read back, and capped
-// at MAX_ROWS' worth of pixels. The `|| 20` fallback covers a computed
-// line-height that is not a parseable pixel value ("normal", or empty under
-// jsdom); the `leading-5` class makes it parseable in real browsers.
-//
-// Border-box is load-bearing: Tailwind preflight sets it, so the height style
-// must cover content plus padding plus border while `scrollHeight` covers only
-// the first two, and the shortfall clips the last line under overflow-y hidden.
-// The delta is `offsetHeight - clientHeight`, added to the height and to the
-// cap, which also adds the vertical padding so it means MAX_ROWS lines of
-// content rather than MAX_ROWS lines minus the box chrome.
+// older iOS Safari. The height is reset, the element measured, and the cap
+// applied by the pure `composeBoxHeight`, which owns the arithmetic.
 function autosize(el: HTMLTextAreaElement): void {
   // An empty buffer is one row by definition, so it is not measured: the
-  // inline sizing is dropped and the class-level `min-h-10` owns the rest
-  // height. Short-circuited rather than measured, because the measured read can
-  // come back stale after a send and leave the box tall with no text in it.
+  // inline sizing is dropped and the frame's `min-h-10` owns the rest height.
+  // Short-circuited rather than measured, because the measured read can come
+  // back stale after a send and leave the box tall with no text in it.
   if (el.value === "") {
     el.style.height = ""
     el.style.overflowY = ""
@@ -98,14 +90,16 @@ function autosize(el: HTMLTextAreaElement): void {
   }
   el.style.height = "auto"
   const style = getComputedStyle(el)
-  const line = parseFloat(style.lineHeight) || 20
-  const padding =
-    (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0)
-  const border = el.offsetHeight - el.clientHeight
-  const max = Math.ceil(line * MAX_ROWS + padding + border)
-  const needed = el.scrollHeight + border
-  el.style.height = `${Math.min(needed, max)}px`
-  el.style.overflowY = needed > max ? "auto" : "hidden"
+  const { height, scrolls } = composeBoxHeight({
+    lineHeight: parseFloat(style.lineHeight) || FALLBACK_LINE_HEIGHT,
+    padding:
+      (parseFloat(style.paddingTop) || 0) +
+      (parseFloat(style.paddingBottom) || 0),
+    border: el.offsetHeight - el.clientHeight,
+    scrollHeight: el.scrollHeight,
+  })
+  el.style.height = `${height}px`
+  el.style.overflowY = scrolls ? "auto" : "hidden"
 }
 
 export function ComposeBar({
@@ -169,6 +163,16 @@ export function ComposeBar({
     onForwardKey(seq)
   }
 
+  // A press on the frame's padding, the strip above and below the text that
+  // used to belong to the textarea. It lands the caret in the box by hand
+  // rather than leaving it to the browser, which would move focus to the frame
+  // and dismiss the soft keyboard. A press on the box itself is the browser's.
+  const onFramePointerDown = (event: React.PointerEvent) => {
+    if (event.target === taRef.current) return
+    event.preventDefault()
+    taRef.current?.focus()
+  }
+
   // Keyboard/AT activation: Enter or Space on the focused button fires a
   // `click` with `detail === 0` (no pointer press). A click that FOLLOWS a
   // real pointer tap carries `detail >= 1` and is ignored here, because the
@@ -187,30 +191,42 @@ export function ComposeBar({
           while something is hidden, which is what makes the hidden-bars dead
           end unreachable. */}
       {leading}
-      <textarea
-        ref={taRef}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        onKeyDown={onKeyDown}
-        rows={1}
-        placeholder={placeholder}
-        aria-label="Message"
-        // Native keyboard assistance ON, deliberately the opposite of xterm's
-        // hidden textarea (which forces all of these off because a PTY stream
-        // has no buffer for them to fix). This buffer is exactly what they are
-        // for, and enabling them is the reason the compose bar exists.
-        autoComplete="off"
-        autoCorrect="on"
-        autoCapitalize="sentences"
-        spellCheck={true}
-        // text-sm matches the xterm canvas next door in size only; the face is
-        // the app's sans, because this is prose a person composes with
-        // autocorrect and an IME, not a view of terminal content. An input font
-        // under 16px normally trips iOS Safari's auto-zoom-on-focus, which
-        // index.html's viewport `maximum-scale=1` disables. leading-5 pins the
-        // line-height to a parseable 20px for `autosize`'s computed-style read.
-        className="min-h-10 min-w-0 flex-1 resize-none rounded-md border bg-background px-3 py-2 text-sm leading-5 text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-      />
+      {/* The frame around the box, carrying the border, the rounding, the
+          height floor and the focus ring. It also carries the VERTICAL
+          padding, which cannot live on the textarea: a textarea scrolls its
+          own padding along with its text, so padding there makes the visible
+          area three lines plus a sliver and every scroll position cuts a line
+          in half at one end. Horizontal padding stays on the box, where it
+          costs nothing and keeps the caret clickable across the full width. */}
+      <div
+        onPointerDown={onFramePointerDown}
+        className="flex min-h-10 min-w-0 flex-1 flex-col rounded-md border bg-background py-2 focus-within:ring-2 focus-within:ring-ring"
+      >
+        <textarea
+          ref={taRef}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          onKeyDown={onKeyDown}
+          rows={1}
+          placeholder={placeholder}
+          aria-label="Message"
+          // Native keyboard assistance ON, deliberately the opposite of xterm's
+          // hidden textarea (which forces all of these off because a PTY stream
+          // has no buffer for them to fix). This buffer is exactly what they
+          // are for, and enabling them is the reason the compose bar exists.
+          autoComplete="off"
+          autoCorrect="on"
+          autoCapitalize="sentences"
+          spellCheck={true}
+          // text-sm matches the xterm canvas next door in size only; the face
+          // is the app's sans, because this is prose a person composes with
+          // autocorrect and an IME, not a view of terminal content. An input
+          // font under 16px normally trips iOS Safari's auto-zoom-on-focus,
+          // which index.html's viewport `maximum-scale=1` disables. leading-5
+          // pins the line-height to a parseable 20px for `autosize`'s read.
+          className="w-full resize-none bg-transparent px-3 text-sm leading-5 text-foreground outline-none placeholder:text-muted-foreground"
+        />
+      </div>
       {/* Enabled even when the buffer is empty: an empty Send is a bare Enter
           (confirming TUI menus/prompts), not a no-op. size-10 keeps the 40px
           touch-target floor; self-end pins it to the bar's bottom edge as the

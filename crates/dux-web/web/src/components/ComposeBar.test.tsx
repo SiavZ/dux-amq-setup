@@ -233,6 +233,51 @@ describe("ComposeBar", () => {
     expect(ta.style.height).toBe("")
   })
 
+  // The on-device report: with a long draft the box showed three lines and a
+  // fourth cut in half at the top or the bottom, depending on where the scroll
+  // was resting. A textarea scrolls its own vertical padding along with its
+  // text, so padding on the scrolling element makes the scrollport N lines
+  // plus a sliver and no scroll position can show whole lines. The padding
+  // lives on the frame around the box instead, which does not scroll.
+  it("keeps its vertical padding off the scrolling box", () => {
+    render(<Harness />)
+    const ta = textarea()
+    expect(ta.className).not.toMatch(/(^|\s)(py|pt|pb)-/)
+    const frame = ta.parentElement!
+    expect(frame.className).toContain("py-2")
+    expect(frame.className).toContain("border")
+  })
+
+  // The frame owns the height floor and the focus ring it took over with the
+  // padding: the box is still a 40px touch target that visibly takes focus.
+  it("keeps the touch-target floor and the focus ring on that frame", () => {
+    render(<Harness />)
+    const frame = textarea().parentElement!
+    expect(frame.className).toContain("min-h-10")
+    expect(frame.className).toContain("focus-within:ring-2")
+  })
+
+  // The padding moved, so the strip above and below the text belongs to the
+  // frame now. A press there must still land the caret in the box, and must
+  // not shift focus on its own, or the soft keyboard dismisses under the tap.
+  it("lands the caret in the box when the frame around it is pressed", () => {
+    render(<Harness />)
+    const ta = textarea()
+    const frame = ta.parentElement!
+    ;(document.activeElement as HTMLElement | null)?.blur()
+    const notPrevented = fireEvent.pointerDown(frame)
+    expect(notPrevented).toBe(false)
+    expect(document.activeElement).toBe(ta)
+  })
+
+  // A press that lands on the box itself is the browser's to handle: it places
+  // the caret where the finger is and starts a selection drag.
+  it("leaves a press on the box itself to the browser", () => {
+    render(<Harness />)
+    const notPrevented = fireEvent.pointerDown(textarea())
+    expect(notPrevented).toBe(true)
+  })
+
   it("matches the terminal's 14px type, not the browser-default 16px", () => {
     // The xterm canvas next door renders at fontSize 14 (see TerminalPane's
     // Terminal options); text-base (16px) visibly towers over it on a phone.
