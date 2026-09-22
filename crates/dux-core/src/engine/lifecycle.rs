@@ -329,19 +329,9 @@ pub struct ClosedTabExit {
     /// The provider of the tab holding the slot now, which is what the pane
     /// falls back to.
     pub slot_provider: String,
-    /// How many tabs the agent has left, which is what decides whether a strip
-    /// is still on screen to show the pill leaving.
+    /// How many tabs the agent has left, which is what decides whether the
+    /// notice may name the tab the pane fell back to.
     pub tabs_remaining: usize,
-}
-
-impl ClosedTabExit {
-    /// Whether the strip is the announcement: it renders from two tabs up, so
-    /// the pill leaving is visible and a sentence restating it is noise. Below
-    /// that the strip goes with the pill and nothing on screen says what
-    /// happened.
-    pub fn strip_announces(&self) -> bool {
-        self.tabs_remaining >= 2
-    }
 }
 
 /// The notice a clean exit that closed a row earns, in the one wording both
@@ -2731,10 +2721,6 @@ mod tests {
             "Tab (claude) of agent \"server-mode\" exited cleanly and was closed; the pane now \
              shows its codex tab."
         );
-        assert!(
-            !alone.strip_announces(),
-            "one pill is no strip, so the sentence is the only word the user gets"
-        );
 
         let with_siblings = ClosedTabExit {
             tabs_remaining: 2,
@@ -2743,10 +2729,6 @@ mod tests {
         assert_eq!(
             closed_tab_exit_notice(&with_siblings),
             "Tab (claude) of agent \"server-mode\" exited cleanly and was closed."
-        );
-        assert!(
-            with_siblings.strip_announces(),
-            "the strip is on screen and the pill leaving it is the announcement"
         );
     }
 

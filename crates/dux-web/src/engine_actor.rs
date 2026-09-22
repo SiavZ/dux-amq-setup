@@ -1985,16 +1985,11 @@ fn prune_wire_status(pruned: &dux_core::engine::PrunedPty) -> Option<WireStatus>
                 "Open the agent to see the full output, or start a fresh session.",
             ),
         )),
-        // The tab closed itself on a clean exit. Silent while a strip is left to
-        // have shown the pill leaving; otherwise this sentence is the only word
-        // the user gets, so it says which tab the pane holds now.
-        PrunedPtyKind::Agent if pruned.tab_closed => pruned
-            .closed_tab
-            .as_ref()
-            .filter(|closed| !closed.strip_announces())
-            .map(|closed| {
-                WireStatus::new("info", dux_core::engine::closed_tab_exit_notice(closed))
-            }),
+        // The tab closed itself on a clean exit. Every closed row is announced,
+        // in the sentence the terminal UI's status line says.
+        PrunedPtyKind::Agent if pruned.tab_closed => pruned.closed_tab.as_ref().map(|closed| {
+            WireStatus::new("info", dux_core::engine::closed_tab_exit_notice(closed))
+        }),
         // The tab stays, dormant. Nothing else on screen distinguishes a pill
         // whose process just ended from one that was never launched, so this
         // sentence is the only word the user gets.
@@ -4863,8 +4858,7 @@ mod tests {
             output_excerpt: String::new(),
             read_error: None,
             refused_resume_excerpt: None,
-            // Two tabs left, so the strip is still on screen: the shape where a
-            // closed row needs no sentence.
+            // Two tabs left, so the notice claims nothing about the pane.
             closed_tab: tab_closed.then(|| dux_core::engine::ClosedTabExit {
                 provider: "claude".to_string(),
                 agent_label: "feat/x".to_string(),
@@ -4874,15 +4868,19 @@ mod tests {
         }
     }
 
-    /// A reaping whose row leaves the screen says nothing; a reaping that leaves
-    /// something behind still has to explain itself.
+    /// A reaping whose row leaves the screen still says so; a reaping that
+    /// leaves something behind has to explain itself too.
     #[test]
-    fn a_reaped_pty_is_announced_only_when_something_is_left_on_screen() {
+    fn a_reaped_pty_is_announced_whenever_a_tab_row_or_a_pill_is_involved() {
+        let closed = prune_wire_status(&pruned(PrunedPtyKind::Agent, false, true))
+            .expect("every clean tab exit is announced");
+        assert_eq!(closed.tone, "info");
         assert_eq!(
-            prune_wire_status(&pruned(PrunedPtyKind::Agent, false, true)),
-            None,
-            "the pill left the strip in the same sweep"
+            closed.message,
+            "Tab (claude) of agent \"feat/x\" exited cleanly and was closed."
         );
+        assert!(!closed.quiet_on.web);
+
         assert_eq!(
             prune_wire_status(&pruned(PrunedPtyKind::Terminal, false, false)),
             None,
@@ -4902,11 +4900,10 @@ mod tests {
         assert!(!detached.quiet_on.web);
     }
 
-    /// The last pill leaving takes the strip with it, so the toast is the only
-    /// thing that says the tab went and that the pane is on a different
-    /// provider now.
+    /// With one tab left the pane can only be showing it, so the notice names
+    /// the provider the pane fell back to.
     #[test]
-    fn a_closed_tab_that_leaves_no_strip_behind_is_announced() {
+    fn a_closed_tab_that_leaves_one_behind_names_what_the_pane_shows() {
         let mut closed = pruned(PrunedPtyKind::Agent, false, true);
         closed.closed_tab = Some(dux_core::engine::ClosedTabExit {
             provider: "claude".to_string(),
