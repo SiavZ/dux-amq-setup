@@ -335,10 +335,10 @@ describe("deep-link restore on load", () => {
   })
 })
 
-// The URL is written on every selection change. Moving between SCREENS (home to
-// an agent, an agent back to home) pushes an entry so the browser's Back
-// unwinds it; changing which agent or tab is focused within the terminal screen
-// replaces the current entry, so switching around never piles up history.
+// The URL is written on every selection change. Moving to another position
+// (home to an agent, one agent to another, an agent back to home) pushes an
+// entry so the browser's Back unwinds it; moving within the agent already
+// focused, a tab switch above all, replaces the current entry.
 describe("selection writes the hash", () => {
   it("selecting an agent from home pushes #/agent/<id>", async () => {
     const mod = await loadStore("", [{ id: "s1", project_id: "p1" }])
@@ -351,7 +351,7 @@ describe("selection writes the hash", () => {
     )
   })
 
-  it("switching agents replaces rather than pushes", async () => {
+  it("switching agents pushes so Back returns to the previous one", async () => {
     const mod = await loadStore("", [
       { id: "s1", project_id: "p1" },
       { id: "s2", project_id: "p1" },
@@ -360,8 +360,12 @@ describe("selection writes the hash", () => {
     pushStateMock.mockClear()
     replaceStateMock.mockClear()
     mod.selectSession("s2")
-    expect(pushStateMock).not.toHaveBeenCalled()
-    expect(replaceStateMock).toHaveBeenCalledWith(null, "", "#/agent/s2")
+    expect(replaceStateMock).not.toHaveBeenCalled()
+    expect(pushStateMock).toHaveBeenCalledWith(
+      { duxRoute: "#/agent/s2" },
+      "",
+      "#/agent/s2",
+    )
   })
 
   it("selecting an extra tab writes the /tab/ form; the session-slot tab stays bare", async () => {
@@ -377,7 +381,7 @@ describe("selection writes the hash", () => {
     )
     replaceStateMock.mockClear()
     // Focusing the first tab collapses back to the bare form (here spelled with
-    // the placeholder id), and stays on the same screen, so it replaces.
+    // the placeholder id), and stays on the same agent, so it replaces.
     mod.selectTab("s1", "s1")
     expect(replaceStateMock).toHaveBeenCalledWith(null, "", "#/agent/s1")
   })

@@ -664,19 +664,69 @@ describe("moving in pushes, and Back unwinds exactly", () => {
     expect(leftApp).toBe(false)
   })
 
-  it("does not accumulate entries when switching between agents", async () => {
+  it("walks back through the agents it visited, newest first", async () => {
+    // Another agent is another position, so each selection pushes and Back
+    // retraces them in reverse rather than jumping straight home.
+    const mod = await loadStore("", [
+      { id: "s1", project_id: "p1" },
+      { id: "s2", project_id: "p1" },
+      { id: "s3", project_id: "p1" },
+    ])
+    mod.selectSession("s1")
+    mod.selectSession("s2")
+    mod.selectSession("s3")
+    expect(index).toBe(DUX_ENTRY_INDEX + 3)
+    expect(loc.hash).toBe("#/agent/s3")
+
+    history.back()
+    expect(mod.getSnapshot().selectedSessionId).toBe("s2")
+    expect(loc.hash).toBe("#/agent/s2")
+    history.back()
+    expect(mod.getSnapshot().selectedSessionId).toBe("s1")
+    expect(loc.hash).toBe("#/agent/s1")
+    history.back()
+    expect(mod.getSnapshot().mobileScreen).toBe("home")
+    expect(index).toBe(DUX_ENTRY_INDEX)
+    expect(leftApp).toBe(false)
+  })
+
+  it("re-selects the previous agent on a popstate to its hash", async () => {
     const mod = await loadStore("", [
       { id: "s1", project_id: "p1" },
       { id: "s2", project_id: "p1" },
     ])
     mod.selectSession("s1")
-    const afterFirst = index
+    mod.selectSession("s2")
+    popstateTo("#/agent/s1")
+    expect(mod.getSnapshot().selectedSessionId).toBe("s1")
+    expect(mod.getSnapshot().mobileScreen).toBe("terminal")
+  })
+
+  it("selects a standalone terminal as a position of its own", async () => {
+    const mod = await loadStore("", [{ id: "s1", project_id: "p1" }], [], ["t9"])
+    mod.selectSession("s1")
+    const afterAgent = index
+    mod.selectTerminal("t9", { kind: "standalone" })
+    expect(index).toBe(afterAgent + 1)
+    history.back()
+    expect(mod.getSnapshot().selectedSessionId).toBe("s1")
+  })
+
+  it("rewrites the entry when switching tabs inside one agent", async () => {
+    // A tab switch is a move WITHIN the agent's screen, so it replaces: Back
+    // from an extra tab leaves the agent rather than walking its own tabs.
+    const mod = await loadStore("", [
+      { id: "s1", project_id: "p1", tabs: ["t2"] },
+      { id: "s2", project_id: "p1" },
+    ])
     mod.selectSession("s2")
     mod.selectSession("s1")
-    expect(index).toBe(afterFirst)
+    const afterAgent = index
+    mod.selectTab("s1", "t2")
+    expect(index).toBe(afterAgent)
+    expect(loc.hash).toBe("#/agent/s1/tab/t2")
     history.back()
-    expect(mod.getSnapshot().mobileScreen).toBe("home")
-    expect(index).toBe(DUX_ENTRY_INDEX)
+    expect(mod.getSnapshot().selectedSessionId).toBe("s2")
   })
 
   it("leaves a Back that actually moves after ten trips in and out", async () => {
@@ -1804,11 +1854,9 @@ describe("the editor rides the URL", () => {
     expect(tabs[tabs.length - 1].mode).toBe("file")
   })
 
-  it("replaces rather than pushes between two standalone editor roots", async () => {
-    // The accepted collision: the push key carries the surface, not the root,
-    // so one standalone tab retargeted from an agent to a terminal keeps its
-    // history entry. Unreachable in-app (the surface has no exits), so this
-    // pins the decision rather than a journey.
+  it("pushes between two standalone editor roots", async () => {
+    // The key carries the subject as well as the surface, so one standalone tab
+    // retargeted from an agent to a terminal is a move Back comes out of.
     const mod = await loadStore("", [{ id: "s1", project_id: "p1" }])
     const editor = { mode: "file" as const, path: null }
     expect(
@@ -1818,7 +1866,7 @@ describe("the editor rides the URL", () => {
         editor,
         standalone: true,
       }),
-    ).toBe(
+    ).not.toBe(
       mod.routePushKey({
         target: standaloneTerminal,
         changes: false,

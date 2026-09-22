@@ -2403,11 +2403,18 @@ function routeScreen(route: Route): MobileScreen {
 // would leak an "editor" screen into the mobile shell. Opening the editor
 // changes the key, so it pushes; switching files inside it does not.
 //
-// The key says nothing about which root the editor is on, so retargeting a
-// standalone editor tab replaces rather than pushes. Accepted: only a
-// hand-edited address can produce that.
+// The subject leads it, so moving to another agent or terminal pushes and Back
+// walks the ones the user visited in reverse.
 export function routePushKey(route: Route): string {
-  return `${routeScreen(route)}${route.editor ? "+editor" : ""}${route.standalone ? "+standalone" : ""}`
+  return `${routeSubject(route.target)}|${routeScreen(route)}${route.editor ? "+editor" : ""}${route.standalone ? "+standalone" : ""}`
+}
+
+// Which entity a route is about, at the granularity Back moves by. The tab id
+// is left out: an agent's own tabs are one position, so a switch replaces.
+function routeSubject(target: SelectedTarget | null): string {
+  if (!target) return ""
+  if (target.kind === "terminal") return `terminal:${target.terminalId}`
+  return `agent:${target.sessionId}`
 }
 
 // The standalone editor's address for a root, optionally carrying the file

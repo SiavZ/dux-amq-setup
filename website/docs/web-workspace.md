@@ -72,10 +72,11 @@ someone on the same instance:
 - A standalone terminal is `#/terminal/<terminalId>`, with no owner in the address.
 - The phone's Changes screen is the same link with `/changes` on the end.
 
-Every move to a different screen adds one history entry, so Back always returns you to
-the previous screen. Moves that stay on the same screen rewrite the one entry instead:
-switching between agents or tabs, reconnecting after the wifi drops, and following a
-link back to where you already were.
+Every move to a different place adds one history entry, so Back always returns you to
+where you were: select three agents in turn and Back walks them in reverse. Moves that
+stay where you already are rewrite the one entry instead: switching between an agent's
+own tabs, reconnecting after the wifi drops, and following a link back to where you
+already were.
 
 dux never presses Back for you. The phone's back chevron is an **up** control: it takes
 you one level up (Changes to its agent, an agent to the home screen), adds its own
