@@ -53,6 +53,7 @@ import {
 import { firstLoadApi } from "./firstLoadApi"
 import {
   dismissNotification,
+  type Notice,
   notify,
   notifyError,
   notifyInfo,
@@ -61,6 +62,7 @@ import {
   notifyWarning,
   setStatusClearSeconds,
 } from "./notify"
+import { wireProse } from "./prose"
 import { publishConnectionTiming } from "./connectionTiming"
 import { clearServerValidated, noteServerValidated } from "./serverValidated"
 import { registerPageLifecycle } from "./pageLifecycle"
@@ -1100,7 +1102,7 @@ function handleStatusEvent(event: EventsServerMessage): void {
   showStatusToast(
     event.key,
     event.tone ?? "info",
-    event.message ?? "",
+    wireProse(event.message ?? "", event.segments),
     event.sticky ?? false,
   )
 }
@@ -2027,7 +2029,7 @@ const ANON_TOAST_ID = "dux-anon-status"
 function showStatusToast(
   key: string | null | undefined,
   tone: string,
-  message: string,
+  message: Notice,
   sticky: boolean,
 ): void {
   const id = key ?? ANON_TOAST_ID // no key → stable anonymous-slot id

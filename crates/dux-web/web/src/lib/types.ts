@@ -367,6 +367,10 @@ export interface EventsServerMessage {
   tone?: string
   /** Status message (`status`). */
   message?: string
+  /** The parts `message` was built from (`status`), in the `Prose` shape of
+   *  `lib/prose.tsx`; absent for a plain sentence. Typed `unknown` because it is
+   *  checked at the one reader, `wireProse`. */
+  segments?: unknown
   /** Whether this status waits for the user instead of for a clock (`status`).
    *  Absent reads as `false`, never as "unknown, better keep it on screen". What
    *  earns it is documented on `NotifyOptions.sticky` in `lib/notify.ts`. */

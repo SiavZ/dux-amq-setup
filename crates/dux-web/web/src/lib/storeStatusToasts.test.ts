@@ -1,3 +1,5 @@
+import type { ReactElement } from "react"
+import { renderToStaticMarkup } from "react-dom/server"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { BUSY_TOAST_MAX_MS } from "./notify"
@@ -561,6 +563,52 @@ describe("an engine status that says it waits for the user", () => {
     expect(toast.error).toHaveBeenCalledWith("Broken.", {
       id: "ordinary",
       duration: 24000,
+    })
+  })
+})
+
+describe("an engine status that names things", () => {
+  // The frame `crates/dux-web/src/server.rs` sends for the checkout
+  // confirmation: the plain sentence the terminal UI prints, and the parts it
+  // was built from.
+  const frame = {
+    event: "status",
+    key: "op-9",
+    tone: "info",
+    message: 'Checked out "main" for project "app".',
+    segments: [
+      "Checked out ",
+      { name: "main", quoted: true },
+      " for project ",
+      { name: "app", quoted: true },
+      ".",
+    ],
+  }
+
+  it("reaches the toast with every name drawn as a chip", async () => {
+    const mod = await loadStoreWithBootstrap()
+    const { toast } = await import("sonner")
+
+    mod.eventsSocket.onEvent(frame)
+    expect(toast.success).toHaveBeenCalledTimes(1)
+    const [body, options] = vi.mocked(toast.success).mock.calls[0]
+    expect(options).toEqual({ id: "op-9", duration: 6000 })
+    expect(typeof body).not.toBe("string")
+    const html = renderToStaticMarkup(body as ReactElement)
+    expect(html).toContain('<code data-slot="inline-code"')
+    expect(html).toMatch(/>main<\/code>/)
+    expect(html).toMatch(/>app<\/code>/)
+    expect(html).not.toContain("&quot;main&quot;")
+  })
+
+  it("falls back to the plain sentence when the parts do not spell it", async () => {
+    const mod = await loadStoreWithBootstrap()
+    const { toast } = await import("sonner")
+
+    mod.eventsSocket.onEvent({ ...frame, segments: ["something else"] })
+    expect(toast.success).toHaveBeenCalledWith(frame.message, {
+      id: "op-9",
+      duration: 6000,
     })
   })
 })

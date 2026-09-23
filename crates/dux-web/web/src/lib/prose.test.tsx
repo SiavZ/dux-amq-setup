@@ -21,6 +21,7 @@ import {
   proseText,
   quotedChip,
   renderProse,
+  wireProse,
 } from "./prose"
 import { recreateConfirmProse } from "./recreateWorkingCopy"
 

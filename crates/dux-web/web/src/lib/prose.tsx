@@ -45,6 +45,27 @@ export function proseText(prose: Prose): string {
     .join("")
 }
 
+function isProseSegment(value: unknown): value is ProseSegment {
+  if (typeof value === "string") return true
+  if (typeof value !== "object" || value === null) return false
+  const candidate = value as { name?: unknown; quoted?: unknown }
+  return typeof candidate.name === "string" && typeof candidate.quoted === "boolean"
+}
+
+/**
+ * Read an engine status off the wire: its parts when the server sent them and
+ * they spell the message exactly, the plain message otherwise.
+ *
+ * The server builds both from the same parts (`dux_core::status_text`), so a
+ * disagreement means something upstream is wrong, and the plain message is the
+ * one the terminal UI printed. Nothing here ever looks for a name inside the
+ * words: a sentence without parts stays text.
+ */
+export function wireProse(message: string, segments: unknown): string | Prose {
+  if (!Array.isArray(segments) || !segments.every(isProseSegment)) return message
+  return proseText(segments) === message ? segments : message
+}
+
 /** The web spelling: every name drawn through the shared inline code chip. */
 export function renderProse(prose: Prose): ReactNode[] {
   return prose.map((segment, index) =>
