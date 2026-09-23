@@ -39,6 +39,11 @@ pub(crate) fn default_bindings() -> RuntimeBindings {
 }
 
 pub(crate) fn run_git(cwd: &std::path::Path, args: &[&str]) {
+    run_git_output(cwd, args);
+}
+
+/// [`run_git`], returning the command's trimmed stdout.
+pub(crate) fn run_git_output(cwd: &std::path::Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -50,6 +55,7 @@ pub(crate) fn run_git(cwd: &std::path::Path, args: &[&str]) {
         args,
         String::from_utf8_lossy(&output.stderr)
     );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 pub(crate) fn init_test_repo(path: &std::path::Path) {

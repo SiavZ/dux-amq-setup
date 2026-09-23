@@ -8129,20 +8129,6 @@ mod tests {
         );
     }
 
-    fn git_out(dir: &Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
-
     /// A clone of a bare local `origin` whose HEAD names `main`, checked out on
     /// `feature`, which carries one pushed commit `main` does not have. Returns
     /// the holder, the clone's path and that commit.
@@ -8150,14 +8136,14 @@ mod tests {
         let root = tempdir().expect("tempdir");
         let seed = root.path().join("seed");
         std::fs::create_dir_all(&seed).unwrap();
-        git_out(&seed, &["init", "-q", "-b", "main"]);
-        git_out(&seed, &["config", "user.email", "t@example.com"]);
-        git_out(&seed, &["config", "user.name", "Test"]);
+        crate::app::test_support::run_git_output(&seed, &["init", "-q", "-b", "main"]);
+        crate::app::test_support::run_git_output(&seed, &["config", "user.email", "t@example.com"]);
+        crate::app::test_support::run_git_output(&seed, &["config", "user.name", "Test"]);
         std::fs::write(seed.join("README.md"), "base\n").unwrap();
-        git_out(&seed, &["add", "README.md"]);
-        git_out(&seed, &["commit", "-q", "-m", "base"]);
+        crate::app::test_support::run_git_output(&seed, &["add", "README.md"]);
+        crate::app::test_support::run_git_output(&seed, &["commit", "-q", "-m", "base"]);
         let origin = root.path().join("origin.git");
-        git_out(
+        crate::app::test_support::run_git_output(
             root.path(),
             &[
                 "clone",
@@ -8168,7 +8154,7 @@ mod tests {
             ],
         );
         let repo = root.path().join("repo");
-        git_out(
+        crate::app::test_support::run_git_output(
             root.path(),
             &[
                 "clone",
@@ -8177,14 +8163,14 @@ mod tests {
                 repo.to_string_lossy().as_ref(),
             ],
         );
-        git_out(&repo, &["config", "user.email", "t@example.com"]);
-        git_out(&repo, &["config", "user.name", "Test"]);
-        git_out(&repo, &["switch", "-q", "-c", "feature"]);
+        crate::app::test_support::run_git_output(&repo, &["config", "user.email", "t@example.com"]);
+        crate::app::test_support::run_git_output(&repo, &["config", "user.name", "Test"]);
+        crate::app::test_support::run_git_output(&repo, &["switch", "-q", "-c", "feature"]);
         std::fs::write(repo.join("feature.txt"), "only on feature\n").unwrap();
-        git_out(&repo, &["add", "feature.txt"]);
-        git_out(&repo, &["commit", "-q", "-m", "feature work"]);
-        git_out(&repo, &["push", "-q", "-u", "origin", "feature"]);
-        let commit = git_out(&repo, &["rev-parse", "HEAD"]);
+        crate::app::test_support::run_git_output(&repo, &["add", "feature.txt"]);
+        crate::app::test_support::run_git_output(&repo, &["commit", "-q", "-m", "feature work"]);
+        crate::app::test_support::run_git_output(&repo, &["push", "-q", "-u", "origin", "feature"]);
+        let commit = crate::app::test_support::run_git_output(&repo, &["rev-parse", "HEAD"]);
         (root, repo, commit)
     }
 
@@ -8328,7 +8314,7 @@ mod tests {
             "the dialog said new worktrees branch from \"feature\""
         );
         assert_eq!(
-            git_out(&repo, &["symbolic-ref", "--short", "HEAD"]),
+            crate::app::test_support::run_git_output(&repo, &["symbolic-ref", "--short", "HEAD"]),
             "feature",
             "the user's folder stays where it was"
         );
@@ -8346,7 +8332,10 @@ mod tests {
             !app.engine.projects.is_empty() && stored_project_base(app).is_some()
         });
 
-        assert_eq!(git_out(&repo, &["symbolic-ref", "--short", "HEAD"]), "main");
+        assert_eq!(
+            crate::app::test_support::run_git_output(&repo, &["symbolic-ref", "--short", "HEAD"]),
+            "main"
+        );
         assert_eq!(stored_project_base(&app).as_deref(), Some("main"));
         let worktree = create_agent_worktree(&mut app);
         assert!(
