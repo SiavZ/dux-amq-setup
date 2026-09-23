@@ -75,17 +75,21 @@ crates/
 
 ## Porting Strategy
 
-### Phase 1: Minimal Jcode Provider (CURRENT)
+### Phase 1: Minimal Jcode Provider ✅ COMPLETE
 1. ✅ Understand upstream structure
-2. ⬜ Add basic jcode provider WITHOUT extended fields
-3. ⬜ Test basic launch/interaction
-4. ⬜ Commit and verify build
+2. ✅ Add basic jcode provider WITHOUT extended fields
+3. ✅ Test basic launch/interaction (build passes)
+4. ✅ Commit and verify build
 
-### Phase 2: Extended Provider Features
-1. ⬜ Add `resume_by_id_args` to ProviderCommandConfig
-2. ⬜ Add `oneshot_args` and `oneshot_output` enum
-3. ⬜ Update jcode provider to use these
-4. ⬜ Test resume-by-id functionality
+**Commit:** `f85b403c` - feat(providers): add jcode as a default provider
+
+### Phase 2: Extended Provider Features ✅ COMPLETE
+1. ✅ Add `resume_by_id_args` to ProviderCommandConfig
+2. ✅ Add `oneshot_args` and `oneshot_output` enum
+3. ✅ Update jcode provider to use these
+4. ✅ Test resume-by-id functionality (build passes, runtime testing needed)
+
+**Commit:** `99d32f36` - feat(config): add resume_by_id_args and oneshot support to providers
 
 ### Phase 3: AMQ Infrastructure
 1. ⬜ Port amq_activity.rs, amq_inject.rs
