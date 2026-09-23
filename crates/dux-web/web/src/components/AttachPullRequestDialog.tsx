@@ -59,7 +59,8 @@ export function AttachPullRequestDialog() {
           <p className="text-sm text-muted-foreground">
             Currently showing{" "}
             <span className="text-foreground">
-              <InlineCode>#{pr.number}</InlineCode> {pr.title}
+              <InlineCode>#{pr.number}</InlineCode>{" "}
+              <InlineCode>{pr.title}</InlineCode>
             </span>
             {pr.overridden ? " (manually attached)" : ""}. Attaching replaces
             it.

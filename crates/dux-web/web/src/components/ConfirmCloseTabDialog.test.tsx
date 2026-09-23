@@ -75,7 +75,9 @@ describe("ConfirmCloseTabDialog", () => {
     render(<ConfirmCloseTabDialog />)
     expect(screen.getByText(/last live tab, so the agent detaches/)).toBeTruthy()
     // The provider name is named in the body.
-    expect(screen.getByText(/ends the claude session/)).toBeTruthy()
+    expect(screen.getByText(/This ends the/).textContent).toContain(
+      "This ends the claude session",
+    )
   })
 
   // The way back from a closed tab is a NEW tab, and a new tab always starts
@@ -138,7 +140,9 @@ describe("ConfirmCloseTabDialog", () => {
       "t1",
     )
     render(<ConfirmCloseTabDialog />)
-    const body = screen.getByText(/ends the claude session/)
+    const body = screen.getByText(/This ends the/)
+    expect(body.textContent).toContain("This ends the claude session")
+    expect(screen.getByText("claude", { selector: "code" })).toBeTruthy()
     expect(body.textContent).toMatch(
       /The next tab, Codex, takes its place as the agent’s first tab/,
     )
@@ -158,7 +162,8 @@ describe("ConfirmCloseTabDialog", () => {
       "t1",
     )
     render(<ConfirmCloseTabDialog />)
-    const body = screen.getByText(/ends the codex session/)
+    const body = screen.getByText(/This ends the/)
+    expect(body.textContent).toContain("This ends the codex session")
     expect(body.textContent).toMatch(
       /The next tab, Codex 2, takes its place as the agent’s first tab/,
     )
@@ -191,7 +196,9 @@ describe("ConfirmCloseTabDialog", () => {
     )
     render(<ConfirmCloseTabDialog />)
     expect(screen.getByText(/last live tab, so the agent detaches/)).toBeTruthy()
-    const body = screen.getByText(/ends the claude session/)
+    const body = screen.getByText(/This ends the/)
+    expect(body.textContent).toContain("This ends the claude session")
+    expect(screen.getByText("claude", { selector: "code" })).toBeTruthy()
     expect(body.textContent).toMatch(
       /The next tab, Codex, takes its place as the agent’s first tab/,
     )

@@ -101,13 +101,15 @@ describe("ConfirmRecreateWorkingCopyDialog", () => {
 
     const element = screen.getByText(/Recreate the working copy/)
     const body = element.textContent ?? ""
-    // The path and every branch are chips, and the chips replace the quotes.
+    // The path, every branch and the running provider are chips, and the chips
+    // replace the quotes.
     const chips = [...element.querySelectorAll("code")].map((c) => c.textContent)
     expect(chips).toEqual([
       "~/.config/dux/worktrees/repo/feat",
       "feat",
       "origin/feat",
       "main",
+      "Claude",
     ])
     expect(body).toContain("branch feat still exists")
     expect(body).toContain("from main,")

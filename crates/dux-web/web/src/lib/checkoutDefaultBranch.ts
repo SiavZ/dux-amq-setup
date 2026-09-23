@@ -1,6 +1,10 @@
-// Copy for the "Checkout default branch" confirmation on an existing project.
+// Copy for the "Check out default branch" confirmation on an existing project.
 // Byte-for-byte dux-core's `checkout_default_branch_confirm_body`, which the
-// terminal UI's confirmation prints: keep the two in step.
+// terminal UI's confirmation prints: keep the two in step. The sentence is
+// built once as prose (`./prose`): its plain-text spelling is that string, and
+// the web draws the project and the base as chips from the same structure.
+
+import { type Prose, proseText, quotedChip } from "./prose"
 
 /**
  * The confirmation body: what the checkout does, and which branch new
@@ -13,9 +17,29 @@ export function checkoutDefaultBranchBody(
   projectName: string,
   leadingBranch: string | null,
 ): string {
-  const lead = `This switches the source checkout for "${projectName}" back to its default branch, moving HEAD in the shared repository.`
+  return proseText(checkoutDefaultBranchProse(projectName, leadingBranch))
+}
+
+/** The same body with the project and its base marked, for the web to chip. */
+export function checkoutDefaultBranchProse(
+  projectName: string,
+  leadingBranch: string | null,
+): Prose {
+  const lead: Prose = [
+    "This switches the source checkout for ",
+    quotedChip(projectName),
+    " back to its default branch, moving HEAD in the shared repository.",
+  ]
   if (leadingBranch) {
-    return `${lead} New worktrees branch from "${leadingBranch}" now. After the checkout, they branch from the default branch.`
+    return [
+      ...lead,
+      " New worktrees branch from ",
+      quotedChip(leadingBranch),
+      " now. After the checkout, they branch from the default branch.",
+    ]
   }
-  return `${lead} After the checkout, new worktrees branch from the default branch.`
+  return [
+    ...lead,
+    " After the checkout, new worktrees branch from the default branch.",
+  ]
 }

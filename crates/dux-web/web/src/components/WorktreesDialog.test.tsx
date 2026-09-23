@@ -162,7 +162,9 @@ describe("WorktreesDialog", () => {
     render(<WorktreesDialog />)
     expect(screen.getAllByRole("button", { name: "Worktree actions" }).length).toBe(1)
     // And the attached row names the agent holding it.
-    expect(screen.getByText(/tidy-otter/)).toBeTruthy()
+    // The agent after the "Held by" label is a name, so it is the shared chip.
+    const held = screen.getByText("tidy-otter", { selector: "code" })
+    expect(held.parentElement?.textContent).toBe("Held by tidy-otter")
   })
 
   it("names the branch, the full path and the loss in the delete confirmation", () => {

@@ -59,6 +59,23 @@ describe("the recreate body as names in prose", () => {
       recreateConfirmBody("~/wt", "feat", "main", true, ["codex"]),
     )
   })
+
+  it("marks every provider named in the running-tab sentence", () => {
+    const cautious = recreateConfirmProse("~/wt", "feat", "main", true, [
+      "codex",
+      "opencode",
+    ])
+    expect(cautious).toContainEqual(chip("Codex"))
+    expect(cautious).toContainEqual(chip("Opencode"))
+    expect(proseText(cautious)).toBe(
+      recreateConfirmBody("~/wt", "feat", "main", true, ["codex", "opencode"]),
+    )
+    const calm = recreateConfirmProse("~/wt", "feat", "main", true, ["claude"])
+    expect(calm).toContainEqual(chip("Claude"))
+    expect(proseText(calm)).toBe(
+      recreateConfirmBody("~/wt", "feat", "main", true, ["claude"]),
+    )
+  })
 })
 
 describe("recreateConfirmBody", () => {

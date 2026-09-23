@@ -11,6 +11,7 @@ import { InlineCode } from "@/components/ui/inline-code"
 import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
 import { closeTabConsequences } from "@/lib/agentTabs"
 import { DOCS_AGENT_TABS_CLOSING } from "@/lib/docs"
+import { renderProse } from "@/lib/prose"
 import { closeCloseTab, closeTab, useDux } from "@/lib/store"
 
 // Confirmation before closing a tab. The agent's first tab reaches this dialog
@@ -67,7 +68,10 @@ export function ConfirmCloseTabDialog() {
         <DialogHeader>
           <DialogTitle>Close tab?</DialogTitle>
           <DialogDescription>
-            {`This ends ${sessionLabel} in this tab and deletes the tab for good. A new tab always starts fresh, so use your provider's own history command to get back to this conversation.`}
+            This ends {renderProse(sessionLabel)} in this tab and deletes the
+            tab for good. A new tab always starts fresh, so use your
+            provider&rsquo;s own history command to get back to this
+            conversation.
             {willDetach
               ? " It's this agent's last live tab, so the agent detaches and stays in Projects, reopenable."
               : ""}

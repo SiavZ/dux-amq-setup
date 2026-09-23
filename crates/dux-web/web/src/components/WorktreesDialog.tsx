@@ -79,7 +79,7 @@ function WorktreeRowBody({
         </span>
         {heldBy ? (
           <span className="truncate text-xs text-muted-foreground">
-            Held by {heldBy}
+            Held by <InlineCode>{heldBy}</InlineCode>
           </span>
         ) : null}
       </div>

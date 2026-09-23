@@ -35,10 +35,13 @@ export function recreateRunningProviders(session: SessionView): string[] {
   return live.length > 0 ? live : [session.provider]
 }
 
-/** Several provider names as one subject: "Codex", "Codex or Opencode". */
-function providersJoined(names: string[]): string {
-  if (names.length <= 1) return names[0] ?? ""
-  return `${names.slice(0, -1).join(", ")} or ${names[names.length - 1]}`
+/** Several provider names as one subject, each marked as a name: "Codex",
+ * "Codex or Opencode". */
+function providersJoined(names: string[]): Prose {
+  return names.flatMap((name, index): Prose => {
+    if (index === 0) return [chip(name)]
+    return [index === names.length - 1 ? " or " : ", ", chip(name)]
+  })
 }
 
 /** What the tabs still running in the deleted directory do once the working
@@ -54,6 +57,11 @@ function providersJoined(names: string[]): string {
  * until it is quit and resumed in the new folder. OpenCode and Copilot have not
  * been measured, so they get the cautious answer rather than a promise. */
 export function recreateRunningTabClause(providers: string[]): string {
+  return proseText(recreateRunningTabProse(providers))
+}
+
+/** The same clause with each provider marked, for the web to chip. */
+function recreateRunningTabProse(providers: string[]): Prose {
   const name = (provider: string) =>
     provider.charAt(0).toUpperCase() + provider.slice(1)
   const cautious = providers
@@ -61,12 +69,18 @@ export function recreateRunningTabClause(providers: string[]): string {
     .map(name)
   if (cautious.length === 0) {
     const only = providers.length > 0 ? name(providers[0]) : "Claude"
-    return `A running ${only} tab keeps working in the recreated copy by itself.`
+    return [
+      "A running ",
+      chip(only),
+      " tab keeps working in the recreated copy by itself.",
+    ]
   }
-  return (
-    `A running ${providersJoined(cautious)} tab cannot follow the folder: ` +
-    `stop it and start the agent again to continue in the recreated copy.`
-  )
+  return [
+    "A running ",
+    ...providersJoined(cautious),
+    " tab cannot follow the folder: " +
+      "stop it and start the agent again to continue in the recreated copy.",
+  ]
 }
 
 /** The body of the recreate confirmation.
@@ -130,9 +144,9 @@ export function recreateConfirmProse(
     `, and the commits that branch held are not coming ` +
       `back.\n\n` +
       `Any code changes that were in the old directory are gone either way: this ` +
-      `puts the directory back, not its contents. ${conversation}\n\n` +
-      `${recreateRunningTabClause(providers)} ` +
-      `A terminal still open in the old directory keeps ` +
+      `puts the directory back, not its contents. ${conversation}\n\n`,
+    ...recreateRunningTabProse(providers),
+    ` A terminal still open in the old directory keeps ` +
       `working in a directory that is gone; close it and open one in the ` +
       `recreated copy.`,
   ]

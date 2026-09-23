@@ -81,9 +81,13 @@ describe("project confirmations name the project as a chip", () => {
     expect(body.textContent).toContain("This removes duck-pond from dux.")
   })
 
-  it("Checkout default branch names the project and its current base", () => {
+  it("Check out default branch names the project and its current base", () => {
     seed({ checkoutDefaultBranchTarget: "p1" } as Partial<DuxState>)
     render(<CheckoutDefaultBranchDialog />)
+    // The verb form, matching the confirm button and the menu entry.
+    expect(screen.getByRole("heading").textContent).toBe(
+      "Check out default branch?",
+    )
     const body = screen.getByText(/This switches the source checkout/)
     expect(chips(body)).toEqual(["duck-pond", "feature/x"])
     expect(body.textContent).not.toMatch(/["“”]/)

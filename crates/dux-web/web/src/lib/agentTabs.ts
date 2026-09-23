@@ -2,6 +2,7 @@
 // unit-testable without mounting React. Mirrors the TUI's `tab_labels` /
 // strip-visibility logic (a shared fixture keeps the two in parity).
 
+import { chip, type Prose } from "./prose"
 import type { Spine } from "./workspaceApi"
 import type { AgentTabView, SessionView } from "./types"
 import type { SelectedTarget } from "./store"
@@ -176,7 +177,8 @@ export function tabProseLabel(
 // together because they are one reading of the same session.
 export interface CloseTabConsequences {
   /// Names the conversation the close ends, falling back when no provider is known.
-  sessionLabel: string
+  /// The provider is a name, so it is marked for the web to chip.
+  sessionLabel: Prose
   /// The close removes the agent's LAST live tab, so the agent detaches.
   willDetach: boolean
   /// The tab that takes the session slot, absent unless the slot tab is closing.
@@ -189,7 +191,7 @@ export function closeTabConsequences(
 ): CloseTabConsequences {
   const provider = tab?.provider
   return {
-    sessionLabel: provider ? `the ${provider} session` : "the session",
+    sessionLabel: provider ? ["the ", chip(provider), " session"] : ["the session"],
     willDetach: closeDetachesAgent(session, tab),
     successorLabel: slotSuccessorLabel(session, tab),
   }

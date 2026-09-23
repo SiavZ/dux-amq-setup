@@ -8,7 +8,8 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
-import { checkoutDefaultBranchBody } from "@/lib/checkoutDefaultBranch"
+import { checkoutDefaultBranchProse } from "@/lib/checkoutDefaultBranch"
+import { renderProse } from "@/lib/prose"
 import {
   checkoutDefaultBranch,
   closeCheckoutDefaultBranch,
@@ -47,9 +48,11 @@ export function CheckoutDefaultBranchDialog() {
     <Dialog open={isOpen} onOpenChange={handleOpenChange}>
       <DialogContent showCloseButton={false}>
         <DialogHeader>
-          <DialogTitle>Checkout default branch?</DialogTitle>
+          <DialogTitle>Check out default branch?</DialogTitle>
           <DialogDescription>
-            {checkoutDefaultBranchBody(name, project?.leading_branch ?? null)}
+            {renderProse(
+              checkoutDefaultBranchProse(name, project?.leading_branch ?? null),
+            )}
           </DialogDescription>
         </DialogHeader>
         <DialogFooter>
