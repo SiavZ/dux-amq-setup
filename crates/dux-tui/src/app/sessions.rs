@@ -145,8 +145,15 @@ impl App {
             return Ok(());
         }
 
-        let leading_branch =
-            leading_branch_for_project(&path, (!branch.is_empty()).then_some(branch.as_str()));
+        // The base as the dialog opens (its box starts ticked exactly when a
+        // checkout is on offer); confirming recomputes it from the box's final
+        // state in `resolve_confirm_non_default_branch`.
+        let leading_branch = dux_core::project_browser::project_base_for_add(
+            &path,
+            (!branch.is_empty()).then_some(branch.as_str()),
+            plan.can_checkout_default,
+        )
+        .into_branch();
 
         // A non-default-branch warning maps back to the TUI's existing
         // `BranchWarningKind` for the ConfirmNonDefaultBranch dialog. `None`
@@ -8119,6 +8126,232 @@ mod tests {
             app.status.text().contains("to shut down"),
             "status: {}",
             app.status.text()
+        );
+    }
+
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A clone of a bare local `origin` whose HEAD names `main`, checked out on
+    /// `feature`, which carries one pushed commit `main` does not have. Returns
+    /// the holder, the clone's path and that commit.
+    fn clone_on_a_feature_branch() -> (tempfile::TempDir, PathBuf, String) {
+        let root = tempdir().expect("tempdir");
+        let seed = root.path().join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        git_out(&seed, &["init", "-q", "-b", "main"]);
+        git_out(&seed, &["config", "user.email", "t@example.com"]);
+        git_out(&seed, &["config", "user.name", "Test"]);
+        std::fs::write(seed.join("README.md"), "base\n").unwrap();
+        git_out(&seed, &["add", "README.md"]);
+        git_out(&seed, &["commit", "-q", "-m", "base"]);
+        let origin = root.path().join("origin.git");
+        git_out(
+            root.path(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                seed.to_string_lossy().as_ref(),
+                origin.to_string_lossy().as_ref(),
+            ],
+        );
+        let repo = root.path().join("repo");
+        git_out(
+            root.path(),
+            &[
+                "clone",
+                "-q",
+                origin.to_string_lossy().as_ref(),
+                repo.to_string_lossy().as_ref(),
+            ],
+        );
+        git_out(&repo, &["config", "user.email", "t@example.com"]);
+        git_out(&repo, &["config", "user.name", "Test"]);
+        git_out(&repo, &["switch", "-q", "-c", "feature"]);
+        std::fs::write(repo.join("feature.txt"), "only on feature\n").unwrap();
+        git_out(&repo, &["add", "feature.txt"]);
+        git_out(&repo, &["commit", "-q", "-m", "feature work"]);
+        git_out(&repo, &["push", "-q", "-u", "origin", "feature"]);
+        let commit = git_out(&repo, &["rev-parse", "HEAD"]);
+        (root, repo, commit)
+    }
+
+    /// An app whose default provider runs `cat`, the one stand-in: the agent
+    /// CLI is the only part of the journey that cannot run here.
+    fn journey_app() -> App {
+        let mut app = test_app_with_sessions(Vec::new(), Vec::new());
+        let provider = app.engine.config.default_provider();
+        app.engine.config.providers.commands.insert(
+            provider.as_str().to_string(),
+            dux_core::config::ProviderCommandConfig {
+                command: "cat".to_string(),
+                args: vec![],
+                resume_args: None,
+                ..Default::default()
+            },
+        );
+        app
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    /// Answer the non-default-branch dialog the way a person does: move focus
+    /// to the checkbox, set it, then press the confirm button.
+    fn answer_branch_dialog(app: &mut App, check_out_default: bool) {
+        let PromptState::ConfirmNonDefaultBranch {
+            checkout_default, ..
+        } = &app.prompt
+        else {
+            panic!(
+                "expected the non-default-branch dialog, got {:?}",
+                app.prompt
+            );
+        };
+        let starts_checked = *checkout_default;
+        // Cancel -> Add -> Checkbox.
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        if starts_checked != check_out_default {
+            app.handle_key(key(KeyCode::Char(' '), KeyModifiers::NONE))
+                .unwrap();
+        }
+        // Checkbox -> Add.
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::SHIFT))
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(
+            matches!(app.prompt, PromptState::None),
+            "confirming closes the dialog, got {:?}",
+            app.prompt
+        );
+    }
+
+    fn drain_until(app: &mut App, what: &str, mut done: impl FnMut(&App) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !done(app) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}; status: {}",
+                app.status.text()
+            );
+            app.drain_events();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Create an agent in the only project the way the new-agent flow does and
+    /// return its worktree once it exists on disk.
+    fn create_agent_worktree(app: &mut App) -> PathBuf {
+        let project = app.engine.projects[0].clone();
+        app.dispatch_create_agent_request(
+            CreateAgentRequest::NewProject {
+                project,
+                custom_name: Some("agent-one".to_string()),
+                use_existing_branch: false,
+                pull_before_create: true,
+                copy_uncommitted_changes: false,
+            },
+            "Creating an agent...".to_string(),
+        )
+        .expect("dispatch the create");
+        drain_until(app, "the agent's worktree", |app| {
+            app.engine.sessions.iter().any(|s| {
+                s.managed_worktree()
+                    .is_some_and(|p| Path::new(p).join(".git").exists())
+            })
+        });
+        PathBuf::from(
+            app.engine
+                .sessions
+                .iter()
+                .find_map(|s| s.managed_worktree())
+                .unwrap(),
+        )
+    }
+
+    fn worktree_has_commit(worktree: &Path, commit: &str) -> bool {
+        std::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", commit, "HEAD"])
+            .current_dir(worktree)
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    fn stored_project_base(app: &App) -> Option<String> {
+        app.engine
+            .session_store
+            .load_projects()
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|p| p.leading_branch)
+    }
+
+    #[test]
+    fn adding_with_the_box_unticked_branches_new_worktrees_from_the_current_branch() {
+        let (_root, repo, feature_commit) = clone_on_a_feature_branch();
+        let mut app = journey_app();
+
+        app.add_project(repo.to_string_lossy().to_string(), "repo".to_string())
+            .expect("add_project");
+        answer_branch_dialog(&mut app, false);
+        drain_until(&mut app, "the project", |app| {
+            !app.engine.projects.is_empty() && stored_project_base(app).is_some()
+        });
+
+        assert_eq!(
+            app.engine.projects[0].leading_branch.as_deref(),
+            Some("feature")
+        );
+        assert_eq!(stored_project_base(&app).as_deref(), Some("feature"));
+        let worktree = create_agent_worktree(&mut app);
+        assert!(
+            worktree_has_commit(&worktree, &feature_commit),
+            "the dialog said new worktrees branch from \"feature\""
+        );
+        assert_eq!(
+            git_out(&repo, &["symbolic-ref", "--short", "HEAD"]),
+            "feature",
+            "the user's folder stays where it was"
+        );
+    }
+
+    #[test]
+    fn adding_with_the_box_ticked_branches_new_worktrees_from_the_default_branch() {
+        let (_root, repo, feature_commit) = clone_on_a_feature_branch();
+        let mut app = journey_app();
+
+        app.add_project(repo.to_string_lossy().to_string(), "repo".to_string())
+            .expect("add_project");
+        answer_branch_dialog(&mut app, true);
+        drain_until(&mut app, "the project", |app| {
+            !app.engine.projects.is_empty() && stored_project_base(app).is_some()
+        });
+
+        assert_eq!(git_out(&repo, &["symbolic-ref", "--short", "HEAD"]), "main");
+        assert_eq!(stored_project_base(&app).as_deref(), Some("main"));
+        let worktree = create_agent_worktree(&mut app);
+        assert!(
+            !worktree_has_commit(&worktree, &feature_commit),
+            "new worktrees branch from \"main\", which lacks the feature commit"
         );
     }
 }

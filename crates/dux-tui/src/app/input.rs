@@ -7880,6 +7880,23 @@ impl App {
             }
             _ => return false,
         };
+        // The box decides the base: ticked, new worktrees branch from the
+        // default it checks out; unticked, from the branch the folder is on.
+        let action = match action {
+            NonDefaultBranchAction::AddProject { path, name, .. } => {
+                NonDefaultBranchAction::AddProject {
+                    path,
+                    name,
+                    leading_branch: dux_core::add_project_plan::project_base_at_add(
+                        Some(branch.as_str()),
+                        default_branch.as_deref(),
+                        checkout_default,
+                    )
+                    .into_branch(),
+                }
+            }
+            other @ NonDefaultBranchAction::CheckoutProjectDefault { .. } => other,
+        };
         self.prompt = PromptState::None;
         if checkout_default {
             // Safe: `checkout_default` is only true when `default_branch` is `Some`.

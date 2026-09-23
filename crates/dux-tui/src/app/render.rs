@@ -8359,11 +8359,45 @@ impl App {
             }
         }
         body_lines.push(Line::from(""));
-        let worktree_warning = format!(" New worktrees will branch from \"{current_branch}\".");
-        body_lines.push(Line::from(Span::styled(
-            worktree_warning,
-            Style::default().fg(self.theme.warning_fg),
-        )));
+        // The sentence follows the box: the core rule names the branch new
+        // worktrees will start from, and only a branch other than the remote's
+        // default is worth a warning.
+        let known_default = match kind {
+            BranchWarningKind::Known { default_branch } => Some(default_branch.as_str()),
+            BranchWarningKind::Heuristic => None,
+        };
+        let worktree_line = |checked: bool| {
+            let base = dux_core::add_project_plan::project_base_at_add(
+                Some(current_branch.as_str()),
+                known_default,
+                checked,
+            );
+            let style = if base.is_remote_default() {
+                Style::default()
+            } else {
+                Style::default().fg(self.theme.warning_fg)
+            };
+            Line::from(Span::styled(
+                format!(" New worktrees will branch from \"{}\".", base.branch()),
+                style,
+            ))
+        };
+        // Measured with the box both ways, so toggling it never resizes the
+        // dialog under the pointer.
+        let worktree_line_height = [true, false]
+            .into_iter()
+            .map(|checked| wrapped_line_count(&[worktree_line(checked)], inner_width, false))
+            .max()
+            .unwrap_or(1);
+        let worktree_line_extra = worktree_line_height.saturating_sub(wrapped_line_count(
+            &[worktree_line(*checkout_default)],
+            inner_width,
+            false,
+        ));
+        body_lines.push(worktree_line(*checkout_default));
+        for _ in 0..worktree_line_extra {
+            body_lines.push(Line::from(""));
+        }
         if matches!(kind, BranchWarningKind::Heuristic) {
             body_lines.push(Line::from(""));
             body_lines.push(Line::from(Span::styled(
@@ -24635,6 +24669,94 @@ mod tests {
             super::project_env_saved_message(3, "dux"),
             "Saved 3 environment variables for project \"dux\". New agents and terminals will \
              receive them."
+        );
+    }
+
+    /// Render the non-default-branch dialog with the box in `checked` and
+    /// return the worktree sentence's row as (text, foreground of its first
+    /// letter), plus where the Cancel button landed.
+    fn render_branch_dialog(
+        app: &mut App,
+        current_branch: &str,
+        checked: bool,
+    ) -> (String, ratatui::style::Color, Rect) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        app.prompt = PromptState::ConfirmNonDefaultBranch {
+            action: NonDefaultBranchAction::AddProject {
+                path: "/tmp/project".to_string(),
+                name: "project".to_string(),
+                leading_branch: "main".to_string(),
+            },
+            current_branch: current_branch.to_string(),
+            kind: BranchWarningKind::Known {
+                default_branch: "main".to_string(),
+            },
+            focus: ConfirmNonDefaultBranchFocus::Checkbox,
+            checkout_default: checked,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render frame");
+        let buffer = terminal.backend().buffer().clone();
+        let needle = "New worktrees will branch from";
+        for y in 0..buffer.area.height {
+            let row: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect();
+            if let Some(col) = row.find(needle) {
+                let x = row[..col].chars().count() as u16;
+                let OverlayMouseLayout::ConfirmNonDefaultBranch { cancel_button, .. } =
+                    app.overlay_layout.active
+                else {
+                    panic!("the dialog must publish its layout");
+                };
+                return (row.trim().to_string(), buffer[(x, y)].fg, cancel_button);
+            }
+        }
+        panic!("the worktree sentence is missing");
+    }
+
+    #[test]
+    fn a_ticked_checkout_box_says_worktrees_branch_from_the_default_without_a_warning() {
+        let mut app = test_app(default_bindings());
+
+        let (text, fg, _) = render_branch_dialog(&mut app, "feature", true);
+
+        assert!(
+            text.contains("New worktrees will branch from \"main\"."),
+            "{text}"
+        );
+        assert_ne!(fg, app.theme.warning_fg, "the default branch is no warning");
+    }
+
+    #[test]
+    fn an_unticked_checkout_box_warns_that_worktrees_branch_from_the_current_branch() {
+        let mut app = test_app(default_bindings());
+
+        let (text, fg, _) = render_branch_dialog(&mut app, "feature", false);
+
+        assert!(
+            text.contains("New worktrees will branch from \"feature\"."),
+            "{text}"
+        );
+        assert_eq!(fg, app.theme.warning_fg);
+    }
+
+    #[test]
+    fn toggling_the_checkout_box_rewrites_the_sentence_without_resizing_the_dialog() {
+        let mut app = test_app(default_bindings());
+        let long = "feature/a-branch-name-long-enough-to-wrap-the-worktree-sentence-onto-two-rows";
+
+        let (_, _, ticked) = render_branch_dialog(&mut app, long, true);
+        let (text, _, unticked) = render_branch_dialog(&mut app, long, false);
+
+        assert!(text.contains("New worktrees will branch from"), "{text}");
+        assert_eq!(
+            ticked, unticked,
+            "the buttons must not move when the box is toggled"
         );
     }
 }
