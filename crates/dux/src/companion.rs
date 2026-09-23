@@ -137,6 +137,7 @@ impl BackgroundServeCompanion for WebCompanion {
         engine: &mut Engine,
         listeners: Vec<std::net::TcpListener>,
         urls: Vec<String>,
+        claim_before_serving: bool,
     ) -> Result<Vec<String>, String> {
         if self.server.is_some() {
             return Err("The web UI is already serving in the background.".to_string());
@@ -145,7 +146,7 @@ impl BackgroundServeCompanion for WebCompanion {
         // adoption problem rather than a busy port; either way nothing has been
         // taken away from the terminal UI, and dropping `listeners` with the error
         // releases the addresses again.
-        match BackgroundServer::start(engine, listeners, urls) {
+        match BackgroundServer::start(engine, listeners, urls, claim_before_serving) {
             Ok(server) => {
                 let urls = server.urls();
                 self.server = Some(server);

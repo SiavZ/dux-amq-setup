@@ -77,13 +77,51 @@ impl TuiOwnership {
     ///
     /// What "running" means is [`Engine::running_pty_ids`]: a dormant tab has
     /// no process and so no pty, and is never claimed.
+    ///
+    /// Leaves ONE info line in the log: how many it took, and each pty it left
+    /// alone with the connection holding it.
     pub fn claim_every_running_pty(&self, engine: &Engine) -> Vec<PtyOwnershipEvent> {
-        engine
-            .running_pty_ids()
-            .iter()
-            .filter_map(|pty_id| self.claim_if_free(pty_id))
-            .collect()
+        let running = engine.running_pty_ids();
+        let mut claimed = Vec::new();
+        let mut skipped = Vec::new();
+        for pty_id in &running {
+            match self.claim_if_free(pty_id) {
+                Some(event) => claimed.push(event),
+                None => {
+                    let (holder, _, _) = self.owners.current_owner(pty_id);
+                    skipped.push((pty_id.clone(), holder));
+                }
+            }
+        }
+        crate::logger::info(&bulk_claim_log_line(claimed.len(), running.len(), &skipped));
+        claimed
     }
+}
+
+/// The one log line [`TuiOwnership::claim_every_running_pty`] leaves: `claimed`
+/// of `running` ptys taken, and each pty left alone with the connection that
+/// holds it (`None` when the registry records no owner for it).
+fn bulk_claim_log_line(
+    claimed: usize,
+    running: usize,
+    skipped: &[(String, Option<u64>)],
+) -> String {
+    let mut line = format!(
+        "[server] switching serving on claimed {claimed} of {running} running ptys for the \
+         terminal UI"
+    );
+    if !skipped.is_empty() {
+        let left: Vec<String> = skipped
+            .iter()
+            .map(|(pty_id, holder)| match holder {
+                Some(conn_id) => format!("{pty_id} (held by connection {conn_id})"),
+                None => format!("{pty_id} (no owner recorded)"),
+            })
+            .collect();
+        line.push_str("; left alone: ");
+        line.push_str(&left.join(", "));
+    }
+    line
 }
 
 /// An ownership fact the terminal UI produced, on its way to the browsers.
@@ -230,11 +268,21 @@ pub trait BackgroundServeCompanion {
     /// Bound by the CALLER so a bind failure is reported without anything having
     /// been torn down: the terminal UI stays exactly where it was. Returns the
     /// URLs on success, or a message fit for the status line.
+    ///
+    /// `claim_before_serving` asks for every pty running in `engine` that nobody
+    /// drives to be claimed for the terminal UI BEFORE any listener accepts a
+    /// connection (see [`TuiOwnership::claim_every_running_pty`]), and the claims
+    /// announced once the serve is up. The terminal UI passes it for a start
+    /// somebody at its keyboard asked for, and never for the startup autostart.
+    /// Seeding the registry first is the whole point: a browser tab already
+    /// reconnecting cannot win a plain-attach claim in between, and its handshake
+    /// reads the owner from the seeded registry.
     fn start(
         &mut self,
         engine: &mut Engine,
         listeners: Vec<std::net::TcpListener>,
         urls: Vec<String>,
+        claim_before_serving: bool,
     ) -> Result<Vec<String>, String>;
 
     /// Change `[server] tailscale` on the running listener.
@@ -302,6 +350,31 @@ mod tests {
             })
         );
         assert_eq!(seat.claim_if_free("s1-slot"), None);
+    }
+
+    /// The bulk claim leaves one line in the log saying how many of the running
+    /// ptys it took, and which it left alone and who was holding each, so a
+    /// report that a browser "could not type" can be traced to the moment
+    /// serving came on.
+    #[test]
+    fn the_bulk_claim_log_line_counts_and_names_every_pty_left_alone() {
+        let line = bulk_claim_log_line(
+            3,
+            5,
+            &[
+                ("term-2".to_string(), Some(7)),
+                ("s1-slot".to_string(), None),
+            ],
+        );
+        assert_eq!(
+            line,
+            "[server] switching serving on claimed 3 of 5 running ptys for the terminal UI; \
+             left alone: term-2 (held by connection 7), s1-slot (no owner recorded)"
+        );
+        assert_eq!(
+            bulk_claim_log_line(2, 2, &[]),
+            "[server] switching serving on claimed 2 of 2 running ptys for the terminal UI"
+        );
     }
 
     /// Never a steal: a pty another connection holds stays that connection's,

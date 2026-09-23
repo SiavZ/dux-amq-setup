@@ -348,9 +348,9 @@ impl App {
         });
     }
 
-    /// Adopt the pre-flight's listeners and hand them to the companion, and,
-    /// for a start somebody at this keyboard asked for, claim every running pty
-    /// before the loop yields to a browser.
+    /// Adopt the pre-flight's listeners and hand them to the companion. For a
+    /// start somebody at this keyboard asked for, the companion is asked to
+    /// claim every running pty before its listeners accept a connection.
     pub(crate) fn apply_background_server_preflight(
         &mut self,
         result: Result<(Vec<std::net::TcpListener>, Vec<String>), String>,
@@ -375,20 +375,25 @@ impl App {
             return;
         }
         let pending = self.pending_background_server_start.take();
+        let claim_before_serving =
+            pending.as_ref().map(|start| start.trigger) == Some(BackgroundServerStart::UserRequest);
         let outcome = match result {
             Ok((listeners, urls)) => match self.companion.as_mut() {
                 Some(companion) => {
-                    match companion.start(&mut self.engine, listeners, urls.clone()) {
+                    match companion.start(
+                        &mut self.engine,
+                        listeners,
+                        urls.clone(),
+                        claim_before_serving,
+                    ) {
                         Ok(urls) => {
-                            // In this same run-loop step, before anything yields
-                            // to a browser: a start asked for at this keyboard
-                            // keeps every running pty driven from here. See
-                            // `BackgroundServerStart` for why the startup
-                            // autostart claims nothing.
-                            if pending.as_ref().map(|start| start.trigger)
-                                == Some(BackgroundServerStart::UserRequest)
-                            {
-                                self.claim_every_running_pty();
+                            // The serve claimed every running pty for this surface
+                            // before it accepted a connection. A claim transfers a
+                            // pty, so forget the geometry last sent, exactly as a
+                            // launch's claim does: a child something else
+                            // re-gridded would otherwise keep that grid.
+                            if claim_before_serving {
+                                self.last_pty_resize_target = None;
                             }
                             // Persist the choice, so a restart comes up the way the
                             // user left it. Lazy rather than eager: nothing is
@@ -680,7 +685,8 @@ impl App {
 /// before the user has sat down to read that a listener came up.
 ///
 /// And which ptys this surface keeps. A `UserRequest` claims every agent tab and
-/// terminal running when the serve comes up, in that same run-loop step: until
+/// terminal running when the serve comes up, before its listeners accept any
+/// connection, so no browser tab already reconnecting can get in first: until
 /// then this surface was the only one that could drive any of them, and the user
 /// was typing into one a second earlier, so leaving them free would cover every
 /// pane with `Running in the background` before any browser exists. The startup
@@ -968,11 +974,20 @@ pub(crate) mod tests {
 
         fn start(
             &mut self,
-            _engine: &mut Engine,
+            engine: &mut Engine,
             _listeners: Vec<std::net::TcpListener>,
             _urls: Vec<String>,
+            claim_before_serving: bool,
         ) -> Result<Vec<String>, String> {
+            // What the real serve does: seed the claims before it is serving,
+            // then announce them once it is.
+            let seeded = if claim_before_serving {
+                self.ownership.claim_every_running_pty(engine)
+            } else {
+                Vec::new()
+            };
             self.serving = true;
+            self.publish_ownership_events(&seeded);
             Ok(self.urls())
         }
 

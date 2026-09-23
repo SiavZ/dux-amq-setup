@@ -54,12 +54,16 @@
 //!
 //! Switching serving on from here (the palette command, or a reload that turns
 //! `serve_while_tui` on) claims every agent tab and terminal running at that
-//! moment, in the same run-loop step that brings the serve up: until then this
+//! moment, before the serve's listeners accept any connection: until then this
 //! surface was the only one that could drive any of it, and the user was
-//! typing into one a second earlier. A startup with the setting already on
-//! claims nothing, for the same reason the auto-reopen sweep claims nothing.
-//! Which start is which is [`BackgroundServerStart`], carried from the command
-//! to the pre-flight's landing with the start's status op.
+//! typing into one a second earlier. The serve does the claiming, because only
+//! it knows when its listeners start accepting (see
+//! [`dux_core::background_serve::BackgroundServeCompanion::start`]); this
+//! surface asks for it and then forgets the geometry it last sent. A startup
+//! with the setting already on claims nothing, for the same reason the
+//! auto-reopen sweep claims nothing. Which start is which is
+//! [`BackgroundServerStart`], carried from the command to the pre-flight's
+//! landing with the start's status op.
 //!
 //! Which launches count is decided in [`launch_claims_its_pty`]. A create is
 //! armed by a flag rather than by id, because its session id is minted in a
@@ -299,26 +303,6 @@ impl App {
         self.announce_claims(&claimed);
     }
 
-    /// Claim every pty running right now that nobody drives, because the person
-    /// at this keyboard just switched serving on.
-    ///
-    /// Until that moment this surface was the only one that could drive any of
-    /// them, and the user was typing into one a second ago; leaving them free
-    /// would cover every pane with `Running in the background` before any
-    /// browser exists. A browser that wants one presses Take over, exactly as
-    /// for any other pty this surface drives.
-    ///
-    /// Only for a start somebody at this keyboard asked for: a startup with the
-    /// setting already on claims nothing (see [`BackgroundServerStart`]). It
-    /// never steals, and a dormant tab has no process and is not claimed.
-    pub(crate) fn claim_every_running_pty(&mut self) {
-        let Some(seat) = self.pty_ownership() else {
-            return;
-        };
-        let claimed = seat.claim_every_running_pty(&self.engine);
-        self.announce_claims(&claimed);
-    }
-
     /// Announce claims this surface just made, in one batch.
     fn announce_claims(&mut self, claimed: &[PtyOwnershipEvent]) {
         if claimed.is_empty() {
@@ -344,9 +328,9 @@ impl App {
     ///
     /// It never claims on its own. An unowned pty is refused exactly as an owned
     /// one is, because the caller is the render pass; the card's button,
-    /// [`Self::claim_launched_pty`] and [`Self::claim_every_running_pty`] are
-    /// what take a free pty, and only a take-over armed by that button takes one
-    /// from another device.
+    /// [`Self::claim_launched_pty`] and serving switched on from here (claimed by
+    /// the serve before it accepts a connection) are what take a free pty, and
+    /// only a take-over armed by that button takes one from another device.
     ///
     /// Returns whether the resize was granted, which is the caller's cue to
     /// record its dedupe. A refusal records nothing: the pane renders the
@@ -384,9 +368,10 @@ impl App {
         // So a plain resize applies only for a pty this surface already drives,
         // or one an armed take-over is about to transfer. The first claim of a
         // free pty is the card's button, a child started from here
-        // (`claim_launched_pty`), or serving switched on from here
-        // (`claim_every_running_pty`); each clears the resize dedupe, so the very
-        // next render sends this pane's geometry through the apply order below.
+        // (`claim_launched_pty`), or serving switched on from here (claimed by
+        // the serve before it accepts a connection); each clears the resize
+        // dedupe, so the very next render sends this pane's geometry through the
+        // apply order below.
         if !takeover && !seat.owners.is_owner(pty_id, seat.conn_id) {
             self.log_refused_resize_once(&seat, pty_id, rows, cols);
             return false;
@@ -2462,7 +2447,7 @@ mod tests {
 
         assert!(
             !seat.owners.is_owner("session-1-slot", seat.conn_id),
-            "only the card's button claims a pty nobody drives"
+            "typing does not claim a pty nobody drives"
         );
         assert!(
             !app.engine.is_typing("session-1-slot"),
@@ -2826,7 +2811,7 @@ mod tests {
 
         assert!(
             !app.may_type_into_pty("session-1-slot"),
-            "the only act that claims a free pty is the card's button"
+            "typing does not claim a pty nobody drives"
         );
         assert!(!seat.owners.is_owner("session-1-slot", seat.conn_id));
 
@@ -3421,6 +3406,48 @@ mod tests {
         assert_eq!(seat.owners.current_owner("session-1-slot").0, None);
         assert!(!claimed_ids(&recorded).contains(&"session-1-slot".to_string()));
         assert_eq!(app.focused_pty_takeover_card(), None, "no pty, no card");
+    }
+
+    /// The claim is made where the serve starts, not by this surface, so this
+    /// surface still has to forget the geometry it last sent: otherwise a child
+    /// something else re-gridded before serving came on keeps that grid, because
+    /// the dedupe sees the same pane against the same target and sends nothing.
+    #[test]
+    fn switching_serving_on_here_lets_the_next_frame_size_the_claimed_child() {
+        let (mut app, _recorded, _seat) = app_running_everything_with_nothing_serving();
+        let client = |app: &App| {
+            app.engine
+                .providers
+                .get(TabIdRef::new("session-1-slot"))
+                .and_then(|client| client.grid_size())
+        };
+        // Learn the geometry this pane has while serving.
+        app.start_background_server(BackgroundServerStart::UserRequest);
+        finish_a_start(&mut app, None);
+        let _ = render_rows(&mut app, 160, 40);
+        let sized = client(&app).expect("a sized child");
+        app.stop_background_server_quietly();
+
+        // Something re-grids the child, while this surface remembers having
+        // already sent this pane's geometry to it.
+        app.engine
+            .providers
+            .get(TabIdRef::new("session-1-slot"))
+            .expect("live child")
+            .resize(10, 10)
+            .expect("re-grid the child");
+        app.last_pty_resize_target = Some("session-1-slot".to_string());
+        app.last_pty_size = sized;
+
+        app.start_background_server(BackgroundServerStart::UserRequest);
+        finish_a_start(&mut app, None);
+        let _ = render_rows(&mut app, 160, 40);
+
+        assert_eq!(
+            client(&app),
+            Some(sized),
+            "the frame after the claim sized the child"
+        );
     }
 
     /// The whole journey on this surface, with a real child that echoes: the

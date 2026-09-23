@@ -1,17 +1,15 @@
 //! Switching the background server on from the terminal UI, seen from a browser.
 //!
-//! The terminal UI claims every running pty the moment a start somebody at its
-//! keyboard asked for comes up. This drives the web half of that for real: a
-//! real engine with a running agent and a running terminal, a real
-//! `BackgroundServer` on a loopback port serviced the way the terminal UI's run
-//! loop services it, the claim made through the same `dux-core` call the
-//! terminal UI makes and announced through the same seam, and a real browser on
-//! the events socket and the agent's pty socket.
+//! A start somebody at the terminal UI's keyboard asked for claims every running
+//! pty for the terminal UI BEFORE any listener accepts a connection. This drives
+//! that for real: a real engine with a running agent and a running terminal, a
+//! real `BackgroundServer` on a loopback port serviced the way the terminal UI's
+//! run loop services it, and a real browser on the pty sockets.
 //!
 //! What is not real is the terminal UI itself: `dux-tui` cannot be linked into a
-//! `dux-web` test (the web layer never sees the terminal UI), so its two lines
-//! around the claim are stood in for here. Its own tests cover which starts
-//! claim and which do not.
+//! `dux-web` test (the web layer never sees the terminal UI), so the flag it
+//! passes for such a start is passed here by hand. Its own tests cover which
+//! starts pass it.
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -105,8 +103,6 @@ fn engine_with_an_agent_and_a_terminal_running() -> (Engine, String, tempfile::T
 
 /// What the browser thread asks the thread holding the engine to do.
 enum Ask {
-    /// The browser is listening: switch serving on here and claim.
-    ClaimNow,
     /// Type `bytes` into the agent from the terminal UI's seat.
     TuiTypes(&'static [u8]),
 }
@@ -145,59 +141,103 @@ async fn accumulate_until(ws: &mut ClientWs, needle: &str, within: Duration) -> 
     String::from_utf8_lossy(&acc).into_owned()
 }
 
-/// The browser's half of the journey, run on its own thread and runtime while
-/// the test thread services the engine the way the terminal UI's run loop does.
+/// Open a pty socket and read its `connected` handshake.
+async fn attach(url: &str) -> (ClientWs, serde_json::Value) {
+    let (mut pty, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("connect the pty socket");
+    let hello = next_event_frame(&mut pty, "connected", Duration::from_secs(8))
+        .await
+        .expect("the pty handshake");
+    (pty, hello)
+}
+
+/// Start a serve over `engine` on a fresh loopback port.
+fn serve(
+    engine: &mut Engine,
+    claim_before_serving: bool,
+) -> (BackgroundServer, std::net::SocketAddr) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback bind");
+    let addr = listener.local_addr().expect("bound address");
+    let server = BackgroundServer::start(
+        engine,
+        vec![listener],
+        vec![format!("http://{addr}")],
+        claim_before_serving,
+    )
+    .expect("the serve starts");
+    (server, addr)
+}
+
+/// Service the serve the way the terminal UI's run loop does until `browser`
+/// finishes, acting on what it asks for in between, and re-raise its panic.
+fn run_browser(
+    engine: &mut Engine,
+    server: &mut BackgroundServer,
+    browser: std::thread::JoinHandle<()>,
+    asks: mpsc::Receiver<Ask>,
+) {
+    let seat = server.ownership();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !browser.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "the journey did not finish in time"
+        );
+        server.service(engine);
+        match asks.try_recv() {
+            Ok(Ask::TuiTypes(bytes)) => {
+                let client = engine
+                    .providers
+                    .get(TabIdRef::new("s1-slot"))
+                    .expect("the agent is running");
+                assert!(
+                    seat.owners.write_if_owner("s1-slot", seat.conn_id, || {
+                        client.enqueue_bytes(bytes);
+                    }),
+                    "the terminal UI still drives its agent"
+                );
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    if let Err(panic) = browser.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// Run a browser's journey on its own thread and runtime, because the engine
+/// is `!Send` and stays on the test thread.
+fn on_its_own_runtime<F: std::future::Future<Output = ()> + Send + 'static>(
+    journey: F,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("browser runtime")
+            .block_on(journey);
+    })
+}
+
+/// The browser's half of the journey. It connects the moment the serve is up,
+/// with nothing to wait for.
 async fn browser(
     addr: std::net::SocketAddr,
     terminal: String,
     tui_conn: u64,
     ask: mpsc::Sender<Ask>,
 ) {
-    let (mut events, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/events"))
-        .await
-        .expect("connect the events socket");
-    next_event_frame(&mut events, "connected", Duration::from_secs(8))
-        .await
-        .expect("the events handshake");
-    events
-        .send(Message::Text(r#"{"subscribe":["sessions"]}"#.into()))
-        .await
-        .unwrap();
-    // Let the subscribe land before anything is announced.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let tui = tui_conn.to_string();
 
-    ask.send(Ask::ClaimNow).unwrap();
+    // The terminal: its handshake already names the terminal UI.
+    let (_terminal_pty, hello) = attach(&format!("ws://{addr}/ws/terminals/{terminal}/pty")).await;
+    assert_eq!(hello["owner"].as_str(), Some(tui.as_str()), "{hello}");
+    assert_eq!(hello["owner_device"].as_str(), Some(TUI_DEVICE_LABEL));
 
-    // Each claim reaches the browser as the `pty.owner` a launch's claim sends,
-    // naming the terminal UI.
-    let mut owned = std::collections::BTreeMap::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-    while owned.len() < 2 && tokio::time::Instant::now() < deadline {
-        if let Some(frame) =
-            next_event_frame(&mut events, "pty.owner", Duration::from_secs(1)).await
-        {
-            owned.insert(
-                frame["id"].as_str().unwrap_or_default().to_string(),
-                (frame["owner"].clone(), frame["device"].clone()),
-            );
-        }
-    }
-    let expected = (
-        serde_json::Value::String(tui_conn.to_string()),
-        serde_json::Value::String(TUI_DEVICE_LABEL.to_string()),
-    );
-    assert_eq!(owned.get("s1-slot"), Some(&expected), "{owned:?}");
-    assert_eq!(owned.get(&terminal), Some(&expected), "{owned:?}");
-
-    // Opening the agent: the handshake says the terminal UI is driving it.
-    let url = format!("ws://{addr}/ws/sessions/s1/pty");
-    let (mut pty, _) = tokio_tungstenite::connect_async(&url)
-        .await
-        .expect("connect the agent's pty socket");
-    let hello = next_event_frame(&mut pty, "connected", Duration::from_secs(8))
-        .await
-        .expect("the pty handshake");
-    assert_eq!(hello["owner"].as_str(), Some(tui_conn.to_string().as_str()));
+    // The agent: the same.
+    let (mut pty, hello) = attach(&format!("ws://{addr}/ws/sessions/s1/pty")).await;
+    assert_eq!(hello["owner"].as_str(), Some(tui.as_str()), "{hello}");
     assert_eq!(hello["owner_device"].as_str(), Some(TUI_DEVICE_LABEL));
 
     // The terminal UI keeps typing into it, and the browser watches it arrive.
@@ -238,72 +278,66 @@ async fn browser(
 }
 
 /// THE JOURNEY. The user has an agent and a terminal running in the terminal
-/// UI and switches serving on. A browser that opens is told the terminal UI is
-/// driving both, sees the terminal UI's typing arrive, cannot take the agent by
-/// merely attaching, and can by pressing Take over.
+/// UI and switches serving on. Both are the terminal UI's the moment the serve
+/// is up, before any browser has connected, so no reconnecting tab can get in
+/// first. A browser that opens is told the terminal UI is driving both, sees the
+/// terminal UI's typing arrive, cannot take the agent by merely attaching, and
+/// can by pressing Take over.
 #[test]
 fn a_browser_finds_everything_running_driven_by_the_tui_until_it_takes_over() {
     let (mut engine, terminal, _tmp) = engine_with_an_agent_and_a_terminal_running();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback bind");
-    let addr = listener.local_addr().expect("bound address");
-    let mut server =
-        BackgroundServer::start(&mut engine, vec![listener], vec![format!("http://{addr}")])
-            .expect("the serve starts");
+    let (mut server, addr) = serve(&mut engine, true);
     let seat = server.ownership();
 
-    let (ask_tx, ask_rx) = mpsc::channel();
-    let browser_terminal = terminal.clone();
-    let tui_conn = seat.conn_id;
-    let browser_thread = std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("browser runtime")
-            .block_on(browser(addr, browser_terminal, tui_conn, ask_tx));
-    });
+    // Before anything has connected, and before the run loop has turned once.
+    assert!(seat.owners.is_owner("s1-slot", seat.conn_id));
+    assert!(seat.owners.is_owner(&terminal, seat.conn_id));
+    assert_eq!(
+        seat.owners.current_owner("s1-slot").2.as_deref(),
+        Some(TUI_DEVICE_LABEL)
+    );
 
-    // The terminal UI's run loop: service the serve every iteration, and act on
-    // what the journey asks for in between.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !browser_thread.is_finished() {
-        assert!(
-            Instant::now() < deadline,
-            "the journey did not finish in time"
-        );
-        server.service(&mut engine);
-        match ask_rx.try_recv() {
-            Ok(Ask::ClaimNow) => {
-                // What the terminal UI does in the step that brings a serve it
-                // was asked for up: claim everything running, announce it.
-                let claimed = seat.claim_every_running_pty(&engine);
-                assert_eq!(claimed.len(), 2, "the agent and the terminal: {claimed:?}");
-                server.publish_ownership_events(&claimed);
-            }
-            Ok(Ask::TuiTypes(bytes)) => {
-                let client = engine
-                    .providers
-                    .get(TabIdRef::new("s1-slot"))
-                    .expect("the agent is running");
-                assert!(
-                    seat.owners.write_if_owner("s1-slot", seat.conn_id, || {
-                        client.enqueue_bytes(bytes);
-                    }),
-                    "the terminal UI still drives its agent"
-                );
-            }
-            Err(_) => std::thread::sleep(Duration::from_millis(5)),
-        }
-    }
-    let result = browser_thread.join();
+    let (ask_tx, ask_rx) = mpsc::channel();
+    let journey = browser(addr, terminal.clone(), seat.conn_id, ask_tx);
+    run_browser(
+        &mut engine,
+        &mut server,
+        on_its_own_runtime(journey),
+        ask_rx,
+    );
+
     let still_mine = seat.owners.is_owner("s1-slot", seat.conn_id);
     let terminal_mine = seat.owners.is_owner(&terminal, seat.conn_id);
     server.stop();
-    if let Err(panic) = result {
-        std::panic::resume_unwind(panic);
-    }
     assert!(!still_mine, "the take-over moved the agent to the browser");
     assert!(
         terminal_mine,
         "and left the terminal it never touched with the TUI"
     );
+}
+
+/// The startup autostart asks for no claim, so everything running is free the
+/// moment the serve is up and the first browser's handshake says nobody drives
+/// it.
+#[test]
+fn a_serve_started_without_the_claim_leaves_everything_free() {
+    let (mut engine, terminal, _tmp) = engine_with_an_agent_and_a_terminal_running();
+    let (mut server, addr) = serve(&mut engine, false);
+    let seat = server.ownership();
+
+    assert_eq!(seat.owners.current_owner("s1-slot").0, None);
+    assert_eq!(seat.owners.current_owner(&terminal).0, None);
+
+    let (_ask_tx, ask_rx) = mpsc::channel();
+    let journey = async move {
+        let (_pty, hello) = attach(&format!("ws://{addr}/ws/sessions/s1/pty")).await;
+        assert_eq!(hello["owner"], serde_json::Value::Null, "{hello}");
+    };
+    run_browser(
+        &mut engine,
+        &mut server,
+        on_its_own_runtime(journey),
+        ask_rx,
+    );
+    server.stop();
 }
