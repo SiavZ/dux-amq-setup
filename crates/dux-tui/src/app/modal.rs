@@ -166,6 +166,7 @@ pub(crate) fn modal_spec(prompt: &PromptState) -> Option<ModalSpec> {
         | PromptState::ConfirmCloseTab { .. }
         | PromptState::ConfirmDetachAgent { .. }
         | PromptState::ConfirmRecreateWorkingCopy { .. }
+        | PromptState::ConfirmCheckoutDefaultBranch { .. }
         | PromptState::ConfirmQuit { .. }
         | PromptState::ConfirmDiscardFile { .. }
         | PromptState::ConfirmKillRunning(_)
@@ -265,6 +266,7 @@ pub(crate) fn prompt_text_inputs(prompt: &PromptState) -> Vec<&TextInput> {
         | PromptState::ConfirmCloseTab { .. }
         | PromptState::ConfirmDetachAgent { .. }
         | PromptState::ConfirmRecreateWorkingCopy { .. }
+        | PromptState::ConfirmCheckoutDefaultBranch { .. }
         | PromptState::ConfirmQuit { .. }
         | PromptState::ConfirmDiscardFile { .. }
         | PromptState::ConfirmInitRepo { .. }
@@ -363,6 +365,7 @@ pub(crate) fn layout_publishes_confirm_button(layout: &OverlayMouseLayout) -> bo
         | OverlayMouseLayout::ConfirmCloseTab { .. }
         | OverlayMouseLayout::ConfirmDetachAgent { .. }
         | OverlayMouseLayout::ConfirmRecreateWorkingCopy { .. }
+        | OverlayMouseLayout::ConfirmCheckoutDefaultBranch { .. }
         | OverlayMouseLayout::ConfirmDeleteMacro { .. }
         | OverlayMouseLayout::ConfirmQuit { .. }
         | OverlayMouseLayout::ConfirmDiscardFile { .. }
@@ -656,7 +659,7 @@ mod tests {
         SearchableList, StartupCommandLogFocus, StartupCommandLogPrompt,
     };
     use crate::model::ProviderKind;
-    use dux_core::worker::{BranchWarningKind, CreateAgentRequest, NonDefaultBranchAction};
+    use dux_core::worker::{BranchWarningKind, CreateAgentRequest};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::collections::HashSet;
@@ -989,6 +992,15 @@ mod tests {
                 },
             ),
             (
+                "ConfirmCheckoutDefaultBranch",
+                PromptState::ConfirmCheckoutDefaultBranch {
+                    project_id: "p1".to_string(),
+                    project_name: "repo".to_string(),
+                    stored_base: Some("develop".to_string()),
+                    focus: ConfirmFocus::Cancel,
+                },
+            ),
+            (
                 "ConfirmQuit",
                 PromptState::ConfirmQuit {
                     agent_count: 1,
@@ -1101,10 +1113,9 @@ mod tests {
             (
                 "ConfirmNonDefaultBranch",
                 PromptState::ConfirmNonDefaultBranch {
-                    action: NonDefaultBranchAction::AddProject {
+                    add: crate::app::PendingProjectAdd {
                         path: project.path.clone(),
                         name: project.name.clone(),
-                        leading_branch: "main".to_string(),
                     },
                     current_branch: "feature".to_string(),
                     kind: BranchWarningKind::Known {

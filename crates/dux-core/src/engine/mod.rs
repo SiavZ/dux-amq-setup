@@ -923,6 +923,43 @@ pub fn already_on_default_branch_message(
     )
 }
 
+/// The body of the "check out the default branch?" confirmation both surfaces
+/// show before anything runs. `stored_base` is the branch new worktrees start
+/// from today; the default itself is only known once dux looks, so it is named
+/// generically. The browser prints the same words (`lib/checkoutDefaultBranch.ts`).
+pub fn checkout_default_branch_confirm_body(
+    project_name: &str,
+    stored_base: Option<&str>,
+) -> String {
+    let lead = format!(
+        "This switches the source checkout for \"{project_name}\" back to its default branch, \
+         moving HEAD in the shared repository."
+    );
+    match stored_base {
+        Some(base) => format!(
+            "{lead} New worktrees branch from \"{base}\" now. After the checkout, they branch \
+             from the default branch."
+        ),
+        None => format!("{lead} After the checkout, new worktrees branch from the default branch."),
+    }
+}
+
+/// The status line after the confirmation is dismissed: nothing ran, and the
+/// base is where it was.
+pub fn checkout_default_branch_cancelled_message(
+    project_name: &str,
+    stored_base: Option<&str>,
+) -> String {
+    let lead = format!(
+        "Cancelled checking out the default branch for project \"{project_name}\". Nothing was \
+         checked out"
+    );
+    match stored_base {
+        Some(base) => format!("{lead}, and new worktrees still branch from \"{base}\"."),
+        None => format!("{lead}, and the project's base branch is unchanged."),
+    }
+}
+
 fn base_moved_suffix(branch: &str, base_moved: bool) -> String {
     if base_moved {
         format!(" New worktrees branch from \"{branch}\" now.")
@@ -5752,6 +5789,24 @@ mod tests {
     use crate::engine::test_support::{
         sample_project, sample_session, sample_standalone_session, test_engine,
     };
+
+    /// Both surfaces print this confirmation word for word (the browser's copy
+    /// lives in `lib/checkoutDefaultBranch.ts` and is pinned to the same text).
+    #[test]
+    fn the_checkout_default_confirmation_names_the_project_and_its_current_base() {
+        assert_eq!(
+            checkout_default_branch_confirm_body("dux", Some("develop")),
+            "This switches the source checkout for \"dux\" back to its default branch, \
+             moving HEAD in the shared repository. New worktrees branch from \"develop\" now. \
+             After the checkout, they branch from the default branch."
+        );
+        assert_eq!(
+            checkout_default_branch_confirm_body("dux", None),
+            "This switches the source checkout for \"dux\" back to its default branch, \
+             moving HEAD in the shared repository. After the checkout, new worktrees branch \
+             from the default branch."
+        );
+    }
 
     /// An engine with one managed agent that has one extra tab, for the
     /// slot-tab resolvers.

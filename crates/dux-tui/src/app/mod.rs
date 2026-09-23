@@ -2057,6 +2057,14 @@ pub(crate) enum DeleteAgentFocus {
     BranchCheckbox,
 }
 
+/// The project the non-default-branch dialog will add once answered. Its base
+/// is not stored here: confirming decides it from the checkbox's final state.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingProjectAdd {
+    pub(crate) path: String,
+    pub(crate) name: String,
+}
+
 /// Which selectable element has focus in the Non-Default Branch confirmation
 /// modal. `Checkbox` is only reachable when `BranchWarningKind::Known`: the
 /// heuristic path has no checkbox to focus.
@@ -2338,6 +2346,19 @@ pub(crate) enum PromptState {
         running_providers: Vec<String>,
         focus: ConfirmFocus, // Cancel (default) or Recreate
     },
+    /// Asked before "check out the default branch" runs anything, the same
+    /// question the browser's dialog asks: the checkout moves HEAD in the user's
+    /// folder and makes the default the branch new worktrees start from.
+    ///
+    /// The name and the base are captured when the dialog opens: the sentence
+    /// promises to move a specific base, and a reload behind an open dialog
+    /// must not change what the user is agreeing to.
+    ConfirmCheckoutDefaultBranch {
+        project_id: String,
+        project_name: String,
+        stored_base: Option<String>,
+        focus: ConfirmFocus, // Cancel (default) or Check out
+    },
     ConfirmQuit {
         agent_count: usize,
         terminal_count: usize,
@@ -2441,8 +2462,11 @@ pub(crate) enum PromptState {
         editing: Option<MacroEditState>,
         pending_delete: Option<PendingMacroDelete>,
     },
+    /// The add-project pre-flight for a repository on a non-default branch.
+    /// Adding is the only thing it does: checking out an existing project's
+    /// default branch asks through `ConfirmCheckoutDefaultBranch` instead.
     ConfirmNonDefaultBranch {
-        action: NonDefaultBranchAction,
+        add: PendingProjectAdd,
         current_branch: String,
         kind: BranchWarningKind,
         focus: ConfirmNonDefaultBranchFocus,
@@ -3189,6 +3213,10 @@ pub(crate) enum OverlayMouseLayout {
         confirm_button: Rect,
     },
     ConfirmRecreateWorkingCopy {
+        cancel_button: Rect,
+        confirm_button: Rect,
+    },
+    ConfirmCheckoutDefaultBranch {
         cancel_button: Rect,
         confirm_button: Rect,
     },

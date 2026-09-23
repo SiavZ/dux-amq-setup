@@ -7936,6 +7936,92 @@ impl App {
         };
     }
 
+    /// "Check out the default branch?": prose and a Cancel / Check out pair, the
+    /// Confirm family, Cancel focused. The body is
+    /// `dux_core::engine::checkout_default_branch_confirm_body`, the same words
+    /// the browser's dialog prints.
+    fn render_confirm_checkout_default_branch_prompt(&mut self, frame: &mut Frame) {
+        let PromptState::ConfirmCheckoutDefaultBranch {
+            project_name,
+            stored_base,
+            focus,
+            ..
+        } = &self.prompt
+        else {
+            return;
+        };
+        self.render_dim_overlay(frame);
+        let body = dux_core::engine::checkout_default_branch_confirm_body(
+            project_name,
+            stored_base.as_deref(),
+        );
+        let lines = vec![Line::from(""), Line::from(Span::raw(format!(" {body}")))];
+        // Sized to the wrapped prose: the body does not scroll.
+        let dialog_width = 60u16.min(frame.area().width.max(1));
+        let inner_width = dialog_width.saturating_sub(2);
+        let body_height = wrapped_line_count(&lines, inner_width, false);
+        let area = centered_rect_exact(dialog_width, 2 + body_height + 1 + 3, frame.area());
+        self.clear_overlay_area(frame, area);
+        let outer = self.themed_overlay_block("Check Out Default Branch");
+        let inner = outer.inner(area);
+        outer.render(area, frame.buffer_mut());
+
+        let [body_area, _, buttons_area] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(body_height),
+                Constraint::Length(1),
+                Constraint::Length(3),
+            ])
+            .areas(inner);
+
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(body_area, frame.buffer_mut());
+
+        let btn_width = shared_button_width(&["Cancel", "Check out"]);
+        let gap = 2u16;
+        let total = btn_width * 2 + gap;
+        let left_offset = buttons_area.width.saturating_sub(total) / 2;
+        let cancel_area = Rect {
+            x: buttons_area.x + left_offset,
+            y: buttons_area.y,
+            width: btn_width,
+            height: 3,
+        };
+        let confirm_area = Rect {
+            x: cancel_area.x + btn_width + gap,
+            y: buttons_area.y,
+            width: btn_width,
+            height: 3,
+        };
+
+        Button::new("Cancel")
+            .kind(ButtonKind::Confirm)
+            .state(button_state_for(
+                ButtonPressedTarget::ConfirmCheckoutDefaultBranchCancel,
+                self.pressed_button,
+                !focus.is_confirm(),
+                true,
+            ))
+            .render(frame, cancel_area, &self.theme);
+
+        Button::new("Check out")
+            .kind(ButtonKind::Danger)
+            .state(button_state_for(
+                ButtonPressedTarget::ConfirmCheckoutDefaultBranchConfirm,
+                self.pressed_button,
+                focus.is_confirm(),
+                true,
+            ))
+            .render(frame, confirm_area, &self.theme);
+
+        self.overlay_layout.active = OverlayMouseLayout::ConfirmCheckoutDefaultBranch {
+            cancel_button: cancel_area,
+            confirm_button: confirm_area,
+        };
+    }
+
     fn render_confirm_quit_prompt(&mut self, frame: &mut Frame) {
         let PromptState::ConfirmQuit {
             agent_count,
@@ -8307,7 +8393,6 @@ impl App {
 
     fn render_confirm_non_default_branch_prompt(&mut self, frame: &mut Frame) {
         let PromptState::ConfirmNonDefaultBranch {
-            action,
             current_branch,
             kind,
             focus,
@@ -8320,8 +8405,7 @@ impl App {
         self.render_dim_overlay(frame);
         let dialog_width = 60u16.min(frame.area().width.max(1));
         let inner_width = dialog_width.saturating_sub(2);
-        let has_checkbox =
-            matches!(kind, BranchWarningKind::Known { .. }) && action.allows_add_anyway();
+        let has_checkbox = matches!(kind, BranchWarningKind::Known { .. });
 
         // Body: warning text + the "new worktrees branch from …" note,
         // plus a dim info line on the heuristic path explaining why dux
@@ -10551,6 +10635,9 @@ impl App {
             PromptState::ConfirmCloseTab { .. } => self.render_confirm_close_tab_prompt(frame),
             PromptState::ConfirmRecreateWorkingCopy { .. } => {
                 self.render_confirm_recreate_working_copy_prompt(frame)
+            }
+            PromptState::ConfirmCheckoutDefaultBranch { .. } => {
+                self.render_confirm_checkout_default_branch_prompt(frame)
             }
             PromptState::ConfirmDetachAgent { .. } => {
                 self.render_confirm_detach_agent_prompt(frame)
@@ -24684,10 +24771,9 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         app.prompt = PromptState::ConfirmNonDefaultBranch {
-            action: NonDefaultBranchAction::AddProject {
+            add: crate::app::PendingProjectAdd {
                 path: "/tmp/project".to_string(),
                 name: "project".to_string(),
-                leading_branch: "main".to_string(),
             },
             current_branch: current_branch.to_string(),
             kind: BranchWarningKind::Known {
@@ -24743,6 +24829,71 @@ mod tests {
             "{text}"
         );
         assert_eq!(fg, app.theme.warning_fg);
+    }
+
+    /// The confirmation prints dux-core's body word for word (the browser's
+    /// dialog prints the same), wrapped to the dialog, with Cancel focused and
+    /// both buttons published for the mouse.
+    #[test]
+    fn the_checkout_default_confirmation_names_the_current_base_and_the_default() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_app(default_bindings());
+        app.prompt = PromptState::ConfirmCheckoutDefaultBranch {
+            project_id: "p1".to_string(),
+            project_name: "demo".to_string(),
+            stored_base: Some("develop".to_string()),
+            focus: ConfirmFocus::Cancel,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render frame");
+        let buffer = terminal.backend().buffer().clone();
+
+        let OverlayMouseLayout::ConfirmCheckoutDefaultBranch {
+            cancel_button,
+            confirm_button,
+        } = app.overlay_layout.active
+        else {
+            panic!("the dialog must publish its buttons for the mouse");
+        };
+        // The dialog's own text: the rows between its titled top edge and its
+        // buttons, cut to the columns inside its frame, joined the way the
+        // wrap split them.
+        let cell = |x: u16, y: u16| buffer[(x, y)].symbol().to_string();
+        let title = "╭Check Out Default Branch";
+        let title_len = title.chars().count() as u16;
+        let (top, left) = (0..cancel_button.y)
+            .find_map(|y| {
+                (0..buffer.area.width.saturating_sub(title_len))
+                    .find(|&x| {
+                        (x..x + title_len).map(|cx| cell(cx, y)).collect::<String>() == title
+                    })
+                    .map(|x| (y, x))
+            })
+            .expect("the dialog's titled top edge");
+        let right = (left + 1..buffer.area.width)
+            .find(|&x| cell(x, top) == "╮")
+            .expect("the dialog's top-right corner");
+        let text = (top + 1..cancel_button.y)
+            .map(|y| (left + 1..right).map(|x| cell(x, y)).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let _ = confirm_button;
+        let body = dux_core::engine::checkout_default_branch_confirm_body("demo", Some("develop"));
+        assert!(text.contains(&body), "expected the core body in:\n{text}");
+
+        let buttons: String = (cancel_button.y..cancel_button.y + cancel_button.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_string())
+            .collect();
+        assert!(buttons.contains("Cancel"), "{buttons}");
+        assert!(buttons.contains("Check out"), "{buttons}");
     }
 
     #[test]

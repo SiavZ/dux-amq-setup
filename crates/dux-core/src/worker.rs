@@ -108,10 +108,6 @@ impl NonDefaultBranchAction {
             Self::CheckoutProjectDefault { project } => &project.path,
         }
     }
-
-    pub fn allows_add_anyway(&self) -> bool {
-        matches!(self, Self::AddProject { .. })
-    }
 }
 
 /// Payload for the "create an empty initial commit, then register the project"

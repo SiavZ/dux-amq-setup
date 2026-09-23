@@ -1,16 +1,21 @@
 // Copy for the "Checkout default branch" confirmation on an existing project.
-// Web-only: the terminal UI runs this command without a dialog, so there is no
-// TUI string to stay byte-for-byte with.
+// Byte-for-byte dux-core's `checkout_default_branch_confirm_body`, which the
+// terminal UI's confirmation prints: keep the two in step.
 
 /**
- * The line saying which branch new worktrees start from, before and after the
- * checkout. The server names the default branch only once it looks, so the
- * sentence refers to it generically; `leadingBranch` is the project's recorded
- * base (`ProjectView.leading_branch`), which a successful checkout replaces.
+ * The confirmation body: what the checkout does, and which branch new
+ * worktrees start from before and after it. The server names the default
+ * branch only once it looks, so the sentence refers to it generically;
+ * `leadingBranch` is the project's recorded base (`ProjectView.leading_branch`),
+ * which a successful checkout replaces.
  */
-export function checkoutDefaultBaseNote(leadingBranch: string | null): string {
+export function checkoutDefaultBranchBody(
+  projectName: string,
+  leadingBranch: string | null,
+): string {
+  const lead = `This switches the source checkout for "${projectName}" back to its default branch, moving HEAD in the shared repository.`
   if (leadingBranch) {
-    return `New worktrees branch from "${leadingBranch}" now. After the checkout, they branch from the default branch.`
+    return `${lead} New worktrees branch from "${leadingBranch}" now. After the checkout, they branch from the default branch.`
   }
-  return "After the checkout, new worktrees branch from the default branch."
+  return `${lead} After the checkout, new worktrees branch from the default branch.`
 }

@@ -145,16 +145,6 @@ impl App {
             return Ok(());
         }
 
-        // The base as the dialog opens (its box starts ticked exactly when a
-        // checkout is on offer); confirming recomputes it from the box's final
-        // state in `resolve_confirm_non_default_branch`.
-        let leading_branch = dux_core::project_browser::project_base_for_add(
-            &path,
-            (!branch.is_empty()).then_some(branch.as_str()),
-            plan.can_checkout_default,
-        )
-        .into_branch();
-
         // A non-default-branch warning maps back to the TUI's existing
         // `BranchWarningKind` for the ConfirmNonDefaultBranch dialog. `None`
         // (default branch or detached HEAD) falls through to the direct add.
@@ -169,10 +159,9 @@ impl App {
         };
         if let Some(kind) = warning_kind {
             self.prompt = PromptState::ConfirmNonDefaultBranch {
-                action: NonDefaultBranchAction::AddProject {
+                add: crate::app::PendingProjectAdd {
                     path: path.to_string_lossy().to_string(),
                     name,
-                    leading_branch,
                 },
                 current_branch: branch,
                 kind,
@@ -185,6 +174,14 @@ impl App {
             return Ok(());
         }
 
+        // No dialog, no checkout: new worktrees branch from where the folder is
+        // (the default, or the fallback on a detached HEAD).
+        let leading_branch = dux_core::project_browser::project_base_for_add(
+            &path,
+            (!branch.is_empty()).then_some(branch.as_str()),
+            false,
+        )
+        .into_branch();
         let path_str = path.to_string_lossy().to_string();
         self.finish_add_project(path_str, name, branch, leading_branch)
     }
@@ -1184,6 +1181,20 @@ impl App {
             return Ok(());
         }
 
+        // Ask first, the same question the browser asks: the checkout moves
+        // HEAD in the user's folder and moves the project's base with it.
+        self.prompt = PromptState::ConfirmCheckoutDefaultBranch {
+            project_id: project.id.clone(),
+            project_name: project.name.clone(),
+            stored_base: project.leading_branch.clone(),
+            focus: ConfirmFocus::Cancel, // Cancel is the safe default
+        };
+        Ok(())
+    }
+
+    /// Run the confirmed "check out the default branch": inspect, then check
+    /// out (or find the folder already there) and move the project's base.
+    pub(crate) fn dispatch_checkout_project_default_branch(&mut self, project: Project) {
         // One op spans the whole chain: the short-circuit terminals resolve it to
         // a clear in `drain_events`, while the Known case forwards this id into
         // the switch worker and re-emits the busy text through `progress`, so the
@@ -1226,7 +1237,6 @@ impl App {
                 });
             }
         });
-        Ok(())
     }
 
     pub(crate) fn dispatch_create_agent_request(
@@ -8341,6 +8351,127 @@ mod tests {
         assert!(
             !worktree_has_commit(&worktree, &feature_commit),
             "new worktrees branch from \"main\", which lacks the feature commit"
+        );
+    }
+
+    /// A real project whose folder is on `develop` and whose recorded base is
+    /// `develop` (added with the checkout box unticked), selected so the
+    /// project-scoped command acts on it. origin's default is `main`.
+    fn project_based_on_develop() -> (tempfile::TempDir, PathBuf, App) {
+        let (root, repo, _) = clone_on_a_feature_branch();
+        crate::app::test_support::run_git_output(&repo, &["switch", "-q", "-c", "develop"]);
+        let mut app = journey_app();
+        app.add_project(repo.to_string_lossy().to_string(), "repo".to_string())
+            .expect("add_project");
+        answer_branch_dialog(&mut app, false);
+        drain_until(&mut app, "the project", |app| {
+            !app.engine.projects.is_empty() && stored_project_base(app).is_some()
+        });
+        assert_eq!(stored_project_base(&app).as_deref(), Some("develop"));
+        app.project_chooser_context = Some(app.engine.projects[0].id.clone());
+        (root, repo, app)
+    }
+
+    fn folder_branch(repo: &Path) -> String {
+        crate::app::test_support::run_git_output(repo, &["symbolic-ref", "--short", "HEAD"])
+    }
+
+    #[test]
+    fn checking_out_the_default_branch_asks_before_anything_runs() {
+        let (_root, repo, mut app) = project_based_on_develop();
+
+        app.checkout_selected_project_default_branch()
+            .expect("open the confirmation");
+
+        match &app.prompt {
+            PromptState::ConfirmCheckoutDefaultBranch {
+                project_name,
+                stored_base,
+                focus,
+                ..
+            } => {
+                assert_eq!(project_name, "repo");
+                assert_eq!(stored_base.as_deref(), Some("develop"));
+                assert_eq!(*focus, ConfirmFocus::Cancel, "Cancel is the safe default");
+            }
+            other => panic!("expected the checkout confirmation, got {other:?}"),
+        }
+        assert!(
+            app.pending_checkout_inspect_ops.is_empty(),
+            "nothing may run until the user confirms"
+        );
+        assert_eq!(folder_branch(&repo), "develop");
+    }
+
+    #[test]
+    fn escape_cancels_the_default_branch_checkout_and_says_nothing_changed() {
+        let (_root, repo, mut app) = project_based_on_develop();
+        app.checkout_selected_project_default_branch()
+            .expect("open the confirmation");
+
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        // Give a stray worker every chance to have run.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        app.drain_events();
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert!(app.pending_checkout_inspect_ops.is_empty());
+        assert_eq!(folder_branch(&repo), "develop", "nothing was checked out");
+        assert_eq!(stored_project_base(&app).as_deref(), Some("develop"));
+        assert_eq!(
+            app.engine.projects[0].leading_branch.as_deref(),
+            Some("develop")
+        );
+        assert_eq!(
+            app.status.text(),
+            "Cancelled checking out the default branch for project \"repo\". Nothing was \
+             checked out, and new worktrees still branch from \"develop\"."
+        );
+    }
+
+    #[test]
+    fn pressing_cancel_runs_nothing_either() {
+        let (_root, repo, mut app) = project_based_on_develop();
+        app.checkout_selected_project_default_branch()
+            .expect("open the confirmation");
+
+        // Cancel has focus; activating it is the same answer as Escape.
+        app.handle_key(key(KeyCode::Char(' '), KeyModifiers::NONE))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        app.drain_events();
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert!(app.pending_checkout_inspect_ops.is_empty());
+        assert_eq!(folder_branch(&repo), "develop");
+        assert_eq!(stored_project_base(&app).as_deref(), Some("develop"));
+    }
+
+    #[test]
+    fn confirming_checks_out_the_default_and_makes_it_the_project_base() {
+        let (_root, repo, mut app) = project_based_on_develop();
+        app.checkout_selected_project_default_branch()
+            .expect("open the confirmation");
+
+        // Move focus from Cancel to the confirm button, then press it.
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(app.prompt, PromptState::None));
+        drain_until(&mut app, "the base to move to main", |app| {
+            stored_project_base(app).as_deref() == Some("main")
+        });
+
+        assert_eq!(folder_branch(&repo), "main");
+        assert_eq!(
+            app.engine.projects[0].leading_branch.as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            app.status.text(),
+            "Checked out \"main\" for project \"repo\". New worktrees branch from \"main\" now."
         );
     }
 }

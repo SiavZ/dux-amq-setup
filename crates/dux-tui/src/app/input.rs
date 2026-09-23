@@ -236,6 +236,8 @@ enum PromptMouseTarget {
     ConfirmDetachAgentConfirm,
     ConfirmRecreateWorkingCopyCancel,
     ConfirmRecreateWorkingCopyConfirm,
+    ConfirmCheckoutDefaultBranchCancel,
+    ConfirmCheckoutDefaultBranchConfirm,
     ConfirmDeleteMacroCancel,
     ConfirmDeleteMacroConfirm,
     ConfirmQuitCancel,
@@ -330,6 +332,12 @@ impl ButtonPressedTarget {
             }
             PromptMouseTarget::ConfirmRecreateWorkingCopyConfirm => {
                 Some(ButtonPressedTarget::ConfirmRecreateWorkingCopyConfirm)
+            }
+            PromptMouseTarget::ConfirmCheckoutDefaultBranchCancel => {
+                Some(ButtonPressedTarget::ConfirmCheckoutDefaultBranchCancel)
+            }
+            PromptMouseTarget::ConfirmCheckoutDefaultBranchConfirm => {
+                Some(ButtonPressedTarget::ConfirmCheckoutDefaultBranchConfirm)
             }
             PromptMouseTarget::ConfirmDeleteMacroCancel => {
                 Some(ButtonPressedTarget::ConfirmDeleteMacroCancel)
@@ -1867,6 +1875,7 @@ impl App {
             | PromptState::ConfirmCloseTab { .. }
             | PromptState::ConfirmDetachAgent { .. }
             | PromptState::ConfirmRecreateWorkingCopy { .. }
+            | PromptState::ConfirmCheckoutDefaultBranch { .. }
             | PromptState::ConfirmQuit { .. }
             | PromptState::ConfirmDiscardFile { .. }
             | PromptState::ConfirmInitRepo { .. }
@@ -4789,6 +4798,26 @@ impl App {
         Some(false)
     }
 
+    fn handle_confirm_checkout_default_branch_prompt_key(&mut self, key: KeyEvent) -> Option<bool> {
+        let PromptState::ConfirmCheckoutDefaultBranch { focus, .. } = &mut self.prompt else {
+            return None;
+        };
+        let confirm = focus.is_confirm();
+        let action = self.bindings.lookup(&key, BindingScope::Dialog);
+        match modal_key_step(action, key, false) {
+            // Escape is a cancel, and a cancel says so.
+            ModalKeyStep::Close => {
+                return Some(self.resolve_confirm_checkout_default_branch(false));
+            }
+            ModalKeyStep::MoveFocus(_) => *focus = focus.toggled(),
+            ModalKeyStep::Confirm | ModalKeyStep::ActivateFocus => {
+                return Some(self.resolve_confirm_checkout_default_branch(confirm));
+            }
+            ModalKeyStep::FallThroughToField => {}
+        }
+        Some(false)
+    }
+
     fn handle_confirm_quit_prompt_key(&mut self, key: KeyEvent) -> Option<bool> {
         let PromptState::ConfirmQuit { focus, .. } = &mut self.prompt else {
             return None;
@@ -4888,7 +4917,6 @@ impl App {
 
     fn handle_confirm_non_default_branch_prompt_key(&mut self, key: KeyEvent) -> Option<bool> {
         let PromptState::ConfirmNonDefaultBranch {
-            action,
             focus,
             kind,
             checkout_default,
@@ -4897,8 +4925,7 @@ impl App {
         else {
             return None;
         };
-        let has_checkbox =
-            matches!(kind, BranchWarningKind::Known { .. }) && action.allows_add_anyway();
+        let has_checkbox = matches!(kind, BranchWarningKind::Known { .. });
         let action = self.bindings.lookup(&key, BindingScope::Dialog);
         match modal_key_step(action, key, false) {
             ModalKeyStep::Close => self.prompt = PromptState::None,
@@ -4990,6 +5017,9 @@ impl App {
             return Some(exit);
         }
         if let Some(exit) = self.handle_confirm_recreate_working_copy_prompt_key(key) {
+            return Some(exit);
+        }
+        if let Some(exit) = self.handle_confirm_checkout_default_branch_prompt_key(key) {
             return Some(exit);
         }
         if let Some(exit) = self.handle_confirm_quit_prompt_key(key) {
@@ -6495,6 +6525,23 @@ impl App {
                 column,
                 row,
             ),
+            OverlayMouseLayout::ConfirmCheckoutDefaultBranch {
+                cancel_button,
+                confirm_button,
+            } => click_target(
+                &[
+                    (
+                        cancel_button,
+                        PromptMouseTarget::ConfirmCheckoutDefaultBranchCancel,
+                    ),
+                    (
+                        confirm_button,
+                        PromptMouseTarget::ConfirmCheckoutDefaultBranchConfirm,
+                    ),
+                ],
+                column,
+                row,
+            ),
             OverlayMouseLayout::ConfirmDetachAgent {
                 cancel_button,
                 confirm_button,
@@ -7645,6 +7692,49 @@ impl App {
         false
     }
 
+    /// Answer the "check out the default branch?" confirmation. Confirming
+    /// starts the checkout against the project as it is NOW (it may have been
+    /// removed while the dialog was up); cancelling runs nothing and says so,
+    /// because a silent close is indistinguishable from a checkout that quietly
+    /// did nothing.
+    pub(super) fn resolve_confirm_checkout_default_branch(&mut self, confirm: bool) -> bool {
+        let (project_id, project_name, stored_base) = match &self.prompt {
+            PromptState::ConfirmCheckoutDefaultBranch {
+                project_id,
+                project_name,
+                stored_base,
+                ..
+            } => (
+                project_id.clone(),
+                project_name.clone(),
+                stored_base.clone(),
+            ),
+            _ => return false,
+        };
+        self.prompt = PromptState::None;
+        if !confirm {
+            self.set_info(dux_core::engine::checkout_default_branch_cancelled_message(
+                &project_name,
+                stored_base.as_deref(),
+            ));
+            return false;
+        }
+        let Some(project) = self
+            .engine
+            .projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .cloned()
+        else {
+            self.set_warning(format!(
+                "Project \"{project_name}\" is gone, so there was no default branch to check out."
+            ));
+            return false;
+        };
+        self.dispatch_checkout_project_default_branch(project);
+        false
+    }
+
     pub(super) fn resolve_confirm_close_tab(&mut self, confirm: bool) -> bool {
         let (session_id, tab_id) = match &self.prompt {
             PromptState::ConfirmCloseTab {
@@ -7859,9 +7949,9 @@ impl App {
     }
 
     fn resolve_confirm_non_default_branch(&mut self) -> bool {
-        let (action, branch, checkout_default, default_branch) = match &self.prompt {
+        let (add, branch, checkout_default, default_branch) = match &self.prompt {
             PromptState::ConfirmNonDefaultBranch {
-                action,
+                add,
                 current_branch,
                 kind,
                 checkout_default,
@@ -7872,7 +7962,7 @@ impl App {
                     BranchWarningKind::Heuristic => None,
                 };
                 (
-                    action.clone(),
+                    add.clone(),
                     current_branch.clone(),
                     *checkout_default && default_branch.is_some(),
                     default_branch,
@@ -7882,45 +7972,29 @@ impl App {
         };
         // The box decides the base: ticked, new worktrees branch from the
         // default it checks out; unticked, from the branch the folder is on.
-        let action = match action {
-            NonDefaultBranchAction::AddProject { path, name, .. } => {
-                NonDefaultBranchAction::AddProject {
-                    path,
-                    name,
-                    leading_branch: dux_core::add_project_plan::project_base_at_add(
-                        Some(branch.as_str()),
-                        default_branch.as_deref(),
-                        checkout_default,
-                    )
-                    .into_branch(),
-                }
-            }
-            other @ NonDefaultBranchAction::CheckoutProjectDefault { .. } => other,
-        };
+        let leading_branch = dux_core::add_project_plan::project_base_at_add(
+            Some(branch.as_str()),
+            default_branch.as_deref(),
+            checkout_default,
+        )
+        .into_branch();
         self.prompt = PromptState::None;
         if checkout_default {
             // Safe: `checkout_default` is only true when `default_branch` is `Some`.
             let target = default_branch.expect("checkout_default implies known default branch");
-            let reason = match action {
-                NonDefaultBranchAction::AddProject { .. } => "before adding the project",
-                NonDefaultBranchAction::CheckoutProjectDefault { .. } => "for the selected project",
+            let action = NonDefaultBranchAction::AddProject {
+                path: add.path,
+                name: add.name,
+                leading_branch,
             };
-            self.dispatch_non_default_branch_checkout(action, target, reason.to_string(), None);
-        } else {
-            match action {
-                NonDefaultBranchAction::AddProject {
-                    path,
-                    name,
-                    leading_branch,
-                } => {
-                    if let Err(e) = self.finish_add_project(path, name, branch, leading_branch) {
-                        self.set_error(format!("{e:#}"));
-                    }
-                }
-                NonDefaultBranchAction::CheckoutProjectDefault { .. } => {
-                    self.set_error("Check out the default branch before retrying.");
-                }
-            }
+            self.dispatch_non_default_branch_checkout(
+                action,
+                target,
+                "before adding the project".to_string(),
+                None,
+            );
+        } else if let Err(e) = self.finish_add_project(add.path, add.name, branch, leading_branch) {
+            self.set_error(format!("{e:#}"));
         }
         false
     }
@@ -8315,14 +8389,12 @@ impl App {
             }
             OverlayCheckboxId::NonDefaultBranchCheckoutDefault => {
                 if let PromptState::ConfirmNonDefaultBranch {
-                    action,
                     kind,
                     checkout_default,
                     focus,
                     ..
                 } = &mut self.prompt
                     && matches!(kind, BranchWarningKind::Known { .. })
-                    && action.allows_add_anyway()
                 {
                     *checkout_default = !*checkout_default;
                     *focus = ConfirmNonDefaultBranchFocus::Checkbox;
@@ -8859,6 +8931,8 @@ impl App {
             | PromptMouseTarget::ConfirmDetachAgentConfirm
             | PromptMouseTarget::ConfirmRecreateWorkingCopyCancel
             | PromptMouseTarget::ConfirmRecreateWorkingCopyConfirm
+            | PromptMouseTarget::ConfirmCheckoutDefaultBranchCancel
+            | PromptMouseTarget::ConfirmCheckoutDefaultBranchConfirm
             | PromptMouseTarget::ConfirmDeleteMacroCancel
             | PromptMouseTarget::ConfirmDeleteMacroConfirm
             | PromptMouseTarget::MacroCancel
@@ -8976,6 +9050,12 @@ impl App {
             }
             ButtonPressedTarget::ConfirmRecreateWorkingCopyConfirm => {
                 self.resolve_confirm_recreate_working_copy(true)
+            }
+            ButtonPressedTarget::ConfirmCheckoutDefaultBranchCancel => {
+                self.resolve_confirm_checkout_default_branch(false)
+            }
+            ButtonPressedTarget::ConfirmCheckoutDefaultBranchConfirm => {
+                self.resolve_confirm_checkout_default_branch(true)
             }
             ButtonPressedTarget::ConfirmDeleteMacroCancel => {
                 self.resolve_confirm_delete_macro(false)
@@ -26693,10 +26773,9 @@ cyan = "#00ffff"
     fn tab_with_shift_moves_non_default_branch_focus_backwards_when_checkbox_present() {
         let mut app = test_app(default_bindings());
         app.prompt = PromptState::ConfirmNonDefaultBranch {
-            action: NonDefaultBranchAction::AddProject {
+            add: crate::app::PendingProjectAdd {
                 path: "/tmp/project".to_string(),
                 name: "project".to_string(),
-                leading_branch: "main".to_string(),
             },
             current_branch: "feature".to_string(),
             kind: BranchWarningKind::Known {
@@ -26739,10 +26818,9 @@ cyan = "#00ffff"
     fn tab_with_shift_moves_non_default_branch_focus_backwards_without_checkbox() {
         let mut app = test_app(default_bindings());
         app.prompt = PromptState::ConfirmNonDefaultBranch {
-            action: NonDefaultBranchAction::AddProject {
+            add: crate::app::PendingProjectAdd {
                 path: "/tmp/project".to_string(),
                 name: "project".to_string(),
-                leading_branch: "feature".to_string(),
             },
             current_branch: "feature".to_string(),
             kind: BranchWarningKind::Heuristic,
@@ -36483,10 +36561,9 @@ cyan = "#00ffff"
         // ── ConfirmNonDefaultBranch: Cancel -> Add -> Checkbox.
         let mut app = test_app(default_bindings());
         app.prompt = PromptState::ConfirmNonDefaultBranch {
-            action: NonDefaultBranchAction::AddProject {
+            add: crate::app::PendingProjectAdd {
                 path: "/tmp/project".to_string(),
                 name: "project".to_string(),
-                leading_branch: "main".to_string(),
             },
             current_branch: "feature".to_string(),
             kind: BranchWarningKind::Known {
