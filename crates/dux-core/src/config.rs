@@ -2228,7 +2228,7 @@ pub fn default_terminal_args() -> Vec<String> {
 /// normalizer over the bytes dux sends. The table of what each one does, and the
 /// caveat that Copilot's value is a guess because it is closed source, lives on
 /// [`WebDragDropPaste`]. Read it before changing a value here.
-pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 4] {
+pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
     [
         (
             "claude",
@@ -2286,6 +2286,32 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 4]
                 forward_scroll: None,
                 // NOT measured: Copilot CLI is closed source. `bare` is the
                 // do-nothing option and what two of the three verified CLIs want.
+                web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
+            },
+        ),
+        (
+            "jcode",
+            ProviderCommandConfig {
+                command: "jcode".to_string(),
+                // `--no-update` pins the running binary for the life of the
+                // pane. jcode auto-updates by default on release builds
+                // (`--auto-update` documents "default: true"), and a provider
+                // that replaces its own binary mid-session does not belong on
+                // a long-lived PTY.
+                args: vec!["--no-update".to_string()],
+                // jcode has no "resume the most recent session" selector:
+                // `--resume` with no argument LISTS sessions and waits on a
+                // picker, which would hang the PTY spawn. Leave it unset so
+                // dux starts a fresh session instead.
+                resume_args: None,
+                resume_wait_timeout_ms: None,
+                install_hint: Some("brew tap 1jehuang/jcode && brew install jcode".to_string()),
+                // jcode is an alt-screen TUI with its own scrollback (like
+                // claude/gemini): forward wheel events to it. Host scrollback
+                // is empty for alt-screen apps and reads as a dead wheel.
+                forward_scroll: Some(true),
+                // Measured: jcode strips quotes and unescapes, similar to Claude Code.
+                // Never splits on whitespace, so a space is harmless bare.
                 web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
             },
         ),
