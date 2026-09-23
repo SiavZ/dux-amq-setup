@@ -117,6 +117,23 @@ pub fn leading_branch_for_project(path: &Path, current_branch: Option<&str>) -> 
     }
 }
 
+/// The base a repository gets when it is added as a project:
+/// [`crate::add_project_plan::project_base_at_add`] fed with the repository's
+/// remote default. Every add path records its base through this (or through the
+/// pure rule directly when the default is already resolved), so the "check out
+/// the default branch" box decides the base the same way on both surfaces.
+pub fn project_base_for_add(
+    path: &Path,
+    current_branch: Option<&str>,
+    check_out_default: bool,
+) -> crate::add_project_plan::ProjectBase {
+    crate::add_project_plan::project_base_at_add(
+        current_branch,
+        git::remote_default_branch(path).as_deref(),
+        check_out_default,
+    )
+}
+
 /// Convert a slice of `ProjectConfig` entries (from SQLite) into runtime `Project` values.
 /// Each project gets its path expanded, its provider resolved (falling back to the global
 /// default), and its current branch read from git. Missing or non-git paths are flagged
@@ -284,16 +301,18 @@ pub fn run_checkout_project_default_branch_inspection_job(
     let result = git::current_branch_opt(&repo_path)
         .map(|opt_branch| {
             let branch = opt_branch.unwrap_or_default();
-            let warning_kind = if let Some(leading_branch) = project.leading_branch.as_deref() {
-                if branch == leading_branch {
-                    None
-                } else {
-                    Some(BranchWarningKind::Known {
-                        default_branch: leading_branch.to_string(),
-                    })
-                }
-            } else {
-                git::branch_warning_kind(&repo_path, &branch)
+            // The remote's default wins over the stored base: a project added
+            // without the checkout stores the branch it was on, and checking
+            // out "the default" must not mean checking that branch out again.
+            // With no remote default known, the stored base is the best answer
+            // dux has, as it always was.
+            let target = git::remote_default_branch(&repo_path).or(project.leading_branch.clone());
+            let warning_kind = match target {
+                Some(target) if branch == target => None,
+                Some(target) => Some(BranchWarningKind::Known {
+                    default_branch: target,
+                }),
+                None => git::branch_warning_kind(&repo_path, &branch),
             };
             (branch, warning_kind)
         })
@@ -594,6 +613,67 @@ mod tests {
                     warning_kind,
                     Some(BranchWarningKind::Known { default_branch }) if default_branch == "trunk"
                 ));
+            }
+            _ => panic!("expected checkout inspection event"),
+        }
+    }
+
+    /// A project added without the checkout records its feature branch as its
+    /// base. "Check out the default branch" must still mean the REMOTE's
+    /// default, not the stored base, or it would report the folder as already
+    /// there and never move it.
+    #[test]
+    fn checkout_project_default_branch_inspection_prefers_the_remote_default_over_the_stored_base()
+    {
+        let repo = tempdir().expect("repo tempdir");
+        run_git(repo.path(), &["init", "-b", "main"]);
+        run_git(repo.path(), &["config", "user.name", "test"]);
+        run_git(repo.path(), &["config", "user.email", "t@t"]);
+        run_git(repo.path(), &["commit", "--allow-empty", "-m", "init"]);
+        run_git(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        run_git(
+            repo.path(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        run_git(repo.path(), &["switch", "-c", "feature"]);
+
+        let project = Project {
+            id: "project-1".to_string(),
+            name: "demo".to_string(),
+            path: repo.path().to_string_lossy().to_string(),
+            explicit_default_provider: None,
+            default_provider: ProviderKind::from_str("codex"),
+            leading_branch: Some("feature".to_string()),
+            auto_reopen_agents: None,
+            startup_command: None,
+            env: Default::default(),
+            current_branch: "feature".to_string(),
+            branch_status: ProjectBranchStatus::Leading,
+            path_missing: false,
+            created_at: None,
+        };
+        let (worker_tx, worker_rx) = mpsc::channel();
+
+        run_checkout_project_default_branch_inspection_job(project, worker_tx, None);
+
+        match worker_rx.recv().expect("worker event") {
+            WorkerEvent::CheckoutProjectDefaultBranchInspected { result, .. } => {
+                let (current_branch, warning_kind) = result.expect("inspection");
+                assert_eq!(current_branch, "feature");
+                assert!(
+                    matches!(
+                        &warning_kind,
+                        Some(BranchWarningKind::Known { default_branch }) if default_branch == "main"
+                    ),
+                    "expected a checkout of the remote default, got {warning_kind:?}"
+                );
             }
             _ => panic!("expected checkout inspection event"),
         }

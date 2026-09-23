@@ -146,6 +146,67 @@ pub fn add_project_plan(inspection: &AddProjectInspection) -> AddProjectPlan {
     }
 }
 
+/// The branch a project's new worktrees start from, decided once when the
+/// project is added (and again when the user checks out its default branch).
+///
+/// The kind is part of the answer because each surface picks the TONE of its
+/// "New worktrees will branch from ..." line from it: the remote's default is
+/// what a user expects and reads as neutral, anything else is a warning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectBase {
+    /// The remote's default branch (`origin/HEAD`).
+    RemoteDefault(String),
+    /// Any other branch: the one the folder is on, or the `main` fallback when
+    /// nothing better is known.
+    Other(String),
+}
+
+impl ProjectBase {
+    pub fn branch(&self) -> &str {
+        match self {
+            Self::RemoteDefault(branch) | Self::Other(branch) => branch,
+        }
+    }
+
+    pub fn into_branch(self) -> String {
+        match self {
+            Self::RemoteDefault(branch) | Self::Other(branch) => branch,
+        }
+    }
+
+    pub fn is_remote_default(&self) -> bool {
+        match self {
+            Self::RemoteDefault(_) => true,
+            Self::Other(_) => false,
+        }
+    }
+}
+
+/// Which branch becomes a project's base when it is added.
+///
+/// `check_out_default` is the add dialog's "Check out the default branch
+/// before adding" box: ticked, the folder moves to the default and the project
+/// branches from it; unticked, the project branches from wherever the folder
+/// is, which is exactly what the dialog tells the user. A detached HEAD has no
+/// branch to stay on, so it takes the default when one is known and `main`
+/// otherwise, the same fallback every other path uses.
+/// Pure: the caller runs the git probes.
+pub fn project_base_at_add(
+    current_branch: Option<&str>,
+    remote_default: Option<&str>,
+    check_out_default: bool,
+) -> ProjectBase {
+    match (current_branch, remote_default) {
+        (_, Some(default)) if check_out_default => ProjectBase::RemoteDefault(default.to_string()),
+        (Some(current), Some(default)) if current == default => {
+            ProjectBase::RemoteDefault(default.to_string())
+        }
+        (Some(current), _) => ProjectBase::Other(current.to_string()),
+        (None, Some(default)) => ProjectBase::RemoteDefault(default.to_string()),
+        (None, None) => ProjectBase::Other("main".to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +367,96 @@ mod tests {
         for v in vectors() {
             assert_eq!(add_project_plan(&v.inspection), v.expect, "{}", v.name);
         }
+    }
+
+    /// One row of the base-branch matrix: what the add knows and which branch
+    /// new worktrees must then start from.
+    struct BaseVector {
+        name: &'static str,
+        current_branch: Option<&'static str>,
+        remote_default: Option<&'static str>,
+        check_out_default: bool,
+        expect: ProjectBase,
+    }
+
+    fn base_vectors() -> Vec<BaseVector> {
+        vec![
+            BaseVector {
+                name: "known default, box ticked: the default branch",
+                current_branch: Some("feature"),
+                remote_default: Some("main"),
+                check_out_default: true,
+                expect: ProjectBase::RemoteDefault("main".to_string()),
+            },
+            BaseVector {
+                name: "known default, box unticked: the branch the folder is on",
+                current_branch: Some("feature"),
+                remote_default: Some("main"),
+                check_out_default: false,
+                expect: ProjectBase::Other("feature".to_string()),
+            },
+            BaseVector {
+                name: "no known default (heuristic): the current branch",
+                current_branch: Some("wip"),
+                remote_default: None,
+                check_out_default: false,
+                expect: ProjectBase::Other("wip".to_string()),
+            },
+            BaseVector {
+                name: "already on the known default: the default branch",
+                current_branch: Some("main"),
+                remote_default: Some("main"),
+                check_out_default: false,
+                expect: ProjectBase::RemoteDefault("main".to_string()),
+            },
+            BaseVector {
+                name: "detached HEAD with a known default: the default branch",
+                current_branch: None,
+                remote_default: Some("trunk"),
+                check_out_default: false,
+                expect: ProjectBase::RemoteDefault("trunk".to_string()),
+            },
+            BaseVector {
+                name: "detached HEAD checked out to the known default: the default branch",
+                current_branch: None,
+                remote_default: Some("trunk"),
+                check_out_default: true,
+                expect: ProjectBase::RemoteDefault("trunk".to_string()),
+            },
+            BaseVector {
+                name: "detached HEAD, nothing known: the main fallback",
+                current_branch: None,
+                remote_default: None,
+                check_out_default: false,
+                expect: ProjectBase::Other("main".to_string()),
+            },
+            BaseVector {
+                name: "a checkout asked for with no known default cannot happen: current wins",
+                current_branch: Some("wip"),
+                remote_default: None,
+                check_out_default: true,
+                expect: ProjectBase::Other("wip".to_string()),
+            },
+        ]
+    }
+
+    #[test]
+    fn project_base_at_add_matches_the_base_branch_matrix() {
+        for v in base_vectors() {
+            assert_eq!(
+                project_base_at_add(v.current_branch, v.remote_default, v.check_out_default),
+                v.expect,
+                "{}",
+                v.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_project_base_names_its_branch_whichever_kind_it_is() {
+        assert_eq!(ProjectBase::RemoteDefault("main".into()).branch(), "main");
+        assert_eq!(ProjectBase::Other("wip".into()).into_branch(), "wip");
+        assert!(ProjectBase::RemoteDefault("main".into()).is_remote_default());
+        assert!(!ProjectBase::Other("wip".into()).is_remote_default());
     }
 }

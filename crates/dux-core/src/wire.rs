@@ -2863,8 +2863,13 @@ impl Engine {
             move |o: &crate::engine::WebCheckoutOutcome| {
                 use crate::engine::{Final, WebCheckoutOutcome};
                 match o {
-                    WebCheckoutOutcome::Ok { target_branch } => Final::info(format!(
-                        "Checked out \"{target_branch}\" for project \"{project_name}\"."
+                    WebCheckoutOutcome::Ok {
+                        target_branch,
+                        base_moved,
+                    } => Final::info(crate::engine::checkout_default_branch_message(
+                        &project_name,
+                        target_branch,
+                        *base_moved,
                     )),
                     // STICKY: the checkout stopped part-way and the repository
                     // is left on whatever branch it landed on. The message says
@@ -2877,8 +2882,13 @@ impl Engine {
                         "Couldn't check out \"{target_branch}\" in {repo_path}. Resolve in your terminal and retry."
                     ))
                     .sticky(),
-                    WebCheckoutOutcome::AlreadyLeading { current_branch } => Final::info(format!(
-                        "Project \"{project_name}\" is already on the leading branch \"{current_branch}\"."
+                    WebCheckoutOutcome::AlreadyLeading {
+                        current_branch,
+                        base_moved,
+                    } => Final::info(crate::engine::already_on_default_branch_message(
+                        &project_name,
+                        current_branch,
+                        *base_moved,
                     )),
                     // STICKY: same shape, same instruction. dux cannot proceed
                     // and is asking the user to go and settle the repository's
@@ -2974,8 +2984,12 @@ impl Engine {
                 ),
             },
         };
-        let leading_branch =
-            crate::project_browser::leading_branch_for_project(&validated, branch.as_deref());
+        let leading_branch = crate::add_project_plan::project_base_at_add(
+            branch.as_deref(),
+            Some(&default_branch),
+            true,
+        )
+        .into_branch();
         let path_str = validated.to_string_lossy().to_string();
         let action = NonDefaultBranchAction::AddProject {
             path: path_str.clone(),
@@ -4305,10 +4319,14 @@ impl Engine {
                     );
                 }
                 let branch = crate::git::current_branch_opt(&validated)?;
-                let leading_branch = crate::project_browser::leading_branch_for_project(
+                // A plain add is the dialog's unticked box: the folder stays
+                // where it is and new worktrees branch from it.
+                let leading_branch = crate::project_browser::project_base_for_add(
                     &validated,
                     branch.as_deref(),
-                );
+                    false,
+                )
+                .into_branch();
                 let path_str = validated.to_string_lossy().to_string();
                 let display_name = if name.trim().is_empty() {
                     validated

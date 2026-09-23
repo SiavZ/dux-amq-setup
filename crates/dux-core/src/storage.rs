@@ -1050,6 +1050,21 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Record the branch a project's new worktrees start from. SQLite only: the
+    /// base is derived state and config never carries it.
+    pub fn update_project_leading_branch(&self, project_id: &str, branch: &str) -> Result<()> {
+        self.conn.execute(
+            r#"
+            update projects
+            set leading_branch = ?2,
+                updated_at = ?3
+            where id = ?1
+            "#,
+            params![project_id, branch, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     pub fn update_project_auto_reopen(
         &self,
         project_id: &str,
@@ -3503,6 +3518,35 @@ mod tests {
 
         let loaded = store.load_projects().unwrap();
         assert_eq!(loaded, vec![project]);
+    }
+
+    #[test]
+    fn updating_a_project_base_rewrites_only_that_field() {
+        let store = test_store();
+        let project = ProjectConfig {
+            id: "project-1".to_string(),
+            path: "/repo".to_string(),
+            name: Some("dux".to_string()),
+            default_provider: Some("codex".to_string()),
+            leading_branch: Some("feature".to_string()),
+            auto_reopen_agents: Some(false),
+            startup_command: Some("npm install".to_string()),
+            env: BTreeMap::from([("EDITOR".to_string(), "true".to_string())]),
+        };
+        store.upsert_project(&project).unwrap();
+
+        store
+            .update_project_leading_branch("project-1", "main")
+            .unwrap();
+
+        let loaded = store.load_projects().unwrap();
+        assert_eq!(
+            loaded,
+            vec![ProjectConfig {
+                leading_branch: Some("main".to_string()),
+                ..project
+            }]
+        );
     }
 
     #[test]

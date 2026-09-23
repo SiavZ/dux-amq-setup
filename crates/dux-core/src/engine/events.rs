@@ -3040,19 +3040,28 @@ impl Engine {
                         existing.current_branch = current_branch.clone();
                         existing.branch_status = ProjectBranchStatus::Leading;
                     }
-                    if let Some(id) = status_op_id
+                    // The user asked for the default branch, and the folder is
+                    // already there: new worktrees branch from it from now on,
+                    // exactly as if the checkout had run.
+                    let base = self.adopt_project_base(&project, &current_branch);
+                    let final_reaction = if let Some(id) = status_op_id
                         && let Some(op) = self.pending_web_checkout_ops.remove(&id)
                     {
                         op.resolve(&crate::engine::WebCheckoutOutcome::AlreadyLeading {
                             current_branch,
+                            base_moved: base.moved(),
                         })
                         .into_reaction()
                     } else {
-                        EventReaction::Status(StatusUpdate::info(format!(
-                            "Project \"{}\" is already on the leading branch \"{}\".",
-                            project.name, current_branch
-                        )))
-                    }
+                        EventReaction::Status(StatusUpdate::info(
+                            crate::engine::already_on_default_branch_message(
+                                &project.name,
+                                &current_branch,
+                                base.moved(),
+                            ),
+                        ))
+                    };
+                    base.with_unsaved_warning(final_reaction)
                 }
             },
             Err(error) => {
@@ -3098,17 +3107,27 @@ impl Engine {
                         existing.current_branch = target_branch.clone();
                         existing.branch_status = ProjectBranchStatus::Leading;
                     }
-                    if let Some(id) = status_op_id
+                    // Checking out the default branch means new worktrees
+                    // branch from it, the same rule the add dialog's box uses.
+                    let base = self.adopt_project_base(&project, &target_branch);
+                    let final_reaction = if let Some(id) = status_op_id
                         && let Some(op) = self.pending_web_checkout_ops.remove(&id)
                     {
-                        op.resolve(&crate::engine::WebCheckoutOutcome::Ok { target_branch })
-                            .into_reaction()
+                        op.resolve(&crate::engine::WebCheckoutOutcome::Ok {
+                            target_branch,
+                            base_moved: base.moved(),
+                        })
+                        .into_reaction()
                     } else {
-                        EventReaction::Status(StatusUpdate::info(format!(
-                            "Checked out \"{target_branch}\" for project \"{}\".",
-                            project.name
-                        )))
-                    }
+                        EventReaction::Status(StatusUpdate::info(
+                            crate::engine::checkout_default_branch_message(
+                                &project.name,
+                                &target_branch,
+                                base.moved(),
+                            ),
+                        ))
+                    };
+                    base.with_unsaved_warning(final_reaction)
                 }
             },
             Err(error) => {
@@ -3143,6 +3162,34 @@ impl Engine {
                 EventReaction::Status(StatusUpdate::error(format!(
                     "Couldn't check out \"{target_branch}\" in {path}. Resolve in your terminal and retry."
                 )))
+            }
+        }
+    }
+
+    /// Make `branch` the base new worktrees of `project` branch from, in memory
+    /// and in SQLite (never config: the base is derived state).
+    fn adopt_project_base(&mut self, project: &Project, branch: &str) -> BaseMove {
+        let Some(existing) = self.projects.iter_mut().find(|item| item.id == project.id) else {
+            return BaseMove::Unchanged;
+        };
+        if existing.leading_branch.as_deref() == Some(branch) {
+            return BaseMove::Unchanged;
+        }
+        existing.leading_branch = Some(branch.to_string());
+        match self
+            .session_store
+            .update_project_leading_branch(&project.id, branch)
+        {
+            Ok(()) => BaseMove::Moved,
+            Err(err) => {
+                logger::error(&format!(
+                    "failed to save \"{branch}\" as the base branch of project {}: {err:#}",
+                    project.id
+                ));
+                BaseMove::MovedUnsaved(format!(
+                    "Couldn't save \"{branch}\" as the base branch of project \"{}\": {err:#}. New worktrees branch from it until dux restarts, then from the branch saved before.",
+                    project.name
+                ))
             }
         }
     }
@@ -3560,6 +3607,37 @@ impl Engine {
             WorkerEvent::TailscaleModeApplied { mode, outcome } => {
                 EventReaction::TailscaleModeApplied { mode, outcome }
             }
+        }
+    }
+}
+
+/// What [`Engine::adopt_project_base`] did to a project's base.
+enum BaseMove {
+    /// It already was that branch.
+    Unchanged,
+    /// It moved, in memory and in SQLite.
+    Moved,
+    /// It moved in memory, but SQLite refused; carries the warning to show.
+    MovedUnsaved(String),
+}
+
+impl BaseMove {
+    fn moved(&self) -> bool {
+        match self {
+            Self::Unchanged => false,
+            Self::Moved | Self::MovedUnsaved(_) => true,
+        }
+    }
+
+    /// The final, plus the save failure after it when there was one: a base
+    /// that only lives until the next restart must not pass silently.
+    fn with_unsaved_warning(self, final_reaction: EventReaction) -> EventReaction {
+        match self {
+            Self::Unchanged | Self::Moved => final_reaction,
+            Self::MovedUnsaved(warning) => EventReaction::Multi(vec![
+                final_reaction,
+                EventReaction::Status(StatusUpdate::warning(warning)),
+            ]),
         }
     }
 }
@@ -5671,6 +5749,144 @@ mod tests {
         assert_eq!(
             engine.projects[0].branch_status,
             ProjectBranchStatus::Leading
+        );
+    }
+
+    /// A project stored with a feature branch as its base (added with the
+    /// checkout box unticked) and registered in SQLite the way an add leaves it.
+    fn project_based_on_feature(engine: &mut Engine) -> Project {
+        let mut project = sample_project("p1", "/tmp/p1");
+        project.leading_branch = Some("feature".to_string());
+        project.current_branch = "feature".to_string();
+        engine
+            .session_store
+            .upsert_project(&crate::engine::project_to_project_config(&project))
+            .expect("seed the project row");
+        engine.projects.push(project.clone());
+        project
+    }
+
+    fn stored_base(engine: &Engine) -> Option<String> {
+        engine
+            .session_store
+            .load_projects()
+            .expect("load projects")
+            .into_iter()
+            .find(|p| p.id == "p1")
+            .and_then(|p| p.leading_branch)
+    }
+
+    fn status_message(reaction: &EventReaction) -> String {
+        match reaction {
+            EventReaction::Status(update) => update.message.clone(),
+            _ => panic!("expected a status reaction"),
+        }
+    }
+
+    #[test]
+    fn checking_out_the_default_branch_makes_it_the_project_base() {
+        let (mut engine, _tmp) = test_engine();
+        let project = project_based_on_feature(&mut engine);
+
+        let reaction =
+            engine.process_worker_event(WorkerEvent::NonDefaultBranchCheckoutCompleted {
+                action: NonDefaultBranchAction::CheckoutProjectDefault { project },
+                target_branch: "main".into(),
+                result: Ok(()),
+                status_op_id: None,
+            });
+
+        assert_eq!(engine.projects[0].leading_branch.as_deref(), Some("main"));
+        assert_eq!(stored_base(&engine).as_deref(), Some("main"));
+        assert_eq!(
+            status_message(&reaction),
+            "Checked out \"main\" for project \"p1-name\". New worktrees branch from \"main\" now."
+        );
+    }
+
+    #[test]
+    fn a_base_sqlite_refuses_to_save_is_still_used_and_said_out_loud() {
+        let (mut engine, _tmp) = test_engine();
+        let project = project_based_on_feature(&mut engine);
+        rusqlite::Connection::open(&engine.paths.sessions_db_path)
+            .expect("second connection")
+            .execute_batch(
+                "create trigger refuse_updates before update on projects \
+                 begin select raise(abort, 'the disk said no'); end;",
+            )
+            .expect("install the refusing trigger");
+
+        let reaction =
+            engine.process_worker_event(WorkerEvent::NonDefaultBranchCheckoutCompleted {
+                action: NonDefaultBranchAction::CheckoutProjectDefault { project },
+                target_branch: "main".into(),
+                result: Ok(()),
+                status_op_id: None,
+            });
+
+        assert_eq!(engine.projects[0].leading_branch.as_deref(), Some("main"));
+        assert_eq!(stored_base(&engine).as_deref(), Some("feature"));
+        let EventReaction::Multi(parts) = reaction else {
+            panic!("expected the final followed by the save warning");
+        };
+        assert_eq!(
+            status_message(&parts[0]),
+            "Checked out \"main\" for project \"p1-name\". New worktrees branch from \"main\" now."
+        );
+        let EventReaction::Status(warning) = &parts[1] else {
+            panic!("expected a warning status");
+        };
+        assert_eq!(warning.tone, StatusTone::Warning);
+        assert!(
+            warning
+                .message
+                .starts_with("Couldn't save \"main\" as the base branch of project \"p1-name\": ")
+                && warning.message.contains("the disk said no")
+                && warning
+                    .message
+                    .ends_with("until dux restarts, then from the branch saved before."),
+            "{}",
+            warning.message
+        );
+    }
+
+    #[test]
+    fn a_default_branch_checkout_that_keeps_the_base_says_only_what_it_did() {
+        let (mut engine, _tmp) = test_engine();
+        let project = sample_project("p1", "/tmp/p1");
+        engine.projects.push(project.clone());
+
+        let reaction =
+            engine.process_worker_event(WorkerEvent::NonDefaultBranchCheckoutCompleted {
+                action: NonDefaultBranchAction::CheckoutProjectDefault { project },
+                target_branch: "main".into(),
+                result: Ok(()),
+                status_op_id: None,
+            });
+
+        assert_eq!(
+            status_message(&reaction),
+            "Checked out \"main\" for project \"p1-name\"."
+        );
+    }
+
+    #[test]
+    fn a_folder_already_on_the_default_branch_still_makes_it_the_project_base() {
+        let (mut engine, _tmp) = test_engine();
+        let project = project_based_on_feature(&mut engine);
+
+        let reaction =
+            engine.process_worker_event(WorkerEvent::CheckoutProjectDefaultBranchInspected {
+                project,
+                result: Ok(("main".into(), None)),
+                status_op_id: None,
+            });
+
+        assert_eq!(engine.projects[0].leading_branch.as_deref(), Some("main"));
+        assert_eq!(stored_base(&engine).as_deref(), Some("main"));
+        assert_eq!(
+            status_message(&reaction),
+            "Project \"p1-name\" is already on the leading branch \"main\". New worktrees branch from \"main\" now."
         );
     }
 

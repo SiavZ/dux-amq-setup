@@ -873,19 +873,62 @@ pub enum WebDeleteOutcome {
 /// inspect-failed before any switch runs, and the switch (worker 2) finishes
 /// with success / failure.
 pub enum WebCheckoutOutcome {
-    /// The `git switch` (worker 2) succeeded onto `target_branch`.
-    Ok { target_branch: String },
+    /// The `git switch` (worker 2) succeeded onto `target_branch`, which is now
+    /// the project's base; `base_moved` says whether it was not already.
+    Ok {
+        target_branch: String,
+        base_moved: bool,
+    },
     /// The `git switch` (worker 2) failed; `repo_path` is the source checkout path.
     Failed {
         target_branch: String,
         repo_path: String,
     },
     /// Worker 1 found the project already on its leading branch; no switch ran.
-    AlreadyLeading { current_branch: String },
+    /// That branch is now the project's base; `base_moved` as for `Ok`.
+    AlreadyLeading {
+        current_branch: String,
+        base_moved: bool,
+    },
     /// Worker 1 could only heuristically guess the default branch, so it refused.
     Heuristic { current_branch: String },
     /// Worker 1's inspection itself failed.
     InspectFailed { error: String },
+}
+
+/// The confirmation for a finished "check out the default branch" on an
+/// existing project. Both surfaces print exactly this. The base only lives in
+/// the project info, so a move is said out loud rather than left to be noticed.
+pub fn checkout_default_branch_message(
+    project_name: &str,
+    target_branch: &str,
+    base_moved: bool,
+) -> String {
+    format!(
+        "Checked out \"{target_branch}\" for project \"{project_name}\".{}",
+        base_moved_suffix(target_branch, base_moved)
+    )
+}
+
+/// The confirmation when the folder was already on the default branch, so no
+/// checkout ran. Both surfaces print exactly this.
+pub fn already_on_default_branch_message(
+    project_name: &str,
+    current_branch: &str,
+    base_moved: bool,
+) -> String {
+    format!(
+        "Project \"{project_name}\" is already on the leading branch \"{current_branch}\".{}",
+        base_moved_suffix(current_branch, base_moved)
+    )
+}
+
+fn base_moved_suffix(branch: &str, base_moved: bool) -> String {
+    if base_moved {
+        format!(" New worktrees branch from \"{branch}\" now.")
+    } else {
+        String::new()
+    }
 }
 
 /// Handler-computed outcome for the web add-project "Check Out & Add" op.
