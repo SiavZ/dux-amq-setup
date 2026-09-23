@@ -7682,9 +7682,11 @@ mod tests {
         let statuses = wire_statuses_from_reaction(&r2);
         let status = statuses.last().expect("final status");
         assert_eq!(status.tone, "info");
+        // The project had no recorded base, so the checkout records one and
+        // says so.
         assert_eq!(
             status.message,
-            "Checked out \"main\" for project \"p1-name\"."
+            "Checked out \"main\" for project \"p1-name\". New worktrees branch from \"main\" now."
         );
         assert_eq!(
             status.key.as_deref(),
