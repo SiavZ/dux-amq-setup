@@ -1088,11 +1088,42 @@ pub fn local_branch_exists(repo_path: &Path, name: &str) -> bool {
     ref_exists(repo_path, &format!("refs/heads/{name}"))
 }
 
-/// Whether origin's remote-tracking ref for `name` exists, as of the last
-/// fetch. Unlike [`branch_exists`], a local branch of the same name does not
-/// count.
-pub fn remote_branch_exists(repo_path: &Path, name: &str) -> bool {
-    ref_exists(repo_path, &format!("refs/remotes/origin/{name}"))
+/// Whether origin has branch `name` right now, asked of origin itself with
+/// `ls-remote` (plumbing) rather than this clone's tracking refs, which may
+/// never have been fetched. `Ok(false)` only when origin answered and has no
+/// such ref (exit 2); any failure to ask is an `Err`, never a "no".
+///
+/// `ls-remote` patterns match a ref's tail, so the answer is the exact ref in
+/// its output, not the exit status alone. The refspec is fully qualified, so
+/// a dash-leading branch name cannot be read as an option.
+pub fn origin_has_branch(repo_path: &Path, name: &str) -> Result<bool> {
+    let full_ref = format!("refs/heads/{name}");
+    let output = Command::new("git")
+        .args([
+            "-C",
+            repo_path.to_string_lossy().as_ref(),
+            "ls-remote",
+            "--exit-code",
+            "origin",
+            "--",
+            &full_ref,
+        ])
+        // Never stop to ask for credentials: this is a question, not a login.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("failed to run git ls-remote in {}", repo_path.display()))?;
+    match output.status.code() {
+        Some(0) => Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.split('\t').nth(1) == Some(full_ref.as_str()))),
+        Some(2) => Ok(false),
+        _ => anyhow::bail!(
+            "git ls-remote origin failed in {}: {}",
+            repo_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
 }
 
 /// How much of a branch exists only on this machine, and whether there was
@@ -5293,10 +5324,13 @@ mod tests {
         );
     }
 
-    /// Only origin's remote-tracking ref counts: a local branch of the same
-    /// name says nothing about whether origin has it.
+    /// origin itself answers, not this clone's tracking refs: a branch origin
+    /// has counts even though it was never fetched, a local-only branch does
+    /// not, and an origin that cannot be reached is an error, never a "no".
     #[test]
-    fn remote_branch_exists_asks_origin_and_not_the_local_branches() {
+    fn origin_has_branch_asks_origin_itself() {
+        let bare = tempfile::tempdir().unwrap();
+        run_git(bare.path(), &["init", "-q", "--bare", "-b", "main"]);
         let repo = tempfile::tempdir().unwrap();
         run_git(repo.path(), &["init", "-q", "-b", "main"]);
         run_git(repo.path(), &["config", "user.name", "t"]);
@@ -5305,16 +5339,33 @@ mod tests {
             repo.path(),
             &["commit", "-q", "--allow-empty", "-m", "init"],
         );
-        run_git(repo.path(), &["branch", "feature"]);
         run_git(
             repo.path(),
-            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        );
+        run_git(repo.path(), &["push", "-q", "origin", "main"]);
+        run_git(
+            repo.path(),
+            &["update-ref", "-d", "refs/remotes/origin/main"],
+        );
+        run_git(repo.path(), &["branch", "feature"]);
+
+        assert!(
+            origin_has_branch(repo.path(), "main").unwrap(),
+            "exit 0: origin has it, fetched or not"
+        );
+        assert!(
+            !origin_has_branch(repo.path(), "feature").unwrap(),
+            "exit 2: origin answered and has no such branch"
         );
 
-        assert!(remote_branch_exists(repo.path(), "main"));
+        run_git(
+            repo.path(),
+            &["remote", "set-url", "origin", "/nonexistent/dux-origin.git"],
+        );
         assert!(
-            !remote_branch_exists(repo.path(), "feature"),
-            "a local-only branch is not on origin"
+            origin_has_branch(repo.path(), "main").is_err(),
+            "an origin that cannot be asked is not a no"
         );
     }
 

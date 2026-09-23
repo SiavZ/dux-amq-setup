@@ -201,9 +201,11 @@ impl CreatePlanContext<'_> {
             return;
         }
         match git::has_origin_remote(repo_path) {
-            // A base origin has never had (a project added on a local branch)
-            // has nothing to pull; that is steady state, not a failure.
-            Ok(true) if !git::remote_branch_exists(repo_path, leading_branch) => {
+            // A base origin does not have (a project added on a local branch)
+            // has nothing to pull; that is steady state, not a failure. Only
+            // origin's own "no" skips: if origin cannot be asked, the pull
+            // runs and reports the failure itself.
+            Ok(true) if matches!(git::origin_has_branch(repo_path, leading_branch), Ok(false)) => {
                 logger::info(&format!(
                     "skipping pre-create pull for {}: origin has no branch \"{leading_branch}\"",
                     project.path
@@ -2535,12 +2537,6 @@ mod tests {
             repo.path(),
             &["remote", "add", "origin", "/nonexistent/dux-test-origin"],
         );
-        // origin is known to have the branch, so the pull is attempted and
-        // fails on the unreachable remote.
-        git_in(
-            repo.path(),
-            &["update-ref", "refs/remotes/origin/main", "HEAD"],
-        );
 
         let run = drive_create_job_run(repo.path(), new_project_request(repo.path(), true, false));
         assert!(run.failure.is_none(), "creation must survive a failed pull");
@@ -2588,6 +2584,47 @@ mod tests {
         assert!(
             !status.contains("Warning"),
             "a branch origin never had is not a pull failure: {status}"
+        );
+    }
+
+    /// Whether origin has the branch is asked of origin itself: a clone that
+    /// has never fetched it still pulls the newer commit.
+    #[test]
+    fn fresh_agent_pulls_a_branch_origin_has_even_when_this_clone_never_fetched_it() {
+        let repo = init_test_repo();
+        let bare = tempfile::tempdir().unwrap();
+        git_in(bare.path(), &["init", "--bare", "-b", "main"]);
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        );
+        git_in(repo.path(), &["push", "origin", "main"]);
+        // Someone else pushes a newer commit from their own clone.
+        let other = tempfile::tempdir().unwrap();
+        git_in(other.path(), &["clone", bare.path().to_str().unwrap(), "."]);
+        git_in(other.path(), &["config", "user.name", "test"]);
+        git_in(other.path(), &["config", "user.email", "t@t"]);
+        std::fs::write(other.path().join("upstream.txt"), "newer\n").unwrap();
+        git_in(other.path(), &["add", "-A"]);
+        git_in(other.path(), &["commit", "-m", "newer upstream"]);
+        git_in(other.path(), &["push", "origin", "main"]);
+        // And this clone holds no tracking ref for it.
+        git_in(
+            repo.path(),
+            &["update-ref", "-d", "refs/remotes/origin/main"],
+        );
+
+        let run = drive_create_job_run(repo.path(), new_project_request(repo.path(), true, false));
+
+        assert!(
+            run.failure.is_none(),
+            "creation must succeed: {:?}",
+            run.failure
+        );
+        let worktree = PathBuf::from(run.session.unwrap().directory());
+        assert!(
+            worktree.join("upstream.txt").exists(),
+            "the pull must have run and brought in origin's newer commit"
         );
     }
 
