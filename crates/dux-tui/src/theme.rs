@@ -229,7 +229,23 @@ pub struct Theme {
     pub help_banner_fg: Color,
     pub help_banner_bg: Color,
     pub help_body_fg: Color,
+    /// Foreground of a name chip: a branch, path, file, command, or an agent,
+    /// project, terminal or provider name inside a dialog's prose. Defaults to
+    /// `text_fg`, because a name is text the user reads, never the terminal's
+    /// default foreground.
+    pub name_fg: Color,
+    /// Background of a name chip: `overlay_bg` moved [`NAME_BG_TINT`] of the
+    /// way toward `text_fg`, one small step off the modal surface in the
+    /// direction of the text (lighter on dark themes, darker on light ones, in
+    /// the theme's own hue on tinted ones). The chip is the terminal UI's
+    /// counterpart of the web's inline code chip.
+    pub name_bg: Color,
 }
+
+/// How much of the body-text color is mixed into the modal surface to make the
+/// name chip. The same weight [`Theme::selection_bar_tint`] uses for its faint
+/// tint, so the app's two "a little of X over the surface" shades agree.
+pub const NAME_BG_TINT: f32 = 0.16;
 
 /// Load a theme by name.
 ///
@@ -529,6 +545,15 @@ fn register_dux_defaults(theme: &mut OpalineTheme) {
     theme.register_default_token("dux.pr_open_label", GITHUB_PR_OPEN_LABEL);
     theme.register_default_token("dux.pr_merged_label", GITHUB_PR_MERGED_LABEL);
     theme.register_default_token("dux.pr_closed_label", GITHUB_PR_CLOSED_LABEL);
+
+    // The name chip is DERIVED from two dux tokens rather than from Opaline's
+    // semantics, so it must come after both are resolved: either the theme's
+    // explicit values or the defaults registered above. Like every other dux
+    // default, an explicit `dux.name_fg` / `dux.name_bg` wins.
+    let body_text = theme.color("dux.text_fg");
+    let modal_surface = theme.color("dux.overlay_bg");
+    theme.register_default_token("dux.name_fg", body_text);
+    theme.register_default_token("dux.name_bg", modal_surface.lerp(body_text, NAME_BG_TINT));
 }
 
 /// Convert an [`OpalineColor`] (always RGB) into a [`ratatui::style::Color`],
@@ -660,6 +685,8 @@ impl Theme {
             help_banner_fg: pick("dux.help_banner_fg"),
             help_banner_bg: pick("dux.help_banner_bg"),
             help_body_fg: pick("dux.help_body_fg"),
+            name_fg: pick("dux.name_fg"),
+            name_bg: pick("dux.name_bg"),
         }
     }
 
@@ -718,6 +745,13 @@ impl Theme {
         } else {
             Style::default().fg(self.overlay_border)
         }
+    }
+
+    /// The style of a name chip. Callers never apply it by hand: the shared
+    /// `name_chip` component pads the name and applies it, so every name in
+    /// every dialog is the same shape.
+    pub fn name_style(&self) -> Style {
+        Style::default().fg(self.name_fg).bg(self.name_bg)
     }
 
     pub fn selection_style(&self) -> Style {
@@ -1068,6 +1102,10 @@ mod tests {
             help_banner_fg: Color::Rgb(20, 20, 20),
             help_banner_bg: Color::Cyan,
             help_body_fg: Color::Rgb(180, 180, 180),
+            // The name chip: the body text on the modal surface tinted 16%
+            // toward it (#141414 -> white).
+            name_fg: Color::White,
+            name_bg: Color::Rgb(0x3a, 0x3a, 0x3a),
         }
     }
 
@@ -1177,6 +1215,8 @@ mod tests {
         assert_field!(help_banner_fg);
         assert_field!(help_banner_bg);
         assert_field!(help_body_fg);
+        assert_field!(name_fg);
+        assert_field!(name_bg);
     }
 
     /// The fallback path must always produce a valid Theme: it is what the
@@ -1471,5 +1511,101 @@ info = "info"
         assert_eq!(theme.session_attention, Color::Rgb(0xab, 0xcd, 0xef));
         assert_ne!(theme.session_attention, theme.title_focused);
         assert_ne!(theme.session_attention, theme.warning_fg);
+    }
+
+    fn scratch_paths() -> (tempfile::TempDir, DuxPaths) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        let paths = DuxPaths {
+            config_path: root.join("config.toml"),
+            sessions_db_path: root.join("sessions.sqlite3"),
+            worktrees_root: root.join("worktrees"),
+            lock_path: root.join("dux.lock"),
+            root,
+        };
+        (tmp, paths)
+    }
+
+    /// The name chip is derived, not picked: the foreground is the theme's body
+    /// text and the background is the modal surface moved `NAME_BG_TINT` of the
+    /// way toward that text. The bundled theme's values are pinned outright
+    /// (they are what the proof of concept measured), and every built-in is
+    /// checked against the same derivation run over its own resolved tokens, so
+    /// a registration that runs before the tokens it reads are defaulted fails
+    /// here rather than painting the FALLBACK gray.
+    #[test]
+    fn the_name_chip_derives_from_body_text_and_the_modal_surface_in_every_loadable_theme() {
+        let dux_dark = load_from_str(DUX_DARK_TOML).expect("bundled dux-dark must parse");
+        assert_eq!(dux_dark.name_fg, Color::White);
+        assert_eq!(dux_dark.name_bg, Color::Rgb(0x3a, 0x3a, 0x3a));
+
+        let (_tmp, paths) = scratch_paths();
+        let listings = discover_available(&paths);
+        assert!(
+            listings.len() > 1,
+            "expected the bundled theme plus built-ins"
+        );
+        for listing in listings {
+            let theme = load(&listing.id, &paths)
+                .unwrap_or_else(|err| panic!("theme {} failed to load: {err}", listing.id));
+            assert_eq!(
+                theme.name_fg, theme.text_fg,
+                "theme {}: a name reads in the body-text color",
+                listing.id
+            );
+            assert_ne!(
+                theme.name_bg, theme.overlay_bg,
+                "theme {} draws the name chip invisibly on the modal surface",
+                listing.id
+            );
+            assert_ne!(
+                theme.name_bg, theme.name_fg,
+                "theme {} draws a name in its own chip color",
+                listing.id
+            );
+            if listing.source == ThemeSource::Opaline {
+                let raw = [listing.id.replace('_', "-"), listing.id.clone()]
+                    .iter()
+                    .find_map(|candidate| opaline::load_by_name(candidate))
+                    .unwrap_or_else(|| panic!("built-in {} must load", listing.id));
+                let mut raw = raw;
+                register_dux_defaults(&mut raw);
+                let text = raw.color("dux.text_fg");
+                let surface = raw.color("dux.overlay_bg");
+                assert_eq!(
+                    theme.name_bg,
+                    into_ratatui(surface.lerp(text, NAME_BG_TINT)),
+                    "theme {}: the chip is the modal surface tinted toward the text",
+                    listing.id
+                );
+            }
+        }
+    }
+
+    /// A theme that names its own chip keeps it: the derivation is a default,
+    /// never an override.
+    #[test]
+    fn explicit_name_chip_tokens_override_the_derivation() {
+        let theme = load_from_str(
+            r##"
+[meta]
+name = "Explicit Name Theme"
+variant = "dark"
+
+[tokens]
+"dux.name_fg" = "#0a0b0c"
+"dux.name_bg" = "#d0e0f0"
+"##,
+        )
+        .expect("theme must parse");
+
+        assert_eq!(theme.name_fg, Color::Rgb(0x0a, 0x0b, 0x0c));
+        assert_eq!(theme.name_bg, Color::Rgb(0xd0, 0xe0, 0xf0));
+        assert_eq!(
+            theme.name_style(),
+            Style::default()
+                .fg(Color::Rgb(0x0a, 0x0b, 0x0c))
+                .bg(Color::Rgb(0xd0, 0xe0, 0xf0))
+        );
     }
 }

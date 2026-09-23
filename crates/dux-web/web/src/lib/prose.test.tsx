@@ -1,8 +1,22 @@
 // @vitest-environment jsdom
+import { readFileSync } from "node:fs"
+import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
+
 import { describe, expect, it } from "vitest"
 import { render } from "@testing-library/react"
 
-import { chip, proseText, quotedChip, renderProse } from "./prose"
+import { checkoutDefaultBranchProse } from "./checkoutDefaultBranch"
+import { detachConfirmProse } from "./detachAgent"
+import {
+  chip,
+  type Prose,
+  type ProseSegment,
+  proseText,
+  quotedChip,
+  renderProse,
+} from "./prose"
+import { recreateConfirmProse } from "./recreateWorkingCopy"
 
 describe("a sentence built from prose and names", () => {
   it("renders every name as the shared chip and the rest as text", () => {
@@ -26,4 +40,77 @@ describe("a sentence built from prose and names", () => {
     const { container } = render(<p>{renderProse(["a ", chip(""), " b"])}</p>)
     expect(container.querySelectorAll("code")).toHaveLength(1)
   })
+})
+
+describe("the sentences both surfaces print", () => {
+  // The other half of the pin in dux-core's `prose.rs`: both read this same
+  // file, so a sentence passes only when the terminal UI and the web say the
+  // same words and mark the same names. Adjacent strings are merged first, so
+  // either side may split its constant words however it likes.
+  const fixture = JSON.parse(
+    readFileSync(
+      join(
+        dirname(fileURLToPath(import.meta.url)),
+        "../../../../dux-core/tests/fixtures/prose_cross_language.json",
+      ),
+      "utf8",
+    ),
+  ) as {
+    cases: {
+      what: string
+      sentence: string
+      args: Record<string, unknown>
+      segments: Prose
+    }[]
+  }
+
+  function merged(prose: Prose): Prose {
+    const out: ProseSegment[] = []
+    for (const segment of prose) {
+      const last = out[out.length - 1]
+      if (typeof segment === "string" && typeof last === "string") {
+        out[out.length - 1] = last + segment
+      } else {
+        out.push(segment)
+      }
+    }
+    return out
+  }
+
+  function build(sentence: string, args: Record<string, unknown>): Prose {
+    switch (sentence) {
+      case "detach_confirm":
+        return detachConfirmProse(
+          args.label as string,
+          args.grace_seconds as number,
+          args.live_tabs as number,
+        )
+      case "recreate_confirm":
+        return recreateConfirmProse(
+          args.worktree_label as string,
+          args.branch_name as string,
+          args.source_branch as string,
+          args.conversation_resumes as boolean,
+          args.providers as string[],
+        )
+      case "checkout_default_branch_confirm":
+        return checkoutDefaultBranchProse(
+          args.project_name as string,
+          args.stored_base as string | null,
+        )
+      default:
+        throw new Error(`the fixture names a sentence this test cannot build: ${sentence}`)
+    }
+  }
+
+  it("has not lost its cases", () => {
+    expect(fixture.cases.length).toBeGreaterThanOrEqual(6)
+  })
+
+  it.each(fixture.cases.map((c) => [c.what, c] as const))(
+    "agrees with the terminal UI about %s",
+    (_what, c) => {
+      expect(merged(build(c.sentence, c.args))).toEqual(merged(c.segments))
+    },
+  )
 })

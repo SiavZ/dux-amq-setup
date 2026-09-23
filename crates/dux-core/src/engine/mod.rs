@@ -38,8 +38,8 @@ pub use lifecycle::{
     GroupWorktreeRemoval, PendingDetach, PrunedPty, PrunedPtyKind, RAPID_EXIT_WINDOW,
     ReapedTerminations, ShutdownReport, TerminatingPty, agent_exit_with_companion_notice,
     clean_exit_closes_tab_row, closed_tab_exit_notice, closed_terminal_notice, detach_busy_message,
-    detach_confirm_body, detach_final, detach_not_running_message, detach_status_key,
-    detached_agent_notice, format_shutdown_result, format_shutdown_start,
+    detach_confirm_body, detach_confirm_prose, detach_final, detach_not_running_message,
+    detach_status_key, detached_agent_notice, format_shutdown_result, format_shutdown_start,
 };
 pub use pr_sync_control::PrSyncControl;
 pub use resume_fallback::ResumeFallbackOutcome;
@@ -931,16 +931,26 @@ pub fn checkout_default_branch_confirm_body(
     project_name: &str,
     stored_base: Option<&str>,
 ) -> String {
-    let lead = format!(
-        "This switches the source checkout for \"{project_name}\" back to its default branch, \
-         moving HEAD in the shared repository."
-    );
+    checkout_default_branch_confirm_prose(project_name, stored_base).plain()
+}
+
+/// [`checkout_default_branch_confirm_body`] as prose, the project and its base
+/// marked so each surface draws them as chips. Pinned against the browser's
+/// `checkoutDefaultBranchProse` by `tests/fixtures/prose_cross_language.json`.
+pub fn checkout_default_branch_confirm_prose(
+    project_name: &str,
+    stored_base: Option<&str>,
+) -> crate::prose::Prose {
+    let lead = crate::prose::Prose::new()
+        .text("This switches the source checkout for ")
+        .quoted(project_name)
+        .text(" back to its default branch, moving HEAD in the shared repository.");
     match stored_base {
-        Some(base) => format!(
-            "{lead} New worktrees branch from \"{base}\" now. After the checkout, they branch \
-             from the default branch."
-        ),
-        None => format!("{lead} After the checkout, new worktrees branch from the default branch."),
+        Some(base) => lead
+            .text(" New worktrees branch from ")
+            .quoted(base)
+            .text(" now. After the checkout, they branch from the default branch."),
+        None => lead.text(" After the checkout, new worktrees branch from the default branch."),
     }
 }
 

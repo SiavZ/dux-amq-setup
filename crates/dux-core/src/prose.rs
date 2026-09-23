@@ -1,0 +1,296 @@
+//! A sentence that names things, kept as structure rather than as a finished
+//! string.
+//!
+//! A dialog sentence mixes constant words with variables: a branch, a path, an
+//! agent or project name, a provider. Both surfaces draw every such variable as
+//! a chip (the terminal UI's themed name span, the web's inline code), so the
+//! sentence is built once as segments and each surface decides how a name
+//! looks. Nothing ever finds a name by parsing a rendered sentence.
+//!
+//! [`Prose::plain`] is the plain-text spelling, for logs and tests. A name
+//! built with [`Prose::quoted`] is wrapped in straight double quotes there,
+//! because that is how the sentence read before names were chips; the chip
+//! replaces the quotes on both surfaces, and a padded terminal chip is exactly
+//! as wide as the quoted text was.
+//!
+//! The browser's twin is `crates/dux-web/web/src/lib/prose.tsx`. Sentences both
+//! surfaces print are pinned segment for segment by
+//! `tests/fixtures/prose_cross_language.json`, which each side reads.
+
+use serde_json::{Value, json};
+
+/// One piece of a sentence: constant words, or a name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProseSegment {
+    Text(String),
+    Name {
+        name: String,
+        /// The plain-text spelling wraps this name in straight double quotes.
+        quoted: bool,
+    },
+}
+
+/// A sentence as segments. Adjacent text is merged as it is pushed, so two
+/// builders that say the same words produce equal values however they split
+/// the constant parts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Prose {
+    segments: Vec<ProseSegment>,
+}
+
+impl Prose {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Constant words.
+    pub fn text(mut self, text: impl AsRef<str>) -> Self {
+        self.push_text(text);
+        self
+    }
+
+    /// A name the plain-text spelling leaves bare.
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.push_name(name);
+        self
+    }
+
+    /// A name the plain-text spelling wraps in straight double quotes.
+    pub fn quoted(mut self, name: impl Into<String>) -> Self {
+        self.push_quoted(name);
+        self
+    }
+
+    /// Another sentence, appended segment by segment.
+    pub fn then(mut self, other: Prose) -> Self {
+        for segment in other.segments {
+            match segment {
+                ProseSegment::Text(text) => self.push_text(text),
+                name @ ProseSegment::Name { .. } => self.segments.push(name),
+            }
+        }
+        self
+    }
+
+    pub fn push_text(&mut self, text: impl AsRef<str>) {
+        let text = text.as_ref();
+        if text.is_empty() {
+            return;
+        }
+        if let Some(ProseSegment::Text(last)) = self.segments.last_mut() {
+            last.push_str(text);
+        } else {
+            self.segments.push(ProseSegment::Text(text.to_string()));
+        }
+    }
+
+    pub fn push_name(&mut self, name: impl Into<String>) {
+        self.segments.push(ProseSegment::Name {
+            name: name.into(),
+            quoted: false,
+        });
+    }
+
+    pub fn push_quoted(&mut self, name: impl Into<String>) {
+        self.segments.push(ProseSegment::Name {
+            name: name.into(),
+            quoted: true,
+        });
+    }
+
+    pub fn segments(&self) -> &[ProseSegment] {
+        &self.segments
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    /// The plain-text spelling: quoted names in straight double quotes, bare
+    /// names as they are.
+    pub fn plain(&self) -> String {
+        let mut out = String::new();
+        for segment in &self.segments {
+            match segment {
+                ProseSegment::Text(text) => out.push_str(text),
+                ProseSegment::Name { name, quoted: true } => {
+                    out.push('"');
+                    out.push_str(name);
+                    out.push('"');
+                }
+                ProseSegment::Name {
+                    name,
+                    quoted: false,
+                } => out.push_str(name),
+            }
+        }
+        out
+    }
+
+    /// The shape the cross-language fixture records: a string for constant
+    /// words, `{ "name", "quoted" }` for a name, the same shape the browser's
+    /// `Prose` type has.
+    pub fn to_json(&self) -> Value {
+        Value::Array(
+            self.segments
+                .iter()
+                .map(|segment| match segment {
+                    ProseSegment::Text(text) => Value::String(text.clone()),
+                    ProseSegment::Name { name, quoted } => {
+                        json!({ "name": name, "quoted": quoted })
+                    }
+                })
+                .collect(),
+        )
+    }
+}
+
+impl From<&str> for Prose {
+    fn from(text: &str) -> Self {
+        Prose::new().text(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_plain_spelling_quotes_only_the_names_built_quoted() {
+        let prose = Prose::new()
+            .text("Delete ")
+            .quoted("feat/login")
+            .text(" at ")
+            .name("~/src/dux")
+            .text("?");
+        assert_eq!(prose.plain(), "Delete \"feat/login\" at ~/src/dux?");
+    }
+
+    #[test]
+    fn adjacent_text_merges_so_equal_words_are_equal_values() {
+        let split = Prose::new().text("one ").text("two ").name("x");
+        let whole = Prose::new().text("one two ").name("x");
+        assert_eq!(split, whole);
+        assert_eq!(split.segments().len(), 2);
+    }
+
+    #[test]
+    fn then_appends_and_merges_across_the_seam() {
+        let prose = Prose::new()
+            .name("a")
+            .text(" and")
+            .then(Prose::new().text(" more ").quoted("b"));
+        assert_eq!(
+            prose.segments(),
+            &[
+                ProseSegment::Name {
+                    name: "a".into(),
+                    quoted: false
+                },
+                ProseSegment::Text(" and more ".into()),
+                ProseSegment::Name {
+                    name: "b".into(),
+                    quoted: true
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_text_adds_no_segment() {
+        assert!(Prose::new().text("").is_empty());
+    }
+
+    #[test]
+    fn the_json_shape_matches_the_browsers_prose_type() {
+        let prose = Prose::new().text("On ").quoted("main").text(".");
+        assert_eq!(
+            prose.to_json(),
+            json!(["On ", { "name": "main", "quoted": true }, "."])
+        );
+    }
+
+    /// Merge adjacent strings, the normalization the fixture's note promises,
+    /// so neither side is bound to the other's split of its constant words.
+    fn merged(segments: &Value) -> Value {
+        let mut out: Vec<Value> = Vec::new();
+        for segment in segments.as_array().expect("segments are an array") {
+            match (out.last_mut(), segment) {
+                (Some(Value::String(last)), Value::String(next)) => last.push_str(next),
+                _ => out.push(segment.clone()),
+            }
+        }
+        Value::Array(out)
+    }
+
+    /// Build one fixture case's sentence the way the terminal UI does, and the
+    /// plain-text body the string API returns for the same arguments.
+    fn build(sentence: &str, args: &Value) -> (Prose, String) {
+        let s = |key: &str| args[key].as_str().expect(key).to_string();
+        match sentence {
+            "detach_confirm" => {
+                let label = s("label");
+                let grace = args["grace_seconds"].as_u64().expect("grace_seconds");
+                let tabs = args["live_tabs"].as_u64().expect("live_tabs") as usize;
+                (
+                    crate::engine::detach_confirm_prose(&label, grace, tabs),
+                    crate::engine::detach_confirm_body(&label, grace, tabs),
+                )
+            }
+            "recreate_confirm" => {
+                let worktree = std::path::PathBuf::from(s("worktree_label"));
+                let providers: Vec<String> = args["providers"]
+                    .as_array()
+                    .expect("providers")
+                    .iter()
+                    .map(|p| p.as_str().expect("provider").to_string())
+                    .collect();
+                let resumes = args["conversation_resumes"].as_bool().expect("resumes");
+                let (branch, source) = (s("branch_name"), s("source_branch"));
+                (
+                    crate::working_copy::recreate_confirm_prose(
+                        &worktree, &branch, &source, resumes, &providers,
+                    ),
+                    crate::working_copy::recreate_confirm_body(
+                        &worktree, &branch, &source, resumes, &providers,
+                    ),
+                )
+            }
+            "checkout_default_branch_confirm" => {
+                let project = s("project_name");
+                let base = args["stored_base"].as_str();
+                (
+                    crate::engine::checkout_default_branch_confirm_prose(&project, base),
+                    crate::engine::checkout_default_branch_confirm_body(&project, base),
+                )
+            }
+            other => panic!("the fixture names a sentence this test cannot build: {other}"),
+        }
+    }
+
+    /// The other half of the pin in the browser's `prose.test.tsx`. Both read
+    /// `tests/fixtures/prose_cross_language.json`, so a sentence passes only
+    /// when the terminal UI and the web say the same words and mark the same
+    /// names. The plain spelling is checked against the string API too, so the
+    /// logs and the dialog cannot drift apart either.
+    #[test]
+    fn the_two_surfaces_build_every_shared_sentence_from_the_same_segments() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/prose_cross_language.json");
+        let raw = std::fs::read_to_string(&path).expect("fixture must be readable");
+        let fixture: Value = serde_json::from_str(&raw).expect("fixture must parse");
+        let cases = fixture["cases"].as_array().expect("cases");
+        assert!(cases.len() >= 6, "the fixture has lost its cases");
+        for case in cases {
+            let what = case["what"].as_str().expect("what");
+            let sentence = case["sentence"].as_str().expect("sentence");
+            let (prose, body) = build(sentence, &case["args"]);
+            assert_eq!(
+                merged(&prose.to_json()),
+                merged(&case["segments"]),
+                "{what}: the terminal UI's segments differ from the fixture"
+            );
+            assert_eq!(prose.plain(), body, "{what}: the plain spelling drifted");
+        }
+    }
+}

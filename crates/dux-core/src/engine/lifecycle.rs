@@ -594,14 +594,29 @@ pub fn detach_final(label: &str, forced: bool, grace_seconds: u64) -> crate::eng
 /// each asserting the exact sentence, so a change on one side fails visibly on
 /// the side that changed.
 pub fn detach_confirm_body(label: &str, grace_seconds: u64, live_tabs: usize) -> String {
-    let mut body = format!(
-        "dux will ask \"{label}\" to shut down and wait up to {grace_seconds} seconds \
-         for it to exit before forcing it. The agent stays in the list as Detached, \
-         and you can resume it later. Anything the agent is doing right now is \
-         interrupted."
-    );
+    detach_confirm_prose(label, grace_seconds, live_tabs).plain()
+}
+
+/// [`detach_confirm_body`] as prose, the agent's name marked so each surface
+/// draws it as a chip. The dialogs render this; the string is its plain-text
+/// spelling. Pinned against the browser's `detachConfirmProse` by
+/// `tests/fixtures/prose_cross_language.json`.
+pub fn detach_confirm_prose(
+    label: &str,
+    grace_seconds: u64,
+    live_tabs: usize,
+) -> crate::prose::Prose {
+    let mut body = crate::prose::Prose::new()
+        .text("dux will ask ")
+        .quoted(label)
+        .text(format!(
+            " to shut down and wait up to {grace_seconds} seconds \
+             for it to exit before forcing it. The agent stays in the list as Detached, \
+             and you can resume it later. Anything the agent is doing right now is \
+             interrupted."
+        ));
     if live_tabs > 1 {
-        body.push_str(&format!(" All {live_tabs} running tabs stop together."));
+        body.push_text(format!(" All {live_tabs} running tabs stop together."));
     }
     body
 }

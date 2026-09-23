@@ -15,6 +15,7 @@ use std::path::Path;
 use anyhow::{Result, anyhow};
 
 use crate::home_path::shorten_home;
+use crate::prose::Prose;
 
 /// What recreating a working copy did to the agent's branch.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,14 +208,21 @@ fn provider_name(provider: &str) -> String {
     }
 }
 
-/// Several provider names as one subject: "Codex", "Codex or Opencode",
-/// "Codex, Opencode or Copilot".
-fn providers_joined(names: &[String]) -> String {
-    match names.split_last() {
-        None => String::new(),
-        Some((last, [])) => last.clone(),
-        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+/// Several provider names as one subject, each marked as a name: "Codex",
+/// "Codex or Opencode", "Codex, Opencode or Copilot".
+fn providers_joined(names: &[String]) -> Prose {
+    let mut joined = Prose::new();
+    for (index, name) in names.iter().enumerate() {
+        if index > 0 {
+            joined.push_text(if index == names.len() - 1 {
+                " or "
+            } else {
+                ", "
+            });
+        }
+        joined.push_name(name.clone());
     }
+    joined
 }
 
 /// What the tabs still running in the deleted directory do once the working copy
@@ -234,6 +242,11 @@ fn providers_joined(names: &[String]) -> String {
 /// until it is quit and resumed in the new folder. OpenCode and Copilot have not
 /// been measured, so they get the cautious answer rather than a promise.
 pub fn recreate_running_tab_clause(providers: &[String]) -> String {
+    recreate_running_tab_prose(providers).plain()
+}
+
+/// [`recreate_running_tab_clause`] with each provider marked as a name.
+fn recreate_running_tab_prose(providers: &[String]) -> Prose {
     let cautious: Vec<String> = providers
         .iter()
         .filter(|p| !p.eq_ignore_ascii_case("claude"))
@@ -244,13 +257,18 @@ pub fn recreate_running_tab_clause(providers: &[String]) -> String {
             .first()
             .map(|p| provider_name(p))
             .unwrap_or_else(|| "Claude".to_string());
-        return format!("A running {name} tab keeps working in the recreated copy by itself.");
+        return Prose::new()
+            .text("A running ")
+            .name(name)
+            .text(" tab keeps working in the recreated copy by itself.");
     }
-    format!(
-        "A running {} tab cannot follow the folder: stop it and start the agent again to continue \
-         in the recreated copy.",
-        providers_joined(&cautious)
-    )
+    Prose::new()
+        .text("A running ")
+        .then(providers_joined(&cautious))
+        .text(
+            " tab cannot follow the folder: stop it and start the agent again to continue \
+             in the recreated copy.",
+        )
 }
 
 /// What recreating the working copy costs, said plainly in the confirmation.
@@ -279,7 +297,26 @@ pub fn recreate_confirm_body(
     conversation_resumes: bool,
     providers: &[String],
 ) -> String {
-    let running = recreate_running_tab_clause(providers);
+    recreate_confirm_prose(
+        worktree,
+        branch_name,
+        source_branch,
+        conversation_resumes,
+        providers,
+    )
+    .plain()
+}
+
+/// [`recreate_confirm_body`] as prose, the path, every branch and every
+/// provider marked so each surface draws them as chips. Pinned against the
+/// browser's `recreateConfirmProse` by `tests/fixtures/prose_cross_language.json`.
+pub fn recreate_confirm_prose(
+    worktree: &Path,
+    branch_name: &str,
+    source_branch: &str,
+    conversation_resumes: bool,
+    providers: &[String],
+) -> Prose {
     let conversation = if conversation_resumes {
         "The conversation may resume, because the agent's CLI keys its history by directory path \
          and dux recreates the working copy at the same path."
@@ -287,18 +324,33 @@ pub fn recreate_confirm_body(
         "The conversation will not resume: this agent's CLI has no way to pick a conversation \
          back up, so it starts fresh wherever it runs."
     };
-    format!(
-        "Recreate the working copy for this agent at {}?\n\nIf branch \"{branch_name}\" still \
-         exists locally, dux checks it out there again. If it is gone locally but still on the \
-         remote, dux creates it again from \"origin/{branch_name}\", holding everything that had \
-         been pushed. If it is gone everywhere, dux creates it again from \"{source_branch}\", and \
-         the commits that branch held are not coming back.\n\nAny code \
-         changes that were in the old directory are gone either way: this puts the directory \
-         back, not its contents. {conversation}\n\n{running} A \
-         terminal still open in the old directory keeps working in a directory that is gone; close \
-         it and open one in the recreated copy.",
-        shorten_home(worktree)
-    )
+    Prose::new()
+        .text("Recreate the working copy for this agent at ")
+        .name(shorten_home(worktree))
+        .text("?\n\nIf branch ")
+        .quoted(branch_name)
+        .text(
+            " still exists locally, dux checks it out there again. If it is gone locally but \
+             still on the remote, dux creates it again from ",
+        )
+        .quoted(format!("origin/{branch_name}"))
+        .text(
+            ", holding everything that had been pushed. If it is gone everywhere, dux creates \
+             it again from ",
+        )
+        .quoted(source_branch)
+        .text(
+            ", and the commits that branch held are not coming back.\n\nAny code changes that \
+             were in the old directory are gone either way: this puts the directory back, not \
+             its contents. ",
+        )
+        .text(conversation)
+        .text("\n\n")
+        .then(recreate_running_tab_prose(providers))
+        .text(
+            " A terminal still open in the old directory keeps working in a directory that is \
+             gone; close it and open one in the recreated copy.",
+        )
 }
 
 /// The busy sentence while the recreate runs.
