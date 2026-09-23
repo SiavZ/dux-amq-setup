@@ -1,5 +1,7 @@
 import type { ReactNode } from "react"
 
+import { InlineCode } from "@/components/ui/inline-code"
+
 // Renders single-backtick-delimited spans as <code> elements. Deliberately not a markdown
 // parser: no bold, no italic, no links, and no dependency for it. Setting descriptions and
 // dialog copy are adapted from config.toml comments that use backticks for inline code, which
@@ -21,12 +23,7 @@ export function renderInlineCode(text: string): ReactNode[] {
 
     if (treatAsCode) {
       nodes.push(
-        <code
-          key={index}
-          className="rounded bg-muted px-1.5 py-0.5 font-mono text-[0.85em]"
-        >
-          {part}
-        </code>,
+        <InlineCode key={index}>{part}</InlineCode>,
       )
       return
     }
