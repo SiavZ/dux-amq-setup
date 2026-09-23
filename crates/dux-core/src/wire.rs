@@ -7653,6 +7653,20 @@ mod tests {
         // resolves the default branch from the clone's origin/HEAD.
         project.leading_branch = None;
         project.path_missing = false;
+        // Stored the way an add leaves it, so recording the base has a row.
+        engine
+            .session_store
+            .upsert_project(&crate::config::ProjectConfig {
+                id: project.id.clone(),
+                path: project.path.clone(),
+                name: Some(project.name.clone()),
+                default_provider: None,
+                leading_branch: None,
+                auto_reopen_agents: None,
+                startup_command: None,
+                env: Default::default(),
+            })
+            .expect("seed the project row");
         engine.projects.push(project);
 
         let busy = engine

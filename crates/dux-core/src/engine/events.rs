@@ -3043,25 +3043,18 @@ impl Engine {
                     // The user asked for the default branch, and the folder is
                     // already there: new worktrees branch from it from now on,
                     // exactly as if the checkout had run.
-                    let base = self.adopt_project_base(&project, &current_branch);
-                    let final_reaction = if let Some(id) = status_op_id
-                        && let Some(op) = self.pending_web_checkout_ops.remove(&id)
-                    {
-                        op.resolve(&crate::engine::WebCheckoutOutcome::AlreadyLeading {
-                            current_branch,
-                            base_moved: base.moved(),
-                        })
-                        .into_reaction()
-                    } else {
-                        EventReaction::Status(StatusUpdate::info(
-                            crate::engine::already_on_default_branch_message(
-                                &project.name,
-                                &current_branch,
-                                base.moved(),
-                            ),
-                        ))
-                    };
-                    base.with_unsaved_warning(final_reaction)
+                    self.finish_default_branch_checkout(
+                        &project,
+                        current_branch,
+                        status_op_id,
+                        |current_branch, base_moved| {
+                            crate::engine::WebCheckoutOutcome::AlreadyLeading {
+                                current_branch,
+                                base_moved,
+                            }
+                        },
+                        crate::engine::already_on_default_branch_message,
+                    )
                 }
             },
             Err(error) => {
@@ -3109,25 +3102,16 @@ impl Engine {
                     }
                     // Checking out the default branch means new worktrees
                     // branch from it, the same rule the add dialog's box uses.
-                    let base = self.adopt_project_base(&project, &target_branch);
-                    let final_reaction = if let Some(id) = status_op_id
-                        && let Some(op) = self.pending_web_checkout_ops.remove(&id)
-                    {
-                        op.resolve(&crate::engine::WebCheckoutOutcome::Ok {
+                    self.finish_default_branch_checkout(
+                        &project,
+                        target_branch,
+                        status_op_id,
+                        |target_branch, base_moved| crate::engine::WebCheckoutOutcome::Ok {
                             target_branch,
-                            base_moved: base.moved(),
-                        })
-                        .into_reaction()
-                    } else {
-                        EventReaction::Status(StatusUpdate::info(
-                            crate::engine::checkout_default_branch_message(
-                                &project.name,
-                                &target_branch,
-                                base.moved(),
-                            ),
-                        ))
-                    };
-                    base.with_unsaved_warning(final_reaction)
+                            base_moved,
+                        },
+                        crate::engine::checkout_default_branch_message,
+                    )
                 }
             },
             Err(error) => {
@@ -3166,6 +3150,34 @@ impl Engine {
         }
     }
 
+    /// The end of a "check out the default branch" that left the folder on
+    /// `branch` (checked out just now, or already there): make it the project's
+    /// base, then answer with the web op's final when a browser asked, or with
+    /// the local confirmation otherwise, and a save failure after either.
+    fn finish_default_branch_checkout(
+        &mut self,
+        project: &Project,
+        branch: String,
+        status_op_id: Option<String>,
+        web_outcome: impl FnOnce(String, bool) -> crate::engine::WebCheckoutOutcome,
+        message: fn(&str, &str, bool) -> String,
+    ) -> EventReaction {
+        let base = self.adopt_project_base(project, &branch);
+        let final_reaction = if let Some(id) = status_op_id
+            && let Some(op) = self.pending_web_checkout_ops.remove(&id)
+        {
+            op.resolve(&web_outcome(branch, base.moved()))
+                .into_reaction()
+        } else {
+            EventReaction::Status(StatusUpdate::info(message(
+                &project.name,
+                &branch,
+                base.moved(),
+            )))
+        };
+        base.with_unsaved_warning(final_reaction)
+    }
+
     /// Make `branch` the base new worktrees of `project` branch from, in memory
     /// and in SQLite (never config: the base is derived state).
     fn adopt_project_base(&mut self, project: &Project, branch: &str) -> BaseMove {
@@ -3187,7 +3199,7 @@ impl Engine {
                     project.id
                 ));
                 BaseMove::MovedUnsaved(format!(
-                    "Couldn't save \"{branch}\" as the base branch of project \"{}\": {err:#}. New worktrees branch from it until dux restarts, then from the branch saved before.",
+                    "Couldn't save \"{branch}\" as the base branch of project \"{}\": {err:#}. New worktrees branch from it until dux restarts or reloads its config, then from the branch saved before.",
                     project.name
                 ))
             }
@@ -3634,9 +3646,11 @@ impl BaseMove {
     fn with_unsaved_warning(self, final_reaction: EventReaction) -> EventReaction {
         match self {
             Self::Unchanged | Self::Moved => final_reaction,
+            // STICKY: the base is lost at the next restart or reload unless the
+            // user acts, so this must not time out unread.
             Self::MovedUnsaved(warning) => EventReaction::Multi(vec![
                 final_reaction,
-                EventReaction::Status(StatusUpdate::warning(warning)),
+                EventReaction::Status(StatusUpdate::warning(warning).sticky()),
             ]),
         }
     }
@@ -5837,14 +5851,108 @@ mod tests {
             panic!("expected a warning status");
         };
         assert_eq!(warning.tone, StatusTone::Warning);
+        assert!(warning.sticky, "a base that may be lost must not time out");
         assert!(
             warning
                 .message
                 .starts_with("Couldn't save \"main\" as the base branch of project \"p1-name\": ")
                 && warning.message.contains("the disk said no")
-                && warning
-                    .message
-                    .ends_with("until dux restarts, then from the branch saved before."),
+                && warning.message.ends_with(
+                    "until dux restarts or reloads its config, then from the branch saved before."
+                ),
+            "{}",
+            warning.message
+        );
+    }
+
+    /// A repository with an `origin` whose default dux cannot resolve: the
+    /// stored base may be a feature branch from an unticked add, so it must
+    /// not be passed off as "the default branch" and checked out.
+    #[test]
+    fn an_unresolvable_origin_default_refuses_rather_than_checking_out_the_stored_base() {
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        git(repo.path(), &["config", "user.name", "t"]);
+        git(repo.path(), &["config", "user.email", "t@t"]);
+        git(
+            repo.path(),
+            &["commit", "-q", "--allow-empty", "-m", "init"],
+        );
+        git(repo.path(), &["branch", "feature"]);
+        git(repo.path(), &["switch", "-q", "-c", "other"]);
+        // An origin exists, but no origin/HEAD was ever recorded.
+        git(
+            repo.path(),
+            &["remote", "add", "origin", "/nonexistent/origin.git"],
+        );
+
+        let (mut engine, _tmp) = test_engine();
+        let mut project = sample_project("p1", &repo.path().to_string_lossy());
+        project.leading_branch = Some("feature".to_string());
+        project.current_branch = "other".to_string();
+        engine.projects.push(project.clone());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::project_browser::run_checkout_project_default_branch_inspection_job(
+            project, tx, None,
+        );
+        let reaction = engine.process_worker_event(rx.recv().unwrap());
+
+        assert!(
+            !matches!(
+                reaction,
+                EventReaction::DispatchProjectDefaultBranchCheckout { .. }
+            ),
+            "the stored base must not be checked out as if it were the default"
+        );
+        match &reaction {
+            EventReaction::Status(update) => assert_eq!(update.tone, StatusTone::Error),
+            _ => panic!("expected the refusal status"),
+        }
+        assert_eq!(
+            engine.projects[0].leading_branch.as_deref(),
+            Some("feature")
+        );
+        assert_eq!(
+            crate::git::current_branch(repo.path()).unwrap(),
+            "other",
+            "nothing was checked out"
+        );
+    }
+
+    #[test]
+    fn a_base_whose_project_row_is_missing_is_not_reported_as_saved() {
+        let (mut engine, _tmp) = test_engine();
+        // In memory only: SQLite has no row for this project to update.
+        let mut project = sample_project("p1", "/tmp/p1");
+        project.leading_branch = Some("feature".to_string());
+        engine.projects.push(project.clone());
+
+        let reaction =
+            engine.process_worker_event(WorkerEvent::NonDefaultBranchCheckoutCompleted {
+                action: NonDefaultBranchAction::CheckoutProjectDefault { project },
+                target_branch: "main".into(),
+                result: Ok(()),
+                status_op_id: None,
+            });
+
+        let EventReaction::Multi(parts) = reaction else {
+            panic!("expected the final followed by the save warning");
+        };
+        let EventReaction::Status(warning) = &parts[1] else {
+            panic!("expected a warning status");
+        };
+        assert_eq!(warning.tone, StatusTone::Warning);
+        assert!(
+            warning.message.contains("no project with id"),
             "{}",
             warning.message
         );

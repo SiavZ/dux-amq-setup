@@ -304,9 +304,17 @@ pub fn run_checkout_project_default_branch_inspection_job(
             // The remote's default wins over the stored base: a project added
             // without the checkout stores the branch it was on, and checking
             // out "the default" must not mean checking that branch out again.
-            // With no remote default known, the stored base is the best answer
-            // dux has, as it always was.
-            let target = git::remote_default_branch(&repo_path).or(project.leading_branch.clone());
+            // With no origin at all, the stored base is the best answer dux
+            // has, as it always was. With an origin whose default cannot be
+            // resolved, the default is genuinely unknown and the stored base
+            // may be a feature branch, so the heuristic path answers (and
+            // refuses to switch); a failed probe leans the same safe way.
+            let target = git::remote_default_branch(&repo_path).or_else(|| {
+                match git::has_origin_remote(&repo_path) {
+                    Ok(false) => project.leading_branch.clone(),
+                    Ok(true) | Err(_) => None,
+                }
+            });
             let warning_kind = match target {
                 Some(target) if branch == target => None,
                 Some(target) => Some(BranchWarningKind::Known {
