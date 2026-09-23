@@ -123,6 +123,18 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
+// A sentence with names in it is split across chips, so it is found by the
+// paragraph's whole text rather than by one text node.
+function paragraph(pattern: RegExp): HTMLElement {
+  const found = screen
+    .getAllByText((_, el) => el?.tagName === "P" && pattern.test(el.textContent ?? ""))
+  return found[0]
+}
+
+function chipsIn(el: HTMLElement): (string | null)[] {
+  return [...el.querySelectorAll("code")].map((c) => c.textContent)
+}
+
 describe("DeleteSessionDialog", () => {
   it("opens for an existing session", () => {
     seed("s1", [session1])
@@ -426,13 +438,16 @@ describe("DeleteSessionDialog", () => {
         name: "Also delete the branches develop-next and develop",
       }),
     ).toBeTruthy()
+    await screen.findByRole("checkbox", {
+      name: "Also delete the branches develop-next and develop",
+    })
     expect(
-      await screen.findByText(
+      paragraph(
         /The worktree moved from develop onto develop-next, so deleting the agent removes both\./,
       ),
     ).toBeTruthy()
     expect(
-      screen.getByText(/They have 4 commits not pushed anywhere between them\./),
+      paragraph(/They have 4 commits not pushed anywhere between them\./),
     ).toBeTruthy()
   })
 
@@ -457,7 +472,7 @@ describe("DeleteSessionDialog", () => {
     render(<DeleteSessionDialog />)
     fireEvent.click(screen.getByRole("checkbox"))
     expect(
-      screen.getByText(
+      paragraph(
         /The worktree moved from dux\/s7 onto dux\/s7-next, so deleting the agent removes both\./,
       ),
     ).toBeTruthy()
@@ -555,5 +570,70 @@ describe("DeleteSessionDialog", () => {
     expect(screen.getByText(/wobbly-duckling/)).toBeTruthy()
     const reopenedCheckbox = screen.getByRole("checkbox")
     expect(reopenedCheckbox.getAttribute("aria-checked")).toBe("false")
+  })
+})
+
+// Every name the dialog shows is the shared chip, and the chip replaces the
+// quotes the sentences used to wrap names in.
+describe("DeleteSessionDialog names", () => {
+  it("chips the agent's name in the opening sentence", () => {
+    seed("s1", [session1])
+    render(<DeleteSessionDialog />)
+    const opening = paragraph(/This removes the agent session/)
+    expect(opening.textContent).toBe(
+      "This removes the agent session quacky-mallard from dux.",
+    )
+    expect(chipsIn(opening)).toEqual(["quacky-mallard"])
+  })
+
+  it("chips the branch in the branch box's label", () => {
+    seed("s1", [session1])
+    render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("checkbox"))
+    const box = screen.getByRole("checkbox", {
+      name: "Also delete the branch dux/s1",
+    })
+    expect(box).toBeTruthy()
+    const label = document.querySelector('label[for="delete-branch"]') as HTMLElement
+    expect(chipsIn(label)).toEqual(["dux/s1"])
+  })
+
+  it("chips both branches of a drifted agent, in the label and the warning", async () => {
+    branchUnpushed.mockResolvedValue({
+      branches: ["develop-next", "develop"],
+      unpushed: { count: 4, has_remote_refs: true },
+    })
+    seed("s6", [driftedSession])
+    render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("checkbox"))
+    const box = await screen.findByRole("checkbox", {
+      name: "Also delete the branches develop-next and develop",
+    })
+    expect(box).toBeTruthy()
+    const label = document.querySelector('label[for="delete-branch"]') as HTMLElement
+    expect(chipsIn(label)).toEqual(["develop-next", "develop"])
+    const warning = paragraph(/The worktree moved from/)
+    expect(chipsIn(warning)).toEqual(["develop", "develop-next", "develop"])
+    expect(warning.textContent).toContain("develop existed before the agent.")
+  })
+
+  it("chips a standalone agent's folder with no quotes around it", () => {
+    seed("sa1", [
+      {
+        id: "sa1",
+        title: "notes",
+        workspace: {
+          kind: "folder",
+          folder_path: "/home/someone/notes",
+          folder_label: "~/notes",
+          repo_status: "no_repo",
+          quiet_reason: "This folder has no git repository.",
+        },
+      },
+    ])
+    render(<DeleteSessionDialog />)
+    const folder = paragraph(/Its folder/)
+    expect(chipsIn(folder)).toEqual(["~/notes"])
+    expect(folder.textContent).toContain("Its folder ~/notes is left untouched")
   })
 })
