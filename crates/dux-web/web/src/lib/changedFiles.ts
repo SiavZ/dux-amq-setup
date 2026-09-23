@@ -60,12 +60,15 @@ export function filterChangedFiles(
 }
 
 // A group's aggregate recap. Binary files carry no line counts on the wire, so they
-// contribute nothing to the sums and are counted separately instead.
+// contribute nothing to the sums and are counted separately instead, and so do the
+// files the repository excludes from diffs, which are counted apart from the
+// binaries because they are text git merely refuses to diff.
 export interface ChangedFilesRecap {
   count: number
   additions: number
   deletions: number
   binaryCount: number
+  diffExcludedCount: number
 }
 
 // The recap describes exactly the rows visible beneath it, so callers pass the
@@ -78,10 +81,15 @@ export function summarizeChangedFiles(
     additions: 0,
     deletions: 0,
     binaryCount: 0,
+    diffExcludedCount: 0,
   }
   for (const file of files) {
     if (file.binary) {
       recap.binaryCount += 1
+      continue
+    }
+    if (file.diff_excluded) {
+      recap.diffExcludedCount += 1
       continue
     }
     recap.additions += file.additions
@@ -113,6 +121,7 @@ export function mergeChangedFilesRecaps(
     additions: a.additions + b.additions,
     deletions: a.deletions + b.deletions,
     binaryCount: a.binaryCount + b.binaryCount,
+    diffExcludedCount: a.diffExcludedCount + b.diffExcludedCount,
   }
 }
 

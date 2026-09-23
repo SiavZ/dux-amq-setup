@@ -1034,8 +1034,16 @@ describe("the changes pane's group recaps", () => {
     additions: number,
     deletions: number,
     binary = false,
+    diffExcluded = false,
   ) {
-    return { path, status: "M", additions, deletions, binary }
+    return {
+      path,
+      status: "M",
+      additions,
+      deletions,
+      binary,
+      diff_excluded: diffExcluded,
+    }
   }
 
   function withCounted(
@@ -1142,6 +1150,22 @@ describe("the changes pane's group recaps", () => {
     expect(recap("Unstaged").getAttribute("aria-label")).toBe(
       "Unstaged: 5 lines added, 1 line removed, 1 binary file",
     )
+  })
+
+  // A file the repository excludes from diffs has no counts either, and its own
+  // marker and tally say so without calling it binary.
+  it("marks a diff-excluded file with its own marker and tally", () => {
+    mockState = withCounted(
+      [],
+      [counted("a.ts", 5, 1), counted("locked.txt", 0, 0, false, true)],
+    )
+    render(<ChangedFiles />)
+
+    expect(recap("Unstaged").textContent).toBe("+5 −1 · 1 excl")
+    expect(recap("Unstaged").getAttribute("aria-label")).toBe(
+      "Unstaged: 5 lines added, 1 line removed, 1 excluded file",
+    )
+    expect(screen.getByText("Excl")).toBeTruthy()
   })
 
   // An all-binary group has no lines to report, so it says so rather than

@@ -786,7 +786,17 @@ pub struct ChangedFile {
     pub path: String,
     pub additions: usize,
     pub deletions: usize,
+    /// True for a file git itself calls binary, which therefore has no line
+    /// counts. Deliberately NOT the same fact as `diff_excluded`: both rows
+    /// arrive from `--numstat` as `-\t-`, and calling a text file binary
+    /// because its repository refuses to diff it is a lie every surface would
+    /// then repeat.
     pub binary: bool,
+    /// True for a file the repository excludes from diffs, i.e. one a
+    /// `.gitattributes` marks `-diff`. git will not count its lines, so the row
+    /// has no counts, but the file is text and the in-process diff viewer opens
+    /// it normally. Never true at the same time as `binary`.
+    pub diff_excluded: bool,
     /// Where a rename or copy came from, for the surfaces that have to know
     /// which OTHER directory also changed. None for every other status.
     pub renamed_from: Option<String>,

@@ -183,6 +183,13 @@ function StatusSlot({ status, path, selected, onToggleSelected }: StatusSlotProp
   )
 }
 
+// What the row's "Excl" marker says on hover. It names the cause (the
+// repository's own .gitattributes) and the consequence (no counts), and says
+// the file is still readable here, because "excluded" on its own reads as
+// "dux cannot show you this".
+const DIFF_EXCLUDED_HINT =
+  "This repository excludes this file from diffs (-diff in .gitattributes), so git reports no line counts for it. Opening it still shows the diff."
+
 interface FileRowProps {
   file: ChangedFileView
   action: "stage" | "unstage"
@@ -256,9 +263,21 @@ function FileRow({
           <bdi dir="ltr">{file.path}</bdi>
         </span>
 
+        {/* A file the repository excludes from diffs has no counts to show,
+          * and saying nothing there would read as "changed nothing". It is not
+          * binary: the diff viewer opens it, so it gets its own quiet marker
+          * in the counts slot rather than the binary treatment. */}
+        {file.diff_excluded && (
+          <SimpleTooltip content={DIFF_EXCLUDED_HINT}>
+            <span className="shrink-0 font-mono text-xs text-dux-diff-excluded">
+              Excl
+            </span>
+          </SimpleTooltip>
+        )}
+
         {/* Additions and deletions, coloured to match the diff viewer's gutter.
           * Binary files report none. */}
-        {!file.binary && (file.additions > 0 || file.deletions > 0) && (
+        {!file.binary && !file.diff_excluded && (file.additions > 0 || file.deletions > 0) && (
           <span className="shrink-0 font-mono text-xs">
             {file.additions > 0 && (
               <span className="text-green-500">+{file.additions}</span>
@@ -363,6 +382,9 @@ function recapLabel(scope: string, recap: ChangedFilesRecap): string {
   if (recap.binaryCount > 0) {
     parts.push(formatRegularCount(recap.binaryCount, "binary file"))
   }
+  if (recap.diffExcludedCount > 0) {
+    parts.push(formatRegularCount(recap.diffExcludedCount, "excluded file"))
+  }
   return `${scope}: ${parts.join(", ")}`
 }
 
@@ -385,11 +407,12 @@ function ChangesRecap({
   recap: ChangedFilesRecap
   className?: string
 }) {
-  const { additions, deletions, binaryCount } = recap
+  const { additions, deletions, binaryCount, diffExcludedCount } = recap
   const hasLines = additions > 0 || deletions > 0
   // Nothing to say: an empty set, or one whose files changed no lines and are
-  // not binary either (a mode change, an empty new file). No "+0 −0".
-  if (!hasLines && binaryCount === 0) return null
+  // neither binary nor excluded from diffs (a mode change, an empty new file).
+  // No "+0 −0".
+  if (!hasLines && binaryCount === 0 && diffExcludedCount === 0) return null
 
   return (
     <span
@@ -407,6 +430,12 @@ function ChangesRecap({
         <span className="text-muted-foreground">
           {hasLines ? " · " : ""}
           {binaryCount} bin
+        </span>
+      )}
+      {diffExcludedCount > 0 && (
+        <span className="text-dux-diff-excluded">
+          {hasLines || binaryCount > 0 ? " · " : ""}
+          {diffExcludedCount} excl
         </span>
       )}
     </span>

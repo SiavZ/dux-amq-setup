@@ -12198,6 +12198,7 @@ mod tests {
             additions: 1,
             deletions: 0,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         });
         app.engine.staged_files.push(ChangedFile {
@@ -12206,6 +12207,7 @@ mod tests {
             additions: 1,
             deletions: 0,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         });
         assert_eq!(
@@ -12919,6 +12921,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         }];
         app.right_section = RightSection::Unstaged;
@@ -12969,6 +12972,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         }];
         app.right_section = RightSection::Unstaged;
@@ -15682,6 +15686,7 @@ not_a_real_action = ["x"]
             additions: 0,
             deletions: 0,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         };
         app.engine.staged_files = vec![ghost.clone()];
@@ -16673,6 +16678,7 @@ not_a_real_action = ["x"]
                 additions: 1,
                 deletions: 0,
                 binary: false,
+                diff_excluded: false,
                 renamed_from: None,
             },
             ChangedFile {
@@ -16681,6 +16687,7 @@ not_a_real_action = ["x"]
                 additions: 2,
                 deletions: 1,
                 binary: false,
+                diff_excluded: false,
                 renamed_from: None,
             },
         ];
@@ -16690,6 +16697,7 @@ not_a_real_action = ["x"]
             additions: 3,
             deletions: 0,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         }];
 
@@ -16731,6 +16739,7 @@ not_a_real_action = ["x"]
             additions: 2,
             deletions: 1,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         }];
 
@@ -16766,6 +16775,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 1,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         }];
         app.selected_left = 1;
@@ -16828,6 +16838,7 @@ not_a_real_action = ["x"]
                 additions: 1,
                 deletions: 0,
                 binary: false,
+                diff_excluded: false,
                 renamed_from: None,
             },
             ChangedFile {
@@ -16836,6 +16847,7 @@ not_a_real_action = ["x"]
                 additions: 2,
                 deletions: 1,
                 binary: false,
+                diff_excluded: false,
                 renamed_from: None,
             },
         ];
@@ -16860,6 +16872,7 @@ not_a_real_action = ["x"]
                 additions: 1,
                 deletions: 0,
                 binary: false,
+                diff_excluded: false,
                 renamed_from: None,
             },
             ChangedFile {
@@ -16868,6 +16881,7 @@ not_a_real_action = ["x"]
                 additions: 2,
                 deletions: 1,
                 binary: false,
+                diff_excluded: false,
                 renamed_from: None,
             },
         ];
@@ -16891,6 +16905,7 @@ not_a_real_action = ["x"]
                 additions: 1,
                 deletions: 0,
                 binary: false,
+                diff_excluded: false,
                 renamed_from: None,
             })
             .collect();
@@ -20605,6 +20620,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         }];
         app.engine.staged_files = vec![ChangedFile {
@@ -20613,6 +20629,7 @@ not_a_real_action = ["x"]
             additions: 3,
             deletions: 0,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         }];
 
@@ -20644,6 +20661,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 1,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         }];
         app.selected_left = 1;
@@ -20676,6 +20694,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 1,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         }];
         app.selected_left = 1;
@@ -21143,6 +21162,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         }];
         app.engine.staged_files = vec![ChangedFile {
@@ -21151,6 +21171,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         }];
         let original = app.staged_pane_height_pct;
@@ -21196,6 +21217,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         }];
         app.engine.staged_files = vec![ChangedFile {
@@ -21204,6 +21226,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         }];
         let original = app.staged_pane_height_pct;
@@ -21232,6 +21255,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         }];
         let original = app.commit_pane_height_pct;
@@ -21276,6 +21300,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         }];
         let original = app.commit_pane_height_pct;
@@ -26122,6 +26147,7 @@ cyan = "#00ffff"
             additions: 1,
             deletions: 1,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         }];
         app.prompt = PromptState::ConfirmDiscardFile {
@@ -26187,6 +26213,7 @@ cyan = "#00ffff"
             additions: 1,
             deletions: 0,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         }];
         app.selected_left = 1;
@@ -26265,6 +26292,7 @@ cyan = "#00ffff"
             additions: 1,
             deletions: 0,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         }];
         app.selected_left = 1;
@@ -35780,6 +35808,7 @@ cyan = "#00ffff"
                     additions: 1,
                     deletions: 0,
                     binary: false,
+                    diff_excluded: false,
                     renamed_from: None,
                 }];
                 app.right_section = RightSection::Unstaged;

@@ -11,7 +11,14 @@ import {
 import type { ChangedFileView } from "./types"
 
 function file(path: string, status = "M"): ChangedFileView {
-  return { status, path, additions: 0, deletions: 0, binary: false }
+  return {
+    status,
+    path,
+    additions: 0,
+    deletions: 0,
+    binary: false,
+    diff_excluded: false,
+  }
 }
 
 const files = [
@@ -126,8 +133,16 @@ function counted(
   additions: number,
   deletions: number,
   binary = false,
+  diffExcluded = false,
 ): ChangedFileView {
-  return { status: "M", path, additions, deletions, binary }
+  return {
+    status: "M",
+    path,
+    additions,
+    deletions,
+    binary,
+    diff_excluded: diffExcluded,
+  }
 }
 
 describe("summarizeChangedFiles", () => {
@@ -137,7 +152,7 @@ describe("summarizeChangedFiles", () => {
         counted("a.ts", 12, 3),
         counted("b.ts", 7, 40),
       ]),
-    ).toEqual({ count: 2, additions: 19, deletions: 43, binaryCount: 0 })
+    ).toEqual({ count: 2, additions: 19, deletions: 43, binaryCount: 0, diffExcludedCount: 0 })
   })
 
   // Binary files carry no line counts on the wire, so they must be counted
@@ -149,7 +164,7 @@ describe("summarizeChangedFiles", () => {
         counted("logo.png", 0, 0, true),
         counted("clip.mp4", 0, 0, true),
       ]),
-    ).toEqual({ count: 3, additions: 5, deletions: 1, binaryCount: 2 })
+    ).toEqual({ count: 3, additions: 5, deletions: 1, binaryCount: 2, diffExcludedCount: 0 })
   })
 
   it("reports an all-binary set as lineless", () => {
@@ -158,6 +173,7 @@ describe("summarizeChangedFiles", () => {
       additions: 0,
       deletions: 0,
       binaryCount: 1,
+      diffExcludedCount: 0,
     })
   })
 
@@ -167,6 +183,26 @@ describe("summarizeChangedFiles", () => {
       additions: 0,
       deletions: 0,
       binaryCount: 0,
+      diffExcludedCount: 0,
+    })
+  })
+
+  // A file the repository excludes from diffs has no line counts either, and it
+  // is not binary: it is tallied on its own so the two are never confused.
+  it("counts diff-excluded files apart from the binaries", () => {
+    expect(
+      summarizeChangedFiles([
+        counted("a.ts", 5, 1),
+        counted("logo.png", 0, 0, true),
+        counted("locked.txt", 0, 0, false, true),
+        counted("also-locked.txt", 0, 0, false, true),
+      ]),
+    ).toEqual({
+      count: 4,
+      additions: 5,
+      deletions: 1,
+      binaryCount: 1,
+      diffExcludedCount: 2,
     })
   })
 
@@ -179,6 +215,7 @@ describe("summarizeChangedFiles", () => {
       additions: 10,
       deletions: 0,
       binaryCount: 0,
+      diffExcludedCount: 0,
     })
   })
 })
@@ -212,9 +249,27 @@ describe("mergeChangedFilesRecaps", () => {
   it("adds two recaps field by field", () => {
     expect(
       mergeChangedFilesRecaps(
-        { count: 2, additions: 5, deletions: 1, binaryCount: 0 },
-        { count: 3, additions: 4, deletions: 9, binaryCount: 2 },
+        {
+          count: 2,
+          additions: 5,
+          deletions: 1,
+          binaryCount: 0,
+          diffExcludedCount: 1,
+        },
+        {
+          count: 3,
+          additions: 4,
+          deletions: 9,
+          binaryCount: 2,
+          diffExcludedCount: 3,
+        },
       ),
-    ).toEqual({ count: 5, additions: 9, deletions: 10, binaryCount: 2 })
+    ).toEqual({
+      count: 5,
+      additions: 9,
+      deletions: 10,
+      binaryCount: 2,
+      diffExcludedCount: 4,
+    })
   })
 })

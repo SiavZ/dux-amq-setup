@@ -204,6 +204,11 @@ pub struct Theme {
     pub input_cursor_bg: Color,
     pub input_label_fg: Color,
     pub diff_binary_fg: Color,
+    /// The marker for a file the repository excludes from diffs (`-diff`
+    /// in a `.gitattributes`). Muted rather than warning-toned: unlike a
+    /// binary there is nothing wrong with the file, git simply will not
+    /// count its lines, and the diff viewer still opens it.
+    pub diff_excluded_fg: Color,
     pub diff_stat_add_fg: Color,
     pub diff_stat_remove_fg: Color,
     pub runtime_context_value_fg: Color,
@@ -454,6 +459,7 @@ fn register_dux_defaults(theme: &mut OpalineTheme) {
     theme.register_default_token("dux.diff_add_bg", bg_panel);
     theme.register_default_token("dux.diff_remove_bg", bg_panel);
     theme.register_default_token("dux.diff_binary_fg", warning);
+    theme.register_default_token("dux.diff_excluded_fg", text_muted);
     theme.register_default_token("dux.diff_stat_add_fg", success);
     theme.register_default_token("dux.diff_stat_remove_fg", error);
     theme.register_default_token("dux.diff_line_number_fg", text_dim);
@@ -633,6 +639,7 @@ impl Theme {
             input_cursor_bg: pick("dux.input_cursor_bg"),
             input_label_fg: pick("dux.input_label_fg"),
             diff_binary_fg: pick("dux.diff_binary_fg"),
+            diff_excluded_fg: pick("dux.diff_excluded_fg"),
             diff_stat_add_fg: pick("dux.diff_stat_add_fg"),
             diff_stat_remove_fg: pick("dux.diff_stat_remove_fg"),
             runtime_context_value_fg: pick("dux.runtime_context_value_fg"),
@@ -1040,6 +1047,7 @@ mod tests {
             input_cursor_bg: Color::White,
             input_label_fg: Color::White,
             diff_binary_fg: Color::Yellow,
+            diff_excluded_fg: Color::Rgb(140, 140, 140),
             diff_stat_add_fg: Color::Green,
             diff_stat_remove_fg: Color::Red,
             runtime_context_value_fg: Color::Rgb(125, 150, 160),
@@ -1148,6 +1156,7 @@ mod tests {
         assert_field!(input_cursor_bg);
         assert_field!(input_label_fg);
         assert_field!(diff_binary_fg);
+        assert_field!(diff_excluded_fg);
         assert_field!(diff_stat_add_fg);
         assert_field!(diff_stat_remove_fg);
         assert_field!(runtime_context_value_fg);

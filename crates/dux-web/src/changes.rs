@@ -725,6 +725,7 @@ fn view_from(f: &ChangedFile) -> ChangedFileView {
         additions: f.additions,
         deletions: f.deletions,
         binary: f.binary,
+        diff_excluded: f.diff_excluded,
         renamed_from: f.renamed_from.clone(),
     }
 }
@@ -756,6 +757,7 @@ mod tests {
             additions: 0,
             deletions: 0,
             binary: false,
+            diff_excluded: false,
             renamed_from: renamed_from.map(str::to_string),
         }
     }
@@ -767,6 +769,24 @@ mod tests {
         assert_eq!(views[0].renamed_from.as_deref(), Some("src/old.txt"));
         let json = serde_json::to_string(&views[0]).unwrap();
         assert!(json.contains("\"renamed_from\":\"src/old.txt\""), "{json}");
+    }
+
+    /// A countless row says WHY it has no counts: git calls it binary, or the
+    /// repository excludes it from diffs. The browser renders the two
+    /// differently, so both facts travel and neither is inferred from the
+    /// other.
+    #[test]
+    fn a_diff_excluded_file_travels_as_its_own_fact() {
+        let mut file = changed("locked.txt", "M", None);
+        file.diff_excluded = true;
+
+        let views = sorted_views(&[file]);
+
+        assert!(views[0].diff_excluded);
+        assert!(!views[0].binary);
+        let json = serde_json::to_string(&views[0]).unwrap();
+        assert!(json.contains("\"diff_excluded\":true"), "{json}");
+        assert!(json.contains("\"binary\":false"), "{json}");
     }
 
     #[test]

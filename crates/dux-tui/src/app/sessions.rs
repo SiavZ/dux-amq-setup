@@ -5950,6 +5950,7 @@ mod tests {
             additions: 1,
             deletions: 0,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         }
     }

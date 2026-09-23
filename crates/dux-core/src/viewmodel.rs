@@ -945,6 +945,11 @@ pub struct ChangedFileView {
     pub additions: usize,
     pub deletions: usize,
     pub binary: bool,
+    /// True when the repository excludes this path from diffs (`-diff` in a
+    /// `.gitattributes`). Like a binary it has no line counts; unlike a binary
+    /// it is text the editor opens and diffs perfectly well, so the browser
+    /// must not report the two the same way.
+    pub diff_excluded: bool,
     /// Where a rename came from, so a browser can tell that the source
     /// directory's listing moved too. Omitted for every other status, which
     /// leaves the payload every other consumer reads exactly as it was.

@@ -267,6 +267,11 @@ export interface ChangedFileView {
   additions: number
   deletions: number
   binary: boolean
+  /** True when the repository excludes this path from diffs (`-diff` in a
+   * `.gitattributes`). It has no line counts, like a binary, and unlike a
+   * binary it is ordinary text the diff viewer opens, so the row must not
+   * call it binary. Never true at the same time as `binary`. */
+  diff_excluded: boolean
   /** Where a rename came from. Absent for every other status: the source
    * directory's listing lost an entry and nothing else on the wire says so. */
   renamed_from?: string

@@ -148,6 +148,12 @@ input, textarea, .allow-select, .xterm, .xterm * { user-select: text; }
        line two and must read quieter than the working/typing/attention cues.
        Its value lives in :root/.dark below. */
     --color-dux-standalone: var(--dux-standalone);
+    /* The marker for a file the repository excludes from diffs (`-diff` in a
+       .gitattributes), matching the dux TUI's bundled dark-theme excluded
+       hue (`#8c8c8c`). Quiet on purpose: nothing is wrong with the file,
+       git just will not count its lines. Its value lives in :root/.dark
+       below. */
+    --color-dux-diff-excluded: var(--dux-diff-excluded);
     --radius-sm: calc(var(--radius) * 0.6);
     --radius-md: calc(var(--radius) * 0.8);
     --radius-lg: var(--radius);
@@ -363,6 +369,10 @@ input, textarea, .allow-select, .xterm, .xterm * { user-select: text; }
        bundled dark theme's soft slate blue (`#7d96a0`). Identity, not state.
        Constant across light/dark since the web app is dark-only. */
     --dux-standalone: oklch(0.657 0.032 224);
+    /* Diff-excluded marker color, matching the dux TUI bundled dark theme's
+       muted grey (`#8c8c8c`). Constant across light/dark since the web app
+       is dark-only. */
+    --dux-diff-excluded: #8c8c8c;
     /* The phone action flap's OPAQUE body color: the tab strip's translucent
        `bg-muted/30` composited over the app background, written out as one
        opaque value. The flap grows out of the strip, so the two have to be the
@@ -407,6 +417,8 @@ input, textarea, .allow-select, .xterm, .xterm * { user-select: text; }
     --dux-typing: #c586e0;
     /* Standalone-location identity color (see :root above). */
     --dux-standalone: oklch(0.657 0.032 224);
+    /* Diff-excluded marker color (see :root above). */
+    --dux-diff-excluded: #8c8c8c;
     /* The phone action flap's opaque body color (see :root above). */
     --dux-flap-bg: color-mix(in srgb, var(--muted) 30%, var(--background));
 }

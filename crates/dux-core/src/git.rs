@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::unix::ffi::OsStringExt;
@@ -2323,6 +2323,7 @@ pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<Chan
                 additions: 0,
                 deletions: 0,
                 binary: false,
+                diff_excluded: false,
                 renamed_from: None,
             });
             continue;
@@ -2335,6 +2336,7 @@ pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<Chan
                 additions: 0,
                 deletions: 0,
                 binary: false,
+                diff_excluded: false,
                 renamed_from: rename_source(index_status, &source),
             });
         }
@@ -2346,6 +2348,7 @@ pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<Chan
                 additions: 0,
                 deletions: 0,
                 binary: false,
+                diff_excluded: false,
                 renamed_from: rename_source(worktree_status, &source),
             });
         }
@@ -2357,26 +2360,23 @@ pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<Chan
     // tracked rows their line counts and nothing else; running the loop inside
     // the call's `Ok` would take the untracked files' in-process counts with it.
     let tracked_stats = unstaged_numstat(wt.as_ref());
-    apply_unstaged_stats(worktree_path, &mut unstaged, &tracked_stats);
+    let staged_stats = staged_numstat(wt.as_ref());
 
-    if let Ok(ns) = Command::new("git")
-        .args(["-C", wt.as_ref(), "diff", "--cached", "--numstat", "-z"])
-        .output()
-        && ns.status.success()
-    {
-        let stats = parse_numstat(&ns.stdout);
-        for file in &mut staged {
-            if let Some(stat) = stats.get(&file.path) {
-                match stat {
-                    DiffStat::Text(a, d) => {
-                        file.additions = *a;
-                        file.deletions = *d;
-                    }
-                    DiffStat::Binary => {
-                        file.binary = true;
-                    }
-                }
-            }
+    // git prints `-\t-` for a path the repository excludes from diffs in
+    // .gitattributes exactly as it prints it for a real binary, so numstat
+    // alone cannot tell the two apart. One batched `check-attr` over the
+    // countless rows does, and only those rows: the question is not asked at
+    // all in the ordinary case where every path has a number.
+    let excluded = paths_excluded_from_diffs(
+        wt.as_ref(),
+        &countless_paths(&[&tracked_stats, &staged_stats]),
+    );
+
+    apply_unstaged_stats(worktree_path, &mut unstaged, &tracked_stats, &excluded);
+
+    for file in &mut staged {
+        if let Some(stat) = staged_stats.get(&file.path) {
+            apply_stat(file, stat, &excluded);
         }
     }
 
@@ -2398,6 +2398,127 @@ fn unstaged_numstat(worktree: &str) -> HashMap<String, DiffStat> {
         .unwrap_or_default()
 }
 
+/// Per-path line counts for the staged changes in `worktree`. Answers with an
+/// empty map on a failed call, for the same reason [`unstaged_numstat`] does.
+fn staged_numstat(worktree: &str) -> HashMap<String, DiffStat> {
+    Command::new("git")
+        .args(["-C", worktree, "diff", "--cached", "--numstat", "-z"])
+        .output()
+        .ok()
+        .filter(|ns| ns.status.success())
+        .map(|ns| parse_numstat(&ns.stdout))
+        .unwrap_or_default()
+}
+
+/// Every path git answered `-\t-` for, across the numstat maps of one sweep.
+///
+/// Sorted and deduplicated so the follow-up question is asked once per path and
+/// the command line is reproducible.
+fn countless_paths(stats: &[&HashMap<String, DiffStat>]) -> Vec<String> {
+    let mut paths: Vec<String> = stats
+        .iter()
+        .flat_map(|map| map.iter())
+        .filter(|(_, stat)| matches!(stat, DiffStat::Binary))
+        .map(|(path, _)| path.clone())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Which of `paths` the repository excludes from diffs, i.e. which ones carry
+/// an UNSET `diff` attribute (`-diff` in a `.gitattributes`).
+///
+/// Such a path is not binary: git simply refuses to diff it, so `--numstat`
+/// reports no counts for it and `--text` does not override that (measured).
+/// Everything else keeps whatever the caller already decided, so
+/// `unspecified`, `set` and an explicit value (a diff driver) all leave a real
+/// binary reported as binary.
+///
+/// The paths travel on stdin, NUL-delimited, for two reasons: the batch is
+/// bounded by the pipe rather than by `ARG_MAX`, and nothing on the command
+/// line can be read as an option, so a path beginning with a dash is a path.
+/// A call that could not be run answers with an empty set, which leaves every
+/// row saying binary exactly as it did before this question existed.
+fn paths_excluded_from_diffs(worktree: &str, paths: &[String]) -> HashSet<String> {
+    if paths.is_empty() {
+        return HashSet::new();
+    }
+
+    let Ok(mut child) = Command::new("git")
+        .args(["-C", worktree, "check-attr", "-z", "--stdin", "diff"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    else {
+        return HashSet::new();
+    };
+
+    let Some(mut stdin) = child.stdin.take() else {
+        return HashSet::new();
+    };
+    let mut payload = Vec::new();
+    for path in paths {
+        payload.extend_from_slice(path.as_bytes());
+        payload.push(0);
+    }
+
+    // The writer runs on its own thread: check-attr answers three records per
+    // path, so a large batch can fill the output pipe while dux is still
+    // feeding the input one, and a single-threaded write-then-read deadlocks.
+    let writer = std::thread::spawn(move || {
+        let _ = std::io::Write::write_all(&mut stdin, &payload);
+    });
+
+    let output = child.wait_with_output();
+    let _ = writer.join();
+
+    match output {
+        Ok(out) if out.status.success() => parse_check_attr_z(&out.stdout),
+        _ => HashSet::new(),
+    }
+}
+
+/// Parse `git check-attr -z` output: NUL-delimited records in groups of three
+/// (path, attribute, value), and collect the paths whose value is `unset`.
+fn parse_check_attr_z(raw: &[u8]) -> HashSet<String> {
+    let mut excluded = HashSet::new();
+    let mut fields = raw.split(|byte| *byte == 0);
+    while let (Some(path), Some(_attr), Some(value)) = (fields.next(), fields.next(), fields.next())
+    {
+        if path.is_empty() {
+            continue;
+        }
+        if value == b"unset"
+            && let Ok(path) = std::str::from_utf8(path)
+        {
+            excluded.insert(path.to_string());
+        }
+    }
+    excluded
+}
+
+/// Put one numstat answer onto its row.
+///
+/// A countless row is either a real binary or a path the repository excludes
+/// from diffs, and `excluded` is the only thing that can tell them apart.
+fn apply_stat(file: &mut ChangedFile, stat: &DiffStat, excluded: &HashSet<String>) {
+    match stat {
+        DiffStat::Text(additions, deletions) => {
+            file.additions = *additions;
+            file.deletions = *deletions;
+        }
+        DiffStat::Binary => {
+            if excluded.contains(&file.path) {
+                file.diff_excluded = true;
+            } else {
+                file.binary = true;
+            }
+        }
+    }
+}
+
 /// Fill in the line counts of the unstaged rows from the two sources that have
 /// them: `tracked` for anything git diffed, and an in-process read for the
 /// untracked files git has no recorded state for.
@@ -2405,23 +2526,21 @@ fn unstaged_numstat(worktree: &str) -> HashMap<String, DiffStat> {
 /// `tracked` is taken as a plain map rather than computed here, which makes the
 /// independence type-evident: an empty map is what a failed `git diff --numstat`
 /// produces, and the untracked arm below never looks at it.
+///
+/// `excluded` tells a countless tracked row apart from a binary one. The
+/// untracked arm does not consult it: that count is an in-process read of the
+/// bytes rather than a numstat answer, so its binary verdict is git's own
+/// NUL-sniffing rule and not the absence of a number.
 fn apply_unstaged_stats(
     worktree_path: &Path,
     unstaged: &mut [ChangedFile],
     tracked: &HashMap<String, DiffStat>,
+    excluded: &HashSet<String>,
 ) {
     let mut untracked_stats_budget = UNTRACKED_STATS_MAX_FILES;
     for file in unstaged.iter_mut() {
         if let Some(stat) = tracked.get(&file.path) {
-            match stat {
-                DiffStat::Text(a, d) => {
-                    file.additions = *a;
-                    file.deletions = *d;
-                }
-                DiffStat::Binary => {
-                    file.binary = true;
-                }
-            }
+            apply_stat(file, stat, excluded);
         } else if file.status == "?" {
             if untracked_stats_budget == 0 {
                 continue;
@@ -7272,6 +7391,207 @@ mod tests {
         assert!(matches!(stats.get("binary.bin"), Some(DiffStat::Binary)));
     }
 
+    /// A repository can mark a path `-diff` in a `.gitattributes`, and
+    /// `--numstat` then prints `-\t-` for it exactly as it does for a real
+    /// binary (`--text` does not override that; measured on git 2.55). The two
+    /// must not end up wearing the same label: the excluded file is text the
+    /// diff viewer opens perfectly well.
+    #[test]
+    fn changed_files_tells_a_diff_excluded_file_apart_from_a_binary() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "diff-excluded");
+
+        fs::write(wt.join(".gitattributes"), "notes.txt -diff\n").unwrap();
+        fs::write(wt.join("notes.txt"), "one\ntwo\n").unwrap();
+        fs::write(wt.join("image.bin"), [0_u8, 159, 146, 150]).unwrap();
+        let out = test_support::git_command()
+            .args(["-C", wt.to_string_lossy().as_ref(), "add", "-A"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let out = test_support::git_command()
+            .args(["-C", wt.to_string_lossy().as_ref(), "commit", "-m", "seed"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        fs::write(wt.join("notes.txt"), "one\ntwo\nthree\n").unwrap();
+        fs::write(wt.join("image.bin"), [0_u8, 1, 2, 3, 4]).unwrap();
+
+        let (_staged, unstaged) = changed_files(&wt).unwrap();
+        let notes = unstaged
+            .iter()
+            .find(|f| f.path == "notes.txt")
+            .expect("the excluded file is still a row");
+        assert!(
+            notes.diff_excluded,
+            "a path the repository marks -diff is excluded from diffs"
+        );
+        assert!(!notes.binary, "it is text, not a binary");
+        assert_eq!((notes.additions, notes.deletions), (0, 0));
+
+        let image = unstaged
+            .iter()
+            .find(|f| f.path == "image.bin")
+            .expect("the binary is still a row");
+        assert!(image.binary, "a real binary is still binary");
+        assert!(!image.diff_excluded);
+    }
+
+    /// The same split on the STAGED side, which reads its own numstat.
+    #[test]
+    fn staged_rows_tell_a_diff_excluded_file_apart_from_a_binary() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "diff-excluded-staged");
+        let git = |args: &[&str]| {
+            let out = test_support::git_command()
+                .args(["-C", wt.to_string_lossy().as_ref()])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        fs::write(wt.join(".gitattributes"), "notes.txt -diff\n").unwrap();
+        fs::write(wt.join("notes.txt"), "one\n").unwrap();
+        fs::write(wt.join("image.bin"), [0_u8, 159, 146, 150]).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "seed"]);
+
+        fs::write(wt.join("notes.txt"), "one\ntwo\n").unwrap();
+        fs::write(wt.join("image.bin"), [0_u8, 7, 7]).unwrap();
+        git(&["add", "-A"]);
+
+        let (staged, _unstaged) = changed_files(&wt).unwrap();
+        let notes = staged
+            .iter()
+            .find(|f| f.path == "notes.txt")
+            .expect("the excluded file is staged");
+        assert!(notes.diff_excluded);
+        assert!(!notes.binary);
+        let image = staged
+            .iter()
+            .find(|f| f.path == "image.bin")
+            .expect("the binary is staged");
+        assert!(image.binary);
+        assert!(!image.diff_excluded);
+    }
+
+    /// The question is asked only about the rows that have no counts, and only
+    /// when there is at least one of them: an ordinary sweep spawns no
+    /// check-attr at all.
+    #[test]
+    fn nothing_is_asked_about_paths_that_came_back_with_counts() {
+        let stats = HashMap::from([
+            ("counted.txt".to_string(), DiffStat::Text(3, 1)),
+            ("countless.bin".to_string(), DiffStat::Binary),
+        ]);
+
+        assert_eq!(
+            countless_paths(&[&stats]),
+            vec!["countless.bin".to_string()]
+        );
+        assert!(
+            countless_paths(&[&HashMap::from([(
+                "counted.txt".to_string(),
+                DiffStat::Text(3, 1),
+            )])])
+            .is_empty()
+        );
+    }
+
+    /// The staged and unstaged maps can name the same countless path, and the
+    /// batch asks about it once.
+    #[test]
+    fn countless_paths_are_deduplicated_across_the_two_numstat_maps() {
+        let unstaged = HashMap::from([("both.txt".to_string(), DiffStat::Binary)]);
+        let staged = HashMap::from([
+            ("both.txt".to_string(), DiffStat::Binary),
+            ("other.txt".to_string(), DiffStat::Binary),
+        ]);
+
+        assert_eq!(
+            countless_paths(&[&unstaged, &staged]),
+            vec!["both.txt".to_string(), "other.txt".to_string()]
+        );
+    }
+
+    /// check-attr answers three NUL-delimited fields per path, and a path can
+    /// hold a space, a quote and non-ASCII. Only `unset` means excluded:
+    /// `unspecified`, `set` and a named diff driver all leave a countless row
+    /// saying binary.
+    #[test]
+    fn parse_check_attr_z_collects_only_the_unset_paths() {
+        let raw: &[u8] = b"a b\"c\xc3\xa9.txt\0diff\0unset\0plain.bin\0diff\0unspecified\0set.txt\0diff\0set\0driver.txt\0diff\0odf\0";
+
+        let excluded = parse_check_attr_z(raw);
+
+        assert_eq!(
+            excluded,
+            HashSet::from(["a b\"c\u{e9}.txt".to_string()]),
+            "only an unset diff attribute excludes a path"
+        );
+    }
+
+    /// A truncated answer (a killed check-attr) is read as far as it goes and
+    /// never panics or misaligns the fields it did get.
+    #[test]
+    fn parse_check_attr_z_ignores_a_truncated_trailing_record() {
+        let raw: &[u8] = b"done.txt\0diff\0unset\0half.txt\0diff\0";
+
+        assert_eq!(
+            parse_check_attr_z(raw),
+            HashSet::from(["done.txt".to_string()])
+        );
+    }
+
+    /// End to end over a real repository, for the path shape the parser test
+    /// asserts on: a space, a quote and a non-ASCII character in one name.
+    #[test]
+    fn a_diff_excluded_path_with_awkward_bytes_is_classified() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "diff-excluded-awkward");
+        let name = "a b\"c\u{e9}.txt";
+        let git = |args: &[&str]| {
+            let out = test_support::git_command()
+                .args(["-C", wt.to_string_lossy().as_ref()])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        // The pattern is C-quoted, which is how a .gitattributes carries a name
+        // with a space or a quote in it.
+        fs::write(
+            wt.join(".gitattributes"),
+            "\"a b\\\"c\\303\\251.txt\" -diff\n",
+        )
+        .unwrap();
+        fs::write(wt.join(name), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "seed"]);
+        fs::write(wt.join(name), "one\ntwo\n").unwrap();
+
+        let (_staged, unstaged) = changed_files(&wt).unwrap();
+        let row = unstaged
+            .iter()
+            .find(|f| f.path == name)
+            .expect("the awkward path is a row");
+        assert!(row.diff_excluded, "rows: {unstaged:?}");
+        assert!(!row.binary);
+    }
+
     #[test]
     fn parse_status_porcelain_z_skips_non_utf8_paths() {
         // 0xFF is invalid as a UTF-8 start byte. Lossy conversion would
@@ -7326,6 +7646,7 @@ mod tests {
                 additions: 0,
                 deletions: 0,
                 binary: false,
+                diff_excluded: false,
                 renamed_from: None,
             },
             ChangedFile {
@@ -7334,11 +7655,12 @@ mod tests {
                 additions: 0,
                 deletions: 0,
                 binary: false,
+                diff_excluded: false,
                 renamed_from: None,
             },
         ];
 
-        apply_unstaged_stats(dir.path(), &mut unstaged, &HashMap::new());
+        apply_unstaged_stats(dir.path(), &mut unstaged, &HashMap::new(), &HashSet::new());
 
         assert_eq!(
             (unstaged[0].additions, unstaged[0].deletions),
@@ -7366,6 +7688,7 @@ mod tests {
                 additions: 0,
                 deletions: 0,
                 binary: false,
+                diff_excluded: false,
                 renamed_from: None,
             },
             ChangedFile {
@@ -7374,12 +7697,13 @@ mod tests {
                 additions: 0,
                 deletions: 0,
                 binary: false,
+                diff_excluded: false,
                 renamed_from: None,
             },
         ];
         let tracked = HashMap::from([("tracked.txt".to_string(), DiffStat::Text(7, 4))]);
 
-        apply_unstaged_stats(dir.path(), &mut unstaged, &tracked);
+        apply_unstaged_stats(dir.path(), &mut unstaged, &tracked, &HashSet::new());
 
         assert_eq!((unstaged[0].additions, unstaged[0].deletions), (2, 0));
         assert_eq!((unstaged[1].additions, unstaged[1].deletions), (7, 4));

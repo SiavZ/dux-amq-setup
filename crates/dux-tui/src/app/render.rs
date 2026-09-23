@@ -4665,8 +4665,13 @@ impl App {
                 let is_selected = is_active_section && index == self.files_index;
 
                 // Build the right-aligned stats string, e.g. "+12 -3".
-                let stats =
-                    format_line_stats(file.additions, file.deletions, file.binary, &self.theme);
+                let stats = format_line_stats(
+                    file.additions,
+                    file.deletions,
+                    file.binary,
+                    file.diff_excluded,
+                    &self.theme,
+                );
                 let stats_width = stats.iter().map(|s| s.width()).sum::<usize>();
 
                 // Status prefix takes 3 chars ("M  ").
@@ -12203,16 +12208,30 @@ pub(crate) fn list_window_start(len: usize, selected: Option<usize>, viewport: u
     }
 }
 
+/// The right-hand badge of a changed-files row: the lines it adds and removes,
+/// or the word that says why it has no counts.
+///
+/// Two different things have no counts. A binary file reads "bin", and a file
+/// the repository excludes from diffs (`-diff` in a `.gitattributes`) reads
+/// "Excl" in its own muted tone: git will not count its lines, but the file is
+/// text and the diff viewer opens it, so calling it binary would be a lie.
 pub(crate) fn format_line_stats(
     additions: usize,
     deletions: usize,
     binary: bool,
+    diff_excluded: bool,
     theme: &crate::theme::Theme,
 ) -> Vec<Span<'static>> {
     if binary {
         return vec![Span::styled(
             "bin",
             Style::default().fg(theme.diff_binary_fg),
+        )];
+    }
+    if diff_excluded {
+        return vec![Span::styled(
+            "Excl",
+            Style::default().fg(theme.diff_excluded_fg),
         )];
     }
     if additions == 0 && deletions == 0 {
@@ -12264,7 +12283,10 @@ pub(crate) fn format_recap_count(n: usize) -> String {
 /// between them, and a quiet marker for the binaries among them.
 ///
 /// Binary files carry no line counts, so they are counted apart and a group of
-/// nothing but binaries reads as "2 bin" rather than claiming "+0 -0". The
+/// nothing but binaries reads as "2 bin" rather than claiming "+0 -0". Files the
+/// repository excludes from diffs have no counts either, and are tallied
+/// separately again as "2 excl", because they are text that git merely refuses
+/// to diff. The
 /// figures wear the same diff colors the rows below use, but the sums are
 /// abbreviated past a thousand (see `format_recap_count`) where the rows stay
 /// raw: a title's figure is a sense of scale competing for a narrow line. The
@@ -12281,9 +12303,14 @@ pub(crate) fn changed_files_group_title(
     let mut additions = 0usize;
     let mut deletions = 0usize;
     let mut binaries = 0usize;
+    let mut excluded = 0usize;
     for file in files {
         if file.binary {
             binaries += 1;
+            continue;
+        }
+        if file.diff_excluded {
+            excluded += 1;
             continue;
         }
         additions += file.additions;
@@ -12321,6 +12348,20 @@ pub(crate) fn changed_files_group_title(
         spans.push(Span::styled(
             format!("{binaries} bin"),
             Style::default().fg(theme.diff_binary_fg),
+        ));
+    }
+    if excluded > 0 {
+        spans.push(Span::styled(
+            if has_lines || binaries > 0 {
+                " · "
+            } else {
+                " "
+            },
+            title_style,
+        ));
+        spans.push(Span::styled(
+            format!("{excluded} excl"),
+            Style::default().fg(theme.diff_excluded_fg),
         ));
     }
     Line::from(spans)
@@ -13163,6 +13204,7 @@ mod tests {
                 additions: 1,
                 deletions: 0,
                 binary: false,
+                diff_excluded: false,
                 renamed_from: None,
             })
             .collect();
@@ -24140,6 +24182,7 @@ mod tests {
             additions: 12,
             deletions: 3,
             binary: false,
+            diff_excluded: false,
             renamed_from: None,
         }];
         app.focus = FocusPane::Files;
@@ -24330,6 +24373,7 @@ mod tests {
             additions,
             deletions,
             binary,
+            diff_excluded: false,
             renamed_from: None,
         }
     }
@@ -24397,6 +24441,72 @@ mod tests {
         assert_eq!(line_text(&title), "Changes (2) 2 bin");
     }
 
+    fn excluded_file(name: &str) -> ChangedFile {
+        ChangedFile {
+            path: name.to_string(),
+            status: "M".to_string(),
+            additions: 0,
+            deletions: 0,
+            binary: false,
+            diff_excluded: true,
+            renamed_from: None,
+        }
+    }
+
+    /// A row whose repository excludes it from diffs has no counts to show, and
+    /// it is not binary: it reads "Excl" in its own muted tone rather than
+    /// borrowing the binary marker's word or its color.
+    #[test]
+    fn a_diff_excluded_row_reads_excl_in_its_own_color() {
+        let app = test_app(default_bindings());
+
+        let spans = format_line_stats(0, 0, false, true, &app.theme);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), "Excl");
+        assert_eq!(spans[0].style.fg, Some(app.theme.diff_excluded_fg));
+        assert_ne!(
+            app.theme.diff_excluded_fg, app.theme.diff_binary_fg,
+            "the two countless verdicts must not look the same"
+        );
+
+        let binary = format_line_stats(0, 0, true, false, &app.theme);
+        assert_eq!(binary[0].content.as_ref(), "bin");
+        assert_eq!(binary[0].style.fg, Some(app.theme.diff_binary_fg));
+    }
+
+    /// The group title tallies excluded files beside the binaries, in its own
+    /// word, and only when there are any.
+    #[test]
+    fn the_changes_group_title_tallies_excluded_files_beside_the_binaries() {
+        let app = test_app(default_bindings());
+        let title = recap_title(
+            &app,
+            &[
+                recap_file(5, 1, false),
+                recap_file(0, 0, true),
+                excluded_file("locked.txt"),
+                excluded_file("also-locked.txt"),
+            ],
+        );
+
+        assert_eq!(line_text(&title), "Changes (4) +5 -1 · 1 bin · 2 excl");
+        assert_eq!(
+            span_color(&title, "2 excl"),
+            Some(app.theme.diff_excluded_fg),
+            "the tally wears the same color the rows' own Excl marker does"
+        );
+    }
+
+    /// With no lines and no binaries beside them, the excluded tally is the
+    /// whole recap and carries no leading separator.
+    #[test]
+    fn a_changes_group_of_excluded_files_reports_only_its_tally() {
+        let app = test_app(default_bindings());
+        let title = recap_title(&app, &[excluded_file("one.txt"), excluded_file("two.txt")]);
+
+        assert_eq!(line_text(&title), "Changes (2) 2 excl");
+    }
+
     /// Files that changed no lines and are not binary either (a mode change,
     /// an empty new file) leave the title as it always was, and so does an
     /// empty group.
@@ -24440,6 +24550,7 @@ mod tests {
                 additions: 10,
                 deletions: 1,
                 binary: false,
+                diff_excluded: false,
                 renamed_from: None,
             })
             .collect();
@@ -24461,6 +24572,7 @@ mod tests {
                 additions: 12,
                 deletions: 3,
                 binary: false,
+                diff_excluded: false,
                 renamed_from: None,
             },
             ChangedFile {
@@ -24469,12 +24581,22 @@ mod tests {
                 additions: 0,
                 deletions: 0,
                 binary: true,
+                diff_excluded: false,
+                renamed_from: None,
+            },
+            ChangedFile {
+                path: "locked.txt".to_string(),
+                status: "M".to_string(),
+                additions: 0,
+                deletions: 0,
+                binary: false,
+                diff_excluded: true,
                 renamed_from: None,
             },
         ];
         app.right_hidden = false;
 
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).expect("terminal");
         terminal
             .draw(|frame| app.render(frame))
             .expect("render frame");
@@ -24489,8 +24611,12 @@ mod tests {
             .collect();
 
         assert!(
-            screen.contains("Changes (2) +12 -3 · 1 bin"),
+            screen.contains("Changes (3) +12 -3 · 1 bin · 1 excl"),
             "the group title carries its recap:\n{screen}"
+        );
+        assert!(
+            screen.contains("Excl"),
+            "the excluded row carries its own marker where its counts would be:\n{screen}"
         );
     }
 
