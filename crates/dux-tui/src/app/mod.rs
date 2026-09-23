@@ -648,11 +648,10 @@ pub struct App {
     /// here would otherwise rebuild. Folded into the per-iteration mutated answer
     /// and cleared there.
     pub(crate) companion_followup_ran: bool,
-    /// The keyed status op for a background-server start, held from the moment the
-    /// pre-flight is dispatched until its result lands. `Option` rather than a map
-    /// because the pre-flight is in-flight-guarded, so there is only ever one.
-    pub(crate) pending_background_server_op:
-        Option<dux_core::engine::HandlerStatusOp<BackgroundServerOutcome>>,
+    /// The background-server start in flight, held from the moment the pre-flight
+    /// is dispatched until its result lands. `Option` rather than a map because
+    /// the pre-flight is in-flight-guarded, so there is only ever one.
+    pub(crate) pending_background_server_start: Option<PendingBackgroundServerStart>,
     /// The keyed status op for a live `[server] tailscale` change, held from the
     /// moment the background server is asked until its outcome lands on the
     /// worker lane. `Option` rather than a map: the serve loop answers every
@@ -826,8 +825,21 @@ pub enum TuiServerFlipOutcome {
     Failed(String),
 }
 
+/// A background-server start whose bind pre-flight is still on its worker
+/// thread (see [`App::pending_background_server_start`]).
+///
+/// The trigger travels with the status op rather than beside it, because the
+/// place the pre-flight lands is where it decides what the start does beyond
+/// serving: a start somebody at this keyboard asked for claims every running
+/// pty, and the startup autostart claims none. Held together, the two cannot
+/// disagree about which start they belong to.
+pub(crate) struct PendingBackgroundServerStart {
+    pub(crate) op: dux_core::engine::HandlerStatusOp<BackgroundServerOutcome>,
+    pub(crate) trigger: BackgroundServerStart,
+}
+
 /// Handler-resolved outcome for a background-server start (see
-/// [`App::pending_background_server_op`]).
+/// [`App::pending_background_server_start`]).
 ///
 /// Every arm is terminal, unlike the flip's: the flip's busy rides on until the
 /// process changes surface, while this one has an answer either way and the TUI
@@ -3896,7 +3908,7 @@ impl App {
             background_server_preflight_pending: false,
             background_server_wanted: false,
             companion_followup_ran: false,
-            pending_background_server_op: None,
+            pending_background_server_start: None,
             pending_tailscale_mode_op: None,
             server_flip_preflight_pending: false,
             pending_persist_ops: HashMap::new(),

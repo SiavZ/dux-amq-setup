@@ -197,7 +197,9 @@ impl App {
     }
 
     /// Start serving the web UI in the background of this TUI. `trigger` decides
-    /// the tone of the success outcome only: see [`BackgroundServerStart`].
+    /// the tone of the success outcome and whether this surface keeps what is
+    /// running: see [`BackgroundServerStart`]. It travels with the status op to
+    /// [`Self::apply_background_server_preflight`], where the serve comes up.
     ///
     /// The pre-flight (Tailscale detection, then an actual `TcpListener::bind` of
     /// each address) runs on a worker thread, as the flip's does: `tailscale ip`
@@ -294,7 +296,7 @@ impl App {
         });
         let pending = self.engine.begin_status_op(&op);
         self.apply_reaction(EventReaction::Status(pending));
-        self.pending_background_server_op = Some(op);
+        self.pending_background_server_start = Some(PendingBackgroundServerStart { op, trigger });
         self.background_server_preflight_pending = true;
         self.background_server_wanted = true;
         self.spawn_background_server_preflight();
@@ -346,7 +348,9 @@ impl App {
         });
     }
 
-    /// Adopt the pre-flight's listeners and hand them to the companion.
+    /// Adopt the pre-flight's listeners and hand them to the companion, and,
+    /// for a start somebody at this keyboard asked for, claim every running pty
+    /// before the loop yields to a browser.
     pub(crate) fn apply_background_server_preflight(
         &mut self,
         result: Result<(Vec<std::net::TcpListener>, Vec<String>), String>,
@@ -360,7 +364,9 @@ impl App {
         // listeners (which releases the addresses), say so, and write nothing.
         if !self.background_server_wanted {
             drop(result);
-            if let Some(op) = self.pending_background_server_op.take() {
+            if let Some(PendingBackgroundServerStart { op, .. }) =
+                self.pending_background_server_start.take()
+            {
                 self.apply_reaction(
                     op.resolve(&BackgroundServerOutcome::Cancelled)
                         .into_reaction(),
@@ -368,11 +374,22 @@ impl App {
             }
             return;
         }
+        let pending = self.pending_background_server_start.take();
         let outcome = match result {
             Ok((listeners, urls)) => match self.companion.as_mut() {
                 Some(companion) => {
                     match companion.start(&mut self.engine, listeners, urls.clone()) {
                         Ok(urls) => {
+                            // In this same run-loop step, before anything yields
+                            // to a browser: a start asked for at this keyboard
+                            // keeps every running pty driven from here. See
+                            // `BackgroundServerStart` for why the startup
+                            // autostart claims nothing.
+                            if pending.as_ref().map(|start| start.trigger)
+                                == Some(BackgroundServerStart::UserRequest)
+                            {
+                                self.claim_every_running_pty();
+                            }
                             // Persist the choice, so a restart comes up the way the
                             // user left it. Lazy rather than eager: nothing is
                             // half-done if the write lands late, because the serve
@@ -396,7 +413,7 @@ impl App {
         // A start that failed leaves nothing wanted, so a later stop does not
         // report on a listener that never came up.
         self.background_server_wanted = self.background_server_is_serving();
-        if let Some(op) = self.pending_background_server_op.take() {
+        if let Some(PendingBackgroundServerStart { op, .. }) = pending {
             self.apply_reaction(op.resolve(&outcome).into_reaction());
         }
     }
@@ -654,11 +671,21 @@ impl App {
 
 /// What asked for the background server to start.
 ///
-/// This decides the tone of the success outcome and nothing else: a failure or a
-/// cancellation reads the same whoever asked. The startup autostart is the one
-/// start nobody performed, so its outcome takes the warning tone, which holds the
+/// This decides two things about a start that succeeds, and nothing about one
+/// that fails or is cancelled, which reads the same whoever asked.
+///
+/// The tone of the outcome. The startup autostart is the one start nobody
+/// performed, so its outcome takes the warning tone, which holds the
 /// most-recent-wins status line longer than an info would; an info at boot clears
 /// before the user has sat down to read that a listener came up.
+///
+/// And which ptys this surface keeps. A `UserRequest` claims every agent tab and
+/// terminal running when the serve comes up, in that same run-loop step: until
+/// then this surface was the only one that could drive any of them, and the user
+/// was typing into one a second earlier, so leaving them free would cover every
+/// pane with `Running in the background` before any browser exists. The startup
+/// autostart claims nothing, like the auto-reopen sweep that runs beside it, so
+/// a browser can pick any of it up. Neither claim steals from another device.
 ///
 /// A reload that flips the setting to true is a `UserRequest`: editing the file is
 /// an act the user has just taken, and they are looking at the screen when it
@@ -666,9 +693,10 @@ impl App {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BackgroundServerStart {
     /// `[server] serve_while_tui = true` at startup, before anybody touched
-    /// anything.
+    /// anything. Claims nothing.
     ConfigAtStartup,
     /// The palette command, or a config reload that turned the setting on.
+    /// Claims every pty running when the serve comes up.
     UserRequest,
 }
 
@@ -1534,7 +1562,7 @@ pub(crate) mod tests {
     /// Bring a start all the way to its success outcome without binding anything
     /// real: the fake companion ignores the listeners it is handed and reports its
     /// own address back.
-    fn finish_a_start(app: &mut App, warning: Option<String>) {
+    pub(crate) fn finish_a_start(app: &mut App, warning: Option<String>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
         app.apply_background_server_preflight(
             Ok((vec![listener], vec!["http://127.0.0.1:8080".to_string()])),

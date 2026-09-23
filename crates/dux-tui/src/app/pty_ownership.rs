@@ -42,15 +42,24 @@
 //! ones a browser just created and is a heartbeat away from attaching to. So a
 //! render's resize applies only for a pty this surface already drives, or one an
 //! armed take-over is transferring, and the first claim always comes from a
-//! deliberate act: the card's button, or a launch this surface started. Each
-//! clears the resize dedupe, so the geometry follows on the next frame through
-//! the ordinary apply order.
+//! deliberate act: the card's button, a launch this surface started, or
+//! switching serving on from this keyboard. Each clears the resize dedupe, so
+//! the geometry follows on the next frame through the ordinary apply order.
 //!
 //! Typing is not one of them: a keystroke into a pty this surface does not drive
 //! is dropped, whoever holds it and even when nobody does. So the startup
 //! auto-reopen sweep claims nothing and every agent reopened at startup shows
 //! `Running in the background` until somebody presses it, while an agent
 //! launched from this keyboard is this surface's immediately.
+//!
+//! Switching serving on from here (the palette command, or a reload that turns
+//! `serve_while_tui` on) claims every agent tab and terminal running at that
+//! moment, in the same run-loop step that brings the serve up: until then this
+//! surface was the only one that could drive any of it, and the user was
+//! typing into one a second earlier. A startup with the setting already on
+//! claims nothing, for the same reason the auto-reopen sweep claims nothing.
+//! Which start is which is [`BackgroundServerStart`], carried from the command
+//! to the pre-flight's landing with the start's status op.
 //!
 //! Which launches count is decided in [`launch_claims_its_pty`]. A create is
 //! armed by a flag rather than by id, because its session id is minted in a
@@ -67,8 +76,8 @@ use super::*;
 pub(crate) enum PtyDriver {
     /// Nobody has claimed it, or nothing is serving so the question does not
     /// arise. While something is serving this is a card state like any other
-    /// (`Running in the background`), claimed only by the card's button or a
-    /// launch started from here.
+    /// (`Running in the background`), claimed only by the card's button, a
+    /// launch started from here, or switching serving on from here.
     Free,
     /// This surface holds it.
     Mine,
@@ -286,25 +295,42 @@ impl App {
         let Some(seat) = self.pty_ownership() else {
             return;
         };
-        let claim = seat
-            .owners
-            .may_write(pty_id, seat.conn_id, Some(TUI_DEVICE_LABEL), || {});
-        if claim.claimed_new
-            && let Some(epoch) = claim.epoch
-        {
-            // A launch's claim transfers the pty, so it clears the resize dedupe
-            // the way an explicit take-over does. Without it, a child a previous
-            // driver re-gridded keeps that grid indefinitely: the dedupe sees the
-            // same pane size against the same target and sends nothing, and the
-            // card that would have said so is gone once the claim succeeds.
-            self.last_pty_resize_target = None;
-            self.publish_ownership(&[PtyOwnershipEvent::Claimed {
-                pty_id: pty_id.to_string(),
-                conn_id: seat.conn_id,
-                epoch,
-                device: TUI_DEVICE_LABEL.to_string(),
-            }]);
+        let claimed: Vec<PtyOwnershipEvent> = seat.claim_if_free(pty_id).into_iter().collect();
+        self.announce_claims(&claimed);
+    }
+
+    /// Claim every pty running right now that nobody drives, because the person
+    /// at this keyboard just switched serving on.
+    ///
+    /// Until that moment this surface was the only one that could drive any of
+    /// them, and the user was typing into one a second ago; leaving them free
+    /// would cover every pane with `Running in the background` before any
+    /// browser exists. A browser that wants one presses Take over, exactly as
+    /// for any other pty this surface drives.
+    ///
+    /// Only for a start somebody at this keyboard asked for: a startup with the
+    /// setting already on claims nothing (see [`BackgroundServerStart`]). It
+    /// never steals, and a dormant tab has no process and is not claimed.
+    pub(crate) fn claim_every_running_pty(&mut self) {
+        let Some(seat) = self.pty_ownership() else {
+            return;
+        };
+        let claimed = seat.claim_every_running_pty(&self.engine);
+        self.announce_claims(&claimed);
+    }
+
+    /// Announce claims this surface just made, in one batch.
+    fn announce_claims(&mut self, claimed: &[PtyOwnershipEvent]) {
+        if claimed.is_empty() {
+            return;
         }
+        // A claim transfers the pty, so it clears the resize dedupe the way an
+        // explicit take-over does. Without it, a child a previous driver
+        // re-gridded keeps that grid indefinitely: the dedupe sees the same pane
+        // size against the same target and sends nothing, and the card that
+        // would have said so is gone once the claim succeeds.
+        self.last_pty_resize_target = None;
+        self.publish_ownership(claimed);
     }
 
     /// The sizing chokepoint: may this surface resize `pty_id` to `rows` x
@@ -317,9 +343,10 @@ impl App {
     /// made only about a resize that actually happened.
     ///
     /// It never claims on its own. An unowned pty is refused exactly as an owned
-    /// one is, because the caller is the render pass; the card's button and
-    /// [`Self::claim_launched_pty`] are what take a free pty, and only a
-    /// take-over armed by that button takes one from another device.
+    /// one is, because the caller is the render pass; the card's button,
+    /// [`Self::claim_launched_pty`] and [`Self::claim_every_running_pty`] are
+    /// what take a free pty, and only a take-over armed by that button takes one
+    /// from another device.
     ///
     /// Returns whether the resize was granted, which is the caller's cue to
     /// record its dedupe. A refusal records nothing: the pane renders the
@@ -356,9 +383,10 @@ impl App {
         //
         // So a plain resize applies only for a pty this surface already drives,
         // or one an armed take-over is about to transfer. The first claim of a
-        // free pty is the card's button or a child started from here
-        // (`claim_launched_pty`); both clear the resize dedupe, so the very next
-        // render sends this pane's geometry through the apply order below.
+        // free pty is the card's button, a child started from here
+        // (`claim_launched_pty`), or serving switched on from here
+        // (`claim_every_running_pty`); each clears the resize dedupe, so the very
+        // next render sends this pane's geometry through the apply order below.
         if !takeover && !seat.owners.is_owner(pty_id, seat.conn_id) {
             self.log_refused_resize_once(&seat, pty_id, rows, cols);
             return false;
@@ -3151,6 +3179,325 @@ mod tests {
         assert!(
             !flat.contains("Running in the background"),
             "and the card goes: {flat}"
+        );
+    }
+
+    // ── Switching serving on from this keyboard ─────────────────────────────
+
+    use crate::app::background_server::tests::finish_a_start;
+
+    /// Every pty a user can have running: the agent's first tab, an extra tab,
+    /// and one terminal of each owner kind.
+    const EVERYTHING_RUNNING: [&str; 5] = [
+        "session-1-slot",
+        "session-1-tab-2",
+        "term-1",
+        "term-2",
+        "term-3",
+    ];
+
+    fn spawn_sleeper() -> crate::pty::PtyClient {
+        crate::pty::PtyClient::spawn(
+            "sh",
+            &["-c".to_string(), "sleep 5".to_string()],
+            std::path::Path::new("."),
+            10,
+            10,
+            100,
+        )
+        .expect("spawn pty")
+    }
+
+    fn insert_terminal(app: &mut App, id: &str, owner: dux_core::model::TerminalOwner) {
+        app.engine.companion_terminals.insert(
+            id.to_string(),
+            dux_core::model::CompanionTerminal {
+                owner,
+                label: id.to_string(),
+                foreground_cmd: None,
+                client: spawn_sleeper(),
+                sort_order: 0,
+                created_at: chrono::Utc::now(),
+            },
+        );
+    }
+
+    /// The state the user is in right before they switch serving on: every kind
+    /// of pty running, the agent's first tab in the center pane, and nothing
+    /// serving, so no registry and no card anywhere.
+    fn app_running_everything_with_nothing_serving() -> (
+        App,
+        std::sync::Arc<std::sync::Mutex<Recorded>>,
+        TuiOwnership,
+    ) {
+        let (mut app, recorded, seat) = app_with_a_live_pty_running("sleep 5");
+        app.engine.agent_tabs.insert(
+            TabId::new("session-1-tab-2"),
+            dux_core::model::AgentTab {
+                id: "session-1-tab-2".to_string(),
+                session_id: "session-1".to_string(),
+                provider: dux_core::model::ProviderKind::new("claude"),
+                sort_order: 1,
+                created_at: chrono::Utc::now(),
+            },
+        );
+        app.engine
+            .providers
+            .insert(TabId::new("session-1-tab-2"), spawn_sleeper());
+        insert_terminal(
+            &mut app,
+            "term-1",
+            dux_core::model::TerminalOwner::Session("session-1".to_string()),
+        );
+        insert_terminal(
+            &mut app,
+            "term-2",
+            dux_core::model::TerminalOwner::Project("project-1".to_string()),
+        );
+        insert_terminal(
+            &mut app,
+            "term-3",
+            dux_core::model::TerminalOwner::Standalone,
+        );
+        app.stop_background_server_quietly();
+        assert!(app.pty_ownership().is_none(), "nothing is serving yet");
+        recorded.lock().expect("not poisoned").published.clear();
+        (app, recorded, seat)
+    }
+
+    fn claimed_ids(recorded: &std::sync::Arc<std::sync::Mutex<Recorded>>) -> Vec<String> {
+        recorded
+            .lock()
+            .expect("not poisoned")
+            .published
+            .iter()
+            .filter_map(|event| match event {
+                PtyOwnershipEvent::Claimed { pty_id, device, .. } => {
+                    assert_eq!(device, TUI_DEVICE_LABEL);
+                    Some(pty_id.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// THE REPORTED BUG. The user was typing into their agent a second ago and
+    /// no browser exists yet; switching serving on from the palette must not
+    /// cover that agent, or any other running tab or terminal, with `Running in
+    /// the background`.
+    #[test]
+    fn switching_serving_on_here_claims_every_running_agent_tab_and_terminal() {
+        let (mut app, _recorded, seat) = app_running_everything_with_nothing_serving();
+
+        app.execute_command("start-background-server".to_string())
+            .expect("the command runs");
+        finish_a_start(&mut app, None);
+
+        for pty_id in EVERYTHING_RUNNING {
+            assert_eq!(
+                app.pty_driver(pty_id),
+                PtyDriver::Mine,
+                "{pty_id} was running when serving came on, so this terminal keeps it"
+            );
+            assert!(seat.owners.is_owner(pty_id, seat.conn_id));
+        }
+        assert_eq!(app.focused_pty_takeover_card(), None);
+        let flat = flowed(&render_rows(&mut app, 160, 40));
+        assert!(
+            !flat.contains("Running in the background"),
+            "no card over the agent the user was typing into: {flat}"
+        );
+    }
+
+    /// Browsers learn about each claim exactly as they learn about a launch's:
+    /// one `Claimed` per pty under this surface's device label, and nothing
+    /// repeated by the frames that follow.
+    #[test]
+    fn each_claim_made_by_switching_serving_on_is_announced_once() {
+        let (mut app, recorded, seat) = app_running_everything_with_nothing_serving();
+
+        app.start_background_server(BackgroundServerStart::UserRequest);
+        finish_a_start(&mut app, None);
+        let _ = render_rows(&mut app, 160, 40);
+        let _ = render_rows(&mut app, 160, 40);
+
+        assert_eq!(claimed_ids(&recorded), EVERYTHING_RUNNING.to_vec());
+        let published = recorded.lock().expect("not poisoned").published.clone();
+        for pty_id in EVERYTHING_RUNNING {
+            let (_, _, device) = seat.owners.current_owner(pty_id);
+            assert_eq!(device.as_deref(), Some(TUI_DEVICE_LABEL), "{published:?}");
+        }
+    }
+
+    /// UNCHANGED: dux started with the setting already on, before anybody
+    /// touched anything, so nothing is claimed and a browser can pick up any of
+    /// it. The pane says so with the card.
+    #[test]
+    fn a_startup_with_serving_already_on_claims_nothing() {
+        let (mut app, recorded, _seat) = app_running_everything_with_nothing_serving();
+        app.engine.config.server.serve_while_tui = true;
+
+        app.start_background_server_from_config();
+        finish_a_start(&mut app, None);
+
+        for pty_id in EVERYTHING_RUNNING {
+            assert_eq!(app.pty_driver(pty_id), PtyDriver::Free, "{pty_id}");
+        }
+        assert!(claimed_ids(&recorded).is_empty());
+        assert_eq!(app.focused_pty_takeover_card(), Some(PtyTakeoverCard::Free));
+        let flat = flowed(&render_rows(&mut app, 160, 40));
+        assert!(flat.contains("Running in the background"), "{flat}");
+    }
+
+    /// Editing the file to turn the setting on is an act the user just took at
+    /// this machine, so it claims exactly as the palette command does.
+    #[test]
+    fn a_reload_that_turns_serving_on_claims_like_the_palette_command() {
+        let (mut app, recorded, _seat) = app_running_everything_with_nothing_serving();
+
+        app.apply_serve_while_tui_setting(true);
+        finish_a_start(&mut app, None);
+
+        for pty_id in EVERYTHING_RUNNING {
+            assert_eq!(app.pty_driver(pty_id), PtyDriver::Mine, "{pty_id}");
+        }
+        assert_eq!(claimed_ids(&recorded), EVERYTHING_RUNNING.to_vec());
+    }
+
+    /// Stopping releases everything; starting again from here claims whatever
+    /// is still running, rather than leaving the second serve to cover it all.
+    #[test]
+    fn stopping_and_starting_again_here_reclaims_what_is_running() {
+        let (mut app, recorded, seat) = app_running_everything_with_nothing_serving();
+        app.start_background_server(BackgroundServerStart::UserRequest);
+        finish_a_start(&mut app, None);
+
+        app.stop_background_server();
+        for pty_id in EVERYTHING_RUNNING {
+            assert_eq!(seat.owners.current_owner(pty_id).0, None, "{pty_id}");
+        }
+        recorded.lock().expect("not poisoned").published.clear();
+
+        app.start_background_server(BackgroundServerStart::UserRequest);
+        finish_a_start(&mut app, None);
+
+        for pty_id in EVERYTHING_RUNNING {
+            assert_eq!(app.pty_driver(pty_id), PtyDriver::Mine, "{pty_id}");
+        }
+        assert_eq!(claimed_ids(&recorded), EVERYTHING_RUNNING.to_vec());
+    }
+
+    /// The claim is refused by the registry, never forced: a pty another
+    /// connection somehow already holds stays that connection's.
+    #[test]
+    fn switching_serving_on_never_takes_a_pty_another_connection_holds() {
+        let (mut app, recorded, seat) = app_running_everything_with_nothing_serving();
+        let browser = seat.owners.next_conn_id();
+        seat.owners
+            .may_write("term-2", browser, Some(REAL_CHROME_UA), || {})
+            .epoch
+            .expect("the browser holds term-2");
+
+        app.start_background_server(BackgroundServerStart::UserRequest);
+        finish_a_start(&mut app, None);
+
+        assert!(seat.owners.is_owner("term-2", browser));
+        assert!(!claimed_ids(&recorded).contains(&"term-2".to_string()));
+        for pty_id in EVERYTHING_RUNNING.iter().filter(|id| **id != "term-2") {
+            assert_eq!(app.pty_driver(pty_id), PtyDriver::Mine, "{pty_id}");
+        }
+    }
+
+    /// A dormant tab has no process, so there is no pty to claim, and its row is
+    /// left alone.
+    #[test]
+    fn switching_serving_on_claims_no_dormant_tab() {
+        let (mut app, recorded, seat) = app_running_everything_with_nothing_serving();
+        app.engine.providers.remove(TabIdRef::new("session-1-slot"));
+
+        app.start_background_server(BackgroundServerStart::UserRequest);
+        finish_a_start(&mut app, None);
+
+        assert_eq!(seat.owners.current_owner("session-1-slot").0, None);
+        assert!(!claimed_ids(&recorded).contains(&"session-1-slot".to_string()));
+        assert_eq!(app.focused_pty_takeover_card(), None, "no pty, no card");
+    }
+
+    /// The whole journey on this surface, with a real child that echoes: the
+    /// user is typing into their agent, switches serving on, keeps typing into
+    /// it with no card in the way, a browser's plain attach does not take it, and
+    /// a browser's explicit take-over does.
+    #[test]
+    fn after_switching_serving_on_typing_still_reaches_the_agent_until_a_browser_takes_over() {
+        let (mut app, _recorded, seat) = app_with_a_live_pty_running("cat");
+        app.focus = FocusPane::Center;
+        app.input_target = InputTarget::Agent;
+        app.stop_background_server_quietly();
+
+        app.execute_command("start-background-server".to_string())
+            .expect("the command runs");
+        finish_a_start(&mut app, None);
+        let flat = flowed(&render_rows(&mut app, 160, 40));
+        assert!(!flat.contains("Running in the background"), "{flat}");
+
+        assert!(
+            app.write_into_focused_pty(b"DUXTYPED\n"),
+            "the keystroke reaches the child"
+        );
+        let client = app
+            .engine
+            .providers
+            .get(TabIdRef::new("session-1-slot"))
+            .expect("live child");
+        let mut echoed = false;
+        for _ in 0..300 {
+            if client.visible_text_excerpt(40).contains("DUXTYPED") {
+                echoed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(echoed, "the child echoed what was typed here");
+
+        // A browser opens the agent: its plain attach resize and its typing
+        // take nothing.
+        let browser = seat.owners.next_conn_id();
+        let attach = seat.owners.claim_for_resize(
+            "session-1-slot",
+            browser,
+            false,
+            None,
+            Some(REAL_CHROME_UA),
+            |_| {},
+        );
+        assert!(!attach.apply, "attaching never steals");
+        assert!(
+            !seat
+                .owners
+                .may_write("session-1-slot", browser, Some(REAL_CHROME_UA), || {})
+                .allowed
+        );
+        assert_eq!(app.pty_driver("session-1-slot"), PtyDriver::Mine);
+
+        // Its Take over press does.
+        let takeover = seat.owners.claim_for_resize(
+            "session-1-slot",
+            browser,
+            true,
+            None,
+            Some(REAL_CHROME_UA),
+            |_| {},
+        );
+        assert!(takeover.apply && takeover.epoch.is_some());
+        assert!(
+            !app.write_into_focused_pty(b"x"),
+            "and this surface is now a watcher"
+        );
+        assert_eq!(
+            app.focused_pty_takeover_card(),
+            Some(PtyTakeoverCard::Elsewhere {
+                device: Some("Chrome on macOS".to_string())
+            })
         );
     }
 }

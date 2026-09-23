@@ -1206,6 +1206,25 @@ impl Engine {
             .collect()
     }
 
+    /// Every pty in the workspace with a process behind it right now: each live
+    /// provider tab, the first tab and extra tabs alike, and each terminal
+    /// whatever owns it. Sorted, so a caller announcing one fact per pty
+    /// announces them in a stable order.
+    ///
+    /// Read straight from the two maps a process lives in, so a dormant tab (a
+    /// row with no process) is never in it, and neither is a launch that has not
+    /// produced its pty yet.
+    pub fn running_pty_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .providers
+            .keys()
+            .map(|id| id.as_str().to_string())
+            .chain(self.companion_terminals.keys().cloned())
+            .collect();
+        ids.sort();
+        ids
+    }
+
     /// How many of an agent's tabs are running. The confirmation copy's count.
     pub fn live_tab_count(&self, session_id: &str) -> usize {
         self.live_tab_ids(session_id).len()
@@ -6531,6 +6550,65 @@ mod tests {
         assert!(
             text.contains("force-closed"),
             "one forced tab makes the agent's outcome forced: {text}"
+        );
+    }
+
+    /// Every pty with a process behind it, and nothing else: each live provider
+    /// tab (the slot tab and an extra one alike) and each terminal whatever owns
+    /// it. A dormant tab is a row with no process, so it is not a pty at all.
+    /// Sorted, so a caller that announces one fact per pty announces them in the
+    /// same order every time.
+    #[test]
+    fn running_pty_ids_names_every_live_tab_and_terminal_and_no_dormant_tab() {
+        let (mut engine, _tmp) = test_engine();
+        let dir = tempfile::tempdir().expect("working dir");
+        let path = dir.path().to_string_lossy().to_string();
+        engine.projects.push(sample_project("p1", &path));
+        let mut session = sample_session("s1", "p1", "feat");
+        session
+            .workspace
+            .as_managed_mut()
+            .expect("managed test session")
+            .worktree_path = path.clone();
+        engine.sessions.push(session);
+        engine.config.terminal.command = "cat".to_string();
+        engine.config.terminal.args = vec![];
+
+        engine
+            .providers
+            .insert(TabId::new("s1-slot"), spawn_cat(dir.path()));
+        engine
+            .providers
+            .insert(TabId::new("s1-tab-2"), spawn_cat(dir.path()));
+        // An extra tab with a row and no process: dormant.
+        engine.agent_tabs.insert(
+            TabId::new("s1-tab-3"),
+            sample_tab("s1-tab-3", "s1", "claude", 2),
+        );
+        let (session_terminal, _) = engine
+            .create_companion_terminal("s1", 24, 80)
+            .expect("session terminal");
+        let (project_terminal, _) = engine
+            .create_project_terminal("p1", 24, 80)
+            .expect("project terminal");
+        let (standalone_terminal, _) = engine
+            .create_standalone_terminal(24, 80)
+            .expect("standalone terminal");
+
+        let mut expected = vec![
+            "s1-slot".to_string(),
+            "s1-tab-2".to_string(),
+            session_terminal,
+            project_terminal,
+            standalone_terminal,
+        ];
+        expected.sort();
+        assert_eq!(engine.running_pty_ids(), expected);
+
+        engine.providers.remove(TabIdRef::new("s1-tab-2"));
+        assert!(
+            !engine.running_pty_ids().contains(&"s1-tab-2".to_string()),
+            "a tab whose process is gone is no longer a pty"
         );
     }
 }
