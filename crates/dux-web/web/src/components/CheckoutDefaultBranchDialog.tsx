@@ -8,6 +8,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
+import { checkoutDefaultBaseNote } from "@/lib/checkoutDefaultBranch"
 import {
   checkoutDefaultBranch,
   closeCheckoutDefaultBranch,
@@ -49,9 +50,8 @@ export function CheckoutDefaultBranchDialog() {
           <DialogTitle>Checkout default branch?</DialogTitle>
           <DialogDescription>
             This switches the source checkout for &ldquo;{name}&rdquo; back to its
-            default branch, moving HEAD in the shared repository. New agents
-            branch from whatever the source checkout is on, so this affects every
-            new worktree.
+            default branch, moving HEAD in the shared repository.{" "}
+            {checkoutDefaultBaseNote(project?.leading_branch ?? null)}
           </DialogDescription>
         </DialogHeader>
         <DialogFooter>

@@ -13,22 +13,44 @@ describe("branchWarningCopy", () => {
     const copy = branchWarningCopy(
       { kind: "known", default_branch: "main" },
       "feature/x",
+      true,
     )
     expect(copy.message).toBe(
       "This repository is on branch feature/x, but the remote default branch is main.",
     )
-    expect(copy.worktreeNote).toBe('New worktrees will branch from "feature/x".')
     expect(copy.heuristicNote).toBeNull()
     expect(copy.canCheckoutDefault).toBe(true)
     expect(copy.defaultBranch).toBe("main")
   })
 
+  it("says worktrees branch from the default, calmly, while the checkout is ticked", () => {
+    const copy = branchWarningCopy(
+      { kind: "known", default_branch: "main" },
+      "feature/x",
+      true,
+    )
+    expect(copy.worktreeNote).toBe('New worktrees will branch from "main".')
+    expect(copy.worktreeTone).toBe("neutral")
+  })
+
+  it("warns that worktrees branch from the current branch once the checkout is unticked", () => {
+    const copy = branchWarningCopy(
+      { kind: "known", default_branch: "main" },
+      "feature/x",
+      false,
+    )
+    expect(copy.worktreeNote).toBe('New worktrees will branch from "feature/x".')
+    expect(copy.worktreeTone).toBe("warning")
+  })
+
   it("warns without offering checkout for a heuristic warning", () => {
-    const copy = branchWarningCopy({ kind: "heuristic" }, "dev")
+    // The box does not exist on this path, so a stale "ticked" changes nothing.
+    const copy = branchWarningCopy({ kind: "heuristic" }, "dev", true)
     expect(copy.message).toBe(
       "This repository is on branch dev, which doesn't appear to be the main branch.",
     )
     expect(copy.worktreeNote).toBe('New worktrees will branch from "dev".')
+    expect(copy.worktreeTone).toBe("warning")
     expect(copy.heuristicNote).toBe(
       "Dux can't confidently identify this repo's default branch, so it won't change branches for you.",
     )

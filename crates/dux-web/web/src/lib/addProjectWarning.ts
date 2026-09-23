@@ -4,11 +4,15 @@
 
 import type { BranchWarningView, InspectKind } from "./types"
 
+export type WorktreeNoteTone = "neutral" | "warning"
+
 export interface BranchWarningCopy {
   // The headline sentence describing the situation.
   message: string
-  // The always-present note that new worktrees fork from the current branch.
+  // The always-present note naming the branch new worktrees will fork from.
   worktreeNote: string
+  // "neutral" when that branch is the remote default, "warning" otherwise.
+  worktreeTone: WorktreeNoteTone
   // The dim explanatory note shown only on the heuristic path; null otherwise.
   heuristicNote: string | null
   // True when the warning offers a "check out the default branch first" action
@@ -21,16 +25,25 @@ export interface BranchWarningCopy {
 /**
  * Map a branch warning + current branch to the exact user-facing copy and the
  * available choices, mirroring the TUI's `ConfirmNonDefaultBranch` rendering.
+ * `checkoutSelected` is the "Check out … before adding" box: it decides which
+ * branch new worktrees start from, the same rule the server records
+ * (`project_base_at_add` in dux-core), so the sentence follows the box live.
  */
 export function branchWarningCopy(
   warning: BranchWarningView,
   currentBranch: string,
+  checkoutSelected: boolean,
 ): BranchWarningCopy {
-  const worktreeNote = `New worktrees will branch from "${currentBranch}".`
+  const worktreeNoteFor = (branch: string) =>
+    `New worktrees will branch from "${branch}".`
   if (warning.kind === "known") {
+    const fromDefault = checkoutSelected
     return {
       message: `This repository is on branch ${currentBranch}, but the remote default branch is ${warning.default_branch}.`,
-      worktreeNote,
+      worktreeNote: worktreeNoteFor(
+        fromDefault ? warning.default_branch : currentBranch,
+      ),
+      worktreeTone: fromDefault ? "neutral" : "warning",
       heuristicNote: null,
       canCheckoutDefault: true,
       defaultBranch: warning.default_branch,
@@ -38,7 +51,8 @@ export function branchWarningCopy(
   }
   return {
     message: `This repository is on branch ${currentBranch}, which doesn't appear to be the main branch.`,
-    worktreeNote,
+    worktreeNote: worktreeNoteFor(currentBranch),
+    worktreeTone: "warning",
     heuristicNote:
       "Dux can't confidently identify this repo's default branch, so it won't change branches for you.",
     canCheckoutDefault: false,

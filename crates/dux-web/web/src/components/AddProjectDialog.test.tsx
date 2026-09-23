@@ -310,3 +310,39 @@ describe("AddProjectDialog picker", () => {
     expect(screen.getByRole("button", { name: /new folder/i })).toBeTruthy()
   })
 })
+
+describe("AddProjectDialog non-default branch", () => {
+  const onFeature = (path: string) => ({
+    path,
+    kind: "repo" as const,
+    repoRoot: null,
+    gitignoreCandidates: [],
+    currentBranch: "feature",
+    warning: { kind: "known" as const, default_branch: "main" },
+    hasCommits: true,
+    error: null,
+    loading: false,
+  })
+
+  it("names the branch new worktrees start from, following the checkout box", () => {
+    seed({
+      projectPathInspection: onFeature("/home/u/notes"),
+    } as Partial<DuxState>)
+    render(<AddProjectDialog />)
+    fireEvent.click(screen.getByText("Use this folder").closest("button")!)
+
+    // Ticked by default: the default branch, and nothing to warn about.
+    const ticked = screen.getByText('New worktrees will branch from "main".')
+    expect(ticked.getAttribute("data-tone")).toBe("neutral")
+
+    fireEvent.click(screen.getByRole("checkbox"))
+
+    const unticked = screen.getByText(
+      'New worktrees will branch from "feature".',
+    )
+    expect(unticked.getAttribute("data-tone")).toBe("warning")
+    expect(
+      screen.queryByText('New worktrees will branch from "main".'),
+    ).toBeNull()
+  })
+})

@@ -222,7 +222,18 @@ function InspectionMessages({
             <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-500" />
             <div className="grid gap-1 text-sm">
               <span>{branch.message}</span>
-              <span className="text-amber-500">{branch.worktreeNote}</span>
+              {/* Warning tone only when worktrees will NOT branch from the
+                  default; amber matches the panel's own warning glyph. */}
+              <span
+                data-tone={branch.worktreeTone}
+                className={
+                  branch.worktreeTone === "warning"
+                    ? "text-amber-500"
+                    : "text-muted-foreground"
+                }
+              >
+                {branch.worktreeNote}
+              </span>
               {branch.heuristicNote ? (
                 <span className="text-xs text-muted-foreground">
                   {branch.heuristicNote}
@@ -347,6 +358,7 @@ function requiresInitialCommit(
 function inspectionBranch(
   inspection: ProjectInspection | null,
   needsInitialCommit: boolean,
+  checkoutDefault: boolean,
 ): BranchWarningCopy | null {
   if (
     needsInitialCommit ||
@@ -357,7 +369,11 @@ function inspectionBranch(
   ) {
     return null
   }
-  return branchWarningCopy(inspection.warning, inspection.currentBranch)
+  return branchWarningCopy(
+    inspection.warning,
+    inspection.currentBranch,
+    checkoutDefault,
+  )
 }
 
 // The explanatory panel under the picker, one field per panel and at most one of
@@ -393,7 +409,7 @@ function inspectionState(
   const inspection = currentInspection(selected, candidate)
   const kind = inspectionKind(inspection)
   const needsInitialCommit = requiresInitialCommit(inspection)
-  const branch = inspectionBranch(inspection, needsInitialCommit)
+  const branch = inspectionBranch(inspection, needsInitialCommit, checkoutDefault)
   const willCheckout = Boolean(branch?.canCheckoutDefault && checkoutDefault)
   const primary = addProjectPrimaryAction({
     kind,
