@@ -201,6 +201,14 @@ impl CreatePlanContext<'_> {
             return;
         }
         match git::has_origin_remote(repo_path) {
+            // A base origin has never had (a project added on a local branch)
+            // has nothing to pull; that is steady state, not a failure.
+            Ok(true) if !git::remote_branch_exists(repo_path, leading_branch) => {
+                logger::info(&format!(
+                    "skipping pre-create pull for {}: origin has no branch \"{leading_branch}\"",
+                    project.path
+                ));
+            }
             Ok(true) => {
                 if let Err(err) = git::pull_branch(repo_path, leading_branch) {
                     logger::error(&format!(
@@ -2527,6 +2535,12 @@ mod tests {
             repo.path(),
             &["remote", "add", "origin", "/nonexistent/dux-test-origin"],
         );
+        // origin is known to have the branch, so the pull is attempted and
+        // fails on the unreachable remote.
+        git_in(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
 
         let run = drive_create_job_run(repo.path(), new_project_request(repo.path(), true, false));
         assert!(run.failure.is_none(), "creation must survive a failed pull");
@@ -2534,6 +2548,46 @@ mod tests {
         assert!(
             status.contains("could not pull"),
             "the pull failure must be visible in the status message, got: {status}"
+        );
+    }
+
+    /// A leading branch origin has never had (a project added on a local
+    /// feature branch) has nothing to pull: the pull is skipped quietly
+    /// rather than reported as a failure on every create.
+    #[test]
+    fn fresh_agent_skips_the_pull_quietly_when_origin_has_no_such_branch() {
+        let repo = init_test_repo();
+        let bare = tempfile::tempdir().unwrap();
+        git_in(bare.path(), &["init", "--bare", "-b", "main"]);
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        );
+        git_in(repo.path(), &["push", "origin", "main"]);
+        git_in(repo.path(), &["switch", "-c", "feature"]);
+
+        let mut project = test_project(repo.path());
+        project.leading_branch = Some("feature".to_string());
+        project.current_branch = "feature".to_string();
+        let request = CreateAgentRequest::NewProject {
+            project,
+            custom_name: Some("local-base".to_string()),
+            use_existing_branch: false,
+            pull_before_create: true,
+            copy_uncommitted_changes: false,
+        };
+        let run = drive_create_job_run(repo.path(), request);
+
+        assert!(
+            run.failure.is_none(),
+            "creation must succeed: {:?}",
+            run.failure
+        );
+        assert!(run.session.is_some(), "the agent is created");
+        let status = run.status_message.unwrap();
+        assert!(
+            !status.contains("Warning"),
+            "a branch origin never had is not a pull failure: {status}"
         );
     }
 

@@ -1088,6 +1088,13 @@ pub fn local_branch_exists(repo_path: &Path, name: &str) -> bool {
     ref_exists(repo_path, &format!("refs/heads/{name}"))
 }
 
+/// Whether origin's remote-tracking ref for `name` exists, as of the last
+/// fetch. Unlike [`branch_exists`], a local branch of the same name does not
+/// count.
+pub fn remote_branch_exists(repo_path: &Path, name: &str) -> bool {
+    ref_exists(repo_path, &format!("refs/remotes/origin/{name}"))
+}
+
 /// How much of a branch exists only on this machine, and whether there was
 /// anywhere for it to have been pushed to in the first place.
 ///
@@ -5283,6 +5290,31 @@ mod tests {
             args,
             cwd.display(),
             String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Only origin's remote-tracking ref counts: a local branch of the same
+    /// name says nothing about whether origin has it.
+    #[test]
+    fn remote_branch_exists_asks_origin_and_not_the_local_branches() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-q", "-b", "main"]);
+        run_git(repo.path(), &["config", "user.name", "t"]);
+        run_git(repo.path(), &["config", "user.email", "t@t"]);
+        run_git(
+            repo.path(),
+            &["commit", "-q", "--allow-empty", "-m", "init"],
+        );
+        run_git(repo.path(), &["branch", "feature"]);
+        run_git(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+
+        assert!(remote_branch_exists(repo.path(), "main"));
+        assert!(
+            !remote_branch_exists(repo.path(), "feature"),
+            "a local-only branch is not on origin"
         );
     }
 
