@@ -114,5 +114,10 @@ You have two ways to define colors:
   complete, standard Opaline theme works in dux as-is, even if it was never written
   with dux in mind.
 
+Names inside dialogs (branches, paths, agent and project names) are drawn as small
+chips in `dux.name_fg` on `dux.name_bg`. Leave both out and dux works them out from
+your theme: the text color, on the dialog background nudged a little toward it. Set
+them yourself if your theme's chip comes out too faint or too loud.
+
 Save the file and open the theme picker: your theme is listed alongside the built-ins,
 labeled as user-authored, with the same live preview. Tweak, save, re-pick, repeat.
