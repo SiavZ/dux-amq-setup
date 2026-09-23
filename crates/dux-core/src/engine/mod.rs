@@ -68,6 +68,8 @@ use crate::model::{
     ProviderKind, SessionStatus,
 };
 use crate::pty::{ProgressReport, PtyClient};
+use crate::status_text;
+use crate::status_text::StatusText;
 use crate::storage::SessionStore;
 use crate::worker::{
     BranchSyncEntry, PrSyncEntry, ProjectPersistenceAction, ResourceKind, ResourceTarget,
@@ -812,15 +814,19 @@ pub fn launch_outcome_final(o: &LaunchOutcome) -> Final {
         LaunchOutcome::ReconnectFailed {
             branch_name,
             message,
-        } => Final::error(format!(
-            "Reconnect failed for agent \"{branch_name}\": {message}"
-        )),
+        } => Final::error(status_text![
+            "Reconnect failed for agent ",
+            q(branch_name),
+            format!(": {message}")
+        ]),
         LaunchOutcome::ForceReconnectFailed {
             branch_name,
             message,
-        } => Final::error(format!(
-            "Fresh restart failed for agent \"{branch_name}\": {message}"
-        )),
+        } => Final::error(status_text![
+            "Fresh restart failed for agent ",
+            q(branch_name),
+            format!(": {message}")
+        ]),
         LaunchOutcome::Missing => Final::clear(),
     }
 }
@@ -903,11 +909,15 @@ pub fn checkout_default_branch_message(
     project_name: &str,
     target_branch: &str,
     base_moved: bool,
-) -> String {
-    format!(
-        "Checked out \"{target_branch}\" for project \"{project_name}\".{}",
+) -> StatusText {
+    status_text![
+        "Checked out ",
+        q(target_branch),
+        " for project ",
+        q(project_name),
+        ".",
         base_moved_suffix(target_branch, base_moved)
-    )
+    ]
 }
 
 /// The confirmation when the folder was already on the default branch, so no
@@ -916,11 +926,15 @@ pub fn already_on_default_branch_message(
     project_name: &str,
     current_branch: &str,
     base_moved: bool,
-) -> String {
-    format!(
-        "Project \"{project_name}\" is already on the leading branch \"{current_branch}\".{}",
+) -> StatusText {
+    status_text![
+        "Project ",
+        q(project_name),
+        " is already on the leading branch ",
+        q(current_branch),
+        ".",
         base_moved_suffix(current_branch, base_moved)
-    )
+    ]
 }
 
 /// The body of the "check out the default branch?" confirmation both surfaces
@@ -968,22 +982,23 @@ pub fn default_branch_checkout_running_message(project_name: &str) -> String {
 pub fn checkout_default_branch_cancelled_message(
     project_name: &str,
     stored_base: Option<&str>,
-) -> String {
-    let lead = format!(
-        "Cancelled checking out the default branch for project \"{project_name}\". Nothing was \
-         checked out"
-    );
+) -> StatusText {
+    let lead = status_text![
+        "Cancelled checking out the default branch for project ",
+        q(project_name),
+        ". Nothing was checked out"
+    ];
     match stored_base {
-        Some(base) => format!("{lead}, and new worktrees still branch from \"{base}\"."),
-        None => format!("{lead}, and the project's base branch is unchanged."),
+        Some(base) => status_text![lead, ", and new worktrees still branch from ", q(base), "."],
+        None => status_text![lead, ", and the project's base branch is unchanged."],
     }
 }
 
-fn base_moved_suffix(branch: &str, base_moved: bool) -> String {
+fn base_moved_suffix(branch: &str, base_moved: bool) -> StatusText {
     if base_moved {
-        format!(" New worktrees branch from \"{branch}\" now.")
+        status_text![" New worktrees branch from ", q(branch), " now."]
     } else {
-        String::new()
+        StatusText::new()
     }
 }
 

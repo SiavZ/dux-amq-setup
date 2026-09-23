@@ -3205,7 +3205,7 @@ impl Engine {
         branch: String,
         status_op_id: Option<String>,
         web_outcome: impl FnOnce(String, bool) -> crate::engine::WebCheckoutOutcome,
-        message: fn(&str, &str, bool) -> String,
+        message: fn(&str, &str, bool) -> crate::status_text::StatusText,
     ) -> EventReaction {
         let base = self.adopt_project_base(project, &branch);
         let final_reaction = if let Some(id) = status_op_id

@@ -312,3 +312,71 @@ async fn checking_out_the_default_branch_later_moves_the_project_base_to_it() {
         "after checking out the default branch, new worktrees branch from it"
     );
 }
+
+/// The confirmation a person reads in the browser names the branch and the
+/// project, and it arrives over the real events socket carrying the parts it was
+/// built from, so the toast draws both as chips. The plain sentence beside them
+/// is the terminal UI's, byte for byte, quotes included.
+#[tokio::test]
+async fn the_checkout_confirmation_reaches_the_browser_with_its_names_as_parts() {
+    use futures_util::StreamExt;
+
+    let f = boot().await;
+    let project_id = add_project(&f, false).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/ws/events", f.addr))
+        .await
+        .unwrap();
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{}/api/v1/projects/{project_id}/checkout-default",
+            f.addr
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "got {}", resp.status());
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let frame = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the checkout never reported its outcome on the events socket"
+        );
+        let Ok(Some(Ok(message))) =
+            tokio::time::timeout(Duration::from_millis(200), ws.next()).await
+        else {
+            continue;
+        };
+        let Ok(text) = message.into_text() else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if value["event"] == "status"
+            && value["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("Checked out"))
+        {
+            break value;
+        }
+    };
+
+    assert_eq!(
+        frame["message"],
+        "Checked out \"main\" for project \"repo\". New worktrees branch from \"main\" now."
+    );
+    assert_eq!(
+        frame["segments"],
+        serde_json::json!([
+            "Checked out ",
+            {"name": "main", "quoted": true},
+            " for project ",
+            {"name": "repo", "quoted": true},
+            ". New worktrees branch from ",
+            {"name": "main", "quoted": true},
+            " now."
+        ])
+    );
+}
