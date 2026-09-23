@@ -7,6 +7,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
 import { closeDeleteProject, deleteProject, useDux } from "@/lib/store"
 import { workspaceProjectId } from "@/lib/agentWorkspace"
@@ -25,7 +26,7 @@ export function DeleteProjectDialog() {
     project !== undefined,
     closeDeleteProject,
   )
-  const name = project?.name ?? "this project"
+  const name = project?.name
   const agentCount =
     spine?.sessions.filter(
       (s) => workspaceProjectId(s.workspace) === deleteProjectTarget,
@@ -55,7 +56,9 @@ export function DeleteProjectDialog() {
         <DialogHeader>
           <DialogTitle>Delete project?</DialogTitle>
           <DialogDescription>
-            This deletes &ldquo;{name}&rdquo;{cascadeClause} from dux. This is
+            This deletes{" "}
+            {name !== undefined ? <InlineCode>{name}</InlineCode> : "this project"}
+            {cascadeClause} from dux. This is
             irreversible. The source checkout is kept.
           </DialogDescription>
         </DialogHeader>

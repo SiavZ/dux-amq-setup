@@ -7,6 +7,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import { formatRegularCount } from "@/lib/formatRegularCount"
 import { closeRemoveProject, removeProject, useDux } from "@/lib/store"
 import { workspaceProjectId } from "@/lib/agentWorkspace"
@@ -24,7 +25,7 @@ export function RemoveProjectDialog() {
   const orphanName = spine?.sidebar.groups.find(
     (g) => g.project_id === removeProjectTarget,
   )?.name
-  const name = project?.name ?? orphanName ?? "this project"
+  const name = project?.name ?? orphanName
   const agentCount =
     spine?.sessions.filter(
       (s) => workspaceProjectId(s.workspace) === removeProjectTarget,
@@ -46,7 +47,8 @@ export function RemoveProjectDialog() {
         <DialogHeader>
           <DialogTitle>Remove project?</DialogTitle>
           <DialogDescription>
-            This removes &ldquo;{name}&rdquo;
+            This removes{" "}
+            {name !== undefined ? <InlineCode>{name}</InlineCode> : "this project"}
             {agentCount > 0
               ? ` and deletes its ${formatRegularCount(agentCount, "agent")}`
               : ""}{" "}
