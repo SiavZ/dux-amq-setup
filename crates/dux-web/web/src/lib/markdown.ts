@@ -20,25 +20,10 @@ export function decodeFragment(href: string): string {
   }
 }
 
-// GitHub's heading-slug rule, which is what a hand-written `[x](#section)` in a
-// README was written against. Letters, digits, marks and `_` survive; other
-// punctuation is dropped and spaces become hyphens.
-export function headingSlug(text: string): string {
-  return text
-    .trim()
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\p{M}_ -]/gu, "")
-    .replace(/ /g, "-")
-}
-
-const HEADINGS = "h1, h2, h3, h4, h5, h6"
-
 // The element in the rendered preview a fragment names, or null when the
-// document has nothing by that name. Three answers are tried because the
-// preview's ids come from three places: an id react-markdown passed through,
-// an id the sanitizer clobber-prefixed out of author HTML, and no id at all,
-// which is every heading, matched by slugged text the way GitHub numbers
-// repeats.
+// document has nothing by that name. Two answers are tried because every
+// heading carries an id from rehype-slug: the id as written, and the same id
+// after the sanitizer clobber-prefixed it.
 export function previewFragmentTarget(
   container: HTMLElement,
   fragment: string,
@@ -49,14 +34,6 @@ export function previewFragmentTarget(
   const clobbered = `user-content-${fragment}`
   for (const el of container.querySelectorAll<HTMLElement>("[id]")) {
     if (el.id === fragment || el.id === clobbered) return el
-  }
-  const seen = new Map<string, number>()
-  for (const heading of container.querySelectorAll<HTMLElement>(HEADINGS)) {
-    const slug = headingSlug(heading.textContent ?? "")
-    if (!slug) continue
-    const nth = seen.get(slug) ?? 0
-    seen.set(slug, nth + 1)
-    if ((nth === 0 ? slug : `${slug}-${nth}`) === fragment) return heading
   }
   return null
 }

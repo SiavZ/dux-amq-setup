@@ -157,16 +157,62 @@ describe("MarkdownPreview in-document anchors", () => {
     expect(scrolled).toEqual([container.querySelector("h3")])
   })
 
+  it("lands on an author anchor that shares its id with a heading slug", () => {
+    // GitHub's renderer has the same collision: an author anchor keeps its
+    // id and the heading gets the same slug, so two elements share one id.
+    // The first in document order wins the fragment, which is the anchor the
+    // author placed on purpose; that is accepted rather than de-duplicated.
+    const { container } = preview(
+      '<a id="notes"></a>\n\n## Notes\n\n[jump](#notes)\n',
+    )
+    const twins = container.querySelectorAll("#user-content-notes")
+    expect(twins.length).toBe(2)
+    clickLink(container, 'a[href="#notes"]')
+    expect(scrolled).toEqual([container.querySelector('a[id="user-content-notes"]')])
+  })
+
   it("decodes a percent-encoded fragment", () => {
     const { container } = preview("## Café\n\n[jump](#caf%C3%A9)\n")
+    expect(container.querySelector("h2")?.id).toBe("user-content-café")
     clickLink(container, "a")
+    expect(scrolled).toEqual([container.querySelector("h2")])
+  })
+
+  it("resolves a percent-encoded fragment naming a non-Latin heading", () => {
+    const { container } = preview("## 日本語の見出し\n\n[jump](#%E6%97%A5%E6%9C%AC%E8%AA%9E%E3%81%AE%E8%A6%8B%E5%87%BA%E3%81%97)\n")
+    expect(container.querySelector("h2")?.id).toBe("user-content-日本語の見出し")
+    clickLink(container, "a")
+    expect(scrolled).toEqual([container.querySelector("h2")])
+  })
+
+  it("slugs punctuation the way GitHub does, runs of it included", () => {
+    // `C++ & Rust: notes` keeps the gap each dropped symbol sat in, so the
+    // written anchor carries two hyphens where the `&` was.
+    const { container } = preview(
+      "## C++ & Rust: notes\n\n[jump](#c--rust-notes)\n",
+    )
+    expect(container.querySelector("h2")?.id).toBe("user-content-c--rust-notes")
+    clickLink(container, 'a[href="#c--rust-notes"]')
     expect(scrolled).toEqual([container.querySelector("h2")])
   })
 
   it("numbers repeated headings the way a written anchor expects", () => {
     const { container } = preview("## Notes\n\n## Notes\n\n[second](#notes-1)\n")
+    const headings = container.querySelectorAll("h2")
+    expect(headings[0]?.id).toBe("user-content-notes")
+    expect(headings[1]?.id).toBe("user-content-notes-1")
     clickLink(container, 'a[href="#notes-1"]')
-    expect(scrolled).toEqual([container.querySelectorAll("h2")[1]])
+    expect(scrolled).toEqual([headings[1]])
+  })
+
+  it("numbers repeats from the first heading again in each render", () => {
+    // The plugin holds one slugger across renders, so a repeat in the next
+    // document must not be numbered as though it followed this one.
+    const markdown = "## Notes\n\n## Notes\n\n[second](#notes-1)\n"
+    preview(markdown)
+    cleanup()
+    const { container } = preview(markdown)
+    expect(container.querySelectorAll("h2")[1]?.id).toBe("user-content-notes-1")
   })
 
   it("does nothing at all when the anchor names no target", () => {

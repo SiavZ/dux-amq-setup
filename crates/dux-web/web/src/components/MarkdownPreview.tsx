@@ -2,6 +2,7 @@ import { useRef, type MouseEvent } from "react"
 import Markdown, { defaultUrlTransform } from "react-markdown"
 import rehypeRaw from "rehype-raw"
 import rehypeSanitize from "rehype-sanitize"
+import rehypeSlug from "rehype-slug"
 import remarkGfm from "remark-gfm"
 import {
   decodeFragment,
@@ -24,7 +25,8 @@ interface MarkdownPreviewProps {
 // Rendered markdown for the editor's preview toggle, lazy-loaded and styled from
 // theme tokens. Previewed markdown is NOT author-trusted and the preview runs in
 // dux's own origin, so embedded HTML is rendered through rehype-raw and then
-// sanitized on GitHub's schema: sanitize must run AFTER raw.
+// sanitized on GitHub's schema: sanitize must run AFTER raw. rehype-slug gives
+// every heading a GitHub-style id, which sanitize then clobber-prefixes.
 export default function MarkdownPreview({
   content,
   root,
@@ -129,7 +131,7 @@ export default function MarkdownPreview({
         )}
         <Markdown
           remarkPlugins={[remarkGfm]}
-          rehypePlugins={[rehypeRaw, rehypeSanitize]}
+          rehypePlugins={[rehypeRaw, rehypeSlug, rehypeSanitize]}
           urlTransform={transformUrl}
         >
           {body}

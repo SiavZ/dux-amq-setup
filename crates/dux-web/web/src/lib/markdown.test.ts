@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest"
 
 import {
   decodeFragment,
-  headingSlug,
   isMarkdownPath,
   markdownAssetUrl,
   resolveWorktreeRelative,
@@ -89,19 +88,6 @@ describe("markdownAssetUrl", () => {
 
   it("returns null for external references (no rewrite)", () => {
     expect(markdownAssetUrl(agentRoot("s1"), "README.md", "https://x/y.png")).toBeNull()
-  })
-})
-
-describe("headingSlug", () => {
-  it("lowercases, hyphenates spaces and drops punctuation", () => {
-    expect(headingSlug("Hello, World!")).toBe("hello-world")
-    expect(headingSlug("  Getting Started  ")).toBe("getting-started")
-    expect(headingSlug("A/B testing (2024)")).toBe("ab-testing-2024")
-  })
-
-  it("keeps underscores, hyphens, digits and accented letters", () => {
-    expect(headingSlug("snake_case-name 2")).toBe("snake_case-name-2")
-    expect(headingSlug("Café niño")).toBe("café-niño")
   })
 })
 
