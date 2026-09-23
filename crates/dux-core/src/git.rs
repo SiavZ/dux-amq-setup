@@ -2365,18 +2365,37 @@ pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<Chan
     // git prints `-\t-` for a path the repository excludes from diffs in
     // .gitattributes exactly as it prints it for a real binary, so numstat
     // alone cannot tell the two apart. One batched `check-attr` over the
-    // countless rows does, and only those rows: the question is not asked at
-    // all in the ordinary case where every path has a number.
-    let excluded = paths_excluded_from_diffs(
+    // countless rows narrows it down, and only those rows: the question is not
+    // asked at all in the ordinary case where every path has a number. The
+    // attribute is not the whole answer (see `paths_excluded_from_diffs`), so
+    // each candidate's own bytes settle it, per side.
+    let attribute_unset = paths_excluded_from_diffs(
         wt.as_ref(),
         &countless_paths(&[&tracked_stats, &staged_stats]),
     );
+    let excluded_unstaged = diff_excluded_rows(
+        worktree_path,
+        &attribute_unset,
+        &tracked_stats,
+        ContentSide::Worktree,
+    );
+    let excluded_staged = diff_excluded_rows(
+        worktree_path,
+        &attribute_unset,
+        &staged_stats,
+        ContentSide::Index,
+    );
 
-    apply_unstaged_stats(worktree_path, &mut unstaged, &tracked_stats, &excluded);
+    apply_unstaged_stats(
+        worktree_path,
+        &mut unstaged,
+        &tracked_stats,
+        &excluded_unstaged,
+    );
 
     for file in &mut staged {
         if let Some(stat) = staged_stats.get(&file.path) {
-            apply_stat(file, stat, &excluded);
+            apply_stat(file, stat, &excluded_staged);
         }
     }
 
@@ -2426,14 +2445,23 @@ fn countless_paths(stats: &[&HashMap<String, DiffStat>]) -> Vec<String> {
     paths
 }
 
-/// Which of `paths` the repository excludes from diffs, i.e. which ones carry
-/// an UNSET `diff` attribute (`-diff` in a `.gitattributes`).
+/// Which of `paths` carry an UNSET `diff` attribute, which is NECESSARY for a
+/// path to be excluded from diffs and not sufficient on its own.
 ///
-/// Such a path is not binary: git simply refuses to diff it, so `--numstat`
-/// reports no counts for it and `--text` does not override that (measured).
-/// Everything else keeps whatever the caller already decided, so
-/// `unspecified`, `set` and an explicit value (a diff driver) all leave a real
-/// binary reported as binary.
+/// `-diff` in a `.gitattributes` unsets it, and so does the `binary` macro
+/// (`*.png binary` expands to `-diff -merge -text`), which is how repositories
+/// ordinarily declare their real binaries; a `-diff` path may also hold NUL
+/// bytes and be a genuine binary anyway. Both were measured on git 2.55. So
+/// this answers candidates, and the caller settles each one by sniffing its
+/// content the way git does. `unspecified`, `set` and an explicit value (a diff
+/// driver) are not even candidates: those rows stay binary.
+///
+/// The attributes are read from the WORKTREE's `.gitattributes`, for the staged
+/// side too. Reading the index's copy instead would mean `--cached` and a
+/// second batched call for the staged paths alone, and the disagreement it
+/// would resolve (an uncommitted edit to `.gitattributes`) does not change what
+/// the row says: the content sniff is what decides binary from excluded, and it
+/// reads the right side already.
 ///
 /// The paths travel on stdin, NUL-delimited, for two reasons: the batch is
 /// bounded by the pipe rather than by `ARG_MAX`, and nothing on the command
@@ -2497,6 +2525,107 @@ fn parse_check_attr_z(raw: &[u8]) -> HashSet<String> {
         }
     }
     excluded
+}
+
+/// Which side's bytes answer "is this really text", for a countless row whose
+/// `diff` attribute is unset. The two sides genuinely differ: a staged change
+/// is the index's blob, and the working copy may have moved on since.
+#[derive(Clone, Copy)]
+enum ContentSide {
+    Worktree,
+    Index,
+}
+
+/// Of the countless rows in `stats` whose attribute is unset, the ones whose
+/// content really is text and which are therefore excluded from diffs rather
+/// than binary.
+///
+/// The sniff is git's own rule, the same one untracked files are counted by: a
+/// NUL byte within the first [`BINARY_SNIFF_BYTES`]. Anything that cannot be
+/// read stays binary, because promising a text diff dux cannot produce is the
+/// worse of the two wrong answers.
+fn diff_excluded_rows(
+    worktree_path: &Path,
+    attribute_unset: &HashSet<String>,
+    stats: &HashMap<String, DiffStat>,
+    side: ContentSide,
+) -> HashSet<String> {
+    stats
+        .iter()
+        .filter(|(path, stat)| {
+            matches!(stat, DiffStat::Binary) && attribute_unset.contains(path.as_str())
+        })
+        .filter(|(path, _)| content_looks_like_text(worktree_path, path, side))
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+/// Whether one path's content on `side` is text by git's NUL rule. False for
+/// anything that could not be read at all.
+fn content_looks_like_text(worktree_path: &Path, rel_path: &str, side: ContentSide) -> bool {
+    let prefix = match side {
+        // A deleted row has no file on disk any more, and a change git diffed
+        // always has a blob behind it, so the index is the fallback rather than
+        // a second guess.
+        ContentSide::Worktree => file_prefix_on_disk(&worktree_path.join(rel_path))
+            .or_else(|| index_blob_prefix(worktree_path, rel_path)),
+        ContentSide::Index => index_blob_prefix(worktree_path, rel_path),
+    };
+    matches!(prefix, Some(bytes) if !bytes.contains(&0))
+}
+
+/// The first [`BINARY_SNIFF_BYTES`] bytes of a file on disk, or `None` when it
+/// cannot be read.
+fn file_prefix_on_disk(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+
+    let file = fs::File::open(path).ok()?;
+    let mut prefix = Vec::new();
+    file.take(BINARY_SNIFF_BYTES as u64)
+        .read_to_end(&mut prefix)
+        .ok()?;
+    Some(prefix)
+}
+
+/// The first [`BINARY_SNIFF_BYTES`] bytes of a path's INDEX blob, or `None`
+/// when there is no such blob or git could not be run.
+///
+/// `cat-file -p :<path>` is plumbing, so no user configuration can reshape it,
+/// and the revision always starts with a colon, so a dash-leading path can
+/// never be read as an option.
+fn index_blob_prefix(worktree_path: &Path, rel_path: &str) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut child = Command::new("git")
+        .args([
+            "-C",
+            worktree_path.to_string_lossy().as_ref(),
+            "cat-file",
+            "-p",
+            &format!(":{rel_path}"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut prefix = Vec::new();
+    if let Some(stdout) = child.stdout.as_mut() {
+        stdout
+            .take(BINARY_SNIFF_BYTES as u64)
+            .read_to_end(&mut prefix)
+            .ok()?;
+    }
+    // Drop the pipe before waiting: a blob larger than the sniff gets EPIPE and
+    // exits instead of blocking on a reader that stopped.
+    drop(child.stdout.take());
+    let status = child.wait().ok()?;
+    // A blob that fit inside the sniff exits 0; a larger one is killed by
+    // SIGPIPE, which is success as far as this read is concerned. Only an
+    // absent path (a real non-zero exit with nothing read) answers None.
+    if !status.success() && prefix.is_empty() {
+        return None;
+    }
+    Some(prefix)
 }
 
 /// Put one numstat answer onto its row.
@@ -4705,6 +4834,23 @@ mod tests {
         run(&["config", "user.email", "t@t"]);
         run(&["commit", "--allow-empty", "-m", "init"]);
         dir
+    }
+
+    /// Run one git command inside a test worktree, asserting it succeeded.
+    fn worktree_git(wt: &Path) -> impl Fn(&[&str]) + '_ {
+        move |args: &[&str]| {
+            let out = test_support::git_command()
+                .args(["-C", wt.to_string_lossy().as_ref()])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 
     /// Create a worktree + branch from the test repo. Returns the worktree path.
@@ -7443,19 +7589,7 @@ mod tests {
     fn staged_rows_tell_a_diff_excluded_file_apart_from_a_binary() {
         let repo = init_test_repo();
         let wt = add_worktree(repo.path(), "diff-excluded-staged");
-        let git = |args: &[&str]| {
-            let out = test_support::git_command()
-                .args(["-C", wt.to_string_lossy().as_ref()])
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
+        let git = worktree_git(&wt);
 
         fs::write(wt.join(".gitattributes"), "notes.txt -diff\n").unwrap();
         fs::write(wt.join("notes.txt"), "one\n").unwrap();
@@ -7480,6 +7614,136 @@ mod tests {
             .expect("the binary is staged");
         assert!(image.binary);
         assert!(!image.diff_excluded);
+    }
+
+    /// An unset `diff` attribute is not enough on its own. The `binary` macro
+    /// (`*.png binary`) expands to `-diff -merge -text`, so the ordinary way a
+    /// repository declares its binaries also answers `unset` (measured on git
+    /// 2.55), and calling those files "excluded" would promise a text diff for
+    /// a PNG. The content has the last word, on both sides.
+    #[test]
+    fn the_binary_attribute_macro_leaves_a_real_binary_binary() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "binary-macro");
+        let git = worktree_git(&wt);
+
+        fs::write(wt.join(".gitattributes"), "*.png binary\n").unwrap();
+        fs::write(wt.join("pic.png"), [b'P', b'N', b'G', 0, 1, b'a']).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "seed"]);
+        fs::write(wt.join("pic.png"), [b'P', b'N', b'G', 0, 1, b'b', b'c']).unwrap();
+
+        let (_staged, unstaged) = changed_files(&wt).unwrap();
+        let row = unstaged
+            .iter()
+            .find(|f| f.path == "pic.png")
+            .expect("the png is a row");
+        assert!(row.binary, "the binary macro does not make a PNG text");
+        assert!(!row.diff_excluded);
+
+        git(&["add", "-A"]);
+        let (staged, _unstaged) = changed_files(&wt).unwrap();
+        let row = staged
+            .iter()
+            .find(|f| f.path == "pic.png")
+            .expect("the png is staged");
+        assert!(row.binary, "the staged side reads the index blob");
+        assert!(!row.diff_excluded);
+    }
+
+    /// The other half of the same rule: a path the repository marks `-diff`
+    /// outright, whose content holds NUL bytes, is a binary git was told not to
+    /// diff. It keeps the binary verdict, because the diff viewer cannot show
+    /// it as text either.
+    #[test]
+    fn a_diff_excluded_path_holding_nul_bytes_stays_binary() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "excluded-but-binary");
+        let git = worktree_git(&wt);
+
+        fs::write(wt.join(".gitattributes"), "blob.dat -diff\n").unwrap();
+        fs::write(wt.join("blob.dat"), [b'a', 0, b'b']).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "seed"]);
+        fs::write(wt.join("blob.dat"), [b'a', 0, b'b', b'c']).unwrap();
+
+        let (_staged, unstaged) = changed_files(&wt).unwrap();
+        let row = unstaged
+            .iter()
+            .find(|f| f.path == "blob.dat")
+            .expect("the blob is a row");
+        assert!(row.binary);
+        assert!(!row.diff_excluded, "NUL bytes are NUL bytes");
+
+        git(&["add", "-A"]);
+        let (staged, _unstaged) = changed_files(&wt).unwrap();
+        let row = staged
+            .iter()
+            .find(|f| f.path == "blob.dat")
+            .expect("the blob is staged");
+        assert!(row.binary);
+        assert!(!row.diff_excluded);
+    }
+
+    /// The sniff reads the side it is asked about: the index blob for a staged
+    /// change, the working copy for an unstaged one. A file that is text in the
+    /// index and binary on disk is therefore excluded on one side and binary on
+    /// the other, in the same sweep.
+    #[test]
+    fn each_side_sniffs_its_own_content() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "per-side-sniff");
+        let git = worktree_git(&wt);
+
+        fs::write(wt.join(".gitattributes"), "notes.txt -diff\n").unwrap();
+        fs::write(wt.join("notes.txt"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "seed"]);
+
+        // Text in the index...
+        fs::write(wt.join("notes.txt"), "one\ntwo\n").unwrap();
+        git(&["add", "notes.txt"]);
+        // ...and NUL-bearing on disk.
+        fs::write(wt.join("notes.txt"), [b'o', 0, b'n', b'e']).unwrap();
+
+        let (staged, unstaged) = changed_files(&wt).unwrap();
+        let staged_row = staged
+            .iter()
+            .find(|f| f.path == "notes.txt")
+            .expect("staged row");
+        assert!(staged_row.diff_excluded, "the index blob is text");
+        assert!(!staged_row.binary);
+        let unstaged_row = unstaged
+            .iter()
+            .find(|f| f.path == "notes.txt")
+            .expect("unstaged row");
+        assert!(unstaged_row.binary, "the working copy holds a NUL");
+        assert!(!unstaged_row.diff_excluded);
+    }
+
+    /// A deleted row has no working copy left to sniff, and a file git diffed
+    /// always has a blob behind it, so the index answers for it rather than the
+    /// row falling back to "binary" for want of a file to open.
+    #[test]
+    fn a_deleted_excluded_file_is_sniffed_from_the_index() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "excluded-deleted");
+        let git = worktree_git(&wt);
+
+        fs::write(wt.join(".gitattributes"), "notes.txt -diff\n").unwrap();
+        fs::write(wt.join("notes.txt"), "one\ntwo\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "seed"]);
+        fs::remove_file(wt.join("notes.txt")).unwrap();
+
+        let (_staged, unstaged) = changed_files(&wt).unwrap();
+        let row = unstaged
+            .iter()
+            .find(|f| f.path == "notes.txt")
+            .expect("the deleted file is a row");
+        assert_eq!(row.status, "D");
+        assert!(row.diff_excluded, "rows: {unstaged:?}");
+        assert!(!row.binary);
     }
 
     /// The question is asked only about the rows that have no counts, and only
@@ -7557,19 +7821,7 @@ mod tests {
         let repo = init_test_repo();
         let wt = add_worktree(repo.path(), "diff-excluded-awkward");
         let name = "a b\"c\u{e9}.txt";
-        let git = |args: &[&str]| {
-            let out = test_support::git_command()
-                .args(["-C", wt.to_string_lossy().as_ref()])
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
+        let git = worktree_git(&wt);
 
         // The pattern is C-quoted, which is how a .gitattributes carries a name
         // with a space or a quote in it.

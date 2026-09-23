@@ -795,7 +795,9 @@ pub struct ChangedFile {
     /// True for a file the repository excludes from diffs, i.e. one a
     /// `.gitattributes` marks `-diff`. git will not count its lines, so the row
     /// has no counts, but the file is text and the in-process diff viewer opens
-    /// it normally. Never true at the same time as `binary`.
+    /// it normally. Never true at the same time as `binary`: the attribute
+    /// alone does not settle it, because the `binary` macro unsets `diff` too,
+    /// so the content is sniffed before a row claims this.
     pub diff_excluded: bool,
     /// Where a rename or copy came from, for the surfaces that have to know
     /// which OTHER directory also changed. None for every other status.
