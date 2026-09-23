@@ -1,7 +1,12 @@
 // Branch-warning copy and decision helpers for the add-project pre-flight. The strings
 // are byte-for-byte the TUI's `ConfirmNonDefaultBranch` lines, joined into prose for the
 // web dialog. Keep them in step with crates/dux-tui/src/app/render.rs.
+//
+// Each sentence that names something is built once as prose (`./prose`): the
+// plain-text spelling is the TUI's string, and the web draws the names as chips
+// from the same structure.
 
+import { chip, type Prose, proseText, quotedChip } from "./prose"
 import type { BranchWarningView, InspectKind } from "./types"
 
 export type WorktreeNoteTone = "neutral" | "warning"
@@ -9,8 +14,11 @@ export type WorktreeNoteTone = "neutral" | "warning"
 export interface BranchWarningCopy {
   // The headline sentence describing the situation.
   message: string
+  // The same sentence with its branch names marked, for the web to chip.
+  messageProse: Prose
   // The always-present note naming the branch new worktrees will fork from.
   worktreeNote: string
+  worktreeNoteProse: Prose
   // "neutral" when that branch is the remote default, "warning" otherwise.
   worktreeTone: WorktreeNoteTone
   // The dim explanatory note shown only on the heuristic path; null otherwise.
@@ -34,24 +42,45 @@ export function branchWarningCopy(
   currentBranch: string,
   checkoutSelected: boolean,
 ): BranchWarningCopy {
-  const worktreeNoteFor = (branch: string) =>
-    `New worktrees will branch from "${branch}".`
+  const worktreeNoteFor = (branch: string): Prose => [
+    "New worktrees will branch from ",
+    quotedChip(branch),
+    ".",
+  ]
   if (warning.kind === "known") {
     const fromDefault = checkoutSelected
+    const messageProse: Prose = [
+      "This repository is on branch ",
+      chip(currentBranch),
+      ", but the remote default branch is ",
+      chip(warning.default_branch),
+      ".",
+    ]
+    const worktreeNoteProse = worktreeNoteFor(
+      fromDefault ? warning.default_branch : currentBranch,
+    )
     return {
-      message: `This repository is on branch ${currentBranch}, but the remote default branch is ${warning.default_branch}.`,
-      worktreeNote: worktreeNoteFor(
-        fromDefault ? warning.default_branch : currentBranch,
-      ),
+      message: proseText(messageProse),
+      messageProse,
+      worktreeNote: proseText(worktreeNoteProse),
+      worktreeNoteProse,
       worktreeTone: fromDefault ? "neutral" : "warning",
       heuristicNote: null,
       canCheckoutDefault: true,
       defaultBranch: warning.default_branch,
     }
   }
+  const messageProse: Prose = [
+    "This repository is on branch ",
+    chip(currentBranch),
+    ", which doesn't appear to be the main branch.",
+  ]
+  const worktreeNoteProse = worktreeNoteFor(currentBranch)
   return {
-    message: `This repository is on branch ${currentBranch}, which doesn't appear to be the main branch.`,
-    worktreeNote: worktreeNoteFor(currentBranch),
+    message: proseText(messageProse),
+    messageProse,
+    worktreeNote: proseText(worktreeNoteProse),
+    worktreeNoteProse,
     worktreeTone: "warning",
     heuristicNote:
       "Dux can't confidently identify this repo's default branch, so it won't change branches for you.",
@@ -84,6 +113,8 @@ export interface InitRepoCopy {
   message: string
   // What dux will do: init, seed (when candidates exist), empty commit.
   note: string
+  // The same note with each seeded candidate marked, for the web to chip.
+  noteProse: Prose
 }
 
 /**
@@ -91,18 +122,32 @@ export interface InitRepoCopy {
  * clause is omitted when there are no candidates, never promising a seed that will not happen.
  */
 export function initRepoCopy(candidates: string[]): InitRepoCopy {
-  const seedClause =
+  const seedClause: Prose =
     candidates.length > 0
-      ? `, seed a starter .gitignore covering ${candidates.join(", ")},`
-      : ""
+      ? [
+          ", seed a starter .gitignore covering ",
+          ...candidates.flatMap((candidate, index): Prose =>
+            index === 0 ? [chip(candidate)] : [", ", chip(candidate)],
+          ),
+          ",",
+        ]
+      : []
+  const noteProse: Prose = [
+    "Dux will run git init",
+    ...seedClause,
+    " and make an empty initial commit; your existing files are left untouched (untracked).",
+  ]
   return {
     message: "This folder is not a git repository.",
-    note: `Dux will run git init${seedClause} and make an empty initial commit; your existing files are left untouched (untracked).`,
+    note: proseText(noteProse),
+    noteProse,
   }
 }
 
 export interface InsideRepoCopy {
   message: string
+  // The same sentence with the enclosing root marked, for the web to chip.
+  messageProse: Prose
 }
 
 /**
@@ -110,15 +155,16 @@ export interface InsideRepoCopy {
  * `root` means git's internal directory, and the copy degrades to not naming a root.
  */
 export function insideRepoCopy(root: string | null): InsideRepoCopy {
-  if (root) {
-    return {
-      message: `This folder is inside the git repository at ${root}. Add that repository instead.`,
-    }
-  }
-  return {
-    message:
-      "This folder is inside a git repository's internal directory. Add the repository itself instead.",
-  }
+  const messageProse: Prose = root
+    ? [
+        "This folder is inside the git repository at ",
+        chip(root),
+        ". Add that repository instead.",
+      ]
+    : [
+        "This folder is inside a git repository's internal directory. Add the repository itself instead.",
+      ]
+  return { message: proseText(messageProse), messageProse }
 }
 
 export type AddProjectAction =

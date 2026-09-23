@@ -3,9 +3,12 @@ import { describe, expect, it } from "vitest"
 import {
   agentIsDetachable,
   detachConfirmBody,
+  detachConfirmProse,
   forceStopConfirmBody,
+  forceStopConfirmProse,
   shutdownGraceSeconds,
 } from "./detachAgent"
+import { proseText, quotedChip } from "./prose"
 
 describe("shutdownGraceSeconds", () => {
   it("uses the number the server projected", () => {
@@ -54,6 +57,22 @@ describe("detachConfirmBody", () => {
   it("never hardcodes the default wait", () => {
     expect(detachConfirmBody("a", 7, 1)).toContain("7 seconds")
     expect(detachConfirmBody("a", 7, 1)).not.toContain("30 seconds")
+  })
+})
+
+// The web draws the agent's name as a chip; the plain-text spelling of the same
+// structure is the terminal UI's string pinned above.
+describe("the stop confirmations as names in prose", () => {
+  it("marks the agent's name in the detach body", () => {
+    const prose = detachConfirmProse("feat/login", 45, 3)
+    expect(prose).toContainEqual(quotedChip("feat/login"))
+    expect(proseText(prose)).toBe(detachConfirmBody("feat/login", 45, 3))
+  })
+
+  it("marks the agent's name in the force-stop body", () => {
+    const prose = forceStopConfirmProse("fix-auth")
+    expect(prose).toContainEqual(quotedChip("fix-auth"))
+    expect(proseText(prose)).toBe(forceStopConfirmBody("fix-auth"))
   })
 })
 

@@ -99,10 +99,19 @@ describe("ConfirmRecreateWorkingCopyDialog", () => {
     } as unknown as Partial<DuxState>)
     render(<ConfirmRecreateWorkingCopyDialog />)
 
-    const body = screen.getByText(/Recreate the working copy/).textContent ?? ""
-    expect(body).toContain("~/.config/dux/worktrees/repo/feat")
-    expect(body).toContain('branch "feat" still exists')
-    expect(body).toContain('from "main"')
+    const element = screen.getByText(/Recreate the working copy/)
+    const body = element.textContent ?? ""
+    // The path and every branch are chips, and the chips replace the quotes.
+    const chips = [...element.querySelectorAll("code")].map((c) => c.textContent)
+    expect(chips).toEqual([
+      "~/.config/dux/worktrees/repo/feat",
+      "feat",
+      "origin/feat",
+      "main",
+    ])
+    expect(body).toContain("branch feat still exists")
+    expect(body).toContain("from main,")
+    expect(body).not.toContain('"')
     expect(body).toContain("are gone either way")
     expect(body).toContain("same path")
     expect(body).toContain(

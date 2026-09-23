@@ -6,6 +6,7 @@
 // one fails on the side that changed.
 
 import { type AgentWorkspaceWire, matchWorkspace } from "./agentWorkspace"
+import { chip, type Prose, proseText, quotedChip } from "./prose"
 import type { SessionView } from "./types"
 
 /** Whether the recreate action exists for this agent. Its own helper rather
@@ -89,24 +90,50 @@ export function recreateConfirmBody(
   conversationResumes: boolean,
   providers: string[],
 ): string {
+  return proseText(
+    recreateConfirmProse(
+      worktreeLabel,
+      branchName,
+      sourceBranch,
+      conversationResumes,
+      providers,
+    ),
+  )
+}
+
+/** The same body with the path and every branch marked, for the web to chip.
+ * Its plain-text spelling is `recreateConfirmBody`. */
+export function recreateConfirmProse(
+  worktreeLabel: string,
+  branchName: string,
+  sourceBranch: string,
+  conversationResumes: boolean,
+  providers: string[],
+): Prose {
   const conversation = conversationResumes
     ? `The conversation may resume, because the agent's CLI keys its history ` +
       `by directory path and dux recreates the working copy at the same path.`
     : `The conversation will not resume: this agent's CLI has no way to pick ` +
       `a conversation back up, so it starts fresh wherever it runs.`
-  return (
-    `Recreate the working copy for this agent at ${worktreeLabel}?\n\n` +
-    `If branch "${branchName}" still exists locally, dux checks it out there ` +
-    `again. If it is gone locally but still on the remote, dux creates it ` +
-    `again from "origin/${branchName}", holding everything that had been ` +
-    `pushed. If it is gone everywhere, dux creates it again from ` +
-    `"${sourceBranch}", and the commits that branch held are not coming ` +
-    `back.\n\n` +
-    `Any code changes that were in the old directory are gone either way: this ` +
-    `puts the directory back, not its contents. ${conversation}\n\n` +
-    `${recreateRunningTabClause(providers)} ` +
-    `A terminal still open in the old directory keeps ` +
-    `working in a directory that is gone; close it and open one in the ` +
-    `recreated copy.`
-  )
+  return [
+    "Recreate the working copy for this agent at ",
+    chip(worktreeLabel),
+    "?\n\nIf branch ",
+    quotedChip(branchName),
+    ` still exists locally, dux checks it out there ` +
+      `again. If it is gone locally but still on the remote, dux creates it ` +
+      `again from `,
+    quotedChip(`origin/${branchName}`),
+    `, holding everything that had been ` +
+      `pushed. If it is gone everywhere, dux creates it again from `,
+    quotedChip(sourceBranch),
+    `, and the commits that branch held are not coming ` +
+      `back.\n\n` +
+      `Any code changes that were in the old directory are gone either way: this ` +
+      `puts the directory back, not its contents. ${conversation}\n\n` +
+      `${recreateRunningTabClause(providers)} ` +
+      `A terminal still open in the old directory keeps ` +
+      `working in a directory that is gone; close it and open one in the ` +
+      `recreated copy.`,
+  ]
 }

@@ -9,6 +9,7 @@ import {
   DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
   type Bootstrap,
 } from "./bootstrapApi"
+import { type Prose, proseText, quotedChip } from "./prose"
 
 /** How long dux waits for an agent to exit before forcing it, in seconds.
  * The server clamps and projects it; an older server that omits it falls back
@@ -35,13 +36,26 @@ export function detachConfirmBody(
   graceSeconds: number,
   liveTabs: number,
 ): string {
-  const body =
-    `dux will ask "${label}" to shut down and wait up to ${graceSeconds} seconds ` +
-    `for it to exit before forcing it. The agent stays in the list as Detached, ` +
-    `and you can resume it later. Anything the agent is doing right now is ` +
-    `interrupted.`
+  return proseText(detachConfirmProse(label, graceSeconds, liveTabs))
+}
+
+/** The same body with the agent's name marked, for the web to chip. Its
+ * plain-text spelling is `detachConfirmBody`. */
+export function detachConfirmProse(
+  label: string,
+  graceSeconds: number,
+  liveTabs: number,
+): Prose {
+  const body: Prose = [
+    "dux will ask ",
+    quotedChip(label),
+    ` to shut down and wait up to ${graceSeconds} seconds ` +
+      `for it to exit before forcing it. The agent stays in the list as Detached, ` +
+      `and you can resume it later. Anything the agent is doing right now is ` +
+      `interrupted.`,
+  ]
   return liveTabs > 1
-    ? `${body} All ${liveTabs} running tabs stop together.`
+    ? [...body, ` All ${liveTabs} running tabs stop together.`]
     : body
 }
 
@@ -52,11 +66,18 @@ export function detachConfirmBody(
  * Detach agent asks first and waits out the configured grace. No number appears
  * here, because there is no wait to quote. */
 export function forceStopConfirmBody(label: string): string {
-  return (
-    `dux will stop "${label}" immediately, with no shutdown wait. Anything it ` +
-    `is doing right now is lost. The agent stays in the list as Detached, and ` +
-    `you can resume it later.`
-  )
+  return proseText(forceStopConfirmProse(label))
+}
+
+/** The same body with the agent's name marked, for the web to chip. */
+export function forceStopConfirmProse(label: string): Prose {
+  return [
+    "dux will stop ",
+    quotedChip(label),
+    ` immediately, with no shutdown wait. Anything it ` +
+      `is doing right now is lost. The agent stays in the list as Detached, and ` +
+      `you can resume it later.`,
+  ]
 }
 
 /** Whether the agent has anything to detach: a detach asks a PROCESS to go, so

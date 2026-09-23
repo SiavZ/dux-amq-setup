@@ -5,9 +5,11 @@ import type { SessionView } from "./types"
 import {
   canRecreateWorkingCopy,
   recreateConfirmBody,
+  recreateConfirmProse,
   recreateRunningProviders,
   recreateRunningTabClause,
 } from "./recreateWorkingCopy"
+import { chip, proseText, quotedChip } from "./prose"
 
 const managed: AgentWorkspaceWire = {
   kind: "managed",
@@ -37,6 +39,25 @@ describe("canRecreateWorkingCopy", () => {
       quiet_reason: "gone",
     }
     expect(canRecreateWorkingCopy(folder)).toBe(false)
+  })
+})
+
+// The web draws the path and every branch as a chip; the plain-text spelling of
+// the same structure is the terminal UI's string pinned below.
+describe("the recreate body as names in prose", () => {
+  it("marks the path and each branch, and spells the TUI's string", () => {
+    const prose = recreateConfirmProse("~/wt", "feat", "main", true, ["codex"])
+    for (const name of [
+      chip("~/wt"),
+      quotedChip("feat"),
+      quotedChip("origin/feat"),
+      quotedChip("main"),
+    ]) {
+      expect(prose).toContainEqual(name)
+    }
+    expect(proseText(prose)).toBe(
+      recreateConfirmBody("~/wt", "feat", "main", true, ["codex"]),
+    )
   })
 })
 
