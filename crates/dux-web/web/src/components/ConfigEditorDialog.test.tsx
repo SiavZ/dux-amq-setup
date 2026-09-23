@@ -67,13 +67,17 @@ describe("ConfigEditorDialog", () => {
   it("renders nothing while closed", () => {
     seed({})
     render(<ConfigEditorDialog />)
-    expect(screen.queryByText("Edit config.toml")).toBeNull()
+    expect(screen.queryByRole("heading")).toBeNull()
   })
 
   it("lazily mounts the editor with the loaded config once open", async () => {
     seed({ configEditorOpen: true, configEditorContent: "[server]\nport = 1" })
     render(<ConfigEditorDialog />)
-    expect(screen.getByText("Edit config.toml")).toBeTruthy()
+    expect(screen.getByRole("heading").textContent).toBe("Edit config.toml")
+    // The file it edits is named as the shared chip, in the title and the note.
+    expect(
+      screen.getAllByText("config.toml", { selector: "code" }),
+    ).toHaveLength(2)
     // findBy waits out the Suspense boundary: the editor arrives only after
     // the lazy chunk resolves, which is the behavior this test pins.
     const editor = await screen.findByTestId("code-editor")

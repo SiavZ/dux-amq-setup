@@ -12,6 +12,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import {
   closeConfigEditor,
   openConfigEditor,
@@ -68,7 +69,7 @@ function ConfigEditorForm({
       <div className="flex items-start gap-2 rounded-md border border-border bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
         <Info className="mt-0.5 size-4 shrink-0" aria-hidden />
         <span>
-          Saving writes <span className="font-mono">config.toml</span> to disk but
+          Saving writes <InlineCode>config.toml</InlineCode> to disk but
           does not apply it. Run <span className="font-medium">Reload config</span>{" "}
           from the app menu&rsquo;s <span className="font-medium">Configuration</span>{" "}
           submenu to apply your changes.
@@ -104,7 +105,9 @@ export function ConfigEditorDialog() {
     >
       <DialogContent showCloseButton={false} className="sm:max-w-4xl">
         <DialogHeader>
-          <DialogTitle>Edit config.toml</DialogTitle>
+          <DialogTitle>
+            Edit <InlineCode>config.toml</InlineCode>
+          </DialogTitle>
           <DialogDescription>
             Edit the dux configuration. It is validated before saving; invalid
             TOML is rejected with the reason. Saving does not apply the change;
