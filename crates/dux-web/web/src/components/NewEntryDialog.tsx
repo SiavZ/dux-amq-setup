@@ -10,6 +10,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import { Input } from "@/components/ui/input"
 import { validateEntryName } from "@/lib/fileTreeOps"
 
@@ -82,7 +83,7 @@ function NewEntryDialogBody({
       <DialogHeader>
         <DialogTitle>{title}</DialogTitle>
         <DialogDescription>
-          in <span className="font-mono break-all">{dirLabel}</span>
+          in <InlineCode>{dirLabel}</InlineCode>
         </DialogDescription>
       </DialogHeader>
       <Input

@@ -6,6 +6,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 
 export interface SaveConflictTarget {
   tabId: string
@@ -59,14 +60,14 @@ export function SaveConflictDialog({
         <p className="text-sm text-destructive">
           {deleted ? (
             <>
-              <span className="font-mono break-all">{path}</span> was deleted
+              <InlineCode>{path}</InlineCode> was deleted
               after you opened it, so nothing was saved. You can write your
               version back as a new file at the same path, or cancel and keep
               the text here.
             </>
           ) : (
             <>
-              <span className="font-mono break-all">{path}</span> changed after
+              <InlineCode>{path}</InlineCode> changed after
               you opened it, so nothing was saved. Saving anyway replaces
               whatever is on disk now; reloading replaces what you typed.
             </>

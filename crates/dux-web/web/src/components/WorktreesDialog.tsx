@@ -13,6 +13,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -49,7 +50,7 @@ function rowTooltip(entry: ProjectWorktreeEntryView): ReactNode {
   return (
     <span className="flex flex-col gap-0.5">
       {entry.reason ? <span>{entry.reason}</span> : null}
-      <span className="font-mono">{entry.branch_name}</span>
+      <InlineCode>{entry.branch_name}</InlineCode>
       <span>{entry.worktree_path}</span>
     </span>
   )
@@ -164,7 +165,7 @@ function ConfirmDeleteWorktree() {
           className="grid gap-2 text-sm text-destructive"
         >
           <p>
-            <span className="font-mono break-all">{entry?.worktree_path}</span> will be
+            <InlineCode>{entry?.worktree_path}</InlineCode> will be
             removed from disk. This action cannot be undone: dux has no trash and
             removes the directory forcibly.
           </p>
@@ -181,13 +182,13 @@ function ConfirmDeleteWorktree() {
             </p>
           ) : deleteBranch ? (
             <p>
-              The branch <span className="font-mono break-all">{branch}</span> will be
+              The branch <InlineCode>{branch}</InlineCode> will be
               deleted with it, forcibly. Any commits on it that are not merged
               anywhere else go too.
             </p>
           ) : (
             <p className="text-muted-foreground">
-              The branch <span className="font-mono break-all">{branch}</span> is kept.
+              The branch <InlineCode>{branch}</InlineCode> is kept.
               Only the working directory is removed.
             </p>
           )}
@@ -201,7 +202,7 @@ function ConfirmDeleteWorktree() {
             />
             <label htmlFor="delete-worktree-branch" className="text-sm">
               Also delete the branch{" "}
-              <span className="font-mono break-all">{branch}</span>
+              <InlineCode>{branch}</InlineCode>
             </label>
           </div>
         ) : null}

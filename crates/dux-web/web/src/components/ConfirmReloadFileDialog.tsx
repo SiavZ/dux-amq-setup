@@ -6,6 +6,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
 
 export interface ReloadFileTarget {
@@ -46,7 +47,7 @@ export function ConfirmReloadFileDialog({
           <DialogTitle>Discard your edits and reload?</DialogTitle>
         </DialogHeader>
         <p className="text-sm text-destructive">
-          <span className="font-mono break-all">{path}</span> changed on disk.
+          <InlineCode>{path}</InlineCode> changed on disk.
           Reloading replaces everything you have typed here with the file as it
           is now. Your edits are not saved anywhere and cannot be recovered.
         </p>
