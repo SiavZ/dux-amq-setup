@@ -116,7 +116,9 @@ export function recreateConfirmBody(
 }
 
 /** The same body with the path and every branch marked, for the web to chip.
- * Its plain-text spelling is `recreateConfirmBody`. */
+ * Its plain-text spelling is `recreateConfirmBody`. dux-core's
+ * `recreate_confirm_prose` builds the same segments for the terminal UI, and
+ * both are pinned by `crates/dux-core/tests/fixtures/prose_cross_language.json`. */
 export function recreateConfirmProse(
   worktreeLabel: string,
   branchName: string,

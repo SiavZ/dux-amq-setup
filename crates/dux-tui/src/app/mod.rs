@@ -3568,6 +3568,8 @@ mod overlay_dismiss;
 mod pty_ownership;
 mod redraw;
 pub(crate) use redraw::RedrawGate;
+#[cfg(test)]
+mod name_chip_dialogs;
 mod render;
 mod reorder;
 mod sessions;

@@ -59,6 +59,16 @@ pub(crate) fn wrap_styled_lines(lines: &[Line<'_>], width: usize) -> Vec<Line<'s
     out
 }
 
+/// Whether a row may break at `ch`. Whitespace does, except the no-break
+/// space, which glues its neighbours exactly as ratatui's own wrapper treats
+/// it: the name chip pads a name with it so the chip wraps as one piece.
+fn breaks_a_row(ch: char) -> bool {
+    ch.is_whitespace() && ch != NO_BREAK_SPACE
+}
+
+/// U+00A0, the space a row never breaks at.
+pub(crate) const NO_BREAK_SPACE: char = '\u{a0}';
+
 /// Append the wrapped rows of a single line.
 fn wrap_one(line: &Line<'_>, width: usize, out: &mut Vec<Line<'static>>) {
     // Already fits: emit it verbatim, spans and all, so the common case stays
@@ -73,7 +83,7 @@ fn wrap_one(line: &Line<'_>, width: usize, out: &mut Vec<Line<'static>>) {
     let mut word_width = 0usize;
     for span in &line.spans {
         for ch in span.content.chars() {
-            if ch.is_whitespace() {
+            if breaks_a_row(ch) {
                 if !word.is_empty() {
                     wrapper.push_word(std::mem::take(&mut word), word_width);
                     word_width = 0;
@@ -432,6 +442,38 @@ mod tests {
                     "row {y} at width {width} differs\n  ratatui: {want_row:?}\n  ours:    {got_row:?}"
                 );
             }
+        }
+    }
+
+    /// A no-break space glues what is on either side of it, as it does in
+    /// ratatui's own wrapper, so a name chip padded with it wraps as one piece
+    /// and never starts a row without its left padding.
+    #[test]
+    fn a_no_break_space_never_breaks_a_row() {
+        let chip = Style::default().bg(Color::Blue);
+        let line = Line::from(vec![
+            Span::raw("ask the agent "),
+            Span::styled("\u{a0}feat/login\u{a0}", chip),
+            Span::raw(" to stop"),
+        ]);
+        let wrapped = wrap_styled_lines(std::slice::from_ref(&line), 20);
+        assert_eq!(
+            texts(&wrapped),
+            vec!["ask the agent", "\u{a0}feat/login\u{a0} to stop"]
+        );
+
+        let mut ratatui_side = Terminal::new(TestBackend::new(20, 4)).expect("term");
+        ratatui_side
+            .draw(|frame| {
+                Paragraph::new(vec![line])
+                    .wrap(Wrap { trim: false })
+                    .render(frame.area(), frame.buffer_mut());
+            })
+            .expect("draw");
+        let buf = ratatui_side.backend().buffer().clone();
+        for (y, want) in texts(&wrapped).iter().enumerate() {
+            let got: String = (0..20).map(|x| buf[(x, y as u16)].symbol()).collect();
+            assert_eq!(got.trim_end(), want, "row {y} differs from ratatui's wrap");
         }
     }
 

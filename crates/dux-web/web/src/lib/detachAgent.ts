@@ -40,7 +40,9 @@ export function detachConfirmBody(
 }
 
 /** The same body with the agent's name marked, for the web to chip. Its
- * plain-text spelling is `detachConfirmBody`. */
+ * plain-text spelling is `detachConfirmBody`. dux-core's `detach_confirm_prose`
+ * builds the same segments for the terminal UI, and both are pinned by
+ * `crates/dux-core/tests/fixtures/prose_cross_language.json`. */
 export function detachConfirmProse(
   label: string,
   graceSeconds: number,

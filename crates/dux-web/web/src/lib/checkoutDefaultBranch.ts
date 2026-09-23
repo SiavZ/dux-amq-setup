@@ -20,7 +20,10 @@ export function checkoutDefaultBranchBody(
   return proseText(checkoutDefaultBranchProse(projectName, leadingBranch))
 }
 
-/** The same body with the project and its base marked, for the web to chip. */
+/** The same body with the project and its base marked, for the web to chip.
+ * dux-core's `checkout_default_branch_confirm_prose` builds the same segments
+ * for the terminal UI, and both are pinned by
+ * `crates/dux-core/tests/fixtures/prose_cross_language.json`. */
 export function checkoutDefaultBranchProse(
   projectName: string,
   leadingBranch: string | null,

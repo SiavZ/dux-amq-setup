@@ -2,13 +2,14 @@ use super::components::pane_card::CardPlan;
 use super::components::wrap_lines::{char_display_width, display_width};
 use super::components::{
     Button, ButtonKind, ButtonPressedTarget, CardBlockPlan, CardContent, Checkbox, CheckboxState,
-    Hint, Modal, PaneCardBlock, button_state_for, button_width_for, modal_hint_line,
-    plan_pane_card, render_centered_lines, render_scroll_marker, shared_button_width,
-    wrap_styled_lines,
+    Hint, Modal, PaneCardBlock, button_state_for, button_width_for, labelled_name, modal_hint_line,
+    name_chip, plan_pane_card, prose_lines, prose_spans, render_centered_lines,
+    render_scroll_marker, shared_button_width, wrap_styled_lines,
 };
 use super::pty_ownership::PtyTakeoverCard;
 use super::*;
 use crate::tui_color::{to_ratatui_color, to_ratatui_modifier};
+use dux_core::prose::Prose;
 use dux_core::text::{count_of, count_of_with};
 use ratatui::buffer::{CellDiffOption, CellWidth};
 use std::path::Path;
@@ -830,18 +831,40 @@ fn resource_monitor_columns(inner_width: u16) -> ResourceMonitorColumns {
 /// would drift until the height stopped matching the contents.
 pub(super) const DELETE_AGENT_WORKTREE_LABEL: &str = "Also delete the worktree";
 
+/// The add-project "check out the default branch first" checkbox label. One
+/// function because the dialog measures the label before it renders it.
+fn checkout_default_label(default_branch: &str) -> Prose {
+    Prose::new()
+        .text("Check out ")
+        .quoted(default_branch)
+        .text(" before adding")
+}
+
 /// The delete-agent branch checkbox label, naming every branch it would delete.
 /// One function for the same measure-then-render reason.
 ///
 /// A drifted agent gives up two branches, so the label names two: a box that
 /// promised one deletion and performed two would be taking consent it was never
 /// given.
-pub(super) fn delete_agent_branch_checkbox_label(branches: &[&str]) -> String {
+pub(super) fn delete_agent_branch_checkbox_prose(branches: &[&str]) -> Prose {
+    let mut label = Prose::new();
     match branches {
-        [] => String::new(),
-        [branch] => format!("Also delete the branch {branch}"),
-        _ => format!("Also delete the branches {}", branches.join(" and ")),
+        [] => {}
+        [branch] => {
+            label.push_text("Also delete the branch ");
+            label.push_name(*branch);
+        }
+        _ => {
+            label.push_text("Also delete the branches ");
+            for (index, branch) in branches.iter().enumerate() {
+                if index > 0 {
+                    label.push_text(" and ");
+                }
+                label.push_name(*branch);
+            }
+        }
     }
+    label
 }
 
 /// Whether the branch box needs a warning under it, and what it says.
@@ -854,43 +877,56 @@ pub(super) fn delete_agent_branch_checkbox_label(branches: &[&str]) -> String {
 /// The danger lives in this sentence rather than in a red checkbox. `unpushed` is
 /// `None` both while the count is being computed and when git could not answer,
 /// and the sentence is absent in both cases: the dialog never guesses a number.
+#[cfg(test)]
 pub(super) fn delete_agent_branch_warning(
     provenance: dux_core::model::BranchProvenance,
     branches: &[&str],
     unpushed: Option<dux_core::git::UnpushedCommits>,
 ) -> Option<String> {
+    delete_agent_branch_warning_prose(provenance, branches, unpushed).map(|prose| prose.plain())
+}
+
+/// [`delete_agent_branch_warning`] with every branch it names marked as a name.
+pub(super) fn delete_agent_branch_warning_prose(
+    provenance: dux_core::model::BranchProvenance,
+    branches: &[&str],
+    unpushed: Option<dux_core::git::UnpushedCommits>,
+) -> Option<Prose> {
     let drifted = branches.len() > 1;
     let predates = !provenance.dux_may_delete_branch();
     if !drifted && !predates {
         return None;
     }
-    let mut text = String::new();
+    let mut text = Prose::new();
     if let [current, birth, ..] = branches {
-        text.push_str(&format!(
-            "The worktree moved from {birth} onto {current}, so deleting the agent removes both."
-        ));
+        text.push_text("The worktree moved from ");
+        text.push_name(*birth);
+        text.push_text(" onto ");
+        text.push_name(*current);
+        text.push_text(", so deleting the agent removes both.");
     }
     if predates {
         // Mirrors `BranchProvenance::kept_reason`, in the dialog's own voice.
         // The provenance is recorded about the BIRTH branch, so with two
         // branches on screen the sentence names it rather than saying "this".
-        let subject = if drifted { branches[1] } else { "This branch" };
-        let clause = match provenance {
-            dux_core::model::BranchProvenance::Adopted => {
-                format!("{subject} came with the worktree this agent adopted.")
-            }
-            dux_core::model::BranchProvenance::Unknown => {
-                format!("{subject} is not one dux created.")
-            }
-            _ => format!("{subject} existed before the agent."),
-        };
         if !text.is_empty() {
-            text.push(' ');
+            text.push_text(" ");
         }
-        text.push_str(&clause);
+        if drifted {
+            text.push_name(branches[1]);
+        } else {
+            text.push_text("This branch");
+        }
+        text.push_text(match provenance {
+            dux_core::model::BranchProvenance::Adopted => {
+                " came with the worktree this agent adopted."
+            }
+            dux_core::model::BranchProvenance::Unknown => " is not one dux created.",
+            _ => " existed before the agent.",
+        });
     }
     if let Some(sentence) = unpushed_commits_sentence(unpushed, drifted) {
-        text.push_str(&sentence);
+        text.push_text(sentence);
     }
     Some(text)
 }
@@ -960,10 +996,16 @@ pub(super) fn project_env_saved_message(env_count: usize, project_name: &str) ->
 /// and once in the render pass, and two copies would drift the dialog's height
 /// away from its contents. `None` means a detached worktree, which has no
 /// branch and therefore no checkbox; the caller must not render one.
+#[cfg(test)]
 pub(super) fn delete_worktree_checkbox_label(branch: Option<&str>) -> String {
+    delete_worktree_checkbox_prose(branch).plain()
+}
+
+/// [`delete_worktree_checkbox_label`] with the branch marked as a name.
+pub(super) fn delete_worktree_checkbox_prose(branch: Option<&str>) -> Prose {
     match branch {
-        Some(branch) => format!("Also delete the branch {branch}"),
-        None => String::new(),
+        Some(branch) => Prose::new().text("Also delete the branch ").name(branch),
+        None => Prose::new(),
     }
 }
 
@@ -975,8 +1017,17 @@ pub(super) fn delete_worktree_checkbox_label(branch: Option<&str>) -> String {
 /// The question, naming the worktree by its ROW LABEL (the branch when there
 /// is one, the "detached <sha>" stand-in when there is not), so the sentence
 /// reads for a detached worktree too.
+#[cfg(test)]
 pub(super) fn delete_worktree_title(label: &str) -> String {
-    format!("Delete the worktree for {label}?")
+    delete_worktree_title_prose(label).plain()
+}
+
+/// [`delete_worktree_title`] with the worktree marked as a name.
+pub(super) fn delete_worktree_title_prose(label: &str) -> Prose {
+    Prose::new()
+        .text("Delete the worktree for ")
+        .name(label)
+        .text("?")
 }
 
 pub(super) const DELETE_WORKTREE_FORCED: &str =
@@ -993,14 +1044,21 @@ pub(super) const DELETE_WORKTREE_DIRTY: &str = "This worktree has uncommitted ch
 pub(super) const DELETE_WORKTREE_DETACHED: &str = "This worktree is not on a branch, so there is no branch to keep or delete. Only \
      the working directory is removed.";
 
+#[cfg(test)]
 pub(super) fn delete_worktree_branch_line(branch: &str, delete_branch: bool) -> String {
+    delete_worktree_branch_prose(branch, delete_branch).plain()
+}
+
+/// [`delete_worktree_branch_line`] with the branch marked as a name.
+pub(super) fn delete_worktree_branch_prose(branch: &str, delete_branch: bool) -> Prose {
+    let lead = Prose::new().text("The branch ").quoted(branch);
     if delete_branch {
-        format!(
-            "The branch \"{branch}\" will be deleted with it, forcibly. Any commits on it that \
-             are not merged anywhere else go too."
+        lead.text(
+            " will be deleted with it, forcibly. Any commits on it that are not merged anywhere \
+             else go too.",
         )
     } else {
-        format!("The branch \"{branch}\" is kept. Only the working directory is removed.")
+        lead.text(" is kept. Only the working directory is removed.")
     }
 }
 
@@ -1071,6 +1129,18 @@ pub(super) fn indented_body_lines(text: &str, inner_width: u16) -> Vec<String> {
         lines.push(current);
     }
     lines.into_iter().map(|line| format!(" {line}")).collect()
+}
+
+/// A dialog body pre-wrapped to `inner_width`, with its row count.
+///
+/// The bodies that carry name chips are wrapped here rather than by the
+/// `Paragraph`, because a chip changes where a word ends and the estimate in
+/// [`wrapped_line_count`] counts characters rather than words: a height that is
+/// one row short clips the last line of a body that does not scroll.
+fn exact_body(lines: &[Line<'_>], inner_width: u16) -> (Vec<Line<'static>>, u16) {
+    let wrapped = wrap_styled_lines(lines, usize::from(inner_width));
+    let height = u16::try_from(wrapped.len()).unwrap_or(u16::MAX);
+    (wrapped, height)
 }
 
 fn wrapped_line_count(lines: &[Line<'_>], width: u16, trim: bool) -> u16 {
@@ -1253,7 +1323,64 @@ impl App {
         state: CheckboxState,
         hint: Option<Line<'static>>,
     ) -> (Rect, u16) {
-        let checkbox = Checkbox::new(label).checked(checked).state(state);
+        self.render_overlay_checkbox_widget(frame, area, Checkbox::new(label), checked, state, hint)
+    }
+
+    /// A prose dialog's body: a blank row, then `prose` with the one-cell body
+    /// margin and every name as a chip, pre-wrapped to `inner_width` so the
+    /// returned height is the rendered one by construction.
+    fn prose_body(&self, prose: &Prose, inner_width: u16) -> (Vec<Line<'static>>, u16) {
+        let mut lines = vec![Line::from("")];
+        lines.extend(prose_lines(prose, " ", Style::default(), &self.theme));
+        exact_body(&lines, inner_width)
+    }
+
+    /// [`indented_body_lines`] for a sentence that names something: every row
+    /// keeps the body's one-cell margin, continuation rows included, and every
+    /// name is a chip.
+    fn indented_prose_lines(
+        &self,
+        prose: &Prose,
+        style: Style,
+        inner_width: u16,
+    ) -> Vec<Line<'static>> {
+        let sentence = prose_lines(prose, "", style, &self.theme);
+        let width = usize::from(inner_width).saturating_sub(1).max(1);
+        wrap_styled_lines(&sentence, width)
+            .into_iter()
+            .map(|row| {
+                let mut spans = vec![Span::styled(" ", style)];
+                spans.extend(row.spans);
+                Line::from(spans)
+            })
+            .collect()
+    }
+
+    /// [`Self::render_overlay_checkbox`] for a label that names something:
+    /// every name in `label` renders as the shared name chip.
+    fn render_overlay_prose_checkbox(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        label: &Prose,
+        checked: bool,
+        state: CheckboxState,
+        hint: Option<Line<'static>>,
+    ) -> (Rect, u16) {
+        let checkbox = Checkbox::with_prose(label, &self.theme);
+        self.render_overlay_checkbox_widget(frame, area, checkbox, checked, state, hint)
+    }
+
+    fn render_overlay_checkbox_widget(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        checkbox: Checkbox<'_>,
+        checked: bool,
+        state: CheckboxState,
+        hint: Option<Line<'static>>,
+    ) -> (Rect, u16) {
+        let checkbox = checkbox.checked(checked).state(state);
         let marker_style = checkbox.marker_style(match state {
             CheckboxState::Focused => Style::default().fg(self.theme.button_active_fg),
             CheckboxState::Normal => Style::default().fg(self.theme.hint_key_fg),
@@ -5514,6 +5641,8 @@ impl App {
             "Nothing is serving, so the choice applies when a listener starts."
         };
         let detail_lines = vec![
+            // The mode is one of three constant words, not a name, so it keeps
+            // the plain emphasis rather than the name chip.
             Line::from(vec![
                 Span::styled(
                     " Saved mode: ",
@@ -5638,18 +5767,12 @@ impl App {
             .constraints([Constraint::Length(4), Constraint::Min(6)])
             .areas(area);
         let detail_lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    " Current theme: ",
-                    Style::default().fg(self.theme.hint_desc_fg),
-                ),
-                Span::styled(
-                    prompt.current.clone(),
-                    Style::default()
-                        .fg(self.theme.text_fg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
+            labelled_name(
+                " Current theme: ",
+                &prompt.current,
+                Style::default().fg(self.theme.hint_desc_fg),
+                &self.theme,
+            ),
             Line::from(vec![Span::styled(
                 " Selecting a theme applies it instantly and saves it to config.toml.",
                 Style::default().fg(self.theme.hint_desc_fg),
@@ -5840,7 +5963,7 @@ impl App {
             } else {
                 ("/ ", filter.text.as_str(), filter.cursor)
             };
-            let input_block = self.themed_overlay_block(&title);
+            let input_block = self.themed_overlay_block_prose(&title);
             let input_inner = input_block.inner(filter_area);
             Paragraph::new(render_single_line_cursor_input(
                 prefix,
@@ -5927,7 +6050,7 @@ impl App {
             ));
             let title = Self::browse_projects_title(*purpose, current_dir);
             let list_block = self
-                .themed_overlay_block(&title)
+                .themed_overlay_block_prose(&title)
                 .title_bottom(Line::from(bottom_spans));
             let list_inner = list_block.inner(list_render_area);
             StatefulWidget::render(
@@ -5958,12 +6081,14 @@ impl App {
         }
     }
 
-    fn browse_projects_title(purpose: BrowsePurpose, current_dir: &Path) -> String {
+    fn browse_projects_title(purpose: BrowsePurpose, current_dir: &Path) -> Prose {
         let verb = match purpose {
             BrowsePurpose::AddProject => "Add Project",
             BrowsePurpose::StandaloneAgent => "Standalone Agent In",
         };
-        format!("{verb}: {}", current_dir.display())
+        Prose::new()
+            .text(format!("{verb}: "))
+            .name(current_dir.display().to_string())
     }
 
     fn browse_projects_input_footer<'a>(
@@ -6041,22 +6166,18 @@ impl App {
             .areas(area);
 
         let detail_lines = vec![
-            Line::from(vec![
-                Span::styled(" Agent: ", Style::default().fg(self.theme.hint_desc_fg)),
-                Span::styled(
-                    prompt.session_label.as_str(),
-                    Style::default()
-                        .fg(self.theme.text_fg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(" Path: ", Style::default().fg(self.theme.hint_desc_fg)),
-                Span::styled(
-                    prompt.worktree_path.as_str(),
-                    Style::default().fg(self.theme.text_fg),
-                ),
-            ]),
+            labelled_name(
+                " Agent: ",
+                prompt.session_label.as_str(),
+                Style::default().fg(self.theme.hint_desc_fg),
+                &self.theme,
+            ),
+            labelled_name(
+                " Path: ",
+                prompt.worktree_path.as_str(),
+                Style::default().fg(self.theme.hint_desc_fg),
+                &self.theme,
+            ),
         ];
         let overlay_title = match prompt.mode {
             ChangeAgentProviderMode::Retarget => "Change Agent Provider",
@@ -6158,18 +6279,12 @@ impl App {
             .areas(area);
 
         let detail_lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    " Current global default: ",
-                    Style::default().fg(self.theme.hint_desc_fg),
-                ),
-                Span::styled(
-                    prompt.current.as_str().to_string(),
-                    Style::default()
-                        .fg(self.theme.text_fg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
+            labelled_name(
+                " Current global default: ",
+                prompt.current.as_str(),
+                Style::default().fg(self.theme.hint_desc_fg),
+                &self.theme,
+            ),
             Line::from(vec![Span::styled(
                 " Projects with an explicit project provider keep their override. Existing agents keep their current provider.",
                 Style::default().fg(self.theme.hint_desc_fg),
@@ -6260,39 +6375,29 @@ impl App {
             "project override"
         };
         let detail_lines = vec![
-            Line::from(vec![
-                Span::styled(" Project: ", Style::default().fg(self.theme.hint_desc_fg)),
-                Span::styled(
-                    prompt.project_name.clone(),
-                    Style::default()
-                        .fg(self.theme.text_fg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
+            labelled_name(
+                " Project: ",
+                &prompt.project_name,
+                Style::default().fg(self.theme.hint_desc_fg),
+                &self.theme,
+            ),
             Line::from(vec![
                 Span::styled(
                     " Current provider: ",
                     Style::default().fg(self.theme.hint_desc_fg),
                 ),
+                name_chip(prompt.current.as_str(), &self.theme),
                 Span::styled(
-                    format!("{} ({project_mode})", prompt.current.as_str()),
-                    Style::default()
-                        .fg(self.theme.text_fg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    " Global default: ",
+                    format!(" ({project_mode})"),
                     Style::default().fg(self.theme.hint_desc_fg),
                 ),
-                Span::styled(
-                    prompt.global_default.as_str().to_string(),
-                    Style::default()
-                        .fg(self.theme.text_fg)
-                        .add_modifier(Modifier::BOLD),
-                ),
             ]),
+            labelled_name(
+                " Global default: ",
+                prompt.global_default.as_str(),
+                Style::default().fg(self.theme.hint_desc_fg),
+                &self.theme,
+            ),
             Line::from(vec![Span::styled(
                 " Choose \"inherit global default\" to remove the project-specific override. Existing agents keep their current provider.",
                 Style::default().fg(self.theme.hint_desc_fg),
@@ -6421,22 +6526,18 @@ impl App {
             .areas(area);
 
         let detail_lines = vec![
-            Line::from(vec![
-                Span::styled(" Agent: ", Style::default().fg(self.theme.hint_desc_fg)),
-                Span::styled(
-                    session_label.as_str(),
-                    Style::default()
-                        .fg(self.theme.text_fg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(" Path: ", Style::default().fg(self.theme.hint_desc_fg)),
-                Span::styled(
-                    worktree_path.as_str(),
-                    Style::default().fg(self.theme.text_fg),
-                ),
-            ]),
+            labelled_name(
+                " Agent: ",
+                session_label.as_str(),
+                Style::default().fg(self.theme.hint_desc_fg),
+                &self.theme,
+            ),
+            labelled_name(
+                " Path: ",
+                worktree_path.as_str(),
+                Style::default().fg(self.theme.hint_desc_fg),
+                &self.theme,
+            ),
         ];
         Paragraph::new(detail_lines)
             .block(
@@ -6530,22 +6631,18 @@ impl App {
             .areas(area);
 
         let detail_lines = vec![
-            Line::from(vec![
-                Span::styled(" Project: ", Style::default().fg(self.theme.hint_desc_fg)),
-                Span::styled(
-                    prompt.project.name.as_str(),
-                    Style::default()
-                        .fg(self.theme.text_fg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(" Repo: ", Style::default().fg(self.theme.hint_desc_fg)),
-                Span::styled(
-                    prompt.project.path.as_str(),
-                    Style::default().fg(self.theme.text_fg),
-                ),
-            ]),
+            labelled_name(
+                " Project: ",
+                prompt.project.name.as_str(),
+                Style::default().fg(self.theme.hint_desc_fg),
+                &self.theme,
+            ),
+            labelled_name(
+                " Repo: ",
+                prompt.project.path.as_str(),
+                Style::default().fg(self.theme.hint_desc_fg),
+                &self.theme,
+            ),
         ];
         Paragraph::new(detail_lines)
             .block(
@@ -6671,14 +6768,14 @@ impl App {
         let dialog_width = 60.min(frame.area().width.max(1));
         let inner_width = dialog_width.saturating_sub(2);
         let has_checkbox = prompt.has_branch_checkbox();
-        let checkbox_label = delete_worktree_checkbox_label(prompt.branch.as_deref());
+        let checkbox_label = delete_worktree_checkbox_prose(prompt.branch.as_deref());
         let checkbox_height = if has_checkbox {
             let state = if prompt.focus == DeleteWorktreeFocus::Checkbox {
                 CheckboxState::Focused
             } else {
                 CheckboxState::Normal
             };
-            let checkbox = Checkbox::new(checkbox_label.as_str())
+            let checkbox = Checkbox::with_prose(&checkbox_label, &self.theme)
                 .checked(prompt.delete_branch)
                 .state(state);
             checkbox
@@ -6695,25 +6792,22 @@ impl App {
         // The copy is the web dialog's, sentence for sentence, and both
         // sides pin it (see `delete_worktree_title` and the constants
         // beside it).
-        let mut body_lines = vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                format!(" {}", delete_worktree_title(&prompt.label)),
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(vec![
-                Span::raw(" "),
-                Span::styled(
-                    prompt.path.display().to_string(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" will be removed from disk. {DELETE_WORKTREE_FORCED}"),
-                    Style::default().fg(self.theme.warning_fg),
-                ),
-            ]),
-        ];
+        let mut body_lines = vec![Line::from("")];
+        body_lines.extend(prose_lines(
+            &delete_worktree_title_prose(&prompt.label),
+            " ",
+            Style::default().add_modifier(Modifier::BOLD),
+            &self.theme,
+        ));
+        body_lines.push(Line::from(""));
+        body_lines.push(Line::from(vec![
+            Span::raw(" "),
+            name_chip(&prompt.path.display().to_string(), &self.theme),
+            Span::styled(
+                format!(" will be removed from disk. {DELETE_WORKTREE_FORCED}"),
+                Style::default().fg(self.theme.warning_fg),
+            ),
+        ]));
         if prompt.dirty {
             body_lines.push(Line::from(Span::styled(
                 format!(" {DELETE_WORKTREE_DIRTY}"),
@@ -6725,16 +6819,18 @@ impl App {
                 format!(" {DELETE_WORKTREE_DETACHED}"),
                 Style::default().fg(self.theme.hint_desc_fg),
             ))),
-            (Some(branch), delete_branch) => body_lines.push(Line::from(Span::styled(
-                format!(" {}", delete_worktree_branch_line(branch, delete_branch)),
+            (Some(branch), delete_branch) => body_lines.extend(prose_lines(
+                &delete_worktree_branch_prose(branch, delete_branch),
+                " ",
                 Style::default().fg(if delete_branch {
                     self.theme.warning_fg
                 } else {
                     self.theme.hint_desc_fg
                 }),
-            ))),
+                &self.theme,
+            )),
         }
-        let body_height = wrapped_line_count(&body_lines, inner_width, false);
+        let (body_lines, body_height) = exact_body(&body_lines, inner_width);
         let checkbox_spacing = u16::from(has_checkbox);
         let area = centered_rect_exact(
             dialog_width,
@@ -6769,10 +6865,10 @@ impl App {
             } else {
                 CheckboxState::Normal
             };
-            let (rect, _) = self.render_overlay_checkbox(
+            let (rect, _) = self.render_overlay_prose_checkbox(
                 frame,
                 checkbox_area,
-                checkbox_label.as_str(),
+                &checkbox_label,
                 prompt.delete_branch,
                 checkbox_state,
                 None,
@@ -6869,22 +6965,18 @@ impl App {
             .areas(area);
 
         let detail_lines = vec![
-            Line::from(vec![
-                Span::styled(" Project: ", Style::default().fg(self.theme.hint_desc_fg)),
-                Span::styled(
-                    prompt.project.name.as_str(),
-                    Style::default()
-                        .fg(self.theme.text_fg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(" Repo: ", Style::default().fg(self.theme.hint_desc_fg)),
-                Span::styled(
-                    prompt.project.path.as_str(),
-                    Style::default().fg(self.theme.text_fg),
-                ),
-            ]),
+            labelled_name(
+                " Project: ",
+                prompt.project.name.as_str(),
+                Style::default().fg(self.theme.hint_desc_fg),
+                &self.theme,
+            ),
+            labelled_name(
+                " Repo: ",
+                prompt.project.path.as_str(),
+                Style::default().fg(self.theme.hint_desc_fg),
+                &self.theme,
+            ),
         ];
         Paragraph::new(detail_lines)
             .block(
@@ -7558,10 +7650,7 @@ impl App {
             Line::from(""),
             Line::from(vec![
                 Span::raw(" Are you sure you want to delete "),
-                Span::styled(
-                    terminal_label.as_str(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
+                name_chip(terminal_label, &self.theme),
                 Span::raw("?"),
             ]),
         ];
@@ -7658,35 +7747,31 @@ impl App {
             .map(|s| self.session_label(s))
             .unwrap_or_else(|| session_id.clone());
 
-        let tail = confirm_close_tab_tail(will_detach, promoted_label.as_deref());
-        let lines = vec![
+        let tail = confirm_close_tab_tail_prose(will_detach, promoted_label.as_deref());
+        let mut lines = vec![
             Line::from(""),
             Line::from(vec![
                 Span::raw(" Close the "),
-                Span::styled(
-                    provider_label.as_str(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
+                name_chip(provider_label, &self.theme),
                 Span::raw(" tab on "),
-                Span::styled(
-                    agent_name.as_str(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
+                name_chip(&agent_name, &self.theme),
                 Span::raw("?"),
             ]),
             Line::from(""),
-            Line::from(Span::styled(
-                tail.as_str(),
-                Style::default().fg(self.theme.warning_fg),
-            )),
         ];
+        lines.extend(prose_lines(
+            &tail,
+            "",
+            Style::default().fg(self.theme.warning_fg),
+            &self.theme,
+        ));
         // Size to the WRAPPED prose, the way the other prose modals here do (see
         // `render_delete_agent_frame`): the body does not scroll, and a fixed
         // percentage clipped the whole tail on an 80x24 terminal, which is
         // exactly where the promotion sentence has to be readable.
         let dialog_width = 60u16.min(frame.area().width.max(1));
         let inner_width = dialog_width.saturating_sub(2);
-        let body_height = wrapped_line_count(&lines, inner_width, false);
+        let (lines, body_height) = exact_body(&lines, inner_width);
         let area = centered_rect_exact(dialog_width, 2 + body_height + 1 + 3, frame.area());
         self.clear_overlay_area(frame, area);
         let outer = self.themed_overlay_block("Close Tab");
@@ -7768,15 +7853,14 @@ impl App {
             return;
         };
         self.render_dim_overlay(frame);
-        let body = dux_core::engine::detach_confirm_body(label, *grace_seconds, *live_tabs);
-        let lines = vec![Line::from(""), Line::from(Span::raw(format!(" {body}")))];
+        let body = dux_core::engine::detach_confirm_prose(label, *grace_seconds, *live_tabs);
         // Sized to the WRAPPED prose, like the other prose modals here: the body
         // does not scroll, and a fixed percentage clips the tail on an 80x24
         // terminal, which is exactly where the "you can resume it later" half
         // has to be readable.
         let dialog_width = 60u16.min(frame.area().width.max(1));
         let inner_width = dialog_width.saturating_sub(2);
-        let body_height = wrapped_line_count(&lines, inner_width, false);
+        let (lines, body_height) = self.prose_body(&body, inner_width);
         let area = centered_rect_exact(dialog_width, 2 + body_height + 1 + 3, frame.area());
         self.clear_overlay_area(frame, area);
         let outer = self.themed_overlay_block("Detach Agent");
@@ -7859,24 +7943,19 @@ impl App {
             return;
         };
         self.render_dim_overlay(frame);
-        let body = dux_core::working_copy::recreate_confirm_body(
+        let body = dux_core::working_copy::recreate_confirm_prose(
             worktree_path,
             branch_name,
             source_branch,
             *conversation_resumes,
             running_providers,
         );
-        let mut lines = vec![Line::from("")];
-        lines.extend(
-            body.split('\n')
-                .map(|line| Line::from(Span::raw(format!(" {line}")))),
-        );
         // Sized to the WRAPPED prose, like the other prose modals here: the body
         // does not scroll, and the sentence about what is lost has to be
         // readable on an 80x24 terminal.
         let dialog_width = 60u16.min(frame.area().width.max(1));
         let inner_width = dialog_width.saturating_sub(2);
-        let body_height = wrapped_line_count(&lines, inner_width, false);
+        let (lines, body_height) = self.prose_body(&body, inner_width);
         let area = centered_rect_exact(dialog_width, 2 + body_height + 1 + 3, frame.area());
         self.clear_overlay_area(frame, area);
         let outer = self.themed_overlay_block("Recreate Working Copy");
@@ -7955,15 +8034,14 @@ impl App {
             return;
         };
         self.render_dim_overlay(frame);
-        let body = dux_core::engine::checkout_default_branch_confirm_body(
+        let body = dux_core::engine::checkout_default_branch_confirm_prose(
             project_name,
             stored_base.as_deref(),
         );
-        let lines = vec![Line::from(""), Line::from(Span::raw(format!(" {body}")))];
         // Sized to the wrapped prose: the body does not scroll.
         let dialog_width = 60u16.min(frame.area().width.max(1));
         let inner_width = dialog_width.saturating_sub(2);
-        let body_height = wrapped_line_count(&lines, inner_width, false);
+        let (lines, body_height) = self.prose_body(&body, inner_width);
         let area = centered_rect_exact(dialog_width, 2 + body_height + 1 + 3, frame.area());
         self.clear_overlay_area(frame, area);
         let outer = self.themed_overlay_block("Check Out Default Branch");
@@ -8150,12 +8228,9 @@ impl App {
         let lines = vec![
             Line::from(""),
             Line::from(vec![
-                Span::raw(" Discard all changes to \""),
-                Span::styled(
-                    file_path.as_str(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("\"?"),
+                Span::raw(" Discard all changes to "),
+                name_chip(file_path, &self.theme),
+                Span::raw("?"),
             ]),
             Line::from(""),
             Line::from(Span::styled(
@@ -8234,9 +8309,9 @@ impl App {
         let lines = vec![
             Line::from(""),
             Line::from(vec![
-                Span::raw(" \""),
-                Span::styled(path.as_str(), Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw("\" has no commits yet,"),
+                Span::raw(" "),
+                name_chip(path, &self.theme),
+                Span::raw(" has no commits yet,"),
             ]),
             Line::from(" so agents can't branch worktrees from it."),
             Line::from(""),
@@ -8326,9 +8401,9 @@ impl App {
         let mut lines = vec![
             Line::from(""),
             Line::from(vec![
-                Span::raw(" \""),
-                Span::styled(path.as_str(), Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw("\" is not a git repository."),
+                Span::raw(" "),
+                name_chip(path, &self.theme),
+                Span::raw(" is not a git repository."),
             ]),
             Line::from(""),
             Line::from(Span::styled(
@@ -8337,13 +8412,20 @@ impl App {
             )),
         ];
         if !candidates.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    " A starter .gitignore will cover: {}.",
-                    candidates.join(", ")
-                ),
+            let mut cover = Prose::new().text(" A starter .gitignore will cover: ");
+            for (index, candidate) in candidates.iter().enumerate() {
+                if index > 0 {
+                    cover.push_text(", ");
+                }
+                cover.push_name(candidate.as_str());
+            }
+            cover.push_text(".");
+            lines.extend(prose_lines(
+                &cover,
+                "",
                 Style::default().fg(self.theme.hint_desc_fg),
-            )));
+                &self.theme,
+            ));
         }
         lines.push(Line::from(Span::styled(
             " Your existing files are left untouched (untracked).",
@@ -8421,28 +8503,19 @@ impl App {
             BranchWarningKind::Known { default_branch } => {
                 body_lines.push(Line::from(vec![
                     Span::raw(" This repository is on branch "),
-                    Span::styled(
-                        current_branch.as_str(),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
+                    name_chip(current_branch, &self.theme),
                     Span::raw(", but the"),
                 ]));
                 body_lines.push(Line::from(vec![
                     Span::raw(" remote default branch is "),
-                    Span::styled(
-                        default_branch.as_str(),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
+                    name_chip(default_branch, &self.theme),
                     Span::raw("."),
                 ]));
             }
             BranchWarningKind::Heuristic => {
                 body_lines.push(Line::from(vec![
                     Span::raw(" This repository is on branch "),
-                    Span::styled(
-                        current_branch.as_str(),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
+                    name_chip(current_branch, &self.theme),
                     Span::raw(","),
                 ]));
                 body_lines.push(Line::from(" which doesn't appear to be the main branch."));
@@ -8467,10 +8540,11 @@ impl App {
             } else {
                 Style::default().fg(self.theme.warning_fg)
             };
-            Line::from(Span::styled(
-                format!(" New worktrees will branch from \"{}\".", base.branch()),
-                style,
-            ))
+            Line::from(vec![
+                Span::styled(" New worktrees will branch from ", style),
+                name_chip(base.branch(), &self.theme),
+                Span::styled(".", style),
+            ])
         };
         // Measured with the box both ways, so toggling it never resizes the
         // dialog under the pointer.
@@ -8512,8 +8586,8 @@ impl App {
             } else {
                 CheckboxState::Normal
             };
-            let label = format!("Check out \"{default_branch}\" before adding");
-            let checkbox = Checkbox::new(&label)
+            let label = checkout_default_label(default_branch);
+            let checkbox = Checkbox::with_prose(&label, &self.theme)
                 .checked(*checkout_default)
                 .state(state);
             checkbox
@@ -8561,8 +8635,8 @@ impl App {
             } else {
                 CheckboxState::Normal
             };
-            let label = format!("Check out \"{default_branch}\" before adding");
-            let (rect, _) = self.render_overlay_checkbox(
+            let label = checkout_default_label(default_branch);
+            let (rect, _) = self.render_overlay_prose_checkbox(
                 frame,
                 checkbox_area,
                 &label,
@@ -8670,10 +8744,7 @@ impl App {
             Span::raw(" A "),
             Span::raw(location_label),
             Span::raw(" branch named "),
-            Span::styled(
-                branch_name.as_str(),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
+            name_chip(branch_name, &self.theme),
         ]));
         lines.push(Line::from(" already exists."));
         lines.push(Line::from(""));
@@ -9001,10 +9072,12 @@ impl App {
 
         let labels = match project {
             Some(project) => vec![
-                Line::from(Span::styled(
-                    format!(" Project: {}", project.name),
+                labelled_name(
+                    " Project: ",
+                    &project.name,
                     Style::default().fg(self.theme.input_label_fg),
-                )),
+                    &self.theme,
+                ),
                 Line::from(Span::styled(
                     " Paste a GitHub PR URL or enter a PR number:",
                     Style::default().fg(self.theme.input_label_fg),
@@ -9125,10 +9198,12 @@ impl App {
 
         let mut labels = Vec::new();
         if let Some(current) = current_pr {
-            labels.push(Line::from(Span::styled(
-                format!(" Currently showing {current}; attaching replaces it."),
-                Style::default().fg(self.theme.hint_desc_fg),
-            )));
+            let hint = Style::default().fg(self.theme.hint_desc_fg);
+            labels.push(Line::from(vec![
+                Span::styled(" Currently showing ", hint),
+                name_chip(current, &self.theme),
+                Span::styled("; attaching replaces it.", hint),
+            ]));
         }
         labels.push(Line::from(Span::styled(
             " Enter a PR URL, owner/repo#123, #123, or 123:",
@@ -9202,14 +9277,20 @@ impl App {
             .areas(inner);
 
         let labels = vec![
-            Line::from(Span::styled(
-                format!(" Name this agent (optional, defaults to \"{default_name}\"):"),
-                Style::default().fg(self.theme.input_label_fg),
-            )),
-            Line::from(Span::styled(
-                format!(" It runs in {folder_label}"),
+            Line::from(vec![
+                Span::styled(
+                    " Name this agent (optional, defaults to ",
+                    Style::default().fg(self.theme.input_label_fg),
+                ),
+                name_chip(&default_name, &self.theme),
+                Span::styled("):", Style::default().fg(self.theme.input_label_fg)),
+            ]),
+            labelled_name(
+                " It runs in ",
+                &folder_label,
                 Style::default().fg(self.theme.hint_desc_fg),
-            )),
+                &self.theme,
+            ),
             Line::from(Span::styled(
                 " dux never creates, moves or removes that folder.",
                 Style::default().fg(self.theme.hint_desc_fg),
@@ -9298,20 +9379,24 @@ impl App {
             ])
             .areas(inner);
         Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(
-                    if is_global_env {
-                        " Scope: "
-                    } else {
-                        " Project: "
-                    },
+            // The global scope's "All projects" is constant words; a project is
+            // a name, so it is the chip.
+            if is_global_env {
+                Line::from(vec![
+                    Span::styled(" Scope: ", Style::default().fg(self.theme.input_label_fg)),
+                    Span::styled(
+                        project_name.clone(),
+                        Style::default().fg(self.theme.input_label_fg),
+                    ),
+                ])
+            } else {
+                labelled_name(
+                    " Project: ",
+                    project_name,
                     Style::default().fg(self.theme.input_label_fg),
-                ),
-                Span::styled(
-                    project_name.clone(),
-                    Style::default().fg(self.theme.input_label_fg),
-                ),
-            ]),
+                    &self.theme,
+                )
+            },
             Line::from(Span::styled(
                 if is_env {
                     " Enter one variable per line as KEY=value:"
@@ -10088,16 +10173,17 @@ impl App {
         // ask, or the dialog's frame stops matching its contents.
         let offers_branch_checkbox = target.offers_branch_checkbox(*delete_worktree);
         let warned_branches = target.warned_branches();
-        let branch_label = delete_agent_branch_checkbox_label(&warned_branches);
+        let branch_label = delete_agent_branch_checkbox_prose(&warned_branches);
         // ONE measuring pass over every checkbox that will be painted, so a
         // second box cannot silently overflow the frame the first one sized.
-        let measure = |label: &str, checked: bool, focused: bool| {
+        // Each box is measured as the same widget it is painted as.
+        let measure = |checkbox: Checkbox<'_>, checked: bool, focused: bool| {
             let state = if focused {
                 CheckboxState::Focused
             } else {
                 CheckboxState::Normal
             };
-            let checkbox = Checkbox::new(label).checked(checked).state(state);
+            let checkbox = checkbox.checked(checked).state(state);
             checkbox
                 .layout(
                     inner_width,
@@ -10108,7 +10194,7 @@ impl App {
         };
         let checkbox_height = if offers_checkbox {
             measure(
-                DELETE_AGENT_WORKTREE_LABEL,
+                Checkbox::new(DELETE_AGENT_WORKTREE_LABEL),
                 *delete_worktree,
                 *focus == DeleteAgentFocus::WorktreeCheckbox,
             )
@@ -10117,7 +10203,7 @@ impl App {
         };
         let branch_checkbox_height = if offers_branch_checkbox {
             measure(
-                &branch_label,
+                Checkbox::with_prose(&branch_label, &self.theme),
                 *delete_branch,
                 *focus == DeleteAgentFocus::BranchCheckbox,
             )
@@ -10132,10 +10218,7 @@ impl App {
             Line::from(""),
             Line::from(vec![
                 Span::raw(" Are you sure you want to delete "),
-                Span::styled(
-                    agent_label.as_str(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
+                name_chip(agent_label, &self.theme),
                 Span::raw("?"),
             ]),
             Line::from(""),
@@ -10163,15 +10246,16 @@ impl App {
             // The branch box below decides the branches, so the only thing left
             // to say is why these are ones to think twice about. When there is
             // nothing to say the helper says nothing.
-            if let Some(warning) =
-                delete_agent_branch_warning(branch_provenance, &warned_branches, *unpushed_commits)
-            {
-                for line in indented_body_lines(&warning, inner_width) {
-                    body_lines.push(Line::from(Span::styled(
-                        line,
-                        Style::default().fg(self.theme.warning_fg),
-                    )));
-                }
+            if let Some(warning) = delete_agent_branch_warning_prose(
+                branch_provenance,
+                &warned_branches,
+                *unpushed_commits,
+            ) {
+                body_lines.extend(self.indented_prose_lines(
+                    &warning,
+                    Style::default().fg(self.theme.warning_fg),
+                    inner_width,
+                ));
             }
         } else {
             body_lines.push(Line::from(Span::styled(
@@ -10249,7 +10333,7 @@ impl App {
             } else {
                 CheckboxState::Normal
             };
-            let (rect, _) = self.render_overlay_checkbox(
+            let (rect, _) = self.render_overlay_prose_checkbox(
                 frame,
                 branch_checkbox_area,
                 &branch_label,
@@ -10363,16 +10447,16 @@ impl App {
         let copy_checkbox_spacing = u16::from(show_copy_checkbox);
         let footer_spacing = 1;
         let context_line = match request {
-            CreateAgentRequest::ExistingManagedWorktree { worktree_path, .. } => Some(format!(
-                " This starts a fresh agent session in {}.",
-                worktree_path.display()
+            CreateAgentRequest::ExistingManagedWorktree { worktree_path, .. } => Some((
+                " This starts a fresh agent session in ",
+                worktree_path.display().to_string(),
             )),
             CreateAgentRequest::ForkExternalWorktree {
                 source_worktree_path,
                 ..
-            } => Some(format!(
-                " External worktree will be copied into a fresh managed dux worktree: {}.",
-                source_worktree_path.display()
+            } => Some((
+                " External worktree will be copied into a fresh managed dux worktree: ",
+                source_worktree_path.display().to_string(),
             )),
             _ => None,
         };
@@ -10428,11 +10512,18 @@ impl App {
             Style::default().fg(self.theme.input_label_fg),
         )))
         .render(label_area, frame.buffer_mut());
-        if let Some(context_line) = context_line {
-            Paragraph::new(Line::from(Span::styled(
-                git::ellipsize_middle(&context_line, inner.width as usize),
-                Style::default().fg(self.theme.hint_desc_fg),
-            )))
+        if let Some((lead, path)) = context_line {
+            // One row: the path gives up its middle so the sentence and the
+            // chip's two pads still fit.
+            let room = usize::from(inner.width)
+                .saturating_sub(display_width(lead))
+                .saturating_sub(3);
+            let hint = Style::default().fg(self.theme.hint_desc_fg);
+            Paragraph::new(Line::from(vec![
+                Span::styled(lead, hint),
+                name_chip(&git::ellipsize_middle(&path, room), &self.theme),
+                Span::styled(".", hint),
+            ]))
             .render(context_area, frame.buffer_mut());
         }
 
@@ -10579,7 +10670,7 @@ impl App {
             Line::from(""),
             Line::from(vec![
                 Span::raw(" Are you sure you want to delete "),
-                Span::styled(agent_label, Style::default().add_modifier(Modifier::BOLD)),
+                name_chip(&agent_label, &self.theme),
                 Span::raw("?"),
             ]),
             Line::from(""),
@@ -10587,10 +10678,14 @@ impl App {
                 " This removes dux's record of the agent only.",
                 Style::default().fg(self.theme.hint_desc_fg),
             )),
-            Line::from(Span::styled(
-                format!(" Its folder \"{folder_label}\" is left untouched."),
-                Style::default().fg(self.theme.hint_desc_fg),
-            )),
+            Line::from(vec![
+                Span::styled(" Its folder ", Style::default().fg(self.theme.hint_desc_fg)),
+                name_chip(&folder_label, &self.theme),
+                Span::styled(
+                    " is left untouched.",
+                    Style::default().fg(self.theme.hint_desc_fg),
+                ),
+            ]),
         ];
         self.render_delete_agent_frame(frame, dialog_width, inner_width, body_lines, focus);
         true
@@ -10860,10 +10955,10 @@ impl App {
     /// see is not focus.
     fn render_macro_editor(&mut self, frame: &mut Frame, popup: Rect, state: &MacroEditState) {
         let title = match &state.id {
-            Some(name) => format!("Edit Macro: {name}"),
-            None => "New Macro".to_string(),
+            Some(name) => Prose::new().text("Edit Macro: ").name(name.as_str()),
+            None => Prose::from("New Macro"),
         };
-        let outer = self.themed_overlay_block(&title);
+        let outer = self.themed_overlay_block_prose(&title);
         outer.render(popup, frame.buffer_mut());
 
         let [
@@ -11175,7 +11270,7 @@ impl App {
             Line::from(""),
             Line::from(vec![
                 Span::raw(" Are you sure you want to delete "),
-                Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
+                name_chip(name, &self.theme),
                 Span::raw("?"),
             ]),
             Line::from(""),
@@ -11751,13 +11846,28 @@ impl App {
     }
 
     pub(super) fn themed_overlay_block<'a>(&self, title: &'a str) -> Block<'a> {
+        self.overlay_block_titled(Line::from(Span::styled(title, self.overlay_title_style())))
+    }
+
+    /// [`Self::themed_overlay_block`] for a title that names something: the
+    /// words in the title style, every name as the shared chip.
+    pub(super) fn themed_overlay_block_prose<'a>(&self, title: &Prose) -> Block<'a> {
+        self.overlay_block_titled(Line::from(prose_spans(
+            title,
+            self.overlay_title_style(),
+            &self.theme,
+        )))
+    }
+
+    fn overlay_title_style(&self) -> Style {
+        Style::default()
+            .fg(self.theme.input_label_fg)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    fn overlay_block_titled<'a>(&self, title: Line<'a>) -> Block<'a> {
         Block::default()
-            .title(Line::from(Span::styled(
-                title,
-                Style::default()
-                    .fg(self.theme.input_label_fg)
-                    .add_modifier(Modifier::BOLD),
-            )))
+            .title(title)
             .borders(Borders::ALL)
             .border_set(border::ROUNDED)
             // The border ring doubles as the modal's refusal cue: while the
@@ -12975,17 +13085,22 @@ fn close_tab_detaches(closing_tab_is_live: bool, live_tabs: usize) -> bool {
 /// session slot on (which it does when the closed tab is the one holding it,
 /// and `successor` then names the tab taking its place). Mirrors the web's
 /// `ConfirmCloseTabDialog.tsx` so the two surfaces promise the same thing.
+#[cfg(test)]
 fn confirm_close_tab_tail(will_detach: bool, successor: Option<&str>) -> String {
-    let mut tail = if will_detach {
+    confirm_close_tab_tail_prose(will_detach, successor).plain()
+}
+
+/// What closing the tab costs, with the successor tab marked as a name.
+fn confirm_close_tab_tail_prose(will_detach: bool, successor: Option<&str>) -> Prose {
+    let mut tail = Prose::new().text(if will_detach {
         " It's this agent's last live tab, so the agent detaches and stays in Projects, reopenable."
-            .to_string()
     } else {
-        " dux deletes this tab for good. A new tab always starts fresh, so use your provider's own history command to get back to this conversation.".to_string()
-    };
+        " dux deletes this tab for good. A new tab always starts fresh, so use your provider's own history command to get back to this conversation."
+    });
     if let Some(successor) = successor {
-        tail.push_str(&format!(
-            " The next tab, {successor}, takes its place as the agent's first tab."
-        ));
+        tail.push_text(" The next tab, ");
+        tail.push_name(successor);
+        tail.push_text(", takes its place as the agent's first tab.");
     }
     tail
 }
@@ -13000,6 +13115,21 @@ mod tests {
     };
     use crate::model::{CompanionTerminal, SessionSurface};
     use crate::pty::PtyClient;
+
+    /// How `prose` reads on screen: its words, and every name as the chip's
+    /// text (the name between its two no-break pads), quotes gone.
+    fn on_screen(prose: &Prose) -> String {
+        prose
+            .segments()
+            .iter()
+            .map(|segment| match segment {
+                dux_core::prose::ProseSegment::Text(text) => text.clone(),
+                dux_core::prose::ProseSegment::Name { name, .. } => {
+                    format!("\u{a0}{name}\u{a0}")
+                }
+            })
+            .collect()
+    }
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans
@@ -23034,7 +23164,7 @@ mod tests {
             "the modal must name what it creates:\n{screen}"
         );
         assert!(
-            screen.contains("defaults to \"notes\""),
+            screen.contains("defaults to \u{a0}notes\u{a0}"),
             "an empty field must promise the folder's own name:\n{screen}"
         );
         assert!(
@@ -23483,7 +23613,10 @@ mod tests {
             !title.contains('\u{2014}'),
             "shipped title still holds an em-dash: {title:?}"
         );
-        assert!(title.contains("Edit Macro: greet"), "got {title:?}");
+        assert!(
+            title.contains("Edit Macro: \u{a0}greet\u{a0}"),
+            "got {title:?}"
+        );
     }
 
     /// A drifted agent gives up two branches, and the box names both: the one
@@ -23508,8 +23641,15 @@ mod tests {
         };
         let screen = rendered_screen(&mut app);
         assert!(
-            screen.contains("Also delete the branches feature-x and main"),
+            screen.contains(&on_screen(&super::delete_agent_branch_checkbox_prose(&[
+                "feature-x",
+                "main"
+            ]))),
             "the box names every branch the tick would delete:\n{screen}"
+        );
+        assert!(
+            screen.contains("Also delete the branches"),
+            "the box says what it does:\n{screen}"
         );
     }
 
@@ -23547,7 +23687,7 @@ mod tests {
         app.prompt = confirm(&app, Some("free"), false, true);
         let screen = rendered_screen(&mut app);
         assert!(
-            screen.contains("Delete the worktree for free?"),
+            screen.contains(&on_screen(&super::delete_worktree_title_prose("free"))),
             "the dialog asks the web dialog's question:\n{screen}"
         );
         assert!(
@@ -23559,7 +23699,9 @@ mod tests {
             "the removal is forced and cannot be undone:\n{screen}"
         );
         assert!(
-            screen.contains("Also delete the branch free"),
+            screen.contains(&on_screen(&super::delete_worktree_checkbox_prose(Some(
+                "free"
+            )))),
             "the checkbox names the branch:\n{screen}"
         );
         assert!(
@@ -23585,7 +23727,9 @@ mod tests {
         app.prompt = confirm(&app, None, false, true);
         let screen = rendered_screen(&mut app);
         assert!(
-            screen.contains("Delete the worktree for detached 1a2b3c4?"),
+            screen.contains(&on_screen(&super::delete_worktree_title_prose(
+                "detached 1a2b3c4"
+            ))),
             "a detached worktree is named by its row label:\n{screen}"
         );
         assert!(
@@ -23701,7 +23845,9 @@ mod tests {
             "the rendered worktree label must be the constant's:\n{screen}"
         );
         assert!(
-            screen.contains(&super::delete_agent_branch_checkbox_label(&["feature"])),
+            screen.contains(&on_screen(&super::delete_agent_branch_checkbox_prose(&[
+                "feature"
+            ]))),
             "the rendered branch label must be the helper's:\n{screen}"
         );
     }
@@ -24151,11 +24297,25 @@ mod tests {
             pushed_nowhere(4),
         );
         let screen = rendered_screen(&mut app);
+        // The chips make the label wrap at this width, so the label is read
+        // across the rows the checkbox takes, joined the way the wrap split it.
+        let label_rows = screen
+            .lines()
+            .skip_while(|row| !row.contains("[x] Also delete the branches"))
+            .take(2)
+            .map(|row| row.trim_matches(|c: char| c == '│' || c == ' '))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let label_words = |text: &str| {
+            text.split(|c: char| c.is_whitespace())
+                .filter(|word| !word.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         assert!(
-            screen.contains(&super::delete_agent_branch_checkbox_label(&[
-                "develop-next",
-                "develop"
-            ])),
+            label_words(&label_rows).contains(&label_words(&on_screen(
+                &super::delete_agent_branch_checkbox_prose(&["develop-next", "develop"])
+            ))),
             "the box must name every branch the tick would delete:\n{screen}"
         );
         assert_eq!(
@@ -24818,7 +24978,7 @@ mod tests {
         let (text, fg, _) = render_branch_dialog(&mut app, "feature", true);
 
         assert!(
-            text.contains("New worktrees will branch from \"main\"."),
+            text.contains("New worktrees will branch from \u{a0}main\u{a0}."),
             "{text}"
         );
         assert_ne!(fg, app.theme.warning_fg, "the default branch is no warning");
@@ -24831,7 +24991,7 @@ mod tests {
         let (text, fg, _) = render_branch_dialog(&mut app, "feature", false);
 
         assert!(
-            text.contains("New worktrees will branch from \"feature\"."),
+            text.contains("New worktrees will branch from \u{a0}feature\u{a0}."),
             "{text}"
         );
         assert_eq!(fg, app.theme.warning_fg);
@@ -24891,7 +25051,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let _ = confirm_button;
-        let body = dux_core::engine::checkout_default_branch_confirm_body("demo", Some("develop"));
+        let body = on_screen(&dux_core::engine::checkout_default_branch_confirm_prose(
+            "demo",
+            Some("develop"),
+        ))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
         assert!(text.contains(&body), "expected the core body in:\n{text}");
 
         let buttons: String = (cancel_button.y..cancel_button.y + cancel_button.height)
