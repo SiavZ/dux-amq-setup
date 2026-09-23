@@ -9,6 +9,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import { Textarea } from "@/components/ui/textarea"
 import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
 import { envToText, parseEnv } from "@/lib/env"
@@ -40,10 +41,12 @@ function AgentEnvForm({
   return (
     <DialogContent showCloseButton={false}>
       <DialogHeader>
-        <DialogTitle>Environment: {agentName}</DialogTitle>
+        <DialogTitle>
+          Environment: <InlineCode>{agentName}</InlineCode>
+        </DialogTitle>
         <DialogDescription>
           KEY=VALUE per line, applied to every agent and terminal in project{" "}
-          <span className="font-medium">{project.name}</span> (layered over the
+          <InlineCode>{project.name}</InlineCode> (layered over the
           global env). This applies to the whole project, not just this agent.
         </DialogDescription>
       </DialogHeader>

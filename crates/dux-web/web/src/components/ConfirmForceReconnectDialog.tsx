@@ -7,6 +7,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
 import {
   closeForceReconnect,
@@ -49,7 +50,8 @@ export function ConfirmForceReconnectDialog() {
       <DialogContent showCloseButton={false} destructive>
         <DialogHeader>
           <DialogTitle>
-            Force recreate <span className="break-all">{name || "agent"}</span>?
+            Force recreate{" "}
+            {name ? <InlineCode>{name}</InlineCode> : "agent"}?
           </DialogTitle>
           <DialogDescription>
             Do you want to force reconnect the agent? This will start a fresh

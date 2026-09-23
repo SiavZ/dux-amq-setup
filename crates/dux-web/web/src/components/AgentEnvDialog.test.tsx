@@ -70,7 +70,12 @@ describe("AgentEnvDialog", () => {
   it("renders the form when session and project resolve", () => {
     seed("s1", [session], [project])
     render(<AgentEnvDialog />)
-    expect(screen.getByText("Environment: quacky-mallard")).toBeTruthy()
+    // The agent in the title and the project in the body are both chips.
+    expect(screen.getByRole("heading").textContent).toBe(
+      "Environment: quacky-mallard",
+    )
+    expect(screen.getByText("quacky-mallard", { selector: "code" })).toBeTruthy()
+    expect(screen.getByText("acme", { selector: "code" })).toBeTruthy()
     expect(closeAgentEnv).not.toHaveBeenCalled()
   })
 

@@ -49,6 +49,7 @@ function installBootStubs() {
 installBootStubs()
 const { StartupLogsDialog } = await import("./StartupLogsDialog")
 const { startupLogsCopy } = await import("./startupLogsCopy")
+const { chip } = await import("@/lib/prose")
 
 const SPINE = {
   projects: [{ id: "p1", name: "Repo" }],
@@ -96,7 +97,10 @@ afterEach(() => {
 describe("StartupLogsDialog", () => {
   it("names the AGENT in agent scope", () => {
     renderOpen({ startupLogsTarget: "s1", startupLogsScope: "agent", ...ONE_RUN })
-    expect(screen.getByText(/Startup command logs: Fix login/)).toBeTruthy()
+    expect(screen.getByRole("heading").textContent).toBe(
+      "Startup command logs: Fix login",
+    )
+    expect(screen.getByText("Fix login", { selector: "code" })).toBeTruthy()
     expect(screen.getByText(/in this agent's worktree/)).toBeTruthy()
     expect(screen.getByText("install ok")).toBeTruthy()
   })
@@ -109,7 +113,10 @@ describe("StartupLogsDialog", () => {
 
   it("names the PROJECT and says it spans every agent in project scope", () => {
     renderOpen({ startupLogsTarget: "p1", startupLogsScope: "project", ...ONE_RUN })
-    expect(screen.getByText(/Startup command logs: Repo \(all agents\)/)).toBeTruthy()
+    expect(screen.getByRole("heading").textContent).toBe(
+      "Startup command logs: Repo (all agents)",
+    )
+    expect(screen.getByText("Repo", { selector: "code" })).toBeTruthy()
     expect(screen.getByText(/across every agent in this project/)).toBeTruthy()
     // The agent-scope subtitle must not leak into the project view.
     expect(screen.queryByText(/in this agent's worktree/)).toBeNull()
@@ -168,27 +175,36 @@ describe("StartupLogsDialog", () => {
 describe("startupLogsCopy", () => {
   it("names the entity in the title and the breadth in the subtitle", () => {
     const project = startupLogsCopy("project", "Repo", undefined)
-    expect(project.title).toBe("Startup command logs: Repo (all agents)")
+    expect(project.title).toEqual([
+      "Startup command logs: ",
+      chip("Repo"),
+      " (all agents)",
+    ])
     expect(project.description).toContain("across every agent in this project")
     expect(project.emptyMessage).toContain("for an agent in this project")
 
     const agent = startupLogsCopy("agent", undefined, "Fix login")
-    expect(agent.title).toBe("Startup command logs: Fix login")
+    expect(agent.title).toEqual(["Startup command logs: ", chip("Fix login")])
     expect(agent.description).toContain("in this agent's worktree")
     expect(agent.emptyMessage).toContain("for this agent")
   })
 
   it("falls back to the generic noun when the entity is not in the spine", () => {
-    expect(startupLogsCopy("project", undefined, undefined).title).toBe(
+    // A generic noun is prose, not a name, so it is no chip.
+    expect(startupLogsCopy("project", undefined, undefined).title).toEqual([
       "Startup command logs: project (all agents)",
-    )
-    expect(startupLogsCopy("agent", undefined, undefined).title).toBe(
+    ])
+    expect(startupLogsCopy("agent", undefined, undefined).title).toEqual([
       "Startup command logs: agent",
-    )
+    ])
   })
 
   it("ignores the other scope's name", () => {
-    expect(startupLogsCopy("project", "Repo", "Fix login").title).toContain("Repo")
-    expect(startupLogsCopy("agent", "Repo", "Fix login").title).toContain("Fix login")
+    expect(startupLogsCopy("project", "Repo", "Fix login").title).toContainEqual(
+      chip("Repo"),
+    )
+    expect(startupLogsCopy("agent", "Repo", "Fix login").title).toContainEqual(
+      chip("Fix login"),
+    )
   })
 })

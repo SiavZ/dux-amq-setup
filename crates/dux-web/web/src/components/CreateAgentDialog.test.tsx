@@ -74,7 +74,8 @@ describe("CreateAgentDialog", () => {
     const { CreateAgentDialog } = await import("./CreateAgentDialog")
     render(<CreateAgentDialog />)
 
-    expect(screen.getByText("New agent in acme")).toBeTruthy()
+    expect(screen.getByRole("heading").textContent).toBe("New agent in acme")
+    expect(screen.getByText("acme", { selector: "code" })).toBeTruthy()
     expect(screen.getByRole("button", { name: "Create agent" })).toBeTruthy()
     expect(
       screen.getByText("Copy uncommitted changes from the project checkout"),
@@ -86,7 +87,10 @@ describe("CreateAgentDialog", () => {
     const { CreateAgentDialog } = await import("./CreateAgentDialog")
     render(<CreateAgentDialog />)
 
-    expect(screen.getByText("Fork quacky-mallard")).toBeTruthy()
+    expect(screen.getByRole("heading").textContent).toBe("Fork quacky-mallard")
+    expect(
+      screen.getByText("quacky-mallard", { selector: "code" }),
+    ).toBeTruthy()
     expect(screen.getByPlaceholderText("Branch name")).toBeTruthy()
     expect(
       (screen.getByRole("button", { name: "Fork agent" }) as HTMLButtonElement)

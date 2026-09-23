@@ -11,6 +11,7 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { sanitizeAgentName } from "@/lib/agentName"
+import { renderProse } from "@/lib/prose"
 import type { ChangeEvent, KeyboardEvent } from "react"
 import {
   createAgentDialogView,
@@ -58,7 +59,7 @@ export function CreateAgentDialog() {
     <Dialog open={dialog.open} onOpenChange={handleOpenChange}>
       <DialogContent showCloseButton={false}>
         <DialogHeader>
-          <DialogTitle>{dialog.title}</DialogTitle>
+          <DialogTitle>{renderProse(dialog.title)}</DialogTitle>
           <DialogDescription>{dialog.description}</DialogDescription>
         </DialogHeader>
         <PrReferenceFields

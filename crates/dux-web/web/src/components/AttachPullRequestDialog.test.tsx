@@ -97,7 +97,11 @@ describe("AttachPullRequestDialog", () => {
     seed("s1", "", [withAutoPr])
     render(<AttachPullRequestDialog />)
     expect(screen.getByText(/Currently showing/)).toBeTruthy()
-    expect(screen.getByText(/#7 Fix the flap/)).toBeTruthy()
+    expect(screen.getByText(/Currently showing/).textContent).toContain(
+      "#7 Fix the flap",
+    )
+    // The number is the shared chip.
+    expect(screen.getByText("#7", { selector: "code" })).toBeTruthy()
     // Autodetected: not called out as manually attached.
     expect(screen.queryByText(/manually attached/)).toBeNull()
   })

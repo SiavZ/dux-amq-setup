@@ -7,6 +7,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import { Input } from "@/components/ui/input"
 import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
 import {
@@ -58,7 +59,7 @@ export function AttachPullRequestDialog() {
           <p className="text-sm text-muted-foreground">
             Currently showing{" "}
             <span className="text-foreground">
-              #{pr.number} {pr.title}
+              <InlineCode>#{pr.number}</InlineCode> {pr.title}
             </span>
             {pr.overridden ? " (manually attached)" : ""}. Attaching replaces
             it.
