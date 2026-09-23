@@ -50,7 +50,7 @@ function rowTooltip(entry: ProjectWorktreeEntryView): ReactNode {
   return (
     <span className="flex flex-col gap-0.5">
       {entry.reason ? <span>{entry.reason}</span> : null}
-      <InlineCode>{entry.branch_name}</InlineCode>
+      <span className="font-mono">{entry.branch_name}</span>
       <span>{entry.worktree_path}</span>
     </span>
   )
@@ -158,7 +158,9 @@ function ConfirmDeleteWorktree() {
     >
       <DialogContent showCloseButton={false} destructive>
         <DialogHeader>
-          <DialogTitle>Delete the worktree for {entry?.branch_name}?</DialogTitle>
+          <DialogTitle>
+            Delete the worktree for <InlineCode>{entry?.branch_name}</InlineCode>?
+          </DialogTitle>
         </DialogHeader>
         <div
           data-testid="delete-worktree-confirm"
@@ -277,7 +279,9 @@ function WorktreesBody({ projectId }: { projectId: string }) {
   return (
     <DialogContent className="sm:max-w-xl" showCloseButton={false}>
       <DialogHeader>
-        <DialogTitle>Worktrees in {projectName}</DialogTitle>
+        <DialogTitle>
+          Worktrees in <InlineCode>{projectName}</InlineCode>
+        </DialogTitle>
         <DialogDescription>
           Every worktree dux manages for this project. Pick an unused one to
           start an agent on its existing branch, or remove one you are done with.

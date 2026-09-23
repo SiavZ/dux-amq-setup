@@ -7,6 +7,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
 import { closeTabConsequences } from "@/lib/agentTabs"
 import { DOCS_AGENT_TABS_CLOSING } from "@/lib/docs"
@@ -70,9 +71,13 @@ export function ConfirmCloseTabDialog() {
             {willDetach
               ? " It's this agent's last live tab, so the agent detaches and stays in Projects, reopenable."
               : ""}
-            {successorLabel
-              ? ` The next tab, ${successorLabel}, takes its place as the agent's first tab.`
-              : ""}{" "}
+            {successorLabel ? (
+              <>
+                {" "}
+                The next tab, <InlineCode>{successorLabel}</InlineCode>, takes its
+                place as the agent&rsquo;s first tab.
+              </>
+            ) : null}{" "}
             <a
               href={DOCS_AGENT_TABS_CLOSING}
               target="_blank"

@@ -7,6 +7,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import {
   closeExistingBranch,
   confirmCreateWithExistingBranch,
@@ -36,10 +37,11 @@ export function ConfirmUseExistingBranchDialog() {
       <DialogContent showCloseButton={false} destructive>
         <DialogHeader>
           <DialogTitle>
-            Attach to existing branch “<span className="break-all">{name}</span>”?
+            Attach to existing branch <InlineCode>{name}</InlineCode>?
           </DialogTitle>
           <DialogDescription>
-            A branch named “<span className="break-all">{name}</span>” already exists {where}. Creating this agent
+            A branch named <InlineCode>{name}</InlineCode> already exists{" "}
+            {where}. Creating this agent
             will attach to that branch and adopt its history, not start a fresh
             branch. Continue, or cancel and pick a different name.
           </DialogDescription>
