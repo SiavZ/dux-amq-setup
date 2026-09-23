@@ -56,7 +56,8 @@ export function CheckoutDefaultBranchDialog() {
           <Button variant="outline" onClick={closeCheckoutDefaultBranch}>
             Cancel
           </Button>
-          <Button onClick={handleConfirm}>Checkout default branch</Button>
+          {/* The terminal UI's confirm button reads the same. */}
+          <Button onClick={handleConfirm}>Check out default branch</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

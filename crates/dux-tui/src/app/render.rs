@@ -292,6 +292,10 @@ pub(crate) const AGENT_WORKING_WORD: &str = "Working";
 /// at one.
 pub(crate) const TERMINAL_WORKING_WORD: &str = "Running";
 
+/// The confirm button of the check-out-default-branch dialog. The browser's
+/// dialog carries the same label; keep them in step.
+const CHECKOUT_DEFAULT_BRANCH_LABEL: &str = "Check out default branch";
+
 /// The colored state word on an agent row's second line, read off the same flags
 /// that drive the working spinner and the attention pulse so the word cannot
 /// disagree with the motion cue. Mirrors the web's `stateWord`
@@ -7936,7 +7940,7 @@ impl App {
         };
     }
 
-    /// "Check out the default branch?": prose and a Cancel / Check out pair, the
+    /// "Check out the default branch?": prose and a Cancel / confirm pair, the
     /// Confirm family, Cancel focused. The body is
     /// `dux_core::engine::checkout_default_branch_confirm_body`, the same words
     /// the browser's dialog prints.
@@ -7979,7 +7983,7 @@ impl App {
             .wrap(Wrap { trim: false })
             .render(body_area, frame.buffer_mut());
 
-        let btn_width = shared_button_width(&["Cancel", "Check out"]);
+        let btn_width = shared_button_width(&["Cancel", CHECKOUT_DEFAULT_BRANCH_LABEL]);
         let gap = 2u16;
         let total = btn_width * 2 + gap;
         let left_offset = buttons_area.width.saturating_sub(total) / 2;
@@ -8006,8 +8010,10 @@ impl App {
             ))
             .render(frame, cancel_area, &self.theme);
 
-        Button::new("Check out")
-            .kind(ButtonKind::Danger)
+        // The safe kind, like the browser's primary (not destructive) button:
+        // the checkout moves HEAD but loses nothing.
+        Button::new(CHECKOUT_DEFAULT_BRANCH_LABEL)
+            .kind(ButtonKind::Confirm)
             .state(button_state_for(
                 ButtonPressedTarget::ConfirmCheckoutDefaultBranchConfirm,
                 self.pressed_button,
@@ -24893,7 +24899,25 @@ mod tests {
             .map(|(x, y)| buffer[(x, y)].symbol().to_string())
             .collect();
         assert!(buttons.contains("Cancel"), "{buttons}");
-        assert!(buttons.contains("Check out"), "{buttons}");
+        assert!(buttons.contains("Check out default branch"), "{buttons}");
+
+        // Not a destructive act, so not a Danger button: focused, the confirm
+        // button paints exactly like the focused Cancel (the safe kind), the way
+        // the browser's dialog uses its primary rather than destructive button.
+        let focused_cancel = buffer[(cancel_button.x, cancel_button.y)].style();
+        let PromptState::ConfirmCheckoutDefaultBranch { focus, .. } = &mut app.prompt else {
+            unreachable!("the prompt is still open");
+        };
+        *focus = ConfirmFocus::Confirm;
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render frame");
+        let focused_confirm =
+            terminal.backend().buffer()[(confirm_button.x, confirm_button.y)].style();
+        assert_eq!(
+            focused_confirm, focused_cancel,
+            "the confirm button must use the non-destructive kind"
+        );
     }
 
     #[test]
