@@ -838,14 +838,30 @@ has `--no-update` force-injected (and `resume_by_id_args` repeats it, since
 resume args replace base args), pinning the pane's binary for the PTY's
 lifetime. Subcommand invocations (`run`, `usage`, `telemetry`, ...) bypass
 identity and wake claims, so oneshot work cannot register or hold an AMQ
-handle. Wrapped sessions use the same owner-bound co-op wake, flock-guarded
+handle. The wrapper's contract (`--no-update`, `--resume [<id>]`,
+`run --quiet`, `debug -S <session> client:message` / `clients:map`, and the
+`recent_sessions` table in `session-metadata-v1.sqlite3` that auto-resume
+reads) has been verified through jcode v0.88.0.
+
+**Operator note: upgrading jcode under a running fleet.** The shared `serve`
+daemon keeps the old binary mapped after the files on disk are replaced, so
+panes attached to it keep running the previous version. jcode's own
+`server reload` compares binary timestamps and, once the old file is deleted
+or renamed away, reports "already the newest binary" and does nothing;
+`jcode --no-update server reload --force` performs the graceful in-place
+handoff (same pid, live sessions preserved). `jcode server stop` without
+`--force` is refused by jcode, and with it kills every attached pane; check
+`jcode debug clients:map` first. Replace the launcher and `.bin` by rename
+(copy to a temporary name, then `mv`), since the daemon holds the file busy. Wrapped sessions use the same owner-bound co-op wake, flock-guarded
 registration, and inject-bridge verification path as the other wrappers.
 
 The inject-bridge can deliver AMQ wakes through each provider's own push
 channel instead of typing into the PTY: claude panes via the claude-peers
-channel (`dux peer send --transport claude-peers`, live pane resolved by
-process ancestry) and jcode panes via the daemon's client protocol
-(`jcode debug client:message`). This is **opt-in** (`DUX_AMQ_NATIVE_DELIVERY=1`)
+channel (`dux peer send --transport claude-peers`, the live registration
+chosen by host kind: daemon-hosted session, then the pane dux spawned, then
+other clients, daemon spares last) and jcode panes via the daemon's client
+protocol (`jcode debug -S <session> client:message`, the session matched to
+the receiver's worktree via `clients:map`). This is **opt-in** (`DUX_AMQ_NATIVE_DELIVERY=1`)
 and requires jcode's `display.debug_socket = true`; a stock install keeps the
 file-queue/drainer path. When enabled, readiness is checked before the inbox
 is drained so a held message is retried rather than lost, an unreachable
