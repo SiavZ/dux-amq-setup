@@ -41,6 +41,7 @@ use crate::engine::{
 };
 use crate::ids::{SessionIdRef, TabId, TabIdRef};
 use crate::model::{Project, ProjectBranchStatus, ProviderKind};
+use crate::status_text::{StatusSegment, StatusText};
 use crate::statusline::{QuietSurfaces, StatusScope};
 use crate::worker::{
     CreateAgentRequest, NonDefaultBranchAction, ProjectPersistenceAction, PullTarget,
@@ -905,6 +906,12 @@ pub struct WireStatus {
     /// "info" | "busy" | "warning" | "error"
     pub tone: String,
     pub message: String,
+    /// The parts `message` was built from, in the browser's `Prose` shape
+    /// (words as strings, names as `{ name, quoted }`), so a toast draws each
+    /// name as a chip. Absent for a plain sentence, and an older peer that never
+    /// sends it reads as plain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segments: Option<Vec<StatusSegment>>,
     /// `None` = an unkeyed transient (anonymous slot). `Some` = a keyed op whose
     /// later success/error/clear carries the same key so the surfaces correlate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -986,10 +993,12 @@ fn quiet_web_when(status: WireStatus, quiet: bool) -> WireStatus {
 
 impl WireStatus {
     /// Construct a wire status directly (for non-reaction sources like PTY-exit notices).
-    pub fn new(tone: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn new(tone: impl Into<String>, message: impl Into<StatusText>) -> Self {
+        let (message, segments) = message.into().into_parts();
         Self {
             tone: tone.into(),
-            message: message.into(),
+            message,
+            segments,
             key: None,
             scope: StatusScope::All,
             sticky: false,
@@ -1001,11 +1010,13 @@ impl WireStatus {
     pub fn keyed(
         key: impl Into<String>,
         tone: impl Into<String>,
-        message: impl Into<String>,
+        message: impl Into<StatusText>,
     ) -> Self {
+        let (message, segments) = message.into().into_parts();
         Self {
             tone: tone.into(),
-            message: message.into(),
+            message,
+            segments,
             key: Some(key.into()),
             scope: StatusScope::All,
             sticky: false,
@@ -1049,6 +1060,7 @@ impl WireStatus {
         Self {
             tone: update.tone.as_wire().to_string(),
             message: update.message.clone(),
+            segments: update.segments.clone(),
             key: update.key.clone(),
             scope: update.scope.clone(),
             sticky: update.sticky,
@@ -4074,11 +4086,13 @@ impl Engine {
                 crate::engine::Final::Message {
                     tone,
                     text,
+                    segments,
                     sticky,
                     quiet_on,
                 } => WebFollowupStatuses {
                     statuses: vec![{
-                        let s = WireStatus::new(tone.as_wire(), text);
+                        let s =
+                            WireStatus::new(tone.as_wire(), StatusText::from_parts(text, segments));
                         let s = if sticky { s.sticky() } else { s };
                         // The outcome decided its own per-surface answer; this
                         // path carries the web half rather than re-deciding it.
@@ -4789,6 +4803,55 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_status_built_from_parts_carries_its_segments_on_the_wire() {
+        let update = StatusUpdate::info(crate::status_text![
+            "Checked out ",
+            q("main"),
+            " in ",
+            n("/src/app"),
+            "."
+        ]);
+        let wire = WireStatus::from_update(&update);
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(json["message"], "Checked out \"main\" in /src/app.");
+        assert_eq!(
+            json["segments"],
+            serde_json::json!([
+                "Checked out ",
+                {"name": "main", "quoted": true},
+                " in ",
+                {"name": "/src/app", "quoted": false},
+                "."
+            ])
+        );
+        let back: WireStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(back, wire);
+    }
+
+    #[test]
+    fn a_plain_status_leaves_the_segments_field_out() {
+        let wire = WireStatus::from_update(&StatusUpdate::info(format!("plain {}", 1)));
+        let json = serde_json::to_value(&wire).unwrap();
+        assert!(json.get("segments").is_none(), "got {json}");
+        let old: WireStatus =
+            serde_json::from_value(serde_json::json!({"tone": "info", "message": "m"})).unwrap();
+        assert_eq!(old.segments, None);
+    }
+
+    #[test]
+    fn a_resolved_final_carries_its_segments_into_the_reaction() {
+        let final_ = crate::engine::Final::warning(crate::status_text!["Kept ", q("dev"), "."]);
+        let reaction = crate::engine::ResolvedFinal::new("op-1", final_).into_reaction();
+        let statuses = wire_statuses_from_reaction(&reaction);
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].message, "Kept \"dev\".");
+        assert_eq!(
+            statuses[0].segments.as_deref(),
+            crate::status_text!["Kept ", q("dev"), "."].segments()
+        );
+    }
     use crate::engine::test_support::{
         sample_project, sample_session, sample_standalone_session, settle_gh_probe, test_engine,
     };

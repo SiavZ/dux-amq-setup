@@ -59,6 +59,7 @@ pub mod scroll_hint;
 pub mod scroll_margins;
 pub mod sidebar;
 pub mod startup;
+pub mod status_text;
 pub mod statusline;
 pub mod storage;
 pub mod tab_verdict;

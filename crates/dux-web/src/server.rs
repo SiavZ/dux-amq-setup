@@ -2553,6 +2553,10 @@ struct WireStatusEvent {
     key: Option<String>,
     tone: String,
     message: String,
+    /// The parts `message` was built from, so the toast draws each name as a
+    /// chip; left out for a plain sentence. See [`dux_core::status_text`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    segments: Option<Vec<dux_core::status_text::StatusSegment>>,
     scope: StatusScope,
     sticky: bool,
 }
@@ -2886,6 +2890,7 @@ impl EventsSocketLoop {
                         key: status.key,
                         tone: status.tone,
                         message: status.message,
+                        segments: status.segments,
                         scope: status.scope,
                         sticky: status.sticky,
                     },
@@ -3339,6 +3344,7 @@ fn status_events(
             key: e.key.clone(),
             tone: e.tone.clone(),
             message: e.message.clone(),
+            segments: e.segments.clone(),
             scope: e.scope.clone(),
             sticky: e.sticky,
         })
@@ -4853,6 +4859,7 @@ mod tests {
             key: Some("pull".into()),
             tone: "busy".into(),
             message: "Pulling\u{2026}".into(),
+            segments: None,
             scope: StatusScope::All,
             sticky: false,
         }];
@@ -4870,6 +4877,28 @@ mod tests {
         );
     }
 
+    /// A replayed status built from parts carries them, so a page that joins
+    /// late still draws the names as chips.
+    #[test]
+    fn status_events_carry_a_named_sentence_s_segments() {
+        let named = dux_core::status_text!["Pushed ", q("main"), "."];
+        let (message, segments) = named.into_parts();
+        let snapshot = vec![KeyedWireStatus {
+            key: Some("push".into()),
+            tone: "info".into(),
+            message,
+            segments,
+            scope: StatusScope::All,
+            sticky: false,
+        }];
+        let events = status_events(&snapshot, "conn", &live_connections(&["conn"]));
+        let json = serde_json::to_string(&events[0]).unwrap();
+        assert_eq!(
+            json,
+            r#"{"event":"status","key":"push","tone":"info","message":"Pushed \"main\".","segments":["Pushed ",{"name":"main","quoted":true},"."],"scope":"all","sticky":false}"#
+        );
+    }
+
     /// A multi-entry snapshot produces one event per entry, in order.
     #[test]
     fn status_events_multi_entry_produces_n_events() {
@@ -4878,6 +4907,7 @@ mod tests {
                 key: Some("pull".into()),
                 tone: "busy".into(),
                 message: "Pulling\u{2026}".into(),
+                segments: None,
                 scope: StatusScope::All,
                 sticky: false,
             },
@@ -4885,6 +4915,7 @@ mod tests {
                 key: Some("commit".into()),
                 tone: "info".into(),
                 message: "Changes committed.".into(),
+                segments: None,
                 scope: StatusScope::All,
                 sticky: false,
             },
@@ -4892,6 +4923,7 @@ mod tests {
                 key: None,
                 tone: "warning".into(),
                 message: "Worktree dirty.".into(),
+                segments: None,
                 scope: StatusScope::All,
                 sticky: false,
             },
@@ -4910,6 +4942,7 @@ mod tests {
                 key: Some("op".into()),
                 tone: "info".into(),
                 message: String::new(),
+                segments: None,
                 scope: StatusScope::All,
                 sticky: false,
             },
@@ -4917,6 +4950,7 @@ mod tests {
                 key: Some("other".into()),
                 tone: "busy".into(),
                 message: "Working\u{2026}".into(),
+                segments: None,
                 scope: StatusScope::All,
                 sticky: false,
             },
@@ -5560,6 +5594,7 @@ mod tests {
                 key: Some("push".into()),
                 tone: "busy".into(),
                 message: "Pushing\u{2026}".into(),
+                segments: None,
                 scope: StatusScope::Connection("A".into()),
                 sticky: false,
             },
@@ -5567,6 +5602,7 @@ mod tests {
                 key: Some("commit".into()),
                 tone: "info".into(),
                 message: "Changes committed.".into(),
+                segments: None,
                 scope: StatusScope::All,
                 sticky: false,
             },
@@ -5593,6 +5629,7 @@ mod tests {
             key: Some("push".into()),
             tone: "busy".into(),
             message: "Pushing\u{2026}".into(),
+            segments: None,
             scope: StatusScope::Connection("A".into()),
             sticky: false,
         }];
@@ -5605,6 +5642,7 @@ mod tests {
             key: Some("push".into()),
             tone: "info".into(),
             message: "Pushed.".into(),
+            segments: None,
             scope: StatusScope::Connection("A".into()),
             sticky: false,
         }];

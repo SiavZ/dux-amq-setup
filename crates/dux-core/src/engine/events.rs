@@ -20,6 +20,7 @@ use crate::model::{
     AgentSession, GhStatus, PrState, Project, ProjectBranchStatus, ProviderKind, SessionStatus,
 };
 use crate::startup::StartupCommandLogListing;
+use crate::status_text::{StatusSegment, StatusText};
 use crate::statusline::{QuietSurfaces, StatusScope, StatusTone};
 use crate::storage::StoredPr;
 use crate::worker::{
@@ -66,7 +67,12 @@ pub(crate) fn branch_drift_log_line(
 #[derive(Clone, Debug)]
 pub struct StatusUpdate {
     pub tone: StatusTone,
+    /// The plain sentence: what the terminal UI prints, byte for byte.
     pub message: String,
+    /// The parts `message` was built from when a producer built it with
+    /// [`crate::status_text!`], so the web can draw its names as chips. `None`
+    /// for a sentence handed over as a finished string. The TUI never reads it.
+    pub segments: Option<Vec<StatusSegment>>,
     /// Optional correlation key. `None` = an unkeyed transient. `Some` = a
     /// keyed op whose later success/error/clear carries the same key so both
     /// surfaces can correlate the pair. Ignored by the TUI today; copied into
@@ -92,10 +98,12 @@ pub struct StatusUpdate {
 }
 
 impl StatusUpdate {
-    pub fn info(message: impl Into<String>) -> Self {
+    pub fn info(message: impl Into<StatusText>) -> Self {
+        let (message, segments) = message.into().into_parts();
         Self {
             tone: StatusTone::Info,
-            message: message.into(),
+            message,
+            segments,
             key: None,
             scope: StatusScope::All,
             sticky: false,
@@ -108,30 +116,36 @@ impl StatusUpdate {
     /// outcomes; only the `status_op` module is meant to call it.
     ///
     /// [`StatusOp`]: crate::engine::StatusOp
-    pub(crate) fn busy(message: impl Into<String>) -> Self {
+    pub(crate) fn busy(message: impl Into<StatusText>) -> Self {
+        let (message, segments) = message.into().into_parts();
         Self {
             tone: StatusTone::Busy,
-            message: message.into(),
+            message,
+            segments,
             key: None,
             scope: StatusScope::All,
             sticky: false,
             quiet_on: QuietSurfaces::LOUD,
         }
     }
-    pub fn warning(message: impl Into<String>) -> Self {
+    pub fn warning(message: impl Into<StatusText>) -> Self {
+        let (message, segments) = message.into().into_parts();
         Self {
             tone: StatusTone::Warning,
-            message: message.into(),
+            message,
+            segments,
             key: None,
             scope: StatusScope::All,
             sticky: false,
             quiet_on: QuietSurfaces::LOUD,
         }
     }
-    pub fn error(message: impl Into<String>) -> Self {
+    pub fn error(message: impl Into<StatusText>) -> Self {
+        let (message, segments) = message.into().into_parts();
         Self {
             tone: StatusTone::Error,
-            message: message.into(),
+            message,
+            segments,
             key: None,
             scope: StatusScope::All,
             sticky: false,
@@ -143,10 +157,12 @@ impl StatusUpdate {
     /// (info/error) for the same operation should carry the same key so
     /// `WireStatus::from_update` can propagate it and the web layer can
     /// dismiss the correct toast.
-    pub fn keyed(key: impl Into<String>, tone: StatusTone, message: impl Into<String>) -> Self {
+    pub fn keyed(key: impl Into<String>, tone: StatusTone, message: impl Into<StatusText>) -> Self {
+        let (message, segments) = message.into().into_parts();
         Self {
             tone,
-            message: message.into(),
+            message,
+            segments,
             key: Some(key.into()),
             scope: StatusScope::All,
             sticky: false,

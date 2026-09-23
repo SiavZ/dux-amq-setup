@@ -2953,7 +2953,10 @@ impl StatusEmitter {
             Instant::now(),
             status.key.clone(),
             tone,
-            status.message.as_str(),
+            dux_core::status_text::StatusText::from_parts(
+                status.message.clone(),
+                status.segments.clone(),
+            ),
             status.scope.clone(),
             status.sticky,
         );
@@ -3037,6 +3040,7 @@ impl StatusEmitter {
                 key: up.key,
                 tone: up.tone,
                 message: up.message,
+                segments: up.segments,
                 scope: up.scope,
                 sticky: up.sticky,
                 // A quiet status never reaches the controller, so nothing it
@@ -5325,6 +5329,34 @@ mod tests {
             controller: KeyedStatusController::emitting_finals(),
             generations: std::collections::HashMap::new(),
         }
+    }
+
+    #[test]
+    fn a_named_status_keeps_its_segments_in_the_replay_snapshot() {
+        let (mut e, snap) = make_emitter();
+        let named =
+            dux_core::status_text!["Checked out ", q("main"), " for project ", q("app"), "."];
+        let _ = e.send(WireStatus::keyed("checkout", "info", named.clone()));
+        let snapshot = snap.borrow().clone();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].message, named.message());
+        assert_eq!(snapshot[0].segments.as_deref(), named.segments());
+    }
+
+    #[test]
+    fn a_named_busy_is_re_broadcast_with_its_segments_on_a_heartbeat() {
+        let (tx, mut rx) = broadcast::channel::<WireStatus>(16);
+        let (clear_tx, _crx) = broadcast::channel::<Option<String>>(16);
+        let (snap_tx, _snap_rx) = watch::channel::<Vec<KeyedWireStatus>>(vec![]);
+        let live = dux_core::statusline::LiveStatusKeys::default();
+        live.register("pull");
+        let mut e = StatusEmitter::new(tx, clear_tx, snap_tx, Arc::new(AtomicUsize::new(1)), live);
+        let busy = dux_core::status_text!["Pulling ", q("main"), "\u{2026}"];
+        let _ = e.send(WireStatus::keyed("pull", "busy", busy.clone()));
+        let _ = rx.try_recv();
+        e.tick(Instant::now() + LAUNCH_TIMEOUT);
+        let again = rx.try_recv().expect("the live busy is re-sent");
+        assert_eq!(again.segments.as_deref(), busy.segments());
     }
 
     #[test]
