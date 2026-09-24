@@ -123,7 +123,7 @@ archive_checksum() {
   [ -x "$INSTALL_DIR/dux" ]
   grep -Fq -- "github.com/SiavZ/dux-amq-setup/releases/download/dux-amq-v1.2.3/dux-linux-amd64.tar.gz" "$CURL_LOG"
   grep -Fq -- "github.com/SiavZ/dux-amq-setup/releases/download/dux-amq-v1.2.3/dux-linux-amd64.tar.gz.sha256" "$CURL_LOG"
-  ! grep -Fq -- "patrickdappollonio" "$CURL_LOG"
+  ! grep -Fq -- "patrickdappollonio" "$CURL_LOG" || false
   [[ "$output" == *"Checksum verified"* ]]
 }
 
@@ -183,7 +183,7 @@ archive_checksum() {
   run env FAKE_API_LATEST=dux-amq-v0.3.0 DUX_INSTALL_DIR="$INSTALL_DIR" "$REPO_ROOT/install.sh"
   [ "$status" -eq 0 ]
   grep -Fxq -- "https://github.com/SiavZ/dux-amq-setup/releases/download/dux-amq-v0.3.0/dux-linux-amd64.tar.gz" "$CURL_LOG"
-  ! grep -q -- ' ' "$CURL_LOG"
+  ! grep -q -- ' ' "$CURL_LOG" || false
 }
 
 @test "root installer names the repository when no release can be resolved" {

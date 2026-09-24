@@ -173,7 +173,7 @@ EOF
   grep -q 'keep me' "$STATE_ROOT/claude/preserved.txt"
 
   # Confirm rsync was invoked WITHOUT --delete on the claude directory.
-  ! grep -- '--delete' "$TEST_HOME/rsync.log"
+  ! grep -- '--delete' "$TEST_HOME/rsync.log" || false
 }
 
 # -----------------------------------------------------------------------

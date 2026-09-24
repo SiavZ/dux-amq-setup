@@ -132,7 +132,7 @@ TOML
 
   [ -L "$STATE_ROOT/dux/config.toml" ]
   cmp "$STATE_ROOT/dux/config.toml.expected" "$config_target"
-  ! grep -Fq -- "/data/state" "$HOME/.bashrc"
+  ! grep -Fq -- "/data/state" "$HOME/.bashrc" || false
   run env -u STATE_ROOT -u DUX_HOME -u AMQ_GLOBAL_ROOT \
     HOME="$HOME" bash -c 'source "$HOME/.bashrc"; printf "%s|%s|%s\n" "$STATE_ROOT" "$DUX_HOME" "$AMQ_GLOBAL_ROOT"'
   [ "$status" -eq 0 ]

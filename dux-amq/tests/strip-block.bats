@@ -47,7 +47,7 @@ MD
   strip_block "$f" md
   grep -q "DO NOT DELETE" "$f"
   grep -q "## My personal notes" "$f"
-  ! grep -q "old content from pre-phase-12 install" "$f"
+  ! grep -q "old content from pre-phase-12 install" "$f" || false
 }
 
 @test "P0-G: versioned md markers are still stripped" {
@@ -63,7 +63,7 @@ old version block
 keep me
 MD
   strip_block "$f" md
-  ! grep -q "old version block" "$f"
+  ! grep -q "old version block" "$f" || false
   grep -q "keep me" "$f"
 }
 
@@ -77,6 +77,6 @@ legacy stanza
 free text outside any heading
 MD
   strip_block "$f" md
-  ! grep -q "legacy stanza" "$f"
+  ! grep -q "legacy stanza" "$f" || false
   grep -q "free text outside any heading" "$f"
 }

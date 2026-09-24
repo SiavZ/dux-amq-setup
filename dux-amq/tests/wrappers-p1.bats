@@ -65,7 +65,7 @@ teardown() {
     grep -Fxq -- "-y" "$ARGV_FILE"
     grep -Fxq -- "--wake-inject-mode" "$ARGV_FILE"
     grep -Fxq -- "raw" "$ARGV_FILE"
-    ! grep -Fxq -- "--no-wake" "$ARGV_FILE"
+    ! grep -Fxq -- "--no-wake" "$ARGV_FILE" || false
   done
 }
 
