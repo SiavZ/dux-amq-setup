@@ -563,6 +563,9 @@ pub struct App {
     /// one diff, so a new request supersedes the old one rather than queueing
     /// behind it.
     pub(crate) pending_diff: Option<PendingDiff>,
+    /// The in-flight changes-panel git mutation (stage/unstage/discard/commit),
+    /// run off the run loop; see `changes_job`.
+    pub(crate) pending_changes_job: Option<changes_job::PendingChangesJob>,
     /// Monotonic request counter, stamped into every [`crate::diff::DiffRequestKey`]
     /// so two requests that agree on file and settings are still told apart.
     pub(crate) diff_request_seq: u64,
@@ -3550,6 +3553,7 @@ pub(crate) fn build_left_items(
 }
 
 mod background_server;
+mod changes_job;
 pub(crate) use background_server::{BackgroundServerStart, CompanionRouting};
 // `pub(crate)` for its width helpers alone: the diff wrapper has to measure a
 // CJK glyph exactly as the pane's own wrapper does, and two functions that
@@ -3916,6 +3920,7 @@ impl App {
             pr_banner_at_bottom,
             syntax_cache: Arc::new(SyntaxCache::new()),
             pending_diff: None,
+            pending_changes_job: None,
             diff_request_seq: 0,
             snapshot_buf: TerminalSnapshot::empty(),
             last_snapshot_id: None,

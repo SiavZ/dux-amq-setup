@@ -2,8 +2,7 @@ use super::components::{ButtonPressedTarget, PressedButton, next_focus};
 use super::modal::{ModalKeyStep, binding_lookup_is_suppressed, click_target, modal_key_step};
 use super::*;
 use chrono::Local;
-use dux_core::engine::{Command, EventReaction, StatusUpdate};
-use dux_core::statusline::StatusTone;
+use dux_core::engine::Command;
 use dux_core::text::count_of;
 use ratatui::buffer::CellWidth;
 /// Lines moved per mouse-wheel tick for local scrolling, shared by every wheel
@@ -2634,29 +2633,14 @@ impl App {
         };
         let Some(file) = file else { return Ok(()) };
         let path = file.path.clone();
-        let reaction = match self.right_section {
-            RightSection::Unstaged => self.engine.apply(Command::StageFile {
-                worktree_path: worktree,
-                path,
-            })?,
-            RightSection::Staged => self.engine.apply(Command::UnstageFile {
-                worktree_path: worktree,
-                path,
-            })?,
+        // The git call runs on a worker (it can stall on the index lock); the
+        // refresh and the section hop run when it answers. See `changes_job`.
+        let job = match self.right_section {
+            RightSection::Unstaged => super::changes_job::ChangesJob::Stage { path },
+            RightSection::Staged => super::changes_job::ChangesJob::Unstage { path },
             RightSection::CommitInput => return Ok(()),
         };
-        self.apply_reaction(reaction);
-        self.reload_changed_files();
-        // If the section we were in is now empty, move to the other one.
-        if self.right_section == RightSection::Staged && self.engine.staged_files.is_empty() {
-            self.right_section = RightSection::Unstaged;
-            self.clamp_files_cursor();
-        } else if self.right_section == RightSection::Unstaged
-            && self.engine.unstaged_files.is_empty()
-        {
-            self.right_section = RightSection::Staged;
-            self.clamp_files_cursor();
-        }
+        self.dispatch_changes_job(worktree, job);
         Ok(())
     }
 
@@ -2689,20 +2673,14 @@ impl App {
             return Ok(());
         };
         let message = self.commit_input.text.clone();
-        // Route the empty-message / nothing-staged decision through the shared core
-        // preflight so the TUI and the web agree, and so the nothing-staged check
-        // reads LIVE git status rather than the possibly-stale `staged_files`
-        // cache. Each surface still renders its own copy for the refusals.
-        match git::commit_preflight(&worktree, &message) {
-            git::CommitPreflight::EmptyMessage => {
-                self.set_error("Enter a commit message first.");
-                return Ok(());
-            }
-            git::CommitPreflight::NothingStaged => {
-                self.set_error("No staged changes to commit.");
-                return Ok(());
-            }
-            git::CommitPreflight::Ready => {}
+        // The empty-message refusal needs no git, so it answers at once. The
+        // nothing-staged refusal reads LIVE git status through the shared core
+        // preflight (so the TUI and the web agree and a stale `staged_files`
+        // cache cannot let a commit through), which is git work and therefore
+        // runs on the worker together with the commit. See `changes_job`.
+        if message.trim().is_empty() {
+            self.set_error("Enter a commit message first.");
+            return Ok(());
         }
         // The push hint is only offered where pushing is possible. A standalone
         // agent has no branch, so `push_to_remote` refuses it, and advertising
@@ -2713,23 +2691,13 @@ impl App {
             .filter(|session| session.supports_branch_git())
             .map(|_| self.bindings.label_for(Action::PushToRemote));
         let success_message = commit_success_message(push_key.as_deref());
-        let reaction = self.engine.apply(Command::CommitChanges {
-            worktree_path: worktree,
-            message,
-            success_message,
-        })?;
-        let success = matches!(
-            &reaction,
-            EventReaction::Status(StatusUpdate {
-                tone: StatusTone::Info,
-                ..
-            })
+        self.dispatch_changes_job(
+            worktree,
+            super::changes_job::ChangesJob::Commit {
+                message,
+                success_message,
+            },
         );
-        self.apply_reaction(reaction);
-        if success {
-            self.commit_input.clear();
-            self.reload_changed_files();
-        }
         Ok(())
     }
 
@@ -7789,28 +7757,12 @@ impl App {
             // action agree with the worktree as it is NOW (not as it was when the
             // prompt opened). This closes a data-loss window: a file that was
             // untracked at prompt-open but became tracked before confirm would
-            // otherwise be deleted outright instead of restored from HEAD.
-            let is_untracked = match git::discard_classify(&worktree, &file_path) {
-                Ok(u) => u,
-                Err(e) => {
-                    // The live check refused (now staged, or nothing left to
-                    // discard). Surface it and leave the file untouched.
-                    self.set_error(format!("Discard failed: {e}"));
-                    return false;
-                }
-            };
-            let reaction = self.engine.apply(Command::DiscardFile {
-                worktree_path: worktree,
-                path: file_path,
-                is_untracked,
-            });
-            match reaction {
-                Ok(reaction) => {
-                    self.apply_reaction(reaction);
-                    self.reload_changed_files();
-                }
-                Err(e) => self.set_error(format!("Discard failed: {e}")),
-            }
+            // otherwise be deleted outright instead of restored from HEAD. Both
+            // halves run together on the worker; see `changes_job`.
+            self.dispatch_changes_job(
+                worktree,
+                super::changes_job::ChangesJob::Discard { path: file_path },
+            );
         }
         false
     }
@@ -26276,6 +26228,7 @@ cyan = "#00ffff"
         // Down+Up at the same coordinates fires the button action.
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 53, 10));
         app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 53, 10));
+        app.finish_changes_job();
 
         assert!(matches!(app.prompt, PromptState::None));
         let contents = std::fs::read_to_string(
@@ -26348,11 +26301,76 @@ cyan = "#00ffff"
         git(&["commit", "-m", "track ghost"]);
 
         app.resolve_confirm_discard_file(true);
+        app.finish_changes_job();
 
         assert!(
             worktree.join("ghost.txt").exists(),
             "a file that became tracked-and-clean between prompt-open and confirm must NOT be deleted by discard",
         );
+    }
+
+    /// Fork b91ed679 / 773a6b04 P1-23: staging runs git on a worker, not on
+    /// the run loop. The key handler returns with the job in flight and a busy
+    /// on the status line; the file is staged only once the answer is folded
+    /// in, and a second mutation while one is running is refused rather than
+    /// racing it on the index.
+    #[test]
+    fn staging_runs_on_a_worker_and_refuses_a_second_job_while_busy() {
+        let mut app = test_app(default_bindings());
+        let worktree = std::path::PathBuf::from(
+            app.engine.sessions[0]
+                .managed_worktree()
+                .expect("managed test session"),
+        );
+        std::fs::create_dir_all(&worktree).expect("worktree dir");
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&worktree)
+                .output()
+                .expect("git");
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test User"]);
+        std::fs::write(worktree.join("a.txt"), "one\n").expect("seed");
+        git(&["add", "a.txt"]);
+        git(&["commit", "-qm", "initial"]);
+        std::fs::write(worktree.join("a.txt"), "two\n").expect("edit");
+        app.engine.unstaged_files = vec![ChangedFile {
+            path: "a.txt".into(),
+            status: "M".into(),
+            additions: 1,
+            deletions: 1,
+            binary: false,
+            diff_excluded: false,
+            renamed_from: None,
+        }];
+        app.selected_left = 1;
+        app.right_section = RightSection::Unstaged;
+        app.files_index = 0;
+
+        app.toggle_stage_selected_file().expect("stage");
+        assert!(
+            app.pending_changes_job.is_some(),
+            "the git call must be dispatched to a worker, not run inline"
+        );
+        assert_eq!(app.status.tone(), crate::statusline::StatusTone::Busy);
+
+        assert!(
+            !app.dispatch_changes_job(
+                worktree.clone(),
+                super::changes_job::ChangesJob::Unstage {
+                    path: "a.txt".into()
+                },
+            ),
+            "one job at a time"
+        );
+
+        app.finish_changes_job();
+        assert!(app.pending_changes_job.is_none());
+        assert_eq!(git(&["diff", "--cached", "--name-only"]).trim(), "a.txt");
     }
 
     /// Commit refuses an empty message via the shared core preflight (rendered
@@ -26416,6 +26434,7 @@ cyan = "#00ffff"
         app.commit_input.text = "a real message".to_string();
 
         app.execute_commit().expect("execute_commit");
+        app.finish_changes_job();
 
         assert_eq!(app.status.tone(), crate::statusline::StatusTone::Error);
         assert!(

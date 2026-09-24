@@ -103,6 +103,7 @@ impl App {
         self.drain_notes_fetch();
         self.drain_unpushed_count();
         self.drain_pending_diff();
+        self.drain_changes_job();
         self.drain_worker_events();
         self.apply_resume_fallback_sweep();
         self.apply_reaped_terminations();

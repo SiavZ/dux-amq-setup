@@ -4570,6 +4570,7 @@ mod tests {
             pr_banner_at_bottom: true,
             syntax_cache: Arc::new(crate::diff::SyntaxCache::new()),
             pending_diff: None,
+            pending_changes_job: None,
             diff_request_seq: 0,
             snapshot_buf: crate::pty::TerminalSnapshot::empty(),
             last_snapshot_id: None,
