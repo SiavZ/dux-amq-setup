@@ -3229,6 +3229,21 @@ fn apply_terminal_env_from_parent(
     if let Some(colorterm) = parent_colorterm.filter(|value| !value.is_empty()) {
         cmd.env("COLORTERM", colorterm);
     }
+
+    // `DUX_PANE` is the marker the dux-amq inject bridge
+    // (dux-amq/scripts/dux-amq-inject-bridge) uses to detect that it runs
+    // inside a dux-spawned process tree. When present, the bridge skips its
+    // tmux send-keys path and writes to the file queue that dux's AMQ drainer
+    // (`crate::amq`) consumes only when the agent is idle; without it a wake
+    // is typed straight into whatever the agent is doing ("stuck in input
+    // field"). `DUX_PID` lets long-lived `amq wake` daemons inherited from
+    // this pane stop once this dux exits instead of refilling the queue for a
+    // dead UI. Set on every PTY child (agents and companion terminals) because
+    // a wake can be started from either. A hot reload execs in place, which
+    // keeps the pid, so agents adopted across a reload still carry the right
+    // DUX_PID without being told again.
+    cmd.env("DUX_PANE", "1");
+    cmd.env("DUX_PID", std::process::id().to_string());
 }
 
 fn resolve_term_from_parent(parent_term: Option<&OsStr>) -> String {
@@ -5720,6 +5735,27 @@ mod tests {
         assert_eq!(
             cmd.get_env("COLORTERM").and_then(|value| value.to_str()),
             Some("truecolor")
+        );
+    }
+
+    #[test]
+    fn apply_terminal_env_marks_children_as_under_dux() {
+        // Every PTY-spawned child must see DUX_PANE=1 so the
+        // dux-amq-inject-bridge knows to write to the file queue
+        // instead of using tmux send-keys. Dropping this would
+        // re-introduce the "stuck in input field" bug.
+        let mut cmd = CommandBuilder::new("printf");
+        apply_terminal_env_from_parent(&mut cmd, Some(OsStr::new("xterm-256color")), None);
+        assert_eq!(
+            cmd.get_env("DUX_PANE").and_then(|value| value.to_str()),
+            Some("1"),
+            "PTY children must have DUX_PANE exported for the inject-bridge to detect dux"
+        );
+        let expected_pid = std::process::id().to_string();
+        assert_eq!(
+            cmd.get_env("DUX_PID").and_then(|value| value.to_str()),
+            Some(expected_pid.as_str()),
+            "PTY children must have DUX_PID exported so stale wake daemons stop queueing"
         );
     }
 
