@@ -1005,10 +1005,13 @@ fn run_create_standalone_agent_job(
                 return;
             }
         };
+    // A brand-new agent has no saved settings row yet, so it launches with
+    // the defaults; a later settings change applies at its next launch.
     let env = crate::agent_env::agent_launch_env(
         &paths,
         &config,
         &session,
+        &crate::session_settings::SessionSettings::default(),
         session.slot_tab_id().as_str(),
         env,
     );
@@ -1422,10 +1425,13 @@ fn launch_managed_create(
     let (cols, rows) = term_size;
     // The startup command above ran with the user env alone; the provider
     // additionally gets the Dux identity and session settings.
+    // A brand-new agent has no saved settings row yet, so it launches with
+    // the defaults; a later settings change applies at its next launch.
     let env = crate::agent_env::agent_launch_env(
         &paths,
         &config,
         &session,
+        &crate::session_settings::SessionSettings::default(),
         session.slot_tab_id().as_str(),
         env,
     );
