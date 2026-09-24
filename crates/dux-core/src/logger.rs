@@ -988,9 +988,19 @@ mod tests {
             log.write_line("second line\n");
             log.write_line("third line\n");
 
-            wait_for("the first copy to be compressed", || {
-                dir.path().join("dux.log.1.gz").exists()
-            });
+            // Both halves, not just the gzip. Finalising a compression is a
+            // rename of the temporary onto `.gz` followed by a delete of the
+            // plain copy, two separate syscalls with no lock held between them
+            // as far as an outside observer is concerned. Waiting only for the
+            // `.gz` can therefore return in the window between them, and the
+            // assertion below then reports a half-finished rotation as a bug.
+            wait_for(
+                "the first copy to be compressed and the plain one removed",
+                || {
+                    dir.path().join("dux.log.1.gz").exists()
+                        && !dir.path().join("dux.log.1").exists()
+                },
+            );
             assert!(
                 !dir.path().join("dux.log.1").exists(),
                 "the plain copy must be removed once the gzip is in place"

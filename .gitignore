@@ -25,3 +25,6 @@ docs/server-mode-summary.md
 
 # Subagent-driven-development scratch (briefs, reports, review packages)
 .superpowers/
+
+# Inter-agent mailbox scratch, not part of the project
+.agent-mail/

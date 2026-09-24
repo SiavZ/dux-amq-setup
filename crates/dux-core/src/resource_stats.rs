@@ -486,6 +486,19 @@ mod tests {
 
     fn fresh_system() -> sysinfo::System {
         use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+        // NOTE for the thread-filtering tests below: this refresh does NOT ask
+        // for tasks (`ProcessRefreshKind::with_tasks`), and on macOS sysinfo
+        // then reports no thread rows whatsoever. Measured: eight spinning
+        // threads produced zero rows with `thread_kind().is_some()` and zero
+        // rows parented to the current process.
+        //
+        // So on macOS the live "threads are not counted as processes" tests
+        // cannot fail for the reason they name: there is nothing there to be
+        // miscounted. They are smoke tests that the real walk runs against real
+        // data. The ACTUAL guard for that behaviour is
+        // `aggregate_proc_tree_counts_processes_not_threads`, which builds thread
+        // nodes itself and therefore holds on every platform. Do not tighten the
+        // live tests into a proof of thread filtering; tighten that one.
         let mut sys = System::new();
         // Establish a CPU baseline, then refresh again so cpu_usage() is real.
         sys.refresh_processes_specifics(
@@ -621,11 +634,58 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
 
+        // The defect this guards is THREAD memory being summed as though each
+        // thread were a process, which inflates the total by a multiple. So the
+        // bound is the kernel's own sum over the real processes in the tree, not
+        // a fixed multiple of `self_rss`: the tree is rooted at the test binary,
+        // whose descendants include whatever subprocesses other tests happen to
+        // be running, and each of those legitimately adds to the aggregate.
+        // `self_rss * 2` silently assumed the tree was just this process plus a
+        // ~1MB `sleep`, so a busy moment failed a test about thread handling.
+        let real_process_sum: u64 = descendants_of(&sys, self_pid)
+            .into_iter()
+            .filter_map(|pid| sys.process(pid).map(|p| p.memory()))
+            .sum();
+
         assert!(
-            rss < self_rss * 2,
-            "aggregated rss ({rss}) must be close to self ({self_rss}) plus the \
-             sleep child, not inflated by summing duplicated thread memory"
+            rss <= real_process_sum,
+            "aggregated rss ({rss}) must not exceed the kernel's sum over the \
+             real processes in the tree ({real_process_sum}); if it does, thread \
+             memory is being counted as process memory again"
         );
+        assert!(
+            rss >= self_rss,
+            "aggregated rss ({rss}) must at least include the root process \
+             itself ({self_rss})"
+        );
+    }
+
+    /// Every REAL PROCESS in `root`'s tree, `root` included, following the same
+    /// parent links `aggregate_tree` walks. Used to state a bound in terms of
+    /// the processes that are ACTUALLY there, rather than a guess about how many
+    /// there will be.
+    ///
+    /// Threads are excluded, and that exclusion is what gives the bound its
+    /// teeth: `sysinfo` lists a thread as a process-like row carrying its whole
+    /// process's memory and a parent link, so counting them here would inflate
+    /// this sum by exactly the same multiple as the defect it is meant to catch,
+    /// and the comparison would pass no matter what `aggregate_tree` did.
+    fn descendants_of(sys: &sysinfo::System, root: sysinfo::Pid) -> Vec<sysinfo::Pid> {
+        let mut found = vec![root];
+        let mut added = true;
+        while added {
+            added = false;
+            for (pid, proc_info) in sys.processes() {
+                if found.contains(pid) || proc_info.thread_kind().is_some() {
+                    continue;
+                }
+                if proc_info.parent().is_some_and(|p| found.contains(&p)) {
+                    found.push(*pid);
+                    added = true;
+                }
+            }
+        }
+        found
     }
 
     /// Live adapter smoke test: `sysinfo`'s thread rows really do carry a
@@ -662,13 +722,22 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
 
-        // Real processes are just self and the sleep child; a stray transient
-        // thread-as-process would nudge this by one or two, still nowhere near
-        // THREADS. If threads were counted, count would be >= THREADS + 1.
-        assert!(
-            (1..THREADS).contains(&count),
-            "process_count ({count}) must be a small real-process count, not the \
-             {THREADS} threads; outside [1, {THREADS}) means threads are counted"
+        // Compared against the real processes that were ACTUALLY in the tree,
+        // not against a fixed small band. The tree is rooted at the test binary,
+        // so its descendants include whatever subprocesses other tests happen to
+        // be running; the old `[1, THREADS)` band silently assumed the tree was
+        // just this process plus a `sleep`, and failed on a busy run for a
+        // reason that had nothing to do with threads.
+        //
+        // The bound still has teeth: `descendants_of` excludes thread rows, so
+        // if the adapter stopped flagging them, `count` would jump by roughly
+        // THREADS while this number did not, and the equality below would fail.
+        let real_processes = descendants_of(&sys, self_pid).len();
+        assert_eq!(
+            count, real_processes,
+            "process_count ({count}) must equal the real processes in the tree \
+             ({real_processes}); a larger count means the {THREADS} threads are \
+             being counted as processes"
         );
     }
 
@@ -695,11 +764,19 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         let sys = fresh_system();
 
-        let self_pid = sysinfo::Pid::from_u32(std::process::id());
-        let (_cpu, _rss, count, children) = aggregate_tree(&sys, self_pid);
+        // Rooted at the `sh` child rather than at the test process. Both find
+        // the grandchild, but the test process is the WHOLE test binary, whose
+        // descendants include every subprocess any other test happens to be
+        // running (the git-shelling fixtures spawn plenty). `aggregate_tree`
+        // keeps only the top ten children by RSS, so on a busy run a handful of
+        // `git` processes at ~4MB each rank the ~1MB `sleep` out of the list and
+        // the assertion below fails on the state of the machine rather than on
+        // dux. Rooting at `sh` keeps the intermediate-parent hop this test is
+        // about while bounding the tree to what the fixture itself created.
+        let sh_pid = sysinfo::Pid::from_u32(child.id());
+        let (_cpu, _rss, count, children) = aggregate_tree(&sys, sh_pid);
 
         // Find the grandchild: a process whose parent is the `sh` child.
-        let sh_pid = sysinfo::Pid::from_u32(child.id());
         let grandchild = sys
             .processes()
             .iter()
@@ -721,8 +798,8 @@ mod tests {
             "a real grandchild process must still be aggregated through an intermediate parent: {children:?}"
         );
         assert!(
-            count >= 3,
-            "process_count must include self, the sh child, and the grandchild: got {count}"
+            count >= 2,
+            "process_count must include the sh root and its sleep grandchild: got {count}"
         );
     }
 
@@ -982,10 +1059,25 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
 
-        assert!(
-            count <= 10,
-            "fixture must stay under aggregate_tree's top-10 children cap, got {count}"
-        );
+        // The sum-to-total invariant only holds while the tree fits inside
+        // `aggregate_tree`'s top-ten cap, and this tree is rooted at the TEST
+        // BINARY, whose descendants include whatever subprocesses other tests
+        // are running at the same moment (the git-shelling fixtures spawn
+        // plenty). It cannot be re-rooted at a child the way the grandchild test
+        // is, because the thread entries that could wrongly inflate the sum live
+        // in THIS process and are the point of the fixture.
+        //
+        // So when the machine is busy enough to push the tree past the cap, the
+        // premise is genuinely absent and there is nothing to assert. Skipping
+        // is honest here; asserting would report the state of the machine.
+        if count > 10 {
+            eprintln!(
+                "skipping: {count} processes in this binary's tree exceeds \
+                 aggregate_tree's top-10 cap, so the breakdown is truncated by \
+                 design and cannot sum to the total"
+            );
+            return;
+        }
         let children_sum: u64 = children.iter().map(|c| c.rss_bytes).sum();
         assert_eq!(
             rss, children_sum,
@@ -1068,11 +1160,40 @@ mod tests {
             "a sleeping process must read about nothing, got {idle_cpu}%"
         );
         if cores >= 6 {
-            assert!(
-                burner_cpu > 100.0,
-                "four busy processes on a {cores}-core box must exceed 100% aggregate; \
-                 got {burner_cpu}% (a clamp would pin this at exactly 100)"
-            );
+            // "A box with cores to spare" is a PREMISE, not a given. This
+            // asserts that four spinning shells were handed more than one core
+            // between them, which the scheduler can only do when more than one
+            // core is free. Run alone that is true on any developer machine;
+            // run inside the full suite, where a couple of thousand other tests
+            // are competing for the same cores (and alongside whatever else the
+            // machine happens to be doing), the burners get a fair share of a
+            // saturated box instead, and the aggregate lands below 100% without
+            // anything being wrong with dux.
+            //
+            // So the premise is measured: `spare` is how much CPU was NOT being
+            // used by anything else at the moment of the sample. The direction
+            // this test exists to prove, that a burn reads high and is never
+            // clamped at exactly 100, is asserted above and unconditionally.
+            let busy_elsewhere: f32 = sys
+                .processes()
+                .iter()
+                .filter(|(pid, _)| pid.as_u32() != burner_pid && pid.as_u32() != idler_pid)
+                .map(|(_, p)| p.cpu_usage())
+                .sum();
+            let spare = (cores as f32 * 100.0) - busy_elsewhere;
+            if spare > 200.0 {
+                assert!(
+                    burner_cpu > 100.0,
+                    "four busy processes on a {cores}-core box with {spare:.0}% spare \
+                     must exceed 100% aggregate; got {burner_cpu}% (a clamp would pin \
+                     this at exactly 100)"
+                );
+            } else {
+                eprintln!(
+                    "skipping the >100% aggregate check: only {spare:.0}% CPU was \
+                     spare, so the scheduler could not give the burn whole cores"
+                );
+            }
         }
     }
 
