@@ -1995,7 +1995,7 @@ fn prune_wire_status(pruned: &dux_core::engine::PrunedPty) -> Option<WireStatus>
         // sentence is the only word the user gets.
         PrunedPtyKind::Agent => Some(WireStatus::new(
             "info",
-            format!("Tab ({}) exited.", pruned.label),
+            dux_core::status_text!["Tab (", n(pruned.label), ") exited."],
         )),
         // The terminal's row is gone from the sidebar in the same breath.
         PrunedPtyKind::Terminal => None,

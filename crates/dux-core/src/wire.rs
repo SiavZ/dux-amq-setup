@@ -2656,14 +2656,20 @@ impl Engine {
             .and_then(|id| self.tab_prose_label(sid, id.as_ref_id()));
         let outcome = self.close_tab(session_id, tab_id)?;
         let message = match (&outcome.promoted, closed.as_deref(), successor.as_deref()) {
-            (Some(_), Some(closed), Some(next)) => format!(
-                "Closed the first tab, {closed}. {next} took its place as the agent's first tab."
-            ),
-            (Some(_), None, Some(next)) => format!(
-                "Closed the agent's first tab. {next} took its place as the agent's first tab."
-            ),
-            (_, Some(closed), _) => format!("Closed the {closed} tab."),
-            (_, None, _) => "Closed the tab.".to_string(),
+            (Some(_), Some(closed), Some(next)) => crate::status_text![
+                "Closed the first tab, ",
+                n(closed),
+                ". ",
+                n(next),
+                " took its place as the agent's first tab."
+            ],
+            (Some(_), None, Some(next)) => crate::status_text![
+                "Closed the agent's first tab. ",
+                n(next),
+                " took its place as the agent's first tab."
+            ],
+            (_, Some(closed), _) => crate::status_text!["Closed the ", n(closed), " tab."],
+            (_, None, _) => "Closed the tab.".into(),
         };
         // Loud: closing a tab deletes the tab, and a pill leaving a strip is
         // too small to stand in for a destructive act's confirmation. The slot
@@ -2693,20 +2699,24 @@ impl Engine {
         if outcome.running {
             Ok(WireStatus::new(
                 "warning",
-                format!(
-                    "This tab is set to {}, but the {} process is still running. Close and reopen the tab to relaunch with {}.",
-                    provider.as_str(),
-                    outcome.previous.as_str(),
-                    provider.as_str(),
-                ),
+                crate::status_text![
+                    "This tab is set to ",
+                    n(provider.as_str()),
+                    ", but the ",
+                    n(outcome.previous.as_str()),
+                    " process is still running. Close and reopen the tab to relaunch with ",
+                    n(provider.as_str()),
+                    "."
+                ],
             ))
         } else {
             Ok(WireStatus::new(
                 "info",
-                format!(
-                    "This tab will use {} on its next launch (it starts fresh).",
-                    provider.as_str(),
-                ),
+                crate::status_text![
+                    "This tab will use ",
+                    n(provider.as_str()),
+                    " on its next launch (it starts fresh)."
+                ],
             ))
         }
     }
@@ -3244,9 +3254,13 @@ impl Engine {
                     // This flow never switches branches, so `SwitchFailed` can't be
                     // produced for it, but the op type is shared with the
                     // checkout-add flow, so the match must stay total.
-                    WebAddProjectOutcome::SwitchFailed { repo_path, .. } => Final::error(format!(
-                        "Couldn't add the project at {repo_path} after creating the initial commit."
-                    )),
+                    WebAddProjectOutcome::SwitchFailed { repo_path, .. } => {
+                        Final::error(crate::status_text![
+                            "Couldn't add the project at ",
+                            n(repo_path),
+                            " after creating the initial commit."
+                        ])
+                    }
                 }
             },
         );
@@ -3321,9 +3335,13 @@ impl Engine {
                     WebAddProjectOutcome::AddFailed { message } => Final::error(message.clone()),
                     // This flow never switches branches; the op type is shared
                     // with the checkout-add flow, so the match must stay total.
-                    WebAddProjectOutcome::SwitchFailed { repo_path, .. } => Final::error(format!(
-                        "Couldn't add the project at {repo_path} after initializing the repository."
-                    )),
+                    WebAddProjectOutcome::SwitchFailed { repo_path, .. } => {
+                        Final::error(crate::status_text![
+                            "Couldn't add the project at ",
+                            n(repo_path),
+                            " after initializing the repository."
+                        ])
+                    }
                 }
             },
         );
@@ -3574,7 +3592,11 @@ impl Engine {
                     Ok(reaction) => wire_statuses_from_reaction(&reaction),
                     Err(e) => vec![WireStatus::new(
                         "error",
-                        format!("Failed to create an agent from PR #{}: {e:#}", pr.number),
+                        crate::status_text![
+                            "Failed to create an agent from PR ",
+                            n(format!("#{}", pr.number)),
+                            format!(": {:#}", e)
+                        ],
                     )],
                 };
                 self.current_origin = crate::statusline::StatusScope::All;

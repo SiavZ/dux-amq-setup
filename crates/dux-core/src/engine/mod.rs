@@ -1388,7 +1388,7 @@ const PR_RATE_LIMIT_BACKOFF_SECS: u64 = 300;
 pub struct PrPauseNotice {
     pub pause: Duration,
     pub tone: crate::statusline::StatusTone,
-    pub message: String,
+    pub message: StatusText,
 }
 
 /// Decide whether a host's sync signal pauses its pull-request checks, and how
@@ -1426,33 +1426,39 @@ pub fn pr_pause_notice(
         return Some(PrPauseNotice {
             pause: Duration::from_secs(secs_until),
             tone: StatusTone::Info,
-            message: format!(
-                "GitHub's API rate limit for {} is nearly used up ({} points left). dux \
-                 paused PR status checks; they resume automatically{when}.",
-                sig.host, r.remaining,
-            ),
+            message: crate::status_text![
+                "GitHub's API rate limit for ",
+                n(sig.host),
+                format!(
+                    " is nearly used up ({} points left). dux \
+                 paused PR status checks; they resume automatically{}.",
+                    r.remaining, when
+                )
+            ],
         });
     }
     if sig.rate_limited {
         return Some(PrPauseNotice {
             pause: Duration::from_secs(PR_RATE_LIMIT_BACKOFF_SECS),
             tone: StatusTone::Warning,
-            message: format!(
-                "GitHub is rate-limiting API requests on {}. dux paused PR status checks; \
-                 they resume automatically once the limit clears.",
-                sig.host,
-            ),
+            message: crate::status_text![
+                "GitHub is rate-limiting API requests on ",
+                n(sig.host),
+                ". dux paused PR status checks; \
+                 they resume automatically once the limit clears."
+            ],
         });
     }
     if sig.hard_failed {
         return Some(PrPauseNotice {
             pause: Duration::from_secs(PR_HARD_FAILURE_BACKOFF_SECS),
             tone: StatusTone::Warning,
-            message: format!(
-                "dux could not reach GitHub for PR status on {} (a network or gh error); \
-                 it will retry shortly.",
-                sig.host,
-            ),
+            message: crate::status_text![
+                "dux could not reach GitHub for PR status on ",
+                n(sig.host),
+                " (a network or gh error); \
+                 it will retry shortly."
+            ],
         });
     }
     None

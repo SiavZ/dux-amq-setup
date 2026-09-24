@@ -231,7 +231,7 @@ pub fn remove_managed_worktree(
 /// branch is gone" come apart.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemovalReport {
-    pub message: String,
+    pub message: crate::status_text::StatusText,
     /// A branch git refused to delete is a warning, not a success: the worktree
     /// went and the branch did not.
     pub warning: bool,
@@ -252,33 +252,43 @@ pub struct RemovalReport {
 pub fn removal_report(worktree_path: &str, branch: Option<&BranchOutcome>) -> RemovalReport {
     let Some(branch) = branch else {
         return RemovalReport {
-            message: format!(
-                "Removed the worktree at {worktree_path}. Its branch, if it had one, was kept: \
+            message: crate::status_text![
+                "Removed the worktree at ",
+                n(worktree_path),
+                ". Its branch, if it had one, was kept: \
                  you did not ask for it."
-            ),
+            ],
             warning: false,
         };
     };
     match &branch.deletion {
         git::BranchDeletion::Deleted => RemovalReport {
-            message: format!(
-                "Removed the worktree at {worktree_path} and deleted its branch \"{}\".",
-                branch.name
-            ),
+            message: crate::status_text![
+                "Removed the worktree at ",
+                n(worktree_path),
+                " and deleted its branch ",
+                q(branch.name),
+                "."
+            ],
             warning: false,
         },
         git::BranchDeletion::AlreadyGone => RemovalReport {
-            message: format!(
-                "Removed the worktree at {worktree_path}. Its branch \"{}\" was already gone.",
-                branch.name
-            ),
+            message: crate::status_text![
+                "Removed the worktree at ",
+                n(worktree_path),
+                ". Its branch ",
+                q(branch.name),
+                " was already gone."
+            ],
             warning: false,
         },
         git::BranchDeletion::Refused { reason } => RemovalReport {
-            message: format!(
-                "Removed the worktree at {worktree_path}, but its branch is still there. {}",
+            message: crate::status_text![
+                "Removed the worktree at ",
+                n(worktree_path),
+                ", but its branch is still there. ",
                 git::branch_refusal_note(&branch.name, reason)
-            ),
+            ],
             warning: true,
         },
     }

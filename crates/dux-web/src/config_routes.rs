@@ -452,6 +452,10 @@ struct TailscaleModeReply {
     /// Whether the sentence is a warning rather than plain information.
     warning: bool,
     message: String,
+    /// The parts `message` was built from, in the browser's `Prose` shape, so
+    /// the toast it raises draws the address as a chip. Absent for a plain one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    segments: Option<Vec<dux_core::prose::ProseSegment>>,
 }
 
 /// `POST /api/v1/server/tailscale-mode`. Save `[server] tailscale`, then apply it
@@ -486,10 +490,12 @@ async fn set_tailscale_mode(
         None => dux_core::config::TailscaleModeOutcome::NotServing,
     };
     let report = outcome.report(mode);
+    let (message, segments) = report.message.into_parts();
     Json(TailscaleModeReply {
         mode: mode.as_str().to_string(),
         warning: report.warning,
-        message: report.message,
+        message,
+        segments,
     })
     .into_response()
 }

@@ -658,11 +658,14 @@ impl Engine {
                 let display = path.display().to_string();
                 let t_ok = target.clone();
                 let t_err = target.clone();
-                let op = crate::engine::status_op(format!("Opening {target}: {display}"))
-                    .on_success(move |_: &()| crate::engine::Final::info(format!("Opened {t_ok}.")))
-                    .on_failure(move |e: &String| {
-                        crate::engine::Final::error(format!("Could not open {t_err}: {e}"))
-                    });
+                let op = crate::engine::status_op(crate::status_text![
+                    format!("Opening {}: ", target),
+                    n(display)
+                ])
+                .on_success(move |_: &()| crate::engine::Final::info(format!("Opened {t_ok}.")))
+                .on_failure(move |e: &String| {
+                    crate::engine::Final::error(format!("Could not open {t_err}: {e}"))
+                });
                 Ok(self.spawn_status_op(op, move || {
                     crate::startup::open_path(&path).map_err(|err| format!("{err:#}"))
                 }))
