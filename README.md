@@ -413,7 +413,7 @@ Deleting a whole worktree or reset root is also blocked whenever the target is a
 
 ### Operations Settings
 
-<!-- INTEGRATION: path pending unassigned, fork-main [limits], [auto_resume], [storage] and `dux doctor` are not yet in any worker scope -->
+<!-- INTEGRATION: sections pending port: [limits] and [storage] backup_interval_minutes (cow), [auto_resume] (palmtree), `dux doctor` CLI side (cow) with the dux-amq-doctor script (ant). Verify each key below exists in the rendered config once merged. -->
 
 The fork also ships settings for running many agents on one host. Each is documented inline in `config.toml`:
 
