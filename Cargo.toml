@@ -26,7 +26,12 @@ content_inspector = "0.2.4"
 tempfile = "3.20.0"
 notify = "7"
 flate2 = "1"
-sysinfo = "0.35"
+# 0.36 is a floor, not a preference: 0.35 reports every process's CPU usage as
+# exactly 0.0 on macOS, which is the whole of what the resource panel shows.
+# The 0.36.0 changelog entry is "Linux/macOS: Fix CPU usage update", and the
+# two versions were measured side by side on the same machine with the same
+# refresh calls (0.35.2: 0%, 0.36.0: 100%) before this bound was moved.
+sysinfo = "0.36"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal"] }
 libc = "0.2"
 url = "2.5"
