@@ -5917,8 +5917,13 @@ mod tests {
 
         match engine.session_git_access("sa1") {
             Some(SessionGitAccess::NoRepository { quiet_reason, .. }) => {
+                // The message names the folder the way the USER sees it, which
+                // is home-shortened (`~/...`). Comparing against the raw path
+                // fails for anyone whose TMPDIR lives under their home
+                // directory, which is the default on some setups and is what
+                // this assertion used to trip over.
                 assert!(
-                    quiet_reason.contains(&folder.path().to_string_lossy().to_string()),
+                    quiet_reason.contains(&crate::home_path::shorten_home(folder.path())),
                     "{quiet_reason}"
                 );
                 assert!(

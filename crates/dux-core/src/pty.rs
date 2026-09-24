@@ -3075,6 +3075,132 @@ const fn rgb(r: u8, g: u8, b: u8) -> Rgb {
 }
 
 #[cfg(test)]
+pub(crate) mod pty_capability {
+    use super::PtyClient;
+    use std::path::Path;
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    /// Whether this kernel lets a BACKGROUNDED GRANDCHILD hold the slave side of
+    /// a PTY open after the session leader has exited and been reaped.
+    ///
+    /// Several fixtures need exactly that state: a tab whose shell is gone and
+    /// reaped while the read side has still not reached end of input, which is
+    /// what separates "not running" (`is_live`) from "the stream is finished"
+    /// (`is_exited`) and what the prune's drain grace exists to bound. Each of
+    /// those tests asserts its own premise first, with a message saying the test
+    /// would otherwise prove nothing.
+    ///
+    /// On Linux the premise holds. On macOS it CANNOT: the kernel hangs up the
+    /// master as soon as the session leader exits, so the read side EOFs
+    /// immediately no matter what still holds the slave. That was measured
+    /// directly, including with the grandchild in its own session via `setsid`
+    /// re-opening `/dev/tty`, which is the strongest form available, and the
+    /// master reached end of input every time. There is no fixture that can
+    /// stage this state on macOS, so it is not a matter of writing a better one.
+    ///
+    /// The answer is therefore MEASURED once per test binary rather than
+    /// hardcoded per operating system: this spawns the same shape the fixtures
+    /// use and reports what the kernel actually did. A future macOS that keeps
+    /// the PTY open runs the tests, and a Linux configuration that does not stops
+    /// reporting a failure that belongs to the kernel rather than to dux.
+    pub(crate) fn backgrounded_child_can_hold_pty_open() -> bool {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        *SUPPORTED.get_or_init(|| {
+            let args = vec![
+                "-c".to_string(),
+                "trap '' HUP; sleep 30 & exit 0".to_string(),
+            ];
+            let Ok(mut client) = PtyClient::spawn("/bin/sh", &args, Path::new("."), 5, 40, 100)
+            else {
+                return false;
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while client.try_wait().is_none() {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // The leader is reaped. If the grandchild is holding the slave, the
+            // read side has NOT reached end of input.
+            std::thread::sleep(Duration::from_millis(200));
+            !client.is_exited()
+        })
+    }
+
+    /// Skip the calling test when the kernel cannot hold a PTY open past the
+    /// session leader's exit. Returns `true` when the caller should return early.
+    pub(crate) fn skip_unless_pty_survives_leader_exit(test: &str) -> bool {
+        if backgrounded_child_can_hold_pty_open() {
+            return false;
+        }
+        eprintln!(
+            "skipping {test}: this kernel hangs up the PTY when the session \
+             leader exits, so a reaped-but-not-EOF tab cannot be staged"
+        );
+        true
+    }
+
+    /// Whether a child that closes its standard descriptors and keeps RUNNING
+    /// drives the master side to end of input.
+    ///
+    /// This is the mirror image of [`backgrounded_child_can_hold_pty_open`], and
+    /// the other half of the prune's two-sided contract: a tab whose stream has
+    /// finished while its exit status is still unknown. The fixtures stage it by
+    /// having the shell `exec 0<&- 1>&- 2>&-` and then linger.
+    ///
+    /// On Linux the master reaches end of input at that point. On macOS it does
+    /// not: the slave remains open for the session regardless of the child's own
+    /// descriptors, so the read side simply stays open until the child leaves,
+    /// and the fixture's "EOF while still unreapable" window never exists.
+    /// Measured the same way as its counterpart rather than assumed from the
+    /// platform name.
+    pub(crate) fn eof_arrives_while_child_still_runs() -> bool {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        *SUPPORTED.get_or_init(|| {
+            let args = vec![
+                "-c".to_string(),
+                "exec 0<&- 1>&- 2>&-; sleep 5; exit 0".to_string(),
+            ];
+            let Ok(mut client) = PtyClient::spawn("/bin/sh", &args, Path::new("."), 5, 40, 100)
+            else {
+                return false;
+            };
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !client.is_exited() {
+                if Instant::now() >= deadline {
+                    // Never reached end of input while the child was alive.
+                    return false;
+                }
+                if client.try_wait().is_some() {
+                    // The child left before any EOF was seen, so the window
+                    // this asks about did not occur.
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // EOF observed. It only counts if the child is still running.
+            client.try_wait().is_none()
+        })
+    }
+
+    /// Skip the calling test when the kernel will not deliver end of input while
+    /// the child is still running. Returns `true` when the caller should return.
+    pub(crate) fn skip_unless_eof_precedes_exit(test: &str) -> bool {
+        if eof_arrives_while_child_still_runs() {
+            return false;
+        }
+        eprintln!(
+            "skipping {test}: on this kernel the PTY read side does not reach \
+             end of input while the child still runs, so a drained-but-unreaped \
+             tab cannot be staged"
+        );
+        true
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use compact_str::CompactString;
@@ -3253,7 +3379,14 @@ mod tests {
     /// Wait until the PTY viewport shows `needle` (proving the reader thread has
     /// consumed the child's output), or panic after a bounded wait.
     fn wait_for_viewport(client: &PtyClient, needle: &str) {
-        for _ in 0..50 {
+        // Deadline rather than a fixed iteration count. This waits on a real
+        // child process starting up and echoing, so the time it needs is the
+        // machine's to decide: the old 50 x 10ms budget was half a second, which
+        // a loaded box (the full suite runs a couple of thousand tests against
+        // the same cores) can exceed for a bash startup without anything being
+        // wrong. Generous on a quiet machine, still bounded on a wedged one.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
             let snapshot = client.snapshot();
             if viewport_lines(&snapshot)
                 .iter()
@@ -3261,9 +3394,12 @@ mod tests {
             {
                 return;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {needle:?} in the PTY viewport"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        panic!("timed out waiting for {needle:?} in the PTY viewport");
     }
 
     /// A child that repaints its bottom-right corner on demand: every line it
@@ -5622,6 +5758,12 @@ mod tests {
         // The grandchild has to ignore SIGHUP to hold the slave open: the kernel
         // hangs the terminal up when the session leader exits, and a plain
         // `sleep` dies with it, which EOFs the read side and reproduces nothing.
+        // Not every kernel allows even that; see `pty_capability`.
+        if crate::pty::pty_capability::skip_unless_pty_survives_leader_exit(
+            "a_reaped_child_is_not_live_even_while_its_pty_stays_open",
+        ) {
+            return;
+        }
         let args = vec![
             "-c".to_string(),
             "trap '' HUP; sleep 30 & exit 0".to_string(),

@@ -2028,12 +2028,23 @@ mod tests {
 
     /// A directory whose NAME is exactly `raw`, which is how a folder holding a
     /// line feed, an escape byte or invalid UTF-8 gets built.
-    fn dir_named(raw: &[u8]) -> (tempfile::TempDir, PathBuf) {
+    ///
+    /// `None` when the filesystem will not hold the name: APFS and HFS+ enforce
+    /// valid UTF-8 and reject the invalid-UTF-8 cases with EILSEQ. The control
+    /// character cases are unaffected, so a caller that skips on `None` still
+    /// covers every name that can exist on the filesystem it is running on.
+    fn dir_named(raw: &[u8]) -> Option<(tempfile::TempDir, PathBuf)> {
         use std::os::unix::ffi::OsStrExt;
         let parent = tmp();
         let child = parent.path().join(std::ffi::OsStr::from_bytes(raw));
-        std::fs::create_dir(&child).expect("create the awkwardly named directory");
-        (parent, child)
+        match std::fs::create_dir(&child) {
+            Ok(()) => Some((parent, child)),
+            Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => {
+                eprintln!("skipping {raw:?}: filesystem refuses this name ({e})");
+                None
+            }
+            Err(e) => panic!("create the awkwardly named directory {raw:?}: {e}"),
+        }
     }
 
     #[test]
@@ -2063,7 +2074,9 @@ mod tests {
                 UnreportablePath::NotUtf8,
             ),
         ] {
-            let (_parent, child) = dir_named(raw);
+            let Some((_parent, child)) = dir_named(raw) else {
+                continue;
+            };
             let err = DropDir::open(&child)
                 .err()
                 .unwrap_or_else(|| panic!("a folder with {label} in its path must be refused"));
@@ -2324,6 +2337,14 @@ mod tests {
     }
 
     #[test]
+    // `process_group_members` enumerates a process group from `/proc`, and is
+    // `ProcessGroup::Unknown` on every other platform by construction, which
+    // makes `open` refuse with `ForegroundGroupUnreadable`. That refusal is the
+    // DESIGNED behaviour off Linux (see `WorkingDirectory::open`: "A platform
+    // that cannot enumerate the group refuses instead of guessing"), and it is
+    // covered by its own test. This one asserts the answer only a group scan can
+    // give, so it belongs to the same platform as the scan.
+    #[cfg(target_os = "linux")]
     fn a_surviving_group_member_answers_when_the_foreground_leader_has_exited() {
         // A pipeline whose first stage finished is ordinary: the group still owns
         // the terminal, so the shell's directory is NOT where the user is.
@@ -3104,7 +3125,18 @@ mod independent_path_safety_check {
         ] {
             let name = std::ffi::OsStr::from_bytes(raw);
             let dir = root.path().join(name);
-            std::fs::create_dir(&dir).expect("create dir");
+            // A filesystem that enforces UTF-8 names (APFS, HFS+) refuses the
+            // invalid-UTF-8 case with EILSEQ. The control-character cases are
+            // unaffected and still run, so the refusal this test is about is
+            // still covered wherever the name can exist at all.
+            match std::fs::create_dir(&dir) {
+                Ok(()) => {}
+                Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => {
+                    eprintln!("skipping {raw:?}: filesystem refuses this name ({e})");
+                    continue;
+                }
+                Err(e) => panic!("create dir {raw:?}: {e}"),
+            }
             let opened = DropDir::open(&dir);
             assert!(
                 opened.is_err(),

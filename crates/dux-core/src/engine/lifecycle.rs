@@ -3593,7 +3593,14 @@ mod tests {
     ///
     /// Returns once the child is reaped, and ASSERTS the premise, so a shell
     /// that behaved differently fails loudly rather than passing vacuously.
-    fn engine_with_reaped_but_undrained_agent(worktree: &Path) -> (Engine, TempDir) {
+    /// `None` when this kernel cannot stage the state at all, in which case the
+    /// caller returns without asserting. See `pty::pty_capability`.
+    fn engine_with_reaped_but_undrained_agent(worktree: &Path) -> Option<(Engine, TempDir)> {
+        if crate::pty::pty_capability::skip_unless_pty_survives_leader_exit(
+            "engine_with_reaped_but_undrained_agent",
+        ) {
+            return None;
+        }
         let (mut engine, tmp) = test_engine();
         engine
             .projects
@@ -3645,7 +3652,7 @@ mod tests {
             "premise: the grandchild must still hold the PTY read side open, so \
              the reader has NOT reached EOF; without that this test proves nothing"
         );
-        (engine, tmp)
+        Some((engine, tmp))
     }
 
     /// The invariant behind the flaky excerpt test above, pinned without racing.
@@ -3659,7 +3666,10 @@ mod tests {
     #[test]
     fn prune_defers_a_reaped_child_until_its_reader_has_drained() {
         let worktree = tempfile::tempdir().expect("worktree dir");
-        let (mut engine, _tmp) = engine_with_reaped_but_undrained_agent(worktree.path());
+        let Some((mut engine, _tmp)) = engine_with_reaped_but_undrained_agent(worktree.path())
+        else {
+            return;
+        };
 
         // Comfortably inside the drain grace, measured from the reap the fixture
         // already observed: the reader can never reach EOF here, so every pass in
@@ -3687,7 +3697,10 @@ mod tests {
     #[test]
     fn prune_takes_a_never_draining_pty_once_the_drain_grace_expires() {
         let worktree = tempfile::tempdir().expect("worktree dir");
-        let (mut engine, _tmp) = engine_with_reaped_but_undrained_agent(worktree.path());
+        let Some((mut engine, _tmp)) = engine_with_reaped_but_undrained_agent(worktree.path())
+        else {
+            return;
+        };
         let reaped_at = engine.providers[TabIdRef::new("s1-slot")]
             .reaped_at()
             .expect("reaped");
@@ -3738,12 +3751,19 @@ mod tests {
     ///
     /// Returns once the reader has reached EOF, and ASSERTS both halves of the
     /// premise, so a shell that behaved differently fails loudly rather than
-    /// passing vacuously.
+    /// passing vacuously. `None` when this kernel cannot stage the state at all,
+    /// in which case the caller returns without asserting. See
+    /// `pty::pty_capability`.
     fn engine_with_drained_but_unreaped_agent(
         worktree: &Path,
         tab_id: &str,
         linger: &str,
-    ) -> (Engine, TempDir) {
+    ) -> Option<(Engine, TempDir)> {
+        if crate::pty::pty_capability::skip_unless_eof_precedes_exit(
+            "engine_with_drained_but_unreaped_agent",
+        ) {
+            return None;
+        }
         let (mut engine, tmp) = test_engine();
         engine
             .projects
@@ -3793,7 +3813,7 @@ mod tests {
              status is unknown) while its reader is already at end of input; \
              without that this test proves nothing"
         );
-        (engine, tmp)
+        Some((engine, tmp))
     }
 
     /// End of input alone must not prune, because it does not carry the exit
@@ -3806,8 +3826,11 @@ mod tests {
     #[test]
     fn prune_defers_a_drained_child_until_its_exit_status_is_known() {
         let worktree = tempfile::tempdir().expect("worktree dir");
-        let (mut engine, _tmp) =
-            engine_with_drained_but_unreaped_agent(worktree.path(), "s1-slot", "5");
+        let Some((mut engine, _tmp)) =
+            engine_with_drained_but_unreaped_agent(worktree.path(), "s1-slot", "5")
+        else {
+            return;
+        };
 
         // Comfortably inside the grace, measured from the EOF the fixture already
         // observed: the child cannot exit here, so every pass must hold off.
@@ -3833,8 +3856,11 @@ mod tests {
     #[test]
     fn prune_takes_a_never_reaped_child_once_the_drain_grace_expires() {
         let worktree = tempfile::tempdir().expect("worktree dir");
-        let (mut engine, _tmp) =
-            engine_with_drained_but_unreaped_agent(worktree.path(), "s1-slot", "30");
+        let Some((mut engine, _tmp)) =
+            engine_with_drained_but_unreaped_agent(worktree.path(), "s1-slot", "30")
+        else {
+            return;
+        };
         let eof_at = engine.providers[TabIdRef::new("s1-slot")]
             .exited_at()
             .expect("EOF stamped");
@@ -3880,8 +3906,11 @@ mod tests {
         // child is still alive (it polls at 1ms), and short enough that the reap
         // lands well inside `REAPED_DRAIN_GRACE`, so this exercises the
         // status-arrives path rather than the expiry valve.
-        let (mut engine, _tmp) =
-            engine_with_drained_but_unreaped_agent(worktree.path(), "tab-x", "0.1");
+        let Some((mut engine, _tmp)) =
+            engine_with_drained_but_unreaped_agent(worktree.path(), "tab-x", "0.1")
+        else {
+            return;
+        };
         engine
             .agent_tabs
             .insert(TabId::new("tab-x"), sample_tab("tab-x", "s1", "claude", 1));
