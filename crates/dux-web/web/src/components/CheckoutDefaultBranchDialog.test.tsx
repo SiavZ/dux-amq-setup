@@ -1,8 +1,12 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from "vitest"
-import { cleanup, render, screen } from "@testing-library/react"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 
-import type { DuxState } from "@/lib/store"
+import {
+  checkoutDefaultBranch,
+  closeCheckoutDefaultBranch,
+  type DuxState,
+} from "@/lib/store"
 
 let mockState: DuxState
 vi.mock("@/lib/store", () => ({
@@ -14,6 +18,14 @@ vi.mock("@/lib/store", () => ({
 import { CheckoutDefaultBranchDialog } from "@/components/CheckoutDefaultBranchDialog"
 
 afterEach(() => cleanup())
+
+function openFor(projectId: string) {
+  mockState = {
+    checkoutDefaultBranchTarget: projectId,
+    spine: { projects: [{ id: "p1", name: "dux", leading_branch: "develop" }] },
+  } as unknown as DuxState
+  render(<CheckoutDefaultBranchDialog />)
+}
 
 describe("CheckoutDefaultBranchDialog", () => {
   it("asks with the terminal UI's words and its confirm label", () => {
@@ -36,5 +48,43 @@ describe("CheckoutDefaultBranchDialog", () => {
     expect(
       screen.getByRole("button", { name: "Check out default branch" }),
     ).toBeTruthy()
+  })
+
+  describe("its buttons and Escape", () => {
+    beforeEach(() => {
+      vi.mocked(checkoutDefaultBranch).mockClear()
+      vi.mocked(closeCheckoutDefaultBranch).mockClear()
+    })
+
+    it("checks out the project it was opened for, then closes", () => {
+      openFor("p1")
+      fireEvent.click(
+        screen.getByRole("button", { name: "Check out default branch" }),
+      )
+      expect(checkoutDefaultBranch).toHaveBeenCalledTimes(1)
+      expect(checkoutDefaultBranch).toHaveBeenCalledWith("p1")
+      expect(closeCheckoutDefaultBranch).toHaveBeenCalled()
+      expect(
+        vi.mocked(checkoutDefaultBranch).mock.invocationCallOrder[0],
+      ).toBeLessThan(
+        vi.mocked(closeCheckoutDefaultBranch).mock.invocationCallOrder[0],
+      )
+    })
+
+    it("closes on Cancel and checks nothing out", () => {
+      openFor("p1")
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }))
+      expect(closeCheckoutDefaultBranch).toHaveBeenCalled()
+      expect(checkoutDefaultBranch).not.toHaveBeenCalled()
+    })
+
+    it("closes on Escape and checks nothing out", () => {
+      openFor("p1")
+      fireEvent.keyDown(document.activeElement ?? document.body, {
+        key: "Escape",
+      })
+      expect(closeCheckoutDefaultBranch).toHaveBeenCalled()
+      expect(checkoutDefaultBranch).not.toHaveBeenCalled()
+    })
   })
 })
