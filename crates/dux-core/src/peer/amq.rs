@@ -592,6 +592,7 @@ fn write_atomic(path: &Path, body: &[u8]) -> Result<()> {
 /// its inbox and exact owner marker as an ordinary-delete tombstone. Failures
 /// are logged, never propagated: a registry problem must not block deleting
 /// the agent locally.
+// INTEGRATION: no caller yet. Engine session delete must call this (fork: src/app/sessions.rs delete path, gated by amq_handle_is_exact_owner_at_root) (evergreen)
 pub fn tombstone_amq_session(
     paths: &DuxPaths,
     store_id: &str,
@@ -660,6 +661,7 @@ pub fn tombstone_amq_session_at_root(
 
 /// Verify exact ownership, stop wake delivery, remove the inbox, and release
 /// a global handle. The hard-purge path is the production caller.
+// INTEGRATION: no caller yet. `dux purge` and `dux reset --all` must call this before deleting rows (evergreen / purge worker)
 pub fn free_amq_handle(paths: &DuxPaths, store_id: &str, session: &PeerSession) -> Result<()> {
     let Some(root) = optional_amq_root(paths) else {
         return Ok(());
