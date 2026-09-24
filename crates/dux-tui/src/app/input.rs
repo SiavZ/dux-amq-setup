@@ -14362,6 +14362,9 @@ not_a_real_action = ["x"]
         let now = Utc::now();
         app.engine.sessions.push(AgentSession {
             id: "session-2".to_string(),
+            agent_handle: "session-2".to_string(),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: "session-2-slot".to_string(),
             provider: ProviderKind::from_str("claude"),
             title: None,
@@ -14442,6 +14445,9 @@ not_a_real_action = ["x"]
         for name in ["charlie", "alpha", "bravo"] {
             let session = AgentSession {
                 id: format!("session-{name}"),
+                agent_handle: dux_core::model::normalize_agent_handle(&format!("session-{name}")),
+                shared_workspace: false,
+                deleted_at: None,
                 slot_tab_id: format!("session-{name}-slot"),
                 provider: ProviderKind::from_str("codex"),
                 title: None,
@@ -14515,6 +14521,9 @@ not_a_real_action = ["x"]
     ) -> AgentSession {
         AgentSession {
             id: id.to_string(),
+            agent_handle: dux_core::model::normalize_agent_handle(id),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: format!("{id}-slot"),
             provider: ProviderKind::from_str("codex"),
             title: None,
@@ -14849,6 +14858,9 @@ not_a_real_action = ["x"]
         for name in ["charlie", "alpha", "bravo"] {
             let session = AgentSession {
                 id: format!("session-{name}"),
+                agent_handle: dux_core::model::normalize_agent_handle(&format!("session-{name}")),
+                shared_workspace: false,
+                deleted_at: None,
                 slot_tab_id: format!("session-{name}-slot"),
                 provider: ProviderKind::from_str("codex"),
                 title: None,
@@ -15857,6 +15869,9 @@ not_a_real_action = ["x"]
         for name in ["alpha", "bravo"] {
             app.engine.sessions.push(AgentSession {
                 id: format!("session-{name}"),
+                agent_handle: dux_core::model::normalize_agent_handle(&format!("session-{name}")),
+                shared_workspace: false,
+                deleted_at: None,
                 slot_tab_id: format!("session-{name}-slot"),
                 provider: ProviderKind::from_str("codex"),
                 title: None,
@@ -16052,6 +16067,9 @@ not_a_real_action = ["x"]
         std::fs::create_dir_all(&worktree).expect("imported worktree");
         let session = AgentSession {
             id: "imported-session".to_string(),
+            agent_handle: "imported-session".to_string(),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: "imported-session-slot".to_string(),
             provider: ProviderKind::from_str("codex"),
             title: Some("imported".to_string()),
@@ -20814,6 +20832,9 @@ not_a_real_action = ["x"]
         let now = Utc::now();
         app.engine.sessions.push(AgentSession {
             id: "session-2".to_string(),
+            agent_handle: "session-2".to_string(),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: "session-2-slot".to_string(),
             provider: ProviderKind::from_str("codex"),
             title: None,

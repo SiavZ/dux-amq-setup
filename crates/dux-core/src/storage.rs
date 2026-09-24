@@ -1,11 +1,15 @@
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::HashSet;
 
 use crate::config::ProjectConfig;
-use crate::model::{AgentSession, AgentTab, ProviderKind, SessionStatus};
+use crate::model::{
+    AGENT_HANDLE_MAX_LEN, AgentSession, AgentTab, ProviderKind, SessionStatus, derive_agent_handle,
+    is_valid_agent_handle, normalize_agent_handle,
+};
 use crate::text::count_of;
 
 /// A stored PR association loaded from the database.
@@ -438,9 +442,122 @@ impl SessionStore {
         // table has to exist, and a failure in any of them aborts the open. A
         // workspace whose first tabs are unaddressable is worse than a startup
         // that says why it stopped.
+        // The identity columns are ADDED first because the slot passes below
+        // filter on `deleted_at`; the handle backfill runs last.
+        self.ensure_shared_workspace_identity_columns()?;
         self.sweep_orphan_agent_tabs()?;
         self.backfill_slot_tabs()?;
         self.heal_slot_tab_pointers()?;
+        self.backfill_agent_handles()?;
+        Ok(())
+    }
+
+    /// Shared-workspace identity schema, ported from the fork's migration 0005
+    /// (and the column half of its 0003/0006 that this layout still lacks).
+    ///
+    /// Upstream has no numbered migrations: every step is idempotent and runs on
+    /// every open. This one follows the same rules, and it must accept THREE
+    /// starting shapes:
+    ///
+    /// - an upstream database: none of the columns exist; they are added and
+    ///   every row gets a derived, locally unique `agent_handle`;
+    /// - a database a fork build wrote (fork schema 0006): the columns already
+    ///   exist with their values, `PRAGMA user_version` is 6, and the fork's
+    ///   own `idx_agent_sessions_sort_order` index is present. Stored handles
+    ///   are kept byte for byte (AMQ inboxes on disk are named after them),
+    ///   and every upstream-only column is added by the steps above;
+    /// - this build's own database on a second open: a pure no-op.
+    ///
+    /// The columns are ADDITIVE with defaults so an older upstream binary's
+    /// INSERT (which names none of them) still satisfies the schema. The fork
+    /// enforced the handle alphabet with a CHECK on a rebuilt table; SQLite
+    /// cannot add a CHECK to an existing table, so the contract is enforced in
+    /// Rust instead (`upsert_session_in` refuses to write a bad handle, and
+    /// `validate_stored_handles` refuses to load one) and uniqueness by a
+    /// partial unique index over non-empty handles.
+    fn ensure_shared_workspace_identity_columns(&self) -> Result<()> {
+        // Same autocommit ALTER rationale as `initial_branch`: a concurrent
+        // opener losing the race sees "duplicate column" and moves on.
+        ensure_column(
+            &self.conn,
+            "agent_sessions",
+            "agent_handle",
+            "text not null default ''",
+        )?;
+        ensure_column(
+            &self.conn,
+            "agent_sessions",
+            "shared_workspace",
+            "integer not null default 0",
+        )?;
+        ensure_column(&self.conn, "agent_sessions", "deleted_at", "text")?;
+        Ok(())
+    }
+
+    /// Give every row without an `agent_handle` a derived, locally unique one.
+    /// See [`Self::ensure_shared_workspace_identity_columns`] for the three
+    /// database shapes this must accept.
+    fn backfill_agent_handles(&self) -> Result<()> {
+        // Backfill in ONE transaction: a crash mid-way rolls every assignment
+        // back and the next open retries from the same state, so no row can
+        // end up with a handle that collides with one assigned in the retry.
+        // Rows that already carry a handle (fork databases, or rows this build
+        // wrote) keep it and are reserved first, so a derived handle never
+        // steals an identity that an AMQ inbox on disk already uses.
+        let pending: Vec<(String, String, String, String, String)> = {
+            let mut stmt = self.conn.prepare(
+                "select id, workspace_kind, worktree_path, coalesce(folder_path, ''), branch_name \
+                 from agent_sessions where agent_handle = '' order by id",
+            )?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if !pending.is_empty() {
+            let tx = self
+                .conn
+                .unchecked_transaction()
+                .context("failed to start the agent handle backfill")?;
+            let mut used = used_agent_handles(&tx)?;
+            for (id, kind, worktree_path, folder_path, branch_name) in &pending {
+                let directory = if kind == "folder" {
+                    folder_path
+                } else {
+                    worktree_path
+                };
+                let base = derive_agent_handle(directory, branch_name, id);
+                let handle = next_unique_agent_handle(&base, &used);
+                used.insert(handle.clone());
+                tx.execute(
+                    "update agent_sessions set agent_handle = ?2 where id = ?1 and agent_handle = ''",
+                    params![id, handle],
+                )
+                .with_context(|| format!("failed to assign an agent handle to session {id}"))?;
+            }
+            tx.commit()
+                .context("failed to commit the agent handle backfill")?;
+            crate::logger::info(&format!(
+                "one-time migration: gave {} a stable agent handle",
+                count_of(pending.len(), "session")
+            ));
+        }
+        // Partial so the '' default an older binary's INSERT writes cannot
+        // collide with itself before the next open backfills it.
+        self.conn
+            .execute_batch(
+                "create unique index if not exists idx_agent_sessions_agent_handle \
+                 on agent_sessions(agent_handle) where agent_handle <> '';",
+            )
+            .context(
+                "failed to index agent handles: the session database holds duplicate handles",
+            )?;
         Ok(())
     }
 
@@ -478,7 +595,8 @@ impl SessionStore {
         let pending: Vec<(String, String, String)> = {
             let mut stmt = self.conn.prepare(
                 "select id, provider, created_at from agent_sessions \
-                 where slot_tab_id is null or trim(slot_tab_id) = ''",
+                 where (slot_tab_id is null or trim(slot_tab_id) = '') \
+                   and deleted_at is null",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get::<_, String>(2)?))
@@ -544,6 +662,7 @@ impl SessionStore {
             let mut stmt = self.conn.prepare(
                 "select s.id, s.slot_tab_id, s.provider, s.created_at from agent_sessions s \
                  where s.slot_tab_id is not null and trim(s.slot_tab_id) <> '' \
+                   and s.deleted_at is null \
                    and not exists (select 1 from agent_tabs t \
                                    where t.id = s.slot_tab_id and t.session_id = s.id)",
             )?;
@@ -711,7 +830,8 @@ impl SessionStore {
         let mut stmt = self.conn.prepare(
             "select t.id, t.session_id, t.provider, t.sort_order, t.created_at \
              from agent_tabs t join agent_sessions s on s.id = t.session_id \
-             where s.slot_tab_id is null or t.id <> s.slot_tab_id \
+             where (s.slot_tab_id is null or t.id <> s.slot_tab_id) \
+               and s.deleted_at is null \
              order by t.session_id, t.sort_order, t.created_at",
         )?;
         let rows = stmt.query_map([], read_agent_tab)?;
@@ -1400,6 +1520,75 @@ impl SessionStore {
         Self::upsert_session_in(&self.conn, session)
     }
 
+    /// Assign a locally unique handle to a brand-new session before its first
+    /// insert: its derived handle normalized, suffixed `-2`, `-3`, ... on a
+    /// collision. Tombstones participate, so an ordinary delete never frees an
+    /// identity that a later purge still needs to find.
+    ///
+    /// The read here and the insert that follows are separate statements;
+    /// uniqueness holds because sessions are only ever inserted from the
+    /// engine's single thread, and the unique index turns any violation of
+    /// that assumption into a failed insert rather than a shared inbox.
+    pub fn assign_unique_agent_handle(&self, session: &mut AgentSession) -> Result<()> {
+        let base = normalize_agent_handle(session.agent_handle());
+        ensure!(!base.is_empty(), "new session has an empty agent handle");
+        let used = used_agent_handles(&self.conn)?;
+        session.agent_handle = next_unique_agent_handle(&base, &used);
+        Ok(())
+    }
+
+    /// Complete a global AMQ ownership backfill for one row. Normal upserts
+    /// reject every handle change; this narrow compare-and-swap is for the AMQ
+    /// layer only, called while its shared lock proves `expected` is occupied
+    /// by a foreign owner and `replacement` is free.
+    pub fn reassign_agent_handle_for_global_backfill(
+        &self,
+        id: &str,
+        expected: &str,
+        replacement: &str,
+    ) -> Result<()> {
+        ensure!(
+            is_valid_agent_handle(replacement),
+            "refusing invalid global agent handle replacement"
+        );
+        let changed = self.conn.execute(
+            "update agent_sessions set agent_handle = ?1 where id = ?2 and agent_handle = ?3",
+            params![replacement, id, expected],
+        )?;
+        ensure!(
+            changed == 1,
+            "session changed while completing global handle backfill"
+        );
+        Ok(())
+    }
+
+    /// Tombstone a session instead of removing it: the row, its handle and its
+    /// PR history stay so a later hard purge can find everything the agent
+    /// left behind, and [`Self::load_sessions`] stops returning it. Its tabs
+    /// and per-session housekeeping rows ARE removed, because nothing can
+    /// reach them once the agent is gone from both surfaces and keeping them
+    /// would let the slot-tab repair passes resurrect state for a dead agent.
+    /// Idempotent: a second call keeps the first timestamp.
+    pub fn soft_delete_session(&self, id: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "delete from session_pr_overrides where session_id = ?1",
+            params![id],
+        )?;
+        tx.execute(
+            "delete from session_pr_suppressions where session_id = ?1",
+            params![id],
+        )?;
+        tx.execute("delete from changes_rev where session_id = ?1", params![id])?;
+        tx.execute("delete from agent_tabs where session_id = ?1", params![id])?;
+        tx.execute(
+            "update agent_sessions set deleted_at = ?2 where id = ?1 and deleted_at is null",
+            params![id, Utc::now().to_rfc3339()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Record that dux minted this agent's branch itself, after recreating a
     /// working copy whose branch was gone from the repository too.
     ///
@@ -1438,6 +1627,28 @@ impl SessionStore {
     /// The body of [`Self::upsert_session`], parameterized over the connection so
     /// [`Self::create_session`] can run it inside its transaction.
     fn upsert_session_in(conn: &Connection, session: &AgentSession) -> Result<()> {
+        // Identity is checked before anything is written. A bad handle is a
+        // bug at the creation site, and a changed one would orphan the AMQ
+        // inbox named after the old value, so both refuse loudly.
+        ensure!(
+            is_valid_agent_handle(session.agent_handle()),
+            "refusing to persist invalid agent handle {:?}",
+            crate::sanitize::for_terminal(session.agent_handle())
+        );
+        let stored_handle: Option<String> = conn
+            .query_row(
+                "select agent_handle from agent_sessions where id = ?1",
+                params![session.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(stored_handle) = stored_handle {
+            ensure!(
+                stored_handle == session.agent_handle(),
+                "refusing to change immutable agent handle for session {:?}",
+                crate::sanitize::for_terminal(&session.id)
+            );
+        }
         // Flatten the workspace into the row's columns ONCE, here, so no SQL
         // below reaches into the enum. A folder row writes empty text into the
         // git columns (`project_id` is NOT NULL, and the rest predate the
@@ -1480,6 +1691,9 @@ impl SessionStore {
         //   tab to ADOPT. The read path hands a pre-pointer row the session's own
         //   id as a stand-in, so a re-upsert would store that stand-in as a real
         //   pointer and the next open would adopt tab 2 instead of minting tab 1.
+        // - `agent_handle` (identity, checked unchanged above) and `deleted_at`
+        //   (owned by `soft_delete_session`, so a stale in-memory copy can
+        //   never resurrect a tombstone).
         //
         // `initial_branch` IS in the SET list; its immutability is engine
         // discipline rather than a schema guarantee, so do not follow it here.
@@ -1499,7 +1713,8 @@ impl SessionStore {
                 updated_at=?12,
                 initial_branch=?13,
                 workspace_kind=?14,
-                folder_path=?15
+                folder_path=?15,
+                shared_workspace=?16
             where id = ?1
             "#,
             params![
@@ -1518,6 +1733,7 @@ impl SessionStore {
                 initial_branch,
                 workspace_kind,
                 folder_path,
+                session.shared_workspace,
             ],
         )?;
         if updated > 0 {
@@ -1543,9 +1759,9 @@ impl SessionStore {
         conn.execute(
             r#"
             insert into agent_sessions
-                (id, project_id, project_path, provider, source_branch, branch_name, worktree_path, title, started_providers, desired_running, auto_reopen_enabled, status, sort_order, created_at, updated_at, initial_branch, branch_provenance, workspace_kind, folder_path, slot_tab_id)
+                (id, project_id, project_path, provider, source_branch, branch_name, worktree_path, title, started_providers, desired_running, auto_reopen_enabled, status, sort_order, created_at, updated_at, initial_branch, branch_provenance, workspace_kind, folder_path, slot_tab_id, agent_handle, shared_workspace, deleted_at)
             values
-                (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
             "#,
             params![
                 session.id,
@@ -1568,6 +1784,9 @@ impl SessionStore {
                 workspace_kind,
                 folder_path,
                 session.slot_tab_id,
+                session.agent_handle(),
+                session.shared_workspace,
+                session.deleted_at.map(|at| at.to_rfc3339()),
             ],
         )?;
         Ok(())
@@ -1703,14 +1922,37 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Every live session, in display order. Soft-deleted tombstones are
+    /// excluded; see [`Self::load_sessions_including_deleted`].
     pub fn load_sessions(&self) -> Result<Vec<AgentSession>> {
-        let mut stmt = self.conn.prepare(
+        self.load_sessions_impl(false)
+    }
+
+    /// Live sessions AND tombstones, for AMQ ownership reconciliation and
+    /// destructive maintenance (purge, orphan cleanup), which must see every
+    /// identity dux still owns.
+    pub fn load_sessions_including_deleted(&self) -> Result<Vec<AgentSession>> {
+        self.load_sessions_impl(true)
+    }
+
+    fn load_sessions_impl(&self, include_deleted: bool) -> Result<Vec<AgentSession>> {
+        validate_stored_handles(&self.conn)?;
+        // Visibility is decided by the raw NULL here, never by parsing the
+        // stamp: `soft_delete_session` always writes a valid RFC 3339 value,
+        // but a hand-edited unparseable one must still read as deleted.
+        let where_clause = if include_deleted {
+            ""
+        } else {
+            "where deleted_at is null"
+        };
+        let mut stmt = self.conn.prepare(&format!(
             r#"
-            select id, project_id, provider, source_branch, branch_name, worktree_path, title, project_path, started_providers, desired_running, auto_reopen_enabled, status, created_at, updated_at, initial_branch, last_focused_tab, branch_provenance, workspace_kind, folder_path, slot_tab_id
+            select id, project_id, provider, source_branch, branch_name, worktree_path, title, project_path, started_providers, desired_running, auto_reopen_enabled, status, created_at, updated_at, initial_branch, last_focused_tab, branch_provenance, workspace_kind, folder_path, slot_tab_id, agent_handle, shared_workspace, deleted_at
             from agent_sessions
+            {where_clause}
             order by sort_order asc, updated_at desc
-            "#,
-        )?;
+            "#
+        ))?;
         let rows = stmt.query_map([], |row| {
             let started_providers: String = row.get(8)?;
             let created_at: String = row.get(12)?;
@@ -1784,6 +2026,25 @@ impl SessionStore {
             };
             Ok(Some(AgentSession {
                 id: row.get(0)?,
+                // Validated above; loaded verbatim, never re-normalized.
+                agent_handle: {
+                    let handle: String = row.get(20)?;
+                    if handle.is_empty() {
+                        let id: String = row.get(0)?;
+                        crate::logger::warn(&format!(
+                            "skipping session {id} until the next open gives it an agent \
+                             handle: an older dux inserted it after this one migrated"
+                        ));
+                        return Ok(None);
+                    }
+                    handle
+                },
+                shared_workspace: row.get::<_, i64>(21)? != 0,
+                // A present-but-unparseable stamp still means deleted; the
+                // epoch keeps `is_deleted()` true for it.
+                deleted_at: row
+                    .get::<_, Option<String>>(22)?
+                    .map(|raw| parse_time(&raw).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)),
                 // `migrate()` has already run by the time anything reads, so a
                 // usable pointer is guaranteed. The fallback is defence for a
                 // row written by a build that is not this one; it restores the
@@ -1939,6 +2200,9 @@ fn test_session(
 ) -> crate::model::AgentSession {
     crate::model::AgentSession {
         id: id.to_string(),
+        agent_handle: crate::model::normalize_agent_handle(id),
+        shared_workspace: false,
+        deleted_at: None,
         slot_tab_id: format!("{id}-slot"),
         provider: crate::model::ProviderKind::new("claude"),
         title: None,
@@ -2001,6 +2265,9 @@ mod tests {
         let now = Utc::now();
         AgentSession {
             id: id.to_string(),
+            agent_handle: crate::model::normalize_agent_handle(id),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: format!("{id}-slot"),
             provider: crate::model::ProviderKind::new("claude"),
             workspace: AgentWorkspace::Folder(FolderWorkspace {
@@ -3945,6 +4212,105 @@ mod tests {
     }
 
     #[test]
+    fn upsert_refuses_to_change_an_agent_handle() {
+        let store = test_store();
+        let now = Utc::now();
+        let mut session = test_session("s1", now, now);
+        store.create_session(&session).unwrap();
+        session.agent_handle = "renamed".to_string();
+        let err = store.upsert_session(&session).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("immutable agent handle"),
+            "{err:#}"
+        );
+        assert_eq!(store.load_sessions().unwrap()[0].agent_handle(), "s1");
+    }
+
+    #[test]
+    fn upsert_refuses_an_invalid_agent_handle() {
+        let store = test_store();
+        let now = Utc::now();
+        let mut session = test_session("s1", now, now);
+        session.agent_handle = "Bad Handle".to_string();
+        assert!(store.create_session(&session).is_err());
+        assert!(store.load_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_corrupt_stored_handle_fails_the_load_closed() {
+        let store = test_store();
+        let now = Utc::now();
+        store.create_session(&test_session("s1", now, now)).unwrap();
+        store
+            .conn
+            .execute(
+                "update agent_sessions set agent_handle = 'x/../y' where id = 's1'",
+                [],
+            )
+            .unwrap();
+        let err = store.load_sessions().unwrap_err();
+        assert!(format!("{err:#}").contains("corruption"), "{err:#}");
+    }
+
+    #[test]
+    fn soft_delete_hides_the_row_keeps_the_tombstone_and_reserves_its_handle() {
+        let store = test_store();
+        let now = Utc::now();
+        let session = test_session("s1", now, now);
+        store.create_session(&session).unwrap();
+        store.upsert_pr(&stored_pr("s1", 4)).unwrap();
+
+        store.soft_delete_session("s1").unwrap();
+
+        assert!(store.load_sessions().unwrap().is_empty());
+        let all = store.load_sessions_including_deleted().unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(all[0].is_deleted());
+        assert_eq!(all[0].agent_handle(), "s1");
+        assert_eq!(store.count_agent_tabs("s1").unwrap(), 0, "tabs dropped");
+        assert_eq!(store.load_prs("s1").unwrap().len(), 1, "PR history kept");
+        // The slot-tab repair must not resurrect a first tab for a tombstone.
+        store.migrate().unwrap();
+        assert_eq!(store.count_agent_tabs("s1").unwrap(), 0);
+
+        let mut fresh = test_session("s2", now, now);
+        fresh.agent_handle = "s1".to_string();
+        store.assign_unique_agent_handle(&mut fresh).unwrap();
+        assert_eq!(fresh.agent_handle(), "s1-2");
+    }
+
+    #[test]
+    fn a_stale_upsert_cannot_resurrect_a_tombstone() {
+        let store = test_store();
+        let now = Utc::now();
+        let session = test_session("s1", now, now);
+        store.create_session(&session).unwrap();
+        store.soft_delete_session("s1").unwrap();
+        store.upsert_session(&session).unwrap();
+        assert!(store.load_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn shared_workspace_round_trips() {
+        let store = test_store();
+        let now = Utc::now();
+        let mut session = test_session("s1", now, now);
+        session.shared_workspace = true;
+        store.create_session(&session).unwrap();
+        assert!(store.load_sessions().unwrap()[0].shared_workspace());
+    }
+
+    #[test]
+    fn next_unique_agent_handle_suffixes_within_the_length_limit() {
+        let long = "a".repeat(AGENT_HANDLE_MAX_LEN);
+        let used: HashSet<String> = [long.clone()].into_iter().collect();
+        let next = next_unique_agent_handle(&long, &used);
+        assert_eq!(next.len(), AGENT_HANDLE_MAX_LEN);
+        assert!(next.ends_with("-2"));
+        assert!(is_valid_agent_handle(&next));
+    }
+
+    #[test]
     fn reopening_same_db_file_remigrates_cleanly() {
         // With the initial_branch ALTER moved to autocommit,
         // re-opening the same on-disk DB re-runs migrate() and every
@@ -4541,6 +4907,63 @@ mod pr_tests {
             "Other PR"
         )));
     }
+}
+
+/// Every non-empty handle already stored, tombstones included: a soft-deleted
+/// agent keeps its identity reserved so a later hard purge can still find the
+/// AMQ inbox that carries its name.
+fn used_agent_handles(conn: &Connection) -> Result<HashSet<String>> {
+    let mut stmt =
+        conn.prepare("select agent_handle from agent_sessions where agent_handle <> ''")?;
+    let used = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<HashSet<String>>>()?;
+    Ok(used)
+}
+
+/// `base` if it is free, otherwise `base-2`, `base-3`, ... with the prefix
+/// truncated so the suffixed handle still fits [`AGENT_HANDLE_MAX_LEN`].
+fn next_unique_agent_handle(base: &str, used: &HashSet<String>) -> String {
+    if !used.contains(base) {
+        return base.to_string();
+    }
+    for ordinal in 2usize.. {
+        let suffix = format!("-{ordinal}");
+        let prefix: String = base
+            .chars()
+            .take(AGENT_HANDLE_MAX_LEN - suffix.len())
+            .collect();
+        let candidate = format!("{prefix}{suffix}");
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded handle suffix search")
+}
+
+/// Fail closed on a corrupt identity instead of repairing it: every stored
+/// handle must satisfy the persisted contract. Uniqueness is the partial unique
+/// index's job. An EMPTY handle is not corruption: it is a row an older binary
+/// inserted after this build's last open, which the next open's backfill
+/// fixes. The loader skips such a row (loudly) rather than failing every load.
+fn validate_stored_handles(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "select id, agent_handle from agent_sessions where agent_handle <> '' order by id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (id, handle) = row?;
+        if !is_valid_agent_handle(&handle) {
+            bail!(
+                "session database corruption: invalid agent_handle {:?} for session {:?}",
+                crate::sanitize::for_terminal(&handle),
+                crate::sanitize::for_terminal(&id)
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Read one `agent_tabs` row. Shared by every tab query so the slot tab and an

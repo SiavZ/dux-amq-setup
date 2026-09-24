@@ -1004,7 +1004,7 @@ impl Engine {
         data: AgentLaunchReadyData,
     ) -> (AgentLaunchReadyOutcome, Option<ResolvedFinal>) {
         let AgentLaunchReadyData { request, client } = data;
-        let session = request.session.clone();
+        let mut session = request.session.clone();
         let pty_size = request.pty_size;
         // Runtime PTY/provider state is keyed by tab id (the slot tab id for the
         // session-slot tab). Use it for the in-flight clear, the providers insert, and
@@ -1020,7 +1020,15 @@ impl Engine {
             // A brand-new agent's session row, its first tab's row and the
             // pointer between them land in one transaction: a session whose slot
             // tab is missing has a PTY address nothing resolves.
-            if let Err(err) = self.session_store.create_session(&session) {
+            //
+            // The handle is made locally unique first (tombstones included),
+            // right before the insert, so two agents on same-named worktrees
+            // never share an AMQ inbox.
+            let persisted = self
+                .session_store
+                .assign_unique_agent_handle(&mut session)
+                .and_then(|()| self.session_store.create_session(&session));
+            if let Err(err) = persisted {
                 logger::error(&format!(
                     "session store upsert failed for {}: {err}",
                     session.id,
@@ -1472,7 +1480,12 @@ impl Engine {
         // untouched and the session remains visible in the UI. If we cleared
         // in-memory state first and the DB call then failed, the session
         // would vanish from the UI but reappear on restart.
-        self.session_store.delete_session(session_id)?;
+        //
+        // A user delete TOMBSTONES the row rather than removing it: the handle
+        // stays reserved and a later hard purge can still find the AMQ inbox
+        // and provider history the agent left. `delete_session` (physical
+        // removal) is reserved for purge.
+        self.session_store.soft_delete_session(session_id)?;
         Ok(self.finish_delete_session_memory(session_id))
     }
 
@@ -3605,6 +3618,29 @@ mod tests {
         assert_eq!(outcome.project.as_ref().map(|p| p.id.as_str()), Some("p1"));
         assert!(!outcome.other_sessions_on_worktree);
         assert!(!outcome.project_still_has_sessions);
+    }
+
+    #[test]
+    fn a_user_delete_tombstones_the_row_instead_of_removing_it() {
+        let (mut engine, _tmp) = test_engine();
+        engine.projects.push(sample_project("p1", "/tmp/p1"));
+        let session = sample_session("s1", "p1", "feat/x");
+        engine.session_store.upsert_session(&session).unwrap();
+        engine.sessions.push(session.clone());
+
+        engine
+            .finish_delete_session("s1")
+            .unwrap()
+            .expect("outcome");
+
+        assert!(engine.session_store.load_sessions().unwrap().is_empty());
+        let retained = engine
+            .session_store
+            .load_sessions_including_deleted()
+            .unwrap();
+        assert_eq!(retained.len(), 1, "the tombstone must be kept for purge");
+        assert!(retained[0].is_deleted());
+        assert_eq!(retained[0].agent_handle(), session.agent_handle());
     }
 
     #[test]

@@ -1995,6 +1995,9 @@ mod tests {
     fn test_session(worktree: &Path) -> AgentSession {
         AgentSession {
             id: "session-1".to_string(),
+            agent_handle: "session-1".to_string(),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: "session-1-slot".to_string(),
             provider: ProviderKind::from_str("custom"),
             title: None,
@@ -3233,6 +3236,9 @@ mod tests {
         let now = Utc::now();
         let source_session = AgentSession {
             id: "session-1".to_string(),
+            agent_handle: "session-1".to_string(),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: "session-1-slot".to_string(),
             provider: ProviderKind::from_str("codex"),
             title: None,

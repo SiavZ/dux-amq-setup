@@ -934,6 +934,9 @@ mod tests {
         store
             .upsert_session(&AgentSession {
                 id: "sa1".to_string(),
+                agent_handle: "sa1".to_string(),
+                shared_workspace: false,
+                deleted_at: None,
                 slot_tab_id: "sa1-slot".to_string(),
                 provider: ProviderKind::new("claude"),
                 workspace: dux_core::model::AgentWorkspace::Folder(
@@ -1000,6 +1003,9 @@ mod tests {
         store
             .upsert_session(&AgentSession {
                 id: "m1".to_string(),
+                agent_handle: "m1".to_string(),
+                shared_workspace: false,
+                deleted_at: None,
                 slot_tab_id: "m1-slot".to_string(),
                 provider: ProviderKind::new("claude"),
                 workspace: dux_core::model::AgentWorkspace::Managed(
@@ -1028,6 +1034,9 @@ mod tests {
         store
             .upsert_session(&AgentSession {
                 id: "sa1".to_string(),
+                agent_handle: "sa1".to_string(),
+                shared_workspace: false,
+                deleted_at: None,
                 slot_tab_id: "sa1-slot".to_string(),
                 provider: ProviderKind::new("claude"),
                 workspace: dux_core::model::AgentWorkspace::Folder(
@@ -1884,6 +1893,9 @@ mod tests {
             store
                 .upsert_session(&AgentSession {
                     id: id.to_string(),
+                    agent_handle: dux_core::model::normalize_agent_handle(id),
+                    shared_workspace: false,
+                    deleted_at: None,
                     slot_tab_id: format!("{id}-slot"),
                     provider: ProviderKind::new("claude"),
                     title: None,
@@ -1955,6 +1967,9 @@ mod tests {
         let now = Utc::now();
         let session = AgentSession {
             id: "wt".to_string(),
+            agent_handle: "wt".to_string(),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: "wt-slot".to_string(),
             provider: ProviderKind::new("claude"),
             title: None,
@@ -2050,6 +2065,9 @@ mod tests {
         let now = Utc::now();
         let session = AgentSession {
             id: "wt".to_string(),
+            agent_handle: "wt".to_string(),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: "wt-slot".to_string(),
             provider: ProviderKind::new("claude"),
             title: None,
