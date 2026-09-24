@@ -355,7 +355,7 @@ sequences can corrupt subsequent rendering. Same incident class
 as Rails CVE-2025-55193.
 
 **Mitigation in code.** Phase 03 introduces
-<!-- INTEGRATION: path pending seedling (fork main had src/sanitize.rs) -->
+<!-- INTEGRATION: path pending unassigned, sanitizer not yet in any worker scope (fork main had src/sanitize.rs) -->
 `sanitize_for_terminal(s: &str) -> String` (lives in
 `crates/dux-core/src/sanitize.rs`) which strips
 `[\x00-\x08\x0b-\x1f\x7f\x1b]`. Every `logger::*` call and every
