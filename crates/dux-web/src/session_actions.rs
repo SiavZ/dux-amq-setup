@@ -1036,6 +1036,15 @@ mod tests {
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     }
 
+    /// The disk watchdog samples the host's real disk at boot; on a nearly
+    /// full machine (or CI runner) it would refuse every create these tests
+    /// drive. The guard itself is covered by `dux_core::engine::limits` with
+    /// synthetic samples.
+    fn ignore_host_disk_fullness(engine: &mut dux_core::engine::Engine) {
+        engine.config.limits.disk_high_water_pct = 0;
+        engine.config.limits.disk_warn_pct = 0;
+    }
+
     fn run_git(cwd: &std::path::Path, args: &[&str]) {
         let out = std::process::Command::new("git")
             .args(args)
@@ -1074,7 +1083,8 @@ mod tests {
             ),
         )
         .unwrap();
-        let engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        let mut engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        ignore_host_disk_fullness(&mut engine);
         let (handle, _join) = crate::engine_actor::spawn_engine_thread(engine);
         (tmp, crate::server::router(handle), "p1".to_string())
     }
@@ -1227,6 +1237,7 @@ mod tests {
             .unwrap();
         drop(store);
         let mut engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        ignore_host_disk_fullness(&mut engine);
         prepare(&mut engine, tmp.path());
         let (handle, _join) = crate::engine_actor::spawn_engine_thread(engine);
         (tmp, crate::server::router(handle))

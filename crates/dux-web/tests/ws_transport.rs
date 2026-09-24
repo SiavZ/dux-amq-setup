@@ -107,6 +107,12 @@ async fn boot() -> (SocketAddr, tempfile::TempDir) {
     // created terminal echoes input back the same way the provider override does.
     engine.config.terminal.command = "cat".to_string();
     engine.config.terminal.args = vec![];
+    // The host's real disk fullness must not decide these tests: the disk
+    // watchdog samples at boot, and on a nearly full machine (or CI runner) it
+    // refuses every create and puts its own error/warning on the status stream.
+    // The guard is covered by dux_core::engine::limits with synthetic samples.
+    engine.config.limits.disk_high_water_pct = 0;
+    engine.config.limits.disk_warn_pct = 0;
     let (handle, _join) = spawn_engine_thread(engine);
     let app = router(handle);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -195,6 +201,12 @@ async fn boot_with_repo() -> (SocketAddr, tempfile::TempDir) {
     );
     engine.config.terminal.command = "cat".to_string();
     engine.config.terminal.args = vec![];
+    // The host's real disk fullness must not decide these tests: the disk
+    // watchdog samples at boot, and on a nearly full machine (or CI runner) it
+    // refuses every create and puts its own error/warning on the status stream.
+    // The guard is covered by dux_core::engine::limits with synthetic samples.
+    engine.config.limits.disk_high_water_pct = 0;
+    engine.config.limits.disk_warn_pct = 0;
     let (handle, _join) = spawn_engine_thread(engine);
     let app = router(handle);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -478,6 +490,12 @@ async fn boot_for_create_agent_window(
     // The test repo has no remote, so a pre-create pull would fail; disable it.
     engine.config.defaults.pull_before_creating_agent_by_default = false;
     prepare(&mut engine, tmp.path());
+    // The host's real disk fullness must not decide these tests: the disk
+    // watchdog samples at boot, and on a nearly full machine (or CI runner) it
+    // refuses every create and puts its own error/warning on the status stream.
+    // The guard is covered by dux_core::engine::limits with synthetic samples.
+    engine.config.limits.disk_high_water_pct = 0;
+    engine.config.limits.disk_warn_pct = 0;
     let (handle, _join) = spawn_engine_thread(engine);
     let app = match create_await {
         Some(window) => dux_web::server::build_app(
@@ -690,6 +708,12 @@ async fn boot_with_gated_startup_command() -> (SocketAddr, std::path::PathBuf, t
     // rather than depending on whatever login shell the host defaults to.
     engine.config.startup_command_terminal.command = "sh".to_string();
     engine.config.startup_command_terminal.args = vec!["-c".to_string()];
+    // The host's real disk fullness must not decide these tests: the disk
+    // watchdog samples at boot, and on a nearly full machine (or CI runner) it
+    // refuses every create and puts its own error/warning on the status stream.
+    // The guard is covered by dux_core::engine::limits with synthetic samples.
+    engine.config.limits.disk_high_water_pct = 0;
+    engine.config.limits.disk_warn_pct = 0;
     let (handle, _join) = spawn_engine_thread(engine);
     let app = router(handle);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1562,6 +1586,12 @@ async fn boot_two_sessions() -> (SocketAddr, tempfile::TempDir) {
     );
     engine.config.terminal.command = "cat".to_string();
     engine.config.terminal.args = vec![];
+    // The host's real disk fullness must not decide these tests: the disk
+    // watchdog samples at boot, and on a nearly full machine (or CI runner) it
+    // refuses every create and puts its own error/warning on the status stream.
+    // The guard is covered by dux_core::engine::limits with synthetic samples.
+    engine.config.limits.disk_high_water_pct = 0;
+    engine.config.limits.disk_warn_pct = 0;
     let (handle, _join) = spawn_engine_thread(engine);
     let app = router(handle);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
