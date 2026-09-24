@@ -662,6 +662,7 @@ pub(crate) fn build_actor_channels(engine: &Engine) -> (EngineHandle, ActorLoopE
 pub(crate) fn spawn_global_workers(engine: &mut Engine) {
     engine.spawn_changed_files_poller();
     engine.spawn_branch_sync_worker();
+    engine.spawn_limits_watchdogs();
     engine.spawn_project_branch_status_checks();
     engine.spawn_gh_status_check();
 }

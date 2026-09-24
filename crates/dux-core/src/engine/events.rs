@@ -3501,6 +3501,8 @@ impl Engine {
                 self.clear_in_flight(&InFlightKey::ResourceStats);
                 EventReaction::ResourceStatsArrived(stats, was_baseline)
             }
+            WorkerEvent::DiskUsageSampled(pct) => self.handle_disk_usage_event(pct),
+            WorkerEvent::ScrollbackWatchdogTick => self.handle_scrollback_watchdog_tick(),
             WorkerEvent::NonDefaultBranchCheckoutCompleted {
                 action,
                 target_branch,

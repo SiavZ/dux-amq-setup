@@ -643,6 +643,49 @@ fn apply_patches(doc: &mut DocumentMut, config: &Config) {
 
     // --- [macros] ---
     patch_macros(doc, &config.macros);
+
+    // --- [limits] (port-misc: fork P1-AA resource guards) ---
+    patch_limits(doc, &config.limits);
+}
+
+fn patch_limits(doc: &mut DocumentMut, limits: &crate::config::LimitsConfig) {
+    patch_table_usize(doc, "limits", "max_panes", limits.max_panes);
+    patch_table_usize(
+        doc,
+        "limits",
+        "max_panes_soft_warn",
+        limits.max_panes_soft_warn,
+    );
+    patch_table_usize(
+        doc,
+        "limits",
+        "max_companion_terminals",
+        limits.max_companion_terminals,
+    );
+    patch_table_usize(
+        doc,
+        "limits",
+        "max_total_scrollback_mb",
+        limits.max_total_scrollback_mb,
+    );
+    patch_table_u16(
+        doc,
+        "limits",
+        "disk_high_water_pct",
+        u16::from(limits.disk_high_water_pct),
+    );
+    patch_table_u16(
+        doc,
+        "limits",
+        "disk_warn_pct",
+        u16::from(limits.disk_warn_pct),
+    );
+    patch_table_bool(
+        doc,
+        "limits",
+        "enable_scrollback_overflow_autodetach",
+        limits.enable_scrollback_overflow_autodetach,
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -1305,6 +1305,73 @@ fn config_schema() -> Vec<ConfigEntry> {
         ConfigEntry::Keys,
         ConfigEntry::Blank,
         ConfigEntry::Macros,
+        ConfigEntry::Blank,
+        ConfigEntry::Section("limits"),
+        ConfigEntry::Comment(
+            "# Resource guards. Most are warnings or off by default: dux only refuses\n\
+             # to start an agent when you set a hard cap here, or when the disk that\n\
+             # holds the dux config directory is nearly full.",
+        ),
+        ConfigEntry::Field {
+            key: "max_panes",
+            comment: Some(CommentSource::Static(
+                "# Hard cap on agents running at once; a new agent is refused at the cap.\n\
+                 # Default 0, which means no cap.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.limits.max_panes),
+        },
+        ConfigEntry::Field {
+            key: "max_panes_soft_warn",
+            comment: Some(CommentSource::Static(
+                "# Number of running agents at which starting another shows a warning.\n\
+                 # The agent still starts. Default 16. Set to 0 to silence it.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.limits.max_panes_soft_warn),
+        },
+        ConfigEntry::Field {
+            key: "max_companion_terminals",
+            comment: Some(CommentSource::Static(
+                "# Hard cap on companion shell terminals across all agents. Default 0,\n\
+                 # which means no cap.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.limits.max_companion_terminals),
+        },
+        ConfigEntry::Field {
+            key: "max_total_scrollback_mb",
+            comment: Some(CommentSource::Static(
+                "# Budget in MiB for the estimated scrollback memory of every running\n\
+                 # agent. Only used when enable_scrollback_overflow_autodetach is true.\n\
+                 # Default 256.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.limits.max_total_scrollback_mb),
+        },
+        ConfigEntry::Field {
+            key: "disk_high_water_pct",
+            comment: Some(CommentSource::Static(
+                "# Disk usage percentage (of the filesystem holding the dux config\n\
+                 # directory) at which new agents are refused. Checked once a minute.\n\
+                 # Default 95. Set to 0 to turn the refusal off.",
+            )),
+            value_fn: |c| FieldValue::U16(u16::from(c.limits.disk_high_water_pct)),
+        },
+        ConfigEntry::Field {
+            key: "disk_warn_pct",
+            comment: Some(CommentSource::Static(
+                "# Disk usage percentage at which dux shows a warning. Default 80. Set to\n\
+                 # 0 to turn the warning off.",
+            )),
+            value_fn: |c| FieldValue::U16(u16::from(c.limits.disk_warn_pct)),
+        },
+        ConfigEntry::Field {
+            key: "enable_scrollback_overflow_autodetach",
+            comment: Some(CommentSource::Static(
+                "# When true, dux stops the agent that has been idle longest once the\n\
+                 # estimated scrollback total goes over max_total_scrollback_mb. The\n\
+                 # agent's record is kept and it can be resumed. Default false.\n\
+                 # Every [limits] value is read at startup and on a config reload.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.limits.enable_scrollback_overflow_autodetach),
+        },
     ]
 }
 
@@ -2006,6 +2073,86 @@ mod tests {
             !raw.contains('#'),
             "fixture must contain zero comments, or it is not a bare config"
         );
+    }
+
+    // -- [limits] (port of fork tests/limits.rs, P1-AA and its #13 softening) --
+
+    /// The defaults are the contract: no hard pane cap (soft warning at 16, the
+    /// old hard cap), no terminal cap, a 256 MiB scrollback budget, 80/95 disk
+    /// thresholds, auto-detach off.
+    #[test]
+    fn limits_defaults_match_audit_phase_16() {
+        let limits = dux_core::config::LimitsConfig::default();
+        assert_eq!(limits.max_panes, 0, "no hard cap by default");
+        assert_eq!(limits.max_panes_soft_warn, 16);
+        assert_eq!(limits.max_companion_terminals, 0);
+        assert_eq!(limits.max_total_scrollback_mb, 256);
+        assert_eq!(limits.disk_high_water_pct, 95);
+        assert_eq!(limits.disk_warn_pct, 80);
+        assert!(!limits.enable_scrollback_overflow_autodetach);
+        assert_eq!(Config::default().limits, limits);
+    }
+
+    /// A fresh config documents every [limits] knob inline.
+    #[test]
+    fn canonical_config_renders_limits_section() {
+        let body = render_default_config();
+        assert!(
+            body.contains("\n[limits]\n"),
+            "no [limits] section:\n{body}"
+        );
+        let section = body.split("\n[limits]\n").nth(1).unwrap();
+        for key in [
+            "max_panes",
+            "max_panes_soft_warn",
+            "max_companion_terminals",
+            "max_total_scrollback_mb",
+            "disk_high_water_pct",
+            "disk_warn_pct",
+            "enable_scrollback_overflow_autodetach",
+        ] {
+            let line = format!("\n{key} = ");
+            let at = section
+                .find(&line)
+                .unwrap_or_else(|| panic!("[limits] is missing {key}:\n{section}"));
+            assert!(
+                section[..at].lines().last().unwrap_or("").starts_with('#'),
+                "{key} has no comment above it:\n{section}"
+            );
+        }
+        for phrase in ["Default 0, which means no cap", "Default 16", "Set to 0"] {
+            assert!(section.contains(phrase), "[limits] never says {phrase:?}");
+        }
+    }
+
+    #[test]
+    fn limits_section_round_trips_through_toml() {
+        let body = render_default_config();
+        let parsed: Config = toml::from_str(&body).expect("rendered config parses");
+        assert_eq!(parsed.limits, dux_core::config::LimitsConfig::default());
+
+        let mut custom = Config::default();
+        custom.limits.max_panes = 7;
+        custom.limits.max_panes_soft_warn = 3;
+        custom.limits.disk_warn_pct = 70;
+        custom.limits.enable_scrollback_overflow_autodetach = true;
+        let reparsed: Config =
+            toml::from_str(&render_config_documented(&custom)).expect("custom round trip");
+        assert_eq!(reparsed.limits, custom.limits);
+        // The core writer (web saves, surgical patches) must agree.
+        let core: Config = toml::from_str(&dux_core::config_write::render_config_plain(&custom))
+            .expect("core writer output parses");
+        assert_eq!(core.limits, custom.limits);
+    }
+
+    /// A config written before [limits] existed loads with the defaults.
+    #[test]
+    fn a_config_without_limits_takes_the_defaults() {
+        let parsed: Config = toml::from_str("[logging]\nlevel = \"info\"\n").unwrap();
+        assert_eq!(parsed.limits, dux_core::config::LimitsConfig::default());
+        let partial: Config = toml::from_str("[limits]\nmax_panes = 4\n").unwrap();
+        assert_eq!(partial.limits.max_panes, 4);
+        assert_eq!(partial.limits.max_panes_soft_warn, 16);
     }
 
     /// The config file is the documentation, so the three rotation settings must

@@ -3765,6 +3765,7 @@ impl App {
             pty_progress: HashMap::new(),
             agent_viewed: HashMap::new(),
             last_foreground_refresh: None,
+            limits: Default::default(),
             pending_web_checkout_ops: HashMap::new(),
             pending_web_add_project_ops: HashMap::new(),
             pending_web_pr_lookup_ops: HashMap::new(),
@@ -4067,6 +4068,7 @@ impl App {
     fn start_run_services(&mut self) {
         self.engine.spawn_changed_files_poller();
         self.engine.spawn_branch_sync_worker();
+        self.engine.spawn_limits_watchdogs();
         self.engine.spawn_project_branch_status_checks();
         self.engine.spawn_gh_status_check();
         // The background server assumes these process-wide workers are already running.

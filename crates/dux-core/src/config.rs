@@ -2757,6 +2757,10 @@ pub struct Config {
     pub server: ServerConfig,
     pub keys: KeysConfig,
     pub macros: MacrosConfig,
+    /// Runtime resource guards (`[limits]`). Absent in older files, which get
+    /// the defaults: no hard pane cap, a warning at 16 live agents.
+    #[serde(default)]
+    pub limits: LimitsConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2838,6 +2842,7 @@ impl Default for Config {
             server: ServerConfig::default(),
             keys: KeysConfig::default(),
             macros: MacrosConfig::default(),
+            limits: LimitsConfig::default(),
         }
     }
 }
@@ -2846,6 +2851,161 @@ impl Config {
     pub fn default_provider(&self) -> crate::model::ProviderKind {
         crate::model::ProviderKind::from_str(&self.defaults.provider)
     }
+}
+
+/// The `[limits]` section: runtime resource guards (fork audit02 P1-AA, later
+/// softened in fork #13).
+///
+/// Every guard defaults to off or to a warning: dux never refuses to start an
+/// agent unless the user asked for a hard cap, because spawn freedom on a
+/// single-user machine mattered more than a RAM budget. The one refusal on by
+/// default is a nearly full disk, where carrying on would corrupt state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LimitsConfig {
+    /// Hard cap on live agent panes; a new agent is refused at the cap. `0`
+    /// (the default) means no cap.
+    pub max_panes: usize,
+    /// Live-pane count at which starting another agent shows a warning. The
+    /// agent still starts. `0` silences it. Default 16, the old hard cap.
+    pub max_panes_soft_warn: usize,
+    /// Hard cap on companion (shell) terminals across all agents. `0` (the
+    /// default) means no cap.
+    pub max_companion_terminals: usize,
+    /// Budget in MiB for the estimated scrollback memory of every live pane.
+    /// Only acted on when `enable_scrollback_overflow_autodetach` is true.
+    pub max_total_scrollback_mb: usize,
+    /// Disk usage percentage of the dux config directory's filesystem at which
+    /// new agents are refused. Default 95. `0` or anything above 100 disables it.
+    pub disk_high_water_pct: u8,
+    /// Disk usage percentage at which a warning is shown. Default 80. `0` or
+    /// anything above 100 disables it.
+    pub disk_warn_pct: u8,
+    /// Stop the oldest live agent when the estimated scrollback total goes over
+    /// `max_total_scrollback_mb`. Off by default: an unattended stop mid-task
+    /// is a surprise nobody asked for.
+    pub enable_scrollback_overflow_autodetach: bool,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_panes: 0,
+            max_panes_soft_warn: 16,
+            max_companion_terminals: 0,
+            max_total_scrollback_mb: 256,
+            disk_high_water_pct: 95,
+            disk_warn_pct: 80,
+            enable_scrollback_overflow_autodetach: false,
+        }
+    }
+}
+
+impl LimitsConfig {
+    /// Why a new agent must not start with `live_panes` agents already live and
+    /// the disk at `disk_pct` (`None` before the first sample), or `None` when
+    /// it may. The message names the knob and the way out.
+    pub fn refuse_agent_spawn(&self, live_panes: usize, disk_pct: Option<u8>) -> Option<String> {
+        if self.max_panes > 0 && live_panes >= self.max_panes {
+            return Some(format!(
+                "Refusing new agent: {live_panes} agents already running \
+                 (limits.max_panes = {}). Detach an unused agent or raise the cap \
+                 in config.toml.",
+                self.max_panes
+            ));
+        }
+        if let Some(pct) = disk_pct
+            && disk_threshold_enabled(self.disk_high_water_pct)
+            && pct >= self.disk_high_water_pct
+        {
+            return Some(format!(
+                "Refusing new agent: the disk holding the dux config directory is \
+                 {pct}% full (limits.disk_high_water_pct = {}%). Free space or \
+                 extend the volume.",
+                self.disk_high_water_pct
+            ));
+        }
+        None
+    }
+
+    /// The non-blocking nudge shown when an agent starts with `live_panes`
+    /// agents already live, or `None` below the threshold or when it is `0`.
+    pub fn soft_warn_for_pane_count(&self, live_panes: usize) -> Option<String> {
+        if self.max_panes_soft_warn == 0 || live_panes < self.max_panes_soft_warn {
+            return None;
+        }
+        Some(format!(
+            "{live_panes} agents running (limits.max_panes_soft_warn = {}). \
+             Detach unused agents to free memory, or raise the threshold (0 \
+             silences it) in config.toml.",
+            self.max_panes_soft_warn
+        ))
+    }
+
+    /// Why a new companion terminal must not open with `open` already open.
+    pub fn refuse_companion_terminal(&self, open: usize) -> Option<String> {
+        (self.max_companion_terminals > 0 && open >= self.max_companion_terminals).then(|| {
+            format!(
+                "Refusing new terminal: {open} already open \
+                 (limits.max_companion_terminals = {}). Close one or raise the cap \
+                 in config.toml.",
+                self.max_companion_terminals
+            )
+        })
+    }
+
+    /// The status a disk sample earns: an error at or over the high-water mark,
+    /// a warning at or over the warn mark, nothing below both.
+    pub fn disk_usage_status(&self, pct: u8) -> Option<(bool, String)> {
+        if disk_threshold_enabled(self.disk_high_water_pct) && pct >= self.disk_high_water_pct {
+            return Some((
+                true,
+                format!(
+                    "The disk holding the dux config directory is {pct}% full \
+                     (limits.disk_high_water_pct = {}%): new agents are refused \
+                     until space is freed.",
+                    self.disk_high_water_pct
+                ),
+            ));
+        }
+        if disk_threshold_enabled(self.disk_warn_pct) && pct >= self.disk_warn_pct {
+            return Some((
+                false,
+                format!(
+                    "The disk holding the dux config directory is {pct}% full \
+                     (limits.disk_warn_pct = {}%).",
+                    self.disk_warn_pct
+                ),
+            ));
+        }
+        None
+    }
+
+    /// The scrollback budget in bytes, or `None` when auto-detach is off or the
+    /// budget is `0`.
+    pub fn scrollback_budget_bytes(&self) -> Option<usize> {
+        (self.enable_scrollback_overflow_autodetach && self.max_total_scrollback_mb > 0)
+            .then(|| self.max_total_scrollback_mb.saturating_mul(1024 * 1024))
+    }
+}
+
+/// A percentage threshold of `0` would fire on an empty disk and one above 100
+/// can never fire, so both read as off rather than as a trap.
+fn disk_threshold_enabled(pct: u8) -> bool {
+    (1..=100).contains(&pct)
+}
+
+/// Used-space percentage (0..=100) of the filesystem holding `path`, counted the
+/// way `df` does for a non-root user (`f_bavail`). `None` when the filesystem
+/// cannot be read, so a failed sample is skipped rather than read as empty.
+pub fn sample_disk_usage_pct(path: &Path) -> Option<u8> {
+    let stat = rustix::fs::statvfs(path).ok()?;
+    let total = stat.f_blocks;
+    if total == 0 {
+        return None;
+    }
+    let used = total.saturating_sub(stat.f_bavail);
+    Some((used.saturating_mul(100) / total).min(100) as u8)
 }
 
 pub fn provider_config(
