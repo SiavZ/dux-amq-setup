@@ -99,7 +99,9 @@ fn the_schema_check_rejects_unknown_and_retired_keys() {
     .expect("parse");
     let mismatches = schema_mismatches(&bad);
     assert!(
-        mismatches.iter().any(|m| m.starts_with("defaults.prompt_for_name")),
+        mismatches
+            .iter()
+            .any(|m| m.starts_with("defaults.prompt_for_name")),
         "{mismatches:?}"
     );
     assert!(
