@@ -33,7 +33,7 @@ fn project_with_agents(app: &mut App, count: usize) -> String {
         .to_string();
     for n in 1..count {
         let mut extra = template.clone();
-        extra.id = format!("{}-extra-{n}", template.id).into();
+        extra.id = format!("{}-extra-{n}", template.id);
         app.engine.sessions.push(extra);
     }
     project_id
