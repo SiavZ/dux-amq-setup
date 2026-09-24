@@ -140,6 +140,39 @@ pub(crate) fn watch_rule_display_label(idx: usize, label: &str, pattern: &str) -
     format!("rule {idx}")
 }
 
+/// Act on a toggleable settings row: radios select, checkboxes flip. Shared by
+/// this modal and the new-agent modal's Advanced section (fork 6448c3f5), so
+/// the two can never disagree about what a row does. Rows that are not
+/// toggles (text fields, buttons) are left alone.
+pub(crate) fn apply_settings_toggle(
+    draft: &mut SessionSettings,
+    rules: &mut [WatchRuleSummary],
+    focus: SettingsFocus,
+) {
+    match focus {
+        SettingsFocus::Title
+        | SettingsFocus::SystemPrompt
+        | SettingsFocus::SaveButton
+        | SettingsFocus::CancelButton => {}
+        SettingsFocus::ModeAttended => draft.mode = ContextMode::Attended,
+        SettingsFocus::ModeOrchestrator => draft.mode = ContextMode::Orchestrator,
+        SettingsFocus::ModeWorker => draft.mode = ContextMode::Worker,
+        SettingsFocus::Yolo => draft.yolo_permissions = !draft.yolo_permissions,
+        SettingsFocus::WatchRule(idx) => {
+            if let Some(rule) = rules.iter_mut().find(|r| r.idx == idx) {
+                rule.armed = !rule.armed;
+                draft.watch_rule_arm.insert(idx, rule.armed);
+            }
+        }
+        SettingsFocus::AutoClearOnDone => {
+            draft.auto_clear_on_task_done = !draft.auto_clear_on_task_done;
+        }
+        SettingsFocus::VerifyDefault => draft.verify_envelope_override = None,
+        SettingsFocus::VerifyStrict => draft.verify_envelope_override = Some(true),
+        SettingsFocus::VerifySkip => draft.verify_envelope_override = Some(false),
+    }
+}
+
 impl App {
     fn session_settings_prompt_mut(&mut self) -> Option<&mut SessionSettingsPrompt> {
         match &mut self.prompt {
@@ -270,28 +303,7 @@ impl App {
         let Some(p) = self.session_settings_prompt_mut() else {
             return;
         };
-        match focus {
-            SettingsFocus::Title
-            | SettingsFocus::SystemPrompt
-            | SettingsFocus::SaveButton
-            | SettingsFocus::CancelButton => {}
-            SettingsFocus::ModeAttended => p.draft.mode = ContextMode::Attended,
-            SettingsFocus::ModeOrchestrator => p.draft.mode = ContextMode::Orchestrator,
-            SettingsFocus::ModeWorker => p.draft.mode = ContextMode::Worker,
-            SettingsFocus::Yolo => p.draft.yolo_permissions = !p.draft.yolo_permissions,
-            SettingsFocus::WatchRule(idx) => {
-                if let Some(rule) = p.rules.iter_mut().find(|r| r.idx == idx) {
-                    rule.armed = !rule.armed;
-                    p.draft.watch_rule_arm.insert(idx, rule.armed);
-                }
-            }
-            SettingsFocus::AutoClearOnDone => {
-                p.draft.auto_clear_on_task_done = !p.draft.auto_clear_on_task_done;
-            }
-            SettingsFocus::VerifyDefault => p.draft.verify_envelope_override = None,
-            SettingsFocus::VerifyStrict => p.draft.verify_envelope_override = Some(true),
-            SettingsFocus::VerifySkip => p.draft.verify_envelope_override = Some(false),
-        }
+        apply_settings_toggle(&mut p.draft, &mut p.rules, focus);
     }
 
     /// Enter / Space / click on a control: buttons fire, the system-prompt

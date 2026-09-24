@@ -104,6 +104,7 @@ impl App {
         self.drain_unpushed_count();
         self.drain_orphan_worktrees();
         self.drain_pending_diff();
+        self.drain_changes_job();
         self.drain_worker_events();
         // After the drain, so a launch that resolved this tick frees its
         // `[auto_resume]` slot for the next queued startup relaunch.
@@ -436,10 +437,12 @@ impl App {
                 self.tui_launched_ptys.remove(data.request.tab_id.as_str());
                 if matches!(data.request.kind, AgentLaunchKind::Create { .. }) {
                     self.create_agent_started_here = false;
+                    self.armed_new_agent_settings = None;
                 }
             }
             WorkerEvent::CreateAgentFailed { .. } => {
                 self.create_agent_started_here = false;
+                self.armed_new_agent_settings = None;
             }
             _ => {}
         }
@@ -1496,6 +1499,7 @@ impl App {
         // tabs, so no follow-up clear is needed here.
         match outcome.view {
             AgentLaunchReadyView::CreatePersistFailed { .. } => {
+                self.armed_new_agent_settings = None;
                 // The create op's keyed error final is resolved ENGINE-SIDE and
                 // arrives alongside this View as a sibling `Status` in the same
                 // `Multi`, so there is no status to set here.
@@ -1504,6 +1508,9 @@ impl App {
                 status_message: _,
                 startup_result_error: _,
             } => {
+                if created_here {
+                    self.apply_armed_new_agent_settings(&outcome.session.id);
+                }
                 self.rebuild_left_items();
                 self.selected_left = self
                     .left_items()

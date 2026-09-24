@@ -197,6 +197,7 @@ pub fn bootstrap_engine(paths: &DuxPaths) -> Result<Engine> {
         pty_progress: HashMap::new(),
         agent_viewed: HashMap::new(),
         last_foreground_refresh: None,
+        limits: Default::default(),
         amq: Default::default(),
     };
 

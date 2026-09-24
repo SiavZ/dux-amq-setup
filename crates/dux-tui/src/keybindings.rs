@@ -1518,6 +1518,9 @@ const HELP_SECTION_ORDER: &[&str] = &[
     "Global",
     "Projects pane",
     "Agent pane",
+    // Fork 55dba0f7: without this entry the four scroll bindings, which carry
+    // `section: "Scrolling"`, were silently dropped from the help overlay.
+    "Scrolling",
     "Files pane",
     "Commit input",
     "Resize mode",
@@ -2766,6 +2769,33 @@ mod tests {
         let section_names: Vec<_> = sections.iter().map(|(n, _)| *n).collect();
         assert!(section_names.contains(&"Global"));
         assert!(section_names.contains(&"Projects pane"));
+        assert!(section_names.contains(&"Scrolling"));
+        let scrolling = sections
+            .iter()
+            .find(|(section, _)| *section == "Scrolling")
+            .expect("scrolling section should render");
+        assert!(
+            scrolling
+                .1
+                .iter()
+                .any(|(_, desc)| desc.starts_with("Scroll up one line"))
+        );
+    }
+
+    /// A help entry whose section is not in HELP_SECTION_ORDER is dropped
+    /// from the overlay without a trace (fork 55dba0f7).
+    #[test]
+    fn every_help_entry_section_is_rendered() {
+        for def in BINDING_DEFS {
+            if let Some(help) = &def.help {
+                assert!(
+                    HELP_SECTION_ORDER.contains(&help.section),
+                    "help section {:?} for {:?} is missing from HELP_SECTION_ORDER",
+                    help.section,
+                    def.action
+                );
+            }
+        }
     }
 
     /// An action that ships with no default key but still carries a help entry

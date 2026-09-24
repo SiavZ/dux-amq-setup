@@ -26,6 +26,11 @@ content_inspector = "0.2.4"
 tempfile = "3.20.0"
 notify = "7"
 flate2 = "1"
+# Structured logging: `tracing` macros write JSON Lines into dux.log through
+# dux-core's own rotating writer (logger::JsonLinesLayer), so only the
+# registry is needed from tracing-subscriber, not its fmt/json/env-filter.
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
 # 0.36 is a floor, not a preference: 0.35 reports every process's CPU usage as
 # exactly 0.0 on macOS, which is the whole of what the resource panel shows.
 # The 0.36.0 changelog entry is "Linux/macOS: Fix CPU usage update", and the
@@ -48,7 +53,10 @@ tokio-tungstenite = "0.29"
 opt-level = "z"    # Optimize for size.
 lto = true         # Enable link time optimization.
 codegen-units = 1  # Reduce parallel code generation units.
-debug = 0          # No debug information
+# Line tables only (fork e79bfbe5, P2-4): file:line for panic locations and,
+# where the platform keeps them, backtraces, at a ~1-2% size cost. The
+# `strip` below still removes the symbol table from the shipped binary.
+debug = "line-tables-only"
 # Strip symbols here, in Cargo, so every release build is small by the same
 # mechanism (CI has no separate strip step). The symbol-keeping path for
 # profilers is [profile.profiling] below.

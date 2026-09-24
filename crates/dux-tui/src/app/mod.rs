@@ -403,6 +403,15 @@ pub struct App {
     /// engine allows exactly one create at a time (`InFlightKey::CreateAgent`),
     /// and it is spent by the create's own outcome, success or failure.
     pub(crate) create_agent_started_here: bool,
+    /// A creation-time session-settings draft, tagged with the create it
+    /// belongs to, held between the new-agent modal's confirm and the
+    /// dispatch (a branch-exists confirm can sit between them).
+    pub(crate) pending_new_agent_settings: Option<(
+        new_agent_settings::CreateTag,
+        dux_core::session_settings::SessionSettings,
+    )>,
+    /// The draft for the create in flight, applied when it commits.
+    pub(crate) armed_new_agent_settings: Option<dux_core::session_settings::SessionSettings>,
     /// How many times the selected surface's grid has been REBUILT (see
     /// `refresh_snapshot_buf`). Not a clock and not a line count: it only
     /// answers "has the grid moved since I looked?", which is the one question
@@ -566,6 +575,9 @@ pub struct App {
     /// one diff, so a new request supersedes the old one rather than queueing
     /// behind it.
     pub(crate) pending_diff: Option<PendingDiff>,
+    /// The in-flight changes-panel git mutation (stage/unstage/discard/commit),
+    /// run off the run loop; see `changes_job`.
+    pub(crate) pending_changes_job: Option<changes_job::PendingChangesJob>,
     /// Monotonic request counter, stamped into every [`crate::diff::DiffRequestKey`]
     /// so two requests that agree on file and settings are still told apart.
     pub(crate) diff_request_seq: u64,
@@ -2126,6 +2138,13 @@ pub(crate) enum NameNewAgentFocus {
     /// Only reachable for `CreateAgentRequest::NewProject`: forks always
     /// copy and the other flows never do, so only fresh agents show the box.
     CopyChangesCheckbox,
+    /// The harness row (fork 6448c3f5): Space picks the next configured one.
+    Provider,
+    /// The "Advanced settings" disclosure row.
+    AdvancedToggle,
+    /// A session-settings row in the Advanced section, shared with the
+    /// session settings modal so a row means the same thing in both.
+    Setting(SettingsFocus),
 }
 
 /// What the folder browser is picking a directory for.
@@ -2460,6 +2479,8 @@ pub(crate) enum PromptState {
         /// `CreateAgentRequest::NewProject`.
         copy_changes: bool,
         focus: NameNewAgentFocus,
+        /// Harness picker and the Advanced session settings (fork 6448c3f5).
+        extras: Box<new_agent_settings::NewAgentExtras>,
     },
     PickEditor {
         session_label: String,
@@ -3012,6 +3033,11 @@ pub(crate) struct MouseLayoutState {
     /// reverse map (see `render::left_row_to_item`, reused for both lists).
     pub(crate) terminal_row_to_item: Vec<usize>,
     pub(crate) agent_term: Option<Rect>,
+    /// The agent pane's scrollbar track, when one is drawn: the pane's right
+    /// border column alongside the terminal rows. Published by the render pass
+    /// only while the grid has scrollback, so a press can only land on a
+    /// scrollbar that is on screen.
+    pub(crate) agent_scrollbar: Option<Rect>,
     /// The take-over card's button, when the card is on screen. Published by the
     /// render pass and cleared with the rest of this state every frame, so a
     /// click can only land on a button that is drawn right now: the card comes
@@ -3048,6 +3074,7 @@ impl MouseLayoutState {
         self.terminal_list = Rect::default();
         self.terminal_row_to_item.clear();
         self.agent_term = None;
+        self.agent_scrollbar = None;
         self.takeover_button = None;
         self.dormant_tab_button = None;
         self.pr_banner = None;
@@ -3353,6 +3380,9 @@ pub(crate) enum ResizeDragState {
     TerminalDivider,
     StagedDivider,
     CommitDivider,
+    /// Dragging the agent pane's scrollbar thumb (fork 670b8c24). Not a pane
+    /// resize: releasing it persists nothing.
+    CenterScrollbar,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3596,6 +3626,7 @@ pub(crate) fn build_left_items(
 }
 
 mod background_server;
+mod changes_job;
 pub(crate) use background_server::{BackgroundServerStart, CompanionRouting};
 // `pub(crate)` for its width helpers alone: the diff wrapper has to measure a
 // CJK glyph exactly as the pane's own wrapper does, and two functions that
@@ -3609,6 +3640,7 @@ mod overlay_dismiss;
 mod pty_ownership;
 mod redraw;
 pub(crate) use redraw::RedrawGate;
+mod new_agent_settings;
 mod render;
 mod reorder;
 mod session_settings;
@@ -3818,6 +3850,7 @@ impl App {
             pty_progress: HashMap::new(),
             agent_viewed: HashMap::new(),
             last_foreground_refresh: None,
+            limits: Default::default(),
             amq: Default::default(),
             pending_web_checkout_ops: HashMap::new(),
             pending_web_add_project_ops: HashMap::new(),
@@ -3927,6 +3960,8 @@ impl App {
             last_pty_resize_target: None,
             tui_launched_ptys: Default::default(),
             create_agent_started_here: false,
+            pending_new_agent_settings: None,
+            armed_new_agent_settings: None,
             pending_pty_takeover: None,
             last_refused_pty_resize: None,
             grid_generation: 0,
@@ -3976,6 +4011,7 @@ impl App {
             pr_banner_at_bottom,
             syntax_cache: Arc::new(SyntaxCache::new()),
             pending_diff: None,
+            pending_changes_job: None,
             diff_request_seq: 0,
             snapshot_buf: TerminalSnapshot::empty(),
             last_snapshot_id: None,
@@ -4122,6 +4158,9 @@ impl App {
     fn start_run_services(&mut self) {
         self.engine.spawn_changed_files_poller();
         self.engine.spawn_branch_sync_worker();
+        self.engine.spawn_limits_watchdogs();
+        self.engine.spawn_project_worktree_links();
+        self.engine.spawn_backup_worker();
         self.engine.spawn_project_branch_status_checks();
         self.engine.spawn_gh_status_check();
         // Idempotent: the web flip hands this same engine over and re-calls it.
@@ -6369,7 +6408,10 @@ impl App {
             self.prompt = PromptState::RenameSession {
                 session_id: session.id,
                 input,
-                rename_branch: branch_named,
+                // Opt-in (port of fork d134b396): renaming the branch rewrites a
+                // ref other tools and remotes may track, so the checkbox starts
+                // unticked and the plain rename only changes the label.
+                rename_branch: false,
                 focus: RenameSessionFocus::Input,
                 branch_named,
             };

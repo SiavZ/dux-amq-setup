@@ -1426,7 +1426,13 @@ impl PtyClient {
     /// Get an owned snapshot of the currently visible terminal viewport.
     #[allow(dead_code)]
     pub fn snapshot(&self) -> TerminalSnapshot {
-        let terminal = self.terminal.lock().expect("terminal mutex poisoned");
+        // A poisoned grid lock (a panic mid-ingest on the reader thread) must
+        // not take the whole TUI down mid-frame (fork dda3d23f): render an
+        // empty snapshot and leave a breadcrumb instead.
+        let Ok(terminal) = self.terminal.lock() else {
+            logger::error("pty: terminal mutex poisoned; rendering empty snapshot");
+            return TerminalSnapshot::empty();
+        };
         terminal.snapshot()
     }
 
@@ -1532,13 +1538,19 @@ impl PtyClient {
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return false;
         }
-        let terminal = self.terminal.lock().expect("terminal mutex poisoned");
+        let Ok(terminal) = self.terminal.lock() else {
+            logger::error("pty: terminal mutex poisoned; skipping snapshot rebuild");
+            return false;
+        };
         terminal.snapshot_into(target, collect_links);
         true
     }
 
     pub fn scrollback_offset(&self) -> usize {
-        let terminal = self.terminal.lock().expect("terminal mutex poisoned");
+        let Ok(terminal) = self.terminal.lock() else {
+            logger::error("pty: terminal mutex poisoned; reporting scrollback offset 0");
+            return 0;
+        };
         terminal.scrollback_offset()
     }
 
@@ -6243,6 +6255,30 @@ mod tests {
     const PADDED_LINE_ECHOER: &str = "stty -echo; pad=$(printf '\\033[0m'); i=0; \
          while [ $i -lt 10 ]; do pad=\"$pad$pad\"; i=$((i+1)); done; \
          while IFS= read -r n; do printf 'L%08d%s\\r\\n' \"$n\" \"$pad\"; done";
+
+    /// Fork dda3d23f: the render-path readers answer a poisoned grid lock
+    /// with a sentinel instead of panicking the UI thread mid-frame.
+    #[test]
+    fn render_path_survives_a_poisoned_terminal_mutex() {
+        let args = vec!["-c".to_string(), "printf hi; sleep 30".to_string()];
+        let client =
+            PtyClient::spawn("/bin/sh", &args, Path::new("."), 5, 40, 100).expect("spawn pty");
+        let terminal = Arc::clone(&client.terminal);
+        let _ = thread::spawn(move || {
+            let _held = terminal.lock().expect("lock before poisoning");
+            panic!("poison the terminal mutex");
+        })
+        .join();
+        assert!(client.terminal.is_poisoned(), "test premise");
+
+        let snap = client.snapshot();
+        assert_eq!((snap.rows, snap.cols), (0, 0));
+        assert!(snap.cells.is_empty());
+        assert_eq!(client.scrollback_offset(), 0);
+        client.dirty.store(true, Ordering::Release);
+        let mut target = TerminalSnapshot::empty();
+        assert!(!client.snapshot_into(&mut target, false));
+    }
 
     fn spawn_padded_line_echoer(scrollback: usize) -> PtyClient {
         let args = vec!["-c".to_string(), PADDED_LINE_ECHOER.to_string()];

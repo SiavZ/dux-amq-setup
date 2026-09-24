@@ -84,7 +84,7 @@ pub fn diff_head_via_git(worktree: &Path, rel_path: &str) -> anyhow::Result<Diff
     let no_index = head_prefix.is_none();
 
     let mut command = Command::new("git");
-    command.args(["-C", worktree.to_string_lossy().as_ref()]);
+    command.arg("-C").arg(worktree);
     // Pin every setting that changes the patch's shape or its length. A reader
     // with `diff.context = 10` must not get different counts from the same
     // file, and a textconv filter must not run a program of the user's choosing

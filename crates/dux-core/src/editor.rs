@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::env;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -139,7 +139,7 @@ pub fn launch_editor(editor: &DetectedEditor, path: &Path) -> Result<()> {
     }
 
     Command::new(&editor.command)
-        .arg(path)
+        .args(editor_launch_args(editor, path, path.is_dir()))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -147,6 +147,27 @@ pub fn launch_editor(editor: &DetectedEditor, path: &Path) -> Result<()> {
         .with_context(|| format!("failed to launch {} via {}", editor.label, editor.command))?;
 
     Ok(())
+}
+
+/// The arguments that open `path` in `editor`.
+///
+/// A directory (an agent worktree) opens in a window of its own for the VS
+/// Code family, whose CLI otherwise reuses the last active window and so
+/// replaces whatever project the user had open there (fork 9d9ffcef). A single
+/// file keeps the editor's default, since a new window per opened file would be
+/// worse. Zed and Sublime Text already open a folder in its own window.
+fn editor_launch_args(editor: &DetectedEditor, path: &Path, is_dir: bool) -> Vec<OsString> {
+    let mut args = Vec::new();
+    if is_dir
+        && matches!(
+            editor.kind,
+            EditorKind::Cursor | EditorKind::VsCode | EditorKind::VsCodium
+        )
+    {
+        args.push(OsString::from("--new-window"));
+    }
+    args.push(path.as_os_str().to_os_string());
+    args
 }
 
 fn detect_editors_from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<DetectedEditor> {
@@ -278,6 +299,63 @@ mod tests {
             "the web editor menu (OPEN_IN_EDITORS in editors.ts) and dux-core \
              EDITOR_SPECS config keys have drifted. Every menu entry must use a real \
              config key and every supported editor should appear in the menu."
+        );
+    }
+
+    fn detected(kind: EditorKind, command: &str) -> DetectedEditor {
+        let spec = spec_for_kind(kind);
+        DetectedEditor {
+            kind,
+            label: spec.label,
+            config_key: spec.config_key,
+            command: command.to_string(),
+        }
+    }
+
+    #[test]
+    fn vscode_launch_args_force_new_window() {
+        let path = std::path::PathBuf::from("/tmp/agent-worktree");
+        assert_eq!(
+            editor_launch_args(&detected(EditorKind::VsCode, "code"), &path, true),
+            vec![
+                OsString::from("--new-window"),
+                OsString::from("/tmp/agent-worktree")
+            ]
+        );
+        assert_eq!(
+            editor_launch_args(&detected(EditorKind::VsCodium, "codium"), &path, true)[0],
+            OsString::from("--new-window")
+        );
+    }
+
+    #[test]
+    fn cursor_launch_args_force_new_window() {
+        let path = std::path::PathBuf::from("/tmp/agent-worktree");
+        assert_eq!(
+            editor_launch_args(&detected(EditorKind::Cursor, "cursor"), &path, true),
+            vec![
+                OsString::from("--new-window"),
+                OsString::from("/tmp/agent-worktree")
+            ]
+        );
+    }
+
+    #[test]
+    fn zed_launch_args_keep_single_path_arg() {
+        let path = std::path::PathBuf::from("/tmp/agent-worktree");
+        assert_eq!(
+            editor_launch_args(&detected(EditorKind::Zed, "zed"), &path, true),
+            vec![OsString::from("/tmp/agent-worktree")]
+        );
+    }
+
+    /// Opening one file must not spawn a window per file.
+    #[test]
+    fn a_single_file_opens_without_a_new_window() {
+        let path = std::path::PathBuf::from("/tmp/agent-worktree/src/main.rs");
+        assert_eq!(
+            editor_launch_args(&detected(EditorKind::VsCode, "code"), &path, false),
+            vec![OsString::from("/tmp/agent-worktree/src/main.rs")]
         );
     }
 }

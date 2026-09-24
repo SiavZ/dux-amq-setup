@@ -650,7 +650,12 @@ impl KeyedStatusController {
         let entry = KeyedStatus {
             key: key.clone(),
             tone,
-            message: message.into(),
+            // Fork 2d9423ae (P0-C): a status line carries git stderr, branch
+            // names and PR titles, any of which can hold terminal escapes
+            // that would retitle or paste-inject the operator's terminal on
+            // the TUI and land raw in a browser toast. One chokepoint for
+            // every surface; escapes show as `\x1b` text instead.
+            message: crate::sanitize::for_terminal(&message.into()),
             scope,
             sticky,
             // Nobody has said otherwise yet; `mark_unwatched` is called by the
@@ -1659,6 +1664,26 @@ mod tests {
         LiveStatusKeys, MAX_QUEUED_STATUSES, StatusTone, WARNING_CLEAR_FACTOR,
     };
     use std::time::{Duration, Instant};
+
+    /// Fork 2d9423ae (P0-C): escapes in a status message (git stderr, a
+    /// hostile branch name) never reach the terminal or the browser raw.
+    #[test]
+    fn status_messages_are_sanitized_at_the_chokepoint() {
+        let mut status = KeyedStatusController::with_clear_after(Duration::from_secs(6));
+        status.set(
+            Instant::now(),
+            None,
+            StatusTone::Error,
+            "git: \x1b]0;pwned\x07 bad ref\nsecond line",
+        );
+        let message = status.message();
+        assert!(
+            !message.contains('\u{1b}') && !message.contains('\u{7}'),
+            "{message:?}"
+        );
+        assert!(message.contains("\\x1b]0;pwned\\x07"), "{message:?}");
+        assert!(message.contains("\nsecond line"), "newlines are kept");
+    }
 
     #[test]
     fn wire_tone_round_trips() {

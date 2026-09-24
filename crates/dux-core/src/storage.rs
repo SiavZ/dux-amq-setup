@@ -145,6 +145,30 @@ fn sidecar_path(db: &std::path::Path, suffix: &str) -> std::path::PathBuf {
 }
 
 impl SessionStore {
+    /// Open an existing database for diagnosis without changing a byte of it:
+    /// read-only, no migration, no journal-mode switch, no chmod. `dux doctor`
+    /// uses it (port of fork c6426735/55dba0f7), because a diagnostic that
+    /// migrates or rewrites the file it is diagnosing destroys the evidence.
+    /// The integrity check still runs and is reported as the error.
+    ///
+    /// Reading sessions from a database written by an older schema can fail
+    /// on a missing column; the caller reports that rather than a zero count.
+    pub fn open_read_only(path: &std::path::Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("failed to open {} read-only", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .context("failed to run the session database integrity check")?;
+        if integrity != "ok" {
+            bail!("sqlite integrity check failed: {integrity}");
+        }
+        Ok(Self { conn })
+    }
+
     pub fn open(path: &std::path::Path) -> Result<Self> {
         let store = Self::connect(path)?;
         store.migrate()?;
@@ -2500,12 +2524,24 @@ fn deserialize_project_env(value: &str) -> BTreeMap<String, String> {
     serde_json::from_str::<BTreeMap<String, String>>(value).unwrap_or_default()
 }
 
+// Fork e79bfbe5 (P2-10): the fallbacks stay (a corrupt row degrades, never
+// crashes the loader), but they are logged instead of silently swallowed.
 fn serialize_started_providers(started_providers: &[String]) -> String {
-    serde_json::to_string(started_providers).unwrap_or_else(|_| "[]".to_string())
+    serde_json::to_string(started_providers).unwrap_or_else(|err| {
+        crate::logger::warn(&format!(
+            "started_providers could not be serialized ({err}); persisting []"
+        ));
+        "[]".to_string()
+    })
 }
 
 fn parse_started_providers(value: &str) -> Vec<String> {
-    serde_json::from_str::<Vec<String>>(value).unwrap_or_default()
+    serde_json::from_str::<Vec<String>>(value).unwrap_or_else(|err| {
+        crate::logger::warn(&format!(
+            "started_providers column is not a JSON string list ({err}); treating it as empty"
+        ));
+        Vec::new()
+    })
 }
 
 pub fn fallback_pr_url(host: &str, owner_repo: &str, pr_number: u64) -> String {
@@ -2595,9 +2631,38 @@ fn test_tab(id: &str, session_id: &str, sort_order: i64) -> crate::model::AgentT
     }
 }
 
+// Kept after every production item: a storage test scans this file's source
+// up to the first `#[cfg(test)]` for `ensure_column` call sites.
+#[cfg(test)]
+impl SessionStore {
+    /// Test-only: make every later write on this handle fail, so a test can
+    /// drive a persistence-failure path without a broken filesystem.
+    #[cfg(test)]
+    pub(crate) fn make_read_only_for_test(&self) {
+        self.conn
+            .execute_batch("pragma query_only = on;")
+            .expect("set query_only");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A corrupt started_providers cell degrades to empty instead of failing
+    /// the load (fork e79bfbe5 kept this while adding the warning).
+    #[test]
+    fn started_providers_parse_failure_degrades_to_empty() {
+        assert_eq!(parse_started_providers("not json"), Vec::<String>::new());
+        assert_eq!(
+            parse_started_providers(r#"["claude","codex"]"#),
+            vec!["claude".to_string(), "codex".to_string()]
+        );
+        assert_eq!(
+            serialize_started_providers(&["claude".to_string()]),
+            r#"["claude"]"#
+        );
+    }
     use crate::model::{AgentWorkspace, FolderWorkspace};
     use chrono::Duration;
 
@@ -4791,6 +4856,26 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1, "table 't' must survive the rejected payloads");
         assert!(ensure_column(&conn, "t", "extra", "text").unwrap());
+    }
+
+    /// The quoted-default shapes the fork's legacy call sites used must keep
+    /// working through the allowlist (fork e393c1d1).
+    #[test]
+    fn ensure_column_accepts_legacy_defaults() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("create table t (id integer);").unwrap();
+        assert!(
+            ensure_column(
+                &conn,
+                "t",
+                "started_providers",
+                "text not null default '[]'"
+            )
+            .unwrap()
+        );
+        assert!(ensure_column(&conn, "t", "state", "TEXT NOT NULL DEFAULT 'OPEN'").unwrap());
+        assert!(ensure_column(&conn, "t", "title", "text not null default ''").unwrap());
+        assert!(!ensure_column(&conn, "t", "title", "text not null default ''").unwrap());
     }
 
     #[test]

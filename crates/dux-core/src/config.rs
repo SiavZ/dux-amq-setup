@@ -2215,7 +2215,7 @@ impl Default for UiConfig {
             agent_scrollback_lines: 10_000,
             agent_tabs_max: DEFAULT_AGENT_TABS_MAX,
             status_clear_seconds: 6,
-            branch_sync_interval: 30,
+            branch_sync_interval: 0,
             show_diff_line_numbers: false,
             diff_tab_width: 4,
             github_integration: true,
@@ -2311,7 +2311,7 @@ pub fn default_terminal_args() -> Vec<String> {
 /// normalizer over the bytes dux sends. The table of what each one does, and the
 /// caveat that Copilot's value is a guess because it is closed source, lives on
 /// [`WebDragDropPaste`]. Read it before changing a value here.
-pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
+pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8] {
     [
         (
             "claude",
@@ -2332,6 +2332,29 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5]
                 // Measured: strips one quote pair then unescapes, so quoting
                 // buys nothing and corrupts an apostrophe.
                 web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
+                watch: Vec::new(),
+            },
+        ),
+        // Cline, Kilo Code and NTL: fork c2c44378. Order is the picker order,
+        // which the fork shipped as claude, cline, codex, opencode, kilocode,
+        // ntl, copilot, jcode. Their paste forms are NOT measured, so they get
+        // `bare`, the do-nothing form (see copilot below).
+        (
+            "cline",
+            ProviderCommandConfig {
+                command: "cline".to_string(),
+                // `--tui` keeps cline in its interactive UI; without it the CLI
+                // runs one task and exits.
+                args: vec!["--tui".to_string()],
+                // No cwd-scoped resume-latest.
+                resume_args: None,
+                resume_wait_timeout_ms: None,
+                resume_by_id_args: None,
+                install_hint: Some("npm install -g cline".to_string()),
+                forward_scroll: Some(true),
+                web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
+                // The fork's value (c2c44378): auto mouse policy.
+                forward_mouse: None,
                 watch: Vec::new(),
             },
         ),
@@ -2371,6 +2394,45 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5]
                 forward_mouse: Some(false),
                 // Measured: strips quote characters and never splits on a space.
                 web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
+                watch: Vec::new(),
+            },
+        ),
+        (
+            "kilocode",
+            ProviderCommandConfig {
+                // The Kilo Code CLI installs as `kilo`.
+                command: "kilo".to_string(),
+                args: Vec::new(),
+                resume_args: Some(vec!["--continue".to_string()]),
+                // Like opencode (its upstream): a `--continue` with nothing to
+                // continue can come up empty, so fall back to fresh after 3s.
+                resume_wait_timeout_ms: Some(3_000),
+                resume_by_id_args: None,
+                install_hint: Some("npm install -g @kilocode/cli".to_string()),
+                forward_scroll: Some(true),
+                web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
+                // The fork's value (c2c44378): auto mouse policy.
+                forward_mouse: None,
+                watch: Vec::new(),
+            },
+        ),
+        (
+            "ntl",
+            ProviderCommandConfig {
+                command: "ntl".to_string(),
+                // `--agent` is NTL's interactive agent REPL.
+                args: vec!["--agent".to_string()],
+                resume_args: None,
+                resume_wait_timeout_ms: None,
+                resume_by_id_args: None,
+                install_hint: Some(
+                    "curl -fsSL https://notokenlimit.com/install.sh | bash".to_string(),
+                ),
+                // A plain line-mode REPL: dux's own scrollback is the history.
+                forward_scroll: Some(false),
+                web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
+                // The fork's value (c2c44378): auto mouse policy.
+                forward_mouse: None,
                 watch: Vec::new(),
             },
         ),
@@ -2792,6 +2854,13 @@ pub struct Config {
     /// Throttle for startup relaunches (07d9b0ba). See [`AutoResumeConfig`].
     #[serde(default)]
     pub auto_resume: AutoResumeConfig,
+    /// Runtime resource guards (`[limits]`). Absent in older files, which get
+    /// the defaults: no hard pane cap, a warning at 16 live agents.
+    #[serde(default)]
+    pub limits: LimitsConfig,
+    /// Session database maintenance (`[storage]`).
+    #[serde(default)]
+    pub storage: StorageConfig,
     /// Shared main-workspace mode (fork shared-workspace Phase 4). `None` means
     /// this config predates workspace modes and keeps worktree isolation, the
     /// guarantee it was installed under. A freshly created config always
@@ -2880,7 +2949,7 @@ impl Default for Config {
                 agent_scrollback_lines: 10_000,
                 agent_tabs_max: DEFAULT_AGENT_TABS_MAX,
                 status_clear_seconds: 6,
-                branch_sync_interval: 30,
+                branch_sync_interval: 0,
                 show_diff_line_numbers: false,
                 diff_tab_width: 4,
                 github_integration: true,
@@ -2914,6 +2983,8 @@ impl Default for Config {
             keys: KeysConfig::default(),
             macros: MacrosConfig::default(),
             auto_resume: AutoResumeConfig::default(),
+            limits: LimitsConfig::default(),
+            storage: StorageConfig::default(),
             workspace: Some(WorkspaceConfig::default()),
             amq: AmqConfig::default(),
         }
@@ -3074,6 +3145,183 @@ pub fn validate_shared_project_paths(config: &Config, paths: &DuxPaths) -> Resul
         }
     }
     Ok(())
+}
+
+/// The `[storage]` section (fork 10d2266d, P1-W).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StorageConfig {
+    /// Minutes between automatic copies of `sessions.sqlite3` to
+    /// `sessions.sqlite3.bak`, taken with SQLite's online backup so a running
+    /// dux never has to stop. The integrity check on open points a user with a
+    /// corrupt database at that file. `0` turns the copies off.
+    pub backup_interval_minutes: u32,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            backup_interval_minutes: DEFAULT_BACKUP_INTERVAL_MINUTES,
+        }
+    }
+}
+
+/// Default for [`StorageConfig::backup_interval_minutes`].
+pub const DEFAULT_BACKUP_INTERVAL_MINUTES: u32 = 30;
+
+/// The `[limits]` section: runtime resource guards (fork audit02 P1-AA, later
+/// softened in fork #13).
+///
+/// Every guard defaults to off or to a warning: dux never refuses to start an
+/// agent unless the user asked for a hard cap, because spawn freedom on a
+/// single-user machine mattered more than a RAM budget. The one refusal on by
+/// default is a nearly full disk, where carrying on would corrupt state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LimitsConfig {
+    /// Hard cap on live agent panes; a new agent is refused at the cap. `0`
+    /// (the default) means no cap.
+    pub max_panes: usize,
+    /// Live-pane count at which starting another agent shows a warning. The
+    /// agent still starts. `0` silences it. Default 16, the old hard cap.
+    pub max_panes_soft_warn: usize,
+    /// Hard cap on companion (shell) terminals across all agents. `0` (the
+    /// default) means no cap.
+    pub max_companion_terminals: usize,
+    /// Budget in MiB for the estimated scrollback memory of every live pane.
+    /// Only acted on when `enable_scrollback_overflow_autodetach` is true.
+    pub max_total_scrollback_mb: usize,
+    /// Disk usage percentage of the dux config directory's filesystem at which
+    /// new agents are refused. Default 95. `0` or anything above 100 disables it.
+    pub disk_high_water_pct: u8,
+    /// Disk usage percentage at which a warning is shown. Default 80. `0` or
+    /// anything above 100 disables it.
+    pub disk_warn_pct: u8,
+    /// Stop the oldest live agent when the estimated scrollback total goes over
+    /// `max_total_scrollback_mb`. Off by default: an unattended stop mid-task
+    /// is a surprise nobody asked for.
+    pub enable_scrollback_overflow_autodetach: bool,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_panes: 0,
+            max_panes_soft_warn: 16,
+            max_companion_terminals: 0,
+            max_total_scrollback_mb: 256,
+            disk_high_water_pct: 95,
+            disk_warn_pct: 80,
+            enable_scrollback_overflow_autodetach: false,
+        }
+    }
+}
+
+impl LimitsConfig {
+    /// Why a new agent must not start with `live_panes` agents already live and
+    /// the disk at `disk_pct` (`None` before the first sample), or `None` when
+    /// it may. The message names the knob and the way out.
+    pub fn refuse_agent_spawn(&self, live_panes: usize, disk_pct: Option<u8>) -> Option<String> {
+        if self.max_panes > 0 && live_panes >= self.max_panes {
+            return Some(format!(
+                "Refusing new agent: {live_panes} agents already running \
+                 (limits.max_panes = {}). Detach an unused agent or raise the cap \
+                 in config.toml.",
+                self.max_panes
+            ));
+        }
+        if let Some(pct) = disk_pct
+            && disk_threshold_enabled(self.disk_high_water_pct)
+            && pct >= self.disk_high_water_pct
+        {
+            return Some(format!(
+                "Refusing new agent: the disk holding the dux config directory is \
+                 {pct}% full (limits.disk_high_water_pct = {}%). Free space or \
+                 extend the volume.",
+                self.disk_high_water_pct
+            ));
+        }
+        None
+    }
+
+    /// The non-blocking nudge shown when an agent starts with `live_panes`
+    /// agents already live, or `None` below the threshold or when it is `0`.
+    pub fn soft_warn_for_pane_count(&self, live_panes: usize) -> Option<String> {
+        if self.max_panes_soft_warn == 0 || live_panes < self.max_panes_soft_warn {
+            return None;
+        }
+        Some(format!(
+            "{live_panes} agents running (limits.max_panes_soft_warn = {}). \
+             Detach unused agents to free memory, or raise the threshold (0 \
+             silences it) in config.toml.",
+            self.max_panes_soft_warn
+        ))
+    }
+
+    /// Why a new companion terminal must not open with `open` already open.
+    pub fn refuse_companion_terminal(&self, open: usize) -> Option<String> {
+        (self.max_companion_terminals > 0 && open >= self.max_companion_terminals).then(|| {
+            format!(
+                "Refusing new terminal: {open} already open \
+                 (limits.max_companion_terminals = {}). Close one or raise the cap \
+                 in config.toml.",
+                self.max_companion_terminals
+            )
+        })
+    }
+
+    /// The status a disk sample earns: an error at or over the high-water mark,
+    /// a warning at or over the warn mark, nothing below both.
+    pub fn disk_usage_status(&self, pct: u8) -> Option<(bool, String)> {
+        if disk_threshold_enabled(self.disk_high_water_pct) && pct >= self.disk_high_water_pct {
+            return Some((
+                true,
+                format!(
+                    "The disk holding the dux config directory is {pct}% full \
+                     (limits.disk_high_water_pct = {}%): new agents are refused \
+                     until space is freed.",
+                    self.disk_high_water_pct
+                ),
+            ));
+        }
+        if disk_threshold_enabled(self.disk_warn_pct) && pct >= self.disk_warn_pct {
+            return Some((
+                false,
+                format!(
+                    "The disk holding the dux config directory is {pct}% full \
+                     (limits.disk_warn_pct = {}%).",
+                    self.disk_warn_pct
+                ),
+            ));
+        }
+        None
+    }
+
+    /// The scrollback budget in bytes, or `None` when auto-detach is off or the
+    /// budget is `0`.
+    pub fn scrollback_budget_bytes(&self) -> Option<usize> {
+        (self.enable_scrollback_overflow_autodetach && self.max_total_scrollback_mb > 0)
+            .then(|| self.max_total_scrollback_mb.saturating_mul(1024 * 1024))
+    }
+}
+
+/// A percentage threshold of `0` would fire on an empty disk and one above 100
+/// can never fire, so both read as off rather than as a trap.
+fn disk_threshold_enabled(pct: u8) -> bool {
+    (1..=100).contains(&pct)
+}
+
+/// Used-space percentage (0..=100) of the filesystem holding `path`, counted the
+/// way `df` does for a non-root user (`f_bavail`). `None` when the filesystem
+/// cannot be read, so a failed sample is skipped rather than read as empty.
+pub fn sample_disk_usage_pct(path: &Path) -> Option<u8> {
+    let stat = rustix::fs::statvfs(path).ok()?;
+    let total = stat.f_blocks;
+    if total == 0 {
+        return None;
+    }
+    let used = total.saturating_sub(stat.f_bavail);
+    Some((used.saturating_mul(100) / total).min(100) as u8)
 }
 
 pub fn provider_config(
@@ -4447,6 +4695,7 @@ mod tests {
 
     #[test]
     fn expand_path_dollar_var() {
+        let _env = crate::env_test_guard();
         // SAFETY: test-only env manipulation; tests are run with --test-threads=1
         // or use unique variable names to avoid races.
         unsafe { std::env::set_var("DUX_TEST_VAR_1", "/test/value") };
@@ -4457,6 +4706,7 @@ mod tests {
 
     #[test]
     fn expand_path_braced_var() {
+        let _env = crate::env_test_guard();
         unsafe { std::env::set_var("DUX_TEST_VAR_2", "/braced") };
         let result = expand_path("${DUX_TEST_VAR_2}/sub").unwrap();
         assert_eq!(result, "/braced/sub");
@@ -4486,6 +4736,7 @@ mod tests {
 
     #[test]
     fn expand_path_rejects_traversal() {
+        let _env = crate::env_test_guard();
         unsafe { std::env::set_var("DUX_TEST_VAR_3", "/safe") };
         assert!(expand_path("$DUX_TEST_VAR_3/../etc/passwd").is_none());
         unsafe { std::env::remove_var("DUX_TEST_VAR_3") };
@@ -4600,6 +4851,7 @@ mod tests {
 
     #[test]
     fn expand_variable_reads_both_forms_and_stops_at_the_name() {
+        let _env = crate::env_test_guard();
         unsafe { std::env::set_var("DUX_TEST_VAR_4", "/value") };
         let mut plain = "DUX_TEST_VAR_4/rest".chars().peekable();
         assert_eq!(expand_variable(&mut plain).as_deref(), Some("/value"));
@@ -4638,6 +4890,7 @@ mod tests {
 
     #[test]
     fn project_env_lines_parse_and_expand() {
+        let _env = crate::env_test_guard();
         unsafe { std::env::set_var("DUX_TEST_PROJECT_ENV_SOURCE", "secret") };
         let env = parse_project_env_lines("EDITOR=true\nAPI_KEY=${DUX_TEST_PROJECT_ENV_SOURCE}")
             .expect("parse env");
@@ -5471,6 +5724,9 @@ mod agent_tabs_cap_tests {
             ("opencode", WebDragDropPaste::Bare),
             ("codex", WebDragDropPaste::SingleQuoted),
             ("copilot", WebDragDropPaste::Bare),
+            ("cline", WebDragDropPaste::Bare),
+            ("kilocode", WebDragDropPaste::Bare),
+            ("ntl", WebDragDropPaste::Bare),
         ] {
             assert_eq!(
                 providers

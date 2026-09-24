@@ -870,6 +870,18 @@ fn session_label(session: &AgentSession) -> String {
     session.display_label()
 }
 
+/// The short name a launch-failure log line records for its launch kind.
+fn launch_kind_label(kind: &AgentLaunchKind) -> &'static str {
+    match kind {
+        AgentLaunchKind::Create { .. } => "create",
+        AgentLaunchKind::Reconnect { .. } => "reconnect",
+        AgentLaunchKind::ForceReconnect { .. } => "force_reconnect",
+        AgentLaunchKind::ResumeFallback { .. } => "resume_fallback",
+        AgentLaunchKind::StartupAutoReopen => "startup_auto_reopen",
+        AgentLaunchKind::Tab { .. } => "tab",
+    }
+}
+
 impl Engine {
     /// Find any other session that owns `worktree_path` and has a running
     /// provider, and detach it so the incoming launch can take over. Returns the
@@ -1045,7 +1057,13 @@ impl Engine {
         let status_quiet = request.status_quiet;
         self.clear_in_flight(&InFlightKey::AgentLaunch(tab_id.clone()));
 
-        if let AgentLaunchKind::Create { status_op_id, .. } = &request.kind {
+        if let AgentLaunchKind::Create {
+            status_op_id,
+            repo_path,
+            owns_worktree,
+            ..
+        } = &request.kind
+        {
             let status_op_id = status_op_id.clone();
             self.clear_in_flight(&InFlightKey::CreateAgent);
             // A brand-new agent's session row, its first tab's row and the
@@ -1064,6 +1082,27 @@ impl Engine {
                     "session store upsert failed for {}: {err}",
                     session.id,
                 ));
+                // Fork 773a6b04 (P1-27): an agent dux cannot record is one it
+                // forgets on restart, so the worktree it just made would be left
+                // behind with nothing pointing at it. Stop the provider first
+                // (dropping the client kills it, so nothing is writing into the
+                // directory), then roll the create back off the engine thread:
+                // the worktree only when dux made it, the branch only when dux
+                // minted it (`rollback_managed_create`, the same rule the
+                // spawn-failure path uses).
+                drop(client);
+                let rollback_session = session.clone();
+                let rollback_repo = std::path::PathBuf::from(repo_path);
+                let owns_worktree = *owns_worktree;
+                let _ = std::thread::Builder::new()
+                    .name("dux-create-rollback".into())
+                    .spawn(move || {
+                        crate::agent_job::rollback_managed_create(
+                            &rollback_repo,
+                            &rollback_session,
+                            owns_worktree,
+                        );
+                    });
                 let create_final = self.resolve_create_op(
                     &status_op_id,
                     CreateLaunchOutcome::PersistFailed {
@@ -1114,6 +1153,11 @@ impl Engine {
             // truth from the first frame instead of starting at "not looked
             // yet" (which fails closed). A no-op for every other kind.
             self.spawn_folder_repo_probe(&session.id);
+            // The new worktree should show up under the project's
+            // `dux-worktrees` link (port of fork 1d69de16).
+            if let Some(project_id) = session.project_id() {
+                self.spawn_project_worktree_link_for(project_id);
+            }
             if inserted.kept() && request.resumes_a_conversation() {
                 self.note_resume_launch(&tab_id);
             }
@@ -2189,6 +2233,28 @@ impl Engine {
         let session = request.session;
         self.clear_in_flight(&InFlightKey::AgentLaunch(tab_id.clone()));
 
+        // Port of fork bc77466f: the create/reconnect failures below reach only
+        // a status line, which a burst of auto-resumes overwrites within
+        // milliseconds, so without this line a failed reconnect leaves no trace
+        // in dux.log. The other arms log their own, more specific lines.
+        if matches!(
+            request.kind,
+            AgentLaunchKind::Create { .. }
+                | AgentLaunchKind::Reconnect { .. }
+                | AgentLaunchKind::ForceReconnect { .. }
+        ) {
+            tracing::error!(
+                target: "dux::sessions",
+                session_id = %session.id,
+                tab_id = %tab_id,
+                provider = %request.provider.as_str(),
+                directory = %session.directory(),
+                launch = launch_kind_label(&request.kind),
+                err = %message,
+                "agent launch failed",
+            );
+        }
+
         let outcome = match request.kind {
             AgentLaunchKind::Create { status_op_id, .. } => {
                 self.clear_in_flight(&InFlightKey::CreateAgent);
@@ -2632,6 +2698,12 @@ impl Engine {
         }
     }
 
+    /// `session` with the title a failed rename started from.
+    fn restore_title(mut session: AgentSession, previous_title: Option<String>) -> AgentSession {
+        session.title = previous_title;
+        session
+    }
+
     fn process_branch_rename_completed(
         &mut self,
         session_id: String,
@@ -2640,10 +2712,12 @@ impl Engine {
         result: Result<(), String>,
         status: ResolvedFinal,
     ) -> EventReaction {
+        let mut status = status;
         match &result {
             Ok(()) => {
                 if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
                     let label = session.display_label();
+                    let before = session.clone();
                     if let Some(managed) = session.workspace.as_managed_mut() {
                         let previous = managed.branch_name.clone();
                         let original = managed.initial_branch.clone();
@@ -2662,6 +2736,38 @@ impl Engine {
                             "failed to persist branch rename for {} (new branch: {}): {err}",
                             session.id, new_branch,
                         ));
+                        // Fork 773a6b04 (P1-27): a rename the database never
+                        // recorded would come back as the old branch on restart
+                        // while git holds the new one, and branch sync would then
+                        // call it drift. Put everything back the way the record
+                        // says: memory now, and git on a worker (the rename runs
+                        // in reverse), and say so instead of reporting success.
+                        let old_branch = before.branch_name().unwrap_or_default().to_string();
+                        let worktree = std::path::PathBuf::from(before.directory());
+                        *session = Self::restore_title(before, previous_title.clone());
+                        let revert_branch = new_branch.clone();
+                        let _ = std::thread::Builder::new()
+                            .name("dux-branch-rename-rollback".into())
+                            .spawn(move || {
+                                if let Err(err) = crate::git::rename_branch(
+                                    &worktree,
+                                    &revert_branch,
+                                    &old_branch,
+                                ) {
+                                    logger::error(&format!(
+                                        "could not revert branch {revert_branch} to {old_branch} \
+                                         after its rename failed to persist: {err}"
+                                    ));
+                                }
+                            });
+                        status = ResolvedFinal::error(
+                            status.key.clone(),
+                            format!(
+                                "The branch rename couldn't be persisted ({err}); \
+                                 reverted the agent and its branch."
+                            ),
+                        )
+                        .with_scope(status.scope.clone());
                     }
                 }
                 self.update_branch_sync_sessions();
@@ -3606,6 +3712,8 @@ impl Engine {
                 self.clear_in_flight(&InFlightKey::ResourceStats);
                 EventReaction::ResourceStatsArrived(stats, was_baseline)
             }
+            WorkerEvent::DiskUsageSampled(pct) => self.handle_disk_usage_event(pct),
+            WorkerEvent::ScrollbackWatchdogTick => self.handle_scrollback_watchdog_tick(),
             WorkerEvent::NonDefaultBranchCheckoutCompleted {
                 action,
                 target_branch,
@@ -5421,6 +5529,93 @@ mod tests {
         assert_eq!(stored[0].branch_name(), Some("new-branch"));
     }
 
+    /// Fork 773a6b04 (P1-27): a rename git made but the database refused is
+    /// undone in memory and in git, and reported as a failure, never success.
+    #[test]
+    fn branch_rename_db_failure_restores_git_and_memory_without_success() {
+        let (mut engine, tmp) = test_engine();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = crate::git::test_support::git_command()
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "seed",
+        ]);
+        git(&["switch", "-q", "-c", "old-branch"]);
+
+        let mut session = sample_session("s1", "p1", "old-branch");
+        if let Some(managed) = session.workspace.as_managed_mut() {
+            managed.worktree_path = repo.to_string_lossy().into_owned();
+        }
+        session.title = Some("renamed-optimistically".into());
+        engine.session_store.upsert_session(&session).unwrap();
+        engine.sessions.push(session);
+        // What the worker did before reporting Ok.
+        crate::git::rename_branch(&repo, "old-branch", "new-branch").unwrap();
+        engine.session_store.make_read_only_for_test();
+        engine.mark_in_flight(InFlightKey::BranchRename("s1".into()));
+
+        let reaction = engine.process_worker_event(WorkerEvent::BranchRenameCompleted {
+            session_id: "s1".into(),
+            new_branch: "new-branch".into(),
+            previous_title: None,
+            result: Ok(()),
+            status: crate::engine::ResolvedFinal::new(
+                "rename:s1",
+                crate::engine::Final::info("Renamed agent and branch"),
+            ),
+        });
+
+        let memory = engine.sessions.iter().find(|s| s.id == "s1").unwrap();
+        assert_eq!(memory.branch_name(), Some("old-branch"));
+        assert_eq!(memory.title, None);
+        let durable = engine.session_store.load_sessions().unwrap();
+        assert_eq!(durable[0].branch_name(), Some("old-branch"));
+        let EventReaction::Multi(items) = reaction else {
+            panic!("expected Multi");
+        };
+        let texts: Vec<String> = items
+            .iter()
+            .filter_map(|r| match r {
+                EventReaction::Status(update) => {
+                    Some(format!("{:?} {}", update.tone, update.message))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("Error") && t.contains("couldn't be persisted")),
+            "{texts:?}"
+        );
+        assert!(!texts.iter().any(|t| t.contains("Renamed agent and branch")));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while crate::git::current_branch(&repo).ok().as_deref() != Some("old-branch")
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(crate::git::current_branch(&repo).unwrap(), "old-branch");
+    }
+
     #[test]
     fn branch_rename_completed_error_clears_marker_and_expected_and_reverts_title() {
         // The Err arm (also the shape the panic_event synthesises) must revert
@@ -7154,6 +7349,164 @@ mod tests {
     /// Left armed, a survivor that simply stayed quiet past its resume wait was
     /// read as a hung resume, and the sweep tore the tab down and SIGKILLed a
     /// healthy agent.
+    /// Fork 773a6b04 (P1-27): a create whose session row cannot be written
+    /// must not leave behind the worktree and branch it just minted, which
+    /// nothing would point at after a restart. A branch dux did not mint
+    /// survives (`attached_branch_survives` below).
+    #[test]
+    fn create_agent_db_failure_removes_owned_worktree_without_success() {
+        let (mut engine, tmp) = test_engine();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = crate::git::test_support::git_command()
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "seed",
+        ]);
+
+        let run = |engine: &mut Engine, id: &str, provenance: crate::model::BranchProvenance| {
+            let worktree = tmp.path().join(format!("wt-{id}"));
+            let branch = format!("agent-{id}");
+            git(&[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &branch,
+                worktree.to_str().unwrap(),
+            ]);
+            let mut session = sample_session(id, "project-1", &branch);
+            if let Some(managed) = session.workspace.as_managed_mut() {
+                managed.worktree_path = worktree.to_string_lossy().into_owned();
+                managed.branch_provenance = provenance;
+            }
+            // The failure: the slot tab's row already exists, so the create's
+            // one transaction is refused.
+            engine
+                .session_store
+                .insert_agent_tab(&crate::engine::test_support::sample_tab(
+                    session.slot_tab_id().as_str(),
+                    "someone-else",
+                    "claude",
+                    0,
+                ))
+                .unwrap();
+            let client =
+                crate::pty::PtyClient::spawn_with_env("cat", &[], &worktree, 24, 80, 100, &[])
+                    .expect("spawn cat");
+            let data = AgentLaunchReadyData {
+                request: AgentLaunchRequest {
+                    tab_id: session.slot_tab_id().to_owned(),
+                    provider: session.provider.clone(),
+                    session,
+                    provider_config: ProviderCommandConfig::default(),
+                    env: Vec::new(),
+                    identity: Default::default(),
+                    resume: false,
+                    pty_size: (24, 80),
+                    scrollback_lines: 1000,
+                    kind: AgentLaunchKind::Create {
+                        status_message: "created".into(),
+                        repo_path: repo.to_string_lossy().into_owned(),
+                        owns_worktree: true,
+                        startup_result: None,
+                        status_op_id: String::new(),
+                    },
+                    wants_fullscreen: false,
+                    status_quiet: QuietSurfaces::LOUD,
+                    provider_session: Default::default(),
+                    yolo_args: Vec::new(),
+                },
+                client,
+            };
+            let (outcome, _) = engine.process_agent_launch_ready(data);
+            assert!(
+                matches!(
+                    outcome.view,
+                    AgentLaunchReadyView::CreatePersistFailed { .. }
+                ),
+                "a failed persist must not report success"
+            );
+            (worktree, branch)
+        };
+        let branch_exists = |branch: &str| {
+            crate::git::test_support::git_command()
+                .arg("-C")
+                .arg(&repo)
+                .args([
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}"),
+                ])
+                .status()
+                .unwrap()
+                .success()
+        };
+        let wait_gone = |path: &std::path::Path| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while path.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        let (worktree, branch) = run(
+            &mut engine,
+            "minted",
+            crate::model::BranchProvenance::CreatedByDux,
+        );
+        wait_gone(&worktree);
+        // The rollback thread removes the worktree first and deletes the
+        // branch after, so poll for the branch too before asserting.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while branch_exists(&branch) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !worktree.exists(),
+            "the unrecorded worktree must be removed"
+        );
+        assert!(
+            !branch_exists(&branch),
+            "the branch dux minted goes with it"
+        );
+        assert!(engine.sessions.iter().all(|s| s.id != "minted"));
+        assert!(!engine.providers.contains_key(TabIdRef::new("minted-slot")));
+
+        // attached_branch_survives: the worktree is dux's, the branch is not.
+        let (worktree, branch) = run(
+            &mut engine,
+            "attached",
+            crate::model::BranchProvenance::AttachedExisting,
+        );
+        wait_gone(&worktree);
+        assert!(!worktree.exists());
+        assert!(
+            branch_exists(&branch),
+            "a user's branch must never be deleted"
+        );
+    }
+
     #[test]
     fn a_dropped_launch_arms_no_resume_fallback_and_leaves_the_survivor_running() {
         let (mut engine, _tmp) = test_engine();
@@ -7351,6 +7704,31 @@ mod tests {
             AgentLaunchFailedOutcome::Reconnect { session_id, agent_label, message }
                 if session_id == "s1" && agent_label == "s1-title" && message == "boom"
         ));
+    }
+
+    /// Fork bc77466f: a failed reconnect leaves a structured error in the log,
+    /// not only a status line a burst of resumes overwrites at once.
+    #[test]
+    fn reconnect_failure_is_logged_with_session_and_error() {
+        let (mut engine, _tmp) = test_engine();
+        let data = make_failed_data(
+            "s1",
+            "feat/x",
+            AgentLaunchKind::Reconnect {
+                status_message: String::new(),
+            },
+            "boom",
+        );
+        let (_, events) =
+            crate::logger::capture_tracing(|| engine.process_agent_launch_failed(data));
+        let (target, fields) = events
+            .iter()
+            .find(|(_, fields)| fields.get("message") == Some(&"agent launch failed".into()))
+            .expect("a launch-failure log line");
+        assert_eq!(target, "dux::sessions");
+        assert_eq!(fields["session_id"], "s1");
+        assert_eq!(fields["launch"], "reconnect");
+        assert_eq!(fields["err"], "boom");
     }
 
     #[test]

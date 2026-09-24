@@ -881,6 +881,7 @@ impl App {
 
         self.input_target = InputTarget::None;
         self.fullscreen_overlay = FullscreenOverlay::None;
+        let extras = Box::new(self.new_agent_extras_for(&request));
         self.prompt = PromptState::NameNewAgent {
             request,
             input,
@@ -892,6 +893,7 @@ impl App {
                 .defaults
                 .copy_uncommitted_changes_by_default,
             focus: NameNewAgentFocus::Input,
+            extras,
         };
         Ok(())
     }
@@ -1288,6 +1290,7 @@ impl App {
         request: CreateAgentRequest,
         busy_message: String,
     ) -> Result<()> {
+        self.arm_new_agent_settings(&request);
         let term_size = crossterm::terminal::size().unwrap_or((80, 24));
         // Armed only once the dispatch is known accepted, and taking the
         // in-flight key is what says so. The engine allows one create at a time
@@ -3818,8 +3821,11 @@ impl App {
             && !editor::matches_configured_editor(&selected_editor, &configured_default)
         {
             self.set_info(format!(
-                "Opened agent \"{session_label}\" in {} via {} (configured default \"{}\" was not found on PATH).",
-                selected_editor.label, selected_editor.command, configured_default
+                "Opened agent \"{session_label}\" in {} via {} at {} (configured default \"{}\" was not found on PATH).",
+                selected_editor.label,
+                selected_editor.command,
+                session.directory(),
+                configured_default
             ));
         }
 
@@ -3865,7 +3871,7 @@ impl App {
     ) -> Result<()> {
         editor::launch_editor(editor_choice, Path::new(worktree_path))?;
         self.set_info(format!(
-            "Opened agent \"{session_label}\" in {} via {}.",
+            "Opened agent \"{session_label}\" in {} via {} at {worktree_path}.",
             editor_choice.label, editor_choice.command
         ));
         Ok(())
@@ -4551,6 +4557,7 @@ mod tests {
             pty_progress: std::collections::HashMap::new(),
             agent_viewed: std::collections::HashMap::new(),
             last_foreground_refresh: None,
+            limits: Default::default(),
             amq: Default::default(),
             pending_web_checkout_ops: std::collections::HashMap::new(),
             pending_web_add_project_ops: std::collections::HashMap::new(),
@@ -4628,6 +4635,8 @@ mod tests {
             last_pty_resize_target: None,
             tui_launched_ptys: Default::default(),
             create_agent_started_here: false,
+            pending_new_agent_settings: None,
+            armed_new_agent_settings: None,
             pending_pty_takeover: None,
             last_refused_pty_resize: None,
             grid_generation: 0,
@@ -4676,6 +4685,7 @@ mod tests {
             pr_banner_at_bottom: true,
             syntax_cache: Arc::new(crate::diff::SyntaxCache::new()),
             pending_diff: None,
+            pending_changes_job: None,
             diff_request_seq: 0,
             snapshot_buf: crate::pty::TerminalSnapshot::empty(),
             last_snapshot_id: None,
@@ -4873,6 +4883,7 @@ mod tests {
             pty_progress: std::collections::HashMap::new(),
             agent_viewed: std::collections::HashMap::new(),
             last_foreground_refresh: None,
+            limits: Default::default(),
             amq: Default::default(),
             pending_web_checkout_ops: std::collections::HashMap::new(),
             pending_web_add_project_ops: std::collections::HashMap::new(),

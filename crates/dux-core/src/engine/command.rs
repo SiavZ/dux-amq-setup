@@ -372,6 +372,13 @@ impl Engine {
                         "An agent is already being created or forked.",
                     )));
                 }
+                // `[limits]` (port-misc, fork P1-AA/#13): a hard cap refuses
+                // before any op is minted; the soft pane warning rides beside
+                // the create's own reaction and never stops it.
+                if let Some(reason) = self.refuse_agent_spawn_for_limits() {
+                    return Ok(EventReaction::Status(StatusUpdate::error(reason)));
+                }
+                let limits_warning = self.soft_warn_for_pane_count();
                 // Mint the shared create-agent `HandlerStatusOp`: its opaque id
                 // correlates the dispatch busy, every progress re-emit and the
                 // final the launch-ready and launch-failed handlers resolve from
@@ -424,7 +431,7 @@ impl Engine {
                 let paths = self.paths.clone();
                 let config = self.config.clone();
                 let identity = self.resolved_identity();
-                Ok(self.spawn_command_worker(
+                let reaction = self.spawn_command_worker(
                     CommandWorkerSpec {
                         label: "create-agent".into(),
                         in_flight_key: Some(InFlightKey::CreateAgent),
@@ -448,7 +455,14 @@ impl Engine {
                             identity,
                         );
                     },
-                ))
+                );
+                Ok(match limits_warning {
+                    Some(warning) => EventReaction::Multi(vec![
+                        EventReaction::Status(StatusUpdate::warning(warning)),
+                        reaction,
+                    ]),
+                    None => reaction,
+                })
             }
 
             Command::DispatchAgentLaunch { request } => {

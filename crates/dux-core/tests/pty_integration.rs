@@ -145,16 +145,38 @@ fn pty_write_input() {
     // Write some text followed by EOF (Ctrl-D).
     writer.write_all(b"test-input\n").expect("write");
     writer.write_all(b"\x04").expect("write eof");
+    let _ = writer.flush();
 
-    // Give it a moment to process.
-    thread::sleep(Duration::from_millis(200));
-
-    // Read whatever is available.
-    let mut output = vec![0u8; 4096];
-    // Non-blocking: try to read
+    // Drain on a thread and wait for the echo, up to 5s, BEFORE the kill
+    // (fork 411a59c2). The old write, sleep(200ms), kill, read order let the
+    // kill land before `cat` had echoed on a slow runner (macOS-14 CI), which
+    // read zero bytes.
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+    let needle = b"test-input";
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut output: Vec<u8> = Vec::new();
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => {
+                output.extend_from_slice(&chunk);
+                if output.windows(needle.len()).any(|w| w == needle) {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
     let _ = child.kill();
-    let n = reader.read(&mut output).unwrap_or(0);
-    let text = String::from_utf8_lossy(&output[..n]);
+    let text = String::from_utf8_lossy(&output);
 
     // The output should contain our input echoed back.
     assert!(

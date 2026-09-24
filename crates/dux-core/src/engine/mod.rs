@@ -5,6 +5,7 @@
 //! engine actor.
 
 pub mod amq;
+pub mod backup;
 pub mod command;
 mod companion;
 pub mod config_saver;
@@ -12,6 +13,7 @@ mod events;
 mod followup;
 mod in_flight;
 mod lifecycle;
+pub mod limits;
 mod pr_sync_control;
 mod provider_sessions;
 mod resume_fallback;
@@ -19,6 +21,7 @@ mod shared_workspace;
 mod spawn_worker;
 pub mod status_op;
 mod watch_tick;
+mod worktree_link;
 
 pub use amq::{AmqFocus, AmqRuntime};
 #[cfg(test)]
@@ -647,6 +650,9 @@ pub struct Engine {
     /// at most once per [`FOREGROUND_REFRESH_INTERVAL`]. `None` until the first
     /// refresh runs. Wall-clock (not tick counts) per the design tenet.
     pub last_foreground_refresh: Option<Instant>,
+    /// `[limits]` runtime state: the latest disk sample and whether the
+    /// watchdogs run (port-misc, fork P1-AA). See [`limits`].
+    pub limits: limits::LimitsRuntime,
 
     /// Web-side `HandlerStatusOp`s awaiting completion, keyed by the op's opaque
     /// id. These three ops run entirely server-side (the web actor drives them);
@@ -2270,6 +2276,7 @@ impl Engine {
             Ordering::Relaxed,
         );
         self.spawn_branch_sync_worker();
+        self.retune_limits();
     }
 
     /// Re-resolve the in-memory `default_provider` for each project against

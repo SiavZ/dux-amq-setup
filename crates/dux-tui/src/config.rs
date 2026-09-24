@@ -492,6 +492,9 @@ fn config_schema() -> Vec<ConfigEntry> {
             key: "path",
             comment: Some(CommentSource::Static(
                 "# Relative paths are resolved from the dux config directory.\n\
+                 # The log is JSON Lines: one object per line with timestamp, level,\n\
+                 # target and a fields object (fields.message, plus session_id and\n\
+                 # similar keys where dux has them), so jq can filter it.\n\
                  # The log file is opened once, so changing this needs a restart.\n\
                  # A symlink here is followed once at startup: the log and its rotated\n\
                  # copies live beside the file it points at, and the link is left alone.",
@@ -614,7 +617,8 @@ fn config_schema() -> Vec<ConfigEntry> {
                  # omits the unit for backward compatibility, but the value IS in\n\
                  # seconds, like every other interval in this file.\n\
                  # Keeps dux in sync if a branch is renamed outside the app.\n\
-                 # Set to 0 to disable.\n\
+                 # Default 0 (off): it runs git in every agent's worktree, so it is\n\
+                 # opt-in. 30 is a reasonable value to turn it on.\n\
                  # A config reload retunes this live, including turning it back on\n\
                  # from 0; no restart needed.",
             )),
@@ -1586,6 +1590,85 @@ fn config_schema() -> Vec<ConfigEntry> {
         ConfigEntry::Keys,
         ConfigEntry::Blank,
         ConfigEntry::Macros,
+        ConfigEntry::Blank,
+        ConfigEntry::Section("limits"),
+        ConfigEntry::Comment(
+            "# Resource guards. Most are warnings or off by default: dux only refuses\n\
+             # to start an agent when you set a hard cap here, or when the disk that\n\
+             # holds the dux config directory is nearly full.",
+        ),
+        ConfigEntry::Field {
+            key: "max_panes",
+            comment: Some(CommentSource::Static(
+                "# Hard cap on agents running at once; a new agent is refused at the cap.\n\
+                 # Default 0, which means no cap.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.limits.max_panes),
+        },
+        ConfigEntry::Field {
+            key: "max_panes_soft_warn",
+            comment: Some(CommentSource::Static(
+                "# Number of running agents at which starting another shows a warning.\n\
+                 # The agent still starts. Default 16. Set to 0 to silence it.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.limits.max_panes_soft_warn),
+        },
+        ConfigEntry::Field {
+            key: "max_companion_terminals",
+            comment: Some(CommentSource::Static(
+                "# Hard cap on companion shell terminals across all agents. Default 0,\n\
+                 # which means no cap.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.limits.max_companion_terminals),
+        },
+        ConfigEntry::Field {
+            key: "max_total_scrollback_mb",
+            comment: Some(CommentSource::Static(
+                "# Budget in MiB for the estimated scrollback memory of every running\n\
+                 # agent. Only used when enable_scrollback_overflow_autodetach is true.\n\
+                 # Default 256.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.limits.max_total_scrollback_mb),
+        },
+        ConfigEntry::Field {
+            key: "disk_high_water_pct",
+            comment: Some(CommentSource::Static(
+                "# Disk usage percentage (of the filesystem holding the dux config\n\
+                 # directory) at which new agents are refused. Checked once a minute.\n\
+                 # Default 95. Set to 0 to turn the refusal off.",
+            )),
+            value_fn: |c| FieldValue::U16(u16::from(c.limits.disk_high_water_pct)),
+        },
+        ConfigEntry::Field {
+            key: "disk_warn_pct",
+            comment: Some(CommentSource::Static(
+                "# Disk usage percentage at which dux shows a warning. Default 80. Set to\n\
+                 # 0 to turn the warning off.",
+            )),
+            value_fn: |c| FieldValue::U16(u16::from(c.limits.disk_warn_pct)),
+        },
+        ConfigEntry::Field {
+            key: "enable_scrollback_overflow_autodetach",
+            comment: Some(CommentSource::Static(
+                "# When true, dux stops the agent that has been idle longest once the\n\
+                 # estimated scrollback total goes over max_total_scrollback_mb. The\n\
+                 # agent's record is kept and it can be resumed. Default false.\n\
+                 # Every [limits] value is read at startup and on a config reload.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.limits.enable_scrollback_overflow_autodetach),
+        },
+        ConfigEntry::Blank,
+        ConfigEntry::Section("storage"),
+        ConfigEntry::Field {
+            key: "backup_interval_minutes",
+            comment: Some(CommentSource::Static(
+                "# Minutes between automatic copies of the session database to\n\
+                 # sessions.sqlite3.bak beside it, taken while dux runs. If the database\n\
+                 # is ever corrupted, dux refuses to open it and points you at this copy.\n\
+                 # Default 30. Set to 0 to turn the copies off. Read at startup.",
+            )),
+            value_fn: |c| FieldValue::U32(c.storage.backup_interval_minutes),
+        },
     ]
 }
 
@@ -2506,6 +2589,127 @@ mod tests {
             !raw.contains('#'),
             "fixture must contain zero comments, or it is not a bare config"
         );
+    }
+
+    // -- branch sync opt-in (port of fork 14ebb0c9) --
+
+    /// Branch sync polls git in every worktree, and a user who turned it off
+    /// saw it come back on regeneration, so it is opt-in.
+    #[test]
+    fn branch_sync_interval_defaults_to_zero() {
+        assert_eq!(Config::default().ui.branch_sync_interval, 0);
+        assert_eq!(
+            dux_core::config::UiConfig::default().branch_sync_interval,
+            0
+        );
+    }
+
+    #[test]
+    fn rendered_default_config_has_branch_sync_off() {
+        let rendered = render_default_config();
+        assert!(
+            rendered.contains("\nbranch_sync_interval = 0\n"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("branch_sync_interval = 30"));
+    }
+
+    /// A user who set the old default explicitly keeps it across a save.
+    #[test]
+    fn ensure_config_preserves_existing_branch_sync_interval() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let body = render_default_config()
+            .replace("branch_sync_interval = 0", "branch_sync_interval = 30");
+        std::fs::write(&config_path, &body).expect("write");
+        let mut config: Config = toml::from_str(&body).expect("parse");
+        assert_eq!(config.ui.branch_sync_interval, 30);
+        config.ui.right_width_pct = 25;
+        dux_core::config_write::save_config(&config_path, &config).expect("save");
+        let reloaded: Config =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).expect("reparse");
+        assert_eq!(reloaded.ui.branch_sync_interval, 30);
+        assert_eq!(reloaded.ui.right_width_pct, 25);
+    }
+
+    // -- [limits] (port of fork tests/limits.rs, P1-AA and its #13 softening) --
+
+    /// The defaults are the contract: no hard pane cap (soft warning at 16, the
+    /// old hard cap), no terminal cap, a 256 MiB scrollback budget, 80/95 disk
+    /// thresholds, auto-detach off.
+    #[test]
+    fn limits_defaults_match_audit_phase_16() {
+        let limits = dux_core::config::LimitsConfig::default();
+        assert_eq!(limits.max_panes, 0, "no hard cap by default");
+        assert_eq!(limits.max_panes_soft_warn, 16);
+        assert_eq!(limits.max_companion_terminals, 0);
+        assert_eq!(limits.max_total_scrollback_mb, 256);
+        assert_eq!(limits.disk_high_water_pct, 95);
+        assert_eq!(limits.disk_warn_pct, 80);
+        assert!(!limits.enable_scrollback_overflow_autodetach);
+        assert_eq!(Config::default().limits, limits);
+    }
+
+    /// A fresh config documents every [limits] knob inline.
+    #[test]
+    fn canonical_config_renders_limits_section() {
+        let body = render_default_config();
+        assert!(
+            body.contains("\n[limits]\n"),
+            "no [limits] section:\n{body}"
+        );
+        let section = body.split("\n[limits]\n").nth(1).unwrap();
+        for key in [
+            "max_panes",
+            "max_panes_soft_warn",
+            "max_companion_terminals",
+            "max_total_scrollback_mb",
+            "disk_high_water_pct",
+            "disk_warn_pct",
+            "enable_scrollback_overflow_autodetach",
+        ] {
+            let line = format!("\n{key} = ");
+            let at = section
+                .find(&line)
+                .unwrap_or_else(|| panic!("[limits] is missing {key}:\n{section}"));
+            assert!(
+                section[..at].lines().last().unwrap_or("").starts_with('#'),
+                "{key} has no comment above it:\n{section}"
+            );
+        }
+        for phrase in ["Default 0, which means no cap", "Default 16", "Set to 0"] {
+            assert!(section.contains(phrase), "[limits] never says {phrase:?}");
+        }
+    }
+
+    #[test]
+    fn limits_section_round_trips_through_toml() {
+        let body = render_default_config();
+        let parsed: Config = toml::from_str(&body).expect("rendered config parses");
+        assert_eq!(parsed.limits, dux_core::config::LimitsConfig::default());
+
+        let mut custom = Config::default();
+        custom.limits.max_panes = 7;
+        custom.limits.max_panes_soft_warn = 3;
+        custom.limits.disk_warn_pct = 70;
+        custom.limits.enable_scrollback_overflow_autodetach = true;
+        let reparsed: Config =
+            toml::from_str(&render_config_documented(&custom)).expect("custom round trip");
+        assert_eq!(reparsed.limits, custom.limits);
+        // The core writer (web saves, surgical patches) must agree.
+        let core: Config = toml::from_str(&dux_core::config_write::render_config_plain(&custom))
+            .expect("core writer output parses");
+        assert_eq!(core.limits, custom.limits);
+    }
+
+    /// A config written before [limits] existed loads with the defaults.
+    #[test]
+    fn a_config_without_limits_takes_the_defaults() {
+        let parsed: Config = toml::from_str("[logging]\nlevel = \"info\"\n").unwrap();
+        assert_eq!(parsed.limits, dux_core::config::LimitsConfig::default());
+        let partial: Config = toml::from_str("[limits]\nmax_panes = 4\n").unwrap();
+        assert_eq!(partial.limits.max_panes, 4);
+        assert_eq!(partial.limits.max_panes_soft_warn, 16);
     }
 
     /// The config file is the documentation, so the three rotation settings must
@@ -3947,9 +4151,11 @@ oneshot_output = "stdout"
     fn default_provider_commands_excludes_retired_gemini() {
         let providers = default_provider_commands();
         assert_eq!(
-            providers.len(),
-            5,
-            "five providers ship as defaults: claude, codex, opencode, copilot, jcode"
+            providers.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            [
+                "claude", "cline", "codex", "opencode", "kilocode", "ntl", "copilot", "jcode"
+            ],
+            "eight providers ship as defaults, in picker order"
         );
         assert!(
             providers.iter().all(|(name, _)| *name != "gemini"),
@@ -4083,6 +4289,127 @@ oneshot_output = "stdout"
         );
         assert_eq!(providers.get("opencode").unwrap().command, "opencode");
         assert_eq!(providers.get("copilot").unwrap().command, "copilot");
+    }
+
+    // -- Cline, Kilo Code, NTL (fork c2c44378) --
+
+    #[test]
+    fn ensure_defaults_adds_builtin_providers() {
+        let mut providers = ProvidersConfig {
+            commands: indexmap::IndexMap::new(),
+        };
+        providers.ensure_defaults();
+        for (name, command) in [
+            ("claude", "claude"),
+            ("cline", "cline"),
+            ("codex", "codex"),
+            ("opencode", "opencode"),
+            ("kilocode", "kilo"),
+            ("ntl", "ntl"),
+            ("copilot", "copilot"),
+            ("jcode", "jcode"),
+        ] {
+            assert_eq!(
+                providers.get(name).map(|cfg| cfg.command.as_str()),
+                Some(command),
+                "{name} should be added"
+            );
+        }
+        assert!(providers.get("gemini").is_none());
+    }
+
+    #[test]
+    fn default_cline_uses_tui_and_plain_prompt() {
+        let providers = default_provider_commands();
+        let cfg = &providers.iter().find(|(n, _)| *n == "cline").unwrap().1;
+        assert_eq!(cfg.command, "cline");
+        assert_eq!(cfg.args, vec!["--tui"]);
+        assert!(!cfg.supports_session_resume());
+        assert_eq!(cfg.install_hint.as_deref(), Some("npm install -g cline"));
+    }
+
+    /// Kilo Code is an opencode fork: same `--continue` resume with the same
+    /// 3s fallback to a fresh start.
+    #[test]
+    fn default_kilocode_resumes_with_continue_and_falls_back_after_3s() {
+        let providers = default_provider_commands();
+        let cfg = &providers.iter().find(|(n, _)| *n == "kilocode").unwrap().1;
+        assert_eq!(cfg.command, "kilo");
+        assert_eq!(cfg.resume_args, Some(vec!["--continue".to_string()]));
+        assert_eq!(cfg.resume_wait_timeout_ms, Some(3_000));
+        assert!(cfg.supports_session_resume());
+        assert_eq!(
+            cfg.install_hint.as_deref(),
+            Some("npm install -g @kilocode/cli")
+        );
+    }
+
+    #[test]
+    fn default_ntl_uses_agent_repl() {
+        let providers = default_provider_commands();
+        let cfg = &providers.iter().find(|(n, _)| *n == "ntl").unwrap().1;
+        assert_eq!(cfg.command, "ntl");
+        assert_eq!(cfg.args, vec!["--agent"]);
+        assert!(!cfg.supports_session_resume());
+    }
+
+    #[test]
+    fn providers_use_expected_scrollback_defaults() {
+        let config = Config::default();
+        for (name, expected) in [
+            ("cline", Some(true)),
+            ("kilocode", Some(true)),
+            ("ntl", Some(false)),
+            ("jcode", Some(true)),
+        ] {
+            assert_eq!(
+                config.providers.get(name).unwrap().forward_scroll,
+                expected,
+                "{name} forward_scroll"
+            );
+        }
+        // Upstream's own providers use the auto policy.
+        for name in ["claude", "codex", "opencode", "copilot"] {
+            assert_eq!(config.providers.get(name).unwrap().forward_scroll, None);
+        }
+    }
+
+    /// The new providers render into the documented template and survive a
+    /// round trip through both config writers.
+    #[test]
+    fn new_default_providers_render_and_round_trip() {
+        let rendered = render_default_config();
+        for header in [
+            "[providers.cline]",
+            "[providers.kilocode]",
+            "[providers.ntl]",
+        ] {
+            assert!(rendered.contains(header), "missing {header}");
+        }
+        // Compared on the fields these providers set. How an absent resume
+        // field renders is the resume workstream's (palmtree) business.
+        let key = |c: &Config, name: &str| {
+            let p = c.providers.get(name).unwrap();
+            (
+                p.command.clone(),
+                p.args.clone(),
+                p.install_hint.clone(),
+                p.forward_scroll,
+                p.web_dragdrop_paste.clone(),
+            )
+        };
+        let parsed: Config = toml::from_str(&rendered).unwrap();
+        let core: Config = toml::from_str(&dux_core::config_write::render_config_plain(
+            &Config::default(),
+        ))
+        .unwrap();
+        for name in ["cline", "kilocode", "ntl"] {
+            assert_eq!(key(&parsed, name), key(&Config::default(), name), "{name}");
+            assert_eq!(key(&core, name), key(&Config::default(), name), "{name}");
+        }
+        let kilo = parsed.providers.get("kilocode").unwrap();
+        assert_eq!(kilo.resume_args, Some(vec!["--continue".to_string()]));
+        assert_eq!(kilo.resume_wait_timeout_ms, Some(3_000));
     }
 
     #[test]

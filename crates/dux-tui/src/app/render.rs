@@ -4160,6 +4160,36 @@ impl App {
         }
     }
 
+    /// Vertical scrollbar for the agent grid's scrollback (fork 12c1b272),
+    /// drawn in the pane's right BORDER column beside the terminal rows so it
+    /// never covers a grid cell (the same rule the one-cell scroll markers
+    /// follow). Unlike the "N below" badge it is drawn in alt-screen mode too:
+    /// Claude Code and Codex keep meaningful history in scrollback while on the
+    /// alternate screen. The track rect is published so the thumb can be
+    /// dragged (fork 670b8c24).
+    fn render_agent_scrollbar(&mut self, frame: &mut Frame, area: Rect, term_area: Rect) {
+        let has_output = self
+            .selected_terminal_surface_client()
+            .is_some_and(|provider| provider.has_output());
+        let total = self.snapshot_buf.scrollback_total;
+        if !has_output || total == 0 || term_area.height < 3 || area.width < 2 {
+            return;
+        }
+        let track = agent_scrollbar_rect(area, term_area);
+        if !frame
+            .area()
+            .contains(ratatui::layout::Position::new(track.x, track.y))
+        {
+            return;
+        }
+        let position = agent_scrollbar_position(total, self.snapshot_buf.scrollback_offset);
+        let mut state = ratatui::widgets::ScrollbarState::new(total).position(position);
+        ratatui::widgets::Scrollbar::new(ratatui::widgets::ScrollbarOrientation::VerticalRight)
+            .style(Style::default().fg(self.theme.scroll_indicator_fg))
+            .render(track, frame.buffer_mut(), &mut state);
+        self.mouse_layout.agent_scrollbar = Some(track);
+    }
+
     fn render_terminal_scrollback_indicator(
         &self,
         frame: &mut Frame,
@@ -4429,6 +4459,7 @@ impl App {
 
         if rendered_content {
             self.welcome_logo_visible = false;
+            self.render_agent_scrollbar(frame, area, term_area);
         } else {
             self.render_terminal_empty_state(frame, term_area, &context);
         }
@@ -10435,11 +10466,13 @@ impl App {
             randomize_name,
             copy_changes,
             focus,
+            extras,
             ..
         } = &self.prompt
         else {
             return;
         };
+        let extras_lines = super::new_agent_settings::extras_lines(extras);
         self.render_dim_overlay(frame);
         let randomize_checkbox = Checkbox::new("Use randomized pet name")
             .checked(*randomize_name)
@@ -10506,6 +10539,8 @@ impl App {
                 + randomize_checkbox_height
                 + copy_checkbox_spacing
                 + copy_checkbox_height
+                + 1
+                + extras_lines.len() as u16
                 + footer_spacing,
             frame.area(),
         );
@@ -10528,6 +10563,8 @@ impl App {
             _,
             copy_checkbox_area,
             _,
+            extras_area,
+            _,
             hint_area,
         ] = Layout::default()
             .direction(Direction::Vertical)
@@ -10539,6 +10576,8 @@ impl App {
                 Constraint::Length(randomize_checkbox_height),
                 Constraint::Length(copy_checkbox_spacing),
                 Constraint::Length(copy_checkbox_height),
+                Constraint::Length(1),
+                Constraint::Length(extras_lines.len() as u16),
                 Constraint::Length(footer_spacing),
                 Constraint::Min(1),
             ])
@@ -10660,6 +10699,10 @@ impl App {
             Style::default().fg(self.theme.hint_desc_fg),
         ));
         Paragraph::new(Line::from(hints)).render(hint_area, frame.buffer_mut());
+        let hit_rows = self.render_new_agent_extras(frame, extras_area, &extras_lines);
+        if let PromptState::NameNewAgent { extras, .. } = &mut self.prompt {
+            extras.hit_rows = hit_rows;
+        }
         self.overlay_layout.active = OverlayMouseLayout::NameNewAgent {
             input: input_inner,
             checkbox: Some(OverlayCheckbox {
@@ -12835,6 +12878,41 @@ fn runtime_context_spans(
     }
 
     spans
+}
+
+/// The agent scrollbar's track: the pane's right border column, spanning the
+/// terminal rows only (the hint lane below keeps its border).
+pub(crate) fn agent_scrollbar_rect(area: Rect, term_area: Rect) -> Rect {
+    Rect::new(
+        area.x + area.width.saturating_sub(1),
+        term_area.y,
+        1,
+        term_area.height,
+    )
+}
+
+/// Map dux's scrollback offset (0 = latest line at the bottom, growing as the
+/// user pages back) onto ratatui's `ScrollbarState` position (0 = top, clamped
+/// to `content_length - 1`). `content_length` is the history size alone:
+/// adding the viewport on top (the fork's first cut, fixed in bb322273)
+/// inflates ratatui's denominator so the thumb never reaches the bottom.
+pub(crate) fn agent_scrollbar_position(total: usize, offset: usize) -> usize {
+    total.saturating_sub(offset.min(total)).saturating_sub(1)
+}
+
+/// The scrollback offset a press or drag at `row` on the scrollbar `track`
+/// asks for: the top row is the oldest history (offset `total`), the bottom
+/// row the live edge (offset 0), linear in between. Rows outside the track
+/// clamp to its ends so a drag past either end pins there.
+pub(crate) fn agent_scrollback_for_row(track: Rect, total: usize, row: u16) -> usize {
+    if track.height == 0 || total == 0 {
+        return 0;
+    }
+    let clamped = row.clamp(track.y, track.y + track.height - 1);
+    let relative = usize::from(clamped - track.y);
+    let denominator = usize::from(track.height - 1).max(1);
+    let position = (relative * total + denominator / 2) / denominator;
+    total.saturating_sub(position)
 }
 
 /// The scrollback badge painted at the top-right of the PTY view.
@@ -15366,6 +15444,148 @@ mod tests {
             None,
             "a press that never left its row paints nothing",
         );
+    }
+
+    // ── Agent pane scrollbar geometry (fork 12c1b272, bb322273) ────
+    //
+    // Rendered through TestBackend and asserted cell by cell, so a ratatui
+    // bump that changes the ScrollbarState math fails here rather than
+    // silently parking the thumb short of the track's end.
+
+    fn scrollbar_column(height: u16, total: usize, offset: usize) -> Vec<String> {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(1, height))
+            .expect("terminal");
+        let mut state = ratatui::widgets::ScrollbarState::new(total)
+            .position(agent_scrollbar_position(total, offset));
+        term.draw(|frame| {
+            let area = frame.area();
+            frame.render_stateful_widget(
+                ratatui::widgets::Scrollbar::new(
+                    ratatui::widgets::ScrollbarOrientation::VerticalRight,
+                ),
+                area,
+                &mut state,
+            );
+        })
+        .expect("draw");
+        let buf = term.backend().buffer();
+        (0..height)
+            .map(|row| buf[(0, row)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn scrollbar_thumb_is_at_bottom_at_the_live_edge() {
+        let col = scrollbar_column(10, 100, 0);
+        assert_eq!(col[0], "▲");
+        assert_eq!(col[9], "▼");
+        assert_eq!(
+            col[8], "█",
+            "thumb sits just above the bottom arrow: {col:?}"
+        );
+        assert!(col[1..8].iter().all(|c| c == "║"), "{col:?}");
+    }
+
+    #[test]
+    fn scrollbar_thumb_is_at_top_at_the_oldest_line() {
+        let col = scrollbar_column(10, 100, 99);
+        assert_eq!(col[1], "█", "thumb sits just below the top arrow: {col:?}");
+        assert!(col[2..9].iter().all(|c| c == "║"), "{col:?}");
+    }
+
+    #[test]
+    fn scrollbar_thumb_is_mid_track_at_half_offset() {
+        let col = scrollbar_column(10, 100, 50);
+        let thumb = col.iter().position(|c| c == "█").expect("thumb drawn");
+        assert!((3..=6).contains(&thumb), "thumb row {thumb}: {col:?}");
+    }
+
+    #[test]
+    fn scrollbar_position_saturates() {
+        assert_eq!(agent_scrollbar_position(10, 999), 0);
+        assert_eq!(agent_scrollbar_position(0, 0), 0);
+        assert_eq!(agent_scrollbar_position(0, 5), 0);
+        assert_eq!(agent_scrollbar_position(10, 0), 9);
+    }
+
+    #[test]
+    fn scrollback_for_row_maps_track_ends_and_clamps() {
+        let track = Rect::new(5, 10, 1, 5);
+        assert_eq!(agent_scrollback_for_row(track, 40, 10), 40, "top = oldest");
+        assert_eq!(
+            agent_scrollback_for_row(track, 40, 14),
+            0,
+            "bottom = live edge"
+        );
+        assert_eq!(agent_scrollback_for_row(track, 40, 12), 20, "middle");
+        assert_eq!(agent_scrollback_for_row(track, 40, 0), 40, "above clamps");
+        assert_eq!(agent_scrollback_for_row(track, 40, 99), 0, "below clamps");
+        assert_eq!(agent_scrollback_for_row(track, 0, 12), 0);
+        assert_eq!(agent_scrollback_for_row(Rect::new(0, 0, 1, 0), 9, 0), 0);
+    }
+
+    /// End to end: an agent with real scrollback draws the scrollbar in the
+    /// pane's right BORDER column (never over a grid cell), publishes its
+    /// track for dragging, and keeps drawing it on the alternate screen.
+    #[test]
+    fn agent_pane_draws_scrollbar_in_its_border_column() {
+        let mut app = test_app(default_bindings());
+        let slot_tab = app.engine.sessions[0].slot_tab_id().to_string();
+        let args = vec![
+            "-c".to_string(),
+            "printf 'L%s\\n' $(seq 1 100); sleep 30".to_string(),
+        ];
+        let client = PtyClient::spawn("/bin/sh", &args, std::path::Path::new("."), 5, 40, 200)
+            .expect("spawn pty");
+        app.engine
+            .providers
+            .insert(TabId::new(slot_tab.clone()), client);
+        app.session_surface = SessionSurface::Agent;
+        app.center_mode = CenterMode::Agent;
+        app.focus = FocusPane::Center;
+        let (_, _) = draw_caret_frame(&mut app);
+        for _ in 0..300 {
+            app.refresh_snapshot_buf();
+            if app.snapshot_buf.scrollback_total > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.snapshot_buf.scrollback_total > 0, "child made history");
+
+        let (terminal, term_area) = draw_caret_frame(&mut app);
+        let track = app
+            .mouse_layout
+            .agent_scrollbar
+            .expect("scrollbar track published when history exists");
+        assert_eq!(track.x, term_area.x + term_area.width, "border column");
+        assert_eq!((track.y, track.height), (term_area.y, term_area.height));
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf[(track.x, track.y)].symbol(), "▲");
+        assert_eq!(buf[(track.x, track.y + track.height - 1)].symbol(), "▼");
+        assert!(
+            (track.y..track.y + track.height).any(|y| buf[(track.x, y)].symbol() == "█"),
+            "thumb drawn somewhere on the track"
+        );
+    }
+
+    #[test]
+    fn agent_pane_without_history_publishes_no_scrollbar() {
+        let mut app = test_app(default_bindings());
+        let slot_tab = app.engine.sessions[0].slot_tab_id().to_string();
+        let args = vec!["-c".to_string(), "printf hi; sleep 30".to_string()];
+        let client = PtyClient::spawn("/bin/sh", &args, std::path::Path::new("."), 5, 40, 200)
+            .expect("spawn pty");
+        app.engine
+            .providers
+            .insert(TabId::new(slot_tab.clone()), client);
+        app.session_surface = SessionSurface::Agent;
+        app.center_mode = CenterMode::Agent;
+        let _ = draw_caret_frame(&mut app);
+        app.refresh_snapshot_buf();
+        assert_eq!(app.snapshot_buf.scrollback_total, 0);
+        let _ = draw_caret_frame(&mut app);
+        assert!(app.mouse_layout.agent_scrollbar.is_none());
     }
 
     #[test]
@@ -22240,6 +22460,7 @@ mod tests {
                 randomized_name,
                 copy_changes,
                 focus,
+                extras: Default::default(),
             },
             other => panic!("expected NameNewAgent, got {other:?}"),
         };
@@ -22653,6 +22874,7 @@ mod tests {
             randomized_name: None,
             copy_changes: false,
             focus: NameNewAgentFocus::Input,
+            extras: Default::default(),
         }
     }
 
@@ -22994,6 +23216,7 @@ mod tests {
             randomized_name: None,
             copy_changes: false,
             focus,
+            extras: Default::default(),
         }
     }
 

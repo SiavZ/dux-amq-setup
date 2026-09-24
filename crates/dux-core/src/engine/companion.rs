@@ -137,6 +137,11 @@ impl Engine {
         rows: u16,
         cols: u16,
     ) -> Result<(String, String)> {
+        // `[limits].max_companion_terminals` (port-misc): one gate for every
+        // owner, since every terminal spawn funnels through here.
+        if let Some(reason) = self.refuse_companion_terminal_for_limits() {
+            anyhow::bail!("{reason}");
+        }
         // A companion terminal is a plain shell, so it opts out of agent-signal
         // tracking: its bytes are never scanned for OSC or bell attention
         // signals and it can never raise a spurious attention flag.

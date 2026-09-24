@@ -547,6 +547,11 @@ pub enum WorkerEvent {
     /// reading measured over the short baseline window rather than the
     /// caller's normal poll interval.
     ResourceStatsReady(Vec<ResourceStats>, bool),
+    /// `[limits]` disk watchdog sample: used-space percentage of the
+    /// filesystem holding the dux config directory (port-misc).
+    DiskUsageSampled(u8),
+    /// `[limits]` scrollback watchdog tick; the engine estimates and acts.
+    ScrollbackWatchdogTick,
     /// One run of the `gh` host probe finished.
     ///
     /// `generation` is stamped before the probe is spawned and travels on every

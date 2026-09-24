@@ -2,8 +2,7 @@ use super::components::{ButtonPressedTarget, PressedButton, next_focus};
 use super::modal::{ModalKeyStep, binding_lookup_is_suppressed, click_target, modal_key_step};
 use super::*;
 use chrono::Local;
-use dux_core::engine::{Command, EventReaction, StatusUpdate};
-use dux_core::statusline::StatusTone;
+use dux_core::engine::Command;
 use dux_core::text::count_of;
 use ratatui::buffer::CellWidth;
 /// Lines moved per mouse-wheel tick for local scrolling, shared by every wheel
@@ -264,6 +263,8 @@ enum PromptMouseTarget {
     Checkbox(OverlayCheckboxId),
     RenameInput,
     NameNewAgentInput,
+    /// A harness, Advanced or settings row of the new-agent modal.
+    NameNewAgentRow(super::NameNewAgentFocus),
     PullRequestInput,
     PullRequestChooseProject,
     AttachPullRequestInput,
@@ -428,6 +429,7 @@ impl ButtonPressedTarget {
             | PromptMouseTarget::Checkbox(_)
             | PromptMouseTarget::RenameInput
             | PromptMouseTarget::NameNewAgentInput
+            | PromptMouseTarget::NameNewAgentRow(_)
             | PromptMouseTarget::PullRequestInput
             | PromptMouseTarget::AttachPullRequestInput
             | PromptMouseTarget::NameStandaloneAgentInput
@@ -2667,29 +2669,14 @@ impl App {
         };
         let Some(file) = file else { return Ok(()) };
         let path = file.path.clone();
-        let reaction = match self.right_section {
-            RightSection::Unstaged => self.engine.apply(Command::StageFile {
-                worktree_path: worktree,
-                path,
-            })?,
-            RightSection::Staged => self.engine.apply(Command::UnstageFile {
-                worktree_path: worktree,
-                path,
-            })?,
+        // The git call runs on a worker (it can stall on the index lock); the
+        // refresh and the section hop run when it answers. See `changes_job`.
+        let job = match self.right_section {
+            RightSection::Unstaged => super::changes_job::ChangesJob::Stage { path },
+            RightSection::Staged => super::changes_job::ChangesJob::Unstage { path },
             RightSection::CommitInput => return Ok(()),
         };
-        self.apply_reaction(reaction);
-        self.reload_changed_files();
-        // If the section we were in is now empty, move to the other one.
-        if self.right_section == RightSection::Staged && self.engine.staged_files.is_empty() {
-            self.right_section = RightSection::Unstaged;
-            self.clamp_files_cursor();
-        } else if self.right_section == RightSection::Unstaged
-            && self.engine.unstaged_files.is_empty()
-        {
-            self.right_section = RightSection::Staged;
-            self.clamp_files_cursor();
-        }
+        self.dispatch_changes_job(worktree, job);
         Ok(())
     }
 
@@ -2722,20 +2709,14 @@ impl App {
             return Ok(());
         };
         let message = self.commit_input.text.clone();
-        // Route the empty-message / nothing-staged decision through the shared core
-        // preflight so the TUI and the web agree, and so the nothing-staged check
-        // reads LIVE git status rather than the possibly-stale `staged_files`
-        // cache. Each surface still renders its own copy for the refusals.
-        match git::commit_preflight(&worktree, &message) {
-            git::CommitPreflight::EmptyMessage => {
-                self.set_error("Enter a commit message first.");
-                return Ok(());
-            }
-            git::CommitPreflight::NothingStaged => {
-                self.set_error("No staged changes to commit.");
-                return Ok(());
-            }
-            git::CommitPreflight::Ready => {}
+        // The empty-message refusal needs no git, so it answers at once. The
+        // nothing-staged refusal reads LIVE git status through the shared core
+        // preflight (so the TUI and the web agree and a stale `staged_files`
+        // cache cannot let a commit through), which is git work and therefore
+        // runs on the worker together with the commit. See `changes_job`.
+        if message.trim().is_empty() {
+            self.set_error("Enter a commit message first.");
+            return Ok(());
         }
         // The push hint is only offered where pushing is possible. A standalone
         // agent has no branch, so `push_to_remote` refuses it, and advertising
@@ -2746,23 +2727,13 @@ impl App {
             .filter(|session| session.supports_branch_git())
             .map(|_| self.bindings.label_for(Action::PushToRemote));
         let success_message = commit_success_message(push_key.as_deref());
-        let reaction = self.engine.apply(Command::CommitChanges {
-            worktree_path: worktree,
-            message,
-            success_message,
-        })?;
-        let success = matches!(
-            &reaction,
-            EventReaction::Status(StatusUpdate {
-                tone: StatusTone::Info,
-                ..
-            })
+        self.dispatch_changes_job(
+            worktree,
+            super::changes_job::ChangesJob::Commit {
+                message,
+                success_message,
+            },
         );
-        self.apply_reaction(reaction);
-        if success {
-            self.commit_input.clear();
-            self.reload_changed_files();
-        }
         Ok(())
     }
 
@@ -3368,6 +3339,18 @@ impl App {
             return RawInputFlow::Continue;
         }
         if self.continue_raw_mouse_forward(&mouse) {
+            return RawInputFlow::Continue;
+        }
+        // The scrollbar is host chrome, not the child's grid: a press on it
+        // (and the drag it starts) is a host scroll even in interactive mode,
+        // never a selection, a forwarded click, or a click outside the overlay.
+        if self.center_scrollbar_at_mouse(mouse.column, mouse.row)
+            || self.mouse_drag == Some(ResizeDragState::CenterScrollbar)
+        {
+            self.terminal_selection = None;
+            if self.handle_mouse(mouse) {
+                return RawInputFlow::Return(true);
+            }
             return RawInputFlow::Continue;
         }
         if self.raw_mouse_is_outside_overlay(&mouse) {
@@ -5314,11 +5297,16 @@ impl App {
         let PromptState::NameNewAgent {
             mut request,
             copy_changes,
+            extras,
             ..
         } = old_prompt
         else {
             unreachable!()
         };
+        // The chosen harness and the Advanced draft (fork 6448c3f5). The name
+        // goes on first because it is part of the draft's create tag.
+        set_create_agent_request_custom_name(&mut request, name.clone());
+        self.take_new_agent_choices(&extras, &mut request);
         if let CreateAgentRequest::NewProject {
             copy_uncommitted_changes,
             ..
@@ -5352,10 +5340,9 @@ impl App {
         let PromptState::NameNewAgent { focus, .. } = &self.prompt else {
             return Ok(None);
         };
-        let checkbox_focused = matches!(
-            focus,
-            NameNewAgentFocus::RandomizedNameCheckbox | NameNewAgentFocus::CopyChangesCheckbox
-        );
+        // Every control but the name field (the checkboxes, and the harness,
+        // Advanced and settings rows of fork 6448c3f5) takes Space, not text.
+        let checkbox_focused = !matches!(focus, NameNewAgentFocus::Input);
         let action = if !checkbox_focused && text_field_owns_key(key) {
             None
         } else {
@@ -6807,7 +6794,12 @@ impl App {
                 input,
                 checkbox,
                 copy_checkbox,
-            } => Self::name_new_agent_target(input, checkbox, copy_checkbox, column, row),
+            } => Self::name_new_agent_target(input, checkbox, copy_checkbox, column, row).or_else(
+                || {
+                    self.new_agent_row_hit(column, row)
+                        .map(PromptMouseTarget::NameNewAgentRow)
+                },
+            ),
         }
     }
 
@@ -7927,28 +7919,12 @@ impl App {
             // action agree with the worktree as it is NOW (not as it was when the
             // prompt opened). This closes a data-loss window: a file that was
             // untracked at prompt-open but became tracked before confirm would
-            // otherwise be deleted outright instead of restored from HEAD.
-            let is_untracked = match git::discard_classify(&worktree, &file_path) {
-                Ok(u) => u,
-                Err(e) => {
-                    // The live check refused (now staged, or nothing left to
-                    // discard). Surface it and leave the file untouched.
-                    self.set_error(format!("Discard failed: {e}"));
-                    return false;
-                }
-            };
-            let reaction = self.engine.apply(Command::DiscardFile {
-                worktree_path: worktree,
-                path: file_path,
-                is_untracked,
-            });
-            match reaction {
-                Ok(reaction) => {
-                    self.apply_reaction(reaction);
-                    self.reload_changed_files();
-                }
-                Err(e) => self.set_error(format!("Discard failed: {e}")),
-            }
+            // otherwise be deleted outright instead of restored from HEAD. Both
+            // halves run together on the worker; see `changes_job`.
+            self.dispatch_changes_job(
+                worktree,
+                super::changes_job::ChangesJob::Discard { path: file_path },
+            );
         }
         false
     }
@@ -8328,30 +8304,41 @@ impl App {
     }
 
     fn focus_next_name_new_agent_control(&mut self, forward: bool) {
-        if let PromptState::NameNewAgent { request, focus, .. } = &mut self.prompt {
+        if let PromptState::NameNewAgent {
+            request,
+            focus,
+            extras,
+            ..
+        } = &mut self.prompt
+        {
             // Only fresh project agents expose the copy checkbox: forks always
             // copy, and the other flows never do.
-            let has_copy_checkbox = matches!(request, CreateAgentRequest::NewProject { .. });
-            *focus = if has_copy_checkbox {
-                match (*focus, forward) {
-                    (NameNewAgentFocus::Input, true) => NameNewAgentFocus::RandomizedNameCheckbox,
-                    (NameNewAgentFocus::RandomizedNameCheckbox, true) => {
-                        NameNewAgentFocus::CopyChangesCheckbox
-                    }
-                    (NameNewAgentFocus::CopyChangesCheckbox, true) => NameNewAgentFocus::Input,
-                    (NameNewAgentFocus::Input, false) => NameNewAgentFocus::CopyChangesCheckbox,
-                    (NameNewAgentFocus::CopyChangesCheckbox, false) => {
-                        NameNewAgentFocus::RandomizedNameCheckbox
-                    }
-                    (NameNewAgentFocus::RandomizedNameCheckbox, false) => NameNewAgentFocus::Input,
-                }
+            let mut order = vec![
+                NameNewAgentFocus::Input,
+                NameNewAgentFocus::RandomizedNameCheckbox,
+            ];
+            if matches!(request, CreateAgentRequest::NewProject { .. }) {
+                order.push(NameNewAgentFocus::CopyChangesCheckbox);
+            }
+            // Harness and Advanced (fork 6448c3f5); the setting rows only
+            // while Advanced is open.
+            order.push(NameNewAgentFocus::Provider);
+            order.push(NameNewAgentFocus::AdvancedToggle);
+            if extras.show_advanced {
+                order.extend(
+                    extras
+                        .setting_rows()
+                        .into_iter()
+                        .map(NameNewAgentFocus::Setting),
+                );
+            }
+            let at = order.iter().position(|f| f == focus).unwrap_or(0);
+            let len = order.len();
+            *focus = order[if forward {
+                (at + 1) % len
             } else {
-                match *focus {
-                    NameNewAgentFocus::Input => NameNewAgentFocus::RandomizedNameCheckbox,
-                    NameNewAgentFocus::RandomizedNameCheckbox
-                    | NameNewAgentFocus::CopyChangesCheckbox => NameNewAgentFocus::Input,
-                }
-            };
+                (at + len - 1) % len
+            }];
         }
     }
 
@@ -8366,6 +8353,7 @@ impl App {
             }
             NameNewAgentFocus::CopyChangesCheckbox => self.toggle_name_new_agent_copy_changes(),
             NameNewAgentFocus::Input => {}
+            other => self.activate_new_agent_row(other),
         }
     }
 
@@ -8686,7 +8674,7 @@ impl App {
         }
     }
 
-    fn handle_prompt_mouse(&mut self, mouse: MouseEvent) -> bool {
+    pub(crate) fn handle_prompt_mouse(&mut self, mouse: MouseEvent) -> bool {
         if let Some(result) = self.handle_first_load_prompt_mouse(&mouse) {
             return result;
         }
@@ -8949,6 +8937,7 @@ impl App {
             PromptMouseTarget::NameNewAgentInput => {
                 self.set_name_new_agent_cursor_from_mouse(mouse.column);
             }
+            PromptMouseTarget::NameNewAgentRow(target) => self.activate_new_agent_row(target),
             PromptMouseTarget::PullRequestInput => {
                 self.set_pull_request_cursor_from_mouse(mouse.column);
             }
@@ -9984,6 +9973,10 @@ impl App {
     }
 
     fn update_dragged_panes(&mut self, column: u16, row: u16) {
+        if self.mouse_drag == Some(ResizeDragState::CenterScrollbar) {
+            self.set_center_scrollback_from_mouse(row);
+            return;
+        }
         let body = self.mouse_layout.body;
         if body.width == 0 {
             return;
@@ -10046,8 +10039,49 @@ impl App {
                     }
                 }
             }
-            None => {}
+            Some(ResizeDragState::CenterScrollbar) | None => {}
         }
+    }
+
+    /// True when (`column`, `row`) is on the agent pane's scrollbar track, as
+    /// published by the last render (fork 670b8c24).
+    fn center_scrollbar_at_mouse(&self, column: u16, row: u16) -> bool {
+        self.mouse_layout
+            .agent_scrollbar
+            .is_some_and(|track| contains_point(track, column, row))
+    }
+
+    /// Jump the selected surface's scrollback to the point on the scrollbar
+    /// track under `row`. Goes through `note_user_scroll` so a drag away from
+    /// the live edge enters scroll mode exactly like a wheel or PageUp would.
+    fn set_center_scrollback_from_mouse(&mut self, row: u16) {
+        let Some(track) = self.mouse_layout.agent_scrollbar else {
+            return;
+        };
+        let total = self.snapshot_buf.scrollback_total;
+        let Some(provider) = self.selected_terminal_surface_client() else {
+            return;
+        };
+        provider.set_scrollback(super::render::agent_scrollback_for_row(track, total, row));
+        self.note_user_scroll();
+    }
+
+    /// Start a scrollbar drag if the press landed on the track. Checked before
+    /// the pane-divider hit test because the track sits in the center pane's
+    /// right border column, which is also a divider column; the divider stays
+    /// reachable from the rows beside the hint lane and from the right pane's
+    /// own border.
+    fn begin_center_scrollbar_drag(&mut self, mouse: &MouseEvent) -> bool {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            || !self.center_scrollbar_at_mouse(mouse.column, mouse.row)
+        {
+            return false;
+        }
+        self.mouse_drag = Some(ResizeDragState::CenterScrollbar);
+        self.focus = FocusPane::Center;
+        self.terminal_selection = None;
+        self.set_center_scrollback_from_mouse(mouse.row);
+        true
     }
 
     fn persist_pane_widths(&mut self) {
@@ -10221,6 +10255,7 @@ impl App {
     fn dismiss_noninteractive_fullscreen_mouse(&mut self, mouse: &MouseEvent) -> bool {
         if !matches!(self.fullscreen_overlay, FullscreenOverlay::None)
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && !self.center_scrollbar_at_mouse(mouse.column, mouse.row)
             && !self
                 .mouse_layout
                 .agent_term
@@ -10546,6 +10581,9 @@ impl App {
         // a press on a row still starts its own gesture.
         self.row_drag = None;
         self.end_terminal_selection_drag();
+        if self.begin_center_scrollbar_drag(mouse) {
+            return;
+        }
         if windowed && let Some(drag) = self.resize_drag_at_mouse(mouse.column, mouse.row) {
             self.mouse_drag = Some(drag);
             self.update_dragged_panes(mouse.column, mouse.row);
@@ -10609,8 +10647,10 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) if self.mouse_drag.is_some() => {
                 self.update_dragged_panes(mouse.column, mouse.row);
             }
-            MouseEventKind::Up(MouseButton::Left) if self.mouse_drag.take().is_some() => {
-                self.persist_pane_widths();
+            MouseEventKind::Up(MouseButton::Left) if self.mouse_drag.is_some() => {
+                if self.mouse_drag.take() != Some(ResizeDragState::CenterScrollbar) {
+                    self.persist_pane_widths();
+                }
             }
             // A selection drag on the minimized grid. The press that started it
             // cleared the row drag, so the two can never be live at once.
@@ -11207,7 +11247,7 @@ impl App {
     }
 }
 
-fn set_create_agent_request_custom_name(request: &mut CreateAgentRequest, name: String) {
+pub(crate) fn set_create_agent_request_custom_name(request: &mut CreateAgentRequest, name: String) {
     match request {
         CreateAgentRequest::NewProject { custom_name, .. }
         | CreateAgentRequest::ForkSession { custom_name, .. }
@@ -11444,6 +11484,7 @@ mod tests {
             terminal_list: Rect::default(),
             terminal_row_to_item: Vec::new(),
             agent_term: Some(Rect::new(21, 1, 55, 16)),
+            agent_scrollbar: None,
             takeover_button: None,
             dormant_tab_button: None,
             pr_banner: None,
@@ -14283,14 +14324,19 @@ not_a_real_action = ["x"]
     }
 
     #[test]
-    fn open_rename_session_initializes_rename_branch_true() {
+    fn open_rename_session_initializes_rename_branch_false() {
         let mut app = test_app(default_bindings());
 
         app.open_rename_session().unwrap();
 
         match &app.prompt {
-            PromptState::RenameSession { rename_branch, .. } => {
-                assert!(*rename_branch, "rename_branch should default to true");
+            PromptState::RenameSession {
+                rename_branch,
+                branch_named,
+                ..
+            } => {
+                assert!(*branch_named, "a branch-backed agent offers the box");
+                assert!(!*rename_branch, "rename_branch should default to false");
             }
             other => panic!("expected RenameSession, got {other:?}"),
         }
@@ -15353,6 +15399,7 @@ not_a_real_action = ["x"]
             randomized_name: None,
             copy_changes: false,
             focus: NameNewAgentFocus::Input,
+            extras: Default::default(),
         };
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -15393,6 +15440,7 @@ not_a_real_action = ["x"]
             randomized_name: None,
             copy_changes: false,
             focus: NameNewAgentFocus::Input,
+            extras: Default::default(),
         };
 
         app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
@@ -15442,6 +15490,7 @@ not_a_real_action = ["x"]
             randomized_name: None,
             copy_changes: false,
             focus: NameNewAgentFocus::Input,
+            extras: Default::default(),
         };
 
         let focus_now = |app: &App| match &app.prompt {
@@ -15455,6 +15504,14 @@ not_a_real_action = ["x"]
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(focus_now(&app), NameNewAgentFocus::CopyChangesCheckbox);
+        // The harness and Advanced rows (fork 6448c3f5) close the cycle; the
+        // settings rows only join it once Advanced is open.
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(focus_now(&app), NameNewAgentFocus::Provider);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(focus_now(&app), NameNewAgentFocus::AdvancedToggle);
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(focus_now(&app), NameNewAgentFocus::Input);
@@ -15463,9 +15520,14 @@ not_a_real_action = ["x"]
             .unwrap();
         assert_eq!(
             focus_now(&app),
-            NameNewAgentFocus::CopyChangesCheckbox,
+            NameNewAgentFocus::AdvancedToggle,
             "Shift-Tab should cycle backward"
         );
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(focus_now(&app), NameNewAgentFocus::CopyChangesCheckbox);
         app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
             .unwrap();
         assert_eq!(focus_now(&app), NameNewAgentFocus::RandomizedNameCheckbox);
@@ -15487,6 +15549,7 @@ not_a_real_action = ["x"]
             randomized_name: None,
             copy_changes: false,
             focus: NameNewAgentFocus::Input,
+            extras: Default::default(),
         };
 
         for c in ['h', 'l'] {
@@ -15527,6 +15590,7 @@ not_a_real_action = ["x"]
             randomized_name: None,
             copy_changes: false,
             focus: NameNewAgentFocus::Input,
+            extras: Default::default(),
         };
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -16470,8 +16534,9 @@ not_a_real_action = ["x"]
         }
     }
 
-    /// The fresh-agent prompt has exactly three focus stops (input, pet-name
-    /// checkbox, copy checkbox) and no pull-before-create checkbox.
+    /// The fresh-agent prompt's focus stops are input, pet-name checkbox, copy
+    /// checkbox, then the harness and Advanced rows (fork 6448c3f5), and no
+    /// pull-before-create checkbox.
     #[test]
     fn fresh_agent_prompt_does_not_expose_pull_before_create_checkbox() {
         let mut app = test_app(default_bindings());
@@ -16497,13 +16562,19 @@ not_a_real_action = ["x"]
             .unwrap();
         expect_focus(&app, NameNewAgentFocus::CopyChangesCheckbox);
 
-        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
-            .unwrap();
-        expect_focus(&app, NameNewAgentFocus::Input);
+        for next in [
+            NameNewAgentFocus::Provider,
+            NameNewAgentFocus::AdvancedToggle,
+            NameNewAgentFocus::Input,
+        ] {
+            app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+                .unwrap();
+            expect_focus(&app, next);
+        }
     }
 
     /// Fork prompts never show the copy checkbox: forks always copy, so the
-    /// focus cycle stays two stops.
+    /// cycle goes from the pet-name checkbox straight to the harness row.
     #[test]
     fn fork_prompt_has_no_copy_checkbox_focus_stop() {
         let mut app = test_app(default_bindings());
@@ -16528,7 +16599,9 @@ not_a_real_action = ["x"]
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .unwrap();
         match &app.prompt {
-            PromptState::NameNewAgent { focus, .. } => assert_eq!(*focus, NameNewAgentFocus::Input),
+            PromptState::NameNewAgent { focus, .. } => {
+                assert_eq!(*focus, NameNewAgentFocus::Provider)
+            }
             other => panic!("expected NameNewAgent prompt, got {other:?}"),
         }
     }
@@ -16556,6 +16629,7 @@ not_a_real_action = ["x"]
             randomized_name: None,
             copy_changes: true,
             focus: NameNewAgentFocus::Input,
+            extras: Default::default(),
         };
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -16918,7 +16992,7 @@ not_a_real_action = ["x"]
     }
 
     #[test]
-    fn slash_search_selects_first_match_and_n_advances() {
+    fn files_search_enter_keeps_query_and_n_advances() {
         let mut app = test_app(default_bindings());
         app.focus = FocusPane::Files;
         app.right_section = RightSection::Unstaged;
@@ -16966,6 +17040,8 @@ not_a_real_action = ["x"]
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
+        assert!(!app.files_search_active, "Enter finishes typing");
+        assert_eq!(app.files_search.text, "main", "Enter keeps the query");
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
             .unwrap();
 
@@ -26703,6 +26779,7 @@ cyan = "#00ffff"
         // Down+Up at the same coordinates fires the button action.
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 53, 10));
         app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 53, 10));
+        app.finish_changes_job();
 
         assert!(matches!(app.prompt, PromptState::None));
         let contents = std::fs::read_to_string(
@@ -26775,11 +26852,76 @@ cyan = "#00ffff"
         git(&["commit", "-m", "track ghost"]);
 
         app.resolve_confirm_discard_file(true);
+        app.finish_changes_job();
 
         assert!(
             worktree.join("ghost.txt").exists(),
             "a file that became tracked-and-clean between prompt-open and confirm must NOT be deleted by discard",
         );
+    }
+
+    /// Fork b91ed679 / 773a6b04 P1-23: staging runs git on a worker, not on
+    /// the run loop. The key handler returns with the job in flight and a busy
+    /// on the status line; the file is staged only once the answer is folded
+    /// in, and a second mutation while one is running is refused rather than
+    /// racing it on the index.
+    #[test]
+    fn staging_runs_on_a_worker_and_refuses_a_second_job_while_busy() {
+        let mut app = test_app(default_bindings());
+        let worktree = std::path::PathBuf::from(
+            app.engine.sessions[0]
+                .managed_worktree()
+                .expect("managed test session"),
+        );
+        std::fs::create_dir_all(&worktree).expect("worktree dir");
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&worktree)
+                .output()
+                .expect("git");
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test User"]);
+        std::fs::write(worktree.join("a.txt"), "one\n").expect("seed");
+        git(&["add", "a.txt"]);
+        git(&["commit", "-qm", "initial"]);
+        std::fs::write(worktree.join("a.txt"), "two\n").expect("edit");
+        app.engine.unstaged_files = vec![ChangedFile {
+            path: "a.txt".into(),
+            status: "M".into(),
+            additions: 1,
+            deletions: 1,
+            binary: false,
+            diff_excluded: false,
+            renamed_from: None,
+        }];
+        app.selected_left = 1;
+        app.right_section = RightSection::Unstaged;
+        app.files_index = 0;
+
+        app.toggle_stage_selected_file().expect("stage");
+        assert!(
+            app.pending_changes_job.is_some(),
+            "the git call must be dispatched to a worker, not run inline"
+        );
+        assert_eq!(app.status.tone(), crate::statusline::StatusTone::Busy);
+
+        assert!(
+            !app.dispatch_changes_job(
+                worktree.clone(),
+                super::changes_job::ChangesJob::Unstage {
+                    path: "a.txt".into()
+                },
+            ),
+            "one job at a time"
+        );
+
+        app.finish_changes_job();
+        assert!(app.pending_changes_job.is_none());
+        assert_eq!(git(&["diff", "--cached", "--name-only"]).trim(), "a.txt");
     }
 
     /// Commit refuses an empty message via the shared core preflight (rendered
@@ -26843,6 +26985,7 @@ cyan = "#00ffff"
         app.commit_input.text = "a real message".to_string();
 
         app.execute_commit().expect("execute_commit");
+        app.finish_changes_job();
 
         assert_eq!(app.status.tone(), crate::statusline::StatusTone::Error);
         assert!(
@@ -30958,6 +31101,151 @@ cyan = "#00ffff"
         );
     }
 
+    // ── Agent pane scrollbar drag (fork 670b8c24) ──────────────────
+
+    /// A scrolled-back PTY with a published scrollbar track at column 60,
+    /// rows 10..15 (the geometry the render pass would publish).
+    fn app_with_scrollbar_track() -> (App, Rect) {
+        let mut app = app_with_scrolled_back_pty();
+        app.refresh_snapshot_buf();
+        assert!(
+            app.snapshot_buf.scrollback_total > 0,
+            "fixture needs history"
+        );
+        let track = Rect::new(60, 10, 1, 5);
+        app.mouse_layout.agent_term = Some(Rect::new(10, 10, 50, 5));
+        app.mouse_layout.agent_scrollbar = Some(track);
+        (app, track)
+    }
+
+    #[test]
+    fn mouse_drag_center_scrollbar_sets_scrollback_offset() {
+        let (mut app, track) = app_with_scrollbar_track();
+        let total = app.snapshot_buf.scrollback_total;
+
+        // Press on the top row: oldest history.
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            track.x,
+            track.y,
+        ));
+        assert_eq!(app.mouse_drag, Some(ResizeDragState::CenterScrollbar));
+        assert_eq!(
+            app.selected_terminal_surface_client()
+                .unwrap()
+                .scrollback_offset(),
+            total
+        );
+
+        // Drag past the bottom: pins to the live edge.
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            track.x,
+            track.y + 20,
+        ));
+        assert_eq!(
+            app.selected_terminal_surface_client()
+                .unwrap()
+                .scrollback_offset(),
+            0
+        );
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            track.x,
+            track.y + 4,
+        ));
+        assert_eq!(app.mouse_drag, None);
+    }
+
+    /// Fork 773a6b04 (P1-23): the key or mouse handler that changes a pane
+    /// width must not do the config write itself, so a slow disk can never
+    /// stall input. Proven by the file NOT existing yet when the handler
+    /// returns (the writer thread waits out its quiet window first), and
+    /// existing, with the new width, once the writer is flushed.
+    #[test]
+    fn config_persistence_delay_does_not_block_input_handler() {
+        let mut app = test_app(default_bindings());
+        let path = app.engine.paths.config_path.clone();
+        let _ = std::fs::remove_file(&path);
+        app.left_width_pct = app.left_width_pct.saturating_add(1);
+
+        let started = std::time::Instant::now();
+        app.persist_pane_widths();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(150),
+            "input handler waited for config I/O"
+        );
+        assert!(!path.exists(), "the handler wrote the config inline");
+
+        app.engine.config_writer.flush();
+        let on_disk: dux_core::config::Config =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk.ui.left_width_pct, app.left_width_pct);
+    }
+
+    #[test]
+    fn scrollbar_drag_release_does_not_persist_pane_widths() {
+        let (mut app, track) = app_with_scrollbar_track();
+        app.fullscreen_overlay = FullscreenOverlay::None;
+        app.left_width_pct = app.engine.config.ui.left_width_pct.wrapping_add(1);
+        let before = app.engine.config.ui.left_width_pct;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            track.x,
+            track.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            track.x,
+            track.y,
+        ));
+        assert_eq!(app.engine.config.ui.left_width_pct, before);
+    }
+
+    #[test]
+    fn interactive_mouse_on_scrollbar_uses_host_drag_not_selection() {
+        let (mut app, track) = app_with_scrollbar_track();
+        // SGR coordinates are 1-based.
+        let (cx, cy) = (track.x + 1, track.y + 1);
+        let mut input = sgr_mouse_down(cx, cy);
+        input.extend_from_slice(format!("\x1b[<32;{cx};{}M", cy + 4).as_bytes());
+        input.extend_from_slice(format!("\x1b[<0;{cx};{}m", cy + 4).as_bytes());
+        let exit = app.process_raw_input_bytes(&input).unwrap();
+
+        assert!(!exit);
+        assert_eq!(
+            app.selected_terminal_surface_client()
+                .unwrap()
+                .scrollback_offset(),
+            0,
+            "dragging the thumb to the bottom returns to the live edge"
+        );
+        assert!(app.terminal_selection.is_none());
+        assert_eq!(app.mouse_drag, None);
+        assert_eq!(
+            app.fullscreen_overlay,
+            FullscreenOverlay::Agent,
+            "a press on the scrollbar is not a click outside the overlay"
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_on_left_pane_chrome_moves_selection() {
+        let mut app = test_app(default_bindings());
+        install_mouse_layout(&mut app);
+        app.focus = FocusPane::Center;
+        app.selected_left = 0;
+        // Row 0 is the left pane's top border: inside `left`, outside
+        // `left_list`, so it resolves to LeftPane rather than a row.
+        assert_eq!(app.mouse_target(2, 0), Some(MouseTarget::LeftPane));
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 2, 0));
+
+        assert_eq!(app.focus, FocusPane::Left);
+        assert_eq!(app.selected_left, 1);
+    }
+
     // ── Click-outside-fullscreen tests ──────────────────────────────
 
     /// Build an SGR mouse left-button-down sequence at 1-based (cx, cy).
@@ -34564,6 +34852,7 @@ cyan = "#00ffff"
             randomized_name: None,
             copy_changes: false,
             focus,
+            extras: Default::default(),
         }
     }
 
@@ -35300,6 +35589,7 @@ cyan = "#00ffff"
             randomized_name: None,
             copy_changes: false,
             focus: NameNewAgentFocus::Input,
+            extras: Default::default(),
         };
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -36592,6 +36882,7 @@ cyan = "#00ffff"
                     randomized_name: None,
                     copy_changes: false,
                     focus: NameNewAgentFocus::Input,
+                    extras: Default::default(),
                 };
                 tap(&mut app, KeyCode::Enter);
             }
