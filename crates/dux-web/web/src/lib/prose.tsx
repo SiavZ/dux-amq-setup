@@ -45,6 +45,75 @@ export function proseText(prose: Prose): string {
     .join("")
 }
 
+// Append one segment, merging adjacent words so two builders that say the same
+// thing produce equal values however they split the constant parts.
+function pushSegment(out: ProseSegment[], segment: ProseSegment): void {
+  if (typeof segment === "string") {
+    if (segment === "") return
+    const last = out.length - 1
+    if (last >= 0 && typeof out[last] === "string") {
+      out[last] = (out[last] as string) + segment
+      return
+    }
+  }
+  out.push(segment)
+}
+
+/** A value a `prose` template can interpolate. */
+export type ProsePart = string | number | ProseName | Prose
+
+/**
+ * Build a sentence as a template: a `chip(...)` or `quotedChip(...)` value is a
+ * name, a whole `Prose` is spliced in, and any other value is words. The way a
+ * sentence the browser writes itself (a toast it raises, say) names things
+ * without anyone hunting for the names in the finished string.
+ */
+export function prose(
+  strings: TemplateStringsArray,
+  ...values: ProsePart[]
+): Prose {
+  const out: ProseSegment[] = []
+  strings.forEach((text, index) => {
+    pushSegment(out, text)
+    if (index >= values.length) return
+    const value = values[index]
+    if (Array.isArray(value)) {
+      for (const segment of value as Prose) pushSegment(out, segment)
+    } else if (typeof value === "object") {
+      out.push(value as ProseName)
+    } else {
+      pushSegment(out, String(value))
+    }
+  })
+  return out
+}
+
+/** Join sentences with a separator, the way `Array.join` joins strings. */
+export function joinProse(parts: readonly Prose[], separator: string): Prose {
+  const out: ProseSegment[] = []
+  parts.forEach((part, index) => {
+    if (index > 0) pushSegment(out, separator)
+    for (const segment of part) pushSegment(out, segment)
+  })
+  return out
+}
+
+/**
+ * End a sentence with exactly one terminator: trailing space dropped, and a
+ * full stop added unless the plain spelling already ends in `.`, `!` or `?`.
+ */
+export function endProse(sentence: Prose): Prose {
+  const out = [...sentence]
+  const last = out.length - 1
+  if (last >= 0 && typeof out[last] === "string") {
+    const trimmed = (out[last] as string).trimEnd()
+    if (trimmed === "") out.pop()
+    else out[last] = trimmed
+  }
+  if (out.length === 0) return out
+  return /[.!?]$/.test(proseText(out)) ? out : joinProse([out, ["."]], "")
+}
+
 function isProseSegment(value: unknown): value is ProseSegment {
   if (typeof value === "string") return true
   if (typeof value !== "object" || value === null) return false

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { Spine } from "./workspaceApi"
+import { toastText } from "@/test/toastText"
 
 // The reference-first from-PR flow, driven through the store the way the dialog
 // drives it. The server's resolution is stubbed at `fetch` (it is the thing
@@ -94,8 +95,8 @@ class FakeWebSocket {
 
 const toasts: { tone: string; message: string }[] = []
 vi.mock("sonner", () => {
-  const record = (tone: string) => (message: string) => {
-    toasts.push({ tone, message })
+  const record = (tone: string) => (message: unknown) => {
+    toasts.push({ tone, message: toastText(message) })
     return tone
   }
   return {

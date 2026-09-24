@@ -31,6 +31,7 @@ import {
 } from "lucide-react"
 import type { PanelImperativeHandle } from "react-resizable-panels"
 import { notify, notifyBusy, notifyError, notifySuccess } from "@/lib/notify"
+import { chip, prose } from "@/lib/prose"
 import { fileApi } from "@/lib/fileApi"
 import { OPEN_IN_EDITORS } from "@/lib/editors"
 import {
@@ -871,7 +872,7 @@ export function EditorBody({ root, standalone = false }: EditorBodyProps) {
       .openInEditor(root, activeTab.path, editorKey)
       // "Opening" not "Opened": we spawned the editor but can't confirm a window
       // actually appeared (e.g. a headless server would launch-then-exit).
-      .then((editor) => notifySuccess(`Opening in ${editor}…`))
+      .then((editor) => notifySuccess(prose`Opening in ${chip(editor)}…`))
       .catch((e) =>
         notifyError(e instanceof Error ? e.message : "could not open in editor"),
       )
@@ -1023,7 +1024,7 @@ export function EditorBody({ root, standalone = false }: EditorBodyProps) {
       // `editorDropToast`, the one place that makes it. Hardcoding it here
       // would be a second opinion; omitting it makes a tree drop unpinnable
       // whatever the report asked for.
-      reportFinal: (t) => notify(t.tone, t.message, { id: toastId, sticky: t.sticky }),
+      reportFinal: (t) => notify(t.tone, t.prose, { id: toastId, sticky: t.sticky }),
     })
   }
 

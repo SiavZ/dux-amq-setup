@@ -21,6 +21,9 @@ import {
   proseText,
   quotedChip,
   renderProse,
+  endProse,
+  joinProse,
+  prose,
   wireProse,
 } from "./prose"
 import { recreateConfirmProse } from "./recreateWorkingCopy"
@@ -139,4 +142,76 @@ describe("the sentences both surfaces print", () => {
       expect(merged(build(c.sentence, c.args))).toEqual(merged(c.segments))
     },
   )
+})
+
+describe("building a sentence in the browser", () => {
+  it("turns a template's names into chips and everything else into words", () => {
+    const built = prose`Saved ${chip("a b.txt")} to ${chip("~/up")} (${3} files).`
+    expect(built).toEqual([
+      "Saved ",
+      chip("a b.txt"),
+      " to ",
+      chip("~/up"),
+      " (3 files).",
+    ])
+  })
+
+  it("splices a sentence built elsewhere, merging the words at the seams", () => {
+    const inner = prose`${chip("x")} and more`
+    expect(prose`Got ${inner}.`).toEqual(["Got ", chip("x"), " and more."])
+  })
+
+  it("joins sentences with a separator", () => {
+    expect(joinProse([[chip("a")], [chip("b")], ["c"]], ", ")).toEqual([
+      chip("a"),
+      ", ",
+      chip("b"),
+      ", c",
+    ])
+    expect(joinProse([], ", ")).toEqual([])
+  })
+
+  it("ends a sentence with exactly one terminator, whatever it ends in", () => {
+    expect(proseText(endProse(prose`Could not save ${chip("f")}`))).toBe(
+      "Could not save f.",
+    )
+    expect(proseText(endProse(prose`Done.  `))).toBe("Done.")
+    expect(proseText(endProse(prose`Ask ${chip("why?")}`))).toBe("Ask why?")
+    expect(endProse([])).toEqual([])
+  })
+})
+
+describe("a status sentence read off the wire", () => {
+  const message = 'Checked out "main" in /src/app.'
+  const segments = [
+    "Checked out ",
+    { name: "main", quoted: true },
+    " in ",
+    { name: "/src/app", quoted: false },
+    ".",
+  ]
+
+  it("takes the parts when they spell the message exactly", () => {
+    expect(wireProse(message, segments)).toEqual(segments)
+  })
+
+  it("keeps the plain message when the server sent no parts", () => {
+    expect(wireProse(message, undefined)).toBe(message)
+    expect(wireProse(message, null)).toBe(message)
+  })
+
+  it("keeps the plain message when the parts are malformed", () => {
+    expect(wireProse(message, "Checked out")).toBe(message)
+    expect(wireProse(message, [{ name: 3, quoted: true }])).toBe(message)
+    expect(wireProse(message, [{ name: "main" }])).toBe(message)
+    expect(wireProse(message, [7])).toBe(message)
+  })
+
+  it("keeps the plain message when the parts spell a different sentence", () => {
+    // The message is the terminal UI's words; parts that disagree with it must
+    // never put different words on the web.
+    expect(
+      wireProse(message, ["Checked out ", { name: "dev", quoted: true }, " in /src/app."]),
+    ).toBe(message)
+  })
 })

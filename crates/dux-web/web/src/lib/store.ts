@@ -62,7 +62,7 @@ import {
   notifyWarning,
   setStatusClearSeconds,
 } from "./notify"
-import { wireProse } from "./prose"
+import { chip, prose, wireProse } from "./prose"
 import { publishConnectionTiming } from "./connectionTiming"
 import { clearServerValidated, noteServerValidated } from "./serverValidated"
 import { registerPageLifecycle } from "./pageLifecycle"
@@ -5286,12 +5286,12 @@ function submitPrReferenceFirst(reference: string, name: string): void {
         // clone, and neither wording may imply it might.
         notifyError(
           resolved.uninspected_summary
-            ? `No project dux could check is a checkout of ${repository}, and dux could not check every project (${resolved.uninspected_summary}). Choose a project that already has it, or add one from a directory on disk.`
-            : `No project in dux is a checkout of ${repository}. Choose a project that already has it, or add one from a directory on disk.`,
+            ? prose`No project dux could check is a checkout of ${chip(repository)}, and dux could not check every project (${resolved.uninspected_summary}). Choose a project that already has it, or add one from a directory on disk.`
+            : prose`No project in dux is a checkout of ${chip(repository)}. Choose a project that already has it, or add one from a directory on disk.`,
         )
       } else {
         notifyInfo(
-          `${resolved.projects.length} projects are checkouts of ${repository}. Choose which one this agent belongs in.`,
+          prose`${resolved.projects.length} projects are checkouts of ${chip(repository)}. Choose which one this agent belongs in.`,
         )
       }
       // Either way the picker is offered, over just the matches when there are

@@ -19,6 +19,7 @@ import type { DuxState } from "@/lib/store"
 import { setStatusClearSeconds } from "@/lib/notify"
 import { notifyPtyOwner, resetPtyOwnerEpochs } from "@/lib/ptyOwnership"
 import { stubCoarsePointer, type MatchMediaStub } from "@/test/matchMedia"
+import { toastText } from "@/test/toastText"
 
 /// The same xterm stand-in the drop suite uses: `paste()` does what xterm's
 /// really does, so an assertion can be made on the bytes that reach the socket
@@ -638,7 +639,7 @@ describe("when an image paste cannot be taken", () => {
     expect(sentToSocket()).toEqual([])
     // Cancelled, so the image does not fall through to xterm either.
     expect(event.defaultPrevented).toBe(true)
-    const message = vi.mocked(toast.error).mock.calls[0][0] as string
+    const message = toastText(vi.mocked(toast.error).mock.calls[0][0])
     expect(message).toContain("Take over")
     expect(TermStub.xtermPastes).toEqual([])
   })
@@ -687,7 +688,7 @@ describe("when an image paste cannot be taken", () => {
     await paste(terminalHost(), [imageItem(png("huge.png"))])
 
     expect(sentToSocket()).toEqual([])
-    const message = vi.mocked(toast.error).mock.calls[0][0] as string
+    const message = toastText(vi.mocked(toast.error).mock.calls[0][0])
     expect(message).toContain("huge.png")
     expect(message).toContain("over the 1024 byte limit")
   })
@@ -745,7 +746,7 @@ describe("pasting an image while the mobile compose bar is the typing surface", 
     expect(event.defaultPrevented).toBe(true)
     // And the toast says where the path actually went, rather than claiming
     // the agent already has it.
-    const message = vi.mocked(toast.success).mock.calls[0][0] as string
+    const message = toastText(vi.mocked(toast.success).mock.calls[0][0])
     expect(message).toContain("message")
     expect(message).not.toContain("sent")
   })
@@ -791,7 +792,7 @@ describe("pasting an image while the mobile compose bar is the typing surface", 
     // Nothing was written anywhere, and the report says so with the full path.
     expect(sentToSocket()).toEqual([])
     expect(TermStub.pastes).toEqual([])
-    const message = vi.mocked(toast.warning).mock.calls.at(-1)?.[0] as string
+    const message = toastText(vi.mocked(toast.warning).mock.calls.at(-1)?.[0])
     expect(message).toContain("/tmp/p1/.dux/uploads/image.png")
     expect(message).toContain("message box closed")
   })
@@ -836,7 +837,7 @@ describe("pasting a very long text onto an agent", () => {
     expect(event.defaultPrevented).toBe(true)
     expect(TermStub.xtermPastes).toEqual([])
     // And the report says what happened, in the user's terms.
-    const message = vi.mocked(toast.success).mock.calls.at(-1)![0] as string
+    const message = toastText(vi.mocked(toast.success).mock.calls.at(-1)![0])
     expect(message).toContain("5000 characters")
     expect(message).toContain("saved it as a file")
     expect(message).toContain("pasted-x.txt")
@@ -917,7 +918,7 @@ describe("pasting a very long text onto an agent", () => {
     expect(uploadDroppedFile).not.toHaveBeenCalled()
     expect(sentToSocket()).toEqual([])
     expect(event.defaultPrevented).toBe(true)
-    const message = vi.mocked(toast.error).mock.calls[0][0] as string
+    const message = toastText(vi.mocked(toast.error).mock.calls[0][0])
     expect(message).toContain("Take over")
     // Its OWN toast id. On the image refusal's id the two would replace each
     // other, so a viewer who pastes a screenshot and then a wall of text sees
@@ -954,7 +955,7 @@ describe("pasting a very long text onto an agent", () => {
     const second = await paste(terminalHost(), [textItem(overLimit)], overLimit)
     expect(uploadDroppedFile).toHaveBeenCalledTimes(1)
     expect(second.defaultPrevented).toBe(true)
-    const message = vi.mocked(toast.success).mock.calls.at(-1)![0] as string
+    const message = toastText(vi.mocked(toast.success).mock.calls.at(-1)![0])
     expect(message).toContain("2501 characters")
   })
 
@@ -1005,7 +1006,7 @@ describe("pasting a very long text onto an agent", () => {
       expect(event.defaultPrevented).toBe(true)
       // And the report says where the path went, in the compose bar's own
       // words, instead of claiming the text was typed at the agent.
-      const message = vi.mocked(toast.success).mock.calls.at(-1)![0] as string
+      const message = toastText(vi.mocked(toast.success).mock.calls.at(-1)![0])
       expect(message).toContain("5000 characters")
       expect(message).toContain("added its path to your message")
       expect(message).not.toContain("typing it into the agent")
@@ -1050,7 +1051,7 @@ describe("pasting a very long text onto an agent", () => {
       })
 
       expect(sentToSocket()).toEqual([])
-      const message = vi.mocked(toast.warning).mock.calls.at(-1)![0] as string
+      const message = toastText(vi.mocked(toast.warning).mock.calls.at(-1)![0])
       expect(message).toContain("5000 characters")
       expect(message).toContain("/tmp/p1/.dux/uploads/pasted-x.txt")
       expect(message).toContain("message box closed")
