@@ -4830,6 +4830,26 @@ impl Engine {
             };
             return Ok(ReconnectPlan::WorktreeMissing { message });
         }
+        // A shared agent relaunches in the real checkout, so that checkout
+        // must still be outside dux's own state tree (fork
+        // `reconnect_rejects_shared_project_inside_managed_root`). The path
+        // was valid at creation, but the project could have been moved, or a
+        // symlink retargeted, into DUX_HOME since; a cleanup there could then
+        // remove the user's work. Refused with the same error surface as a
+        // missing directory, so both the TUI and the web show it. The fork ran
+        // this on a worker; here it sits beside the directory probe just
+        // above, which already touches the same path on this thread.
+        if session.shared_workspace()
+            && let Err(err) =
+                crate::config::validate_shared_workspace_path(session.directory(), &self.paths)
+        {
+            return Ok(ReconnectPlan::WorktreeMissing {
+                message: format!(
+                    "Shared workspace is not eligible for reconnect: {}",
+                    crate::sanitize::for_terminal(&format!("{err:#}"))
+                ),
+            });
+        }
 
         if force {
             // Kill the existing provider and clear ALL resume state (routed
@@ -10250,6 +10270,45 @@ mod tab_ops_tests {
             }
             other => panic!("expected AlreadyConnected, got {other:?}"),
         }
+    }
+
+    /// Fork `reconnect_rejects_shared_project_inside_managed_root`: a shared
+    /// agent whose checkout now sits inside dux's managed worktrees root must
+    /// not be relaunched there, and nothing is started.
+    #[test]
+    fn reconnect_rejects_shared_project_inside_managed_root() {
+        let (mut engine, _tmp) = test_engine();
+        let inside = engine.paths.worktrees_root.join("moved-project");
+        std::fs::create_dir_all(&inside).unwrap();
+        let mut session = sample_session("shared", "p1", "main");
+        session.shared_workspace = true;
+        session
+            .workspace
+            .as_managed_mut()
+            .expect("managed test session")
+            .worktree_path = inside.to_string_lossy().to_string();
+        engine.sessions.push(session.clone());
+
+        match engine
+            .reconnect_plan("shared", false, (24, 80))
+            .expect("plan")
+        {
+            ReconnectPlan::WorktreeMissing { message } => {
+                assert!(message.contains("not eligible for reconnect"), "{message}");
+            }
+            other => panic!("expected the shared reconnect to be refused, got {other:?}"),
+        }
+        assert!(!engine.session_has_live_provider("shared"));
+
+        // The same checkout for an ISOLATED agent is its ordinary worktree:
+        // the guard is specific to shared agents.
+        engine.sessions[0].shared_workspace = false;
+        assert!(matches!(
+            engine
+                .reconnect_plan("shared", false, (24, 80))
+                .expect("plan"),
+            ReconnectPlan::Launch { .. }
+        ));
     }
 
     #[test]

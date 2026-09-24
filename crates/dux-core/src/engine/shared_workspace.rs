@@ -401,4 +401,47 @@ mod tests {
         assert!(engine.project_link_allowed("p1"));
         assert!(!engine.project_link_allowed("other"));
     }
+
+    /// Fork `multi_writer_badge_is_derived_and_recomputes_when_writer_exits`:
+    /// the badge is derived from live state rather than stored, so an isolated
+    /// agent in the same directory never counts, and when a shared writer
+    /// exits (the exit sweep drops its tab through `clear_tab_runtime`) the
+    /// badge goes away with no other bookkeeping.
+    #[test]
+    fn multi_writer_badge_is_derived_and_recomputes_when_writer_exits() {
+        let (mut engine, tmp) = test_engine();
+        let checkout = tmp.path().join("project");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let checkout = checkout.to_string_lossy().to_string();
+        engine.sessions.push(shared_session("first", &checkout));
+        engine.sessions.push(shared_session("second", &checkout));
+        let mut isolated = shared_session("isolated", &checkout);
+        isolated.shared_workspace = false;
+        engine.sessions.push(isolated);
+
+        make_live(&mut engine, "first");
+        assert_eq!(engine.shared_multi_writer_summary(), None);
+        make_live(&mut engine, "isolated");
+        assert_eq!(
+            engine.shared_multi_writer_summary(),
+            None,
+            "an isolated agent in the same directory is not a shared writer"
+        );
+        make_live(&mut engine, "second");
+        assert_eq!(
+            engine.shared_multi_writer_summary().map(|s| s.badge()),
+            Some("CURRENT STORE ONLY \u{b7} 2 LIVE WRITERS".to_string())
+        );
+
+        let second_slot = engine
+            .sessions
+            .iter()
+            .find(|s| s.id == "second")
+            .unwrap()
+            .slot_tab_id()
+            .to_owned();
+        engine.clear_tab_runtime(&second_slot);
+        assert_eq!(engine.shared_multi_writer_summary(), None);
+        engine.shutdown_ptys(std::time::Duration::ZERO);
+    }
 }
