@@ -1662,7 +1662,8 @@ fn reconstruct_from_stored(stored: &StoredPr) -> Option<PrInfo> {
     Some(PrInfo {
         number: stored.pr_number,
         state,
-        title: stored.title.clone(),
+        // Stored rows may predate the stripping at the gh boundary.
+        title: crate::bidi::strip_bidi_controls(&stored.title),
         host: stored.host.clone(),
         owner_repo: stored.owner_repo.clone(),
         url: stored.url.clone(),
@@ -1680,11 +1681,10 @@ fn parse_pr_json_object(json: &str, host: &str, owner_repo: &str) -> Option<PrIn
 fn parse_pr_json_value(obj: &serde_json::Value, host: &str, owner_repo: &str) -> Option<PrInfo> {
     let number = obj.get("number")?.as_u64()?;
     let state_str = obj.get("state")?.as_str()?;
-    let title = obj
-        .get("title")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    // Someone else's text: see `crate::bidi` for why its display-order
+    // controls never get past this point.
+    let title =
+        crate::bidi::strip_bidi_controls(obj.get("title").and_then(|v| v.as_str()).unwrap_or(""));
     let url = obj
         .get("url")
         .and_then(|v| v.as_str())
@@ -2067,11 +2067,8 @@ fn parse_resolved_pull_request_json(
         .get("number")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| "gh PR response did not include a PR number.".to_string())?;
-    let title = obj
-        .get("title")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    let title =
+        crate::bidi::strip_bidi_controls(obj.get("title").and_then(|v| v.as_str()).unwrap_or(""));
     let state = obj
         .get("state")
         .and_then(|v| v.as_str())
@@ -4016,6 +4013,41 @@ mod tests {
         assert_eq!(pr.number, 42);
         assert_eq!(pr.state, PrState::Open);
         assert_eq!(pr.url, "https://github.com/owner/repo/pull/42");
+    }
+
+    /// A pull request title is someone else's text: the controls that would
+    /// reorder the dialog around it are gone before anything shows it.
+    #[test]
+    fn a_pull_request_title_loses_its_bidi_controls_wherever_it_enters() {
+        let title = "Fix login \u{202E}exe.txt\u{202C}";
+        let json = format!(r#"{{"number":42,"state":"OPEN","title":"{title}","headRefName":"f"}}"#);
+        let polled = parse_pr_json_object(&json, "github.com", "owner/repo").expect("pr");
+        assert_eq!(polled.title, "Fix login exe.txt");
+
+        let resolved = parse_resolved_pull_request_json(
+            &json,
+            lookup_test_project(),
+            "github.com",
+            "owner/repo",
+            None,
+        )
+        .expect("resolved");
+        assert_eq!(resolved.title, "Fix login exe.txt");
+
+        // A row stored before the stripping existed is cleaned on the way out.
+        let stored = StoredPr {
+            session_id: "s1".to_string(),
+            pr_number: 42,
+            host: "github.com".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            state: "OPEN".to_string(),
+            title: title.to_string(),
+            url: "https://github.com/owner/repo/pull/42".to_string(),
+        };
+        assert_eq!(
+            reconstruct_pr_from_stored(&stored).expect("pr").title,
+            "Fix login exe.txt"
+        );
     }
 
     #[test]

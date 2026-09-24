@@ -5,6 +5,7 @@ import type { ReactNode } from "react"
 
 import { PrBanner } from "@/components/PrBanner"
 import type { PrView } from "@/lib/types"
+import { type RawWorkspace, normalizeWorkspace } from "@/lib/workspaceApi"
 
 // The real tooltip only mounts its popup into a portal on hover and needs a
 // ResizeObserver, which jsdom lacks. Render its `content` inline instead so a
@@ -57,5 +58,28 @@ describe("PrBanner", () => {
 
     const tooltip = screen.getByTestId("tooltip-content")
     expect(tooltip.textContent).toBe(longTitle)
+  })
+})
+
+describe("PrBanner with a title that arrived over the wire", () => {
+  afterEach(() => {
+    cleanup()
+  })
+
+  it("draws the title in its stored order, with no bidi control left in it", () => {
+    const spine = normalizeWorkspace({
+      projects: [],
+      sessions: [
+        {
+          id: "s1",
+          project_id: "p1",
+          pr: pr({ title: "Fix login \u202Eexe.txt\u202C" }),
+        },
+      ],
+      sidebar: { groups: [], agentless_start: null },
+    } as unknown as RawWorkspace)
+    const { container } = render(<PrBanner pr={spine.sessions[0].pr as PrView} />)
+    expect(container.textContent).toContain("Fix login exe.txt")
+    expect(container.textContent).not.toMatch(/[\u202A-\u202E\u2066-\u2069\u200E\u200F\u061C]/)
   })
 })

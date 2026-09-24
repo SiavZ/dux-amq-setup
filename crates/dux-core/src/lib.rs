@@ -12,6 +12,7 @@ pub mod agent_search;
 pub mod agent_tabs;
 pub mod attention;
 pub mod background_serve;
+pub mod bidi;
 pub mod bounded_command;
 pub mod browser;
 pub mod changes_status;
