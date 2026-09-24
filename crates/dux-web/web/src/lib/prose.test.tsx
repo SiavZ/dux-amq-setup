@@ -30,16 +30,16 @@ import { recreateConfirmProse } from "./recreateWorkingCopy"
 
 describe("a name's bidi controls", () => {
   it("are dropped by both chip builders", () => {
-    expect(chip("a‮b⁦c⁩")).toEqual({ name: "abc", quoted: false })
-    expect(quotedChip("‏x؜")).toEqual({ name: "x", quoted: true })
+    expect(chip("a\u202Eb\u2066c\u2069")).toEqual({ name: "abc", quoted: false })
+    expect(quotedChip("\u200Fx\u061C")).toEqual({ name: "x", quoted: true })
   })
 
   it("never reach the recreate confirm's text", () => {
     const text = proseText(
-      recreateConfirmProse("~/wt", "feat‮txt.exe", "main", true, ["claude"]),
+      recreateConfirmProse("~/wt", "feat\u202Etxt.exe", "main", true, ["claude"]),
     )
     expect(text).toContain('"feattxt.exe"')
-    expect(text).not.toMatch(/[‪-‮⁦-⁩‎‏؜]/)
+    expect(text).not.toMatch(/[\u202A-\u202E\u2066-\u2069\u200E\u200F\u061C]/)
   })
 })
 
@@ -227,7 +227,7 @@ describe("a status sentence read off the wire", () => {
   // older server may still send one, so the wire path strips it too, from the
   // parts and the plain fallback alike.
   it("strips bidi controls from a name that arrives off the wire", () => {
-    const crafted = "feat‮txt.exe"
+    const crafted = "feat\u202Etxt.exe"
     const got = wireProse(`Deleted "${crafted}".`, [
       "Deleted ",
       { name: crafted, quoted: true },

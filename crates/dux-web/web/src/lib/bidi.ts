@@ -10,7 +10,9 @@
 // strips them again where the workspace enters its store, so a screen drawing
 // the title never has to remember to.
 
-const BIDI_CONTROLS = /[‪-‮⁦-⁩‎‏؜]/g
+// Escapes rather than the characters themselves: a literal control in this
+// file would reorder how an editor or a review draws the line it sits on.
+const BIDI_CONTROLS = /[\u202A-\u202E\u2066-\u2069\u200E\u200F\u061C]/g
 
 /** `text` with every bidirectional control removed. */
 export function stripBidiControls(text: string): string {
