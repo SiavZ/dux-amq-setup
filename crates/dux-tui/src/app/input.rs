@@ -21362,6 +21362,56 @@ not_a_real_action = ["x"]
             .collect()
     }
 
+    #[test]
+    fn the_reload_command_is_reachable_from_the_palette() {
+        // Wiring check: the action, the binding and the palette entry are three
+        // separate registrations, and a feature that exists in all the internals
+        // but not in the palette is a feature the user does not have.
+        let app = palette_app("reload", 0);
+        let names = palette_names(&app, "reload");
+        assert!(
+            names.contains(&"reload-binary"),
+            "typing 'reload' must offer the binary reload, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn asking_to_reload_without_a_newer_build_refuses_and_changes_nothing() {
+        // The common case: the user asks, nothing has been rebuilt. It must say
+        // so and leave the app exactly as it was, with no pending reload that
+        // would tear the process down on the next tick.
+        let mut app = test_app(default_bindings());
+        app.reload_target = Some(dux_core::reload_policy::ReloadTarget {
+            path: std::env::current_exe().expect("current exe"),
+            // In the future, so nothing on disk can be newer than it.
+            started_mtime: Some(
+                std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+            ),
+        });
+
+        app.execute_command("reload-binary".to_string())
+            .expect("a refusal is reported on the status line, not returned");
+
+        assert!(
+            app.pending_reload.is_none(),
+            "a refused reload must not leave the run loop about to exec"
+        );
+    }
+
+    #[test]
+    fn a_reload_asked_for_without_a_known_binary_is_refused() {
+        // `current_exe` can fail (an unlinked binary). With no target there is
+        // nothing to exec onto, so this must refuse rather than proceed to
+        // clear FD_CLOEXEC on every master for a reload that cannot happen.
+        let mut app = test_app(default_bindings());
+        app.reload_target = None;
+
+        app.execute_command("reload-binary".to_string())
+            .expect("reported, not returned");
+
+        assert!(app.pending_reload.is_none());
+    }
+
     fn palette_selection(app: &App) -> usize {
         match &app.prompt {
             PromptState::Command { selected, .. } => *selected,

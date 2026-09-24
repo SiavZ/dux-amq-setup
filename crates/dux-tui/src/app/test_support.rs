@@ -340,6 +340,8 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
         url_opener: crate::app::default_url_opener(),
         startup_log_selection: None,
         pending_server_flip: None,
+        pending_reload: None,
+        reload_target: None,
         companion: None,
         background_server_preflight_pending: false,
         background_server_wanted: false,

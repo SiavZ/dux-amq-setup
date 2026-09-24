@@ -603,6 +603,21 @@ pub struct App {
     /// `StartWebServer` palette action only after its (worker) pre-flight
     /// succeeds. LOCAL MODE may bind more than one address (loopback + Tailscale).
     pub(crate) pending_server_flip: Option<(Vec<std::net::TcpListener>, Vec<String>)>,
+    /// When set, the run loop exits with [`RunExit::Reload`], handing the
+    /// manifest of live PTYs to the binary so it can exec onto a newer dux
+    /// while every agent keeps running.
+    ///
+    /// Populated by `request_reload` only after BOTH guards pass and the
+    /// handoff has actually been collected, so by the time this is `Some` the
+    /// reload is known to be possible. Anything that can fail has already
+    /// failed, harmlessly, with the user still running.
+    pub(crate) pending_reload: Option<dux_core::reload_handoff::Handoff>,
+    /// The binary this process was launched from, with its mtime as of startup.
+    ///
+    /// Captured once at boot because a rebuild replaces the file in place: read
+    /// live, the path would describe the NEW build and "is there a newer one"
+    /// could never be true.
+    pub(crate) reload_target: Option<dux_core::reload_policy::ReloadTarget>,
     /// In-flight guard for the server-flip pre-flight. `start_web_server` spawns a
     /// worker that races to `bind` the LOCAL MODE ports; two quick invocations
     /// would both spawn workers and the second would hit a confusing EADDRINUSE.
@@ -3902,6 +3917,8 @@ impl App {
             url_opener: default_url_opener(),
             startup_log_selection: None,
             pending_server_flip: None,
+            pending_reload: None,
+            reload_target: dux_core::reload_policy::ReloadTarget::capture(),
             companion: None,
             background_server_preflight_pending: false,
             background_server_wanted: false,
@@ -3929,6 +3946,12 @@ impl App {
         // engine handed back from the web server already owns the live providers, and
         // any session the user closed in the web UI must stay closed.
         if matches!(restore, SessionRestore::Restore) {
+            // A reload comes through this same path, so the inherited PTYs are
+            // adopted BEFORE `restore_sessions` runs. Order is the whole point:
+            // `restore_sessions` relaunches any session with no live provider,
+            // so adopting second would spawn a duplicate agent alongside the one
+            // that just survived the exec.
+            app.adopt_reload_handoff_from_args();
             app.restore_sessions();
             // The first-load gate runs on a COLD BOOT only. A web-server→TUI flip
             // comes through `resume` with `SessionRestore::Skip`, and re-showing
@@ -4051,6 +4074,12 @@ impl App {
 
             if let Some((listeners, urls)) = self.pending_server_flip.take() {
                 return RunExit::FlipToServer { listeners, urls };
+            }
+            // After the flip check, so a user who asked for both in the same
+            // frame gets the server they explicitly bound ports for. A reload
+            // can always be asked for again; a bound listener cannot.
+            if let Some(handoff) = self.pending_reload.take() {
+                return RunExit::Reload { handoff };
             }
             if self.poll_run_input() {
                 return RunExit::Quit;
@@ -4678,6 +4707,88 @@ impl App {
             .set(Instant::now(), None, StatusTone::Error, message);
     }
 
+    /// Ask to reload onto a newer dux, keeping every running agent alive.
+    ///
+    /// Everything that can refuse does so HERE, while the app is still running
+    /// normally and a refusal costs the user nothing but a status line. By the
+    /// time `pending_reload` is set, the reload has already been shown to be
+    /// possible: the guards passed and the handoff was collected.
+    ///
+    /// The order matters. The cheap, common refusal (no newer build) is checked
+    /// before the one that touches every PTY, so the usual "nothing to do" case
+    /// does not clear `FD_CLOEXEC` on descriptors that are not going anywhere.
+    pub(crate) fn request_reload(&mut self) {
+        use dux_core::reload_policy::ReloadRefusal;
+
+        let Some(target) = self.reload_target.clone() else {
+            self.set_error(
+                "Cannot reload: dux could not work out which binary it is running from.",
+            );
+            return;
+        };
+        if !target.has_newer_build() {
+            self.set_error(ReloadRefusal::NoNewerBinary.message());
+            return;
+        }
+        if let Some(tab_id) = self.engine.agent_blocking_reload() {
+            self.set_error(ReloadRefusal::AgentWorking { tab_id }.message());
+            return;
+        }
+        // Last, because this is the step with a side effect: it clears
+        // `FD_CLOEXEC` on every master so the descriptors survive the exec.
+        // Doing it after the refusals means a refused reload leaves no trace.
+        let Some(handoff) = self.engine.prepare_reload_handoff() else {
+            self.set_error(ReloadRefusal::HandoffUnavailable.message());
+            return;
+        };
+        self.pending_reload = Some(handoff);
+    }
+
+    /// Adopt the PTYs handed over by a previous image, when this process was
+    /// started by a reload.
+    ///
+    /// A no-op on every normal launch: without `--reload-handoff` there is
+    /// nothing to adopt and this returns immediately.
+    ///
+    /// Must run BEFORE `restore_sessions`, which relaunches any session with no
+    /// live provider. Adopting afterwards would leave every surviving agent with
+    /// a freshly spawned duplicate beside it.
+    ///
+    /// Failures here are reported and survived. The alternative, refusing to
+    /// start, would leave the user with no dux at all and a set of orphaned
+    /// agents, which is strictly worse than a cold start.
+    pub(crate) fn adopt_reload_handoff_from_args(&mut self) {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let Some(path) = dux_core::reload_policy::handoff_path_from_args(&args) else {
+            return;
+        };
+        let handoff = match dux_core::reload_handoff::Handoff::consume(&path) {
+            Ok(handoff) => handoff,
+            Err(err) => {
+                logger::warn(&format!("reload: could not read the handoff: {err:#}"));
+                self.set_error(
+                    "Reloaded, but the note describing the running agents could \
+                     not be read. They are still running, detached from dux.",
+                );
+                return;
+            }
+        };
+        let expected = handoff.ptys.len();
+        // SAFETY: the descriptors were inherited through the exec that started
+        // this process, which is exactly what the flag means.
+        let adopted = unsafe { self.engine.restore_reload_handoff(handoff) };
+        if adopted < expected {
+            self.set_error(format!(
+                "Reloaded, but {} of {expected} running agents could not be \
+                 picked back up.",
+                expected - adopted
+            ));
+        }
+        logger::info(&format!(
+            "reload: adopted {adopted} of {expected} handed-over ptys"
+        ));
+    }
+
     /// Show a status-line warning when a missing project is highlighted, or
     /// clear the warning when the selection moves away from one.
     pub(crate) fn update_missing_project_warning(&mut self) {
@@ -4923,6 +5034,14 @@ impl App {
             "change-project-default-provider" => self.open_change_project_default_provider_prompt(),
             "change-theme" => self.open_change_theme_prompt(),
             "reload-config" => self.reload_config_from_disk(),
+            "reload-binary" => {
+                // Every refusal is reported by `request_reload` on the status
+                // line, so there is no error to return here: an `Err` would be
+                // shown as a failure when "nothing to reload onto" is a normal,
+                // expected answer.
+                self.request_reload();
+                Ok(())
+            }
             "start-web-server" => {
                 self.start_web_server();
                 Ok(())

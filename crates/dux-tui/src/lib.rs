@@ -54,6 +54,16 @@ pub enum TuiExit {
         listeners: Vec<std::net::TcpListener>,
         urls: Vec<String>,
     },
+    /// Exec onto a newer dux, keeping the running agents alive.
+    ///
+    /// The engine rides along, and holding it here is what makes the reload
+    /// safe: nothing is dropped, so no `PtyClient` closes a master the next
+    /// image is about to inherit. The binary writes the handoff, then execs; if
+    /// either step fails it still owns a fully working engine and can carry on.
+    Reload {
+        engine: Box<Engine>,
+        handoff: dux_core::reload_handoff::Handoff,
+    },
 }
 
 /// Run dux (TUI mode or a `config` subcommand). Called by the `dux` binary
@@ -163,6 +173,17 @@ fn run_app(
                 engine: Box::new(engine),
                 listeners,
                 urls,
+            })
+        }
+        app::RunExit::Reload { handoff } => {
+            // The engine is MOVED OUT rather than dropped, for the same reason
+            // the flip does it: dropping an `Engine` drops every `PtyClient`,
+            // which closes the masters the next image is about to inherit and
+            // takes the agents down with them. Holding it alive until the exec
+            // is what makes the reload seamless.
+            Ok(TuiExit::Reload {
+                engine: Box::new(app.into_engine()),
+                handoff,
             })
         }
     }

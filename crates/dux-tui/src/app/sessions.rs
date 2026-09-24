@@ -4580,6 +4580,8 @@ mod tests {
             url_opener: default_url_opener(),
             startup_log_selection: None,
             pending_server_flip: None,
+            pending_reload: None,
+            reload_target: dux_core::reload_policy::ReloadTarget::capture(),
             companion: None,
             background_server_preflight_pending: false,
             background_server_wanted: false,

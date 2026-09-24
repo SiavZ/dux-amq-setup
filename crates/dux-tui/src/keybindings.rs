@@ -301,6 +301,16 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         hint_contexts: &[],
     },
     BindingDef {
+        // Palette-only by default, like its neighbours here. A reload discards
+        // every transcript, so it should be asked for deliberately rather than
+        // sitting under a key that is easy to hit by accident.
+        action: Action::ReloadBinary,
+        default_keys: &[],
+        scopes: &[],
+        help: None,
+        hint_contexts: &[],
+    },
+    BindingDef {
         action: Action::StartWebServer,
         default_keys: &[],
         scopes: &[],

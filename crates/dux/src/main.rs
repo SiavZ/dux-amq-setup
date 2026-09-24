@@ -27,6 +27,52 @@ fn main() -> Result<()> {
     }
 }
 
+/// Write the handoff and replace this process with the newer dux binary.
+///
+/// Never returns on success: `exec` replaces the running image in place, which
+/// is precisely what keeps the process, its agent children, and their inherited
+/// descriptors alive across the swap.
+///
+/// `engine` is taken by value and deliberately leaked before the exec. Dropping
+/// an `Engine` drops every `PtyClient`, and dropping those closes the PTY
+/// masters the replacement image is about to inherit, killing the agents this
+/// whole feature exists to keep running. On the success path the process is
+/// replaced anyway, so nothing is really leaked; on the failure paths below the
+/// engine is dropped normally, because there is no successor to inherit
+/// anything.
+fn exec_reload(
+    engine: Box<dux_core::engine::Engine>,
+    handoff: dux_core::reload_handoff::Handoff,
+) -> Result<()> {
+    let handoff_path =
+        dux_core::reload_handoff::Handoff::path_for(&engine.paths.root, std::process::id());
+    if let Err(err) = handoff.write(&handoff_path) {
+        // The agents are untouched and this image is intact, so the honest
+        // outcome is an ordinary exit rather than a half-done reload.
+        return Err(err.context("writing the reload handoff"));
+    }
+
+    let Ok(exe) = std::env::current_exe() else {
+        let _ = std::fs::remove_file(&handoff_path);
+        anyhow::bail!("cannot reload: dux could not find its own binary");
+    };
+
+    // Past this point the descriptors must stay open for the successor.
+    let engine = Box::leak(engine);
+    let err = match dux_core::reload_policy::exec_into_reload(&exe, &handoff_path) {
+        Ok(never) => match never {},
+        Err(err) => err,
+    };
+
+    // exec failed, so this image is still running and still owns everything.
+    // Take the engine back so the agents are shut down properly instead of
+    // being abandoned, and clear the handoff nobody will read.
+    let _ = std::fs::remove_file(&handoff_path);
+    let engine = unsafe { Box::from_raw(engine as *mut dux_core::engine::Engine) };
+    drop(engine);
+    Err(anyhow::Error::from(err).context(format!("exec onto {}", exe.display())))
+}
+
 /// Default arm: run the TUI, and when it flips to the web server, serve the same
 /// engine in this process until the server stops, then resume the TUI, repeating
 /// until the user quits from either surface. While serving, the terminal shows
@@ -37,6 +83,9 @@ fn run_tui_with_flip() -> Result<()> {
     loop {
         match next {
             dux_tui::TuiExit::Done => break,
+            dux_tui::TuiExit::Reload { engine, handoff } => {
+                return exec_reload(engine, handoff);
+            }
             dux_tui::TuiExit::FlipToServer {
                 engine,
                 listeners,

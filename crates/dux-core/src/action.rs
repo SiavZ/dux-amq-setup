@@ -170,6 +170,10 @@ pub enum Action {
     RefreshChanges,
     ChangeTheme,
     ReloadConfig,
+    /// Palette-only: replace the running dux with a newer build on disk,
+    /// keeping every agent alive across the swap. Refuses when no newer binary
+    /// exists or an agent is mid-turn, because a reload clears the transcripts.
+    ReloadBinary,
     StartWebServer,
     /// Palette-only: start serving the web UI in the BACKGROUND, with the
     /// terminal UI still running. Distinct from `StartWebServer`, which hands the
@@ -333,6 +337,7 @@ impl Action {
             Action::RefreshChanges => "refresh_changes",
             Action::ChangeTheme => "change_theme",
             Action::ReloadConfig => "reload_config",
+            Action::ReloadBinary => "reload_binary",
             Action::StartWebServer => "start_web_server",
             Action::StartBackgroundServer => "start_background_server",
             Action::StopBackgroundServer => "stop_background_server",
@@ -562,6 +567,9 @@ impl Action {
             }
             Action::ChangeTheme => "Open a picker to switch the dux color theme.",
             Action::ReloadConfig => "Reload the configuration file.",
+            Action::ReloadBinary => {
+                "Restart dux onto a newer build, keeping the running agents alive."
+            }
             Action::StartWebServer => {
                 "Tear down the TUI and serve the dux web UI over the same agents."
             }
@@ -731,6 +739,7 @@ impl Action {
             | Action::ChangeProjectDefaultProvider
             | Action::ChangeTheme
             | Action::ReloadConfig
+            | Action::ReloadBinary
             | Action::StartWebServer
             | Action::StartBackgroundServer
             | Action::StopBackgroundServer

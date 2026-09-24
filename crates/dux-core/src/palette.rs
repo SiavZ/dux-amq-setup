@@ -152,6 +152,14 @@ pub const PALETTE_COMMANDS: &[PaletteCommand] = &[
         // Web equivalent: the app menu's Configuration submenu.
     },
     PaletteCommand {
+        action: Action::ReloadBinary,
+        name: "reload-binary",
+        description: "Restart dux onto a newer build, keeping your agents running",
+        // TUI-only: this replaces the process the terminal UI is running in.
+        // A browser is attached to a server, not to this image, so the question
+        // does not arise there.
+    },
+    PaletteCommand {
         action: Action::StartWebServer,
         name: "start-web-server",
         description: "Stop the TUI and serve the dux web UI over your running agents",
