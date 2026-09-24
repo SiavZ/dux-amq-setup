@@ -1272,7 +1272,7 @@ mod tests {
             // round-trip below pick whichever one this leaf actually accepts.
             serde_json::Value::String(s) => {
                 let mut candidates = vec![serde_json::json!(format!("{s}-mutated"))];
-                for alternative in ["stdout", "tempfile"] {
+                for alternative in ["stdout", "tempfile", "shared", "worktree"] {
                     if alternative != s {
                         candidates.push(serde_json::json!(alternative));
                     }
@@ -1465,6 +1465,7 @@ mod tests {
             auto_reopen_agents: None,
             startup_command: None,
             env,
+            workspace_mode: None,
         });
 
         let changes = collect_config_changes(&config);

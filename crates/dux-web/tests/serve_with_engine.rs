@@ -78,6 +78,7 @@ fn build_engine() -> (Engine, tempfile::TempDir) {
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .unwrap();
         store

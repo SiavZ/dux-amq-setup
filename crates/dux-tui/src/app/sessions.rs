@@ -6234,6 +6234,7 @@ mod tests {
                 auto_reopen_agents: project.auto_reopen_agents,
                 startup_command: project.startup_command.clone(),
                 env: project.env.clone(),
+                workspace_mode: None,
             })
             .expect("seed project into store");
         app.rebuild_left_items();

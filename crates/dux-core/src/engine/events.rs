@@ -7608,12 +7608,14 @@ mod tests {
             .session_store
             .upsert_project(&crate::engine::project_to_project_config(
                 &engine.projects[0],
+                &[],
             ))
             .unwrap();
         engine
             .session_store
             .upsert_project(&crate::engine::project_to_project_config(
                 &engine.projects[1],
+                &[],
             ))
             .unwrap();
         let s1 = sample_session("s1", "p1", "feat/a");

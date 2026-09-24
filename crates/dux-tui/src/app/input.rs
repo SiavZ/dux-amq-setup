@@ -33033,6 +33033,7 @@ cyan = "#00ffff"
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: pinned.env.clone(),
+                workspace_mode: None,
             })
             .expect("seed pinned project");
         app.engine.projects.push(pinned);
@@ -33199,6 +33200,7 @@ cyan = "#00ffff"
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: pinned.env.clone(),
+                workspace_mode: None,
             })
             .expect("seed pinned project");
         app.engine.projects.push(pinned);

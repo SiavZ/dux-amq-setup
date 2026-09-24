@@ -75,6 +75,7 @@ async fn boot() -> (SocketAddr, tempfile::TempDir) {
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .unwrap();
         store
@@ -164,6 +165,7 @@ async fn boot_with_repo() -> (SocketAddr, tempfile::TempDir) {
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .unwrap();
         store
@@ -448,6 +450,7 @@ async fn boot_for_create_agent_window(
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .unwrap();
     }
@@ -658,6 +661,7 @@ async fn boot_with_gated_startup_command() -> (SocketAddr, std::path::PathBuf, t
                 // Blocks until the test opens the FIFO for writing.
                 startup_command: Some(format!("cat {}", gate.display())),
                 env: Default::default(),
+                workspace_mode: None,
             })
             .unwrap();
         store
@@ -1511,6 +1515,7 @@ async fn boot_two_sessions() -> (SocketAddr, tempfile::TempDir) {
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .unwrap();
         store

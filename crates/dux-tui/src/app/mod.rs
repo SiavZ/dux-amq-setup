@@ -7172,6 +7172,12 @@ pub(crate) fn runtime_project_to_config(
         auto_reopen_agents: project.auto_reopen_agents,
         startup_command: project.startup_command.clone(),
         env: project.env.clone(),
+        // Config-only preference: carried from the existing entry so a rebuild
+        // of `[[projects]]` from runtime state never drops a user's override.
+        workspace_mode: existing_projects
+            .iter()
+            .find(|existing| existing.id == project.id)
+            .and_then(|existing| existing.workspace_mode),
     }
 }
 
@@ -8258,6 +8264,7 @@ leading_branch = "main"
                 auto_reopen_agents: None,
                 startup_command: Some("npm install".to_string()),
                 env: Default::default(),
+                workspace_mode: None,
             })
             .expect("seed project");
 
@@ -8306,6 +8313,7 @@ leading_branch = "main"
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .expect("seed project");
 
@@ -8366,6 +8374,7 @@ leading_branch = "main"
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .expect("seed project");
 
@@ -8430,6 +8439,7 @@ leading_branch = "main"
                 auto_reopen_agents: None,
                 startup_command: Some("pnpm install".to_string()),
                 env: Default::default(),
+                workspace_mode: None,
             })
             .expect("seed project");
 

@@ -1421,7 +1421,7 @@ pub(crate) fn portable_project_path(path: &str) -> String {
 /// on-disk shape stays consistent regardless of which path wrote it. The path is
 /// stored in the portable `$HOME/...` form (via [`portable_project_path`]) so the
 /// config does not pin an absolute, machine-specific path.
-fn project_to_project_config(p: &Project) -> ProjectConfig {
+fn project_to_project_config(p: &Project, existing: &[ProjectConfig]) -> ProjectConfig {
     ProjectConfig {
         id: p.id.clone(),
         path: portable_project_path(&p.path),
@@ -1434,6 +1434,12 @@ fn project_to_project_config(p: &Project) -> ProjectConfig {
         auto_reopen_agents: p.auto_reopen_agents,
         startup_command: p.startup_command.clone(),
         env: p.env.clone(),
+        // Config-only preference, carried from the existing entry so this
+        // rebuild never drops a user's per-project workspace mode.
+        workspace_mode: existing
+            .iter()
+            .find(|project| project.id == p.id)
+            .and_then(|project| project.workspace_mode),
     }
 }
 
@@ -1997,6 +2003,7 @@ impl Engine {
                                 auto_reopen_agents: project.auto_reopen_agents,
                                 startup_command: project.startup_command.clone(),
                                 env: project.env.clone(),
+                                workspace_mode: None,
                             })?;
                         }
                         ProjectPersistenceAction::Remove { project_id, .. }
@@ -2169,10 +2176,11 @@ impl Engine {
     /// its own config-sync path.) Eager synchronous write via the queue; blocks
     /// until the writer confirms or times out.
     pub fn persist_projects_to_config(&mut self) -> anyhow::Result<()> {
+        let existing = std::mem::take(&mut self.config.projects);
         self.config.projects = self
             .projects
             .iter()
-            .map(project_to_project_config)
+            .map(|project| project_to_project_config(project, &existing))
             .collect();
         self.config_writer
             .save_eager(self.config.clone())
@@ -7758,6 +7766,44 @@ mod tests {
             .find(|p| p.id == "p2")
             .expect("p2 present");
         assert_eq!(two.default_provider.as_deref(), Some("codex"));
+    }
+
+    /// `workspace_mode` lives only in config, so rebuilding `[[projects]]`
+    /// from runtime state must carry it from the entry it replaces.
+    #[test]
+    fn persist_projects_to_config_keeps_the_project_workspace_mode_override() {
+        let (mut engine, _tmp) = test_engine();
+        std::fs::write(&engine.paths.config_path, "# dux config\n").expect("seed config");
+        engine.projects.push(sample_project("p1", "/repo/one"));
+        engine.projects.push(sample_project("p2", "/repo/two"));
+        engine.config.projects = vec![crate::config::ProjectConfig {
+            id: "p1".to_string(),
+            path: "/repo/one".to_string(),
+            name: None,
+            default_provider: None,
+            leading_branch: None,
+            auto_reopen_agents: None,
+            startup_command: None,
+            env: Default::default(),
+            workspace_mode: Some(crate::config::WorkspaceMode::Worktree),
+        }];
+
+        engine
+            .persist_projects_to_config()
+            .expect("persist projects to config");
+
+        let saved = std::fs::read_to_string(&engine.paths.config_path).expect("read back");
+        let parsed: Config = toml::from_str(&saved).expect("reparse");
+        let mode = |id: &str| {
+            parsed
+                .projects
+                .iter()
+                .find(|p| p.id == id)
+                .expect("project present")
+                .workspace_mode
+        };
+        assert_eq!(mode("p1"), Some(crate::config::WorkspaceMode::Worktree));
+        assert_eq!(mode("p2"), None);
     }
 
     #[test]

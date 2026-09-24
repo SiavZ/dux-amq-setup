@@ -965,6 +965,7 @@ fn opening_a_database_this_build_created_is_a_no_op_the_second_time() {
                 auto_reopen_agents: Some(true),
                 startup_command: Some("just setup".to_string()),
                 env: std::collections::BTreeMap::from([("TOKEN".to_string(), "abc".to_string())]),
+                workspace_mode: None,
             })
             .expect("upsert project");
         store
