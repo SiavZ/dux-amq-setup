@@ -776,6 +776,10 @@ pub struct BranchSyncEntry {
     pub session_id: String,
     pub worktree_path: String,
     pub branch_name: String,
+    /// A shared-workspace agent runs in the project's real checkout, which
+    /// several agents can share: its branch is read once per checkout and a
+    /// detached HEAD is a normal state rather than an error.
+    pub shared_workspace: bool,
 }
 
 /// The identity of a manually attached ("pinned") pull request, carried on a
@@ -822,6 +826,12 @@ pub struct PrSyncEntry {
     /// session's own status, and which the alias planner reads for a different
     /// question (whether a terminal pull request is worth a call at all).
     pub inactive: bool,
+    /// A shared-workspace agent runs in the project's real checkout, which
+    /// several agents can share. The sync reads that checkout's live branch
+    /// once and asks GitHub about it once for all of them, ignoring each
+    /// agent's remembered pull request (it belonged to whatever branch the
+    /// checkout was on then), and a detached HEAD there has no pull request.
+    pub shared_workspace: bool,
 }
 
 #[derive(Clone, Debug)]

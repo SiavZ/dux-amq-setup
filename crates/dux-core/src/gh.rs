@@ -363,12 +363,14 @@ fn run_entries(
     policy: &GithubHostPolicy,
     trigger: SyncTrigger,
 ) -> PrSyncOutcome {
+    let shared = collapse_shared_entries(entries, &|path| git::current_branch_opt(path));
     let (mut results, planned) = plan_entries(
-        entries,
+        &shared.entries,
         &|path| live_remote_resolver(path, policy),
         policy,
         trigger,
     );
+    results.extend(shared.fixed);
 
     // Group by host; for each host either skip it (already backed off: keep
     // last-known PRs, no gh call, no signal) or chunk its sessions by alias
@@ -434,9 +436,108 @@ fn run_entries(
         });
     }
 
+    let results = fan_out_shared_results(results, &shared.followers);
     log_sync_cycle(entries, planned.len(), points, &results, trigger);
 
     (results, signals)
+}
+
+/// Shared-workspace entries regrouped for one sync cycle: see
+/// [`collapse_shared_entries`].
+struct CollapsedEntries {
+    /// Every entry to plan: each worktree entry as-is, plus ONE representative
+    /// per shared checkout whose HEAD is on a branch.
+    entries: Vec<PrSyncEntry>,
+    /// Answers already known without asking: every agent in a shared checkout
+    /// whose HEAD is detached has no pull request.
+    fixed: Vec<(String, Option<PrInfo>)>,
+    /// `(representative id, follower id)`: a follower gets its
+    /// representative's answer.
+    followers: Vec<(String, String)>,
+}
+
+/// Fork `shared_pr_sync_discovers_once_per_path_and_ignores_known_session_shortcuts`
+/// and the PR half of `detached_shared_head_fans_out_label_and_skips_pr_discovery`.
+///
+/// Shared agents run in one real checkout, possibly reached by different
+/// spellings. Their entries are grouped by canonical directory and that
+/// checkout's live branch is read ONCE (`head_branch`, `Ok(None)` for a
+/// detached HEAD):
+///
+/// - on a branch: one representative entry is planned for the whole group,
+///   carrying the LIVE branch and no remembered pull request. An agent's
+///   stored PR was discovered for whatever branch the checkout had then (the
+///   user switches branches under shared agents), so using it as a by-number
+///   shortcut would report a stale pull request; discovery on the live branch
+///   is the answer for everyone in the checkout.
+/// - detached: nobody in the group has a pull request, and nothing is asked.
+/// - unreadable: the group is left out of this cycle entirely (no answer), so
+///   each agent keeps what it last showed, like a backed-off host.
+///
+/// A pinned shared agent keeps its own entry: the user named its pull request.
+fn collapse_shared_entries(
+    entries: &[PrSyncEntry],
+    head_branch: &dyn Fn(&Path) -> anyhow::Result<Option<String>>,
+) -> CollapsedEntries {
+    let mut out = CollapsedEntries {
+        entries: Vec::new(),
+        fixed: Vec::new(),
+        followers: Vec::new(),
+    };
+    let mut groups: Vec<(std::path::PathBuf, Vec<&PrSyncEntry>)> = Vec::new();
+    for entry in entries {
+        if !entry.shared_workspace || entry.pinned.is_some() {
+            out.entries.push(entry.clone());
+            continue;
+        }
+        let canonical =
+            crate::project_browser::canonical_or_original(Path::new(&entry.worktree_path));
+        match groups.iter_mut().find(|(path, _)| *path == canonical) {
+            Some((_, members)) => members.push(entry),
+            None => groups.push((canonical, vec![entry])),
+        }
+    }
+    for (path, members) in groups {
+        match head_branch(&path) {
+            Err(_) => {}
+            Ok(None) => out
+                .fixed
+                .extend(members.iter().map(|m| (m.session_id.clone(), None))),
+            Ok(Some(branch)) => {
+                let mut representative = members[0].clone();
+                representative.branch_name = branch;
+                representative.known_pr = None;
+                // Asked whenever ANY agent in the checkout is still running.
+                representative.agent_exited = members.iter().all(|m| m.agent_exited);
+                for follower in &members[1..] {
+                    out.followers.push((
+                        representative.session_id.clone(),
+                        follower.session_id.clone(),
+                    ));
+                }
+                out.entries.push(representative);
+            }
+        }
+    }
+    out
+}
+
+/// Copy each shared representative's answer to the agents that share its
+/// checkout (see [`collapse_shared_entries`]).
+fn fan_out_shared_results(
+    mut results: Vec<(String, Option<PrInfo>)>,
+    followers: &[(String, String)],
+) -> Vec<(String, Option<PrInfo>)> {
+    for (representative, follower) in followers {
+        if let Some(pr) = results
+            .iter()
+            .find(|(id, _)| id == representative)
+            .map(|(_, pr)| pr.clone())
+        {
+            results.push((follower.clone(), pr));
+        }
+    }
+    results
 }
 
 /// The remote resolver production uses: the real one, reading the worktree's
@@ -3762,6 +3863,7 @@ mod tests {
             agent_exited: true,
             pinned: None,
             inactive: false,
+            shared_workspace: false,
         };
         let trigger = SyncTrigger::BlindPoll;
         let (results, signals) = run_entries(
@@ -3838,6 +3940,7 @@ mod tests {
             agent_exited: true,
             pinned: None,
             inactive: false,
+            shared_workspace: false,
         };
         let (results, signals) = run_entries(
             std::slice::from_ref(&entry),
@@ -4463,6 +4566,7 @@ mod tests {
             agent_exited: false,
             pinned: None,
             inactive: false,
+            shared_workspace: false,
         }
     }
 
@@ -5102,5 +5206,143 @@ mod tests {
 
         assert_eq!(planned.len(), 1);
         assert_eq!(planned[0].host, "github.com");
+    }
+
+    fn shared_pr_entry(id: &str, path: &Path, branch: &str, shared: bool) -> PrSyncEntry {
+        PrSyncEntry {
+            session_id: id.to_string(),
+            branch_name: branch.to_string(),
+            worktree_path: path.to_string_lossy().to_string(),
+            known_pr: None,
+            agent_exited: false,
+            pinned: None,
+            inactive: false,
+            shared_workspace: shared,
+        }
+    }
+
+    /// Fork `shared_pr_sync_discovers_once_per_path_and_ignores_known_session_shortcuts`:
+    /// two shared agents in one checkout produce ONE planned lookup, on the
+    /// checkout's LIVE branch, with no by-number shortcut from either agent's
+    /// remembered pull request (it was for whatever branch the checkout had
+    /// then); the checkout's HEAD is read once; a worktree agent keeps its own
+    /// lookup; and the one answer reaches both shared agents.
+    #[test]
+    fn shared_pr_sync_discovers_once_per_path_and_ignores_known_session_shortcuts() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        let alias = dir.path().join("shared-alias");
+        std::os::unix::fs::symlink(&shared, &alias).unwrap();
+        let mut stale = shared_pr_entry("shared-a", &shared, "stored-a", true);
+        stale.known_pr = Some(StoredPr {
+            session_id: "shared-a".to_string(),
+            pr_number: 7,
+            host: "github.com".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            state: "OPEN".to_string(),
+            title: "stale shortcut".to_string(),
+            url: pull_request_url("github.com", "owner/repo", 7),
+        });
+        let snapshot = vec![
+            stale,
+            shared_pr_entry("shared-b", &alias, "stored-b", true),
+            shared_pr_entry("worktree", &worktree, "stored-worktree", false),
+        ];
+        let head_calls = std::cell::Cell::new(0);
+
+        let collapsed = collapse_shared_entries(&snapshot, &|_| {
+            head_calls.set(head_calls.get() + 1);
+            Ok(Some("live-shared".to_string()))
+        });
+        assert_eq!(
+            head_calls.get(),
+            1,
+            "the shared checkout's HEAD is read once"
+        );
+        assert!(collapsed.fixed.is_empty());
+
+        let (results, planned) = plan_entries(
+            &collapsed.entries,
+            &|_| {
+                git::RemoteResolution::Allowed(git::GitHubRemote {
+                    host: "github.com".to_string(),
+                    owner_repo: "owner/repo".to_string(),
+                })
+            },
+            &legacy_policy(),
+            SyncTrigger::BlindPoll,
+        );
+        assert!(results.is_empty());
+        assert_eq!(
+            planned.len(),
+            2,
+            "one shared lookup plus the worktree's own"
+        );
+        let shared_plan = planned
+            .iter()
+            .find(|p| p.session_id == "shared-a")
+            .expect("the shared checkout is planned once, under its first agent");
+        assert_eq!(shared_plan.branch, "live-shared");
+        assert!(
+            shared_plan.known.is_none() && !shared_plan.emit_num,
+            "a remembered PR must not become a by-number shortcut for the checkout"
+        );
+        assert!(planned.iter().any(|p| p.session_id == "worktree"));
+        assert!(!planned.iter().any(|p| p.session_id == "shared-b"));
+
+        let answer = PrInfo {
+            number: 42,
+            state: PrState::Open,
+            title: "shared PR".to_string(),
+            host: "github.com".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            url: pull_request_url("github.com", "owner/repo", 42),
+        };
+        let results = fan_out_shared_results(
+            vec![
+                ("shared-a".to_string(), Some(answer.clone())),
+                ("worktree".to_string(), None),
+            ],
+            &collapsed.followers,
+        );
+        for id in ["shared-a", "shared-b"] {
+            assert_eq!(
+                results
+                    .iter()
+                    .find(|(sid, _)| sid == id)
+                    .and_then(|(_, pr)| pr.as_ref())
+                    .map(|pr| pr.number),
+                Some(42),
+                "{id} gets the checkout's answer"
+            );
+        }
+    }
+
+    /// The PR half of fork
+    /// `detached_shared_head_fans_out_label_and_skips_pr_discovery`: a
+    /// detached HEAD in a shared checkout means no pull request for any agent
+    /// there, and nothing is planned (no `gh` call). An unreadable checkout
+    /// answers nothing, so each agent keeps its last badge.
+    #[test]
+    fn detached_shared_head_skips_pr_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = vec![
+            shared_pr_entry("shared-a", dir.path(), "main", true),
+            shared_pr_entry("shared-b", dir.path(), "main", true),
+        ];
+        let collapsed = collapse_shared_entries(&snapshot, &|_| Ok(None));
+        assert!(collapsed.entries.is_empty(), "nothing to ask GitHub");
+        let fixed: Vec<(&str, bool)> = collapsed
+            .fixed
+            .iter()
+            .map(|(id, pr)| (id.as_str(), pr.is_some()))
+            .collect();
+        assert_eq!(fixed, vec![("shared-a", false), ("shared-b", false)]);
+
+        let unreadable = collapse_shared_entries(&snapshot, &|_| anyhow::bail!("index locked"));
+        assert!(unreadable.entries.is_empty() && unreadable.fixed.is_empty());
     }
 }
