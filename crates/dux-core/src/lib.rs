@@ -46,6 +46,7 @@ pub mod project_browser;
 pub mod project_order;
 pub mod provider;
 pub mod pty;
+pub mod pty_adopt_child;
 pub mod pty_owners;
 pub mod pty_reattach;
 pub mod quiet_tail;
