@@ -765,6 +765,38 @@ fn join_urls(urls: &[String]) -> String {
     urls.join(", ")
 }
 
+impl App {
+    /// Palette action: open the watch-rules list.
+    pub(crate) fn open_watch_rules_prompt(&mut self) {
+        let rows = self.engine.watch_rule_rows();
+        self.input_target = InputTarget::None;
+        self.fullscreen_overlay = FullscreenOverlay::None;
+        self.prompt = PromptState::WatchRules(crate::app::WatchRulesPrompt { rows, selected: 0 });
+    }
+
+    /// Disarm or re-arm the highlighted rule and refresh the rows so its badge
+    /// changes in place.
+    pub(crate) fn toggle_selected_watch_rule(&mut self) {
+        let PromptState::WatchRules(prompt) = &self.prompt else {
+            return;
+        };
+        let Some(row) = prompt.rows.get(prompt.selected).cloned() else {
+            return;
+        };
+        let status = self
+            .engine
+            .toggle_watch_rule(row.tab_id.as_ref_id(), row.snapshot.idx);
+        let rows = self.engine.watch_rule_rows();
+        if let PromptState::WatchRules(prompt) = &mut self.prompt {
+            prompt.selected = prompt.selected.min(rows.len().saturating_sub(1));
+            prompt.rows = rows;
+        }
+        if let Some(status) = status {
+            self.set_info(status.message);
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::sync::{Arc, Mutex};

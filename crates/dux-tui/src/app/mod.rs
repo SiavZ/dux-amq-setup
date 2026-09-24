@@ -1594,6 +1594,15 @@ pub(crate) fn agent_info_lines(
     lines
 }
 
+/// The watch-rules list: every rule on every live agent tab, with Enter to
+/// disarm or re-arm the highlighted one. Rows are a snapshot refreshed after
+/// each toggle.
+#[derive(Clone, Debug)]
+pub(crate) struct WatchRulesPrompt {
+    pub(crate) rows: Vec<dux_core::engine::WatchRuleRow>,
+    pub(crate) selected: usize,
+}
+
 /// One row of the Tailscale-mode picker.
 #[derive(Clone, Debug)]
 pub(crate) struct SetTailscaleModeOption {
@@ -2198,6 +2207,10 @@ pub(crate) enum PromptState {
     ChangeDefaultProvider(ChangeDefaultProviderPrompt),
     ChangeProjectDefaultProvider(ChangeProjectDefaultProviderPrompt),
     SetTailscaleMode(SetTailscaleModePrompt),
+    WatchRules(WatchRulesPrompt),
+    /// The per-session settings modal (AMQ + orchestrator workstream).
+    /// Boxed: the draft carries two text inputs and the rule list.
+    SessionSettings(Box<SessionSettingsPrompt>),
     ChangeTheme(ChangeThemePrompt),
     ConfigureStartupCommand {
         project_id: String,
@@ -2831,6 +2844,8 @@ pub(crate) enum InputTarget {
     /// rather than a reuse of `StartupCommand` so a future reader cannot mistake
     /// one modal's engage state for the other's.
     MacroText,
+    /// The session-settings modal's system-prompt editor is engaged.
+    SessionSettingsPrompt,
 }
 
 #[derive(Clone, Copy)]
@@ -3189,6 +3204,13 @@ pub(crate) enum OverlayMouseLayout {
         input: Rect,
         cancel_button: Rect,
         save_button: Rect,
+    },
+    /// The session-settings modal. Its variable-length row rects live on the
+    /// prompt (`SessionSettingsPrompt::hit_rows`), since this type is `Copy`.
+    SessionSettings {
+        title_input: Rect,
+        save_button: Rect,
+        cancel_button: Rect,
     },
     KillRunning {
         input: Option<Rect>,
@@ -3582,7 +3604,9 @@ mod redraw;
 pub(crate) use redraw::RedrawGate;
 mod render;
 mod reorder;
+mod session_settings;
 mod sessions;
+pub(crate) use session_settings::{SessionSettingsPrompt, SettingsFocus};
 #[cfg(test)]
 mod shared_workspace_tests;
 #[cfg(test)]
@@ -3644,7 +3668,12 @@ impl App {
         let mut config = ensure_config(&paths)?;
 
         logger::init(&config.logging, &paths);
-        logger::info("bootstrapping dux");
+        logger::info(&format!("bootstrapping dux {}", dux_core::version::long()));
+        // Reconcile the shared AMQ registry from this store's sessions and let
+        // agent launches reserve their inbox. Under the single-instance lock
+        // the caller holds, after the logger so its outcome is recorded, and
+        // never fatal to the boot.
+        dux_core::peer::init_for_process(&paths);
 
         // Validate and build runtime keybindings from config.
         if let Err(msg) = validate_keys(&config.keys) {
@@ -3730,6 +3759,7 @@ impl App {
             providers: HashMap::new(),
             running_provider_pins: HashMap::new(),
             launched_drop_paste: Default::default(),
+            watch: Default::default(),
             companion_terminals: HashMap::new(),
             agent_tabs: agent_tabs
                 .into_iter()
@@ -3781,6 +3811,7 @@ impl App {
             pty_progress: HashMap::new(),
             agent_viewed: HashMap::new(),
             last_foreground_refresh: None,
+            amq: Default::default(),
             pending_web_checkout_ops: HashMap::new(),
             pending_web_add_project_ops: HashMap::new(),
             pending_web_pr_lookup_ops: HashMap::new(),
@@ -4084,6 +4115,8 @@ impl App {
         self.engine.spawn_branch_sync_worker();
         self.engine.spawn_project_branch_status_checks();
         self.engine.spawn_gh_status_check();
+        // Idempotent: the web flip hands this same engine over and re-calls it.
+        self.engine.start_amq();
         // The background server assumes these process-wide workers are already running.
         self.start_background_server_from_config();
     }
@@ -5063,6 +5096,10 @@ impl App {
             "change-project-default-provider" => self.open_change_project_default_provider_prompt(),
             "change-theme" => self.open_change_theme_prompt(),
             "reload-config" => self.reload_config_from_disk(),
+            "watch-rules" => {
+                self.open_watch_rules_prompt();
+                Ok(())
+            }
             "reload-binary" => {
                 // Every refusal is reported by `request_reload` on the status
                 // line, so there is no error to return here: an `Err` would be
@@ -5100,6 +5137,7 @@ impl App {
             "delete-agent" => self.confirm_delete_selected_session(),
             "rename-agent" => self.open_rename_session(),
             "agent-info" => self.open_agent_info(),
+            "session-settings" => self.open_session_settings(),
             "kill-running" => self.open_kill_running(),
             "detach-agent" => self.confirm_detach_selected_session(),
             "recreate-working-copy" => self.confirm_recreate_selected_working_copy(),
@@ -6792,6 +6830,21 @@ impl App {
         }
     }
 
+    /// Whether a plain left press/drag over the selected surface goes to a
+    /// mouse-reporting child (`true`) or stays a dux text selection (`false`).
+    /// Agents resolve it from their running provider's `forward_mouse`;
+    /// companion terminals have no provider config and always forward, as a
+    /// terminal emulator does.
+    pub(crate) fn selected_surface_forwards_mouse(&self) -> bool {
+        match self.session_surface {
+            SessionSurface::Agent => self.selected_session().is_none_or(|session| {
+                let provider = self.focused_tab_provider(session);
+                provider_config(&self.engine.config, &provider).forwards_mouse()
+            }),
+            SessionSurface::Terminal => true,
+        }
+    }
+
     /// The id that names the currently selected terminal surface: the focused
     /// tab id for an agent, the terminal id for a companion terminal. `None`
     /// when that surface has no live PTY, so it always agrees with
@@ -7646,8 +7699,11 @@ mod tests {
         // alias needs root, so the address is DISCOVERED instead: ask the host
         // which loopback addresses it actually has (a machine may carry extra
         // 127.x aliases for other reasons) and take the first that is not
-        // 127.0.0.1 and that the kernel lets us bind.
-        let second_loopback = crate::app::test_support::bindable_secondary_loopbacks();
+        // 127.0.0.1 and that the kernel lets us bind. 127.0.0.2 is tried
+        // first because on Linux it binds without being listed by `ifconfig`,
+        // and discovery alone would silently skip this test on CI.
+        let second_loopback = std::iter::once(std::net::IpAddr::from([127, 0, 0, 2]))
+            .chain(crate::app::test_support::bindable_secondary_loopbacks());
         let Some((held, ts_ip)) = second_loopback.into_iter().find_map(|ip| {
             let listener = std::net::TcpListener::bind((ip, 0)).ok()?;
             Some((listener, ip))

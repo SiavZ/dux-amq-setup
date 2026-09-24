@@ -8,3 +8,8 @@ dux-tui = { path = "../dux-tui" }
 dux-web = { path = "../dux-web" }
 dux-core.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+chrono.workspace = true
+toml = "1.1.2"

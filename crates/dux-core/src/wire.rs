@@ -584,6 +584,15 @@ pub enum WireCommand {
         #[serde(default)]
         session_id: Option<String>,
     },
+    /// Replace one agent's per-session settings (context mode, YOLO, AMQ
+    /// verify override, watch-rule overrides, auto-clear, system prompt).
+    /// The same `Command::SetSessionSettings` the TUI settings modal sends:
+    /// persisted before live memory changes, untouched on a store failure.
+    /// Title-free on purpose: the web renames through `rename_session`.
+    SetSessionSettings {
+        session_id: String,
+        settings: crate::session_settings::SessionSettings,
+    },
 }
 
 /// The curated favicon TINT color names accepted by `config.server.favicon` and
@@ -4724,6 +4733,14 @@ impl Engine {
             WireCommand::WatchChangedFiles { session_id } => {
                 Command::WatchChangedFiles { session_id }
             }
+            WireCommand::SetSessionSettings {
+                session_id,
+                settings,
+            } => Command::SetSessionSettings {
+                session_id,
+                settings: Box::new(settings),
+                title: None,
+            },
         })
     }
 
@@ -9227,6 +9244,32 @@ mod tests {
         let json = r#"{"command":"watch_changed_files","args":{}}"#;
         let cmd: WireCommand = serde_json::from_str(json).expect("deserialize");
         assert_eq!(cmd, WireCommand::WatchChangedFiles { session_id: None });
+    }
+
+    /// The web drives the same persist-then-apply command as the TUI modal,
+    /// and a partial settings object fills the rest with defaults.
+    #[test]
+    fn apply_wire_set_session_settings_persists_and_updates_the_engine() {
+        let json = r#"{"command":"set_session_settings","args":{"session_id":"s1","settings":{"mode":"worker","yolo_permissions":true}}}"#;
+        let cmd: WireCommand = serde_json::from_str(json).expect("deserialize");
+        let (mut engine, _tmp) = test_engine();
+        let session = sample_session("s1", "p1", "feat");
+        engine.session_store.create_session(&session).unwrap();
+        engine.sessions.push(session);
+        let outcome = engine.apply_wire(cmd).expect("apply_wire");
+        let status = outcome.status.expect("a save reports a status");
+        assert!(status.message.contains("context mode"), "{status:?}");
+        let expected = crate::session_settings::SessionSettings {
+            mode: crate::session_settings::ContextMode::Worker,
+            yolo_permissions: true,
+            ..Default::default()
+        };
+        assert_eq!(engine.session_settings("s1"), Some(&expected));
+        assert_eq!(
+            engine.session_store.load_session_settings().unwrap()["s1"],
+            expected
+        );
+        assert_eq!(engine.sessions[0].title.as_deref(), Some("s1-title"));
     }
 
     #[test]

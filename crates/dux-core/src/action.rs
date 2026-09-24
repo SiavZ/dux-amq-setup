@@ -212,6 +212,13 @@ pub enum Action {
     MoveTerminalDown,
     MoveTerminalTop,
     MoveTerminalBottom,
+    /// Palette-only: list every watch rule on the live agent tabs with its
+    /// state, and disarm or re-arm the selected one.
+    WatchRules,
+    /// Open the per-session settings modal for the selected agent: context
+    /// mode, YOLO, system prompt, watch-rule overrides, auto-clear, AMQ
+    /// verify override. Default Ctrl-Shift-S (fork d0e601c5).
+    SessionSettings,
 }
 
 impl Action {
@@ -355,6 +362,8 @@ impl Action {
             Action::MoveTerminalDown => "move_terminal_down",
             Action::MoveTerminalTop => "move_terminal_top",
             Action::MoveTerminalBottom => "move_terminal_bottom",
+            Action::WatchRules => "watch_rules",
+            Action::SessionSettings => "session_settings",
         }
     }
 
@@ -617,6 +626,10 @@ impl Action {
             Action::MoveTerminalBottom => {
                 "Move the selected terminal to the bottom (switches sorting to manual)."
             }
+            Action::WatchRules => "List the watch rules on running tabs and disarm or re-arm one.",
+            Action::SessionSettings => {
+                "Open the selected agent's session settings (mode, YOLO, system prompt, watch rules, auto-clear, AMQ verify)."
+            }
         }
     }
 
@@ -756,7 +769,9 @@ impl Action {
             | Action::MoveTerminalUp
             | Action::MoveTerminalDown
             | Action::MoveTerminalTop
-            | Action::MoveTerminalBottom => None,
+            | Action::MoveTerminalBottom
+            | Action::WatchRules => None,
+            Action::SessionSettings => Some("Global"),
         }
     }
 }

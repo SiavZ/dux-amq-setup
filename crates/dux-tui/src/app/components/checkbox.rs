@@ -76,7 +76,7 @@ impl<'a> Checkbox<'a> {
             return CheckboxLayout::empty();
         }
 
-        let indent_width = Self::INDENT.chars().count();
+        let indent_width = display_width(Self::INDENT);
         let available = usize::from(max_width);
         let label_width = available.saturating_sub(indent_width).max(1);
         let wrapped = wrap_checkbox_label(self.label, label_width);
@@ -165,6 +165,13 @@ impl Widget for CheckboxLayout {
     }
 }
 
+/// Terminal-cell width of `s`, reusing the renderer's own calculation so
+/// double-width CJK, emoji and combining marks are measured by the columns they
+/// occupy rather than by Unicode scalar count.
+fn display_width(s: &str) -> usize {
+    Line::from(s).width()
+}
+
 fn wrap_checkbox_label(label: &str, max_width: usize) -> Vec<String> {
     if label.is_empty() {
         return vec![String::new()];
@@ -175,7 +182,7 @@ fn wrap_checkbox_label(label: &str, max_width: usize) -> Vec<String> {
         let mut current = String::new();
         let mut current_width = 0usize;
         for word in paragraph.split_whitespace() {
-            let word_width = word.chars().count();
+            let word_width = display_width(word);
             if current.is_empty() {
                 if word_width <= max_width {
                     current.push_str(word);
@@ -220,12 +227,16 @@ fn push_broken_word_lines(word: &str, max_width: usize, lines: &mut Vec<String>)
     let mut chunk = String::new();
     let mut chunk_width = 0usize;
     for ch in word.chars() {
-        if chunk_width == max_width {
+        let ch_width = display_width(ch.encode_utf8(&mut [0u8; 4]));
+        // Flush before a char that would overflow the line. A double-width
+        // glyph can push the running width past `max_width` by one, so this is
+        // a "would exceed" check rather than exact equality.
+        if chunk_width + ch_width > max_width && !chunk.is_empty() {
             lines.push(std::mem::take(&mut chunk));
             chunk_width = 0;
         }
         chunk.push(ch);
-        chunk_width += 1;
+        chunk_width += ch_width;
     }
     if !chunk.is_empty() {
         lines.push(chunk);
@@ -235,6 +246,32 @@ fn push_broken_word_lines(word: &str, max_width: usize, lines: &mut Vec<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fork 7d715a02: an over-long word is broken by terminal columns, so no
+    /// chunk of double-width glyphs overflows the row.
+    #[test]
+    fn wrap_breaks_double_width_words_by_terminal_columns() {
+        // Six CJK chars = 12 columns. At max_width 5 each chunk holds 2 chars
+        // (4 columns), since a third would reach 6 > 5.
+        let lines = wrap_checkbox_label("一二三四五六", 5);
+        for line in &lines {
+            assert!(
+                display_width(line) <= 5,
+                "chunk {line:?} exceeds 5 columns ({} wide)",
+                display_width(line)
+            );
+        }
+        assert_eq!(lines.concat(), "一二三四五六");
+    }
+
+    /// "世界" and "日本" are 4 columns each, so at max_width 5 they cannot
+    /// share a line (4 + 1 + 4 = 9). A scalar count sees 2 + 1 + 2 = 5 and
+    /// packs both onto one line.
+    #[test]
+    fn wrap_wraps_cjk_words_at_column_boundary() {
+        let lines = wrap_checkbox_label("世界 日本", 5);
+        assert_eq!(lines, vec!["世界".to_string(), "日本".to_string()]);
+    }
 
     #[test]
     fn checkbox_wraps_label_with_continuation_indent() {

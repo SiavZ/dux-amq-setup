@@ -146,6 +146,21 @@ pub fn resume_after_server(
     run_app(app, companion)
 }
 
+/// Resume the TUI after a reload's `exec` failed, with `reason` on the status
+/// line.
+///
+/// The engine never left this process, so this is the same rebuild as coming
+/// back from the web server: no session relaunch, every provider still live.
+pub fn resume_after_failed_reload(
+    engine: Box<Engine>,
+    companion: Box<dyn dux_core::background_serve::BackgroundServeCompanion>,
+    reason: String,
+) -> Result<TuiExit> {
+    let mut app = app::App::resume(*engine)?;
+    app.set_error(reason);
+    run_app(app, companion)
+}
+
 /// Run an App's event loop and translate its [`app::RunExit`] into a
 /// [`TuiExit`] for the binary's orchestration loop. On a flip, the engine is
 /// moved out of the App (no `Drop` runs on the providers, since neither `App`
@@ -201,7 +216,10 @@ pub fn help_text() -> &'static str {
          Usage:\n\
           dux              Launch the TUI\n\
           dux server       Serve the web UI over the headless engine\n\
-          dux config       Manage the configuration file\n\n\
+          dux config       Manage the configuration file\n\
+          dux --version    Print the version and the git commit it was built from\n\
+          dux peer         Route messages between Dux agent sessions\n\
+                           (`dux peer --help` for send, list, sync-amq)\n\n\
          Server subcommand:\n\
           dux server                     Serve on the configured host and port\n\
           dux server --bind <ADDR:PORT>  Bind this exact address instead\n\
@@ -274,6 +292,17 @@ mod tests {
         }
     }
 
+    /// `dux peer` is dispatched by the binary and is how agents message each
+    /// other, so the top-level help must name it.
+    #[test]
+    fn help_lists_the_peer_subcommand() {
+        let help = help_text();
+        assert!(
+            help.contains("dux peer"),
+            "--help must name the `dux peer` subcommand:\n{help}"
+        );
+    }
+
     /// The trust model currently appears only deep in the docs. `--help` is the
     /// one place a user is guaranteed to look, so it must say that there is no
     /// login and that everyone who can reach the address shares the workspace.
@@ -288,5 +317,11 @@ mod tests {
             help.contains("shares"),
             "--help must state that reachable clients share the workspace:\n{help}"
         );
+    }
+
+    #[test]
+    fn help_lists_the_version_flag() {
+        let help = help_text();
+        assert!(help.contains("dux --version"), "{help}");
     }
 }

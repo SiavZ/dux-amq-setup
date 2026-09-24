@@ -263,6 +263,17 @@ pub enum Command {
     /// drain. Returns `EventReaction::Nothing`, because the refreshed ViewModel
     /// broadcast is the feedback rather than a toast on every selection.
     WatchChangedFiles { session_id: Option<String> },
+
+    /// Replace one agent's per-session settings (context mode, YOLO, AMQ
+    /// verify override, watch-rule overrides, auto-clear, system prompt) and,
+    /// optionally, its title. Persists BEFORE touching live memory and leaves
+    /// memory untouched on a store failure (fork 773a6b04, audit03 P1-16).
+    SetSessionSettings {
+        session_id: String,
+        settings: Box<crate::session_settings::SessionSettings>,
+        /// `Some` renames the agent; `Some(None)` clears a custom title.
+        title: Option<Option<String>>,
+    },
 }
 
 impl Engine {
@@ -680,6 +691,12 @@ impl Engine {
                     branch_name,
                 ))))
             }
+
+            Command::SetSessionSettings {
+                session_id,
+                settings,
+                title,
+            } => self.set_session_settings(&session_id, *settings, title),
 
             Command::DeleteTerminal { terminal_id } => {
                 // Graceful close: SIGTERM the terminal and move it to the
@@ -2318,6 +2335,22 @@ mod tests {
             .collect()
     }
 
+    /// Poll a PTY render until every `needle` shows up, for at most 10s, and
+    /// return the last render. A fixed sleep here raced the PTY echo whenever
+    /// the machine was busy and failed spuriously; the caller's assertions are
+    /// unchanged, so a genuine miss still fails, just after the deadline.
+    fn wait_for_render(render: impl Fn() -> String, needles: &[&str]) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let rendered = render();
+            if needles.iter().all(|n| rendered.contains(n)) || std::time::Instant::now() >= deadline
+            {
+                return rendered;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
     fn insert_macro(engine: &mut Engine, name: &str, text: &str, surface: MacroSurface) {
         engine.config.macros.entries.insert(
             name.to_string(),
@@ -2410,8 +2443,10 @@ mod tests {
             _ => panic!("expected Info status reaction"),
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let rendered = rendered_snapshot(engine.providers.get(TabIdRef::new("sess-1")).unwrap());
+        let rendered = wait_for_render(
+            || rendered_snapshot(engine.providers.get(TabIdRef::new("sess-1")).unwrap()),
+            &["first", "second", "^[", "^M"],
+        );
         assert!(
             rendered.contains("first") && rendered.contains("second"),
             "both halves should be visible; got: {rendered:?}"
@@ -2454,8 +2489,10 @@ mod tests {
             _ => panic!("expected Info status reaction"),
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let rendered = rendered_snapshot(&engine.companion_terminals.get("term-1").unwrap().client);
+        let rendered = wait_for_render(
+            || rendered_snapshot(&engine.companion_terminals.get("term-1").unwrap().client),
+            &["ls -la"],
+        );
         assert!(
             rendered.contains("ls -la"),
             "macro text should reach the terminal PTY; got: {rendered:?}"

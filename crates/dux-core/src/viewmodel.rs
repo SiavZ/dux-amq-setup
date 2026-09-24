@@ -3191,7 +3191,9 @@ mod tests {
                 oneshot_output: Default::default(),
                 install_hint: None,
                 forward_scroll: None,
+                forward_mouse: None,
                 web_dragdrop_paste: None,
+                watch: Vec::new(),
             },
         );
         engine.config.providers.commands.insert(
@@ -3206,7 +3208,9 @@ mod tests {
                 oneshot_output: Default::default(),
                 install_hint: None,
                 forward_scroll: None,
+                forward_mouse: None,
                 web_dragdrop_paste: None,
+                watch: Vec::new(),
             },
         );
         let forms = engine.bootstrap().provider_drop_paste;

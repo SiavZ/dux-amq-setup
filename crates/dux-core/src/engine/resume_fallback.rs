@@ -146,7 +146,13 @@ impl Engine {
         let provider_config = crate::config::provider_config(&self.config, &provider);
         // A standalone agent has no project to overlay, so it gets the global
         // environment, not the empty one a missed project lookup falls to.
-        let env = self.session_env(&session);
+        let env = crate::agent_env::agent_launch_env(
+            &self.paths,
+            &self.config,
+            &session,
+            tab_id.as_str(),
+            self.session_env(&session),
+        );
         AgentLaunchRequest {
             session,
             tab_id,
