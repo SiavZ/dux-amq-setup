@@ -975,6 +975,234 @@ fn production_source(source: &str) -> &str {
         .map_or(source, |end| &source[..end])
 }
 
+/// `source` with every comment and every string or char literal's contents
+/// blanked to spaces (newlines kept), so a brace or a word inside one can
+/// neither look like code nor unbalance the nesting count. Same length in
+/// chars as the input, so a position in one is the same position in the other.
+fn code_only(source: &str) -> Vec<char> {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = chars.clone();
+    let blank = |out: &mut Vec<char>, i: usize| {
+        if out[i] != '\n' {
+            out[i] = ' ';
+        }
+    };
+    let mut i = 0;
+    while i < chars.len() {
+        let next = chars.get(i + 1).copied();
+        match chars[i] {
+            '/' if next == Some('/') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    blank(&mut out, i);
+                    i += 1;
+                }
+            }
+            '/' if next == Some('*') => {
+                while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                    blank(&mut out, i);
+                    i += 1;
+                }
+                for _ in 0..2 {
+                    if i < chars.len() {
+                        blank(&mut out, i);
+                        i += 1;
+                    }
+                }
+            }
+            'r' if matches!(next, Some('"') | Some('#'))
+                && (i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_')) =>
+            {
+                let mut j = i + 1;
+                let mut hashes = 0;
+                while chars.get(j) == Some(&'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if chars.get(j) != Some(&'"') {
+                    i += 1;
+                    continue;
+                }
+                j += 1;
+                while j < chars.len() {
+                    if chars[j] == '"' && (1..=hashes).all(|k| chars.get(j + k) == Some(&'#')) {
+                        break;
+                    }
+                    blank(&mut out, j);
+                    j += 1;
+                }
+                i = j + 1 + hashes;
+            }
+            '"' => {
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' {
+                        blank(&mut out, i);
+                        i += 1;
+                    }
+                    if i < chars.len() {
+                        blank(&mut out, i);
+                        i += 1;
+                    }
+                }
+                i += 1;
+            }
+            // A char literal ('x', '\n', '{'); a lifetime ('a) has no closing
+            // quote two or more places on and is left alone.
+            '\'' if next == Some('\\') || chars.get(i + 2) == Some(&'\'') => {
+                i += 1;
+                while i < chars.len() && chars[i] != '\'' {
+                    if chars[i] == '\\' {
+                        blank(&mut out, i);
+                        i += 1;
+                    }
+                    if i < chars.len() {
+                        blank(&mut out, i);
+                        i += 1;
+                    }
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// The 1-based line of every ratatui `Wrap` struct literal in `source` whose
+/// statement carries no `chip-free:` reason: not in the statement's own text
+/// (comments included), and not on the comment lines directly above it. The
+/// literal is found as a token, wherever the formatter put its line breaks and
+/// however its path is qualified, so a call split across lines, a
+/// `ratatui::widgets::` prefix or a literal bound to a variable first are all
+/// seen.
+fn unreasoned_ratatui_wraps(source: &str) -> Vec<usize> {
+    let original: Vec<char> = source.chars().collect();
+    let code = code_only(source);
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let line_of = |pos: usize| original[..pos].iter().filter(|c| **c == '\n').count() + 1;
+    let word: Vec<char> = concat!("Wr", "ap").chars().collect();
+    let mut found = Vec::new();
+    let mut p = 0;
+    while p + word.len() <= code.len() {
+        let is_token = code[p..p + word.len()] == word[..]
+            && (p == 0 || !ident(code[p - 1]))
+            && code.get(p + word.len()).is_none_or(|c| !ident(*c));
+        let literal = is_token && {
+            let mut q = p + word.len();
+            while code.get(q).is_some_and(|c| c.is_whitespace()) {
+                q += 1;
+            }
+            code.get(q) == Some(&'{')
+        };
+        if !literal {
+            p += 1;
+            continue;
+        }
+        // The enclosing statement: back to the `;`, `{` or `}` that ends the
+        // one before it, forward to the `;` or `}` that ends this one.
+        // Walking backwards, an unmatched `(` or `[` is a call or index the
+        // literal sits inside, so the statement goes on; an unmatched `{` is the
+        // block it sits in, and a `}` or `;` at this level ends the one before.
+        let mut depth = 0u32;
+        let mut start = 0;
+        for i in (0..p).rev() {
+            match code[i] {
+                ';' | '}' | '{' if depth == 0 => {
+                    start = i + 1;
+                    break;
+                }
+                ')' | ']' | '}' => depth += 1,
+                '(' | '[' | '{' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        let mut depth = 0i32;
+        let mut end = code.len();
+        for (i, c) in code.iter().enumerate().skip(p) {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' => depth -= 1,
+                '}' if depth <= 0 => {
+                    end = i;
+                    break;
+                }
+                '}' => depth -= 1,
+                ';' if depth <= 0 => {
+                    end = i;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let statement: String = original[start..end].iter().collect();
+        let first_line = line_of(start + statement.len() - statement.trim_start().len());
+        let lines: Vec<&str> = source.lines().collect();
+        let above = lines[..first_line - 1]
+            .iter()
+            .rev()
+            .take_while(|line| line.trim_start().starts_with("//"))
+            .any(|line| line.contains("chip-free:"));
+        if !statement.contains("chip-free:") && !above {
+            found.push(line_of(p));
+        }
+        p += word.len();
+    }
+    found
+}
+
+/// The guard's scanner on the shapes a formatter or a hand can give the call:
+/// split across lines, a qualified path, the literal bound first, and the
+/// reason written anywhere in the statement or on the line above it.
+#[test]
+fn the_wrap_scan_sees_every_shape_of_a_ratatui_wrap() {
+    let w = concat!("Wr", "ap");
+    let cases: Vec<(String, Vec<usize>)> = vec![
+        (format!("p.wrap({w} {{ trim: false }});\n"), vec![1]),
+        (
+            format!(
+                "frame.render_widget(\n    Paragraph::new(lines)\n        .wrap(\n            \
+                 {w} {{ trim: false }},\n        ),\n    area,\n);\n"
+            ),
+            vec![4],
+        ),
+        (
+            format!("p.wrap(ratatui::widgets::{w} {{ trim: true }});\n"),
+            vec![1],
+        ),
+        (
+            format!("let wrap = {w}{{ trim: false }};\np.wrap(wrap);\n"),
+            vec![1],
+        ),
+        (
+            format!("// chip-free: constant words.\np.wrap({w} {{ trim: false }});\n"),
+            vec![],
+        ),
+        (
+            format!(
+                "Paragraph::new(x)\n    // chip-free: a legend.\n    .wrap(\n        {w} {{ trim: \
+                 false }},\n    )\n    .render(a, b);\n"
+            ),
+            vec![],
+        ),
+        (
+            format!(
+                "// chip-free: only the first.\na.wrap({w} {{ trim: false }});\nb.wrap({w} {{ \
+                 trim: false }});\n"
+            ),
+            vec![3],
+        ),
+        (
+            format!(
+                "/// Renders like `{w} {{ trim: false }}`.\nlet s = \"{w} {{\";\nNo{w} {{ x: 1 }};\n"
+            ),
+            vec![],
+        ),
+    ];
+    for (source, expected) in cases {
+        assert_eq!(unreasoned_ratatui_wraps(&source), expected, "{source}");
+    }
+}
+
 /// ratatui's `Wrap` breaks at a chip's pads and between the words of a
 /// multi-word name, so a body that can carry a chip must be pre-wrapped by the
 /// shared wrapper instead. A paragraph that genuinely never carries one says
@@ -995,17 +1223,8 @@ fn no_paragraph_that_can_carry_a_chip_is_wrapped_by_ratatui() {
                 continue;
             }
             let source = std::fs::read_to_string(&path).expect("read source");
-            let lines: Vec<&str> = production_source(&source).lines().collect();
-            for (index, line) in lines.iter().enumerate() {
-                if !line.contains(concat!(".wrap(", "Wrap {")) {
-                    continue;
-                }
-                let reasoned = index
-                    .checked_sub(1)
-                    .is_some_and(|prev| lines[prev].contains("chip-free:"));
-                if !reasoned {
-                    offenders.push(format!("{}:{}", path.display(), index + 1));
-                }
+            for line in unreasoned_ratatui_wraps(production_source(&source)) {
+                offenders.push(format!("{}:{line}", path.display()));
             }
         }
     }
