@@ -4516,9 +4516,10 @@ mod web_dragdrop_paste_render_tests {
 
     /// User-authored `[[providers.claude.watch]]` rules survive a save
     /// round-trip, including comments inside the rule body. `patch_providers`
-    /// never touches the watch array.
+    /// never touches the watch array. The test drives the deprecated sync save
+    /// path directly, as the fork's test did.
     #[test]
-    #[allow(deprecated)] // test drives the sync save path directly, as the fork's test did
+    #[allow(deprecated)]
     fn save_config_preserves_user_authored_watch_rules() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let config_path = dir.path().join("config.toml");

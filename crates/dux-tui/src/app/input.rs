@@ -21543,6 +21543,16 @@ not_a_real_action = ["x"]
         prompt
     }
 
+    /// Fork name for the empty-state palette check (042ac638): with no engines
+    /// attached the command still opens the modal.
+    #[test]
+    fn watch_rules_palette_command_opens_modal() {
+        let mut app = test_app(default_bindings());
+        app.execute_command("watch-rules".to_string())
+            .expect("execute_command");
+        assert!(matches!(app.prompt, PromptState::WatchRules(_)));
+    }
+
     #[test]
     fn the_watch_rules_command_opens_the_list_from_the_palette() {
         let app = palette_app("watch", 0);
