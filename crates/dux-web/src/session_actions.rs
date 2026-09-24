@@ -1074,7 +1074,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        let engine = crate::test_support::bootstrap_test_engine(&paths).unwrap();
         let (handle, _join) = crate::engine_actor::spawn_engine_thread(engine);
         (tmp, crate::server::router(handle), "p1".to_string())
     }
@@ -1223,7 +1223,7 @@ mod tests {
             })
             .unwrap();
         drop(store);
-        let mut engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        let mut engine = crate::test_support::bootstrap_test_engine(&paths).unwrap();
         prepare(&mut engine, tmp.path());
         let (handle, _join) = crate::engine_actor::spawn_engine_thread(engine);
         (tmp, crate::server::router(handle))
@@ -1371,7 +1371,7 @@ mod tests {
             })
             .unwrap();
         drop(store);
-        let mut engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        let mut engine = crate::test_support::bootstrap_test_engine(&paths).unwrap();
         // The gate the dispatch checks, preset so the PUT cannot race the boot
         // probe; the probe itself is pointed at the stand-in gh so enabling
         // the integration never runs a real gh.

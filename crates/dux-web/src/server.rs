@@ -3612,7 +3612,7 @@ mod tests {
             lock_path: tmp.join("dux.lock"),
         };
         std::fs::create_dir_all(&paths.worktrees_root).unwrap();
-        let engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        let engine = crate::test_support::bootstrap_test_engine(&paths).unwrap();
         let (handle, _join) = crate::engine_actor::spawn_engine_thread(engine);
         handle
     }
@@ -3969,7 +3969,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        let engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        let engine = crate::test_support::bootstrap_test_engine(&paths).unwrap();
         let (handle, _join) = crate::engine_actor::spawn_engine_thread(engine);
         handle
     }
@@ -6452,7 +6452,7 @@ mod tests {
                     .unwrap();
             }
         }
-        let engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        let engine = crate::test_support::bootstrap_test_engine(&paths).unwrap();
         let (handle, _join) = crate::engine_actor::spawn_engine_thread(engine);
         handle
     }

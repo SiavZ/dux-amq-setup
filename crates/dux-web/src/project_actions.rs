@@ -901,7 +901,7 @@ mod tests {
             })
             .unwrap();
         drop(store);
-        let mut engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        let mut engine = crate::test_support::bootstrap_test_engine(&paths).unwrap();
         engine.mark_in_flight(dux_core::engine::InFlightKey::AgentLaunch(
             engine
                 .slot_tab_id_of(dux_core::ids::SessionIdRef::new("s1"))

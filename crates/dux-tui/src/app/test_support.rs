@@ -12,7 +12,7 @@ use crate::app::{
     MouseLayoutState, OverlayMouseLayoutState, PromptState, RedrawGate, RightSection, TextInput,
 };
 use crate::clipboard::Clipboard;
-use crate::config::{Config, DuxPaths, ProjectConfig};
+use crate::config::{DuxPaths, ProjectConfig};
 use crate::keybindings::{BINDING_DEFS, RuntimeBindings};
 use crate::model::{AgentSession, Project, ProjectBranchStatus, ProviderKind, SessionStatus};
 use crate::statusline::KeyedStatusController;
@@ -137,7 +137,7 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
         worker_tx.clone(),
     );
     let engine = dux_core::engine::Engine {
-        config: Config::default(),
+        config: dux_core::test_provider::harmless_config(),
         paths,
         session_store,
         projects: vec![project],
@@ -546,4 +546,13 @@ fn test_app_removes_its_scratch_root_when_dropped() {
         "the scratch root {} outlived the app",
         root.display()
     );
+}
+
+/// Every test in this crate builds its engine here, so a stock provider table
+/// in the fixture would let any launching test exec the developer's real agent
+/// CLI.
+#[test]
+fn test_app_cannot_launch_a_real_agent_cli() {
+    let app = test_app(default_bindings());
+    dux_core::test_provider::assert_fixture_config_is_harmless(&app.engine.config);
 }

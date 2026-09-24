@@ -4392,7 +4392,7 @@ mod tests {
         let config_writer =
             dux_core::config_queue::ConfigWriteQueue::new(paths.config_path.clone());
         let engine = dux_core::engine::Engine {
-            config: Config::default(),
+            config: dux_core::test_provider::harmless_config(),
             paths,
             session_store,
             projects,
@@ -4726,7 +4726,7 @@ mod tests {
             .expect("single-instance lock for test engine");
         let (worker_tx, worker_rx) = mpsc::channel();
         // auto_reopen on so bootstrap WOULD relaunch, proving resume's skip.
-        let mut config = Config::default();
+        let mut config = dux_core::test_provider::harmless_config();
         config.ui.auto_reopen_agents = true;
         let config_writer =
             dux_core::config_queue::ConfigWriteQueue::new(paths.config_path.clone());

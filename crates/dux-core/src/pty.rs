@@ -1086,6 +1086,9 @@ impl PtyClient {
             track_agent_signals,
             identity,
         } = opts;
+        // Test builds only: never exec a developer's real agent CLI.
+        #[cfg(any(test, feature = "test-support"))]
+        crate::test_provider::refuse_real_agent_cli(command)?;
         let pty_system = NativePtySystem::default();
         let pair = pty_system
             .openpty(PtySize {

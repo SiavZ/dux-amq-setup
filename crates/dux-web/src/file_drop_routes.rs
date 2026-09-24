@@ -454,7 +454,7 @@ mod tests {
                 .create_session(&sample_session("s1", wt.to_string_lossy().as_ref()))
                 .unwrap();
         }
-        let engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        let engine = crate::test_support::bootstrap_test_engine(&paths).unwrap();
         let (handle, _join) = crate::engine_actor::spawn_engine_thread(engine);
         let app = crate::server::build_app(
             handle,
@@ -592,7 +592,7 @@ mod tests {
                 .create_session(&sample_session("s1", wt.to_string_lossy().as_ref()))
                 .unwrap();
         }
-        let mut engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        let mut engine = crate::test_support::bootstrap_test_engine(&paths).unwrap();
         // A plain, always-present shell, so the test does not depend on whatever
         // the machine's own terminal setting happens to be.
         engine.config.terminal.command = "/bin/sh".to_string();
@@ -1179,7 +1179,7 @@ mod tests {
                 .create_session(&sample_session("s1", wt.to_string_lossy().as_ref()))
                 .unwrap();
         }
-        let mut engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        let mut engine = crate::test_support::bootstrap_test_engine(&paths).unwrap();
         // A plain, always-present shell, so the test does not depend on whatever
         // the machine's own terminal setting happens to be.
         engine.config.terminal.command = "/bin/sh".to_string();

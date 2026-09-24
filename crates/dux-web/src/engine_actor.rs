@@ -4176,7 +4176,8 @@ fn auto_reopen_log_line(count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bootstrap::bootstrap_engine;
+    // The test flavour: stock provider names, harmless commands.
+    use crate::test_support::bootstrap_test_engine as bootstrap_engine;
     use dux_core::config::{DuxPaths, server_restart_settings_changed};
     use dux_core::statusline::FINAL_REPLAY_WINDOW;
 

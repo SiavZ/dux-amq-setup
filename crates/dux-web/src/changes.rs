@@ -894,7 +894,7 @@ mod tests {
                 .create_session(&sample_session("s_err", wt_err.to_string_lossy().as_ref()))
                 .unwrap();
         }
-        let engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        let engine = crate::test_support::bootstrap_test_engine(&paths).unwrap();
         let (handle, _join) = crate::engine_actor::spawn_engine_thread(engine);
         (handle, Arc::new(EventBus::new()), tmp, wt)
     }

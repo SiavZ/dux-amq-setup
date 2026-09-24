@@ -62,6 +62,8 @@ pub mod tab_verdict;
 pub mod tailscale;
 pub mod term_identity;
 pub mod terminal_title;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_provider;
 pub mod text;
 pub mod theme;
 pub mod urls;

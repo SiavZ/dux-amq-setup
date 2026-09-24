@@ -772,7 +772,7 @@ mod tests {
                 .create_session(&standalone_session("sa1", plain.to_string_lossy().as_ref()))
                 .unwrap();
         }
-        let engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        let engine = crate::test_support::bootstrap_test_engine(&paths).unwrap();
         let (handle, _join) = crate::engine_actor::spawn_engine_thread(engine);
 
         let slot: std::sync::Arc<std::sync::Mutex<Option<AppState>>> = Default::default();

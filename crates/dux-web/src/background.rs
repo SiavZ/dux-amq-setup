@@ -279,7 +279,7 @@ mod tests {
             lock_path: tmp.path().join("dux.lock"),
         };
         std::fs::create_dir_all(&paths.worktrees_root).expect("worktrees dir");
-        let engine = crate::bootstrap::bootstrap_engine(&paths).expect("engine");
+        let engine = crate::test_support::bootstrap_test_engine(&paths).expect("engine");
         // The terminal UI spawned the four global workers before it started
         // serving. Mark the two observable ones as already up, so a test can tell
         // "the background server left them alone" from "nothing ever started".

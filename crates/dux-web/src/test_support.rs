@@ -13,6 +13,18 @@ use tempfile::TempDir;
 use crate::engine_actor::EngineHandle;
 use crate::server;
 
+/// [`crate::bootstrap::bootstrap_engine`] for tests: the same boot, with every
+/// provider pointed at a harmless stand-in under its stock name, so no test that
+/// creates or launches an agent can exec the developer's real agent CLI. Every
+/// test in this crate boots through here rather than the production function.
+pub(crate) fn bootstrap_test_engine(
+    paths: &dux_core::config::DuxPaths,
+) -> anyhow::Result<dux_core::engine::Engine> {
+    let mut engine = crate::bootstrap::bootstrap_engine(paths)?;
+    dux_core::test_provider::defuse_providers(&mut engine.config);
+    Ok(engine)
+}
+
 /// Boot a minimal headless engine handle rooted at `tmp`. The handle just needs
 /// to exist; routing-only tests never drive a real agent through it.
 pub(crate) fn test_engine_handle(tmp: &Path) -> EngineHandle {
@@ -24,7 +36,7 @@ pub(crate) fn test_engine_handle(tmp: &Path) -> EngineHandle {
         lock_path: tmp.join("dux.lock"),
     };
     std::fs::create_dir_all(&paths.worktrees_root).unwrap();
-    let engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+    let engine = crate::test_support::bootstrap_test_engine(&paths).unwrap();
     let (handle, _join) = crate::engine_actor::spawn_engine_thread(engine);
     handle
 }
@@ -55,4 +67,22 @@ pub(crate) async fn boot_plain_test_server() -> (TempDir, SocketAddr) {
         .await;
     });
     (tmp, addr)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_test_boot_cannot_launch_a_real_agent_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = dux_core::config::DuxPaths {
+            root: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            sessions_db_path: tmp.path().join("sessions.sqlite3"),
+            worktrees_root: tmp.path().join("worktrees"),
+            lock_path: tmp.path().join("dux.lock"),
+        };
+        std::fs::create_dir_all(&paths.worktrees_root).unwrap();
+        let engine = super::bootstrap_test_engine(&paths).unwrap();
+        dux_core::test_provider::assert_fixture_config_is_harmless(&engine.config);
+    }
 }

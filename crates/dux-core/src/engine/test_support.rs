@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use chrono::Utc;
 use tempfile::TempDir;
 
-use crate::config::{Config, DuxPaths};
+use crate::config::DuxPaths;
 use crate::engine::Engine;
 use crate::lockfile::SingleInstanceLock;
 use crate::model::{
@@ -39,7 +39,9 @@ pub(crate) fn test_engine() -> (Engine, TempDir) {
         worker_tx.clone(),
     );
     let engine = Engine {
-        config: Config::default(),
+        // Stock provider names, harmless commands: a test that launches an agent
+        // must never exec the developer's real CLI.
+        config: crate::test_provider::harmless_config(),
         paths,
         session_store,
         projects: Vec::new(),
