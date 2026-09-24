@@ -1375,8 +1375,10 @@ impl App {
         let label_fg = self.theme.header_label_fg;
         let mut spans = vec![
             Span::styled(" dux ", Style::default().fg(label_fg).bg(bg)),
+            // The build, not just the version: every development build says
+            // "development", so the commit is what tells them apart.
             Span::styled(
-                env!("DUX_DISPLAY_VERSION"),
+                dux_core::version::long(),
                 Style::default().fg(self.theme.branch_fg).bg(bg),
             ),
         ];
@@ -13214,6 +13216,32 @@ mod tests {
     /// The old bar wrapped its entire body in "if a project is selected", so a
     /// project-less agent got the dux name and version and nothing else, losing
     /// the provider and the terminal count with it.
+    /// The header identifies the BUILD: every development build shares the
+    /// "development" label, so the commit rides along to tell them apart.
+    #[test]
+    fn the_top_bar_names_the_commit_the_binary_was_built_from() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_app(default_bindings());
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render frame");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            rendered.contains(&dux_core::version::long()),
+            "the header must show {}; got:\n{rendered}",
+            dux_core::version::long()
+        );
+    }
+
     #[test]
     fn the_top_bar_names_a_standalone_agents_folder_and_provider() {
         use ratatui::Terminal;

@@ -727,6 +727,7 @@ dependencies = [
  "dux-core",
  "dux-tui",
  "dux-web",
+ "tempfile",
 ]
 
 [[package]]

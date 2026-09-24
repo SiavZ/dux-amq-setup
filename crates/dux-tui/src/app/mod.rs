@@ -3625,7 +3625,7 @@ impl App {
         let mut config = ensure_config(&paths)?;
 
         logger::init(&config.logging, &paths);
-        logger::info("bootstrapping dux");
+        logger::info(&format!("bootstrapping dux {}", dux_core::version::long()));
 
         // Validate and build runtime keybindings from config.
         if let Err(msg) = validate_keys(&config.keys) {

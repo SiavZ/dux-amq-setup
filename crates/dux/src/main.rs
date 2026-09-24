@@ -23,6 +23,12 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("server") => run_server(args),
+        // Before anything touches config or the lock: a version query must work
+        // on a machine with no dux home and while another dux is running.
+        Some("--version" | "-V") => {
+            println!("dux {}", dux_core::version::long());
+            Ok(())
+        }
         _ => run_tui_with_flip(),
     }
 }
