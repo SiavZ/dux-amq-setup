@@ -297,6 +297,17 @@ pub(crate) const TERMINAL_WORKING_WORD: &str = "Running";
 /// dialog carries the same label; keep them in step.
 const CHECKOUT_DEFAULT_BRANCH_LABEL: &str = "Check out default branch";
 
+/// What differs between the delete-project and remove-project confirmations;
+/// the frame, the body wrap and the Cancel / Danger pair are shared.
+struct ProjectConfirmDialog<'a> {
+    title: &'a str,
+    body: &'a dux_core::prose::Prose,
+    confirm_label: &'a str,
+    confirm_focused: bool,
+    cancel_target: ButtonPressedTarget,
+    confirm_target: ButtonPressedTarget,
+}
+
 /// The colored state word on an agent row's second line, read off the same flags
 /// that drive the working spinner and the attention pulse so the word cannot
 /// disagree with the motion cue. Mirrors the web's `stateWord`
@@ -8061,6 +8072,142 @@ impl App {
         };
     }
 
+    /// "Delete project?": the core body (`project_prose`), the same words the
+    /// browser's Delete project dialog prints, and a Cancel / Delete pair with
+    /// Cancel focused. Delete is the Danger kind: the cascade removes every
+    /// agent's worktree from disk.
+    fn render_confirm_delete_project_prompt(&mut self, frame: &mut Frame) {
+        let PromptState::ConfirmDeleteProject {
+            project_name,
+            agent_count,
+            focus,
+            ..
+        } = &self.prompt
+        else {
+            return;
+        };
+        let body =
+            dux_core::project_prose::delete_project_confirm_prose(Some(project_name), *agent_count);
+        let confirm_focused = focus.is_confirm();
+        let (cancel_button, confirm_button) = self.render_project_confirm(
+            frame,
+            ProjectConfirmDialog {
+                title: "Delete Project",
+                body: &body,
+                confirm_label: "Delete",
+                confirm_focused,
+                cancel_target: ButtonPressedTarget::ConfirmDeleteProjectCancel,
+                confirm_target: ButtonPressedTarget::ConfirmDeleteProjectConfirm,
+            },
+        );
+        self.overlay_layout.active = OverlayMouseLayout::ConfirmDeleteProject {
+            cancel_button,
+            confirm_button,
+        };
+    }
+
+    /// "Remove project?": the core body, the browser's Remove project dialog's
+    /// words, and a Cancel / Remove pair with Cancel focused. Remove is the
+    /// Danger kind like the browser's destructive button: it takes the project
+    /// (and any orphaned agents' records) out of dux.
+    fn render_confirm_remove_project_prompt(&mut self, frame: &mut Frame) {
+        let PromptState::ConfirmRemoveProject {
+            project_name,
+            agent_count,
+            focus,
+            ..
+        } = &self.prompt
+        else {
+            return;
+        };
+        let body =
+            dux_core::project_prose::remove_project_confirm_prose(Some(project_name), *agent_count);
+        let confirm_focused = focus.is_confirm();
+        let (cancel_button, confirm_button) = self.render_project_confirm(
+            frame,
+            ProjectConfirmDialog {
+                title: "Remove Project",
+                body: &body,
+                confirm_label: "Remove",
+                confirm_focused,
+                cancel_target: ButtonPressedTarget::ConfirmRemoveProjectCancel,
+                confirm_target: ButtonPressedTarget::ConfirmRemoveProjectConfirm,
+            },
+        );
+        self.overlay_layout.active = OverlayMouseLayout::ConfirmRemoveProject {
+            cancel_button,
+            confirm_button,
+        };
+    }
+
+    /// The shared body of the two project confirmations: prose sized to its
+    /// wrapped rows, and a Cancel / Danger pair. Returns the two button rects
+    /// for the caller to publish under its own layout variant.
+    fn render_project_confirm(
+        &mut self,
+        frame: &mut Frame,
+        dialog: ProjectConfirmDialog<'_>,
+    ) -> (Rect, Rect) {
+        self.render_dim_overlay(frame);
+        // Sized to the wrapped prose: the body does not scroll.
+        let dialog_width = 60u16.min(frame.area().width.max(1));
+        let inner_width = dialog_width.saturating_sub(2);
+        let (lines, body_height) = self.prose_body(dialog.body, inner_width);
+        let area = centered_rect_exact(dialog_width, 2 + body_height + 1 + 3, frame.area());
+        self.clear_overlay_area(frame, area);
+        let outer = self.themed_overlay_block(dialog.title);
+        let inner = outer.inner(area);
+        outer.render(area, frame.buffer_mut());
+
+        let [body_area, _, buttons_area] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(body_height),
+                Constraint::Length(1),
+                Constraint::Length(3),
+            ])
+            .areas(inner);
+
+        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
+
+        let btn_width = shared_button_width(&["Cancel", dialog.confirm_label]);
+        let gap = 2u16;
+        let total = btn_width * 2 + gap;
+        let left_offset = buttons_area.width.saturating_sub(total) / 2;
+        let cancel_area = Rect {
+            x: buttons_area.x + left_offset,
+            y: buttons_area.y,
+            width: btn_width,
+            height: 3,
+        };
+        let confirm_area = Rect {
+            x: cancel_area.x + btn_width + gap,
+            y: buttons_area.y,
+            width: btn_width,
+            height: 3,
+        };
+
+        Button::new("Cancel")
+            .kind(ButtonKind::Confirm)
+            .state(button_state_for(
+                dialog.cancel_target,
+                self.pressed_button,
+                !dialog.confirm_focused,
+                true,
+            ))
+            .render(frame, cancel_area, &self.theme);
+        Button::new(dialog.confirm_label)
+            .kind(ButtonKind::Danger)
+            .state(button_state_for(
+                dialog.confirm_target,
+                self.pressed_button,
+                dialog.confirm_focused,
+                true,
+            ))
+            .render(frame, confirm_area, &self.theme);
+        (cancel_area, confirm_area)
+    }
+
     fn render_confirm_quit_prompt(&mut self, frame: &mut Frame) {
         let PromptState::ConfirmQuit {
             agent_count,
@@ -10666,6 +10813,12 @@ impl App {
             }
             PromptState::ConfirmCheckoutDefaultBranch { .. } => {
                 self.render_confirm_checkout_default_branch_prompt(frame)
+            }
+            PromptState::ConfirmDeleteProject { .. } => {
+                self.render_confirm_delete_project_prompt(frame)
+            }
+            PromptState::ConfirmRemoveProject { .. } => {
+                self.render_confirm_remove_project_prompt(frame)
             }
             PromptState::ConfirmDetachAgent { .. } => {
                 self.render_confirm_detach_agent_prompt(frame)

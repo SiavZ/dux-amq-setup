@@ -3352,78 +3352,135 @@ impl App {
         Ok(())
     }
 
+    /// `remove-project`: ask first, the same question the browser's Remove
+    /// project dialog asks. A real project that still holds agents is refused
+    /// before anything is asked (removing it would orphan them; `delete-project`
+    /// takes the agents too). With no real project selected, an orphaned
+    /// agent's group (its project record is gone) is the target instead.
     pub(crate) fn remove_selected_project(&mut self) -> Result<()> {
         if let Some(project) = self.take_selected_project() {
-            // Real project: keep the guard. Removing one that still has agents
-            // here would orphan them. Use "delete project" to remove agents too.
-            let has_sessions = self
-                .engine
-                .sessions
-                .iter()
-                .any(|s| s.project_id() == Some(project.id.as_str()));
-            if has_sessions {
+            if self.project_agent_count(&project.id) > 0 {
                 self.set_error("Delete all agents in this project first.");
                 return Ok(());
             }
-            let project_name = project.name.clone();
-            let success_name = project_name.clone();
-            let db_fail_name = project_name.clone();
-            let op = dux_core::engine::status_op(format!(
-                "Removing project \"{project_name}\" from workspace..."
-            ))
-            .resolve_in_handler(move |o: &PersistFinalOutcome| match o {
-                PersistFinalOutcome::Saved => dux_core::engine::Final::info(format!(
-                    "Removed project \"{success_name}\" from app"
-                )),
-                PersistFinalOutcome::DbFailed(error) => dux_core::engine::Final::error(format!(
-                    "Could not remove project \"{db_fail_name}\" from the database: {error}"
-                )),
-                PersistFinalOutcome::ConfigWriteFailed(err) => dux_core::engine::Final::error(format!(
-                    "Project was removed from the database, but config.toml could not be updated: {err}"
-                )),
-            });
-            let pending = self.engine.begin_status_op(&op);
-            let op_id = op.id().to_string();
-            self.pending_persist_ops.insert(op_id.clone(), op);
-            let reaction = self.engine.apply(Command::PersistProject {
-                action: Box::new(ProjectPersistenceAction::Remove {
-                    project_id: project.id.clone(),
-                    project_name: project.name.clone(),
-                }),
-                status_op_id: Some(op_id),
-            })?;
-            self.apply_reaction(reaction);
-            self.apply_reaction(dux_core::engine::EventReaction::Status(pending));
+            self.prompt = PromptState::ConfirmRemoveProject {
+                project_id: project.id.clone(),
+                project_name: project.name.clone(),
+                agent_count: 0,
+                orphaned: false,
+                focus: ConfirmFocus::Cancel, // Cancel is the safe default
+            };
             return Ok(());
         }
-        // No real project is selected. An orphaned session, whose project record
-        // is gone, clears the whole ghost group: `Command::RemoveProject` cascades
-        // the orphaned session records and keeps their worktrees on disk. A
-        // standalone agent is not an orphan and has no ghost group to clear.
+        // A standalone agent is not an orphan and has no ghost group to clear.
         if let Some(session) = self.selected_session().cloned()
             && let Some(project_id) = session.project_id().map(str::to_string)
         {
-            let project_name = dux_core::sidebar::short_project_id(&project_id);
-            let reaction = self.engine.apply(Command::RemoveProject {
+            self.prompt = PromptState::ConfirmRemoveProject {
+                project_name: dux_core::sidebar::short_project_id(&project_id),
+                agent_count: self.project_agent_count(&project_id),
                 project_id,
-                project_name,
-            })?;
-            self.apply_reaction(reaction);
-            // The cascade mutates engine.sessions synchronously; refresh the cache
-            // (and fix the selection) so render never indexes a stale row.
-            self.rebuild_left_items();
+                orphaned: true,
+                focus: ConfirmFocus::Cancel, // Cancel is the safe default
+            };
             return Ok(());
         }
         self.set_error("Select a project first.");
         Ok(())
     }
 
+    /// `delete-project`: ask first, the same question the browser's Delete
+    /// project dialog asks, because the cascade deletes every agent in the
+    /// project and removes their worktrees from disk. Nothing runs until the
+    /// dialog is confirmed (`resolve_confirm_delete_project`).
     pub(crate) fn delete_selected_project(&mut self) -> Result<()> {
         let Some(project) = self.take_selected_project() else {
             self.set_error("Select a project first.");
             return Ok(());
         };
+        self.prompt = PromptState::ConfirmDeleteProject {
+            agent_count: self.project_agent_count(&project.id),
+            project_id: project.id,
+            project_name: project.name,
+            focus: ConfirmFocus::Cancel, // Cancel is the safe default
+        };
+        Ok(())
+    }
 
+    /// How many agents belong to `project_id`, a real project's or an
+    /// orphaned group's.
+    pub(crate) fn project_agent_count(&self, project_id: &str) -> usize {
+        self.engine
+            .sessions
+            .iter()
+            .filter(|s| s.project_id() == Some(project_id))
+            .count()
+    }
+
+    /// Remove a real, agent-less project from dux, keeping its files. Runs only
+    /// once the removal is confirmed, and refuses a project that has gained an
+    /// agent behind the open dialog.
+    pub(crate) fn run_remove_project(&mut self, project: Project) -> Result<()> {
+        // Removing one that still has agents here would orphan them. Use
+        // "delete project" to remove agents too.
+        if self.project_agent_count(&project.id) > 0 {
+            self.set_error("Delete all agents in this project first.");
+            return Ok(());
+        }
+        let project_name = project.name.clone();
+        let success_name = project_name.clone();
+        let db_fail_name = project_name.clone();
+        let op = dux_core::engine::status_op(format!(
+            "Removing project \"{project_name}\" from workspace..."
+        ))
+        .resolve_in_handler(move |o: &PersistFinalOutcome| match o {
+            PersistFinalOutcome::Saved => dux_core::engine::Final::info(format!(
+                "Removed project \"{success_name}\" from app"
+            )),
+            PersistFinalOutcome::DbFailed(error) => dux_core::engine::Final::error(format!(
+                "Could not remove project \"{db_fail_name}\" from the database: {error}"
+            )),
+            PersistFinalOutcome::ConfigWriteFailed(err) => dux_core::engine::Final::error(format!(
+                "Project was removed from the database, but config.toml could not be updated: {err}"
+            )),
+        });
+        let pending = self.engine.begin_status_op(&op);
+        let op_id = op.id().to_string();
+        self.pending_persist_ops.insert(op_id.clone(), op);
+        let reaction = self.engine.apply(Command::PersistProject {
+            action: Box::new(ProjectPersistenceAction::Remove {
+                project_id: project.id.clone(),
+                project_name: project.name.clone(),
+            }),
+            status_op_id: Some(op_id),
+        })?;
+        self.apply_reaction(reaction);
+        self.apply_reaction(dux_core::engine::EventReaction::Status(pending));
+        Ok(())
+    }
+
+    /// Clear an orphaned group (agents whose project record is gone):
+    /// `Command::RemoveProject` cascades the orphaned session records and keeps
+    /// their worktrees on disk. Runs only once the removal is confirmed.
+    pub(crate) fn run_remove_orphaned_project(
+        &mut self,
+        project_id: String,
+        project_name: String,
+    ) -> Result<()> {
+        let reaction = self.engine.apply(Command::RemoveProject {
+            project_id,
+            project_name,
+        })?;
+        self.apply_reaction(reaction);
+        // The cascade mutates engine.sessions synchronously; refresh the cache
+        // (and fix the selection) so render never indexes a stale row.
+        self.rebuild_left_items();
+        Ok(())
+    }
+
+    /// Delete a project, every agent in it and their worktrees. Runs only once
+    /// the deletion is confirmed.
+    pub(crate) fn run_delete_project(&mut self, project: Project) -> Result<()> {
         // The whole delete (guards, the per-session cascade with worktree
         // removal, and the project record and config removal) is owned by the
         // core `Command::DeleteProject`, so the two surfaces cannot disagree on
@@ -7242,7 +7299,9 @@ mod tests {
         app.selected_left = 0;
 
         app.delete_selected_project()
-            .expect("should return Ok (error reported via status line)");
+            .expect("open the confirmation");
+        // The engine's guard answers the confirmed delete.
+        app.resolve_confirm_delete_project(true);
 
         // Session must still be present, because deletion was refused.
         assert!(
@@ -7284,7 +7343,9 @@ mod tests {
         app.selected_left = 0;
 
         app.delete_selected_project()
-            .expect("should return Ok (error reported via status line)");
+            .expect("open the confirmation");
+        // The engine's guard answers the confirmed delete.
+        app.resolve_confirm_delete_project(true);
 
         assert!(
             app.engine.sessions.iter().any(|s| s.id == "s1"),
@@ -8169,6 +8230,300 @@ mod tests {
             "status: {}",
             app.status.text()
         );
+    }
+
+    /// A real project (a clone added through the add-project flow) holding one
+    /// real agent whose worktree exists on disk, targeted by the project-scoped
+    /// palette commands.
+    fn project_with_a_real_agent() -> (tempfile::TempDir, App, PathBuf) {
+        let (root, _repo, mut app) = project_based_on_develop();
+        let worktree = create_agent_worktree(&mut app);
+        assert!(worktree.is_dir(), "the agent's worktree is on disk");
+        app.project_chooser_context = Some(app.engine.projects[0].id.clone());
+        (root, app, worktree)
+    }
+
+    #[test]
+    fn the_delete_project_command_asks_first_and_deletes_nothing() {
+        let (_root, mut app, worktree) = project_with_a_real_agent();
+
+        app.execute_command("delete-project".to_string())
+            .expect("open the confirmation");
+
+        match &app.prompt {
+            PromptState::ConfirmDeleteProject {
+                project_name,
+                agent_count,
+                focus,
+                ..
+            } => {
+                assert_eq!(project_name, "repo");
+                assert_eq!(*agent_count, 1);
+                assert_eq!(*focus, ConfirmFocus::Cancel, "Cancel is the safe default");
+            }
+            other => panic!("expected the delete-project confirmation, got {other:?}"),
+        }
+        assert_eq!(app.engine.projects.len(), 1, "nothing is deleted yet");
+        assert_eq!(app.engine.sessions.len(), 1, "nothing is deleted yet");
+        assert!(worktree.is_dir(), "the worktree is untouched");
+    }
+
+    #[test]
+    fn escape_cancels_the_project_delete_and_keeps_the_worktree() {
+        let (_root, mut app, worktree) = project_with_a_real_agent();
+        app.execute_command("delete-project".to_string())
+            .expect("open the confirmation");
+
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        app.drain_events();
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert_eq!(app.engine.projects.len(), 1);
+        assert_eq!(app.engine.sessions.len(), 1);
+        assert!(worktree.is_dir(), "the worktree is still on disk");
+        assert_eq!(
+            app.status.text(),
+            "Cancelled deleting project \"repo\". Nothing was deleted: its agent and its \
+             worktree are still here."
+        );
+    }
+
+    #[test]
+    fn pressing_cancel_on_the_project_delete_deletes_nothing_either() {
+        let (_root, mut app, worktree) = project_with_a_real_agent();
+        app.execute_command("delete-project".to_string())
+            .expect("open the confirmation");
+
+        // Cancel has focus; activating it is the same answer as Escape.
+        app.handle_key(key(KeyCode::Char(' '), KeyModifiers::NONE))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        app.drain_events();
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert_eq!(app.engine.projects.len(), 1);
+        assert_eq!(app.engine.sessions.len(), 1);
+        assert!(worktree.is_dir(), "the worktree is still on disk");
+        assert!(
+            app.status.text().starts_with("Cancelled deleting project"),
+            "{}",
+            app.status.text()
+        );
+    }
+
+    #[test]
+    fn confirming_the_project_delete_runs_the_cascade_and_removes_the_worktree() {
+        let (_root, mut app, worktree) = project_with_a_real_agent();
+        app.execute_command("delete-project".to_string())
+            .expect("open the confirmation");
+
+        // Move focus from Cancel to Delete, then press it.
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert!(app.engine.projects.is_empty(), "the project is gone");
+        assert!(app.engine.sessions.is_empty(), "its agent is gone");
+        assert!(
+            app.engine.session_store.load_projects().unwrap().is_empty(),
+            "the project record is gone"
+        );
+        assert!(!worktree.exists(), "the worktree was removed from disk");
+    }
+
+    #[test]
+    fn confirming_the_project_delete_after_the_project_is_gone_says_so() {
+        let (_root, mut app, worktree) = project_with_a_real_agent();
+        app.execute_command("delete-project".to_string())
+            .expect("open the confirmation");
+        // The project leaves behind the open dialog (the browser removed it).
+        app.engine.projects.clear();
+
+        app.resolve_confirm_delete_project(true);
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert_eq!(app.engine.sessions.len(), 1, "nothing is cascaded");
+        assert!(worktree.is_dir(), "the worktree is untouched");
+        assert_eq!(
+            app.status.text(),
+            "Project \"repo\" is gone, so there was nothing to delete."
+        );
+    }
+
+    /// Click the middle of `rect` the way a person does: press, then release.
+    fn click(app: &mut App, rect: ratatui::layout::Rect) {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (column, row) = (rect.x + rect.width / 2, rect.y + rect.height / 2);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+    }
+
+    fn render_once(app: &mut App) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("render");
+    }
+
+    #[test]
+    fn clicking_the_project_delete_buttons_cancels_and_confirms() {
+        let (_root, mut app, worktree) = project_with_a_real_agent();
+
+        app.execute_command("delete-project".to_string())
+            .expect("open the confirmation");
+        render_once(&mut app);
+        let OverlayMouseLayout::ConfirmDeleteProject { cancel_button, .. } =
+            app.overlay_layout.active
+        else {
+            panic!("the dialog must publish its buttons for the mouse");
+        };
+        click(&mut app, cancel_button);
+        assert!(matches!(app.prompt, PromptState::None));
+        assert_eq!(app.engine.projects.len(), 1, "Cancel deletes nothing");
+        assert!(worktree.is_dir());
+
+        app.project_chooser_context = Some(app.engine.projects[0].id.clone());
+        app.execute_command("delete-project".to_string())
+            .expect("open the confirmation");
+        render_once(&mut app);
+        let OverlayMouseLayout::ConfirmDeleteProject { confirm_button, .. } =
+            app.overlay_layout.active
+        else {
+            panic!("the dialog must publish its buttons for the mouse");
+        };
+        click(&mut app, confirm_button);
+        assert!(app.engine.projects.is_empty(), "Delete runs the cascade");
+        assert!(!worktree.exists(), "the worktree was removed from disk");
+    }
+
+    /// A real project with no agents, targeted by the project-scoped commands.
+    fn agentless_project() -> (tempfile::TempDir, App) {
+        let (root, _repo, mut app) = project_based_on_develop();
+        app.project_chooser_context = Some(app.engine.projects[0].id.clone());
+        (root, app)
+    }
+
+    #[test]
+    fn the_remove_project_command_asks_first_and_removes_nothing() {
+        let (_root, mut app) = agentless_project();
+
+        app.execute_command("remove-project".to_string())
+            .expect("open the confirmation");
+
+        match &app.prompt {
+            PromptState::ConfirmRemoveProject {
+                project_name,
+                agent_count,
+                focus,
+                ..
+            } => {
+                assert_eq!(project_name, "repo");
+                assert_eq!(*agent_count, 0);
+                assert_eq!(*focus, ConfirmFocus::Cancel, "Cancel is the safe default");
+            }
+            other => panic!("expected the remove-project confirmation, got {other:?}"),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        app.drain_events();
+        assert_eq!(app.engine.projects.len(), 1, "nothing is removed yet");
+        assert_eq!(app.engine.session_store.load_projects().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn escape_cancels_the_project_removal() {
+        let (_root, mut app) = agentless_project();
+        app.execute_command("remove-project".to_string())
+            .expect("open the confirmation");
+
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        app.drain_events();
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert_eq!(app.engine.projects.len(), 1);
+        assert_eq!(app.engine.session_store.load_projects().unwrap().len(), 1);
+        assert_eq!(
+            app.status.text(),
+            "Cancelled removing project \"repo\". Nothing was removed."
+        );
+    }
+
+    #[test]
+    fn confirming_the_project_removal_removes_the_record_and_keeps_the_folder() {
+        let (_root, mut app) = agentless_project();
+        let folder = PathBuf::from(&app.engine.projects[0].path);
+        app.execute_command("remove-project".to_string())
+            .expect("open the confirmation");
+
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        drain_until(&mut app, "the project to be removed", |app| {
+            app.engine.projects.is_empty()
+        });
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert!(app.engine.session_store.load_projects().unwrap().is_empty());
+        assert!(folder.is_dir(), "the source checkout stays on disk");
+    }
+
+    #[test]
+    fn removing_a_project_that_still_has_agents_is_refused_without_asking() {
+        let (_root, mut app, worktree) = project_with_a_real_agent();
+
+        app.execute_command("remove-project".to_string())
+            .expect("refuse");
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert_eq!(
+            app.status.text(),
+            "Delete all agents in this project first."
+        );
+        assert_eq!(app.engine.projects.len(), 1);
+        assert!(worktree.is_dir());
+    }
+
+    #[test]
+    fn removing_an_orphaned_group_asks_first_and_keeps_the_worktrees() {
+        let (_root, mut app, worktree) = project_with_a_real_agent();
+        // The project record goes, leaving its agent as an orphan.
+        app.engine.projects.clear();
+        app.project_chooser_context = None;
+        app.rebuild_left_items();
+        app.selected_left = app
+            .left_items()
+            .iter()
+            .position(|item| matches!(item, LeftItem::Session(_)))
+            .expect("the orphaned agent's row");
+
+        app.execute_command("remove-project".to_string())
+            .expect("open the confirmation");
+        match &app.prompt {
+            PromptState::ConfirmRemoveProject { agent_count, .. } => {
+                assert_eq!(*agent_count, 1);
+            }
+            other => panic!("expected the remove-project confirmation, got {other:?}"),
+        }
+        assert_eq!(app.engine.sessions.len(), 1, "nothing is removed yet");
+
+        app.resolve_confirm_remove_project(true);
+
+        assert!(app.engine.sessions.is_empty(), "the orphan record is gone");
+        assert!(worktree.is_dir(), "its worktree stays on disk");
     }
 
     /// A clone of a bare local `origin` whose HEAD names `main`, checked out on

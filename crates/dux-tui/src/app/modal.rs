@@ -167,6 +167,10 @@ pub(crate) fn modal_spec(prompt: &PromptState) -> Option<ModalSpec> {
         | PromptState::ConfirmDetachAgent { .. }
         | PromptState::ConfirmRecreateWorkingCopy { .. }
         | PromptState::ConfirmCheckoutDefaultBranch { .. }
+        // Prose and a Cancel / Danger pair, Cancel focused: the project-scoped
+        // deletes, the same questions the browser's dialogs ask.
+        | PromptState::ConfirmDeleteProject { .. }
+        | PromptState::ConfirmRemoveProject { .. }
         | PromptState::ConfirmQuit { .. }
         | PromptState::ConfirmDiscardFile { .. }
         | PromptState::ConfirmKillRunning(_)
@@ -267,6 +271,8 @@ pub(crate) fn prompt_text_inputs(prompt: &PromptState) -> Vec<&TextInput> {
         | PromptState::ConfirmDetachAgent { .. }
         | PromptState::ConfirmRecreateWorkingCopy { .. }
         | PromptState::ConfirmCheckoutDefaultBranch { .. }
+        | PromptState::ConfirmDeleteProject { .. }
+        | PromptState::ConfirmRemoveProject { .. }
         | PromptState::ConfirmQuit { .. }
         | PromptState::ConfirmDiscardFile { .. }
         | PromptState::ConfirmInitRepo { .. }
@@ -366,6 +372,8 @@ pub(crate) fn layout_publishes_confirm_button(layout: &OverlayMouseLayout) -> bo
         | OverlayMouseLayout::ConfirmDetachAgent { .. }
         | OverlayMouseLayout::ConfirmRecreateWorkingCopy { .. }
         | OverlayMouseLayout::ConfirmCheckoutDefaultBranch { .. }
+        | OverlayMouseLayout::ConfirmDeleteProject { .. }
+        | OverlayMouseLayout::ConfirmRemoveProject { .. }
         | OverlayMouseLayout::ConfirmDeleteMacro { .. }
         | OverlayMouseLayout::ConfirmQuit { .. }
         | OverlayMouseLayout::ConfirmDiscardFile { .. }
@@ -997,6 +1005,25 @@ mod tests {
                     project_id: "p1".to_string(),
                     project_name: "repo".to_string(),
                     stored_base: Some("develop".to_string()),
+                    focus: ConfirmFocus::Cancel,
+                },
+            ),
+            (
+                "ConfirmDeleteProject",
+                PromptState::ConfirmDeleteProject {
+                    project_id: "p1".to_string(),
+                    project_name: "repo".to_string(),
+                    agent_count: 2,
+                    focus: ConfirmFocus::Cancel,
+                },
+            ),
+            (
+                "ConfirmRemoveProject",
+                PromptState::ConfirmRemoveProject {
+                    project_id: "p1".to_string(),
+                    project_name: "repo".to_string(),
+                    agent_count: 0,
+                    orphaned: false,
                     focus: ConfirmFocus::Cancel,
                 },
             ),

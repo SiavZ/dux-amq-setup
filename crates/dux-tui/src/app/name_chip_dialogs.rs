@@ -104,6 +104,36 @@ fn assert_chipped(app: &App, buf: &Buffer, name: &str) {
     );
 }
 
+/// The words inside the dialog titled `title`: every row between its titled
+/// top edge and its bottom edge, cut to the columns inside its frame and
+/// joined with single spaces, so a wrapped sentence reads as one.
+fn dialog_text(buf: &Buffer, title: &str) -> String {
+    let edge = format!("\u{256d}{title}");
+    let edge: Vec<String> = edge.chars().map(|c| c.to_string()).collect();
+    let len = edge.len() as u16;
+    let cell = |x: u16, y: u16| buf[(x, y)].symbol().to_string();
+    let (top, left) = (0..buf.area.height)
+        .find_map(|y| {
+            (0..buf.area.width.saturating_sub(len))
+                .find(|&x| (0..len).all(|i| cell(x + i, y) == edge[usize::from(i)]))
+                .map(|x| (y, x))
+        })
+        .unwrap_or_else(|| panic!("no dialog titled {title:?}:\n{}", screen(buf)));
+    let right = (left + 1..buf.area.width)
+        .find(|&x| cell(x, top) == "\u{256e}")
+        .expect("the dialog's top-right corner");
+    let bottom = (top + 1..buf.area.height)
+        .find(|&y| cell(left, y) == "\u{2570}")
+        .expect("the dialog's bottom-left corner");
+    (top + 1..bottom)
+        .map(|y| (left + 1..right).map(|x| cell(x, y)).collect::<String>())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn open(app: &mut App, prompt: PromptState) -> Buffer {
     app.prompt = prompt;
     render(app)
@@ -167,6 +197,80 @@ fn the_checkout_default_branch_dialog_chips_the_project_and_its_base() {
     );
     assert_chipped(&app, &buf, "proj-co");
     assert_chipped(&app, &buf, "base-co");
+}
+
+/// The delete-project dialog prints the core body (the browser's words),
+/// chips the project, names the cascade, and publishes a Cancel / Delete pair
+/// whose Delete is the Danger kind.
+#[test]
+fn the_delete_project_dialog_chips_the_project_and_names_the_cascade() {
+    let mut app = test_app(default_bindings());
+    let buf = open(
+        &mut app,
+        PromptState::ConfirmDeleteProject {
+            project_id: "p1".to_string(),
+            project_name: "proj-del".to_string(),
+            agent_count: 2,
+            focus: ConfirmFocus::Cancel,
+        },
+    );
+    assert_chipped(&app, &buf, "proj-del");
+    let flat = dialog_text(&buf, "Delete Project");
+    for words in [
+        "This deletes proj-del , its 2 agents,",
+        "and their worktrees on disk from dux. This is irreversible. The source \
+         checkout is kept.",
+        "Cancel",
+        "Delete",
+    ] {
+        assert!(flat.contains(words), "{words:?} missing:\n{}", screen(&buf));
+    }
+    let OverlayMouseLayout::ConfirmDeleteProject {
+        cancel_button,
+        confirm_button,
+    } = app.overlay_layout.active
+    else {
+        panic!("the dialog must publish its buttons for the mouse");
+    };
+    // Delete is destructive: focused, it does not paint like the focused Cancel.
+    let focused_cancel = buf[(cancel_button.x, cancel_button.y)].style();
+    let PromptState::ConfirmDeleteProject { focus, .. } = &mut app.prompt else {
+        unreachable!("the prompt is still open");
+    };
+    *focus = ConfirmFocus::Confirm;
+    let buf = render(&mut app);
+    assert_ne!(
+        buf[(confirm_button.x, confirm_button.y)].style(),
+        focused_cancel,
+        "Delete must be the Danger kind"
+    );
+}
+
+#[test]
+fn the_remove_project_dialog_chips_the_project_and_keeps_the_worktrees() {
+    let mut app = test_app(default_bindings());
+    let buf = open(
+        &mut app,
+        PromptState::ConfirmRemoveProject {
+            project_id: "p1".to_string(),
+            project_name: "proj-rm".to_string(),
+            agent_count: 1,
+            orphaned: true,
+            focus: ConfirmFocus::Cancel,
+        },
+    );
+    assert_chipped(&app, &buf, "proj-rm");
+    let flat = dialog_text(&buf, "Remove Project");
+    for words in [
+        "This removes proj-rm and deletes its 1 agent from dux. Worktrees on disk are kept.",
+        "Remove",
+    ] {
+        assert!(flat.contains(words), "{words:?} missing:\n{}", screen(&buf));
+    }
+    assert!(matches!(
+        app.overlay_layout.active,
+        OverlayMouseLayout::ConfirmRemoveProject { .. }
+    ));
 }
 
 /// A name with spaces in it is one chip: at every width the dialog can be

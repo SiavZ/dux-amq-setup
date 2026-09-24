@@ -118,6 +118,8 @@ pub(super) fn outside_click_policy(prompt: &PromptState) -> OutsideClickPolicy {
         | PromptState::ConfirmDetachAgent { .. }
         | PromptState::ConfirmRecreateWorkingCopy { .. }
         | PromptState::ConfirmCheckoutDefaultBranch { .. }
+        | PromptState::ConfirmDeleteProject { .. }
+        | PromptState::ConfirmRemoveProject { .. }
         | PromptState::ConfirmDiscardFile { .. }
         | PromptState::ConfirmQuit { .. }
         | PromptState::ConfirmKillRunning(_)
@@ -314,6 +316,12 @@ impl App {
             }
             PromptState::ConfirmCheckoutDefaultBranch { .. } => {
                 self.resolve_confirm_checkout_default_branch(false);
+            }
+            PromptState::ConfirmDeleteProject { .. } => {
+                self.resolve_confirm_delete_project(false);
+            }
+            PromptState::ConfirmRemoveProject { .. } => {
+                self.resolve_confirm_remove_project(false);
             }
             PromptState::ConfirmDetachAgent { .. } => {
                 self.resolve_confirm_detach_agent(false);

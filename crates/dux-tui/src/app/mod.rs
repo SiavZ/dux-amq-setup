@@ -2366,6 +2366,32 @@ pub(crate) enum PromptState {
         stored_base: Option<String>,
         focus: ConfirmFocus, // Cancel (default) or Check out
     },
+    /// Asked before `delete-project` runs anything, the same question the
+    /// browser's Delete project dialog asks: the cascade deletes every agent in
+    /// the project and removes their worktrees from disk.
+    ///
+    /// The name and the agent count are captured when the dialog opens, so the
+    /// sentence the user agrees to does not change behind it; the confirm reads
+    /// the project again, because it may have gone meanwhile.
+    ConfirmDeleteProject {
+        project_id: String,
+        project_name: String,
+        agent_count: usize,
+        focus: ConfirmFocus, // Cancel (default) or Delete
+    },
+    /// Asked before `remove-project` runs anything, the same question the
+    /// browser's Remove project dialog asks: the project leaves dux and every
+    /// worktree stays on disk.
+    ConfirmRemoveProject {
+        project_id: String,
+        project_name: String,
+        agent_count: usize,
+        /// The target is an orphaned group (agents whose project record is
+        /// gone) rather than a real project: confirming clears those agents'
+        /// records through the core cascade instead of removing a project.
+        orphaned: bool,
+        focus: ConfirmFocus, // Cancel (default) or Remove
+    },
     ConfirmQuit {
         agent_count: usize,
         terminal_count: usize,
@@ -3224,6 +3250,14 @@ pub(crate) enum OverlayMouseLayout {
         confirm_button: Rect,
     },
     ConfirmCheckoutDefaultBranch {
+        cancel_button: Rect,
+        confirm_button: Rect,
+    },
+    ConfirmDeleteProject {
+        cancel_button: Rect,
+        confirm_button: Rect,
+    },
+    ConfirmRemoveProject {
         cancel_button: Rect,
         confirm_button: Rect,
     },

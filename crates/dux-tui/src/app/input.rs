@@ -238,6 +238,10 @@ enum PromptMouseTarget {
     ConfirmRecreateWorkingCopyConfirm,
     ConfirmCheckoutDefaultBranchCancel,
     ConfirmCheckoutDefaultBranchConfirm,
+    ConfirmDeleteProjectCancel,
+    ConfirmDeleteProjectConfirm,
+    ConfirmRemoveProjectCancel,
+    ConfirmRemoveProjectConfirm,
     ConfirmDeleteMacroCancel,
     ConfirmDeleteMacroConfirm,
     ConfirmQuitCancel,
@@ -338,6 +342,18 @@ impl ButtonPressedTarget {
             }
             PromptMouseTarget::ConfirmCheckoutDefaultBranchConfirm => {
                 Some(ButtonPressedTarget::ConfirmCheckoutDefaultBranchConfirm)
+            }
+            PromptMouseTarget::ConfirmDeleteProjectCancel => {
+                Some(ButtonPressedTarget::ConfirmDeleteProjectCancel)
+            }
+            PromptMouseTarget::ConfirmDeleteProjectConfirm => {
+                Some(ButtonPressedTarget::ConfirmDeleteProjectConfirm)
+            }
+            PromptMouseTarget::ConfirmRemoveProjectCancel => {
+                Some(ButtonPressedTarget::ConfirmRemoveProjectCancel)
+            }
+            PromptMouseTarget::ConfirmRemoveProjectConfirm => {
+                Some(ButtonPressedTarget::ConfirmRemoveProjectConfirm)
             }
             PromptMouseTarget::ConfirmDeleteMacroCancel => {
                 Some(ButtonPressedTarget::ConfirmDeleteMacroCancel)
@@ -1876,6 +1892,8 @@ impl App {
             | PromptState::ConfirmDetachAgent { .. }
             | PromptState::ConfirmRecreateWorkingCopy { .. }
             | PromptState::ConfirmCheckoutDefaultBranch { .. }
+            | PromptState::ConfirmDeleteProject { .. }
+            | PromptState::ConfirmRemoveProject { .. }
             | PromptState::ConfirmQuit { .. }
             | PromptState::ConfirmDiscardFile { .. }
             | PromptState::ConfirmInitRepo { .. }
@@ -4818,6 +4836,42 @@ impl App {
         Some(false)
     }
 
+    fn handle_confirm_delete_project_prompt_key(&mut self, key: KeyEvent) -> Option<bool> {
+        let PromptState::ConfirmDeleteProject { focus, .. } = &mut self.prompt else {
+            return None;
+        };
+        let confirm = focus.is_confirm();
+        let action = self.bindings.lookup(&key, BindingScope::Dialog);
+        match modal_key_step(action, key, false) {
+            // Escape is a cancel, and a cancel says so.
+            ModalKeyStep::Close => return Some(self.resolve_confirm_delete_project(false)),
+            ModalKeyStep::MoveFocus(_) => *focus = focus.toggled(),
+            ModalKeyStep::Confirm | ModalKeyStep::ActivateFocus => {
+                return Some(self.resolve_confirm_delete_project(confirm));
+            }
+            ModalKeyStep::FallThroughToField => {}
+        }
+        Some(false)
+    }
+
+    fn handle_confirm_remove_project_prompt_key(&mut self, key: KeyEvent) -> Option<bool> {
+        let PromptState::ConfirmRemoveProject { focus, .. } = &mut self.prompt else {
+            return None;
+        };
+        let confirm = focus.is_confirm();
+        let action = self.bindings.lookup(&key, BindingScope::Dialog);
+        match modal_key_step(action, key, false) {
+            // Escape is a cancel, and a cancel says so.
+            ModalKeyStep::Close => return Some(self.resolve_confirm_remove_project(false)),
+            ModalKeyStep::MoveFocus(_) => *focus = focus.toggled(),
+            ModalKeyStep::Confirm | ModalKeyStep::ActivateFocus => {
+                return Some(self.resolve_confirm_remove_project(confirm));
+            }
+            ModalKeyStep::FallThroughToField => {}
+        }
+        Some(false)
+    }
+
     fn handle_confirm_quit_prompt_key(&mut self, key: KeyEvent) -> Option<bool> {
         let PromptState::ConfirmQuit { focus, .. } = &mut self.prompt else {
             return None;
@@ -5020,6 +5074,12 @@ impl App {
             return Some(exit);
         }
         if let Some(exit) = self.handle_confirm_checkout_default_branch_prompt_key(key) {
+            return Some(exit);
+        }
+        if let Some(exit) = self.handle_confirm_delete_project_prompt_key(key) {
+            return Some(exit);
+        }
+        if let Some(exit) = self.handle_confirm_remove_project_prompt_key(key) {
             return Some(exit);
         }
         if let Some(exit) = self.handle_confirm_quit_prompt_key(key) {
@@ -6542,6 +6602,34 @@ impl App {
                 column,
                 row,
             ),
+            OverlayMouseLayout::ConfirmDeleteProject {
+                cancel_button,
+                confirm_button,
+            } => click_target(
+                &[
+                    (cancel_button, PromptMouseTarget::ConfirmDeleteProjectCancel),
+                    (
+                        confirm_button,
+                        PromptMouseTarget::ConfirmDeleteProjectConfirm,
+                    ),
+                ],
+                column,
+                row,
+            ),
+            OverlayMouseLayout::ConfirmRemoveProject {
+                cancel_button,
+                confirm_button,
+            } => click_target(
+                &[
+                    (cancel_button, PromptMouseTarget::ConfirmRemoveProjectCancel),
+                    (
+                        confirm_button,
+                        PromptMouseTarget::ConfirmRemoveProjectConfirm,
+                    ),
+                ],
+                column,
+                row,
+            ),
             OverlayMouseLayout::ConfirmDetachAgent {
                 cancel_button,
                 confirm_button,
@@ -7738,6 +7826,97 @@ impl App {
             return false;
         };
         self.dispatch_checkout_project_default_branch(project);
+        false
+    }
+
+    /// Answer the "delete project?" confirmation. Confirming runs the core
+    /// cascade against the project as it is NOW (it may have been removed
+    /// while the dialog was up, which is said out loud); cancelling deletes
+    /// nothing and says so, because a silent close is indistinguishable from a
+    /// delete that quietly did nothing.
+    pub(crate) fn resolve_confirm_delete_project(&mut self, confirm: bool) -> bool {
+        let (project_id, project_name) = match &self.prompt {
+            PromptState::ConfirmDeleteProject {
+                project_id,
+                project_name,
+                ..
+            } => (project_id.clone(), project_name.clone()),
+            _ => return false,
+        };
+        self.prompt = PromptState::None;
+        if !confirm {
+            let kept = match self.project_agent_count(&project_id) {
+                0 => String::new(),
+                1 => ": its agent and its worktree are still here".to_string(),
+                n => format!(": its {n} agents and their worktrees are still here"),
+            };
+            self.set_info(format!(
+                "Cancelled deleting project \"{project_name}\". Nothing was deleted{kept}."
+            ));
+            return false;
+        }
+        let Some(project) = self
+            .engine
+            .projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .cloned()
+        else {
+            self.set_warning(format!(
+                "Project \"{project_name}\" is gone, so there was nothing to delete."
+            ));
+            return false;
+        };
+        if let Err(err) = self.run_delete_project(project) {
+            self.set_error(format!("{err:#}"));
+        }
+        false
+    }
+
+    /// Answer the "remove project?" confirmation. Confirming re-reads the
+    /// target: a real project must still exist and still hold no agents, and
+    /// an orphaned group must still have agents to clear. Cancelling removes
+    /// nothing and says so.
+    pub(crate) fn resolve_confirm_remove_project(&mut self, confirm: bool) -> bool {
+        let (project_id, project_name, orphaned) = match &self.prompt {
+            PromptState::ConfirmRemoveProject {
+                project_id,
+                project_name,
+                orphaned,
+                ..
+            } => (project_id.clone(), project_name.clone(), *orphaned),
+            _ => return false,
+        };
+        self.prompt = PromptState::None;
+        if !confirm {
+            self.set_info(format!(
+                "Cancelled removing project \"{project_name}\". Nothing was removed."
+            ));
+            return false;
+        }
+        let gone = format!("Project \"{project_name}\" is gone, so there was nothing to remove.");
+        let outcome = if orphaned {
+            if self.project_agent_count(&project_id) == 0 {
+                self.set_warning(gone);
+                return false;
+            }
+            self.run_remove_orphaned_project(project_id, project_name)
+        } else {
+            let Some(project) = self
+                .engine
+                .projects
+                .iter()
+                .find(|p| p.id == project_id)
+                .cloned()
+            else {
+                self.set_warning(gone);
+                return false;
+            };
+            self.run_remove_project(project)
+        };
+        if let Err(err) = outcome {
+            self.set_error(format!("{err:#}"));
+        }
         false
     }
 
@@ -8939,6 +9118,10 @@ impl App {
             | PromptMouseTarget::ConfirmRecreateWorkingCopyConfirm
             | PromptMouseTarget::ConfirmCheckoutDefaultBranchCancel
             | PromptMouseTarget::ConfirmCheckoutDefaultBranchConfirm
+            | PromptMouseTarget::ConfirmDeleteProjectCancel
+            | PromptMouseTarget::ConfirmDeleteProjectConfirm
+            | PromptMouseTarget::ConfirmRemoveProjectCancel
+            | PromptMouseTarget::ConfirmRemoveProjectConfirm
             | PromptMouseTarget::ConfirmDeleteMacroCancel
             | PromptMouseTarget::ConfirmDeleteMacroConfirm
             | PromptMouseTarget::MacroCancel
@@ -9062,6 +9245,18 @@ impl App {
             }
             ButtonPressedTarget::ConfirmCheckoutDefaultBranchConfirm => {
                 self.resolve_confirm_checkout_default_branch(true)
+            }
+            ButtonPressedTarget::ConfirmDeleteProjectCancel => {
+                self.resolve_confirm_delete_project(false)
+            }
+            ButtonPressedTarget::ConfirmDeleteProjectConfirm => {
+                self.resolve_confirm_delete_project(true)
+            }
+            ButtonPressedTarget::ConfirmRemoveProjectCancel => {
+                self.resolve_confirm_remove_project(false)
+            }
+            ButtonPressedTarget::ConfirmRemoveProjectConfirm => {
+                self.resolve_confirm_remove_project(true)
             }
             ButtonPressedTarget::ConfirmDeleteMacroCancel => {
                 self.resolve_confirm_delete_macro(false)
