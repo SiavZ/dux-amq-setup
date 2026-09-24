@@ -428,7 +428,7 @@ impl Engine {
                         )),
                         panic_event: Some(Box::new(move |reason| WorkerEvent::CreateAgentFailed {
                             status_op_id: op_id_panic,
-                            message: format!("Agent-creation worker panicked: {reason}"),
+                            message: format!("Agent-creation worker panicked: {reason}").into(),
                         })),
                     },
                     move |tx| {

@@ -2119,7 +2119,7 @@ impl Engine {
                 let create_final = self.resolve_create_op(
                     &status_op_id,
                     CreateLaunchOutcome::Failed {
-                        message: message.clone(),
+                        message: message.clone().into(),
                     },
                 );
                 (
@@ -3374,7 +3374,7 @@ impl Engine {
     fn process_create_agent_progress(
         &self,
         status_op_id: String,
-        message: String,
+        message: StatusText,
     ) -> EventReaction {
         match self.pending_create_ops.get(&status_op_id) {
             Some(op) => EventReaction::Status(op.progress(message)),
@@ -3385,7 +3385,7 @@ impl Engine {
     fn process_create_agent_failed(
         &mut self,
         status_op_id: String,
-        message: String,
+        message: StatusText,
     ) -> EventReaction {
         self.clear_in_flight(&InFlightKey::CreateAgent);
         match self.pending_create_ops.remove(&status_op_id) {
@@ -6975,7 +6975,7 @@ mod tests {
 
         let reaction = engine.process_worker_event(WorkerEvent::CreateAgentFailed {
             status_op_id: op_id.clone(),
-            message: "nope".to_string(),
+            message: "nope".to_string().into(),
         });
         let final_status = unwrap_status(reaction);
         status.set(
@@ -7009,7 +7009,7 @@ mod tests {
 
         let reaction = engine.process_worker_event(WorkerEvent::CreateAgentFailed {
             status_op_id: op_id.clone(),
-            message: "nope".to_string(),
+            message: "nope".to_string().into(),
         });
 
         assert!(!engine.is_in_flight(&InFlightKey::CreateAgent));
@@ -7073,7 +7073,7 @@ mod tests {
 
         let reaction = engine.process_worker_event(WorkerEvent::CreateAgentProgress {
             status_op_id: op_id.clone(),
-            message: "Launching codex in a fresh session...".to_string(),
+            message: "Launching codex in a fresh session...".to_string().into(),
         });
 
         let status = unwrap_status(reaction);
@@ -7108,12 +7108,14 @@ mod tests {
         let op_id = op.id().to_string();
         engine.pending_create_ops.insert(op_id.clone(), op);
 
-        let progress = unwrap_status(engine.process_worker_event(
-            WorkerEvent::CreateAgentProgress {
+        let progress = unwrap_status(
+            engine.process_worker_event(WorkerEvent::CreateAgentProgress {
                 status_op_id: op_id.clone(),
-                message: "Attaching to existing branch \"x\" for project \"y\"...".to_string(),
-            },
-        ));
+                message: "Attaching to existing branch \"x\" for project \"y\"..."
+                    .to_string()
+                    .into(),
+            }),
+        );
         controller.set(
             now,
             progress.key.clone(),
@@ -7125,7 +7127,7 @@ mod tests {
 
         let failure = engine.process_worker_event(WorkerEvent::CreateAgentFailed {
             status_op_id: op_id.clone(),
-            message: "Failed to create a new worktree.".to_string(),
+            message: "Failed to create a new worktree.".to_string().into(),
         });
         let failure = unwrap_status(failure);
         controller.set(
@@ -8909,7 +8911,7 @@ mod tests {
                 already_running_status: None,
                 panic_event: Some(Box::new(|reason| WorkerEvent::CreateAgentFailed {
                     status_op_id: "op-test".to_string(),
-                    message: format!("panic: {reason}"),
+                    message: format!("panic: {reason}").into(),
                 })),
             },
             |_tx| panic!("boom"),

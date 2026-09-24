@@ -2379,7 +2379,7 @@ mod tests {
             .worker_tx
             .send(WorkerEvent::CreateAgentFailed {
                 status_op_id: "missing-op".to_string(),
-                message: "creation failed".to_string(),
+                message: "creation failed".to_string().into(),
             })
             .expect("send create failure");
 

@@ -63,7 +63,7 @@ struct PendingCopy {
     /// The project checkout, or the fork's source worktree.
     source: PathBuf,
     /// Short human description of the source for progress/error messages.
-    source_desc: String,
+    source_desc: crate::status_text::StatusText,
     on_head_mismatch: HeadMismatch,
 }
 
@@ -90,7 +90,7 @@ struct CreatePlanContext<'a> {
     paths: &'a DuxPaths,
     worker_tx: &'a Sender<WorkerEvent>,
     create_key: &'a str,
-    creation_notes: &'a mut Vec<String>,
+    creation_notes: &'a mut Vec<crate::status_text::StatusText>,
 }
 
 impl CreatePlanContext<'_> {
@@ -166,17 +166,17 @@ impl CreatePlanContext<'_> {
         }
     }
 
-    fn send_failure(&self, message: String) {
+    fn send_failure(&self, message: impl Into<crate::status_text::StatusText>) {
         let _ = self.worker_tx.send(WorkerEvent::CreateAgentFailed {
             status_op_id: self.create_key.to_string(),
-            message,
+            message: message.into(),
         });
     }
 
-    fn send_progress(&self, message: String) {
+    fn send_progress(&self, message: impl Into<crate::status_text::StatusText>) {
         let _ = self.worker_tx.send(WorkerEvent::CreateAgentProgress {
             status_op_id: self.create_key.to_string(),
-            message,
+            message: message.into(),
         });
     }
 
@@ -186,18 +186,21 @@ impl CreatePlanContext<'_> {
         repo_path: &Path,
         leading_branch: &str,
     ) {
-        self.send_progress(format!(
-            "Pulling latest changes for project \"{}\" before creating the agent...",
-            project.name
-        ));
+        self.send_progress(crate::status_text![
+            "Pulling latest changes for project ",
+            q(project.name),
+            " before creating the agent..."
+        ]);
         if let Err(err) = git::switch_branch_if_needed(repo_path, leading_branch) {
             logger::error(&format!(
                 "pre-create branch switch failed for {}: {err}",
                 project.path
             ));
-            self.creation_notes.push(format!(
-                "Warning: could not switch the project checkout to \"{leading_branch}\": {err}. The agent starts from the local branch state."
-            ));
+            self.creation_notes.push(crate::status_text![
+                "Warning: could not switch the project checkout to ",
+                q(leading_branch),
+                format!(": {}. The agent starts from the local branch state.", err)
+            ]);
             return;
         }
         match git::has_origin_remote(repo_path) {
@@ -217,9 +220,14 @@ impl CreatePlanContext<'_> {
                         "pre-create pull failed for {}: {err}",
                         project.path
                     ));
-                    self.creation_notes.push(format!(
-                        "Warning: could not pull \"{leading_branch}\" from origin: {err}. The agent starts from the local branch state."
-                    ));
+                    self.creation_notes.push(crate::status_text![
+                        "Warning: could not pull ",
+                        q(leading_branch),
+                        format!(
+                            " from origin: {}. The agent starts from the local branch state.",
+                            err
+                        )
+                    ]);
                 }
             }
             Ok(false) => logger::info(&format!(
@@ -233,7 +241,7 @@ impl CreatePlanContext<'_> {
                 ));
                 self.creation_notes.push(format!(
                     "Warning: could not check for an origin remote: {err}. The agent starts from the local branch state."
-                ));
+                ).into());
             }
         }
     }
@@ -276,10 +284,11 @@ impl CreatePlanContext<'_> {
                 } else {
                     "create a new worktree"
                 };
-                self.send_failure(format!(
-                    "Failed to {action} for project \"{}\": {err}",
-                    project.name
-                ));
+                self.send_failure(crate::status_text![
+                    format!("Failed to {} for project ", action),
+                    q(project.name),
+                    format!(": {}", err)
+                ]);
                 None
             }
         }
@@ -307,30 +316,33 @@ impl CreatePlanContext<'_> {
         let attach_existing =
             use_existing_branch || git::branch_exists(&repo_path, &resolved_name).is_some();
         if !attach_existing && git::repo_commit_state(&repo_path) == git::CommitState::Unborn {
-            self.send_failure(format!(
-                "Cannot create agent for \"{}\": the repository at {} has no commits yet. Create an initial commit (for example with git commit --allow-empty -m \"Initial commit\"), then try again.",
-                project.name,
-                repo_path.display()
-            ));
+            self.send_failure(crate::status_text!["Cannot create agent for ", q(project.name), ": the repository at ", n(repo_path.display()), " has no commits yet. Create an initial commit (for example with git commit --allow-empty -m \"Initial commit\"), then try again."]);
             return None;
         }
         if !attach_existing && !git::local_branch_exists(&repo_path, &leading_branch) {
-            self.send_failure(format!(
-                "Cannot create agent for \"{}\": leading branch \"{}\" no longer exists locally. Restore that branch or re-add the project.",
-                project.name, leading_branch
-            ));
+            self.send_failure(crate::status_text![
+                "Cannot create agent for ",
+                q(project.name),
+                ": leading branch ",
+                q(leading_branch),
+                " no longer exists locally. Restore that branch or re-add the project."
+            ]);
             return None;
         }
         self.send_progress(if attach_existing {
-            format!(
-                "Attaching to existing branch \"{}\" for project \"{}\"...",
-                resolved_name, project.name
-            )
+            crate::status_text![
+                "Attaching to existing branch ",
+                q(resolved_name),
+                " for project ",
+                q(project.name),
+                "..."
+            ]
         } else {
-            format!(
-                "Creating a new worktree for project \"{}\"...",
-                project.name
-            )
+            crate::status_text![
+                "Creating a new worktree for project ",
+                q(project.name),
+                "..."
+            ]
         });
         let (branch_name, worktree_path) = self.create_new_project_worktree(
             &project,
@@ -340,21 +352,27 @@ impl CreatePlanContext<'_> {
             attach_existing,
         )?;
         let status_message = if attach_existing {
-            format!(
-                "Attached to existing branch \"{}\" in project \"{}\". The worktree is ready in a fresh session.",
-                branch_name, project.name
-            )
+            crate::status_text![
+                "Attached to existing branch ",
+                q(branch_name),
+                " in project ",
+                q(project.name),
+                ". The worktree is ready in a fresh session."
+            ]
         } else {
-            format!(
-                "Created {} agent \"{}\" in project \"{}\". The new worktree is ready in a fresh session.",
-                project.default_provider.as_str(),
-                branch_name,
-                project.name
-            )
+            crate::status_text![
+                "Created ",
+                n(project.default_provider.as_str()),
+                " agent ",
+                q(branch_name),
+                " in project ",
+                q(project.name),
+                ". The new worktree is ready in a fresh session."
+            ]
         };
         let pending_copy = copy_uncommitted_changes.then(|| PendingCopy {
             source: repo_path,
-            source_desc: format!("project \"{}\"", project.name),
+            source_desc: crate::status_text!["project ", q(project.name)],
             on_head_mismatch: HeadMismatch::SkipWithNote {
                 branch: if attach_existing {
                     resolved_name
@@ -430,18 +448,28 @@ impl CreatePlanContext<'_> {
             if attach_existing {
                 let _ = self.worker_tx.send(WorkerEvent::CreateAgentProgress {
                     status_op_id: self.create_key.to_string(),
-                    message: format!(
-                        "Attaching to existing branch \"{}\" for PR #{} in project \"{}\"...",
-                        resolved_name, number, project.name
-                    ),
+                    message: crate::status_text![
+                        "Attaching to existing branch ",
+                        q(resolved_name),
+                        " for PR ",
+                        n(format!("#{}", number)),
+                        " in project ",
+                        q(project.name),
+                        "..."
+                    ],
                 });
             } else {
                 let _ = self.worker_tx.send(WorkerEvent::CreateAgentProgress {
                     status_op_id: self.create_key.to_string(),
-                    message: format!(
-                        "Fetching PR #{} from {} into branch \"{}\"...",
-                        number, owner_repo, resolved_name
-                    ),
+                    message: crate::status_text![
+                        "Fetching PR ",
+                        n(format!("#{}", number)),
+                        " from ",
+                        n(owner_repo),
+                        " into branch ",
+                        q(resolved_name),
+                        "..."
+                    ],
                 });
                 if let Err(err) = git::fetch_pull_request_head(&repo_path, number, &resolved_name) {
                     logger::error(&format!(
@@ -450,10 +478,13 @@ impl CreatePlanContext<'_> {
                     ));
                     let _ = self.worker_tx.send(WorkerEvent::CreateAgentFailed {
                         status_op_id: self.create_key.to_string(),
-                        message: format!(
-                            "Failed to fetch PR #{} from {}: {err}",
-                            number, owner_repo
-                        ),
+                        message: crate::status_text![
+                            "Failed to fetch PR ",
+                            n(format!("#{}", number)),
+                            " from ",
+                            n(owner_repo),
+                            format!(": {}", err)
+                        ],
                     });
                     return None;
                 }
@@ -483,22 +514,30 @@ impl CreatePlanContext<'_> {
                     }
                     let _ = self.worker_tx.send(WorkerEvent::CreateAgentFailed {
                         status_op_id: self.create_key.to_string(),
-                        message: format!(
-                            "Failed to create a worktree for PR #{} in project \"{}\": {err}",
-                            number, project.name
-                        ),
+                        message: crate::status_text![
+                            "Failed to create a worktree for PR ",
+                            n(format!("#{}", number)),
+                            " in project ",
+                            q(project.name),
+                            format!(": {}", err)
+                        ],
                     });
                     return None;
                 }
             };
-            let status_message = format!(
-                "Created {} agent \"{}\" from PR #{} ({}) in project \"{}\".",
-                project.default_provider.as_str(),
-                branch_name,
-                number,
-                title,
-                project.name
-            );
+            let status_message = crate::status_text![
+                "Created ",
+                n(project.default_provider.as_str()),
+                " agent ",
+                q(branch_name),
+                " from PR ",
+                n(format!("#{}", number)),
+                " (",
+                n(title),
+                ") in project ",
+                q(project.name),
+                "."
+            ];
             logger::info(&format!(
                 "created PR worktree from {} #{} ({state}) {}",
                 owner_repo,
@@ -543,7 +582,9 @@ impl CreatePlanContext<'_> {
             let Some(custom_name) = custom_name else {
                 let _ = self.worker_tx.send(WorkerEvent::CreateAgentFailed {
                     status_op_id: self.create_key.to_string(),
-                    message: "Forking an agent requires choosing a name first.".to_string(),
+                    message: "Forking an agent requires choosing a name first."
+                        .to_string()
+                        .into(),
                 });
                 return None;
             };
@@ -558,16 +599,18 @@ impl CreatePlanContext<'_> {
             ) else {
                 let _ = self.worker_tx.send(WorkerEvent::CreateAgentFailed {
                             status_op_id: self.create_key.to_string(),
-                            message: format!(
-                                "Agent \"{source_label}\" is a standalone agent, so there is no branch or managed worktree to fork. \
-                                 Add its folder as a project if you want several agents working on it, and fork one of those instead."
-                            ),
+                            message: crate::status_text!["Agent ", q(source_label), " is a standalone agent, so there is no branch or managed worktree to fork. \
+                                 Add its folder as a project if you want several agents working on it, and fork one of those instead."],
                         });
                 return None;
             };
             let _ = self.worker_tx.send(WorkerEvent::CreateAgentProgress {
                 status_op_id: self.create_key.to_string(),
-                message: format!("Creating a forked worktree from agent \"{source_label}\"..."),
+                message: crate::status_text![
+                    "Creating a forked worktree from agent ",
+                    q(source_label),
+                    "..."
+                ],
             });
             let source_head = match git::head_commit(&source_worktree) {
                 Ok(head) => head,
@@ -576,9 +619,14 @@ impl CreatePlanContext<'_> {
                         "failed to resolve HEAD for {}: {err}",
                         source_worktree.display()
                     ));
-                    let _ = self.worker_tx.send(WorkerEvent::CreateAgentFailed { status_op_id: self.create_key.to_string(), message: format!(
-                                "Failed to inspect the source worktree for agent \"{source_label}\": {err}",
-                            ) });
+                    let _ = self.worker_tx.send(WorkerEvent::CreateAgentFailed {
+                        status_op_id: self.create_key.to_string(),
+                        message: crate::status_text![
+                            "Failed to inspect the source worktree for agent ",
+                            q(source_label),
+                            format!(": {}", err)
+                        ],
+                    });
                     return None;
                 }
             };
@@ -596,24 +644,33 @@ impl CreatePlanContext<'_> {
                         "fork worktree creation failed for {}: {err}",
                         project.path
                     ));
-                    let _ = self.worker_tx.send(WorkerEvent::CreateAgentFailed { status_op_id: self.create_key.to_string(), message: format!(
-                                "Failed to create a forked worktree from agent \"{source_label}\": {err}",
-                            ) });
+                    let _ = self.worker_tx.send(WorkerEvent::CreateAgentFailed {
+                        status_op_id: self.create_key.to_string(),
+                        message: crate::status_text![
+                            "Failed to create a forked worktree from agent ",
+                            q(source_label),
+                            format!(": {}", err)
+                        ],
+                    });
                     return None;
                 }
             };
-            let status_message = format!(
-                "Forked {} agent \"{}\" from \"{}\" in project \"{}\". The new worktree starts with the copied uncommitted and untracked changes (gitignored files are not copied) and a fresh session.",
-                source_session.provider.as_str(),
-                branch_name,
-                source_label,
-                project.name
-            );
+            let status_message = crate::status_text![
+                "Forked ",
+                n(source_session.provider.as_str()),
+                " agent ",
+                q(branch_name),
+                " from ",
+                q(source_label),
+                " in project ",
+                q(project.name),
+                ". The new worktree starts with the copied uncommitted and untracked changes (gitignored files are not copied) and a fresh session."
+            ];
             // Equal HEADs hold by construction (the worktree was just created
             // from `source_head`); the copy itself runs in the common tail.
             let pending_copy = Some(PendingCopy {
                 source: source_worktree,
-                source_desc: format!("agent \"{source_label}\""),
+                source_desc: crate::status_text!["agent ", q(source_label)],
                 on_head_mismatch: HeadMismatch::Fail,
             });
             ManagedCreatePlan {
@@ -649,18 +706,23 @@ impl CreatePlanContext<'_> {
             let agent_name = custom_name.clone().unwrap_or_else(|| branch_name.clone());
             let _ = self.worker_tx.send(WorkerEvent::CreateAgentProgress {
                 status_op_id: self.create_key.to_string(),
-                message: format!(
-                    "Launching {} in existing worktree \"{}\"...",
-                    project.default_provider.as_str(),
-                    worktree_path.display(),
-                ),
+                message: crate::status_text![
+                    "Launching ",
+                    n(project.default_provider.as_str()),
+                    " in existing worktree ",
+                    q(worktree_path.display()),
+                    "..."
+                ],
             });
-            let status_message = format!(
-                "Imported {} agent \"{}\" from existing managed worktree for project \"{}\".",
-                project.default_provider.as_str(),
-                agent_name,
-                project.name
-            );
+            let status_message = crate::status_text![
+                "Imported ",
+                n(project.default_provider.as_str()),
+                " agent ",
+                q(agent_name),
+                " from existing managed worktree for project ",
+                q(project.name),
+                "."
+            ];
             ManagedCreatePlan {
                 project: project.clone(),
                 provider: project.default_provider.clone(),
@@ -692,9 +754,11 @@ impl CreatePlanContext<'_> {
         Some({
             let _ = self.worker_tx.send(WorkerEvent::CreateAgentProgress {
                 status_op_id: self.create_key.to_string(),
-                message: format!(
-                    "Creating a managed worktree from external worktree \"{source_label}\"...",
-                ),
+                message: crate::status_text![
+                    "Creating a managed worktree from external worktree ",
+                    q(source_label),
+                    "..."
+                ],
             });
             let source_head = match git::head_commit(&source_worktree_path) {
                 Ok(head) => head,
@@ -705,9 +769,11 @@ impl CreatePlanContext<'_> {
                     ));
                     let _ = self.worker_tx.send(WorkerEvent::CreateAgentFailed {
                         status_op_id: self.create_key.to_string(),
-                        message: format!(
-                            "Failed to inspect external worktree \"{source_label}\": {err}",
-                        ),
+                        message: crate::status_text![
+                            "Failed to inspect external worktree ",
+                            q(source_label),
+                            format!(": {}", err)
+                        ],
                     });
                     return None;
                 }
@@ -726,24 +792,33 @@ impl CreatePlanContext<'_> {
                         "external worktree fork creation failed for {}: {err}",
                         project.path
                     ));
-                    let _ = self.worker_tx.send(WorkerEvent::CreateAgentFailed { status_op_id: self.create_key.to_string(), message: format!(
-                                "Failed to create a managed worktree from external worktree \"{source_label}\": {err}",
-                            ) });
+                    let _ = self.worker_tx.send(WorkerEvent::CreateAgentFailed {
+                        status_op_id: self.create_key.to_string(),
+                        message: crate::status_text![
+                            "Failed to create a managed worktree from external worktree ",
+                            q(source_label),
+                            format!(": {}", err)
+                        ],
+                    });
                     return None;
                 }
             };
-            let status_message = format!(
-                "Created {} agent \"{}\" from external worktree \"{}\" in project \"{}\". Uncommitted and untracked changes were copied into the managed worktree (gitignored files are not copied).",
-                project.default_provider.as_str(),
-                branch_name,
-                source_label,
-                project.name
-            );
+            let status_message = crate::status_text![
+                "Created ",
+                n(project.default_provider.as_str()),
+                " agent ",
+                q(branch_name),
+                " from external worktree ",
+                q(source_label),
+                " in project ",
+                q(project.name),
+                ". Uncommitted and untracked changes were copied into the managed worktree (gitignored files are not copied)."
+            ];
             // Equal HEADs hold by construction (the worktree was just created
             // from the external worktree's head); the copy runs in the tail.
             let pending_copy = Some(PendingCopy {
                 source: source_worktree_path,
-                source_desc: format!("external worktree \"{source_label}\""),
+                source_desc: crate::status_text!["external worktree ", q(source_label)],
                 on_head_mismatch: HeadMismatch::Fail,
             });
             ManagedCreatePlan {
@@ -800,17 +875,15 @@ fn handle_copy_mismatch(
     owns_worktree: bool,
     worker_tx: &Sender<WorkerEvent>,
     create_key: &str,
-    creation_notes: &mut Vec<String>,
+    creation_notes: &mut Vec<crate::status_text::StatusText>,
 ) -> bool {
     match copy.on_head_mismatch {
         HeadMismatch::SkipWithNote { branch } => {
             creation_notes.push(match check_error {
                 Some(error) => format!(
                     "Uncommitted changes were not copied: could not verify the checkout's commit: {error}."
-                ),
-                None => format!(
-                    "Uncommitted changes were not copied: the project checkout is not on \"{branch}\"'s commit."
-                ),
+                ).into(),
+                None => crate::status_text!["Uncommitted changes were not copied: the project checkout is not on ", q(branch), "'s commit."],
             });
             true
         }
@@ -824,14 +897,19 @@ fn handle_copy_mismatch(
             }
             rollback_managed_create(repo_path, session, owns_worktree);
             let message = match check_error {
-                Some(error) => format!(
-                    "Failed to copy uncommitted changes from {}: could not verify the source worktree's commit: {error}.",
-                    copy.source_desc
-                ),
-                None => format!(
-                    "Failed to copy uncommitted changes from {}: the source moved to a different commit during creation.",
-                    copy.source_desc
-                ),
+                Some(error) => crate::status_text![
+                    "Failed to copy uncommitted changes from ",
+                    &copy.source_desc,
+                    format!(
+                        ": could not verify the source worktree's commit: {}.",
+                        error
+                    )
+                ],
+                None => crate::status_text![
+                    "Failed to copy uncommitted changes from ",
+                    &copy.source_desc,
+                    ": the source moved to a different commit during creation."
+                ],
             };
             let _ = worker_tx.send(WorkerEvent::CreateAgentFailed {
                 status_op_id: create_key.to_string(),
@@ -850,14 +928,15 @@ fn apply_pending_copy(
     owns_worktree: bool,
     worker_tx: &Sender<WorkerEvent>,
     create_key: &str,
-    creation_notes: &mut Vec<String>,
+    creation_notes: &mut Vec<crate::status_text::StatusText>,
 ) -> bool {
     let _ = worker_tx.send(WorkerEvent::CreateAgentProgress {
         status_op_id: create_key.to_string(),
-        message: format!(
-            "Copying uncommitted and untracked changes from {} into the new worktree (gitignored files are not copied)...",
-            copy.source_desc
-        ),
+        message: crate::status_text![
+            "Copying uncommitted and untracked changes from ",
+            &copy.source_desc,
+            " into the new worktree (gitignored files are not copied)..."
+        ],
     });
     let worktree = Path::new(session.directory());
     match compare_copy_heads(&copy.source, worktree) {
@@ -867,7 +946,7 @@ fn apply_pending_copy(
                     creation_notes.push(format!(
                         "Some paths were not copied (submodules, embedded repositories, or special files): {}.",
                         summary.skipped_paths.join(", ")
-                    ));
+                    ).into());
                 }
                 true
             }
@@ -880,10 +959,11 @@ fn apply_pending_copy(
                 rollback_managed_create(repo_path, session, owns_worktree);
                 let _ = worker_tx.send(WorkerEvent::CreateAgentFailed {
                     status_op_id: create_key.to_string(),
-                    message: format!(
-                        "Failed to copy uncommitted changes from {}: {error}",
-                        copy.source_desc
-                    ),
+                    message: crate::status_text![
+                        "Failed to copy uncommitted changes from ",
+                        &copy.source_desc,
+                        format!(": {}", error)
+                    ],
                 });
                 false
             }
@@ -936,11 +1016,13 @@ fn run_create_standalone_agent_job(
     if !folder.is_dir() {
         let _ = worker_tx.send(WorkerEvent::CreateAgentFailed {
             status_op_id: create_key,
-            message: format!(
-                "Cannot create a standalone agent in \"{folder_label}\": that folder does not \
+            message: crate::status_text![
+                "Cannot create a standalone agent in ",
+                q(folder_label),
+                ": that folder does not \
                  exist, or is not a directory dux can read. Pick a folder that is already there; \
                  dux never creates one."
-            ),
+            ],
         });
         return;
     }
@@ -969,7 +1051,7 @@ fn run_create_standalone_agent_job(
         // Nothing to roll back: no directory was created, no branch was minted.
         let _ = worker_tx.send(WorkerEvent::CreateAgentFailed {
             status_op_id: create_key,
-            message: hint,
+            message: hint.into(),
         });
         return;
     }
@@ -983,20 +1065,32 @@ fn run_create_standalone_agent_job(
                     message: format!(
                         "Invalid global environment variables, so the standalone agent was not \
                      started: {err:#}"
-                    ),
+                    )
+                    .into(),
                 });
                 return;
             }
         };
-    let status_message = format!(
-        "Created standalone agent \"{title}\" running {} in \"{folder_label}\". \
+    let status_message = crate::status_text![
+        "Created standalone agent ",
+        q(title),
+        " running ",
+        n(provider.as_str()),
+        " in ",
+        q(folder_label),
+        ". \
          dux does not manage a branch or a worktree for it, and never creates, moves \
-         or removes that folder.",
-        provider.as_str()
-    );
+         or removes that folder."
+    ];
     let _ = worker_tx.send(WorkerEvent::CreateAgentProgress {
         status_op_id: create_key.clone(),
-        message: format!("Launching {} in \"{folder_label}\"...", provider.as_str()),
+        message: crate::status_text![
+            "Launching ",
+            n(provider.as_str()),
+            " in ",
+            q(folder_label),
+            "..."
+        ],
     });
     // crossterm::terminal::size() returns (cols, rows).
     let (cols, rows) = term_size;
@@ -1042,7 +1136,7 @@ fn launch_managed_create(
     term_size: (u16, u16),
     create_key: String,
     identity: crate::term_identity::TerminalIdentity,
-    mut creation_notes: Vec<String>,
+    mut creation_notes: Vec<crate::status_text::StatusText>,
 ) {
     let ManagedCreatePlan {
         project,
@@ -1114,7 +1208,7 @@ fn launch_managed_create(
         }
         let _ = worker_tx.send(WorkerEvent::CreateAgentFailed {
             status_op_id: create_key.clone(),
-            message: hint,
+            message: hint.into(),
         });
         return;
     }
@@ -1141,7 +1235,11 @@ fn launch_managed_create(
         (status_message, status_quiet)
     } else {
         (
-            crate::status_text![status_message, " ", creation_notes.join(" ")],
+            creation_notes
+                .into_iter()
+                .fold(status_message, |joined, note| {
+                    crate::status_text![joined, " ", note]
+                }),
             crate::statusline::QuietSurfaces::LOUD,
         )
     };
@@ -1150,10 +1248,11 @@ fn launch_managed_create(
         Err(err) => {
             let _ = worker_tx.send(WorkerEvent::CreateAgentFailed {
                 status_op_id: create_key.clone(),
-                message: format!(
-                    "Invalid environment variables for project \"{}\": {err:#}",
-                    project.name
-                ),
+                message: crate::status_text![
+                    "Invalid environment variables for project ",
+                    q(project.name),
+                    format!(": {:#}", err)
+                ],
             });
             return;
         }
@@ -1166,10 +1265,11 @@ fn launch_managed_create(
         .map(|command| {
             let _ = worker_tx.send(WorkerEvent::CreateAgentProgress {
                 status_op_id: create_key.clone(),
-                message: format!(
-                    "Running startup command for agent \"{}\"...",
-                    session.display_label()
-                ),
+                message: crate::status_text![
+                    "Running startup command for agent ",
+                    q(session.display_label()),
+                    "..."
+                ],
             });
             run_startup_command(
                 &paths,
@@ -1210,7 +1310,7 @@ fn launch_managed_create(
     };
     let _ = worker_tx.send(WorkerEvent::CreateAgentProgress {
         status_op_id: create_key.clone(),
-        message: launch_message,
+        message: launch_message.into(),
     });
     // crossterm::terminal::size() returns (cols, rows).
     let (cols, rows) = term_size;
@@ -1258,7 +1358,7 @@ pub fn run_create_agent_job(
     // Non-fatal notes (best-effort pull problems, skipped copies) accumulated
     // across the job and appended to the create status message, so they ride
     // the keyed create-op final and stay visible.
-    let mut creation_notes: Vec<String> = Vec::new();
+    let mut creation_notes: Vec<crate::status_text::StatusText> = Vec::new();
     // Standalone agents bypass worktree provisioning and its disk rollbacks.
     if let CreateAgentRequest::Standalone {
         folder,
@@ -1489,10 +1589,10 @@ mod tests {
                     }
                 }
                 WorkerEvent::CreateAgentFailed { message, .. } => {
-                    run.failure = Some(message);
+                    run.failure = Some(message.to_string());
                 }
                 WorkerEvent::CreateAgentProgress { message, .. } => {
-                    run.progress.push(message);
+                    run.progress.push(message.to_string());
                 }
                 _ => {}
             }
@@ -1731,7 +1831,9 @@ mod tests {
         let mut run = StandaloneRun::default();
         while let Ok(event) = rx.try_recv() {
             match event {
-                WorkerEvent::CreateAgentFailed { message, .. } => run.failure = Some(message),
+                WorkerEvent::CreateAgentFailed { message, .. } => {
+                    run.failure = Some(message.to_string())
+                }
                 WorkerEvent::AgentLaunchReady(ready) => {
                     run.launch_env = Some(ready.request.env.clone());
                 }

@@ -13381,7 +13381,7 @@ mod tests {
 
         let reaction = engine.process_worker_event(WorkerEvent::CreateAgentFailed {
             status_op_id: op_id.clone(),
-            message: "worker panicked".to_string(),
+            message: "worker panicked".to_string().into(),
         });
         // Project the engine reaction through the wire to confirm the web sees the
         // keyed error on the op's id.

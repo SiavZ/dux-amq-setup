@@ -770,7 +770,7 @@ pub enum CreateLaunchOutcome {
     PersistFailed { error: String },
     /// The launch (or the create worker) failed; `message` is the already-formatted
     /// error line.
-    Failed { message: String },
+    Failed { message: StatusText },
 }
 
 /// Handler-computed outcome for a reconnect / force-restart launch op, shared by

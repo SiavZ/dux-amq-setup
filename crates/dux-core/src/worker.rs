@@ -422,11 +422,11 @@ pub enum WorkerEvent {
     /// progress update render as one in-place toast that the final state dismisses.
     CreateAgentProgress {
         status_op_id: String,
-        message: String,
+        message: crate::status_text::StatusText,
     },
     CreateAgentFailed {
         status_op_id: String,
-        message: String,
+        message: crate::status_text::StatusText,
     },
     AgentLaunchReady(Box<AgentLaunchReadyData>),
     AgentLaunchFailed(Box<AgentLaunchFailedData>),
