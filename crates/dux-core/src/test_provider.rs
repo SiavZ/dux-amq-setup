@@ -18,6 +18,16 @@
 //!   harmless programs tests genuinely run instead. A fixture that forgets the
 //!   first half fails its launch instead of starting a real agent.
 //!
+//! The same allowlist covers every program dux starts OUTSIDE a PTY that a
+//! developer would see or feel: the "open in editor" launch, the browser and
+//! file opener, and the shell a project's startup command runs through.
+//! [`refuse_unlisted_launch`] is called from each of those chokepoints in test
+//! builds, [`detect_installed_editors`](crate::editor::detect_installed_editors)
+//! reports only stand-in editors whose command is [`HARMLESS_EDITOR_COMMAND`]
+//! instead of scanning `PATH`, and [`defuse_config`] points the startup-command
+//! shell at a plain `sh`. Git, `gh` and `tailscale` are plumbing the suites fake
+//! or need, and are not routed through it.
+//!
 //! Compiled only for dux-core's own tests and for the `test-support` feature that
 //! `dux-tui` and `dux-web` enable as a dev-dependency, so none of it ships.
 
@@ -47,6 +57,16 @@ pub const HARMLESS_PROVIDER_COMMAND: &str = "sh";
 /// arguments, so it reads no login profile and behaves the same on every
 /// machine whatever the developer's own shell is.
 pub const HARMLESS_TERMINAL_COMMAND: &str = "sh";
+
+/// The command every stand-in editor launches. `true` ignores the path it is
+/// handed and exits, so a test that opens a worktree "in an editor" exercises
+/// the whole launch path and opens nothing on the developer's desktop.
+pub const HARMLESS_EDITOR_COMMAND: &str = "true";
+
+/// The shell and arguments a defused project startup command runs through: a
+/// plain `sh -c`, never the default `$SHELL -l -c`, which would source the
+/// developer's own login profile.
+pub const HARMLESS_STARTUP_SHELL: &str = "sh";
 
 /// The arguments that go with [`HARMLESS_PROVIDER_COMMAND`]. The trailing word is
 /// `$0`, so a `ps` listing names what the process is.
@@ -86,11 +106,37 @@ pub fn refuse_unlisted_spawn(command: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Point every provider and the terminal in `config` at the harmless stand-ins.
+/// The refusal every non-PTY launch chokepoint returns in test builds: the
+/// editor launch, the browser and file opener, and the startup-command shell.
+/// `what` names the kind of program for the message ("editor", "browser").
+/// An `Err` rather than a panic for the same reason as [`refuse_unlisted_spawn`]:
+/// these launches run on worker threads and report failure through the
+/// ordinary error path.
+pub fn refuse_unlisted_launch(what: &str, command: &str) -> anyhow::Result<()> {
+    if !is_allowed_test_command(command) {
+        let message = format!(
+            "test guard: refused to launch the {what} '{command}', which is not one of the \
+             programs tests may run. A test must never open a program on the developer's \
+             desktop. Editor detection in test builds already reports only stand-ins that run \
+             dux_core::test_provider::HARMLESS_EDITOR_COMMAND; a test that needs another \
+             launcher should inject one rather than reach the real program. If the program is \
+             a harmless helper the test genuinely needs, add its file name to \
+             dux_core::test_provider::ALLOWED_TEST_COMMANDS."
+        );
+        eprintln!("{message}");
+        anyhow::bail!(message);
+    }
+    Ok(())
+}
+
+/// Point every provider, the terminal and the startup-command shell in `config`
+/// at the harmless stand-ins.
 pub fn defuse_config(config: &mut Config) {
     defuse_providers(config);
     config.terminal.command = HARMLESS_TERMINAL_COMMAND.to_string();
     config.terminal.args = Vec::new();
+    config.startup_command_terminal.command = HARMLESS_STARTUP_SHELL.to_string();
+    config.startup_command_terminal.args = vec!["-c".to_string()];
 }
 
 /// Point every provider in `config` at the harmless stand-in, keeping each
@@ -143,6 +189,11 @@ pub fn assert_fixture_config_is_harmless(config: &Config) {
         is_allowed_test_command(&config.terminal.command),
         "the fixture's terminal command is '{}', which is not a harmless stand-in",
         config.terminal.command
+    );
+    assert!(
+        is_allowed_test_command(&config.startup_command_terminal.command),
+        "the fixture's startup-command shell is '{}', which is not a harmless stand-in",
+        config.startup_command_terminal.command
     );
 }
 
@@ -208,6 +259,54 @@ mod tests {
         let err = refuse_unlisted_spawn("aider").unwrap_err().to_string();
         assert!(err.contains("aider"), "{err}");
         assert!(err.contains("ALLOWED_TEST_COMMANDS"), "{err}");
+    }
+
+    #[test]
+    fn the_launch_guard_refuses_editors_browsers_and_openers_and_passes_the_stand_in() {
+        for command in [
+            "code",
+            "/usr/bin/code",
+            "code-insiders",
+            "cursor",
+            "zed",
+            "subl",
+            "idea",
+            "xdg-open",
+            "open",
+            "gio",
+            "firefox",
+            "google-chrome",
+            "/usr/bin/zsh",
+        ] {
+            let err = refuse_unlisted_launch("editor", command).unwrap_err();
+            assert!(
+                err.to_string().starts_with("test guard:"),
+                "{command}: {err}"
+            );
+            assert!(err.to_string().contains(command), "{command}: {err}");
+        }
+        refuse_unlisted_launch("editor", HARMLESS_EDITOR_COMMAND).unwrap();
+        refuse_unlisted_launch("startup-command shell", HARMLESS_STARTUP_SHELL).unwrap();
+    }
+
+    /// The default startup-command shell is `$SHELL -l`, which sources the
+    /// developer's login profile; a fixture runs a plain `sh -c` instead.
+    #[test]
+    fn a_harmless_config_runs_startup_commands_through_a_plain_sh() {
+        let config = harmless_config();
+        assert_eq!(
+            config.startup_command_terminal.command,
+            HARMLESS_STARTUP_SHELL
+        );
+        assert_eq!(config.startup_command_terminal.args, vec!["-c"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "startup-command shell")]
+    fn the_fixture_check_refuses_a_login_shell_for_startup_commands() {
+        let mut config = harmless_config();
+        config.startup_command_terminal.command = "$SHELL".to_string();
+        assert_fixture_config_is_harmless(&config);
     }
 
     #[test]

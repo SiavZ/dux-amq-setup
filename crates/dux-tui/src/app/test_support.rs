@@ -557,6 +557,32 @@ fn test_app_cannot_launch_a_real_agent_cli() {
     dux_core::test_provider::assert_fixture_config_is_harmless(&app.engine.config);
 }
 
+/// Opening a worktree "in an editor" from this crate's tests resolves to the
+/// stand-in and opens nothing, and a real editor command is refused rather
+/// than launched on the developer's desktop.
+#[test]
+fn test_app_opens_worktrees_only_in_the_stand_in_editor() {
+    let mut app = test_app(default_bindings());
+    let worktree = tempfile::tempdir().unwrap();
+    let path = worktree.path().to_string_lossy().into_owned();
+    let editors = crate::editor::detect_installed_editors();
+    let editor = crate::editor::preferred_editor(&editors, &app.engine.config.editor.default)
+        .expect("the fixture always has a stand-in editor");
+    assert_eq!(
+        editor.command,
+        dux_core::test_provider::HARMLESS_EDITOR_COMMAND
+    );
+    app.open_worktree_in_editor(&path, "agent", &editor)
+        .expect("the stand-in launches");
+
+    let mut real = editor.clone();
+    real.command = "code".to_string();
+    let err = app
+        .open_worktree_in_editor(&path, "agent", &real)
+        .unwrap_err();
+    assert!(err.to_string().starts_with("test guard:"), "{err}");
+}
+
 /// A scratch directory a test app holds. Tests leave worker threads running
 /// that nobody joins (a dispatch running a subprocess, a worktree write), so
 /// one may still be writing into the directory at the moment the app drops. A

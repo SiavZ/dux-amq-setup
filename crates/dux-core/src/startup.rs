@@ -206,6 +206,9 @@ pub fn open_path(path: &Path) -> Result<()> {
     } else {
         "xdg-open"
     };
+    // Test builds only: never open a file on the developer's desktop.
+    #[cfg(any(test, feature = "test-support"))]
+    crate::test_provider::refuse_unlisted_launch("file opener", opener)?;
     Command::new(opener)
         .arg(path)
         .spawn()
@@ -224,6 +227,10 @@ pub fn run_startup_command(paths: &DuxPaths, run: StartupCommandRun) -> StartupC
             .with_context(|| format!("failed to create {}", log_dir.display()))?;
         let shell = startup_shell_command(&run.terminal.command);
         let shell_args = run.terminal.args.clone();
+        // Test builds only: a startup command runs through a stand-in shell,
+        // never the developer's own login shell and its profile.
+        #[cfg(any(test, feature = "test-support"))]
+        crate::test_provider::refuse_unlisted_launch("startup-command shell", &shell)?;
         let started = Utc::now();
         let started_instant = Instant::now();
         let mut command = Command::new(&shell);
@@ -474,6 +481,45 @@ mod tests {
         assert!(log.contains("success = true"));
         assert!(log.contains("command = printf hello"));
         assert!(log.contains("--- stdout ---\nhello"));
+    }
+
+    /// A shell outside the allowlist (the developer's own login shell, say) is
+    /// refused before it runs, and the refusal is the recorded failure.
+    #[test]
+    fn a_startup_command_through_an_unlisted_shell_is_refused_in_test_builds() {
+        let tmp = tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let project = test_project(tmp.path());
+        let session = test_session(tmp.path());
+        let result = run_startup_command(
+            &paths,
+            StartupCommandRun {
+                project,
+                managed: session
+                    .workspace
+                    .as_managed()
+                    .expect("test_session builds a managed agent")
+                    .clone(),
+                session,
+                command: "printf hello".to_string(),
+                terminal: StartupCommandTerminalConfig {
+                    command: "/usr/bin/zsh".to_string(),
+                    args: vec!["-l".to_string(), "-c".to_string()],
+                },
+                env: Vec::new(),
+            },
+        );
+        let err = result
+            .status
+            .expect_err("an unlisted shell must be refused");
+        assert!(err.starts_with("test guard:"), "{err}");
+    }
+
+    #[test]
+    fn opening_a_path_is_refused_in_test_builds() {
+        let tmp = tempdir().expect("tempdir");
+        let err = open_path(tmp.path()).unwrap_err();
+        assert!(err.to_string().starts_with("test guard:"), "{err}");
     }
 
     #[test]
