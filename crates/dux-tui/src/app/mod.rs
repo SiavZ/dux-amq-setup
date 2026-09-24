@@ -4988,6 +4988,7 @@ impl App {
             "rerun-startup-command-on-agent" => self.rerun_startup_command_on_agent(),
             "read-startup-command-logs" => self.open_startup_command_logs(),
             "pull-project" => self.refresh_selected_project(),
+            "checkout-project-default-branch" => self.checkout_selected_project_default_branch(),
             "delete-project" => self.delete_selected_project(),
             "remove-project" => self.remove_selected_project(),
             "delete-agent" => self.confirm_delete_selected_session(),
@@ -5013,6 +5014,11 @@ impl App {
             }
             "move-agent-bottom" => {
                 self.move_selected_agent(reorder::MoveDir::Bottom);
+                Ok(())
+            }
+            "delete-terminal" => self.delete_terminal_from_palette(),
+            "filter-agents" => {
+                self.filter_agents_from_palette();
                 Ok(())
             }
             "move-terminal-up" => {
@@ -5586,6 +5592,33 @@ impl App {
     /// Enter agent-list filter mode: seed an empty query and rebuild the list.
     /// While active, printable keys type into the query and the arrows navigate
     /// the filtered rows (mirroring the project browser's type-to-filter).
+    /// The palette's way into the agent filter. The key binding only fires
+    /// from the agents pane, where typing already reaches the filter; the
+    /// palette can run from anywhere, so it brings the pane into view and gives
+    /// it focus, or the query would be typed into nothing.
+    pub(crate) fn filter_agents_from_palette(&mut self) {
+        self.left_collapsed = false;
+        self.focus = FocusPane::Left;
+        self.left_section = LeftSection::Projects;
+        self.open_agent_filter();
+    }
+
+    /// The palette's way to delete a terminal. The key binding acts on the
+    /// highlighted terminal row, so the palette does too, and only while a
+    /// terminal row is the selection: the remembered terminal index outlives
+    /// the cursor moving back onto an agent, and deleting a terminal the
+    /// user is not looking at is not what they asked for.
+    pub(crate) fn delete_terminal_from_palette(&mut self) -> Result<()> {
+        if self.left_section != LeftSection::Terminals {
+            self.set_error(
+                "Select a terminal in the agents pane first, then run delete-terminal again to \
+                 close it.",
+            );
+            return Ok(());
+        }
+        self.confirm_delete_selected_terminal()
+    }
+
     pub(crate) fn open_agent_filter(&mut self) {
         self.agent_filter = Some(TextInput::new());
         self.rebuild_left_items();
@@ -7100,6 +7133,94 @@ pub(crate) fn runtime_project_to_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every command the palette lists must reach an arm of `execute_command`,
+    /// never the catch-all that reports it as unknown. Each name runs on a
+    /// fresh app, so one command's state cannot hide another's miss.
+    #[test]
+    fn every_palette_command_reaches_a_real_arm() {
+        let mut missing = Vec::new();
+        for command in dux_core::palette::PALETTE_COMMANDS {
+            let mut app = test_support::test_app(test_support::default_bindings());
+            // Both ways to serve refuse early while a flip is starting, so the
+            // sweep never binds a port or detects Tailscale.
+            app.server_flip_preflight_pending = true;
+            // An `Err` is a real arm refusing on this bare fixture; only the
+            // catch-all's status says the name was never matched.
+            let _ = app.execute_command(command.name.to_string());
+            if let Some((_, message)) = app.status.most_recent_tui()
+                && message.contains("Unknown command")
+            {
+                missing.push(command.name);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "palette commands with no execute_command arm: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn the_palette_opens_the_agent_filter_in_view_and_focused() {
+        let mut app = test_support::test_app(test_support::default_bindings());
+        app.focus = FocusPane::Center;
+        app.left_collapsed = true;
+
+        app.execute_command("filter-agents".to_string()).unwrap();
+
+        assert!(app.agent_filter.is_some(), "the filter must be open");
+        assert_eq!(app.focus, FocusPane::Left, "typing must reach the filter");
+        assert!(!app.left_collapsed, "the filter must be on screen");
+    }
+
+    #[test]
+    fn the_palette_asks_before_deleting_the_selected_terminal() {
+        let mut app = test_support::test_app(test_support::default_bindings());
+        app.show_companion_terminal().expect("launch a terminal");
+        app.left_section = LeftSection::Terminals;
+        app.selected_terminal_index = 0;
+
+        app.execute_command("delete-terminal".to_string()).unwrap();
+
+        assert!(
+            matches!(app.prompt, PromptState::ConfirmDeleteTerminal { .. }),
+            "expected the delete-terminal confirmation, got {:?}",
+            app.prompt
+        );
+    }
+
+    #[test]
+    fn the_palette_refuses_to_delete_a_terminal_that_is_not_selected() {
+        let mut app = test_support::test_app(test_support::default_bindings());
+        app.show_companion_terminal().expect("launch a terminal");
+        app.left_section = LeftSection::Projects;
+        app.selected_terminal_index = 0;
+
+        app.execute_command("delete-terminal".to_string()).unwrap();
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert!(
+            app.status
+                .text()
+                .contains("Select a terminal in the agents pane first"),
+            "{}",
+            app.status.text()
+        );
+    }
+
+    #[test]
+    fn the_palette_asks_before_checking_out_the_default_branch() {
+        let mut app = test_support::test_app(test_support::default_bindings());
+
+        app.execute_command("checkout-project-default-branch".to_string())
+            .unwrap();
+
+        assert!(
+            matches!(app.prompt, PromptState::ConfirmCheckoutDefaultBranch { .. }),
+            "expected the checkout confirmation, got {:?}",
+            app.prompt
+        );
+    }
 
     /// The answer the delete request carries, in the three states the dialog
     /// can be in. The absent case is the load-bearing one: it is what keeps the
