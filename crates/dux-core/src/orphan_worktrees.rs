@@ -127,7 +127,9 @@ fn load_inventory(paths: &DuxPaths) -> Result<Inventory> {
     })?;
     // An absent database has no rows; anything else must open and load whole.
     let (store, sessions) = if paths.sessions_db_path.exists() {
-        let store = SessionStore::open(&paths.sessions_db_path).with_context(|| {
+        // The TUI runs this on a worker while its engine is live, so it must
+        // not rerun the migration's repair passes against the engine's rows.
+        let store = SessionStore::open_existing(&paths.sessions_db_path).with_context(|| {
             format!("{abort}: repair {database_path} or restore {database_path}.bak, then retry")
         })?;
         let sessions = store.load_sessions_including_deleted().with_context(|| {
