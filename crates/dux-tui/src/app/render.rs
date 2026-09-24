@@ -1146,61 +1146,20 @@ fn render_wrapped_body(
 /// A dialog body pre-wrapped to `inner_width`, with its row count.
 ///
 /// The bodies that carry name chips are wrapped here rather than by the
-/// `Paragraph`, because a chip changes where a word ends and the estimate in
-/// [`wrapped_line_count`] counts characters rather than words: a height that is
-/// one row short clips the last line of a body that does not scroll.
+/// `Paragraph`, because a chip changes where a word ends and a character-count
+/// estimate disagrees with where whole words and whole chips end: a height that
+/// is one row short clips the last line of a body that does not scroll.
 fn exact_body(lines: &[Line<'_>], inner_width: u16, theme: &Theme) -> (Vec<Line<'static>>, u16) {
     let wrapped = wrap_styled_lines(lines, usize::from(inner_width), theme);
     let height = u16::try_from(wrapped.len()).unwrap_or(u16::MAX);
     (wrapped, height)
 }
 
-fn wrapped_line_count(lines: &[Line<'_>], width: u16, trim: bool) -> u16 {
-    if width == 0 {
-        return 0;
-    }
-
-    let max_width = usize::from(width);
-    let mut total = 0u16;
-    for line in lines {
-        let mut current_width = 0usize;
-        let mut line_count = 1u16;
-        for span in &line.spans {
-            let content = if trim {
-                span.content.trim_end_matches(' ')
-            } else {
-                span.content.as_ref()
-            };
-            for segment in content.split('\n') {
-                let segment_width = segment.chars().count();
-                if segment_width == 0 {
-                    continue;
-                }
-
-                let remaining = if current_width == 0 {
-                    max_width
-                } else {
-                    max_width.saturating_sub(current_width)
-                };
-                if segment_width <= remaining {
-                    current_width += segment_width;
-                } else {
-                    let needed = if current_width == 0 {
-                        segment_width
-                    } else {
-                        segment_width - remaining
-                    };
-                    line_count = line_count.saturating_add(((needed - 1) / max_width) as u16 + 1);
-                    current_width = needed % max_width;
-                    if current_width == 0 {
-                        current_width = max_width;
-                    }
-                }
-            }
-        }
-        total = total.saturating_add(line_count);
-    }
-    total
+/// How many rows `lines` take once the shared wrapper has wrapped them to
+/// `width`: the height a dialog sized to its body must use, because that
+/// wrapper is what paints the body.
+fn wrapped_rows(lines: &[Line<'_>], width: u16, theme: &Theme) -> u16 {
+    exact_body(lines, width, theme).1
 }
 
 /// The macro editor's popup size. Tall enough that the body still gets a
@@ -1260,7 +1219,7 @@ impl App {
         body_lines: Vec<Line<'static>>,
         focus: DeleteAgentFocus,
     ) {
-        let body_height = wrapped_line_count(&body_lines, inner_width, false);
+        let body_height = wrapped_rows(&body_lines, inner_width, &self.theme);
         let area = centered_rect_exact(dialog_width, 2 + body_height + 1 + 3, frame.area());
         self.clear_overlay_area(frame, area);
         let outer = self.themed_overlay_block("Delete Agent");
@@ -7577,7 +7536,7 @@ impl App {
                 body_lines.push(Line::from(Span::styled(row, style)));
             }
         }
-        let body_height = wrapped_line_count(&body_lines, inner_width, false);
+        let body_height = wrapped_rows(&body_lines, inner_width, &self.theme);
         let area = centered_rect_exact(dialog_width, 2 + body_height + 3, frame.area());
         self.clear_overlay_area(frame, area);
 
@@ -8538,13 +8497,13 @@ impl App {
         // dialog under the pointer.
         let worktree_line_height = [true, false]
             .into_iter()
-            .map(|checked| wrapped_line_count(&[worktree_line(checked)], inner_width, false))
+            .map(|checked| wrapped_rows(&[worktree_line(checked)], inner_width, &self.theme))
             .max()
             .unwrap_or(1);
-        let worktree_line_extra = worktree_line_height.saturating_sub(wrapped_line_count(
+        let worktree_line_extra = worktree_line_height.saturating_sub(wrapped_rows(
             &[worktree_line(*checkout_default)],
             inner_width,
-            false,
+            &self.theme,
         ));
         body_lines.push(worktree_line(*checkout_default));
         for _ in 0..worktree_line_extra {
@@ -8561,7 +8520,7 @@ impl App {
                 Style::default().fg(self.theme.hint_desc_fg),
             )));
         }
-        let body_height = wrapped_line_count(&body_lines, inner_width, false);
+        let body_height = wrapped_rows(&body_lines, inner_width, &self.theme);
 
         // Checkbox height is measured up-front so the outer rect can
         // be sized exactly, mirroring the Delete Agent modal.
@@ -10248,7 +10207,7 @@ impl App {
                 Style::default().fg(self.theme.hint_desc_fg),
             )));
         }
-        let body_height = wrapped_line_count(&body_lines, inner_width, false);
+        let body_height = wrapped_rows(&body_lines, inner_width, &self.theme);
         let checkbox_spacing = u16::from(!worktree_shared);
         let button_spacing = u16::from(!worktree_shared);
         let area = centered_rect_exact(
@@ -19256,14 +19215,14 @@ mod tests {
     }
 
     #[test]
-    fn wrapped_line_count_counts_unwrapped_lines() {
+    fn wrapped_rows_counts_unwrapped_lines() {
         let lines = vec![Line::from(" short line"), Line::from(" another short line")];
 
-        assert_eq!(wrapped_line_count(&lines, 40, false), 2);
+        assert_eq!(wrapped_rows(&lines, 40, &Theme::default_dark()), 2);
     }
 
     #[test]
-    fn wrapped_line_count_grows_for_narrow_widths() {
+    fn wrapped_rows_grows_for_narrow_widths() {
         let lines = vec![Line::from(vec![
             Span::raw(" Are you sure you want to delete "),
             Span::styled(
@@ -19273,7 +19232,7 @@ mod tests {
             Span::raw("?"),
         ])];
 
-        assert!(wrapped_line_count(&lines, 20, false) > 1);
+        assert!(wrapped_rows(&lines, 20, &Theme::default_dark()) > 1);
     }
 
     // ── Unit tests for capitalize ─────────────────────────────────

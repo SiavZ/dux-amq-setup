@@ -373,6 +373,60 @@ fn the_non_default_branch_dialog_chips_both_branches_the_note_and_the_checkbox()
     assert!(occurrences(&buf, "main-nd").len() >= 2, "{}", screen(&buf));
 }
 
+/// The dialog sizes itself to its body, so the height must be the rows the
+/// wrapper actually produces: an estimate that counts characters instead of
+/// whole words and whole chips comes up short and clips the last sentence.
+#[test]
+fn the_non_default_branch_dialog_is_as_tall_as_its_wrapped_body() {
+    let gap_to_buttons = |buf: &Buffer, width: u16| {
+        let shown = screen(buf);
+        let rows: Vec<&str> = shown.lines().collect();
+        let last = rows
+            .iter()
+            .position(|row| row.contains("you."))
+            .unwrap_or_else(|| panic!("at width {width} the last sentence is clipped:\n{shown}"));
+        let cancel = rows
+            .iter()
+            .position(|row| row.contains("Cancel"))
+            .expect("the Cancel button");
+        cancel.checked_sub(last)
+    };
+    let prompt = |app: &App| PromptState::ConfirmNonDefaultBranch {
+        add: PendingProjectAdd {
+            path: app.engine.projects[0].path.clone(),
+            name: "demo".to_string(),
+        },
+        current_branch: "My Topic Branch".to_string(),
+        kind: dux_core::worker::BranchWarningKind::Heuristic,
+        focus: ConfirmNonDefaultBranchFocus::Cancel,
+        checkout_default: false,
+    };
+    // Wide enough that nothing wraps: the gap every narrower drawing must keep.
+    let mut app = test_app(default_bindings());
+    app.prompt = prompt(&app);
+    let unwrapped = gap_to_buttons(&render_at(&mut app, 160, HEIGHT), 160);
+    for width in 30..=90u16 {
+        let mut app = test_app(default_bindings());
+        app.prompt = prompt(&app);
+        let buf = render_at(&mut app, width, HEIGHT);
+        assert_eq!(
+            occurrences(&buf, "My Topic Branch").len(),
+            2,
+            "at width {width} the branch must be whole in the warning and the note:\n{}",
+            screen(&buf)
+        );
+        // The body's last row sits exactly as far above the buttons as it
+        // does unwrapped: an estimate that is too short clips the sentence,
+        // one that is too tall leaves a blank band.
+        assert_eq!(
+            gap_to_buttons(&buf, width),
+            unwrapped,
+            "at width {width} the body is not exactly as tall as its wrapped rows:\n{}",
+            screen(&buf)
+        );
+    }
+}
+
 #[test]
 fn the_use_existing_branch_dialog_chips_the_branch() {
     let mut app = test_app(default_bindings());
