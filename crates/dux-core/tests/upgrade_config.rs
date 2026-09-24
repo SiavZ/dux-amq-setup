@@ -457,3 +457,94 @@ fn an_unknown_compose_bar_mode_degrades_to_auto_at_load() {
     assert_eq!(config.ui.compose_bar, "auto");
     assert_eq!(config.ui.status_clear_seconds, 7, "the load did not fail");
 }
+
+/// Fork 07d9b0ba-era `config_v0_loads_and_migrates_to_current`. The fork
+/// versioned its config with a root `schema_version` and a migration ladder;
+/// dux migrates by idempotent key rules on every load instead (see
+/// `config_migrate`), so the version number means nothing here. What must
+/// still hold: a fork config carrying ANY `schema_version`, even the
+/// pre-versioning 0, loads without error, keeps the values set beside it, and
+/// loading it a second time gives the same answer.
+#[test]
+fn config_v0_loads_and_migrates_to_current() {
+    for version in [0, 3, 4] {
+        let raw = format!(
+            "schema_version = {version}\n\n[defaults]\nprovider = \"codex\"\n\n\
+             [ui]\nleft_width_pct = 31\n"
+        );
+        let (_tmp, paths, first) = load_old(&raw);
+        assert_eq!(
+            first.defaults.provider, "codex",
+            "v{version}: provider kept"
+        );
+        assert_eq!(first.ui.left_width_pct, 31, "v{version}: ui value kept");
+        let second = load_config(&paths);
+        assert_eq!(first, second, "v{version}: a second load is stable");
+    }
+}
+
+/// Fork 2bdd42ba (its v2 -> v3 ladder step). A fork v2 config forced
+/// `forward_scroll = true` on a stock codex block, so the wheel went to a CLI
+/// that never takes the mouse and the pane could not scroll. On load the forced
+/// value is dropped (auto keeps codex scrollback in dux, which is what the fork
+/// chose), while a codex block with customized args keeps what the user set.
+#[test]
+fn config_v2_moves_default_codex_scrollback_into_dux() {
+    let stock = "schema_version = 2\n\n[providers.codex]\ncommand = \"codex-amq\"\n\
+                 args = []\nforward_scroll = true\n";
+    let (_tmp, paths, config) = load_old(stock);
+    assert_eq!(
+        config.providers.commands["codex"].forward_scroll, None,
+        "a stock codex block must stop forcing the wheel into codex"
+    );
+    assert_eq!(load_config(&paths), config, "a second load is stable");
+
+    let customized = "schema_version = 2\n\n[providers.codex]\ncommand = \"codex-amq\"\n\
+                      args = [\"--model\", \"o3\"]\nforward_scroll = true\n";
+    let (_tmp, _paths, config) = load_old(customized);
+    let codex = &config.providers.commands["codex"];
+    assert_eq!(codex.args, ["--model", "o3"]);
+    assert_eq!(
+        codex.forward_scroll,
+        Some(true),
+        "a customized block is kept"
+    );
+
+    // A config dux itself wrote has no schema_version: an explicit true there
+    // is a choice and is never touched.
+    let upstream = "[providers.codex]\ncommand = \"codex\"\nforward_scroll = true\n";
+    let (_tmp, _paths, config) = load_old(upstream);
+    assert_eq!(
+        config.providers.commands["codex"].forward_scroll,
+        Some(true)
+    );
+}
+
+/// Fork bc3a9eec (its v3 -> v4 ladder step). Before it, the fork's renderer
+/// wrote the resolved `forward_mouse = true` for claude and codex, so a fork v3
+/// config carries an explicit `true` nobody chose, and plain drags went to the
+/// agent instead of selecting text. On load a stock command is pinned back to
+/// `false`; a custom wrapper keeps its value.
+#[test]
+fn config_v3_keeps_claude_and_codex_drags_in_dux() {
+    let raw = "schema_version = 3\n\n\
+               [providers.claude]\ncommand = \"claude-amq\"\nforward_mouse = true\n\n\
+               [providers.codex]\ncommand = \"codex-amq\"\nforward_mouse = true\n";
+    let (_tmp, paths, config) = load_old(raw);
+    assert!(!config.providers.commands["claude"].forwards_mouse());
+    assert!(!config.providers.commands["codex"].forwards_mouse());
+    assert_eq!(load_config(&paths), config, "a second load is stable");
+
+    let custom = raw.replace(
+        "command = \"claude-amq\"",
+        "command = \"my-claude-wrapper\"",
+    );
+    let (_tmp, _paths, config) = load_old(&custom);
+    assert!(config.providers.commands["claude"].forwards_mouse());
+    assert!(!config.providers.commands["codex"].forwards_mouse());
+
+    // A v4 config already had its drags pinned; an explicit true there is a
+    // choice made after the fix and is kept.
+    let (_tmp, _paths, config) = load_old(&raw.replace("schema_version = 3", "schema_version = 4"));
+    assert!(config.providers.commands["claude"].forwards_mouse());
+}

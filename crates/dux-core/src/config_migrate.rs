@@ -28,7 +28,77 @@ use crate::config_write::{ensure_table, remove_table_key_item};
 pub fn apply_load_migrations(doc: &mut DocumentMut) -> Result<bool> {
     let deprecations_changed = apply_config_deprecations(doc)?;
     let retired_changed = prune_retired_providers(doc);
-    Ok(deprecations_changed || retired_changed)
+    let fork_changed = consume_fork_schema_version(doc);
+    Ok(deprecations_changed || retired_changed || fork_changed)
+}
+
+/// The fork versioned its config with a root `schema_version` and a migration
+/// ladder; dux migrates by the key rules in this module instead, and never
+/// writes that key. Its presence therefore marks a config written by the fork,
+/// and the one ladder step whose effect an upstream load would otherwise lose
+/// runs here, once: the key is removed as it is consumed, so a later explicit
+/// choice is never overridden again.
+///
+/// Fork v3 -> v4 (bc3a9eec): the fork's renderer wrote the RESOLVED
+/// `forward_mouse` (always `true` for claude and codex before then), so a
+/// config from that era carries an explicit `true` the user never chose.
+/// `ensure_defaults` keeps explicit values, so without this those users keep
+/// forwarding plain drags to the agent and cannot copy pane text. Only a
+/// stock command (plain or the dux-amq wrapper) is rewritten; a custom wrapper
+/// was the user's choice and keeps its value, as it did on the fork.
+///
+/// Fork v2 -> v3 (2bdd42ba): the fork shipped codex with `forward_scroll =
+/// true`, which sends the wheel to a CLI that never takes the mouse (measured,
+/// see 16a18590), so the pane cannot scroll. The fork fixed it by keeping
+/// codex scrollback in dux; here that is upstream's auto mode, so an untouched
+/// stock codex block (no base args) simply drops the forced `true`. The fork
+/// also added `--no-alt-screen`, which upstream does not need and does not
+/// ship, so it is not added. Customized args keep their `forward_scroll`.
+fn consume_fork_schema_version(doc: &mut DocumentMut) -> bool {
+    let Some(version) = doc.get("schema_version").and_then(Item::as_integer) else {
+        return false;
+    };
+    doc.remove("schema_version");
+    if version < 3
+        && let Some(codex) = doc
+            .get_mut("providers")
+            .and_then(Item::as_table_mut)
+            .and_then(|providers| providers.get_mut("codex"))
+            .and_then(Item::as_table_mut)
+    {
+        let stock_command = codex
+            .get("command")
+            .and_then(Item::as_str)
+            .is_none_or(|command| matches!(command, "codex" | "codex-amq"));
+        let no_base_args = codex
+            .get("args")
+            .and_then(Item::as_array)
+            .is_none_or(|args| args.is_empty());
+        let forced_on = codex.get("forward_scroll").and_then(Item::as_bool) == Some(true);
+        if stock_command && no_base_args && forced_on {
+            codex.remove("forward_scroll");
+        }
+    }
+    if version < 4
+        && let Some(providers) = doc.get_mut("providers").and_then(Item::as_table_mut)
+    {
+        for (name, commands) in [
+            ("claude", ["claude", "claude-amq"]),
+            ("codex", ["codex", "codex-amq"]),
+        ] {
+            let Some(table) = providers.get_mut(name).and_then(Item::as_table_mut) else {
+                continue;
+            };
+            let stock = table
+                .get("command")
+                .and_then(Item::as_str)
+                .is_none_or(|command| commands.contains(&command));
+            if stock {
+                table["forward_mouse"] = toml_edit::value(false);
+            }
+        }
+    }
+    true
 }
 
 #[derive(Clone, Copy, Debug)]
