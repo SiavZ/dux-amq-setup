@@ -9,19 +9,30 @@
 //!   provider table whose names are the stock ones but whose command is a plain
 //!   `cat` behind `sh`, so a test that needs "the claude provider" keeps the name
 //!   and launches nothing real.
-//! - [`refuse_real_agent_cli`] is called from the PTY spawn chokepoint in test
-//!   builds only, and refuses to exec any command whose file name is a known agent
-//!   CLI. A fixture that forgets the first half fails its launch instead of
-//!   starting a real agent.
+//! - [`refuse_unlisted_spawn`] is called from the PTY spawn chokepoint in test
+//!   builds only, and refuses to exec any command that is not one of the
+//!   [`ALLOWED_TEST_COMMANDS`]. Any CLI can be a provider, so a list of the agent
+//!   CLIs we know about could never be complete; the allowlist names the few
+//!   harmless programs tests genuinely run instead. A fixture that forgets the
+//!   first half fails its launch instead of starting a real agent.
 //!
 //! Compiled only for dux-core's own tests and for the `test-support` feature that
 //! `dux-tui` and `dux-web` enable as a dev-dependency, so none of it ships.
 
 use crate::config::{Config, ProviderCommandConfig, default_provider_commands};
 
-/// The file names of the agent CLIs a test must never exec. The stock providers
-/// plus `gemini`, the documented example of a user-added one.
-pub const REAL_AGENT_CLIS: &[&str] = &["claude", "codex", "opencode", "copilot", "gemini"];
+/// The file names of the only programs a test may spawn through a PTY. Matched
+/// exactly against the command's file name, so `/bin/sh` is allowed and `Claude`
+/// is not (on a case-insensitive filesystem that name is the real `claude`).
+///
+/// The shells are here because a terminal's default command is `$SHELL`, which
+/// differs from one developer's machine to the next; the rest are the stand-ins
+/// and one-shot helpers the suites use. To allow another program, add its file
+/// name here, and only if running it can touch nothing outside the test's own
+/// scratch directory.
+pub const ALLOWED_TEST_COMMANDS: &[&str] = &[
+    "sh", "bash", "dash", "zsh", "fish", "cat", "sleep", "true", "false", "printf", "echo", "env",
+];
 
 /// The stand-in every defused provider runs. `sh -c 'exec cat'` rather than a bare
 /// `cat` because a launch appends the provider's resume arguments (`--continue`,
@@ -39,25 +50,27 @@ pub fn harmless_provider_args() -> Vec<String> {
     ]
 }
 
-/// Whether `command` names a real agent CLI, by its file name, so `claude`,
-/// `/usr/local/bin/claude` and `~/.local/bin/claude` all count.
-pub fn names_real_agent_cli(command: &str) -> bool {
+/// Whether a test may spawn `command`, judged by its file name, so `sh` and
+/// `/bin/sh` both count and `claude`, `Cat` and `/bin/claude-notes` do not.
+pub fn is_allowed_test_command(command: &str) -> bool {
     let name = std::path::Path::new(command.trim())
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
-    REAL_AGENT_CLIS.contains(&name)
+    ALLOWED_TEST_COMMANDS.contains(&name)
 }
 
 /// The refusal the PTY spawn path returns in test builds. An `Err` rather than a
 /// panic because launches run on worker threads, where a panic would vanish and
 /// leave the test waiting; the ordinary spawn-failure path reports it instead.
-pub fn refuse_real_agent_cli(command: &str) -> anyhow::Result<()> {
-    if names_real_agent_cli(command) {
+pub fn refuse_unlisted_spawn(command: &str) -> anyhow::Result<()> {
+    if !is_allowed_test_command(command) {
         let message = format!(
-            "test guard: refused to spawn the real agent CLI '{command}'. A test resolved a \
-             provider to a real agent binary; build its config with \
-             dux_core::test_provider::harmless_config() or defuse_providers()."
+            "test guard: refused to spawn '{command}', which is not one of the programs tests \
+             may run. If a test resolved a provider to a real agent CLI, build its config with \
+             dux_core::test_provider::harmless_config() or defuse_providers(). If the program is \
+             a harmless helper the test genuinely needs, add its file name to \
+             dux_core::test_provider::ALLOWED_TEST_COMMANDS."
         );
         eprintln!("{message}");
         anyhow::bail!(message);
@@ -106,8 +119,8 @@ pub fn assert_fixture_config_is_harmless(config: &Config) {
     for provider in providers {
         let command = crate::config::provider_config(config, &provider).command;
         assert!(
-            !names_real_agent_cli(&command),
-            "the fixture resolves provider '{}' to the real agent CLI '{command}'",
+            is_allowed_test_command(&command),
+            "the fixture resolves provider '{}' to '{command}', which is not a harmless stand-in",
             provider.as_str()
         );
     }
@@ -120,21 +133,71 @@ mod tests {
     use crate::model::ProviderKind;
 
     #[test]
-    fn a_real_agent_cli_is_recognised_by_its_file_name() {
-        for name in REAL_AGENT_CLIS {
-            assert!(names_real_agent_cli(name));
-            assert!(names_real_agent_cli(&format!("/usr/local/bin/{name}")));
+    fn an_allowed_command_is_recognised_by_its_exact_file_name() {
+        for name in ALLOWED_TEST_COMMANDS {
+            assert!(is_allowed_test_command(name));
+            assert!(is_allowed_test_command(&format!("/usr/bin/{name}")));
         }
-        assert!(!names_real_agent_cli("cat"));
-        assert!(!names_real_agent_cli("sh"));
-        assert!(!names_real_agent_cli("/bin/claude-notes"));
+        assert!(!is_allowed_test_command("claude"));
+        assert!(!is_allowed_test_command("Cat"));
+        assert!(!is_allowed_test_command("/bin/claude-notes"));
+        assert!(!is_allowed_test_command(""));
     }
 
     #[test]
     fn the_spawn_guard_refuses_a_real_agent_cli_and_passes_the_stand_in() {
-        let err = refuse_real_agent_cli("claude").unwrap_err();
+        let err = refuse_unlisted_spawn("claude").unwrap_err();
         assert!(err.to_string().contains("test guard"), "{err}");
-        refuse_real_agent_cli(HARMLESS_PROVIDER_COMMAND).unwrap();
+        refuse_unlisted_spawn(HARMLESS_PROVIDER_COMMAND).unwrap();
+    }
+
+    /// Any CLI can be a provider, so a list of the agents we know about cannot
+    /// keep a test away from the one we do not: only the stand-ins are allowed.
+    #[test]
+    fn the_spawn_guard_refuses_any_command_that_is_not_a_listed_stand_in() {
+        for command in [
+            "claude",
+            "/usr/local/bin/codex",
+            "aider",
+            "goose",
+            "cursor-agent",
+        ] {
+            let err = refuse_unlisted_spawn(command).unwrap_err();
+            assert!(
+                err.to_string().starts_with("test guard:"),
+                "{command}: {err}"
+            );
+        }
+    }
+
+    /// A case-insensitive filesystem resolves `Claude` to the real `claude`, so
+    /// the comparison is exact: a differently cased name is simply not listed.
+    #[test]
+    fn the_spawn_guard_refuses_a_differently_cased_agent_cli() {
+        for command in ["Claude", "CLAUDE", "/opt/bin/Codex", "Sh"] {
+            let err = refuse_unlisted_spawn(command).unwrap_err();
+            assert!(
+                err.to_string().starts_with("test guard:"),
+                "{command}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_spawn_guard_error_says_how_to_extend_the_allowlist() {
+        let err = refuse_unlisted_spawn("aider").unwrap_err().to_string();
+        assert!(err.contains("aider"), "{err}");
+        assert!(err.contains("ALLOWED_TEST_COMMANDS"), "{err}");
+    }
+
+    #[test]
+    fn the_pty_spawn_path_runs_an_allowed_stand_in_by_name_and_by_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        for command in ["sh", "/bin/sh"] {
+            let args = vec!["-c".to_string(), "exit 0".to_string()];
+            crate::pty::PtyClient::spawn_with_env(command, &args, tmp.path(), 24, 80, 10, &[])
+                .unwrap_or_else(|err| panic!("{command} was refused: {err}"));
+        }
     }
 
     #[test]
@@ -162,7 +225,7 @@ mod tests {
                 "{name}"
             );
         }
-        assert!(!names_real_agent_cli(
+        assert!(is_allowed_test_command(
             &provider_config(&config, &config.default_provider()).command
         ));
     }
