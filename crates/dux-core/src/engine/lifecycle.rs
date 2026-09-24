@@ -518,8 +518,10 @@ pub enum DetachSessionOutcome {
         key: String,
         /// The wait the request promised, in seconds.
         grace_seconds: u64,
-        /// The busy sentence to show while the wait runs.
-        busy: String,
+        /// The busy sentence to show while the wait runs, built from parts so
+        /// the web's busy toast chips the agent's name; the terminal UI prints
+        /// its plain message.
+        busy: crate::status_text::StatusText,
     },
 }
 
@@ -1347,7 +1349,7 @@ impl Engine {
             label,
             key,
             grace_seconds,
-            busy: busy.to_string(),
+            busy,
         }
     }
 

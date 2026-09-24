@@ -7283,6 +7283,15 @@ mod tests {
         assert_eq!(status.tone, "busy", "msg: {}", status.message);
         assert_eq!(status.key.as_deref(), Some("detach-agent:s1"));
         assert_eq!(status.message, "Asking \"s1-title\" to shut down…");
+        // The busy toast chips the agent's name like its final does.
+        assert_eq!(
+            serde_json::to_value(status.segments.as_ref().expect("built from parts")).unwrap(),
+            serde_json::json!([
+                "Asking ",
+                {"name": "s1-title", "quoted": true},
+                " to shut down…"
+            ])
+        );
         // EVERY tab's provider is gone, not just the session-slot one.
         assert!(
             !engine.providers.contains_key(TabIdRef::new("s1-slot")),
