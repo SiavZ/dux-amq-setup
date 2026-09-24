@@ -4169,6 +4169,35 @@ mod tests {
         assert_eq!(ids, vec!["b", "a"]);
     }
 
+    /// Fork audit02 P1-Z (tests/session_state.rs). The fork persisted a
+    /// typestate `SessionState` in a `state_json` column; upstream persists
+    /// the same lifecycle as `SessionStatus` in `status`, and every value must
+    /// come back as written, or a restart would revive an exited agent or lose
+    /// a detached one.
+    #[test]
+    fn session_state_persists_round_trip_through_store() {
+        let store = test_store();
+        let now = Utc::now();
+        for (id, status) in [
+            ("active", SessionStatus::Active),
+            ("detached", SessionStatus::Detached),
+            ("exited", SessionStatus::Exited),
+        ] {
+            let mut session = test_session(id, now, now);
+            session.status = status;
+            store.upsert_session(&session).unwrap();
+        }
+        let loaded = store.load_sessions().unwrap();
+        for (id, status) in [
+            ("active", SessionStatus::Active),
+            ("detached", SessionStatus::Detached),
+            ("exited", SessionStatus::Exited),
+        ] {
+            let row = loaded.iter().find(|s| s.id == id).expect("row survives");
+            assert_eq!(row.status, status, "{id} round-trips");
+        }
+    }
+
     /// Fork a38187f3. Every provider's id round-trips, independently.
     #[test]
     fn provider_session_ids_round_trip() {
