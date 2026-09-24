@@ -453,6 +453,9 @@ const LEFT_PANE_GUTTER: u16 = 1;
 /// Badge glyph marking a pull request on the agent row, standing in for the
 /// letters "PR" to save a column. U+2387 (ALTERNATIVE KEY SYMBOL) renders as a
 /// branch fork in most terminals and is width-1; the `#<number>` follows it.
+/// The sidebar badge on a shared main-workspace agent's row.
+pub(crate) const SHARED_WORKSPACE_BADGE: &str = "SHARED ";
+
 const PR_BADGE_GLYPH: &str = "⎇";
 
 /// Truncate `s` to at most `max_w` display columns, measured by real
@@ -1386,6 +1389,20 @@ impl App {
         // rather than ellipsizing, and a running network listener is not visible
         // anywhere else, while its siblings are recoverable from the panes.
         self.push_live_header_chip(&mut spans, self.serving_chip());
+        // Shared main-workspace mode (fork d0ce0afc): a persistent warning while
+        // more than one agent writes in one checkout. Derived from live state
+        // every frame, so it cannot be overwritten by an unrelated status, and
+        // honest about its scope: another dux home is invisible from here.
+        if let Some(summary) = self.engine.shared_multi_writer_summary() {
+            spans.push(Span::styled(" ╱ ", Style::default().fg(sep_fg).bg(bg)));
+            spans.push(Span::styled(
+                summary.badge(),
+                Style::default()
+                    .fg(self.theme.warning_fg)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         // A standalone agent has no project and no branch, so it gets the folder
         // it runs in, home-collapsed, in the slot the project crumb occupies.
         // Its own arm rather than a hole in the project arm: gating the bar's
@@ -1801,9 +1818,22 @@ impl App {
         // the marker, state word, and tab count fully visible and truncates the
         // project name and branch to fit (matching the web's per-field shrink),
         // rather than ellipsizing the whole run and dropping the tab count first.
-        let line1 = match pr_badge {
-            Some(badge) => right_align_line(line1_left, vec![badge], text_width, 2),
-            None => ellipsize_spans(line1_left, text_width),
+        // Shared main-workspace agents wear a SHARED badge (fork 73c597ae):
+        // the row runs in the user's own checkout, which changes what delete
+        // and rename may do, so it must be visible at a glance.
+        let shared_badge = session.shared_workspace().then(|| {
+            Span::styled(
+                SHARED_WORKSPACE_BADGE,
+                Style::default()
+                    .fg(self.theme.warning_fg)
+                    .add_modifier(Modifier::BOLD),
+            )
+        });
+        let right: Vec<Span<'static>> = shared_badge.into_iter().chain(pr_badge).collect();
+        let line1 = if right.is_empty() {
+            ellipsize_spans(line1_left, text_width)
+        } else {
+            right_align_line(line1_left, right, text_width, 2)
         };
         // Line two renders two more searched fields (project name, branch), so
         // a live filter hit inside either gets the same emphasis as the name on
@@ -8511,6 +8541,97 @@ impl App {
         };
     }
 
+    /// Shared main-workspace second-writer consent (fork d0ce0afc).
+    fn render_confirm_shared_writer_prompt(&mut self, frame: &mut Frame) {
+        let PromptState::ConfirmSharedWriter {
+            existing_agent,
+            focus,
+            ..
+        } = &self.prompt
+        else {
+            return;
+        };
+        let existing_agent = existing_agent.clone();
+        let focus = *focus;
+        self.render_dim_overlay(frame);
+        let area = centered_rect(60, 30, frame.area());
+        self.clear_overlay_area(frame, area);
+        let outer = self.themed_overlay_block("Another Agent Is Writing Here");
+        let inner = outer.inner(area);
+        outer.render(area, frame.buffer_mut());
+
+        let [body_area, _, buttons_area] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(3),
+            ])
+            .areas(inner);
+        let lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::raw(" Agent "),
+                Span::styled(
+                    existing_agent,
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" is already running in this shared checkout."),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                " Two agents editing the same files can overwrite each other's work.",
+                Style::default().fg(self.theme.warning_fg),
+            )),
+            Line::from(Span::styled(
+                " Start a second writer anyway?",
+                Style::default().fg(self.theme.warning_fg),
+            )),
+        ];
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(body_area, frame.buffer_mut());
+
+        let btn_width = 16u16;
+        let gap = 2u16;
+        let total = btn_width * 2 + gap;
+        let left_offset = buttons_area.width.saturating_sub(total) / 2;
+        let cancel_area = Rect {
+            x: buttons_area.x + left_offset,
+            y: buttons_area.y,
+            width: btn_width,
+            height: 3,
+        };
+        let start_area = Rect {
+            x: cancel_area.x + btn_width + gap,
+            y: buttons_area.y,
+            width: btn_width,
+            height: 3,
+        };
+        Button::new("Cancel")
+            .kind(ButtonKind::Confirm)
+            .state(button_state_for(
+                ButtonPressedTarget::ConfirmSharedWriterCancel,
+                self.pressed_button,
+                !focus.is_confirm(),
+                true,
+            ))
+            .render(frame, cancel_area, &self.theme);
+        Button::new("Start Anyway")
+            .kind(ButtonKind::Danger)
+            .state(button_state_for(
+                ButtonPressedTarget::ConfirmSharedWriterStart,
+                self.pressed_button,
+                focus.is_confirm(),
+                true,
+            ))
+            .render(frame, start_area, &self.theme);
+        self.overlay_layout.active = OverlayMouseLayout::ConfirmSharedWriter {
+            cancel_button: cancel_area,
+            start_button: start_area,
+        };
+    }
+
     fn render_confirm_use_existing_branch_prompt(&mut self, frame: &mut Frame) {
         let PromptState::ConfirmUseExistingBranch {
             branch_name,
@@ -9925,6 +10046,11 @@ impl App {
     }
 
     fn render_confirm_delete_agent_prompt(&mut self, frame: &mut Frame) {
+        let shared_checkout = matches!(
+            &self.prompt,
+            PromptState::ConfirmDeleteAgent { session_id, .. }
+                if self.engine.sessions.iter().any(|s| &s.id == session_id && s.shared_workspace())
+        );
         let PromptState::ConfirmDeleteAgent {
             agent_label,
             target,
@@ -10024,7 +10150,11 @@ impl App {
         };
         if worktree_shared {
             body_lines.push(Line::from(Span::styled(
-                " Worktree is shared with another agent and will be preserved.",
+                if shared_checkout {
+                    " Runs in the shared project checkout, which is preserved."
+                } else {
+                    " Worktree is shared with another agent and will be preserved."
+                },
                 Style::default().fg(self.theme.hint_desc_fg),
             )));
         } else if *delete_worktree {
@@ -10250,8 +10380,14 @@ impl App {
                 " External worktree will be copied into a fresh managed dux worktree: {}.",
                 source_worktree_path.display()
             )),
+            // Shared main-workspace mode: say plainly that no worktree is made.
+            CreateAgentRequest::SharedWorkspace { project, .. } => Some(format!(
+                " SHARED: runs directly in the project checkout {}; no worktree or branch is created.",
+                dux_core::home_path::shorten_home(std::path::Path::new(&project.path))
+            )),
             _ => None,
         };
+        let shared_create = matches!(request, CreateAgentRequest::SharedWorkspace { .. });
         let context_height = u16::from(context_line.is_some());
         let area = centered_rect_exact(
             dialog_width,
@@ -10265,7 +10401,11 @@ impl App {
         );
         self.clear_overlay_area(frame, area);
 
-        let outer = self.themed_overlay_block("Name New Agent");
+        let outer = self.themed_overlay_block(if shared_create {
+            "Name New Agent \u{b7} SHARED WORKSPACE"
+        } else {
+            "Name New Agent"
+        });
         let inner = outer.inner(area);
         outer.render(area, frame.buffer_mut());
 
@@ -10534,6 +10674,9 @@ impl App {
             }
             PromptState::ConfirmUseExistingBranch { .. } => {
                 self.render_confirm_use_existing_branch_prompt(frame)
+            }
+            PromptState::ConfirmSharedWriter { .. } => {
+                self.render_confirm_shared_writer_prompt(frame)
             }
             _ => return false,
         }

@@ -2471,6 +2471,15 @@ pub(crate) enum PromptState {
         location: crate::git::BranchLocation,
         focus: ConfirmFocus, // Cancel (default) or Use Existing
     },
+    /// Shared main-workspace mode (fork d0ce0afc): another agent is already
+    /// running in this checkout. Two agents editing the same files can
+    /// overwrite each other's work, so a second writer starts only after the
+    /// user confirms. Cancel is focused by default.
+    ConfirmSharedWriter {
+        existing_agent: String,
+        action: SharedWriterAction,
+        focus: ConfirmFocus,
+    },
     DebugInput {
         lines: Vec<Line<'static>>,
         scroll_offset: u16,
@@ -2758,6 +2767,20 @@ impl ConfigureFieldFocus {
         ];
         components::focus_ring::next_focus(&ring, self, forward)
     }
+}
+
+/// What a confirmed [`PromptState::ConfirmSharedWriter`] goes on to do.
+#[derive(Clone, Debug)]
+pub(crate) enum SharedWriterAction {
+    Create {
+        request: Box<CreateAgentRequest>,
+        busy_message: String,
+    },
+    Reconnect {
+        session_id: String,
+        force: bool,
+        seek_fullscreen: bool,
+    },
 }
 
 /// Which control has focus in a two-button confirmation.
@@ -3234,6 +3257,10 @@ pub(crate) enum OverlayMouseLayout {
         cancel_button: Rect,
         use_button: Rect,
     },
+    ConfirmSharedWriter {
+        cancel_button: Rect,
+        start_button: Rect,
+    },
     ConfigReloadFailed {
         close_button: Rect,
         apply_button: Rect,
@@ -3556,6 +3583,8 @@ pub(crate) use redraw::RedrawGate;
 mod render;
 mod reorder;
 mod sessions;
+#[cfg(test)]
+mod shared_workspace_tests;
 #[cfg(test)]
 mod test_support;
 pub(crate) mod text_input;

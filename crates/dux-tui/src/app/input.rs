@@ -250,6 +250,8 @@ enum PromptMouseTarget {
     ConfirmNonDefaultBranchAdd,
     ConfirmUseExistingBranchCancel,
     ConfirmUseExistingBranchUse,
+    ConfirmSharedWriterCancel,
+    ConfirmSharedWriterStart,
     ConfigReloadFailedClose,
     ConfigReloadFailedApply,
     AddProjectFailedOk,
@@ -374,6 +376,12 @@ impl ButtonPressedTarget {
             }
             PromptMouseTarget::ConfirmUseExistingBranchUse => {
                 Some(ButtonPressedTarget::ConfirmUseExistingBranchUse)
+            }
+            PromptMouseTarget::ConfirmSharedWriterCancel => {
+                Some(ButtonPressedTarget::ConfirmSharedWriterCancel)
+            }
+            PromptMouseTarget::ConfirmSharedWriterStart => {
+                Some(ButtonPressedTarget::ConfirmSharedWriterStart)
             }
             PromptMouseTarget::ConfigReloadFailedClose => {
                 Some(ButtonPressedTarget::ConfigReloadFailedClose)
@@ -1873,6 +1881,7 @@ impl App {
             | PromptState::ConfirmCreateInitialCommit { .. }
             | PromptState::ConfirmNonDefaultBranch { .. }
             | PromptState::ConfirmUseExistingBranch { .. }
+            | PromptState::ConfirmSharedWriter { .. }
             | PromptState::ConfirmKillRunning(_)
             | PromptState::PickEditor { .. }
             | PromptState::PickProjectWorktree(_)
@@ -5007,7 +5016,29 @@ impl App {
         if let Some(exit) = self.handle_confirm_non_default_branch_prompt_key(key) {
             return Some(exit);
         }
+        if let Some(exit) = self.handle_confirm_shared_writer_prompt_key(key) {
+            return Some(exit);
+        }
         self.handle_confirm_use_existing_branch_prompt_key(key)
+    }
+
+    fn handle_confirm_shared_writer_prompt_key(&mut self, key: KeyEvent) -> Option<bool> {
+        let PromptState::ConfirmSharedWriter { focus, .. } = &mut self.prompt else {
+            return None;
+        };
+        let confirm = focus.is_confirm();
+        let action = self.bindings.lookup(&key, BindingScope::Dialog);
+        match modal_key_step(action, key, false) {
+            ModalKeyStep::Close => {
+                self.resolve_confirm_shared_writer(false);
+            }
+            ModalKeyStep::MoveFocus(_) => *focus = focus.toggled(),
+            ModalKeyStep::Confirm | ModalKeyStep::ActivateFocus => {
+                return Some(self.resolve_confirm_shared_writer(confirm));
+            }
+            ModalKeyStep::FallThroughToField => {}
+        }
+        Some(false)
     }
 
     fn handle_pull_request_input_prompt_key(&mut self, key: KeyEvent) -> Result<Option<bool>> {
@@ -6601,6 +6632,17 @@ impl App {
                         PromptMouseTarget::ConfirmUseExistingBranchCancel,
                     ),
                     (use_button, PromptMouseTarget::ConfirmUseExistingBranchUse),
+                ],
+                column,
+                row,
+            ),
+            OverlayMouseLayout::ConfirmSharedWriter {
+                cancel_button,
+                start_button,
+            } => click_target(
+                &[
+                    (cancel_button, PromptMouseTarget::ConfirmSharedWriterCancel),
+                    (start_button, PromptMouseTarget::ConfirmSharedWriterStart),
                 ],
                 column,
                 row,
@@ -8865,6 +8907,8 @@ impl App {
             | PromptMouseTarget::ConfirmNonDefaultBranchAdd
             | PromptMouseTarget::ConfirmUseExistingBranchCancel
             | PromptMouseTarget::ConfirmUseExistingBranchUse
+            | PromptMouseTarget::ConfirmSharedWriterCancel
+            | PromptMouseTarget::ConfirmSharedWriterStart
             | PromptMouseTarget::ConfigReloadFailedClose
             | PromptMouseTarget::ConfigReloadFailedApply
             | PromptMouseTarget::AddProjectFailedOk
@@ -9022,6 +9066,12 @@ impl App {
             }
             ButtonPressedTarget::ConfirmUseExistingBranchUse => {
                 self.resolve_confirm_use_existing_branch(true)
+            }
+            ButtonPressedTarget::ConfirmSharedWriterCancel => {
+                self.resolve_confirm_shared_writer(false)
+            }
+            ButtonPressedTarget::ConfirmSharedWriterStart => {
+                self.resolve_confirm_shared_writer(true)
             }
             ButtonPressedTarget::ConfigReloadFailedClose => {
                 self.resolve_config_reload_failed(false)
