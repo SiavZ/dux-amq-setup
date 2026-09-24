@@ -7838,14 +7838,25 @@ impl App {
     /// nothing and says so, because a silent close is indistinguishable from a
     /// delete that quietly did nothing.
     pub(crate) fn resolve_confirm_delete_project(&mut self, confirm: bool) -> bool {
-        let (project_id, project_name) = match &self.prompt {
+        let (project_id, project_name, painted) = match &self.prompt {
             PromptState::ConfirmDeleteProject {
                 project_id,
                 project_name,
+                agent_count,
                 ..
-            } => (project_id.clone(), project_name.clone()),
+            } => (project_id.clone(), project_name.clone(), *agent_count),
             _ => return false,
         };
+        if confirm
+            && self.ask_again_if_project_grew(
+                &project_id,
+                &project_name,
+                painted,
+                dux_core::project_prose::ProjectGoneVerb::Delete,
+            )
+        {
+            return false;
+        }
         self.prompt = PromptState::None;
         if !confirm {
             self.set_info(dux_core::project_prose::delete_project_cancelled_message(
@@ -7873,20 +7884,68 @@ impl App {
         false
     }
 
+    /// The project-confirm guard: when the project now holds more agents than
+    /// the dialog last painted, the confirm was consent to a smaller cascade.
+    /// Keep the dialog open (the next paint shows the true count), hand focus
+    /// back to Cancel, and say why on the status line. Returns whether it asked
+    /// again, in which case nothing may run.
+    fn ask_again_if_project_grew(
+        &mut self,
+        project_id: &str,
+        project_name: &str,
+        painted: usize,
+        verb: dux_core::project_prose::ProjectGoneVerb,
+    ) -> bool {
+        let live = self.project_agent_count(project_id);
+        if live <= painted {
+            return false;
+        }
+        match &mut self.prompt {
+            PromptState::ConfirmDeleteProject { focus, .. }
+            | PromptState::ConfirmRemoveProject { focus, .. } => *focus = ConfirmFocus::Cancel,
+            _ => {}
+        }
+        self.set_warning(dux_core::project_prose::project_gained_agents_message(
+            project_name,
+            live,
+            verb,
+        ));
+        true
+    }
+
     /// Answer the "remove project?" confirmation. Confirming re-reads the
     /// target: a real project must still exist and still hold no agents, and
     /// an orphaned group must still have agents to clear. Cancelling removes
     /// nothing and says so.
     pub(crate) fn resolve_confirm_remove_project(&mut self, confirm: bool) -> bool {
-        let (project_id, project_name, orphaned) = match &self.prompt {
+        let (project_id, project_name, orphaned, painted) = match &self.prompt {
             PromptState::ConfirmRemoveProject {
                 project_id,
                 project_name,
                 orphaned,
+                agent_count,
                 ..
-            } => (project_id.clone(), project_name.clone(), *orphaned),
+            } => (
+                project_id.clone(),
+                project_name.clone(),
+                *orphaned,
+                *agent_count,
+            ),
             _ => return false,
         };
+        // A real project's removal needs no re-ask: `run_remove_project` refuses
+        // one that has gained any agent at all.
+        if confirm
+            && orphaned
+            && self.ask_again_if_project_grew(
+                &project_id,
+                &project_name,
+                painted,
+                dux_core::project_prose::ProjectGoneVerb::Remove,
+            )
+        {
+            return false;
+        }
         self.prompt = PromptState::None;
         if !confirm {
             self.set_info(dux_core::project_prose::remove_project_cancelled_message(

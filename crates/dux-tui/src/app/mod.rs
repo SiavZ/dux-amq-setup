@@ -2371,12 +2371,15 @@ pub(crate) enum PromptState {
     /// browser's Delete project dialog asks: the cascade deletes every agent in
     /// the project and removes their worktrees from disk.
     ///
-    /// The name and the agent count are captured when the dialog opens, so the
-    /// sentence the user agrees to does not change behind it; the confirm reads
-    /// the project again, because it may have gone meanwhile.
+    /// The name is captured when the dialog opens. The agent count is the
+    /// project's LIVE count, rewritten on every paint, so `agent_count` holds
+    /// the number the user last saw; the confirm compares it with a fresh count
+    /// and asks again rather than deleting agents that were never on screen.
+    /// The confirm also reads the project again, because it may have gone.
     ConfirmDeleteProject {
         project_id: String,
         project_name: String,
+        /// The count the dialog last painted.
         agent_count: usize,
         focus: ConfirmFocus, // Cancel (default) or Delete
     },

@@ -8077,6 +8077,7 @@ impl App {
     /// Cancel focused. Delete is the Danger kind: the cascade removes every
     /// agent's worktree from disk.
     fn render_confirm_delete_project_prompt(&mut self, frame: &mut Frame) {
+        self.repaint_project_confirm_count();
         let PromptState::ConfirmDeleteProject {
             project_name,
             agent_count,
@@ -8111,6 +8112,7 @@ impl App {
     /// Danger kind like the browser's destructive button: it takes the project
     /// (and any orphaned agents' records) out of dux.
     fn render_confirm_remove_project_prompt(&mut self, frame: &mut Frame) {
+        self.repaint_project_confirm_count();
         let PromptState::ConfirmRemoveProject {
             project_name,
             agent_count,
@@ -8138,6 +8140,31 @@ impl App {
             cancel_button,
             confirm_button,
         };
+    }
+
+    /// Both project confirmations count the project's agents as it is NOW, the
+    /// way the browser's dialogs do, and record the painted number in the prompt:
+    /// the confirm compares it with a fresh count, so an agent that arrived after
+    /// this paint is never taken on consent given to a smaller number. A real
+    /// project's removal keeps its zero: it only opens with no agents, and its
+    /// confirm refuses outright once one arrives, so a body promising to delete
+    /// agents would describe an act that cannot happen.
+    fn repaint_project_confirm_count(&mut self) {
+        let project_id = match &self.prompt {
+            PromptState::ConfirmDeleteProject { project_id, .. }
+            | PromptState::ConfirmRemoveProject {
+                project_id,
+                orphaned: true,
+                ..
+            } => project_id.clone(),
+            _ => return,
+        };
+        let live = self.project_agent_count(&project_id);
+        match &mut self.prompt {
+            PromptState::ConfirmDeleteProject { agent_count, .. }
+            | PromptState::ConfirmRemoveProject { agent_count, .. } => *agent_count = live,
+            _ => {}
+        }
     }
 
     /// The shared body of the two project confirmations: prose sized to its

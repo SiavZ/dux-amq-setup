@@ -22,6 +22,23 @@ fn render(app: &mut App) -> Buffer {
     render_at(app, WIDTH, HEIGHT)
 }
 
+/// Give the fixture app `count` agents in one project and return that
+/// project's id: the project confirmations count agents live at paint time,
+/// so a fixture's number has to be real rather than written into the prompt.
+fn project_with_agents(app: &mut App, count: usize) -> String {
+    let template = app.engine.sessions[0].clone();
+    let project_id = template
+        .project_id()
+        .expect("the fixture agent belongs to a project")
+        .to_string();
+    for n in 1..count {
+        let mut extra = template.clone();
+        extra.id = format!("{}-extra-{n}", template.id).into();
+        app.engine.sessions.push(extra);
+    }
+    project_id
+}
+
 fn render_at(app: &mut App, width: u16, height: u16) -> Buffer {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
     terminal.draw(|frame| app.render(frame)).expect("render");
@@ -205,10 +222,11 @@ fn the_checkout_default_branch_dialog_chips_the_project_and_its_base() {
 #[test]
 fn the_delete_project_dialog_chips_the_project_and_names_the_cascade() {
     let mut app = test_app(default_bindings());
+    let project_id = project_with_agents(&mut app, 2);
     let buf = open(
         &mut app,
         PromptState::ConfirmDeleteProject {
-            project_id: "p1".to_string(),
+            project_id,
             project_name: "proj-del".to_string(),
             agent_count: 2,
             focus: ConfirmFocus::Cancel,
@@ -249,10 +267,11 @@ fn the_delete_project_dialog_chips_the_project_and_names_the_cascade() {
 #[test]
 fn the_remove_project_dialog_chips_the_project_and_keeps_the_worktrees() {
     let mut app = test_app(default_bindings());
+    let project_id = project_with_agents(&mut app, 1);
     let buf = open(
         &mut app,
         PromptState::ConfirmRemoveProject {
-            project_id: "p1".to_string(),
+            project_id,
             project_name: "proj-rm".to_string(),
             agent_count: 1,
             orphaned: true,

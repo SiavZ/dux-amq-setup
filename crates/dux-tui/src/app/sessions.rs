@@ -8408,6 +8408,140 @@ mod tests {
         assert!(!worktree.exists(), "the worktree was removed from disk");
     }
 
+    /// A second real agent in the first project, created the way the palette
+    /// creates one, while whatever dialog is open stays open.
+    fn add_second_agent(app: &mut App) {
+        let project = app.engine.projects[0].clone();
+        app.dispatch_create_agent_request(
+            CreateAgentRequest::NewProject {
+                project,
+                custom_name: Some("agent-two".to_string()),
+                use_existing_branch: false,
+                pull_before_create: true,
+                copy_uncommitted_changes: false,
+            },
+            "Creating an agent...".to_string(),
+        )
+        .expect("dispatch the create");
+        drain_until(app, "the second agent", |app| {
+            app.engine.sessions.len() == 2
+        });
+    }
+
+    /// Every cell of one frame, row by row, as text.
+    fn rendered_text(app: &mut App) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("render");
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The count is the one number the user agrees to, so it must be the
+    /// project's count at the moment it is painted, not when the dialog opened.
+    #[test]
+    fn the_project_delete_dialog_counts_an_agent_added_while_it_is_open() {
+        let (_root, mut app, _worktree) = project_with_a_real_agent();
+        app.execute_command("delete-project".to_string())
+            .expect("open the confirmation");
+        assert!(rendered_text(&mut app).contains("its 1 agent,"));
+
+        add_second_agent(&mut app);
+
+        let text = rendered_text(&mut app);
+        assert!(
+            text.contains("its 2 agents,"),
+            "the dialog must count the agent that arrived: {text}"
+        );
+        match &app.prompt {
+            PromptState::ConfirmDeleteProject { agent_count, .. } => assert_eq!(*agent_count, 2),
+            other => panic!("expected the delete-project confirmation, got {other:?}"),
+        }
+    }
+
+    /// Consent was given for the agents the dialog showed. An agent that
+    /// arrived after the last paint was never on screen, so the cascade must not
+    /// take it on that consent: the dialog stays, Cancel regains focus, and the
+    /// status line says why.
+    #[test]
+    fn confirming_after_the_project_gained_an_agent_deletes_nothing_and_asks_again() {
+        let (_root, mut app, worktree) = project_with_a_real_agent();
+        app.execute_command("delete-project".to_string())
+            .expect("open the confirmation");
+        rendered_text(&mut app);
+        if let PromptState::ConfirmDeleteProject { focus, .. } = &mut app.prompt {
+            *focus = ConfirmFocus::Confirm;
+        }
+
+        add_second_agent(&mut app);
+        app.resolve_confirm_delete_project(true);
+
+        assert_eq!(app.engine.projects.len(), 1, "the project is kept");
+        assert_eq!(app.engine.sessions.len(), 2, "no agent is deleted");
+        assert!(worktree.is_dir(), "the first worktree is untouched");
+        match &app.prompt {
+            PromptState::ConfirmDeleteProject { focus, .. } => {
+                assert_eq!(*focus, ConfirmFocus::Cancel, "Cancel regains focus");
+            }
+            other => panic!("the dialog must stay open to ask again, got {other:?}"),
+        }
+        assert_eq!(
+            app.status.text(),
+            "Project \"repo\" gained an agent while the dialog was open, so nothing was \
+             deleted. It now has 2 agents; confirm again to delete them."
+        );
+        assert!(rendered_text(&mut app).contains("its 2 agents,"));
+
+        // Asked again with the true count on screen, the answer stands.
+        app.resolve_confirm_delete_project(true);
+        assert!(app.engine.projects.is_empty(), "the second answer deletes");
+    }
+
+    #[test]
+    fn confirming_an_orphan_removal_after_the_group_grew_asks_again() {
+        let (_root, mut app, _worktree) = project_with_a_real_agent();
+        app.engine.projects.clear();
+        app.project_chooser_context = None;
+        app.rebuild_left_items();
+        app.selected_left = app
+            .left_items()
+            .iter()
+            .position(|item| matches!(item, LeftItem::Session(_)))
+            .expect("the orphaned agent's row");
+        app.execute_command("remove-project".to_string())
+            .expect("open the confirmation");
+        rendered_text(&mut app);
+
+        // A second record for the same missing project arrives behind the dialog.
+        let mut extra = app.engine.sessions[0].clone();
+        extra.id = "orphan-two".into();
+        app.engine.sessions.push(extra);
+        app.resolve_confirm_remove_project(true);
+
+        assert_eq!(app.engine.sessions.len(), 2, "no record is cleared");
+        assert!(matches!(
+            app.prompt,
+            PromptState::ConfirmRemoveProject {
+                focus: ConfirmFocus::Cancel,
+                ..
+            }
+        ));
+        assert!(
+            app.status
+                .text()
+                .contains("gained an agent while the dialog was open"),
+            "{}",
+            app.status.text()
+        );
+    }
+
     /// A real project with no agents, targeted by the project-scoped commands.
     fn agentless_project() -> (tempfile::TempDir, App) {
         let (root, _repo, mut app) = project_based_on_develop();

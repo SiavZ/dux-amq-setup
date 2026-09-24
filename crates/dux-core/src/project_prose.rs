@@ -101,6 +101,30 @@ pub fn project_gone_message(project_name: &str, verb: ProjectGoneVerb) -> Status
     ]
 }
 
+/// The status line when a confirm arrives after the project gained agents the
+/// dialog never showed: nothing was done, the dialog stays open with the true
+/// count, and the user is asked again. Consent covers what was on screen.
+pub fn project_gained_agents_message(
+    project_name: &str,
+    agent_count: usize,
+    verb: ProjectGoneVerb,
+) -> StatusText {
+    let (done, act) = match verb {
+        ProjectGoneVerb::Delete => ("deleted", "delete"),
+        ProjectGoneVerb::Remove => ("removed", "remove"),
+    };
+    let them = if agent_count == 1 { "it" } else { "them" };
+    status_text![
+        "Project ",
+        q(project_name),
+        format!(
+            " gained an agent while the dialog was open, so nothing was {done}. It now has \
+             {}; confirm again to {act} {them}.",
+            count_of(agent_count, "agent")
+        )
+    ]
+}
+
 /// Which confirmed act found its project gone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProjectGoneVerb {
@@ -122,6 +146,20 @@ mod tests {
             delete_project_confirm_prose(Some("dux"), 2).plain(),
             "This deletes \"dux\", its 2 agents, and their worktrees on disk from dux. This is \
              irreversible. The source checkout is kept."
+        );
+    }
+
+    #[test]
+    fn the_gained_agents_line_names_the_new_count_and_asks_again() {
+        assert_eq!(
+            project_gained_agents_message("dux", 1, ProjectGoneVerb::Delete).message(),
+            "Project \"dux\" gained an agent while the dialog was open, so nothing was \
+             deleted. It now has 1 agent; confirm again to delete it."
+        );
+        assert_eq!(
+            project_gained_agents_message("dux", 3, ProjectGoneVerb::Remove).message(),
+            "Project \"dux\" gained an agent while the dialog was open, so nothing was \
+             removed. It now has 3 agents; confirm again to remove them."
         );
     }
 
