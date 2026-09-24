@@ -3455,11 +3455,24 @@ impl Engine {
                 message,
             } => self.process_create_agent_failed(status_op_id, message),
             WorkerEvent::AgentLaunchReady(boxed) => {
+                // A shared agent that just started fresh because its provider
+                // cannot resume by id is told why, after the launch's own final.
+                let shared_warning = (!boxed.request.resumes_a_conversation()
+                    && boxed.request.session.is_slot_tab(&boxed.request.tab_id))
+                .then(|| self.shared_targeted_resume_warning(&boxed.request.session.id))
+                .flatten();
                 let (outcome, create_final) = self.process_agent_launch_ready(*boxed);
-                Self::launch_view_with_final(
+                let view = Self::launch_view_with_final(
                     EventReaction::AgentLaunchReadyView(Box::new(outcome)),
                     create_final,
-                )
+                );
+                match shared_warning {
+                    Some(warning) => EventReaction::Multi(vec![
+                        view,
+                        EventReaction::Status(StatusUpdate::warning(warning)),
+                    ]),
+                    None => view,
+                }
             }
             WorkerEvent::AgentLaunchFailed(boxed) => {
                 let (outcome, create_final) = self.process_agent_launch_failed(*boxed);

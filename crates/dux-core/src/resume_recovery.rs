@@ -1932,6 +1932,40 @@ mod tests {
         );
     }
 
+    /// A shared agent never resumes through a "latest in this directory"
+    /// selector: with no usable stored id its launch is fresh, whatever shape
+    /// the stored value has.
+    #[test]
+    fn shared_mode_never_emits_a_latest_selector() {
+        for provider in ["claude", "codex"] {
+            let config = stock(provider);
+            for stored_id in [None, Some("not-a-uuid")] {
+                let planned = plan_resume_id(
+                    &input(provider, &config, stored_id, true),
+                    never_claude,
+                    no_jcode,
+                );
+                assert_eq!(planned, None);
+                // The engine passes `resume = false` for a shared agent (see
+                // `Engine::should_resume_provider`), so the argv is the fresh one.
+                let argv = launch_args(
+                    &config,
+                    provider,
+                    &ProviderSessionLaunch::Plain,
+                    false,
+                    None,
+                    Path::new("/tmp/shared-project"),
+                )
+                .unwrap();
+                assert!(
+                    !argv
+                        .iter()
+                        .any(|arg| matches!(arg.as_str(), "--continue" | "--last"))
+                );
+            }
+        }
+    }
+
     /// A provider with no `resume_by_id_args` never resumes by id, whatever is
     /// stored, so the stored id cannot reach a CLI that would misread it.
     #[test]

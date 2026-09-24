@@ -3804,6 +3804,26 @@ mod tests {
 
     use super::*;
 
+    /// Only the exact `{session_id}` token is replaced: an id embedded in a
+    /// larger argument is left alone, so no argument is half-substituted.
+    #[test]
+    fn targeted_resume_substitutes_only_the_exact_session_id_token() {
+        let cfg = ProviderCommandConfig {
+            resume_by_id_args: Some(vec![
+                "resume".to_string(),
+                "{session_id}".to_string(),
+                "prefix-{session_id}".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+
+        assert_eq!(
+            cfg.resume_by_id_args(&id).unwrap(),
+            vec!["resume".to_string(), id, "prefix-{session_id}".to_string()]
+        );
+    }
+
     #[test]
     fn shutdown_grace_converts_and_clamps_to_the_ceiling() {
         use std::time::Duration;

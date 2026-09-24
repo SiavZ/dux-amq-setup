@@ -82,6 +82,28 @@ impl Engine {
         resume_recovery::fresh_capture_for(provider.as_str(), &config)
     }
 
+    /// The warning owed when a shared agent starts fresh because its provider
+    /// has no `resume_by_id_args`: in shared mode dux never falls back to a
+    /// latest-session selector, so that agent can never get its conversation
+    /// back. `None` for an unshared agent or one whose provider resumes by id.
+    pub fn shared_targeted_resume_warning(&self, session_id: &str) -> Option<String> {
+        let session = self.session_by_id(session_id)?;
+        if !resume_recovery::session_is_shared(session)
+            || crate::config::provider_config(&self.config, &session.provider)
+                .supports_session_resume_by_id()
+        {
+            return None;
+        }
+        Some(format!(
+            "Started shared {} agent \"{}\" fresh. Exact per-agent resume is unavailable because \
+             providers.{}.resume_by_id_args is not configured; dux will never use a latest-session \
+             selector in shared mode.",
+            session.provider.as_str(),
+            session.display_label(),
+            session.provider.as_str(),
+        ))
+    }
+
     /// Whether another tab of `session` is running (or launching) `provider`.
     /// The same collision `tab_resume_decision` guards, asked on its own so a
     /// provider with no `resume_args` (jcode) is still kept from resuming the
@@ -576,6 +598,123 @@ mod tests {
         assert!(engine.pump_startup_launches((24, 80)).is_empty());
         engine.process_worker_event(WorkerEvent::ResumeRecoveryCompleted(Ok(Default::default())));
         assert!(!engine.startup_launches.is_held());
+    }
+
+    /// A resume by id that turns out to be dead (here: never answers within
+    /// `resume_wait_timeout_ms`) falls back to ONE fresh launch, and that fresh
+    /// launch neither resumes by id nor by the resume-latest flag.
+    #[test]
+    fn targeted_resume_timeout_falls_back_to_fresh_session_once() {
+        let (mut engine, tmp) = test_engine();
+        engine.config.providers.commands.insert(
+            "opencode".to_string(),
+            crate::config::ProviderCommandConfig {
+                command: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "sleep 5".to_string()],
+                resume_args: Some(vec!["-c".to_string(), "sleep 5".to_string()]),
+                resume_by_id_args: Some(vec!["resume".to_string(), "{session_id}".to_string()]),
+                resume_wait_timeout_ms: Some(10),
+                ..Default::default()
+            },
+        );
+        let mut session = session_in(tmp.path(), "s1", "opencode");
+        session.started_providers = vec!["opencode".to_string()];
+        engine.session_store.create_session(&session).unwrap();
+        engine.sessions.push(session.clone());
+        let id = uuid::Uuid::new_v4().to_string();
+        engine
+            .session_store
+            .set_provider_session_id("s1", "opencode", &id)
+            .unwrap();
+
+        let request = engine.build_agent_launch_request(
+            session.clone(),
+            true,
+            (24, 80),
+            AgentLaunchKind::Reconnect {
+                status_message: String::new(),
+            },
+        );
+        assert_eq!(
+            request.provider_session,
+            ProviderSessionLaunch::ResumeId(id)
+        );
+        assert!(
+            request.resumes_a_conversation(),
+            "a by-id resume arms the resume-fallback sweep"
+        );
+
+        // The resumed PTY is live but silent past its timeout.
+        let slot = session.slot_tab_id().to_owned();
+        let client = crate::pty::PtyClient::spawn(
+            "/bin/sh",
+            &["-c".to_string(), "sleep 5".to_string()],
+            tmp.path(),
+            24,
+            80,
+            1_000,
+        )
+        .unwrap();
+        engine.providers.insert(slot.clone(), client);
+        engine.resume_fallback_candidates.insert(
+            slot.clone(),
+            Instant::now() - std::time::Duration::from_millis(50),
+        );
+        let reactions = engine.sweep_resume_fallbacks((24, 80));
+        assert_eq!(reactions.len(), 1, "exactly one fallback relaunch");
+        assert!(!engine.resume_fallback_candidates.contains_key(&slot));
+
+        // The relaunch the sweep dispatched is a fresh one.
+        let fallback = engine.build_agent_launch_request(
+            session,
+            false,
+            (24, 80),
+            AgentLaunchKind::ResumeFallback {
+                status_message: String::new(),
+            },
+        );
+        assert!(!fallback.resumes_a_conversation());
+    }
+
+    /// A shared agent with no usable id never gets upstream's resume-latest
+    /// flag either: in a shared directory it would pick another agent's
+    /// conversation (fork a38187f3).
+    #[test]
+    fn shared_agent_never_resumes_latest() {
+        let (mut engine, tmp) = test_engine();
+        let mut session = session_in(tmp.path(), "s1", "codex");
+        session.started_providers = vec!["codex".to_string()];
+        session.shared_workspace = true;
+        engine.session_store.create_session(&session).unwrap();
+        engine.sessions.push(session.clone());
+        let request = engine.build_agent_launch_request(
+            session,
+            true,
+            (24, 80),
+            AgentLaunchKind::StartupAutoReopen,
+        );
+        assert!(!request.resume);
+        assert!(!request.resumes_a_conversation());
+    }
+
+    #[test]
+    fn shared_provider_without_targeted_resume_gets_clear_warning() {
+        let (mut engine, tmp) = test_engine();
+        let mut shared = session_in(tmp.path(), "shared", "opencode");
+        shared.shared_workspace = true;
+        engine.sessions.push(shared);
+        let warning = engine
+            .shared_targeted_resume_warning("shared")
+            .expect("shared provider without exact resume must warn");
+        assert!(warning.contains("resume_by_id_args is not configured"));
+        assert!(warning.contains("never use a latest-session selector"));
+
+        // A provider that resumes by id, or an unshared agent, owes nothing.
+        engine.sessions[0].provider = ProviderKind::new("claude");
+        assert_eq!(engine.shared_targeted_resume_warning("shared"), None);
+        engine.sessions[0].provider = ProviderKind::new("opencode");
+        engine.sessions[0].shared_workspace = false;
+        assert_eq!(engine.shared_targeted_resume_warning("shared"), None);
     }
 
     /// The pump never has more than `concurrency` startup launches in flight.

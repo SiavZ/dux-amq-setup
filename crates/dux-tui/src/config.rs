@@ -2414,6 +2414,43 @@ mod tests {
         render_config(config, &bindings)
     }
 
+    /// A user's own `resume_by_id_args` and the comment beside it survive an
+    /// unrelated save.
+    #[test]
+    fn save_config_preserves_targeted_resume_args_and_adjacent_comment() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let mut body = render_default_config();
+        let default_line = body
+            .lines()
+            .find(|line| line.starts_with("resume_by_id_args = "))
+            .expect("Claude targeted resume line")
+            .to_string();
+        body = body.replacen(
+            &default_line,
+            "# keep my exact provider flags\nresume_by_id_args = [\"--resume\", \"{session_id}\", \"--custom\"]",
+            1,
+        );
+        fs::write(&config_path, &body).expect("write config");
+
+        let mut config: Config = toml::from_str(&body).expect("parse config");
+        config.ui.right_width_pct = 31;
+        let bindings = crate::keybindings::RuntimeBindings::from_keys_config(&config.keys);
+        save_config(&config_path, &config, &bindings).expect("save config");
+
+        let saved = fs::read_to_string(&config_path).expect("read config");
+        assert!(saved.contains("# keep my exact provider flags"));
+        let reloaded: Config = toml::from_str(&saved).expect("reload config");
+        assert_eq!(
+            reloaded.providers.commands["claude"].resume_by_id_args,
+            Some(vec![
+                "--resume".to_string(),
+                "{session_id}".to_string(),
+                "--custom".to_string(),
+            ])
+        );
+    }
+
     /// Every provider block documents `forward_mouse` inline; the ones that ship
     /// a value write it, the rest carry the commented example. The rendered
     /// document must also load back to the same policy.
