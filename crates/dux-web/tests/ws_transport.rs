@@ -61,6 +61,9 @@ async fn boot() -> (SocketAddr, tempfile::TempDir) {
         lock_path: root.join("dux.lock"),
     };
     std::fs::create_dir_all(&paths.worktrees_root).unwrap();
+    // `[limits]` disk gate off: the temp root is on the host's real disk, and
+    // a nearly full developer disk would refuse creates these tests make.
+    std::fs::write(&paths.config_path, "[limits]\ndisk_high_water_pct = 0\n").unwrap();
     {
         let store = SessionStore::open(&paths.sessions_db_path).unwrap();
         // Seed the owning project so session-delete (which looks up the project)
@@ -156,6 +159,9 @@ async fn boot_with_repo() -> (SocketAddr, tempfile::TempDir) {
         lock_path: root.join("dux.lock"),
     };
     std::fs::create_dir_all(&paths.worktrees_root).unwrap();
+    // `[limits]` disk gate off: the temp root is on the host's real disk, and
+    // a nearly full developer disk would refuse creates these tests make.
+    std::fs::write(&paths.config_path, "[limits]\ndisk_high_water_pct = 0\n").unwrap();
     {
         let store = SessionStore::open(&paths.sessions_db_path).unwrap();
         store
@@ -444,6 +450,9 @@ async fn boot_for_create_agent_window(
         lock_path: root.join("dux.lock"),
     };
     std::fs::create_dir_all(&paths.worktrees_root).unwrap();
+    // `[limits]` disk gate off: the temp root is on the host's real disk, and
+    // a nearly full developer disk would refuse creates these tests make.
+    std::fs::write(&paths.config_path, "[limits]\ndisk_high_water_pct = 0\n").unwrap();
     {
         let store = SessionStore::open(&paths.sessions_db_path).unwrap();
         store
@@ -657,6 +666,9 @@ async fn boot_with_gated_startup_command() -> (SocketAddr, std::path::PathBuf, t
         lock_path: root.join("dux.lock"),
     };
     std::fs::create_dir_all(&paths.worktrees_root).unwrap();
+    // `[limits]` disk gate off: the temp root is on the host's real disk, and
+    // a nearly full developer disk would refuse creates these tests make.
+    std::fs::write(&paths.config_path, "[limits]\ndisk_high_water_pct = 0\n").unwrap();
     {
         let store = SessionStore::open(&paths.sessions_db_path).unwrap();
         store
@@ -1515,6 +1527,9 @@ async fn boot_two_sessions() -> (SocketAddr, tempfile::TempDir) {
         lock_path: root.join("dux.lock"),
     };
     std::fs::create_dir_all(&paths.worktrees_root).unwrap();
+    // `[limits]` disk gate off: the temp root is on the host's real disk, and
+    // a nearly full developer disk would refuse creates these tests make.
+    std::fs::write(&paths.config_path, "[limits]\ndisk_high_water_pct = 0\n").unwrap();
     {
         let store = SessionStore::open(&paths.sessions_db_path).unwrap();
         store

@@ -1066,10 +1066,13 @@ mod tests {
             lock_path: tmp.path().join("dux.lock"),
         };
         std::fs::create_dir_all(&paths.worktrees_root).unwrap();
+        // `[limits]` disk gate off: the fixture's temp dir sits on the host's
+        // real disk, and a nearly full developer disk would refuse the create
+        // for a reason these tests are not about.
         std::fs::write(
             &paths.config_path,
             format!(
-                "[[projects]]\nid = \"p1\"\npath = \"{}\"\nname = \"Repo\"\n",
+                "[limits]\ndisk_high_water_pct = 0\n\n[[projects]]\nid = \"p1\"\npath = \"{}\"\nname = \"Repo\"\n",
                 repo.to_string_lossy()
             ),
         )
