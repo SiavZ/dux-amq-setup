@@ -64,6 +64,25 @@ pub fn keep_open_across_exec(fd: RawFd) -> Result<()> {
     Ok(())
 }
 
+/// Set `FD_CLOEXEC` again, the inverse of [`keep_open_across_exec`].
+///
+/// Used once a descriptor has crossed its exec: from then on it must behave
+/// like any other master and stay out of every process spawned later.
+pub fn set_close_on_exec(fd: RawFd) -> Result<()> {
+    // SAFETY: `F_GETFD`/`F_SETFD` only read and write this descriptor's flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("reading the descriptor flags of fd {fd}"));
+    }
+    // SAFETY: as above.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("setting FD_CLOEXEC on fd {fd}"));
+    }
+    Ok(())
+}
+
 /// Whether `fd` would survive an `exec`, i.e. whether `FD_CLOEXEC` is clear.
 ///
 /// Reads the kernel's answer rather than remembering what was set, so a handoff
@@ -109,6 +128,14 @@ impl ReattachedMaster {
                 "fd {fd} is not a terminal, so it is not a PTY master to re-attach: {err}"
             );
         }
+        // Close-on-exec goes back ON the moment the descriptor is ours again.
+        // It was cleared only so it could cross the one exec that brought it
+        // here. Left cleared, every process this image spawns afterwards (git,
+        // gh, an editor, a hook) would inherit a copy of the agent's master,
+        // which keeps the terminal open behind dux's back and lets an unrelated
+        // program read or write the agent. The next reload clears it again in
+        // `keep_open_across_exec`, right before its own exec.
+        set_close_on_exec(fd)?;
         // SAFETY: the caller guarantees ownership of `fd`; `File` takes it over
         // and closes it on drop, which is the ownership this type documents.
         let file = unsafe { std::fs::File::from_raw_fd(fd) };
@@ -342,6 +369,36 @@ mod tests {
             got.contains("hello through the master"),
             "the slave must receive what was written to the re-attached master, got {got:?}"
         );
+    }
+
+    #[test]
+    fn an_adopted_master_and_its_clones_are_closed_on_the_next_exec() {
+        // The master arrives with close-on-exec CLEARED, because that is how it
+        // crossed the reload. If adoption left it that way, every process this
+        // image spawns later (git, gh, an editor, the next agent) would inherit
+        // a copy of this agent's terminal.
+        let (fd, slave) = open_pty_pair();
+        keep_open_across_exec(fd).unwrap();
+        assert!(survives_exec(fd).unwrap(), "premise: arrives inheritable");
+
+        // SAFETY: freshly opened above and not owned elsewhere.
+        let master = unsafe { ReattachedMaster::adopt(fd) }.unwrap();
+        assert!(
+            !survives_exec(master.raw_fd()).unwrap(),
+            "an adopted master must be close-on-exec again, or it leaks into \
+             every child spawned after the reload"
+        );
+        // The reader and writer are dup'd descriptors of their own.
+        let reader = master.duplicate().unwrap();
+        let writer = master.duplicate().unwrap();
+        for clone in [&reader, &writer] {
+            assert!(
+                !survives_exec(clone.as_raw_fd()).unwrap(),
+                "a clone of the adopted master must be close-on-exec too"
+            );
+        }
+        // SAFETY: the slave was never adopted, so this scope closes it.
+        unsafe { libc::close(slave) };
     }
 
     #[test]

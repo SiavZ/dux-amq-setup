@@ -1520,19 +1520,31 @@ impl Engine {
         }
     }
 
-    /// Boot-time normalization of persisted session statuses: nothing is running
-    /// yet, so a session whose worktree still exists is `Detached` and one whose
-    /// worktree vanished is `Exited`, persisted through `mark_session_status`.
-    /// Auto-reopens nothing.
+    /// Boot-time normalization of persisted session statuses: on a cold boot
+    /// nothing is running yet, so a session whose worktree still exists is
+    /// `Detached` and one whose worktree vanished is `Exited`, persisted through
+    /// `mark_session_status`. Auto-reopens nothing.
+    ///
+    /// The one exception is a session that already has a live tab, which only
+    /// happens after a reload adopted its process from the previous image. That
+    /// agent is running, so it is `Active`, whatever its directory says.
     pub fn normalize_restored_sessions(&mut self) {
-        let ids: Vec<(String, bool)> = self
+        let ids: Vec<(String, bool, bool)> = self
             .sessions
             .iter()
-            .map(|s| (s.id.clone(), std::path::Path::new(s.directory()).exists()))
+            .map(|s| {
+                (
+                    s.id.clone(),
+                    std::path::Path::new(s.directory()).exists(),
+                    !self.live_tab_ids(&s.id).is_empty(),
+                )
+            })
             .collect();
         let mut moved = false;
-        for (id, exists) in ids {
-            let status = if exists {
+        for (id, exists, live) in ids {
+            let status = if live {
+                SessionStatus::Active
+            } else if exists {
                 SessionStatus::Detached
             } else {
                 SessionStatus::Exited
@@ -1579,7 +1591,10 @@ impl Engine {
     ///   (`project_allows_auto_reopen`), and
     /// - its provider can resume a conversation (`supports_session_resume`;
     ///   reopening one that starts from scratch would silently discard the
-    ///   conversation the intent was about).
+    ///   conversation the intent was about), and
+    /// - none of its tabs is already running or launching
+    ///   ([`Engine::any_tab_active`]). After a reload the adopted agents are
+    ///   live at boot, and relaunching one would put a duplicate beside it.
     ///
     /// The project consult is a structural switch on the workspace, not a lookup
     /// that happens to miss. `project_allows_auto_reopen` fails open on an
@@ -1602,6 +1617,7 @@ impl Engine {
                     crate::model::AgentWorkspace::Folder(_) => true,
                 };
                 session.desired_running
+                    && !self.any_tab_active(&session.id)
                     && session.auto_reopen_enabled
                     && std::path::Path::new(session.directory()).exists()
                     && owner_allows
@@ -1648,7 +1664,43 @@ impl Engine {
     /// behaviour this feature exists to avoid.
     pub fn prepare_reload_handoff(&self) -> Option<crate::reload_handoff::Handoff> {
         let mut ptys = Vec::new();
+        let Some(()) = self.collect_reload_ptys(&mut ptys) else {
+            // Refused partway: the masters collected so far already had
+            // close-on-exec cleared. There is no exec coming, so put it back,
+            // or every git, gh or editor process this image spawns from now on
+            // inherits a copy of those agents' terminals.
+            crate::reload_handoff::Handoff {
+                written_by: std::process::id(),
+                ptys,
+            }
+            .abandon();
+            return None;
+        };
+        self.pre_exec_quiesce();
+        Some(crate::reload_handoff::Handoff {
+            written_by: std::process::id(),
+            ptys,
+        })
+    }
 
+    /// Stop everything that must not straddle the reload exec, other than the
+    /// PTYs (which are handed over, not stopped).
+    ///
+    /// Runs once the handoff is known to be complete, immediately before the
+    /// caller execs. Every descriptor this process holds WITHOUT close-on-exec,
+    /// other than the PTY masters named in the handoff, is a leak into the new
+    /// image, and every background thread holding a lock or a claim simply
+    /// vanishes at the exec without releasing it. This is the one place that
+    /// winds such things down.
+    pub fn pre_exec_quiesce(&self) {
+        // INTEGRATION: stop AMQ inject workers + release claims (maple), close peer listeners (seedling)
+    }
+
+    /// Describe every provider and companion terminal into `ptys`, clearing
+    /// close-on-exec on each master as it goes. `None` as soon as one cannot be
+    /// handed over, with `ptys` holding the ones already prepared so the caller
+    /// can undo them.
+    fn collect_reload_ptys(&self, ptys: &mut Vec<crate::reload_handoff::HandoffPty>) -> Option<()> {
         for (tab_id, client) in &self.providers {
             let session_id = self
                 .agent_tabs
@@ -1693,10 +1745,7 @@ impl Engine {
             ptys.push(entry);
         }
 
-        Some(crate::reload_handoff::Handoff {
-            written_by: std::process::id(),
-            ptys,
-        })
+        Some(())
     }
 
     /// Adopt the PTYs a previous image handed over, putting each back in the row
@@ -1761,6 +1810,18 @@ impl Engine {
                         // it over a field nobody can repair from here.
                         _ => crate::model::TerminalOwner::Standalone,
                     };
+                    // This image's counter started at zero, and it mints both
+                    // the next `term-N` id and the next default sort order. Left
+                    // there, the next terminal spawned would reuse an adopted
+                    // id and replace it in the map, dropping (and so killing)
+                    // the shell that just survived the reload.
+                    let id_number = entry
+                        .tab_id
+                        .strip_prefix("term-")
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let order_number = usize::try_from(terminal.sort_order).unwrap_or(0);
+                    self.terminal_counter = self.terminal_counter.max(id_number).max(order_number);
                     self.companion_terminals.insert(
                         entry.tab_id.clone(),
                         crate::model::CompanionTerminal {
@@ -4694,12 +4755,14 @@ mod tests {
     #[test]
     fn kill_tab_runtime_clears_desired_running_and_drops_the_auto_reopen_candidate() {
         let (mut engine, _tmp, _worktree) = auto_reopen_fixture();
+        // Eligible while nothing runs. (A live tab is itself a reason not to
+        // relaunch, so the premise is checked before the provider exists.)
+        assert_eq!(candidate_ids(&engine), vec!["s1".to_string()]);
         // Give the eligible session a live provider on its session-slot tab so
         // there is something to kill.
         let worktree = engine.sessions[0].directory().to_string();
         let client = spawn_cat(Path::new(&worktree));
         engine.providers.insert(TabId::new("s1-slot"), client);
-        assert_eq!(candidate_ids(&engine), vec!["s1".to_string()]);
 
         let outcome = engine.kill_tab_runtime("s1-slot");
         assert!(outcome.killed, "the live provider was killed");
@@ -6943,6 +7006,171 @@ mod tests {
         assert!(
             !receiver.providers.contains_key(TabIdRef::new("broken")),
             "the unusable entry must be dropped, not stood up as a dead row"
+        );
+    }
+
+    /// A reload refused partway must not leave the masters it already prepared
+    /// inheritable: no exec is coming, and every git, gh or editor process
+    /// spawned afterwards would get a copy of those agents' terminals.
+    #[test]
+    fn a_refused_handoff_puts_close_on_exec_back_on_the_masters_it_touched() {
+        let (mut engine, tmp) = engine_with_one_live_agent();
+        // Providers are collected before terminals, so the healthy agent is
+        // prepared (flag cleared) before the terminal that cannot cross.
+        let mut bad = crate::pty::PtyClient::spawn_with_env(
+            "sleep",
+            &["30".to_string()],
+            tmp.path(),
+            24,
+            80,
+            1000,
+            &[],
+        )
+        .expect("spawn terminal");
+        bad.make_unhandoverable_for_test();
+        engine.companion_terminals.insert(
+            "term-1".to_string(),
+            crate::model::CompanionTerminal {
+                owner: crate::model::TerminalOwner::Standalone,
+                label: "t".to_string(),
+                foreground_cmd: None,
+                client: bad,
+                sort_order: 1,
+                created_at: chrono::Utc::now(),
+            },
+        );
+        let good_fd = engine
+            .providers
+            .values()
+            .next()
+            .expect("the fixture's agent")
+            .prepare_for_reload("probe", None)
+            .expect("the healthy agent can be prepared")
+            .master_fd;
+        // Undo the probe so the test starts from the real resting state.
+        crate::pty_reattach::set_close_on_exec(good_fd).unwrap();
+
+        assert!(
+            engine.prepare_reload_handoff().is_none(),
+            "premise: one pty cannot cross, so the reload is refused"
+        );
+        assert!(
+            !crate::pty_reattach::survives_exec(good_fd).unwrap(),
+            "a refused reload must leave the agent's master close-on-exec"
+        );
+    }
+
+    /// The boot sequence a reload runs through: adopt the handoff, then the
+    /// ordinary restore (normalize every row, then pick auto-reopen candidates).
+    /// The ordinary restore assumes nothing is running at boot, which is false
+    /// after a reload, so an adopted agent used to be marked Detached AND
+    /// relaunched beside itself.
+    #[test]
+    fn an_adopted_agent_stays_active_and_is_not_relaunched_by_the_boot_restore() {
+        let (mut donor, tmp) = engine_with_one_live_agent();
+        // Make s1 a fully eligible auto-reopen candidate, so the only thing that
+        // can keep it off the list is the live provider the reload carried over.
+        donor.sessions[0]
+            .workspace
+            .as_managed_mut()
+            .expect("managed test session")
+            .worktree_path = tmp.path().to_string_lossy().to_string();
+        let handoff = donor.prepare_reload_handoff().expect("collect");
+        let session = donor.sessions[0].clone();
+        std::mem::forget(donor);
+
+        let (mut receiver, _tmp2) = test_engine();
+        receiver.config.ui.auto_reopen_agents = true;
+        receiver
+            .projects
+            .push(sample_project("p1", tmp.path().to_string_lossy().as_ref()));
+        let mut restored = session;
+        restored.desired_running = true;
+        restored.auto_reopen_enabled = true;
+        restored.status = SessionStatus::Active;
+        receiver.session_store.upsert_session(&restored).unwrap();
+        receiver.sessions.push(restored);
+
+        // SAFETY: the donor's descriptors are still open in this process.
+        let adopted = unsafe { receiver.restore_reload_handoff(handoff) };
+        assert_eq!(adopted, 1);
+        let providers_before = receiver.providers.len();
+
+        receiver.normalize_restored_sessions();
+        let candidates = candidate_ids(&receiver);
+
+        assert_eq!(
+            receiver.sessions[0].status,
+            SessionStatus::Active,
+            "an agent whose process survived the reload is running, not detached"
+        );
+        assert!(
+            !candidates.contains(&"s1".to_string()),
+            "an adopted agent must not be relaunched beside itself: {candidates:?}"
+        );
+        assert_eq!(receiver.providers.len(), providers_before);
+        let persisted = receiver
+            .session_store
+            .load_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == "s1")
+            .expect("s1 persisted");
+        assert_eq!(persisted.status, SessionStatus::Active);
+    }
+
+    /// A reloaded engine starts its terminal counter at zero, so the next
+    /// terminal spawned would be `term-1` again and replace the adopted one in
+    /// the map (dropping its client, which kills the user's shell).
+    #[test]
+    fn a_terminal_spawned_after_a_reload_does_not_reuse_an_adopted_id() {
+        let (mut donor, tmp) = test_engine();
+        for (id, order) in [("term-1", 1u64), ("term-3", 9u64)] {
+            let client = crate::pty::PtyClient::spawn_with_env(
+                "sleep",
+                &["30".to_string()],
+                tmp.path(),
+                24,
+                80,
+                1000,
+                &[],
+            )
+            .expect("spawn terminal");
+            donor.companion_terminals.insert(
+                id.to_string(),
+                crate::model::CompanionTerminal {
+                    owner: crate::model::TerminalOwner::Standalone,
+                    label: id.to_string(),
+                    foreground_cmd: None,
+                    client,
+                    sort_order: order,
+                    created_at: chrono::Utc::now(),
+                },
+            );
+        }
+        let handoff = donor.prepare_reload_handoff().expect("collect");
+        std::mem::forget(donor);
+
+        let (mut receiver, _tmp2) = test_engine();
+        // SAFETY: the donor's descriptors are still open in this process.
+        let adopted = unsafe { receiver.restore_reload_handoff(handoff) };
+        assert_eq!(adopted, 2);
+
+        receiver.config.terminal.command = "sleep".to_string();
+        receiver.config.terminal.args = vec!["30".to_string()];
+        let (new_id, _label) = receiver
+            .create_standalone_terminal(24, 80)
+            .expect("spawn a terminal after the reload");
+
+        assert!(
+            new_id != "term-1" && new_id != "term-3",
+            "the new terminal reused an adopted id: {new_id}"
+        );
+        assert_eq!(receiver.companion_terminals.len(), 3);
+        let new_order = receiver.companion_terminals[&new_id].sort_order;
+        assert!(
+            new_order > 9,
+            "a new terminal must sort after every adopted one, got {new_order}"
         );
     }
 }

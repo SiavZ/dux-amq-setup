@@ -146,6 +146,21 @@ pub fn resume_after_server(
     run_app(app, companion)
 }
 
+/// Resume the TUI after a reload's `exec` failed, with `reason` on the status
+/// line.
+///
+/// The engine never left this process, so this is the same rebuild as coming
+/// back from the web server: no session relaunch, every provider still live.
+pub fn resume_after_failed_reload(
+    engine: Box<Engine>,
+    companion: Box<dyn dux_core::background_serve::BackgroundServeCompanion>,
+    reason: String,
+) -> Result<TuiExit> {
+    let mut app = app::App::resume(*engine)?;
+    app.set_error(reason);
+    run_app(app, companion)
+}
+
 /// Run an App's event loop and translate its [`app::RunExit`] into a
 /// [`TuiExit`] for the binary's orchestration loop. On a flip, the engine is
 /// moved out of the App (no `Drop` runs on the providers, since neither `App`

@@ -43,3 +43,11 @@ alacritty_terminal = "0.26.0"
 ureq = "3.3.0"
 
 [dev-dependencies]
+
+# The reload end-to-end test execs itself to play the second generation of a
+# reload, so it needs its own `main` instead of libtest's (which would just run
+# the suite again after the exec). Being a test target, it is never built by
+# `cargo build` or `cargo install`, unlike the `[[bin]]` it replaced.
+[[test]]
+name = "reload_handoff_e2e"
+harness = false
