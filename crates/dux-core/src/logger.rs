@@ -801,6 +801,38 @@ pub fn resolve_log_path(config: &LoggingConfig, paths: &DuxPaths) -> PathBuf {
     }
 }
 
+/// Run `f` with a thread-local `tracing` subscriber that records every event's
+/// target and fields (as [`JsonFieldVisitor`] renders them), and return them.
+/// For tests that must see a structured log line was emitted.
+#[cfg(test)]
+pub(crate) fn capture_tracing<R>(
+    f: impl FnOnce() -> R,
+) -> (R, Vec<(String, serde_json::Map<String, serde_json::Value>)>) {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    type Seen = Arc<Mutex<Vec<(String, serde_json::Map<String, serde_json::Value>)>>>;
+    struct Capture(Seen);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = JsonFieldVisitor(serde_json::Map::new());
+            event.record(&mut visitor);
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((event.metadata().target().to_string(), visitor.0));
+        }
+    }
+    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&seen)));
+    let result = tracing::subscriber::with_default(subscriber, f);
+    let events = std::mem::take(&mut *seen.lock().unwrap_or_else(PoisonError::into_inner));
+    (result, events)
+}
+
 /// Serializes the tests that move the process-wide [`LEVEL`], so a parallel run
 /// cannot read another test's threshold.
 #[cfg(test)]

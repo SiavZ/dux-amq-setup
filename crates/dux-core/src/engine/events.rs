@@ -870,6 +870,18 @@ fn session_label(session: &AgentSession) -> String {
     session.display_label()
 }
 
+/// The short name a launch-failure log line records for its launch kind.
+fn launch_kind_label(kind: &AgentLaunchKind) -> &'static str {
+    match kind {
+        AgentLaunchKind::Create { .. } => "create",
+        AgentLaunchKind::Reconnect { .. } => "reconnect",
+        AgentLaunchKind::ForceReconnect { .. } => "force_reconnect",
+        AgentLaunchKind::ResumeFallback { .. } => "resume_fallback",
+        AgentLaunchKind::StartupAutoReopen => "startup_auto_reopen",
+        AgentLaunchKind::Tab { .. } => "tab",
+    }
+}
+
 impl Engine {
     /// Find any other session that owns `worktree_path` and has a running
     /// provider, and detach it so the incoming launch can take over. Returns the
@@ -2159,6 +2171,28 @@ impl Engine {
         let tab_id = request.tab_id.clone();
         let session = request.session;
         self.clear_in_flight(&InFlightKey::AgentLaunch(tab_id.clone()));
+
+        // Port of fork bc77466f: the create/reconnect failures below reach only
+        // a status line, which a burst of auto-resumes overwrites within
+        // milliseconds, so without this line a failed reconnect leaves no trace
+        // in dux.log. The other arms log their own, more specific lines.
+        if matches!(
+            request.kind,
+            AgentLaunchKind::Create { .. }
+                | AgentLaunchKind::Reconnect { .. }
+                | AgentLaunchKind::ForceReconnect { .. }
+        ) {
+            tracing::error!(
+                target: "dux::sessions",
+                session_id = %session.id,
+                tab_id = %tab_id,
+                provider = %request.provider.as_str(),
+                directory = %session.directory(),
+                launch = launch_kind_label(&request.kind),
+                err = %message,
+                "agent launch failed",
+            );
+        }
 
         let outcome = match request.kind {
             AgentLaunchKind::Create { status_op_id, .. } => {
@@ -7171,6 +7205,31 @@ mod tests {
             AgentLaunchFailedOutcome::Reconnect { session_id, agent_label, message }
                 if session_id == "s1" && agent_label == "s1-title" && message == "boom"
         ));
+    }
+
+    /// Fork bc77466f: a failed reconnect leaves a structured error in the log,
+    /// not only a status line a burst of resumes overwrites at once.
+    #[test]
+    fn reconnect_failure_is_logged_with_session_and_error() {
+        let (mut engine, _tmp) = test_engine();
+        let data = make_failed_data(
+            "s1",
+            "feat/x",
+            AgentLaunchKind::Reconnect {
+                status_message: String::new(),
+            },
+            "boom",
+        );
+        let (_, events) =
+            crate::logger::capture_tracing(|| engine.process_agent_launch_failed(data));
+        let (target, fields) = events
+            .iter()
+            .find(|(_, fields)| fields.get("message") == Some(&"agent launch failed".into()))
+            .expect("a launch-failure log line");
+        assert_eq!(target, "dux::sessions");
+        assert_eq!(fields["session_id"], "s1");
+        assert_eq!(fields["launch"], "reconnect");
+        assert_eq!(fields["err"], "boom");
     }
 
     #[test]
