@@ -292,7 +292,7 @@ pub fn jcode_session_id_is_valid(id: &str) -> bool {
 /// own metadata database (`recent_sessions` in
 /// `~/.jcode/session-metadata-v1.sqlite3`). dux cannot assign jcode ids at
 /// spawn the way it does for Claude, and jcode has no rollout files to
-/// diff the way Codex does — but every jcode session records its
+/// diff the way Codex does. But every jcode session records its
 /// `working_dir`, and dux agents own their directory, so "newest non-empty
 /// session for this directory" is the session the operator would pick from
 /// jcode's `/resume` menu. Any failure resolves to `None`, which keeps the
