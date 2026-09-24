@@ -1,0 +1,4 @@
+# Placeholder. Phases 02+ will drop fake `git`, `claude`, `amq`, etc.
+# binaries here and `setup_isolated_home` will prepend this directory
+# to PATH so the wrappers under test resolve them instead of the real
+# ones.

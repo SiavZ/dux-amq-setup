@@ -1,0 +1,25 @@
+// Add these entries to your VSCode User settings.json on the LOCAL machine
+// (not the remote VM). They free Ctrl-G, Ctrl-O, and Ctrl-P in the terminal
+// so dux's exit_interactive keybind, dux's open_palette keybind, and Claude
+// Code's Ctrl-O (toggle verbose / multi-line) reach the running PTY instead
+// of being captured by VS Code.
+//
+// Background: VS Code's "commandsToSkipShell" controls which Workbench
+// commands flow through to the integrated terminal. By default it
+// intercepts a curated allowlist — including the bindings for Goto Line,
+// Recent Directory, and Open File — which means key combinations bound
+// to those commands never reach the program running in the terminal,
+// even when that program (dux, claude, etc.) wants to handle them itself.
+// The "-" prefix on each entry tells VS Code to STOP intercepting that
+// command, falling back to the default of forwarding it to the shell.
+//
+// Reload the VS Code window (Cmd/Ctrl-Shift-P → "Reload Window") after
+// editing for the change to take effect on existing terminals.
+{
+  "terminal.integrated.commandsToSkipShell": [
+    "-workbench.action.gotoLine",
+    "-workbench.action.terminal.goToRecentDirectory",
+    "-workbench.action.files.openFile",
+    "-workbench.action.quickOpen"
+  ]
+}

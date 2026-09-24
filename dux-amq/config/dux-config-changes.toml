@@ -1,0 +1,47 @@
+# The dux settings the AMQ overlay changes, as they read in
+# $DUX_HOME/config.toml once install.sh has patched it. install.sh applies
+# them with config/dux-config.sed; this file is the same end state in config
+# form, for applying by hand and for review. Keep the two in step.
+#
+# Generate the default first:
+#   DUX_HOME=/data/state/dux dux config regenerate --yes
+# Then apply the values below (or run install.sh, which does both).
+#
+# crates/dux/tests/overlay_config.rs parses this file with dux's own config
+# types and fails on any key or value the current schema does not accept, so a
+# setting renamed upstream cannot linger here silently.
+
+[defaults]
+# Start the new-agent name prompt empty: the branch name the user types becomes
+# the AMQ identity. (Formerly `prompt_for_name = true`, which dux still
+# migrates on load to this inverse.)
+enable_randomized_pet_name_by_default = false
+
+[providers.claude]
+command = "claude-amq"
+# Fork the session on resume so deferred tools don't block the resumed pane.
+resume_args = ["--continue", "--fork-session"]
+# Tri-state since upstream: absent is auto. Pin it so the wheel always reaches
+# Claude's renderer.
+forward_scroll = true
+# Plain drags stay in dux so pane text can be selected and copied (bc3a9eec).
+forward_mouse = false
+
+[providers.codex]
+command = "codex-amq"
+# Inline mode: codex output lands in dux's host scrollback, so scroll it there.
+args = ["--no-alt-screen"]
+resume_args = ["--no-alt-screen", "resume", "--last"]
+resume_by_id_args = ["--no-alt-screen", "resume", "{session_id}"]
+forward_scroll = false
+# Plain drags stay in dux so pane text can be selected and copied (bc3a9eec).
+forward_mouse = false
+
+[providers.jcode]
+command = "jcode-amq"
+
+# gemini is no longer a stock dux provider. If you keep a [providers.gemini]
+# block of your own, route it through the wrapper too:
+#   [providers.gemini]
+#   command = "gemini-amq"
+#   forward_scroll = true

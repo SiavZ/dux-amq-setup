@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="patrickdappollonio/dux"
+# This fork's releases, not upstream's: upstream's builds carry none of the
+# AMQ/peer/watch features this repository ships (244b33c6, audit03 P1-07).
+# DUX_REPO exists for mirrors and tests.
+REPO="${DUX_REPO:-SiavZ/dux-amq-setup}"
 BINARY="dux"
 
 # Allow overriding the version and install directory via environment variables.
@@ -238,25 +241,65 @@ verify_checksum() {
     return 0
 }
 
+# Parse the first tag_name out of a GitHub API response without requiring jq.
+# Works for both the single-object shape (/releases/latest) and the array
+# shape (/releases), where the newest release is first.
+parse_tag() {
+    printf '%s' "${1:-}" \
+        | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' \
+        | head -1 \
+        | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/'
+}
+
+# Print the line for `name` from a combined SHA256SUMS file (sha256sum format,
+# `<hex>  <name>` or `<hex> *<name>`), or nothing when it has no such entry.
+# verify_checksum then sees either a one-line checksum file or an empty one,
+# and an empty one already reads as "no published checksum".
+checksum_line_from_sums() {
+    local sums="$1" name="$2"
+    awk -v name="$name" '$2 == name || $2 == "*" name { print; exit }' "$sums"
+}
+
 resolve_version() {
     if [ -n "$VERSION" ]; then
-        # Ensure the version starts with 'v'.
+        # Fork releases are tagged `dux-amq-vX.Y.Z`, so they never collide with
+        # upstream's `vX.Y.Z`. A bare `X.Y.Z` still gets the `v` prefix.
         case "$VERSION" in
-            v*) echo "$VERSION" ;;
-            *)  echo "v$VERSION" ;;
+            dux-amq-*|v*) echo "$VERSION" ;;
+            *)            echo "v$VERSION" ;;
         esac
         return
     fi
 
     log "Fetching latest release version..."
-    local response
-    response="$(http_get "https://api.github.com/repos/${REPO}/releases/latest")" \
-        || err "Failed to fetch latest release from GitHub API. Set DUX_VERSION to install a specific version."
+    local response tag
 
-    # Parse the tag_name from the JSON response without requiring jq.
-    local tag
-    tag="$(echo "$response" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')"
-    [ -n "$tag" ] || err "Could not determine latest release version. Set DUX_VERSION to install a specific version."
+    # `/releases/latest` excludes prereleases and answers 404 when a repository
+    # has only prereleases, which is the state this fork was in before its first
+    # stable release. Fall back to the full list (newest first) so such a repo
+    # still installs rather than dying with a bare error.
+    if response="$(http_get "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null)"; then
+        tag="$(parse_tag "$response")"
+    fi
+
+    if [ -z "${tag:-}" ]; then
+        log "No stable release found; falling back to the most recent release..."
+        response="$(http_get "https://api.github.com/repos/${REPO}/releases?per_page=1" 2>/dev/null)" || true
+        tag="$(parse_tag "${response:-}")"
+    fi
+
+    if [ -z "${tag:-}" ]; then
+        err "Could not determine the latest release for ${REPO}." \
+            "" \
+            "The repository may have no releases yet, or the GitHub API may be" \
+            "unreachable from this host (rate limit, proxy, or no network)." \
+            "" \
+            "Install a specific version instead:" \
+            "  curl -sSfL https://github.com/${REPO}/releases/latest/download/install.sh \\" \
+            "    | DUX_VERSION=dux-amq-v0.1.1 bash" \
+            "" \
+            "Available releases: https://github.com/${REPO}/releases"
+    fi
     echo "$tag"
 }
 
@@ -280,14 +323,15 @@ resolve_install_dir() {
 }
 
 main() {
-    local os arch version install_dir archive url checksum_file checksum_status
+    local os arch version install_dir archive base_url url checksum_file checksum_status
 
     os="$(detect_os)"
     arch="$(detect_arch)"
     version="$(resolve_version)"
     install_dir="$(resolve_install_dir)"
     archive="${BINARY}-${os}-${arch}.tar.gz"
-    url="https://github.com/${REPO}/releases/download/${version}/${archive}"
+    base_url="https://github.com/${REPO}/releases/download/${version}"
+    url="${base_url}/${archive}"
 
     log "Installing ${BINARY} ${version} (${os}/${arch}) to ${install_dir}"
 
@@ -305,6 +349,18 @@ main() {
     checksum_file="${DUX_TMPDIR}/${archive}.sha256"
     checksum_status=0
     http_fetch_optional "${url}.sha256" "$checksum_file" || checksum_status=$?
+
+    # This fork's releases before the per-archive .sha256 files existed
+    # (dux-amq-v0.1.0, dux-amq-v0.1.1) publish one combined SHA256SUMS instead.
+    # When the server says the .sha256 is not there, read the archive's line out
+    # of SHA256SUMS so those releases stay verified rather than warned through.
+    if [ "$checksum_status" -eq 1 ]; then
+        checksum_status=0
+        http_fetch_optional "${base_url}/SHA256SUMS" "${DUX_TMPDIR}/SHA256SUMS" || checksum_status=$?
+        if [ "$checksum_status" -eq 0 ]; then
+            checksum_line_from_sums "${DUX_TMPDIR}/SHA256SUMS" "$archive" > "$checksum_file"
+        fi
+    fi
 
     # A mismatch exits from inside here without installing anything. A missing or
     # unfetchable checksum warns and returns non-zero, which is not a failure of

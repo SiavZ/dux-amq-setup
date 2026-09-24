@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# encode-claude-project-dir: encode an absolute path the way Claude Code
+# names its on-disk session dirs at ~/.claude/projects/<encoded>.
+#
+# Single source of truth used by:
+#   - dux-amq/wrappers/claude-amq        (session-history seeding)
+#   - dux-amq/scripts/finalize-claude-migration.sh (audit01 P0-A migrate)
+#   - audit02 Phase 10 (purge-stale-claude-sessions, when implemented)
+#
+# Encoding rules (verified against Claude Code 2.1.111 on Linux,
+# probed by directly running `claude --print 'hi'` in directories
+# named to exercise each rule, then observing
+# `ls ~/.claude/projects/` — see audit02 Phase 12 commit body for
+# raw probe transcript and Phase 27 for kernel-matrix re-validation):
+#
+#   1. Strip a single trailing `/` if present.
+#   2. Replace every character that is NOT in [A-Za-z0-9-] with `-`.
+#      This single rule covers `/`, `_`, `.`, space, parens, brackets,
+#      `@`, `+`, `=`, `:`, and every other separator we probed. Runs
+#      of unsafe chars are NOT collapsed: `__` becomes `--`, not `-`.
+#   3. Case is preserved (`Foo_Bar` → `Foo-Bar`, not `foo-bar`).
+#
+# Pinned to AMQ_PINNED_VERSION's bundled `claude` binary. If Anthropic
+# changes the encoder in a future release, the fixture-based bats test
+# at dux-amq/tests/encoder-fixtures.bats will fail and we re-derive.
+#
+# Caveat (audit02 Phase 12 — author note): the probes above were run on
+# *one* Linux VM with `claude` 2.1.111. macOS, alternate file-system
+# encodings, and any future Claude version may diverge. The Phase 27
+# kernel-matrix run is the gating final-validation; if it disagrees,
+# update fixtures here, do NOT special-case the encoder.
+
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE' >&2
+usage: encode-claude-project-dir <abs-path>
+
+Encodes an absolute filesystem path into the form Claude Code uses for
+on-disk session storage at ~/.claude/projects/<encoded-name>.
+
+Path must be absolute. Trailing slash is stripped. Encoding is purely
+syntactic — symlinks are NOT resolved (caller must canonicalize via
+realpath if that is desired).
+USAGE
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  --)        shift ;;
+esac
+
+if [[ $# -ne 1 ]]; then
+  usage
+  exit 2
+fi
+
+in="$1"
+
+# Refuse relative paths — Claude Code itself only ever stores absolute
+# paths, and accepting a relative one here would silently produce a
+# wrong cache-dir name.
+if [[ "$in" != /* ]]; then
+  printf 'encode-claude-project-dir: absolute path required, got %q\n' "$in" >&2
+  exit 2
+fi
+
+# Step 1: strip a single trailing `/` (preserve "/" itself though —
+# stripping would yield "" and we then have nothing to encode).
+if [[ "$in" != "/" ]]; then
+  in="${in%/}"
+fi
+
+# Step 2: replace every char outside [A-Za-z0-9-] with `-`.
+# Implementation note: we walk the string char-by-char in pure bash so
+# the script has no `sed`/`tr` runtime dependency beyond bash itself.
+# A single `tr` would also work — `tr -c 'A-Za-z0-9-' '-'` — but it
+# requires LC_ALL=C to avoid locale-dependent character classes, and
+# bash's [[ =~ ]] is locale-stable for the literal class we use.
+out=""
+i=0
+len=${#in}
+while (( i < len )); do
+  ch="${in:i:1}"
+  if [[ "$ch" =~ ^[A-Za-z0-9-]$ ]]; then
+    out+="$ch"
+  else
+    out+="-"
+  fi
+  i=$((i + 1))
+done
+
+printf '%s' "$out"

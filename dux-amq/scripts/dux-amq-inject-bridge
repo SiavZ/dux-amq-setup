@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+# amq prints its "update available" banner on stderr, which the drain calls
+# below merge into the message body; the documented env switch silences it
+# without changing argv (the test fakes dispatch on argv).
+export AMQ_NO_UPDATE_CHECK=1
+# dux-amq-inject-bridge — TIOCSTI-disabled fallback for `amq wake`
+# (audit02 Phase 13, audit01 P1-1; receiver-keyed queue rev added when
+# the dux-side drainer was implemented; verify-opt-in rev added when
+# T2 was reclassified as accepted-risk in single-user-VM mode).
+#
+# AMQ v0.34.0's `--inject-mode raw` calls `ioctl(TIOCSTI)` directly and
+# silently fails on Linux ≥ 6.2 / Ubuntu 24.04 / Debian 12+ (kernels
+# built with CONFIG_LEGACY_TIOCSTI=n). The wrappers detect the kernel
+# state at install time (sentinel at $STATE_ROOT/dux/.tiocsti-state)
+# and switch to `--inject-via "$LOCAL_BIN/dux-amq-inject-bridge"`. AMQ
+# spawns this script with the wake notification preview as the FINAL
+# argv element ($1 here).
+#
+# Flow:
+#   1. (Optional) Verify the envelope through `amq-receive-verify` when
+#      `DUX_AMQ_VERIFY=1`. Verification was originally mandatory
+#      (audit02 Phase 08, T2: "compromised peer spoofs identity"), but
+#      our trust model in SECURITY.md states all panes share the same
+#      Linux user, $HOME, and FS perms — i.e. there's no boundary
+#      between peers in the first place. A peer with same-UID access
+#      can `cat ~/.local/share/dux-amq/amq-secret` (mode 0600 on the
+#      same $HOME) or `ptrace`/`LD_PRELOAD` the signer. Per Linus
+#      ("there is a complete lack of a security boundary between
+#      processes of the same user") and MIT 6.828, HMAC against a
+#      same-UID adversary is not a meaningful boundary. So strict
+#      verification is now opt-in for environments that genuinely
+#      bridge a trust boundary (e.g. wake notifications proxied across
+#      hosts) — most users want skip mode.
+#
+#      Skip mode (default): DUX2 envelopes are decoded byte-for-byte
+#      without checking the MAC; legacy DUX1 envelopes remain readable.
+#      Other input is used as-is. Either way we deliver SOMETHING —
+#      that's the entire point of the change.
+#
+#      Strict mode (`DUX_AMQ_VERIFY=1`): the original behaviour. We
+#      call `amq-receive-verify` and drop on any failure (unsigned,
+#      stale, replayed, MAC mismatch). dux exports this env var when
+#      `[amq.inject].verify_envelope = true` in `config.toml`.
+#
+#   2. Inject the body into the dux pane. Strategy selection:
+#        a. When DUX_PANE is set (dux is the parent process tree), we
+#           ALWAYS go to the file queue. The dux-side drainer reads it
+#           and types into the agent's PTY only when the agent is idle
+#           — this avoids the "stuck in input field" failure mode
+#           where tmux send-keys delivers the body but the trailing
+#           Enter is dropped because Claude Code's Ink input is in
+#           non-accepting state during streaming.
+#        b. Otherwise, when $TMUX is set, use `tmux send-keys`. This
+#           covers operators running plain claude/codex under tmux
+#           outside dux, where there's no other consumer and the
+#           streaming-state race is less common.
+#        c. Otherwise, write to the file queue and let an operator
+#           (or a future polling consumer) recover the body manually.
+#
+# Queue layout (receiver-keyed):
+#   $QUEUE_DIR/<receiver>/<ts>.msg     — addressed messages
+#   $QUEUE_DIR/.unrouted/<ts>.msg      — fallback when AM_ME is unset
+#                                         or sanitises to empty
+#
+# `<receiver>` is `$AM_ME` after the same sanitisation as the wrapper
+# (lowercase, [a-z0-9_-] only). The leading dot on `.unrouted` makes it
+# disjoint from every valid handle. The dux drainer treats `.unrouted/`
+# specially: it routes to the currently selected session with a status
+# warning instead of dropping.
+#
+# Exit status is always 0 on the happy path AND on every soft-failure
+# branch (silent verify rejection in strict mode, missing tmux, full
+# filesystem). The upstream AMQ contract says: a non-zero
+# `--inject-via` exit means "retry this message later", which we never
+# want for a malformed/spoofed body. Setup errors that *would* benefit
+# from a retry aren't present here (no network calls, no auth tokens
+# to refresh) — every failure mode is either "the message is bad" or
+# "the host is bad", and neither is helped by a retry.
+set -euo pipefail
+
+ENVELOPE="${1:-}"
+
+# Mode selection. Default is skip-verify, matching the trust model in
+# SECURITY.md (T2 accepted-risk in single-user-VM mode). dux exports
+# DUX_AMQ_VERIFY=1 when the operator opts back into strict mode via
+# `[amq.inject].verify_envelope = true`. Outside dux, env unset =
+# default = skip.
+VERIFY_MODE="${DUX_AMQ_VERIFY:-0}"
+
+# `coop exec` deliberately baselines mail that predates wake startup. Dux
+# instead wants downtime mail delivered after the provider is ready, so the
+# wrappers launch one bounded bridge process that waits for this exact owner
+# generation, then drains once. ponytail: remove when AMQ exposes a coop
+# no-baseline or post-ready hook.
+STARTUP_OWNER_PID="${DUX_AMQ_STARTUP_OWNER_PID:-}"
+if [[ -n "$STARTUP_OWNER_PID" ]]; then
+  if [[ ! "$STARTUP_OWNER_PID" =~ ^[0-9]+$ || -z "${AM_ROOT:-${AMQ_GLOBAL_ROOT:-}}" ||
+    ! "${AM_ME:-}" =~ ^[a-z0-9_-]+$ ]]; then
+    printf '[inject-bridge] invalid startup-drain owner or AMQ identity; skipping backlog recovery\n' >&2
+    exit 0
+  fi
+  ROOT="${AM_ROOT:-${AMQ_GLOBAL_ROOT}}"
+  LOCK="$ROOT/agents/$AM_ME/.wake.lock"
+  PREPARED="$ROOT/agents/$AM_ME/.wake.prepared"
+  ready=0
+  for _ in {1..50}; do
+    kill -0 "$STARTUP_OWNER_PID" 2>/dev/null || exit 0
+    generation=$(jq -er --argjson owner "$STARTUP_OWNER_PID" \
+      'select(.owner.pid == $owner) | .generation' "$LOCK" 2>/dev/null || true)
+    if [[ -n "$generation" ]] &&
+      jq -e --arg generation "$generation" '.generation == $generation' \
+        "$PREPARED" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 0.1
+  done
+  if (( ready == 0 )); then
+    printf '[inject-bridge] managed wake was not ready within 5s; backlog remains unread\n' >&2
+    exit 0
+  fi
+  ENVELOPE='[AMQ] startup backlog recovery'
+fi
+
+# Empty envelope is always a no-op regardless of mode. Stays exit 0
+# because retrying empty input would just produce another empty input.
+if [[ -z "$ENVELOPE" ]]; then
+  exit 0
+fi
+
+# Resolve the expected receiver before verification so strict mode can bind
+# the authenticated recipient to the actual wake daemon identity.
+sanitised_receiver=""
+if [[ -n "${AM_ME:-}" ]]; then
+  sanitised_receiver=$(printf '%s' "$AM_ME" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed 's|[^a-z0-9_-]|-|g; s|^-\+||; s|-\+$||')
+fi
+RECEIVER="${sanitised_receiver:-.unrouted}"
+body_is_b64=0
+
+if [[ "$VERIFY_MODE" == "1" ]]; then
+  # ---- Strict mode (opt-in) ----
+  #
+  # Run the verifier with stdin closed (`</dev/null`) so it picks the
+  # argv branch deterministically. Empty stdout = soft-drop (unsigned,
+  # replayed, stale, MAC mismatch); we exit 0 silently per AMQ
+  # `--inject-via` contract.
+  if ! command -v amq-receive-verify >/dev/null 2>&1; then
+    printf '[inject-bridge] DUX_AMQ_VERIFY=1 but amq-receive-verify not on PATH; dropping\n' >&2
+    exit 0
+  fi
+  body_b64=$(AMQ_EXPECTED_RECEIVER="$RECEIVER" \
+    amq-receive-verify --emit-base64 "$ENVELOPE" </dev/null) || body_b64=""
+  if [[ -z "$body_b64" ]]; then
+    exit 0
+  fi
+  body_is_b64=1
+else
+  # ---- Skip mode (default) ----
+  #
+  # DUX2 stores the body as base64, so tabs/newlines and trailing bytes
+  # survive the single argv envelope. Plain `amq send` bodies pass through
+  # as-is. The DUX1 arm below is compatibility for already queued messages.
+  if [[ "$ENVELOPE" == DUX2$'\t'* ]]; then
+    extra=""
+    IFS=$'\t' read -r magic _sender _recipient _ts _nonce body_b64 _mac extra <<<"$ENVELOPE"
+    if [[ "$magic" == "DUX2" && -n "$body_b64" && -z "$extra" ]]; then
+      body_is_b64=1
+    else
+      body="$ENVELOPE"
+    fi
+  elif [[ "$ENVELOPE" == DUX1$'\t'* ]]; then
+    rest="${ENVELOPE#DUX1$'\t'}"
+    # Skip 5 more fields: sender, recipient, ts, nonce, mac.
+    for _ in 1 2 3 4 5; do
+      next="${rest#*$'\t'}"
+      if [[ "$next" == "$rest" ]]; then
+        # Malformed envelope (fewer than 7 fields). Treat as raw.
+        rest="$ENVELOPE"
+        break
+      fi
+      rest="$next"
+    done
+    body="$rest"
+  else
+    body="$ENVELOPE"
+  fi
+fi
+
+if (( body_is_b64 == 0 )); then
+  send_body="$body"
+fi
+
+# `amq wake` sends an interrupt command before the human-readable
+# interrupt notice for urgent interrupt-labeled messages. Under dux the
+# bridge writes to a file queue, so a raw Ctrl+C byte cannot actually
+# interrupt the agent; it only creates an invalid queue file that the
+# Rust drainer must reject. Drop that transport-only signal and let the
+# following interrupt notice carry the actionable prompt.
+if (( body_is_b64 == 0 )) && [[ "$send_body" == $'\003' ]]; then
+  exit 0
+fi
+
+# Step 2a — under dux, always go to the queue.
+#
+# `DUX_PANE` is set by dux when it spawns the agent's PTY (see
+# `apply_terminal_env` in crates/dux-core/src/pty.rs). Children of that PTY (the
+# wrapper, then AMQ's owner-bound wake, then the inject-bridge spawned
+# by AMQ) inherit it. When present, we skip tmux entirely and let
+# the dux-side drainer deliver the body — it knows when the agent
+# is idle and can type the body + submit reliably.
+under_dux=0
+if [[ -n "${DUX_PANE:-}" ]]; then
+  under_dux=1
+fi
+
+# Dux-spawned panes export DUX_PID. Owner-bound wake exits with its provider,
+# but this check closes the shutdown race: never queue into a dead Dux instance.
+if (( under_dux == 1 )) && [[ -n "${DUX_PID:-}" ]]; then
+  if ! [[ "$DUX_PID" =~ ^[0-9]+$ ]] || ! kill -0 "$DUX_PID" 2>/dev/null; then
+    exit 0
+  fi
+fi
+
+# Under dux, do not make the model execute a second command just to read
+# the message. Convert the wake notification into the actual AMQ drain
+# output, then queue that output for the dux-side drainer to submit to
+# the agent. This keeps `inbox/new` from accumulating when an agent sees
+# a wake prompt but does not follow the "run amq drain" instruction.
+# Compact an `amq drain --include-body` batch into claude-peers-style
+# notifications: one "← amq from <sender>:" header per message followed by
+# the body, envelope noise (thread/id/subject/priority/kind/created) dropped.
+# Falls back to the raw batch if the layout is not recognised.
+amq_compact() {
+  local raw="$1" out
+  out=$(printf '%s\n' "$raw" | awk '
+    function flush() {
+      sub(/\n+$/, "", body)
+      printf "← amq from %s:\n%s\n\n", from, body
+      from = ""; body = ""; inbody = 0
+    }
+    /^- From: /  { if (from != "") flush(); from = substr($0, 9); next }
+    /^  Body:$/  { inbody = 1; next }
+    /^  (Thread|ID|Subject|Priority|Kind|Created): / { next }
+    /^\[AMQ\] /  { next }
+    /^---$/      { if (from != "") flush(); next }
+    inbody       { body = body $0 "\n"; next }
+    END          { if (from != "") flush() }
+  ')
+  out="${out%"${out##*[![:space:]]}"}"
+  if [[ -n "$out" ]]; then printf '%s' "$out"; else printf '%s' "$raw"; fi
+}
+
+# Step 2a-jcode — jcode panes never touch the PTY. Delivery goes through the
+# jcode daemon's client protocol: `debug client:message:<text>` queues the
+# body to the connected TUI client and submits it as that pane's next turn —
+# the same role claude-peers' channel plays for Claude sessions. Requires
+# `display.debug_socket = true` in ~/.jcode/config.toml.
+#
+# Ordering matters: readiness is checked BEFORE the inbox is drained, so a
+# held message (daemon down, or several jcode clients connected — the client
+# target would be ambiguous) stays unread for the wake's next retry instead
+# of being marked read and lost. Non-zero exit = retryable, by AMQ contract.
+# Opt-in (DUX_AMQ_NATIVE_DELIVERY=1). Default installs keep the proven
+# file-queue/drainer path so a stock jcode (debug_socket=false) or a fleet
+# without the daemon socket is never left with undeliverable messages.
+if (( under_dux == 1 )) && [[ "${DUX_AMQ_NATIVE_DELIVERY:-0}" == "1" ]] \
+   && [[ "${DUX_PROVIDER:-}" == "jcode" ]] && command -v jcode >/dev/null 2>&1; then
+  jc_ctl=(env JCODE_DEBUG_CONTROL=1 timeout 15 jcode --no-update debug)
+  jc_log="${DUX_AMQ_JCODE_LOG:-$HOME/.local/state/inject-bridge-jcode.log}"
+  # stdin/stdout detached: under the wake they are the pane's TTY, and a
+  # CLI that touches a terminal it does not own stalls or fails.
+  jc_map=$("${jc_ctl[@]}" clients:map </dev/null 2>/dev/null || true)
+  jc_clients=$(printf '%s' "$jc_map" | grep -o '"count":[0-9]*' | grep -o '[0-9]*$' || true)
+  jc_sid=""
+  if [[ -n "$jc_clients" ]]; then
+    # Several jcode panes share one daemon; a bare client:message would land
+    # in whichever client the daemon picks. Target the session whose working
+    # directory is this receiver's worktree (the wake runs from it), falling
+    # back to a handle == directory-basename match, then to the sole client.
+    jc_here=$(realpath -- "$PWD" 2>/dev/null || printf '%s' "$PWD")
+    while IFS= read -r jc_entry; do
+      jc_esid=$(printf '%s' "$jc_entry" | grep -o '"session_id":"[^"]*"' | cut -d'"' -f4)
+      jc_ewd=$(printf '%s' "$jc_entry" | grep -o '"working_dir":"[^"]*"' | cut -d'"' -f4)
+      [[ -n "$jc_esid" && -n "$jc_ewd" ]] || continue
+      jc_ewd_real=$(realpath -- "$jc_ewd" 2>/dev/null || printf '%s' "$jc_ewd")
+      if [[ "$jc_ewd_real" == "$jc_here" || "${jc_ewd##*/}" == "$RECEIVER" ]]; then
+        jc_sid="$jc_esid"
+        break
+      fi
+    done < <(printf '%s' "$jc_map" | tr '}' '\n')
+    if [[ -z "$jc_sid" && "$jc_clients" == "1" ]]; then
+      jc_sid=$(printf '%s' "$jc_map" | grep -o '"session_id":"[^"]*"' | head -1 | cut -d'"' -f4)
+    fi
+  fi
+  if [[ -z "$jc_clients" ]]; then
+    # Daemon socket unreachable or debug control disabled: use the queue.
+    printf '[inject-bridge] jcode daemon not reachable for %s; using file queue\n' "$RECEIVER" >&2
+    jc_native=0
+  elif [[ -z "$jc_sid" ]]; then
+    printf '[inject-bridge] jcode delivery held for %s: %s connected clients, none in this worktree\n' \
+      "$RECEIVER" "$jc_clients" >&2
+    exit 1
+  else
+    jc_native=1
+  fi
+  if (( jc_native == 1 )); then
+  if [[ "$VERIFY_MODE" != "1" ]] && command -v amq >/dev/null 2>&1; then
+    ROOT="${AM_ROOT:-${AMQ_GLOBAL_ROOT:-/data/state/amq}}"
+    if ! jc_body=$(amq drain --root "$ROOT" --me "$RECEIVER" --include-body --limit "${DUX_AMQ_DRAIN_LIMIT:-20}" 2>&1); then
+      printf '[inject-bridge] amq drain failed for %s: %s\n' "$RECEIVER" "$jc_body" >&2
+      exit 1
+    fi
+    [[ -z "$jc_body" ]] && exit 0
+    jc_body=$(amq_compact "$jc_body")
+  elif (( body_is_b64 == 1 )); then
+    jc_body=$(printf '%s' "$body_b64" | openssl base64 -d -A 2>/dev/null) || exit 1
+  else
+    jc_body="$send_body"
+  fi
+  jc_body=$(printf '%s' "$jc_body" | LC_ALL=C tr -d '\000-\010\013\014\015\016-\037\177')
+  jc_out=$("${jc_ctl[@]}" -S "$jc_sid" "client:message:$jc_body" </dev/null 2>&1) || true
+  printf '%s %s clients=%s session=%s result=%s\n' "$(date -u +%FT%TZ)" "$RECEIVER" "$jc_clients" "$jc_sid" "${jc_out:0:120}" >>"$jc_log" 2>/dev/null || true
+  if [[ "$jc_out" == OK:* ]]; then
+    # `client:message` records the delivery in the TUI's prompt history like
+    # a typed prompt. The live session keeps that in memory (no knob), but
+    # scrubbing the persisted history keeps ↑ clean in every later session.
+    jc_hist="$HOME/.jcode/prompt-history.jsonl"
+    if [[ -s "$jc_hist" ]] && grep -q '← amq from ' "$jc_hist" 2>/dev/null; then
+      if jc_tmp=$(mktemp "$jc_hist.XXXXXX"); then
+        if grep -v '← amq from ' "$jc_hist" >"$jc_tmp" 2>/dev/null; then
+          mv -f "$jc_tmp" "$jc_hist" || rm -f "$jc_tmp"
+        else
+          rm -f "$jc_tmp"
+        fi
+      fi
+    fi
+    exit 0
+  fi
+  printf '[inject-bridge] jcode client delivery FAILED for %s: %s\n' "$RECEIVER" "${jc_out:0:200}" >&2
+  exit 1
+  fi
+fi
+
+# Step 2a-claude — Claude panes get AMQ deliveries through the claude-peers
+# channel (their native push path, the same one peers use), not the PTY.
+# `dux peer send --transport claude-peers` resolves the receiver's live pane
+# by process ancestry (daemon spare sessions in the same cwd are skipped) and
+# the sender handle rides along so the pane knows whom to answer. The file
+# queue (PTY typing) remains only as the emergency fallback when the peers
+# channel is unavailable — e.g. the pane's MCP server is not up yet — so a
+# drained message is never silently lost.
+if (( under_dux == 1 )) && [[ "${DUX_AMQ_NATIVE_DELIVERY:-0}" == "1" ]] \
+   && [[ "${DUX_PROVIDER:-}" == "claude" ]] \
+   && [[ "$VERIFY_MODE" != "1" ]] && command -v amq >/dev/null 2>&1 && command -v dux >/dev/null 2>&1; then
+  ROOT="${AM_ROOT:-${AMQ_GLOBAL_ROOT:-/data/state/amq}}"
+  if cp_body=$(amq drain --root "$ROOT" --me "$RECEIVER" --include-body --limit "${DUX_AMQ_DRAIN_LIMIT:-20}" 2>&1); then
+    [[ -z "$cp_body" ]] && exit 0
+    cp_from=$(printf '%s\n' "$cp_body" | grep -m1 -oE '^- From: [a-z0-9_-]+' | awk '{print $3}')
+    cp_body=$(amq_compact "$cp_body")
+    cp_body=$(printf '%s' "$cp_body" | LC_ALL=C tr -d '\000-\010\013\014\015\016-\037\177')
+    if [[ -n "$cp_from" ]] && timeout 20 dux peer send --from "$cp_from" --transport claude-peers "$RECEIVER" "$cp_body" >/dev/null 2>&1; then
+      exit 0
+    fi
+    if timeout 20 dux peer send --transport claude-peers "$RECEIVER" "$cp_body" >/dev/null 2>&1; then
+      exit 0
+    fi
+    printf '[inject-bridge] claude-peers channel unavailable for %s; falling back to PTY queue\n' "$RECEIVER" >&2
+    send_body="$cp_body"
+    body_is_b64=0
+    claude_drained=1
+  else
+    printf '[inject-bridge] amq drain failed for %s: %s\n' "$RECEIVER" "$cp_body" >&2
+  fi
+fi
+
+if (( under_dux == 1 )) && [[ "${claude_drained:-0}" != "1" ]] && [[ "$VERIFY_MODE" != "1" ]] &&
+  [[ -n "${AM_ROOT:-${AMQ_GLOBAL_ROOT:-}}" ]] && command -v amq >/dev/null 2>&1; then
+  ROOT="${AM_ROOT:-${AMQ_GLOBAL_ROOT:-/data/state/amq}}"
+  drain_limit="${DUX_AMQ_DRAIN_LIMIT:-20}"
+  if drain_out=$(amq drain --root "$ROOT" --me "$RECEIVER" --include-body --json --limit "$drain_limit"); then
+    if jq -e '.count == 0' >/dev/null 2>&1 <<<"$drain_out"; then
+      # Another wake/drain path already consumed the message. Avoid
+      # injecting stale "Drain with..." notices that create confusion.
+      exit 0
+    fi
+    if ! jq -e '.count > 0 and (.drained | type == "array")' >/dev/null 2>&1 <<<"$drain_out"; then
+      printf '[inject-bridge] amq drain returned invalid JSON for %s; dropping\n' "$RECEIVER" >&2
+      exit 0
+    fi
+    send_body=$'[AMQ] Drained messages (JSON):\n'"$drain_out"$'\nAct on these AMQ messages now. Reply over AMQ when needed.'
+    body_is_b64=0
+  else
+    printf '[inject-bridge] amq drain failed for %s\n' "$RECEIVER" >&2
+  fi
+fi
+
+# The Rust drainer rejects unsafe control bytes. AMQ message bodies are
+# peer-authored, so strip transport/control bytes before queueing the
+# drain output; preserve TAB and LF because they are useful formatting.
+if (( body_is_b64 == 0 )); then
+  send_body=$(printf '%s' "$send_body" | LC_ALL=C tr -d '\000-\010\013\014\015\016-\037\177')
+fi
+
+# Step 2b — outside dux, prefer tmux send-keys when available.
+#
+# `DUX_TMUX_TARGET` lets the operator point at a specific pane (e.g.
+# `mywindow:0.1`); the default of empty means "current pane of current
+# window" — the same pane the wrapper is running in.
+if (( under_dux == 0 )) && [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
+  if (( body_is_b64 == 1 )); then
+    send_body=$(printf '%s' "$body_b64" | openssl base64 -d -A) || exit 0
+  fi
+  TARGET="${DUX_TMUX_TARGET:-}"
+  if [[ -n "$TARGET" ]]; then
+    tmux send-keys -t "$TARGET" -- "$send_body" Enter
+  else
+    tmux send-keys -- "$send_body" Enter
+  fi
+  exit 0
+fi
+
+# Step 2c — file queue (under dux always; outside dux as final
+# fallback when tmux isn't available).
+QUEUE_ROOT="$HOME/.local/share/dux-amq/inject-queue"
+QUEUE_DIR="$QUEUE_ROOT/$RECEIVER"
+mkdir -p "$QUEUE_DIR" 2>/dev/null || {
+  printf '[inject-bridge] cannot create %s; dropping message\n' "$QUEUE_DIR" >&2
+  exit 0
+}
+# Use mktemp for the final filename to guarantee uniqueness even when the
+# system clock jumps backward (NTP correction, VM suspend/resume). The
+# timestamp prefix preserves arrival-order sorting for the drainer; the
+# random suffix from mktemp prevents collisions.
+ts=$(date -u +%s%N 2>/dev/null) || ts=""
+if [[ -z "$ts" || "$ts" == *N* ]]; then
+  ts="$(date -u +%s)"
+fi
+# Use a temp + rename so a concurrent reader never sees a half-written
+# file. The temp lives in the same receiver dir to keep the rename
+# atomic across the FS boundary. The `.inflight.` prefix matches the
+# pattern the dux drainer uses for its own in-flight reservation,
+# letting both sides agree on what to skip during scans.
+tmp=$(mktemp "$QUEUE_DIR/.inflight.XXXXXX") || exit 0
+if (( body_is_b64 == 1 )); then
+  if ! printf '%s' "$body_b64" | openssl base64 -d -A >"$tmp"; then
+    rm -f "$tmp"
+    exit 0
+  fi
+else
+  printf '%s' "$send_body" >"$tmp"
+fi
+# Derive the final name from the temp's random suffix to stay unique.
+suffix="${tmp##*.inflight.}"
+target="$QUEUE_DIR/${ts}-${suffix}.msg"
+mv -f "$tmp" "$target"
+exit 0

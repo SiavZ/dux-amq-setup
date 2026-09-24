@@ -355,6 +355,54 @@ if [ "$supported_os" -eq 1 ] && [ "$supported_arch" -eq 1 ]; then
     fail "end to end no checksum: expected a warning and an installed binary"
   fi
 
+  # 7c'. This fork's releases before per-archive .sha256 files (dux-amq-v0.1.0
+  #      and v0.1.1) publish only a combined SHA256SUMS. With no .sha256 beside
+  #      the archive, the installer must verify against that file's line: a
+  #      match installs with "Checksum verified", a mismatch installs nothing,
+  #      and a SHA256SUMS with no line for this archive is "no published
+  #      checksum", not a pass.
+  case "$arch_now" in x86_64|amd64) arch_name=amd64 ;; *) arch_name=arm64 ;; esac
+  this_archive="dux-${os_now}-${arch_name}.tar.gz"
+  (
+    cd "$WORK/release"
+    for f in *.tar.gz; do
+      if command -v sha256sum >/dev/null 2>&1; then sha256sum "$f"; else shasum -a 256 "$f"; fi
+    done
+  ) > "$WORK/release/SHA256SUMS"
+  mkdir -p "$WORK/bin-sums-ok"
+  out="$(run_main_offline "$WORK/bin-sums-ok")" || true
+  printf -- '--- end to end, combined SHA256SUMS only ---\n%s\n' "$out"
+  if [ -x "$WORK/bin-sums-ok/dux" ] && [ "${out#*"Checksum verified"}" != "$out" ]; then
+    pass "end to end SHA256SUMS fallback: verified and installed"
+  else
+    fail "end to end SHA256SUMS fallback: expected a verified install"
+  fi
+
+  awk -v n="$this_archive" '$2 == n { $1 = "0000000000000000000000000000000000000000000000000000000000000000" } { print $1 "  " $2 }' \
+    "$WORK/release/SHA256SUMS" > "$WORK/release/SHA256SUMS.new"
+  mv "$WORK/release/SHA256SUMS.new" "$WORK/release/SHA256SUMS"
+  mkdir -p "$WORK/bin-sums-bad"
+  out="$(run_main_offline "$WORK/bin-sums-bad")" || true
+  printf -- '--- end to end, combined SHA256SUMS mismatch ---\n%s\n' "$out"
+  if [ ! -e "$WORK/bin-sums-bad/dux" ] && [ "${out#*"Checksum mismatch"}" != "$out" ]; then
+    pass "end to end SHA256SUMS fallback mismatch: nothing installed"
+  else
+    fail "end to end SHA256SUMS fallback mismatch: a binary was installed or no mismatch reported"
+  fi
+
+  grep -v " ${this_archive}\$" "$WORK/release/SHA256SUMS" > "$WORK/release/SHA256SUMS.new" || true
+  mv "$WORK/release/SHA256SUMS.new" "$WORK/release/SHA256SUMS"
+  mkdir -p "$WORK/bin-sums-none"
+  out="$(run_main_offline "$WORK/bin-sums-none")" || true
+  printf -- '--- end to end, SHA256SUMS without this archive ---\n%s\n' "$out"
+  if [ "${out#*"WARNING: no published checksum"}" != "$out" ] \
+    && [ "${out#*"Checksum verified"}" = "$out" ]; then
+    pass "end to end SHA256SUMS without an entry: warned as unverified"
+  else
+    fail "end to end SHA256SUMS without an entry: must warn, not verify"
+  fi
+  rm -f "$WORK/release/SHA256SUMS"
+
   # 7d. The checksum fetch fails at the transport layer (no DNS, refused
   #     connection, TLS error, proxy error). The archive itself downloaded fine,
   #     so the install still proceeds, but the warning has to name the real cause

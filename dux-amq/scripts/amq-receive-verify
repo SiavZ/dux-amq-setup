@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Verify one DUX2 authenticated envelope and emit its exact decoded body.
+# Drops malformed, stale, misaddressed, replayed, or MAC-mismatched input with
+# exit 0 so AMQ does not retry poison messages. Setup failures exit 1.
+set -euo pipefail
+
+EMIT_BASE64=0
+if [[ "${1:-}" == "--emit-base64" ]]; then
+  EMIT_BASE64=1
+  shift
+fi
+
+SECRET_PATH="${AMQ_SECRET_PATH:-$HOME/.local/share/dux-amq/amq-secret}"
+if [[ ! -r "$SECRET_PATH" ]]; then
+  printf '[amq-verify] secret not readable at %s\n' "$SECRET_PATH" >&2
+  exit 1
+fi
+SECRET=$(<"$SECRET_PATH")
+if [[ -z "$SECRET" ]]; then
+  printf '[amq-verify] secret file is empty\n' >&2
+  exit 1
+fi
+
+line=""
+if [[ -t 0 ]]; then
+  [[ -n "${1:-}" ]] && line="$1"
+else
+  IFS= read -r line || true
+  [[ -z "$line" && -n "${1:-}" ]] && line="$1"
+fi
+if [[ -z "$line" ]]; then
+  printf '[amq-verify] no envelope on stdin or argv (empty invocation)\n' >&2
+  exit 0
+fi
+
+extra=""
+IFS=$'\t' read -r MAGIC SENDER RECEIVER TS NONCE BODY_B64 MAC extra <<<"$line"
+if [[ "$MAGIC" != "DUX2" ]]; then
+  printf '[amq-verify] dropping unsigned/unknown-magic message (magic=%q sender=%q)\n' \
+    "${MAGIC:-<empty>}" "${SENDER:-?}" >&2
+  exit 0
+fi
+if [[ -z "$SENDER" || -z "$RECEIVER" || -z "$TS" || -z "$NONCE" ||
+      -z "$BODY_B64" || -z "$MAC" || -n "$extra" ]]; then
+  printf '[amq-verify] dropping malformed DUX2 envelope\n' >&2
+  exit 0
+fi
+if [[ ! "$SENDER" =~ ^[a-z0-9_-]+$ || ! "$RECEIVER" =~ ^[a-z0-9_-]+$ ||
+      ! "$NONCE" =~ ^[0-9a-f]{24}$ || ! "$BODY_B64" =~ ^[A-Za-z0-9+/]+={0,2}$ ||
+      ! "$MAC" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]; then
+  printf '[amq-verify] dropping malformed DUX2 field encoding\n' >&2
+  exit 0
+fi
+
+EXPECTED_RECEIVER="${AMQ_EXPECTED_RECEIVER:-${AM_ME:-}}"
+if [[ -z "$EXPECTED_RECEIVER" || "$RECEIVER" != "$EXPECTED_RECEIVER" ]]; then
+  printf '[amq-verify] wrong recipient (signed=%q expected=%q)\n' \
+    "$RECEIVER" "${EXPECTED_RECEIVER:-<unset>}" >&2
+  exit 0
+fi
+
+SKEW="${AMQ_AUTH_SKEW_SECONDS:-60}"
+WINDOW="${AMQ_AUTH_WINDOW_SECONDS:-86400}"
+NOW=$(date -u +%s)
+parse_utc_epoch() {
+  date -u -d "$1" +%s 2>/dev/null ||
+    date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null
+}
+if ! MSG_TS=$(parse_utc_epoch "$TS"); then
+  printf '[amq-verify] dropping message with unparseable timestamp %q\n' "$TS" >&2
+  exit 0
+fi
+DELTA=$((NOW - MSG_TS))
+if (( DELTA < -SKEW )); then
+  printf '[amq-verify] dropping future-dated message (delta=%ds, ts=%s)\n' "$DELTA" "$TS" >&2
+  exit 0
+fi
+if (( DELTA > WINDOW )); then
+  printf '[amq-verify] dropping stale message (age=%ds > %ds, ts=%s)\n' "$DELTA" "$WINDOW" "$TS" >&2
+  exit 0
+fi
+
+PAYLOAD="DUX2|$SENDER|$RECEIVER|$TS|$NONCE|$BODY_B64"
+EXPECT=$(printf '%s' "$PAYLOAD" \
+  | openssl dgst -sha256 -hmac "$SECRET" -binary \
+  | openssl base64 -A)
+if [[ "$MAC" != "$EXPECT" ]]; then
+  printf '[amq-verify] HMAC mismatch from %s\n' "$SENDER" >&2
+  exit 0
+fi
+
+# A directory create is the check-and-record operation. POSIX mkdir is
+# atomic, so simultaneous verifiers cannot both accept one nonce.
+NONCE_ROOT="${XDG_RUNTIME_DIR:-/tmp}/dux-amq"
+NONCES="$NONCE_ROOT/seen-nonces.d"
+mkdir -p "$NONCES"
+chmod 0700 "$NONCE_ROOT" "$NONCES" 2>/dev/null || true
+if ! mkdir "$NONCES/$NONCE" 2>/dev/null; then
+  printf '[amq-verify] replay rejected (nonce=%s sender=%s)\n' "$NONCE" "$SENDER" >&2
+  exit 0
+fi
+
+# Opportunistically remove nonce claims older than the freshness window.
+if (( RANDOM % 100 == 0 )); then
+  find "$NONCES" -mindepth 1 -maxdepth 1 -type d \
+    -mmin "+$((WINDOW / 60 + 1))" -exec rm -rf -- {} + 2>/dev/null || true
+fi
+
+if (( EMIT_BASE64 )); then
+  printf '%s\n' "$BODY_B64"
+else
+  printf '%s' "$BODY_B64" | openssl base64 -d -A
+fi

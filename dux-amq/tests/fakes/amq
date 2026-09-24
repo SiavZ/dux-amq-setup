@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Fake `amq` for dux-amq overlay tests.
+#
+# Records its argv (NUL-separated, one arg per line for human readability)
+# into "$AMQ_FAKE_ARGV_FILE" so the calling test can assert what flags
+# were forwarded to the underlying provider (claude/codex/gemini).
+#
+# All other invocations append a record of the form:
+#
+#   ARGV
+#   <arg0>
+#   <arg1>
+#   ...
+#   END
+#
+# so multiple invocations in the same test can be told apart.
+set -euo pipefail
+
+if [[ -n "${AMQ_FAKE_ARGV_FILE:-}" ]]; then
+  {
+    printf 'ARGV\n'
+    for arg in "$@"; do
+      printf '%s\n' "$arg"
+    done
+    printf 'END\n'
+  } >>"$AMQ_FAKE_ARGV_FILE"
+fi
+if [[ "${AMQ_FAKE_FAIL_RECOVER_OWNER:-0}" == "1" && "${1:-}" == "wake" && "${2:-}" == "recover-owner" ]]; then
+  exit 42
+fi
+exit 0
