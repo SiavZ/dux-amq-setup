@@ -1853,11 +1853,12 @@ pub fn branch_refusal_note(branch: &str, reason: &str) -> crate::status_text::St
     ]
 }
 
-/// The command a status tells the user to run to remove a branch by hand,
-/// spelled exactly as the sentences always printed it, so it can travel as one
-/// name (the web draws it as a single chip).
+/// The command a status tells the user to run to remove a branch by hand, as
+/// one string so it can travel as one name (the web draws it as a single chip).
+/// The branch is single-quoted, because a branch name can come from a pull
+/// request somebody else opened and the user is being invited to paste this.
 pub fn branch_delete_command(branch: &str) -> String {
-    format!("git branch -D \"{branch}\"")
+    format!("git branch -D {}", crate::shell_quote::single_quote(branch))
 }
 
 /// git's stderr line, tidied for a status message: the "error: " prefix dropped,
@@ -6938,7 +6939,7 @@ mod tests {
             .initial_branch_note("born-here")
             .expect("a refusal is worth a sentence");
         assert!(
-            note.contains("still there") && note.contains("git branch -D \"born-here\""),
+            note.contains("still there") && note.contains("git branch -D 'born-here'"),
             "the note must be honest and actionable: {note}"
         );
         assert!(
@@ -7030,9 +7031,55 @@ mod tests {
         assert_eq!(
             note,
             "Git refused to delete branch \"feat\": cannot delete branch 'feat' used by \
-             worktree at '/tmp/w'. Delete it yourself with git branch -D \"feat\", or give \
+             worktree at '/tmp/w'. Delete it yourself with git branch -D 'feat', or give \
              the next agent a different name."
         );
+    }
+
+    /// Run the suggested command the way a user pasting it would, through a
+    /// POSIX shell, with `git` shadowed by a function that records its argv one
+    /// NUL-terminated argument at a time. Returns the arguments `git` received
+    /// after `branch -D`, and whether anything else ran (a file the crafted
+    /// names would `touch`).
+    fn run_suggested_delete(branch: &str) -> (Vec<String>, bool) {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let command = branch_delete_command(branch);
+        let script = format!("git() {{ shift 2; printf '%s\\0' \"$@\" > argv; }}; {command}");
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .current_dir(dir.path())
+            .status()
+            .expect("run sh");
+        assert!(status.success(), "the command must parse: {command}");
+        let raw = std::fs::read(dir.path().join("argv")).expect("git was called");
+        let args = raw
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8(s.to_vec()).unwrap())
+            .collect();
+        let injected = dir.path().join("INJECTED").exists();
+        (args, injected)
+    }
+
+    /// A branch name is attacker-shaped text (a pull request's head branch
+    /// reaches dux verbatim), and the delete command is one a user copies into
+    /// a shell. Double quotes left `$`, backticks and a closing quote live, so a
+    /// crafted name ran its own command.
+    #[test]
+    fn the_suggested_delete_command_passes_a_crafted_name_as_one_argument() {
+        let crafted = "foo\";touch${IFS}INJECTED;echo\"";
+        let (args, injected) = run_suggested_delete(crafted);
+        assert_eq!(args, vec![crafted.to_string()]);
+        assert!(!injected, "the crafted name ran a command of its own");
+    }
+
+    #[test]
+    fn the_suggested_delete_command_survives_a_single_quote_in_the_name() {
+        let name = "it's';touch INJECTED;'";
+        let (args, injected) = run_suggested_delete(name);
+        assert_eq!(args, vec![name.to_string()]);
+        assert!(!injected, "the name broke out of its quotes");
     }
 
     #[test]

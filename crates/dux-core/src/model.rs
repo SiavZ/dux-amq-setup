@@ -1170,7 +1170,7 @@ mod tests {
             "a branch dux created gets no provenance excuse, got {declined:?}"
         );
         assert!(
-            declined.contains("git branch -D \"feature\""),
+            declined.contains("git branch -D 'feature'"),
             "the branch outlives every dux surface, so the note names the way out, got {declined:?}"
         );
 

@@ -2,6 +2,7 @@
 // and pastes its path: no agent CLI reads a file from its input stream.
 
 import { chip, endProse, joinProse, type Prose, prose, proseText } from "./prose"
+import { singleQuoted } from "./shellQuote"
 
 /// How many file names one toast spells out before it points at the folder
 /// instead.
@@ -268,13 +269,6 @@ export function tooLongToAttachReason(limit: number): string {
 /// only on purpose: escaping every CJK codepoint would make the prompt
 /// unreadable for the users most likely to have one, for no lexical gain.
 const SHELL_SIGNIFICANT = /[\s"#$&'()*;<>?[\\\]`{|}~]/g
-
-/// Wrap in single quotes, closing and reopening around each embedded apostrophe.
-/// Inside POSIX single quotes nothing else is special, so nothing else is
-/// escaped, and leaving the quotes is the only way to include an apostrophe.
-function singleQuoted(path: string): string {
-  return `'${path.replaceAll("'", `'\\''`)}'`
-}
 
 /// Wrap in double quotes, escaping all four characters a double-quoted string
 /// gives meaning to: `"`, `\`, `$` and a backtick. Shell lexing removes the

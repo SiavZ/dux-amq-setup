@@ -7649,8 +7649,8 @@ mod tests {
             "Deleted claude agent \"branch-s1\" from project \"demo\" and removed its \
              worktree. Its branch \"branch-s1\" was created inside this agent's worktree and \
              was kept, and its branch \"develop\" existed before this agent and was kept. \
-             Delete either yourself with git branch -D \"branch-s1\" or git branch -D \
-             \"develop\" if you no longer need them."
+             Delete either yourself with git branch -D 'branch-s1' or git branch -D \
+             'develop' if you no longer need them."
         );
     }
 
@@ -7684,7 +7684,7 @@ mod tests {
             status.message,
             "Deleted claude agent \"branch-s1\" from project \"demo\" and removed its \
              worktree. Its branch \"branch-s1\" came with the worktree this agent adopted and \
-             was kept. Delete it yourself with git branch -D \"branch-s1\" if you no longer \
+             was kept. Delete it yourself with git branch -D 'branch-s1' if you no longer \
              need it."
         );
     }

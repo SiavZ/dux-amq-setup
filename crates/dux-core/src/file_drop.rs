@@ -2169,7 +2169,7 @@ mod tests {
             .arg("-c")
             .arg(format!(
                 "cd {} && echo ready && read _line",
-                shell_single_quote(&target.to_string_lossy())
+                crate::shell_quote::single_quote(&target.to_string_lossy())
             ))
             .current_dir(start.path())
             .stdin(std::process::Stdio::piped())
@@ -2344,7 +2344,7 @@ mod tests {
             .arg("-c")
             .arg(format!(
                 "(cd {} && echo ready && exec sleep 300) & exit 0",
-                shell_single_quote(&member_target.to_string_lossy())
+                crate::shell_quote::single_quote(&member_target.to_string_lossy())
             ))
             .stdout(std::process::Stdio::piped())
             // A new process group whose id is this child's pid, so killing the
@@ -2453,7 +2453,7 @@ mod tests {
             .arg("-c")
             .arg(format!(
                 "(cd {} && echo ready && exec sleep 300) & exit 0",
-                shell_single_quote(&member_target.to_string_lossy())
+                crate::shell_quote::single_quote(&member_target.to_string_lossy())
             ))
             .stdout(std::process::Stdio::piped())
             .process_group(0)
@@ -3016,10 +3016,6 @@ mod tests {
         stdout.read_exact(&mut buf).expect("read ready marker");
         child.stdout = Some(stdout);
         child
-    }
-
-    fn shell_single_quote(s: &str) -> String {
-        format!("'{}'", s.replace('\'', "'\\''"))
     }
 
     // ── lsof's answer is bytes, and bytes are what a path is ─────────────────

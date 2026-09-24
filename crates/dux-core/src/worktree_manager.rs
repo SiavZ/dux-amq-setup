@@ -640,7 +640,7 @@ mod tests {
         assert!(refused.warning, "a surviving branch is not a clean success");
         assert!(refused.message.contains("still there"));
         assert!(
-            refused.message.contains("git branch -D \"free\""),
+            refused.message.contains("git branch -D 'free'"),
             "the report names the way out: {}",
             refused.message
         );

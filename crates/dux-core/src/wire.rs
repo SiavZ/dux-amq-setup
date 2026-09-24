@@ -5520,7 +5520,7 @@ mod tests {
             ),
             "Deleted claude agent \"agent-one\" and removed its worktree. Its branch \"develop\" \
              existed before this agent and was kept. Delete it yourself with \
-             git branch -D \"develop\" if you no longer need it."
+             git branch -D 'develop' if you no longer need it."
         );
         // Drifted: two branches survive, and "existed before this agent" is
         // false of the one the drift created, so each gets its own reason.
@@ -5533,7 +5533,7 @@ mod tests {
             "Deleted claude agent \"agent-one\" and removed its worktree. Its branch \"feature-x\" \
              was created inside this agent's worktree and was kept, and its branch \
              \"develop\" existed before this agent and was kept. Delete either yourself \
-             with git branch -D \"feature-x\" or git branch -D \"develop\" if you no longer \
+             with git branch -D 'feature-x' or git branch -D 'develop' if you no longer \
              need them."
         );
         // An adopted agent's branch came with the worktree, which is a different
@@ -5542,7 +5542,7 @@ mod tests {
             message("main", "main", crate::model::BranchProvenance::Adopted),
             "Deleted claude agent \"agent-one\" and removed its worktree. Its branch \"main\" \
              came with the worktree this agent adopted and was kept. Delete it yourself \
-             with git branch -D \"main\" if you no longer need it."
+             with git branch -D 'main' if you no longer need it."
         );
     }
 
