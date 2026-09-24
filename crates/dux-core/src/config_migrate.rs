@@ -260,8 +260,6 @@ fn retired_stock_gemini() -> ProviderCommandConfig {
         // the stock block dux persisted parses back to `Some(0)`.
         resume_wait_timeout_ms: Some(0),
         resume_by_id_args: None,
-        oneshot_args: Vec::new(),
-        oneshot_output: crate::config::OneshotOutput::Stdout,
         install_hint: Some("brew install gemini-cli".to_string()),
         forward_scroll: None,
         // gemini was retired before `web_dragdrop_paste` existed, so the stock

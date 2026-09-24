@@ -1150,17 +1150,6 @@ pub fn server_console_settings_changed(prev: &ServerConfig, next: &ServerConfig)
     prev.color != next.color
 }
 
-/// Where a provider's oneshot command writes its output.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum OneshotOutput {
-    /// Read from stdout (default).
-    #[default]
-    Stdout,
-    /// Read from a temporary file path passed via placeholder.
-    Tempfile,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProviderCommandConfig {
@@ -1175,12 +1164,6 @@ pub struct ProviderCommandConfig {
     /// This is distinct from `resume_args` which resumes the "most recent" or
     /// "last in CWD" session without needing an ID.
     pub resume_by_id_args: Option<Vec<String>>,
-    /// Arguments for one-shot command execution. Uses `{prompt}` placeholder.
-    /// Example: `["run", "--quiet", "{prompt}"]` for sending a single message
-    /// and exiting without entering interactive mode.
-    pub oneshot_args: Vec<String>,
-    /// Where to read oneshot command output from.
-    pub oneshot_output: OneshotOutput,
     pub install_hint: Option<String>,
     /// Scroll-forwarding policy for the wheel and PgUp/PgDn over this
     /// provider's embedded PTY. Tri-state:
@@ -2290,8 +2273,6 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5]
                 resume_args: Some(vec!["--continue".to_string()]),
                 resume_wait_timeout_ms: None,
                 resume_by_id_args: None,
-                oneshot_args: Vec::new(),
-                oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("curl -fsSL https://claude.ai/install.sh | bash".to_string()),
                 forward_scroll: None,
                 // Measured: strips one quote pair then unescapes, so quoting
@@ -2307,8 +2288,6 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5]
                 resume_args: Some(vec!["resume".to_string(), "--last".to_string()]),
                 resume_wait_timeout_ms: None,
                 resume_by_id_args: None,
-                oneshot_args: Vec::new(),
-                oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("brew install --cask codex".to_string()),
                 forward_scroll: None,
                 // Measured: falls back to POSIX shell lexing and accepts only a
@@ -2324,8 +2303,6 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5]
                 resume_args: Some(vec!["--continue".to_string()]),
                 resume_wait_timeout_ms: Some(3_000),
                 resume_by_id_args: None,
-                oneshot_args: Vec::new(),
-                oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("curl -fsSL https://opencode.ai/install | bash".to_string()),
                 forward_scroll: None,
                 // Measured: strips quote characters and never splits on a space.
@@ -2344,8 +2321,6 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5]
                 resume_args: None,
                 resume_wait_timeout_ms: None,
                 resume_by_id_args: None,
-                oneshot_args: Vec::new(),
-                oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("curl -fsSL https://gh.io/copilot-install | bash".to_string()),
                 forward_scroll: None,
                 // NOT measured: Copilot CLI is closed source. `bare` is the
@@ -2379,18 +2354,6 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5]
                     "--resume".to_string(),
                     "{session_id}".to_string(),
                 ]),
-                // `jcode run` sends one message and exits; `--quiet`
-                // suppresses status output. Caveat: jcode still writes a
-                // trailing `[Tokens] upload: ...` line to stdout, so it lands
-                // in generated commit messages. `--json` returns a clean
-                // `{"text": ...}` object, but dux has no JSON extraction for
-                // oneshot output.
-                oneshot_args: vec![
-                    "run".to_string(),
-                    "--quiet".to_string(),
-                    "{prompt}".to_string(),
-                ],
-                oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("brew tap 1jehuang/jcode && brew install jcode".to_string()),
                 // jcode is an alt-screen TUI with its own scrollback (like
                 // claude/gemini): forward wheel events to it. Host scrollback
