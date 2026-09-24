@@ -148,6 +148,9 @@ impl Engine {
         // falling back to `resume` (see `provider_session_launch`).
         let provider_session =
             self.provider_session_launch(&session, &tab_id, &provider, requested, resume);
+        let yolo_args = self
+            .session_settings_or_default(&session.id)
+            .yolo_launch_args(&provider);
         let provider_config = crate::config::provider_config(&self.config, &provider);
         // A standalone agent has no project to overlay, so it gets the global
         // environment, not the empty one a missed project lookup falls to.
@@ -176,6 +179,7 @@ impl Engine {
             // the returned request.
             status_quiet: crate::statusline::QuietSurfaces::LOUD,
             provider_session,
+            yolo_args,
         }
     }
 
