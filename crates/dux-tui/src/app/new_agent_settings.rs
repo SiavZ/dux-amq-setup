@@ -428,12 +428,13 @@ impl App {
     /// The create committed: apply the draft through the settings modal's
     /// persist-before-mutate command.
     ///
-    /// INTEGRATION: spawn-time settings (YOLO, AMQ verification) apply from
-    /// the agent's NEXT launch, because the first spawn already happened in the
-    /// create worker before the session id existed. When the launch env reads
-    /// Engine::session_settings (maple/seedling: agent_env::session_settings_env
-    /// and SessionSettings::yolo_launch_args), thread this draft into the first
-    /// launch instead.
+    /// Spawn-time settings (YOLO, AMQ verification) take effect from the
+    /// agent's NEXT launch: the first spawn happens in the create worker, which
+    /// launches with default settings because the session row (and so its
+    /// settings) does not exist yet. Every later launch reads the saved
+    /// settings (`Engine::build_tab_launch_request` passes them to
+    /// `agent_env::agent_launch_env` and fills `yolo_args`), so the warning
+    /// below tells the user a reconnect applies them now.
     pub(crate) fn apply_armed_new_agent_settings(&mut self, session_id: &str) {
         let Some(settings) = self.armed_new_agent_settings.take() else {
             return;
