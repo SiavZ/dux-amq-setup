@@ -42,7 +42,7 @@ impl App {
     /// web so the two surfaces cannot answer differently.
     pub(crate) fn planned_standalone_agent_create(
         &self,
-    ) -> Option<Result<(CreateAgentRequest, String)>> {
+    ) -> Option<Result<(CreateAgentRequest, dux_core::status_text::StatusText)>> {
         let PromptState::NameStandaloneAgent { folder, input } = &self.prompt else {
             return None;
         };
@@ -65,7 +65,7 @@ impl App {
         self.prompt = PromptState::None;
         match planned {
             Ok((request, busy_message)) => {
-                if let Err(err) = self.dispatch_create_agent_request(request, busy_message) {
+                if let Err(err) = self.dispatch_create_agent_request(request, busy_message.into()) {
                     self.set_error(format!("Could not create the standalone agent: {err:#}"));
                 }
             }
@@ -249,7 +249,7 @@ impl App {
         let reaction = self.engine.apply(Command::PersistProject {
             action: Box::new(ProjectPersistenceAction::Add {
                 project,
-                status_message,
+                status_message: status_message.into(),
             }),
             // Add is inline (returns its final immediately); no handler-resolved op.
             status_op_id: None,
@@ -1261,7 +1261,7 @@ impl App {
             .is_in_flight(&dux_core::engine::InFlightKey::CreateAgent);
         let reaction = self.engine.apply(Command::DispatchCreateAgentRequest {
             request: Box::new(request),
-            busy_message,
+            busy_message: busy_message.into(),
             term_size,
         })?;
         if !was_in_flight
@@ -1811,7 +1811,7 @@ impl App {
                 project_name: project.name.clone(),
                 leading_branch: project.leading_branch.clone(),
             },
-            busy_message: format!("Refreshing project \"{}\" from remote\u{2026}", project.name),
+            busy_message: format!("Refreshing project \"{}\" from remote\u{2026}", project.name).into(),
             already_running_message: format!(
                 "Project refresh already in progress for \"{}\". Wait for the current pull to finish.",
                 project.name,
@@ -3555,7 +3555,7 @@ impl App {
                     // Route the busy through a keyed reconnect op so its final
                     // (resolved in the shared launch-ready/failed view handlers)
                     // replaces exactly this spinner instead of most-recent-wins.
-                    let op = self.build_reconnect_status_op(busy_message);
+                    let op = self.build_reconnect_status_op(busy_message.to_string());
                     let pending = self.engine.begin_status_op(&op);
                     self.apply_reaction(dux_core::engine::EventReaction::Status(pending));
                     self.pending_reconnect_ops
@@ -6194,11 +6194,11 @@ mod tests {
         app.apply_project_persistence_outcome(ProjectPersistenceOutcome {
             action: ProjectPersistenceAction::Add {
                 project: make_project("project-2", "claude"),
-                status_message: "Added project".to_string(),
+                status_message: "Added project".to_string().into(),
             },
             view: ProjectPersistenceView::Added {
                 project_id: "project-2".to_string(),
-                status_message: "Added project".to_string(),
+                status_message: "Added project".to_string().into(),
             },
             status_op_id: None,
         });

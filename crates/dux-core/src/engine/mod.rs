@@ -756,7 +756,7 @@ pub enum CreateLaunchOutcome {
     /// The session was committed and the agent surface is ready. `status_message`
     /// is the create-kind success line.
     Committed {
-        status_message: String,
+        status_message: StatusText,
         /// Which surfaces withhold that line. A create whose pane launches and
         /// streams confirms nothing; one whose sentence carries a fact the
         /// screen does not show still does.
@@ -782,7 +782,7 @@ pub enum CreateLaunchOutcome {
 pub enum LaunchOutcome {
     /// Reconnect / force-reconnect succeeded; `status_message` is the success line.
     Ready {
-        status_message: String,
+        status_message: StatusText,
         /// Which surfaces withhold that line. A resumed pane relaunches and
         /// paints its prior conversation, so it confirms nothing; a pane that
         /// comes up empty still has to say why.
@@ -1006,7 +1006,7 @@ fn base_moved_suffix(branch: &str, base_moved: bool) -> StatusText {
 pub enum WebAddProjectOutcome {
     /// The switch and the inline project-add both succeeded; `status_message` is
     /// the combined "Checked out X and added project Y" line.
-    Added { status_message: String },
+    Added { status_message: StatusText },
     /// The `git switch` failed before the add ran.
     SwitchFailed {
         target_branch: String,
@@ -1031,10 +1031,10 @@ pub enum WebPrLookupOutcome {
 pub enum PrAttachOutcome {
     /// The lookup resolved and the pin was applied; `message` is the
     /// already-formatted confirmation from [`Engine::apply_pr_attach`].
-    Attached { message: String },
+    Attached { message: StatusText },
     /// The lookup failed or applying the pin failed; `message` is the
     /// already-formatted error line.
-    Failed { message: String },
+    Failed { message: StatusText },
     /// The agent the lookup was for is gone by the time the answer landed.
     /// There is nothing to attach it to and nothing on either surface the
     /// sentence could be about, so the operation ends with its spinner retired
@@ -4289,7 +4289,7 @@ impl Engine {
         title: &str,
         state: &str,
         url: &str,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<StatusText> {
         let Some(session) = self.sessions.iter().find(|s| s.id == session_id) else {
             anyhow::bail!("unknown session: {session_id}");
         };
@@ -4333,10 +4333,16 @@ impl Engine {
         }
         self.pr_overrides.insert(session_id.to_string(), stored);
         self.update_pr_sync_sessions();
-        Ok(format!(
-            "Attached PR #{number} ({owner_repo}) to agent \"{agent_name}\". dux will track \
+        Ok(crate::status_text![
+            "Attached PR ",
+            n(format!("#{}", number)),
+            " (",
+            n(owner_repo),
+            ") to agent ",
+            q(agent_name),
+            ". dux will track \
              this pull request until you detach it; autodetection is paused for this agent."
-        ))
+        ])
     }
 
     /// Detach a session's pull request: this agent has no PR, as of now. The
@@ -4349,7 +4355,7 @@ impl Engine {
     /// The suppression is durable: a restart is not the user changing their
     /// mind. It is lifted by a manual attach or by
     /// [`Self::resume_pr_autodetection`].
-    pub fn clear_pull_request_override(&mut self, session_id: &str) -> anyhow::Result<String> {
+    pub fn clear_pull_request_override(&mut self, session_id: &str) -> anyhow::Result<StatusText> {
         let Some(session) = self.sessions.iter().find(|s| s.id == session_id) else {
             anyhow::bail!("unknown session: {session_id}");
         };
@@ -4389,11 +4395,13 @@ impl Engine {
         // TUI rebuilds its rows off the same call.
         self.pr_statuses.remove(session_id);
         self.update_pr_sync_sessions();
-        Ok(format!(
-            "Detached the pull request from agent \"{agent_name}\". dux will stop looking for \
+        Ok(crate::status_text![
+            "Detached the pull request from agent ",
+            q(agent_name),
+            ". dux will stop looking for \
              one on this agent until you attach a pull request by hand or resume autodetection \
              for it."
-        ))
+        ])
     }
 
     /// Undo a detach: autodetection is switched back on for the session and one
@@ -4403,7 +4411,7 @@ impl Engine {
     /// CLI that could have been uninstalled since. Without a usable `gh` the
     /// check is a no-op and the next cycle after the integration re-arms picks
     /// the session up.
-    pub fn resume_pr_autodetection(&mut self, session_id: &str) -> anyhow::Result<String> {
+    pub fn resume_pr_autodetection(&mut self, session_id: &str) -> anyhow::Result<StatusText> {
         let Some(session) = self.sessions.iter().find(|s| s.id == session_id) else {
             anyhow::bail!("unknown session: {session_id}");
         };
@@ -4438,13 +4446,17 @@ impl Engine {
             "dux will check GitHub once the GitHub integration is enabled and gh is signed in."
         };
         if was_suppressed {
-            Ok(format!(
-                "Resumed pull-request autodetection for agent \"{agent_name}\". {tail}"
-            ))
+            Ok(crate::status_text![
+                "Resumed pull-request autodetection for agent ",
+                q(agent_name),
+                format!(". {}", tail)
+            ])
         } else {
-            Ok(format!(
-                "Pull-request autodetection was already running for agent \"{agent_name}\"; {tail}"
-            ))
+            Ok(crate::status_text![
+                "Pull-request autodetection was already running for agent ",
+                q(agent_name),
+                format!("; {}", tail)
+            ])
         }
     }
 }
@@ -4512,9 +4524,11 @@ impl Engine {
         // dispatch is certain, never before a refusal path).
         self.mark_in_flight(InFlightKey::PrAttach(session_id.to_string()));
 
-        let op = status_op(format!(
-            "Resolving PR to attach to agent \"{agent_name}\"..."
-        ))
+        let op = status_op(crate::status_text![
+            "Resolving PR to attach to agent ",
+            q(agent_name),
+            "..."
+        ])
         .resolve_in_handler(pr_attach_final)
         .with_scope(self.current_origin.clone());
         let op_id = op.id().to_string();
@@ -4607,7 +4621,7 @@ impl Engine {
         folder: &str,
         name: &str,
         provider: Option<&str>,
-    ) -> anyhow::Result<(crate::worker::CreateAgentRequest, String)> {
+    ) -> anyhow::Result<(crate::worker::CreateAgentRequest, StatusText)> {
         let folder = PathBuf::from(folder.trim());
         if !folder.is_absolute() {
             anyhow::bail!(
@@ -4674,10 +4688,11 @@ impl Engine {
             }
             None => self.config.default_provider(),
         };
-        let busy_message = format!(
-            "Creating a standalone agent in \"{}\"\u{2026}",
-            crate::home_path::shorten_home(&folder)
-        );
+        let busy_message = crate::status_text![
+            "Creating a standalone agent in ",
+            q(crate::home_path::shorten_home(&folder)),
+            "\u{2026}"
+        ];
         Ok((
             crate::worker::CreateAgentRequest::Standalone {
                 folder,
@@ -4794,15 +4809,17 @@ impl Engine {
     /// Where an agent lives, as a phrase a status line can drop into a
     /// sentence: `project "web"` for a managed agent, `folder "~/notes"` for a
     /// standalone one. Folder paths are shortened against the server's home.
-    pub fn session_location_phrase(&self, session: &AgentSession) -> String {
+    pub fn session_location_phrase(&self, session: &AgentSession) -> StatusText {
         match &session.workspace {
             crate::model::AgentWorkspace::Managed(_) => {
-                format!("project \"{}\"", self.project_name_for_session(session))
+                crate::status_text!["project ", q(self.project_name_for_session(session))]
             }
-            crate::model::AgentWorkspace::Folder(folder) => format!(
-                "folder \"{}\"",
-                crate::home_path::shorten_home(Path::new(&folder.folder_path))
-            ),
+            crate::model::AgentWorkspace::Folder(folder) => crate::status_text![
+                "folder ",
+                q(crate::home_path::shorten_home(Path::new(
+                    &folder.folder_path
+                )))
+            ],
         }
     }
 
@@ -4812,22 +4829,32 @@ impl Engine {
     /// "attaching…" placeholder back to the user. `resume` is the result of
     /// [`should_resume_session`]. Callers may append extra context (e.g. a
     /// detached-worktree note) to the returned string.
-    pub fn agent_reconnect_status_message(&self, session: &AgentSession, resume: bool) -> String {
+    pub fn agent_reconnect_status_message(
+        &self,
+        session: &AgentSession,
+        resume: bool,
+    ) -> StatusText {
         let location = self.session_location_phrase(session);
         if resume {
-            format!(
-                "Resumed {} agent \"{}\" in {}.",
-                session.provider.as_str(),
-                session.display_label(),
-                location
-            )
+            crate::status_text![
+                "Resumed ",
+                n(session.provider.as_str()),
+                " agent ",
+                q(session.display_label()),
+                " in ",
+                location,
+                "."
+            ]
         } else {
-            format!(
-                "Started fresh {} session for agent \"{}\" in {}. Your provider's own resume command can bring back an earlier conversation.",
-                session.provider.as_str(),
-                session.display_label(),
-                location
-            )
+            crate::status_text![
+                "Started fresh ",
+                n(session.provider.as_str()),
+                " session for agent ",
+                q(session.display_label()),
+                " in ",
+                location,
+                ". Your provider's own resume command can bring back an earlier conversation."
+            ]
         }
     }
 
@@ -4863,10 +4890,11 @@ impl Engine {
         // guard the worktree.
         if !force && self.providers.contains_key(session.slot_tab_id()) {
             return Ok(ReconnectPlan::AlreadyConnected {
-                message: format!(
-                    "Agent \"{}\" is already connected.",
-                    session.display_label()
-                ),
+                message: crate::status_text![
+                    "Agent ",
+                    q(session.display_label()),
+                    " is already connected."
+                ],
             });
         }
         // Both kinds have a directory to reconnect into, and both must
@@ -4876,17 +4904,25 @@ impl Engine {
             == crate::git::DirectoryPresence::Missing
         {
             let message = match &session.workspace {
-                crate::model::AgentWorkspace::Managed(managed) => format!(
-                    "The working copy for agent \"{}\" at {} no longer exists. Recreate the \
-                     working copy to check its branch out there again, or delete this agent.",
-                    session.display_label(),
-                    crate::home_path::shorten_home(Path::new(&managed.worktree_path))
-                ),
-                crate::model::AgentWorkspace::Folder(folder) => format!(
-                    "The folder agent \"{}\" runs in ({}) no longer exists. Restore the folder, or delete this agent and create a new one pointing at the folder you want.",
-                    session.display_label(),
-                    crate::home_path::shorten_home(Path::new(&folder.folder_path))
-                ),
+                crate::model::AgentWorkspace::Managed(managed) => crate::status_text![
+                    "The working copy for agent ",
+                    q(session.display_label()),
+                    " at ",
+                    n(crate::home_path::shorten_home(Path::new(
+                        &managed.worktree_path
+                    ))),
+                    " no longer exists. Recreate the \
+                     working copy to check its branch out there again, or delete this agent."
+                ],
+                crate::model::AgentWorkspace::Folder(folder) => crate::status_text![
+                    "The folder agent ",
+                    q(session.display_label()),
+                    " runs in (",
+                    n(crate::home_path::shorten_home(Path::new(
+                        &folder.folder_path
+                    ))),
+                    ") no longer exists. Restore the folder, or delete this agent and create a new one pointing at the folder you want."
+                ],
             };
             return Ok(ReconnectPlan::WorktreeMissing { message });
         }
@@ -4911,10 +4947,11 @@ impl Engine {
         };
         let mut msg = self.agent_reconnect_status_message(&session, resume);
         if let Some(detached) = &detached_label {
-            msg.push_str(&format!(
-                " Agent \"{}\" was detached to avoid worktree conflicts.",
-                detached,
-            ));
+            msg.push(crate::status_text![
+                " Agent ",
+                q(detached),
+                " was detached to avoid worktree conflicts."
+            ]);
         }
         // A standalone agent has no project whose default provider it could
         // be diverging from, so the note is simply not written for one.
@@ -4928,11 +4965,13 @@ impl Engine {
             } else {
                 "current global default provider"
             };
-            msg.push_str(&format!(
-                " Note: this agent uses {}. Your {provider_label} is {}.",
-                session.provider.as_str(),
-                project.default_provider.as_str(),
-            ));
+            msg.push(crate::status_text![
+                " Note: this agent uses ",
+                n(session.provider.as_str()),
+                format!(". Your {} is ", provider_label),
+                n(project.default_provider.as_str()),
+                "."
+            ]);
         }
 
         let branch_name = session.display_label();
@@ -4956,9 +4995,9 @@ impl Engine {
                 crate::statusline::QuietSurfaces::LOUD
             });
         let busy_message = if force {
-            format!("Starting fresh agent \"{branch_name}\"...")
+            crate::status_text!["Starting fresh agent ", q(branch_name), "..."]
         } else {
-            format!("Launching agent \"{branch_name}\"...")
+            crate::status_text!["Launching agent ", q(branch_name), "..."]
         };
         Ok(ReconnectPlan::Launch {
             request: Box::new(request),
@@ -5363,7 +5402,7 @@ impl Engine {
             pty_size,
             crate::worker::AgentLaunchKind::Tab {
                 is_fresh: true,
-                status_message,
+                status_message: status_message.into(),
             },
         );
         // The launch itself runs on a worker (ready/failed arrives later), but the
@@ -5746,17 +5785,17 @@ impl Engine {
 pub enum ReconnectPlan {
     /// Normal reconnect refused: a provider is already live. The caller shows
     /// `message` and does nothing else.
-    AlreadyConnected { message: String },
+    AlreadyConnected { message: StatusText },
     /// The session's worktree is gone. The caller surfaces `message` as an error
     /// (the TUI as a status error, the web as a 400).
-    WorktreeMissing { message: String },
+    WorktreeMissing { message: StatusText },
     /// Relaunch: dispatch `request` and surface `busy_message` as the pending
     /// status. `resume` is the collision-aware decision the request carries, so a
     /// surface can announce it truthfully. `detached_label` names any conflicting
     /// same-worktree agent that was detached to make room (already applied).
     Launch {
         request: Box<crate::worker::AgentLaunchRequest>,
-        busy_message: String,
+        busy_message: StatusText,
         resume: bool,
         detached_label: Option<String>,
     },
@@ -9398,7 +9437,7 @@ mod tests {
     fn launch_outcome_final_maps_each_variant_to_its_message() {
         assert_eq!(
             launch_outcome_final(&LaunchOutcome::Ready {
-                status_message: "Resumed claude agent \"x\".".to_string(),
+                status_message: "Resumed claude agent \"x\".".to_string().into(),
                 quiet_on: crate::statusline::QuietSurfaces::LOUD,
             }),
             Final::info("Resumed claude agent \"x\".".to_string()),
@@ -9408,14 +9447,44 @@ mod tests {
                 branch_name: "feat".to_string(),
                 message: "boom".to_string(),
             }),
-            Final::error("Reconnect failed for agent \"feat\": boom".to_string()),
+            Final::error(crate::status_text![
+                "Reconnect failed for agent ",
+                q("feat"),
+                ": boom"
+            ]),
+        );
+        let Final::Message { text, .. } = launch_outcome_final(&LaunchOutcome::ReconnectFailed {
+            branch_name: "feat".to_string(),
+            message: "boom".to_string(),
+        }) else {
+            panic!("a failed reconnect has a message");
+        };
+        assert_eq!(
+            text, "Reconnect failed for agent \"feat\": boom",
+            "the plain words are unchanged"
         );
         assert_eq!(
             launch_outcome_final(&LaunchOutcome::ForceReconnectFailed {
                 branch_name: "feat".to_string(),
                 message: "boom".to_string(),
             }),
-            Final::error("Fresh restart failed for agent \"feat\": boom".to_string()),
+            Final::error(crate::status_text![
+                "Fresh restart failed for agent ",
+                q("feat"),
+                ": boom"
+            ]),
+        );
+        let Final::Message { text, .. } =
+            launch_outcome_final(&LaunchOutcome::ForceReconnectFailed {
+                branch_name: "feat".to_string(),
+                message: "boom".to_string(),
+            })
+        else {
+            panic!("a failed fresh restart has a message");
+        };
+        assert_eq!(
+            text, "Fresh restart failed for agent \"feat\": boom",
+            "the plain words are unchanged"
         );
         assert_eq!(
             launch_outcome_final(&LaunchOutcome::Missing),
@@ -11350,7 +11419,7 @@ mod tab_ops_tests {
             .insert(TabId::new("t2"), std::time::Instant::now());
         engine.closing_sessions.insert("s1".to_string());
 
-        let outcome = engine.retry_resume_fallback("t2", (24, 80), "retrying".to_string());
+        let outcome = engine.retry_resume_fallback("t2", (24, 80), "retrying".to_string().into());
 
         let ResumeFallbackOutcome::Retried { reaction } = outcome else {
             panic!("expected a Retried outcome");
@@ -11388,7 +11457,7 @@ mod tab_ops_tests {
             .insert(TabId::new("t3"), std::time::Instant::now());
         engine.closing_sessions.insert("s1".to_string());
 
-        let outcome = engine.retry_resume_fallback("t3", (24, 80), "retrying".to_string());
+        let outcome = engine.retry_resume_fallback("t3", (24, 80), "retrying".to_string().into());
 
         assert!(matches!(outcome, ResumeFallbackOutcome::Retried { .. }));
         assert_eq!(

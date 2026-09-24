@@ -230,7 +230,7 @@ pub struct BrowserEntry {
 #[derive(Clone, Debug)]
 pub enum AgentLaunchKind {
     Create {
-        status_message: String,
+        status_message: crate::status_text::StatusText,
         repo_path: String,
         owns_worktree: bool,
         startup_result: Option<crate::startup::StartupCommandResult>,
@@ -241,13 +241,13 @@ pub enum AgentLaunchKind {
         status_op_id: String,
     },
     Reconnect {
-        status_message: String,
+        status_message: crate::status_text::StatusText,
     },
     ForceReconnect {
-        status_message: String,
+        status_message: crate::status_text::StatusText,
     },
     ResumeFallback {
-        status_message: String,
+        status_message: crate::status_text::StatusText,
     },
     StartupAutoReopen,
     /// An extra-tab launch. Whether it resumes is decided dynamically, per
@@ -258,7 +258,7 @@ pub enum AgentLaunchKind {
     /// extra tab (whose row is kept and whose real error is surfaced).
     Tab {
         is_fresh: bool,
-        status_message: String,
+        status_message: crate::status_text::StatusText,
     },
 }
 
@@ -773,7 +773,7 @@ pub struct PrSyncEntry {
 pub enum ProjectPersistenceAction {
     Add {
         project: Project,
-        status_message: String,
+        status_message: crate::status_text::StatusText,
     },
     Remove {
         project_id: String,

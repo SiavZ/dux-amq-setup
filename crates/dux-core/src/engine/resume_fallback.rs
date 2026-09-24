@@ -215,7 +215,7 @@ impl Engine {
                 pty_size,
                 AgentLaunchKind::Tab {
                     is_fresh: false,
-                    status_message,
+                    status_message: status_message.into(),
                 },
             )
             .quiet_status_on(if resume {
@@ -234,7 +234,7 @@ impl Engine {
         &mut self,
         tab_id: &str,
         pty_size: (u16, u16),
-        status_message: String,
+        status_message: crate::status_text::StatusText,
     ) -> ResumeFallbackOutcome {
         // Transport-facing entry point: named here, at the door.
         let tab_id = TabIdRef::new(tab_id);
@@ -397,7 +397,7 @@ impl Engine {
                 }
             ));
             if let ResumeFallbackOutcome::Retried { reaction } =
-                self.retry_resume_fallback(tab_id.as_str(), pty_size, status_message)
+                self.retry_resume_fallback(tab_id.as_str(), pty_size, status_message.into())
             {
                 // Nothing is cleared by hand here: the retry's teardown goes
                 // through `clear_tab_runtime`, and a second list of tab-keyed
@@ -846,7 +846,7 @@ mod tests {
             .insert(TabId::new("s1-slot"), Instant::now());
         engine.mark_in_flight(InFlightKey::AgentLaunch(TabId::new("s1-slot")));
 
-        let outcome = engine.retry_resume_fallback("s1-slot", (24, 80), "msg".to_string());
+        let outcome = engine.retry_resume_fallback("s1-slot", (24, 80), "msg".to_string().into());
 
         assert!(matches!(outcome, ResumeFallbackOutcome::InFlight));
         // Protected: candidate still present, in-flight key untouched.
@@ -871,7 +871,7 @@ mod tests {
             crate::model::ProviderKind::new("claude"),
         );
 
-        let outcome = engine.retry_resume_fallback("s1-slot", (24, 80), "fresh".to_string());
+        let outcome = engine.retry_resume_fallback("s1-slot", (24, 80), "fresh".to_string().into());
 
         assert!(matches!(outcome, ResumeFallbackOutcome::Retried { .. }));
         // Candidate and pin were torn down. The providers check is
@@ -933,7 +933,7 @@ mod tests {
             .resume_fallback_candidates
             .insert(TabId::new("tab-1"), Instant::now());
 
-        let outcome = engine.retry_resume_fallback("tab-1", (24, 80), "fresh".to_string());
+        let outcome = engine.retry_resume_fallback("tab-1", (24, 80), "fresh".to_string().into());
         assert!(matches!(outcome, ResumeFallbackOutcome::Retried { .. }));
         // The pin is torn down as part of the retry regardless of which
         // provider was captured.
@@ -994,7 +994,7 @@ mod tests {
             .resume_fallback_candidates
             .insert(TabId::new("tab-1"), Instant::now());
 
-        let outcome = engine.retry_resume_fallback("tab-1", (24, 80), "fresh".to_string());
+        let outcome = engine.retry_resume_fallback("tab-1", (24, 80), "fresh".to_string().into());
 
         assert!(matches!(outcome, ResumeFallbackOutcome::Retried { .. }));
         // Candidate torn down; the fresh relaunch is in flight under the TAB id.
@@ -1081,7 +1081,7 @@ mod tests {
             .agent_viewed
             .insert(TabId::new("s1-slot"), Instant::now());
 
-        let outcome = engine.retry_resume_fallback("s1-slot", (24, 80), "fresh".to_string());
+        let outcome = engine.retry_resume_fallback("s1-slot", (24, 80), "fresh".to_string().into());
         assert!(matches!(outcome, ResumeFallbackOutcome::Retried { .. }));
 
         // Drive the launch to its FAILURE through the real event path, so this
@@ -1151,7 +1151,7 @@ mod tests {
         engine.sessions.push(session);
         // No resume_fallback_candidates entry seeded.
 
-        let outcome = engine.retry_resume_fallback("s1-slot", (24, 80), "msg".to_string());
+        let outcome = engine.retry_resume_fallback("s1-slot", (24, 80), "msg".to_string().into());
 
         assert!(matches!(outcome, ResumeFallbackOutcome::NotCandidate));
         assert!(!engine.is_in_flight(&InFlightKey::AgentLaunch(TabId::new("s1"))));
@@ -1165,7 +1165,7 @@ mod tests {
             .resume_fallback_candidates
             .insert(TabId::new("ghost"), Instant::now());
 
-        let outcome = engine.retry_resume_fallback("ghost", (24, 80), "msg".to_string());
+        let outcome = engine.retry_resume_fallback("ghost", (24, 80), "msg".to_string().into());
 
         assert!(matches!(outcome, ResumeFallbackOutcome::NotCandidate));
         assert!(

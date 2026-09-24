@@ -102,7 +102,7 @@ pub enum Command {
     /// threshold.
     DispatchCreateAgentRequest {
         request: Box<CreateAgentRequest>,
-        busy_message: String,
+        busy_message: crate::status_text::StatusText,
         term_size: (u16, u16),
     },
 
@@ -160,7 +160,7 @@ pub enum Command {
     Pull {
         repo_path: PathBuf,
         target: PullTarget,
-        busy_message: String,
+        busy_message: crate::status_text::StatusText,
         already_running_message: String,
     },
 
@@ -834,7 +834,7 @@ impl Engine {
         &mut self,
         repo_path: PathBuf,
         target: PullTarget,
-        busy_message: String,
+        busy_message: crate::status_text::StatusText,
         already_running_message: String,
     ) -> EventReaction {
         let repo_key = repo_path.to_string_lossy().into_owned();
@@ -1014,7 +1014,7 @@ impl Engine {
     fn add_project_inline(
         &mut self,
         project: Project,
-        status_message: String,
+        status_message: crate::status_text::StatusText,
     ) -> anyhow::Result<EventReaction> {
         if let Some((project_id, project_name)) = self
             .projects
@@ -1025,7 +1025,7 @@ impl Engine {
             let message = format!(
                 "Project at this path is already in the workspace as \"{project_name}\"; nothing new was added."
             );
-            return Ok(project_added_reaction(project, project_id, message));
+            return Ok(project_added_reaction(project, project_id, message.into()));
         }
 
         self.session_store
@@ -1233,7 +1233,7 @@ impl Engine {
 fn project_added_reaction(
     project: Project,
     project_id: String,
-    status_message: String,
+    status_message: crate::status_text::StatusText,
 ) -> EventReaction {
     EventReaction::ProjectPersistenceOutcome(Box::new(ProjectPersistenceOutcome {
         action: ProjectPersistenceAction::Add {
@@ -1323,7 +1323,7 @@ fn reorder_in_place<T>(items: &mut Vec<T>, position: impl Fn(&T) -> Option<usize
 /// warning rather than an error: the refresh is best-effort and the project
 /// keeps working from local branch state.
 fn project_refresh_status_op(
-    busy_message: String,
+    busy_message: crate::status_text::StatusText,
     project_name: &str,
 ) -> crate::engine::StatusOp<crate::worker::PullOutcome, String> {
     let pn_ok = project_name.to_string();
@@ -1424,7 +1424,7 @@ mod tests {
             .apply(Command::Pull {
                 repo_path: tmp.path().to_path_buf(),
                 target: PullTarget::Session,
-                busy_message: "Pulling latest changes\u{2026}".to_string(),
+                busy_message: "Pulling latest changes\u{2026}".to_string().into(),
                 already_running_message: "A pull is already running.".to_string(),
             })
             .expect("apply succeeds");
@@ -1585,7 +1585,7 @@ mod tests {
             .apply(Command::PersistProject {
                 action: Box::new(ProjectPersistenceAction::Add {
                     project: duplicate,
-                    status_message: "Added losing request".to_string(),
+                    status_message: "Added losing request".to_string().into(),
                 }),
                 status_op_id: Some("ignored-for-inline-add".to_string()),
             })
@@ -1785,7 +1785,7 @@ mod tests {
             false,
             (24, 80),
             crate::worker::AgentLaunchKind::Reconnect {
-                status_message: String::new(),
+                status_message: crate::status_text::StatusText::default(),
             },
         );
         let reaction = engine
@@ -1835,7 +1835,7 @@ mod tests {
             false,
             (24, 80),
             crate::worker::AgentLaunchKind::Reconnect {
-                status_message: String::new(),
+                status_message: crate::status_text::StatusText::default(),
             },
         );
         let reaction = engine
@@ -1886,7 +1886,7 @@ mod tests {
             false,
             (24, 80),
             crate::worker::AgentLaunchKind::Reconnect {
-                status_message: String::new(),
+                status_message: crate::status_text::StatusText::default(),
             },
         );
         let reaction = engine
@@ -1916,7 +1916,7 @@ mod tests {
             false,
             (24, 80),
             crate::worker::AgentLaunchKind::Reconnect {
-                status_message: String::new(),
+                status_message: crate::status_text::StatusText::default(),
             },
         );
         let _ = engine
@@ -2938,7 +2938,7 @@ mod tests {
         }
 
         // The op maps the no-origin outcome to an INFO final.
-        let op = project_refresh_status_op("Refreshing...".to_string(), "demo");
+        let op = project_refresh_status_op("Refreshing...".to_string().into(), "demo");
         let resolved = op.resolve(&Ok(outcome));
         match resolved.outcome {
             crate::engine::Final::Message { tone, text, .. } => {
@@ -2963,7 +2963,7 @@ mod tests {
         let result = run_project_refresh(repo.path(), Some("main".to_string()));
         assert!(result.is_err(), "the pull must fail");
 
-        let op = project_refresh_status_op("Refreshing...".to_string(), "demo");
+        let op = project_refresh_status_op("Refreshing...".to_string().into(), "demo");
         let resolved = op.resolve(&result);
         match resolved.outcome {
             crate::engine::Final::Message { tone, text, .. } => {

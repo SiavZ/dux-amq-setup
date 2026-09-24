@@ -443,19 +443,21 @@ pub enum AgentLaunchReadyView {
     /// new session, reloads changed files, shows the agent surface, and
     /// surfaces either the startup-command error or the create status.
     CreateCommitted {
-        status_message: String,
+        status_message: crate::status_text::StatusText,
         startup_result_error: Option<String>,
     },
     /// Non-Create launch found the session vanished. App does nothing
     /// (Engine has already logged the "dropping launched PTY" line).
     SessionMissing,
     /// Reconnect / ForceReconnect: App shows the agent surface + sets info.
-    Reconnect { status_message: String },
+    Reconnect {
+        status_message: crate::status_text::StatusText,
+    },
     /// ResumeFallback: App shows the agent surface only if `session_id` is
     /// the currently selected session, and always sets info.
     ResumeFallback {
         session_id: String,
-        status_message: String,
+        status_message: crate::status_text::StatusText,
     },
     /// StartupAutoReopen: App does nothing.
     StartupAutoReopen,
@@ -559,7 +561,7 @@ pub enum ProjectPersistenceView {
     },
     Added {
         project_id: String,
-        status_message: String,
+        status_message: crate::status_text::StatusText,
     },
     Removed {
         project_name: String,
@@ -3304,14 +3306,17 @@ impl Engine {
                             ) {
                                 Ok(message) => crate::engine::PrAttachOutcome::Attached { message },
                                 Err(error) => crate::engine::PrAttachOutcome::Failed {
-                                    message: format!(
-                                        "Failed to attach PR #{}: {error:#}",
-                                        pr.number
-                                    ),
+                                    message: crate::status_text![
+                                        "Failed to attach PR ",
+                                        n(format!("#{}", pr.number)),
+                                        format!(": {:#}", error)
+                                    ],
                                 },
                             }
                         }
-                        Err(message) => crate::engine::PrAttachOutcome::Failed { message },
+                        Err(message) => crate::engine::PrAttachOutcome::Failed {
+                            message: message.into(),
+                        },
                     }
                 };
                 let attached = matches!(outcome, crate::engine::PrAttachOutcome::Attached { .. });
@@ -7232,7 +7237,7 @@ mod tests {
                 pty_size: (24, 80),
                 scrollback_lines: 1000,
                 kind: AgentLaunchKind::Reconnect {
-                    status_message: String::new(),
+                    status_message: crate::status_text::StatusText::default(),
                 },
                 wants_fullscreen: false,
                 status_quiet: QuietSurfaces::LOUD,
@@ -7274,7 +7279,7 @@ mod tests {
             "s1",
             "feat/x",
             AgentLaunchKind::Create {
-                status_message: String::new(),
+                status_message: crate::status_text::StatusText::default(),
                 repo_path: String::from("/tmp/wt"),
                 owns_worktree: true,
                 startup_result: None,
@@ -7302,7 +7307,7 @@ mod tests {
             "s1",
             "feat/x",
             AgentLaunchKind::ResumeFallback {
-                status_message: String::new(),
+                status_message: crate::status_text::StatusText::default(),
             },
             "boom",
         );
@@ -7325,7 +7330,7 @@ mod tests {
             "s1",
             "feat/x",
             AgentLaunchKind::Reconnect {
-                status_message: String::new(),
+                status_message: crate::status_text::StatusText::default(),
             },
             "boom",
         );
@@ -7360,7 +7365,7 @@ mod tests {
             "s1",
             "feat/x",
             AgentLaunchKind::Create {
-                status_message: String::new(),
+                status_message: crate::status_text::StatusText::default(),
                 repo_path: String::from("/tmp/wt"),
                 owns_worktree: true,
                 startup_result: None,
@@ -7381,7 +7386,7 @@ mod tests {
             "s1",
             "feat/x",
             AgentLaunchKind::Reconnect {
-                status_message: String::new(),
+                status_message: crate::status_text::StatusText::default(),
             },
             "boom",
         );
@@ -7428,7 +7433,7 @@ mod tests {
                 scrollback_lines: 1000,
                 kind: AgentLaunchKind::Tab {
                     is_fresh,
-                    status_message: String::new(),
+                    status_message: crate::status_text::StatusText::default(),
                 },
                 wants_fullscreen: false,
                 status_quiet: QuietSurfaces::LOUD,
@@ -7558,7 +7563,7 @@ mod tests {
         let project = sample_project("p1", "/tmp/p1");
         let action = ProjectPersistenceAction::Add {
             project: project.clone(),
-            status_message: "Added project \"p1\" to workspace.".to_string(),
+            status_message: "Added project \"p1\" to workspace.".to_string().into(),
         };
         let outcome = engine.process_project_persistence_completed(action, Ok(()), None);
         assert_eq!(engine.projects.len(), 1);
@@ -8196,7 +8201,7 @@ mod tests {
         let project = sample_project("p1", "/tmp/p1");
         let action = ProjectPersistenceAction::Add {
             project: project.clone(),
-            status_message: "added".to_string(),
+            status_message: "added".to_string().into(),
         };
         let reaction = engine
             .apply(crate::engine::Command::PersistProject {
@@ -8242,7 +8247,7 @@ mod tests {
         let reaction = engine
             .apply(crate::engine::Command::DispatchCreateAgentRequest {
                 request: Box::new(request),
-                busy_message: "busy".to_string(),
+                busy_message: "busy".to_string().into(),
                 term_size: (24, 80),
             })
             .expect("apply succeeds");
@@ -8273,7 +8278,7 @@ mod tests {
             pty_size: (24, 80),
             scrollback_lines: 1000,
             kind: AgentLaunchKind::Reconnect {
-                status_message: String::new(),
+                status_message: crate::status_text::StatusText::default(),
             },
             wants_fullscreen: false,
             status_quiet: QuietSurfaces::LOUD,
@@ -8313,7 +8318,7 @@ mod tests {
             .apply(crate::engine::Command::Pull {
                 repo_path: repo_path.clone(),
                 target: PullTarget::Session,
-                busy_message: "busy".to_string(),
+                busy_message: "busy".to_string().into(),
                 already_running_message: "Pull already in progress".to_string(),
             })
             .expect("apply succeeds");

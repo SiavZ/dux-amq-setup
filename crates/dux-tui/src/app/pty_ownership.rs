@@ -3078,7 +3078,7 @@ mod tests {
         let outcome = ready_view(
             &app,
             AgentLaunchReadyView::CreateCommitted {
-                status_message: "Created.".to_string(),
+                status_message: "Created.".to_string().into(),
                 startup_result_error: None,
             },
         );
@@ -3104,20 +3104,20 @@ mod tests {
         );
         for kind in [
             AgentLaunchKind::Reconnect {
-                status_message: String::new(),
+                status_message: String::new().into(),
             },
             AgentLaunchKind::ForceReconnect {
-                status_message: String::new(),
+                status_message: String::new().into(),
             },
             AgentLaunchKind::ResumeFallback {
-                status_message: String::new(),
+                status_message: String::new().into(),
             },
             AgentLaunchKind::Tab {
                 is_fresh: true,
-                status_message: String::new(),
+                status_message: String::new().into(),
             },
             AgentLaunchKind::Create {
-                status_message: String::new(),
+                status_message: String::new().into(),
                 repo_path: String::new(),
                 owns_worktree: false,
                 startup_result: None,

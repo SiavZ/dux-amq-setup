@@ -2857,7 +2857,9 @@ impl App {
         let reaction = self.engine.apply(Command::Pull {
             repo_path: PathBuf::from(managed.worktree_path.clone()),
             target: PullTarget::Session,
-            busy_message: "Pulling latest changes from remote\u{2026}".to_string(),
+            busy_message: "Pulling latest changes from remote\u{2026}"
+                .to_string()
+                .into(),
             already_running_message:
                 "Pull already in progress for this worktree. Wait for the current pull to finish."
                     .to_string(),
@@ -16378,7 +16380,7 @@ not_a_real_action = ["x"]
             session.clone(),
             true,
             AgentLaunchKind::Create {
-                status_message: "imported".to_string(),
+                status_message: "imported".to_string().into(),
                 repo_path: app.engine.projects[0].path.clone(),
                 owns_worktree: false,
                 startup_result: None,

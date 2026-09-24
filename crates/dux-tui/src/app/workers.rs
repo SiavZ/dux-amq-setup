@@ -1378,7 +1378,7 @@ impl App {
                 project_id: _,
                 status_message,
             } => {
-                self.apply_added_project(status_message);
+                self.apply_added_project(status_message.to_string());
             }
             ProjectPersistenceView::Removed { project_name } => {
                 self.apply_project_removal(
@@ -1513,12 +1513,14 @@ impl App {
                 // resolving the slot tab's op with the wrong message. The engine's
                 // message is shared with the web; the TUI appends where the launch
                 // landed and how to toggle fullscreen.
-                let status_message =
-                    self.launch_completion_message(status_message, outcome.wants_fullscreen);
+                let status_message = self.launch_completion_message(
+                    status_message.to_string(),
+                    outcome.wants_fullscreen,
+                );
                 self.resolve_reconnect_op_or(
                     &outcome.tab_id,
                     dux_core::engine::LaunchOutcome::Ready {
-                        status_message,
+                        status_message: status_message.into(),
                         quiet_on: outcome.status_quiet,
                     },
                 );
@@ -1544,14 +1546,17 @@ impl App {
                     // unselected agent moves no focus, so promising a typeable
                     // pane there would be a lie.
                     self.land_completed_launch(outcome.wants_fullscreen);
-                    self.launch_completion_message(status_message, outcome.wants_fullscreen)
+                    self.launch_completion_message(
+                        status_message.to_string(),
+                        outcome.wants_fullscreen,
+                    )
                 } else {
-                    status_message
+                    status_message.to_string()
                 };
                 self.resolve_reconnect_op_or(
                     &session_id,
                     dux_core::engine::LaunchOutcome::Ready {
-                        status_message,
+                        status_message: status_message.into(),
                         quiet_on: outcome.status_quiet,
                     },
                 );
@@ -2609,7 +2614,7 @@ mod tests {
             wants_fullscreen: false,
             status_quiet: dux_core::statusline::QuietSurfaces::LOUD,
             view: AgentLaunchReadyView::CreateCommitted {
-                status_message: "Created agent.".to_string(),
+                status_message: "Created agent.".to_string().into(),
                 startup_result_error: None,
             },
         });
@@ -2640,7 +2645,7 @@ mod tests {
             wants_fullscreen: false,
             status_quiet: dux_core::statusline::QuietSurfaces::LOUD,
             view: AgentLaunchReadyView::CreateCommitted {
-                status_message: "Created agent.".to_string(),
+                status_message: "Created agent.".to_string().into(),
                 startup_result_error: None,
             },
         });
@@ -2684,7 +2689,7 @@ mod tests {
             wants_fullscreen: false,
             status_quiet: dux_core::statusline::QuietSurfaces::LOUD,
             view: AgentLaunchReadyView::Reconnect {
-                status_message: "Reconnected.".to_string(),
+                status_message: "Reconnected.".to_string().into(),
             },
         });
 
@@ -2721,7 +2726,7 @@ mod tests {
             wants_fullscreen: true,
             status_quiet: dux_core::statusline::QuietSurfaces::LOUD,
             view: AgentLaunchReadyView::Reconnect {
-                status_message: "Reconnected.".to_string(),
+                status_message: "Reconnected.".to_string().into(),
             },
         });
 
@@ -2745,7 +2750,7 @@ mod tests {
             wants_fullscreen: false,
             status_quiet: dux_core::statusline::QuietSurfaces::LOUD,
             view: AgentLaunchReadyView::CreateCommitted {
-                status_message: "Created agent.".to_string(),
+                status_message: "Created agent.".to_string().into(),
                 startup_result_error: None,
             },
         });
@@ -2775,7 +2780,7 @@ mod tests {
             status_quiet: dux_core::statusline::QuietSurfaces::LOUD,
             view: AgentLaunchReadyView::ResumeFallback {
                 session_id: session.id.clone(),
-                status_message: "Fresh restart.".to_string(),
+                status_message: "Fresh restart.".to_string().into(),
             },
         });
 
@@ -2818,7 +2823,7 @@ mod tests {
             wants_fullscreen: false,
             status_quiet: dux_core::statusline::QuietSurfaces::LOUD,
             view: AgentLaunchReadyView::Reconnect {
-                status_message: "Reconnected.".to_string(),
+                status_message: "Reconnected.".to_string().into(),
             },
         });
 
@@ -2860,7 +2865,7 @@ mod tests {
             wants_fullscreen: false,
             status_quiet: dux_core::statusline::QuietSurfaces::LOUD,
             view: AgentLaunchReadyView::Reconnect {
-                status_message: "Reconnected.".to_string(),
+                status_message: "Reconnected.".to_string().into(),
             },
         });
 
@@ -2921,7 +2926,7 @@ mod tests {
             wants_fullscreen: false,
             status_quiet: dux_core::statusline::QuietSurfaces::BOTH,
             view: AgentLaunchReadyView::Reconnect {
-                status_message: "Resumed claude agent.".to_string(),
+                status_message: "Resumed claude agent.".to_string().into(),
             },
         });
 
@@ -2955,7 +2960,9 @@ mod tests {
             wants_fullscreen: false,
             status_quiet: dux_core::statusline::QuietSurfaces::BOTH,
             view: AgentLaunchReadyView::Reconnect {
-                status_message: "Resumed the claude conversation in this tab.".to_string(),
+                status_message: "Resumed the claude conversation in this tab."
+                    .to_string()
+                    .into(),
             },
         });
 
@@ -3079,7 +3086,7 @@ mod tests {
             env: Vec::new(),
             identity: Default::default(),
             kind: AgentLaunchKind::Reconnect {
-                status_message: "reconnect".to_string(),
+                status_message: "reconnect".to_string().into(),
             },
             wants_fullscreen: false,
             status_quiet: dux_core::statusline::QuietSurfaces::LOUD,

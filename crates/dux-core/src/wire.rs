@@ -1189,7 +1189,7 @@ struct WebProjectAdd<'a> {
 /// The authoritative "added" status message from a `PersistProject::Add`
 /// reaction (the engine's real outcome: an honest dedup message when a race
 /// hit that path, or the normal success text), or `None` for any other reaction.
-fn added_status_message(reaction: &EventReaction) -> Option<String> {
+fn added_status_message(reaction: &EventReaction) -> Option<StatusText> {
     if let EventReaction::ProjectPersistenceOutcome(outcome) = reaction
         && let ProjectPersistenceView::Added { status_message, .. } = &outcome.view
     {
@@ -3480,7 +3480,7 @@ impl Engine {
                 self.current_origin = origin;
                 let statuses = match self.apply(Command::DispatchCreateAgentRequest {
                     request: Box::new(request),
-                    busy_message: busy_message.clone(),
+                    busy_message: busy_message.clone().into(),
                     term_size: (80, 24),
                 }) {
                     Ok(reaction) => wire_statuses_from_reaction(&reaction),
@@ -3653,11 +3653,11 @@ impl Engine {
         // race hit that path, not this caller's optimistic narrative. Surface
         // that (falling back to the caller's message only if the engine didn't
         // provide one), for both the unkeyed status and the keyed op below.
-        let mut success_message = status_message.clone();
+        let mut success_message: StatusText = status_message.clone().into();
         let statuses = match self.apply(Command::PersistProject {
             action: Box::new(ProjectPersistenceAction::Add {
                 project,
-                status_message: status_message.clone(),
+                status_message: status_message.clone().into(),
             }),
             status_op_id: None,
         }) {
@@ -3695,7 +3695,7 @@ impl Engine {
             let is_success = statuses.iter().any(|s| s.tone == "info");
             let outcome = if is_success {
                 crate::engine::WebAddProjectOutcome::Added {
-                    status_message: success_message.clone(),
+                    status_message: success_message.clone().into(),
                 }
             } else {
                 // Surface the same failure text the unkeyed `statuses`
@@ -4217,7 +4217,7 @@ impl Engine {
                         .worktree_path,
                 ),
                 target: PullTarget::Session,
-                busy_message: "Pulling latest changes from remote\u{2026}".to_string(),
+                busy_message: "Pulling latest changes from remote\u{2026}".to_string().into(),
                 already_running_message:
                     "Pull already in progress for this worktree. Wait for the current pull to finish."
                         .to_string(),
@@ -4249,7 +4249,8 @@ impl Engine {
                     busy_message: format!(
                         "Refreshing project \"{}\" from remote\u{2026}",
                         project.name
-                    ),
+                    )
+                    .into(),
                     already_running_message: format!(
                         "Project refresh already in progress for \"{}\". Wait for the current pull to finish.",
                         project.name,
@@ -4374,7 +4375,7 @@ impl Engine {
                 Command::PersistProject {
                     action: Box::new(ProjectPersistenceAction::Add {
                         project,
-                        status_message,
+                        status_message: status_message.into(),
                     }),
                     status_op_id: None,
                 }
@@ -4453,7 +4454,7 @@ impl Engine {
         };
         Ok(Command::DispatchCreateAgentRequest {
             request: Box::new(request),
-            busy_message: "Creating a new agent\u{2026}".to_string(),
+            busy_message: "Creating a new agent\u{2026}".to_string().into(),
             term_size: (80, 24),
         })
     }
@@ -4503,7 +4504,7 @@ impl Engine {
         };
         Ok(Command::DispatchCreateAgentRequest {
             request: Box::new(request),
-            busy_message,
+            busy_message: busy_message.into(),
             term_size: (80, 24),
         })
     }
@@ -4558,7 +4559,7 @@ impl Engine {
         };
         Ok(Command::DispatchCreateAgentRequest {
             request: Box::new(request),
-            busy_message,
+            busy_message: busy_message.into(),
             term_size: (80, 24),
         })
     }
@@ -8723,7 +8724,7 @@ mod tests {
         let add = |id: &str| Command::PersistProject {
             action: Box::new(crate::worker::ProjectPersistenceAction::Add {
                 project: sample_project(id, "/same/path"),
-                status_message: "added".to_string(),
+                status_message: "added".to_string().into(),
             }),
             status_op_id: None,
         };
@@ -8754,7 +8755,7 @@ mod tests {
             .apply(Command::PersistProject {
                 action: Box::new(crate::worker::ProjectPersistenceAction::Add {
                     project: sample_project("winner", "/p"),
-                    status_message: "added".to_string(),
+                    status_message: "added".to_string().into(),
                 }),
                 status_op_id: None,
             })
@@ -9226,7 +9227,7 @@ mod tests {
             wants_fullscreen: false,
             status_quiet: QuietSurfaces::LOUD,
             view: AgentLaunchReadyView::CreateCommitted {
-                status_message: "Launched agent \"feat\".".to_string(),
+                status_message: "Launched agent \"feat\".".to_string().into(),
                 startup_result_error: None,
             },
         };
@@ -13074,14 +13075,14 @@ mod tests {
 
         for view in [
             AgentLaunchReadyView::CreateCommitted {
-                status_message: "Launched.".to_string(),
+                status_message: "Launched.".to_string().into(),
                 startup_result_error: None,
             },
             AgentLaunchReadyView::CreatePersistFailed {
                 error: "db error".to_string(),
             },
             AgentLaunchReadyView::Reconnect {
-                status_message: "ok".to_string(),
+                status_message: "ok".to_string().into(),
             },
             AgentLaunchReadyView::SessionMissing,
             AgentLaunchReadyView::StartupAutoReopen,

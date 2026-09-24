@@ -251,6 +251,17 @@ impl From<StatusText> for String {
     }
 }
 
+/// A sentence reads as its plain spelling wherever it is only looked at
+/// (`contains`, `starts_with`, a log line), so a producer that builds one from
+/// parts changes nothing for a reader that only ever wanted the words.
+impl std::ops::Deref for StatusText {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.message
+    }
+}
+
 impl fmt::Display for StatusText {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.message)

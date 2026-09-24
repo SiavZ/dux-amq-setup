@@ -7257,6 +7257,24 @@ mod tests {
         );
     }
 
+    /// An engine status built from parts, for the web's name chips, reaches the
+    /// terminal UI's status line as exactly the sentence it printed before the
+    /// parts existed: straight quotes where it always had them, nothing else.
+    #[test]
+    fn a_status_built_from_parts_prints_byte_for_byte_as_before() {
+        let mut app =
+            crate::app::test_support::test_app(crate::app::test_support::default_bindings());
+        let update = dux_core::engine::StatusUpdate::info(
+            dux_core::engine::checkout_default_branch_message("app", "main", true),
+        );
+        assert!(update.segments.is_some(), "the sentence carries its parts");
+        app.apply_reaction(dux_core::engine::EventReaction::Status(update));
+        assert_eq!(
+            app.status.text().as_bytes(),
+            b"Checked out \"main\" for project \"app\". New worktrees branch from \"main\" now."
+        );
+    }
+
     /// The answer the delete request carries, in the three states the dialog
     /// can be in. The absent case is the load-bearing one: it is what keeps the
     /// engine's provenance default, and sending `Some(false)` there would
