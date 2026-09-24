@@ -2,6 +2,9 @@
 name = "dux-core"
 version.workspace = true
 edition = "2024"
+# Ships only inside the dux binary, never on crates.io. cargo-deny keys its
+# private-crate exemptions (license, path wildcards) on this.
+publish = false
 
 [features]
 # Exposes the stand-in `gh` builders (`gh::probe_test_support`) to other crates'

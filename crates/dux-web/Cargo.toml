@@ -2,6 +2,9 @@
 name = "dux-web"
 version.workspace = true
 edition = "2024"
+# Ships only inside the dux binary, never on crates.io. cargo-deny keys its
+# private-crate exemptions (license, path wildcards) on this.
+publish = false
 
 [dependencies]
 dux-core.workspace = true

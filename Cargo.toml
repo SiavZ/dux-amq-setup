@@ -13,7 +13,9 @@ resolver = "3"
 version = "0.1.0"
 
 [workspace.dependencies]
-anyhow = "1.0.98"
+# 1.0.103 is a floor: earlier releases carry RUSTSEC-2026-0190 (unsound
+# `Error::downcast_mut`), which the Security job denies.
+anyhow = "1.0.103"
 chrono = { version = "0.4.41", features = ["serde"] }
 rustix = { version = "1.1", features = ["termios", "process", "event", "stdio", "fs", "time"] }
 dux-core = { path = "crates/dux-core" }
