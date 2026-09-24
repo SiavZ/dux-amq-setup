@@ -809,6 +809,13 @@ pub struct App {
     /// full, unfiltered list is shown. This is a DISPLAY filter only: it never
     /// mutates `engine.sessions`, never persists, and composes with the sort mode.
     pub(crate) agent_filter: Option<TextInput>,
+    /// Test builds only: the scratch directories this app's paths point into
+    /// (its config root, and any repository a test hands it). Holding the
+    /// guards here removes them when the app drops, so a test run leaves
+    /// nothing behind in the temp directory. Declared last so it drops after
+    /// every field that may still hold a file inside it open.
+    #[cfg(test)]
+    pub(crate) test_scratch_dirs: Vec<tempfile::TempDir>,
 }
 
 /// Handler-resolved outcome for the server-flip op (see
@@ -3956,6 +3963,8 @@ impl App {
             pending_config_reload_op: None,
             project_chooser_context: None,
             agent_filter: None,
+            #[cfg(test)]
+            test_scratch_dirs: Vec::new(),
         };
         // First boot relaunches prior sessions; a resume must not, because the
         // engine handed back from the web server already owns the live providers, and

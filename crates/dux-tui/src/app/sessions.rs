@@ -4375,7 +4375,6 @@ mod tests {
     fn test_app_with_sessions(sessions: Vec<AgentSession>, projects: Vec<Project>) -> App {
         let tmp = tempdir().expect("tempdir");
         let root = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
 
         let paths = DuxPaths {
             config_path: root.join("config.toml"),
@@ -4618,6 +4617,7 @@ mod tests {
             pending_config_reload_op: None,
             project_chooser_context: None,
             agent_filter: None,
+            test_scratch_dirs: vec![tmp],
         };
         app.interactive_patterns = app.bindings.interactive_byte_patterns();
         app.rebuild_left_items();
@@ -4680,13 +4680,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scratch_roots_are_removed_when_their_holders_drop() {
+        let app = test_app_with_sessions(Vec::new(), Vec::new());
+        let app_root = app.engine.paths.root.clone();
+        assert!(app_root.join("sessions.sqlite3").exists());
+        drop(app);
+        assert!(
+            !app_root.exists(),
+            "{} outlived the app",
+            app_root.display()
+        );
+
+        let (engine, scratch) = test_engine_with_sessions(Vec::new(), Vec::new());
+        let engine_root = engine.paths.root.clone();
+        drop(engine);
+        drop(scratch);
+        assert!(
+            !engine_root.exists(),
+            "{} outlived its guard",
+            engine_root.display()
+        );
+    }
+
+    /// An engine over a scratch config root, returned with the root's guard:
+    /// the caller holds it for as long as the engine runs, and dropping it
+    /// removes the directory.
     fn test_engine_with_sessions(
         sessions: Vec<AgentSession>,
         projects: Vec<Project>,
-    ) -> dux_core::engine::Engine {
+    ) -> (dux_core::engine::Engine, tempfile::TempDir) {
         let tmp = tempdir().expect("tempdir");
         let root = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
 
         let paths = DuxPaths {
             config_path: root.join("config.toml"),
@@ -4705,7 +4730,7 @@ mod tests {
         config.ui.auto_reopen_agents = true;
         let config_writer =
             dux_core::config_queue::ConfigWriteQueue::new(paths.config_path.clone());
-        dux_core::engine::Engine {
+        let engine = dux_core::engine::Engine {
             config,
             paths,
             session_store,
@@ -4790,7 +4815,8 @@ mod tests {
             live_status_keys: Default::default(),
             last_created_op_id: None,
             created_session_by_op: std::collections::HashMap::new(),
-        }
+        };
+        (engine, tmp)
     }
 
     fn seed_tab(app: &mut App, id: &str, session_id: &str, provider: &str, order: i64) {
@@ -5864,7 +5890,7 @@ mod tests {
         session.status = SessionStatus::Active;
         session.desired_running = true;
         let project = make_project("project-1", "codex");
-        let engine = test_engine_with_sessions(vec![session], vec![project]);
+        let (engine, _scratch) = test_engine_with_sessions(vec![session], vec![project]);
 
         let app = App::resume(engine).expect("resume builds an App");
 

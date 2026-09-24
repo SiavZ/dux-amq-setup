@@ -68,7 +68,6 @@ pub(crate) fn init_test_repo(path: &std::path::Path) {
 pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
     let tmp = tempdir().expect("tempdir");
     let root = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
     init_test_repo(&root);
 
     let paths = DuxPaths {
@@ -367,6 +366,7 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
         pending_config_reload_op: None,
         project_chooser_context: None,
         agent_filter: None,
+        test_scratch_dirs: vec![tmp],
     };
     app.interactive_patterns = app.bindings.interactive_byte_patterns();
     app.rebuild_left_items();
@@ -529,4 +529,21 @@ pub(crate) fn project_default_provider_prompt(
         ],
         selected: 0,
     }
+}
+
+/// A test app's scratch root must go when the app does. Every test in this
+/// crate builds one, so a helper that keeps the directory past the app fills the
+/// temp directory one repository at a time (a RAM-backed `/tmp` runs out of
+/// inodes long before it runs out of bytes).
+#[test]
+fn test_app_removes_its_scratch_root_when_dropped() {
+    let app = test_app(default_bindings());
+    let root = app.engine.paths.root.clone();
+    assert!(root.join(".git").exists(), "the fixture repository exists");
+    drop(app);
+    assert!(
+        !root.exists(),
+        "the scratch root {} outlived the app",
+        root.display()
+    );
 }

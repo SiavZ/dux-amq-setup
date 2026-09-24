@@ -818,7 +818,8 @@ mod tests {
     /// Compared canonically, so a symlinked folder cannot hide the occupant.
     #[test]
     fn a_standalone_agent_occupying_a_managed_worktree_makes_it_unselectable() {
-        let root = tempdir().unwrap().keep();
+        let scratch = tempdir().unwrap();
+        let root = scratch.path().to_path_buf();
         let repo = root.join("repo");
         let occupied = root.join("worktrees").join("demo").join("occupied");
         fs::create_dir_all(&repo).unwrap();
@@ -885,8 +886,6 @@ mod tests {
             !entry.is_selectable,
             "the manager must not offer to remove a directory an agent is living in"
         );
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

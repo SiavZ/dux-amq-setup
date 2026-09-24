@@ -15653,10 +15653,9 @@ not_a_real_action = ["x"]
     fn chooser_new_agent_on_agentless_project_proceeds_to_branch_inspection() {
         let mut app = test_app(default_bindings());
         // Point the second project at a real repo so branch inspection can run.
-        let repo = PathBuf::from(&app.engine.projects[0].path)
-            .parent()
-            .unwrap()
-            .join("second-repo");
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let repo = scratch.path().join("second-repo");
+        app.test_scratch_dirs.push(scratch);
         std::fs::create_dir_all(&repo).unwrap();
         init_test_repo(&repo);
         app.engine.projects.push(Project {
@@ -35830,23 +35829,24 @@ cyan = "#00ffff"
     }
 
     /// A git repository with no commits yet, so `add_project` takes the
-    /// initial-commit rung. Leaked rather than returned so the caller keeps one
-    /// return type.
-    fn leaked_unborn_repo() -> String {
+    /// initial-commit rung. The app holds the directory's guard, so it is
+    /// removed when the app drops.
+    fn scratch_unborn_repo(app: &mut App) -> String {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().to_path_buf();
-        std::mem::forget(dir);
+        app.test_scratch_dirs.push(dir);
         run_git(&path, &["init", "-b", "main"]);
         run_git(&path, &["config", "user.name", "test"]);
         run_git(&path, &["config", "user.email", "t@t"]);
         path.to_string_lossy().to_string()
     }
 
-    /// A plain directory that is not a repository at all.
-    fn leaked_plain_dir() -> String {
+    /// A plain directory that is not a repository at all, held by the app the
+    /// same way.
+    fn scratch_plain_dir(app: &mut App) -> String {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().to_path_buf();
-        std::mem::forget(dir);
+        app.test_scratch_dirs.push(dir);
         path.to_string_lossy().to_string()
     }
 
@@ -35912,11 +35912,13 @@ cyan = "#00ffff"
                     .expect("open the discard confirmation");
             }
             "ConfirmCreateInitialCommit" => {
-                app.add_project(leaked_unborn_repo(), "Fresh".to_string())
+                let repo = scratch_unborn_repo(&mut app);
+                app.add_project(repo, "Fresh".to_string())
                     .expect("add an unborn repo");
             }
             "ConfirmInitRepo" => {
-                app.add_project_from_browser_path(leaked_plain_dir());
+                let dir = scratch_plain_dir(&mut app);
+                app.add_project_from_browser_path(dir);
             }
             "ConfirmUseExistingBranch" => {
                 let project = app.engine.projects[0].clone();
