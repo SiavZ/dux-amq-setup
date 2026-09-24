@@ -10545,6 +10545,7 @@ impl App {
             PromptState::ConfigureStartupCommand { .. }
             | PromptState::ConfigureProjectEnv { .. }
             | PromptState::ConfigureGlobalEnv { .. } => self.render_configure_prompt(frame),
+            PromptState::SessionSettings(_) => self.render_session_settings(frame),
             PromptState::RenameSession { .. } => self.render_rename_session_prompt(frame),
             PromptState::EditMacros { .. } => self.render_edit_macros(frame),
             PromptState::ResourceMonitor { .. } => {
@@ -10997,7 +10998,7 @@ impl App {
     /// to, so a focused and unfocused pair built from the two is one colour in
     /// every shipped theme. `engaged_exit_key`, when present, marks the field as
     /// engaged and names the key that leaves edit mode.
-    fn render_modal_text_field_frame(
+    pub(super) fn render_modal_text_field_frame(
         &self,
         frame: &mut Frame,
         area: Rect,

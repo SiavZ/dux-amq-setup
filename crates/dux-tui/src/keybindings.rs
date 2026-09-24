@@ -1481,6 +1481,19 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         help: None,
         hint_contexts: &[],
     },
+    BindingDef {
+        // Global so it works from any pane (fork d0e601c5). Ctrl-Shift-S is
+        // bound nowhere upstream; plain Ctrl-S (new standalone agent) is a
+        // different chord to `keys_conflict`.
+        action: Action::SessionSettings,
+        default_keys: &[key!(ctrl - shift - s)],
+        scopes: &[BindingScope::Global],
+        help: Some(HelpEntry {
+            section: "Global",
+            description: "Open the selected agent's session settings",
+        }),
+        hint_contexts: &[],
+    },
 ];
 
 const HELP_SECTION_ORDER: &[&str] = &[
@@ -3252,6 +3265,7 @@ mod tests {
             "rerun-startup-command-on-agent",
             "resource-monitor",
             "resume-pull-request-autodetection",
+            "session-settings",
             "set-tailscale-mode",
             "show-agent",
             "show-release-notes",

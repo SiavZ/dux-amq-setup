@@ -84,6 +84,8 @@ pub(crate) enum ButtonPressedTarget {
     /// Save writes the startup command / environment block.
     ConfigureFieldCancel,
     ConfigureFieldSave,
+    SessionSettingsCancel,
+    SessionSettingsSave,
     ConfirmQuitCancel,
     ConfirmQuitConfirm,
     ConfirmDiscardCancel,

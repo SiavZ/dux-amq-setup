@@ -225,6 +225,11 @@ pub(crate) fn modal_spec(prompt: &PromptState) -> Option<ModalSpec> {
         | PromptState::ConfigureProjectEnv { .. }
         | PromptState::ConfigureGlobalEnv { .. } => ModalSpec::new(Form, true, true),
 
+        // Session settings: a single-line title, the multiline system-prompt
+        // editor, radios and checkboxes, and Cancel/Save. The Save button is
+        // what keeps it dual-mode compliant.
+        PromptState::SessionSettings(_) => ModalSpec::new(Form, true, true),
+
         // ── The one variant that is two modals ──────────────────────────
         // `EditMacros` serves two families depending on its own state, so the
         // registry answers as a function of state rather than of the variant.
@@ -292,6 +297,9 @@ pub(crate) fn prompt_text_inputs(prompt: &PromptState) -> Vec<&TextInput> {
         | PromptState::NameNewAgent { input, .. } => vec![input],
 
         PromptState::StartupCommandLogs(prompt) => vec![&prompt.filter],
+        PromptState::SessionSettings(prompt) => {
+            vec![&prompt.draft_title, &prompt.draft_system_prompt]
+        }
         PromptState::PickProject { list, .. } => vec![&list.filter],
         PromptState::KillRunning(prompt) => vec![&prompt.list.filter],
         PromptState::ConfirmKillRunning(prompt) => vec![&prompt.previous.list.filter],
@@ -372,6 +380,7 @@ pub(crate) fn layout_publishes_confirm_button(layout: &OverlayMouseLayout) -> bo
         | OverlayMouseLayout::ConfirmUseExistingBranch { .. }
         | OverlayMouseLayout::ConfigReloadFailed { .. }
         | OverlayMouseLayout::ConfigureStartupCommand { .. }
+        | OverlayMouseLayout::SessionSettings { .. }
         | OverlayMouseLayout::EditMacros { .. } => true,
     }
 }
@@ -858,6 +867,19 @@ mod tests {
                     input: TextInput::with_text("K=V".to_string()).with_multiline(8),
                     focus: ConfigureFieldFocus::default(),
                 },
+            ),
+            (
+                "SessionSettings",
+                PromptState::SessionSettings(Box::new(crate::app::SessionSettingsPrompt {
+                    session_id: app.engine.sessions[0].id.clone(),
+                    session_label: "demo".to_string(),
+                    draft: Default::default(),
+                    draft_title: TextInput::with_text("demo".to_string()),
+                    draft_system_prompt: TextInput::new().with_multiline(4),
+                    focus: crate::app::SettingsFocus::ModeAttended,
+                    rules: Vec::new(),
+                    hit_rows: Vec::new(),
+                })),
             ),
             (
                 "StartupCommandLogs",
