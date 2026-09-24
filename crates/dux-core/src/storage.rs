@@ -4169,6 +4169,27 @@ mod tests {
         assert_eq!(ids, vec!["b", "a"]);
     }
 
+    /// Fork name. A manual (drag / Shift-J/K) order is a global permutation
+    /// written by `set_global_session_order`, and `load_sessions` must return
+    /// exactly it, across projects, whatever the timestamps say.
+    #[test]
+    fn update_session_order_persists_manual_order() {
+        let store = test_store();
+        let now = Utc::now();
+        store.upsert_session(&test_session("a", now, now)).unwrap();
+        let b = test_session_in("b", "other-project", now, now);
+        store.upsert_session(&b).unwrap();
+        store.upsert_session(&test_session("c", now, now)).unwrap();
+
+        store
+            .set_global_session_order(&["b".to_string(), "a".to_string(), "c".to_string()])
+            .unwrap();
+
+        let loaded = store.load_sessions().unwrap();
+        let ids: Vec<&str> = loaded.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "a", "c"]);
+    }
+
     #[test]
     fn started_providers_round_trip() {
         let store = test_store();
