@@ -1287,6 +1287,8 @@ impl App {
                 Action::CopyPath => self.copy_selected_path()?,
                 Action::OpenWorktreeInEditor => self.open_selected_worktree_in_default_editor()?,
                 Action::ChooseWorktreeEditor => self.open_worktree_editor_picker()?,
+                Action::MoveAgentDown => self.move_selected_agent(super::reorder::MoveDir::Down),
+                Action::MoveAgentUp => self.move_selected_agent(super::reorder::MoveDir::Up),
                 Action::ToggleProject => self.toggle_collapse_selected_project(),
                 Action::InteractAgent => {
                     if self.selected_session().is_some()
@@ -1442,6 +1444,9 @@ impl App {
                     self.spawn_terminal_for_selected_terminal()?;
                 }
                 Action::DeleteSession => self.confirm_delete_selected_terminal()?,
+                // Shift-J / Shift-K reorder whatever row is selected.
+                Action::MoveAgentDown => self.move_selected_terminal(super::reorder::MoveDir::Down),
+                Action::MoveAgentUp => self.move_selected_terminal(super::reorder::MoveDir::Up),
                 // A standalone agent belongs to no row, so it is creatable
                 // from anywhere in the Left pane: the terminals subsection is
                 // still the agents pane, and the footer names the key there
@@ -22786,6 +22791,71 @@ not_a_real_action = ["x"]
 
         let order: Vec<&str> = app.engine.sessions.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(order, vec!["s3", "s1", "s2"]);
+    }
+
+    /// Seed `ids` as stored + in-memory agents of one project, manual sort,
+    /// Left focus, for the Shift-J/K tests below.
+    fn seed_reorder_agents(app: &mut App, ids: &[&str]) {
+        let now = Utc::now();
+        app.engine.sessions.clear();
+        for id in ids {
+            let session = filter_test_session(id, id, "p1", now);
+            app.engine
+                .session_store
+                .upsert_session(&session)
+                .expect("seed session");
+            app.engine.sessions.push(session);
+        }
+        app.engine.config.ui.agent_sort = "manual".to_string();
+        app.rebuild_left_items();
+        app.focus = FocusPane::Left;
+    }
+
+    fn stored_agent_order(app: &App) -> Vec<String> {
+        app.engine
+            .session_store
+            .load_sessions()
+            .expect("load sessions")
+            .into_iter()
+            .map(|s| s.id)
+            .collect()
+    }
+
+    /// Fork 3da9bc6f, via the key: Shift-J moves the selected agent down,
+    /// keeps the selection on it, and the order survives a reload. The fork
+    /// test moved a project row; upstream's sidebar is a flat agent list with
+    /// no project rows (projects reorder in the web and via
+    /// `ReorderProjects`, pinned by `reorder_projects_happy_path_reorders_and_persists`),
+    /// so the persisted-order half is checked on the session order.
+    #[test]
+    fn shift_j_moves_selected_project_down_and_persists_config_order() {
+        let mut app = test_app(default_bindings());
+        seed_reorder_agents(&mut app, &["s1", "s2", "s3"]);
+        app.selected_left = 0;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT))
+            .unwrap();
+
+        let order: Vec<&str> = app.engine.sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(order, vec!["s2", "s1", "s3"]);
+        assert_eq!(app.selected_session().map(|s| s.id.as_str()), Some("s1"));
+        assert_eq!(stored_agent_order(&app), vec!["s2", "s1", "s3"]);
+    }
+
+    #[test]
+    fn shift_k_moves_selected_agent_up_and_persists_session_order() {
+        let mut app = test_app(default_bindings());
+        seed_reorder_agents(&mut app, &["s1", "s2"]);
+        app.selected_left = 1;
+        assert_eq!(app.selected_session().map(|s| s.id.as_str()), Some("s2"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT))
+            .unwrap();
+
+        let order: Vec<&str> = app.engine.sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(order, vec!["s2", "s1"]);
+        assert_eq!(app.selected_left, 0);
+        assert_eq!(stored_agent_order(&app), vec!["s2", "s1"]);
     }
 
     #[test]
