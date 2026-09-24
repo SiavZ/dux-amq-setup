@@ -28,6 +28,21 @@ import {
 } from "./prose"
 import { recreateConfirmProse } from "./recreateWorkingCopy"
 
+describe("a name's bidi controls", () => {
+  it("are dropped by both chip builders", () => {
+    expect(chip("a‮b⁦c⁩")).toEqual({ name: "abc", quoted: false })
+    expect(quotedChip("‏x؜")).toEqual({ name: "x", quoted: true })
+  })
+
+  it("never reach the recreate confirm's text", () => {
+    const text = proseText(
+      recreateConfirmProse("~/wt", "feat‮txt.exe", "main", true, ["claude"]),
+    )
+    expect(text).toContain('"feattxt.exe"')
+    expect(text).not.toMatch(/[‪-‮⁦-⁩‎‏؜]/)
+  })
+})
+
 describe("a sentence built from prose and names", () => {
   it("renders every name as the shared chip and the rest as text", () => {
     const { container } = render(
@@ -205,6 +220,21 @@ describe("a status sentence read off the wire", () => {
     expect(wireProse(message, [{ name: 3, quoted: true }])).toBe(message)
     expect(wireProse(message, [{ name: "main" }])).toBe(message)
     expect(wireProse(message, [7])).toBe(message)
+  })
+
+  // A chip is drawn as one unit inside dux's own words; an override inside a
+  // name (a branch from somebody else's pull request) would reorder them. An
+  // older server may still send one, so the wire path strips it too, from the
+  // parts and the plain fallback alike.
+  it("strips bidi controls from a name that arrives off the wire", () => {
+    const crafted = "feat‮txt.exe"
+    const got = wireProse(`Deleted "${crafted}".`, [
+      "Deleted ",
+      { name: crafted, quoted: true },
+      ".",
+    ])
+    expect(got).toEqual(["Deleted ", { name: "feattxt.exe", quoted: true }, "."])
+    expect(wireProse(`Deleted "${crafted}".`, undefined)).toBe('Deleted "feattxt.exe".')
   })
 
   it("keeps the plain message when the parts spell a different sentence", () => {

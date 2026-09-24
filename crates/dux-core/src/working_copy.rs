@@ -422,6 +422,26 @@ pub fn recreate_success_message(
 mod tests {
     use super::*;
 
+    /// A branch name can come from a pull request somebody else opened; an
+    /// override inside it must not reorder the confirm's own words.
+    #[test]
+    fn the_recreate_confirm_draws_a_crafted_branch_without_bidi_controls() {
+        let prose = recreate_confirm_prose(
+            Path::new("/tmp/wt"),
+            "feat\u{202E}txt.exe",
+            "main",
+            true,
+            &["claude".to_string()],
+        );
+        let plain = prose.plain();
+        assert!(
+            !plain.chars().any(crate::bidi::is_bidi_control),
+            "{plain:?}"
+        );
+        assert!(plain.contains("\"feattxt.exe\""), "{plain}");
+        assert!(plain.contains("\"origin/feattxt.exe\""), "{plain}");
+    }
+
     #[test]
     fn the_missing_reason_names_the_path_and_never_says_busy() {
         let reason = missing_working_copy_reason(Path::new("/tmp/worktrees/p/v0"));

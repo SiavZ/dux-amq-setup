@@ -230,6 +230,23 @@ impl PartialEq<String> for StatusText {
 mod tests {
     use super::*;
 
+    /// The plain message the terminal UI prints and the parts the web chips
+    /// come from the same names, so both lose the bidi controls together.
+    #[test]
+    fn a_status_name_is_stripped_in_the_message_and_the_parts_alike() {
+        let status = crate::status_text!["Deleted ", q("feat\u{202E}xe"), " in ", n("/r\u{200F}")];
+        assert_eq!(status.message(), "Deleted \"featxe\" in /r");
+        assert_eq!(
+            status.segments().expect("built from parts"),
+            &[
+                text("Deleted "),
+                name("featxe", true),
+                text(" in "),
+                name("/r", false)
+            ]
+        );
+    }
+
     fn text(s: &str) -> ProseSegment {
         ProseSegment::Text(s.to_string())
     }

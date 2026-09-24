@@ -11811,6 +11811,45 @@ mod tests {
         );
     }
 
+    /// The refusal quotes the head branch, which is somebody else's text: the
+    /// toast chip and the plain message both arrive without its bidi controls.
+    #[test]
+    fn drive_pr_lookup_followup_refusal_strips_bidi_controls_from_the_head_branch() {
+        let repo = init_repo_with_commit();
+        let (mut engine, _tmp) = test_engine();
+        let mut project = sample_project("p1", &repo.path().to_string_lossy());
+        project.path_missing = false;
+        engine.projects.push(project.clone());
+
+        let reaction = EventReaction::OpenNewAgentPromptForPr {
+            pr: Box::new(crate::worker::ResolvedPullRequest {
+                project,
+                host: "github.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+                number: 7,
+                title: "Add feature".to_string(),
+                state: "OPEN".to_string(),
+                head_ref_name: "feat\u{202E}txt.exe".to_string(),
+                custom_name: None,
+            }),
+            status_op_id: None,
+        };
+        let followup = engine.drive_pr_lookup_followup(&reaction);
+        let error = followup
+            .statuses
+            .iter()
+            .find(|s| s.tone == "error")
+            .expect("a refusal");
+        assert!(
+            error.message.contains("\"feattxt.exe\""),
+            "{:?}",
+            error.message
+        );
+        let wire = serde_json::to_string(&error.segments).unwrap();
+        assert!(!wire.contains('\u{202E}'), "{wire}");
+        assert!(wire.contains("feattxt.exe"), "{wire}");
+    }
+
     #[test]
     fn drive_pr_lookup_followup_ignores_unrelated_reactions() {
         let (mut engine, _tmp) = test_engine();

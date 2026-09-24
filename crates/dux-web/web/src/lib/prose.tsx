@@ -1,6 +1,7 @@
 import type { ReactNode } from "react"
 
 import { InlineCode } from "@/components/ui/inline-code"
+import { stripBidiControls } from "@/lib/bidi"
 
 // A sentence that names things, kept as structure rather than as a finished
 // string, so the web can draw each name as a chip without hunting for it in the
@@ -22,14 +23,19 @@ export type ProseSegment = string | ProseName
 
 export type Prose = readonly ProseSegment[]
 
+// A name is where text dux did not write (a branch, a pull request's head, a
+// folder) enters a sentence, so the two builders drop its bidi controls: a chip
+// is drawn as one unit inside dux's own words, and an override inside it would
+// reorder them. The same rule as `dux_core::prose`'s name builders.
+
 /** A name that the plain-text spelling leaves bare. */
 export function chip(name: string): ProseName {
-  return { name, quoted: false }
+  return { name: stripBidiControls(name), quoted: false }
 }
 
 /** A name that the plain-text spelling wraps in straight double quotes. */
 export function quotedChip(name: string): ProseName {
-  return { name, quoted: true }
+  return { name: stripBidiControls(name), quoted: true }
 }
 
 /** The plain-text spelling: what the terminal UI says, word for word. */
@@ -129,10 +135,20 @@ function isProseSegment(value: unknown): value is ProseSegment {
  * disagreement means something upstream is wrong, and the plain message is the
  * one the terminal UI printed. Nothing here ever looks for a name inside the
  * words: a sentence without parts stays text.
+ *
+ * Bidi controls are dropped from both halves before they are compared: the
+ * server already strips them from every name it builds, and an older server
+ * that did not must not get to reorder a toast either.
  */
 export function wireProse(message: string, segments: unknown): string | Prose {
-  if (!Array.isArray(segments) || !segments.every(isProseSegment)) return message
-  return proseText(segments) === message ? segments : message
+  const plain = stripBidiControls(message)
+  if (!Array.isArray(segments) || !segments.every(isProseSegment)) return plain
+  const stripped: Prose = segments.map((segment) =>
+    typeof segment === "string"
+      ? stripBidiControls(segment)
+      : { name: stripBidiControls(segment.name), quoted: segment.quoted },
+  )
+  return proseText(stripped) === plain ? stripped : plain
 }
 
 /** The web spelling: every name drawn through the shared inline code chip. */

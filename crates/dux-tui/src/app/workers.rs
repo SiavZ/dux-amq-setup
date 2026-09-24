@@ -1157,8 +1157,11 @@ impl App {
             number: pr.number,
             title: pr.title.clone(),
             state: pr.state.clone(),
+            // The head branch keeps its exact bytes; the seed is what the
+            // prompt shows and the user edits, so it drops the bidi controls
+            // that would redraw the dialog around it.
             head_branch: pr.head_ref_name.clone(),
-            custom_name: Some(pr.head_ref_name.clone()),
+            custom_name: Some(dux_core::bidi::strip_bidi_controls(&pr.head_ref_name)),
             use_existing_branch: false,
         };
         if let Err(err) = self.open_name_new_agent_prompt(request) {

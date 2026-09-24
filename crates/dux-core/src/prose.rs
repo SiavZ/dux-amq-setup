@@ -90,16 +90,22 @@ impl Prose {
         }
     }
 
+    /// A name is where text dux did not write (a branch, a pull request's head,
+    /// a folder) enters a sentence, so this is where its bidi controls go: a
+    /// chip is drawn as one unit inside dux's own words, and an override inside
+    /// it would reorder them. Every name reaches a status through here too, so
+    /// the plain message and the parts agree.
     pub fn push_name(&mut self, name: impl Into<String>) {
         self.segments.push(ProseSegment::Name {
-            name: name.into(),
+            name: crate::bidi::strip_bidi_controls(&name.into()),
             quoted: false,
         });
     }
 
+    /// See [`Prose::push_name`].
     pub fn push_quoted(&mut self, name: impl Into<String>) {
         self.segments.push(ProseSegment::Name {
-            name: name.into(),
+            name: crate::bidi::strip_bidi_controls(&name.into()),
             quoted: true,
         });
     }
@@ -168,6 +174,34 @@ impl From<&str> for Prose {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A chip draws a name as one unit inside dux's own sentence, so a name
+    /// carrying an override would reorder the words around it. Every name
+    /// enters a sentence through the name builders, which is where they go.
+    #[test]
+    fn a_name_arrives_without_bidi_controls() {
+        let prose = Prose::new()
+            .text("On ")
+            .quoted("feat\u{202E}txt.exe\u{202C}")
+            .text(" in ")
+            .name("/src/\u{2066}x\u{2069}");
+        assert_eq!(
+            prose.segments(),
+            &[
+                ProseSegment::Text("On ".into()),
+                ProseSegment::Name {
+                    name: "feattxt.exe".into(),
+                    quoted: true
+                },
+                ProseSegment::Text(" in ".into()),
+                ProseSegment::Name {
+                    name: "/src/x".into(),
+                    quoted: false
+                },
+            ]
+        );
+        assert_eq!(prose.plain(), "On \"feattxt.exe\" in /src/x");
+    }
 
     #[test]
     fn segments_read_back_from_their_json_shape() {

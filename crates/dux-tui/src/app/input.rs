@@ -22738,6 +22738,51 @@ not_a_real_action = ["x"]
         }
     }
 
+    /// A pull request's head branch is somebody else's text. The name the
+    /// prompt seeds (visible and editable) drops the bidi controls that would
+    /// redraw the dialog around it, while the head branch the create looks up
+    /// keeps its exact bytes.
+    #[test]
+    fn a_pull_request_head_branch_seeds_the_name_without_bidi_controls() {
+        let mut app = test_app(default_bindings());
+        let project = app.engine.projects[0].clone();
+        let crafted = "feat\u{202E}txt.exe";
+
+        app.engine
+            .worker_tx
+            .send(WorkerEvent::PullRequestResolved {
+                result: Ok(ResolvedPullRequest {
+                    project,
+                    host: "github.com".to_string(),
+                    owner_repo: "octocat/Hello-World".to_string(),
+                    number: 42,
+                    title: "Fix issue".to_string(),
+                    state: "OPEN".to_string(),
+                    head_ref_name: crafted.to_string(),
+                    custom_name: None,
+                }),
+                purpose: dux_core::worker::PrLookupPurpose::CreateAgent,
+                status_op_id: None,
+            })
+            .expect("send PR resolution");
+        app.drain_events();
+
+        let PromptState::NameNewAgent { input, request, .. } = &app.prompt else {
+            panic!("expected name-new-agent prompt, got {:?}", app.prompt);
+        };
+        assert_eq!(input.text, "feattxt.exe");
+        let CreateAgentRequest::PullRequest {
+            head_branch,
+            custom_name,
+            ..
+        } = request
+        else {
+            panic!("expected PullRequest request, got {request:?}");
+        };
+        assert_eq!(head_branch, crafted, "the lookup keeps the exact ref");
+        assert_eq!(custom_name.as_deref(), Some("feattxt.exe"));
+    }
+
     /// Mint and register a PR-lookup op exactly as `dispatch_pull_request_lookup`
     /// does (without spawning the real `gh` worker), returning its opaque id and
     /// leaving its keyed busy on the status line.
