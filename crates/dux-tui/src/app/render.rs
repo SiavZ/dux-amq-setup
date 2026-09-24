@@ -1375,10 +1375,8 @@ impl App {
         let label_fg = self.theme.header_label_fg;
         let mut spans = vec![
             Span::styled(" dux ", Style::default().fg(label_fg).bg(bg)),
-            // The build, not just the version: every development build says
-            // "development", so the commit is what tells them apart.
             Span::styled(
-                dux_core::version::long(),
+                env!("DUX_DISPLAY_VERSION"),
                 Style::default().fg(self.theme.branch_fg).bg(bg),
             ),
         ];
@@ -1515,6 +1513,20 @@ impl App {
             }
             self.push_live_header_chip(&mut spans, self.running_terminals_chip());
         }
+        // The BUILD, last: every development build says "development", so the
+        // commit is what tells two of them apart. It trails rather than riding
+        // on the version because this header clips its tail, and the crumbs
+        // before it (above all the serving chip) matter more on a narrow
+        // terminal than a build id that `dux --version` also reports.
+        spans.push(Span::styled(" ╱ ", Style::default().fg(sep_fg).bg(bg)));
+        spans.push(Span::styled(
+            "build: ",
+            Style::default().fg(label_fg).bg(bg),
+        ));
+        spans.push(Span::styled(
+            dux_core::version::GIT_COMMIT,
+            Style::default().fg(self.theme.branch_fg).bg(bg),
+        ));
         Paragraph::new(Line::from(spans))
             .style(self.theme.header_style())
             .render(area, frame.buffer_mut());
@@ -13236,9 +13248,9 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(
-            rendered.contains(&dux_core::version::long()),
-            "the header must show {}; got:\n{rendered}",
-            dux_core::version::long()
+            rendered.contains(&format!("build: {}", dux_core::version::GIT_COMMIT)),
+            "the header must show build: {}; got:\n{rendered}",
+            dux_core::version::GIT_COMMIT
         );
     }
 

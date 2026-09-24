@@ -1231,7 +1231,18 @@ mod tests {
             serde_json::Value::Array(items) => {
                 let mut grown = items.clone();
                 grown.push(serde_json::json!("dux-diff-probe"));
-                vec![serde_json::Value::Array(grown)]
+                // An array of TABLES (a provider's `watch` rules) refuses a
+                // string element, so offer a minimal table-shaped one too.
+                let mut grown_table = items.clone();
+                grown_table.push(serde_json::json!({
+                    "pattern": "dux-diff-probe",
+                    "action": "send_text",
+                    "text": "dux-diff-probe",
+                }));
+                vec![
+                    serde_json::Value::Array(grown),
+                    serde_json::Value::Array(grown_table),
+                ]
             }
             // A null carries no type, so try each shape an `Option` field can take.
             serde_json::Value::Null => vec![
