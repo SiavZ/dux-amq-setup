@@ -210,3 +210,54 @@ fn pty_resize() {
         })
         .expect("resize should succeed");
 }
+
+/// Fork name. Per-session settings (YOLO, verify override) turned into env by
+/// `SessionSettings::to_pty_env` must reach the child through a real PTY,
+/// alongside the terminal env the PTY layer adds itself.
+#[test]
+fn spawn_with_env_propagates_per_session_vars() {
+    use dux_core::model::ProviderKind;
+    use dux_core::pty::PtyClient;
+    use dux_core::session_settings::SessionSettings;
+    use std::time::Instant;
+
+    let settings = SessionSettings {
+        yolo_permissions: true,
+        verify_envelope_override: Some(true),
+        ..SessionSettings::default()
+    };
+    // Global verify off: the per-session override must win.
+    let env = settings.to_pty_env(&ProviderKind::new("claude"), false);
+
+    let args = [
+        "-c".to_string(),
+        "printf 'CY=%s\\nDV=%s\\nTM=%s\\n' \"$CLAUDE_AMQ_YOLO\" \"$DUX_AMQ_VERIFY\" \"${TERM:+set}\""
+            .to_string(),
+    ];
+    let pty = PtyClient::spawn_with_env(
+        "/bin/sh",
+        &args,
+        std::path::Path::new("/tmp"),
+        24,
+        80,
+        1_000,
+        &env.vars,
+    )
+    .expect("spawn_with_env");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut snapshot = String::new();
+    while Instant::now() < deadline {
+        snapshot = pty.scan_recent_lines(30);
+        if snapshot.contains("CY=1") && snapshot.contains("DV=1") && snapshot.contains("TM=set") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(snapshot.contains("CY=1"), "CLAUDE_AMQ_YOLO: {snapshot}");
+    assert!(snapshot.contains("DV=1"), "DUX_AMQ_VERIFY: {snapshot}");
+    assert!(
+        snapshot.contains("TM=set"),
+        "the PTY's own TERM must survive the extra env: {snapshot}"
+    );
+}
