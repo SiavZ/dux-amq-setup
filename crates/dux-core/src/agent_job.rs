@@ -389,7 +389,7 @@ impl CreatePlanContext<'_> {
                 leading_branch
             },
             project,
-            status_message: status_message.into(),
+            status_message,
             // Attaching to a branch that already existed is nowhere on screen,
             // so that arm stays loud. A plain create says only what the new row
             // and its streaming pane already say.
@@ -548,7 +548,7 @@ impl CreatePlanContext<'_> {
                 project: project.clone(),
                 provider: project.default_provider.clone(),
                 source_branch: project.current_branch.clone(),
-                status_message: status_message.into(),
+                status_message,
                 // Quiet on both: the new row carries the pull-request chip and
                 // its pane launches and streams.
                 status_quiet: crate::statusline::QuietSurfaces::BOTH,
@@ -677,7 +677,7 @@ impl CreatePlanContext<'_> {
                 project,
                 provider: source_session.provider,
                 source_branch: source_branch_name,
-                status_message: status_message.into(),
+                status_message,
                 // Loud: what a fork copied, and what it left behind, is nowhere
                 // on screen.
                 status_quiet: crate::statusline::QuietSurfaces::LOUD,
@@ -727,7 +727,7 @@ impl CreatePlanContext<'_> {
                 project: project.clone(),
                 provider: project.default_provider.clone(),
                 source_branch: branch_name.clone(),
-                status_message: status_message.into(),
+                status_message,
                 // Quiet on both: the new row appears and its pane launches.
                 status_quiet: crate::statusline::QuietSurfaces::BOTH,
                 branch_name,
@@ -825,7 +825,7 @@ impl CreatePlanContext<'_> {
                 project: project.clone(),
                 provider: project.default_provider.clone(),
                 source_branch,
-                status_message: status_message.into(),
+                status_message,
                 // Loud: the copy rule, and what it skipped, is invisible.
                 status_quiet: crate::statusline::QuietSurfaces::LOUD,
                 branch_name,
@@ -1108,7 +1108,7 @@ fn run_create_standalone_agent_job(
         pty_size: (rows, cols),
         scrollback_lines: config.ui.agent_scrollback_lines,
         kind: AgentLaunchKind::Create {
-            status_message: status_message.into(),
+            status_message,
             // There is no repository behind this agent. The field is only read
             // by the rollback, which `owns_worktree: false` switches off.
             repo_path: String::new(),

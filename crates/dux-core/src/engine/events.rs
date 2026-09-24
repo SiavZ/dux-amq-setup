@@ -2048,7 +2048,7 @@ impl Engine {
                  want it gone."
             ];
             logger::warn(&message);
-            return message.into();
+            return message;
         }
         // Guard against a duplicate worker (e.g. a project delete racing the
         // reap); the completion handler clears it.

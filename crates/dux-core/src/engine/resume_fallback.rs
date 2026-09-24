@@ -403,7 +403,7 @@ impl Engine {
                 }
             ));
             if let ResumeFallbackOutcome::Retried { reaction } =
-                self.retry_resume_fallback(tab_id.as_str(), pty_size, status_message.into())
+                self.retry_resume_fallback(tab_id.as_str(), pty_size, status_message)
             {
                 // Nothing is cleared by hand here: the retry's teardown goes
                 // through `clear_tab_runtime`, and a second list of tab-keyed

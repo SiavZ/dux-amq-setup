@@ -1080,7 +1080,7 @@ impl Engine {
                 q(project_name),
                 "; nothing new was added."
             ];
-            return Ok(project_added_reaction(project, project_id, message.into()));
+            return Ok(project_added_reaction(project, project_id, message));
         }
 
         self.session_store

@@ -1403,7 +1403,7 @@ pub fn delete_session_status_message(
                 message.push(" ");
                 message.push(note);
             }
-            message.into()
+            message
         }
         WorktreeRemoval::PreservedShared => {
             crate::status_text![
@@ -3586,7 +3586,7 @@ impl Engine {
                 self.current_origin = origin;
                 let statuses = match self.apply(Command::DispatchCreateAgentRequest {
                     request: Box::new(request),
-                    busy_message: busy_message.clone().into(),
+                    busy_message: busy_message.clone(),
                     term_size: (80, 24),
                 }) {
                     Ok(reaction) => wire_statuses_from_reaction(&reaction),
@@ -3772,11 +3772,11 @@ impl Engine {
         // race hit that path, not this caller's optimistic narrative. Surface
         // that (falling back to the caller's message only if the engine didn't
         // provide one), for both the unkeyed status and the keyed op below.
-        let mut success_message: StatusText = status_message.clone().into();
+        let mut success_message: StatusText = status_message.clone();
         let statuses = match self.apply(Command::PersistProject {
             action: Box::new(ProjectPersistenceAction::Add {
                 project,
-                status_message: status_message.clone().into(),
+                status_message: status_message.clone(),
             }),
             status_op_id: None,
         }) {
@@ -3814,7 +3814,7 @@ impl Engine {
             let is_success = statuses.iter().any(|s| s.tone == "info");
             let outcome = if is_success {
                 crate::engine::WebAddProjectOutcome::Added {
-                    status_message: success_message.clone().into(),
+                    status_message: success_message.clone(),
                 }
             } else {
                 // Surface the same failure text the unkeyed `statuses`
@@ -3825,9 +3825,7 @@ impl Engine {
                     .find(|s| s.tone == "error")
                     .map(|s| StatusText::from_parts(s.message.clone(), s.segments.clone()))
                     .unwrap_or_else(|| status_message.clone());
-                crate::engine::WebAddProjectOutcome::AddFailed {
-                    message: message.into(),
-                }
+                crate::engine::WebAddProjectOutcome::AddFailed { message }
             };
             // The add-project op always resolves to a Message (never a
             // Clear), so `into_reaction()` is a keyed `Status` that
@@ -4379,8 +4377,7 @@ impl Engine {
                         "Refreshing project ",
                         q(project.name),
                         " from remote\u{2026}"
-                    ]
-                    .into(),
+                    ],
                     already_running_message: crate::status_text![
                         "Project refresh already in progress for ",
                         q(project.name),
@@ -4507,7 +4504,7 @@ impl Engine {
                 Command::PersistProject {
                     action: Box::new(ProjectPersistenceAction::Add {
                         project,
-                        status_message: status_message.into(),
+                        status_message,
                     }),
                     status_op_id: None,
                 }
@@ -4640,7 +4637,7 @@ impl Engine {
         };
         Ok(Command::DispatchCreateAgentRequest {
             request: Box::new(request),
-            busy_message: busy_message.into(),
+            busy_message,
             term_size: (80, 24),
         })
     }
@@ -4699,7 +4696,7 @@ impl Engine {
         };
         Ok(Command::DispatchCreateAgentRequest {
             request: Box::new(request),
-            busy_message: busy_message.into(),
+            busy_message,
             term_size: (80, 24),
         })
     }

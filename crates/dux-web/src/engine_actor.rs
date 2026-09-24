@@ -2918,12 +2918,11 @@ impl StatusEmitter {
     }
 
     /// Upsert the status in the controller (keyed or anonymous), refresh the
-    /// Vec snapshot, then broadcast it live. Returns the broadcast `send` result
-    /// so the call sites keep discarding it with `let _ =` exactly as before.
-    fn send(
-        &mut self,
-        status: WireStatus,
-    ) -> Result<usize, broadcast::error::SendError<WireStatus>> {
+    /// Vec snapshot, then broadcast it live. Returns how many receivers the
+    /// broadcast reached (zero when nobody is subscribed), which every call site
+    /// discards with `let _ =`. Not the broadcast's own `Result`: its error
+    /// variant carries the whole status back, which is too large to return.
+    fn send(&mut self, status: WireStatus) -> usize {
         let tone = StatusTone::from_wire(&status.tone);
         // A status quiet on the web is the command's answer and not a
         // notification: it already rode back to its caller in the outcome, so it
@@ -2946,7 +2945,7 @@ impl StatusEmitter {
                 None => false,
             };
             if !stranded {
-                return Ok(0);
+                return 0;
             }
         }
         let generation = self.controller.set_scoped(
@@ -2971,7 +2970,7 @@ impl StatusEmitter {
             self.controller.mark_unwatched(status.key.as_deref());
         }
         let _ = self.snapshot_tx.send(self.controller.snapshot());
-        self.tx.send(status)
+        self.tx.send(status).unwrap_or(0)
     }
 
     /// Explicitly clear a keyed entry (remove from the controller, push the

@@ -4705,7 +4705,7 @@ impl Engine {
                 title,
                 provider,
             },
-            busy_message.into(),
+            busy_message,
         ))
     }
 
@@ -4930,9 +4930,7 @@ impl Engine {
                     ") no longer exists. Restore the folder, or delete this agent and create a new one pointing at the folder you want."
                 ],
             };
-            return Ok(ReconnectPlan::WorktreeMissing {
-                message: message.into(),
-            });
+            return Ok(ReconnectPlan::WorktreeMissing { message });
         }
 
         if force {
@@ -5009,7 +5007,7 @@ impl Engine {
         };
         Ok(ReconnectPlan::Launch {
             request: Box::new(request),
-            busy_message: busy_message.into(),
+            busy_message,
             resume,
             detached_label,
         })
