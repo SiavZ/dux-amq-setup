@@ -41,15 +41,12 @@
 # codex: run inline (no alt screen) so its output lands in dux's host
 # scrollback, and therefore never forward scroll to it.
 /^\[providers\.codex\]$/,/^\[/ s|^args = \[\]$|args = ["--no-alt-screen"]|
-# dux renders no resume_by_id_args line for codex (it ships no default), so the
-# targeted-resume form is appended right after the stock resume_args line, in
-# the same pass that rewrites that line. The rewrite is what makes it one-shot:
-# on a rerun the stock line no longer exists, so nothing is appended twice.
-# POSIX `a\` form, so the program runs under GNU and BSD sed alike.
-/^\[providers\.codex\]$/,/^\[/ {
-/^resume_args = \["resume", "--last"\]$/a\
-resume_by_id_args = ["--no-alt-screen", "resume", "{session_id}"]
-}
+# codex's targeted resume must keep --no-alt-screen, because resume_by_id_args
+# replaces args. dux renders a stock line for it, so this rewrites that line in
+# place like every other rule. (It used to be appended, back when dux shipped
+# no codex default; appending now would write the key twice, the file would no
+# longer parse, and dux would silently fall back to its built-in defaults.)
+/^\[providers\.codex\]$/,/^\[/ s|^resume_by_id_args = \["resume", "{session_id}"\]$|resume_by_id_args = ["--no-alt-screen", "resume", "{session_id}"]|
 /^\[providers\.codex\]$/,/^\[/ s|^resume_args = \["resume", "--last"\]$|resume_args = ["--no-alt-screen", "resume", "--last"]|
 /^\[providers\.codex\]$/,/^\[/ s|^# forward_scroll = true$|forward_scroll = false|
 /^\[providers\.codex\]$/,/^\[/ s|^forward_scroll = true$|forward_scroll = false|

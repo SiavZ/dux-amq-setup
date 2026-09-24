@@ -204,9 +204,9 @@ fn the_installer_sed_turns_a_fresh_config_into_the_documented_end_state() {
     // The patch must not cost the user the documentation comments dux wrote:
     // only the targeted lines change.
     assert_eq!(
-        stock.lines().count() + 1,
+        stock.lines().count(),
         patched.lines().count(),
-        "exactly one line (codex's resume_by_id_args) is added; every other rule rewrites in place"
+        "every rule rewrites one line in place; none adds or removes a line"
     );
 }
 
