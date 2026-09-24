@@ -9,12 +9,11 @@
 //! `dux peer` CLI ([`run_peer`]) is dispatched from the binary's argument
 //! router.
 //!
-//! The router speaks in [`PeerSession`] rather than [`crate::model::AgentSession`]
-//! on purpose. The fork's session carried a persisted immutable
-//! `agent_handle`, a `shared_workspace` flag and soft-delete tombstones; upstream's
-//! does not yet, and those belong to the shared-workspace port. Everything the
-//! router decides is a function of the small projection below, and the one
-//! place that builds it from upstream's store is [`session_store`].
+//! The router speaks in [`PeerSession`], a small projection of
+//! [`crate::model::AgentSession`] (its persisted immutable `agent_handle`,
+//! `shared_workspace` flag and soft-delete state). Everything the router
+//! decides is a function of that projection, and the one place that builds
+//! it from the session store is [`session_store`].
 
 mod amq;
 mod handle;
@@ -85,11 +84,10 @@ impl PeerSession {
 
 /// Persistence the AMQ registry lifecycle needs from a Dux session store.
 ///
-/// INTEGRATION: the fork implemented these directly on its `SessionStore`
-/// (`load_sessions_including_deleted`, `upsert_session`,
-/// `reassign_agent_handle_for_global_backfill`). The shared-workspace port adds
-/// the persisted handle and tombstones to upstream's store; the adapter in
-/// [`session_store`] is then the only code that changes.
+/// The fork implemented these directly on its `SessionStore`. Here they sit
+/// behind a trait so the lifecycle is testable against an in-memory store;
+/// production is [`session_store::SqlitePeerStore`], backed by the persisted
+/// `agent_handle` column and soft-delete tombstones.
 pub trait PeerStore {
     /// Every session this store knows, tombstones included, so a deleted row's
     /// handle is never handed to a new session.

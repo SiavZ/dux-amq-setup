@@ -162,9 +162,9 @@ impl SessionSettings {
     /// flags. `verify_envelope_global` is `[amq.inject].verify_envelope`,
     /// used when `verify_envelope_override` is `None`.
     ///
-    /// INTEGRATION: the agent launch path must append these vars to the
-    /// child env (fork `run_create_agent_job` / reconnect). The DUX_* launch
-    /// env is owned by the peer worker (seedling).
+    /// Every agent launch appends these through
+    /// [`crate::agent_env::session_settings_env`], after the DUX_* identity
+    /// and before the user's `[env]`.
     pub fn to_pty_env(
         &self,
         provider: &ProviderKind,
