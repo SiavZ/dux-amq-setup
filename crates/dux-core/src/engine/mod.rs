@@ -2013,7 +2013,9 @@ impl Engine {
             },
             move |tx| {
                 let result = (|| -> anyhow::Result<()> {
-                    let store = SessionStore::open(&db_path)?;
+                    // A worker beside the live engine: connect without the
+                    // migration's repair passes (see `open_existing`).
+                    let store = SessionStore::open_existing(&db_path)?;
                     match &action {
                         ProjectPersistenceAction::Add { project, .. } => {
                             store.upsert_project(&ProjectConfig {
