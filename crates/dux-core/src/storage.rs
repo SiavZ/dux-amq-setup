@@ -28,6 +28,108 @@ pub struct StoredPr {
 /// shown. One key, one meaning; see [`SessionStore::last_seen_version`].
 const LAST_SEEN_VERSION_KEY: &str = "last_seen_version";
 
+const STORE_ID_FILE: &str = "store-id";
+const STORE_ID_LOCK: &str = ".store-id.lock";
+
+/// Load the stable identifier for one dux home (the config directory that
+/// holds `sessions.sqlite3`), creating it atomically on first use.
+///
+/// AMQ ownership markers record `{store_id, session_id}` so two dux homes
+/// sharing one AMQ root can never free each other's inboxes. The lock covers
+/// the first write AND readers, so no process can observe a half-written id.
+pub fn load_or_create_store_id(dux_home: &std::path::Path) -> Result<String> {
+    use rustix::fs::{FlockOperation, flock};
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::create_dir_all(dux_home)
+        .with_context(|| format!("failed to create {}", dux_home.display()))?;
+    let lock_path = dux_home.join(STORE_ID_LOCK);
+    let mut lock_options = std::fs::OpenOptions::new();
+    lock_options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    lock_options.mode(0o600);
+    let lock_file = lock_options
+        .open(&lock_path)
+        .with_context(|| format!("failed to open {}", lock_path.display()))?;
+    crate::io_retry::retry_on_interrupt_errno(|| flock(&lock_file, FlockOperation::LockExclusive))
+        .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+
+    let path = dux_home.join(STORE_ID_FILE);
+    let result = if path.exists() {
+        read_store_id(&path)
+    } else {
+        (|| {
+            let id = uuid::Uuid::new_v4().to_string();
+            let tmp = dux_home.join(format!(
+                ".{STORE_ID_FILE}.tmp.{}.{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut file = options
+                .open(&tmp)
+                .with_context(|| format!("failed to create {}", tmp.display()))?;
+            file.write_all(format!("{id}\n").as_bytes())
+                .with_context(|| format!("failed to write {}", tmp.display()))?;
+            file.sync_all()
+                .with_context(|| format!("failed to sync {}", tmp.display()))?;
+            std::fs::rename(&tmp, &path).with_context(|| {
+                format!(
+                    "failed to replace {} with {}",
+                    path.display(),
+                    tmp.display()
+                )
+            })?;
+            std::fs::File::open(dux_home)
+                .and_then(|dir| dir.sync_all())
+                .with_context(|| format!("failed to sync {}", dux_home.display()))?;
+            Ok(id)
+        })()
+    };
+    let _ = crate::io_retry::retry_on_interrupt_errno(|| flock(&lock_file, FlockOperation::Unlock));
+    result
+}
+
+/// Load an existing store identity WITHOUT creating one. Destructive reset and
+/// purge paths use this so a missing or corrupt identity fails them closed
+/// instead of minting a new id that would disown every existing AMQ inbox.
+pub fn load_store_id(dux_home: &std::path::Path) -> Result<String> {
+    read_store_id(&dux_home.join(STORE_ID_FILE))
+}
+
+/// Remove the durable store identity. Only valid after every exactly-owned
+/// AMQ handle is gone; the caller holds dux's per-home process lock.
+pub fn remove_store_identity(dux_home: &std::path::Path) -> Result<()> {
+    for name in [STORE_ID_FILE, STORE_ID_LOCK] {
+        let path = dux_home.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to remove {}", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_store_id(path: &std::path::Path) -> Result<String> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let parsed = uuid::Uuid::parse_str(raw.trim()).with_context(|| {
+        format!(
+            "dux home metadata corruption: {} does not contain a valid store id",
+            path.display()
+        )
+    })?;
+    Ok(parsed.to_string())
+}
+
 pub struct SessionStore {
     conn: Connection,
 }
@@ -56,6 +158,31 @@ impl SessionStore {
         // that tolerates it (a `:memory:` DB stays in "memory" mode, a harmless
         // no-op). `execute_batch` ignores the returned row.
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        // Fork audit02 P1-W. NORMAL is the WAL-appropriate durability level: a
+        // power loss can drop the last transactions but never corrupts the
+        // file, and it avoids an fsync per commit on the status-churn hot path.
+        //
+        // `foreign_keys` is deliberately NOT enabled even though the fork did:
+        // upstream's schema is written for it being off (every delete path
+        // removes child rows explicitly, and `session_prs` rows are kept past a
+        // soft delete on purpose). Turning it on here would change the meaning
+        // of existing declared-but-dormant cascades underneath that code.
+        conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
+        // Fail fast on a corrupt file, pointing at the backup, rather than
+        // failing later on some unrelated query. `:memory:` stores are always
+        // pristine and have no `.bak`.
+        if path != std::path::Path::new(":memory:") {
+            let integrity: String = conn
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .context("failed to run the session database integrity check")?;
+            if integrity != "ok" {
+                bail!(
+                    "sqlite integrity check failed for {}: {integrity}; restore from {}.bak",
+                    path.display(),
+                    path.display()
+                );
+            }
+        }
         // The database mirrors the same per-project `env` map that made
         // `config.toml` 0600, so it gets the same mode. SQLite creates the file
         // (and, after the WAL pragma, its `-wal`/`-shm` sidecars) itself at the
@@ -734,6 +861,19 @@ impl SessionStore {
         }
         tx.commit()
             .context("failed to commit the slot tab repair")?;
+        Ok(())
+    }
+
+    /// Online-backup the live database to `dst` with SQLite's backup API (fork
+    /// audit02 P1-W). Safe while other connections write: the API copies pages
+    /// consistently and includes WAL content, which a plain file copy of the
+    /// `.sqlite3` alone would miss. The destination is tightened to owner-only
+    /// like the database itself, because it carries the same per-project env.
+    pub fn backup_to(&self, dst: &std::path::Path) -> Result<()> {
+        self.conn
+            .backup(rusqlite::MAIN_DB, dst, None)
+            .with_context(|| format!("backup to {} failed", dst.display()))?;
+        crate::file_modes::restrict_to_owner_best_effort(dst, "session database backup");
         Ok(())
     }
 
@@ -4311,6 +4451,158 @@ mod tests {
     }
 
     #[test]
+    fn store_id_is_durable_and_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = load_or_create_store_id(dir.path()).unwrap();
+        let second = load_or_create_store_id(dir.path()).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(STORE_ID_FILE))
+                .unwrap()
+                .trim(),
+            first
+        );
+        assert_eq!(load_store_id(dir.path()).unwrap(), first);
+    }
+
+    #[test]
+    fn corrupt_store_id_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(STORE_ID_FILE), "not-a-uuid\n").unwrap();
+        let error = format!("{:#}", load_or_create_store_id(dir.path()).unwrap_err());
+        assert!(error.contains("metadata corruption"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(STORE_ID_FILE)).unwrap(),
+            "not-a-uuid\n",
+            "a corrupt id is reported, never silently replaced"
+        );
+    }
+
+    #[test]
+    fn load_store_id_never_creates_one() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_store_id(dir.path()).is_err());
+        assert!(!dir.path().join(STORE_ID_FILE).exists());
+        load_or_create_store_id(dir.path()).unwrap();
+        remove_store_identity(dir.path()).unwrap();
+        assert!(load_store_id(dir.path()).is_err());
+        remove_store_identity(dir.path()).expect("removing twice is fine");
+    }
+
+    #[test]
+    fn backup_to_copies_committed_rows_including_wal_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sessions.sqlite3");
+        let store = SessionStore::open(&db).unwrap();
+        let now = Utc::now();
+        store.create_session(&test_session("s1", now, now)).unwrap();
+        let bak = dir.path().join("sessions.sqlite3.bak");
+        store.backup_to(&bak).unwrap();
+        let restored = SessionStore::open(&bak).unwrap();
+        assert_eq!(restored.load_sessions().unwrap()[0].id, "s1");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&bak).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode & 0o077, 0, "backup must be owner-only, got {mode:o}");
+        }
+    }
+
+    #[test]
+    fn a_corrupt_database_fails_open_and_points_at_the_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sessions.sqlite3");
+        {
+            let store = SessionStore::open(&db).unwrap();
+            let now = Utc::now();
+            for i in 0..50 {
+                store
+                    .create_session(&test_session(&format!("s{i}"), now, now))
+                    .unwrap();
+            }
+            store
+                .conn
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+        // Scribble over a b-tree page past the header so the file still opens
+        // as SQLite but its structure is broken.
+        let mut bytes = std::fs::read(&db).unwrap();
+        let page = 4096;
+        assert!(bytes.len() > page * 3, "fixture too small to corrupt");
+        for byte in &mut bytes[page * 2 + 8..page * 3] {
+            *byte = 0xA5;
+        }
+        std::fs::write(&db, bytes).unwrap();
+        let err = format!("{:#}", SessionStore::open(&db).err().expect("must refuse"));
+        assert!(
+            err.contains("integrity check failed") && err.contains(".bak"),
+            "corruption must fail open loudly: {err}"
+        );
+    }
+
+    #[test]
+    fn ensure_column_rejects_injection() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("create table t (id integer);").unwrap();
+        assert!(ensure_column(&conn, "t", "x; drop table t; --", "text").is_err());
+        assert!(ensure_column(&conn, "t", "ok_name", "text; drop table t; --").is_err());
+        assert!(ensure_column(&conn, "1bad", "ok_name", "text").is_err());
+        assert!(ensure_column(&conn, "t", "ok_name", "text /* sneaky */").is_err());
+        assert!(ensure_column(&conn, "t", "ok_name", "text default 'x'").is_err());
+        assert!(ensure_column(&conn, "t", "ok_name", "text check(1)").is_err());
+        let count: i64 = conn
+            .query_row(
+                "select count(*) from sqlite_master where name='t'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "table 't' must survive the rejected payloads");
+        assert!(ensure_column(&conn, "t", "extra", "text").unwrap());
+    }
+
+    #[test]
+    fn is_safe_ident_matches_pattern() {
+        assert!(is_safe_ident("agent_sessions"));
+        assert!(is_safe_ident("_under"));
+        assert!(is_safe_ident("Col1"));
+        assert!(!is_safe_ident(""));
+        assert!(!is_safe_ident("1col"));
+        assert!(!is_safe_ident("col-name"));
+        assert!(!is_safe_ident("col;drop"));
+        assert!(!is_safe_ident("col name"));
+    }
+
+    /// Every `ensure_column` call in this file must pass the allowlist, or the
+    /// open fails at runtime. Scans the source so a column another change
+    /// appends is caught here, by name, instead of on a user's first boot.
+    #[test]
+    fn every_ensure_column_call_site_passes_the_allowlist() {
+        let source = include_str!("storage.rs");
+        // Production code only: the tests below pass hostile literals on purpose.
+        let source = source.split("#[cfg(test)]").next().unwrap();
+        let mut checked = 0;
+        for call in source.split("ensure_column(").skip(1) {
+            let args: String = call.chars().take_while(|c| *c != ')').collect();
+            let literals: Vec<&str> = args.split('"').skip(1).step_by(2).collect();
+            // Only real call sites pass three string literals.
+            if literals.len() != 3 || !args.trim_start().starts_with('&') {
+                continue;
+            }
+            let (table, column, sql_type) = (literals[0], literals[1], literals[2]);
+            assert!(is_safe_ident(table), "{table}");
+            assert!(is_safe_ident(column), "{column}");
+            assert!(
+                is_allowed_column_type(sql_type),
+                "ensure_column({table}, {column}, {sql_type:?}) is not on the allowlist"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 25, "the scan found only {checked} call sites");
+    }
+
+    #[test]
     fn reopening_same_db_file_remigrates_cleanly() {
         // With the initial_branch ALTER moved to autocommit,
         // re-opening the same on-disk DB re-runs migrate() and every
@@ -5003,6 +5295,23 @@ fn min_session_sort_order_in(conn: &Connection, project_id: &str) -> Result<Opti
 /// was just added by this call, `false` when it already existed. Callers that
 /// need a one-time backfill of a newly-added column branch on the return value.
 fn ensure_column(conn: &Connection, table: &str, column: &str, sql_type: &str) -> Result<bool> {
+    // Defence in depth (fork audit02 P1-K): the three strings are spliced into
+    // DDL because SQLite cannot bind identifiers or types. Every caller passes
+    // literals today, but one refactor that routes a runtime value in here
+    // would otherwise be an injection. Refuse anything that is not a plain
+    // identifier, and any type clause not on the explicit allowlist.
+    if !is_safe_ident(table) {
+        bail!("ensure_column: rejected unsafe table name {table:?}");
+    }
+    if !is_safe_ident(column) {
+        bail!("ensure_column: rejected unsafe column name {column:?}");
+    }
+    if !is_allowed_column_type(sql_type) {
+        bail!(
+            "ensure_column: sql type {sql_type:?} is not on the allowlist; add it to \
+             ALLOWED_COLUMN_TYPES if it is a literal you wrote"
+        );
+    }
     let mut stmt = conn.prepare(&format!("pragma table_info({table})"))?;
     let existing = stmt
         .query_map([], |row| row.get::<_, String>(1))?
@@ -5023,6 +5332,67 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, sql_type: &str) -
         Err(e) if is_duplicate_column_error(&e) => Ok(false),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Quoted-default type clauses `ensure_column` accepts, compared after
+/// lowercasing and collapsing whitespace. A clause with a quote in it is only
+/// accepted if it is listed here; every literal a caller in this file passes
+/// is here, and a new one fails loudly (and in tests) until it is added.
+const ALLOWED_COLUMN_TYPES: &[&str] = &[
+    "text not null default ''",
+    "text not null default '[]'",
+    "text not null default '{}'",
+    "text not null default 'open'",
+    "text not null default 'created'",
+    "text not null default 'managed'",
+    "text not null default 'github.com'",
+];
+
+/// A plain SQL identifier: an ASCII letter or `_`, then ASCII alphanumerics
+/// or `_`.
+fn is_safe_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A column type clause safe to splice into `alter table ... add column`: a
+/// SQLite storage class, optionally followed by constraint words and a numeric
+/// default. Nothing that could end the statement, open a comment, or smuggle
+/// in a string unless the whole clause is on [`ALLOWED_COLUMN_TYPES`].
+fn is_allowed_column_type(s: &str) -> bool {
+    let normalized = s
+        .trim()
+        .to_ascii_lowercase()
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.contains('\'') {
+        return ALLOWED_COLUMN_TYPES.contains(&normalized.as_str());
+    }
+    if normalized.is_empty()
+        || normalized.contains(';')
+        || normalized.contains("--")
+        || normalized.contains("/*")
+        || normalized.contains('"')
+        || normalized.contains('`')
+    {
+        return false;
+    }
+    const STORAGE_CLASSES: &[&str] = &["text", "integer", "real", "blob", "numeric"];
+    let mut words = normalized.split(' ');
+    let Some(class) = words.next() else {
+        return false;
+    };
+    let is_integer = |word: &str| {
+        let digits = word.strip_prefix('-').unwrap_or(word);
+        !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+    };
+    STORAGE_CLASSES.contains(&class)
+        && words.all(|word| matches!(word, "not" | "null" | "default") || is_integer(word))
 }
 
 /// True when `err` is SQLite's "duplicate column name" error, raised when an
