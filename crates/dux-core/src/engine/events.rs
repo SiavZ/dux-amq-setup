@@ -1458,6 +1458,13 @@ impl Engine {
         self.pty_pointer.remove(terminal_id);
     }
 
+    /// Every registered project checkout, for the whole-worktree removal guard
+    /// (`git::guard_whole_workspace_removal`). Fails closed on a project path
+    /// that does not expand to a safe absolute one.
+    pub fn registered_project_paths(&self) -> anyhow::Result<Vec<std::path::PathBuf>> {
+        crate::git::registered_project_paths(self.projects.iter().map(|p| p.path.as_str()))
+    }
+
     /// Engine half of the session-deletion cascade: remove the session from the
     /// store, the providers, the runtime maps and the sessions vector, refresh
     /// branch-sync entries and spawn the startup-log deletion worker. `Ok(None)`
@@ -1748,6 +1755,17 @@ impl Engine {
             // as `delete_branch`. Deciding it here means the project-delete
             // cascade, which calls this per agent with no answer, inherits the
             // provenance default.
+            // Every registered checkout is protected from this whole-worktree
+            // removal, not only this agent's own project: a corrupt row can
+            // point a worktree at ANY project. An unreadable inventory refuses
+            // the removal rather than running it half-guarded.
+            let protected = match self.registered_project_paths() {
+                Ok(protected) => protected,
+                Err(err) => {
+                    self.closing_sessions.remove(session_id);
+                    return Err(err);
+                }
+            };
             let result = if managed
                 .branch_provenance
                 .resolve_branch_deletion(delete_branch)
@@ -1760,6 +1778,7 @@ impl Engine {
                     // worktree drifted onto, so deleting only that leaves the
                     // original behind and recreating the agent collides with it.
                     Some(managed.initial_branch.as_str()),
+                    &protected,
                 ) {
                     Ok(result) => RemovedBranches::Deleted(result),
                     Err(err) => {
@@ -1771,6 +1790,7 @@ impl Engine {
                 match crate::git::remove_worktree_keep_branch(
                     std::path::Path::new(&project.path),
                     std::path::Path::new(&managed.worktree_path),
+                    &protected,
                 ) {
                     Ok(()) => RemovedBranches::Kept(branch_kept_reason(
                         managed.branch_provenance,
@@ -2042,9 +2062,16 @@ impl Engine {
         self.deletion_busy_messages
             .insert(session_id.clone(), busy_message.clone());
         let tx = self.worker_tx.clone();
+        // Snapshotted now, on the engine thread; the worker cannot read engine
+        // state. An unreadable inventory is carried into the worker as the
+        // error so the removal is refused through the normal completion path.
+        let protected = self
+            .registered_project_paths()
+            .map_err(|e| format!("{e:#}"));
         std::thread::spawn(move || {
             use std::panic::AssertUnwindSafe;
             let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let protected = protected?;
                 // The same gate as the synchronous path: unasked, only branches
                 // dux created are dux's to delete, and the delete dialog's
                 // answer overrides that in either direction.
@@ -2055,6 +2082,7 @@ impl Engine {
                         &branch_name,
                         // The BIRTH branch too; see `git::remove_worktree`.
                         Some(initial_branch.as_str()),
+                        &protected,
                     )
                     .map(RemovedBranches::Deleted)
                     .map_err(|e| format!("{e:#}"))
@@ -2062,6 +2090,7 @@ impl Engine {
                     crate::git::remove_worktree_keep_branch(
                         std::path::Path::new(&project_path),
                         std::path::Path::new(&worktree_path),
+                        &protected,
                     )
                     .map(|()| {
                         RemovedBranches::Kept(branch_kept_reason(branch_provenance, delete_branch))
@@ -3738,6 +3767,54 @@ mod tests {
         );
         // The delete aborted, so the session record survives.
         assert!(engine.sessions.iter().any(|s| s.id == "s1"));
+    }
+
+    /// Fork f4f2257a (`begin_delete_session_applies_registered_project_overlap_guard`):
+    /// a session row whose worktree overlaps ANY registered project, not only
+    /// its own, is refused and nothing on disk is touched.
+    #[test]
+    fn begin_delete_session_applies_registered_project_overlap_guard() {
+        for project_is_descendant in [true, false] {
+            let (mut engine, tmp) = test_engine();
+            let root = tmp.path().join("root");
+            let worktree = root.join("worktree");
+            std::fs::create_dir_all(&worktree).unwrap();
+            let own = tmp.path().join("own-project");
+            std::fs::create_dir_all(&own).unwrap();
+            let protected = if project_is_descendant {
+                let nested = worktree.join("nested-project");
+                std::fs::create_dir_all(&nested).unwrap();
+                nested
+            } else {
+                root.clone()
+            };
+            engine
+                .projects
+                .push(sample_project("p1", own.to_str().unwrap()));
+            engine
+                .projects
+                .push(sample_project("protected", protected.to_str().unwrap()));
+            let mut session = sample_session("s1", "p1", "feat/x");
+            session
+                .workspace
+                .as_managed_mut()
+                .expect("managed test session")
+                .worktree_path = worktree.to_str().unwrap().to_string();
+            engine.session_store.upsert_session(&session).unwrap();
+            engine.sessions.push(session);
+
+            let Err(err) = engine.do_delete_session("s1", true, None) else {
+                panic!("an overlapping worktree removal must be refused");
+            };
+            assert!(
+                format!("{err:#}").contains("overlaps the registered project"),
+                "unexpected error: {err:#}"
+            );
+            assert!(worktree.exists());
+            assert!(protected.exists());
+            assert!(!engine.closing_sessions.contains("s1"));
+            assert!(engine.sessions.iter().any(|s| s.id == "s1"));
+        }
     }
 
     /// The reported journey, end to end through the engine and a REAL repo:

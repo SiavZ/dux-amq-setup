@@ -129,6 +129,12 @@ impl App {
         let project = prompt.project.clone();
         let paths = self.engine.paths.clone();
         let sessions = self.engine.sessions.clone();
+        // Snapshotted on the UI thread; an unreadable inventory refuses the
+        // removal inside the worker rather than running it unguarded.
+        let protected = self
+            .engine
+            .registered_project_paths()
+            .map_err(|e| format!("{e:#}"));
         let path = prompt.path.clone();
         let delete_branch = prompt.delete_branch;
         let display_path = path.to_string_lossy().to_string();
@@ -176,6 +182,7 @@ impl App {
                 &sessions,
                 &path,
                 delete_branch,
+                &protected?,
             )
         });
         self.apply_reaction(reaction);

@@ -49,10 +49,21 @@ enum HeadMismatch {
 /// untouched, and a caller holding a folder workspace cannot name the argument.
 fn rollback_created_worktree(repo_path: &Path, managed: &ManagedWorkspace) {
     let worktree_path = Path::new(&managed.worktree_path);
+    // The worktree was created seconds ago inside dux's managed root; the one
+    // checkout a bad path could realistically hit is the project it was made
+    // from, so that is what is protected here. The engine's delete paths pass
+    // the full registered-project inventory.
+    let protected = [repo_path.to_path_buf()];
     if managed.branch_provenance.dux_may_delete_branch() {
-        let _ = git::remove_worktree(repo_path, worktree_path, &managed.branch_name, None);
+        let _ = git::remove_worktree(
+            repo_path,
+            worktree_path,
+            &managed.branch_name,
+            None,
+            &protected,
+        );
     } else {
-        let _ = git::remove_worktree_keep_branch(repo_path, worktree_path);
+        let _ = git::remove_worktree_keep_branch(repo_path, worktree_path, &protected);
     }
 }
 
