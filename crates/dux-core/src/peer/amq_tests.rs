@@ -596,9 +596,34 @@ fn amq_root_comes_from_env_else_an_existing_sibling_dir() {
 
 /// The wrapper script takes the same `meta/config.lock` before claiming an
 /// inbox, so a wrapper launched while Dux holds the lock waits for it.
+///
+/// Runs the real `dux-amq/wrappers/claude-amq` from this repository. The
+/// wrapper needs a command-form `flock`: util-linux's on Linux, or the test
+/// shim in `dux-amq/tests/fakes/flock` (which takes a real kernel flock via
+/// ruby) on macOS. With neither, the test skips with a printed reason instead
+/// of failing on a host that cannot stage the race at all.
 #[test]
-#[ignore = "INTEGRATION: needs dux-amq overlay"]
 fn rust_and_wrapper_claims_serialize_on_config_lock() {
+    let has = |bin: &str| {
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("command -v {bin}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let native_flock = ["/usr/bin/flock", "/bin/flock"]
+        .iter()
+        .any(|p| Path::new(p).is_file());
+    if !native_flock && !has("ruby") {
+        eprintln!(
+            "skipping rust_and_wrapper_claims_serialize_on_config_lock: no flock(1) \
+             and no ruby for the dux-amq test shim, so the wrapper cannot take the lock"
+        );
+        return;
+    }
+
     let dir = tempdir().unwrap();
     let root = dir.path().join("amq");
     let home = dir.path().join("home");
@@ -632,12 +657,29 @@ fn rust_and_wrapper_claims_serialize_on_config_lock() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    std::thread::sleep(Duration::from_millis(150));
-    assert!(child.try_wait().unwrap().is_none());
+    // While Dux holds the lock the wrapper must block, not claim. Wait long
+    // enough that a wrapper that ignored the lock would already have exited.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "claude-amq finished while Dux held meta/config.lock"
+    );
     assert!(!root.join("agents/wrapper-agent/.dux-amq-source").exists());
 
     drop(lock);
-    assert!(child.wait().unwrap().success());
+    // Bounded: a wrapper that deadlocks must fail the test, not hang CI.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("claude-amq did not finish within 30s of the lock being released");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "claude-amq exited with {status}");
     assert!(root.join("agents/wrapper-agent/.dux-amq-source").exists());
 }
 
