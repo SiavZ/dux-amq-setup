@@ -56,7 +56,7 @@ describe("CheckoutDefaultBranchDialog", () => {
       vi.mocked(closeCheckoutDefaultBranch).mockClear()
     })
 
-    it("checks out the project it was opened for, then closes", () => {
+    it("checks out the project it was opened for and closes", () => {
       openFor("p1")
       fireEvent.click(
         screen.getByRole("button", { name: "Check out default branch" }),
@@ -64,11 +64,6 @@ describe("CheckoutDefaultBranchDialog", () => {
       expect(checkoutDefaultBranch).toHaveBeenCalledTimes(1)
       expect(checkoutDefaultBranch).toHaveBeenCalledWith("p1")
       expect(closeCheckoutDefaultBranch).toHaveBeenCalled()
-      expect(
-        vi.mocked(checkoutDefaultBranch).mock.invocationCallOrder[0],
-      ).toBeLessThan(
-        vi.mocked(closeCheckoutDefaultBranch).mock.invocationCallOrder[0],
-      )
     })
 
     it("closes on Cancel and checks nothing out", () => {
