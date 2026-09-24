@@ -3939,12 +3939,16 @@ mod tests {
                     auto_reopen_agents: None,
                     startup_command: None,
                     env: Default::default(),
+                    workspace_mode: None,
                 })
                 .unwrap();
             let now = chrono::Utc::now();
             store
                 .create_session(&dux_core::model::AgentSession {
                     id: "s1".to_string(),
+                    agent_handle: "s1".to_string(),
+                    shared_workspace: false,
+                    deleted_at: None,
                     slot_tab_id: "s1-slot".to_string(),
                     provider: dux_core::model::ProviderKind::new("claude"),
                     title: None,
@@ -6420,6 +6424,7 @@ mod tests {
                     auto_reopen_agents: None,
                     startup_command: None,
                     env: Default::default(),
+                    workspace_mode: None,
                 })
                 .unwrap();
             let now = chrono::Utc::now();
@@ -6427,6 +6432,9 @@ mod tests {
                 store
                     .create_session(&dux_core::model::AgentSession {
                         id: sid.to_string(),
+                        agent_handle: dux_core::model::normalize_agent_handle(sid),
+                        shared_workspace: false,
+                        deleted_at: None,
                         slot_tab_id: format!("{sid}-slot"),
                         provider: dux_core::model::ProviderKind::new("claude"),
                         title: None,

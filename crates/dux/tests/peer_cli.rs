@@ -25,6 +25,9 @@ fn dux(home: &Path, amq: &Path, args: &[&str]) -> Output {
 fn session(id: &str, provider: &str, folder: &Path, status: SessionStatus) -> AgentSession {
     AgentSession {
         id: id.to_string(),
+        agent_handle: dux_core::model::normalize_agent_handle(id),
+        shared_workspace: false,
+        deleted_at: None,
         slot_tab_id: format!("{id}-slot"),
         provider: ProviderKind::new(provider),
         workspace: AgentWorkspace::Folder(FolderWorkspace {

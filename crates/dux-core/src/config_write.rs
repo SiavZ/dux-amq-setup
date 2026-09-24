@@ -249,6 +249,25 @@ fn apply_patches(doc: &mut DocumentMut, config: &Config) {
     // --- [env] ---
     patch_env_table(doc, "env", &config.env);
 
+    // --- [workspace] (fork shared-workspace) ---
+    // Written only when the config has the section. A legacy config without it
+    // resolves to worktree mode, and saving an unrelated setting must not add
+    // the section and silently flip that install to shared.
+    if let Some(workspace) = &config.workspace {
+        patch_table_str(
+            doc,
+            "workspace",
+            "default_mode",
+            workspace.default_mode.as_str(),
+        );
+        patch_table_bool(
+            doc,
+            "workspace",
+            "auto_resume_shared",
+            workspace.auto_resume_shared,
+        );
+    }
+
     // --- [logging] ---
     patch_table_str(doc, "logging", "level", &config.logging.level);
     patch_table_str(doc, "logging", "path", &config.logging.path);
@@ -913,6 +932,7 @@ const PROJECT_MANAGED_KEYS: &[&str] = &[
     "auto_reopen_agents",
     "startup_command",
     "env",
+    "workspace_mode",
 ];
 
 /// Project keys dux once wrote to config and now keeps in SQLite instead. These
@@ -1176,6 +1196,9 @@ fn patch_projects(doc: &mut DocumentMut, projects: &[ProjectConfig]) {
                 inline.insert(name, Value::String(Formatted::new(value.clone())));
             }
             table["env"] = toml_edit::value(Value::InlineTable(inline));
+        }
+        if let Some(mode) = project.workspace_mode {
+            table["workspace_mode"] = toml_edit::value(mode.as_str());
         }
         // Put the user's own keys and comments back. The source entry is matched
         // by identity rather than by position (see `take_carried_project`) and is
@@ -2454,6 +2477,7 @@ unknown_key = \"untouched\"
             auto_reopen_agents: Some(true),
             startup_command: Some("npm install".to_string()),
             env,
+            workspace_mode: None,
         });
 
         patch_config_file(&config_path, &config).expect("patch");
@@ -2496,6 +2520,7 @@ unknown_key = \"untouched\"
             auto_reopen_agents: None,
             startup_command: None,
             env: BTreeMap::new(),
+            workspace_mode: None,
         });
 
         patch_config_file(&config_path, &config).expect("patch");
@@ -2539,6 +2564,7 @@ unknown_key = \"untouched\"
             auto_reopen_agents: None,
             startup_command: None,
             env: BTreeMap::new(),
+            workspace_mode: None,
         });
 
         patch_config_file(&config_path, &config).expect("patch");
@@ -2573,6 +2599,7 @@ unknown_key = \"untouched\"
             auto_reopen_agents: None,
             startup_command: None,
             env: BTreeMap::new(),
+            workspace_mode: None,
         });
 
         patch_config_file(&config_path, &config).expect("patch");
@@ -2597,6 +2624,7 @@ unknown_key = \"untouched\"
             auto_reopen_agents: None,
             startup_command: None,
             env: BTreeMap::new(),
+            workspace_mode: None,
         }
     }
 
@@ -3316,6 +3344,7 @@ unknown_key = \"untouched\"
             auto_reopen_agents: None,
             startup_command: None,
             env: BTreeMap::new(),
+            workspace_mode: None,
         });
 
         save_config(&config_path, &config).expect("save");

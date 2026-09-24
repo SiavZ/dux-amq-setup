@@ -173,6 +173,7 @@ pub(crate) fn modal_spec(prompt: &PromptState) -> Option<ModalSpec> {
         | PromptState::ConfirmCreateInitialCommit { .. }
         | PromptState::ConfirmNonDefaultBranch { .. }
         | PromptState::ConfirmUseExistingBranch { .. }
+        | PromptState::ConfirmSharedWriter { .. }
         // Prose, a conditional checkbox and a Cancel/Delete pair; horizontal
         // keys move focus and Space acts on what has it.
         | PromptState::ConfirmDeleteWorktree(_)
@@ -279,6 +280,7 @@ pub(crate) fn prompt_text_inputs(prompt: &PromptState) -> Vec<&TextInput> {
         | PromptState::ConfirmCreateInitialCommit { .. }
         | PromptState::ConfirmNonDefaultBranch { .. }
         | PromptState::ConfirmUseExistingBranch { .. }
+        | PromptState::ConfirmSharedWriter { .. }
         | PromptState::PickEditor { .. }
         | PromptState::PickProjectWorktree(_)
         | PromptState::ManageWorktrees(_)
@@ -382,6 +384,7 @@ pub(crate) fn layout_publishes_confirm_button(layout: &OverlayMouseLayout) -> bo
         | OverlayMouseLayout::ConfirmInitRepo { .. }
         | OverlayMouseLayout::ConfirmNonDefaultBranch { .. }
         | OverlayMouseLayout::ConfirmUseExistingBranch { .. }
+        | OverlayMouseLayout::ConfirmSharedWriter { .. }
         | OverlayMouseLayout::ConfigReloadFailed { .. }
         | OverlayMouseLayout::ConfigureStartupCommand { .. }
         | OverlayMouseLayout::SessionSettings { .. }
@@ -1146,6 +1149,17 @@ mod tests {
                     request: new_project_request(&project),
                     branch_name: "b".to_string(),
                     location: crate::git::BranchLocation::Local,
+                    focus: ConfirmFocus::Cancel,
+                },
+            ),
+            (
+                "ConfirmSharedWriter",
+                PromptState::ConfirmSharedWriter {
+                    existing_agent: "other".to_string(),
+                    action: crate::app::SharedWriterAction::Create {
+                        request: Box::new(new_project_request(&project)),
+                        busy_message: "creating".to_string(),
+                    },
                     focus: ConfirmFocus::Cancel,
                 },
             ),

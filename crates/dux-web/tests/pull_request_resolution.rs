@@ -86,12 +86,16 @@ async fn boot(projects: &[(&str, &str, &str)], hosts: &[&str]) -> (SocketAddr, t
                     auto_reopen_agents: None,
                     startup_command: None,
                     env: Default::default(),
+                    workspace_mode: None,
                 })
                 .unwrap();
         }
     }
 
     let mut engine = bootstrap_engine(&paths).unwrap();
+    // A worktree-mode install: these fixtures register dux's own root as the
+    // project, which shared mode rightly refuses to run agents in.
+    engine.config.workspace = None;
     engine.github_integration_enabled = true;
     // Point the probe at a stand-in `gh` that reports exactly `hosts`. Starting
     // the engine thread starts the REAL host probe, so placing an answer here

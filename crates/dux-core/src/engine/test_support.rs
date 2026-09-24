@@ -39,7 +39,12 @@ pub(crate) fn test_engine() -> (Engine, TempDir) {
         worker_tx.clone(),
     );
     let engine = Engine {
-        config: Config::default(),
+        // An existing install (no `[workspace]` section): worktree mode, so
+        // upstream's create tests keep their meaning. Shared tests opt in.
+        config: Config {
+            workspace: None,
+            ..Config::default()
+        },
         paths,
         session_store,
         projects: Vec::new(),
@@ -164,6 +169,9 @@ pub(crate) fn sample_session(id: &str, project_id: &str, branch: &str) -> AgentS
     let now = Utc::now();
     AgentSession {
         id: id.to_string(),
+        agent_handle: crate::model::normalize_agent_handle(id),
+        shared_workspace: false,
+        deleted_at: None,
         // Deliberately NOT the session id: the slot tab is a stored pointer at a
         // generated id, and a fixture that reused the session id would hide
         // every place still assuming the two are the same string.
@@ -195,6 +203,9 @@ pub(crate) fn sample_standalone_session(id: &str, folder: &str) -> AgentSession 
     let now = Utc::now();
     AgentSession {
         id: id.to_string(),
+        agent_handle: crate::model::normalize_agent_handle(id),
+        shared_workspace: false,
+        deleted_at: None,
         // Deliberately NOT the session id: the slot tab is a stored pointer at a
         // generated id, and a fixture that reused the session id would hide
         // every place still assuming the two are the same string.

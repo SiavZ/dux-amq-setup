@@ -57,6 +57,7 @@ pub mod reload_handoff;
 pub mod reload_policy;
 pub mod resource_stats;
 pub mod row_state;
+pub mod sanitize;
 pub mod scroll_hint;
 pub mod scroll_margins;
 pub mod sidebar;

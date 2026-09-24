@@ -250,6 +250,8 @@ enum PromptMouseTarget {
     ConfirmNonDefaultBranchAdd,
     ConfirmUseExistingBranchCancel,
     ConfirmUseExistingBranchUse,
+    ConfirmSharedWriterCancel,
+    ConfirmSharedWriterStart,
     ConfigReloadFailedClose,
     ConfigReloadFailedApply,
     AddProjectFailedOk,
@@ -384,6 +386,12 @@ impl ButtonPressedTarget {
             }
             PromptMouseTarget::ConfirmUseExistingBranchUse => {
                 Some(ButtonPressedTarget::ConfirmUseExistingBranchUse)
+            }
+            PromptMouseTarget::ConfirmSharedWriterCancel => {
+                Some(ButtonPressedTarget::ConfirmSharedWriterCancel)
+            }
+            PromptMouseTarget::ConfirmSharedWriterStart => {
+                Some(ButtonPressedTarget::ConfirmSharedWriterStart)
             }
             PromptMouseTarget::ConfigReloadFailedClose => {
                 Some(ButtonPressedTarget::ConfigReloadFailedClose)
@@ -1895,6 +1903,7 @@ impl App {
             | PromptState::ConfirmCreateInitialCommit { .. }
             | PromptState::ConfirmNonDefaultBranch { .. }
             | PromptState::ConfirmUseExistingBranch { .. }
+            | PromptState::ConfirmSharedWriter { .. }
             | PromptState::ConfirmKillRunning(_)
             | PromptState::PickEditor { .. }
             | PromptState::PickProjectWorktree(_)
@@ -5084,7 +5093,29 @@ impl App {
         if let Some(exit) = self.handle_confirm_non_default_branch_prompt_key(key) {
             return Some(exit);
         }
+        if let Some(exit) = self.handle_confirm_shared_writer_prompt_key(key) {
+            return Some(exit);
+        }
         self.handle_confirm_use_existing_branch_prompt_key(key)
+    }
+
+    fn handle_confirm_shared_writer_prompt_key(&mut self, key: KeyEvent) -> Option<bool> {
+        let PromptState::ConfirmSharedWriter { focus, .. } = &mut self.prompt else {
+            return None;
+        };
+        let confirm = focus.is_confirm();
+        let action = self.bindings.lookup(&key, BindingScope::Dialog);
+        match modal_key_step(action, key, false) {
+            ModalKeyStep::Close => {
+                self.resolve_confirm_shared_writer(false);
+            }
+            ModalKeyStep::MoveFocus(_) => *focus = focus.toggled(),
+            ModalKeyStep::Confirm | ModalKeyStep::ActivateFocus => {
+                return Some(self.resolve_confirm_shared_writer(confirm));
+            }
+            ModalKeyStep::FallThroughToField => {}
+        }
+        Some(false)
     }
 
     fn handle_pull_request_input_prompt_key(&mut self, key: KeyEvent) -> Result<Option<bool>> {
@@ -5232,6 +5263,10 @@ impl App {
             CreateAgentRequest::Standalone { folder, .. } => format!(
                 "Creating a standalone agent \"{name}\" in \"{}\"...",
                 dux_core::home_path::shorten_home(folder)
+            ),
+            CreateAgentRequest::SharedWorkspace { project, .. } => format!(
+                "Starting shared-workspace agent \"{name}\" in the checkout of project \"{}\"...",
+                project.name
             ),
             CreateAgentRequest::ForkSession { source_label, .. } => format!(
                 "Forking agent \"{source_label}\" as \"{name}\" by cloning its current worktree contents into a fresh session...",
@@ -6701,6 +6736,17 @@ impl App {
                 column,
                 row,
             ),
+            OverlayMouseLayout::ConfirmSharedWriter {
+                cancel_button,
+                start_button,
+            } => click_target(
+                &[
+                    (cancel_button, PromptMouseTarget::ConfirmSharedWriterCancel),
+                    (start_button, PromptMouseTarget::ConfirmSharedWriterStart),
+                ],
+                column,
+                row,
+            ),
             OverlayMouseLayout::ConfigReloadFailed {
                 close_button,
                 apply_button,
@@ -8046,6 +8092,7 @@ impl App {
             CreateAgentRequest::ForkSession { .. }
             | CreateAgentRequest::ExistingManagedWorktree { .. }
             | CreateAgentRequest::ForkExternalWorktree { .. }
+            | CreateAgentRequest::SharedWorkspace { .. }
             | CreateAgentRequest::Standalone { .. } => unreachable!(),
         };
         if let Err(e) = self.dispatch_create_agent_request(request, msg) {
@@ -8966,6 +9013,8 @@ impl App {
             | PromptMouseTarget::ConfirmNonDefaultBranchAdd
             | PromptMouseTarget::ConfirmUseExistingBranchCancel
             | PromptMouseTarget::ConfirmUseExistingBranchUse
+            | PromptMouseTarget::ConfirmSharedWriterCancel
+            | PromptMouseTarget::ConfirmSharedWriterStart
             | PromptMouseTarget::ConfigReloadFailedClose
             | PromptMouseTarget::ConfigReloadFailedApply
             | PromptMouseTarget::AddProjectFailedOk
@@ -9131,6 +9180,12 @@ impl App {
             }
             ButtonPressedTarget::ConfirmUseExistingBranchUse => {
                 self.resolve_confirm_use_existing_branch(true)
+            }
+            ButtonPressedTarget::ConfirmSharedWriterCancel => {
+                self.resolve_confirm_shared_writer(false)
+            }
+            ButtonPressedTarget::ConfirmSharedWriterStart => {
+                self.resolve_confirm_shared_writer(true)
             }
             ButtonPressedTarget::ConfigReloadFailedClose => {
                 self.resolve_config_reload_failed(false)
@@ -11154,7 +11209,8 @@ fn set_create_agent_request_custom_name(request: &mut CreateAgentRequest, name: 
         | CreateAgentRequest::ForkSession { custom_name, .. }
         | CreateAgentRequest::PullRequest { custom_name, .. }
         | CreateAgentRequest::ExistingManagedWorktree { custom_name, .. }
-        | CreateAgentRequest::ForkExternalWorktree { custom_name, .. } => {
+        | CreateAgentRequest::ForkExternalWorktree { custom_name, .. }
+        | CreateAgentRequest::SharedWorkspace { custom_name, .. } => {
             *custom_name = Some(name);
         }
         // A standalone create resolves its title before dispatching (the
@@ -14535,6 +14591,9 @@ not_a_real_action = ["x"]
         let now = Utc::now();
         app.engine.sessions.push(AgentSession {
             id: "session-2".to_string(),
+            agent_handle: "session-2".to_string(),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: "session-2-slot".to_string(),
             provider: ProviderKind::from_str("claude"),
             title: None,
@@ -14615,6 +14674,9 @@ not_a_real_action = ["x"]
         for name in ["charlie", "alpha", "bravo"] {
             let session = AgentSession {
                 id: format!("session-{name}"),
+                agent_handle: dux_core::model::normalize_agent_handle(&format!("session-{name}")),
+                shared_workspace: false,
+                deleted_at: None,
                 slot_tab_id: format!("session-{name}-slot"),
                 provider: ProviderKind::from_str("codex"),
                 title: None,
@@ -14688,6 +14750,9 @@ not_a_real_action = ["x"]
     ) -> AgentSession {
         AgentSession {
             id: id.to_string(),
+            agent_handle: dux_core::model::normalize_agent_handle(id),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: format!("{id}-slot"),
             provider: ProviderKind::from_str("codex"),
             title: None,
@@ -15022,6 +15087,9 @@ not_a_real_action = ["x"]
         for name in ["charlie", "alpha", "bravo"] {
             let session = AgentSession {
                 id: format!("session-{name}"),
+                agent_handle: dux_core::model::normalize_agent_handle(&format!("session-{name}")),
+                shared_workspace: false,
+                deleted_at: None,
                 slot_tab_id: format!("session-{name}-slot"),
                 provider: ProviderKind::from_str("codex"),
                 title: None,
@@ -16030,6 +16098,9 @@ not_a_real_action = ["x"]
         for name in ["alpha", "bravo"] {
             app.engine.sessions.push(AgentSession {
                 id: format!("session-{name}"),
+                agent_handle: dux_core::model::normalize_agent_handle(&format!("session-{name}")),
+                shared_workspace: false,
+                deleted_at: None,
                 slot_tab_id: format!("session-{name}-slot"),
                 provider: ProviderKind::from_str("codex"),
                 title: None,
@@ -16225,6 +16296,9 @@ not_a_real_action = ["x"]
         std::fs::create_dir_all(&worktree).expect("imported worktree");
         let session = AgentSession {
             id: "imported-session".to_string(),
+            agent_handle: "imported-session".to_string(),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: "imported-session-slot".to_string(),
             provider: ProviderKind::from_str("codex"),
             title: Some("imported".to_string()),
@@ -21050,6 +21124,9 @@ not_a_real_action = ["x"]
         let now = Utc::now();
         app.engine.sessions.push(AgentSession {
             id: "session-2".to_string(),
+            agent_handle: "session-2".to_string(),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: "session-2-slot".to_string(),
             provider: ProviderKind::from_str("codex"),
             title: None,
@@ -33587,6 +33664,7 @@ cyan = "#00ffff"
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: pinned.env.clone(),
+                workspace_mode: None,
             })
             .expect("seed pinned project");
         app.engine.projects.push(pinned);
@@ -33753,6 +33831,7 @@ cyan = "#00ffff"
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: pinned.env.clone(),
+                workspace_mode: None,
             })
             .expect("seed pinned project");
         app.engine.projects.push(pinned);

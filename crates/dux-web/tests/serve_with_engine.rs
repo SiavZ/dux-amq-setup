@@ -26,6 +26,9 @@ fn sample_session(
     let now = chrono::Utc::now();
     dux_core::model::AgentSession {
         id: id.to_string(),
+        agent_handle: dux_core::model::normalize_agent_handle(id),
+        shared_workspace: false,
+        deleted_at: None,
         slot_tab_id: format!("{id}-slot"),
         provider: dux_core::model::ProviderKind::new("claude"),
         title: Some(format!("{id}-title")),
@@ -75,6 +78,7 @@ fn build_engine() -> (Engine, tempfile::TempDir) {
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .unwrap();
         store
@@ -87,6 +91,9 @@ fn build_engine() -> (Engine, tempfile::TempDir) {
             .unwrap();
     }
     let mut engine = bootstrap_engine(&paths).unwrap();
+    // A worktree-mode install: these fixtures register dux's own root as the
+    // project, which shared mode rightly refuses to run agents in.
+    engine.config.workspace = None;
     engine.config.providers.commands.insert(
         "claude".to_string(),
         ProviderCommandConfig {

@@ -2484,6 +2484,15 @@ pub(crate) enum PromptState {
         location: crate::git::BranchLocation,
         focus: ConfirmFocus, // Cancel (default) or Use Existing
     },
+    /// Shared main-workspace mode (fork d0ce0afc): another agent is already
+    /// running in this checkout. Two agents editing the same files can
+    /// overwrite each other's work, so a second writer starts only after the
+    /// user confirms. Cancel is focused by default.
+    ConfirmSharedWriter {
+        existing_agent: String,
+        action: SharedWriterAction,
+        focus: ConfirmFocus,
+    },
     DebugInput {
         lines: Vec<Line<'static>>,
         scroll_offset: u16,
@@ -2771,6 +2780,20 @@ impl ConfigureFieldFocus {
         ];
         components::focus_ring::next_focus(&ring, self, forward)
     }
+}
+
+/// What a confirmed [`PromptState::ConfirmSharedWriter`] goes on to do.
+#[derive(Clone, Debug)]
+pub(crate) enum SharedWriterAction {
+    Create {
+        request: Box<CreateAgentRequest>,
+        busy_message: String,
+    },
+    Reconnect {
+        session_id: String,
+        force: bool,
+        seek_fullscreen: bool,
+    },
 }
 
 /// Which control has focus in a two-button confirmation.
@@ -3256,6 +3279,10 @@ pub(crate) enum OverlayMouseLayout {
         cancel_button: Rect,
         use_button: Rect,
     },
+    ConfirmSharedWriter {
+        cancel_button: Rect,
+        start_button: Rect,
+    },
     ConfigReloadFailed {
         close_button: Rect,
         apply_button: Rect,
@@ -3580,6 +3607,8 @@ mod reorder;
 mod session_settings;
 mod sessions;
 pub(crate) use session_settings::{SessionSettingsPrompt, SettingsFocus};
+#[cfg(test)]
+mod shared_workspace_tests;
 #[cfg(test)]
 mod test_support;
 pub(crate) mod text_input;
@@ -6356,6 +6385,13 @@ impl App {
                 );
                 return;
             }
+            BranchRenamePlan::Rejected(BranchRenameRejection::SharedWorkspaceBranch) => {
+                self.set_error(
+                    "This agent runs in the shared project checkout, and dux never renames \
+                     the branch checked out there. Rename the title only.",
+                );
+                return;
+            }
             BranchRenamePlan::Rejected(BranchRenameRejection::AlreadyInFlight) => {
                 self.set_error(
                     "A rename is already in progress for this agent. Wait for it to finish before renaming again.",
@@ -7225,6 +7261,12 @@ pub(crate) fn runtime_project_to_config(
         auto_reopen_agents: project.auto_reopen_agents,
         startup_command: project.startup_command.clone(),
         env: project.env.clone(),
+        // Config-only preference: carried from the existing entry so a rebuild
+        // of `[[projects]]` from runtime state never drops a user's override.
+        workspace_mode: existing_projects
+            .iter()
+            .find(|existing| existing.id == project.id)
+            .and_then(|existing| existing.workspace_mode),
     }
 }
 
@@ -7323,6 +7365,9 @@ mod tests {
         let now = Utc::now() + chrono::Duration::seconds(created_offset);
         AgentSession {
             id: id.to_string(),
+            agent_handle: dux_core::model::normalize_agent_handle(id),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: format!("{id}-slot"),
             provider: ProviderKind::from_str("codex"),
             title: None,
@@ -8311,6 +8356,7 @@ leading_branch = "main"
                 auto_reopen_agents: None,
                 startup_command: Some("npm install".to_string()),
                 env: Default::default(),
+                workspace_mode: None,
             })
             .expect("seed project");
 
@@ -8359,6 +8405,7 @@ leading_branch = "main"
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .expect("seed project");
 
@@ -8419,6 +8466,7 @@ leading_branch = "main"
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .expect("seed project");
 
@@ -8483,6 +8531,7 @@ leading_branch = "main"
                 auto_reopen_agents: None,
                 startup_command: Some("pnpm install".to_string()),
                 env: Default::default(),
+                workspace_mode: None,
             })
             .expect("seed project");
 

@@ -1,11 +1,15 @@
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::HashSet;
 
 use crate::config::ProjectConfig;
-use crate::model::{AgentSession, AgentTab, ProviderKind, SessionStatus};
+use crate::model::{
+    AGENT_HANDLE_MAX_LEN, AgentSession, AgentTab, ProviderKind, SessionStatus, derive_agent_handle,
+    is_valid_agent_handle, normalize_agent_handle,
+};
 use crate::text::count_of;
 
 /// A stored PR association loaded from the database.
@@ -23,6 +27,108 @@ pub struct StoredPr {
 /// The `app_state` key holding the last dux version whose first-load screen was
 /// shown. One key, one meaning; see [`SessionStore::last_seen_version`].
 const LAST_SEEN_VERSION_KEY: &str = "last_seen_version";
+
+const STORE_ID_FILE: &str = "store-id";
+const STORE_ID_LOCK: &str = ".store-id.lock";
+
+/// Load the stable identifier for one dux home (the config directory that
+/// holds `sessions.sqlite3`), creating it atomically on first use.
+///
+/// AMQ ownership markers record `{store_id, session_id}` so two dux homes
+/// sharing one AMQ root can never free each other's inboxes. The lock covers
+/// the first write AND readers, so no process can observe a half-written id.
+pub fn load_or_create_store_id(dux_home: &std::path::Path) -> Result<String> {
+    use rustix::fs::{FlockOperation, flock};
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::create_dir_all(dux_home)
+        .with_context(|| format!("failed to create {}", dux_home.display()))?;
+    let lock_path = dux_home.join(STORE_ID_LOCK);
+    let mut lock_options = std::fs::OpenOptions::new();
+    lock_options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    lock_options.mode(0o600);
+    let lock_file = lock_options
+        .open(&lock_path)
+        .with_context(|| format!("failed to open {}", lock_path.display()))?;
+    crate::io_retry::retry_on_interrupt_errno(|| flock(&lock_file, FlockOperation::LockExclusive))
+        .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+
+    let path = dux_home.join(STORE_ID_FILE);
+    let result = if path.exists() {
+        read_store_id(&path)
+    } else {
+        (|| {
+            let id = uuid::Uuid::new_v4().to_string();
+            let tmp = dux_home.join(format!(
+                ".{STORE_ID_FILE}.tmp.{}.{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut file = options
+                .open(&tmp)
+                .with_context(|| format!("failed to create {}", tmp.display()))?;
+            file.write_all(format!("{id}\n").as_bytes())
+                .with_context(|| format!("failed to write {}", tmp.display()))?;
+            file.sync_all()
+                .with_context(|| format!("failed to sync {}", tmp.display()))?;
+            std::fs::rename(&tmp, &path).with_context(|| {
+                format!(
+                    "failed to replace {} with {}",
+                    path.display(),
+                    tmp.display()
+                )
+            })?;
+            std::fs::File::open(dux_home)
+                .and_then(|dir| dir.sync_all())
+                .with_context(|| format!("failed to sync {}", dux_home.display()))?;
+            Ok(id)
+        })()
+    };
+    let _ = crate::io_retry::retry_on_interrupt_errno(|| flock(&lock_file, FlockOperation::Unlock));
+    result
+}
+
+/// Load an existing store identity WITHOUT creating one. Destructive reset and
+/// purge paths use this so a missing or corrupt identity fails them closed
+/// instead of minting a new id that would disown every existing AMQ inbox.
+pub fn load_store_id(dux_home: &std::path::Path) -> Result<String> {
+    read_store_id(&dux_home.join(STORE_ID_FILE))
+}
+
+/// Remove the durable store identity. Only valid after every exactly-owned
+/// AMQ handle is gone; the caller holds dux's per-home process lock.
+pub fn remove_store_identity(dux_home: &std::path::Path) -> Result<()> {
+    for name in [STORE_ID_FILE, STORE_ID_LOCK] {
+        let path = dux_home.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to remove {}", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_store_id(path: &std::path::Path) -> Result<String> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let parsed = uuid::Uuid::parse_str(raw.trim()).with_context(|| {
+        format!(
+            "dux home metadata corruption: {} does not contain a valid store id",
+            path.display()
+        )
+    })?;
+    Ok(parsed.to_string())
+}
 
 pub struct SessionStore {
     conn: Connection,
@@ -52,6 +158,31 @@ impl SessionStore {
         // that tolerates it (a `:memory:` DB stays in "memory" mode, a harmless
         // no-op). `execute_batch` ignores the returned row.
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        // Fork audit02 P1-W. NORMAL is the WAL-appropriate durability level: a
+        // power loss can drop the last transactions but never corrupts the
+        // file, and it avoids an fsync per commit on the status-churn hot path.
+        //
+        // `foreign_keys` is deliberately NOT enabled even though the fork did:
+        // upstream's schema is written for it being off (every delete path
+        // removes child rows explicitly, and `session_prs` rows are kept past a
+        // soft delete on purpose). Turning it on here would change the meaning
+        // of existing declared-but-dormant cascades underneath that code.
+        conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
+        // Fail fast on a corrupt file, pointing at the backup, rather than
+        // failing later on some unrelated query. `:memory:` stores are always
+        // pristine and have no `.bak`.
+        if path != std::path::Path::new(":memory:") {
+            let integrity: String = conn
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .context("failed to run the session database integrity check")?;
+            if integrity != "ok" {
+                bail!(
+                    "sqlite integrity check failed for {}: {integrity}; restore from {}.bak",
+                    path.display(),
+                    path.display()
+                );
+            }
+        }
         // The database mirrors the same per-project `env` map that made
         // `config.toml` 0600, so it gets the same mode. SQLite creates the file
         // (and, after the WAL pragma, its `-wal`/`-shm` sidecars) itself at the
@@ -452,9 +583,122 @@ impl SessionStore {
         // table has to exist, and a failure in any of them aborts the open. A
         // workspace whose first tabs are unaddressable is worse than a startup
         // that says why it stopped.
+        // The identity columns are ADDED first because the slot passes below
+        // filter on `deleted_at`; the handle backfill runs last.
+        self.ensure_shared_workspace_identity_columns()?;
         self.sweep_orphan_agent_tabs()?;
         self.backfill_slot_tabs()?;
         self.heal_slot_tab_pointers()?;
+        self.backfill_agent_handles()?;
+        Ok(())
+    }
+
+    /// Shared-workspace identity schema, ported from the fork's migration 0005
+    /// (and the column half of its 0003/0006 that this layout still lacks).
+    ///
+    /// Upstream has no numbered migrations: every step is idempotent and runs on
+    /// every open. This one follows the same rules, and it must accept THREE
+    /// starting shapes:
+    ///
+    /// - an upstream database: none of the columns exist; they are added and
+    ///   every row gets a derived, locally unique `agent_handle`;
+    /// - a database a fork build wrote (fork schema 0006): the columns already
+    ///   exist with their values, `PRAGMA user_version` is 6, and the fork's
+    ///   own `idx_agent_sessions_sort_order` index is present. Stored handles
+    ///   are kept byte for byte (AMQ inboxes on disk are named after them),
+    ///   and every upstream-only column is added by the steps above;
+    /// - this build's own database on a second open: a pure no-op.
+    ///
+    /// The columns are ADDITIVE with defaults so an older upstream binary's
+    /// INSERT (which names none of them) still satisfies the schema. The fork
+    /// enforced the handle alphabet with a CHECK on a rebuilt table; SQLite
+    /// cannot add a CHECK to an existing table, so the contract is enforced in
+    /// Rust instead (`upsert_session_in` refuses to write a bad handle, and
+    /// `validate_stored_handles` refuses to load one) and uniqueness by a
+    /// partial unique index over non-empty handles.
+    fn ensure_shared_workspace_identity_columns(&self) -> Result<()> {
+        // Same autocommit ALTER rationale as `initial_branch`: a concurrent
+        // opener losing the race sees "duplicate column" and moves on.
+        ensure_column(
+            &self.conn,
+            "agent_sessions",
+            "agent_handle",
+            "text not null default ''",
+        )?;
+        ensure_column(
+            &self.conn,
+            "agent_sessions",
+            "shared_workspace",
+            "integer not null default 0",
+        )?;
+        ensure_column(&self.conn, "agent_sessions", "deleted_at", "text")?;
+        Ok(())
+    }
+
+    /// Give every row without an `agent_handle` a derived, locally unique one.
+    /// See [`Self::ensure_shared_workspace_identity_columns`] for the three
+    /// database shapes this must accept.
+    fn backfill_agent_handles(&self) -> Result<()> {
+        // Backfill in ONE transaction: a crash mid-way rolls every assignment
+        // back and the next open retries from the same state, so no row can
+        // end up with a handle that collides with one assigned in the retry.
+        // Rows that already carry a handle (fork databases, or rows this build
+        // wrote) keep it and are reserved first, so a derived handle never
+        // steals an identity that an AMQ inbox on disk already uses.
+        let pending: Vec<(String, String, String, String, String)> = {
+            let mut stmt = self.conn.prepare(
+                "select id, workspace_kind, worktree_path, coalesce(folder_path, ''), branch_name \
+                 from agent_sessions where agent_handle = '' order by id",
+            )?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if !pending.is_empty() {
+            let tx = self
+                .conn
+                .unchecked_transaction()
+                .context("failed to start the agent handle backfill")?;
+            let mut used = used_agent_handles(&tx)?;
+            for (id, kind, worktree_path, folder_path, branch_name) in &pending {
+                let directory = if kind == "folder" {
+                    folder_path
+                } else {
+                    worktree_path
+                };
+                let base = derive_agent_handle(directory, branch_name, id);
+                let handle = next_unique_agent_handle(&base, &used);
+                used.insert(handle.clone());
+                tx.execute(
+                    "update agent_sessions set agent_handle = ?2 where id = ?1 and agent_handle = ''",
+                    params![id, handle],
+                )
+                .with_context(|| format!("failed to assign an agent handle to session {id}"))?;
+            }
+            tx.commit()
+                .context("failed to commit the agent handle backfill")?;
+            crate::logger::info(&format!(
+                "one-time migration: gave {} a stable agent handle",
+                count_of(pending.len(), "session")
+            ));
+        }
+        // Partial so the '' default an older binary's INSERT writes cannot
+        // collide with itself before the next open backfills it.
+        self.conn
+            .execute_batch(
+                "create unique index if not exists idx_agent_sessions_agent_handle \
+                 on agent_sessions(agent_handle) where agent_handle <> '';",
+            )
+            .context(
+                "failed to index agent handles: the session database holds duplicate handles",
+            )?;
         Ok(())
     }
 
@@ -492,7 +736,8 @@ impl SessionStore {
         let pending: Vec<(String, String, String)> = {
             let mut stmt = self.conn.prepare(
                 "select id, provider, created_at from agent_sessions \
-                 where slot_tab_id is null or trim(slot_tab_id) = ''",
+                 where (slot_tab_id is null or trim(slot_tab_id) = '') \
+                   and deleted_at is null",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get::<_, String>(2)?))
@@ -558,6 +803,7 @@ impl SessionStore {
             let mut stmt = self.conn.prepare(
                 "select s.id, s.slot_tab_id, s.provider, s.created_at from agent_sessions s \
                  where s.slot_tab_id is not null and trim(s.slot_tab_id) <> '' \
+                   and s.deleted_at is null \
                    and not exists (select 1 from agent_tabs t \
                                    where t.id = s.slot_tab_id and t.session_id = s.id)",
             )?;
@@ -629,6 +875,19 @@ impl SessionStore {
         }
         tx.commit()
             .context("failed to commit the slot tab repair")?;
+        Ok(())
+    }
+
+    /// Online-backup the live database to `dst` with SQLite's backup API (fork
+    /// audit02 P1-W). Safe while other connections write: the API copies pages
+    /// consistently and includes WAL content, which a plain file copy of the
+    /// `.sqlite3` alone would miss. The destination is tightened to owner-only
+    /// like the database itself, because it carries the same per-project env.
+    pub fn backup_to(&self, dst: &std::path::Path) -> Result<()> {
+        self.conn
+            .backup(rusqlite::MAIN_DB, dst, None)
+            .with_context(|| format!("backup to {} failed", dst.display()))?;
+        crate::file_modes::restrict_to_owner_best_effort(dst, "session database backup");
         Ok(())
     }
 
@@ -725,7 +984,8 @@ impl SessionStore {
         let mut stmt = self.conn.prepare(
             "select t.id, t.session_id, t.provider, t.sort_order, t.created_at \
              from agent_tabs t join agent_sessions s on s.id = t.session_id \
-             where s.slot_tab_id is null or t.id <> s.slot_tab_id \
+             where (s.slot_tab_id is null or t.id <> s.slot_tab_id) \
+               and s.deleted_at is null \
              order by t.session_id, t.sort_order, t.created_at",
         )?;
         let rows = stmt.query_map([], read_agent_tab)?;
@@ -1013,6 +1273,7 @@ impl SessionStore {
                 auto_reopen_agents: row.get(5)?,
                 startup_command: row.get(6)?,
                 env: deserialize_project_env(row.get::<_, String>(7)?.as_str()),
+                workspace_mode: None,
             })
         })?;
 
@@ -1414,6 +1675,75 @@ impl SessionStore {
         Self::upsert_session_in(&self.conn, session)
     }
 
+    /// Assign a locally unique handle to a brand-new session before its first
+    /// insert: its derived handle normalized, suffixed `-2`, `-3`, ... on a
+    /// collision. Tombstones participate, so an ordinary delete never frees an
+    /// identity that a later purge still needs to find.
+    ///
+    /// The read here and the insert that follows are separate statements;
+    /// uniqueness holds because sessions are only ever inserted from the
+    /// engine's single thread, and the unique index turns any violation of
+    /// that assumption into a failed insert rather than a shared inbox.
+    pub fn assign_unique_agent_handle(&self, session: &mut AgentSession) -> Result<()> {
+        let base = normalize_agent_handle(session.agent_handle());
+        ensure!(!base.is_empty(), "new session has an empty agent handle");
+        let used = used_agent_handles(&self.conn)?;
+        session.agent_handle = next_unique_agent_handle(&base, &used);
+        Ok(())
+    }
+
+    /// Complete a global AMQ ownership backfill for one row. Normal upserts
+    /// reject every handle change; this narrow compare-and-swap is for the AMQ
+    /// layer only, called while its shared lock proves `expected` is occupied
+    /// by a foreign owner and `replacement` is free.
+    pub fn reassign_agent_handle_for_global_backfill(
+        &self,
+        id: &str,
+        expected: &str,
+        replacement: &str,
+    ) -> Result<()> {
+        ensure!(
+            is_valid_agent_handle(replacement),
+            "refusing invalid global agent handle replacement"
+        );
+        let changed = self.conn.execute(
+            "update agent_sessions set agent_handle = ?1 where id = ?2 and agent_handle = ?3",
+            params![replacement, id, expected],
+        )?;
+        ensure!(
+            changed == 1,
+            "session changed while completing global handle backfill"
+        );
+        Ok(())
+    }
+
+    /// Tombstone a session instead of removing it: the row, its handle and its
+    /// PR history stay so a later hard purge can find everything the agent
+    /// left behind, and [`Self::load_sessions`] stops returning it. Its tabs
+    /// and per-session housekeeping rows ARE removed, because nothing can
+    /// reach them once the agent is gone from both surfaces and keeping them
+    /// would let the slot-tab repair passes resurrect state for a dead agent.
+    /// Idempotent: a second call keeps the first timestamp.
+    pub fn soft_delete_session(&self, id: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "delete from session_pr_overrides where session_id = ?1",
+            params![id],
+        )?;
+        tx.execute(
+            "delete from session_pr_suppressions where session_id = ?1",
+            params![id],
+        )?;
+        tx.execute("delete from changes_rev where session_id = ?1", params![id])?;
+        tx.execute("delete from agent_tabs where session_id = ?1", params![id])?;
+        tx.execute(
+            "update agent_sessions set deleted_at = ?2 where id = ?1 and deleted_at is null",
+            params![id, Utc::now().to_rfc3339()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Record that dux minted this agent's branch itself, after recreating a
     /// working copy whose branch was gone from the repository too.
     ///
@@ -1452,6 +1782,28 @@ impl SessionStore {
     /// The body of [`Self::upsert_session`], parameterized over the connection so
     /// [`Self::create_session`] can run it inside its transaction.
     fn upsert_session_in(conn: &Connection, session: &AgentSession) -> Result<()> {
+        // Identity is checked before anything is written. A bad handle is a
+        // bug at the creation site, and a changed one would orphan the AMQ
+        // inbox named after the old value, so both refuse loudly.
+        ensure!(
+            is_valid_agent_handle(session.agent_handle()),
+            "refusing to persist invalid agent handle {:?}",
+            crate::sanitize::for_terminal(session.agent_handle())
+        );
+        let stored_handle: Option<String> = conn
+            .query_row(
+                "select agent_handle from agent_sessions where id = ?1",
+                params![session.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(stored_handle) = stored_handle {
+            ensure!(
+                stored_handle == session.agent_handle(),
+                "refusing to change immutable agent handle for session {:?}",
+                crate::sanitize::for_terminal(&session.id)
+            );
+        }
         // Flatten the workspace into the row's columns ONCE, here, so no SQL
         // below reaches into the enum. A folder row writes empty text into the
         // git columns (`project_id` is NOT NULL, and the rest predate the
@@ -1494,6 +1846,9 @@ impl SessionStore {
         //   tab to ADOPT. The read path hands a pre-pointer row the session's own
         //   id as a stand-in, so a re-upsert would store that stand-in as a real
         //   pointer and the next open would adopt tab 2 instead of minting tab 1.
+        // - `agent_handle` (identity, checked unchanged above) and `deleted_at`
+        //   (owned by `soft_delete_session`, so a stale in-memory copy can
+        //   never resurrect a tombstone).
         //
         // `initial_branch` IS in the SET list; its immutability is engine
         // discipline rather than a schema guarantee, so do not follow it here.
@@ -1513,7 +1868,8 @@ impl SessionStore {
                 updated_at=?12,
                 initial_branch=?13,
                 workspace_kind=?14,
-                folder_path=?15
+                folder_path=?15,
+                shared_workspace=?16
             where id = ?1
             "#,
             params![
@@ -1532,6 +1888,7 @@ impl SessionStore {
                 initial_branch,
                 workspace_kind,
                 folder_path,
+                session.shared_workspace,
             ],
         )?;
         if updated > 0 {
@@ -1557,9 +1914,9 @@ impl SessionStore {
         conn.execute(
             r#"
             insert into agent_sessions
-                (id, project_id, project_path, provider, source_branch, branch_name, worktree_path, title, started_providers, desired_running, auto_reopen_enabled, status, sort_order, created_at, updated_at, initial_branch, branch_provenance, workspace_kind, folder_path, slot_tab_id)
+                (id, project_id, project_path, provider, source_branch, branch_name, worktree_path, title, started_providers, desired_running, auto_reopen_enabled, status, sort_order, created_at, updated_at, initial_branch, branch_provenance, workspace_kind, folder_path, slot_tab_id, agent_handle, shared_workspace, deleted_at)
             values
-                (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
             "#,
             params![
                 session.id,
@@ -1582,6 +1939,9 @@ impl SessionStore {
                 workspace_kind,
                 folder_path,
                 session.slot_tab_id,
+                session.agent_handle(),
+                session.shared_workspace,
+                session.deleted_at.map(|at| at.to_rfc3339()),
             ],
         )?;
         Ok(())
@@ -1717,14 +2077,37 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Every live session, in display order. Soft-deleted tombstones are
+    /// excluded; see [`Self::load_sessions_including_deleted`].
     pub fn load_sessions(&self) -> Result<Vec<AgentSession>> {
-        let mut stmt = self.conn.prepare(
+        self.load_sessions_impl(false)
+    }
+
+    /// Live sessions AND tombstones, for AMQ ownership reconciliation and
+    /// destructive maintenance (purge, orphan cleanup), which must see every
+    /// identity dux still owns.
+    pub fn load_sessions_including_deleted(&self) -> Result<Vec<AgentSession>> {
+        self.load_sessions_impl(true)
+    }
+
+    fn load_sessions_impl(&self, include_deleted: bool) -> Result<Vec<AgentSession>> {
+        validate_stored_handles(&self.conn)?;
+        // Visibility is decided by the raw NULL here, never by parsing the
+        // stamp: `soft_delete_session` always writes a valid RFC 3339 value,
+        // but a hand-edited unparseable one must still read as deleted.
+        let where_clause = if include_deleted {
+            ""
+        } else {
+            "where deleted_at is null"
+        };
+        let mut stmt = self.conn.prepare(&format!(
             r#"
-            select id, project_id, provider, source_branch, branch_name, worktree_path, title, project_path, started_providers, desired_running, auto_reopen_enabled, status, created_at, updated_at, initial_branch, last_focused_tab, branch_provenance, workspace_kind, folder_path, slot_tab_id
+            select id, project_id, provider, source_branch, branch_name, worktree_path, title, project_path, started_providers, desired_running, auto_reopen_enabled, status, created_at, updated_at, initial_branch, last_focused_tab, branch_provenance, workspace_kind, folder_path, slot_tab_id, agent_handle, shared_workspace, deleted_at
             from agent_sessions
+            {where_clause}
             order by sort_order asc, updated_at desc
-            "#,
-        )?;
+            "#
+        ))?;
         let rows = stmt.query_map([], |row| {
             let started_providers: String = row.get(8)?;
             let created_at: String = row.get(12)?;
@@ -1798,6 +2181,25 @@ impl SessionStore {
             };
             Ok(Some(AgentSession {
                 id: row.get(0)?,
+                // Validated above; loaded verbatim, never re-normalized.
+                agent_handle: {
+                    let handle: String = row.get(20)?;
+                    if handle.is_empty() {
+                        let id: String = row.get(0)?;
+                        crate::logger::warn(&format!(
+                            "skipping session {id} until the next open gives it an agent \
+                             handle: an older dux inserted it after this one migrated"
+                        ));
+                        return Ok(None);
+                    }
+                    handle
+                },
+                shared_workspace: row.get::<_, i64>(21)? != 0,
+                // A present-but-unparseable stamp still means deleted; the
+                // epoch keeps `is_deleted()` true for it.
+                deleted_at: row
+                    .get::<_, Option<String>>(22)?
+                    .map(|raw| parse_time(&raw).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)),
                 // `migrate()` has already run by the time anything reads, so a
                 // usable pointer is guaranteed. The fallback is defence for a
                 // row written by a build that is not this one; it restores the
@@ -2000,6 +2402,9 @@ fn test_session(
 ) -> crate::model::AgentSession {
     crate::model::AgentSession {
         id: id.to_string(),
+        agent_handle: crate::model::normalize_agent_handle(id),
+        shared_workspace: false,
+        deleted_at: None,
         slot_tab_id: format!("{id}-slot"),
         provider: crate::model::ProviderKind::new("claude"),
         title: None,
@@ -2062,6 +2467,9 @@ mod tests {
         let now = Utc::now();
         AgentSession {
             id: id.to_string(),
+            agent_handle: crate::model::normalize_agent_handle(id),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: format!("{id}-slot"),
             provider: crate::model::ProviderKind::new("claude"),
             workspace: AgentWorkspace::Folder(FolderWorkspace {
@@ -2088,6 +2496,7 @@ mod tests {
             auto_reopen_agents: None,
             startup_command: None,
             env: Default::default(),
+            workspace_mode: None,
         }
     }
 
@@ -3418,6 +3827,7 @@ mod tests {
             auto_reopen_agents: None,
             startup_command: None,
             env: BTreeMap::new(),
+            workspace_mode: None,
         };
         let p2 = ProjectConfig {
             id: "p2".to_string(),
@@ -3428,6 +3838,7 @@ mod tests {
             auto_reopen_agents: None,
             startup_command: None,
             env: BTreeMap::new(),
+            workspace_mode: None,
         };
         store.upsert_project(&p1).unwrap();
         store.upsert_project(&p2).unwrap();
@@ -3558,6 +3969,7 @@ mod tests {
             auto_reopen_agents: Some(false),
             startup_command: Some("npm install".to_string()),
             env: BTreeMap::from([("EDITOR".to_string(), "true".to_string())]),
+            workspace_mode: None,
         };
 
         store.upsert_project(&project).unwrap();
@@ -3579,6 +3991,7 @@ mod tests {
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .unwrap();
 
@@ -3592,6 +4005,7 @@ mod tests {
                 auto_reopen_agents: Some(false),
                 startup_command: Some("echo setup".to_string()),
                 env: BTreeMap::from([("API_KEY".to_string(), "${FOO_API_KEY}".to_string())]),
+                workspace_mode: None,
             })
             .unwrap();
 
@@ -4006,6 +4420,257 @@ mod tests {
     }
 
     #[test]
+    fn upsert_refuses_to_change_an_agent_handle() {
+        let store = test_store();
+        let now = Utc::now();
+        let mut session = test_session("s1", now, now);
+        store.create_session(&session).unwrap();
+        session.agent_handle = "renamed".to_string();
+        let err = store.upsert_session(&session).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("immutable agent handle"),
+            "{err:#}"
+        );
+        assert_eq!(store.load_sessions().unwrap()[0].agent_handle(), "s1");
+    }
+
+    #[test]
+    fn upsert_refuses_an_invalid_agent_handle() {
+        let store = test_store();
+        let now = Utc::now();
+        let mut session = test_session("s1", now, now);
+        session.agent_handle = "Bad Handle".to_string();
+        assert!(store.create_session(&session).is_err());
+        assert!(store.load_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_corrupt_stored_handle_fails_the_load_closed() {
+        let store = test_store();
+        let now = Utc::now();
+        store.create_session(&test_session("s1", now, now)).unwrap();
+        store
+            .conn
+            .execute(
+                "update agent_sessions set agent_handle = 'x/../y' where id = 's1'",
+                [],
+            )
+            .unwrap();
+        let err = store.load_sessions().unwrap_err();
+        assert!(format!("{err:#}").contains("corruption"), "{err:#}");
+    }
+
+    #[test]
+    fn soft_delete_hides_the_row_keeps_the_tombstone_and_reserves_its_handle() {
+        let store = test_store();
+        let now = Utc::now();
+        let session = test_session("s1", now, now);
+        store.create_session(&session).unwrap();
+        store.upsert_pr(&stored_pr("s1", 4)).unwrap();
+
+        store.soft_delete_session("s1").unwrap();
+
+        assert!(store.load_sessions().unwrap().is_empty());
+        let all = store.load_sessions_including_deleted().unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(all[0].is_deleted());
+        assert_eq!(all[0].agent_handle(), "s1");
+        assert_eq!(store.count_agent_tabs("s1").unwrap(), 0, "tabs dropped");
+        assert_eq!(store.load_prs("s1").unwrap().len(), 1, "PR history kept");
+        // The slot-tab repair must not resurrect a first tab for a tombstone.
+        store.migrate().unwrap();
+        assert_eq!(store.count_agent_tabs("s1").unwrap(), 0);
+
+        let mut fresh = test_session("s2", now, now);
+        fresh.agent_handle = "s1".to_string();
+        store.assign_unique_agent_handle(&mut fresh).unwrap();
+        assert_eq!(fresh.agent_handle(), "s1-2");
+    }
+
+    #[test]
+    fn a_stale_upsert_cannot_resurrect_a_tombstone() {
+        let store = test_store();
+        let now = Utc::now();
+        let session = test_session("s1", now, now);
+        store.create_session(&session).unwrap();
+        store.soft_delete_session("s1").unwrap();
+        store.upsert_session(&session).unwrap();
+        assert!(store.load_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn shared_workspace_round_trips() {
+        let store = test_store();
+        let now = Utc::now();
+        let mut session = test_session("s1", now, now);
+        session.shared_workspace = true;
+        store.create_session(&session).unwrap();
+        assert!(store.load_sessions().unwrap()[0].shared_workspace());
+    }
+
+    #[test]
+    fn next_unique_agent_handle_suffixes_within_the_length_limit() {
+        let long = "a".repeat(AGENT_HANDLE_MAX_LEN);
+        let used: HashSet<String> = [long.clone()].into_iter().collect();
+        let next = next_unique_agent_handle(&long, &used);
+        assert_eq!(next.len(), AGENT_HANDLE_MAX_LEN);
+        assert!(next.ends_with("-2"));
+        assert!(is_valid_agent_handle(&next));
+    }
+
+    #[test]
+    fn store_id_is_durable_and_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = load_or_create_store_id(dir.path()).unwrap();
+        let second = load_or_create_store_id(dir.path()).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(STORE_ID_FILE))
+                .unwrap()
+                .trim(),
+            first
+        );
+        assert_eq!(load_store_id(dir.path()).unwrap(), first);
+    }
+
+    #[test]
+    fn corrupt_store_id_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(STORE_ID_FILE), "not-a-uuid\n").unwrap();
+        let error = format!("{:#}", load_or_create_store_id(dir.path()).unwrap_err());
+        assert!(error.contains("metadata corruption"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(STORE_ID_FILE)).unwrap(),
+            "not-a-uuid\n",
+            "a corrupt id is reported, never silently replaced"
+        );
+    }
+
+    #[test]
+    fn load_store_id_never_creates_one() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_store_id(dir.path()).is_err());
+        assert!(!dir.path().join(STORE_ID_FILE).exists());
+        load_or_create_store_id(dir.path()).unwrap();
+        remove_store_identity(dir.path()).unwrap();
+        assert!(load_store_id(dir.path()).is_err());
+        remove_store_identity(dir.path()).expect("removing twice is fine");
+    }
+
+    #[test]
+    fn backup_to_copies_committed_rows_including_wal_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sessions.sqlite3");
+        let store = SessionStore::open(&db).unwrap();
+        let now = Utc::now();
+        store.create_session(&test_session("s1", now, now)).unwrap();
+        let bak = dir.path().join("sessions.sqlite3.bak");
+        store.backup_to(&bak).unwrap();
+        let restored = SessionStore::open(&bak).unwrap();
+        assert_eq!(restored.load_sessions().unwrap()[0].id, "s1");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&bak).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode & 0o077, 0, "backup must be owner-only, got {mode:o}");
+        }
+    }
+
+    #[test]
+    fn a_corrupt_database_fails_open_and_points_at_the_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sessions.sqlite3");
+        {
+            let store = SessionStore::open(&db).unwrap();
+            let now = Utc::now();
+            for i in 0..50 {
+                store
+                    .create_session(&test_session(&format!("s{i}"), now, now))
+                    .unwrap();
+            }
+            store
+                .conn
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+        // Scribble over a b-tree page past the header so the file still opens
+        // as SQLite but its structure is broken.
+        let mut bytes = std::fs::read(&db).unwrap();
+        let page = 4096;
+        assert!(bytes.len() > page * 3, "fixture too small to corrupt");
+        for byte in &mut bytes[page * 2 + 8..page * 3] {
+            *byte = 0xA5;
+        }
+        std::fs::write(&db, bytes).unwrap();
+        let err = format!("{:#}", SessionStore::open(&db).err().expect("must refuse"));
+        assert!(
+            err.contains("integrity check failed") && err.contains(".bak"),
+            "corruption must fail open loudly: {err}"
+        );
+    }
+
+    #[test]
+    fn ensure_column_rejects_injection() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("create table t (id integer);").unwrap();
+        assert!(ensure_column(&conn, "t", "x; drop table t; --", "text").is_err());
+        assert!(ensure_column(&conn, "t", "ok_name", "text; drop table t; --").is_err());
+        assert!(ensure_column(&conn, "1bad", "ok_name", "text").is_err());
+        assert!(ensure_column(&conn, "t", "ok_name", "text /* sneaky */").is_err());
+        assert!(ensure_column(&conn, "t", "ok_name", "text default 'x'").is_err());
+        assert!(ensure_column(&conn, "t", "ok_name", "text check(1)").is_err());
+        let count: i64 = conn
+            .query_row(
+                "select count(*) from sqlite_master where name='t'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "table 't' must survive the rejected payloads");
+        assert!(ensure_column(&conn, "t", "extra", "text").unwrap());
+    }
+
+    #[test]
+    fn is_safe_ident_matches_pattern() {
+        assert!(is_safe_ident("agent_sessions"));
+        assert!(is_safe_ident("_under"));
+        assert!(is_safe_ident("Col1"));
+        assert!(!is_safe_ident(""));
+        assert!(!is_safe_ident("1col"));
+        assert!(!is_safe_ident("col-name"));
+        assert!(!is_safe_ident("col;drop"));
+        assert!(!is_safe_ident("col name"));
+    }
+
+    /// Every `ensure_column` call in this file must pass the allowlist, or the
+    /// open fails at runtime. Scans the source so a column another change
+    /// appends is caught here, by name, instead of on a user's first boot.
+    #[test]
+    fn every_ensure_column_call_site_passes_the_allowlist() {
+        let source = include_str!("storage.rs");
+        // Production code only: the tests below pass hostile literals on purpose.
+        let source = source.split("#[cfg(test)]").next().unwrap();
+        let mut checked = 0;
+        for call in source.split("ensure_column(").skip(1) {
+            let args: String = call.chars().take_while(|c| *c != ')').collect();
+            let literals: Vec<&str> = args.split('"').skip(1).step_by(2).collect();
+            // Only real call sites pass three string literals.
+            if literals.len() != 3 || !args.trim_start().starts_with('&') {
+                continue;
+            }
+            let (table, column, sql_type) = (literals[0], literals[1], literals[2]);
+            assert!(is_safe_ident(table), "{table}");
+            assert!(is_safe_ident(column), "{column}");
+            assert!(
+                is_allowed_column_type(sql_type),
+                "ensure_column({table}, {column}, {sql_type:?}) is not on the allowlist"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 25, "the scan found only {checked} call sites");
+    }
+
+    #[test]
     fn reopening_same_db_file_remigrates_cleanly() {
         // With the initial_branch ALTER moved to autocommit,
         // re-opening the same on-disk DB re-runs migrate() and every
@@ -4330,6 +4995,7 @@ mod tests {
             auto_reopen_agents: None,
             startup_command: None,
             env: Default::default(),
+            workspace_mode: None,
         };
         store.upsert_project(&mk("a")).unwrap();
         store.upsert_project(&mk("b")).unwrap();
@@ -4604,6 +5270,63 @@ mod pr_tests {
     }
 }
 
+/// Every non-empty handle already stored, tombstones included: a soft-deleted
+/// agent keeps its identity reserved so a later hard purge can still find the
+/// AMQ inbox that carries its name.
+fn used_agent_handles(conn: &Connection) -> Result<HashSet<String>> {
+    let mut stmt =
+        conn.prepare("select agent_handle from agent_sessions where agent_handle <> ''")?;
+    let used = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<HashSet<String>>>()?;
+    Ok(used)
+}
+
+/// `base` if it is free, otherwise `base-2`, `base-3`, ... with the prefix
+/// truncated so the suffixed handle still fits [`AGENT_HANDLE_MAX_LEN`].
+fn next_unique_agent_handle(base: &str, used: &HashSet<String>) -> String {
+    if !used.contains(base) {
+        return base.to_string();
+    }
+    for ordinal in 2usize.. {
+        let suffix = format!("-{ordinal}");
+        let prefix: String = base
+            .chars()
+            .take(AGENT_HANDLE_MAX_LEN - suffix.len())
+            .collect();
+        let candidate = format!("{prefix}{suffix}");
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded handle suffix search")
+}
+
+/// Fail closed on a corrupt identity instead of repairing it: every stored
+/// handle must satisfy the persisted contract. Uniqueness is the partial unique
+/// index's job. An EMPTY handle is not corruption: it is a row an older binary
+/// inserted after this build's last open, which the next open's backfill
+/// fixes. The loader skips such a row (loudly) rather than failing every load.
+fn validate_stored_handles(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "select id, agent_handle from agent_sessions where agent_handle <> '' order by id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (id, handle) = row?;
+        if !is_valid_agent_handle(&handle) {
+            bail!(
+                "session database corruption: invalid agent_handle {:?} for session {:?}",
+                crate::sanitize::for_terminal(&handle),
+                crate::sanitize::for_terminal(&id)
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Read one `agent_tabs` row. Shared by every tab query so the slot tab and an
 /// extra tab can never be decoded differently.
 fn read_agent_tab(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentTab> {
@@ -4641,6 +5364,23 @@ fn min_session_sort_order_in(conn: &Connection, project_id: &str) -> Result<Opti
 /// was just added by this call, `false` when it already existed. Callers that
 /// need a one-time backfill of a newly-added column branch on the return value.
 fn ensure_column(conn: &Connection, table: &str, column: &str, sql_type: &str) -> Result<bool> {
+    // Defence in depth (fork audit02 P1-K): the three strings are spliced into
+    // DDL because SQLite cannot bind identifiers or types. Every caller passes
+    // literals today, but one refactor that routes a runtime value in here
+    // would otherwise be an injection. Refuse anything that is not a plain
+    // identifier, and any type clause not on the explicit allowlist.
+    if !is_safe_ident(table) {
+        bail!("ensure_column: rejected unsafe table name {table:?}");
+    }
+    if !is_safe_ident(column) {
+        bail!("ensure_column: rejected unsafe column name {column:?}");
+    }
+    if !is_allowed_column_type(sql_type) {
+        bail!(
+            "ensure_column: sql type {sql_type:?} is not on the allowlist; add it to \
+             ALLOWED_COLUMN_TYPES if it is a literal you wrote"
+        );
+    }
     let mut stmt = conn.prepare(&format!("pragma table_info({table})"))?;
     let existing = stmt
         .query_map([], |row| row.get::<_, String>(1))?
@@ -4661,6 +5401,67 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, sql_type: &str) -
         Err(e) if is_duplicate_column_error(&e) => Ok(false),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Quoted-default type clauses `ensure_column` accepts, compared after
+/// lowercasing and collapsing whitespace. A clause with a quote in it is only
+/// accepted if it is listed here; every literal a caller in this file passes
+/// is here, and a new one fails loudly (and in tests) until it is added.
+const ALLOWED_COLUMN_TYPES: &[&str] = &[
+    "text not null default ''",
+    "text not null default '[]'",
+    "text not null default '{}'",
+    "text not null default 'open'",
+    "text not null default 'created'",
+    "text not null default 'managed'",
+    "text not null default 'github.com'",
+];
+
+/// A plain SQL identifier: an ASCII letter or `_`, then ASCII alphanumerics
+/// or `_`.
+fn is_safe_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A column type clause safe to splice into `alter table ... add column`: a
+/// SQLite storage class, optionally followed by constraint words and a numeric
+/// default. Nothing that could end the statement, open a comment, or smuggle
+/// in a string unless the whole clause is on [`ALLOWED_COLUMN_TYPES`].
+fn is_allowed_column_type(s: &str) -> bool {
+    let normalized = s
+        .trim()
+        .to_ascii_lowercase()
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.contains('\'') {
+        return ALLOWED_COLUMN_TYPES.contains(&normalized.as_str());
+    }
+    if normalized.is_empty()
+        || normalized.contains(';')
+        || normalized.contains("--")
+        || normalized.contains("/*")
+        || normalized.contains('"')
+        || normalized.contains('`')
+    {
+        return false;
+    }
+    const STORAGE_CLASSES: &[&str] = &["text", "integer", "real", "blob", "numeric"];
+    let mut words = normalized.split(' ');
+    let Some(class) = words.next() else {
+        return false;
+    };
+    let is_integer = |word: &str| {
+        let digits = word.strip_prefix('-').unwrap_or(word);
+        !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+    };
+    STORAGE_CLASSES.contains(&class)
+        && words.all(|word| matches!(word, "not" | "null" | "default") || is_integer(word))
 }
 
 /// True when `err` is SQLite's "duplicate column name" error, raised when an

@@ -1593,6 +1593,8 @@ impl Engine {
     /// - the directory it runs in still exists on disk,
     /// - for a managed agent, its project has not opted out
     ///   (`project_allows_auto_reopen`), and
+    /// - a shared main-workspace agent reopens only when
+    ///   `[workspace] auto_resume_shared` is on, and
     /// - its provider can resume a conversation (`supports_session_resume`;
     ///   reopening one that starts from scratch would silently discard the
     ///   conversation the intent was about), and
@@ -1620,7 +1622,13 @@ impl Engine {
                     // No project, so nothing to consult and nobody to veto.
                     crate::model::AgentWorkspace::Folder(_) => true,
                 };
+                // Shared main-workspace agents run in the user's real
+                // checkout, so a boot must not fire all of them into the live
+                // repo unasked: they reopen only with the explicit
+                // `[workspace] auto_resume_shared` opt-in.
+                let shared_allows = !session.shared_workspace() || self.config.auto_resume_shared();
                 session.desired_running
+                    && shared_allows
                     && !self.any_tab_active(&session.id)
                     && session.auto_reopen_enabled
                     && std::path::Path::new(session.directory()).exists()

@@ -25,6 +25,9 @@ fn sample_session(
     let now = chrono::Utc::now();
     dux_core::model::AgentSession {
         id: id.to_string(),
+        agent_handle: dux_core::model::normalize_agent_handle(id),
+        shared_workspace: false,
+        deleted_at: None,
         slot_tab_id: format!("{id}-slot"),
         provider: dux_core::model::ProviderKind::new("claude"),
         title: Some(format!("{id}-title")),
@@ -72,6 +75,7 @@ async fn boot() -> (SocketAddr, tempfile::TempDir) {
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .unwrap();
         store
@@ -84,6 +88,9 @@ async fn boot() -> (SocketAddr, tempfile::TempDir) {
             .unwrap();
     }
     let mut engine = bootstrap_engine(&paths).unwrap();
+    // A worktree-mode install: these fixtures register dux's own root as the
+    // project, which shared mode rightly refuses to run agents in.
+    engine.config.workspace = None;
     // The sample session's provider is "claude", which isn't on PATH in CI. Override
     // it with `cat`, a runnable program that echoes stdin so the real launch flow
     // spawns a streaming PTY (the marker the streaming tests send is echoed back).
@@ -161,6 +168,7 @@ async fn boot_with_repo() -> (SocketAddr, tempfile::TempDir) {
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .unwrap();
         store
@@ -173,6 +181,9 @@ async fn boot_with_repo() -> (SocketAddr, tempfile::TempDir) {
             .unwrap();
     }
     let mut engine = bootstrap_engine(&paths).unwrap();
+    // A worktree-mode install: these fixtures register dux's own root as the
+    // project, which shared mode rightly refuses to run agents in.
+    engine.config.workspace = None;
     engine.config.providers.commands.insert(
         "claude".to_string(),
         ProviderCommandConfig {
@@ -445,10 +456,14 @@ async fn boot_for_create_agent_window(
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .unwrap();
     }
     let mut engine = bootstrap_engine(&paths).unwrap();
+    // A worktree-mode install: these fixtures register dux's own root as the
+    // project, which shared mode rightly refuses to run agents in.
+    engine.config.workspace = None;
     // The spawned agent provider defaults to "claude"; override with `cat` so the
     // launch flow spawns a runnable PTY in CI.
     engine.config.providers.commands.insert(
@@ -655,6 +670,7 @@ async fn boot_with_gated_startup_command() -> (SocketAddr, std::path::PathBuf, t
                 // Blocks until the test opens the FIFO for writing.
                 startup_command: Some(format!("cat {}", gate.display())),
                 env: Default::default(),
+                workspace_mode: None,
             })
             .unwrap();
         store
@@ -667,6 +683,9 @@ async fn boot_with_gated_startup_command() -> (SocketAddr, std::path::PathBuf, t
             .unwrap();
     }
     let mut engine = bootstrap_engine(&paths).unwrap();
+    // A worktree-mode install: these fixtures register dux's own root as the
+    // project, which shared mode rightly refuses to run agents in.
+    engine.config.workspace = None;
     // Pin the shell so the gate command is interpreted identically everywhere,
     // rather than depending on whatever login shell the host defaults to.
     engine.config.startup_command_terminal.command = "sh".to_string();
@@ -1508,6 +1527,7 @@ async fn boot_two_sessions() -> (SocketAddr, tempfile::TempDir) {
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .unwrap();
         store
@@ -1528,6 +1548,9 @@ async fn boot_two_sessions() -> (SocketAddr, tempfile::TempDir) {
             .unwrap();
     }
     let mut engine = bootstrap_engine(&paths).unwrap();
+    // A worktree-mode install: these fixtures register dux's own root as the
+    // project, which shared mode rightly refuses to run agents in.
+    engine.config.workspace = None;
     engine.config.providers.commands.insert(
         "claude".to_string(),
         ProviderCommandConfig {

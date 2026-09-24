@@ -104,6 +104,9 @@ fn real_jcode_mouse_scroll_in_dux() {
     store
         .create_session(&AgentSession {
             id: "acceptance-session".into(),
+            agent_handle: "acceptance-session".into(),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: "acceptance-session-slot".into(),
             provider: ProviderKind::from_str("jcode"),
             workspace: AgentWorkspace::Folder(FolderWorkspace {

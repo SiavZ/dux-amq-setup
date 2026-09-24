@@ -99,6 +99,8 @@ pub(crate) enum ButtonPressedTarget {
     ConfirmNonDefaultBranchAdd,
     ConfirmUseExistingBranchCancel,
     ConfirmUseExistingBranchUse,
+    ConfirmSharedWriterCancel,
+    ConfirmSharedWriterStart,
     ConfigReloadFailedClose,
     ConfigReloadFailedApply,
     AddProjectFailedOk,

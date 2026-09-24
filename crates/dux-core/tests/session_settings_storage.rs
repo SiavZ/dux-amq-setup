@@ -17,6 +17,9 @@ fn fixture_session(id: &str) -> AgentSession {
     let now = Utc::now();
     AgentSession {
         id: id.to_string(),
+        agent_handle: id.to_string(),
+        shared_workspace: false,
+        deleted_at: None,
         slot_tab_id: format!("{id}-slot"),
         provider: ProviderKind::new("claude"),
         workspace: AgentWorkspace::Managed(ManagedWorkspace {

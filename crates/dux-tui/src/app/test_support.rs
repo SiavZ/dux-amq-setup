@@ -100,10 +100,14 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
             auto_reopen_agents: project.auto_reopen_agents,
             startup_command: project.startup_command.clone(),
             env: project.env.clone(),
+            workspace_mode: None,
         })
         .expect("seed project");
     let session = AgentSession {
         id: "session-1".to_string(),
+        agent_handle: "session-1".to_string(),
+        shared_workspace: false,
+        deleted_at: None,
         slot_tab_id: "session-1-slot".to_string(),
         provider: ProviderKind::from_str("codex"),
         title: None,
@@ -132,7 +136,12 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
         worker_tx.clone(),
     );
     let engine = dux_core::engine::Engine {
-        config: Config::default(),
+        // An existing install (no `[workspace]` section), so the harness keeps
+        // upstream's worktree create flow. Shared-mode tests opt in explicitly.
+        config: Config {
+            workspace: None,
+            ..Config::default()
+        },
         paths,
         session_store,
         projects: vec![project],

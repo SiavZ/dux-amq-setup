@@ -465,6 +465,9 @@ mod tests {
     pub(crate) fn folder_session(id: &str, provider: &str, dir: &Path) -> AgentSession {
         AgentSession {
             id: id.to_string(),
+            agent_handle: crate::model::normalize_agent_handle(id),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: format!("{id}-slot"),
             provider: ProviderKind::new(provider),
             workspace: AgentWorkspace::Folder(FolderWorkspace {

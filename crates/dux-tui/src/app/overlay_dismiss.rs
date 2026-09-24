@@ -125,6 +125,7 @@ pub(super) fn outside_click_policy(prompt: &PromptState) -> OutsideClickPolicy {
         | PromptState::ConfirmCreateInitialCommit { .. }
         | PromptState::ConfirmNonDefaultBranch { .. }
         | PromptState::ConfirmUseExistingBranch { .. }
+        | PromptState::ConfirmSharedWriter { .. }
         // The worktree-removal confirm cancels back to the manager it was
         // raised from, exactly as its Esc arm does.
         | PromptState::ConfirmDeleteWorktree(_) => Cancel,
@@ -325,6 +326,9 @@ impl App {
             }
             PromptState::ConfirmUseExistingBranch { .. } => {
                 self.resolve_confirm_use_existing_branch(false);
+            }
+            PromptState::ConfirmSharedWriter { .. } => {
+                self.resolve_confirm_shared_writer(false);
             }
 
             // The nested macro delete-confirm: clears the confirm and leaves
