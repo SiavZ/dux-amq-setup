@@ -434,6 +434,13 @@ mod tests {
     fn app_with_a_real_worktree(delete_branch: bool) -> (App, PathBuf, PathBuf) {
         use crate::app::test_support::run_git;
         let mut app = test_app(default_bindings());
+        // `test_app` registers dux's own root as the project, which puts every
+        // managed worktree INSIDE a registered checkout, and the whole-worktree
+        // guard rightly refuses that. Point the project at a real repo of its
+        // own, outside dux's state, the way a real install is laid out.
+        let own_repo = tempfile::tempdir().unwrap().keep();
+        crate::app::test_support::init_test_repo(&own_repo);
+        app.engine.projects[0].path = own_repo.to_string_lossy().to_string();
         let project = app.engine.projects[0].clone();
         let repo = PathBuf::from(&project.path);
         let worktree = app
