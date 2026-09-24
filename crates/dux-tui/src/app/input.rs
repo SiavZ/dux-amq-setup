@@ -32658,15 +32658,30 @@ cyan = "#00ffff"
 
         assert_eq!(app.status.message(), "Sent macro \"multi\".");
 
-        std::thread::sleep(std::time::Duration::from_millis(300));
-
-        let provider = app.engine.providers.values().next().expect("provider");
-        let snapshot = provider.snapshot();
-        let rendered: String = snapshot
-            .cells
-            .iter()
-            .map(|cell| cell.symbol.as_str())
-            .collect();
+        // Wait for the echo instead of sleeping a fixed time: under heavy
+        // machine load the PTY round trip can take longer than a fixed
+        // sleep, which made this fail spuriously. The assertions below are
+        // unchanged; only how long we are willing to wait for them grew.
+        let render = |app: &App| -> String {
+            let provider = app.engine.providers.values().next().expect("provider");
+            provider
+                .snapshot()
+                .cells
+                .iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut rendered = render(&app);
+        while !(rendered.contains("first")
+            && rendered.contains("second")
+            && rendered.contains("^[")
+            && rendered.contains("^M"))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            rendered = render(&app);
+        }
 
         assert!(
             rendered.contains("first") && rendered.contains("second"),
