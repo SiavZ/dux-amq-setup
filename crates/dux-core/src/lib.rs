@@ -47,6 +47,7 @@ pub mod project_order;
 pub mod provider;
 pub mod pty;
 pub mod pty_owners;
+pub mod pty_reattach;
 pub mod quiet_tail;
 pub mod release_notes;
 pub mod resource_stats;
