@@ -1087,7 +1087,7 @@ fn maybe_redact_json_line(line: &str, target: &str) -> Option<String> {
 
 /// Read one line and check it is exactly `PURGE <branch>`. Typing the branch
 /// name is the point: it prevents accidental yes-mashing.
-pub fn confirm_with_reader<R: BufRead>(plan: &PurgePlan, reader: &mut R) -> Result<bool> {
+pub fn confirm_with_reader<R: BufRead + ?Sized>(plan: &PurgePlan, reader: &mut R) -> Result<bool> {
     let mut input = String::new();
     reader
         .read_line(&mut input)

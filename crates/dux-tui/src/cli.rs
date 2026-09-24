@@ -60,6 +60,276 @@ fn reject_unknown_flags(args: &[String], known: &[&str]) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// dux session: GDPR hard purge (fork 3e5c1c32, 0b831554)
+// ---------------------------------------------------------------------------
+
+/// Exit code for "a cascade step reported an error".
+const EXIT_PURGE_ERRORS: i32 = 1;
+/// Exit code for "aborted at the confirmation prompt".
+const EXIT_PURGE_ABORTED: i32 = 2;
+
+/// `dux session <sub>`. Returns the process exit code: 0 on success or a dry
+/// run, [`EXIT_PURGE_ERRORS`] when any cascade step failed,
+/// [`EXIT_PURGE_ABORTED`] when the confirmation phrase did not match. Invalid
+/// arguments and an unknown target are `Err`. The caller holds the
+/// single-instance lock for the mutating subcommands.
+pub fn run_session(args: &[String], paths: &DuxPaths) -> Result<i32> {
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    run_session_with_input(args, paths, &mut input)
+}
+
+fn run_session_with_input(
+    args: &[String],
+    paths: &DuxPaths,
+    input: &mut dyn std::io::BufRead,
+) -> Result<i32> {
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("");
+    match sub {
+        "purge" => run_session_purge(paths, &args[1..], input),
+        "purge-all" => {
+            let rest = &args[1..];
+            reject_unknown_flags(rest, &["--yes", "--dry-run"])?;
+            if let Some(extra) = rest.iter().find(|arg| !arg.starts_with('-')) {
+                bail!("unexpected positional argument: {extra}");
+            }
+            let yes = rest.iter().any(|a| a == "--yes");
+            let dry_run = rest.iter().any(|a| a == "--dry-run");
+            run_session_purge_all(paths, yes, dry_run, input)
+        }
+        "" | "--help" | "-h" => {
+            print_session_help();
+            Ok(0)
+        }
+        other => bail!("unknown session subcommand: {other}\nRun `dux session --help` for usage."),
+    }
+}
+
+fn print_session_help() {
+    println!(
+        "\
+dux session: manage individual agents
+
+Subcommands:
+  dux session purge --hard <target> [--yes] [--dry-run]
+                       [--accept-residual-data | --workspace-wide-provider-history]
+                       Permanently erase one agent: its worktree, provider chat
+                       history, AMQ inbox, startup-command logs, log records, and
+                       its row (a soft-deleted agent included). <target> is a
+                       session id, agent handle, or a branch naming exactly one
+                       agent. A shared-workspace or standalone agent's directory
+                       is never removed, and its provider history needs explicit
+                       consent (below).
+  dux session purge-all [--yes] [--dry-run]
+                       Purge every agent. Shared provider history stays and is
+                       reported incomplete; rows that cannot be planned safely
+                       are kept and listed.
+
+Flags:
+  --hard               Required for `purge`. Affirms the destructive intent.
+  --yes                Skip the typed 'PURGE <branch>' confirmation.
+  --dry-run            Print the plan and exit without changing anything.
+  --accept-residual-data
+                       Shared or standalone agents only: keep the shared provider
+                       history but erase everything this agent owns, row included.
+  --workspace-wide-provider-history
+                       Shared or standalone agents only: purge EVERY agent in that
+                       directory and its provider history, including chats that
+                       were never started by dux.
+
+Environment:
+  CLAUDE_CONFIG_DIR, STATE_ROOT, AMQ_GLOBAL_ROOT, AM_ROOT
+                       Where provider history and the AMQ bus live. Each must be
+                       an absolute path. See the plan output for what is targeted.
+
+Exit codes:
+  0  success (or dry run)
+  1  a step failed; the row is kept so the purge can be re-run
+  2  aborted at the confirmation prompt"
+    );
+}
+
+fn run_session_purge(
+    paths: &DuxPaths,
+    args: &[String],
+    input: &mut dyn std::io::BufRead,
+) -> Result<i32> {
+    use dux_core::purge::SharedPurgeMode;
+
+    let mut yes = false;
+    let mut dry_run = false;
+    let mut hard = false;
+    let mut shared_mode = SharedPurgeMode::RetainIdentity;
+    let mut target: Option<String> = None;
+    for arg in args {
+        match arg.as_str() {
+            "--yes" => yes = true,
+            "--dry-run" => dry_run = true,
+            "--hard" => hard = true,
+            "--accept-residual-data" => {
+                if shared_mode == SharedPurgeMode::WorkspaceWide {
+                    bail!("shared purge consent flags are mutually exclusive");
+                }
+                shared_mode = SharedPurgeMode::AcceptResidualData;
+            }
+            "--workspace-wide-provider-history" => {
+                if shared_mode == SharedPurgeMode::AcceptResidualData {
+                    bail!("shared purge consent flags are mutually exclusive");
+                }
+                shared_mode = SharedPurgeMode::WorkspaceWide;
+            }
+            s if s.starts_with('-') => bail!("unknown flag: {s}"),
+            other => {
+                if target.is_some() {
+                    bail!("unexpected positional argument: {other}");
+                }
+                target = Some(other.to_string());
+            }
+        }
+    }
+    if !hard {
+        bail!(
+            "`dux session purge` requires --hard to affirm the destructive intent.\n\
+             It permanently deletes the agent's worktree, provider chat history, AMQ inbox,\n\
+             logs and row. Shared provider history additionally needs\n\
+             --accept-residual-data or --workspace-wide-provider-history.\n\
+             Re-run as: dux session purge --hard <target>"
+        );
+    }
+    let Some(target) = target else {
+        bail!("missing target: dux session purge --hard <session-id-handle-or-branch>");
+    };
+    let (storage, purge_config) = open_purge_inputs(paths)?;
+    let plans = dux_core::purge::build_plans_for_target(
+        &storage,
+        paths,
+        &purge_config,
+        &target,
+        shared_mode,
+    )?;
+    for plan in &plans {
+        println!("{}", format_purge_plan(plan, dry_run));
+    }
+
+    if !yes && !dry_run {
+        let confirmed = if shared_mode == SharedPurgeMode::WorkspaceWide {
+            let phrase = format!("PURGE WORKSPACE {}", plans[0].branch);
+            eprint!(
+                "Type '{}' to confirm provider-history deletion for every agent in this directory: ",
+                dux_core::sanitize::for_terminal(&phrase)
+            );
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            let mut line = String::new();
+            input
+                .read_line(&mut line)
+                .map_err(|err| anyhow!("failed to read confirmation: {err}"))?;
+            line.trim() == phrase
+        } else {
+            prompt_purge_confirmation(&plans[0], input)?
+        };
+        if !confirmed {
+            eprintln!("aborted: confirmation phrase did not match");
+            return Ok(EXIT_PURGE_ABORTED);
+        }
+    }
+
+    let mut any_errors = false;
+    for plan in &plans {
+        let report = dux_core::purge::execute(plan, &storage, paths, &purge_config, dry_run)?;
+        eprint!("{}", report.summary());
+        any_errors |= report.had_errors();
+    }
+    Ok(if any_errors { EXIT_PURGE_ERRORS } else { 0 })
+}
+
+fn run_session_purge_all(
+    paths: &DuxPaths,
+    yes: bool,
+    dry_run: bool,
+    input: &mut dyn std::io::BufRead,
+) -> Result<i32> {
+    let (storage, purge_config) = open_purge_inputs(paths)?;
+    let (plans, planning_failures) =
+        dux_core::purge::build_plans_for_all(&storage, paths, &purge_config)?;
+    for failure in &planning_failures {
+        eprintln!("WARNING: {failure}");
+    }
+    println!("about to purge {} session(s)", plans.len());
+    for (i, plan) in plans.iter().enumerate() {
+        println!("--- session {} of {} ---", i + 1, plans.len());
+        println!("{}", format_purge_plan(plan, dry_run));
+    }
+
+    if !yes && !dry_run {
+        // One phrase for the whole list: typing every branch is impractical.
+        eprint!("Type 'PURGE ALL' to confirm: ");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        let mut line = String::new();
+        input
+            .read_line(&mut line)
+            .map_err(|e| anyhow!("failed to read confirmation: {e}"))?;
+        if line.trim() != "PURGE ALL" {
+            eprintln!("aborted: confirmation phrase did not match");
+            return Ok(EXIT_PURGE_ABORTED);
+        }
+    }
+
+    let mut any_errors = !planning_failures.is_empty();
+    for plan in &plans {
+        let report = dux_core::purge::execute(plan, &storage, paths, &purge_config, dry_run)?;
+        eprint!("{}", report.summary());
+        any_errors |= report.had_errors();
+    }
+    Ok(if any_errors { EXIT_PURGE_ERRORS } else { 0 })
+}
+
+/// Everything a purge needs, loaded fail-closed: the database must exist and
+/// load whole, and the config must parse, because a defaulted config would
+/// register no projects and so protect none of them.
+fn open_purge_inputs(paths: &DuxPaths) -> Result<(SessionStore, dux_core::purge::PurgeConfig)> {
+    if !paths.sessions_db_path.exists() {
+        bail!(
+            "no sessions database found at {}: nothing to purge",
+            dux_core::sanitize::for_terminal(&paths.sessions_db_path.display().to_string())
+        );
+    }
+    let config = dux_core::purge::load_config_strict(paths)?;
+    let storage = SessionStore::open(&paths.sessions_db_path)?;
+    let sessions = storage.load_sessions_including_deleted()?;
+    let protected = dux_core::purge::protected_project_paths(&config, &storage, &sessions)?;
+    let purge_config = dux_core::purge::PurgeConfig::default_layout(paths, &config, protected)?;
+    Ok((storage, purge_config))
+}
+
+fn prompt_purge_confirmation(
+    plan: &dux_core::purge::PurgePlan,
+    input: &mut dyn std::io::BufRead,
+) -> Result<bool> {
+    eprint!(
+        "Type 'PURGE {}' to confirm: ",
+        dux_core::sanitize::for_terminal(&plan.branch)
+    );
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    dux_core::purge::confirm_with_reader(plan, input)
+}
+
+fn format_purge_plan(plan: &dux_core::purge::PurgePlan, dry_run: bool) -> String {
+    let session_id = dux_core::sanitize::for_terminal(&plan.session_id);
+    let branch = dux_core::sanitize::for_terminal(&plan.branch);
+    let mut s = if dry_run {
+        format!("DRY-RUN purge plan for session {session_id} (branch {branch}):\n")
+    } else {
+        format!("purge plan for session {session_id} (branch {branch}):\n")
+    };
+    for item in &plan.items {
+        s.push_str("  - ");
+        s.push_str(&item.describe());
+        s.push('\n');
+    }
+    s
+}
+
 fn print_config_help() {
     println!(
         "\
@@ -2186,5 +2456,100 @@ mod tests {
         assert_eq!(removed_worktrees_line(0), "removed 0 session worktrees");
         assert_eq!(removed_worktrees_line(1), "removed 1 session worktree");
         assert_eq!(removed_worktrees_line(3), "removed 3 session worktrees");
+    }
+
+    fn session_args(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    fn run_session_reading(harness: &ResetHarness, args: &[&str], stdin: &str) -> Result<i32> {
+        let mut input = std::io::Cursor::new(stdin.as_bytes().to_vec());
+        run_session_with_input(&session_args(args), &harness.paths, &mut input)
+    }
+
+    #[test]
+    fn session_purge_requires_hard_a_target_and_known_exclusive_flags() {
+        let harness = ResetHarness::new();
+        harness.create_session("agent-1");
+        let cases: &[(&[&str], &str)] = &[
+            (&["purge", "agent-1"], "requires --hard"),
+            (&["purge", "--hard"], "missing target"),
+            (
+                &["purge", "--hard", "agent-1", "agent-2"],
+                "unexpected positional",
+            ),
+            (&["purge", "--hard", "--wat", "agent-1"], "unknown flag"),
+            (
+                &[
+                    "purge",
+                    "--hard",
+                    "--accept-residual-data",
+                    "--workspace-wide-provider-history",
+                    "agent-1",
+                ],
+                "mutually exclusive",
+            ),
+            (&["purge-all", "extra"], "unexpected positional"),
+            (&["wat"], "unknown session subcommand"),
+        ];
+        for (args, expected) in cases {
+            let error =
+                run_session_reading(&harness, args, "").expect_err("invalid arguments must error");
+            assert!(error.to_string().contains(expected), "{args:?}: {error}");
+        }
+        assert!(harness.paths.worktrees_root.join("agent-1").exists());
+    }
+
+    #[test]
+    fn session_purge_aborts_on_wrong_phrase_and_dry_run_changes_nothing() {
+        let harness = ResetHarness::new();
+        harness.write_config_with_log_path("dux.log");
+        let worktree = harness.create_session("agent-1");
+        // The AMQ step needs the durable store identity even in a dry run: a
+        // missing one fails the purge closed rather than disowning inboxes.
+        dux_core::storage::load_or_create_store_id(&harness.paths.root).unwrap();
+
+        let code = run_session_reading(
+            &harness,
+            &["purge", "--hard", "agent-1"],
+            "PURGE something-else\n",
+        )
+        .expect("aborting is not an error");
+        assert_eq!(code, EXIT_PURGE_ABORTED);
+        assert!(worktree.exists());
+
+        let code = run_session_reading(&harness, &["purge-all"], "PURGE\n").expect("abort");
+        assert_eq!(code, EXIT_PURGE_ABORTED);
+        assert!(worktree.exists());
+
+        let code = run_session_reading(&harness, &["purge", "--hard", "--dry-run", "agent-1"], "")
+            .expect("dry run");
+        assert_eq!(code, 0);
+        assert!(worktree.exists());
+        let store = SessionStore::open(&harness.paths.sessions_db_path).unwrap();
+        assert_eq!(store.load_sessions_including_deleted().unwrap().len(), 1);
+    }
+
+    /// A config that does not parse must stop a purge before anything is
+    /// planned: the lenient loader would fall back to defaults, register no
+    /// projects, and so protect none of them.
+    #[test]
+    fn session_purge_fails_closed_on_an_unparseable_config() {
+        let harness = ResetHarness::new();
+        let worktree = harness.create_session("agent-1");
+        fs::write(&harness.paths.config_path, "not = [valid").unwrap();
+
+        let error = run_session_reading(&harness, &["purge", "--hard", "--yes", "agent-1"], "")
+            .expect_err("corrupt config must refuse");
+        assert!(
+            format!("{error:#}").contains(&harness.paths.config_path.display().to_string()),
+            "{error:#}"
+        );
+        assert!(worktree.exists());
+
+        let no_db = ResetHarness::new();
+        let error = run_session_reading(&no_db, &["purge-all", "--yes"], "")
+            .expect_err("missing database must refuse");
+        assert!(error.to_string().contains("nothing to purge"), "{error}");
     }
 }
