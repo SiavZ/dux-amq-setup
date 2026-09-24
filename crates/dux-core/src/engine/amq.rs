@@ -10,7 +10,6 @@
 //! execs the process leaves only `.inflight.*.msg` files the next process's
 //! startup reclaim puts back (0e8efd57).
 //!
-//! Seams to other workstreams are marked `INTEGRATION:`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -78,10 +77,11 @@ pub struct AmqRuntime {
     pub orchestrator_project_last_checkpoint: HashMap<String, Instant>,
     /// Orchestrators that already received their typed startup policy.
     pub orchestrator_policy_injected: HashSet<String>,
-    /// Watchdog prompts whose body was typed and whose Enter is pending.
-    ///
-    /// INTEGRATION: the fork shared this map with watch-rule SendText
-    /// (`watch_pending_enters`); herb's watch port may merge the two.
+    /// Watchdog prompts whose body was typed and whose Enter is pending,
+    /// keyed by session. Kept apart from the watch engine's own per-tab
+    /// `pending_enters` (the fork shared one map): the two are keyed
+    /// differently and flushed by different ticks, and a shared map would let
+    /// one flush the other's Enter early.
     pub pending_enters: HashMap<String, Instant>,
 }
 
@@ -119,10 +119,9 @@ pub struct AmqQuiesceReport {
 impl Engine {
     // ─── session settings ────────────────────────────────────────────
 
-    /// The saved settings for `session_id`. `None` means defaults.
-    ///
-    /// INTEGRATION: herb's watch engine reads `watch_rule_arm` and
-    /// `auto_clear_on_task_done` through this getter.
+    /// The saved settings for `session_id`. `None` means defaults. The watch
+    /// engine reads `watch_rule_arm` and `auto_clear_on_task_done` through
+    /// this getter (`Engine::watch_session_settings`).
     pub fn session_settings(&self, session_id: &str) -> Option<&SessionSettings> {
         self.amq.session_settings.get(session_id)
     }
@@ -300,8 +299,9 @@ impl Engine {
     /// a busy footer, a claimed or queued wake, unread/pending mail, or
     /// recent collaboration (b6638ae0, 22e6b1e3).
     ///
-    /// INTEGRATION: herb's auto-clear rule must rebaseline instead of firing
-    /// while this is true (fork `should_suppress_auto_clear`).
+    /// The watch engine's auto-clear rule consults this through
+    /// `Engine::watch_auto_clear_suppressed` and rebaselines instead of firing
+    /// while it is true (fork `should_suppress_auto_clear`).
     pub fn amq_blocks_auto_clear(&self, session_id: &str) -> bool {
         let Some(session) = self.session_by_id(session_id) else {
             return true;

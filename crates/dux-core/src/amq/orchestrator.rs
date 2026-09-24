@@ -130,8 +130,8 @@ mod tests {
         let prompt = build_orchestrator_checkpoint_prompt(&[qa()]);
         assert!(prompt.contains("front-end-qa"));
         assert!(prompt.contains("Do not do their implementation work yourself"));
-        // INTEGRATION: `dux peer send` is the peer worker's CLI (seedling);
-        // this only pins the text the orchestrator is told to run.
+        // Pins the command the orchestrator is told to run; the `dux peer
+        // send` CLI itself is tested in `peer::router`.
         assert!(prompt.contains("dux peer send <handle>"));
         assert!(prompt.contains("status, blockers, ETA"));
     }

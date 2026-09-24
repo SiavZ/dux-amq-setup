@@ -33,15 +33,35 @@ pub fn agent_launch_env(
     env
 }
 
-/// Per-session settings exported to the provider (the fork's YOLO and AMQ
-/// envelope-verify switches).
-// INTEGRATION: extend with Engine::session_settings(id).to_pty_env() (maple)
+/// Per-session settings exported to the provider: the fork's YOLO,
+/// envelope-verify and custom system prompt switches
+/// ([`SessionSettings::to_pty_env`](crate::session_settings::SessionSettings::to_pty_env)),
+/// which the AMQ wrappers read to choose CLI flags.
+///
+/// Read from the store rather than the engine's in-memory map because the
+/// create and reconnect jobs build the env on worker threads with only the
+/// paths and config; the settings row is the persisted source of truth and
+/// is written before any change is applied (persist-before-mutate), so the
+/// two never disagree at launch. A store that cannot be read yields the
+/// defaults with a warning rather than blocking the launch.
 pub fn session_settings_env(
-    _paths: &DuxPaths,
-    _config: &Config,
-    _session: &AgentSession,
+    paths: &DuxPaths,
+    config: &Config,
+    session: &AgentSession,
 ) -> Vec<(String, String)> {
-    Vec::new()
+    let settings = crate::storage::SessionStore::open(&paths.sessions_db_path)
+        .and_then(|store| store.load_session_settings_for(&session.id))
+        .unwrap_or_else(|err| {
+            crate::logger::warn(&format!(
+                "could not read session settings for {}; launching with defaults: {}",
+                crate::sanitize::for_terminal(&session.id),
+                crate::sanitize::for_terminal(&format!("{err:#}"))
+            ));
+            crate::session_settings::SessionSettings::default()
+        });
+    settings
+        .to_pty_env(&session.provider, config.amq.inject.verify_envelope)
+        .vars
 }
 
 #[cfg(test)]
@@ -106,6 +126,9 @@ mod tests {
                 "DUX_STORE_ID",
                 "DUX_PROVIDER",
                 "DUX_AMQ_HANDLE",
+                // Session settings: always exported so the bridge sees a
+                // deterministic value (fork to_pty_env).
+                "DUX_AMQ_VERIFY",
                 "DUX_AMQ_HANDLE"
             ]
         );
@@ -127,7 +150,48 @@ mod tests {
             user.clone(),
         );
 
-        assert_eq!(env, user);
+        // No DUX_* identity (two readers on one inbox), but the session's
+        // settings still apply to every provider process it runs.
+        assert_eq!(
+            env,
+            [
+                ("DUX_AMQ_VERIFY".to_string(), "0".to_string()),
+                ("KEY".to_string(), "v".to_string()),
+            ]
+        );
+    }
+
+    /// Stored per-session settings reach the launch env: YOLO maps to the
+    /// provider's wrapper variable, the verify override wins over the global
+    /// default, and a custom system prompt is exported. The fork applied these
+    /// at every create and reconnect; without it the settings modal saved
+    /// values no agent ever saw.
+    #[test]
+    fn stored_session_settings_reach_the_launch_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        std::fs::create_dir_all(&paths.root).unwrap();
+        let session = session(dir.path());
+        let store = crate::storage::SessionStore::open(&paths.sessions_db_path).unwrap();
+        store.create_session(&session).unwrap();
+        store
+            .set_session_settings(
+                &session.id,
+                &crate::session_settings::SessionSettings {
+                    yolo_permissions: true,
+                    verify_envelope_override: Some(true),
+                    system_prompt: Some("be terse".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let env = agent_launch_env(&paths, &Config::default(), &session, "slot", Vec::new());
+        let get = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+
+        assert_eq!(get("CLAUDE_AMQ_YOLO"), Some("1"));
+        assert_eq!(get("DUX_AMQ_VERIFY"), Some("1"));
+        assert_eq!(get("DUX_SYSTEM_PROMPT"), Some("be terse"));
     }
 
     /// The engine's launch builder (the path every reconnect, reopen and
