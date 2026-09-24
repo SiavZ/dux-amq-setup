@@ -1214,6 +1214,116 @@ impl PtyClient {
         })
     }
 
+    /// Rebuild a client around a PTY and child inherited from the previous image
+    /// after a reload.
+    ///
+    /// The counterpart to [`PtyClient::prepare_for_reload`]. Nothing is spawned:
+    /// the agent has been running the whole time, and this only rebuilds the
+    /// Rust values that described it, which were lost with the old image's
+    /// memory.
+    ///
+    /// The terminal starts EMPTY. The scrollback lived in the previous image and
+    /// cannot be recovered, so the row shows nothing until the agent writes
+    /// again. That is the one visible cost of a reload, and it is a deliberate
+    /// trade: a cleared transcript in exchange for an agent that never stopped.
+    ///
+    /// # Safety
+    ///
+    /// `master_fd` must be a PTY master this process inherited and that nothing
+    /// else owns; ownership moves into the returned client.
+    pub unsafe fn adopt_after_reload(
+        master_fd: std::os::fd::RawFd,
+        child_pid: Option<u32>,
+        rows: u16,
+        cols: u16,
+        scrollback_lines: usize,
+        spawn_dir: &Path,
+    ) -> Result<Self> {
+        // SAFETY: the caller guarantees the descriptor is an owned, inherited
+        // PTY master. `adopt` additionally refuses anything that is not a tty,
+        // so a stale number from a handoff fails here rather than much later.
+        let master = unsafe { crate::pty_reattach::ReattachedMaster::adopt(master_fd) }
+            .context("adopting the inherited PTY master")?;
+
+        let reader = master
+            .try_clone_reader()
+            .context("cloning the reader for an adopted PTY")?;
+        let pty_writer = master
+            .take_writer()
+            .context("taking the writer for an adopted PTY")?;
+
+        // Without a pid there is nothing to wait on or signal. Refusing is the
+        // honest answer: a client that cannot reap its child would report the
+        // agent as running forever.
+        let pid = child_pid.context("the reload handoff carried no pid for this PTY")?;
+        let child = crate::pty_adopt_child::AdoptedChild::new(pid);
+
+        let terminal = Arc::new(Mutex::new(TerminalState::new(rows, cols, scrollback_lines)));
+        let attention_bell = Arc::new(AtomicBool::new(false));
+        let writer = PtyWriter::spawn(pty_writer);
+        let writer_tx = writer.sender();
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_at: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
+        let read_error: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
+        let has_output = Arc::new(AtomicBool::new(false));
+        let dirty = Arc::new(AtomicBool::new(true));
+        let received_data = Arc::new(AtomicBool::new(false));
+        let subscribers: SubscriberList = Arc::new(Mutex::new(Vec::new()));
+        let attention_notify = Arc::new(AtomicBool::new(false));
+        let progress: Arc<Mutex<Option<ProgressReport>>> = Arc::new(Mutex::new(None));
+        let passthrough: Arc<Mutex<VecDeque<crate::attention::CapturedSeq>>> =
+            Arc::new(Mutex::new(VecDeque::new()));
+
+        let reader_state = ReaderLoopState {
+            terminal: Arc::clone(&terminal),
+            writer_tx,
+            exited: Arc::clone(&exited),
+            exited_at: Arc::clone(&exited_at),
+            read_error: Arc::clone(&read_error),
+            label: format!("adopted pty {pid} in {}", spawn_dir.display()),
+            has_output: Arc::clone(&has_output),
+            dirty: Arc::clone(&dirty),
+            received_data: Arc::clone(&received_data),
+            subscribers: Arc::clone(&subscribers),
+            attention_bell: Arc::clone(&attention_bell),
+            attention_notify: Arc::clone(&attention_notify),
+            progress: Arc::clone(&progress),
+            passthrough: Arc::clone(&passthrough),
+            // Agent signal tracking is rebuilt from the live stream; there is no
+            // carried-over scanner state to honour.
+            track_agent_signals: true,
+        };
+        let reader_thread = thread::spawn(move || Self::reader_loop(reader, reader_state));
+
+        Ok(Self {
+            master: Box::new(master),
+            writer,
+            terminal,
+            child: Box::new(child),
+            spawn_dir: spawn_dir.to_path_buf(),
+            scrollback_capacity: scrollback_lines,
+            reaped: None,
+            // The agent is older than this, but nothing in the new image can
+            // know when it really started, and claiming otherwise would make
+            // every "how long has this run" answer a guess presented as a fact.
+            spawned_at: Instant::now(),
+            exited,
+            read_error,
+            exited_at,
+            has_output,
+            dirty,
+            received_data,
+            last_resize_at: Mutex::new(None),
+            subscribers,
+            next_sub_id: AtomicU64::new(0),
+            reader_thread: Some(reader_thread),
+            attention_bell,
+            attention_notify,
+            progress,
+            passthrough,
+        })
+    }
+
     fn reader_loop(mut reader: Box<dyn std::io::Read + Send>, state: ReaderLoopState) {
         let mut buf = [0u8; 4096];
         let mut scanner = crate::attention::AttentionScanner::new();

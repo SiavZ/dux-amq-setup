@@ -87,6 +87,15 @@ fn an_agent_survives_a_reload_and_answers_the_next_image() {
         Some("e2e-session"),
         "the session the tab belongs to must survive the handoff:\n{stdout}"
     );
+
+    // The UI decides whether a row is running from the client's own liveness,
+    // so a rebuilt client that answered but reported itself dead would show the
+    // agent as exited while it is plainly still talking.
+    assert_eq!(
+        field(&stdout, "CLIENT_LIVE="),
+        Some("true"),
+        "the rebuilt client must report its adopted agent as live:\n{stdout}"
+    );
 }
 
 #[test]
