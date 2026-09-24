@@ -9166,6 +9166,10 @@ mod tests {
             engine.pending_web_add_project_ops.contains_key(key),
             "the add-project op must be registered under its busy key"
         );
+        // Let the switch worker finish before the fixture repositories drop: a
+        // `git switch` still writing into the clone while its TempDir is being
+        // removed leaves the scratch directory behind in the temp directory.
+        drive_add_project_chain(&mut engine);
     }
 
     // Helper: detach HEAD on a path (requires at least one commit).
