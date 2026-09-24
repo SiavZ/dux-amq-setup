@@ -167,8 +167,7 @@ pub fn peer_session(session: &AgentSession, agent_handle: String, deleted: bool)
         branch: session.branch_name().map(str::to_string),
         title: session.title.clone(),
         agent_handle,
-        // INTEGRATION: read `AgentSession::shared_workspace()` once it exists.
-        shared_workspace: false,
+        shared_workspace: session.shared_workspace(),
         deleted,
         exited: matches!(session.status, SessionStatus::Exited),
     }

@@ -1909,6 +1909,7 @@ impl App {
             | PromptState::PickProjectWorktree(_)
             | PromptState::ManageWorktrees(_)
             | PromptState::ConfirmDeleteWorktree(_)
+            | PromptState::OrphanWorktrees(_)
             | PromptState::ChangeTheme(_)
             | PromptState::ChangeAgentProvider(_)
             | PromptState::ChangeDefaultProvider(_)
@@ -5417,6 +5418,9 @@ impl App {
             return Ok(Some(exit));
         }
         if let Some(exit) = self.handle_pick_editor_prompt_key(key) {
+            return Ok(Some(exit));
+        }
+        if let Some(exit) = self.handle_orphan_worktrees_prompt_key(key) {
             return Ok(Some(exit));
         }
         if let Some(exit) = self.handle_manage_worktrees_prompt_key(key) {

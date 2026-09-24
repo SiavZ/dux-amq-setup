@@ -555,6 +555,15 @@ pub const PALETTE_COMMANDS: &[PaletteCommand] = &[
         // which already described this same dialog.
     },
     PaletteCommand {
+        action: Action::PruneOrphanWorktrees,
+        name: "prune-orphan-worktrees",
+        description: "Review and remove Git-registered orphan worktrees",
+        // TUI-only for now (fork 5c9edb78). Opt-in by design: nothing runs
+        // until the palette command is chosen, and every removal is confirmed
+        // per item. Drives `dux_core::orphan_worktrees`, which a web dialog
+        // can call later.
+    },
+    PaletteCommand {
         action: Action::ToggleGithubIntegration,
         name: "toggle-github-integration",
         description: "Toggle GitHub PR integration",

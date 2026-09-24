@@ -1368,6 +1368,14 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         hint_contexts: &[],
     },
     BindingDef {
+        // Palette-only: the opt-in orphan-worktree cleaner. No default key.
+        action: Action::PruneOrphanWorktrees,
+        default_keys: &[],
+        scopes: &[],
+        help: None,
+        hint_contexts: &[],
+    },
+    BindingDef {
         action: Action::ToggleGithubIntegration,
         default_keys: &[],
         scopes: &[],
@@ -3104,6 +3112,17 @@ mod tests {
     }
 
     #[test]
+    fn filtered_palette_includes_orphan_worktree_cleaner() {
+        let bindings = default_bindings();
+        let names = bindings
+            .filtered_palette("orphan")
+            .iter()
+            .filter_map(|binding| binding.palette_name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"prune-orphan-worktrees"));
+    }
+
+    #[test]
     fn filtered_palette_includes_reload_config_command() {
         let bindings = default_bindings();
         let results = bindings.filtered_palette("reload");
@@ -3271,6 +3290,7 @@ mod tests {
             "open-current-pr",
             "open-worktree",
             "open-worktree-with",
+            "prune-orphan-worktrees",
             "pull-project",
             "read-startup-command-logs",
             "recheck-github",

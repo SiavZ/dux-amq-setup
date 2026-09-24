@@ -470,6 +470,7 @@ mod tests {
                 "open-worktree",
                 "open-worktree-with",
                 "recreate-working-copy",
+                "prune-orphan-worktrees",
                 "fork-agent",
                 "change-agent-provider"
             ]

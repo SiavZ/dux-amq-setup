@@ -150,6 +150,9 @@ pub enum Action {
     DebugInput,
     ToggleDiffLineNumbers,
     ResourceMonitor,
+    /// Review and remove git-registered worktrees under dux's root that no
+    /// agent (live or soft-deleted) owns. Palette-only, per-item confirmation.
+    PruneOrphanWorktrees,
     ToggleGithubIntegration,
     RecheckGithub,
     ToggleCopyOnSelect,
@@ -328,6 +331,7 @@ impl Action {
             Action::DebugInput => "debug_input",
             Action::ToggleDiffLineNumbers => "toggle_diff_line_numbers",
             Action::ResourceMonitor => "resource_monitor",
+            Action::PruneOrphanWorktrees => "prune_orphan_worktrees",
             Action::ToggleGithubIntegration => "toggle_github_integration",
             Action::RecheckGithub => "recheck_github",
             Action::ToggleCopyOnSelect => "toggle_copy_on_select",
@@ -540,6 +544,9 @@ impl Action {
             Action::DebugInput => "Open input event debugger to inspect keyboard and mouse events.",
             Action::ToggleDiffLineNumbers => "Toggle line numbers in diff view.",
             Action::ResourceMonitor => "Show CPU and memory usage for dux and all running agents.",
+            Action::PruneOrphanWorktrees => {
+                "List Dux-root Git worktrees with no active or tombstoned session."
+            }
             Action::ToggleGithubIntegration => "Toggle GitHub PR integration.",
             Action::RecheckGithub => {
                 "Ask the gh CLI again whether GitHub features can be used, without restarting dux."
@@ -731,6 +738,7 @@ impl Action {
             | Action::DebugInput
             | Action::ToggleDiffLineNumbers
             | Action::ResourceMonitor
+            | Action::PruneOrphanWorktrees
             | Action::ToggleGithubIntegration
             | Action::RecheckGithub
             | Action::ToggleCopyOnSelect

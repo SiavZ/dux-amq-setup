@@ -4599,6 +4599,7 @@ mod tests {
             pending_first_load: None,
             unpushed_count_rx: None,
             notes_fetch_rx: None,
+            orphan_worktrees_rx: None,
             deferred_first_load_notes: None,
             notes_fetch_explicit_request: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,

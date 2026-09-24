@@ -99,6 +99,7 @@ pub(super) fn outside_click_policy(prompt: &PromptState) -> OutsideClickPolicy {
         | PromptState::PickEditor { .. }
         | PromptState::PickProjectWorktree(_)
         | PromptState::ManageWorktrees(_)
+        | PromptState::OrphanWorktrees(_)
         | PromptState::PickProject { .. }
         | PromptState::ChangeAgentProvider(_)
         | PromptState::ChangeDefaultProvider(_)
@@ -306,6 +307,8 @@ impl App {
             PromptState::ConfirmDeleteWorktree(_) => {
                 self.resolve_confirm_delete_worktree(false);
             }
+            // Same as its Esc: a confirmation steps back to the list.
+            PromptState::OrphanWorktrees(_) => self.cancel_orphan_worktrees_prompt(),
             PromptState::ConfirmDeleteTerminal { .. } => {
                 self.resolve_confirm_delete_terminal(false);
             }

@@ -51,6 +51,12 @@ pub mod pty;
 pub mod pty_adopt_child;
 pub mod pty_owners;
 pub mod pty_reattach;
+// Hard purge (GDPR erasure) and the opt-in orphan-worktree cleaner, ported
+// from the fork (purge workstream).
+pub mod orphan_worktrees;
+pub mod purge;
+pub mod purge_amq;
+pub mod purge_encoding;
 pub mod quiet_tail;
 pub mod release_notes;
 pub mod reload_handoff;

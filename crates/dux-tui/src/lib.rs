@@ -116,6 +116,25 @@ pub fn run(
         return Ok(TuiExit::Done);
     }
 
+    // `dux session purge|purge-all`: GDPR hard purge. Every mutating form
+    // takes the single-instance lock, so a purge can never race a running dux
+    // that would recreate what it deletes. `--help` and a missing root need no
+    // lock and must not create the root just to take one.
+    if args.first().map(|s| s.as_str()) == Some("session") {
+        let session_args = &args[1..];
+        let _lock = match session_args.first().map(|s| s.as_str()) {
+            Some("purge" | "purge-all") if paths.root.exists() => {
+                Some(acquire_lock_or_exit(&paths.lock_path))
+            }
+            _ => None,
+        };
+        let code = cli::run_session(session_args, &paths)?;
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(TuiExit::Done);
+    }
+
     // TUI: always create the root directory (so the lockfile can be
     // opened), acquire the lock, then let bootstrap create everything
     // else. A losing process never touches shared state beyond the
@@ -219,7 +238,8 @@ pub fn help_text() -> &'static str {
           dux config       Manage the configuration file\n\
           dux --version    Print the version and the git commit it was built from\n\
           dux peer         Route messages between Dux agent sessions\n\
-                           (`dux peer --help` for send, list, sync-amq)\n\n\
+                           (`dux peer --help` for send, list, sync-amq)\n\
+          dux session      Permanently purge an agent's data (dux session --help)\n\n\
          Server subcommand:\n\
           dux server                     Serve on the configured host and port\n\
           dux server --bind <ADDR:PORT>  Bind this exact address instead\n\

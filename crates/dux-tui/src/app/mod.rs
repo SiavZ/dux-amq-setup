@@ -294,6 +294,9 @@ pub struct App {
     /// themselves come back here. `Some` means a fetch is in flight, which is
     /// what stops the palette command from starting a second one.
     pub(crate) notes_fetch_rx: Option<mpsc::Receiver<NotesFetched>>,
+    /// The in-flight orphan-worktree cleaner worker, inventory or removal.
+    /// `Some` also means "one is running", so a second cannot start.
+    pub(crate) orphan_worktrees_rx: Option<mpsc::Receiver<orphan_worktrees::OrphanWorktreesAnswer>>,
     /// Notes that arrived while the user had a DIFFERENT modal open.
     /// `PromptState` is a single slot, so showing the what's-new screen the
     /// instant the fetch lands would discard whatever the user was typing. The
@@ -2263,6 +2266,9 @@ pub(crate) enum PromptState {
     /// The manager's removal confirmation. Boxed because it carries the list it
     /// came from, and a big variant would inflate every `PromptState`.
     ConfirmDeleteWorktree(Box<ConfirmDeleteWorktreePrompt>),
+    /// The opt-in orphan-worktree cleaner, list and per-item confirmation in
+    /// one variant. See [`orphan_worktrees`].
+    OrphanWorktrees(orphan_worktrees::OrphanWorktreesPrompt),
     KillRunning(KillRunningPrompt),
     ConfirmKillRunning(ConfirmKillRunningPrompt),
     ConfigReloadFailed {
@@ -3598,6 +3604,7 @@ pub(crate) mod components;
 mod first_load;
 mod input;
 pub(crate) mod modal;
+mod orphan_worktrees;
 mod overlay_dismiss;
 mod pty_ownership;
 mod redraw;
@@ -3898,6 +3905,7 @@ impl App {
             pending_first_load: None,
             unpushed_count_rx: None,
             notes_fetch_rx: None,
+            orphan_worktrees_rx: None,
             deferred_first_load_notes: None,
             notes_fetch_explicit_request: Arc::new(AtomicBool::new(false)),
             fullscreen_overlay: FullscreenOverlay::None,
@@ -5241,6 +5249,7 @@ impl App {
                 };
                 Ok(())
             }
+            "prune-orphan-worktrees" => self.open_orphan_worktree_cleaner(),
             "resource-monitor" => {
                 self.open_resource_monitor();
                 Ok(())
