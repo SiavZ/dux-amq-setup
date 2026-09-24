@@ -212,6 +212,10 @@ pub enum Action {
     MoveTerminalDown,
     MoveTerminalTop,
     MoveTerminalBottom,
+    /// Open the per-session settings modal for the selected agent: context
+    /// mode, YOLO, system prompt, watch-rule overrides, auto-clear, AMQ
+    /// verify override. Default Ctrl-Shift-S (fork d0e601c5).
+    SessionSettings,
 }
 
 impl Action {
@@ -355,6 +359,7 @@ impl Action {
             Action::MoveTerminalDown => "move_terminal_down",
             Action::MoveTerminalTop => "move_terminal_top",
             Action::MoveTerminalBottom => "move_terminal_bottom",
+            Action::SessionSettings => "session_settings",
         }
     }
 
@@ -617,6 +622,9 @@ impl Action {
             Action::MoveTerminalBottom => {
                 "Move the selected terminal to the bottom (switches sorting to manual)."
             }
+            Action::SessionSettings => {
+                "Open the selected agent's session settings (mode, YOLO, system prompt, watch rules, auto-clear, AMQ verify)."
+            }
         }
     }
 
@@ -757,6 +765,7 @@ impl Action {
             | Action::MoveTerminalDown
             | Action::MoveTerminalTop
             | Action::MoveTerminalBottom => None,
+            Action::SessionSettings => Some("Global"),
         }
     }
 }

@@ -275,6 +275,10 @@ enum PromptMouseTarget {
     MacroSave,
     ConfigureFieldCancel,
     ConfigureFieldSave,
+    /// A session-settings row (radio, checkbox, title, prompt editor).
+    SessionSettingsRow(super::SettingsFocus),
+    SessionSettingsCancel,
+    SessionSettingsSave,
 }
 
 impl ButtonPressedTarget {
@@ -343,6 +347,12 @@ impl ButtonPressedTarget {
                 Some(ButtonPressedTarget::ConfigureFieldCancel)
             }
             PromptMouseTarget::ConfigureFieldSave => Some(ButtonPressedTarget::ConfigureFieldSave),
+            PromptMouseTarget::SessionSettingsCancel => {
+                Some(ButtonPressedTarget::SessionSettingsCancel)
+            }
+            PromptMouseTarget::SessionSettingsSave => {
+                Some(ButtonPressedTarget::SessionSettingsSave)
+            }
             PromptMouseTarget::ConfirmQuitCancel => Some(ButtonPressedTarget::ConfirmQuitCancel),
             PromptMouseTarget::ConfirmQuitConfirm => Some(ButtonPressedTarget::ConfirmQuitConfirm),
             PromptMouseTarget::ConfirmDiscardCancel => {
@@ -416,7 +426,8 @@ impl ButtonPressedTarget {
             | PromptMouseTarget::MacroNameInput
             | PromptMouseTarget::MacroTextInput
             | PromptMouseTarget::MacroSurfaceOption(_)
-            | PromptMouseTarget::MacroListItem(_) => None,
+            | PromptMouseTarget::MacroListItem(_)
+            | PromptMouseTarget::SessionSettingsRow(_) => None,
         }
     }
 }
@@ -1105,6 +1116,11 @@ impl App {
             }
             Action::RemoveGitPane => self.toggle_git_pane_removed(),
             Action::ToggleResizeMode => self.toggle_resize_mode(),
+            Action::SessionSettings => {
+                if let Err(err) = self.open_session_settings() {
+                    self.set_error(format!("{err:#}"));
+                }
+            }
             Action::CloseOverlay if self.center_typeable() && !self.scroll_mode_active() => {
                 self.forward_typing_key_to_center(&key);
             }
@@ -1754,8 +1770,14 @@ impl App {
         // Follow-ups that need `&mut self` after the prompt borrow ends.
         let mut refresh_path_completions = false;
         let mut select_startup_log: Option<usize> = None;
+        if matches!(self.prompt, PromptState::SessionSettings(_)) {
+            self.paste_into_session_settings(text);
+            return;
+        }
         match &mut self.prompt {
             PromptState::None => {}
+            // Handled above: it needs `&mut self` for the engage state.
+            PromptState::SessionSettings(_) => {}
 
             // Type-immediately: the palette query.
             PromptState::Command { input, selected } => {
@@ -5358,6 +5380,10 @@ impl App {
             return self.handle_configure_modal_key(key, focus);
         }
 
+        if matches!(self.prompt, PromptState::SessionSettings(_)) {
+            return self.handle_session_settings_key(key);
+        }
+
         if let Some(should_exit) = self.handle_notice_prompt_key(key) {
             return Ok(should_exit);
         }
@@ -6332,6 +6358,22 @@ impl App {
                 column,
                 row,
             ),
+            OverlayMouseLayout::SessionSettings {
+                save_button,
+                cancel_button,
+                ..
+            } => click_target(
+                &[
+                    (save_button, PromptMouseTarget::SessionSettingsSave),
+                    (cancel_button, PromptMouseTarget::SessionSettingsCancel),
+                ],
+                column,
+                row,
+            )
+            .or_else(|| {
+                self.session_settings_hit(column, row)
+                    .map(PromptMouseTarget::SessionSettingsRow)
+            }),
             OverlayMouseLayout::ConfigureStartupCommand {
                 input,
                 cancel_button,
@@ -8811,6 +8853,12 @@ impl App {
             PromptMouseTarget::StartupCommandInput => {
                 self.click_startup_command_input(mouse);
             }
+            PromptMouseTarget::SessionSettingsRow(focus) => {
+                if let Err(err) = self.click_session_settings_row(focus, mouse) {
+                    self.set_error(format!("{err:#}"));
+                }
+            }
+            PromptMouseTarget::SessionSettingsCancel | PromptMouseTarget::SessionSettingsSave => {}
             PromptMouseTarget::MacroNameInput => {
                 self.focus_macro_edit_control(MacroEditFocus::Name);
                 self.set_macro_name_cursor_from_mouse(mouse.column);
@@ -8981,6 +9029,14 @@ impl App {
             ButtonPressedTarget::ConfigureFieldCancel => {
                 self.focus_configure_control(ConfigureFieldFocus::Cancel);
                 self.cancel_configure_modal();
+                false
+            }
+            ButtonPressedTarget::SessionSettingsCancel => {
+                self.press_session_settings_button(false);
+                false
+            }
+            ButtonPressedTarget::SessionSettingsSave => {
+                self.press_session_settings_button(true);
                 false
             }
             ButtonPressedTarget::ConfigureFieldSave => {

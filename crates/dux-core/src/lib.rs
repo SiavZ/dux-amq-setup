@@ -71,6 +71,7 @@ pub mod text;
 pub mod theme;
 pub mod urls;
 pub mod viewmodel;
+pub mod watch;
 pub mod welcome;
 pub mod welcome_screen;
 pub mod wire;
@@ -79,6 +80,9 @@ pub mod working_copy;
 pub mod working_cue;
 pub mod worktree_file;
 pub mod worktree_manager;
+// Fork port: AMQ inject/orchestrator and per-session settings.
+pub mod amq;
+pub mod session_settings;
 
 /// Display version string ('vX.Y.Z' for release builds, 'development' otherwise), set by build.rs, mirroring the TUI's `DUX_DISPLAY_VERSION`.
 pub fn display_version() -> &'static str {

@@ -2198,6 +2198,9 @@ pub(crate) enum PromptState {
     ChangeDefaultProvider(ChangeDefaultProviderPrompt),
     ChangeProjectDefaultProvider(ChangeProjectDefaultProviderPrompt),
     SetTailscaleMode(SetTailscaleModePrompt),
+    /// The per-session settings modal (AMQ + orchestrator workstream).
+    /// Boxed: the draft carries two text inputs and the rule list.
+    SessionSettings(Box<SessionSettingsPrompt>),
     ChangeTheme(ChangeThemePrompt),
     ConfigureStartupCommand {
         project_id: String,
@@ -2808,6 +2811,8 @@ pub(crate) enum InputTarget {
     /// rather than a reuse of `StartupCommand` so a future reader cannot mistake
     /// one modal's engage state for the other's.
     MacroText,
+    /// The session-settings modal's system-prompt editor is engaged.
+    SessionSettingsPrompt,
 }
 
 #[derive(Clone, Copy)]
@@ -3166,6 +3171,13 @@ pub(crate) enum OverlayMouseLayout {
         input: Rect,
         cancel_button: Rect,
         save_button: Rect,
+    },
+    /// The session-settings modal. Its variable-length row rects live on the
+    /// prompt (`SessionSettingsPrompt::hit_rows`), since this type is `Copy`.
+    SessionSettings {
+        title_input: Rect,
+        save_button: Rect,
+        cancel_button: Rect,
     },
     KillRunning {
         input: Option<Rect>,
@@ -3555,7 +3567,9 @@ mod redraw;
 pub(crate) use redraw::RedrawGate;
 mod render;
 mod reorder;
+mod session_settings;
 mod sessions;
+pub(crate) use session_settings::{SessionSettingsPrompt, SettingsFocus};
 #[cfg(test)]
 mod test_support;
 pub(crate) mod text_input;
@@ -3706,6 +3720,7 @@ impl App {
             providers: HashMap::new(),
             running_provider_pins: HashMap::new(),
             launched_drop_paste: Default::default(),
+            watch: Default::default(),
             companion_terminals: HashMap::new(),
             agent_tabs: agent_tabs
                 .into_iter()
@@ -3757,6 +3772,7 @@ impl App {
             pty_progress: HashMap::new(),
             agent_viewed: HashMap::new(),
             last_foreground_refresh: None,
+            amq: Default::default(),
             pending_web_checkout_ops: HashMap::new(),
             pending_web_add_project_ops: HashMap::new(),
             pending_web_pr_lookup_ops: HashMap::new(),
@@ -4060,6 +4076,8 @@ impl App {
         self.engine.spawn_branch_sync_worker();
         self.engine.spawn_project_branch_status_checks();
         self.engine.spawn_gh_status_check();
+        // Idempotent: the web flip hands this same engine over and re-calls it.
+        self.engine.start_amq();
         // The background server assumes these process-wide workers are already running.
         self.start_background_server_from_config();
     }
@@ -5076,6 +5094,7 @@ impl App {
             "delete-agent" => self.confirm_delete_selected_session(),
             "rename-agent" => self.open_rename_session(),
             "agent-info" => self.open_agent_info(),
+            "session-settings" => self.open_session_settings(),
             "kill-running" => self.open_kill_running(),
             "detach-agent" => self.confirm_detach_selected_session(),
             "recreate-working-copy" => self.confirm_recreate_selected_working_copy(),

@@ -267,6 +267,8 @@ fn retired_stock_gemini() -> ProviderCommandConfig {
         // gemini was retired before `web_dragdrop_paste` existed, so the stock
         // block dux shipped never carried the key.
         web_dragdrop_paste: None,
+        // Watch rules postdate gemini's retirement too.
+        watch: Vec::new(),
     }
 }
 
@@ -322,6 +324,8 @@ fn table_matches_provider_config(table: &Table, stock: &ProviderCommandConfig) -
         && user.install_hint == stock.install_hint
         && user.forward_scroll == stock.forward_scroll
         && user.web_dragdrop_paste == stock.web_dragdrop_paste
+        // A block carrying user-authored watch rules is customized: keep it.
+        && user.watch == stock.watch
 }
 
 #[cfg(test)]
@@ -417,6 +421,17 @@ mod tests {
             "[providers.gemini]\ncommand = \"/opt/my-gemini\"\nargs = []\nresume_args = [\"--resume\"]\nresume_wait_timeout_ms = 0\n",
         );
         // Only the customized block is present; nothing else to migrate.
+        assert!(!apply_load_migrations(&mut d).expect("migrate"));
+        assert!(d.get("providers").and_then(|p| p.get("gemini")).is_some());
+    }
+
+    /// A stock gemini block the user added watch rules to is customized and
+    /// must not be pruned, or the rules would be deleted with it.
+    #[test]
+    fn keeps_a_stock_gemini_block_that_carries_watch_rules() {
+        let mut d = doc(
+            "[providers.gemini]\ncommand = \"gemini\"\nargs = []\nresume_args = [\"--resume\"]\nresume_wait_timeout_ms = 0\ninstall_hint = \"brew install gemini-cli\"\n\n[[providers.gemini.watch]]\npattern = \"quota\"\ntext = \"retry\"\n",
+        );
         assert!(!apply_load_migrations(&mut d).expect("migrate"));
         assert!(d.get("providers").and_then(|p| p.get("gemini")).is_some());
     }

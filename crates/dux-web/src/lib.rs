@@ -472,6 +472,12 @@ fn run_plain_http(paths: DuxPaths, plan: ServerPlan, version: String) -> Result<
 
         // Spawn the engine on its own std thread (it runs the synchronous engine
         // loop, not a tokio task).
+        //
+        // AMQ starts here and at the flip, not in `spawn_global_workers`: it
+        // claims files from the user's real inject queue, which the many test
+        // engines built on `spawn_engine_thread` must never touch.
+        let mut engine = engine;
+        engine.start_amq();
         let (handle, _join) = engine_actor::spawn_engine_thread(engine);
 
         // The shared shutdown primitive: a SIGINT/SIGTERM or a first-listener
@@ -1791,6 +1797,9 @@ pub fn serve_with_engine(
     let console = Console::capture(activity);
     let (handle, ends) = engine_actor::build_actor_channels(&engine);
     engine_actor::spawn_global_workers(&mut engine);
+    // AMQ is not started here: the flip hands over a TUI engine whose drainer
+    // is already running (`App::start_run_services`), and a test flip must
+    // never claim files from the user's real inject queue.
 
     // Grab the teardown flag before the handle moves into the router. `ServeCore`
     // trips it the instant serving ends (before axum graceful shutdown) so any

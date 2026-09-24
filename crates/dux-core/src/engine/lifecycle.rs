@@ -1529,6 +1529,10 @@ impl Engine {
     /// happens after a reload adopted its process from the previous image. That
     /// agent is running, so it is `Active`, whatever its directory says.
     pub fn normalize_restored_sessions(&mut self) {
+        // Per-session settings (mode, YOLO, ...) live beside the session rows,
+        // not in `AgentSession`; both surfaces restore through here, including
+        // after a hot reload's exec, so this is where they come back.
+        self.load_session_settings_from_store();
         let ids: Vec<(String, bool, bool)> = self
             .sessions
             .iter()
@@ -1683,17 +1687,31 @@ impl Engine {
         })
     }
 
-    /// Stop everything that must not straddle the reload exec, other than the
-    /// PTYs (which are handed over, not stopped).
-    ///
-    /// Runs once the handoff is known to be complete, immediately before the
-    /// caller execs. Every descriptor this process holds WITHOUT close-on-exec,
+    /// Checks that only need `&self` and must hold as soon as the handoff is
+    /// complete. Every descriptor this process holds WITHOUT close-on-exec,
     /// other than the PTY masters named in the handoff, is a leak into the new
-    /// image, and every background thread holding a lock or a claim simply
-    /// vanishes at the exec without releasing it. This is the one place that
-    /// winds such things down.
-    pub fn pre_exec_quiesce(&self) {
-        // INTEGRATION: stop AMQ inject workers + release claims (maple), close peer listeners (seedling)
+    /// image; nothing here may clear close-on-exec on anything else.
+    ///
+    /// Stopping background workers is deliberately NOT done here: this runs
+    /// inside `prepare_reload_handoff`, while the TUI loop is still live and
+    /// the reload can still be abandoned. Winding workers down happens in
+    /// [`quiesce_for_exec`](Self::quiesce_for_exec), the last step before the
+    /// exec itself. The peer router holds no socket, thread or lock across a
+    /// call, so it has nothing to stop.
+    pub fn pre_exec_quiesce(&self) {}
+
+    /// Wind down every background worker that must not straddle the reload
+    /// exec, other than the PTYs, which are handed over rather than stopped.
+    ///
+    /// Call it once nothing can refuse the reload any more, immediately
+    /// before exec: a background thread holding a claim simply vanishes at the
+    /// exec without releasing it. Today that is AMQ (watcher, poll thread and
+    /// inbox claims, see [`quiesce_amq_for_exec`](Self::quiesce_amq_for_exec)).
+    /// A failed exec is recovered by the surface restarting its services, which
+    /// calls `start_amq` again.
+    pub fn quiesce_for_exec(&mut self) {
+        let report = self.quiesce_amq_for_exec();
+        crate::logger::info(&format!("reload: quiesced background workers: {report:?}"));
     }
 
     /// Describe every provider and companion terminal into `ptys`, clearing

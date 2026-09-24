@@ -79,6 +79,13 @@ fn exec_reload(
         );
     };
 
+    // The last step before the exec, once nothing can refuse the reload any
+    // more: wind down this image's background workers (AMQ watcher and poll
+    // thread, settling every inbox claim) so the successor starts its own.
+    // If the exec then fails, `resume_after_failed_reload` runs the TUI's
+    // `start_run_services` again, which restarts them.
+    let mut engine = engine;
+    engine.quiesce_for_exec();
     let err = match dux_core::reload_policy::exec_into_reload(&exe, &handoff_path) {
         Ok(never) => match never {},
         Err(err) => err,
