@@ -1650,7 +1650,29 @@ impl Engine {
         }
 
         for (tab_id, terminal) in &self.companion_terminals {
-            let entry = terminal.client.prepare_for_reload(tab_id.as_str(), None)?;
+            let mut entry = terminal.client.prepare_for_reload(tab_id.as_str(), None)?;
+            // A terminal has no database row: its owner, label and order exist
+            // only here, so they have to travel in the handoff or the user's
+            // shells come back anonymous and unowned.
+            let (owner_kind, owner_id) = match &terminal.owner {
+                crate::model::TerminalOwner::Session(id) => (
+                    crate::reload_handoff::TerminalOwnerKind::Session,
+                    Some(id.clone()),
+                ),
+                crate::model::TerminalOwner::Project(id) => (
+                    crate::reload_handoff::TerminalOwnerKind::Project,
+                    Some(id.clone()),
+                ),
+                crate::model::TerminalOwner::Standalone => {
+                    (crate::reload_handoff::TerminalOwnerKind::Standalone, None)
+                }
+            };
+            entry.terminal = Some(crate::reload_handoff::HandoffTerminal {
+                owner_kind,
+                owner_id,
+                label: terminal.label.clone(),
+                sort_order: terminal.sort_order,
+            });
             ptys.push(entry);
         }
 
@@ -1658,6 +1680,90 @@ impl Engine {
             written_by: std::process::id(),
             ptys,
         })
+    }
+
+    /// Adopt the PTYs a previous image handed over, putting each back in the row
+    /// it came from.
+    ///
+    /// The receiving half of [`prepare_reload_handoff`](Self::prepare_reload_handoff).
+    /// Returns the number adopted, and logs every entry it could not take.
+    ///
+    /// Unlike the collecting side this is NOT all or nothing, and the asymmetry
+    /// is deliberate. Before the exec, refusing costs nothing: the old image
+    /// keeps running and the user never notices. Afterwards there is nothing to
+    /// go back to, so a single bad entry must not discard the agents that are
+    /// still perfectly reachable. What can be saved is saved; the rest is
+    /// reported.
+    ///
+    /// # Safety
+    ///
+    /// The descriptors named in `handoff` must have been inherited by THIS
+    /// process through the exec that consumed it. A manifest from any other
+    /// process names descriptors that now belong to something else.
+    pub unsafe fn restore_reload_handoff(
+        &mut self,
+        handoff: crate::reload_handoff::Handoff,
+    ) -> usize {
+        let mut adopted = 0usize;
+        for entry in handoff.ptys {
+            // SAFETY: the caller guarantees these descriptors were inherited by
+            // this process; `adopt_after_reload` refuses anything that is not a
+            // tty, so a stale number fails here rather than later.
+            let client = match unsafe {
+                crate::pty::PtyClient::adopt_after_reload(
+                    entry.master_fd,
+                    entry.child_pid,
+                    entry.rows,
+                    entry.cols,
+                    entry.scrollback_capacity,
+                    &entry.spawn_dir,
+                )
+            } {
+                Ok(client) => client,
+                Err(err) => {
+                    crate::logger::warn(&format!(
+                        "reload: could not adopt the pty for tab {}: {err:#}",
+                        entry.tab_id
+                    ));
+                    continue;
+                }
+            };
+
+            match entry.terminal {
+                Some(terminal) => {
+                    let owner = match (terminal.owner_kind, terminal.owner_id) {
+                        (crate::reload_handoff::TerminalOwnerKind::Session, Some(id)) => {
+                            crate::model::TerminalOwner::Session(id)
+                        }
+                        (crate::reload_handoff::TerminalOwnerKind::Project, Some(id)) => {
+                            crate::model::TerminalOwner::Project(id)
+                        }
+                        // A session or project owner with no id is a manifest
+                        // that contradicts itself. Standing the terminal up as
+                        // standalone keeps the user's shell rather than dropping
+                        // it over a field nobody can repair from here.
+                        _ => crate::model::TerminalOwner::Standalone,
+                    };
+                    self.companion_terminals.insert(
+                        entry.tab_id.clone(),
+                        crate::model::CompanionTerminal {
+                            owner,
+                            label: terminal.label,
+                            foreground_cmd: None,
+                            client,
+                            sort_order: terminal.sort_order,
+                            created_at: chrono::Utc::now(),
+                        },
+                    );
+                }
+                None => {
+                    self.providers
+                        .insert(crate::ids::TabId::new(entry.tab_id.clone()), client);
+                }
+            }
+            adopted += 1;
+        }
+        adopted
     }
 
     /// Gracefully wind down every running PTY for server shutdown: SIGTERM each
@@ -6689,5 +6795,137 @@ mod tests {
             .prepare_reload_handoff()
             .expect("an idle engine has nothing to fail at");
         assert!(handoff.ptys.is_empty());
+    }
+
+    #[test]
+    fn a_collected_handoff_restores_into_a_fresh_engine_with_the_agent_still_live() {
+        // The round trip the reload performs, minus the exec: collect from one
+        // engine, restore into another, and check the agent is still there and
+        // still answering. The exec itself is covered end to end by
+        // `tests/reload_handoff_e2e.rs`; what this pins is that the ENGINE puts
+        // the pty back in the row it came from.
+        let (donor, tmp) = engine_with_one_live_agent();
+        let slot = donor
+            .providers
+            .keys()
+            .next()
+            .expect("the fixture has one provider")
+            .clone();
+        let pid_before = donor.providers[slot.as_ref()]
+            .child_process_id()
+            .expect("the live agent has a pid");
+
+        let handoff = donor.prepare_reload_handoff().expect("collect");
+        // The donor must not close the descriptors it just handed over, exactly
+        // as the outgoing image must not before it execs.
+        std::mem::forget(donor);
+
+        let (mut receiver, _tmp2) = test_engine();
+        // SAFETY: the descriptors are owned by this process and were not closed,
+        // which is the same guarantee an exec provides.
+        let adopted = unsafe { receiver.restore_reload_handoff(handoff) };
+
+        assert_eq!(adopted, 1, "the one live agent must be adopted");
+        let client = receiver
+            .providers
+            .get(slot.as_ref())
+            .expect("the agent must come back in the tab it left from");
+        assert_eq!(
+            client.child_process_id(),
+            Some(pid_before),
+            "the adopted agent must be the same process, not a new one"
+        );
+        assert!(client.is_live(), "the adopted agent must report as running");
+        drop(tmp);
+    }
+
+    #[test]
+    fn a_companion_terminal_comes_back_owned_and_labelled() {
+        // A terminal has no database row, so everything that identifies it
+        // travels in the handoff. Without that the user's shells return as
+        // anonymous standalone rows, which looks like data loss.
+        let (mut donor, tmp) = test_engine();
+        let client = crate::pty::PtyClient::spawn_with_env(
+            "sleep",
+            &["30".to_string()],
+            tmp.path(),
+            24,
+            80,
+            1000,
+            &[],
+        )
+        .expect("spawn terminal");
+        donor.companion_terminals.insert(
+            "term-1".to_string(),
+            crate::model::CompanionTerminal {
+                owner: crate::model::TerminalOwner::Project("p1".to_string()),
+                label: "my shell".to_string(),
+                foreground_cmd: None,
+                client,
+                sort_order: 7,
+                created_at: chrono::Utc::now(),
+            },
+        );
+
+        let handoff = donor.prepare_reload_handoff().expect("collect");
+        std::mem::forget(donor);
+
+        let (mut receiver, _tmp2) = test_engine();
+        // SAFETY: as above, the descriptors are owned and still open here.
+        let adopted = unsafe { receiver.restore_reload_handoff(handoff) };
+        assert_eq!(adopted, 1);
+
+        let term = receiver
+            .companion_terminals
+            .get("term-1")
+            .expect("the terminal must come back under its own tab id");
+        assert_eq!(term.label, "my shell", "the label must survive the reload");
+        assert_eq!(
+            term.owner,
+            crate::model::TerminalOwner::Project("p1".to_string()),
+            "the terminal must come back owned by the same project"
+        );
+        assert_eq!(term.sort_order, 7, "its place in the list must survive");
+        assert!(
+            receiver.providers.is_empty(),
+            "a terminal must not be restored as an agent provider"
+        );
+    }
+
+    #[test]
+    fn one_unusable_entry_does_not_cost_the_agents_that_are_fine() {
+        // After the exec there is nothing to fall back to, so a single bad entry
+        // must not discard the agents that are still reachable. (The collecting
+        // side is all-or-nothing for the opposite reason: refusing before the
+        // exec costs the user nothing.)
+        let (donor, tmp) = engine_with_one_live_agent();
+        let mut handoff = donor.prepare_reload_handoff().expect("collect");
+        std::mem::forget(donor);
+
+        // A descriptor that is open but is not a tty: the shape a stale or
+        // wrong fd number takes.
+        let not_a_tty = tempfile::NamedTempFile::new().expect("tempfile");
+        handoff.ptys.push(crate::reload_handoff::HandoffPty {
+            tab_id: "broken".to_string(),
+            session_id: None,
+            terminal: None,
+            master_fd: std::os::fd::AsRawFd::as_raw_fd(not_a_tty.as_file()),
+            child_pid: Some(std::process::id()),
+            rows: 24,
+            cols: 80,
+            spawn_dir: tmp.path().to_path_buf(),
+            scrollback_capacity: 1000,
+        });
+
+        let (mut receiver, _tmp2) = test_engine();
+        // SAFETY: the good descriptor is owned here; the bad one is refused
+        // before adoption, so `not_a_tty` still owns it.
+        let adopted = unsafe { receiver.restore_reload_handoff(handoff) };
+
+        assert_eq!(adopted, 1, "the healthy agent must still be adopted");
+        assert!(
+            !receiver.providers.contains_key(TabIdRef::new("broken")),
+            "the unusable entry must be dropped, not stood up as a dead row"
+        );
     }
 }

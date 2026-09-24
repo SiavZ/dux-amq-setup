@@ -1871,6 +1871,9 @@ impl PtyClient {
         Some(crate::reload_handoff::HandoffPty {
             tab_id: tab_id.to_string(),
             session_id: session_id.map(str::to_string),
+            // Filled in by the caller for a companion terminal; an agent leaves
+            // it unset because its row is restored from the database.
+            terminal: None,
             master_fd: fd,
             child_pid: self.child_process_id(),
             rows,

@@ -43,6 +43,31 @@ use serde::{Deserialize, Serialize};
 /// notes.
 pub const HANDOFF_FLAG: &str = "--reload-handoff";
 
+/// What a companion terminal needs in order to come back as itself.
+///
+/// Agents can be rebuilt from the database, but a terminal has no row there:
+/// its owner, label and ordering live only in memory (see
+/// [`crate::model::CompanionTerminal`], whose fields are marked RUNTIME ONLY).
+/// A reload that did not carry them would return the user's shells as
+/// anonymous, unowned rows in an arbitrary order, so they travel here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffTerminal {
+    /// The owner, flattened to a kind and an optional id because
+    /// [`crate::model::TerminalOwner`] is not itself serializable.
+    pub owner_kind: TerminalOwnerKind,
+    pub owner_id: Option<String>,
+    pub label: String,
+    pub sort_order: u64,
+}
+
+/// Which kind of owner a [`HandoffTerminal`] had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TerminalOwnerKind {
+    Session,
+    Project,
+    Standalone,
+}
+
 /// One live agent, described well enough to be rebuilt after the exec.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandoffPty {
@@ -50,6 +75,11 @@ pub struct HandoffPty {
     pub tab_id: String,
     /// The session the tab belongs to, for rejoining the row to its session.
     pub session_id: Option<String>,
+    /// Set when this PTY is a companion terminal rather than an agent, carrying
+    /// the parts of it that exist nowhere but memory. `None` for an agent, whose
+    /// row is restored from the database.
+    #[serde(default)]
+    pub terminal: Option<HandoffTerminal>,
     /// The inherited master descriptor.
     ///
     /// Only meaningful inside the process that inherited it, which is why the
@@ -128,16 +158,37 @@ mod tests {
     fn sample() -> Handoff {
         Handoff {
             written_by: 4242,
-            ptys: vec![HandoffPty {
-                tab_id: "s1-slot".to_string(),
-                session_id: Some("s1".to_string()),
-                master_fd: 7,
-                child_pid: Some(991),
-                rows: 24,
-                cols: 80,
-                spawn_dir: PathBuf::from("/tmp/work"),
-                scrollback_capacity: 1000,
-            }],
+            ptys: vec![
+                HandoffPty {
+                    tab_id: "s1-slot".to_string(),
+                    session_id: Some("s1".to_string()),
+                    terminal: None,
+                    master_fd: 7,
+                    child_pid: Some(991),
+                    rows: 24,
+                    cols: 80,
+                    spawn_dir: PathBuf::from("/tmp/work"),
+                    scrollback_capacity: 1000,
+                },
+                // A terminal too, because its identity is the part that exists
+                // nowhere but in this file.
+                HandoffPty {
+                    tab_id: "term-1".to_string(),
+                    session_id: None,
+                    terminal: Some(HandoffTerminal {
+                        owner_kind: TerminalOwnerKind::Project,
+                        owner_id: Some("p1".to_string()),
+                        label: "my shell".to_string(),
+                        sort_order: 7,
+                    }),
+                    master_fd: 9,
+                    child_pid: Some(992),
+                    rows: 30,
+                    cols: 100,
+                    spawn_dir: PathBuf::from("/tmp/work"),
+                    scrollback_capacity: 500,
+                },
+            ],
         }
     }
 
