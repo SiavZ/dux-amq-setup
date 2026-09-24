@@ -106,6 +106,7 @@ impl App {
         self.drain_worker_events();
         self.apply_resume_fallback_sweep();
         self.apply_reaped_terminations();
+        self.apply_watch_rules_tick();
         let maintenance = self.apply_pruned_pty_events();
         self.note_companion_maintenance(&maintenance);
         self.refresh_resource_monitor_if_due();
@@ -359,6 +360,19 @@ impl App {
         for reaction in self.engine.sweep_resume_fallbacks(sweep_size) {
             self.mark_frame_dirty();
             let routing = self.companion_routing();
+            self.notify_companion(&reaction);
+            self.apply_routed_reaction(reaction, &routing);
+        }
+    }
+
+    /// Drive the watch rules one tick and show what they report. The terminal
+    /// UI is the single tick site while it runs (the web actor's maintenance
+    /// sweep does not run beside it), so a rule fires once.
+    pub(crate) fn apply_watch_rules_tick(&mut self) {
+        for status in self.engine.tick_watch_rules() {
+            self.mark_frame_dirty();
+            let routing = self.companion_routing();
+            let reaction = EventReaction::Status(status);
             self.notify_companion(&reaction);
             self.apply_routed_reaction(reaction, &routing);
         }

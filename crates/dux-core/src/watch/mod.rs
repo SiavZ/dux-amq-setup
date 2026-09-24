@@ -19,9 +19,11 @@
 //! disarmed by hand from the watch-rules palette command.
 
 pub mod builtin;
+pub mod delivery;
 pub mod engine;
 pub mod reset_time;
 pub mod rule;
+pub mod runtime;
 
 pub use engine::{RuleSnapshot, RuleStateKind, WatchEffect, WatchEngine};
 pub use rule::{WaitFormat, WatchAction, WatchBackoff, WatchBudget, WatchRule, WatchRuleKind};

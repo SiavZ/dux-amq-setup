@@ -156,6 +156,7 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
         providers: std::collections::HashMap::new(),
         running_provider_pins: std::collections::HashMap::new(),
         launched_drop_paste: Default::default(),
+        watch: Default::default(),
         companion_terminals: std::collections::HashMap::new(),
         agent_tabs: std::collections::HashMap::new(),
         terminating_ptys: Vec::new(),

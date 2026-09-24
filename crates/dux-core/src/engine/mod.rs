@@ -15,6 +15,7 @@ mod pr_sync_control;
 mod resume_fallback;
 mod spawn_worker;
 pub mod status_op;
+mod watch_tick;
 
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -48,6 +49,7 @@ pub use spawn_worker::{
     format_panic_payload,
 };
 pub use status_op::{Final, HandlerStatusOp, ResolvedFinal, StatusOp, status_op};
+pub use watch_tick::{WATCH_SCAN_ROWS, WATCH_TYPING_QUIET, WatchRuleRow, WatchSessionSettings};
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -316,6 +318,10 @@ pub struct Engine {
     /// user edits in their own editor and dux reloads, so there is no point at
     /// which a refusal could be delivered.
     pub launched_drop_paste: HashMap<TabId, LaunchedDropPaste>,
+    /// Watch-rule engines and their delivery state, per live agent tab. See
+    /// `engine/watch_tick.rs`. Memory-only: budgets and cooldowns restart with
+    /// the tab.
+    pub watch: crate::watch::runtime::WatchRuntime,
     pub companion_terminals: HashMap<String, CompanionTerminal>,
     /// Persisted **extra tabs** (secondary provider tabs), keyed by tab id with
     /// the owning `session_id` carried in the value (mirrors `companion_terminals`

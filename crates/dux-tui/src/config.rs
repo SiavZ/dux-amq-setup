@@ -4383,6 +4383,7 @@ mod web_dragdrop_paste_render_tests {
     /// round-trip, including comments inside the rule body. `patch_providers`
     /// never touches the watch array.
     #[test]
+    #[allow(deprecated)] // test drives the sync save path directly, as the fork's test did
     fn save_config_preserves_user_authored_watch_rules() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let config_path = dir.path().join("config.toml");

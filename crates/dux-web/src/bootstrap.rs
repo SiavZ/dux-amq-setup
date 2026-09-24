@@ -144,6 +144,7 @@ pub fn bootstrap_engine(paths: &DuxPaths) -> Result<Engine> {
         providers: HashMap::new(),
         running_provider_pins: HashMap::new(),
         launched_drop_paste: Default::default(),
+        watch: Default::default(),
         companion_terminals: HashMap::new(),
         agent_tabs: agent_tabs
             .into_iter()

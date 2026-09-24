@@ -1416,6 +1416,7 @@ impl Engine {
         self.providers.remove(tab_id);
         self.running_provider_pins.remove(tab_id);
         self.launched_drop_paste.remove(tab_id);
+        self.watch.forget(tab_id);
         self.resume_fallback_candidates.remove(tab_id);
         self.resumed_tab_runs.remove(tab_id);
         self.pty_activity.remove(tab_id.as_str());
