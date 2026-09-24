@@ -134,11 +134,6 @@ const ALLOWED: { file: string; line: string; reason: string }[] = [
   },
   {
     file: "lib/fileDrop.ts",
-    line: "return `'${path.replaceAll(\"'\", `'\\\\''`)}'`",
-    reason: "Shell quoting of a pasted path: the quotes are the text the terminal receives.",
-  },
-  {
-    file: "lib/fileDrop.ts",
     line: 'return `"${path.replaceAll(/[\\\\"$`]/g, (c) => `\\\\${c}`)}"`',
     reason: "Shell quoting of a pasted path: the quotes are the text the terminal receives.",
   },
