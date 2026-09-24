@@ -148,7 +148,14 @@ export function wireProse(message: string, segments: unknown): string | Prose {
       ? stripBidiControls(segment)
       : { name: stripBidiControls(segment.name), quoted: segment.quoted },
   )
-  return proseText(stripped) === plain ? stripped : plain
+  if (proseText(stripped) === plain) return stripped
+  // The fallback hides a producer upstream that is wrong, so say it where a
+  // developer can find it.
+  console.warn("[dux] status parts do not spell their message; showing the plain text", {
+    message,
+    segments,
+  })
+  return plain
 }
 
 /** The web spelling: every name drawn through the shared inline code chip. */

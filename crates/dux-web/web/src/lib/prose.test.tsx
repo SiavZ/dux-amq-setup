@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import { render } from "@testing-library/react"
 
 import {
@@ -240,8 +240,16 @@ describe("a status sentence read off the wire", () => {
   it("keeps the plain message when the parts spell a different sentence", () => {
     // The message is the terminal UI's words; parts that disagree with it must
     // never put different words on the web.
-    expect(
-      wireProse(message, ["Checked out ", { name: "dev", quoted: true }, " in /src/app."]),
-    ).toBe(message)
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    try {
+      expect(
+        wireProse(message, ["Checked out ", { name: "dev", quoted: true }, " in /src/app."]),
+      ).toBe(message)
+      // The fallback hides a producer upstream that is wrong; the console is
+      // where a developer can still find it.
+      expect(warn).toHaveBeenCalledTimes(1)
+    } finally {
+      warn.mockRestore()
+    }
   })
 })

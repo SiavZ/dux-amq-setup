@@ -47,9 +47,19 @@ impl StatusText {
     /// kept only when they spell the message, so a copy can never put different
     /// words beside the ones the terminal UI prints.
     pub fn from_parts(message: String, segments: Option<Vec<ProseSegment>>) -> Self {
-        let prose = segments
-            .map(Prose::from_segments)
-            .filter(|prose| prose.plain() == message);
+        let prose = segments.map(Prose::from_segments).filter(|prose| {
+            let spelled = prose.plain();
+            let agrees = spelled == message;
+            if !agrees {
+                // The fallback hides the disagreement from the user, so say it
+                // where a developer can find it: a producer upstream is wrong.
+                crate::logger::debug(&format!(
+                    "status parts do not spell their message, keeping the plain text: \
+                     message {message:?}, parts spell {spelled:?}"
+                ));
+            }
+            agrees
+        });
         Self { message, prose }
     }
 
@@ -389,9 +399,19 @@ mod tests {
         let built = crate::status_text!["On ", q("main"), "."];
         let (message, segments) = built.clone().into_parts();
         assert_eq!(StatusText::from_parts(message, segments.clone()), built);
-        let other = StatusText::from_parts("Something else.".into(), segments);
+        let (other, logged) = crate::logger::capture_for_test(|| {
+            StatusText::from_parts("Something else.".into(), segments)
+        });
         assert_eq!(other.segments(), None);
         assert_eq!(other.message(), "Something else.");
+        // A disagreement means a producer upstream is wrong; the fallback hides
+        // it from the user, so the log is where it can still be found.
+        assert!(
+            logged
+                .iter()
+                .any(|line| line.starts_with("DEBUG") && line.contains("Something else.")),
+            "{logged:?}"
+        );
     }
 
     #[test]
