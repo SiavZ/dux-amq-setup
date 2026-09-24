@@ -877,6 +877,9 @@ mod tests {
         store
             .create_session(&dux_core::model::AgentSession {
                 id: "s1".to_string(),
+                agent_handle: "s1".to_string(),
+                shared_workspace: false,
+                deleted_at: None,
                 slot_tab_id: "s1-slot".to_string(),
                 provider: dux_core::model::ProviderKind::new("claude"),
                 title: None,

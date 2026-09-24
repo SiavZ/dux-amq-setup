@@ -21,7 +21,7 @@ home.workspace = true
 indexmap.workspace = true
 petname = { version = "3.0.0", default-features = false, features = ["default-rng", "default-words"] }
 portable-pty = "0.9"
-rusqlite = { version = "0.39.0", features = ["bundled", "chrono"] }
+rusqlite = { version = "0.39.0", features = ["bundled", "chrono", "backup"] }
 libc.workspace = true
 rustix.workspace = true
 serde.workspace = true

@@ -934,12 +934,20 @@ fn run_create_standalone_agent_job(
         });
         return;
     }
+    let id = Uuid::new_v4().to_string();
+    let folder_string = folder.to_string_lossy().to_string();
+    // Basename-first, like a managed agent. Local uniqueness is settled by
+    // `SessionStore::assign_unique_agent_handle` right before the first insert.
+    let agent_handle = crate::model::derive_agent_handle(&folder_string, "", &id);
     let session = AgentSession {
-        id: Uuid::new_v4().to_string(),
+        id,
+        agent_handle,
+        shared_workspace: false,
+        deleted_at: None,
         slot_tab_id: Uuid::new_v4().to_string(),
         provider: provider.clone(),
         workspace: AgentWorkspace::Folder(FolderWorkspace {
-            folder_path: folder.to_string_lossy().to_string(),
+            folder_path: folder_string,
         }),
         // Always set. Every row label falls back through the branch name when
         // there is no title, and this agent has no branch, so a title-less
@@ -1082,8 +1090,14 @@ fn launch_managed_create(
         branch_name,
         worktree_path: worktree_path.to_string_lossy().to_string(),
     };
+    let id = Uuid::new_v4().to_string();
+    let agent_handle =
+        crate::model::derive_agent_handle(&managed.worktree_path, &managed.branch_name, &id);
     let session = AgentSession {
-        id: Uuid::new_v4().to_string(),
+        id,
+        agent_handle,
+        shared_workspace: false,
+        deleted_at: None,
         slot_tab_id: Uuid::new_v4().to_string(),
         provider,
         workspace: AgentWorkspace::Managed(managed.clone()),
@@ -1533,6 +1547,9 @@ mod tests {
     fn fork_source_session(worktree: &Path) -> AgentSession {
         AgentSession {
             id: "src-1".to_string(),
+            agent_handle: "src-1".to_string(),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: "src-1-slot".to_string(),
             provider: ProviderKind::new("cat"),
             title: None,

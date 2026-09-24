@@ -4524,6 +4524,9 @@ mod tests {
         let now = chrono::Utc::now();
         dux_core::model::AgentSession {
             id: id.to_string(),
+            agent_handle: dux_core::model::normalize_agent_handle(id),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: format!("{id}-slot"),
             provider: dux_core::model::ProviderKind::new("claude"),
             title: Some(format!("{id}-title")),
@@ -7299,6 +7302,9 @@ mod tests {
         let now = chrono::Utc::now();
         engine.sessions.push(dux_core::model::AgentSession {
             id: "s1".to_string(),
+            agent_handle: "s1".to_string(),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: "s1-slot".to_string(),
             provider: dux_core::model::ProviderKind::new("claude"),
             title: None,
