@@ -117,6 +117,23 @@ pub(crate) fn run_changes_job(
     }
 }
 
+/// Where the files cursor goes after a stage or unstage, decided from the
+/// lists as git reports them AFTER the operation: the section it was in has
+/// emptied and the other one has something in it. `None` stays put. Discard
+/// and commit never move it (fork 773a6b04's `section_after_git_file_op`,
+/// expressed on post-reload counts).
+pub(crate) fn section_after_stage_toggle(
+    current: RightSection,
+    staged: usize,
+    unstaged: usize,
+) -> Option<RightSection> {
+    match current {
+        RightSection::Unstaged if unstaged == 0 && staged > 0 => Some(RightSection::Staged),
+        RightSection::Staged if staged == 0 && unstaged > 0 => Some(RightSection::Unstaged),
+        _ => None,
+    }
+}
+
 impl App {
     /// Start a changes-panel mutation on a worker. Returns `false` (and says so
     /// on the status line) when another one is still running.
@@ -190,15 +207,12 @@ impl App {
         match answer.job {
             ChangesJob::Stage { .. } | ChangesJob::Unstage { .. } => {
                 self.reload_changed_files();
-                // If the section we were in is now empty, move to the other one.
-                if self.right_section == RightSection::Staged && self.engine.staged_files.is_empty()
-                {
-                    self.right_section = RightSection::Unstaged;
-                    self.clamp_files_cursor();
-                } else if self.right_section == RightSection::Unstaged
-                    && self.engine.unstaged_files.is_empty()
-                {
-                    self.right_section = RightSection::Staged;
+                if let Some(section) = section_after_stage_toggle(
+                    self.right_section,
+                    self.engine.staged_files.len(),
+                    self.engine.unstaged_files.len(),
+                ) {
+                    self.right_section = section;
                     self.clamp_files_cursor();
                 }
             }
@@ -302,6 +316,54 @@ mod tests {
         assert_eq!(
             run_changes_job(dir.path(), &job("msg")),
             Err("No staged changes to commit.".to_string())
+        );
+    }
+
+    // Fork 773a6b04 section-advance tests, on post-reload counts.
+
+    #[test]
+    fn staging_last_unstaged_file_advances_to_staged() {
+        // Before: 2 staged, 1 unstaged. After staging it: 3 staged, 0 unstaged.
+        assert_eq!(
+            section_after_stage_toggle(RightSection::Unstaged, 3, 0),
+            Some(RightSection::Staged)
+        );
+    }
+
+    #[test]
+    fn unstaging_last_staged_file_advances_to_unstaged() {
+        assert_eq!(
+            section_after_stage_toggle(RightSection::Staged, 0, 4),
+            Some(RightSection::Unstaged)
+        );
+    }
+
+    #[test]
+    fn no_advance_when_source_section_keeps_entries() {
+        assert_eq!(
+            section_after_stage_toggle(RightSection::Unstaged, 2, 1),
+            None
+        );
+        assert_eq!(section_after_stage_toggle(RightSection::Staged, 2, 2), None);
+    }
+
+    #[test]
+    fn no_advance_when_destination_section_empty() {
+        // Both lists empty (a stage that git answered with nothing to show):
+        // there is no better section to move to.
+        assert_eq!(
+            section_after_stage_toggle(RightSection::Unstaged, 0, 0),
+            None
+        );
+        assert_eq!(section_after_stage_toggle(RightSection::Staged, 0, 0), None);
+    }
+
+    #[test]
+    fn discard_never_advances() {
+        // Discard does not consult the rule at all; the commit box never moves.
+        assert_eq!(
+            section_after_stage_toggle(RightSection::CommitInput, 0, 0),
+            None
         );
     }
 }

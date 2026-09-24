@@ -169,6 +169,15 @@ impl SessionStore {
         Ok(Self { conn })
     }
 
+    /// Test-only: make every later write on this handle fail, so a test can
+    /// drive a persistence-failure path without a broken filesystem.
+    #[cfg(test)]
+    pub(crate) fn make_read_only_for_test(&self) {
+        self.conn
+            .execute_batch("pragma query_only = on;")
+            .expect("set query_only");
+    }
+
     pub fn open(path: &std::path::Path) -> Result<Self> {
         let conn =
             Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;

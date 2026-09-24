@@ -794,7 +794,11 @@ fn compare_copy_heads(source: &Path, destination: &Path) -> CopyHeadCheck {
     }
 }
 
-fn rollback_managed_create(repo_path: &Path, session: &AgentSession, owns_worktree: bool) {
+pub(crate) fn rollback_managed_create(
+    repo_path: &Path,
+    session: &AgentSession,
+    owns_worktree: bool,
+) {
     if owns_worktree && let Some(managed) = session.workspace.as_managed() {
         rollback_created_worktree(repo_path, managed);
     }
