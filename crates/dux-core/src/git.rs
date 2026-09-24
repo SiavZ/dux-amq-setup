@@ -99,14 +99,9 @@ const UNTRACKED_STATS_MAX_FILES: usize = 2000;
 
 pub fn current_branch(repo_path: &Path) -> Result<String> {
     let output = Command::new("git")
-        .args([
-            "-C",
-            repo_path.to_string_lossy().as_ref(),
-            "symbolic-ref",
-            "--quiet",
-            "--short",
-            "HEAD",
-        ])
+        .arg("-C")
+        .arg(repo_path)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
         .output()
         .with_context(|| format!("failed to inspect {}", repo_path.display()))?;
     if !output.status.success() {
@@ -125,14 +120,9 @@ pub fn current_branch(repo_path: &Path) -> Result<String> {
 /// missing). For inspection sites that must not treat a detached HEAD as fatal.
 pub fn current_branch_opt(repo_path: &Path) -> Result<Option<String>> {
     let output = Command::new("git")
-        .args([
-            "-C",
-            repo_path.to_string_lossy().as_ref(),
-            "symbolic-ref",
-            "--quiet",
-            "--short",
-            "HEAD",
-        ])
+        .arg("-C")
+        .arg(repo_path)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
         .output()
         .with_context(|| format!("failed to inspect {}", repo_path.display()))?;
     if output.status.success() {
@@ -159,12 +149,9 @@ pub fn current_branch_opt(repo_path: &Path) -> Result<Option<String>> {
 /// "unknown" and callers fall back to a heuristic.
 pub fn remote_default_branch(repo_path: &Path) -> Option<String> {
     let output = Command::new("git")
-        .args([
-            "-C",
-            repo_path.to_string_lossy().as_ref(),
-            "symbolic-ref",
-            "refs/remotes/origin/HEAD",
-        ])
+        .arg("-C")
+        .arg(repo_path)
+        .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -209,12 +196,9 @@ pub fn branch_status_from_warning(warning_kind: Option<&BranchWarningKind>) -> P
 
 pub fn is_git_repo(path: &Path) -> bool {
     Command::new("git")
-        .args([
-            "-C",
-            path.to_string_lossy().as_ref(),
-            "rev-parse",
-            "--git-dir",
-        ])
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--git-dir"])
         .output()
         .map(|out| out.status.success())
         .unwrap_or(false)
@@ -584,14 +568,9 @@ pub enum CommitState {
 /// transient git hiccup cannot be mistaken for "no commits".
 pub fn repo_commit_state(path: &Path) -> CommitState {
     let out = Command::new("git")
-        .args([
-            "-C",
-            path.to_string_lossy().as_ref(),
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            "HEAD",
-        ])
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
         .stdin(Stdio::null())
         .output();
     match out {
@@ -729,7 +708,7 @@ fn commit_tree(
 /// detached HEAD, and on a genuine git failure, surfaced verbatim. The CAS is
 /// the cross-process backstop behind the engine's own in-flight gate.
 pub fn create_initial_commit(path: &Path) -> Result<String> {
-    let repo = path.to_string_lossy();
+    let repo = path.as_os_str();
     // Fail closed on commit state: only bootstrap a confirmed-unborn repo. A
     // Born repo is idempotent success, so return the current branch (empty if
     // detached, which the caller handles as on the normal born path).
@@ -747,7 +726,9 @@ pub fn create_initial_commit(path: &Path) -> Result<String> {
     // the index, so this can't leak staged content into history; it just stops
     // us from quietly adding a project while the user has staged work pending.
     let staged = Command::new("git")
-        .args(["-C", repo.as_ref(), "diff", "--cached", "--quiet"])
+        .arg("-C")
+        .arg(repo)
+        .args(["diff", "--cached", "--quiet"])
         .stdin(Stdio::null())
         .output()
         .with_context(|| format!("failed to inspect the index of {}", path.display()))?;
@@ -813,9 +794,9 @@ pub fn create_initial_commit(path: &Path) -> Result<String> {
     // yet exist, closing the "a real commit landed concurrently" race. hooksPath
     // at /dev/null so the ref update runs no `reference-transaction` hook.
     let update = Command::new("git")
+        .arg("-C")
+        .arg(repo)
         .args([
-            "-C",
-            repo.as_ref(),
             "-c",
             "core.hooksPath=/dev/null",
             "update-ref",
@@ -869,14 +850,9 @@ fn run_git_capture(path: &Path, args: &[&str], what: &str) -> Result<String> {
 
 pub fn list_worktrees(repo_path: &Path) -> Result<Vec<GitWorktree>> {
     let output = Command::new("git")
-        .args([
-            "-C",
-            repo_path.to_string_lossy().as_ref(),
-            "worktree",
-            "list",
-            "--porcelain",
-            "-z",
-        ])
+        .arg("-C")
+        .arg(repo_path)
+        .args(["worktree", "list", "--porcelain", "-z"])
         .output()
         .with_context(|| format!("failed to list worktrees for {}", repo_path.display()))?;
     if !output.status.success() {
@@ -969,13 +945,9 @@ pub fn switch_branch_if_needed(repo_path: &Path, branch: &str) -> Result<()> {
 /// git-safety rules for imperative commands.
 pub fn has_origin_remote(repo_path: &Path) -> Result<bool> {
     let status = Command::new("git")
-        .args([
-            "-C",
-            repo_path.to_string_lossy().as_ref(),
-            "remote",
-            "get-url",
-            "origin",
-        ])
+        .arg("-C")
+        .arg(repo_path)
+        .args(["remote", "get-url", "origin"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -1013,15 +985,9 @@ pub fn has_origin_remote(repo_path: &Path) -> Result<bool> {
 fn pull_origin_branch(repo_path: &Path, branch: &str) -> Result<()> {
     let refspec = format!("refs/heads/{branch}");
     let output = Command::new("git")
-        .args([
-            "-C",
-            repo_path.to_string_lossy().as_ref(),
-            "pull",
-            "--ff-only",
-            "origin",
-            "--",
-            &refspec,
-        ])
+        .arg("-C")
+        .arg(repo_path)
+        .args(["pull", "--ff-only", "origin", "--", &refspec])
         .output()?;
     if !output.status.success() {
         return Err(git_failure("git pull", repo_path, &output));
@@ -1035,9 +1001,9 @@ fn pull_origin_branch(repo_path: &Path, branch: &str) -> Result<()> {
 /// on failure so callers can surface the concrete reason. Requires git >= 2.23.
 pub fn switch_branch(repo_path: &Path, branch_name: &str) -> Result<()> {
     let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
         .args([
-            "-C",
-            repo_path.to_string_lossy().as_ref(),
             "switch",
             // `--` so the branch is read as a REF and never as an option.
             // Without it `git switch --detach` detaches HEAD instead of
@@ -1060,21 +1026,16 @@ pub fn switch_branch(repo_path: &Path, branch_name: &str) -> Result<()> {
 /// Uses the plumbing command `git rev-parse --verify --quiet` and inspects
 /// only the exit code: no stdout is parsed.
 pub fn branch_exists(repo_path: &Path, name: &str) -> Option<BranchLocation> {
-    let repo = repo_path.to_string_lossy();
+    let repo = repo_path.as_os_str();
     let local_ref = format!("refs/heads/{name}");
     if ref_exists(repo_path, &local_ref) {
         return Some(BranchLocation::Local);
     }
     let remote_ref = format!("refs/remotes/origin/{name}");
     let remote = Command::new("git")
-        .args([
-            "-C",
-            repo.as_ref(),
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &remote_ref,
-        ])
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet", &remote_ref])
         .output()
         .ok()
         .is_some_and(|o| o.status.success());
@@ -1109,11 +1070,11 @@ pub struct UnpushedCommits {
 /// `for-each-ref` is plumbing and prints nothing at all for an empty namespace,
 /// so "no output" is the whole answer and no parsing is involved.
 fn has_remote_tracking_refs(repo_path: &Path) -> bool {
-    let repo = repo_path.to_string_lossy();
+    let repo = repo_path.as_os_str();
     Command::new("git")
+        .arg("-C")
+        .arg(repo)
         .args([
-            "-C",
-            repo.as_ref(),
             "for-each-ref",
             "--count=1",
             "--format=%(refname)",
@@ -1151,18 +1112,16 @@ pub fn unpushed_commit_count(repo_path: &Path, branches: &[&str]) -> Result<Unpu
             has_remote_refs: has_remote_tracking_refs(repo_path),
         });
     }
-    let repo = repo_path.to_string_lossy();
-    let mut args: Vec<String> = vec![
-        "-C".to_string(),
-        repo.to_string(),
-        "rev-list".to_string(),
-        "--count".to_string(),
-    ];
+    let mut args: Vec<String> = vec!["rev-list".to_string(), "--count".to_string()];
     args.extend(branches.iter().map(|branch| format!("refs/heads/{branch}")));
     args.push("--not".to_string());
     args.push("--remotes".to_string());
     args.push("--".to_string());
-    let output = Command::new("git").args(&args).output()?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(&args)
+        .output()?;
     if !output.status.success() {
         let named = branches
             .iter()
@@ -1186,16 +1145,11 @@ pub fn unpushed_commit_count(repo_path: &Path, branches: &[&str]) -> Result<Unpu
 }
 
 fn ref_exists(repo_path: &Path, ref_name: &str) -> bool {
-    let repo = repo_path.to_string_lossy();
+    let repo = repo_path.as_os_str();
     Command::new("git")
-        .args([
-            "-C",
-            repo.as_ref(),
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            ref_name,
-        ])
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet", ref_name])
         .output()
         .ok()
         .is_some_and(|o| o.status.success())
@@ -1419,21 +1373,17 @@ pub fn add_worktree_existing_branch_at(
     if let Some(parent) = worktree_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let repo = repo_path.to_string_lossy();
-    let worktree = worktree_path.to_string_lossy();
+    let repo = repo_path.as_os_str();
+    let worktree = worktree_path.as_os_str();
     let output = Command::new("git")
-        .args([
-            "-C",
-            repo.as_ref(),
-            "worktree",
-            "add",
-            worktree.as_ref(),
-            // `--` so the commit-ish is read as a REF and never as an option.
-            // Without it `git worktree add <path> --force` obeys the flag and
-            // checks out HEAD instead. Measured on git 2.55.
-            "--",
-            branch_name,
-        ])
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "add"])
+        .arg(worktree)
+        // `--` so the commit-ish is read as a REF and never as an option.
+        // Without it `git worktree add <path> --force` obeys the flag and
+        // checks out HEAD instead. Measured on git 2.55.
+        .args(["--", branch_name])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
@@ -1516,9 +1466,11 @@ pub fn parse_worktree_registrations(output: &[u8]) -> Vec<WorktreeRegistration> 
 /// measured, which is why the prunable check gates the call rather than merely
 /// informing it.
 pub fn forget_missing_worktree_registration(repo_path: &Path, worktree_path: &Path) -> Result<()> {
-    let repo = repo_path.to_string_lossy();
+    let repo = repo_path.as_os_str();
     let listed = Command::new("git")
-        .args(["-C", repo.as_ref(), "worktree", "list", "--porcelain", "-z"])
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "list", "--porcelain", "-z"])
         .output()?;
     if !listed.status.success() {
         return Err(anyhow!(
@@ -1541,17 +1493,12 @@ pub fn forget_missing_worktree_registration(repo_path: &Path, worktree_path: &Pa
             target.path.display()
         ));
     }
-    let path = target.path.to_string_lossy();
+    let path = target.path.as_os_str();
     let output = Command::new("git")
-        .args([
-            "-C",
-            repo.as_ref(),
-            "worktree",
-            "remove",
-            "--force",
-            "--",
-            path.as_ref(),
-        ])
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "remove", "--force", "--"])
+        .arg(path)
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
@@ -1584,10 +1531,12 @@ fn same_worktree_path(registered: &Path, target: &Path) -> bool {
 }
 
 pub fn fetch_pull_request_head(repo_path: &Path, pr_number: u64, branch_name: &str) -> Result<()> {
-    let repo = repo_path.to_string_lossy();
+    let repo = repo_path.as_os_str();
     let refspec = format!("pull/{pr_number}/head:refs/heads/{branch_name}");
     let output = Command::new("git")
-        .args(["-C", repo.as_ref(), "fetch", "origin", &refspec])
+        .arg("-C")
+        .arg(repo)
+        .args(["fetch", "origin", &refspec])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
@@ -1629,8 +1578,8 @@ pub fn add_worktree_new_branch_at(
     if let Some(parent) = worktree_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let repo = repo_path.to_string_lossy();
-    let worktree = worktree_path.to_string_lossy();
+    let repo = repo_path.as_os_str();
+    let worktree = worktree_path.as_os_str();
     // Resolve the start point to an object id BEFORE handing it to
     // `worktree add`: a `--` separator is not enough at this call shape
     // (measured on git 2.55), because `worktree add` consumes the separator and
@@ -1653,15 +1602,11 @@ pub fn add_worktree_new_branch_at(
         None => None,
     };
     let mut command = Command::new("git");
-    command.args([
-        "-C",
-        repo.as_ref(),
-        "worktree",
-        "add",
-        "-b",
-        branch_name,
-        worktree.as_ref(),
-    ]);
+    command
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "add", "-b", branch_name])
+        .arg(worktree);
     if let Some(resolved_start) = resolved_start.as_deref() {
         // Defence in depth alongside the resolve above.
         command.arg("--").arg(resolved_start);
@@ -1680,12 +1625,9 @@ pub fn add_worktree_new_branch_at(
 
 pub fn head_commit(repo_path: &Path) -> Result<String> {
     let output = Command::new("git")
-        .args([
-            "-C",
-            repo_path.to_string_lossy().as_ref(),
-            "rev-parse",
-            "HEAD",
-        ])
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "HEAD"])
         .output()
         .with_context(|| format!("failed to inspect HEAD for {}", repo_path.display()))?;
     if !output.status.success() {
@@ -1749,9 +1691,9 @@ pub fn copy_uncommitted_changes(
 
 fn uncommitted_status(source: &Path) -> Result<Vec<u8>> {
     let output = Command::new("git")
+        .arg("-C")
+        .arg(source)
         .args([
-            "-C",
-            source.to_string_lossy().as_ref(),
             // Pin rename/copy detection off so every record carries exactly
             // one path (rename records are two-path and config-dependent).
             "-c",
@@ -2048,14 +1990,9 @@ impl RemoveResult {
 /// `refs/heads/...` that cannot lead with a dash anyway.
 fn delete_branch_force(repo_path: &Path, branch_name: &str) -> Result<BranchDeletion> {
     let output = Command::new("git")
-        .args([
-            "-C",
-            repo_path.to_string_lossy().as_ref(),
-            "branch",
-            "-D",
-            "--",
-            branch_name,
-        ])
+        .arg("-C")
+        .arg(repo_path)
+        .args(["branch", "-D", "--", branch_name])
         .output()?;
     if output.status.success() {
         return Ok(BranchDeletion::Deleted);
@@ -2090,9 +2027,9 @@ pub(crate) fn delete_created_branch_best_effort(repo_path: &Path, branch_name: &
 /// inventing a refusal nobody can act on.
 fn branch_still_exists(repo_path: &Path, branch_name: &str) -> bool {
     Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
         .args([
-            "-C",
-            repo_path.to_string_lossy().as_ref(),
             "show-ref",
             "--verify",
             "--quiet",
@@ -2118,17 +2055,15 @@ fn branch_still_exists(repo_path: &Path, branch_name: &str) -> bool {
 /// caller must confirm with the user first.
 pub fn remove_worktree_keep_branch(repo_path: &Path, worktree_path: &Path) -> Result<()> {
     let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
         .args([
-            "-C",
-            repo_path.to_string_lossy().as_ref(),
-            "worktree",
-            "remove",
-            "--force",
+            "worktree", "remove", "--force",
             // `--` so a worktree path that begins with a dash is read as a
             // POSITIONAL and never as an option (the CLAUDE.md rule).
             "--",
-            worktree_path.to_string_lossy().as_ref(),
         ])
+        .arg(worktree_path)
         .output()?;
     if !output.status.success() {
         if worktree_path.exists() {
@@ -2139,12 +2074,9 @@ pub fn remove_worktree_keep_branch(repo_path: &Path, worktree_path: &Path) -> Re
         }
         // Worktree already gone from disk: prune stale git refs.
         let _ = Command::new("git")
-            .args([
-                "-C",
-                repo_path.to_string_lossy().as_ref(),
-                "worktree",
-                "prune",
-            ])
+            .arg("-C")
+            .arg(repo_path)
+            .args(["worktree", "prune"])
             .output();
     }
     Ok(())
@@ -2159,14 +2091,9 @@ pub fn remove_worktree_keep_branch(repo_path: &Path, worktree_path: &Path) -> Re
 /// records is read, never the paths.
 pub fn worktree_is_dirty(worktree_path: &Path) -> Result<bool> {
     let output = Command::new("git")
-        .args([
-            "-C",
-            worktree_path.to_string_lossy().as_ref(),
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-        ])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
@@ -2460,17 +2387,12 @@ fn rename_source(status: char, source: &Option<String>) -> Option<String> {
 }
 
 pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<ChangedFile>)> {
-    let wt = worktree_path.to_string_lossy();
+    let wt = worktree_path.as_os_str();
 
     let output = Command::new("git")
-        .args([
-            "-C",
-            wt.as_ref(),
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-        ])
+        .arg("-C")
+        .arg(wt)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
@@ -2531,8 +2453,8 @@ pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<Chan
     // whatever came back. A failed `git diff` yields an empty map, which costs
     // tracked rows their line counts and nothing else; running the loop inside
     // the call's `Ok` would take the untracked files' in-process counts with it.
-    let tracked_stats = unstaged_numstat(wt.as_ref());
-    let staged_stats = staged_numstat(wt.as_ref());
+    let tracked_stats = unstaged_numstat(wt);
+    let staged_stats = staged_numstat(wt);
 
     // git prints `-\t-` for a path the repository excludes from diffs in
     // .gitattributes exactly as it prints it for a real binary, so numstat
@@ -2541,10 +2463,8 @@ pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<Chan
     // asked at all in the ordinary case where every path has a number. The
     // attribute is not the whole answer (see `paths_excluded_from_diffs`), so
     // each candidate's own bytes settle it, per side.
-    let attribute_unset = paths_excluded_from_diffs(
-        wt.as_ref(),
-        &countless_paths(&[&tracked_stats, &staged_stats]),
-    );
+    let attribute_unset =
+        paths_excluded_from_diffs(wt, &countless_paths(&[&tracked_stats, &staged_stats]));
     let excluded_unstaged = diff_excluded_rows(
         worktree_path,
         &attribute_unset,
@@ -2579,9 +2499,11 @@ pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<Chan
 /// A git call that could not be run, or that exited non-zero, answers with an
 /// empty map rather than an error: it is one of two independent sources feeding
 /// the unstaged rows, and the other one still has something to say.
-fn unstaged_numstat(worktree: &str) -> HashMap<String, DiffStat> {
+fn unstaged_numstat(worktree: &std::ffi::OsStr) -> HashMap<String, DiffStat> {
     Command::new("git")
-        .args(["-C", worktree, "diff", "--numstat", "-z"])
+        .arg("-C")
+        .arg(worktree)
+        .args(["diff", "--numstat", "-z"])
         .output()
         .ok()
         .filter(|ns| ns.status.success())
@@ -2591,9 +2513,11 @@ fn unstaged_numstat(worktree: &str) -> HashMap<String, DiffStat> {
 
 /// Per-path line counts for the staged changes in `worktree`. Answers with an
 /// empty map on a failed call, for the same reason [`unstaged_numstat`] does.
-fn staged_numstat(worktree: &str) -> HashMap<String, DiffStat> {
+fn staged_numstat(worktree: &std::ffi::OsStr) -> HashMap<String, DiffStat> {
     Command::new("git")
-        .args(["-C", worktree, "diff", "--cached", "--numstat", "-z"])
+        .arg("-C")
+        .arg(worktree)
+        .args(["diff", "--cached", "--numstat", "-z"])
         .output()
         .ok()
         .filter(|ns| ns.status.success())
@@ -2640,13 +2564,15 @@ fn countless_paths(stats: &[&HashMap<String, DiffStat>]) -> Vec<String> {
 /// line can be read as an option, so a path beginning with a dash is a path.
 /// A call that could not be run answers with an empty set, which leaves every
 /// row saying binary exactly as it did before this question existed.
-fn paths_excluded_from_diffs(worktree: &str, paths: &[String]) -> HashSet<String> {
+fn paths_excluded_from_diffs(worktree: &std::ffi::OsStr, paths: &[String]) -> HashSet<String> {
     if paths.is_empty() {
         return HashSet::new();
     }
 
     let Ok(mut child) = Command::new("git")
-        .args(["-C", worktree, "check-attr", "-z", "--stdin", "diff"])
+        .arg("-C")
+        .arg(worktree)
+        .args(["check-attr", "-z", "--stdin", "diff"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2769,13 +2695,9 @@ fn index_blob_prefix(worktree_path: &Path, rel_path: &str) -> Option<Vec<u8>> {
     use std::io::Read as _;
 
     let mut child = Command::new("git")
-        .args([
-            "-C",
-            worktree_path.to_string_lossy().as_ref(),
-            "cat-file",
-            "-p",
-            &format!(":{rel_path}"),
-        ])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["cat-file", "-p", &format!(":{rel_path}")])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -2918,9 +2840,9 @@ fn untracked_file_stat(path: &Path) -> DiffStat {
 #[cfg(test)]
 fn untracked_file_diff_stat(worktree_path: &Path, rel_path: &str) -> Option<DiffStat> {
     let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
         .args([
-            "-C",
-            worktree_path.to_string_lossy().as_ref(),
             "diff",
             "--no-index",
             "--numstat",
@@ -2995,11 +2917,11 @@ pub struct FileStatusCodes {
 /// decides whether git failed because there is no repository (answer `None`)
 /// or for some other reason (a real error the caller surfaces).
 pub fn file_status(worktree: &Path, rel_path: &str) -> Result<Option<FileStatusCodes>> {
-    let wt = worktree.to_string_lossy();
+    let wt = worktree.as_os_str();
     let output = Command::new("git")
+        .arg("-C")
+        .arg(wt)
         .args([
-            "-C",
-            wt.as_ref(),
             "status",
             "--porcelain=v1",
             "-z",
@@ -3057,12 +2979,9 @@ pub fn file_status(worktree: &Path, rel_path: &str) -> Result<Option<FileStatusC
 /// so the trade is refused and the gap is written down instead.
 fn is_inside_work_tree(path: &Path) -> Result<bool> {
     let output = Command::new("git")
-        .args([
-            "-C",
-            path.to_string_lossy().as_ref(),
-            "rev-parse",
-            "--is-inside-work-tree",
-        ])
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--is-inside-work-tree"])
         .output()?;
     Ok(output.status.success())
 }
@@ -3085,12 +3004,9 @@ fn is_inside_work_tree(path: &Path) -> Result<bool> {
 /// is tested; only the failure to spawn git at all is not.
 pub fn repository_root(dir: &Path) -> Result<Option<PathBuf>> {
     let output = Command::new("git")
-        .args([
-            "-C",
-            dir.to_string_lossy().as_ref(),
-            "rev-parse",
-            "--show-toplevel",
-        ])
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--show-toplevel"])
         .output()?;
     if !output.status.success() {
         return Ok(None);
@@ -3119,9 +3035,11 @@ pub fn repository_root(dir: &Path) -> Result<Option<PathBuf>> {
 /// `check-ignore` consults the index by default, which is what we want: a
 /// TRACKED file that also matches an ignore rule answers "not ignored".
 pub fn path_is_ignored(worktree: &Path, rel_path: &str) -> Result<bool> {
-    let wt = worktree.to_string_lossy();
+    let wt = worktree.as_os_str();
     let output = Command::new("git")
-        .args(["-C", wt.as_ref(), "check-ignore", "-q", "--"])
+        .arg("-C")
+        .arg(wt)
+        .args(["check-ignore", "-q", "--"])
         .arg(rel_path)
         .output()?;
     match output.status.code() {
@@ -3254,10 +3172,14 @@ fn run_pathspec_batch(
             "{what} was asked to act on no files; git would read that as the whole index"
         ));
     }
-    let wt = worktree_path.to_string_lossy();
-    let mut args: Vec<&str> = vec!["--literal-pathspecs", "-C", wt.as_ref()];
-    args.extend_from_slice(subcommand);
-    args.extend_from_slice(&["--pathspec-from-file=-", "--pathspec-file-nul"]);
+    let wt = worktree_path.as_os_str();
+    let mut args: Vec<&std::ffi::OsStr> = vec![
+        std::ffi::OsStr::new("--literal-pathspecs"),
+        std::ffi::OsStr::new("-C"),
+        wt,
+    ];
+    args.extend(subcommand.iter().map(std::ffi::OsStr::new));
+    args.extend(["--pathspec-from-file=-", "--pathspec-file-nul"].map(std::ffi::OsStr::new));
     let mut child = Command::new("git")
         .args(&args)
         .stdin(std::process::Stdio::piped())
@@ -3286,16 +3208,12 @@ fn run_pathspec_batch(
 }
 
 pub fn stage_file(worktree_path: &Path, file_path: &str) -> Result<()> {
-    let wt = worktree_path.to_string_lossy();
+    let wt = worktree_path.as_os_str();
     let output = Command::new("git")
-        .args([
-            "--literal-pathspecs",
-            "-C",
-            wt.as_ref(),
-            "add",
-            "--",
-            file_path,
-        ])
+        .arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(wt)
+        .args(["add", "--", file_path])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
@@ -3307,17 +3225,12 @@ pub fn stage_file(worktree_path: &Path, file_path: &str) -> Result<()> {
 }
 
 pub fn unstage_file(worktree_path: &Path, file_path: &str) -> Result<()> {
-    let wt = worktree_path.to_string_lossy();
+    let wt = worktree_path.as_os_str();
     let output = Command::new("git")
-        .args([
-            "--literal-pathspecs",
-            "-C",
-            wt.as_ref(),
-            "reset",
-            "HEAD",
-            "--",
-            file_path,
-        ])
+        .arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(wt)
+        .args(["reset", "HEAD", "--", file_path])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
@@ -3348,16 +3261,12 @@ pub fn discard_file(worktree_path: &Path, file_path: &str, is_untracked: bool) -
         }
         return Ok(());
     }
-    let wt = worktree_path.to_string_lossy();
+    let wt = worktree_path.as_os_str();
     let output = Command::new("git")
-        .args([
-            "--literal-pathspecs",
-            "-C",
-            wt.as_ref(),
-            "checkout",
-            "--",
-            file_path,
-        ])
+        .arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(wt)
+        .args(["checkout", "--", file_path])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
@@ -3394,16 +3303,11 @@ pub fn discard_classify(worktree_path: &Path, path: &str) -> Result<bool> {
 /// Return the text of `git diff --cached` for the given worktree.
 /// Uses `-c color.diff=false` to strip ANSI escapes regardless of user config.
 pub fn staged_diff_text(worktree_path: &Path) -> Result<String> {
-    let wt = worktree_path.to_string_lossy();
+    let wt = worktree_path.as_os_str();
     let output = Command::new("git")
-        .args([
-            "-C",
-            wt.as_ref(),
-            "-c",
-            "color.diff=false",
-            "diff",
-            "--cached",
-        ])
+        .arg("-C")
+        .arg(wt)
+        .args(["-c", "color.diff=false", "diff", "--cached"])
         .output()?;
     if !output.status.success() {
         return Err(anyhow!(
@@ -3563,9 +3467,11 @@ fn git_failure(what: &str, worktree_path: &Path, output: &std::process::Output) 
 }
 
 pub fn commit(worktree_path: &Path, message: &str) -> Result<String> {
-    let wt = worktree_path.to_string_lossy();
+    let wt = worktree_path.as_os_str();
     let output = Command::new("git")
-        .args(["-C", wt.as_ref(), "commit", "-m", message])
+        .arg("-C")
+        .arg(wt)
+        .args(["commit", "-m", message])
         .output()?;
     if !output.status.success() {
         return Err(git_failure("git commit", worktree_path, &output));
@@ -3574,7 +3480,7 @@ pub fn commit(worktree_path: &Path, message: &str) -> Result<String> {
 }
 
 pub fn push(worktree_path: &Path) -> Result<String> {
-    let wt = worktree_path.to_string_lossy();
+    let wt = worktree_path.as_os_str();
     let branch = match current_branch_opt(worktree_path)? {
         Some(b) => b,
         None => {
@@ -3587,7 +3493,9 @@ pub fn push(worktree_path: &Path) -> Result<String> {
         // `--` so the branch is read as a REFSPEC and never as an option.
         // Without it, a checkout whose HEAD points at a ref named `--all`
         // pushes EVERY branch to the remote. Measured on git 2.55.
-        .args(["-C", wt.as_ref(), "push", "-u", "origin", "--", &branch])
+        .arg("-C")
+        .arg(wt)
+        .args(["push", "-u", "origin", "--", &branch])
         .output()?;
     if !output.status.success() {
         return Err(git_failure("git push", worktree_path, &output));
@@ -3600,13 +3508,9 @@ pub fn push(worktree_path: &Path) -> Result<String> {
 /// immune to user configuration.
 pub fn file_bytes_at_head(worktree_path: &Path, path: &str) -> Result<Option<Vec<u8>>> {
     let output = Command::new("git")
-        .args([
-            "-C",
-            worktree_path.to_string_lossy().as_ref(),
-            "cat-file",
-            "-p",
-            &format!("HEAD:{path}"),
-        ])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["cat-file", "-p", &format!("HEAD:{path}")])
         .output()?;
     if !output.status.success() {
         // File doesn't exist at HEAD (new/untracked file).
@@ -3621,13 +3525,9 @@ pub fn file_bytes_at_head(worktree_path: &Path, path: &str) -> Result<Option<Vec
 /// size before buffering the full HEAD content into memory.
 pub fn blob_size_at_head(worktree_path: &Path, path: &str) -> Result<Option<u64>> {
     let output = Command::new("git")
-        .args([
-            "-C",
-            worktree_path.to_string_lossy().as_ref(),
-            "cat-file",
-            "-s",
-            &format!("HEAD:{path}"),
-        ])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["cat-file", "-s", &format!("HEAD:{path}")])
         .output()?;
     if !output.status.success() {
         // Not present at HEAD (new/untracked file).
@@ -3665,13 +3565,9 @@ pub fn file_prefix_at_head(
         return Ok(None);
     }
     let mut child = Command::new("git")
-        .args([
-            "-C",
-            worktree_path.to_string_lossy().as_ref(),
-            "cat-file",
-            "-p",
-            &format!("HEAD:{path}"),
-        ])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["cat-file", "-p", &format!("HEAD:{path}")])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
@@ -3965,18 +3861,15 @@ fn wait_child_or_kill(
 /// so a wedged git invocation can't strand the rename worker forever.
 pub fn rename_branch(worktree_path: &Path, old_name: &str, new_name: &str) -> Result<()> {
     let mut child = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
         .args([
-            "-C",
-            worktree_path.to_string_lossy().as_ref(),
-            "branch",
-            "-m",
+            "branch", "-m",
             // `--` so the two names are read as REFS and never as options.
             // Measured on git 2.55: `git branch -m --force renamed` obeys the
             // flag, renames the CURRENT branch forcibly, leaves the requested
             // branch untouched and exits 0.
-            "--",
-            old_name,
-            new_name,
+            "--", old_name, new_name,
         ])
         .stdout(Stdio::null())
         // `git branch -m` writes only a short line to stderr on failure, well
@@ -4251,13 +4144,9 @@ pub fn resolve_remote_github_repo(
     policy: &crate::gh::GithubHostPolicy,
 ) -> RemoteResolution {
     let Ok(output) = Command::new("git")
-        .args([
-            "-C",
-            worktree_path.to_string_lossy().as_ref(),
-            "remote",
-            "get-url",
-            "origin",
-        ])
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["remote", "get-url", "origin"])
         .output()
     else {
         return RemoteResolution::Unresolved;
@@ -5185,9 +5074,9 @@ mod tests {
     fn add_worktree(repo: &Path, branch: &str) -> PathBuf {
         let wt = repo.join(format!("wt-{branch}"));
         let out = test_support::git_command()
+            .arg("-C")
+            .arg(repo)
             .args([
-                "-C",
-                repo.to_string_lossy().as_ref(),
                 "worktree",
                 "add",
                 "-b",
@@ -7063,13 +6952,9 @@ mod tests {
     /// Every local branch of the repo, one per line, for the drift tests below.
     fn branch_list(repo_path: &Path) -> String {
         let listed = std::process::Command::new("git")
-            .args([
-                "-C",
-                repo_path.to_string_lossy().as_ref(),
-                "for-each-ref",
-                "--format=%(refname:short)",
-                "refs/heads/",
-            ])
+            .arg("-C")
+            .arg(repo_path)
+            .args(["for-each-ref", "--format=%(refname:short)", "refs/heads/"])
             .output()
             .unwrap();
         String::from_utf8_lossy(&listed.stdout).to_string()
@@ -7582,13 +7467,9 @@ mod tests {
         let _ = push(repo.path());
 
         let heads = std::process::Command::new("git")
-            .args([
-                "-C",
-                remote.to_string_lossy().as_ref(),
-                "for-each-ref",
-                "--format=%(refname)",
-                "refs/heads",
-            ])
+            .arg("-C")
+            .arg(remote)
+            .args(["for-each-ref", "--format=%(refname)", "refs/heads"])
             .output()
             .unwrap();
         let heads = String::from_utf8_lossy(&heads.stdout);
@@ -10005,13 +9886,9 @@ mod tests {
         );
         // Exactly one commit exists (the CAS prevented a second).
         let out = test_support::git_command()
-            .args([
-                "-C",
-                path.to_string_lossy().as_ref(),
-                "rev-list",
-                "--count",
-                "HEAD",
-            ])
+            .arg("-C")
+            .arg(path)
+            .args(["rev-list", "--count", "HEAD"])
             .output()
             .unwrap();
         assert_eq!(
@@ -10088,13 +9965,9 @@ mod tests {
         );
 
         let author = test_support::git_command()
-            .args([
-                "-C",
-                repo.to_string_lossy().as_ref(),
-                "log",
-                "-1",
-                "--format=%an <%ae>",
-            ])
+            .arg("-C")
+            .arg(repo)
+            .args(["log", "-1", "--format=%an <%ae>"])
             .output()
             .unwrap();
         String::from_utf8_lossy(&author.stdout).trim().to_string()

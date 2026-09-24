@@ -53,7 +53,10 @@ tokio-tungstenite = "0.29"
 opt-level = "z"    # Optimize for size.
 lto = true         # Enable link time optimization.
 codegen-units = 1  # Reduce parallel code generation units.
-debug = 0          # No debug information
+# Line tables only (fork e79bfbe5, P2-4): file:line for panic locations and,
+# where the platform keeps them, backtraces, at a ~1-2% size cost. The
+# `strip` below still removes the symbol table from the shipped binary.
+debug = "line-tables-only"
 # Strip symbols here, in Cargo, so every release build is small by the same
 # mechanism (CI has no separate strip step). The symbol-keeping path for
 # profilers is [profile.profiling] below.

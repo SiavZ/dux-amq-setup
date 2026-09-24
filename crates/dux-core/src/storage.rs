@@ -2300,12 +2300,24 @@ fn deserialize_project_env(value: &str) -> BTreeMap<String, String> {
     serde_json::from_str::<BTreeMap<String, String>>(value).unwrap_or_default()
 }
 
+// Fork e79bfbe5 (P2-10): the fallbacks stay (a corrupt row degrades, never
+// crashes the loader), but they are logged instead of silently swallowed.
 fn serialize_started_providers(started_providers: &[String]) -> String {
-    serde_json::to_string(started_providers).unwrap_or_else(|_| "[]".to_string())
+    serde_json::to_string(started_providers).unwrap_or_else(|err| {
+        crate::logger::warn(&format!(
+            "started_providers could not be serialized ({err}); persisting []"
+        ));
+        "[]".to_string()
+    })
 }
 
 fn parse_started_providers(value: &str) -> Vec<String> {
-    serde_json::from_str::<Vec<String>>(value).unwrap_or_default()
+    serde_json::from_str::<Vec<String>>(value).unwrap_or_else(|err| {
+        crate::logger::warn(&format!(
+            "started_providers column is not a JSON string list ({err}); treating it as empty"
+        ));
+        Vec::new()
+    })
 }
 
 pub fn fallback_pr_url(host: &str, owner_repo: &str, pr_number: u64) -> String {
@@ -2398,6 +2410,21 @@ fn test_tab(id: &str, session_id: &str, sort_order: i64) -> crate::model::AgentT
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A corrupt started_providers cell degrades to empty instead of failing
+    /// the load (fork e79bfbe5 kept this while adding the warning).
+    #[test]
+    fn started_providers_parse_failure_degrades_to_empty() {
+        assert_eq!(parse_started_providers("not json"), Vec::<String>::new());
+        assert_eq!(
+            parse_started_providers(r#"["claude","codex"]"#),
+            vec!["claude".to_string(), "codex".to_string()]
+        );
+        assert_eq!(
+            serialize_started_providers(&["claude".to_string()]),
+            r#"["claude"]"#
+        );
+    }
     use crate::model::{AgentWorkspace, FolderWorkspace};
     use chrono::Duration;
 
