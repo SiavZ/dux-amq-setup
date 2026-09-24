@@ -537,7 +537,8 @@ fn config_schema() -> Vec<ConfigEntry> {
                  # omits the unit for backward compatibility, but the value IS in\n\
                  # seconds, like every other interval in this file.\n\
                  # Keeps dux in sync if a branch is renamed outside the app.\n\
-                 # Set to 0 to disable.\n\
+                 # Default 0 (off): it runs git in every agent's worktree, so it is\n\
+                 # opt-in. 30 is a reasonable value to turn it on.\n\
                  # A config reload retunes this live, including turning it back on\n\
                  # from 0; no restart needed.",
             )),
@@ -2073,6 +2074,47 @@ mod tests {
             !raw.contains('#'),
             "fixture must contain zero comments, or it is not a bare config"
         );
+    }
+
+    // -- branch sync opt-in (port of fork 14ebb0c9) --
+
+    /// Branch sync polls git in every worktree, and a user who turned it off
+    /// saw it come back on regeneration, so it is opt-in.
+    #[test]
+    fn branch_sync_interval_defaults_to_zero() {
+        assert_eq!(Config::default().ui.branch_sync_interval, 0);
+        assert_eq!(
+            dux_core::config::UiConfig::default().branch_sync_interval,
+            0
+        );
+    }
+
+    #[test]
+    fn rendered_default_config_has_branch_sync_off() {
+        let rendered = render_default_config();
+        assert!(
+            rendered.contains("\nbranch_sync_interval = 0\n"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("branch_sync_interval = 30"));
+    }
+
+    /// A user who set the old default explicitly keeps it across a save.
+    #[test]
+    fn ensure_config_preserves_existing_branch_sync_interval() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let body = render_default_config()
+            .replace("branch_sync_interval = 0", "branch_sync_interval = 30");
+        std::fs::write(&config_path, &body).expect("write");
+        let mut config: Config = toml::from_str(&body).expect("parse");
+        assert_eq!(config.ui.branch_sync_interval, 30);
+        config.ui.right_width_pct = 25;
+        dux_core::config_write::save_config(&config_path, &config).expect("save");
+        let reloaded: Config =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).expect("reparse");
+        assert_eq!(reloaded.ui.branch_sync_interval, 30);
+        assert_eq!(reloaded.ui.right_width_pct, 25);
     }
 
     // -- [limits] (port of fork tests/limits.rs, P1-AA and its #13 softening) --

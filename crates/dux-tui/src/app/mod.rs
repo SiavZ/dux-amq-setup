@@ -6297,7 +6297,10 @@ impl App {
             self.prompt = PromptState::RenameSession {
                 session_id: session.id,
                 input,
-                rename_branch: branch_named,
+                // Opt-in (port of fork d134b396): renaming the branch rewrites a
+                // ref other tools and remotes may track, so the checkbox starts
+                // unticked and the plain rename only changes the label.
+                rename_branch: false,
                 focus: RenameSessionFocus::Input,
                 branch_named,
             };

@@ -14069,14 +14069,19 @@ not_a_real_action = ["x"]
     }
 
     #[test]
-    fn open_rename_session_initializes_rename_branch_true() {
+    fn open_rename_session_initializes_rename_branch_false() {
         let mut app = test_app(default_bindings());
 
         app.open_rename_session().unwrap();
 
         match &app.prompt {
-            PromptState::RenameSession { rename_branch, .. } => {
-                assert!(*rename_branch, "rename_branch should default to true");
+            PromptState::RenameSession {
+                rename_branch,
+                branch_named,
+                ..
+            } => {
+                assert!(*branch_named, "a branch-backed agent offers the box");
+                assert!(!*rename_branch, "rename_branch should default to false");
             }
             other => panic!("expected RenameSession, got {other:?}"),
         }
