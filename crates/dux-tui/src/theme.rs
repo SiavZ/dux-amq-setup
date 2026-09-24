@@ -750,6 +750,11 @@ impl Theme {
     /// The style of a name chip. Callers never apply it by hand: the shared
     /// `name_chip` component pads the name and applies it, so every name in
     /// every dialog is the same shape.
+    ///
+    /// This exact style is also how a chip is RECOGNISED: `wrap_styled_lines`
+    /// keeps any span in precisely this style whole, never breaking a row
+    /// inside it. Do not reuse it for other text, or that text will refuse to
+    /// wrap; a look that merely resembles a chip needs a style of its own.
     pub fn name_style(&self) -> Style {
         Style::default().fg(self.name_fg).bg(self.name_bg)
     }
