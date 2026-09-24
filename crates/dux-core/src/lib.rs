@@ -52,6 +52,7 @@ pub mod pty_reattach;
 pub mod quiet_tail;
 pub mod release_notes;
 pub mod reload_handoff;
+pub mod reload_policy;
 pub mod resource_stats;
 pub mod row_state;
 pub mod scroll_hint;

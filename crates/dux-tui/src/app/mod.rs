@@ -1030,6 +1030,16 @@ pub enum RunExit {
         listeners: Vec<std::net::TcpListener>,
         urls: Vec<String>,
     },
+    /// Replace this process with a newer dux binary, keeping every running
+    /// agent alive across the swap.
+    ///
+    /// Carries the manifest describing the PTYs the next image will inherit.
+    /// It is built BEFORE the loop exits, because collecting it can fail and a
+    /// failure has to leave the user exactly where they were, still running,
+    /// rather than half-way out of an event loop with nothing to go back to.
+    Reload {
+        handoff: dux_core::reload_handoff::Handoff,
+    },
 }
 
 /// Whether the shared App constructor should relaunch prior sessions. First

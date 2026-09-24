@@ -1612,6 +1612,23 @@ impl Engine {
             .collect()
     }
 
+    /// The first agent that is mid-turn, if any.
+    ///
+    /// A reload clears every transcript (the scrollback lives in this image's
+    /// memory), so doing it while an agent is streaming throws away the output
+    /// of a turn the user is still waiting on. The agent itself would survive,
+    /// but what it had just said would not.
+    ///
+    /// Uses the same `is_agent_streaming` signal the sidebar's "Working" word
+    /// reads, so a refusal always matches what the user can see on screen. This
+    /// is dux's equivalent of jcode's `is_processing` check.
+    pub fn agent_blocking_reload(&self) -> Option<String> {
+        self.providers
+            .keys()
+            .find(|tab_id| self.is_agent_streaming(tab_id.as_str()))
+            .map(|tab_id| tab_id.as_str().to_string())
+    }
+
     /// Describe every live PTY so the image on the other side of a reload can
     /// adopt them, and make their descriptors survive the `exec`.
     ///
