@@ -1193,7 +1193,11 @@ mod tests {
                  scheduler could not give the burn a whole core"
             );
         }
-        if cores >= 6 && spare > 200.0 {
+        // Four burners can only EXCEED one core in aggregate if the scheduler
+        // can run more than one of them at once, which needs a free core for
+        // each: 400% spare. With less, fair sharing against everything else
+        // runnable can legitimately hold the four under 100% in the window.
+        if cores >= 6 && spare > 400.0 {
             assert!(
                 burner_cpu > 100.0,
                 "four busy processes on a {cores}-core box with {spare:.0}% spare \
