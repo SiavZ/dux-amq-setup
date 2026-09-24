@@ -373,6 +373,77 @@ fn the_non_default_branch_dialog_chips_both_branches_the_note_and_the_checkbox()
     assert!(occurrences(&buf, "main-nd").len() >= 2, "{}", screen(&buf));
 }
 
+/// The warning's sentences are dux-core's, shared with the web word for word;
+/// the terminal UI breaks their rows exactly where it always has.
+#[test]
+fn the_non_default_branch_dialog_keeps_its_line_breaks() {
+    let rows_of = |kind: dux_core::worker::BranchWarningKind| {
+        let mut app = test_app(default_bindings());
+        let project_path = app.engine.projects[0].path.clone();
+        let buf = open(
+            &mut app,
+            PromptState::ConfirmNonDefaultBranch {
+                add: PendingProjectAdd {
+                    path: project_path,
+                    name: "demo".to_string(),
+                },
+                current_branch: "topic".to_string(),
+                kind,
+                focus: ConfirmNonDefaultBranchFocus::Cancel,
+                checkout_default: false,
+            },
+        );
+        screen(&buf).lines().map(str::to_string).collect::<Vec<_>>()
+    };
+    // A body row as the dialog paints it: the text right after the frame's
+    // left edge, then nothing but padding up to its right edge.
+    let is_row = |row: &str, text: &str| {
+        row.split('│')
+            .any(|cell| cell.trim_end() == text && (text.is_empty() || cell.starts_with(text)))
+    };
+    let contains_in_order = |rows: &[String], want: &[&str]| {
+        let start = rows
+            .iter()
+            .position(|row| is_row(row, want[0]))
+            .unwrap_or_else(|| panic!("no row {:?} in:\n{}", want[0], rows.join("\n")));
+        for (offset, text) in want.iter().enumerate() {
+            assert!(
+                is_row(&rows[start + offset], text),
+                "row {} should read {text:?}:\n{}",
+                start + offset,
+                rows.join("\n")
+            );
+        }
+    };
+
+    let known = rows_of(dux_core::worker::BranchWarningKind::Known {
+        default_branch: "main".to_string(),
+    });
+    contains_in_order(
+        &known,
+        &[
+            " This repository is on branch  topic , but the",
+            " remote default branch is  main .",
+            "",
+            " New worktrees will branch from  topic .",
+        ],
+    );
+
+    let heuristic = rows_of(dux_core::worker::BranchWarningKind::Heuristic);
+    contains_in_order(
+        &heuristic,
+        &[
+            " This repository is on branch  topic ,",
+            " which doesn't appear to be the main branch.",
+            "",
+            " New worktrees will branch from  topic .",
+            "",
+            " Dux can't confidently identify this repo's default",
+            " branch, so it won't change branches for you.",
+        ],
+    );
+}
+
 /// The dialog sizes itself to its body, so the height must be the rows the
 /// wrapper actually produces: an estimate that counts characters instead of
 /// whole words and whole chips comes up short and clips the last sentence.

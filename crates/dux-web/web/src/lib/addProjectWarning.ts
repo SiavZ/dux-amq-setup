@@ -1,10 +1,14 @@
-// Branch-warning copy and decision helpers for the add-project pre-flight. The strings
-// are byte-for-byte the TUI's `ConfirmNonDefaultBranch` lines, joined into prose for the
-// web dialog. Keep them in step with crates/dux-tui/src/app/render.rs.
+// Branch-warning copy and decision helpers for the add-project pre-flight.
 //
-// Each sentence that names something is built once as prose (`./prose`): the
-// plain-text spelling is the TUI's string, and the web draws the names as chips
-// from the same structure.
+// The branch warning's three sentences are the terminal UI's too: dux-core builds
+// them in `add_project_prose.rs`, and the segments here are pinned against those
+// word for word by the shared fixture both suites read
+// (crates/dux-core/tests/fixtures/prose_cross_language.json). A line break inside
+// one of them is where the terminal UI breaks its row; HTML renders it as a space.
+//
+// The no-commits, init-repository and inside-a-repository sentences are this
+// dialog's own wording: the terminal UI words those dialogs differently, so no
+// parity is claimed for them.
 
 import { chip, type Prose, proseText, quotedChip } from "./prose"
 import type { BranchWarningView, InspectKind } from "./types"
@@ -30,6 +34,36 @@ export interface BranchWarningCopy {
   defaultBranch: string | null
 }
 
+/** The warning's headline: `defaultBranch` null means dux could not identify one. */
+export function branchWarningProse(
+  currentBranch: string,
+  defaultBranch: string | null,
+): Prose {
+  return defaultBranch !== null
+    ? [
+        "This repository is on branch ",
+        chip(currentBranch),
+        ", but the\nremote default branch is ",
+        chip(defaultBranch),
+        ".",
+      ]
+    : [
+        "This repository is on branch ",
+        chip(currentBranch),
+        ",\nwhich doesn't appear to be the main branch.",
+      ]
+}
+
+/** The note naming the branch new worktrees will start from. */
+export function worktreeBaseNoteProse(branch: string): Prose {
+  return ["New worktrees will branch from ", quotedChip(branch), "."]
+}
+
+/** The dim note under a warning dux could not be sure of. */
+export const HEURISTIC_BRANCH_NOTE_PROSE: Prose = [
+  "Dux can't confidently identify this repo's default\nbranch, so it won't change branches for you.",
+]
+
 /**
  * Map a branch warning + current branch to the exact user-facing copy and the
  * available choices, mirroring the TUI's `ConfirmNonDefaultBranch` rendering.
@@ -42,21 +76,10 @@ export function branchWarningCopy(
   currentBranch: string,
   checkoutSelected: boolean,
 ): BranchWarningCopy {
-  const worktreeNoteFor = (branch: string): Prose => [
-    "New worktrees will branch from ",
-    quotedChip(branch),
-    ".",
-  ]
   if (warning.kind === "known") {
     const fromDefault = checkoutSelected
-    const messageProse: Prose = [
-      "This repository is on branch ",
-      chip(currentBranch),
-      ", but the remote default branch is ",
-      chip(warning.default_branch),
-      ".",
-    ]
-    const worktreeNoteProse = worktreeNoteFor(
+    const messageProse = branchWarningProse(currentBranch, warning.default_branch)
+    const worktreeNoteProse = worktreeBaseNoteProse(
       fromDefault ? warning.default_branch : currentBranch,
     )
     return {
@@ -70,20 +93,15 @@ export function branchWarningCopy(
       defaultBranch: warning.default_branch,
     }
   }
-  const messageProse: Prose = [
-    "This repository is on branch ",
-    chip(currentBranch),
-    ", which doesn't appear to be the main branch.",
-  ]
-  const worktreeNoteProse = worktreeNoteFor(currentBranch)
+  const messageProse = branchWarningProse(currentBranch, null)
+  const worktreeNoteProse = worktreeBaseNoteProse(currentBranch)
   return {
     message: proseText(messageProse),
     messageProse,
     worktreeNote: proseText(worktreeNoteProse),
     worktreeNoteProse,
     worktreeTone: "warning",
-    heuristicNote:
-      "Dux can't confidently identify this repo's default branch, so it won't change branches for you.",
+    heuristicNote: proseText(HEURISTIC_BRANCH_NOTE_PROSE),
     canCheckoutDefault: false,
     defaultBranch: null,
   }

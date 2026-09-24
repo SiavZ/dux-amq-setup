@@ -6,6 +6,11 @@ import { fileURLToPath } from "node:url"
 import { describe, expect, it } from "vitest"
 import { render } from "@testing-library/react"
 
+import {
+  branchWarningProse,
+  HEURISTIC_BRANCH_NOTE_PROSE,
+  worktreeBaseNoteProse,
+} from "./addProjectWarning"
 import { checkoutDefaultBranchProse } from "./checkoutDefaultBranch"
 import { detachConfirmProse } from "./detachAgent"
 import {
@@ -98,13 +103,22 @@ describe("the sentences both surfaces print", () => {
           args.project_name as string,
           args.stored_base as string | null,
         )
+      case "add_project_branch_warning":
+        return branchWarningProse(
+          args.current_branch as string,
+          args.default_branch as string | null,
+        )
+      case "add_project_worktree_base":
+        return worktreeBaseNoteProse(args.branch as string)
+      case "add_project_heuristic_note":
+        return HEURISTIC_BRANCH_NOTE_PROSE
       default:
         throw new Error(`the fixture names a sentence this test cannot build: ${sentence}`)
     }
   }
 
   it("has not lost its cases", () => {
-    expect(fixture.cases.length).toBeGreaterThanOrEqual(6)
+    expect(fixture.cases.length).toBeGreaterThanOrEqual(10)
   })
 
   it.each(fixture.cases.map((c) => [c.what, c] as const))(

@@ -3,12 +3,11 @@
 //!
 //! Split of responsibility (per the CLAUDE.md tenets):
 //! core owns the DECISION and returns a STABLE TYPED code carrying its
-//! structured data (path, default-branch name); each surface keeps its OWN
-//! rendered strings, mapping the code to its own copy however it sees fit. The
-//! prose is deliberately NOT centralized here. The decision is pinned by the
-//! shared test-vector matrix below (the `agent_search` style), so the two
-//! surfaces' string maps can evolve independently while the branch-selection
-//! logic stays single-source.
+//! structured data (path, default-branch name); each surface maps the code to
+//! its own copy. The exception is the branch warning, whose sentences both
+//! surfaces print word for word: those live in [`crate::add_project_prose`].
+//! The decision is pinned by the shared test-vector matrix below (the
+//! `agent_search` style), so the branch-selection logic stays single-source.
 //!
 //! Precedence (highest first): blocked > init > unborn-commit > known-checkout >
 //! heuristic-warn > ready. The `can_checkout_default` rule rides the plan: only

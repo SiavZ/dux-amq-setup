@@ -8445,37 +8445,23 @@ impl App {
         // Body: warning text + the "new worktrees branch from …" note,
         // plus a dim info line on the heuristic path explaining why dux
         // won't offer to switch branches automatically.
-        let mut body_lines = vec![Line::from("")];
-        match kind {
-            BranchWarningKind::Known { default_branch } => {
-                body_lines.push(Line::from(vec![
-                    Span::raw(" This repository is on branch "),
-                    name_chip(current_branch, &self.theme),
-                    Span::raw(", but the"),
-                ]));
-                body_lines.push(Line::from(vec![
-                    Span::raw(" remote default branch is "),
-                    name_chip(default_branch, &self.theme),
-                    Span::raw("."),
-                ]));
-            }
-            BranchWarningKind::Heuristic => {
-                body_lines.push(Line::from(vec![
-                    Span::raw(" This repository is on branch "),
-                    name_chip(current_branch, &self.theme),
-                    Span::raw(","),
-                ]));
-                body_lines.push(Line::from(" which doesn't appear to be the main branch."));
-            }
-        }
-        body_lines.push(Line::from(""));
-        // The sentence follows the box: the core rule names the branch new
-        // worktrees will start from, and only a branch other than the remote's
-        // default is worth a warning.
+        // The sentences are dux-core's, the web's word for word; their line
+        // breaks are where this dialog breaks its rows.
         let known_default = match kind {
             BranchWarningKind::Known { default_branch } => Some(default_branch.as_str()),
             BranchWarningKind::Heuristic => None,
         };
+        let mut body_lines = vec![Line::from("")];
+        body_lines.extend(prose_lines(
+            &dux_core::add_project_prose::branch_warning_prose(current_branch, known_default),
+            " ",
+            Style::default(),
+            &self.theme,
+        ));
+        body_lines.push(Line::from(""));
+        // The sentence follows the box: the core rule names the branch new
+        // worktrees will start from, and only a branch other than the remote's
+        // default is worth a warning.
         let worktree_line = |checked: bool| {
             let base = dux_core::add_project_plan::project_base_at_add(
                 Some(current_branch.as_str()),
@@ -8487,38 +8473,37 @@ impl App {
             } else {
                 Style::default().fg(self.theme.warning_fg)
             };
-            Line::from(vec![
-                Span::styled(" New worktrees will branch from ", style),
-                name_chip(base.branch(), &self.theme),
-                Span::styled(".", style),
-            ])
+            prose_lines(
+                &dux_core::add_project_prose::worktree_base_note_prose(base.branch()),
+                " ",
+                style,
+                &self.theme,
+            )
         };
         // Measured with the box both ways, so toggling it never resizes the
         // dialog under the pointer.
         let worktree_line_height = [true, false]
             .into_iter()
-            .map(|checked| wrapped_rows(&[worktree_line(checked)], inner_width, &self.theme))
+            .map(|checked| wrapped_rows(&worktree_line(checked), inner_width, &self.theme))
             .max()
             .unwrap_or(1);
         let worktree_line_extra = worktree_line_height.saturating_sub(wrapped_rows(
-            &[worktree_line(*checkout_default)],
+            &worktree_line(*checkout_default),
             inner_width,
             &self.theme,
         ));
-        body_lines.push(worktree_line(*checkout_default));
+        body_lines.extend(worktree_line(*checkout_default));
         for _ in 0..worktree_line_extra {
             body_lines.push(Line::from(""));
         }
         if matches!(kind, BranchWarningKind::Heuristic) {
             body_lines.push(Line::from(""));
-            body_lines.push(Line::from(Span::styled(
-                " Dux can't confidently identify this repo's default",
+            body_lines.extend(prose_lines(
+                &dux_core::add_project_prose::heuristic_branch_note_prose(),
+                " ",
                 Style::default().fg(self.theme.hint_desc_fg),
-            )));
-            body_lines.push(Line::from(Span::styled(
-                " branch, so it won't change branches for you.",
-                Style::default().fg(self.theme.hint_desc_fg),
-            )));
+                &self.theme,
+            ));
         }
         let body_height = wrapped_rows(&body_lines, inner_width, &self.theme);
 

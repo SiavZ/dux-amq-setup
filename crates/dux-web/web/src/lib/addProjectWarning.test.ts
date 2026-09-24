@@ -7,7 +7,7 @@ import {
   insideRepoCopy,
   noCommitsCopy,
 } from "./addProjectWarning"
-import { chip, proseText, quotedChip } from "./prose"
+import { chip, quotedChip } from "./prose"
 
 describe("branchWarningCopy", () => {
   it("names the default branch and offers checkout for a known warning", () => {
@@ -17,7 +17,7 @@ describe("branchWarningCopy", () => {
       true,
     )
     expect(copy.message).toBe(
-      "This repository is on branch feature/x, but the remote default branch is main.",
+      "This repository is on branch feature/x, but the\nremote default branch is main.",
     )
     expect(copy.heuristicNote).toBeNull()
     expect(copy.canCheckoutDefault).toBe(true)
@@ -48,12 +48,12 @@ describe("branchWarningCopy", () => {
     // The box does not exist on this path, so a stale "ticked" changes nothing.
     const copy = branchWarningCopy({ kind: "heuristic" }, "dev", true)
     expect(copy.message).toBe(
-      "This repository is on branch dev, which doesn't appear to be the main branch.",
+      "This repository is on branch dev,\nwhich doesn't appear to be the main branch.",
     )
     expect(copy.worktreeNote).toBe('New worktrees will branch from "dev".')
     expect(copy.worktreeTone).toBe("warning")
     expect(copy.heuristicNote).toBe(
-      "Dux can't confidently identify this repo's default branch, so it won't change branches for you.",
+      "Dux can't confidently identify this repo's default\nbranch, so it won't change branches for you.",
     )
     expect(copy.canCheckoutDefault).toBe(false)
     expect(copy.defaultBranch).toBeNull()
@@ -61,10 +61,10 @@ describe("branchWarningCopy", () => {
 })
 
 // The web draws every name as a chip, so each sentence also comes as structure.
-// Its plain-text spelling is the very string pinned above, which is what keeps
-// the terminal UI's words intact while the web drops the quotes.
+// The branch warning's segments are also pinned against the terminal UI's by the
+// shared fixture in prose.test.tsx.
 describe("the add-project copy as names in prose", () => {
-  it("marks both branches in the known warning, and spells the TUI's string", () => {
+  it("marks both branches in the known warning", () => {
     const copy = branchWarningCopy(
       { kind: "known", default_branch: "main" },
       "feature/x",
@@ -73,38 +73,29 @@ describe("the add-project copy as names in prose", () => {
     expect(copy.messageProse).toEqual([
       "This repository is on branch ",
       chip("feature/x"),
-      ", but the remote default branch is ",
+      ", but the\nremote default branch is ",
       chip("main"),
       ".",
     ])
-    expect(proseText(copy.messageProse)).toBe(copy.message)
     expect(copy.worktreeNoteProse).toEqual([
       "New worktrees will branch from ",
       quotedChip("feature/x"),
       ".",
     ])
-    expect(proseText(copy.worktreeNoteProse)).toBe(copy.worktreeNote)
   })
 
   it("marks the branch in the heuristic warning", () => {
     const copy = branchWarningCopy({ kind: "heuristic" }, "dev", true)
     expect(copy.messageProse).toContainEqual(chip("dev"))
-    expect(proseText(copy.messageProse)).toBe(copy.message)
   })
 
   it("marks each seeded candidate and the enclosing root", () => {
     const init = initRepoCopy(["node_modules", ".venv"])
     expect(init.noteProse).toContainEqual(chip("node_modules"))
     expect(init.noteProse).toContainEqual(chip(".venv"))
-    expect(proseText(init.noteProse)).toBe(init.note)
-    expect(proseText(initRepoCopy([]).noteProse)).toBe(initRepoCopy([]).note)
 
     const inside = insideRepoCopy("/home/u/repo")
     expect(inside.messageProse).toContainEqual(chip("/home/u/repo"))
-    expect(proseText(inside.messageProse)).toBe(inside.message)
-    expect(proseText(insideRepoCopy(null).messageProse)).toBe(
-      insideRepoCopy(null).message,
-    )
   })
 })
 

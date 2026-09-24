@@ -1,5 +1,5 @@
 {
-  "note": "Dialog sentences BOTH surfaces print, as prose segments: a string is constant words, an object is a name each surface draws as a chip (`quoted` says the plain-text spelling wraps it in straight double quotes). Read by `the_two_surfaces_build_every_shared_sentence_from_the_same_segments` in crates/dux-core/src/prose.rs and by prose.test.tsx in crates/dux-web/web. Adjacent strings are merged before comparing, so either side may split its constant words however it likes; the words and the names must be the same. Paths are outside any home directory because the terminal side home-collapses them.",
+  "note": "Dialog sentences BOTH surfaces print, as prose segments: a string is constant words, an object is a name each surface draws as a chip (`quoted` says the plain-text spelling wraps it in straight double quotes). Read by `the_two_surfaces_build_every_shared_sentence_from_the_same_segments` in crates/dux-core/src/prose.rs and by prose.test.tsx in crates/dux-web/web. Adjacent strings are merged before comparing, so either side may split its constant words however it likes; the words and the names must be the same. Paths are outside any home directory because the terminal side home-collapses them. A single line break inside a sentence is where the terminal UI breaks the row; the web renders it as the space HTML makes of it.",
   "cases": [
     {
       "what": "detaching an agent with one running tab",
@@ -165,6 +165,66 @@
           "quoted": true
         },
         " back to its default branch, moving HEAD in the shared repository. After the checkout, new worktrees branch from the default branch."
+      ]
+    },
+    {
+      "what": "adding a project on a branch other than the remote's default",
+      "sentence": "add_project_branch_warning",
+      "args": {
+        "current_branch": "feature/x",
+        "default_branch": "main"
+      },
+      "segments": [
+        "This repository is on branch ",
+        {
+          "name": "feature/x",
+          "quoted": false
+        },
+        ", but the\nremote default branch is ",
+        {
+          "name": "main",
+          "quoted": false
+        },
+        "."
+      ]
+    },
+    {
+      "what": "adding a project whose default branch dux cannot identify",
+      "sentence": "add_project_branch_warning",
+      "args": {
+        "current_branch": "dev",
+        "default_branch": null
+      },
+      "segments": [
+        "This repository is on branch ",
+        {
+          "name": "dev",
+          "quoted": false
+        },
+        ",\nwhich doesn't appear to be the main branch."
+      ]
+    },
+    {
+      "what": "the branch new worktrees start from when a project is added",
+      "sentence": "add_project_worktree_base",
+      "args": {
+        "branch": "main"
+      },
+      "segments": [
+        "New worktrees will branch from ",
+        {
+          "name": "main",
+          "quoted": true
+        },
+        "."
+      ]
+    },
+    {
+      "what": "the note under a warning dux could not be sure of",
+      "sentence": "add_project_heuristic_note",
+      "args": {},
+      "segments": [
+        "Dux can't confidently identify this repo's default\nbranch, so it won't change branches for you."
       ]
     }
   ]

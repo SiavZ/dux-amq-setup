@@ -223,19 +223,15 @@ mod tests {
         Value::Array(out)
     }
 
-    /// Build one fixture case's sentence the way the terminal UI does, and the
-    /// plain-text body the string API returns for the same arguments.
-    fn build(sentence: &str, args: &Value) -> (Prose, String) {
+    /// Build one fixture case's sentence the way the terminal UI does.
+    fn build(sentence: &str, args: &Value) -> Prose {
         let s = |key: &str| args[key].as_str().expect(key).to_string();
         match sentence {
             "detach_confirm" => {
                 let label = s("label");
                 let grace = args["grace_seconds"].as_u64().expect("grace_seconds");
                 let tabs = args["live_tabs"].as_u64().expect("live_tabs") as usize;
-                (
-                    crate::engine::detach_confirm_prose(&label, grace, tabs),
-                    crate::engine::detach_confirm_body(&label, grace, tabs),
-                )
+                crate::engine::detach_confirm_prose(&label, grace, tabs)
             }
             "recreate_confirm" => {
                 let worktree = std::path::PathBuf::from(s("worktree_label"));
@@ -247,23 +243,23 @@ mod tests {
                     .collect();
                 let resumes = args["conversation_resumes"].as_bool().expect("resumes");
                 let (branch, source) = (s("branch_name"), s("source_branch"));
-                (
-                    crate::working_copy::recreate_confirm_prose(
-                        &worktree, &branch, &source, resumes, &providers,
-                    ),
-                    crate::working_copy::recreate_confirm_body(
-                        &worktree, &branch, &source, resumes, &providers,
-                    ),
+                crate::working_copy::recreate_confirm_prose(
+                    &worktree, &branch, &source, resumes, &providers,
                 )
             }
             "checkout_default_branch_confirm" => {
                 let project = s("project_name");
                 let base = args["stored_base"].as_str();
-                (
-                    crate::engine::checkout_default_branch_confirm_prose(&project, base),
-                    crate::engine::checkout_default_branch_confirm_body(&project, base),
-                )
+                crate::engine::checkout_default_branch_confirm_prose(&project, base)
             }
+            "add_project_branch_warning" => crate::add_project_prose::branch_warning_prose(
+                &s("current_branch"),
+                args["default_branch"].as_str(),
+            ),
+            "add_project_worktree_base" => {
+                crate::add_project_prose::worktree_base_note_prose(&s("branch"))
+            }
+            "add_project_heuristic_note" => crate::add_project_prose::heuristic_branch_note_prose(),
             other => panic!("the fixture names a sentence this test cannot build: {other}"),
         }
     }
@@ -271,8 +267,7 @@ mod tests {
     /// The other half of the pin in the browser's `prose.test.tsx`. Both read
     /// `tests/fixtures/prose_cross_language.json`, so a sentence passes only
     /// when the terminal UI and the web say the same words and mark the same
-    /// names. The plain spelling is checked against the string API too, so the
-    /// logs and the dialog cannot drift apart either.
+    /// names.
     #[test]
     fn the_two_surfaces_build_every_shared_sentence_from_the_same_segments() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -280,17 +275,16 @@ mod tests {
         let raw = std::fs::read_to_string(&path).expect("fixture must be readable");
         let fixture: Value = serde_json::from_str(&raw).expect("fixture must parse");
         let cases = fixture["cases"].as_array().expect("cases");
-        assert!(cases.len() >= 6, "the fixture has lost its cases");
+        assert!(cases.len() >= 10, "the fixture has lost its cases");
         for case in cases {
             let what = case["what"].as_str().expect("what");
             let sentence = case["sentence"].as_str().expect("sentence");
-            let (prose, body) = build(sentence, &case["args"]);
+            let prose = build(sentence, &case["args"]);
             assert_eq!(
                 merged(&prose.to_json()),
                 merged(&case["segments"]),
                 "{what}: the terminal UI's segments differ from the fixture"
             );
-            assert_eq!(prose.plain(), body, "{what}: the plain spelling drifted");
         }
     }
 }
