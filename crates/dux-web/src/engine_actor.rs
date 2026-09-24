@@ -301,6 +301,10 @@ pub enum EngineRequest {
             )>,
         >,
     ),
+    /// The registered-project inventory for the whole-worktree removal guard
+    /// (`Engine::registered_project_paths`). `Err` when a project path does not
+    /// expand to a safe absolute one; the caller refuses the removal.
+    RegisteredProjectPaths(oneshot::Sender<Result<Vec<std::path::PathBuf>, String>>),
     /// Everything the pull-request reference resolver needs: the live project list
     /// and the GitHub host policy. Instant clones, because reading a project's
     /// configured address shells to git and must not run on the engine loop or the
@@ -1560,6 +1564,22 @@ impl EngineHandle {
             .clone()
     }
 
+    /// The registered-project inventory for the whole-worktree removal guard.
+    /// A dead engine reads as an error, so the caller refuses the removal.
+    pub async fn registered_project_paths(&self) -> Result<Vec<std::path::PathBuf>, String> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .req_tx
+            .send(EngineRequest::RegisteredProjectPaths(tx))
+            .await
+            .is_err()
+        {
+            return Err("the engine is not running".to_string());
+        }
+        rx.await
+            .unwrap_or_else(|_| Err("the engine is not running".to_string()))
+    }
+
     /// Snapshot the inputs to classify a project's managed worktrees (project,
     /// paths, sessions). Instant: the git classification runs off-thread in the
     /// caller. `None` when the project id is unknown.
@@ -1896,6 +1916,7 @@ fn request_mutates_spine(req: &EngineRequest) -> bool {
         | EngineRequest::FileDropRefreshTarget(..)
         | EngineRequest::ProjectPath(..)
         | EngineRequest::ProjectWorktreeInputs(..)
+        | EngineRequest::RegisteredProjectPaths(..)
         | EngineRequest::SessionStartupLogContext(..)
         | EngineRequest::ProjectStartupLogContext(..)
         | EngineRequest::EditorDefault(..)
@@ -2418,6 +2439,28 @@ impl EngineService {
         // delete also removes its worktree, dispatch that removal now, only after
         // the agent's process is actually gone (the existing
         // `WorktreeRemoveCompleted` path then drives its status).
+        // Watch rules: this sweep is the single tick site for `dux serve`,
+        // exactly like the activity poll above, so a rule fires once.
+        for status in engine.tick_watch_rules() {
+            self.note_mutation();
+            let reaction = dux_core::engine::EventReaction::Status(status);
+            for status in dux_core::wire::wire_statuses_from_reaction(&reaction) {
+                let _ = self.status.send(status);
+            }
+        }
+
+        // AMQ wake delivery and the Orchestrator watchdog: single tick site
+        // for `dux serve`, like the watch rules. No agent is "focused" in the
+        // TUI sense here, so only recent keystrokes gate delivery, and a wake
+        // with no receiver has no selected agent to fall back to.
+        let amq = engine.tick_amq(dux_core::engine::AmqFocus::default());
+        if !matches!(amq, dux_core::engine::EventReaction::Nothing) {
+            self.note_mutation();
+            for status in dux_core::wire::wire_statuses_from_reaction(&amq) {
+                let _ = self.status.send(status);
+            }
+        }
+
         let reaped = engine.reap_terminating_ptys();
         for removal in reaped.removals {
             let _busy = engine.dispatch_deferred_worktree_removal(removal);
@@ -3846,6 +3889,13 @@ fn handle_request(
                 .map(|project| (project, engine.paths.clone(), engine.sessions.clone()));
             let _ = reply.send(inputs);
         }
+        EngineRequest::RegisteredProjectPaths(reply) => {
+            let _ = reply.send(
+                engine
+                    .registered_project_paths()
+                    .map_err(|e| format!("{e:#}")),
+            );
+        }
         EngineRequest::SessionStartupLogContext(session_id, reply) => {
             let context = engine
                 .sessions
@@ -4524,6 +4574,9 @@ mod tests {
         let now = chrono::Utc::now();
         dux_core::model::AgentSession {
             id: id.to_string(),
+            agent_handle: dux_core::model::normalize_agent_handle(id),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: format!("{id}-slot"),
             provider: dux_core::model::ProviderKind::new("claude"),
             title: Some(format!("{id}-title")),
@@ -7129,6 +7182,11 @@ mod tests {
                 false,
             ),
             (
+                "RegisteredProjectPaths",
+                EngineRequest::RegisteredProjectPaths(dead_reply()),
+                false,
+            ),
+            (
                 "BrowseStartDir",
                 EngineRequest::BrowseStartDir(dead_reply()),
                 false,
@@ -7276,7 +7334,7 @@ mod tests {
         // through with a copied-from-its-neighbour `false` that nothing reads.
         assert_eq!(
             request_kind_answers().len(),
-            43,
+            44,
             "every EngineRequest kind needs a row in request_kind_answers; \
              update the count deliberately when adding one"
         );
@@ -7299,6 +7357,9 @@ mod tests {
         let now = chrono::Utc::now();
         engine.sessions.push(dux_core::model::AgentSession {
             id: "s1".to_string(),
+            agent_handle: "s1".to_string(),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: "s1-slot".to_string(),
             provider: dux_core::model::ProviderKind::new("claude"),
             title: None,

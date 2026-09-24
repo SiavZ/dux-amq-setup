@@ -583,9 +583,71 @@ impl AgentWorkspace {
     }
 }
 
+/// Longest persisted [`AgentSession::agent_handle`], in bytes (the alphabet is
+/// ASCII, so bytes and characters agree). Matches the storage CHECK the fork's
+/// schema enforced and the AMQ wrappers' inbox-name limit.
+pub const AGENT_HANDLE_MAX_LEN: usize = 64;
+
+/// Normalize a candidate identity for a NEW agent: the AMQ wrapper alphabet
+/// (`[a-z0-9_-]`, see [`crate::sanitize::amq_handle`]) truncated to
+/// [`AGENT_HANDLE_MAX_LEN`]. Only ever applied at creation or by the one-time
+/// storage backfill; a handle already stored is never rewritten, because AMQ
+/// inboxes and peer routing are keyed by it.
+pub fn normalize_agent_handle(candidate: &str) -> String {
+    let normalized: String = crate::sanitize::amq_handle(candidate)
+        .chars()
+        .take(AGENT_HANDLE_MAX_LEN)
+        .collect();
+    // Truncation can expose a trailing dash the full string did not end in.
+    normalized.trim_end_matches('-').to_string()
+}
+
+/// Derive the basename-first identity used by the storage backfill and by agent
+/// creation: the working directory's basename, else the branch, else the id,
+/// else the literal `agent`. The first candidate that normalizes to something
+/// non-empty wins.
+pub fn derive_agent_handle(directory: &str, branch_name: &str, id: &str) -> String {
+    let basename = std::path::Path::new(directory)
+        .file_name()
+        .and_then(|part| part.to_str());
+    basename
+        .into_iter()
+        .chain([branch_name, id])
+        .map(normalize_agent_handle)
+        .find(|handle| !handle.is_empty())
+        .unwrap_or_else(|| "agent".to_string())
+}
+
+/// The exact persisted handle contract: 1..=[`AGENT_HANDLE_MAX_LEN`] bytes of
+/// `[a-z0-9_-]`. Storage refuses to write anything else and refuses to load a
+/// database holding anything else (fail closed rather than silently repair an
+/// identity that AMQ state on disk may already reference).
+pub fn is_valid_agent_handle(handle: &str) -> bool {
+    (1..=AGENT_HANDLE_MAX_LEN).contains(&handle.len())
+        && handle
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte))
+}
+
 #[derive(Clone, Debug)]
 pub struct AgentSession {
     pub id: String,
+    /// Stable, locally unique identity used for AMQ inboxes and peer routing.
+    /// Assigned once, before the first insert (see
+    /// `SessionStore::assign_unique_agent_handle`), and immutable afterwards:
+    /// storage refuses an upsert that would change it. Unlike the branch or
+    /// title it never drifts, so an inbox keyed by it survives renames.
+    pub agent_handle: String,
+    /// True when this agent runs in the project's registered main checkout
+    /// (shared main-workspace mode) instead of a worktree dux minted for it.
+    /// A shared agent's directory is the user's checkout and must never be
+    /// removed by any delete, purge or cleanup path.
+    pub shared_workspace: bool,
+    /// Soft-delete tombstone. `None` for a live agent. Set when the user deletes
+    /// the agent: the row is hidden from [`crate::storage::SessionStore::load_sessions`]
+    /// but retained so its handle stays reserved and a later hard purge can
+    /// still find what to erase.
+    pub deleted_at: Option<DateTime<Utc>>,
     /// The id of this agent's **session-slot tab**: a pointer into `agent_tabs`,
     /// stored in the session row. Read it through
     /// [`AgentSession::slot_tab_id`], never directly, so slot-ness stays one
@@ -616,6 +678,39 @@ pub struct AgentSession {
 }
 
 impl AgentSession {
+    /// The immutable AMQ/peer identity. See the field doc.
+    pub fn agent_handle(&self) -> &str {
+        &self.agent_handle
+    }
+
+    /// Whether this agent shares the project's main checkout. See the field doc.
+    pub fn shared_workspace(&self) -> bool {
+        self.shared_workspace
+    }
+
+    /// Whether this row is a soft-deleted tombstone.
+    pub fn is_deleted(&self) -> bool {
+        self.deleted_at.is_some()
+    }
+
+    /// Whether deleting this agent may remove the directory it runs in.
+    ///
+    /// Stronger than [`AgentWorkspace::deletion_may_remove_directory`]: a
+    /// shared-workspace agent is stored as a managed workspace (so branch and
+    /// PR features keep working), but its directory is the user's registered
+    /// checkout, which no delete may ever remove. Every teardown decision asks
+    /// the session, not the workspace, so the shared flag cannot be skipped.
+    pub fn deletion_may_remove_directory(&self) -> bool {
+        !self.shared_workspace && self.workspace.deletion_may_remove_directory()
+    }
+
+    /// Whether a rename may run `git branch -m`. Never for a shared agent: its
+    /// branch is whatever the user has checked out in their own checkout, and
+    /// renaming it would rename the user's branch under every other writer.
+    pub fn may_rename_branch(&self) -> bool {
+        !self.shared_workspace && self.supports_branch_git()
+    }
+
     /// Where this agent runs. Both kinds of workspace have a directory; this
     /// one is NOT a promise that git can run in it. See
     /// [`AgentWorkspace::directory`].
@@ -1033,10 +1128,55 @@ pub struct CompanionTerminal {
 mod tests {
     use super::*;
 
+    #[test]
+    fn normalize_agent_handle_follows_the_amq_wrapper_alphabet() {
+        assert_eq!(normalize_agent_handle("Feature/Login"), "feature-login");
+        assert_eq!(normalize_agent_handle("--Already_OK--"), "already_ok");
+        assert_eq!(normalize_agent_handle("!!!"), "");
+        let long = format!("{}-x", "a".repeat(AGENT_HANDLE_MAX_LEN - 1));
+        let normalized = normalize_agent_handle(&long);
+        assert_eq!(normalized.len(), AGENT_HANDLE_MAX_LEN - 1);
+        assert!(
+            is_valid_agent_handle(&normalized),
+            "truncation must not leave a trailing dash: {normalized}"
+        );
+    }
+
+    #[test]
+    fn derive_agent_handle_prefers_basename_then_branch_then_id() {
+        assert_eq!(
+            derive_agent_handle("/wt/p/Lively-Otter", "b", "id"),
+            "lively-otter"
+        );
+        assert_eq!(
+            derive_agent_handle("/wt/p/!!!", "dux/Feat", "id"),
+            "dux-feat"
+        );
+        assert_eq!(derive_agent_handle("", "", "Id-1"), "id-1");
+        assert_eq!(derive_agent_handle("", "", "!!!"), "agent");
+    }
+
+    #[test]
+    fn is_valid_agent_handle_is_the_exact_persisted_contract() {
+        assert!(is_valid_agent_handle("a"));
+        assert!(is_valid_agent_handle("a_b-1"));
+        assert!(!is_valid_agent_handle(""));
+        assert!(!is_valid_agent_handle("A"));
+        assert!(!is_valid_agent_handle("a/b"));
+        assert!(!is_valid_agent_handle("a.b"));
+        assert!(!is_valid_agent_handle(
+            &"a".repeat(AGENT_HANDLE_MAX_LEN + 1)
+        ));
+        assert!(is_valid_agent_handle(&"a".repeat(AGENT_HANDLE_MAX_LEN)));
+    }
+
     fn session_with_focus(last_focused_tab: Option<&str>) -> AgentSession {
         let now = Utc::now();
         AgentSession {
             id: "s1".to_string(),
+            agent_handle: "s1".to_string(),
+            shared_workspace: false,
+            deleted_at: None,
             // Deliberately not the session id: the slot is a stored pointer at
             // a generated tab id, and a fixture that reused the session id
             // would let a comparison against `id` pass by coincidence.
@@ -1166,6 +1306,9 @@ mod tests {
         let now = Utc::now();
         AgentSession {
             id: "sa1".to_string(),
+            agent_handle: "sa1".to_string(),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: "sa1-slot".to_string(),
             provider: ProviderKind::new("claude"),
             workspace: AgentWorkspace::Folder(FolderWorkspace {

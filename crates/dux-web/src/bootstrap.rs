@@ -144,6 +144,7 @@ pub fn bootstrap_engine(paths: &DuxPaths) -> Result<Engine> {
         providers: HashMap::new(),
         running_provider_pins: HashMap::new(),
         launched_drop_paste: Default::default(),
+        watch: Default::default(),
         companion_terminals: HashMap::new(),
         agent_tabs: agent_tabs
             .into_iter()
@@ -195,6 +196,7 @@ pub fn bootstrap_engine(paths: &DuxPaths) -> Result<Engine> {
         pty_progress: HashMap::new(),
         agent_viewed: HashMap::new(),
         last_foreground_refresh: None,
+        amq: Default::default(),
     };
 
     engine.normalize_restored_sessions();
@@ -265,6 +267,7 @@ mod tests {
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .expect("upsert project");
         drop(store);

@@ -1199,6 +1199,9 @@ mod tests {
         store
             .create_session(&dux_core::model::AgentSession {
                 id: id.to_string(),
+                agent_handle: dux_core::model::normalize_agent_handle(id),
+                shared_workspace: false,
+                deleted_at: None,
                 slot_tab_id: format!("{id}-slot"),
                 provider: dux_core::model::ProviderKind::new("claude"),
                 title: Some("seeded".to_string()),
@@ -1347,6 +1350,9 @@ mod tests {
         store
             .create_session(&dux_core::model::AgentSession {
                 id: id.to_string(),
+                agent_handle: dux_core::model::normalize_agent_handle(id),
+                shared_workspace: false,
+                deleted_at: None,
                 slot_tab_id: format!("{id}-slot"),
                 provider: dux_core::model::ProviderKind::new("claude"),
                 title: Some("seeded".to_string()),

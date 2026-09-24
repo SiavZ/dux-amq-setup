@@ -15,6 +15,9 @@ fn sample_session(id: &str, worktree: &str) -> dux_core::model::AgentSession {
     let n = chrono::Utc::now();
     dux_core::model::AgentSession {
         id: id.to_string(),
+        agent_handle: dux_core::model::normalize_agent_handle(id),
+        shared_workspace: false,
+        deleted_at: None,
         slot_tab_id: format!("{id}-slot"),
         provider: dux_core::model::ProviderKind::new("claude"),
         title: None,
@@ -70,6 +73,7 @@ async fn boot() -> (SocketAddr, tempfile::TempDir) {
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .unwrap();
         store

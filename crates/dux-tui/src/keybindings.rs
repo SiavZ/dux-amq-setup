@@ -434,7 +434,9 @@ pub const BINDING_DEFS: &[BindingDef] = &[
     },
     BindingDef {
         action: Action::OpenWorktreeInEditor,
-        default_keys: &[key!(o)],
+        // Unbound by default: a stray `o` in the sidebar launched an editor
+        // window. It stays in the palette, and `[keys]` documents it.
+        default_keys: &[],
         scopes: &[BindingScope::Left],
         help: Some(HelpEntry {
             section: "Projects pane",
@@ -1366,6 +1368,14 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         hint_contexts: &[],
     },
     BindingDef {
+        // Palette-only: the opt-in orphan-worktree cleaner. No default key.
+        action: Action::PruneOrphanWorktrees,
+        default_keys: &[],
+        scopes: &[],
+        help: None,
+        hint_contexts: &[],
+    },
+    BindingDef {
         action: Action::ToggleGithubIntegration,
         default_keys: &[],
         scopes: &[],
@@ -1479,6 +1489,27 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         default_keys: &[],
         scopes: &[],
         help: None,
+        hint_contexts: &[],
+    },
+    BindingDef {
+        // Palette-only: an occasional management view, not a hot path.
+        action: Action::WatchRules,
+        default_keys: &[],
+        scopes: &[],
+        help: None,
+        hint_contexts: &[],
+    },
+    BindingDef {
+        // Global so it works from any pane (fork d0e601c5). Ctrl-Shift-S is
+        // bound nowhere upstream; plain Ctrl-S (new standalone agent) is a
+        // different chord to `keys_conflict`.
+        action: Action::SessionSettings,
+        default_keys: &[key!(ctrl - shift - s)],
+        scopes: &[BindingScope::Global],
+        help: Some(HelpEntry {
+            section: "Global",
+            description: "Open the selected agent's session settings",
+        }),
         hint_contexts: &[],
     },
 ];
@@ -1876,6 +1907,12 @@ impl RuntimeBindings {
                     } else {
                         self.label_for(b.action)
                     };
+                    // An unbound action (shipped that way, like
+                    // open_worktree_in_editor, or unbound by the user) has no
+                    // key to advertise; an empty `<>` badge would be a lie.
+                    if label.is_empty() {
+                        continue;
+                    }
                     result.push((label, desc));
                 }
             }
@@ -2038,7 +2075,10 @@ pub struct KeyConflict {
 ///
 /// Mirrors the matching semantics of `RuntimeBindings::lookup()`:
 /// - Plain bindings (no modifiers) only conflict with other plain bindings.
-/// - Modifier bindings conflict only when modifiers are identical.
+/// - Any two modifier bindings on the same code conflict, not only identical
+///   ones: `lookup()` matches a binding whose modifiers are a SUBSET of the
+///   event's, so an event carrying the union (ctrl-alt-x against ctrl-x and
+///   ctrl-alt-x) matches both and the first one in table order silently wins.
 fn keys_conflict(a: &KeyCombination, b: &KeyCombination) -> bool {
     let na = normalize_ctrl_punct(normalize_backtab(a.normalized()));
     let nb = normalize_ctrl_punct(normalize_backtab(b.normalized()));
@@ -2048,7 +2088,7 @@ fn keys_conflict(a: &KeyCombination, b: &KeyCombination) -> bool {
     match (na.modifiers.is_empty(), nb.modifiers.is_empty()) {
         (true, true) => true,
         (true, false) | (false, true) => false,
-        (false, false) => na.modifiers == nb.modifiers,
+        (false, false) => true,
     }
 }
 
@@ -3072,6 +3112,17 @@ mod tests {
     }
 
     #[test]
+    fn filtered_palette_includes_orphan_worktree_cleaner() {
+        let bindings = default_bindings();
+        let names = bindings
+            .filtered_palette("orphan")
+            .iter()
+            .filter_map(|binding| binding.palette_name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"prune-orphan-worktrees"));
+    }
+
+    #[test]
     fn filtered_palette_includes_reload_config_command() {
         let bindings = default_bindings();
         let results = bindings.filtered_palette("reload");
@@ -3239,6 +3290,7 @@ mod tests {
             "open-current-pr",
             "open-worktree",
             "open-worktree-with",
+            "prune-orphan-worktrees",
             "pull-project",
             "read-startup-command-logs",
             "recheck-github",
@@ -3252,6 +3304,7 @@ mod tests {
             "rerun-startup-command-on-agent",
             "resource-monitor",
             "resume-pull-request-autodetection",
+            "session-settings",
             "set-tailscale-mode",
             "show-agent",
             "show-release-notes",
@@ -3273,6 +3326,7 @@ mod tests {
             "toggle-remove-git-pane",
             "toggle-sidebar",
             "toggle-tab-to-agent",
+            "watch-rules",
         ];
 
         assert_eq!(
@@ -3540,6 +3594,59 @@ mod tests {
     }
 
     // ── Conflict detection tests ────────────────────────────────────────
+
+    /// Fork 24deeeee: `lookup` matches a binding whose modifiers are a SUBSET of
+    /// the event's, so ctrl-x and ctrl-alt-x on the same scope both match a
+    /// ctrl-alt-x press and table order silently picks one. That pair must be
+    /// reported as a conflict, not only an identical-modifier pair.
+    #[test]
+    fn detect_conflicts_rejects_modifier_subset_shadowing() {
+        let mut keys = crate::config::KeysConfig::default();
+        keys.bindings
+            .insert("quit".to_string(), vec!["ctrl-x".to_string()]);
+        keys.bindings
+            .insert("toggle_help".to_string(), vec!["ctrl-alt-x".to_string()]);
+
+        let conflicts = detect_conflicts(&keys);
+        assert!(conflicts.iter().any(|conflict| {
+            (conflict.action_a == "quit" && conflict.action_b == "toggle_help")
+                || (conflict.action_a == "toggle_help" && conflict.action_b == "quit")
+        }));
+
+        let bindings = RuntimeBindings::from_keys_config(&keys);
+        let event = KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        assert!(
+            bindings.lookup(&event, BindingScope::Global).is_some(),
+            "runtime lookup matches one of them, which is why the subset must be rejected"
+        );
+    }
+
+    /// The shipped defaults must stay conflict-free under the stricter rule.
+    #[test]
+    fn default_bindings_have_no_modifier_subset_conflicts() {
+        let conflicts = detect_conflicts(&crate::config::KeysConfig::default());
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+    }
+
+    /// Fork d945e200: plain `o` in the sidebar launched an external editor far
+    /// too easily. The action stays (palette and `[keys]`), unbound.
+    #[test]
+    fn open_worktree_is_not_bound_to_plain_o_by_default() {
+        let bindings = default_bindings();
+        let key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE);
+        assert_eq!(bindings.lookup(&key, BindingScope::Left), None);
+        // And the sidebar hint no longer advertises it with an empty badge.
+        assert!(
+            bindings
+                .hints_for(HintContext::LeftSession)
+                .iter()
+                .all(|(label, desc)| !label.is_empty() && *desc != "Open"),
+            "an unbound action must not appear in the hint bar"
+        );
+    }
 
     #[test]
     fn detect_conflicts_same_key_same_scope() {

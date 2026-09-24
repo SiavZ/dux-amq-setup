@@ -4,6 +4,7 @@
 //! embeds it and calls it directly, and the web server reaches it through its
 //! engine actor.
 
+pub mod amq;
 pub mod command;
 mod companion;
 pub mod config_saver;
@@ -13,9 +14,12 @@ mod in_flight;
 mod lifecycle;
 mod pr_sync_control;
 mod resume_fallback;
+mod shared_workspace;
 mod spawn_worker;
 pub mod status_op;
+mod watch_tick;
 
+pub use amq::{AmqFocus, AmqRuntime};
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -43,11 +47,13 @@ pub use lifecycle::{
 };
 pub use pr_sync_control::PrSyncControl;
 pub use resume_fallback::ResumeFallbackOutcome;
+pub use shared_workspace::{SharedMultiWriterSummary, project_link_allowed};
 pub use spawn_worker::{
     BackgroundSpawn, BackgroundWorkerSpec, CommandWorkerSpec, LoopControl, LoopWorkerSpec,
     format_panic_payload,
 };
 pub use status_op::{Final, HandlerStatusOp, ResolvedFinal, StatusOp, status_op};
+pub use watch_tick::{WATCH_SCAN_ROWS, WATCH_TYPING_QUIET, WatchRuleRow, WatchSessionSettings};
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -316,6 +322,10 @@ pub struct Engine {
     /// user edits in their own editor and dux reloads, so there is no point at
     /// which a refusal could be delivered.
     pub launched_drop_paste: HashMap<TabId, LaunchedDropPaste>,
+    /// Watch-rule engines and their delivery state, per live agent tab. See
+    /// `engine/watch_tick.rs`. Memory-only: budgets and cooldowns restart with
+    /// the tab.
+    pub watch: crate::watch::runtime::WatchRuntime,
     pub companion_terminals: HashMap<String, CompanionTerminal>,
     /// Persisted **extra tabs** (secondary provider tabs), keyed by tab id with
     /// the owning `session_id` carried in the value (mirrors `companion_terminals`
@@ -743,6 +753,10 @@ pub struct Engine {
     /// past [`CREATED_SESSION_TTL`] or whose session no longer exists, so a
     /// long-running server cannot accumulate stale entries.
     pub created_session_by_op: HashMap<String, (String, Instant)>,
+    /// AMQ runtime: per-session settings, the inject-queue drainer and the
+    /// Orchestrator watchdog (see [`amq`]). Construct with `Default`; load
+    /// settings with [`Engine::load_session_settings_from_store`].
+    pub amq: amq::AmqRuntime,
 }
 
 /// Handler-computed outcome for a create-agent op (see
@@ -1421,7 +1435,7 @@ pub(crate) fn portable_project_path(path: &str) -> String {
 /// on-disk shape stays consistent regardless of which path wrote it. The path is
 /// stored in the portable `$HOME/...` form (via [`portable_project_path`]) so the
 /// config does not pin an absolute, machine-specific path.
-fn project_to_project_config(p: &Project) -> ProjectConfig {
+fn project_to_project_config(p: &Project, existing: &[ProjectConfig]) -> ProjectConfig {
     ProjectConfig {
         id: p.id.clone(),
         path: portable_project_path(&p.path),
@@ -1434,6 +1448,12 @@ fn project_to_project_config(p: &Project) -> ProjectConfig {
         auto_reopen_agents: p.auto_reopen_agents,
         startup_command: p.startup_command.clone(),
         env: p.env.clone(),
+        // Config-only preference, carried from the existing entry so this
+        // rebuild never drops a user's per-project workspace mode.
+        workspace_mode: existing
+            .iter()
+            .find(|project| project.id == p.id)
+            .and_then(|project| project.workspace_mode),
     }
 }
 
@@ -1572,6 +1592,11 @@ impl Engine {
     /// keep showing the agent as working.
     pub fn note_pty_input(&mut self, tab_id: &str) {
         self.pty_input.insert(tab_id.to_string(), Instant::now());
+        // The AMQ quiet window needs "last typed" per agent over minutes, which
+        // `pty_input` (a 1.25 s window, cleared with the tab) cannot answer.
+        if let Some(session_id) = self.session_id_for_tab(tab_id) {
+            self.note_amq_user_input(&session_id);
+        }
     }
 
     /// Record that a forwarded POINTER report just reached this PTY. This is
@@ -1997,6 +2022,7 @@ impl Engine {
                                 auto_reopen_agents: project.auto_reopen_agents,
                                 startup_command: project.startup_command.clone(),
                                 env: project.env.clone(),
+                                workspace_mode: None,
                             })?;
                         }
                         ProjectPersistenceAction::Remove { project_id, .. }
@@ -2169,10 +2195,11 @@ impl Engine {
     /// its own config-sync path.) Eager synchronous write via the queue; blocks
     /// until the writer confirms or times out.
     pub fn persist_projects_to_config(&mut self) -> anyhow::Result<()> {
+        let existing = std::mem::take(&mut self.config.projects);
         self.config.projects = self
             .projects
             .iter()
-            .map(project_to_project_config)
+            .map(|project| project_to_project_config(project, &existing))
             .collect();
         self.config_writer
             .save_eager(self.config.clone())
@@ -3931,6 +3958,18 @@ impl Engine {
         let name = new_name.trim().to_string();
         if name.is_empty() {
             return BranchRenamePlan::Rejected(BranchRenameRejection::EmptyName);
+        }
+        // Shared main-workspace mode: the branch is the user's checkout, shared
+        // with every other writer, so asking to rename it is refused before any
+        // state changes. A title-only rename goes through below.
+        if rename_branch
+            && self
+                .sessions
+                .iter()
+                .find(|s| s.id == session_id)
+                .is_some_and(|s| s.shared_workspace())
+        {
+            return BranchRenamePlan::Rejected(BranchRenameRejection::SharedWorkspaceBranch);
         }
         // The refname rules apply only when the name really does become a git
         // branch. A STANDALONE agent's name is a label: creation takes it
@@ -7758,6 +7797,44 @@ mod tests {
             .find(|p| p.id == "p2")
             .expect("p2 present");
         assert_eq!(two.default_provider.as_deref(), Some("codex"));
+    }
+
+    /// `workspace_mode` lives only in config, so rebuilding `[[projects]]`
+    /// from runtime state must carry it from the entry it replaces.
+    #[test]
+    fn persist_projects_to_config_keeps_the_project_workspace_mode_override() {
+        let (mut engine, _tmp) = test_engine();
+        std::fs::write(&engine.paths.config_path, "# dux config\n").expect("seed config");
+        engine.projects.push(sample_project("p1", "/repo/one"));
+        engine.projects.push(sample_project("p2", "/repo/two"));
+        engine.config.projects = vec![crate::config::ProjectConfig {
+            id: "p1".to_string(),
+            path: "/repo/one".to_string(),
+            name: None,
+            default_provider: None,
+            leading_branch: None,
+            auto_reopen_agents: None,
+            startup_command: None,
+            env: Default::default(),
+            workspace_mode: Some(crate::config::WorkspaceMode::Worktree),
+        }];
+
+        engine
+            .persist_projects_to_config()
+            .expect("persist projects to config");
+
+        let saved = std::fs::read_to_string(&engine.paths.config_path).expect("read back");
+        let parsed: Config = toml::from_str(&saved).expect("reparse");
+        let mode = |id: &str| {
+            parsed
+                .projects
+                .iter()
+                .find(|p| p.id == id)
+                .expect("project present")
+                .workspace_mode
+        };
+        assert_eq!(mode("p1"), Some(crate::config::WorkspaceMode::Worktree));
+        assert_eq!(mode("p2"), None);
     }
 
     #[test]

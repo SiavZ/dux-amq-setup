@@ -294,6 +294,9 @@ pub struct App {
     /// themselves come back here. `Some` means a fetch is in flight, which is
     /// what stops the palette command from starting a second one.
     pub(crate) notes_fetch_rx: Option<mpsc::Receiver<NotesFetched>>,
+    /// The in-flight orphan-worktree cleaner worker, inventory or removal.
+    /// `Some` also means "one is running", so a second cannot start.
+    pub(crate) orphan_worktrees_rx: Option<mpsc::Receiver<orphan_worktrees::OrphanWorktreesAnswer>>,
     /// Notes that arrived while the user had a DIFFERENT modal open.
     /// `PromptState` is a single slot, so showing the what's-new screen the
     /// instant the fetch lands would discard whatever the user was typing. The
@@ -1594,6 +1597,15 @@ pub(crate) fn agent_info_lines(
     lines
 }
 
+/// The watch-rules list: every rule on every live agent tab, with Enter to
+/// disarm or re-arm the highlighted one. Rows are a snapshot refreshed after
+/// each toggle.
+#[derive(Clone, Debug)]
+pub(crate) struct WatchRulesPrompt {
+    pub(crate) rows: Vec<dux_core::engine::WatchRuleRow>,
+    pub(crate) selected: usize,
+}
+
 /// One row of the Tailscale-mode picker.
 #[derive(Clone, Debug)]
 pub(crate) struct SetTailscaleModeOption {
@@ -2198,6 +2210,10 @@ pub(crate) enum PromptState {
     ChangeDefaultProvider(ChangeDefaultProviderPrompt),
     ChangeProjectDefaultProvider(ChangeProjectDefaultProviderPrompt),
     SetTailscaleMode(SetTailscaleModePrompt),
+    WatchRules(WatchRulesPrompt),
+    /// The per-session settings modal (AMQ + orchestrator workstream).
+    /// Boxed: the draft carries two text inputs and the rule list.
+    SessionSettings(Box<SessionSettingsPrompt>),
     ChangeTheme(ChangeThemePrompt),
     ConfigureStartupCommand {
         project_id: String,
@@ -2250,6 +2266,9 @@ pub(crate) enum PromptState {
     /// The manager's removal confirmation. Boxed because it carries the list it
     /// came from, and a big variant would inflate every `PromptState`.
     ConfirmDeleteWorktree(Box<ConfirmDeleteWorktreePrompt>),
+    /// The opt-in orphan-worktree cleaner, list and per-item confirmation in
+    /// one variant. See [`orphan_worktrees`].
+    OrphanWorktrees(orphan_worktrees::OrphanWorktreesPrompt),
     KillRunning(KillRunningPrompt),
     ConfirmKillRunning(ConfirmKillRunningPrompt),
     ConfigReloadFailed {
@@ -2470,6 +2489,15 @@ pub(crate) enum PromptState {
         branch_name: String,
         location: crate::git::BranchLocation,
         focus: ConfirmFocus, // Cancel (default) or Use Existing
+    },
+    /// Shared main-workspace mode (fork d0ce0afc): another agent is already
+    /// running in this checkout. Two agents editing the same files can
+    /// overwrite each other's work, so a second writer starts only after the
+    /// user confirms. Cancel is focused by default.
+    ConfirmSharedWriter {
+        existing_agent: String,
+        action: SharedWriterAction,
+        focus: ConfirmFocus,
     },
     DebugInput {
         lines: Vec<Line<'static>>,
@@ -2760,6 +2788,20 @@ impl ConfigureFieldFocus {
     }
 }
 
+/// What a confirmed [`PromptState::ConfirmSharedWriter`] goes on to do.
+#[derive(Clone, Debug)]
+pub(crate) enum SharedWriterAction {
+    Create {
+        request: Box<CreateAgentRequest>,
+        busy_message: String,
+    },
+    Reconnect {
+        session_id: String,
+        force: bool,
+        seek_fullscreen: bool,
+    },
+}
+
 /// Which control has focus in a two-button confirmation.
 ///
 /// A `bool` cannot say which control has focus: `confirm_selected: false` at a
@@ -2808,6 +2850,8 @@ pub(crate) enum InputTarget {
     /// rather than a reuse of `StartupCommand` so a future reader cannot mistake
     /// one modal's engage state for the other's.
     MacroText,
+    /// The session-settings modal's system-prompt editor is engaged.
+    SessionSettingsPrompt,
 }
 
 #[derive(Clone, Copy)]
@@ -3167,6 +3211,13 @@ pub(crate) enum OverlayMouseLayout {
         cancel_button: Rect,
         save_button: Rect,
     },
+    /// The session-settings modal. Its variable-length row rects live on the
+    /// prompt (`SessionSettingsPrompt::hit_rows`), since this type is `Copy`.
+    SessionSettings {
+        title_input: Rect,
+        save_button: Rect,
+        cancel_button: Rect,
+    },
     KillRunning {
         input: Option<Rect>,
         list: Rect,
@@ -3233,6 +3284,10 @@ pub(crate) enum OverlayMouseLayout {
     ConfirmUseExistingBranch {
         cancel_button: Rect,
         use_button: Rect,
+    },
+    ConfirmSharedWriter {
+        cancel_button: Rect,
+        start_button: Rect,
     },
     ConfigReloadFailed {
         close_button: Rect,
@@ -3549,13 +3604,18 @@ pub(crate) mod components;
 mod first_load;
 mod input;
 pub(crate) mod modal;
+mod orphan_worktrees;
 mod overlay_dismiss;
 mod pty_ownership;
 mod redraw;
 pub(crate) use redraw::RedrawGate;
 mod render;
 mod reorder;
+mod session_settings;
 mod sessions;
+pub(crate) use session_settings::{SessionSettingsPrompt, SettingsFocus};
+#[cfg(test)]
+mod shared_workspace_tests;
 #[cfg(test)]
 mod test_support;
 pub(crate) mod text_input;
@@ -3615,7 +3675,12 @@ impl App {
         let mut config = ensure_config(&paths)?;
 
         logger::init(&config.logging, &paths);
-        logger::info("bootstrapping dux");
+        logger::info(&format!("bootstrapping dux {}", dux_core::version::long()));
+        // Reconcile the shared AMQ registry from this store's sessions and let
+        // agent launches reserve their inbox. Under the single-instance lock
+        // the caller holds, after the logger so its outcome is recorded, and
+        // never fatal to the boot.
+        dux_core::peer::init_for_process(&paths);
 
         // Validate and build runtime keybindings from config.
         if let Err(msg) = validate_keys(&config.keys) {
@@ -3701,6 +3766,7 @@ impl App {
             providers: HashMap::new(),
             running_provider_pins: HashMap::new(),
             launched_drop_paste: Default::default(),
+            watch: Default::default(),
             companion_terminals: HashMap::new(),
             agent_tabs: agent_tabs
                 .into_iter()
@@ -3752,6 +3818,7 @@ impl App {
             pty_progress: HashMap::new(),
             agent_viewed: HashMap::new(),
             last_foreground_refresh: None,
+            amq: Default::default(),
             pending_web_checkout_ops: HashMap::new(),
             pending_web_add_project_ops: HashMap::new(),
             pending_web_pr_lookup_ops: HashMap::new(),
@@ -3838,6 +3905,7 @@ impl App {
             pending_first_load: None,
             unpushed_count_rx: None,
             notes_fetch_rx: None,
+            orphan_worktrees_rx: None,
             deferred_first_load_notes: None,
             notes_fetch_explicit_request: Arc::new(AtomicBool::new(false)),
             fullscreen_overlay: FullscreenOverlay::None,
@@ -4055,6 +4123,8 @@ impl App {
         self.engine.spawn_branch_sync_worker();
         self.engine.spawn_project_branch_status_checks();
         self.engine.spawn_gh_status_check();
+        // Idempotent: the web flip hands this same engine over and re-calls it.
+        self.engine.start_amq();
         // The background server assumes these process-wide workers are already running.
         self.start_background_server_from_config();
     }
@@ -5034,6 +5104,10 @@ impl App {
             "change-project-default-provider" => self.open_change_project_default_provider_prompt(),
             "change-theme" => self.open_change_theme_prompt(),
             "reload-config" => self.reload_config_from_disk(),
+            "watch-rules" => {
+                self.open_watch_rules_prompt();
+                Ok(())
+            }
             "reload-binary" => {
                 // Every refusal is reported by `request_reload` on the status
                 // line, so there is no error to return here: an `Err` would be
@@ -5071,6 +5145,7 @@ impl App {
             "delete-agent" => self.confirm_delete_selected_session(),
             "rename-agent" => self.open_rename_session(),
             "agent-info" => self.open_agent_info(),
+            "session-settings" => self.open_session_settings(),
             "kill-running" => self.open_kill_running(),
             "detach-agent" => self.confirm_detach_selected_session(),
             "recreate-working-copy" => self.confirm_recreate_selected_working_copy(),
@@ -5174,6 +5249,7 @@ impl App {
                 };
                 Ok(())
             }
+            "prune-orphan-worktrees" => self.open_orphan_worktree_cleaner(),
             "resource-monitor" => {
                 self.open_resource_monitor();
                 Ok(())
@@ -6318,6 +6394,13 @@ impl App {
                 );
                 return;
             }
+            BranchRenamePlan::Rejected(BranchRenameRejection::SharedWorkspaceBranch) => {
+                self.set_error(
+                    "This agent runs in the shared project checkout, and dux never renames \
+                     the branch checked out there. Rename the title only.",
+                );
+                return;
+            }
             BranchRenamePlan::Rejected(BranchRenameRejection::AlreadyInFlight) => {
                 self.set_error(
                     "A rename is already in progress for this agent. Wait for it to finish before renaming again.",
@@ -6756,6 +6839,21 @@ impl App {
         }
     }
 
+    /// Whether a plain left press/drag over the selected surface goes to a
+    /// mouse-reporting child (`true`) or stays a dux text selection (`false`).
+    /// Agents resolve it from their running provider's `forward_mouse`;
+    /// companion terminals have no provider config and always forward, as a
+    /// terminal emulator does.
+    pub(crate) fn selected_surface_forwards_mouse(&self) -> bool {
+        match self.session_surface {
+            SessionSurface::Agent => self.selected_session().is_none_or(|session| {
+                let provider = self.focused_tab_provider(session);
+                provider_config(&self.engine.config, &provider).forwards_mouse()
+            }),
+            SessionSurface::Terminal => true,
+        }
+    }
+
     /// The id that names the currently selected terminal surface: the focused
     /// tab id for an agent, the terminal id for a companion terminal. `None`
     /// when that surface has no live PTY, so it always agrees with
@@ -7172,6 +7270,12 @@ pub(crate) fn runtime_project_to_config(
         auto_reopen_agents: project.auto_reopen_agents,
         startup_command: project.startup_command.clone(),
         env: project.env.clone(),
+        // Config-only preference: carried from the existing entry so a rebuild
+        // of `[[projects]]` from runtime state never drops a user's override.
+        workspace_mode: existing_projects
+            .iter()
+            .find(|existing| existing.id == project.id)
+            .and_then(|existing| existing.workspace_mode),
     }
 }
 
@@ -7270,6 +7374,9 @@ mod tests {
         let now = Utc::now() + chrono::Duration::seconds(created_offset);
         AgentSession {
             id: id.to_string(),
+            agent_handle: dux_core::model::normalize_agent_handle(id),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: format!("{id}-slot"),
             provider: ProviderKind::from_str("codex"),
             title: None,
@@ -8258,6 +8365,7 @@ leading_branch = "main"
                 auto_reopen_agents: None,
                 startup_command: Some("npm install".to_string()),
                 env: Default::default(),
+                workspace_mode: None,
             })
             .expect("seed project");
 
@@ -8306,6 +8414,7 @@ leading_branch = "main"
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .expect("seed project");
 
@@ -8366,6 +8475,7 @@ leading_branch = "main"
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .expect("seed project");
 
@@ -8430,6 +8540,7 @@ leading_branch = "main"
                 auto_reopen_agents: None,
                 startup_command: Some("pnpm install".to_string()),
                 env: Default::default(),
+                workspace_mode: None,
             })
             .expect("seed project");
 

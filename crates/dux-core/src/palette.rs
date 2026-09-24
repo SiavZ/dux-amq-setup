@@ -555,6 +555,15 @@ pub const PALETTE_COMMANDS: &[PaletteCommand] = &[
         // which already described this same dialog.
     },
     PaletteCommand {
+        action: Action::PruneOrphanWorktrees,
+        name: "prune-orphan-worktrees",
+        description: "Review and remove Git-registered orphan worktrees",
+        // TUI-only for now (fork 5c9edb78). Opt-in by design: nothing runs
+        // until the palette command is chosen, and every removal is confirmed
+        // per item. Drives `dux_core::orphan_worktrees`, which a web dialog
+        // can call later.
+    },
+    PaletteCommand {
         action: Action::ToggleGithubIntegration,
         name: "toggle-github-integration",
         description: "Toggle GitHub PR integration",
@@ -665,6 +674,19 @@ pub const PALETTE_COMMANDS: &[PaletteCommand] = &[
         action: Action::MoveTerminalBottom,
         name: "move-terminal-bottom",
         description: "Move the selected terminal to the bottom (sorting becomes manual)",
+    },
+    PaletteCommand {
+        action: Action::WatchRules,
+        name: "watch-rules",
+        description: "List watch rules on running tabs; disarm or re-arm one",
+        // TUI-only for now: the web has no watch-rules surface yet.
+    },
+    PaletteCommand {
+        action: Action::SessionSettings,
+        name: "session-settings",
+        description: "Per-session settings: mode, YOLO, system prompt, watch rules, AMQ verify",
+        // Per-session. The web drives the same Command through the
+        // `set_session_settings` wire command; it has no dialog for it yet.
     },
 ];
 

@@ -37,6 +37,8 @@ Building from source instead? `cargo build` is the whole story, though it also b
 
 ## Install
 
+> **This is a fork.** [SiavZ/dux-amq-setup](https://github.com/SiavZ/dux-amq-setup) builds on [patrickdappollonio/dux](https://github.com/patrickdappollonio/dux) and adds shared-workspace agents, multi-agent messaging (AMQ), peer routing, watch rules, per-agent session resume, and the `dux-amq` overlay. The Homebrew, npm and shell installers below install *upstream* dux, which lacks those features. Fork releases are tagged `dux-amq-vX.Y.Z` so they never collide with upstream's tags; install one with `curl -sSfL https://github.com/SiavZ/dux-amq-setup/releases/latest/download/install.sh | bash` (the script accepts the same `DUX_INSTALL_DIR` and `DUX_VERSION` overrides). The AMQ overlay (multi-agent wrappers, message queue, doctor tooling) is installed separately, see [`dux-amq/README.md`](dux-amq/README.md). <!-- INTEGRATION: path pending ant -->
+
 dux targets macOS and Linux only. There is no native Windows build; Windows users run dux through WSL2, which is Linux.
 
 **Homebrew (macOS and Linux):**
@@ -142,16 +144,19 @@ You can also end an agent's session from outside its own CLI. **Detach agent…*
 
 ### Bring Any CLI
 
-Any terminal command can be a provider. The four defaults (Claude, Codex, Copilot, and OpenCode) are pre-configured, but adding your own is a config-only change:
+Any terminal command can be a provider. The defaults (Claude, Codex, Copilot, OpenCode, and [jcode](https://github.com/1jehuang/jcode)) are pre-configured, but adding your own is a config-only change:
 
 ```toml
 [providers.my-agent]
 command = "my-cool-agent"
 args = ["--some-flag"]
 resume_args = ["--continue"]
+resume_by_id_args = ["--resume", "{session_id}"]
 ```
 
 `resume_args` is your CLI's own resume flag: when dux relaunches the provider in a worktree it has already run in, it passes those args so the CLI picks its own conversation for that directory back up. dux is not reattaching to a live process, it is starting a new one that continues where the old one left off. Omit `resume_args` if your CLI doesn't support resuming; dux will just relaunch it fresh. Two tabs of the *same* provider can't both resume the one conversation, so only the first one up does; different providers in one agent each resume their own.
+
+`resume_by_id_args` resumes one exact provider conversation instead of the most recent one for the directory: `{session_id}` is replaced with the captured conversation UUID as a literal argv token. Agents in a [shared workspace](#workspace-modes) never fall back to `resume_args`, because several agents share one directory and "most recent" would pick the wrong conversation. Without a valid captured UUID and a configured `resume_by_id_args` they start fresh and show a warning.
 
 Provider blocks carry a few more keys than these: `install_hint` (what to suggest when the command isn't on your PATH), `resume_wait_timeout_ms`, `forward_scroll`, and `web_dragdrop_paste` (how a dropped file's path is quoted for this CLI). The [docs site](https://getdux.app/docs) covers each of them, and so do the comments in your config file.
 
@@ -244,6 +249,49 @@ And a **standalone terminal** belongs to nothing at all: no agent, no project. I
 
 See an agent going down the wrong path? Fork it. dux creates a new worktree with the current files copied over so you can try a different approach without losing the original session. It's branching, but for your AI conversations.
 
+Forking always creates an isolated worktree, even when the project normally runs agents in a shared workspace.
+
+### Workspace Modes
+
+<!-- INTEGRATION: path pending evergreen (shared workspace), palmtree (exact-ID resume) -->
+
+An agent can run in its own git worktree or directly in the project's registered checkout (a shared workspace). Freshly generated configs default new agents to the shared checkout:
+
+```toml
+[workspace]
+default_mode = "shared" # or "worktree"
+
+[[projects]]
+path = "$HOME/projects/example"
+workspace_mode = "worktree" # optional per-project override; "" inherits
+```
+
+Consent is preserved for existing installations: if an existing config has no `[workspace]` section at all, dux keeps creating isolated worktrees. Regenerating a fresh config writes the shared default explicitly.
+
+Shared sessions use the project's canonical path and never switch the real checkout during registration. Claude and Codex conversations are captured per agent and reconnect by exact provider UUID, so multiple agents in one directory never select history by recency. Shared startup auto-resume is off by default (`workspace.auto_resume_shared = false`); when enabled it uses the same exact-ID rule. Histories stranded under old dux worktrees are copied (Claude) or mapped (Codex) once at startup without modifying their originals. Branch and PR status follow the checkout's live `HEAD`; a detached `HEAD` skips PR discovery. A shared project cannot live inside `DUX_HOME` or its managed worktree tree.
+
+Starting a second live shared agent asks for confirmation, because both agents share the checkout's files, index, staging area, commits, branch switches and discards. While this dux store can see several live writers, the header shows a persistent `CURRENT STORE ONLY` warning. That warning cannot see agents launched under another `DUX_HOME` or unmanaged processes using the checkout, so its absence is not proof of exclusive access. Fork into an isolated worktree whenever changes need to diverge.
+
+The `prune-orphan-worktrees` palette action is opt-in and never automatic. It lists only Git-registered linked worktrees inside dux's worktree root that have no active session row or soft-deleted tombstone, excludes the main checkout and unrelated directories, and reports dirty or untracked state. Every item needs its own confirmation, and its branch is kept unless you explicitly choose to delete it. Changing workspace mode never orphans or removes existing worktree sessions.
+
+### Peer Routing
+
+Agents send messages through dux instead of picking a transport themselves:
+
+```bash
+dux peer send <handle> "status? blockers? next proof?"
+dux peer list
+dux peer sync-amq
+```
+
+`dux peer send` sends to a Claude agent over Claude Peers and to every other provider over AMQ; pass `--transport amq` to override. If either end is in a shared workspace, dux always routes through AMQ by the agent's immutable handle, because matching peers by working directory would be ambiguous. Every agent is launched with `DUX_SESSION_ID`, `DUX_STORE_ID`, `DUX_PROVIDER` and `DUX_AMQ_HANDLE`, and dux refreshes AMQ's agent registry from `sessions.sqlite3` when the TUI or `dux server` starts, and on `dux peer sync-amq`.
+
+### Per-Session Settings
+
+<!-- INTEGRATION: path pending maple (session settings, orchestrator modes), herb (watch rules) -->
+
+Every agent has its own settings drawer (the `session-settings` palette command, or its keybinding) covering context mode (Attended, Orchestrator or Worker), YOLO permissions (including OpenCode's `--auto` mode), per-rule arm and disarm for watch rules, auto-clear after a task is done, and an AMQ verify-envelope override. The defaults are cautious on purpose: a missing or corrupt settings record always loads as Attended with no YOLO and no auto-clear, so tampering with the database cannot escalate a session into autonomous mode. Settings persist in `sessions.sqlite3` and follow the agent across detach and reconnect.
+
 ### Adding Projects
 
 Point dux at any folder. A git repository joins the workspace as-is; a plain folder gets an offer to become one: dux runs `git init`, seeds a commented starter `.gitignore` for the dependency and build directories it finds (`node_modules`, `target`, and friends), creates an empty initial commit, and registers the project. Your existing files are left untouched (untracked). Folders inside an existing repository are refused with a pointer to the repository root, so projects never nest inside each other's history. In the web UI the picker can even create a new folder first, which makes starting a brand-new project from a phone entirely shell-free.
@@ -322,6 +370,69 @@ touching a single value. It previews the change by default; `--yes` applies it
 and writes a timestamped backup first.
 
 Override the config directory with the `DUX_HOME` environment variable.
+
+<!-- INTEGRATION: path pending evergreen (fail-closed reset --all) -->
+`dux config reset --all` fails closed: it needs a loadable config, a valid store ID and project inventory, and a loadable session and tombstone database when one exists. If it aborts, repair the item it names (regenerate the config, restore `sessions.sqlite3.bak`, or restore the original store ID) and retry. If the identity cannot be restored, verify and remove the associated data by hand before deleting metadata, because a replacement store ID cannot prove old AMQ ownership.
+
+### Data Lifecycle
+
+<!-- INTEGRATION: path pending evergreen (dux session purge) -->
+
+dux keeps per-session data in several places: the worktree on disk, a row in `sessions.sqlite3`, the exact-owner AMQ inbox (`agents/<agent_handle>/` under the AMQ root), the provider's own chat history for that directory, and log lines tagged with the session. Most workflows leave all of it alone. `dux config reset --all` is the holistic factory reset described above.
+
+For a right-to-erasure request (GDPR Art. 17), or just "delete this customer's data", use `dux session purge`:
+
+```bash
+# Preview the cascade; nothing is changed.
+dux session purge --hard <uuid-handle-or-branch> --dry-run
+
+# Real run. Asks for the confirmation phrase 'PURGE <branch>'.
+dux session purge --hard <uuid-handle-or-branch>
+
+# Skip the prompt, for scripts.
+dux session purge --hard <uuid-handle-or-branch> --yes
+
+# Shared workspace: erase owned records and accept that provider transcripts
+# remain, because the provider directory is shared.
+dux session purge --hard <uuid-or-handle> --accept-residual-data
+
+# Shared workspace: purge provider history for the whole checkout. This purges
+# every dux session on that checkout.
+dux session purge --hard <uuid-or-handle> --workspace-wide-provider-history
+
+# Bulk: erase owned data for every session.
+dux session purge-all --dry-run
+dux session purge-all --yes
+```
+
+For isolated worktree sessions the cascade runs in a fixed order (worktree, provider chat directories, exact-owner AMQ inbox, log redaction, SQLite row) so a failure leaves a recoverable record in `sessions.sqlite3`. A shared-session purge never removes the registered checkout. Its provider history is reported as `INCOMPLETE` and the row is kept unless you accept residual transcripts or confirm a workspace-wide purge, which also deletes non-dux conversations the provider stored for that path, since providers do not separate them by dux session. A branch that matches several sessions is rejected; use the UUID or the immutable handle instead.
+
+Deleting a whole worktree or reset root is also blocked whenever the target is an ancestor or descendant of any registered project path. This guard does not apply to ordinary operations on files inside a worktree, such as discarding an untracked directory.
+
+### Operations Settings
+
+<!-- INTEGRATION: sections pending port: [limits] and [storage] backup_interval_minutes (cow), [auto_resume] (palmtree), `dux doctor` CLI side (cow) with the dux-amq-doctor script (ant). Verify each key below exists in the rendered config once merged. -->
+
+The fork also ships settings for running many agents on one host. Each is documented inline in `config.toml`:
+
+```toml
+[limits]
+max_panes = 16                # hard cap on simultaneously active panes
+max_companion_terminals = 4   # cap on companion terminals
+max_total_scrollback_mb = 256 # soft cap on scrollback memory
+disk_high_water_pct = 95      # refuse new agents above this disk usage
+disk_warn_pct = 80            # status-line warning above this disk usage
+
+[auto_resume]
+concurrency = 4   # max parallel PTY spawns when resuming at startup
+stale_days = 30   # skip sessions whose worktree is older than this
+stagger_ms = 250  # delay between spawn attempts
+
+[storage]
+backup_interval_minutes = 30  # periodic sessions.sqlite3.bak, 0 disables
+```
+
+`dux doctor` (`--json`, `--anonymize`) prints a read-only triage dump to attach to a support thread: database integrity and counts, plus AMQ queue health and encryption posture when the `dux-amq` overlay is installed. For encrypting agent state at rest, see [docs/operations/encryption-at-rest.md](docs/operations/encryption-at-rest.md); for the threat model, [docs/operations/threat-model.md](docs/operations/threat-model.md).
 
 ### Themes
 

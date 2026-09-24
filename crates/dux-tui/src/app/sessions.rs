@@ -275,6 +275,15 @@ impl App {
         if project.path_missing {
             return Ok(());
         }
+        // Shared main-workspace mode: the agent runs in the checkout itself,
+        // so there is no leading branch to inspect and no worktree to name.
+        // The prompt still asks for the agent's name (its title and AMQ handle).
+        if self.engine.new_agent_is_shared(&project.id) {
+            return self.open_name_new_agent_prompt(CreateAgentRequest::SharedWorkspace {
+                project,
+                custom_name: None,
+            });
+        }
         self.dispatch_create_agent_branch_inspection(project);
         Ok(())
     }
@@ -833,7 +842,8 @@ impl App {
         let initial_name = match &request {
             CreateAgentRequest::NewProject { custom_name, .. }
             | CreateAgentRequest::ForkSession { custom_name, .. }
-            | CreateAgentRequest::ForkExternalWorktree { custom_name, .. } => custom_name.clone(),
+            | CreateAgentRequest::ForkExternalWorktree { custom_name, .. }
+            | CreateAgentRequest::SharedWorkspace { custom_name, .. } => custom_name.clone(),
             // A standalone create already has its title (resolved from the
             // folder), so the prompt opens pre-filled with it.
             CreateAgentRequest::Standalone { title, .. } => Some(title.clone()),
@@ -1223,6 +1233,57 @@ impl App {
     }
 
     pub(crate) fn dispatch_create_agent_request(
+        &mut self,
+        request: CreateAgentRequest,
+        busy_message: String,
+    ) -> Result<()> {
+        // Shared main-workspace mode: a second writer in a checkout that
+        // already has a live agent is asked for first (fork d0ce0afc).
+        if let CreateAgentRequest::SharedWorkspace { project, .. } = &request
+            && let Some(existing) = self.engine.live_shared_writer(&project.path, None)
+        {
+            self.prompt = PromptState::ConfirmSharedWriter {
+                existing_agent: dux_core::sanitize::for_terminal(&existing.display_label()),
+                action: crate::app::SharedWriterAction::Create {
+                    request: Box::new(request),
+                    busy_message,
+                },
+                focus: ConfirmFocus::Cancel,
+            };
+            return Ok(());
+        }
+        self.start_create_agent_request(request, busy_message)
+    }
+
+    /// Resolve the second-writer consent. Always closes the prompt; `true`
+    /// continues the create or reconnect it was raised for.
+    pub(crate) fn resolve_confirm_shared_writer(&mut self, confirm: bool) -> bool {
+        let prompt = std::mem::replace(&mut self.prompt, PromptState::None);
+        let PromptState::ConfirmSharedWriter { action, .. } = prompt else {
+            self.prompt = prompt;
+            return false;
+        };
+        if !confirm {
+            return false;
+        }
+        let result = match action {
+            crate::app::SharedWriterAction::Create {
+                request,
+                busy_message,
+            } => self.start_create_agent_request(*request, busy_message),
+            crate::app::SharedWriterAction::Reconnect {
+                session_id,
+                force,
+                seek_fullscreen,
+            } => self.dispatch_reconnect_plan_confirmed(&session_id, force, seek_fullscreen),
+        };
+        if let Err(err) = result {
+            self.set_error(format!("{err:#}"));
+        }
+        false
+    }
+
+    fn start_create_agent_request(
         &mut self,
         request: CreateAgentRequest,
         busy_message: String,
@@ -1870,13 +1931,18 @@ impl App {
         };
         let target = match &session.workspace {
             dux_core::model::AgentWorkspace::Managed(managed) => {
-                let worktree_shared = self.engine.sessions.iter().any(|s| {
-                    s.id != session.id
-                        && dux_core::project_browser::same_directory(
-                            s.directory(),
-                            session.directory(),
-                        )
-                });
+                // A shared-workspace agent runs in the project checkout, which
+                // dux never removes, so its dialog offers no worktree box and
+                // says the directory is preserved, exactly like a worktree
+                // another agent is using.
+                let worktree_shared = session.shared_workspace()
+                    || self.engine.sessions.iter().any(|s| {
+                        s.id != session.id
+                            && dux_core::project_browser::same_directory(
+                                s.directory(),
+                                session.directory(),
+                            )
+                    });
                 crate::app::DeleteAgentTarget::Managed {
                     branch_name: managed.branch_name.clone(),
                     initial_branch: managed.initial_branch.clone(),
@@ -3457,6 +3523,39 @@ impl App {
         force: bool,
         seek_fullscreen: bool,
     ) -> Result<()> {
+        // Shared main-workspace mode: reconnecting a shared agent while another
+        // agent is live in the same checkout needs the same consent as a
+        // second create.
+        if let Some(session) = self
+            .engine
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id && s.shared_workspace())
+            && !self.engine.session_has_live_provider(session_id)
+            && let Some(existing) = self
+                .engine
+                .live_shared_writer(session.directory(), Some(session_id))
+        {
+            self.prompt = PromptState::ConfirmSharedWriter {
+                existing_agent: dux_core::sanitize::for_terminal(&existing.display_label()),
+                action: crate::app::SharedWriterAction::Reconnect {
+                    session_id: session_id.to_string(),
+                    force,
+                    seek_fullscreen,
+                },
+                focus: ConfirmFocus::Cancel,
+            };
+            return Ok(());
+        }
+        self.dispatch_reconnect_plan_confirmed(session_id, force, seek_fullscreen)
+    }
+
+    fn dispatch_reconnect_plan_confirmed(
+        &mut self,
+        session_id: &str,
+        force: bool,
+        seek_fullscreen: bool,
+    ) -> Result<()> {
         let pty_size = self.pty_size_for_launch();
         match self.engine.reconnect_plan(session_id, force, pty_size)? {
             dux_core::engine::ReconnectPlan::AlreadyConnected { message } => {
@@ -4400,6 +4499,7 @@ mod tests {
             providers: std::collections::HashMap::new(),
             running_provider_pins: std::collections::HashMap::new(),
             launched_drop_paste: Default::default(),
+            watch: Default::default(),
             companion_terminals: std::collections::HashMap::new(),
             agent_tabs: std::collections::HashMap::new(),
             terminating_ptys: Vec::new(),
@@ -4448,6 +4548,7 @@ mod tests {
             pty_progress: std::collections::HashMap::new(),
             agent_viewed: std::collections::HashMap::new(),
             last_foreground_refresh: None,
+            amq: Default::default(),
             pending_web_checkout_ops: std::collections::HashMap::new(),
             pending_web_add_project_ops: std::collections::HashMap::new(),
             pending_web_pr_lookup_ops: std::collections::HashMap::new(),
@@ -4498,6 +4599,7 @@ mod tests {
             pending_first_load: None,
             unpushed_count_rx: None,
             notes_fetch_rx: None,
+            orphan_worktrees_rx: None,
             deferred_first_load_notes: None,
             notes_fetch_explicit_request: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
@@ -4613,6 +4715,9 @@ mod tests {
         let now = Utc::now();
         AgentSession {
             id: id.to_string(),
+            agent_handle: dux_core::model::normalize_agent_handle(id),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: format!("{id}-slot"),
             provider: ProviderKind::from_str(provider),
             title: None,
@@ -4715,6 +4820,7 @@ mod tests {
             providers: std::collections::HashMap::new(),
             running_provider_pins: std::collections::HashMap::new(),
             launched_drop_paste: Default::default(),
+            watch: Default::default(),
             companion_terminals: std::collections::HashMap::new(),
             agent_tabs: std::collections::HashMap::new(),
             terminating_ptys: Vec::new(),
@@ -4763,6 +4869,7 @@ mod tests {
             pty_progress: std::collections::HashMap::new(),
             agent_viewed: std::collections::HashMap::new(),
             last_foreground_refresh: None,
+            amq: Default::default(),
             pending_web_checkout_ops: std::collections::HashMap::new(),
             pending_web_add_project_ops: std::collections::HashMap::new(),
             pending_web_pr_lookup_ops: std::collections::HashMap::new(),
@@ -6231,6 +6338,7 @@ mod tests {
                 auto_reopen_agents: project.auto_reopen_agents,
                 startup_command: project.startup_command.clone(),
                 env: project.env.clone(),
+                workspace_mode: None,
             })
             .expect("seed project into store");
         app.rebuild_left_items();
