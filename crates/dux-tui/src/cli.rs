@@ -1682,7 +1682,8 @@ mod tests {
                 "missing {path} in {changes:#?}"
             );
         }
-        let edits: Vec<(&str, fn(&mut Config))> = vec![
+        type Edit = (&'static str, fn(&mut Config));
+        let edits: Vec<Edit> = vec![
             ("defaults.provider:", |c| {
                 c.defaults.provider = "codex".into()
             }),
