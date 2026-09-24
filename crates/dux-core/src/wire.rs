@@ -2848,6 +2848,10 @@ impl Engine {
                 project.name
             );
         }
+        // One at a time per repository, whichever surface asked first.
+        if let Err(refusal) = self.begin_default_branch_checkout(&project) {
+            return Ok(WireStatus::from_update(&refusal));
+        }
 
         // Spawn worker 1 exactly as the TUI does, with the same busy message.
         let busy = format!(
@@ -7394,6 +7398,69 @@ mod tests {
         statuses
     }
 
+    /// Whatever the chain ended in, the repository is free again: the next
+    /// request for it is not refused as a duplicate.
+    fn assert_checkout_accepted_again(engine: &Engine, project_id: &str) {
+        let path = engine
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .expect("the project")
+            .path
+            .clone();
+        assert!(
+            !engine.is_in_flight(&InFlightKey::CheckoutDefaultBranch(path)),
+            "the checkout's ending must release the repository"
+        );
+    }
+
+    /// A second request for the same repository while one runs is refused with
+    /// an ordinary warning (not an error, not sticky) and starts nothing.
+    #[test]
+    fn apply_wire_checkout_project_default_branch_refuses_a_second_request_while_one_runs() {
+        let repo = init_repo_on_feature_branch("trunk");
+        let (mut engine, _tmp) = test_engine();
+        let mut project = sample_project("p1", repo.path().to_string_lossy().as_ref());
+        project.leading_branch = Some("trunk".to_string());
+        project.current_branch = "feature".to_string();
+        project.branch_status = ProjectBranchStatus::NotLeading;
+        engine.projects.push(project);
+
+        let first = engine
+            .apply_wire(WireCommand::CheckoutProjectDefaultBranch {
+                project_id: "p1".to_string(),
+            })
+            .expect("first checkout");
+        assert_eq!(first.status.expect("busy").tone, "busy");
+        assert_eq!(engine.pending_web_checkout_ops.len(), 1);
+
+        let second = engine
+            .apply_wire(WireCommand::CheckoutProjectDefaultBranch {
+                project_id: "p1".to_string(),
+            })
+            .expect("a repeat is refused with a status, not an error");
+        let status = second.status.expect("the refusal");
+        assert_eq!(status.tone, "warning");
+        assert!(
+            !status.sticky,
+            "a refusal needs no action outside the toast"
+        );
+        assert_eq!(
+            status.message,
+            "dux is already checking out the default branch for project \"p1-name\". Wait for \
+             it to finish; its result will say where the project's worktrees branch from."
+        );
+        assert_eq!(
+            engine.pending_web_checkout_ops.len(),
+            1,
+            "the refusal must not start a second chain"
+        );
+
+        let statuses = drive_checkout_chain(&mut engine);
+        assert_eq!(statuses.last().expect("final").tone, "info");
+        assert_checkout_accepted_again(&engine, "p1");
+    }
+
     #[test]
     fn apply_wire_checkout_project_default_branch_switches_from_feature() {
         // A project whose persisted leading branch ("trunk") differs from HEAD
@@ -7424,6 +7491,7 @@ mod tests {
         );
 
         let statuses = drive_checkout_chain(&mut engine);
+        assert_checkout_accepted_again(&engine, "p1");
         let status = statuses.last().expect("final status");
         assert_eq!(status.tone, "info");
         assert!(
@@ -7463,6 +7531,7 @@ mod tests {
         assert_eq!(outcome.status.expect("busy status").tone, "busy");
 
         let statuses = drive_checkout_chain(&mut engine);
+        assert_checkout_accepted_again(&engine, "p1");
         let status = statuses.last().expect("final status");
         assert_eq!(status.tone, "error");
         assert!(
@@ -7501,6 +7570,7 @@ mod tests {
         assert_eq!(outcome.status.expect("busy status").tone, "busy");
 
         let statuses = drive_checkout_chain(&mut engine);
+        assert_checkout_accepted_again(&engine, "p1");
         let status = statuses.last().expect("final status");
         assert_eq!(status.tone, "error");
         assert!(
@@ -7532,6 +7602,7 @@ mod tests {
         assert_eq!(outcome.status.expect("busy status").tone, "busy");
 
         let statuses = drive_checkout_chain(&mut engine);
+        assert_checkout_accepted_again(&engine, "p1");
         let status = statuses.last().expect("final status");
         assert_eq!(status.tone, "info");
         assert!(
@@ -7569,6 +7640,7 @@ mod tests {
         assert_eq!(outcome.status.expect("busy status").tone, "busy");
 
         let statuses = drive_checkout_chain(&mut engine);
+        assert_checkout_accepted_again(&engine, "p1");
         let status = statuses.last().expect("final status");
         assert_eq!(status.tone, "error");
         assert!(

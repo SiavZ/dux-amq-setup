@@ -1195,6 +1195,12 @@ impl App {
     /// Run the confirmed "check out the default branch": inspect, then check
     /// out (or find the folder already there) and move the project's base.
     pub(crate) fn dispatch_checkout_project_default_branch(&mut self, project: Project) {
+        // One at a time per repository, whichever surface asked first; the
+        // engine releases it at every ending of the chain.
+        if let Err(refusal) = self.engine.begin_default_branch_checkout(&project) {
+            self.apply_reaction(dux_core::engine::EventReaction::Status(refusal));
+            return;
+        }
         // One op spans the whole chain: the short-circuit terminals resolve it to
         // a clear in `drain_events`, while the Known case forwards this id into
         // the switch worker and re-emits the busy text through `progress`, so the
@@ -8498,6 +8504,53 @@ mod tests {
         assert_eq!(
             app.status.text(),
             "Checked out \"main\" for project \"repo\". New worktrees branch from \"main\" now."
+        );
+    }
+
+    /// One checkout per repository at a time, from either surface: a second
+    /// confirmation while one runs is refused with an ordinary warning and
+    /// starts nothing, and every ending hands the repository back.
+    #[test]
+    fn a_second_checkout_while_one_runs_is_refused_and_the_repository_is_released_after() {
+        let (_root, repo, mut app) = project_based_on_develop();
+        let project = app.engine.projects[0].clone();
+        let key = dux_core::engine::InFlightKey::CheckoutDefaultBranch(project.path.clone());
+
+        app.dispatch_checkout_project_default_branch(project.clone());
+        assert_eq!(app.pending_checkout_inspect_ops.len(), 1);
+        app.dispatch_checkout_project_default_branch(project.clone());
+        assert_eq!(
+            app.pending_checkout_inspect_ops.len(),
+            1,
+            "the refusal must not start a second chain"
+        );
+        let (tone, message) = app.status.most_recent_tui().expect("the refusal");
+        assert_eq!(tone, dux_core::statusline::StatusTone::Warning);
+        assert_eq!(
+            message,
+            "dux is already checking out the default branch for project \"repo\". Wait for it \
+             to finish; its result will say where the project's worktrees branch from."
+        );
+
+        // Ending one: the switch succeeded.
+        drain_until(&mut app, "the base to move to main", |app| {
+            stored_project_base(app).as_deref() == Some("main")
+        });
+        drain_until(&mut app, "the chain to finish", |app| {
+            app.pending_checkout_inspect_ops.is_empty()
+        });
+        assert!(!app.engine.is_in_flight(&key), "success releases it");
+        assert_eq!(folder_branch(&repo), "main");
+
+        // Ending two: the folder is already on the default branch.
+        app.dispatch_checkout_project_default_branch(project);
+        assert_eq!(app.pending_checkout_inspect_ops.len(), 1, "accepted again");
+        drain_until(&mut app, "the already-there answer", |app| {
+            app.pending_checkout_inspect_ops.is_empty()
+        });
+        assert!(
+            !app.engine.is_in_flight(&key),
+            "already being there releases it"
         );
     }
 }

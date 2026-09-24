@@ -3009,6 +3009,11 @@ impl Engine {
         result: Result<(String, Option<BranchWarningKind>), String>,
         status_op_id: Option<String>,
     ) -> EventReaction {
+        // Every answer but a known default ends the chain here; that one hands
+        // the repository on to the switch, whose completion releases it.
+        if !matches!(result, Ok((_, Some(BranchWarningKind::Known { .. })))) {
+            self.end_default_branch_checkout(&project.path);
+        }
         match result {
             Ok((current_branch, warning_kind)) => match warning_kind {
                 Some(BranchWarningKind::Known { default_branch }) => {
@@ -3080,6 +3085,9 @@ impl Engine {
         result: Result<(), String>,
         status_op_id: Option<String>,
     ) -> EventReaction {
+        if let NonDefaultBranchAction::CheckoutProjectDefault { project } = &action {
+            self.end_default_branch_checkout(&project.path);
+        }
         match result {
             Ok(()) => match action {
                 NonDefaultBranchAction::AddProject {
@@ -3148,6 +3156,27 @@ impl Engine {
                 )))
             }
         }
+    }
+
+    /// Take the project's repository for a "check out the default branch", or
+    /// answer why not: one already running there would race this one's
+    /// `git switch`, and the loser would report a failure that is not one.
+    /// Both surfaces ask here before starting the chain.
+    pub fn begin_default_branch_checkout(&mut self, project: &Project) -> Result<(), StatusUpdate> {
+        if self.mark_in_flight(InFlightKey::CheckoutDefaultBranch(project.path.clone())) {
+            Ok(())
+        } else {
+            Err(StatusUpdate::warning(
+                crate::engine::default_branch_checkout_running_message(&project.name),
+            ))
+        }
+    }
+
+    /// Release the repository at every ending of the chain.
+    fn end_default_branch_checkout(&mut self, project_path: &str) {
+        self.clear_in_flight(&InFlightKey::CheckoutDefaultBranch(
+            project_path.to_string(),
+        ));
     }
 
     /// The end of a "check out the default branch" that left the folder on

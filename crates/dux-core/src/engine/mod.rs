@@ -954,6 +954,15 @@ pub fn checkout_default_branch_confirm_prose(
     }
 }
 
+/// The refusal when a "check out the default branch" is already running for
+/// the project: an ordinary warning, because waiting is all it asks.
+pub fn default_branch_checkout_running_message(project_name: &str) -> String {
+    format!(
+        "dux is already checking out the default branch for project \"{project_name}\". Wait \
+         for it to finish; its result will say where the project's worktrees branch from."
+    )
+}
+
 /// The status line after the confirmation is dismissed: nothing ran, and the
 /// base is where it was.
 pub fn checkout_default_branch_cancelled_message(
