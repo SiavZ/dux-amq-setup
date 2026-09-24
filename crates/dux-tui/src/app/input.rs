@@ -37236,4 +37236,91 @@ cyan = "#00ffff"
             );
         }
     }
+
+    /// Fork fc57e65b: Codex keeps its scrollback in dux. It shipped as
+    /// `forward_scroll = false` there; upstream's auto mode gets the same
+    /// answer from the child itself, because Codex never raises the alt screen
+    /// (measured: it emits only ?1004h/?2004h/?2026h), so a PgUp at the live
+    /// edge pages dux's own scrollback.
+    #[test]
+    fn codex_page_up_at_bottom_uses_host_scrollback() {
+        let mut app = app_with_scrolled_back_pty();
+        assert_eq!(app.engine.sessions[0].provider.as_str(), "codex");
+        assert_eq!(app.selected_surface_forward_scroll(), None);
+        app.selected_terminal_surface_client()
+            .unwrap()
+            .set_scrollback(0);
+        app.reconcile_scroll_mode();
+
+        let result = app.process_raw_input_bytes(b"\x1b[5~").unwrap();
+
+        assert!(!result);
+        assert!(
+            app.selected_terminal_surface_client()
+                .unwrap()
+                .scrollback_offset()
+                > 0,
+            "PgUp should engage Dux host scrollback"
+        );
+    }
+
+    /// Fork 0d6fa312: a provider that owns its scrollback (`forward_scroll =
+    /// true`) gets PgUp at the live edge; dux does not page its own history.
+    #[test]
+    fn forward_scroll_provider_page_up_at_bottom_does_not_use_host_scrollback() {
+        let mut app = app_with_scrolled_back_pty();
+        set_forward_scroll(&mut app, true);
+        app.selected_terminal_surface_client()
+            .unwrap()
+            .set_scrollback(0);
+        app.reconcile_scroll_mode();
+
+        let result = app.process_raw_input_bytes(b"\x1b[5~").unwrap();
+
+        assert!(!result);
+        assert_eq!(
+            app.selected_terminal_surface_client()
+                .unwrap()
+                .scrollback_offset(),
+            0,
+            "PgUp should be forwarded to the provider instead of engaging Dux host scrollback"
+        );
+    }
+
+    /// Fork 0d6fa312 / c2c44378 (`terminal_tui_providers_forward_scroll_by_default`,
+    /// later `providers_use_expected_scrollback_defaults`). The fork pinned a
+    /// bool per provider; upstream's tri-state leaves the shipped TUIs on auto
+    /// and decides from what the child does, which gives the fork's final
+    /// answers for each one:
+    ///
+    /// - Claude and Codex emit no mouse or alt-screen mode (measured on claude
+    ///   2.x and codex 0.155: only ?1004h/?2004h/?2026h), so auto keeps the
+    ///   wheel and PgUp in dux host scrollback, which is what fork fc57e65b
+    ///   settled on for both. Forwarding a wheel to them is dropped on the
+    ///   floor, as the fork found.
+    /// - OpenCode and jcode raise ?1049h plus mouse reporting, so auto forwards
+    ///   to them; jcode pins `Some(true)` so the wheel works before its first
+    ///   frame.
+    #[test]
+    fn providers_use_expected_scrollback_defaults() {
+        use super::{should_forward_page, should_forward_wheel};
+        let config = Config::default();
+        for name in ["claude", "codex", "opencode", "copilot"] {
+            assert_eq!(
+                config.providers.commands[name].forward_scroll, None,
+                "{name} should ship on auto"
+            );
+        }
+        assert_eq!(
+            config.providers.commands["jcode"].forward_scroll,
+            Some(true)
+        );
+
+        // A normal-buffer TUI without mouse reporting (Claude, Codex) keeps both.
+        assert!(!should_forward_wheel(None, false, false));
+        assert!(!should_forward_page(None, false));
+        // A fullscreen mouse-aware TUI (OpenCode, jcode) gets both.
+        assert!(should_forward_wheel(None, true, true));
+        assert!(should_forward_page(None, true));
+    }
 }
