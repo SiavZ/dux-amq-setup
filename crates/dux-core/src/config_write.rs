@@ -43,6 +43,23 @@ pub enum Durability {
 /// self-deletes on drop if the rename never happens, so a failed/panicking write
 /// leaves no orphan and never a partial real file.
 pub fn write_config_atomic(path: &Path, contents: &str, durability: Durability) -> Result<()> {
+    write_config_atomic_with(path, contents, durability, |tmp, destination| {
+        tmp.persist(destination).map(drop).map_err(|e| e.error)
+    })
+}
+
+/// [`write_config_atomic`] with the rename step injectable, so a test can prove
+/// a failed replacement leaves the previous file byte-identical and no temp
+/// behind (fork 9c4c694f, P1-28).
+fn write_config_atomic_with<R>(
+    path: &Path,
+    contents: &str,
+    durability: Durability,
+    replace: R,
+) -> Result<()>
+where
+    R: FnOnce(tempfile::NamedTempFile, &Path) -> std::io::Result<()>,
+{
     let dir = path
         .parent()
         .with_context(|| format!("config path {} has no parent directory", path.display()))?;
@@ -64,9 +81,18 @@ pub fn write_config_atomic(path: &Path, contents: &str, durability: Durability) 
             .with_context(|| format!("failed to fsync temp config in {}", dir.display()))?;
     }
 
-    tmp.persist(path)
-        .map_err(|e| e.error)
+    replace(tmp, path)
         .with_context(|| format!("failed to rename temp config over {}", path.display()))?;
+
+    // The rename is only durable once the directory entry is: without this a
+    // power loss right after the save can bring back the old file, or on some
+    // filesystems no file at all (fork 9c4c694f, P1-28). Best effort, since
+    // not every filesystem lets a directory be opened and synced.
+    if durability == Durability::Fsync
+        && let Ok(dir_handle) = fs::File::open(dir)
+    {
+        let _ = dir_handle.sync_all();
+    }
     Ok(())
 }
 
@@ -1466,6 +1492,49 @@ pub fn escape_toml_multiline(value: &str) -> String {
 #[allow(deprecated)] // tests call the deprecated wrappers directly to verify their behaviour
 mod tests {
     use super::*;
+
+    /// A save whose final rename fails must leave the previous config
+    /// byte-identical and no sibling temp behind (fork 9c4c694f, P1-28).
+    #[test]
+    fn atomic_config_replace_failure_preserves_previous_bytes() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "valid = true\n").expect("seed");
+
+        let err = write_config_atomic_with(
+            &path,
+            "valid = false\n",
+            Durability::Fsync,
+            |_tmp, _destination| Err(std::io::Error::other("injected replacement failure")),
+        )
+        .expect_err("replacement must fail");
+
+        assert!(format!("{err:#}").contains("injected replacement failure"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "valid = true\n");
+        assert_eq!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .count(),
+            1,
+            "failed replacement must clean its sibling temporary"
+        );
+
+        write_config_atomic(&path, "valid = false\n", Durability::Fsync).expect("real write");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "valid = false\n");
+    }
+
+    /// A `[ui]` section that sets only some keys fills the rest from the same
+    /// widths `Config::default` uses (fork 9c4c694f, P1-20).
+    #[test]
+    fn partial_ui_deserialization_matches_config_default_widths() {
+        let config_default = Config::default();
+        let parsed: Config = toml::from_str("[ui]\ntheme = \"dux_dark\"\n").unwrap();
+        assert_eq!(parsed.ui.left_width_pct, config_default.ui.left_width_pct);
+        assert_eq!(parsed.ui.right_width_pct, config_default.ui.right_width_pct);
+        assert_eq!(crate::config::UiConfig::default().left_width_pct, 20);
+        assert_eq!(crate::config::UiConfig::default().right_width_pct, 23);
+    }
 
     /// A pure REORDER of the macro set must reach the file. `[macros]` order is
     /// meaningful (the macro bar, quick-picker, and web editor all render in
