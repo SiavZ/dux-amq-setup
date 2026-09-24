@@ -17,10 +17,16 @@
 //! surfaces print are pinned segment for segment by
 //! `tests/fixtures/prose_cross_language.json`, which each side reads.
 
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// One piece of a sentence: constant words, or a name.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Serialized untagged, which IS the browser's `Prose` shape: a JSON string for
+/// words, `{ "name", "quoted" }` for a name. The wire (a status's parts) and the
+/// cross-language fixture both go through this one derive.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum ProseSegment {
     Text(String),
     Name {
@@ -102,6 +108,23 @@ impl Prose {
         &self.segments
     }
 
+    /// Rebuild a sentence from segments (read off the wire, say), merging
+    /// adjacent text the way the builders do.
+    pub fn from_segments(segments: impl IntoIterator<Item = ProseSegment>) -> Self {
+        let mut prose = Prose::new();
+        for segment in segments {
+            match segment {
+                ProseSegment::Text(text) => prose.push_text(text),
+                name @ ProseSegment::Name { .. } => prose.segments.push(name),
+            }
+        }
+        prose
+    }
+
+    pub fn into_segments(self) -> Vec<ProseSegment> {
+        self.segments
+    }
+
     pub fn is_empty(&self) -> bool {
         self.segments.is_empty()
     }
@@ -131,17 +154,7 @@ impl Prose {
     /// words, `{ "name", "quoted" }` for a name, the same shape the browser's
     /// `Prose` type has.
     pub fn to_json(&self) -> Value {
-        Value::Array(
-            self.segments
-                .iter()
-                .map(|segment| match segment {
-                    ProseSegment::Text(text) => Value::String(text.clone()),
-                    ProseSegment::Name { name, quoted } => {
-                        json!({ "name": name, "quoted": quoted })
-                    }
-                })
-                .collect(),
-        )
+        serde_json::to_value(&self.segments).expect("prose segments always serialize")
     }
 }
 
@@ -154,6 +167,18 @@ impl From<&str> for Prose {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn segments_read_back_from_their_json_shape() {
+        let prose = Prose::new()
+            .text("On ")
+            .quoted("main")
+            .text(" in ")
+            .name("/src");
+        let back: Vec<ProseSegment> = serde_json::from_value(prose.to_json()).unwrap();
+        assert_eq!(Prose::from_segments(back), prose);
+    }
 
     #[test]
     fn the_plain_spelling_quotes_only_the_names_built_quoted() {

@@ -1,4 +1,5 @@
-use crate::status_text::{StatusSegment, StatusText};
+use crate::prose::ProseSegment;
+use crate::status_text::StatusText;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
@@ -298,7 +299,7 @@ pub struct KeyedStatus {
     /// The parts `message` was built from, when it was built from parts; see
     /// [`crate::status_text`]. The web draws the names in them as chips; the
     /// terminal UI never reads them.
-    pub segments: Option<Vec<StatusSegment>>,
+    pub segments: Option<Vec<ProseSegment>>,
     /// Delivery audience for this status. Defaults to [`StatusScope::All`]; the
     /// web actor sets it from the originating connection so per-connection
     /// filtering can suppress other clients' operation toasts.
@@ -338,7 +339,7 @@ pub struct KeyedWireStatus {
     pub message: String,
     /// The parts `message` was built from, carried so a replayed status still
     /// draws its names as chips. `None` for a plain sentence.
-    pub segments: Option<Vec<StatusSegment>>,
+    pub segments: Option<Vec<ProseSegment>>,
     /// Delivery audience, carried so the on-connect status snapshot can be
     /// filtered per connection (a mid-operation joiner must not receive another
     /// connection's in-progress `Busy`). Defaults to [`StatusScope::All`].

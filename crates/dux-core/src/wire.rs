@@ -41,7 +41,8 @@ use crate::engine::{
 };
 use crate::ids::{SessionIdRef, TabId, TabIdRef};
 use crate::model::{Project, ProjectBranchStatus, ProviderKind};
-use crate::status_text::{StatusSegment, StatusText};
+use crate::prose::ProseSegment;
+use crate::status_text::StatusText;
 use crate::statusline::{QuietSurfaces, StatusScope};
 use crate::worker::{
     CreateAgentRequest, NonDefaultBranchAction, ProjectPersistenceAction, PullTarget,
@@ -911,7 +912,7 @@ pub struct WireStatus {
     /// name as a chip. Absent for a plain sentence, and an older peer that never
     /// sends it reads as plain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub segments: Option<Vec<StatusSegment>>,
+    pub segments: Option<Vec<ProseSegment>>,
     /// `None` = an unkeyed transient (anonymous slot). `Some` = a keyed op whose
     /// later success/error/clear carries the same key so the surfaces correlate.
     #[serde(default, skip_serializing_if = "Option::is_none")]

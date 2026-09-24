@@ -19,8 +19,9 @@ use crate::logger;
 use crate::model::{
     AgentSession, GhStatus, PrState, Project, ProjectBranchStatus, ProviderKind, SessionStatus,
 };
+use crate::prose::ProseSegment;
 use crate::startup::StartupCommandLogListing;
-use crate::status_text::{StatusSegment, StatusText};
+use crate::status_text::StatusText;
 use crate::statusline::{QuietSurfaces, StatusScope, StatusTone};
 use crate::storage::StoredPr;
 use crate::worker::{
@@ -72,7 +73,7 @@ pub struct StatusUpdate {
     /// The parts `message` was built from when a producer built it with
     /// [`crate::status_text!`], so the web can draw its names as chips. `None`
     /// for a sentence handed over as a finished string. The TUI never reads it.
-    pub segments: Option<Vec<StatusSegment>>,
+    pub segments: Option<Vec<ProseSegment>>,
     /// Optional correlation key. `None` = an unkeyed transient. `Some` = a
     /// keyed op whose later success/error/clear carries the same key so both
     /// surfaces can correlate the pair. Ignored by the TUI today; copied into

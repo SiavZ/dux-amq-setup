@@ -13,7 +13,8 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::engine::StatusUpdate;
-use crate::status_text::{StatusSegment, StatusText};
+use crate::prose::ProseSegment;
+use crate::status_text::StatusText;
 use crate::statusline::{QuietSurfaces, StatusScope, StatusTone};
 
 /// Process-global source of opaque status ids. Monotonic only so each op gets a
@@ -39,7 +40,7 @@ pub enum Final {
         text: String,
         /// The parts `text` was built from, for the web's name chips; see
         /// [`crate::status_text`].
-        segments: Option<Vec<StatusSegment>>,
+        segments: Option<Vec<ProseSegment>>,
         sticky: bool,
         /// Which surfaces withhold this outcome. A quieted keyed final still
         /// retires its spinner; only the sentence is withheld.

@@ -1,76 +1,56 @@
-//! A status sentence built from its parts, so the web can draw every name in it
-//! as a chip without ever parsing the finished words.
+//! A status sentence as the status line and the web's toasts need it: the plain
+//! message every surface has always read, and, when the producer built it from
+//! parts, the [`Prose`] behind it so the web can draw each name as a chip.
 //!
-//! One sentence has two spellings. The plain one ([`StatusText::message`]) is
-//! what the terminal UI's status line prints, the logs record and every older
-//! consumer reads, byte for byte what the sentence said before names were
-//! structure: a name the sentence wraps in straight double quotes keeps them
-//! there ([`q`] in [`status_text!`]), and a bare one stays bare ([`n`]). The
-//! structured one ([`StatusText::segments`]) rides the wire beside it, and the
-//! browser renders each name segment through its inline code chip with the
-//! quotes dropped. Both come from the same parts, so they cannot disagree about
-//! the words.
+//! The parts ARE [`crate::prose`]: one segment type and one JSON shape for the
+//! dialogs and the statuses alike. This module only adds what a status needs on
+//! top: a sentence handed over as a finished string has no parts at all (the
+//! wire leaves the field out and the browser shows the text as it always did),
+//! and the plain message is carried beside the parts rather than recomputed, so
+//! every existing reader of `message` keeps its exact bytes. The terminal UI's
+//! status line reads the message and nothing else.
 //!
-//! A sentence built from a plain `String` has no segments at all, and the wire
-//! leaves the field out: the browser renders it as the text it always was.
-//!
-//! [`q`]: crate::status_text!
-//! [`n`]: crate::status_text!
+//! Build one with [`status_text!`](crate::status_text!): `q(name)` for a name
+//! the plain spelling wraps in straight double quotes, `n(name)` for a bare one,
+//! anything else for words or a whole sentence spliced in.
 
 use std::borrow::Cow;
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use crate::prose::{Prose, ProseSegment};
 
-/// One part of a structured status sentence.
-///
-/// Serialized untagged so the wire shape is exactly the browser's `Prose`
-/// (`lib/prose.tsx`): a bare JSON string for words, `{ "name", "quoted" }` for
-/// a name.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum StatusSegment {
-    /// Words of the sentence, drawn as they are.
-    Text(String),
-    /// A name (a branch, path, file, command, agent, project, terminal,
-    /// provider, pull request, URL or device), drawn as a chip on the web.
-    /// `quoted` records whether the plain spelling wraps it in straight double
-    /// quotes.
-    Name { name: String, quoted: bool },
-}
-
-/// A status sentence: its plain spelling, and the parts it was built from when
+/// A status sentence: its plain spelling, and the prose it was built from when
 /// it was built from parts.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StatusText {
     message: String,
-    /// `None` for a sentence that arrived as a finished string. `Some` once any
-    /// part has been pushed through the builder, names or not, so a converted
-    /// sentence is recognisably structured on the wire.
-    segments: Option<Vec<StatusSegment>>,
+    /// `None` for a sentence that arrived as a finished string. When `Some`,
+    /// `prose.plain() == message`, by construction.
+    prose: Option<Prose>,
 }
 
 impl StatusText {
-    /// An empty structured sentence, ready for the builder methods.
+    /// An empty structured sentence.
     pub fn new() -> Self {
-        Self {
-            message: String::new(),
-            segments: Some(Vec::new()),
-        }
+        Self::from(Prose::new())
     }
 
     /// A finished string with no structure: what every unconverted site passes.
     pub fn plain(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            segments: None,
+            prose: None,
         }
     }
 
-    /// Reassemble a sentence from the two halves a status carries. Used where a
-    /// status is copied field by field (the status controller, the wire).
-    pub fn from_parts(message: String, segments: Option<Vec<StatusSegment>>) -> Self {
-        Self { message, segments }
+    /// Reassemble a sentence from the two halves a status carries. The parts are
+    /// kept only when they spell the message, so a copy can never put different
+    /// words beside the ones the terminal UI prints.
+    pub fn from_parts(message: String, segments: Option<Vec<ProseSegment>>) -> Self {
+        let prose = segments
+            .map(Prose::from_segments)
+            .filter(|prose| prose.plain() == message);
+        Self { message, prose }
     }
 
     /// The plain spelling: what the terminal UI prints, word for word.
@@ -78,101 +58,52 @@ impl StatusText {
         &self.message
     }
 
+    /// The prose, or `None` when the sentence carries no structure.
+    pub fn prose(&self) -> Option<&Prose> {
+        self.prose.as_ref()
+    }
+
     /// The parts, or `None` when the sentence carries no structure.
-    pub fn segments(&self) -> Option<&[StatusSegment]> {
-        self.segments.as_deref()
+    pub fn segments(&self) -> Option<&[ProseSegment]> {
+        self.prose.as_ref().map(Prose::segments)
     }
 
     /// Split into the plain spelling and the parts.
-    pub fn into_parts(self) -> (String, Option<Vec<StatusSegment>>) {
-        (self.message, self.segments)
+    pub fn into_parts(self) -> (String, Option<Vec<ProseSegment>>) {
+        (self.message, self.prose.map(Prose::into_segments))
     }
 
     pub fn is_empty(&self) -> bool {
         self.message.is_empty()
     }
 
-    /// Append another sentence (words, or a whole sentence built elsewhere).
-    ///
-    /// Appending a plain string to a structured sentence adds it as words;
-    /// appending a structured sentence splices its parts in, names included.
+    /// Append another sentence: words, or a whole sentence built elsewhere,
+    /// whose names come along.
     pub fn push(&mut self, part: impl Into<StatusText>) {
         let part = part.into();
         if part.message.is_empty() {
             return;
         }
-        let parts = match part.segments {
-            Some(parts) => parts,
-            None => vec![StatusSegment::Text(part.message.clone())],
+        let own = self
+            .prose
+            .take()
+            .unwrap_or_else(|| Prose::new().text(&self.message));
+        let joined = match part.prose {
+            Some(prose) => own.then(prose),
+            None => own.text(&part.message),
         };
         self.message.push_str(&part.message);
-        let own = self.segments.get_or_insert_with(|| {
-            // A plain sentence becoming structured: its words so far are text.
-            if self.message.len() == part.message.len() {
-                Vec::new()
-            } else {
-                vec![StatusSegment::Text(
-                    self.message[..self.message.len() - part.message.len()].to_string(),
-                )]
-            }
-        });
-        for segment in parts {
-            match (own.last_mut(), segment) {
-                (Some(StatusSegment::Text(last)), StatusSegment::Text(more)) => {
-                    last.push_str(&more)
-                }
-                (_, segment) => own.push(segment),
-            }
-        }
+        self.prose = Some(joined);
     }
 
     /// Append a name the plain spelling wraps in straight double quotes.
     pub fn push_quoted(&mut self, name: impl fmt::Display) {
-        self.push_name_segment(name.to_string(), true);
+        self.push(Prose::new().quoted(name.to_string()));
     }
 
     /// Append a name the plain spelling leaves bare (a path, a URL, a number).
     pub fn push_name(&mut self, name: impl fmt::Display) {
-        self.push_name_segment(name.to_string(), false);
-    }
-
-    fn push_name_segment(&mut self, name: String, quoted: bool) {
-        if quoted {
-            self.message.push('"');
-            self.message.push_str(&name);
-            self.message.push('"');
-        } else {
-            self.message.push_str(&name);
-        }
-        let prefix_len = self.message.len() - name.len() - if quoted { 2 } else { 0 };
-        let prefix = self.message[..prefix_len].to_string();
-        self.segments
-            .get_or_insert_with(|| {
-                if prefix.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![StatusSegment::Text(prefix)]
-                }
-            })
-            .push(StatusSegment::Name { name, quoted });
-    }
-
-    /// Builder form of [`Self::push`].
-    pub fn text(mut self, part: impl Into<StatusText>) -> Self {
-        self.push(part);
-        self
-    }
-
-    /// Builder form of [`Self::push_quoted`].
-    pub fn quoted(mut self, name: impl fmt::Display) -> Self {
-        self.push_quoted(name);
-        self
-    }
-
-    /// Builder form of [`Self::push_name`].
-    pub fn name(mut self, name: impl fmt::Display) -> Self {
-        self.push_name(name);
-        self
+        self.push(Prose::new().name(name.to_string()));
     }
 }
 
@@ -186,7 +117,7 @@ impl StatusText {
 ///
 /// - `q(expr)`: a name the plain spelling wraps in straight double quotes;
 /// - `n(expr)`: a name the plain spelling leaves bare;
-/// - anything else: words, or a whole [`StatusText`] spliced in.
+/// - anything else: words, or a whole [`StatusText`] or [`Prose`] spliced in.
 #[macro_export]
 macro_rules! status_text {
     ($($part:tt)*) => {{
@@ -213,6 +144,15 @@ macro_rules! __status_text_parts {
         $t.push($e);
         $crate::__status_text_parts!($t; $($($rest)*)?);
     };
+}
+
+impl From<Prose> for StatusText {
+    fn from(prose: Prose) -> Self {
+        Self {
+            message: prose.plain(),
+            prose: Some(prose),
+        }
+    }
 }
 
 impl From<String> for StatusText {
@@ -290,12 +230,12 @@ impl PartialEq<String> for StatusText {
 mod tests {
     use super::*;
 
-    fn text(s: &str) -> StatusSegment {
-        StatusSegment::Text(s.to_string())
+    fn text(s: &str) -> ProseSegment {
+        ProseSegment::Text(s.to_string())
     }
 
-    fn name(s: &str, quoted: bool) -> StatusSegment {
-        StatusSegment::Name {
+    fn name(s: &str, quoted: bool) -> ProseSegment {
+        ProseSegment::Name {
             name: s.to_string(),
             quoted,
         }
@@ -303,7 +243,7 @@ mod tests {
 
     #[test]
     fn a_quoted_name_keeps_its_quotes_in_the_plain_spelling_and_drops_them_in_the_segment() {
-        let built = status_text![
+        let built = crate::status_text![
             "Checked out ",
             q("main"),
             " for project ",
@@ -328,7 +268,7 @@ mod tests {
 
     #[test]
     fn a_bare_name_stays_bare_in_the_plain_spelling() {
-        let built = status_text!["Saved to ", n("/tmp/a b/c.txt"), "."];
+        let built = crate::status_text!["Saved to ", n("/tmp/a b/c.txt"), "."];
         assert_eq!(built.message(), "Saved to /tmp/a b/c.txt.");
         assert_eq!(
             built.segments().unwrap(),
@@ -338,7 +278,7 @@ mod tests {
 
     #[test]
     fn a_leading_name_has_no_empty_text_before_it() {
-        let built = status_text![q("feature"), " is gone."];
+        let built = crate::status_text![q("feature"), " is gone."];
         assert_eq!(
             built.segments().unwrap(),
             &[name("feature", true), text(" is gone.")]
@@ -354,8 +294,8 @@ mod tests {
 
     #[test]
     fn splicing_a_structured_sentence_keeps_its_names_and_merges_adjacent_words() {
-        let suffix = status_text![" New worktrees branch from ", q("main"), " now."];
-        let built = status_text!["Checked out ", q("main"), ".", suffix];
+        let suffix = crate::status_text![" New worktrees branch from ", q("main"), " now."];
+        let built = crate::status_text!["Checked out ", q("main"), ".", suffix];
         assert_eq!(
             built.message(),
             "Checked out \"main\". New worktrees branch from \"main\" now."
@@ -374,7 +314,7 @@ mod tests {
 
     #[test]
     fn splicing_an_empty_sentence_changes_nothing() {
-        let built = status_text!["Done", String::new(), "."];
+        let built = crate::status_text!["Done", String::new(), "."];
         assert_eq!(built.segments().unwrap(), &[text("Done.")]);
     }
 
@@ -390,8 +330,19 @@ mod tests {
     }
 
     #[test]
+    fn a_dialog_prose_spliced_in_keeps_its_names() {
+        let prose = Prose::new().text("agent ").quoted("feat");
+        let built = crate::status_text!["Stopped ", prose, "."];
+        assert_eq!(built.message(), "Stopped agent \"feat\".");
+        assert_eq!(
+            built.segments().unwrap(),
+            &[text("Stopped agent "), name("feat", true), text(".")]
+        );
+    }
+
+    #[test]
     fn names_with_multibyte_characters_are_carried_whole() {
-        let built = status_text!["Añadido ", q("rama-ñ✓"), " ✓"];
+        let built = crate::status_text!["Añadido ", q("rama-ñ✓"), " ✓"];
         assert_eq!(built.message(), "Añadido \"rama-ñ✓\" ✓");
         assert_eq!(
             built.segments().unwrap(),
@@ -401,7 +352,7 @@ mod tests {
 
     #[test]
     fn segments_serialize_as_the_browsers_prose_shape() {
-        let built = status_text!["Pushed ", q("main"), " to ", n("origin"), "."];
+        let built = crate::status_text!["Pushed ", q("main"), " to ", n("origin"), "."];
         let json = serde_json::to_value(built.segments().unwrap()).unwrap();
         assert_eq!(
             json,
@@ -413,13 +364,22 @@ mod tests {
                 "."
             ])
         );
-        let back: Vec<StatusSegment> = serde_json::from_value(json).unwrap();
-        assert_eq!(back, built.segments().unwrap());
+        assert_eq!(json, built.prose().unwrap().to_json(), "one JSON shape");
+    }
+
+    #[test]
+    fn parts_that_do_not_spell_the_message_are_dropped_on_reassembly() {
+        let built = crate::status_text!["On ", q("main"), "."];
+        let (message, segments) = built.clone().into_parts();
+        assert_eq!(StatusText::from_parts(message, segments.clone()), built);
+        let other = StatusText::from_parts("Something else.".into(), segments);
+        assert_eq!(other.segments(), None);
+        assert_eq!(other.message(), "Something else.");
     }
 
     #[test]
     fn it_compares_equal_to_its_plain_spelling() {
-        let built = status_text!["Opened ", n(42), "."];
+        let built = crate::status_text!["Opened ", n(42), "."];
         assert_eq!(built, "Opened 42.");
         assert_eq!(built, "Opened 42.".to_string());
         assert_eq!(built.to_string(), "Opened 42.");

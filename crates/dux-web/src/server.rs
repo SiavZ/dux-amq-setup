@@ -2556,7 +2556,7 @@ struct WireStatusEvent {
     /// The parts `message` was built from, so the toast draws each name as a
     /// chip; left out for a plain sentence. See [`dux_core::status_text`].
     #[serde(skip_serializing_if = "Option::is_none")]
-    segments: Option<Vec<dux_core::status_text::StatusSegment>>,
+    segments: Option<Vec<dux_core::prose::ProseSegment>>,
     scope: StatusScope,
     sticky: bool,
 }
