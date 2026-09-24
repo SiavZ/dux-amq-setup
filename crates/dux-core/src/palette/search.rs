@@ -437,6 +437,10 @@ mod tests {
                 "toggle-project",
                 "change-default-provider",
                 "change-project-default-provider",
+                // Matches on its description ("keeping your agents running"),
+                // like its neighbours here, so it ranks with the
+                // description-only hits rather than the name hits above.
+                "reload-binary",
                 "start-web-server",
                 "stop-background-server",
                 "configure-project-env",

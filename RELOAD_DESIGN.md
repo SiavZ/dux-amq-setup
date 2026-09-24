@@ -37,6 +37,18 @@ That made a daemon split look necessary. It is not.
 The last row matters: `exec` replaces the image, not the process, so the
 parent-child relationship survives and ordinary signals and `waitpid` work.
 
+## How to use it
+
+Open the command palette and run **`reload-binary`**.
+
+It refuses, on the status line, when:
+- the binary on disk is not newer than the one running
+- any agent is mid-turn (a reload clears transcripts)
+- a PTY cannot be handed over
+
+Every refusal happens before anything is touched, so a refused reload leaves the
+session exactly as it was.
+
 ## What is built
 
 - `pty_reattach` — adopt an inherited master as a `MasterPty` (portable-pty's own
@@ -44,8 +56,10 @@ parent-child relationship survives and ordinary signals and `waitpid` work.
 - `pty_adopt_child` — wrap the surviving process as a `Child` (thin: same
   `waitpid`/`kill` the original made)
 - `reload_handoff` — the manifest naming which fd belongs to which tab
+- `reload_policy` — the guards, the exec, and the `--reload-handoff` flag
 - `PtyClient::prepare_for_reload` / `adopt_after_reload`
 - `Engine::prepare_reload_handoff` / `restore_reload_handoff`
+- `RunExit::Reload` → `TuiExit::Reload` → `exec_reload` in the binary
 
 ### Deliberate asymmetry
 
@@ -56,6 +70,16 @@ agents as unreachable orphans.
 Restore is **best effort**: after the exec there is nothing to go back to, so one
 bad entry must not discard agents that are still fine.
 
+### Two orderings that matter
+
+The engine is carried to the exec and leaked at the last moment. Dropping it
+would drop every `PtyClient`, closing the masters the next image is about to
+inherit.
+
+The handoff is adopted **before** `restore_sessions`, which relaunches any
+session with no live provider. Adopting second would put a duplicate agent beside
+every one that just survived.
+
 ### Known cost
 
 Scrollback is not carried. The alacritty grid lives in the old image's memory, so
@@ -64,8 +88,8 @@ stops, which is the point.
 
 ## Test status
 
-2618 dux-core tests pass. The reload work adds 24, including an end-to-end test
-that execs for real and drives a live `PtyClient` on both sides.
+The reload work adds 30 tests, including an end-to-end test that execs for real
+and drives a live `PtyClient` on both sides (passing in debug and release).
 
 Mutation-checked at every load-bearing point, each fails a test when broken:
 - removing `keep_open_across_exec`
@@ -73,18 +97,15 @@ Mutation-checked at every load-bearing point, each fails a test when broken:
 - dropping the adopted child's exit-status memoization
 - rebuilding a client around the wrong pid
 - dropping companion terminal identity
+- deleting the palette entry
 
 One test was found weaker than it looked: it reported the pid straight from the
 handoff, so it agreed with itself regardless of what the client was wired to. It
 now reads the rebuilt client's own pid.
 
-## Remaining
+## Not done
 
-The transport is complete and proven. Not yet wired to the UI:
+- No default keybinding (palette only, deliberately: a reload clears transcripts)
+- Scrollback is not preserved
+- Only exercised on macOS
 
-1. `RunExit::Reload`, mirroring the existing `RunExit::FlipToServer`
-2. A keybinding or command to request it
-3. Startup consuming `--reload-handoff` before restoring sessions
-4. Guards, ported from jcode: refuse mid-turn, only reload on a newer binary
-
-A user cannot press anything and get a reload yet.
