@@ -2015,6 +2015,57 @@ async fn next_terminate_signal(
     }
 }
 
+/// Loopback addresses this host actually has, other than `127.0.0.1`.
+///
+/// Several fixtures need a SECOND local address to stand in for a Tailscale IP,
+/// so a leg can really bind somewhere that is not the primary. They used to name
+/// `127.0.0.2` directly, which is a Linux assumption: the whole `127.0.0.0/8`
+/// range is loopback and bindable there, while macOS configures only
+/// `127.0.0.1` on `lo0` and answers anything else with `EADDRNOTAVAIL`. Those
+/// fixtures failed in setup on macOS, before reaching the behaviour they test.
+///
+/// Adding an alias needs root, so the host is ASKED instead of assumed. Reading
+/// `ifconfig` keeps this free of a new dependency and of `unsafe` FFI for a
+/// test-only question, and finds whatever extra `127.x` aliases a machine
+/// happens to carry. An empty answer is legitimate and means the caller must
+/// skip: there is no second address to stage the state with.
+#[cfg(test)]
+pub(crate) fn secondary_loopback_addrs() -> Vec<std::net::IpAddr> {
+    let Ok(output) = std::process::Command::new("ifconfig").output() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::str::from_utf8(&output.stdout) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("inet ") else {
+            continue;
+        };
+        let Some(token) = rest.split_whitespace().next() else {
+            continue;
+        };
+        let Ok(ip) = token.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        if ip.is_loopback() && ip != std::net::IpAddr::from([127, 0, 0, 1]) && !found.contains(&ip)
+        {
+            found.push(ip);
+        }
+    }
+    found
+}
+
+/// The first [`secondary_loopback_addrs`] entry this process can actually bind,
+/// which is the only proof that matters: an address can be listed and still be
+/// unusable.
+#[cfg(test)]
+pub(crate) fn bindable_secondary_loopback() -> Option<std::net::IpAddr> {
+    secondary_loopback_addrs()
+        .into_iter()
+        .find(|ip| std::net::TcpListener::bind((*ip, 0)).is_ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2451,11 +2502,22 @@ mod tests {
         // and return a warning naming it. host-only-from-bound is the caller's
         // concern; here we prove the bound set excludes the failed address.
         //
-        // 127.0.0.2 stands in for the Tailscale IP (all of 127.0.0.0/8 is loopback
-        // on Linux), held on an ephemeral port for the whole test so the leg is
-        // genuinely busy. The bind-failure path doesn't care that it's not a real
-        // Tailscale address, only that the entry is best-effort.
-        let held = std::net::TcpListener::bind("127.0.0.2:0").expect("hold a best-effort addr");
+        // A SECOND loopback address stands in for the Tailscale IP, held on an
+        // ephemeral port for the whole test so the leg is genuinely busy. The
+        // bind-failure path doesn't care that it's not a real Tailscale address,
+        // only that the entry is best-effort.
+        //
+        // Discovered rather than hardcoded: naming `127.0.0.2` assumes the Linux
+        // rule that all of 127.0.0.0/8 is bindable, which macOS does not follow.
+        // See `secondary_loopback_addrs`.
+        let Some(leg_ip) = super::bindable_secondary_loopback() else {
+            eprintln!(
+                "skipping: no second loopback address on this host to stand in \
+                 for a busy Tailscale leg"
+            );
+            return;
+        };
+        let held = std::net::TcpListener::bind((leg_ip, 0)).expect("hold a best-effort addr");
         let held_addr = held.local_addr().expect("held addr");
 
         // The required leg asks for port 0 and lets the KERNEL pick a free port
@@ -2758,9 +2820,37 @@ mod live_tailscale_mode_tests {
     /// trips it, short enough that a regression fails instead of hanging.
     const WAIT: Duration = Duration::from_secs(5);
 
-    /// The stand-in Tailscale address.
+    /// The stand-in Tailscale address: a real second loopback address this host
+    /// can bind.
+    ///
+    /// Discovered rather than named, because `127.0.0.2` is only guaranteed
+    /// bindable on Linux; macOS refuses it and every test in this module failed
+    /// in setup there. Resolved once per test binary, so the `ifconfig` read
+    /// does not repeat across the dozen call sites below.
+    /// See `secondary_loopback_addrs`.
+    fn leg_ip_opt() -> Option<IpAddr> {
+        static LEG: std::sync::OnceLock<Option<IpAddr>> = std::sync::OnceLock::new();
+        *LEG.get_or_init(super::bindable_secondary_loopback)
+    }
+
+    /// [`leg_ip_opt`] for the call sites that have already passed
+    /// [`skip_without_leg_ip`], which is every use inside a test body.
     fn leg_ip() -> IpAddr {
-        "127.0.0.2".parse().unwrap()
+        leg_ip_opt().expect("the test guarded on skip_without_leg_ip first")
+    }
+
+    /// Returns `true` when this host cannot supply a second loopback address, in
+    /// which case the calling test must return without asserting: the two-leg
+    /// state it is about cannot be staged at all.
+    fn skip_without_leg_ip(test: &str) -> bool {
+        if leg_ip_opt().is_some() {
+            return false;
+        }
+        eprintln!(
+            "skipping {test}: this host has no second loopback address to stand \
+             in for a Tailscale leg"
+        );
+        true
     }
 
     /// A primary listener held open for the whole test, so its port stays
@@ -2868,6 +2958,9 @@ mod live_tailscale_mode_tests {
 
     #[tokio::test]
     async fn switching_to_yes_binds_what_the_detection_found() {
+        if skip_without_leg_ip("switching_to_yes_binds_what_the_detection_found") {
+            return;
+        }
         let (_primary, primary_addr) = primary_listener();
         let h = Harness::start(
             TailscaleMode::No,
@@ -2997,6 +3090,9 @@ mod live_tailscale_mode_tests {
 
     #[tokio::test]
     async fn the_leg_command_lane_stays_open_in_the_static_modes() {
+        if skip_without_leg_ip("the_leg_command_lane_stays_open_in_the_static_modes") {
+            return;
+        }
         // The loop holds a sender for its whole life, so a mode with no watcher
         // behind it is not a closed channel: switching back to `auto` later must
         // find the arm still listening.
@@ -3034,6 +3130,9 @@ mod live_tailscale_mode_tests {
 
     #[tokio::test]
     async fn a_command_from_a_replaced_watcher_generation_is_dropped() {
+        if skip_without_leg_ip("a_command_from_a_replaced_watcher_generation_is_dropped") {
+            return;
+        }
         // A watcher parked in a probe when the mode changed comes back with a
         // command for the mode dux already left. Acting on it would re-bind the
         // leg the change just let go.
@@ -3086,6 +3185,9 @@ mod live_tailscale_mode_tests {
 
     #[tokio::test]
     async fn a_watcher_command_from_before_the_switch_to_no_is_dropped() {
+        if skip_without_leg_ip("a_watcher_command_from_before_the_switch_to_no_is_dropped") {
+            return;
+        }
         // A watcher whose probe returned in the window between the switch to
         // `no` storing its stop flag and the loop reading the next command is
         // still allowed to emit. Its bind must not put the leg back.
@@ -3169,6 +3271,9 @@ mod live_tailscale_mode_tests {
 
     #[tokio::test]
     async fn choosing_yes_again_leaves_a_leg_that_is_already_bound_alone() {
+        if skip_without_leg_ip("choosing_yes_again_leaves_a_leg_that_is_already_bound_alone") {
+            return;
+        }
         // Re-binding dux's own port fails with EADDRINUSE and warns about a
         // conflict that is dux itself, so the idempotence guard has to hold on
         // the mode the serve is already in.
@@ -3276,6 +3381,9 @@ mod live_tailscale_mode_tests {
 
     #[tokio::test]
     async fn a_closed_mode_lane_leaves_the_rest_of_the_loop_working() {
+        if skip_without_leg_ip("a_closed_mode_lane_leaves_the_rest_of_the_loop_working") {
+            return;
+        }
         // Every control handle is gone, so no mode change can arrive again. The
         // loop keeps serving: the legs, the parent lane and the teardown all
         // still work, and the mode arm is simply disabled rather than left

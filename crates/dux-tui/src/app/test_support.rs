@@ -524,3 +524,48 @@ pub(crate) fn project_default_provider_prompt(
         selected: 0,
     }
 }
+
+/// Loopback addresses this host actually has, other than `127.0.0.1`, in the
+/// order they were found.
+///
+/// A fixture that needs a SECOND local address (to hold one leg of a two-leg
+/// bind busy while leaving the other free) cannot simply name `127.0.0.2`.
+/// That works on Linux, where the whole `127.0.0.0/8` range is loopback and
+/// bindable without configuration, and fails on macOS, which configures only
+/// `127.0.0.1` on `lo0` and answers any other `127.x` with `EADDRNOTAVAIL`.
+/// Adding an alias needs root, which a test may not assume.
+///
+/// So the host is ASKED rather than assumed. `ifconfig` is read because it
+/// needs no new dependency and no `unsafe` FFI for what is a test-only
+/// question; a machine that happens to carry extra `127.x` aliases (some do,
+/// for unrelated reasons) is discovered correctly rather than being ruled out
+/// by a hardcoded guess. An empty result is a legitimate answer and means the
+/// caller must skip: there is no second address to stage the state with.
+pub(crate) fn bindable_secondary_loopbacks() -> Vec<std::net::IpAddr> {
+    let Ok(output) = std::process::Command::new("ifconfig").output() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::str::from_utf8(&output.stdout) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_start();
+        let Some(rest) = line.strip_prefix("inet ") else {
+            continue;
+        };
+        let Some(token) = rest.split_whitespace().next() else {
+            continue;
+        };
+        let Ok(ip) = token.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        // Loopback only: a routable address would make the "busy leg" reachable
+        // from off the machine, which is not what the fixture is staging.
+        if ip.is_loopback() && ip != std::net::IpAddr::from([127, 0, 0, 1]) && !found.contains(&ip)
+        {
+            found.push(ip);
+        }
+    }
+    found
+}

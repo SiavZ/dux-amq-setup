@@ -7460,14 +7460,32 @@ mod tests {
         // failed leg, and carry a warning naming the busy address.
         //
         // The whole 127.0.0.0/8 range is loopback on Linux, so a SECOND loopback
-        // address (127.0.0.2) stands in for the Tailscale IP: hold 127.0.0.2:P,
-        // leave 127.0.0.1:P free. local_addrs builds required(127.0.0.1:P) +
-        // best_effort(127.0.0.2:P): distinct addresses (no dedupe), so the bind
+        // address stands in for the Tailscale IP: hold second:P, leave
+        // 127.0.0.1:P free. local_addrs builds required(127.0.0.1:P) +
+        // best_effort(second:P): distinct addresses (no dedupe), so the bind
         // path is exercised exactly as production would hit it.
-        let held = std::net::TcpListener::bind("127.0.0.2:0").expect("hold a second-loopback port");
+        //
+        // WHICH second address is not hardcoded, because that is a Linux
+        // assumption. macOS configures only 127.0.0.1 on lo0 by default and
+        // refuses a bind to any other 127.x with EADDRNOTAVAIL, so a fixed
+        // choice failed in setup there before any product code ran. Adding an
+        // alias needs root, so the address is DISCOVERED instead: ask the host
+        // which loopback addresses it actually has (a machine may carry extra
+        // 127.x aliases for other reasons) and take the first that is not
+        // 127.0.0.1 and that the kernel lets us bind.
+        let second_loopback = crate::app::test_support::bindable_secondary_loopbacks();
+        let Some((held, ts_ip)) = second_loopback.into_iter().find_map(|ip| {
+            let listener = std::net::TcpListener::bind((ip, 0)).ok()?;
+            Some((listener, ip))
+        }) else {
+            eprintln!(
+                "skipping: this host has no second loopback address available to \
+                 stand in for a Tailscale IP, so the busy-leg state cannot be staged"
+            );
+            return;
+        };
         let held_addr = held.local_addr().expect("held addr");
         let port = held_addr.port();
-        let ts_ip: std::net::IpAddr = "127.0.0.2".parse().unwrap();
 
         let (listeners, urls, warnings) = preflight_server_listeners(port, Some(ts_ip))
             .expect("a busy Tailscale leg must NOT fail the pre-flight");

@@ -430,7 +430,14 @@ mod tests {
     /// Create a real directory whose absolute path is exactly `target_len`
     /// characters, nesting components that each stay well inside the 255-byte
     /// name limit.
-    fn deep_dir(base: &std::path::Path, target_len: usize) -> std::path::PathBuf {
+    ///
+    /// `None` when the OPERATING SYSTEM will not hold a path that long.
+    /// [`MAX_PATH_LEN`] is 4096, which is Linux's `PATH_MAX`; macOS caps a path
+    /// at 1024 bytes and refuses anything longer with `ENAMETOOLONG`, so a
+    /// fixture asking for a near-4096 path dies in setup there rather than
+    /// reaching the behaviour under test. Measured: the nesting fails at a
+    /// total length just over 1024 on this platform.
+    fn deep_dir(base: &std::path::Path, target_len: usize) -> Option<std::path::PathBuf> {
         let mut remaining = target_len - base.to_string_lossy().chars().count();
         // Every component costs one separator plus its own length, so pick a
         // final component that leaves a whole number of 100-char ones.
@@ -446,8 +453,21 @@ mod tests {
         }
         path.push("d".repeat(last));
         assert_eq!(path.to_string_lossy().chars().count(), target_len);
-        std::fs::create_dir_all(&path).unwrap();
-        path
+        match std::fs::create_dir_all(&path) {
+            Ok(()) => Some(path),
+            // This OS's path limit is below what the caller asked for. Nothing
+            // about dux can be observed through a path that cannot exist.
+            // `InvalidFilename` is how std reports `ENAMETOOLONG` here, and is
+            // used in place of the raw errno so this needs no `libc` dependency.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidFilename => {
+                eprintln!(
+                    "skipping: this OS will not hold a {target_len}-character \
+                     path ({e})"
+                );
+                None
+            }
+            Err(e) => panic!("creating the deep fixture directory failed: {e}"),
+        }
     }
 
     #[tokio::test]
@@ -456,7 +476,9 @@ mod tests {
         // cap plus a name inside its own limit can still join into a path the
         // inspect route would refuse to look at.
         let dir = tempfile::tempdir().unwrap();
-        let deep = deep_dir(dir.path(), MAX_PATH_LEN - 6);
+        let Some(deep) = deep_dir(dir.path(), MAX_PATH_LEN - 6) else {
+            return;
+        };
         let parent = deep.to_string_lossy().to_string();
 
         let long_name = "n".repeat(32);
