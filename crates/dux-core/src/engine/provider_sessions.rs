@@ -799,6 +799,47 @@ mod tests {
         );
     }
 
+    /// Recovery's worker never writes: the engine persists what it found when
+    /// the report arrives, and an id captured by a launch in the meantime wins.
+    #[test]
+    fn recovered_ids_are_persisted_by_the_engine_and_never_over_a_capture() {
+        let (mut engine, tmp) = test_engine();
+        for id in ["found", "captured"] {
+            let session = session_in(tmp.path(), id, "claude");
+            engine.session_store.create_session(&session).unwrap();
+            engine.sessions.push(session);
+        }
+        let launch_id = uuid::Uuid::new_v4().to_string();
+        engine
+            .session_store
+            .set_provider_session_id("captured", "claude", &launch_id)
+            .unwrap();
+        let recovered = |session_id: &str| resume_recovery::ProviderSessionUpdate {
+            session_id: session_id.to_string(),
+            provider: "claude".to_string(),
+            provider_session_id: format!("recovered-{session_id}"),
+        };
+        let report = resume_recovery::RecoveryReport {
+            updates: vec![recovered("found"), recovered("captured")],
+            ..Default::default()
+        };
+
+        engine.process_worker_event(WorkerEvent::ResumeRecoveryCompleted(Ok(report)));
+
+        let store = &engine.session_store;
+        assert_eq!(
+            store
+                .provider_session_id("found", "claude")
+                .unwrap()
+                .as_deref(),
+            Some("recovered-found")
+        );
+        assert_eq!(
+            store.provider_session_id("captured", "claude").unwrap(),
+            Some(launch_id)
+        );
+    }
+
     /// The pump never has more than `concurrency` startup launches in flight.
     #[test]
     fn pump_respects_concurrency() {
