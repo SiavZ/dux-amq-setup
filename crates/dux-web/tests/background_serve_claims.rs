@@ -86,6 +86,7 @@ fn engine_with_an_agent_and_a_terminal_running() -> (Engine, String, tempfile::T
             .unwrap();
     }
     let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     engine
         .changed_files_poller_started
         .store(true, std::sync::atomic::Ordering::Relaxed);
