@@ -198,6 +198,23 @@ impl SessionSettings {
         }
         PerSessionEnv { vars }
     }
+
+    /// Extra CLI args YOLO adds for providers that take it as a flag rather
+    /// than through a wrapper env var (fork c2c44378: OpenCode `--auto`).
+    /// Appended after the provider's own args, resume args included.
+    ///
+    /// INTEGRATION: the agent launch argv builder (resume worker, palmtree,
+    /// with the peer worker's launch env) must append these for a session
+    /// whose settings have `yolo_permissions`.
+    pub fn yolo_launch_args(&self, provider: &ProviderKind) -> Vec<String> {
+        if !self.yolo_permissions {
+            return Vec::new();
+        }
+        match provider.as_str() {
+            "opencode" => vec!["--auto".to_string()],
+            _ => Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -218,6 +235,36 @@ mod tests {
         assert!(!s.auto_clear_on_task_done);
         assert!(s.is_default());
         assert_eq!(s.effective_system_prompt(), None);
+        assert!(
+            s.yolo_launch_args(&ProviderKind::from_str("opencode"))
+                .is_empty()
+        );
+    }
+
+    /// c2c44378: OpenCode's YOLO is `--auto` on the command line, after any
+    /// resume args; no other provider gets a flag from it.
+    #[test]
+    fn opencode_yolo_launch_adds_auto() {
+        let opencode = ProviderKind::from_str("opencode");
+        let yolo = SessionSettings {
+            yolo_permissions: true,
+            ..SessionSettings::default()
+        };
+        assert!(
+            SessionSettings::default()
+                .yolo_launch_args(&opencode)
+                .is_empty()
+        );
+        assert_eq!(yolo.yolo_launch_args(&opencode), vec!["--auto"]);
+        let mut resumed = vec!["--continue".to_string()];
+        resumed.extend(yolo.yolo_launch_args(&opencode));
+        assert_eq!(resumed, vec!["--continue", "--auto"]);
+        for other in ["claude", "codex", "jcode"] {
+            assert!(
+                yolo.yolo_launch_args(&ProviderKind::from_str(other))
+                    .is_empty()
+            );
+        }
     }
 
     #[test]
