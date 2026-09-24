@@ -6,6 +6,7 @@ mod clipboard;
 mod config;
 mod config_saver;
 mod diff;
+mod doctor;
 // The terminal-focus grace state machine is core-owned (`dux_core::focus`),
 // shared by rule with the web's viewed-ping grace.
 pub(crate) use dux_core::focus;
@@ -84,6 +85,21 @@ pub fn run(
     }
 
     let paths = config::DuxPaths::discover()?;
+
+    // `dux doctor` (fork c6426735): read-only, so it takes no lock and works
+    // while a TUI holds one, which is exactly when it gets run.
+    if args.first().map(|s| s.as_str()) == Some("doctor") {
+        let json = args.iter().any(|a| a == "--json");
+        let anonymize = args.iter().any(|a| a == "--anonymize");
+        if let Some(unknown) = args[1..]
+            .iter()
+            .find(|a| !matches!(a.as_str(), "--json" | "--anonymize"))
+        {
+            anyhow::bail!("unknown argument to dux doctor: {unknown}");
+        }
+        doctor::run_doctor(&paths, json, anonymize)?;
+        return Ok(TuiExit::Done);
+    }
 
     if args.first().map(|s| s.as_str()) == Some("config") {
         let config_args = &args[1..];
@@ -201,7 +217,8 @@ pub fn help_text() -> &'static str {
          Usage:\n\
           dux              Launch the TUI\n\
           dux server       Serve the web UI over the headless engine\n\
-          dux config       Manage the configuration file\n\n\
+          dux config       Manage the configuration file\n\
+          dux doctor       Print a diagnostic dump (--json, --anonymize)\n\n\
          Server subcommand:\n\
           dux server                     Serve on the configured host and port\n\
           dux server --bind <ADDR:PORT>  Bind this exact address instead\n\

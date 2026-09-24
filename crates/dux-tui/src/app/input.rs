@@ -16715,7 +16715,7 @@ not_a_real_action = ["x"]
     }
 
     #[test]
-    fn slash_search_selects_first_match_and_n_advances() {
+    fn files_search_enter_keeps_query_and_n_advances() {
         let mut app = test_app(default_bindings());
         app.focus = FocusPane::Files;
         app.right_section = RightSection::Unstaged;
@@ -16763,6 +16763,8 @@ not_a_real_action = ["x"]
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
+        assert!(!app.files_search_active, "Enter finishes typing");
+        assert_eq!(app.files_search.text, "main", "Enter keeps the query");
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
             .unwrap();
 

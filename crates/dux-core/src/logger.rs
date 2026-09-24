@@ -805,12 +805,13 @@ pub fn resolve_log_path(config: &LoggingConfig, paths: &DuxPaths) -> PathBuf {
 /// target and fields (as [`JsonFieldVisitor`] renders them), and return them.
 /// For tests that must see a structured log line was emitted.
 #[cfg(test)]
-pub(crate) fn capture_tracing<R>(
-    f: impl FnOnce() -> R,
-) -> (R, Vec<(String, serde_json::Map<String, serde_json::Value>)>) {
+pub(crate) type CapturedEvent = (String, serde_json::Map<String, serde_json::Value>);
+
+#[cfg(test)]
+pub(crate) fn capture_tracing<R>(f: impl FnOnce() -> R) -> (R, Vec<CapturedEvent>) {
     use tracing_subscriber::layer::SubscriberExt;
 
-    type Seen = Arc<Mutex<Vec<(String, serde_json::Map<String, serde_json::Value>)>>>;
+    type Seen = Arc<Mutex<Vec<CapturedEvent>>>;
     struct Capture(Seen);
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
         fn on_event(

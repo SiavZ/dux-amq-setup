@@ -145,6 +145,30 @@ fn sidecar_path(db: &std::path::Path, suffix: &str) -> std::path::PathBuf {
 }
 
 impl SessionStore {
+    /// Open an existing database for diagnosis without changing a byte of it:
+    /// read-only, no migration, no journal-mode switch, no chmod. `dux doctor`
+    /// uses it (port of fork c6426735/55dba0f7), because a diagnostic that
+    /// migrates or rewrites the file it is diagnosing destroys the evidence.
+    /// The integrity check still runs and is reported as the error.
+    ///
+    /// Reading sessions from a database written by an older schema can fail
+    /// on a missing column; the caller reports that rather than a zero count.
+    pub fn open_read_only(path: &std::path::Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("failed to open {} read-only", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .context("failed to run the session database integrity check")?;
+        if integrity != "ok" {
+            bail!("sqlite integrity check failed: {integrity}");
+        }
+        Ok(Self { conn })
+    }
+
     pub fn open(path: &std::path::Path) -> Result<Self> {
         let conn =
             Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
