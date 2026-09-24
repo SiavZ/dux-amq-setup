@@ -3973,6 +3973,53 @@ pub(crate) mod test_support {
             .env_remove("GIT_CONFIG_COUNT")
             .env_remove("GIT_CONFIG_PARAMETERS");
     }
+
+    /// Give a fixture repository an `origin` that PRODUCTION code reads back
+    /// verbatim, and return the address it will read.
+    ///
+    /// [`git_command`] isolates the fixture's own WRITES, and the comment there
+    /// is explicit that the isolation cannot reach a git command spawned by
+    /// production code. For a fixture that only writes and then asserts on the
+    /// bytes itself, composing the two halves by hand is enough. A fixture that
+    /// hands the PATH to production (`remote_github_repo`, and everything in
+    /// `pr_reference` built on it) has no such seam: production shells out to
+    /// git itself, inherits the developer's configuration, and
+    /// `git remote get-url` APPLIES `url.*.insteadOf`.
+    ///
+    /// That is not hypothetical. A developer with the common
+    /// `url.https://.insteadOf git@` rule turns the scp-like `git@github.com:acme/widget.git`
+    /// every one of these fixtures writes into `https://github.com:acme/widget.git`,
+    /// where `:acme` is now a PORT rather than the start of the path. The
+    /// address parser correctly refuses it, production reports no GitHub
+    /// remote, and two dozen tests fail on a rule that belongs to the
+    /// developer's machine rather than to anybody's code.
+    ///
+    /// The fix is written into the FIXTURE REPOSITORY instead of around
+    /// production: a repo-local `insteadOf` mapping the address to itself.
+    /// Git resolves `insteadOf` by LONGEST MATCHING PREFIX, so this exact-length
+    /// rule outranks the developer's shorter `git@` one and rewrites the address
+    /// to itself, for any reader of this repository including production.
+    /// Production keeps reading the developer's real configuration everywhere
+    /// else, which is what dux wants when it runs for real.
+    pub(crate) fn set_origin_readable_by_production(path: &std::path::Path, address: &str) {
+        for args in [
+            vec!["remote", "set-url", "origin", address],
+            // Self-mapping: a prefix as long as the address itself, so no
+            // shorter rule can win, and the replacement is the address.
+            vec!["config", &format!("url.{address}.insteadOf"), address],
+        ] {
+            let out = git_command()
+                .args(&args)
+                .current_dir(path)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5102,7 +5149,17 @@ mod tests {
         // keys rows by path) must never see duplicated.
         let name_a = OsString::from_vec(vec![0xFF]);
         let name_b = OsString::from_vec(vec![0xFE]);
-        std::fs::write(dir.path().join(&name_a), "a").unwrap();
+        // A filesystem that enforces UTF-8 names (APFS, HFS+) cannot hold
+        // either name, so the collision this test is about cannot be staged
+        // there at all. See `create_dir_with_non_utf8_name`.
+        match std::fs::write(dir.path().join(&name_a), "a") {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => {
+                eprintln!("skipping: filesystem cannot hold a non-UTF8 filename ({e})");
+                return;
+            }
+            Err(e) => panic!("writing a non-UTF8 filename failed unexpectedly: {e}"),
+        }
         std::fs::write(dir.path().join(&name_b), "b").unwrap();
 
         let entries = list_dir(dir.path(), "").unwrap();
@@ -10141,6 +10198,41 @@ mod tests {
         );
     }
 
+    /// Create a directory whose name is not valid UTF-8, or return `None` when
+    /// the filesystem refuses to hold one.
+    ///
+    /// A non-UTF8 filename is legal on Linux, where these tests do their work:
+    /// a byte sequence is just bytes, and dux must decode `--show-toplevel`
+    /// from the raw bytes rather than lossily. It is NOT universally legal.
+    /// macOS's APFS and HFS+ enforce valid UTF-8 in filenames at the syscall
+    /// boundary and reject the name with `EILSEQ` ("illegal byte sequence"),
+    /// so the fixture cannot be BUILT there and the test used to die in setup,
+    /// before a line of product code ran.
+    ///
+    /// Skipping where the filesystem cannot express the premise is the honest
+    /// reading, and it is narrow on purpose: the check is what the filesystem
+    /// just DID with the name, not which operating system is running. A macOS
+    /// filesystem that does accept the bytes still runs the test, and a Linux
+    /// filesystem that refuses them (some network and FUSE mounts do) stops
+    /// reporting a failure that is not dux's.
+    fn create_dir_with_non_utf8_name(parent: &Path, name: &[u8]) -> Option<std::path::PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = parent.join(std::ffi::OsStr::from_bytes(name));
+        match std::fs::create_dir(&path) {
+            Ok(()) => Some(path),
+            // EILSEQ: the filesystem enforces UTF-8 names and will not hold
+            // this one. Nothing about dux can be observed here.
+            Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => {
+                eprintln!(
+                    "skipping: {} cannot hold a non-UTF8 filename ({e})",
+                    parent.display()
+                );
+                None
+            }
+            Err(e) => panic!("creating a non-UTF8 directory failed unexpectedly: {e}"),
+        }
+    }
+
     #[test]
     fn repo_path_kind_classifies_repos_under_non_utf8_paths() {
         // Catches the fail-open gate bypass: `--show-toplevel` output for a
@@ -10148,10 +10240,10 @@ mod tests {
         // raw bytes; a lossy decode rewrites the byte to U+FFFD, fails
         // canonicalization, and falls to Indeterminate, which the add gate
         // accepts.
-        use std::os::unix::ffi::OsStrExt;
         let base = tempfile::tempdir().unwrap();
-        let repo = base.path().join(std::ffi::OsStr::from_bytes(b"rep\xFFo"));
-        std::fs::create_dir(&repo).unwrap();
+        let Some(repo) = create_dir_with_non_utf8_name(base.path(), b"rep\xFFo") else {
+            return;
+        };
         let out = test_support::git_command()
             .arg("-C")
             .arg(&repo)

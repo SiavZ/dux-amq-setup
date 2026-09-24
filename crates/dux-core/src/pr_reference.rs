@@ -1455,9 +1455,22 @@ mod resolution_tests {
     /// The `git init` and `git remote add` run through the isolated command
     /// helper, so no developer's configuration decides what gets written. What
     /// READS the address afterwards is production code, which inherits the test
-    /// process's environment on purpose: an `insteadOf` rewrite is meant to
-    /// apply, because the rewritten address is the one git would really
-    /// contact, and it is what a reference should be compared against.
+    /// process's environment.
+    ///
+    /// That inheritance is the hazard these fixtures cannot live with, and the
+    /// reason for the pin below. Every assertion here names the address that was
+    /// WRITTEN, so a developer whose configuration rewrites it is testing an
+    /// address nobody in this file wrote: the common `url.https://.insteadOf git@`
+    /// rule turns `git@github.com:acme/widget.git` into
+    /// `https://github.com:acme/widget.git`, whose `:acme` parses as a port, and
+    /// every test in this module reports no match at all.
+    ///
+    /// Letting the rewrite through would be right for a fixture asking which
+    /// address git would really CONTACT. It is wrong for these, which ask
+    /// whether a reference is matched against the address on record, so the
+    /// address is pinned to itself per repository. Production's own behaviour is
+    /// untouched: outside these fixture repositories it still applies whatever
+    /// the user configured, which is what dux wants when it runs for real.
     fn project_with_origin(name: &str, address: &str) -> (tempfile::TempDir, Project) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().to_path_buf();
@@ -1476,6 +1489,10 @@ mod resolution_tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
+        // These fixtures hand the PATH to production, which reads the remote
+        // with the developer's own git configuration. Pin the address so an
+        // `insteadOf` rewrite cannot rename it on the way back out.
+        crate::git::test_support::set_origin_readable_by_production(&path, address);
         let project = Project {
             id: format!("id-{name}"),
             name: name.to_string(),
@@ -1707,17 +1724,12 @@ mod resolution_tests {
         let reference = parse_typed_reference("acme/widget#1").unwrap();
         assert!(resolve(&reference, &projects).matches.is_empty());
 
-        let out = crate::git::test_support::git_command()
-            .args([
-                "remote",
-                "set-url",
-                "origin",
-                "git@github.com:acme/widget.git",
-            ])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        assert!(out.status.success());
+        // Re-pins the new address as well, for the same reason the fixture
+        // pinned the first one.
+        crate::git::test_support::set_origin_readable_by_production(
+            dir.path(),
+            "git@github.com:acme/widget.git",
+        );
 
         assert_eq!(
             names(&resolve(&reference, &projects).matches),
