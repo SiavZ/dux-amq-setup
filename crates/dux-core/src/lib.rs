@@ -40,6 +40,7 @@ pub mod logger;
 pub mod macros;
 pub mod model;
 pub mod palette;
+pub mod peer;
 pub mod poller_status;
 pub mod pr_reference;
 pub mod project_browser;
