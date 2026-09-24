@@ -53,6 +53,11 @@ pub struct AmqRuntime {
     pub watcher: Option<Arc<Mutex<notify::RecommendedWatcher>>>,
     /// Set on [`Engine::stop_amq`]; the poll loop exits on it (3d520748).
     pub shutdown: Arc<AtomicBool>,
+    /// Liveness token for the poll thread: its loop body owns one clone and
+    /// drops it when the thread returns, so `strong_count == 1` means the
+    /// thread is gone. `spawn_loop_worker` hands back no `JoinHandle`, and
+    /// this is how [`Engine::quiesce_amq_for_exec`] still gets a bounded join.
+    pub poll_alive: Arc<()>,
     pub started: bool,
     pub pending: HashMap<String, VecDeque<QueuedMessage>>,
     pub startup_grace_until: Option<Instant>,
@@ -89,6 +94,26 @@ pub struct AmqFocus<'a> {
     pub focused_session: Option<&'a str>,
     /// The session the unrouted fallback delivers to.
     pub selected_session: Option<&'a str>,
+}
+
+/// Upper bound on how long [`Engine::quiesce_amq_for_exec`] waits for the
+/// poll thread. The loop sleeps in 50 ms slices, so a healthy thread exits
+/// well inside it; a wedged one must not hold up a hot reload forever.
+pub const AMQ_QUIESCE_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// What [`Engine::quiesce_amq_for_exec`] did, for the reload log.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AmqQuiesceReport {
+    /// The poll thread was confirmed gone within the timeout (or never ran).
+    pub poll_thread_stopped: bool,
+    /// Claimed wakes nothing had typed yet, renamed back to `.msg`.
+    pub released: usize,
+    /// Wakes whose body was already typed: Enter sent and the claim unlinked,
+    /// so the successor does not retype them over the waiting prompt.
+    pub completed: usize,
+    /// Claims that could not be released or unlinked. They stay
+    /// `.inflight.*.msg` and the successor's startup reclaim handles them.
+    pub left_inflight: usize,
 }
 
 impl Engine {
@@ -368,6 +393,8 @@ impl Engine {
         }
         let shutdown = Arc::new(AtomicBool::new(false));
         self.amq.shutdown = Arc::clone(&shutdown);
+        let alive = Arc::new(());
+        self.amq.poll_alive = Arc::clone(&alive);
         let interval = Duration::from_millis(cfg.poll_interval_ms.max(100));
         self.spawn_loop_worker(
             LoopWorkerSpec {
@@ -376,6 +403,9 @@ impl Engine {
                 remedy: crate::poller_status::REMEDY_RESTART_DUX.into(),
             },
             move |tx| {
+                // Owned by the closure, so it drops exactly when the thread
+                // returns: the liveness signal `quiesce_amq_for_exec` waits on.
+                let _alive = &alive;
                 // Sleep in short slices so `stop_amq` is honoured promptly.
                 let mut slept = Duration::ZERO;
                 while slept < interval {
@@ -410,6 +440,96 @@ impl Engine {
         self.amq.shutdown.store(true, Ordering::Relaxed);
         self.amq.watcher = None;
         self.amq.started = false;
+    }
+
+    /// Quiesce AMQ right before a hot-reload `exec`, so the successor image
+    /// finds no thread, watcher or claim of ours (fork 3d520748).
+    ///
+    /// Stops the notify watcher and the poll thread and waits for the poll
+    /// thread to exit, bounded by [`AMQ_QUIESCE_JOIN_TIMEOUT`]. Then every
+    /// claim this engine holds is settled: a wake whose body is already typed
+    /// gets its Enter (after the phase delay, so an Ink CLI does not read it
+    /// as part of the paste) and its file is unlinked; an untyped one is
+    /// renamed back to `.msg` for the successor. Deferred watchdog Enters are
+    /// flushed the same way. Idempotent, and safe when AMQ never started.
+    ///
+    /// INTEGRATION: call from `Engine::pre_exec_quiesce` (reload worker,
+    /// crates/dux-core/src/engine/lifecycle.rs). `dux`'s `exec_reload` calls
+    /// it directly until that merge.
+    pub fn quiesce_amq_for_exec(&mut self) -> AmqQuiesceReport {
+        self.stop_amq();
+        let deadline = Instant::now() + AMQ_QUIESCE_JOIN_TIMEOUT;
+        while Arc::strong_count(&self.amq.poll_alive) > 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut report = AmqQuiesceReport {
+            poll_thread_stopped: Arc::strong_count(&self.amq.poll_alive) == 1,
+            ..AmqQuiesceReport::default()
+        };
+        if !report.poll_thread_stopped {
+            crate::logger::warn("amq: poll thread did not stop before exec; continuing");
+        }
+
+        // One wait covers every typed body: they were all typed at or before
+        // `latest_typed`, and the watchdog's deferred Enters likewise.
+        let delay = delivery::effective_enter_phase_delay(self.config.amq.inject.phase_delay_ms);
+        let latest_typed = self
+            .amq
+            .pending
+            .values()
+            .flatten()
+            .filter_map(|m| m.body_typed_at)
+            .chain(self.amq.pending_enters.values().copied())
+            .max();
+        if let Some(at) = latest_typed {
+            let ready = at + delay;
+            let now = Instant::now();
+            if ready > now {
+                std::thread::sleep(ready - now);
+            }
+        }
+        self.flush_amq_pending_enters();
+
+        let receivers: Vec<String> = self.amq.pending.keys().cloned().collect();
+        for receiver in receivers {
+            let messages = self.amq.pending.remove(&receiver).unwrap_or_default();
+            let session_id = if receiver == UNROUTED_RECEIVER {
+                None
+            } else {
+                self.find_session_for_receiver(&receiver)
+            };
+            for msg in messages {
+                if msg.body_typed {
+                    let sent = session_id.as_deref().is_some_and(|id| {
+                        let submit = delivery::submit_key_bytes_for_provider(
+                            self.running_provider_of(id).as_ref(),
+                        );
+                        self.slot_client(id)
+                            .is_some_and(|c| c.write_bytes(submit).is_ok())
+                    });
+                    if sent && std::fs::remove_file(&msg.inflight_path).is_ok() {
+                        report.completed += 1;
+                        continue;
+                    }
+                    // The PTY is gone: nothing sits in a prompt, so the body
+                    // can safely be delivered again by the successor.
+                }
+                match queue::release(&msg.inflight_path) {
+                    Ok(_) => report.released += 1,
+                    Err(err) => {
+                        report.left_inflight += 1;
+                        crate::logger::warn(&format!(
+                            "amq: could not release {} before exec; the next start reclaims it: {err}",
+                            msg.inflight_path.display()
+                        ));
+                    }
+                }
+            }
+        }
+        self.amq.first_pending_at.clear();
+        self.amq.timeout_warned.clear();
+        crate::logger::info(&format!("amq: quiesced for exec: {report:?}"));
+        report
     }
 
     // ─── scan (claim) ────────────────────────────────────────────────
@@ -1636,6 +1756,72 @@ mod tests {
             ),
             "no scans after stop"
         );
+    }
+
+    fn inflight_files(queue: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for dir in fs::read_dir(queue).into_iter().flatten().flatten() {
+            for f in fs::read_dir(dir.path()).into_iter().flatten().flatten() {
+                if f.file_name().to_string_lossy().starts_with(".inflight.") {
+                    out.push(f.path());
+                }
+            }
+        }
+        out
+    }
+
+    /// Hot reload (3d520748): after quiescing, the poll thread is gone and
+    /// no `.inflight.*` claim is left. The untyped wake goes back to `.msg`;
+    /// the typed one gets its Enter and is unlinked, never retyped.
+    #[test]
+    fn quiesce_amq_for_exec_stops_the_poll_thread_and_leaves_no_claim() {
+        let (mut engine, _tmp, queue) = engine_with_agent();
+        engine.config.amq.inject.poll_interval_ms = 100;
+        engine.start_amq();
+        assert!(
+            Arc::strong_count(&engine.amq.poll_alive) > 1,
+            "thread running"
+        );
+
+        // Receiver `bob` has no agent, so its claim is only ever held.
+        write_msg(&queue, "alice", "001.msg", "typed before reload");
+        write_msg(&queue, "bob", "002.msg", "never typed");
+        engine.drain_amq_inject_queue();
+        engine.tick_amq(AmqFocus::default());
+        assert!(wait_for(|| screen(&engine).contains("typed before reload")));
+        assert_eq!(inflight_files(&queue).len(), 2, "both claimed");
+
+        let report = engine.quiesce_amq_for_exec();
+        assert!(report.poll_thread_stopped);
+        assert_eq!(Arc::strong_count(&engine.amq.poll_alive), 1, "no thread");
+        assert!(engine.amq.watcher.is_none() && !engine.amq.started);
+        assert_eq!(report.completed, 1);
+        assert_eq!(report.released, 1);
+        assert_eq!(report.left_inflight, 0);
+        assert!(inflight_files(&queue).is_empty(), "no claim left open");
+        assert!(queue.join("bob/002.msg").exists(), "untyped wake requeued");
+        assert!(
+            !queue.join("alice/001.msg").exists(),
+            "typed wake not replayed"
+        );
+        assert!(engine.amq.pending.is_empty());
+
+        // Idempotent, and nothing restarts behind our back.
+        assert_eq!(engine.quiesce_amq_for_exec().released, 0);
+        while engine.worker_rx.try_recv().is_ok() {}
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!matches!(
+            engine.worker_rx.try_recv(),
+            Ok(WorkerEvent::AmqInjectScanRequested)
+        ));
+    }
+
+    #[test]
+    fn quiesce_amq_for_exec_is_safe_when_amq_never_started() {
+        let (mut engine, _tmp, _queue) = engine_with_agent();
+        let report = engine.quiesce_amq_for_exec();
+        assert!(report.poll_thread_stopped);
+        assert_eq!(report.released + report.completed + report.left_inflight, 0);
     }
 
     // ─── orchestrator watchdog ──────────────────────────────────────
