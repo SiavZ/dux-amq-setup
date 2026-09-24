@@ -1874,6 +1874,21 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
         None => out.push_str("# forward_scroll = true\n"),
     }
     out.push_str(
+        "# Whether a plain left-button drag over this agent's pane goes to the\n\
+         # provider once it has turned on mouse reporting. Terminal UI only.\n\
+         #   (unset) or true = forward presses and drags to the provider, as a\n\
+         #                     terminal emulator does.\n\
+         #   false           = keep a plain drag in dux as a text selection so it\n\
+         #                     can be copied; a click that did not move is still\n\
+         #                     sent to the provider when the button comes up.\n\
+         # Shift+drag always selects in dux. The wheel is governed by\n\
+         # forward_scroll above, not by this key.\n",
+    );
+    match config.forward_mouse {
+        Some(value) => out.push_str(&format!("forward_mouse = {value}\n")),
+        None => out.push_str("# forward_mouse = false\n"),
+    }
+    out.push_str(
         "# What a dragged, dropped or pasted file's path looks like when the web UI\n\
          # writes it into this provider's prompt.\n\
          #\n\
@@ -2092,6 +2107,34 @@ mod tests {
         let bindings =
             crate::keybindings::RuntimeBindings::from_keys_config(&KeysConfig::default());
         render_config(config, &bindings)
+    }
+
+    /// Every provider block documents `forward_mouse` inline; the ones that ship
+    /// a value write it, the rest carry the commented example. The rendered
+    /// document must also load back to the same policy.
+    #[test]
+    fn rendered_config_documents_forward_mouse_per_provider() {
+        let rendered = render_config_default(&Config::default());
+        for name in ["claude", "codex", "opencode", "copilot", "jcode"] {
+            let section = rendered
+                .split(&format!("[providers.{name}]\n"))
+                .nth(1)
+                .and_then(|s| s.split("\n[").next())
+                .unwrap_or_else(|| panic!("{name} section"));
+            assert!(
+                section.contains("# Whether a plain left-button drag"),
+                "{name} must document forward_mouse: {section}"
+            );
+            let expected = if matches!(name, "claude" | "codex" | "opencode") {
+                "\nforward_mouse = false\n"
+            } else {
+                "\n# forward_mouse = false\n"
+            };
+            assert!(section.contains(expected), "{name}: {section}");
+        }
+        let parsed: Config = toml::from_str(&rendered).expect("rendered config parses");
+        assert!(!parsed.providers.commands["claude"].forwards_mouse());
+        assert_eq!(parsed.providers.commands["jcode"].forward_mouse, None);
     }
 
     // -----------------------------------------------------------------------
@@ -3264,6 +3307,7 @@ agent_scrollback_lines = 10000
             oneshot_output: Default::default(),
             install_hint: None,
             forward_scroll: None,
+            forward_mouse: None,
             web_dragdrop_paste: None,
             watch: Vec::new(),
         };
@@ -3283,6 +3327,7 @@ agent_scrollback_lines = 10000
             oneshot_output: Default::default(),
             install_hint: None,
             forward_scroll: None,
+            forward_mouse: None,
             web_dragdrop_paste: None,
             watch: Vec::new(),
         };
@@ -3305,6 +3350,7 @@ agent_scrollback_lines = 10000
                     oneshot_output: Default::default(),
                     install_hint: None,
                     forward_scroll: None,
+                    forward_mouse: None,
                     web_dragdrop_paste: None,
                     watch: Vec::new(),
                 },
@@ -3337,6 +3383,7 @@ agent_scrollback_lines = 10000
                     oneshot_output: Default::default(),
                     install_hint: None,
                     forward_scroll: None,
+                    forward_mouse: None,
                     web_dragdrop_paste: None,
                     watch: Vec::new(),
                 },
@@ -3554,6 +3601,7 @@ oneshot_output = "stdout"
                     oneshot_output: Default::default(),
                     install_hint: None,
                     forward_scroll: None,
+                    forward_mouse: None,
                     web_dragdrop_paste: None,
                     watch: Vec::new(),
                 },
@@ -3961,6 +4009,7 @@ args = [\"-l\"]
             oneshot_output: Default::default(),
             install_hint: Some("brew install gemini-cli".to_string()),
             forward_scroll: None,
+            forward_mouse: None,
             web_dragdrop_paste: None,
             watch: Vec::new(),
         };

@@ -780,6 +780,15 @@ fn patch_providers(doc: &mut DocumentMut, providers: &ProvidersConfig) {
             }
         }
 
+        // Write `forward_mouse` only when set, like `forward_scroll`: an absent
+        // key means the terminal-emulator default (forward drags).
+        match config.forward_mouse {
+            Some(value) => tbl["forward_mouse"] = toml_edit::value(value),
+            None => {
+                tbl.remove("forward_mouse");
+            }
+        }
+
         // The drag-and-drop paste form for the WEB UI. Every provider dux ships
         // carries one (`ensure_defaults` fills it in), so in practice this writes;
         // a provider the user added themselves has none and an absent key means
@@ -2197,6 +2206,40 @@ build = { text = \"cargo build\", surface = \"terminal\" }
         assert!(
             !claude_section.contains("forward_scroll"),
             "None must omit forward_scroll; got: {claude_section}"
+        );
+    }
+
+    #[test]
+    fn patch_round_trips_forward_mouse_and_omits_it_when_unset() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            "[providers.claude]\ncommand = \"claude\"\nforward_mouse = true\n",
+        )
+        .expect("write initial");
+
+        let mut config = Config::default();
+        config.providers.commands["claude"].forward_mouse = Some(false);
+        config.providers.commands["jcode"].forward_mouse = None;
+        patch_config_file(&config_path, &config).expect("patch");
+        let saved = fs::read_to_string(&config_path).expect("read back");
+
+        let parsed: Config = toml::from_str(&saved).expect("reparse");
+        assert_eq!(
+            parsed.providers.commands["claude"].forward_mouse,
+            Some(false),
+            "an explicit value must be written: {saved}"
+        );
+        assert_eq!(parsed.providers.commands["jcode"].forward_mouse, None);
+        let jcode_section = saved
+            .split("[providers.jcode]")
+            .nth(1)
+            .and_then(|s| s.split("[providers.").next())
+            .unwrap_or("");
+        assert!(
+            !jcode_section.contains("forward_mouse"),
+            "None must omit forward_mouse; got: {jcode_section}"
         );
     }
 

@@ -6771,6 +6771,21 @@ impl App {
         }
     }
 
+    /// Whether a plain left press/drag over the selected surface goes to a
+    /// mouse-reporting child (`true`) or stays a dux text selection (`false`).
+    /// Agents resolve it from their running provider's `forward_mouse`;
+    /// companion terminals have no provider config and always forward, as a
+    /// terminal emulator does.
+    pub(crate) fn selected_surface_forwards_mouse(&self) -> bool {
+        match self.session_surface {
+            SessionSurface::Agent => self.selected_session().is_none_or(|session| {
+                let provider = self.focused_tab_provider(session);
+                provider_config(&self.engine.config, &provider).forwards_mouse()
+            }),
+            SessionSurface::Terminal => true,
+        }
+    }
+
     /// The id that names the currently selected terminal surface: the focused
     /// tab id for an agent, the terminal id for a companion terminal. `None`
     /// when that surface has no live PTY, so it always agrees with
