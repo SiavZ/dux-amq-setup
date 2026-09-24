@@ -23,6 +23,19 @@ pub fn long() -> String {
 mod tests {
     use super::*;
 
+    /// Fork name (3dd80427). The fork stamped the Cargo package version;
+    /// here the prefix is `display_version()`, which is what every surface
+    /// shows. build.rs always emits a non-empty stamp ("unknown" outside a
+    /// checkout), so something must follow the `+`.
+    #[test]
+    fn long_embeds_pkg_version_and_commit() {
+        let v = long();
+        assert!(v.starts_with(crate::display_version()));
+        assert!(v.ends_with(GIT_COMMIT));
+        let stamp = v.split('+').nth(1).unwrap_or("");
+        assert!(!stamp.is_empty());
+    }
+
     #[test]
     fn long_embeds_display_version_and_commit() {
         let v = long();

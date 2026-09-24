@@ -10511,7 +10511,10 @@ impl App {
 
     fn route_mouse_wheel(&mut self, mouse: MouseEvent, down: bool) {
         match self.mouse_target(mouse.column, mouse.row) {
-            Some(MouseTarget::LeftRow(_)) => {
+            // The pane's border, title and empty space scroll the list too
+            // (fork aaa59319): with more agents than fit, a wheel anywhere over
+            // the pane must reach the rows below the fold.
+            Some(MouseTarget::LeftRow(_) | MouseTarget::LeftPane) => {
                 self.handle_left_mouse_wheel(down, mouse.column, mouse.row)
             }
             Some(MouseTarget::Center) => self.handle_center_mouse_wheel(mouse),
@@ -19663,6 +19666,49 @@ not_a_real_action = ["x"]
 
         assert_eq!(app.input_target, InputTarget::Agent);
         assert_eq!(app.fullscreen_overlay, FullscreenOverlay::Agent);
+    }
+
+    /// Fork aaa59319: with more agents than the left pane can show, the wheel
+    /// over the pane (here its title border, not a row) walks the selection and
+    /// the rendered list follows it, so rows below the fold become reachable.
+    /// Drives the real renderer, which owns the list offset upstream.
+    #[test]
+    fn mouse_wheel_left_pane_scrolls_overflowing_agent_list() {
+        let mut app = test_app(default_bindings());
+        let now = Utc::now();
+        app.engine.sessions.clear();
+        for i in 0..40 {
+            let id = format!("s{i:02}");
+            app.engine.sessions.push(filter_test_session(
+                &id,
+                &format!("agent-{i:02}"),
+                "project-1",
+                now,
+            ));
+        }
+        app.rebuild_left_items();
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 20)).expect("terminal");
+        draw_frame(&mut app, &mut terminal);
+        let first_row = app.mouse_layout.left_row_to_item.first().copied();
+        let left = app.mouse_layout.left;
+
+        for _ in 0..30 {
+            app.handle_mouse(mouse(MouseEventKind::ScrollDown, left.x + 2, left.y));
+            draw_frame(&mut app, &mut terminal);
+        }
+
+        assert_eq!(app.focus, FocusPane::Left);
+        let map = &app.mouse_layout.left_row_to_item;
+        assert!(
+            map.contains(&app.selected_left),
+            "the selected row {} must be on screen after wheeling: {map:?}",
+            app.selected_left
+        );
+        assert_ne!(
+            map.first().copied(),
+            first_row,
+            "the list must have scrolled past its first screenful"
+        );
     }
 
     #[test]
