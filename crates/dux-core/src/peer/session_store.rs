@@ -127,32 +127,53 @@ fn launch_env_with_root(
     amq_root: Option<&Path>,
 ) -> Result<Vec<(String, String)>> {
     let store_id = load_or_create_store_id(&paths.root)?;
+    let mut peer = peer_session(session, session.agent_handle().to_string(), false);
     // The engine has already opened and migrated this database; a launch only
-    // reads handles and may swap one, so it must not rerun the migration.
-    let store = SessionStore::open_existing(&paths.sessions_db_path)
-        .with_context(|| format!("failed to open {}", paths.sessions_db_path.display()))?;
-    let rows = store.load_sessions_including_deleted()?;
+    // reads handles and may swap one, so it must not rerun the migration. A
+    // database that was never migrated (no engine yet) has no rows to read.
+    let rows = if paths.sessions_db_path.exists() {
+        let store = SessionStore::open_existing(&paths.sessions_db_path)
+            .with_context(|| format!("failed to open {}", paths.sessions_db_path.display()))?;
+        match store.load_sessions_including_deleted() {
+            Ok(rows) => Some((store, rows)),
+            Err(_) if !store.has_session_table()? => None,
+            Err(err) => return Err(err),
+        }
+    } else {
+        None
+    };
     // The stored row is authoritative: a global backfill may have moved this
-    // session's handle since the in-memory copy was loaded. A session with no
-    // row yet (a test, or a launch racing its own create) uses its own value.
-    let handle = rows.iter().find(|row| row.id == session.id).map_or_else(
-        || session.agent_handle().to_string(),
-        |row| row.agent_handle().to_string(),
-    );
-    let mut peer = peer_session(session, handle, false);
+    // session's handle since the in-memory copy was loaded. A create launches
+    // before its row is written, so it keeps its own derived value.
+    let stored = rows
+        .as_ref()
+        .is_some_and(|(_, rows)| rows.iter().any(|row| row.id == session.id));
+    if let Some((_, rows)) = &rows
+        && let Some(row) = rows.iter().find(|row| row.id == session.id)
+    {
+        peer.agent_handle = row.agent_handle().to_string();
+    }
     if let Some(root) = amq_root {
+        // With a shared root the inbox is reserved up front, so the handle the
+        // provider is told is one this session provably owns.
         let used = rows
-            .iter()
-            .filter(|row| row.id != session.id)
-            .map(|row| row.agent_handle().to_string())
-            .collect::<HashSet<_>>();
+            .as_ref()
+            .map(|(_, rows)| {
+                rows.iter()
+                    .filter(|row| row.id != session.id)
+                    .map(|row| row.agent_handle().to_string())
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
         let owned = super::amq::claim_handle_at_root(root, &store_id, &peer, &used)?;
         if owned != peer.agent_handle {
-            store.reassign_agent_handle_for_global_backfill(
-                &peer.id,
-                &peer.agent_handle,
-                &owned,
-            )?;
+            if stored && let Some((store, _)) = &rows {
+                store.reassign_agent_handle_for_global_backfill(
+                    &peer.id,
+                    &peer.agent_handle,
+                    &owned,
+                )?;
+            }
             peer.agent_handle = owned;
         }
     }

@@ -162,6 +162,21 @@ impl SessionStore {
         Self::connect(path)
     }
 
+    /// Whether this database has been migrated at all (its sessions table
+    /// exists). A reader on an [`Self::open_existing`] connection uses it to
+    /// tell "no rows yet" from a real error.
+    pub fn has_session_table(&self) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "select 1 from sqlite_master where type = 'table' and name = 'agent_sessions'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
     fn connect(path: &std::path::Path) -> Result<Self> {
         let conn =
             Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
