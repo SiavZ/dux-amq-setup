@@ -769,7 +769,7 @@ mod tests {
                 PromptState::ChangeAgentProvider(ChangeAgentProviderPrompt {
                     session_id: "s1".to_string(),
                     tab_id: "s1".to_string(),
-                    session_label: "agent".to_string(),
+                    session_label: "my cool agent".to_string(),
                     worktree_path: "/tmp/wt".to_string(),
                     options: vec![ChangeAgentProviderOption {
                         provider: ProviderKind::new("claude"),
@@ -784,7 +784,7 @@ mod tests {
             (
                 "AgentInfo",
                 PromptState::AgentInfo(AgentInfoPrompt {
-                    session_label: "agent".to_string(),
+                    session_label: "my cool agent".to_string(),
                     lines: vec![("Name: agent".to_string(), AgentInfoTone::Neutral)],
                 }),
             ),
@@ -873,7 +873,7 @@ mod tests {
             (
                 "StartupCommandLogs",
                 PromptState::StartupCommandLogs(StartupCommandLogPrompt {
-                    scope_label: "demo".to_string(),
+                    scope_label: "my cool project".to_string(),
                     entries: Vec::new(),
                     selected: 0,
                     filter: TextInput::new(),
@@ -947,7 +947,7 @@ mod tests {
                     delete_branch: false,
                     unpushed_commits: None,
                     session_id: "s1".to_string(),
-                    agent_label: "b".to_string(),
+                    agent_label: "my cool agent".to_string(),
                     target: crate::app::DeleteAgentTarget::Managed {
                         branch_name: "b".to_string(),
                         initial_branch: "wt-branch".to_string(),
@@ -962,7 +962,7 @@ mod tests {
                 "ConfirmDeleteTerminal",
                 PromptState::ConfirmDeleteTerminal {
                     terminal_id: "t1".to_string(),
-                    terminal_label: "Terminal 1".to_string(),
+                    terminal_label: "My Cool Terminal".to_string(),
                     foreground_cmd: None,
                     focus: ConfirmFocus::Cancel,
                 },
@@ -972,8 +972,8 @@ mod tests {
                 PromptState::ConfirmCloseTab {
                     session_id: "s1".to_string(),
                     tab_id: "t1".to_string(),
-                    provider_label: "Claude".to_string(),
-                    promoted_label: None,
+                    provider_label: "Claude Code".to_string(),
+                    promoted_label: Some("Codex Two".to_string()),
                     focus: ConfirmFocus::Cancel,
                 },
             ),
@@ -981,7 +981,7 @@ mod tests {
                 "ConfirmDetachAgent",
                 PromptState::ConfirmDetachAgent {
                     session_id: "s1".to_string(),
-                    label: "feat".to_string(),
+                    label: "my cool agent".to_string(),
                     grace_seconds: 30,
                     live_tabs: 1,
                     focus: ConfirmFocus::Cancel,
@@ -1003,7 +1003,7 @@ mod tests {
                 "ConfirmCheckoutDefaultBranch",
                 PromptState::ConfirmCheckoutDefaultBranch {
                     project_id: "p1".to_string(),
-                    project_name: "repo".to_string(),
+                    project_name: "My Cool Project".to_string(),
                     stored_base: Some("develop".to_string()),
                     focus: ConfirmFocus::Cancel,
                 },
@@ -1012,7 +1012,7 @@ mod tests {
                 "ConfirmDeleteProject",
                 PromptState::ConfirmDeleteProject {
                     project_id: "p1".to_string(),
-                    project_name: "repo".to_string(),
+                    project_name: "My Cool Project".to_string(),
                     agent_count: 2,
                     focus: ConfirmFocus::Cancel,
                 },
@@ -1021,7 +1021,7 @@ mod tests {
                 "ConfirmRemoveProject",
                 PromptState::ConfirmRemoveProject {
                     project_id: "p1".to_string(),
-                    project_name: "repo".to_string(),
+                    project_name: "My Cool Project".to_string(),
                     agent_count: 0,
                     orphaned: false,
                     focus: ConfirmFocus::Cancel,
@@ -1038,7 +1038,7 @@ mod tests {
             (
                 "ConfirmDiscardFile",
                 PromptState::ConfirmDiscardFile {
-                    file_path: "a.txt".to_string(),
+                    file_path: "my notes.txt".to_string(),
                     focus: ConfirmFocus::Cancel,
                 },
             ),
@@ -1079,7 +1079,7 @@ mod tests {
             (
                 "NameStandaloneAgent",
                 PromptState::NameStandaloneAgent {
-                    folder: "/home/ada/notes".to_string(),
+                    folder: "/home/ada/my notes".to_string(),
                     input: TextInput::new(),
                 },
             ),
@@ -1097,7 +1097,7 @@ mod tests {
             (
                 "PickEditor",
                 PromptState::PickEditor {
-                    session_label: "agent".to_string(),
+                    session_label: "my cool agent".to_string(),
                     worktree_path: "/tmp/wt".to_string(),
                     editors: Vec::new(),
                     selected: 0,
@@ -1321,6 +1321,112 @@ mod tests {
             offenders.is_empty(),
             "these dialogs quote a name instead of drawing it as a chip:\n{}",
             offenders.join("\n")
+        );
+    }
+
+    /// Paint `prompt` into a `width` x `height` buffer.
+    fn painted_buffer(
+        app: &mut App,
+        prompt: PromptState,
+        width: u16,
+        height: u16,
+    ) -> ratatui::buffer::Buffer {
+        app.prompt = prompt;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("render");
+        terminal.backend().buffer().clone()
+    }
+
+    /// Every chip-colored run the dialog added to a row that begins mid-name,
+    /// as `(row, run)`. A chip opens on its pad space, so a run that does not
+    /// is the continuation of a name the wrap cut across rows. A run that opens
+    /// on its pad but ends early is a name clipped by the edge of a row that
+    /// does not wrap, which is a different question. Cells already
+    /// chip-colored with no dialog open belong to the screen behind it.
+    fn split_chips(
+        buf: &ratatui::buffer::Buffer,
+        baseline: &ratatui::buffer::Buffer,
+        name_bg: ratatui::style::Color,
+    ) -> Vec<(u16, String)> {
+        let area = buf.area;
+        let mut found = Vec::new();
+        for y in 0..area.height {
+            let mut x = 0;
+            while x < area.width {
+                let is_chip = |x: u16| buf[(x, y)].bg == name_bg && baseline[(x, y)] != buf[(x, y)];
+                if !is_chip(x) {
+                    x += 1;
+                    continue;
+                }
+                let start = x;
+                while x < area.width && is_chip(x) {
+                    x += 1;
+                }
+                let run: String = (start..x).map(|cx| buf[(cx, y)].symbol()).collect();
+                if !run.starts_with(' ') {
+                    found.push((y, run));
+                }
+            }
+        }
+        found
+    }
+
+    /// The chip rule's other half: a name is one unit, so no dialog may cut
+    /// one across rows, at any width where the name fits on a row at all. The
+    /// fixtures carry multi-word names where a name is free text, because a
+    /// space inside a name is exactly where a word wrap would cut it.
+    #[test]
+    fn no_dialog_splits_a_chip_across_rows() {
+        let mut app = test_app(default_bindings());
+        app.engine.projects[0].name = "My Cool Project".to_string();
+        let name_bg = app.theme.name_bg;
+        let mut offenders = Vec::new();
+        for width in 44..=100u16 {
+            let baseline = painted_buffer(&mut app, PromptState::None, width, 40);
+            for (name, prompt) in every_prompt(&app) {
+                let buf = painted_buffer(&mut app, prompt, width, 40);
+                for (row, run) in split_chips(&buf, &baseline, name_bg) {
+                    offenders.push(format!("{name} at width {width}, row {row}: {run:?}"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these dialogs cut a name across rows:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// The split scan on the shapes it must catch and the ones it must not.
+    #[test]
+    fn the_split_chip_scan_tells_a_whole_chip_from_half_of_one() {
+        use ratatui::buffer::Buffer;
+        use ratatui::style::{Color, Style};
+        let bg = Color::Rgb(1, 2, 3);
+        let chip = Style::default().bg(bg);
+        let blank = Buffer::empty(Rect::new(0, 0, 12, 2));
+        let mut buf = blank.clone();
+        buf.set_string(0, 0, "a ", Style::default());
+        buf.set_string(2, 0, " My Cool ", chip);
+        assert!(split_chips(&buf, &blank, bg).is_empty(), "a whole chip");
+        let mut clipped = blank.clone();
+        clipped.set_string(8, 0, " My ", chip);
+        clipped.set_string(10, 1, " M", chip);
+        assert!(
+            split_chips(&clipped, &blank, bg).is_empty(),
+            "a chip clipped by the row's edge is not a split"
+        );
+        let mut cut = blank.clone();
+        cut.set_string(9, 0, " My", chip);
+        cut.set_string(0, 1, "Cool ", chip);
+        assert_eq!(
+            split_chips(&cut, &blank, bg),
+            vec![(1, "Cool ".to_string())],
+            "the continuation row is what proves the cut"
+        );
+        assert!(
+            split_chips(&cut, &cut, bg).is_empty(),
+            "chip colors already on screen with no dialog open are not the dialog's"
         );
     }
 
