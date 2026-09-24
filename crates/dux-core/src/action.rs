@@ -212,6 +212,9 @@ pub enum Action {
     MoveTerminalDown,
     MoveTerminalTop,
     MoveTerminalBottom,
+    /// Palette-only: list every watch rule on the live agent tabs with its
+    /// state, and disarm or re-arm the selected one.
+    WatchRules,
 }
 
 impl Action {
@@ -355,6 +358,7 @@ impl Action {
             Action::MoveTerminalDown => "move_terminal_down",
             Action::MoveTerminalTop => "move_terminal_top",
             Action::MoveTerminalBottom => "move_terminal_bottom",
+            Action::WatchRules => "watch_rules",
         }
     }
 
@@ -617,6 +621,7 @@ impl Action {
             Action::MoveTerminalBottom => {
                 "Move the selected terminal to the bottom (switches sorting to manual)."
             }
+            Action::WatchRules => "List the watch rules on running tabs and disarm or re-arm one.",
         }
     }
 
@@ -756,7 +761,8 @@ impl Action {
             | Action::MoveTerminalUp
             | Action::MoveTerminalDown
             | Action::MoveTerminalTop
-            | Action::MoveTerminalBottom => None,
+            | Action::MoveTerminalBottom
+            | Action::WatchRules => None,
         }
     }
 }

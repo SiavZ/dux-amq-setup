@@ -4423,9 +4423,9 @@ mod web_dragdrop_paste_render_tests {
         );
     }
 
-    /// `restore-docs` re-renders the whole file from the parsed config, so the
-    /// renderer must emit configured rules as real entries. A rule with every
-    /// field set, including a regex with backslashes and quotes, must survive.
+    /// Configured rules survive `restore-docs` and a first-creation render. A
+    /// rule with every field set, including a regex with backslashes and
+    /// quotes, must round-trip exactly.
     #[test]
     fn restore_docs_keeps_configured_watch_rules() {
         let raw = "[providers.claude]\ncommand = \"claude\"\n\n\
@@ -4442,6 +4442,7 @@ mod web_dragdrop_paste_render_tests {
                    cooldown_ms = 7\n\n\
                    [[providers.claude.watch]]\n\
                    pattern = \"second\"\n\
+                   action = \"send_text\"\n\
                    text = \"x\"\n";
         let before: Config = toml::from_str(raw).expect("fixture parses");
         let restored = restore_documentation(raw).expect("restore");
@@ -4452,5 +4453,16 @@ mod web_dragdrop_paste_render_tests {
             restored.text
         );
         assert_eq!(after.providers.commands["claude"].watch.len(), 2);
+
+        // First creation writes the documented render of the in-memory config
+        // with no original file to merge from, so the renderer itself must emit
+        // the rules or a config born from them (dux serve's bootstrap, a web
+        // save onto a missing file) would lose them.
+        let rendered = render_config_documented(&before);
+        let reparsed: Config = toml::from_str(&rendered).expect("rendered parses");
+        assert_eq!(
+            before.providers.commands["claude"].watch, reparsed.providers.commands["claude"].watch,
+            "{rendered}"
+        );
     }
 }

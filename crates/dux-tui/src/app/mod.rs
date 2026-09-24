@@ -1594,6 +1594,15 @@ pub(crate) fn agent_info_lines(
     lines
 }
 
+/// The watch-rules list: every rule on every live agent tab, with Enter to
+/// disarm or re-arm the highlighted one. Rows are a snapshot refreshed after
+/// each toggle.
+#[derive(Clone, Debug)]
+pub(crate) struct WatchRulesPrompt {
+    pub(crate) rows: Vec<dux_core::engine::WatchRuleRow>,
+    pub(crate) selected: usize,
+}
+
 /// One row of the Tailscale-mode picker.
 #[derive(Clone, Debug)]
 pub(crate) struct SetTailscaleModeOption {
@@ -2198,6 +2207,7 @@ pub(crate) enum PromptState {
     ChangeDefaultProvider(ChangeDefaultProviderPrompt),
     ChangeProjectDefaultProvider(ChangeProjectDefaultProviderPrompt),
     SetTailscaleMode(SetTailscaleModePrompt),
+    WatchRules(WatchRulesPrompt),
     ChangeTheme(ChangeThemePrompt),
     ConfigureStartupCommand {
         project_id: String,
@@ -5035,6 +5045,10 @@ impl App {
             "change-project-default-provider" => self.open_change_project_default_provider_prompt(),
             "change-theme" => self.open_change_theme_prompt(),
             "reload-config" => self.reload_config_from_disk(),
+            "watch-rules" => {
+                self.open_watch_rules_prompt();
+                Ok(())
+            }
             "reload-binary" => {
                 // Every refusal is reported by `request_reload` on the status
                 // line, so there is no error to return here: an `Err` would be

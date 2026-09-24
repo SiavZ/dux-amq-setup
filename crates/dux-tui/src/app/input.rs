@@ -1882,7 +1882,8 @@ impl App {
             | PromptState::ChangeAgentProvider(_)
             | PromptState::ChangeDefaultProvider(_)
             | PromptState::ChangeProjectDefaultProvider(_)
-            | PromptState::SetTailscaleMode(_) => {}
+            | PromptState::SetTailscaleMode(_)
+            | PromptState::WatchRules(_) => {}
         }
         if refresh_path_completions {
             self.refresh_path_editor_completions();
@@ -4423,6 +4424,24 @@ impl App {
         Ok(Some(false))
     }
 
+    fn handle_watch_rules_prompt_key(&mut self, key: KeyEvent) -> Option<bool> {
+        let PromptState::WatchRules(prompt) = &mut self.prompt else {
+            return None;
+        };
+        let palette_action = self.bindings.lookup(&key, BindingScope::Palette);
+        let dialog_action = self.bindings.lookup(&key, BindingScope::Dialog);
+        match palette_action.or(dialog_action) {
+            Some(Action::CloseOverlay) => self.prompt = PromptState::None,
+            Some(Action::MoveDown) if prompt.selected + 1 < prompt.rows.len() => {
+                prompt.selected += 1;
+            }
+            Some(Action::MoveUp) if prompt.selected > 0 => prompt.selected -= 1,
+            Some(Action::Confirm) => self.toggle_selected_watch_rule(),
+            _ => {}
+        }
+        Some(false)
+    }
+
     fn handle_set_tailscale_mode_prompt_key(&mut self, key: KeyEvent) -> Option<bool> {
         let PromptState::SetTailscaleMode(prompt) = &mut self.prompt else {
             return None;
@@ -5318,6 +5337,9 @@ impl App {
         }
         if let Some(which) = provider_picker_kind(&self.prompt) {
             return Ok(Some(self.handle_provider_picker_key(key, which)?));
+        }
+        if let Some(exit) = self.handle_watch_rules_prompt_key(key) {
+            return Ok(Some(exit));
         }
         if let Some(exit) = self.handle_set_tailscale_mode_prompt_key(key) {
             return Ok(Some(exit));
@@ -21360,6 +21382,173 @@ not_a_real_action = ["x"]
             .into_iter()
             .filter_map(|binding| binding.palette_name)
             .collect()
+    }
+
+    // ── Watch-rules palette modal (fork 042ac638) ─────────────────────
+
+    fn make_watch_rule(label: &str, pattern: &str) -> dux_core::watch::WatchRule {
+        dux_core::watch::WatchRule {
+            pattern: pattern.to_string(),
+            label: label.to_string(),
+            action: dux_core::watch::WatchAction::SendText {
+                text: "please continue".to_string(),
+                append_enter: true,
+            },
+            backoff: dux_core::watch::WatchBackoff::default(),
+            budget: dux_core::watch::WatchBudget { max_attempts: 5 },
+            cooldown_ms: 1_000,
+            ..Default::default()
+        }
+    }
+
+    /// A test app whose agent's slot tab is live (a `cat` PTY) and whose
+    /// provider (codex, the fixture's) carries `rules`, with one engine tick
+    /// run so the engines are attached exactly as in production.
+    fn watch_app(rules: Vec<dux_core::watch::WatchRule>) -> App {
+        let mut app = test_app(default_bindings());
+        let mut codex = dux_core::config::ProviderCommandConfig {
+            command: "codex".to_string(),
+            ..Default::default()
+        };
+        codex.watch = rules;
+        app.engine
+            .config
+            .providers
+            .commands
+            .insert("codex".to_string(), codex);
+        app.engine.providers.insert(
+            app.engine.sessions[0].slot_tab_id().to_owned(),
+            PtyClient::spawn("cat", &[], &std::env::temp_dir(), 24, 80, 100).expect("cat"),
+        );
+        app.engine.tick_watch_rules();
+        app
+    }
+
+    fn watch_prompt(app: &App) -> &crate::app::WatchRulesPrompt {
+        let PromptState::WatchRules(prompt) = &app.prompt else {
+            panic!("expected the watch-rules prompt, got {:?}", app.prompt);
+        };
+        prompt
+    }
+
+    #[test]
+    fn the_watch_rules_command_opens_the_list_from_the_palette() {
+        let app = palette_app("watch", 0);
+        assert!(palette_names(&app, "watch").contains(&"watch-rules"));
+        let mut app = watch_app(vec![make_watch_rule("throttle", "rate limited")]);
+        app.execute_command("watch-rules".to_string())
+            .expect("watch-rules");
+        assert_eq!(watch_prompt(&app).rows.len(), 1);
+    }
+
+    /// No engines loaded: an empty list, and the renderer points at config.toml.
+    #[test]
+    fn open_watch_rules_prompt_empty_state() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_app(default_bindings());
+        app.open_watch_rules_prompt();
+        assert!(watch_prompt(&app).rows.is_empty());
+        assert_eq!(watch_prompt(&app).selected, 0);
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("render");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("No watch rules are loaded"), "{rendered}");
+    }
+
+    #[test]
+    fn open_watch_rules_prompt_lists_attached_rules() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = watch_app(vec![
+            make_watch_rule("throttle", "rate limited"),
+            make_watch_rule("usage-limit", "Claude usage limit reached"),
+        ]);
+        app.open_watch_rules_prompt();
+        let prompt = watch_prompt(&app);
+        assert_eq!(prompt.rows.len(), 2);
+        assert_eq!(prompt.rows[0].snapshot.label, "throttle");
+        assert_eq!(prompt.rows[1].snapshot.label, "usage-limit");
+        assert_eq!(prompt.rows[0].session_id, app.engine.sessions[0].id);
+        assert!(matches!(
+            prompt.rows[0].snapshot.state,
+            dux_core::watch::RuleStateKind::Idle
+        ));
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("render");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("armed"), "{rendered}");
+        assert!(rendered.contains("usage-limit"), "{rendered}");
+        assert!(rendered.contains("0/5"), "{rendered}");
+    }
+
+    /// Enter disarms, Enter again re-arms, and the row's badge follows without
+    /// reopening the list.
+    #[test]
+    fn toggle_selected_watch_rule_disarms_then_rearms() {
+        let mut app = watch_app(vec![make_watch_rule("test", "trigger")]);
+        app.open_watch_rules_prompt();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("enter");
+        assert!(matches!(
+            watch_prompt(&app).rows[0].snapshot.state,
+            dux_core::watch::RuleStateKind::Disarmed
+        ));
+        let tab = app.engine.sessions[0].slot_tab_id().to_owned();
+        assert!(app.engine.watch.attached[&tab].engine.is_disarmed(0));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("enter");
+        assert!(matches!(
+            watch_prompt(&app).rows[0].snapshot.state,
+            dux_core::watch::RuleStateKind::Idle
+        ));
+        assert!(!app.engine.watch.attached[&tab].engine.is_disarmed(0));
+    }
+
+    #[test]
+    fn watch_rules_modal_closes_on_close_overlay_action() {
+        let mut app = watch_app(vec![make_watch_rule("test", "trigger")]);
+        app.open_watch_rules_prompt();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("esc");
+        assert!(matches!(app.prompt, PromptState::None), "{:?}", app.prompt);
+    }
+
+    #[test]
+    fn watch_rules_modal_navigates_with_arrows() {
+        let mut app = watch_app(vec![
+            make_watch_rule("a", "p1"),
+            make_watch_rule("b", "p2"),
+            make_watch_rule("c", "p3"),
+        ]);
+        app.open_watch_rules_prompt();
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        app.handle_key(down).expect("down");
+        assert_eq!(watch_prompt(&app).selected, 1);
+        app.handle_key(down).expect("down");
+        assert_eq!(watch_prompt(&app).selected, 2);
+        app.handle_key(down).expect("down");
+        assert_eq!(watch_prompt(&app).selected, 2, "clamps at the end");
+        app.handle_key(up).expect("up");
+        assert_eq!(watch_prompt(&app).selected, 1);
     }
 
     #[test]

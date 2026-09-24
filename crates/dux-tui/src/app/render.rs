@@ -5465,6 +5465,102 @@ impl App {
         };
     }
 
+    fn render_watch_rules_prompt(&mut self, frame: &mut Frame) {
+        let PromptState::WatchRules(prompt) = &self.prompt else {
+            return;
+        };
+        self.render_dim_overlay(frame);
+        let area = centered_rect(72, 60, frame.area());
+        self.clear_overlay_area(frame, area);
+
+        let move_down = self.bindings.label_for(Action::MoveDown);
+        let move_up = self.bindings.label_for(Action::MoveUp);
+        let confirm_key = self.bindings.label_for(Action::Confirm);
+        let close_key = self.bindings.label_for(Action::CloseOverlay);
+        let key = Style::default().fg(self.theme.hint_key_fg);
+        let desc = Style::default().fg(self.theme.hint_desc_fg);
+        let bottom_spans = vec![
+            Span::styled(format!(" {move_up}/{move_down} "), key),
+            Span::styled("move  ", desc),
+            Span::styled(format!("{confirm_key} "), key),
+            Span::styled("disarm / re-arm", desc),
+            Span::styled(format!("  {close_key} "), key),
+            Span::styled("close ", desc),
+        ];
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(self.theme.overlay_border))
+            .style(Style::default().bg(self.theme.overlay_bg))
+            .title(" Watch rules ")
+            .title_style(
+                Style::default()
+                    .fg(self.theme.title_focused)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .title_bottom(Line::from(bottom_spans));
+
+        if prompt.rows.is_empty() {
+            let body = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    " No watch rules are loaded on a running tab.",
+                    Style::default().fg(self.theme.text_fg),
+                )),
+                Line::from(Span::styled(
+                    " Add [[providers.<name>.watch]] entries to config.toml; the file has \
+                     commented examples under [providers.claude].",
+                    desc,
+                )),
+            ])
+            .wrap(Wrap { trim: false })
+            .block(block);
+            frame.render_widget(body, area);
+            return;
+        }
+
+        let items = prompt
+            .rows
+            .iter()
+            .map(|row| {
+                let (badge, color) = watch_rule_badge(row.snapshot.state, &self.theme);
+                let budget = if row.snapshot.max_attempts == 0 {
+                    format!("{}/unlimited", row.snapshot.attempts_made)
+                } else {
+                    format!(
+                        "{}/{}",
+                        row.snapshot.attempts_made, row.snapshot.max_attempts
+                    )
+                };
+                let session = self
+                    .engine
+                    .session_by_id(&row.session_id)
+                    .map(|s| s.display_label())
+                    .unwrap_or_else(|| row.session_id.clone());
+                let built_in = if row.built_in { " (built-in)" } else { "" };
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!(" {badge:<9}"),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("{}{built_in}", row.snapshot.label),
+                        Style::default().fg(self.theme.text_fg),
+                    ),
+                    Span::styled(format!("  {session} · {budget}"), desc),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        let mut state =
+            ListState::default().with_selected(Some(prompt.selected.min(prompt.rows.len() - 1)));
+        StatefulWidget::render(
+            List::new(items)
+                .block(block)
+                .highlight_style(self.theme.selection_style()),
+            area,
+            frame.buffer_mut(),
+            &mut state,
+        );
+    }
+
     fn render_set_tailscale_mode_prompt(&mut self, frame: &mut Frame) {
         let PromptState::SetTailscaleMode(prompt) = &self.prompt else {
             return;
@@ -10484,6 +10580,7 @@ impl App {
                 self.render_change_project_default_provider_prompt(frame)
             }
             PromptState::SetTailscaleMode(_) => self.render_set_tailscale_mode_prompt(frame),
+            PromptState::WatchRules(_) => self.render_watch_rules_prompt(frame),
             PromptState::ChangeTheme(_) => self.render_change_theme_prompt(frame),
             PromptState::StartupCommandLogs(_) => self.render_startup_command_logs_prompt(frame),
             PromptState::PickEditor { .. } => self.render_pick_editor_prompt(frame),
@@ -12861,6 +12958,17 @@ fn confirm_close_tab_tail(will_detach: bool, successor: Option<&str>) -> String 
         ));
     }
     tail
+}
+
+/// The state word and color for one watch-rule row.
+fn watch_rule_badge(state: dux_core::watch::RuleStateKind, theme: &Theme) -> (&'static str, Color) {
+    use dux_core::watch::RuleStateKind;
+    match state {
+        RuleStateKind::Idle => ("armed", theme.status_info_fg),
+        RuleStateKind::Pending => ("pending", theme.status_busy_fg),
+        RuleStateKind::Cooling => ("cooling", theme.hint_desc_fg),
+        RuleStateKind::Disarmed => ("disarmed", theme.warning_fg),
+    }
 }
 
 #[cfg(test)]

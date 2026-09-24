@@ -1481,6 +1481,14 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         help: None,
         hint_contexts: &[],
     },
+    BindingDef {
+        // Palette-only: an occasional management view, not a hot path.
+        action: Action::WatchRules,
+        default_keys: &[],
+        scopes: &[],
+        help: None,
+        hint_contexts: &[],
+    },
 ];
 
 const HELP_SECTION_ORDER: &[&str] = &[
@@ -3273,6 +3281,7 @@ mod tests {
             "toggle-remove-git-pane",
             "toggle-sidebar",
             "toggle-tab-to-agent",
+            "watch-rules",
         ];
 
         assert_eq!(
