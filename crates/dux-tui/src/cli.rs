@@ -1214,7 +1214,20 @@ mod tests {
                     .map(|v| serde_json::json!(v));
                 raised.into_iter().chain(lowered).collect()
             }
-            serde_json::Value::String(s) => vec![serde_json::json!(format!("{s}-mutated"))],
+            // A free-form string mutates by suffixing, but a leaf whose type is a
+            // CLOSED SET (a serde enum such as `oneshot_output`) refuses the
+            // suffixed value at deserialization, leaving no candidate at all. So
+            // offer the other spellings of every such enum too, and let the
+            // round-trip below pick whichever one this leaf actually accepts.
+            serde_json::Value::String(s) => {
+                let mut candidates = vec![serde_json::json!(format!("{s}-mutated"))];
+                for alternative in ["stdout", "tempfile"] {
+                    if alternative != s {
+                        candidates.push(serde_json::json!(alternative));
+                    }
+                }
+                candidates
+            }
             serde_json::Value::Array(items) => {
                 let mut grown = items.clone();
                 grown.push(serde_json::json!("dux-diff-probe"));

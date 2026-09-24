@@ -3141,6 +3141,9 @@ agent_scrollback_lines = 10000
             args: vec!["--interactive".to_string()],
             resume_args: Some(vec!["--resume".to_string(), "--last".to_string()]),
             resume_wait_timeout_ms: Some(2_000),
+            resume_by_id_args: None,
+            oneshot_args: Vec::new(),
+            oneshot_output: Default::default(),
             install_hint: None,
             forward_scroll: None,
             web_dragdrop_paste: None,
@@ -3156,6 +3159,9 @@ agent_scrollback_lines = 10000
             args: vec!["--interactive".to_string()],
             resume_args: None,
             resume_wait_timeout_ms: None,
+            resume_by_id_args: None,
+            oneshot_args: Vec::new(),
+            oneshot_output: Default::default(),
             install_hint: None,
             forward_scroll: None,
             web_dragdrop_paste: None,
@@ -3174,6 +3180,9 @@ agent_scrollback_lines = 10000
                     args: Vec::new(),
                     resume_args: None,
                     resume_wait_timeout_ms: None,
+                    resume_by_id_args: None,
+                    oneshot_args: Vec::new(),
+                    oneshot_output: Default::default(),
                     install_hint: None,
                     forward_scroll: None,
                     web_dragdrop_paste: None,
@@ -3202,6 +3211,9 @@ agent_scrollback_lines = 10000
                     args: Vec::new(),
                     resume_args: Some(Vec::new()),
                     resume_wait_timeout_ms: None,
+                    resume_by_id_args: None,
+                    oneshot_args: Vec::new(),
+                    oneshot_output: Default::default(),
                     install_hint: None,
                     forward_scroll: None,
                     web_dragdrop_paste: None,
@@ -3305,7 +3317,11 @@ oneshot_output = "stdout"
     #[test]
     fn default_provider_commands_excludes_retired_gemini() {
         let providers = default_provider_commands();
-        assert_eq!(providers.len(), 4, "four providers ship as defaults");
+        assert_eq!(
+            providers.len(),
+            5,
+            "five providers ship as defaults: claude, codex, opencode, copilot, jcode"
+        );
         assert!(
             providers.iter().all(|(name, _)| *name != "gemini"),
             "gemini was retired and must not ship as a default provider"
@@ -3411,6 +3427,9 @@ oneshot_output = "stdout"
                     args: Vec::new(),
                     resume_args: Some(vec!["--continue".to_string()]),
                     resume_wait_timeout_ms: None,
+                    resume_by_id_args: None,
+                    oneshot_args: Vec::new(),
+                    oneshot_output: Default::default(),
                     install_hint: None,
                     forward_scroll: None,
                     web_dragdrop_paste: None,
@@ -3814,6 +3833,9 @@ args = [\"-l\"]
             args: Vec::new(),
             resume_args: Some(vec!["--resume".to_string()]),
             resume_wait_timeout_ms: None,
+            resume_by_id_args: None,
+            oneshot_args: Vec::new(),
+            oneshot_output: Default::default(),
             install_hint: Some("brew install gemini-cli".to_string()),
             forward_scroll: None,
             web_dragdrop_paste: None,
