@@ -100,7 +100,7 @@ The web UI (`crates/dux-web/web/`, React + Vite + Tailwind) has its own conventi
 
 - **A provider is supported if and only if it supports PTY mode.** dux embeds the CLI's interactive session in a pseudo-terminal; that is the only thing a provider has to support.
 - **Any CLI tool can be a provider.** Configure `command` in `config.toml` and dux spawns it. No adapters, no protocol layer. Adding a new provider is a config-only change, not a code change.
-- **Claude, Codex, OpenCode, Copilot, and jcode are the defaults.**
+- **Claude, Cline, Codex, OpenCode, Kilo Code, NTL, Copilot, and jcode are the defaults.**
 - **No protocol layer.** No JSON-RPC, no custom message format, no adapter binaries. The CLI runs exactly as it would in a normal terminal.
 
 ### Standalone Agents
@@ -177,7 +177,7 @@ The current app provides:
 - Commented user config in the platform-specific dux config directory (`~/.dux/` on macOS, `~/.config/dux/` on Linux)
 - Session persistence in `sessions.sqlite3` alongside the config
 - Logging in `dux.log` alongside the config, as JSON Lines (`timestamp`, `level`, `target`, `fields`). New code may use `tracing::{info,warn,error,debug}!(target: "dux::<module>", session_id = %id, "...")` for structured fields; the `logger::*` free functions write under `dux::legacy`. Both sanitize strings through `dux_core::sanitize::for_terminal`, which must therefore never log.
-- PTY-based agent startup: spawns CLI tools (`claude`, `codex`, `opencode`, `copilot`, `jcode`) directly in a pseudo-terminal
+- PTY-based agent startup: spawns CLI tools (`claude`, `cline`, `codex`, `opencode`, `kilo`, `ntl`, `copilot`, `jcode`) directly in a pseudo-terminal
 
 ## Important Constraints
 

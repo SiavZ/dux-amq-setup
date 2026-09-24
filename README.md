@@ -144,7 +144,7 @@ You can also end an agent's session from outside its own CLI. **Detach agent…*
 
 ### Bring Any CLI
 
-Any terminal command can be a provider. The defaults (Claude, Codex, Copilot, OpenCode, and [jcode](https://github.com/1jehuang/jcode)) are pre-configured, but adding your own is a config-only change:
+Any terminal command can be a provider. The defaults (Claude, Cline, Codex, OpenCode, Kilo Code, NTL, Copilot, and [jcode](https://github.com/1jehuang/jcode)) are pre-configured, but adding your own is a config-only change:
 
 ```toml
 [providers.my-agent]
