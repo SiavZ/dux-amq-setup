@@ -151,10 +151,8 @@ mod tests {
         let stopped = exited_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .is_ok();
-        if !stopped {
-            if let Some(p) = rustix::process::Pid::from_raw(pid as i32) {
-                let _ = rustix::process::kill_process(p, rustix::process::Signal::KILL);
-            }
+        if !stopped && let Some(p) = rustix::process::Pid::from_raw(pid as i32) {
+            let _ = rustix::process::kill_process(p, rustix::process::Signal::KILL);
         }
 
         freed.expect("an exactly owned inbox is freed");

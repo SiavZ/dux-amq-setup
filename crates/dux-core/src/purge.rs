@@ -810,7 +810,7 @@ fn execute_amq_inbox(
     let Some(store_id) = store_id else {
         return PurgeOutcome::Error("durable store identity is unavailable".to_string());
     };
-    // INTEGRATION: free_amq_handle (seedling). purge_amq is the local stand-in.
+    // Through the peer router's exact-owner free (stops the wake, then removes).
     match crate::purge_amq::free_amq_handle_at_root(root, store_id, session) {
         Ok(()) => PurgeOutcome::Done,
         Err(err) => PurgeOutcome::Error(format!("{err:#}")),

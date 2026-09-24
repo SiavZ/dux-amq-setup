@@ -879,8 +879,7 @@ fn reset_amq_root(paths: &DuxPaths) -> Option<PathBuf> {
             .map(|parent| parent.join("amq"))
             .filter(|root| root.exists());
     }
-    // INTEGRATION: free_amq_handle (seedling). Swap for
-    // `dux_core::peer::amq::optional_amq_root(paths)` at merge.
+    // The same AMQ root resolution the peer router uses.
     dux_core::purge_amq::optional_amq_root(paths)
 }
 
@@ -998,7 +997,6 @@ fn reset_agent_data_at_amq_root(paths: &DuxPaths, amq_root: Option<&Path>) -> Re
     let mut owned_amq = Vec::new();
     if let (Some(root), Some(store_id)) = (amq_root, store_id.as_deref()) {
         for session in &sessions {
-            // INTEGRATION: free_amq_handle (seedling). purge_amq is the stand-in.
             let owned =
                 dux_core::purge_amq::amq_handle_is_exact_owner_at_root(root, store_id, session)
                     .with_context(|| {
@@ -1021,7 +1019,6 @@ fn reset_agent_data_at_amq_root(paths: &DuxPaths, amq_root: Option<&Path>) -> Re
     // stops before any worktree or row is gone, so the reset can be re-run.
     if let (Some(root), Some(store_id)) = (amq_root, store_id.as_deref()) {
         for session in owned_amq {
-            // INTEGRATION: free_amq_handle (seedling). purge_amq is the stand-in.
             dux_core::purge_amq::free_amq_handle_at_root(root, store_id, session)?;
         }
     }
