@@ -114,3 +114,141 @@ fn load_sessions_fails_closed_on_duplicate_handle() {
     let loaded = store.load_sessions().expect("load");
     assert_eq!(loaded.len(), 1);
 }
+
+/// Fork `tests/storage_integration.rs`. A corrupt database file must surface
+/// as an error naming the file (operators restore from `<path>.bak`), never
+/// a panic halfway through startup.
+#[test]
+fn integrity_check_failure_returns_error_not_panic() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("corrupt.sqlite3");
+    std::fs::write(
+        &path,
+        b"not a sqlite db, just some bytes that are not sqlite",
+    )
+    .expect("write corrupt file");
+
+    let err = match SessionStore::open(&path) {
+        Ok(_) => panic!("expected SessionStore::open on a corrupt file to return Err"),
+        Err(err) => err,
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("corrupt.sqlite3"),
+        "the error must name the corrupt file; got: {msg}"
+    );
+}
+
+/// Fork `tests/storage_integration.rs`. A stored handle outside the AMQ
+/// alphabet names a path component of an inbox on disk; loading it would let
+/// a tampered row steer AMQ traffic. The load refuses the whole database.
+/// (Upstream has no CHECK constraint to bypass, so the row is written raw.)
+#[test]
+fn load_sessions_fails_closed_on_invalid_handle() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("invalid.sqlite3");
+    let store = SessionStore::open(&path).expect("open");
+    store
+        .create_session(&fixture_session("invalid"))
+        .expect("insert");
+    rusqlite::Connection::open(&path)
+        .expect("raw open")
+        .execute(
+            "update agent_sessions set agent_handle = 'Bad/handle' where id = 'invalid'",
+            [],
+        )
+        .expect("inject invalid handle");
+
+    let err = store
+        .load_sessions()
+        .expect_err("invalid handle must fail closed");
+    let message = format!("{err:#}");
+    assert!(message.contains("database corruption"), "{message}");
+    assert!(message.contains("invalid agent_handle"), "{message}");
+}
+
+/// Fork `tests/storage_integration.rs`. The handle and the shared-workspace
+/// flag persist, and a handle, once written, can never be changed by an
+/// upsert: AMQ inboxes on disk are named after it.
+///
+/// The fork test was named for a per-session `workspace_mode`; in the fork
+/// that was the `shared_workspace` column, which is what this round-trips.
+#[test]
+fn session_identity_and_workspace_mode_round_trip() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = SessionStore::open(&dir.path().join("identity.sqlite3")).expect("open");
+    let mut session = fixture_session("identity");
+    session.agent_handle = "durable-handle".to_string();
+    session.shared_workspace = true;
+    store.create_session(&session).expect("insert");
+
+    let loaded = store.load_sessions().expect("load");
+    assert_eq!(loaded[0].agent_handle(), "durable-handle");
+    assert!(loaded[0].shared_workspace());
+
+    let mut changed = loaded[0].clone();
+    changed.agent_handle = "changed-handle".to_string();
+    let err = store
+        .upsert_session(&changed)
+        .expect_err("handle mutation must fail");
+    assert!(
+        format!("{err:#}").contains("immutable agent handle"),
+        "{err:#}"
+    );
+    assert_eq!(
+        store.load_sessions().expect("reload")[0].agent_handle(),
+        "durable-handle"
+    );
+}
+
+/// Fork `tests/storage_integration.rs`. A soft delete hides the agent from
+/// the live list but keeps a tombstone carrying its identity (the handle
+/// stays reserved, purge can still find its data), stamped with an RFC 3339
+/// time; a hard delete then removes the tombstone too.
+#[test]
+fn soft_delete_hides_active_session_and_retains_tombstone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("soft-delete.sqlite3");
+    let store = SessionStore::open(&path).expect("open");
+    let mut session = fixture_session("soft-delete");
+    if let AgentWorkspace::Managed(managed) = &mut session.workspace {
+        managed.project_path = Some("/tmp/project".to_string());
+    }
+    store.create_session(&session).expect("insert");
+
+    store
+        .soft_delete_session(&session.id)
+        .expect("soft delete session");
+    let raw_deleted_at: String = rusqlite::Connection::open(&path)
+        .expect("raw open")
+        .query_row(
+            "select deleted_at from agent_sessions where id = ?1",
+            rusqlite::params![session.id],
+            |row| row.get(0),
+        )
+        .expect("read tombstone timestamp");
+    chrono::DateTime::parse_from_rfc3339(&raw_deleted_at).expect("deleted_at is RFC 3339");
+    assert!(store.load_sessions().expect("load active").is_empty());
+    let tombstones = store
+        .load_sessions_including_deleted()
+        .expect("load tombstones");
+    assert_eq!(tombstones.len(), 1);
+    let tombstone = &tombstones[0];
+    assert_eq!(tombstone.id, session.id);
+    assert_eq!(tombstone.project_id(), session.project_id());
+    assert_eq!(tombstone.project_path(), Some("/tmp/project"));
+    assert_eq!(tombstone.provider, session.provider);
+    assert_eq!(tombstone.agent_handle(), session.agent_handle());
+    assert_eq!(tombstone.directory(), session.directory());
+    assert!(tombstone.is_deleted());
+
+    store
+        .delete_session(&session.id)
+        .expect("hard delete tombstone");
+    assert!(
+        store
+            .load_sessions_including_deleted()
+            .expect("load after hard delete")
+            .is_empty()
+    );
+}
