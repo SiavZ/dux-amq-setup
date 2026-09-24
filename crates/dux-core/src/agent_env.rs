@@ -53,7 +53,9 @@ mod tests {
     fn session(dir: &std::path::Path) -> AgentSession {
         AgentSession {
             id: "s1".to_string(),
-            agent_handle: "s1".to_string(),
+            // What the create job assigns for a folder named "My Agent"; the
+            // launch exports the persisted handle, never re-derives it.
+            agent_handle: "my-agent".to_string(),
             shared_workspace: false,
             deleted_at: None,
             slot_tab_id: "slot".to_string(),

@@ -1,30 +1,24 @@
 //! The adapter between upstream's session store and the peer router, plus
 //! the per-launch `DUX_*` identity environment.
 //!
-//! INTEGRATION: everything marked below stands in for identity the
-//! shared-workspace port adds to `AgentSession` / `SessionStore` (a persisted
-//! immutable `agent_handle` column, `shared_workspace`, soft-delete
-//! tombstones). Until then the handle a session owns is kept in a small
-//! sidecar ledger, `<DUX_HOME>/peer-handles.json`, so it is still assigned
-//! once, never rewritten, and stays reserved after the row is deleted, which
-//! is exactly the contract the fork's column had. When the real column lands,
-//! [`SqlitePeerStore`] reads and writes it instead and the ledger goes away;
-//! nothing else in `peer` changes.
+//! A session's AMQ identity is its persisted, immutable `agent_handle` column
+//! (`AgentSession::agent_handle`), assigned once at create, never rewritten
+//! except by the global-backfill compare-and-swap, and kept on the row's
+//! soft-delete tombstone so a deleted agent's handle is never reused. This
+//! module only projects rows into the router's [`PeerSession`] and exports
+//! the launch environment.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use rustix::fs::{FlockOperation, flock};
-use serde::{Deserialize, Serialize};
 
-use super::handle::{
-    derive_agent_handle, for_terminal, is_valid_agent_handle, next_unique_agent_handle,
-};
+use super::handle::{for_terminal, is_valid_agent_handle};
 use super::{PeerSession, PeerStore};
 use crate::config::DuxPaths;
 use crate::logger;
@@ -33,9 +27,6 @@ use crate::storage::SessionStore;
 
 const STORE_ID_FILE: &str = "store-id";
 const STORE_ID_LOCK: &str = ".store-id.lock";
-// INTEGRATION: replaced by the `agent_sessions.agent_handle` column.
-const LEDGER_FILE: &str = "peer-handles.json";
-const LEDGER_LOCK: &str = ".peer-handles.lock";
 
 /// Load the stable identifier of one `DUX_HOME`, creating it atomically on
 /// first use. AMQ owner markers name `(store_id, session_id)`, so two Dux
@@ -81,7 +72,7 @@ pub fn append_session_env(env: &mut Vec<(String, String)>, session: &PeerSession
 
 /// The `DUX_*` identity variables for launching `session`, reserving its
 /// handle on first launch. Best effort: a failure is logged and yields no
-/// variables, so a broken ledger or AMQ root never blocks starting an agent
+/// variables, so a broken session store or AMQ root never blocks starting an agent
 /// (the wrappers then fall back to their own identity, as before dux set one).
 pub fn launch_env_for_session(paths: &DuxPaths, session: &AgentSession) -> Vec<(String, String)> {
     match try_launch_env_for_session(paths, session) {
@@ -136,20 +127,30 @@ fn launch_env_with_root(
     amq_root: Option<&Path>,
 ) -> Result<Vec<(String, String)>> {
     let store_id = load_or_create_store_id(&paths.root)?;
-    let ledger = Ledger::at(&paths.root);
-    let handle = ledger.handle_for(session)?;
+    let store = SessionStore::open(&paths.sessions_db_path)
+        .with_context(|| format!("failed to open {}", paths.sessions_db_path.display()))?;
+    let rows = store.load_sessions_including_deleted()?;
+    // The stored row is authoritative: a global backfill may have moved this
+    // session's handle since the in-memory copy was loaded. A session with no
+    // row yet (a test, or a launch racing its own create) uses its own value.
+    let handle = rows.iter().find(|row| row.id == session.id).map_or_else(
+        || session.agent_handle().to_string(),
+        |row| row.agent_handle().to_string(),
+    );
     let mut peer = peer_session(session, handle, false);
     if let Some(root) = amq_root {
-        let used = ledger
-            .load()?
-            .sessions
-            .into_iter()
-            .filter(|(id, _)| id != &session.id)
-            .map(|(_, entry)| entry.agent_handle)
+        let used = rows
+            .iter()
+            .filter(|row| row.id != session.id)
+            .map(|row| row.agent_handle().to_string())
             .collect::<HashSet<_>>();
         let owned = super::amq::claim_handle_at_root(root, &store_id, &peer, &used)?;
         if owned != peer.agent_handle {
-            ledger.reassign(&peer.id, &peer.agent_handle, &owned)?;
+            store.reassign_agent_handle_for_global_backfill(
+                &peer.id,
+                &peer.agent_handle,
+                &owned,
+            )?;
             peer.agent_handle = owned;
         }
     }
@@ -177,16 +178,12 @@ pub fn peer_session(session: &AgentSession, agent_handle: String, deleted: bool)
 pub fn open(paths: &DuxPaths) -> Result<SqlitePeerStore> {
     let store = SessionStore::open(&paths.sessions_db_path)
         .with_context(|| format!("failed to open {}", paths.sessions_db_path.display()))?;
-    Ok(SqlitePeerStore {
-        store,
-        ledger: Ledger::at(&paths.root),
-    })
+    Ok(SqlitePeerStore { store })
 }
 
 /// Upstream's [`SessionStore`] seen through the [`PeerStore`] seam.
 pub struct SqlitePeerStore {
     store: SessionStore,
-    ledger: Ledger,
 }
 
 impl SqlitePeerStore {
@@ -202,42 +199,60 @@ impl SqlitePeerStore {
 
 impl PeerStore for SqlitePeerStore {
     fn load_sessions_including_deleted(&self) -> Result<Vec<PeerSession>> {
-        let rows = self.store.load_sessions()?;
-        let ledger = self.ledger.backfill(&rows)?;
-        let live = rows
+        Ok(self
+            .store
+            .load_sessions_including_deleted()?
             .iter()
-            .map(|row| row.id.as_str())
-            .collect::<HashSet<_>>();
-        let mut sessions = rows
-            .iter()
-            .map(|row| {
-                let handle = ledger.sessions[&row.id].agent_handle.clone();
-                peer_session(row, handle, false)
-            })
-            .collect::<Vec<_>>();
-        // INTEGRATION: upstream hard-deletes rows, so the ledger's leftovers
-        // are the tombstones. Only their id and handle survive, which is all
-        // reconciliation reads from a deleted row.
-        for (id, entry) in &ledger.sessions {
-            if !live.contains(id.as_str()) {
-                sessions.push(PeerSession {
-                    id: id.clone(),
-                    provider: String::new(),
-                    directory: String::new(),
-                    branch: None,
-                    title: None,
-                    agent_handle: entry.agent_handle.clone(),
-                    shared_workspace: false,
-                    deleted: true,
-                    exited: true,
-                });
-            }
-        }
-        Ok(sessions)
+            .map(|row| peer_session(row, row.agent_handle().to_string(), row.is_deleted()))
+            .collect())
     }
 
+    /// Record a brand-new session with its reserved handle (fork: the
+    /// reservation's `upsert_session` inserted the row). An existing row's
+    /// handle is immutable outside the global-backfill swap, so a differing
+    /// value is refused; an identical one is a no-op. A row that does not
+    /// exist yet is created as a folder agent at `directory`, which is all a
+    /// router-driven reservation knows about it.
     fn persist_new_session(&self, session: &PeerSession) -> Result<()> {
-        self.ledger.insert(&session.id, &session.agent_handle)
+        ensure!(
+            is_valid_agent_handle(&session.agent_handle),
+            "refusing to persist invalid agent handle {:?}",
+            for_terminal(&session.agent_handle)
+        );
+        let stored = self
+            .store
+            .load_sessions_including_deleted()?
+            .into_iter()
+            .find(|row| row.id == session.id);
+        if let Some(row) = stored {
+            ensure!(
+                row.agent_handle() == session.agent_handle,
+                "refusing to change immutable agent handle for session {:?}",
+                for_terminal(&session.id)
+            );
+            return Ok(());
+        }
+        let now = chrono::Utc::now();
+        let row = AgentSession {
+            id: session.id.clone(),
+            agent_handle: session.agent_handle.clone(),
+            shared_workspace: session.shared_workspace,
+            deleted_at: None,
+            slot_tab_id: format!("{}-slot", session.id),
+            provider: crate::model::ProviderKind::new(&session.provider),
+            workspace: crate::model::AgentWorkspace::Folder(crate::model::FolderWorkspace {
+                folder_path: session.directory.clone(),
+            }),
+            title: session.title.clone(),
+            started_providers: Vec::new(),
+            desired_running: false,
+            auto_reopen_enabled: false,
+            status: SessionStatus::Detached,
+            created_at: now,
+            updated_at: now,
+            last_focused_tab: None,
+        };
+        self.store.create_session(&row)
     }
 
     fn reassign_agent_handle_for_global_backfill(
@@ -246,146 +261,8 @@ impl PeerStore for SqlitePeerStore {
         expected: &str,
         replacement: &str,
     ) -> Result<()> {
-        self.ledger.reassign(id, expected, replacement)
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-struct LedgerFile {
-    #[serde(default)]
-    sessions: BTreeMap<String, LedgerEntry>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct LedgerEntry {
-    agent_handle: String,
-}
-
-/// INTEGRATION: sidecar stand-in for the persisted `agent_handle` column.
-struct Ledger {
-    path: PathBuf,
-    lock: PathBuf,
-}
-
-impl Ledger {
-    fn at(dux_home: &Path) -> Self {
-        Self {
-            path: dux_home.join(LEDGER_FILE),
-            lock: dux_home.join(LEDGER_LOCK),
-        }
-    }
-
-    fn load(&self) -> Result<LedgerFile> {
-        let _lock = FileLock::acquire(&self.lock)?;
-        self.read()
-    }
-
-    fn read(&self) -> Result<LedgerFile> {
-        if !self.path.exists() {
-            return Ok(LedgerFile::default());
-        }
-        let raw = fs::read_to_string(&self.path)
-            .with_context(|| format!("failed to read {}", self.path.display()))?;
-        serde_json::from_str(&raw)
-            .with_context(|| format!("failed to parse {}", self.path.display()))
-    }
-
-    fn write(&self, ledger: &LedgerFile) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        let body = serde_json::to_vec_pretty(ledger)?;
-        write_private_atomic(&self.path, &body)
-    }
-
-    /// Give every row without a handle a locally unique one (tombstones
-    /// included in the uniqueness check), and return the whole ledger.
-    fn backfill(&self, rows: &[AgentSession]) -> Result<LedgerFile> {
-        let _lock = FileLock::acquire(&self.lock)?;
-        let mut ledger = self.read()?;
-        let mut used = ledger
-            .sessions
-            .values()
-            .map(|entry| entry.agent_handle.clone())
-            .collect::<HashSet<_>>();
-        let mut changed = false;
-        for row in rows {
-            if ledger.sessions.contains_key(&row.id) {
-                continue;
-            }
-            let base = derive_agent_handle(row.directory(), row.branch_name(), &row.id);
-            let handle = next_unique_agent_handle(&base, &used);
-            used.insert(handle.clone());
-            ledger.sessions.insert(
-                row.id.clone(),
-                LedgerEntry {
-                    agent_handle: handle,
-                },
-            );
-            changed = true;
-        }
-        if changed {
-            self.write(&ledger)?;
-        }
-        Ok(ledger)
-    }
-
-    /// The handle `session` owns, assigning one on first sight.
-    fn handle_for(&self, session: &AgentSession) -> Result<String> {
-        let ledger = self.backfill(std::slice::from_ref(session))?;
-        Ok(ledger.sessions[&session.id].agent_handle.clone())
-    }
-
-    /// Record a brand-new session's handle. An existing entry is immutable.
-    fn insert(&self, id: &str, handle: &str) -> Result<()> {
-        ensure!(
-            is_valid_agent_handle(handle),
-            "refusing to persist invalid agent handle {:?}",
-            for_terminal(handle)
-        );
-        let _lock = FileLock::acquire(&self.lock)?;
-        let mut ledger = self.read()?;
-        if let Some(existing) = ledger.sessions.get(id) {
-            ensure!(
-                existing.agent_handle == handle,
-                "refusing to change immutable agent handle for session {:?}",
-                for_terminal(id)
-            );
-            return Ok(());
-        }
-        ledger.sessions.insert(
-            id.to_string(),
-            LedgerEntry {
-                agent_handle: handle.to_string(),
-            },
-        );
-        self.write(&ledger)
-    }
-
-    /// Compare-and-swap a handle. The only way a stored handle ever changes.
-    fn reassign(&self, id: &str, expected: &str, replacement: &str) -> Result<()> {
-        ensure!(
-            is_valid_agent_handle(replacement),
-            "refusing invalid global agent handle replacement"
-        );
-        let _lock = FileLock::acquire(&self.lock)?;
-        let mut ledger = self.read()?;
-        match ledger.sessions.get_mut(id) {
-            Some(entry) if entry.agent_handle == expected => {
-                entry.agent_handle = replacement.to_string();
-            }
-            Some(_) => bail!("session changed while completing global handle backfill"),
-            None => {
-                ledger.sessions.insert(
-                    id.to_string(),
-                    LedgerEntry {
-                        agent_handle: replacement.to_string(),
-                    },
-                );
-            }
-        }
-        self.write(&ledger)
+        self.store
+            .reassign_agent_handle_for_global_backfill(id, expected, replacement)
     }
 }
 
@@ -534,8 +411,11 @@ mod tests {
         assert!(env.contains(&("DUX_AMQ_HANDLE".to_string(), "stable-handle".to_string())));
     }
 
+    /// The persisted `agent_handle` column is the peer identity: assigned once
+    /// and locally unique at create (tombstones included), kept on a soft
+    /// delete, immutable except through the global-backfill compare-and-swap.
     #[test]
-    fn ledger_assigns_once_keeps_tombstones_and_deconflicts_locally() {
+    fn stored_handles_are_unique_kept_on_tombstones_and_only_swapped_by_backfill() {
         let dir = tempdir().unwrap();
         let paths = paths_in(dir.path());
         fs::create_dir_all(&paths.root).unwrap();
@@ -544,12 +424,12 @@ mod tests {
         fs::create_dir_all(&a).unwrap();
         fs::create_dir_all(&b).unwrap();
         let store = SessionStore::open(&paths.sessions_db_path).unwrap();
-        store
-            .upsert_session(&folder_session("s1", "claude", &a))
-            .unwrap();
-        store
-            .upsert_session(&folder_session("s2", "codex", &b))
-            .unwrap();
+        for (id, provider, dir) in [("s1", "claude", &a), ("s2", "codex", &b)] {
+            let mut session = folder_session(id, provider, dir);
+            session.agent_handle = "agent".to_string();
+            store.assign_unique_agent_handle(&mut session).unwrap();
+            store.create_session(&session).unwrap();
+        }
 
         let peer_store = open(&paths).unwrap();
         let mut handles = peer_store
@@ -561,11 +441,12 @@ mod tests {
         handles.sort();
         assert_eq!(handles, ["agent", "agent-2"]);
 
-        // Deleting the row keeps its handle reserved as a tombstone.
-        store.delete_session("s1").unwrap();
+        // Deleting the agent keeps its handle reserved as a tombstone.
+        store.soft_delete_session("s1").unwrap();
         let all = peer_store.load_sessions_including_deleted().unwrap();
         let tomb = all.iter().find(|s| s.id == "s1").unwrap();
         assert!(tomb.deleted);
+        assert_eq!(tomb.agent_handle, "agent");
         assert!(
             peer_store
                 .load_sessions()
@@ -607,7 +488,13 @@ mod tests {
         let paths = paths_in(dir.path());
         let worktree = dir.path().join("Feature Login");
         fs::create_dir_all(&worktree).unwrap();
-        let session = folder_session("s1", "claude", &worktree);
+        let mut session = folder_session("s1", "claude", &worktree);
+        session.agent_handle = crate::model::derive_agent_handle(session.directory(), "", "s1");
+        fs::create_dir_all(&paths.root).unwrap();
+        SessionStore::open(&paths.sessions_db_path)
+            .unwrap()
+            .create_session(&session)
+            .unwrap();
 
         let first = try_launch_env_for_session(&paths, &session).unwrap();
         let second = try_launch_env_for_session(&paths, &session).unwrap();
@@ -648,7 +535,13 @@ mod tests {
         .unwrap();
         let worktree = dir.path().join("agent");
         fs::create_dir_all(&worktree).unwrap();
-        let session = folder_session("s1", "claude", &worktree);
+        let mut session = folder_session("s1", "claude", &worktree);
+        session.agent_handle = "agent".to_string();
+        fs::create_dir_all(&paths.root).unwrap();
+        SessionStore::open(&paths.sessions_db_path)
+            .unwrap()
+            .create_session(&session)
+            .unwrap();
 
         let env = launch_env_with_root(&paths, &session, Some(&root)).unwrap();
         let handle = env
