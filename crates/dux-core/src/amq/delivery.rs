@@ -23,21 +23,10 @@ pub use crate::watch::delivery::{
 
 /// Sanitise a name the same way the AMQ wrappers do: lowercase ASCII, keep
 /// `[a-z0-9_-]`, replace anything else with `-`, trim leading/trailing `-`.
-///
-/// INTEGRATION: the peer worker (seedling) ports the same function as
-/// `crate::peer::handle::amq_handle`; delegate to it at merge.
+/// The one implementation is [`crate::sanitize::amq_handle`], which the peer
+/// router uses too, so AMQ and peer agree on every receiver name.
 pub fn sanitise_handle(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for ch in name.chars() {
-        if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-' {
-            out.push(ch);
-        } else if ch.is_ascii_uppercase() {
-            out.push(ch.to_ascii_lowercase());
-        } else {
-            out.push('-');
-        }
-    }
-    out.trim_matches('-').to_string()
+    crate::sanitize::amq_handle(name)
 }
 
 /// One session as the receiver matcher sees it.

@@ -585,20 +585,13 @@ fn cleanup_needs_a_worker_only_for_owned_or_unclear_markers() {
 
 #[test]
 fn amq_root_comes_from_env_else_an_existing_sibling_dir() {
+    // Unit tests never read AMQ_GLOBAL_ROOT/AM_ROOT (see optional_amq_root),
+    // so the sibling rule is exercised on every machine, exported or not.
     let dir = tempdir().unwrap();
     let paths = test_paths(&dir.path().join("home"));
-    // Only the sibling rule is testable without mutating process env, and
-    // it only applies when no override is exported.
-    if std::env::var_os("AMQ_GLOBAL_ROOT").is_none() && std::env::var_os("AM_ROOT").is_none() {
-        assert_eq!(optional_amq_root(&paths), None);
-        fs::create_dir_all(dir.path().join("amq")).unwrap();
-        assert_eq!(optional_amq_root(&paths), Some(dir.path().join("amq")));
-    } else {
-        let expected = std::env::var_os("AMQ_GLOBAL_ROOT")
-            .or_else(|| std::env::var_os("AM_ROOT"))
-            .map(PathBuf::from);
-        assert_eq!(optional_amq_root(&paths), expected);
-    }
+    assert_eq!(optional_amq_root(&paths), None);
+    fs::create_dir_all(dir.path().join("amq")).unwrap();
+    assert_eq!(optional_amq_root(&paths), Some(dir.path().join("amq")));
 }
 
 /// The wrapper script takes the same `meta/config.lock` before claiming an
@@ -809,9 +802,7 @@ fn tombstone_ignores_a_handle_this_session_does_not_own() {
 fn bootstrap_amq_sync_degrades_on_corrupt_shared_config() {
     // The root resolves through the sibling rule only when no override is
     // exported, and an exported root must never be written by a test.
-    if std::env::var_os("AMQ_GLOBAL_ROOT").is_some() || std::env::var_os("AM_ROOT").is_some() {
-        return;
-    }
+    // Runs on every machine: unit tests never read AMQ_GLOBAL_ROOT/AM_ROOT.
     let dir = tempdir().unwrap();
     let amq_root = dir.path().join("amq");
     fs::create_dir_all(amq_root.join("meta")).unwrap();

@@ -46,8 +46,16 @@ pub struct AmqSyncReport {
 
 /// The AMQ root this Dux store shares, if any: `AMQ_GLOBAL_ROOT`, else
 /// `AM_ROOT`, else an `amq` directory that already exists beside `DUX_HOME`.
+///
+/// Under `cfg(test)` the environment is ignored and only the sibling rule
+/// applies: a developer machine that exports `AMQ_GLOBAL_ROOT` would
+/// otherwise have every engine test that deletes or reserves an agent take
+/// the real bus's registry lock and inspect live inboxes. Tests place an
+/// `amq` directory beside their temp dux home instead.
 pub fn optional_amq_root(paths: &DuxPaths) -> Option<PathBuf> {
-    if let Some(path) = env::var_os("AMQ_GLOBAL_ROOT").or_else(|| env::var_os("AM_ROOT")) {
+    if !cfg!(test)
+        && let Some(path) = env::var_os("AMQ_GLOBAL_ROOT").or_else(|| env::var_os("AM_ROOT"))
+    {
         return Some(PathBuf::from(path));
     }
     if let Some(parent) = paths.root.parent() {
@@ -592,7 +600,7 @@ fn write_atomic(path: &Path, body: &[u8]) -> Result<()> {
 /// its inbox and exact owner marker as an ordinary-delete tombstone. Failures
 /// are logged, never propagated: a registry problem must not block deleting
 /// the agent locally.
-// INTEGRATION: no caller yet. Engine session delete must call this (fork: src/app/sessions.rs delete path, gated by amq_handle_is_exact_owner_at_root) (evergreen)
+// Called by `Engine::finish_delete_session` on a detached thread.
 pub fn tombstone_amq_session(
     paths: &DuxPaths,
     store_id: &str,
@@ -661,7 +669,7 @@ pub fn tombstone_amq_session_at_root(
 
 /// Verify exact ownership, stop wake delivery, remove the inbox, and release
 /// a global handle. The hard-purge path is the production caller.
-// INTEGRATION: no caller yet. `dux purge` and `dux reset --all` must call this before deleting rows (evergreen / purge worker)
+// Purge and reset call the `_at_root` form through `crate::purge_amq`.
 pub fn free_amq_handle(paths: &DuxPaths, store_id: &str, session: &PeerSession) -> Result<()> {
     let Some(root) = optional_amq_root(paths) else {
         return Ok(());

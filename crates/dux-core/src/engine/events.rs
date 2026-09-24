@@ -1525,7 +1525,39 @@ impl Engine {
         // and provider history the agent left. `delete_session` (physical
         // removal) is reserved for purge.
         self.session_store.soft_delete_session(session_id)?;
+        self.tombstone_amq_after_delete(session_id);
         Ok(self.finish_delete_session_memory(session_id))
+    }
+
+    /// Stop AMQ delivery to a deleted agent (fork sessions.rs delete path):
+    /// drop its handle from the live AMQ registry and stop its recorded `amq
+    /// wake` process, while KEEPING its inbox and exact owner marker as a
+    /// tombstone so a later hard purge can still find and erase them.
+    ///
+    /// Runs on a detached thread because stopping a wake waits for it to exit
+    /// (up to TERM plus KILL grace) under the shared registry lock, which must
+    /// never stall the UI. It is best-effort by contract: a registry problem
+    /// is logged and never blocks deleting the agent locally, and it only
+    /// touches an inbox this store exactly owns (a foreign, legacy or missing
+    /// marker is left alone).
+    fn tombstone_amq_after_delete(&self, session_id: &str) {
+        let Some(session) = self.sessions.iter().find(|s| s.id == session_id) else {
+            return;
+        };
+        let Ok(store_id) = crate::storage::load_store_id(&self.paths.root) else {
+            // No store identity means this dux never reserved an AMQ inbox,
+            // so there is nothing of ours to tombstone.
+            return;
+        };
+        let peer = crate::peer::session_store::peer_session(
+            session,
+            session.agent_handle().to_string(),
+            true,
+        );
+        let paths = self.paths.clone();
+        std::thread::spawn(move || {
+            let _ = crate::peer::tombstone_amq_session(&paths, &store_id, &peer);
+        });
     }
 
     /// The IN-MEMORY half of a session deletion (no DB write): tear down the
@@ -3700,6 +3732,133 @@ mod tests {
         assert_eq!(outcome.project.as_ref().map(|p| p.id.as_str()), Some("p1"));
         assert!(!outcome.other_sessions_on_worktree);
         assert!(!outcome.project_still_has_sessions);
+    }
+
+    /// Point the engine's dux home at `<tmp>/dux-home` so the AMQ root is the
+    /// `<tmp>/amq` sibling, like a real install beside dux-amq. Returns it.
+    fn amq_beside_home(engine: &mut Engine, tmp: &std::path::Path) -> std::path::PathBuf {
+        engine.paths.root = tmp.join("dux-home");
+        std::fs::create_dir_all(&engine.paths.root).unwrap();
+        let amq = tmp.join("amq");
+        std::fs::create_dir_all(amq.join("agents")).unwrap();
+        amq
+    }
+
+    fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        cond()
+    }
+
+    /// Fork sessions.rs: a UI delete tombstones the row and keeps its handle.
+    #[test]
+    fn ui_delete_soft_deletes_session() {
+        let (mut engine, _tmp) = test_engine();
+        engine.projects.push(sample_project("p1", "/tmp/p1"));
+        let session = sample_session("s1", "p1", "feat/x");
+        engine.session_store.upsert_session(&session).unwrap();
+        engine.sessions.push(session.clone());
+
+        engine
+            .finish_delete_session("s1")
+            .expect("UI delete succeeds");
+
+        assert!(engine.session_store.load_sessions().unwrap().is_empty());
+        let retained = engine
+            .session_store
+            .load_sessions_including_deleted()
+            .unwrap();
+        assert_eq!(retained.len(), 1);
+        assert!(retained[0].deleted_at.is_some());
+        assert_eq!(retained[0].agent_handle(), session.agent_handle());
+    }
+
+    /// Deleting an agent whose AMQ inbox this store owns drops its handle
+    /// from the live registry (so the bus stops delivering to it) but keeps
+    /// the inbox and owner marker for a later hard purge.
+    #[test]
+    fn delete_tombstones_an_owned_amq_registration_and_keeps_the_inbox() {
+        let (mut engine, tmp) = test_engine();
+        let amq = amq_beside_home(&mut engine, tmp.path());
+        let store_id = crate::storage::load_or_create_store_id(&engine.paths.root).unwrap();
+        engine.projects.push(sample_project("p1", "/tmp/p1"));
+        let mut session = sample_session("s1", "p1", "feat/x");
+        session.agent_handle = "worker-1".to_string();
+        engine.session_store.upsert_session(&session).unwrap();
+        engine.sessions.push(session.clone());
+        let inbox = amq.join("agents/worker-1");
+        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::write(
+            inbox.join(".dux-amq-source"),
+            serde_json::json!({ "store_id": store_id, "session_id": "s1" }).to_string(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(amq.join("meta")).unwrap();
+        std::fs::write(
+            amq.join("meta/config.json"),
+            serde_json::json!({ "agents": ["worker-1", "someone-else"] }).to_string(),
+        )
+        .unwrap();
+
+        engine.finish_delete_session("s1").unwrap();
+
+        let config = || std::fs::read_to_string(amq.join("meta/config.json")).unwrap();
+        assert!(
+            wait_until(|| !config().contains("\"worker-1\"")),
+            "the deleted agent's handle leaves the live registry: {}",
+            config()
+        );
+        assert!(config().contains("\"someone-else\""), "others untouched");
+        assert!(
+            inbox.join(".dux-amq-source").is_file(),
+            "inbox kept for purge"
+        );
+    }
+
+    /// Fork sessions.rs: a foreign, legacy or missing AMQ marker never blocks
+    /// the local soft delete and is never modified.
+    #[test]
+    fn foreign_legacy_and_missing_markers_do_not_block_local_soft_delete() {
+        let (mut engine, tmp) = test_engine();
+        let amq = amq_beside_home(&mut engine, tmp.path());
+        crate::storage::load_or_create_store_id(&engine.paths.root).unwrap();
+        engine.projects.push(sample_project("p1", "/tmp/p1"));
+        for id in ["foreign", "legacy", "missing"] {
+            let mut session = sample_session(id, "p1", &format!("feat/{id}"));
+            session.agent_handle = id.to_string();
+            engine.session_store.upsert_session(&session).unwrap();
+            engine.sessions.push(session);
+        }
+        let foreign_marker = amq.join("agents/foreign/.dux-amq-source");
+        let legacy_marker = amq.join("agents/legacy/.dux-amq-source");
+        std::fs::create_dir_all(foreign_marker.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(legacy_marker.parent().unwrap()).unwrap();
+        let foreign = br#"{"store_id":"other-store","session_id":"other-session"}"#;
+        let legacy = b"/foreign/worktree\n";
+        std::fs::write(&foreign_marker, foreign).unwrap();
+        std::fs::write(&legacy_marker, legacy).unwrap();
+
+        for id in ["foreign", "legacy", "missing"] {
+            engine.finish_delete_session(id).unwrap();
+        }
+        // The tombstone runs off-thread; give it the same bounded window.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        assert!(engine.session_store.load_sessions().unwrap().is_empty());
+        let retained = engine
+            .session_store
+            .load_sessions_including_deleted()
+            .unwrap();
+        assert_eq!(retained.len(), 3);
+        assert!(retained.iter().all(|session| session.deleted_at.is_some()));
+        assert_eq!(std::fs::read(foreign_marker).unwrap(), foreign);
+        assert_eq!(std::fs::read(legacy_marker).unwrap(), legacy);
+        assert!(!amq.join("agents/missing").exists());
     }
 
     #[test]

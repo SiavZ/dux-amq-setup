@@ -10,7 +10,6 @@
 //! execs the process leaves only `.inflight.*.msg` files the next process's
 //! startup reclaim puts back (0e8efd57).
 //!
-//! Seams to other workstreams are marked `INTEGRATION:`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -78,10 +77,11 @@ pub struct AmqRuntime {
     pub orchestrator_project_last_checkpoint: HashMap<String, Instant>,
     /// Orchestrators that already received their typed startup policy.
     pub orchestrator_policy_injected: HashSet<String>,
-    /// Watchdog prompts whose body was typed and whose Enter is pending.
-    ///
-    /// INTEGRATION: the fork shared this map with watch-rule SendText
-    /// (`watch_pending_enters`); herb's watch port may merge the two.
+    /// Watchdog prompts whose body was typed and whose Enter is pending,
+    /// keyed by session. Kept apart from the watch engine's own per-tab
+    /// `pending_enters` (the fork shared one map): the two are keyed
+    /// differently and flushed by different ticks, and a shared map would let
+    /// one flush the other's Enter early.
     pub pending_enters: HashMap<String, Instant>,
 }
 
@@ -119,10 +119,9 @@ pub struct AmqQuiesceReport {
 impl Engine {
     // ─── session settings ────────────────────────────────────────────
 
-    /// The saved settings for `session_id`. `None` means defaults.
-    ///
-    /// INTEGRATION: herb's watch engine reads `watch_rule_arm` and
-    /// `auto_clear_on_task_done` through this getter.
+    /// The saved settings for `session_id`. `None` means defaults. The watch
+    /// engine reads `watch_rule_arm` and `auto_clear_on_task_done` through
+    /// this getter (`Engine::watch_session_settings`).
     pub fn session_settings(&self, session_id: &str) -> Option<&SessionSettings> {
         self.amq.session_settings.get(session_id)
     }
@@ -300,8 +299,9 @@ impl Engine {
     /// a busy footer, a claimed or queued wake, unread/pending mail, or
     /// recent collaboration (b6638ae0, 22e6b1e3).
     ///
-    /// INTEGRATION: herb's auto-clear rule must rebaseline instead of firing
-    /// while this is true (fork `should_suppress_auto_clear`).
+    /// The watch engine's auto-clear rule consults this through
+    /// `Engine::watch_auto_clear_suppressed` and rebaselines instead of firing
+    /// while it is true (fork `should_suppress_auto_clear`).
     pub fn amq_blocks_auto_clear(&self, session_id: &str) -> bool {
         let Some(session) = self.session_by_id(session_id) else {
             return true;
@@ -334,9 +334,10 @@ impl Engine {
         {
             return true;
         }
-        let agent_dir = amq_root_for_collaboration_guard()
-            .join("agents")
-            .join(&receiver);
+        let Some(root) = amq_root_for_collaboration_guard(&self.paths) else {
+            return false;
+        };
+        let agent_dir = root.join("agents").join(&receiver);
         if crate::amq::activity::has_pending_mail(&agent_dir) {
             return true;
         }
@@ -1298,42 +1299,31 @@ fn reaction_from(mut reactions: Vec<EventReaction>) -> EventReaction {
     }
 }
 
-/// The agent's AMQ handle.
+/// The agent's AMQ handle: the immutable, persisted `agent_handle`.
 ///
-/// INTEGRATION: return `session.agent_handle()` once the shared-workspace
-/// worker (evergreen) adds the immutable handle to `AgentSession`. Until
-/// then this is the fork's pre-handle derivation (worktree basename, then
-/// branch, then id), which is what the wrappers compute for a dux pane.
+/// The fork first derived the receiver from the worktree basename, then the
+/// branch, then the id (what the wrappers compute for a dux pane). Fork
+/// 78923992 made the handle authoritative, because in a shared workspace every
+/// agent has the same directory, so a basename would put all of them on one
+/// inbox. The wrappers read the same value from `DUX_AMQ_HANDLE`. Legacy
+/// directory/branch aliases are still honoured on the RECEIVE side by
+/// [`delivery::match_receiver`], only when they identify exactly one session.
 pub fn agent_handle_of(session: &AgentSession) -> String {
-    amq_receiver_for_session(session)
+    session.agent_handle().to_string()
 }
 
-/// The receiver name a session's wrapper derives (fork
-/// `amq_receiver_for_session`).
+/// The receiver name a session's AMQ inbox is addressed by (fork
+/// `amq_receiver_for_session`); since 78923992 this is the agent handle.
 pub fn amq_receiver_for_session(session: &AgentSession) -> String {
-    // INTEGRATION: prefer `session.agent_handle()` (evergreen).
-    if let Some(base) = std::path::Path::new(session.directory())
-        .file_name()
-        .and_then(|n| n.to_str())
-    {
-        let r = delivery::sanitise_handle(base);
-        if !r.is_empty() {
-            return r;
-        }
-    }
-    let r = delivery::sanitise_handle(session.branch_name().unwrap_or(""));
-    if r.is_empty() { session.id.clone() } else { r }
+    agent_handle_of(session)
 }
 
-/// AMQ's shared root, for the collaboration guard.
-///
-/// INTEGRATION: the shared-workspace / peer workers own AMQ root
-/// resolution; switch to their resolver at merge.
-fn amq_root_for_collaboration_guard() -> PathBuf {
-    std::env::var_os("AM_ROOT")
-        .or_else(|| std::env::var_os("AMQ_GLOBAL_ROOT"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/data/state/amq"))
+/// AMQ's shared root, for the collaboration guard: the same resolution the
+/// peer router uses (`AMQ_GLOBAL_ROOT`, else `AM_ROOT`, else an existing
+/// `amq` directory beside the dux home). `None` when there is no AMQ root,
+/// in which case there is no mail to guard on.
+fn amq_root_for_collaboration_guard(paths: &crate::config::DuxPaths) -> Option<PathBuf> {
+    crate::peer::optional_amq_root(paths)
 }
 
 #[cfg(test)]
@@ -1365,10 +1355,14 @@ mod tests {
 
     /// An engine with one live `cat` agent whose AMQ handle is `alice`, and
     /// the inject queue pointed at a temp dir. Grace and cooldown are zero so
-    /// a test drives delivery tick by tick.
+    /// a test drives delivery tick by tick. The handle is set explicitly: it
+    /// is the persisted identity AMQ routes by, not derived from the
+    /// directory (the worktree basename also reads `alice`, so legacy
+    /// directory aliases resolve to the same agent).
     fn engine_with_agent() -> (Engine, tempfile::TempDir, PathBuf) {
         let (mut engine, tmp) = test_engine();
         let mut session = sample_session("s1", "p1", "feature/x");
+        session.agent_handle = "alice".to_string();
         if let crate::model::AgentWorkspace::Managed(m) = &mut session.workspace {
             m.worktree_path = tmp.path().join("Alice").to_string_lossy().to_string();
         }
@@ -1386,6 +1380,42 @@ mod tests {
         cfg.phase_delay_ms = 0;
         engine.amq.queue_dir = Some(queue.clone());
         (engine, tmp, queue)
+    }
+
+    /// Two shared-workspace agents run in the SAME checkout. AMQ must route
+    /// each by its own persisted handle; the fork's pre-78923992 basename
+    /// derivation gave both the directory name, so every wake for either
+    /// agent reached whichever session matched first.
+    #[test]
+    fn shared_agents_in_one_checkout_get_distinct_amq_receivers() {
+        let (mut engine, tmp) = test_engine();
+        let checkout = tmp.path().join("Jobzy-Front-end");
+        let mut ids = Vec::new();
+        for (id, handle) in [("sa", "frontend-a"), ("sb", "frontend-b")] {
+            let mut session = sample_session(id, "p1", "development");
+            session.agent_handle = handle.to_string();
+            session.shared_workspace = true;
+            if let crate::model::AgentWorkspace::Managed(m) = &mut session.workspace {
+                m.worktree_path = checkout.to_string_lossy().to_string();
+            }
+            ids.push(session.id.clone());
+            engine.sessions.push(session);
+        }
+        let receivers: Vec<String> = engine
+            .sessions
+            .iter()
+            .map(amq_receiver_for_session)
+            .collect();
+        assert_eq!(receivers, ["frontend-a", "frontend-b"]);
+        assert_eq!(
+            engine.find_session_for_receiver("frontend-b").as_deref(),
+            Some(ids[1].as_str())
+        );
+        assert_eq!(
+            engine.find_session_for_receiver("jobzy-front-end"),
+            None,
+            "the shared directory name is ambiguous and must not route"
+        );
     }
 
     fn write_msg(queue: &Path, receiver: &str, name: &str, body: &str) -> PathBuf {
