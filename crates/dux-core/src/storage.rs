@@ -4169,6 +4169,51 @@ mod tests {
         assert_eq!(ids, vec!["b", "a"]);
     }
 
+    /// Fork a38187f3. Every provider's id round-trips, independently.
+    #[test]
+    fn provider_session_ids_round_trip() {
+        let store = test_store();
+        let now = Utc::now();
+        let session = test_session("provider-ids", now, now);
+        store.upsert_session(&session).unwrap();
+        let ids = BTreeMap::from([
+            ("claude".to_string(), uuid::Uuid::new_v4().to_string()),
+            ("codex".to_string(), uuid::Uuid::new_v4().to_string()),
+        ]);
+        for (provider, id) in &ids {
+            store
+                .set_provider_session_id(&session.id, provider, id)
+                .unwrap();
+        }
+
+        assert_eq!(store.provider_session_ids(&session.id).unwrap(), ids);
+    }
+
+    /// Fork a38187f3. A lifecycle write carrying a stale copy of the session
+    /// (the whole-row `upsert_session`) must never erase an id a capture
+    /// recorded in between: the id is owned by its dedicated setter.
+    #[test]
+    fn stale_whole_row_upsert_cannot_erase_captured_provider_uuid() {
+        let store = test_store();
+        let now = Utc::now();
+        let mut stale = test_session("capture-race", now, now);
+        store.upsert_session(&stale).unwrap();
+        let captured = uuid::Uuid::new_v4().to_string();
+        store
+            .set_provider_session_id(&stale.id, "codex", &captured)
+            .unwrap();
+
+        stale.title = Some("unrelated lifecycle update".to_string());
+        store.upsert_session(&stale).unwrap();
+
+        assert_eq!(
+            store.provider_session_id(&stale.id, "codex").unwrap(),
+            Some(captured)
+        );
+        let loaded = store.load_sessions().unwrap();
+        assert_eq!(loaded[0].title.as_deref(), stale.title.as_deref());
+    }
+
     #[test]
     fn started_providers_round_trip() {
         let store = test_store();

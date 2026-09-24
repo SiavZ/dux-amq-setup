@@ -1189,3 +1189,54 @@ fn provider_session_ids_arrive_empty_on_an_upstream_database() {
         Some("first")
     );
 }
+
+/// Fork a38187f3 (its migration 0006). A database from before the column,
+/// here a current database with the column dropped again, gains it on open
+/// and every existing row reads as having no recorded ids and can record one.
+#[test]
+fn migration_0006_adds_provider_session_ids_to_v5_database() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("v5.sqlite3");
+    drop(SessionStore::open(&path).expect("create current database"));
+    let conn = Connection::open(&path).expect("open raw database");
+    conn.execute_batch(
+        r#"
+        alter table agent_sessions drop column provider_session_ids;
+        insert into agent_sessions
+          (id, project_id, provider, source_branch, branch_name, worktree_path,
+           started_providers, status, created_at, updated_at, sort_order, agent_handle)
+        values
+          ('legacy', 'proj-1', 'claude', 'main', 'legacy', '/tmp/legacy',
+           '["claude"]', 'detached', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 0,
+           'legacy');
+        "#,
+    )
+    .expect("construct v5 fixture");
+    let columns = |conn: &Connection| -> Vec<String> {
+        conn.prepare("pragma table_info(agent_sessions)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    assert!(!columns(&conn).contains(&"provider_session_ids".to_string()));
+    drop(conn);
+
+    let store = SessionStore::open(&path).expect("migrate the v5 database");
+    assert!(
+        columns(&Connection::open(&path).unwrap()).contains(&"provider_session_ids".to_string())
+    );
+    assert!(store.provider_session_ids("legacy").unwrap().is_empty());
+    let id = "2f7b1c9e-3a44-4c1b-9a0e-6f1d2c3b4a55";
+    store
+        .set_provider_session_id("legacy", "claude", id)
+        .expect("the migrated row records an id");
+    assert_eq!(
+        store
+            .provider_session_id("legacy", "claude")
+            .unwrap()
+            .as_deref(),
+        Some(id)
+    );
+}
