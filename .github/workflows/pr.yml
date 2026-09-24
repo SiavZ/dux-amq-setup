@@ -113,8 +113,13 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
-    name: Test
-    runs-on: ubuntu-latest
+    # BRANCH-PROTECTION CONTRACT: `Test (ubuntu-24.04)` is a required status
+    # check on main (see .github/BRANCH_PROTECTION.md). Upstream names this job
+    # `Test`; renaming it back would leave the required context unreported and
+    # block every PR. ubuntu-24.04 is what ubuntu-latest resolves to today, so
+    # pinning it keeps upstream's behaviour and makes the name true.
+    name: Test (ubuntu-24.04)
+    runs-on: ubuntu-24.04
     # Gated, not merely accompanied: a sibling job that fails does not stop this
     # one from reporting green, and green-with-no-web-UI is the exact outcome the
     # guard exists to prevent.
@@ -238,7 +243,14 @@ jobs:
   # arms that otherwise run on a maintainer laptop or nowhere. One job, two
   # steps, so the compile cache is warmed once on the slower runner.
   clippy-test-macos:
-    name: Clippy and test (macOS)
+    # BRANCH-PROTECTION CONTRACT: `Test (macos-14)` is a required status check
+    # on main (see .github/BRANCH_PROTECTION.md), so this job carries that name
+    # even though it runs on macos-latest as upstream does: it has not been
+    # proven on a macos-14 runner, and pinning an unverified image would risk
+    # the one required macOS gate. Upstream calls it `Clippy and test (macOS)`;
+    # do not take that name back in an upstream merge. It currently runs
+    # clippy only (see the note on cargo test at the end of the job).
+    name: Test (macos-14)
     runs-on: macos-latest
     needs: no-ui-build-hatch
     steps:

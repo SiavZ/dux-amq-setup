@@ -11,21 +11,27 @@ GitHub UI (Settings → Branches → Protection rules → main).
   - Required approvals: 1 (CODEOWNERS-aware)
   - Dismiss stale approvals on push: yes
   - Require approval from CODEOWNERS: yes
-- **Required status checks.** The workspace CI (upstream's `pr.yml` plus this
-  fork's additions) names its jobs differently from the pre-workspace CI, so
-  the contexts changed. Before the workspace merge, `main` required
-  `Test (ubuntu-24.04)`, `Test (macos-14)`, `Security` and `shell`. Two of
-  those are no longer produced by any workflow, and a required context that
-  never reports blocks every PR, so the protection has to be updated in the
-  same change that lands the workspace CI:
-  - `Test` (`cargo test` on Linux, from `.github/workflows/pr.yml`)
-  - `Clippy and test (macOS)` (clippy on macOS, same file)
-  - `Security` (`cargo audit` + `cargo deny check`, same file)
-  - `shell` (`shellcheck` + `bats` from `.github/workflows/overlay-ci.yml`)
+- **Required status checks** (the contexts currently enforced on `main`;
+  verify with `gh api /repos/SiavZ/dux-amq-setup/branches/main/protection`).
+  These job names are kept stable on purpose. Upstream's workspace CI names
+  its jobs `Test` and `Clippy and test (macOS)`; this fork renames them back so
+  the protection that already exists keeps gating. Each job carries a
+  `BRANCH-PROTECTION CONTRACT` comment. Do not rename them in an upstream merge.
+  - `Test (ubuntu-24.04)`: `cargo test` on Linux, the `test` job in
+    `.github/workflows/pr.yml` and `.github/workflows/test.yml`, pinned to
+    `ubuntu-24.04`
+  - `Test (macos-14)`: the `clippy-test-macos` job in the same two files.
+    It runs clippy with `--all-targets` on `macos-latest` as upstream does
+    (not yet proven on a macos-14 runner). `cargo test` is not run on macOS
+    in CI yet, see the note at the end of that job
+  - `Security`: `cargo audit` + `cargo deny check`, in pr.yml and test.yml
+  - `shell`: `shellcheck` + `bats` from `.github/workflows/overlay-ci.yml`
   - `Strict mode (require branches up to date before merging)`: yes
 - **Recommended (not currently required) but run on every PR**:
   - `Format`, `Clippy`, `Web lint`, `Web build and unit tests`,
-    `dux-web dependency isolation`, `Reject DUX_DISABLE_UI_BUILD`, `MSRV (1.88)`.
+    `dux-web dependency isolation`, `Reject DUX_DISABLE_UI_BUILD`, and
+    `MSRV (1.88)` (`cargo +1.88.0 check`, which keeps the workspace's
+    declared `rust-version` true).
     Add them to the protection if you treat them as merge gates; the recipe
     below shows the syntax.
 - **Disallow force push**: yes (covers force-push to main + delete)
@@ -56,8 +62,8 @@ gh api -X PUT \
   -H "Accept: application/vnd.github+json" \
   /repos/SiavZ/dux-amq-setup/branches/main/protection \
   -f required_status_checks[strict]=true \
-  -f 'required_status_checks[contexts][]=Test' \
-  -f 'required_status_checks[contexts][]=Clippy and test (macOS)' \
+  -f 'required_status_checks[contexts][]=Test (ubuntu-24.04)' \
+  -f 'required_status_checks[contexts][]=Test (macos-14)' \
   -f 'required_status_checks[contexts][]=Security' \
   -f 'required_status_checks[contexts][]=shell' \
   -f required_pull_request_reviews[required_approving_review_count]=1 \

@@ -33,7 +33,10 @@ jobs:
           echo "OK: DUX_DISABLE_UI_BUILD is not set; the frontend will be built."
 
   test:
-    runs-on: ubuntu-latest
+    # BRANCH-PROTECTION CONTRACT: same name as pr.yml's Linux test job, so a
+    # push to main reports the required `Test (ubuntu-24.04)` context too.
+    name: Test (ubuntu-24.04)
+    runs-on: ubuntu-24.04
     # Gated, not merely accompanied: a sibling job that fails does not stop this
     # one reporting green, and green-without-a-web-UI is what the guard prevents.
     needs: no-ui-build-hatch
@@ -77,7 +80,9 @@ jobs:
   # arms that otherwise run on a maintainer laptop or nowhere. One job, two
   # steps, so the compile cache is warmed once on the slower runner.
   clippy-test-macos:
-    name: Clippy and test (macOS)
+    # BRANCH-PROTECTION CONTRACT: reports the required `Test (macos-14)`
+    # context. Stays on macos-latest like upstream; see pr.yml for why.
+    name: Test (macos-14)
     runs-on: macos-latest
     needs: no-ui-build-hatch
     steps:

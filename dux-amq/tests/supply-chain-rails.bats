@@ -170,3 +170,16 @@ host_target() {
     grep -Eiq -- 'unmaintained|no patched|no upstream replacement' "$file"
   done
 }
+
+# main's branch protection requires these exact contexts. A required context
+# that no workflow reports blocks every PR, and upstream's CI names its jobs
+# differently, so an upstream merge must not silently rename them.
+@test "CI emits every status check main's branch protection requires" {
+  local wf="$REPO_ROOT/.github/workflows" name
+  for name in "Test (ubuntu-24.04)" "Test (macos-14)" "Security"; do
+    grep -Fxq -- "    name: $name" "$wf/pr.yml"
+    grep -Fxq -- "    name: $name" "$wf/test.yml"
+  done
+  grep -Eq '^  shell:$' "$wf/overlay-ci.yml"
+  ! grep -Eq '^    name:' "$wf/overlay-ci.yml" || false
+}
