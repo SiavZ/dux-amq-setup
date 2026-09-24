@@ -19,62 +19,72 @@ and `has_newer_binary()` only reloads when the payload mtime actually changed.
 
 ## Why dux is different
 
-dux has no server for agents. `PtyClient` owns the child **directly**
-(`crates/dux-core/src/pty.rs`), and `shutdown_ptys_interruptible`
-(`engine/lifecycle.rs:1623`) terminates every provider on exit.
+dux has no server for agents. `PtyClient` owns the child **directly**, and
+`shutdown_ptys_interruptible` terminates every provider on exit.
 
-## What I verified (not assumed)
+That made a daemon split look necessary. It is not.
+
+## What was verified (probes, not reasoning)
 
 | Question | Method | Result |
 |---|---|---|
-| Do children survive `exec`? | Compiled a Rust probe that spawns a child then execs | **Yes**, child survived, reparented to PPID 1 |
-| Is the PTY master CLOEXEC? | Read `portable-pty-0.9.0/src/unix.rs:64`, then read `F_GETFD` on a live master | **Yes**, so it would be closed on exec |
-| Can the master survive anyway? | Cleared `FD_CLOEXEC`, exec'd, wrote+read through the inherited fd | **Yes**, full round trip |
-| Is it the *same* child? | Compared `$$` before/after exec, and read back a shell var set pre-exec | **Same pid (14309)**, in-shell state intact |
+| Do children survive `exec`? | Rust probe: spawn, then exec | **Yes**, reparented to PPID 1 |
+| Is the PTY master CLOEXEC? | Read `portable-pty/src/unix.rs:64`, then `F_GETFD` on a live master | **Yes**, closed on exec |
+| Can it survive anyway? | Clear `FD_CLOEXEC`, exec, write+read the inherited fd | **Yes**, full round trip |
+| Same child, or a new one? | Compare `$$` and a pre-exec shell var across the exec | **Same pid**, state intact |
+| Is it still *our* child? | After exec, `SIGKILL` + `waitpid` from the new image | **Reaped normally** |
 
-That last row is the whole feature: generation 2 drove the original live agent.
-**No daemon split is required.**
+The last row matters: `exec` replaces the image, not the process, so the
+parent-child relationship survives and ordinary signals and `waitpid` work.
 
-## Design
+## What is built
 
-Add `RunExit::Reload`, mirroring the existing `RunExit::FlipToServer`, which
-already hands live `TcpListener`s across a mode switch. Same shape, same place.
+- `pty_reattach` — adopt an inherited master as a `MasterPty` (portable-pty's own
+  type has private fields and no from-fd constructor, but the trait is small)
+- `pty_adopt_child` — wrap the surviving process as a `Child` (thin: same
+  `waitpid`/`kill` the original made)
+- `reload_handoff` — the manifest naming which fd belongs to which tab
+- `PtyClient::prepare_for_reload` / `adopt_after_reload`
+- `Engine::prepare_reload_handoff` / `restore_reload_handoff`
 
-Per provider, before exec:
-- clear `FD_CLOEXEC` on `master.as_raw_fd()` (already exposed, used at
-  `pty.rs:1840`)
-- record `tab_id -> (fd, child_pid, rows, cols, spawn_dir)` into an env var or
-  a handoff file
+### Deliberate asymmetry
 
-Then `exec` the new binary with a `--reload-handoff` flag. Generation 2 rebuilds
-each `PtyClient` from the inherited fd.
+Collection is **all or nothing**: if one pty cannot cross, refuse and do not
+exec. Refusing before the exec costs nothing, while a partial handoff strands
+agents as unreachable orphans.
 
-### The one real cost
+Restore is **best effort**: after the exec there is nothing to go back to, so one
+bad entry must not discard agents that are still fine.
 
-`portable-pty`'s `UnixMasterPty` has private fields and no from-fd constructor,
-so the inherited fd cannot be turned back into that type. dux only needs
-read / write / resize on the master, all of which work on a raw fd via `std::fs::File`
-and a `TIOCSWINSZ` ioctl. So `PtyClient` needs to hold an enum: either a
-portable-pty master (fresh spawn) or a reattached raw fd (post-reload).
+### Known cost
 
-### Scrollback
+Scrollback is not carried. The alacritty grid lives in the old image's memory, so
+a reloaded row is blank until the agent writes again. The agent itself never
+stops, which is the point.
 
-`TerminalState` (the alacritty grid) is in-process and dies with the old image.
-Sessions already persist in sqlite (`storage.rs`), so tab/session mapping is
-free. The grid is not. Options:
-- accept a cleared scrollback on reload (agents keep running, history resets)
-- serialize the visible grid to the handoff file and repaint
+## Test status
 
-Start with the first; it is honest and much smaller. The agent is still live and
-its next output repaints normally.
+2618 dux-core tests pass. The reload work adds 24, including an end-to-end test
+that execs for real and drives a live `PtyClient` on both sides.
 
-### Guards (ported from jcode)
+Mutation-checked at every load-bearing point, each fails a test when broken:
+- removing `keep_open_across_exec`
+- dropping the slot-tab session fallback
+- dropping the adopted child's exit-status memoization
+- rebuilding a client around the wrong pid
+- dropping companion terminal identity
 
-- refuse to reload while any agent is mid-turn, unless forced
-- only reload when the on-disk binary is actually newer
-- if any part of the handoff fails, do not exec: stay running
+One test was found weaker than it looked: it reported the pid straight from the
+handoff, so it agreed with itself regardless of what the client was wired to. It
+now reads the rebuilt client's own pid.
 
-## Status
+## Remaining
 
-Mechanism proven end to end. Next: implement `RunExit::Reload` and the fd
-handoff.
+The transport is complete and proven. Not yet wired to the UI:
+
+1. `RunExit::Reload`, mirroring the existing `RunExit::FlipToServer`
+2. A keybinding or command to request it
+3. Startup consuming `--reload-handoff` before restoring sessions
+4. Guards, ported from jcode: refuse mid-turn, only reload on a newer binary
+
+A user cannot press anything and get a reload yet.
