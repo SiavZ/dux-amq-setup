@@ -276,8 +276,6 @@ The `prune-orphan-worktrees` palette action is opt-in and never automatic. It li
 
 ### Peer Routing
 
-<!-- INTEGRATION: path pending seedling (peer), maple (AMQ) -->
-
 Agents send messages through dux instead of picking a transport themselves:
 
 ```bash
@@ -286,7 +284,7 @@ dux peer list
 dux peer sync-amq
 ```
 
-`dux peer send` prefers Claude Peers only when both ends are isolated worktree sessions. If either end is in a shared workspace, dux routes through AMQ by the agent's immutable handle, because matching peers by working directory would be ambiguous. dux refreshes AMQ's agent registry from `sessions.sqlite3` at startup and on `dux peer sync-amq`.
+`dux peer send` sends to a Claude agent over Claude Peers and to every other provider over AMQ; pass `--transport amq` to override. If either end is in a shared workspace, dux always routes through AMQ by the agent's immutable handle, because matching peers by working directory would be ambiguous. Every agent is launched with `DUX_SESSION_ID`, `DUX_STORE_ID`, `DUX_PROVIDER` and `DUX_AMQ_HANDLE`, and dux refreshes AMQ's agent registry from `sessions.sqlite3` when the TUI or `dux server` starts, and on `dux peer sync-amq`.
 
 ### Per-Session Settings
 
