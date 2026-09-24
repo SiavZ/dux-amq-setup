@@ -1151,49 +1151,60 @@ mod tests {
             "the burner fixture must be a real tree (sh plus its subshells), got {burner_count} \
              processes; if this fails the shell did not fork as expected"
         );
+        // The bug this test exists for: sysinfo 0.35 reported EXACTLY 0% for
+        // every process on macOS. Four spinning shells always get some CPU,
+        // however saturated the box, so a zero reading is wrong on any machine
+        // and this holds unconditionally.
         assert!(
-            burner_cpu > 50.0,
-            "a tree burning whole cores must read high, got {burner_cpu}%"
+            burner_cpu > 0.0,
+            "a tree burning CPU must never read 0% (the always-zero sysinfo bug), \
+             got {burner_cpu}%"
         );
         assert!(
             idle_cpu < 5.0,
             "a sleeping process must read about nothing, got {idle_cpu}%"
         );
-        if cores >= 6 {
-            // "A box with cores to spare" is a PREMISE, not a given. This
-            // asserts that four spinning shells were handed more than one core
-            // between them, which the scheduler can only do when more than one
-            // core is free. Run alone that is true on any developer machine;
-            // run inside the full suite, where a couple of thousand other tests
-            // are competing for the same cores (and alongside whatever else the
-            // machine happens to be doing), the burners get a fair share of a
-            // saturated box instead, and the aggregate lands below 100% without
-            // anything being wrong with dux.
-            //
-            // So the premise is measured: `spare` is how much CPU was NOT being
-            // used by anything else at the moment of the sample. The direction
-            // this test exists to prove, that a burn reads high and is never
-            // clamped at exactly 100, is asserted above and unconditionally.
-            let busy_elsewhere: f32 = sys
-                .processes()
-                .iter()
-                .filter(|(pid, _)| pid.as_u32() != burner_pid && pid.as_u32() != idler_pid)
-                .map(|(_, p)| p.cpu_usage())
-                .sum();
-            let spare = (cores as f32 * 100.0) - busy_elsewhere;
-            if spare > 200.0 {
-                assert!(
-                    burner_cpu > 100.0,
-                    "four busy processes on a {cores}-core box with {spare:.0}% spare \
-                     must exceed 100% aggregate; got {burner_cpu}% (a clamp would pin \
-                     this at exactly 100)"
-                );
-            } else {
-                eprintln!(
-                    "skipping the >100% aggregate check: only {spare:.0}% CPU was \
-                     spare, so the scheduler could not give the burn whole cores"
-                );
-            }
+        // How HIGH the burn reads depends on a PREMISE, not a given: that the
+        // scheduler had cores to hand it. Run alone on an idle machine that is
+        // true; inside the full suite, or on a box already running dozens of
+        // agents and builds, the burners get a fair share of a saturated machine
+        // and read low without anything being wrong with dux (measured here at
+        // a load average of 58 on 18 cores: 3% to 42%).
+        //
+        // So the premise is measured: `spare` is how much CPU nothing else was
+        // using in the same sample, and each magnitude check runs only when its
+        // premise held. The zero check above is unconditional.
+        let busy_elsewhere: f32 = sys
+            .processes()
+            .iter()
+            .filter(|(pid, _)| pid.as_u32() != burner_pid && pid.as_u32() != idler_pid)
+            .map(|(_, p)| p.cpu_usage())
+            .sum();
+        let spare = (cores as f32 * 100.0) - busy_elsewhere;
+        if spare > 100.0 {
+            assert!(
+                burner_cpu > 50.0,
+                "with {spare:.0}% CPU spare, a tree burning whole cores must read high, \
+                 got {burner_cpu}%"
+            );
+        } else {
+            eprintln!(
+                "skipping the >50% check: only {spare:.0}% CPU was spare, so the \
+                 scheduler could not give the burn a whole core"
+            );
+        }
+        if cores >= 6 && spare > 200.0 {
+            assert!(
+                burner_cpu > 100.0,
+                "four busy processes on a {cores}-core box with {spare:.0}% spare \
+                 must exceed 100% aggregate; got {burner_cpu}% (a clamp would pin \
+                 this at exactly 100)"
+            );
+        } else if cores >= 6 {
+            eprintln!(
+                "skipping the >100% aggregate check: only {spare:.0}% CPU was \
+                 spare, so the scheduler could not give the burn whole cores"
+            );
         }
     }
 
