@@ -475,6 +475,87 @@ mod tests {
         assert!(matches!(app.prompt, PromptState::None));
     }
 
+    /// Fork test, adapted to the one-variant modal: Enter on a row only opens
+    /// its confirmation with branch deletion OFF, Esc backs out without
+    /// starting a worker, `b` opts into branch deletion, and a second Enter is
+    /// what dispatches. Driven through the real `handle_key` path.
+    #[test]
+    fn orphan_cleaner_requires_per_item_confirmation_and_preserves_branch_by_default() {
+        let mut app = test_app(default_bindings());
+        let paths = app.engine.paths.clone();
+        app.prompt = PromptState::OrphanWorktrees(OrphanWorktreesPrompt {
+            candidates: vec![OrphanWorktreeCandidate {
+                project_path: paths.root.clone(),
+                worktree_path: paths.worktrees_root.join("orphan"),
+                branch: Some("keep-by-default".to_string()),
+                dirty: true,
+            }],
+            selected: 0,
+            stage: OrphanWorktreesStage::List,
+        });
+
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            stage(&app),
+            OrphanWorktreesStage::Confirm {
+                delete_branch: false
+            }
+        );
+        app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert_eq!(stage(&app), OrphanWorktreesStage::List);
+        assert!(app.orphan_worktrees_rx.is_none(), "no worker started");
+
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+        app.handle_key(key(KeyCode::Char('b'))).unwrap();
+        assert_eq!(
+            stage(&app),
+            OrphanWorktreesStage::Confirm {
+                delete_branch: true
+            }
+        );
+
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(stage(&app), OrphanWorktreesStage::Removing);
+        assert!(app.orphan_worktrees_rx.is_some(), "the removal worker runs");
+    }
+
+    /// Fork test: the list shows the dirty warning, the branch and the path.
+    #[test]
+    fn orphan_cleaner_renders_dirty_and_untracked_warning() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_app(default_bindings());
+        let paths = app.engine.paths.clone();
+        app.prompt = PromptState::OrphanWorktrees(OrphanWorktreesPrompt {
+            candidates: vec![OrphanWorktreeCandidate {
+                project_path: paths.root.clone(),
+                worktree_path: paths.worktrees_root.join("dirty-orphan"),
+                branch: Some("keep-this-branch".to_string()),
+                dirty: true,
+            }],
+            selected: 0,
+            stage: OrphanWorktreesStage::List,
+        });
+
+        let backend = TestBackend::new(200, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render orphan inventory");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(rendered.contains("DIRTY"));
+        assert!(rendered.contains("keep-this-branch"));
+        assert!(rendered.contains("dirty-orphan"));
+    }
+
     /// A detached orphan cannot opt into branch deletion.
     #[test]
     fn a_detached_row_cannot_toggle_branch_deletion() {
