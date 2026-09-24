@@ -23,14 +23,21 @@ function walk(dir: string): string[] {
 // builder is recognised, so a new one is scanned the day it is written.
 const PROSE_IMPORT = /from\s+["'](?:\.\/prose|@\/lib\/prose)["']/
 
+// A file that renders a modal imports one of the two dialog primitives, which
+// finds a modal whose file is not named like one.
+const DIALOG_IMPORT = /from\s+["']@\/components\/ui\/(?:alert-)?dialog["']/
+
 // Which files the guard reads, by rule rather than by list: every dialog under
-// components/ (subdirectories included), found by name, and every file under
-// components/ or lib/ that builds prose. The prose helpers themselves are the
-// definition of a chip, not a user of one.
+// components/ (subdirectories included), found by its name or by the dialog
+// primitive it imports, and every file under components/ or lib/ that builds
+// prose. The prose helpers themselves are the definition of a chip, not a user
+// of one.
 function isScanned(name: string, source: string): boolean {
   if (!/\.tsx?$/.test(name) || name.includes(".test.")) return false
   if (name === "lib/prose.tsx") return false
-  const isDialog = name.startsWith("components/") && /Dialog[^/]*\.tsx$/.test(name)
+  const isDialog =
+    (name.startsWith("components/") && /Dialog[^/]*\.tsx$/.test(name)) ||
+    DIALOG_IMPORT.test(source)
   return isDialog || PROSE_IMPORT.test(source)
 }
 
@@ -207,6 +214,22 @@ describe("every name a modal shows is the shared chip", () => {
     expect(isScanned("lib/newCopy.ts", 'import { chip } from "./prose"')).toBe(true)
     expect(isScanned("lib/newCopy.ts", 'import { chip } from "@/lib/prose"')).toBe(true)
     expect(isScanned("lib/unrelated.ts", 'import { x } from "./y"')).toBe(false)
+    // A modal that is not named like one is still found by what it renders.
+    expect(
+      isScanned(
+        "components/terminal/TakeOverCard.tsx",
+        'import { Dialog, DialogContent } from "@/components/ui/dialog"',
+      ),
+    ).toBe(true)
+    expect(
+      isScanned(
+        "components/ConfirmThing.tsx",
+        'import {\n  AlertDialog,\n} from "@/components/ui/alert-dialog"',
+      ),
+    ).toBe(true)
+    expect(
+      isScanned("components/Other.tsx", 'import { x } from "@/components/ui/dialog-ish"'),
+    ).toBe(false)
     expect(isScanned("components/SomeDialog.test.tsx", "")).toBe(false)
     expect(isScanned("lib/prose.tsx", "")).toBe(false)
   })
