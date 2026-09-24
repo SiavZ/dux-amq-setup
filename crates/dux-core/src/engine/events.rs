@@ -2048,7 +2048,7 @@ impl Engine {
                  want it gone."
             ];
             logger::warn(&message);
-            return message;
+            return message.into();
         }
         // Guard against a duplicate worker (e.g. a project delete racing the
         // reap); the completion handler clears it.
@@ -3017,8 +3017,10 @@ impl Engine {
                 let error_final = if let Some(id) = status_op_id
                     && let Some(op) = self.pending_web_add_project_ops.remove(&id)
                 {
-                    op.resolve(&crate::engine::WebAddProjectOutcome::AddFailed { message: error })
-                        .into_reaction()
+                    op.resolve(&crate::engine::WebAddProjectOutcome::AddFailed {
+                        message: error.into(),
+                    })
+                    .into_reaction()
                 } else {
                     EventReaction::Status(StatusUpdate::error(error))
                 };
@@ -8343,7 +8345,7 @@ mod tests {
                 repo_path: repo_path.clone(),
                 target: PullTarget::Session,
                 busy_message: "busy".to_string().into(),
-                already_running_message: "Pull already in progress".to_string(),
+                already_running_message: "Pull already in progress".to_string().into(),
             })
             .expect("apply succeeds");
         assert!(matches!(

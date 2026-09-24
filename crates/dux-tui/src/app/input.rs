@@ -2862,7 +2862,8 @@ impl App {
                 .into(),
             already_running_message:
                 "Pull already in progress for this worktree. Wait for the current pull to finish."
-                    .to_string(),
+                    .to_string()
+                    .into(),
         })?;
         self.apply_reaction(reaction);
         Ok(())

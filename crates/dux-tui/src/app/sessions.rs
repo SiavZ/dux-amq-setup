@@ -1815,7 +1815,7 @@ impl App {
             already_running_message: format!(
                 "Project refresh already in progress for \"{}\". Wait for the current pull to finish.",
                 project.name,
-            ),
+            ).into(),
         })?;
         self.apply_reaction(reaction);
         Ok(())

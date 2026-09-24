@@ -258,22 +258,38 @@ impl BranchProvenance {
     /// what it is. Names `git branch -D`, because once the worktree is gone no
     /// dux surface can reach the branch. Shared by the TUI status line and the
     /// web toast.
-    pub fn kept_branches_note(&self, branch_name: &str, initial_branch: &str) -> String {
+    pub fn kept_branches_note(
+        &self,
+        branch_name: &str,
+        initial_branch: &str,
+    ) -> crate::status_text::StatusText {
         let drifted = !initial_branch.is_empty() && initial_branch != branch_name;
         if drifted {
-            format!(
-                "Its branch \"{branch_name}\" was created inside this agent's worktree and was kept, \
-                 and its branch \"{initial_branch}\" {} and was kept. \
-                 Delete either yourself with git branch -D \"{branch_name}\" or \
-                 git branch -D \"{initial_branch}\" if you no longer need them.",
-                self.kept_reason()
-            )
+            crate::status_text![
+                "Its branch ",
+                q(branch_name),
+                " was created inside this agent's worktree and was kept, and its branch ",
+                q(initial_branch),
+                format!(
+                    " {} and was kept. Delete either yourself with ",
+                    self.kept_reason()
+                ),
+                n(crate::git::branch_delete_command(branch_name)),
+                " or ",
+                n(crate::git::branch_delete_command(initial_branch)),
+                " if you no longer need them."
+            ]
         } else {
-            format!(
-                "Its branch \"{branch_name}\" {} and was kept. \
-                 Delete it yourself with git branch -D \"{branch_name}\" if you no longer need it.",
-                self.kept_reason()
-            )
+            crate::status_text![
+                "Its branch ",
+                q(branch_name),
+                format!(
+                    " {} and was kept. Delete it yourself with ",
+                    self.kept_reason()
+                ),
+                n(crate::git::branch_delete_command(branch_name)),
+                " if you no longer need it."
+            ]
         }
     }
 }
@@ -299,24 +315,37 @@ pub enum BranchKeptReason {
 impl BranchKeptReason {
     /// The sentence(s) naming every branch the removal kept, with its reason.
     /// See [`BranchProvenance::kept_branches_note`] for the drift rule.
-    pub fn kept_branches_note(&self, branch_name: &str, initial_branch: &str) -> String {
+    pub fn kept_branches_note(
+        &self,
+        branch_name: &str,
+        initial_branch: &str,
+    ) -> crate::status_text::StatusText {
         match self {
             Self::NotDuxs(provenance) => provenance.kept_branches_note(branch_name, initial_branch),
             Self::UserDeclined => {
                 let drifted = !initial_branch.is_empty() && initial_branch != branch_name;
                 if drifted {
-                    format!(
-                        "Its branches \"{branch_name}\" and \"{initial_branch}\" were kept \
-                         because you left the branch box unticked. Delete either yourself with \
-                         git branch -D \"{branch_name}\" or git branch -D \"{initial_branch}\" \
-                         if you no longer need them."
-                    )
+                    crate::status_text![
+                        "Its branches ",
+                        q(branch_name),
+                        " and ",
+                        q(initial_branch),
+                        " were kept because you left the branch box unticked. Delete either \
+                         yourself with ",
+                        n(crate::git::branch_delete_command(branch_name)),
+                        " or ",
+                        n(crate::git::branch_delete_command(initial_branch)),
+                        " if you no longer need them."
+                    ]
                 } else {
-                    format!(
-                        "Its branch \"{branch_name}\" was kept because you left the branch box \
-                         unticked. Delete it yourself with git branch -D \"{branch_name}\" if \
-                         you no longer need it."
-                    )
+                    crate::status_text![
+                        "Its branch ",
+                        q(branch_name),
+                        " was kept because you left the branch box unticked. Delete it yourself \
+                         with ",
+                        n(crate::git::branch_delete_command(branch_name)),
+                        " if you no longer need it."
+                    ]
                 }
             }
         }

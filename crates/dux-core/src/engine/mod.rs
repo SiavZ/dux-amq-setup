@@ -860,13 +860,13 @@ pub enum WebDeleteOutcome {
     /// message came from the snapshot it left behind. `refused` is true when git
     /// would not delete one of the branches, which leaves the user something to
     /// clean up and is the difference between an info and a warning.
-    Succeeded { message: String, refused: bool },
+    Succeeded { message: StatusText, refused: bool },
     /// Git removal succeeded but the session was already gone (e.g. its project
     /// was removed) before the worker reported back.
     SucceededGone,
     /// Git removal failed; `message` is the authored failure sentence, which
     /// names the agent when the dispatch-time snapshot was still there to name it.
-    Failed { message: String },
+    Failed { message: StatusText },
     /// Git removal succeeded but the post-removal `FinishDeleteSession` cascade
     /// failed; `message` is the formatted error.
     CleanupFailed { message: String },
@@ -1014,7 +1014,7 @@ pub enum WebAddProjectOutcome {
     },
     /// The switch succeeded but the inline add was rolled back; `message` is the
     /// already-formatted failure line.
-    AddFailed { message: String },
+    AddFailed { message: StatusText },
 }
 
 /// Handler-computed outcome for the web new-agent-from-PR lookup op.
@@ -4699,7 +4699,7 @@ impl Engine {
                 title,
                 provider,
             },
-            busy_message,
+            busy_message.into(),
         ))
     }
 
@@ -4924,7 +4924,9 @@ impl Engine {
                     ") no longer exists. Restore the folder, or delete this agent and create a new one pointing at the folder you want."
                 ],
             };
-            return Ok(ReconnectPlan::WorktreeMissing { message });
+            return Ok(ReconnectPlan::WorktreeMissing {
+                message: message.into(),
+            });
         }
 
         if force {
@@ -5001,7 +5003,7 @@ impl Engine {
         };
         Ok(ReconnectPlan::Launch {
             request: Box::new(request),
-            busy_message,
+            busy_message: busy_message.into(),
             resume,
             detached_label,
         })

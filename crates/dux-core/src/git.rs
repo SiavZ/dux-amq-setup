@@ -1842,12 +1842,22 @@ impl BranchDeletion {
 /// the web toast say the same thing, which both need because a surviving branch
 /// makes recreating an agent under the same name fail far from the deletion that
 /// caused it.
-pub fn branch_refusal_note(branch: &str, reason: &str) -> String {
+pub fn branch_refusal_note(branch: &str, reason: &str) -> crate::status_text::StatusText {
     let reason = clean_git_reason(reason);
-    format!(
-        "Git refused to delete branch \"{branch}\": {reason} Delete it yourself with \
-         git branch -D \"{branch}\", or give the next agent a different name."
-    )
+    crate::status_text![
+        "Git refused to delete branch ",
+        q(branch),
+        format!(": {reason} Delete it yourself with "),
+        n(branch_delete_command(branch)),
+        ", or give the next agent a different name."
+    ]
+}
+
+/// The command a status tells the user to run to remove a branch by hand,
+/// spelled exactly as the sentences always printed it, so it can travel as one
+/// name (the web draws it as a single chip).
+pub fn branch_delete_command(branch: &str) -> String {
+    format!("git branch -D \"{branch}\"")
 }
 
 /// git's stderr line, tidied for a status message: the "error: " prefix dropped,
@@ -1886,18 +1896,27 @@ impl RemoveResult {
     /// nothing extra rather than mentioning a branch the user never saw.
     ///
     /// Lives here so the TUI status line and the web toast say the same thing.
-    pub fn initial_branch_note(&self, initial_branch: &str) -> Option<String> {
+    pub fn initial_branch_note(
+        &self,
+        initial_branch: &str,
+    ) -> Option<crate::status_text::StatusText> {
         match self.initial_branch.as_ref()? {
-            BranchDeletion::Deleted => Some(format!(
-                "Its original branch \"{initial_branch}\" was deleted too."
-            )),
-            BranchDeletion::AlreadyGone => Some(format!(
-                "Its original branch \"{initial_branch}\" was already gone."
-            )),
-            BranchDeletion::Refused { reason } => Some(format!(
-                "Its original branch \"{initial_branch}\" is still there. {}",
+            BranchDeletion::Deleted => Some(crate::status_text![
+                "Its original branch ",
+                q(initial_branch),
+                " was deleted too."
+            ]),
+            BranchDeletion::AlreadyGone => Some(crate::status_text![
+                "Its original branch ",
+                q(initial_branch),
+                " was already gone."
+            ]),
+            BranchDeletion::Refused { reason } => Some(crate::status_text![
+                "Its original branch ",
+                q(initial_branch),
+                " is still there. ",
                 branch_refusal_note(initial_branch, reason)
-            )),
+            ]),
         }
     }
 }

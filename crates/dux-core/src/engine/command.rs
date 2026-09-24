@@ -161,7 +161,7 @@ pub enum Command {
         repo_path: PathBuf,
         target: PullTarget,
         busy_message: crate::status_text::StatusText,
-        already_running_message: String,
+        already_running_message: crate::status_text::StatusText,
     },
 
     /// Open a filesystem path via the user's OS handler. Fire-and-forget
@@ -851,7 +851,7 @@ impl Engine {
         repo_path: PathBuf,
         target: PullTarget,
         busy_message: crate::status_text::StatusText,
-        already_running_message: String,
+        already_running_message: crate::status_text::StatusText,
     ) -> EventReaction {
         let repo_key = repo_path.to_string_lossy().into_owned();
         let repo_key_for_panic = repo_key.clone();
@@ -1501,7 +1501,7 @@ mod tests {
                 repo_path: tmp.path().to_path_buf(),
                 target: PullTarget::Session,
                 busy_message: "Pulling latest changes\u{2026}".to_string().into(),
-                already_running_message: "A pull is already running.".to_string(),
+                already_running_message: "A pull is already running.".to_string().into(),
             })
             .expect("apply succeeds");
         let pull_busy = match engine.worker_rx.try_recv() {
