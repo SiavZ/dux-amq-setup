@@ -4050,7 +4050,16 @@ pub fn standalone_agent_title(typed: &str, folder: &Path) -> String {
 }
 
 pub fn docker_style_name() -> String {
-    petname::petname(2, "-").expect("petname generation should not fail")
+    // Fork e393c1d1 (P1-M): petname returns None only when its RNG or word
+    // lists fail, and a random agent name is not worth a panic in the create
+    // path. A uuid-based name is just as unique.
+    petname::petname(2, "-").unwrap_or_else(fallback_agent_name)
+}
+
+/// The name [`docker_style_name`] falls back to: `agent-` plus 32 hex digits,
+/// which is a valid branch name and never collides in practice.
+fn fallback_agent_name() -> String {
+    format!("agent-{}", uuid::Uuid::new_v4().simple())
 }
 
 /// Returns `true` if `name` contains only characters safe for git branch names:
@@ -5036,6 +5045,15 @@ mod tests {
     #[test]
     fn docker_name_uses_dash() {
         assert!(docker_style_name().contains('-'));
+    }
+
+    #[test]
+    fn fallback_agent_name_is_a_valid_unique_branch_name() {
+        let a = fallback_agent_name();
+        let b = fallback_agent_name();
+        assert!(a.starts_with("agent-") && a.len() == "agent-".len() + 32);
+        assert_ne!(a, b);
+        assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
     }
 
     // ── Project worktree explorer link (fork 1d69de16, 18a13536, e80151ad) ──

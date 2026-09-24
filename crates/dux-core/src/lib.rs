@@ -83,3 +83,15 @@ pub mod worktree_manager;
 pub fn display_version() -> &'static str {
     env!("DUX_DISPLAY_VERSION")
 }
+
+/// Serializes the tests that set process environment variables (fork
+/// e393c1d1, P1-L, which used `serial_test`). `set_var` is unsafe precisely
+/// because a parallel test reading the environment can race it; every test
+/// that sets one holds this for its whole body.
+#[cfg(test)]
+pub(crate) fn env_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}

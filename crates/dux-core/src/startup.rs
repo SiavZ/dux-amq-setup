@@ -488,6 +488,7 @@ mod tests {
 
     #[test]
     fn startup_command_shell_expands_config_env_vars() {
+        let _env = crate::env_test_guard();
         unsafe { std::env::set_var("DUX_TEST_STARTUP_SHELL", "/bin/sh") };
         assert_eq!(startup_shell_command("$DUX_TEST_STARTUP_SHELL"), "/bin/sh");
         unsafe { std::env::remove_var("DUX_TEST_STARTUP_SHELL") };

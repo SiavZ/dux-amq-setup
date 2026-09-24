@@ -4620,6 +4620,26 @@ mod tests {
         assert!(ensure_column(&conn, "t", "extra", "text").unwrap());
     }
 
+    /// The quoted-default shapes the fork's legacy call sites used must keep
+    /// working through the allowlist (fork e393c1d1).
+    #[test]
+    fn ensure_column_accepts_legacy_defaults() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("create table t (id integer);").unwrap();
+        assert!(
+            ensure_column(
+                &conn,
+                "t",
+                "started_providers",
+                "text not null default '[]'"
+            )
+            .unwrap()
+        );
+        assert!(ensure_column(&conn, "t", "state", "TEXT NOT NULL DEFAULT 'OPEN'").unwrap());
+        assert!(ensure_column(&conn, "t", "title", "text not null default ''").unwrap());
+        assert!(!ensure_column(&conn, "t", "title", "text not null default ''").unwrap());
+    }
+
     #[test]
     fn is_safe_ident_matches_pattern() {
         assert!(is_safe_ident("agent_sessions"));

@@ -4580,6 +4580,7 @@ mod tests {
 
     #[test]
     fn expand_path_dollar_var() {
+        let _env = crate::env_test_guard();
         // SAFETY: test-only env manipulation; tests are run with --test-threads=1
         // or use unique variable names to avoid races.
         unsafe { std::env::set_var("DUX_TEST_VAR_1", "/test/value") };
@@ -4590,6 +4591,7 @@ mod tests {
 
     #[test]
     fn expand_path_braced_var() {
+        let _env = crate::env_test_guard();
         unsafe { std::env::set_var("DUX_TEST_VAR_2", "/braced") };
         let result = expand_path("${DUX_TEST_VAR_2}/sub").unwrap();
         assert_eq!(result, "/braced/sub");
@@ -4619,6 +4621,7 @@ mod tests {
 
     #[test]
     fn expand_path_rejects_traversal() {
+        let _env = crate::env_test_guard();
         unsafe { std::env::set_var("DUX_TEST_VAR_3", "/safe") };
         assert!(expand_path("$DUX_TEST_VAR_3/../etc/passwd").is_none());
         unsafe { std::env::remove_var("DUX_TEST_VAR_3") };
@@ -4733,6 +4736,7 @@ mod tests {
 
     #[test]
     fn expand_variable_reads_both_forms_and_stops_at_the_name() {
+        let _env = crate::env_test_guard();
         unsafe { std::env::set_var("DUX_TEST_VAR_4", "/value") };
         let mut plain = "DUX_TEST_VAR_4/rest".chars().peekable();
         assert_eq!(expand_variable(&mut plain).as_deref(), Some("/value"));
@@ -4771,6 +4775,7 @@ mod tests {
 
     #[test]
     fn project_env_lines_parse_and_expand() {
+        let _env = crate::env_test_guard();
         unsafe { std::env::set_var("DUX_TEST_PROJECT_ENV_SOURCE", "secret") };
         let env = parse_project_env_lines("EDITOR=true\nAPI_KEY=${DUX_TEST_PROJECT_ENV_SOURCE}")
             .expect("parse env");
