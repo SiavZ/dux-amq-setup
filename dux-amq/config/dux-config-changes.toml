@@ -1,0 +1,28 @@
+# Apply these changes to $DUX_HOME/config.toml after first launch creates the
+# default file. They wire each provider through the AMQ wrapper script and
+# enable session-history fork on resume so deferred tools don't block.
+#
+# Generate the default first:
+#   DUX_HOME=/data/state/dux dux config regenerate --yes
+# Then apply the diffs below.
+
+[defaults]
+prompt_for_name = true   # branch name == AMQ identity
+
+[providers.claude]
+command     = "claude-amq"
+resume_args = ["--continue", "--fork-session"]
+forward_scroll = true
+forward_mouse = false
+
+[providers.codex]
+command = "codex-amq"
+args = ["--no-alt-screen"]
+resume_args = ["--no-alt-screen", "resume", "--last"]
+resume_by_id_args = ["--no-alt-screen", "resume", "{session_id}"]
+forward_scroll = false
+forward_mouse = false
+
+[providers.gemini]
+command = "gemini-amq"
+forward_scroll = true

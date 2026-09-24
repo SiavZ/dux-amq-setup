@@ -1,0 +1,357 @@
+#!/usr/bin/env bats
+#
+# audit02 phase 01: wrapper YOLO defaults + seed default flip.
+#
+# Verifies that:
+#   1. claude-amq does NOT pass --dangerously-skip-permissions by default.
+#   2. claude-amq DOES pass it when CLAUDE_AMQ_YOLO=1.
+#   3. codex-amq does NOT pass --dangerously-bypass-approvals-and-sandbox by default.
+#   4. codex-amq DOES pass it when CODEX_AMQ_YOLO=1.
+#   5. codex-amq does NOT bypass hook trust by default or merely with YOLO.
+#   6. codex-amq bypasses hook trust only with its explicit opt-in.
+#   7. legacy CLAUDE_YOLO=1 still enables Codex's sandbox bypass.
+#   8. claude-amq does NOT seed parent session history by default.
+#   9. claude-amq DOES seed when CLAUDE_AMQ_SEED_FROM_PARENT=1.
+#
+# Implementation: tests/fakes/amq records argv to $AMQ_FAKE_ARGV_FILE.
+# The wrappers `exec amq coop exec ... claude --
+# <flags> <user-args>`, so asserting the presence/absence of a flag in
+# the recorded argv is equivalent to asserting what reaches the provider.
+
+load 'lib/setup'
+
+WRAPPERS_DIR="$BATS_TEST_DIRNAME/../wrappers"
+
+setup() {
+  setup_isolated_home
+  ARGV_FILE="$TEST_HOME/argv.log"
+  : >"$ARGV_FILE"
+  export AMQ_FAKE_ARGV_FILE="$ARGV_FILE"
+  # Pin a stable identity so the wrapper doesn't need git or DUX_HOME.
+  export AM_ME="testpane"
+  # Force-unset every env knob the wrappers consult so each test starts
+  # from a clean default-deny baseline regardless of the host shell.
+  unset CLAUDE_AMQ_YOLO CLAUDE_YOLO CLAUDE_AMQ_SAFE CLAUDE_PEERS_DISABLE
+  unset CODEX_AMQ_YOLO CODEX_AMQ_BYPASS_HOOK_TRUST
+  unset CLAUDE_AMQ_SEED_FROM_PARENT CLAUDE_AMQ_NO_SEED
+  # audit03 Phase 01 §15: DUX_SYSTEM_PROMPT is a per-session env var
+  # set by dux's PTY spawner. Tests may override it explicitly; reset
+  # to unset between tests so a leaked value can't pollute the
+  # default-deny baseline that the YOLO/seed assertions depend on.
+  unset DUX_SYSTEM_PROMPT
+  unset DUX_STORE_ID DUX_SESSION_ID DUX_AMQ_HANDLE DUX_AMQ_FLOCK
+  # Audit02 Phase 13: pin STATE_ROOT under the throwaway $TEST_HOME so
+  # wrappers don't pick up a real /data/state/dux/.tiocsti-state from
+  # the host VM and silently flip into bridge mode for these tests.
+  export STATE_ROOT="$TEST_HOME/state"
+  mkdir -p "$STATE_ROOT/dux"
+  unset DUX_AMQ_INJECT_MODE
+  # Audit02 Phase 22 (P1-F): pin AMQ_GLOBAL_ROOT under the throwaway
+  # $TEST_HOME so the new identity-collision marker doesn't accumulate
+  # in the host VM's /data/state/amq/agents/testpane/ directory and make
+  # the second test invocation fail with "identity collision".
+  export AMQ_GLOBAL_ROOT="$TEST_HOME/amq"
+  mkdir -p "$AMQ_GLOBAL_ROOT/agents"
+}
+
+teardown() {
+  teardown_isolated_home
+}
+
+# Helper: assert the recorded argv contains the given flag literal.
+assert_argv_contains() {
+  local needle="$1"
+  if ! grep -Fxq -- "$needle" "$ARGV_FILE"; then
+    {
+      printf 'expected flag %q in recorded argv but did not find it\n' "$needle"
+      printf '--- recorded argv ---\n'
+      cat "$ARGV_FILE"
+    } >&2
+    return 1
+  fi
+}
+
+# Helper: assert the recorded argv does NOT contain the given flag.
+assert_argv_missing() {
+  local needle="$1"
+  if grep -Fxq -- "$needle" "$ARGV_FILE"; then
+    {
+      printf 'flag %q must NOT appear in argv but did\n' "$needle"
+      printf '--- recorded argv ---\n'
+      cat "$ARGV_FILE"
+    } >&2
+    return 1
+  fi
+}
+
+@test "claude-amq does not pass YOLO flag by default" {
+  run "$WRAPPERS_DIR/claude-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_missing "--dangerously-skip-permissions"
+}
+
+@test "claude-amq passes YOLO flag when CLAUDE_AMQ_YOLO=1" {
+  CLAUDE_AMQ_YOLO=1 run "$WRAPPERS_DIR/claude-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_contains "--dangerously-skip-permissions"
+}
+
+@test "claude-amq passes YOLO flag when legacy CLAUDE_YOLO=1" {
+  CLAUDE_YOLO=1 run "$WRAPPERS_DIR/claude-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_contains "--dangerously-skip-permissions"
+}
+
+@test "claude-amq prints transitional warning when CLAUDE_AMQ_SAFE is set" {
+  CLAUDE_AMQ_SAFE=1 run "$WRAPPERS_DIR/claude-amq"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"CLAUDE_AMQ_SAFE is deprecated"* ]] \
+    || { printf 'missing deprecation warning. output:\n%s\n' "$output" >&2; return 1; }
+  # And CLAUDE_AMQ_SAFE must NOT silently re-enable YOLO:
+  assert_argv_missing "--dangerously-skip-permissions"
+}
+
+@test "claude-amq loads claude-peers channel by default" {
+  run "$WRAPPERS_DIR/claude-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_contains "--dangerously-load-development-channels"
+  assert_argv_contains "server:claude-peers"
+}
+
+@test "claude-amq can disable claude-peers channel loading" {
+  CLAUDE_PEERS_DISABLE=1 run "$WRAPPERS_DIR/claude-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_missing "--dangerously-load-development-channels"
+  assert_argv_missing "server:claude-peers"
+}
+
+@test "codex-amq does not pass sandbox-bypass flag by default" {
+  run "$WRAPPERS_DIR/codex-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_missing "--dangerously-bypass-approvals-and-sandbox"
+  assert_argv_missing "--dangerously-bypass-hook-trust"
+}
+
+@test "codex-amq passes sandbox-bypass flag when CODEX_AMQ_YOLO=1" {
+  CODEX_AMQ_YOLO=1 run "$WRAPPERS_DIR/codex-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_contains "--dangerously-bypass-approvals-and-sandbox"
+  assert_argv_missing "--dangerously-bypass-hook-trust"
+}
+
+@test "codex-amq passes sandbox-bypass flag when legacy CLAUDE_YOLO=1" {
+  CLAUDE_YOLO=1 run "$WRAPPERS_DIR/codex-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_contains "--dangerously-bypass-approvals-and-sandbox"
+  assert_argv_missing "--dangerously-bypass-hook-trust"
+}
+
+@test "codex-amq bypasses hook trust only with explicit opt-in" {
+  CODEX_AMQ_BYPASS_HOOK_TRUST=1 run "$WRAPPERS_DIR/codex-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_missing "--dangerously-bypass-approvals-and-sandbox"
+  assert_argv_contains "--dangerously-bypass-hook-trust"
+  [[ "$output" == *"hook trust review bypass enabled"* ]]
+}
+
+# --- seed tests --------------------------------------------------------------
+#
+# The seed path needs a real git worktree-with-parent setup (the wrapper
+# calls git rev-parse / git worktree list to detect the topology). We
+# build a minimal one in $TEST_HOME and cd into the child worktree
+# before invoking claude-amq.
+#
+# The fake `amq` is still on PATH so the actual provider never runs.
+
+setup_parent_and_worktree() {
+  local repo="$TEST_HOME/parent"
+  local wt="$TEST_HOME/child"
+  mkdir -p "$repo"
+  (
+    cd "$repo"
+    git -c init.defaultBranch=main init -q
+    git config user.email "test@example.com"
+    git config user.name  "Test"
+    : >file
+    git add file
+    git -c commit.gpgsign=false commit -q -m init
+    git worktree add -q -b feature "$wt" >/dev/null
+  )
+  repo=$(realpath "$repo")
+  wt=$(realpath "$wt")
+  # Phase 12: encoding is now done by the shared encode-claude-project-dir
+  # script (single source of truth). It replaces every non-[A-Za-z0-9-]
+  # char with `-`, including `.` (the old inline sed kept `.`). Calling
+  # the script here keeps test fixtures in sync with wrapper behavior.
+  ENC_PARENT=$(encode-claude-project-dir "$repo")
+  ENC_CHILD=$(encode-claude-project-dir "$wt")
+  PARENT_SESS_DIR="$HOME/.claude/projects/$ENC_PARENT"
+  CHILD_SESS_DIR="$HOME/.claude/projects/$ENC_CHILD"
+  mkdir -p "$PARENT_SESS_DIR"
+  echo '{"role":"system","content":"hi"}' >"$PARENT_SESS_DIR/sample.jsonl"
+  CHILD_WT="$wt"
+  export CHILD_WT PARENT_SESS_DIR CHILD_SESS_DIR
+}
+
+@test "claude-amq does NOT seed by default" {
+  if ! command -v git >/dev/null 2>&1; then skip "git not available"; fi
+  setup_parent_and_worktree
+  (
+    cd "$CHILD_WT"
+    DUX_AMQ_INJECT_MODE=via "$WRAPPERS_DIR/claude-amq"
+  )
+  [ ! -e "$CHILD_SESS_DIR/sample.jsonl" ] \
+    || { printf 'seed happened without opt-in (file: %s)\n' "$CHILD_SESS_DIR/sample.jsonl" >&2; return 1; }
+}
+
+@test "claude-amq seeds when CLAUDE_AMQ_SEED_FROM_PARENT=1" {
+  if ! command -v git >/dev/null 2>&1; then skip "git not available"; fi
+  setup_parent_and_worktree
+  (
+    cd "$CHILD_WT"
+    DUX_AMQ_INJECT_MODE=via CLAUDE_AMQ_SEED_FROM_PARENT=1 "$WRAPPERS_DIR/claude-amq"
+  )
+  [ -f "$CHILD_SESS_DIR/sample.jsonl" ] \
+    || { printf 'seed did not happen (missing: %s)\n' "$CHILD_SESS_DIR/sample.jsonl" >&2; return 1; }
+}
+
+# --- DUX_SYSTEM_PROMPT translation (audit03 Phase 01 §15) -------------------
+#
+# Each provider's wrapper consumes DUX_SYSTEM_PROMPT differently:
+#   claude  → translates to `--append-system-prompt <text>` (verified
+#             flag in claude --help)
+#   codex   → no equivalent system-prompt flag; warn-and-drop here
+#             because dux injects Orchestrator policy after startup
+#   gemini  → no equivalent flag; warn-and-drop
+#
+# Tests assert each wrapper's behaviour: the recorded provider argv
+# either contains the flag-and-value pair (claude) or omits it
+# (codex/gemini).
+
+# Helper: assert two consecutive lines in the recorded argv match the
+# given pair, in order. Accommodates the wrapper using `--flag` `value`
+# (separate argv entries — what bash's `EXTRA+=(--flag "$value")`
+# emits), not the `--flag=value` form.
+assert_argv_sequence() {
+  local first="$1"
+  local second="$2"
+  local prev=""
+  while IFS= read -r line; do
+    if [[ "$prev" == "$first" && "$line" == "$second" ]]; then
+      return 0
+    fi
+    prev="$line"
+  done <"$ARGV_FILE"
+  {
+    printf 'expected consecutive argv lines %q then %q; not found\n' "$first" "$second"
+    printf '--- recorded argv ---\n'
+    cat "$ARGV_FILE"
+  } >&2
+  return 1
+}
+
+@test "claude-amq passes --append-system-prompt when DUX_SYSTEM_PROMPT is set" {
+  DUX_SYSTEM_PROMPT="be concise" run "$WRAPPERS_DIR/claude-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_contains "--append-system-prompt"
+  assert_argv_contains "be concise"
+  # And the flag must immediately precede its value (a stray flag with
+  # no value would mis-bind to whatever the next argv slot is).
+  assert_argv_sequence "--append-system-prompt" "be concise"
+}
+
+@test "claude-amq does NOT pass --append-system-prompt when DUX_SYSTEM_PROMPT is unset" {
+  unset DUX_SYSTEM_PROMPT
+  run "$WRAPPERS_DIR/claude-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_missing "--append-system-prompt"
+}
+
+@test "claude-amq does NOT pass --append-system-prompt when DUX_SYSTEM_PROMPT is empty" {
+  DUX_SYSTEM_PROMPT="" run "$WRAPPERS_DIR/claude-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_missing "--append-system-prompt"
+}
+
+@test "claude-amq preserves multi-line DUX_SYSTEM_PROMPT through the exec boundary" {
+  # Newlines inside the env var must round-trip — the wrapper's
+  # `EXTRA+=(--append-system-prompt "$DUX_SYSTEM_PROMPT")` quoting
+  # preserves them; the fake amq writes one argv per line so a
+  # multi-line value lands as multiple lines in the recording.
+  DUX_SYSTEM_PROMPT=$'line one\nline two' run "$WRAPPERS_DIR/claude-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_contains "--append-system-prompt"
+  # The fake records each argv literal; a multi-line value has a real
+  # `\n` inside it, so `grep -Fxq` still works because grep matches
+  # against the line, but the argv file's record-splitting puts the
+  # second physical line in its own slot. We assert at least one of
+  # the two halves landed.
+  grep -F "line one" "$ARGV_FILE" >/dev/null \
+    || { printf 'expected first line of multi-line system prompt in argv\n%s\n' "$(cat "$ARGV_FILE")" >&2; return 1; }
+}
+
+@test "codex-amq warns and drops when DUX_SYSTEM_PROMPT is set" {
+  DUX_SYSTEM_PROMPT="be an orchestrator" run "$WRAPPERS_DIR/codex-amq"
+  [ "$status" -eq 0 ]
+  # No equivalent flag — codex must not see the value either.
+  assert_argv_missing "--append-system-prompt"
+  assert_argv_missing "be an orchestrator"
+  [[ "$output" == *"codex-amq: DUX_SYSTEM_PROMPT set but codex has no system-prompt flag"* ]] \
+    || { printf 'expected warn-and-drop message; got:\n%s\n' "$output" >&2; return 1; }
+}
+
+@test "codex-amq is silent when DUX_SYSTEM_PROMPT is unset" {
+  unset DUX_SYSTEM_PROMPT
+  run "$WRAPPERS_DIR/codex-amq"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"DUX_SYSTEM_PROMPT"* ]] \
+    || { printf 'unexpected diagnostic when prompt unset; got:\n%s\n' "$output" >&2; return 1; }
+}
+
+@test "gemini-amq warns and drops when DUX_SYSTEM_PROMPT is set" {
+  DUX_SYSTEM_PROMPT="ignored" run "$WRAPPERS_DIR/gemini-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_missing "--append-system-prompt"
+  assert_argv_missing "ignored"
+  [[ "$output" == *"gemini-amq: DUX_SYSTEM_PROMPT set but gemini has no equivalent flag"* ]] \
+    || { printf 'expected warn-and-drop message; got:\n%s\n' "$output" >&2; return 1; }
+}
+
+@test "jcode-amq warns and drops when DUX_SYSTEM_PROMPT is set" {
+  DUX_SYSTEM_PROMPT="ignored" run "$WRAPPERS_DIR/jcode-amq"
+  [ "$status" -eq 0 ]
+  assert_argv_missing "ignored"
+  [[ "$output" == *"jcode-amq: DUX_SYSTEM_PROMPT set but jcode has no verified equivalent flag"* ]] \
+    || { printf 'expected warn-and-drop message; got:\n%s\n' "$output" >&2; return 1; }
+}
+
+@test "jcode-amq wraps interactive launches and pins the binary with --no-update" {
+  run "$WRAPPERS_DIR/jcode-amq" --resume session_cactus_1788156095921_18c33bc3e9ed4d80
+  [ "$status" -eq 0 ]
+  # The fake amq records one argv token per line.
+  # Wrapped: the AMQ co-op exec ran with our identity...
+  grep -qx -- 'coop' "$ARGV_FILE" && grep -qx -- 'testpane' "$ARGV_FILE" \
+    || { printf 'expected coop exec with --me testpane; argv:\n%s\n' "$(cat "$ARGV_FILE")" >&2; return 1; }
+  # ...the session id was NOT mistaken for a subcommand (it is a flag value)...
+  grep -qx -- 'session_cactus_1788156095921_18c33bc3e9ed4d80' "$ARGV_FILE"
+  # ...and --no-update was injected even though the caller omitted it.
+  grep -qx -- '--no-update' "$ARGV_FILE" \
+    || { printf 'expected --no-update injected; argv:\n%s\n' "$(cat "$ARGV_FILE")" >&2; return 1; }
+}
+
+@test "jcode-amq bypasses AMQ for subcommand (oneshot) invocations" {
+  run "$WRAPPERS_DIR/jcode-amq" run --quiet "say hi"
+  [ "$status" -eq 0 ]
+  [[ "$output" == "ok" ]]
+  # No coop exec, no identity claim: the fake amq must not have been invoked.
+  [ ! -s "$ARGV_FILE" ] \
+    || { printf 'oneshot must not touch AMQ; argv:\n%s\n' "$(cat "$ARGV_FILE")" >&2; return 1; }
+}
+
+@test "gemini-amq is silent when DUX_SYSTEM_PROMPT is unset" {
+  unset DUX_SYSTEM_PROMPT
+  run "$WRAPPERS_DIR/gemini-amq"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"DUX_SYSTEM_PROMPT"* ]] \
+    || { printf 'unexpected diagnostic when prompt unset; got:\n%s\n' "$output" >&2; return 1; }
+}
