@@ -25,10 +25,26 @@ pub fn backup_path(sessions_db_path: &Path) -> PathBuf {
 }
 
 /// One backup: open the live database read-only (no migration, no WAL
-/// switch) and copy it. Returns where it went.
+/// switch) and copy it. Returns where it went. The copy goes to a temp file
+/// renamed over the old backup, so `.bak` is never a half-written database
+/// (a crash mid-backup keeps the previous good one).
 pub fn backup_once(sessions_db_path: &Path) -> anyhow::Result<PathBuf> {
     let dst = backup_path(sessions_db_path);
-    crate::storage::SessionStore::open_read_only(sessions_db_path)?.backup_to(&dst)?;
+    let mut tmp_name = dst.as_os_str().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = PathBuf::from(tmp_name);
+    let _ = std::fs::remove_file(&tmp);
+    let result = crate::storage::SessionStore::open_read_only(sessions_db_path)
+        .and_then(|store| store.backup_to(&tmp))
+        .and_then(|()| {
+            std::fs::rename(&tmp, &dst).map_err(|error| {
+                anyhow::anyhow!("rename {} -> {}: {error}", tmp.display(), dst.display())
+            })
+        });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result?;
     Ok(dst)
 }
 
