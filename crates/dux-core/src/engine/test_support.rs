@@ -39,7 +39,12 @@ pub(crate) fn test_engine() -> (Engine, TempDir) {
         worker_tx.clone(),
     );
     let engine = Engine {
-        config: Config::default(),
+        // An existing install (no `[workspace]` section): worktree mode, so
+        // upstream's create tests keep their meaning. Shared tests opt in.
+        config: Config {
+            workspace: None,
+            ..Config::default()
+        },
         paths,
         session_store,
         projects: Vec::new(),

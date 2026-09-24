@@ -4392,6 +4392,29 @@ impl Engine {
             }
             Some(trimmed.to_string())
         };
+        // Shared main-workspace mode: the agent runs in the project checkout.
+        // The browser has no second-writer consent dialog, so a second live
+        // writer is refused here with the reason; the terminal UI asks instead.
+        if self.new_agent_is_shared(&project.id) {
+            if let Some(existing) = self.live_shared_writer(&project.path, None) {
+                anyhow::bail!(
+                    "Agent \"{}\" is already running in the shared checkout of project \"{}\". \
+                     Two agents editing the same files can overwrite each other's work, so \
+                     stop it first, or start the second agent from the terminal UI, which \
+                     asks for confirmation.",
+                    existing.display_label(),
+                    project.name
+                );
+            }
+            return Ok(Command::DispatchCreateAgentRequest {
+                request: Box::new(CreateAgentRequest::SharedWorkspace {
+                    project,
+                    custom_name,
+                }),
+                busy_message: "Starting a shared-workspace agent\u{2026}".to_string(),
+                term_size: (80, 24),
+            });
+        }
         if !use_existing_branch
             && let Some(name) = &custom_name
             && matches!(
@@ -4597,7 +4620,7 @@ impl Engine {
         Ok(Command::UpdateMacros { macros })
     }
 
-    fn wire_to_command(&self, command: WireCommand) -> anyhow::Result<Command> {
+    pub(crate) fn wire_to_command(&self, command: WireCommand) -> anyhow::Result<Command> {
         let command = match self.map_changes_command(command)? {
             WireCommandMapping::Mapped(command) => return Ok(command),
             WireCommandMapping::Unhandled(command) => command,

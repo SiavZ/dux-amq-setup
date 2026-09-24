@@ -104,6 +104,9 @@ async fn boot() -> Harness {
             .unwrap();
     }
     let mut engine = bootstrap_engine(&paths).unwrap();
+    // A worktree-mode install: these fixtures register dux's own root as the
+    // project, which shared mode rightly refuses to run agents in.
+    engine.config.workspace = None;
     engine.config.terminal.command = "cat".to_string();
     engine.config.terminal.args = vec![];
     let (handle, _join) = spawn_engine_thread(engine);

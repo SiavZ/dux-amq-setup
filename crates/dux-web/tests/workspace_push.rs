@@ -82,6 +82,9 @@ async fn boot() -> (SocketAddr, tempfile::TempDir) {
             .unwrap();
     }
     let mut engine = bootstrap_engine(&paths).unwrap();
+    // A worktree-mode install: these fixtures register dux's own root as the
+    // project, which shared mode rightly refuses to run agents in.
+    engine.config.workspace = None;
     engine.config.providers.commands.insert(
         "claude".to_string(),
         ProviderCommandConfig {

@@ -154,14 +154,15 @@ mod tests {
     fn new_agent_mode_follows_project_override_then_global() {
         let (mut engine, _tmp) = test_engine();
         assert!(
+            !engine.new_agent_is_shared("p1"),
+            "legacy config keeps worktrees"
+        );
+        engine.config.workspace = Some(crate::config::WorkspaceConfig::default());
+        assert!(
             engine.new_agent_is_shared("p1"),
             "fresh config defaults to shared"
         );
         engine.config.workspace = None;
-        assert!(
-            !engine.new_agent_is_shared("p1"),
-            "legacy config keeps worktrees"
-        );
         engine.config.projects.push(crate::config::ProjectConfig {
             id: "p1".to_string(),
             path: "/p1".to_string(),
@@ -347,6 +348,45 @@ mod tests {
             assert!(engine.session_has_live_provider("s1"));
             engine.shutdown_ptys(std::time::Duration::ZERO);
         }
+    }
+
+    /// The web create honors the project's mode, and refuses a second live
+    /// writer because the browser has no consent dialog.
+    #[test]
+    fn wire_create_agent_follows_shared_mode_and_refuses_a_second_writer() {
+        use crate::engine::Command;
+        use crate::wire::WireCommand;
+        use crate::worker::CreateAgentRequest;
+        let (mut engine, tmp) = test_engine();
+        let checkout = tmp.path().join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let checkout = checkout.to_string_lossy().to_string();
+        engine.projects.push(sample_project("p1", &checkout));
+        engine.config.workspace = Some(crate::config::WorkspaceConfig::default());
+        let create = || WireCommand::CreateAgent {
+            project_id: "p1".to_string(),
+            name: "writer".to_string(),
+            copy_uncommitted_changes: None,
+            use_existing_branch: false,
+        };
+
+        let command = engine.wire_to_command(create()).expect("shared create");
+        let Command::DispatchCreateAgentRequest { request, .. } = command else {
+            panic!("expected a create dispatch");
+        };
+        assert!(matches!(
+            *request,
+            CreateAgentRequest::SharedWorkspace { ref custom_name, .. }
+                if custom_name.as_deref() == Some("writer")
+        ));
+
+        engine.sessions.push(shared_session("live", &checkout));
+        make_live(&mut engine, "live");
+        let Err(err) = engine.wire_to_command(create()) else {
+            panic!("a second writer is refused on the web");
+        };
+        assert!(format!("{err:#}").contains("already running in the shared checkout"));
+        engine.shutdown_ptys(std::time::Duration::ZERO);
     }
 
     #[test]
