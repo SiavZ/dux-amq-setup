@@ -165,7 +165,11 @@ impl SessionSettings {
     /// INTEGRATION: the agent launch path must append these vars to the
     /// child env (fork `run_create_agent_job` / reconnect). The DUX_* launch
     /// env is owned by the peer worker (seedling).
-    pub fn to_pty_env(&self, provider: &ProviderKind, verify_envelope_global: bool) -> PerSessionEnv {
+    pub fn to_pty_env(
+        &self,
+        provider: &ProviderKind,
+        verify_envelope_global: bool,
+    ) -> PerSessionEnv {
         let mut vars: Vec<(String, String)> = Vec::new();
         if self.yolo_permissions {
             match provider.as_str() {
@@ -218,7 +222,10 @@ mod tests {
 
     #[test]
     fn parse_or_default_is_fail_safe() {
-        assert_eq!(SessionSettings::parse_or_default(None), SessionSettings::default());
+        assert_eq!(
+            SessionSettings::parse_or_default(None),
+            SessionSettings::default()
+        );
         assert_eq!(
             SessionSettings::parse_or_default(Some("  ")),
             SessionSettings::default()
@@ -267,18 +274,30 @@ mod tests {
     fn verify_envelope_falls_back_to_global_and_override_wins() {
         let provider = ProviderKind::new("claude");
         let s = SessionSettings::default();
-        assert_eq!(env_value(&s.to_pty_env(&provider, true), "DUX_AMQ_VERIFY"), Some("1"));
-        assert_eq!(env_value(&s.to_pty_env(&provider, false), "DUX_AMQ_VERIFY"), Some("0"));
+        assert_eq!(
+            env_value(&s.to_pty_env(&provider, true), "DUX_AMQ_VERIFY"),
+            Some("1")
+        );
+        assert_eq!(
+            env_value(&s.to_pty_env(&provider, false), "DUX_AMQ_VERIFY"),
+            Some("0")
+        );
         let off = SessionSettings {
             verify_envelope_override: Some(false),
             ..SessionSettings::default()
         };
-        assert_eq!(env_value(&off.to_pty_env(&provider, true), "DUX_AMQ_VERIFY"), Some("0"));
+        assert_eq!(
+            env_value(&off.to_pty_env(&provider, true), "DUX_AMQ_VERIFY"),
+            Some("0")
+        );
         let on = SessionSettings {
             verify_envelope_override: Some(true),
             ..SessionSettings::default()
         };
-        assert_eq!(env_value(&on.to_pty_env(&provider, false), "DUX_AMQ_VERIFY"), Some("1"));
+        assert_eq!(
+            env_value(&on.to_pty_env(&provider, false), "DUX_AMQ_VERIFY"),
+            Some("1")
+        );
     }
 
     /// Fork `to_pty_env_emits_system_prompt_only_when_set_and_non_blank`.
@@ -298,7 +317,10 @@ mod tests {
             ..SessionSettings::default()
         }
         .to_pty_env(&provider, false);
-        assert_eq!(env_value(&env, "DUX_SYSTEM_PROMPT"), Some("line one\nline two"));
+        assert_eq!(
+            env_value(&env, "DUX_SYSTEM_PROMPT"),
+            Some("line one\nline two")
+        );
     }
 
     /// Fork `to_pty_env_emits_system_prompt_for_every_provider`: dux never
@@ -311,7 +333,11 @@ mod tests {
         };
         for name in ["claude", "codex", "gemini", "opencode", "jcode"] {
             let env = s.to_pty_env(&ProviderKind::new(name), false);
-            assert_eq!(env_value(&env, "DUX_SYSTEM_PROMPT"), Some("custom"), "{name}");
+            assert_eq!(
+                env_value(&env, "DUX_SYSTEM_PROMPT"),
+                Some("custom"),
+                "{name}"
+            );
         }
     }
 

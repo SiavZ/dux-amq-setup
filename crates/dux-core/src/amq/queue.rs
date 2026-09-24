@@ -384,10 +384,19 @@ pub fn reclaim_stale_inflight_with_max_age(
                 match quarantine_expired(&inflight_path) {
                     Ok(expired_path) => {
                         expired += 1;
-                        crate::logger::warn(&format!("amq: expired stale AMQ inflight instead of replaying it (from={} to={} max_age_secs={})", inflight_path.display(), expired_path.display(), max_age.map(|d| d.as_secs()).unwrap_or(0)));
+                        crate::logger::warn(&format!(
+                            "amq: expired stale AMQ inflight instead of replaying it (from={} to={} max_age_secs={})",
+                            inflight_path.display(),
+                            expired_path.display(),
+                            max_age.map(|d| d.as_secs()).unwrap_or(0)
+                        ));
                     }
                     Err(e) => {
-                        crate::logger::warn(&format!("amq: stale AMQ inflight expiry failed (path={} err={})", inflight_path.display(), e));
+                        crate::logger::warn(&format!(
+                            "amq: stale AMQ inflight expiry failed (path={} err={})",
+                            inflight_path.display(),
+                            e
+                        ));
                     }
                 }
                 continue;
@@ -401,18 +410,36 @@ pub fn reclaim_stale_inflight_with_max_age(
             ) {
                 Ok(()) => {
                     reclaimed += 1;
-                    crate::logger::info(&format!("amq: reclaimed stale inflight from prior dux instance (path={})", original_path.display()));
+                    crate::logger::info(&format!(
+                        "amq: reclaimed stale inflight from prior dux instance (path={})",
+                        original_path.display()
+                    ));
                 }
                 Err(rustix::io::Errno::EXIST) => match quarantine_expired(&inflight_path) {
                     Ok(expired_path) => {
-                        crate::logger::warn(&format!("amq: quarantined stranded AMQ inflight after reclaim collision (from={} to={} destination={})", inflight_path.display(), expired_path.display(), original_path.display()));
+                        crate::logger::warn(&format!(
+                            "amq: quarantined stranded AMQ inflight after reclaim collision (from={} to={} destination={})",
+                            inflight_path.display(),
+                            expired_path.display(),
+                            original_path.display()
+                        ));
                     }
                     Err(e) => {
-                        crate::logger::warn(&format!("amq: stale inflight collision quarantine failed; future claims fail closed (from={} to={} err={})", inflight_path.display(), original_path.display(), e));
+                        crate::logger::warn(&format!(
+                            "amq: stale inflight collision quarantine failed; future claims fail closed (from={} to={} err={})",
+                            inflight_path.display(),
+                            original_path.display(),
+                            e
+                        ));
                     }
                 },
                 Err(e) => {
-                    crate::logger::warn(&format!("amq: stale inflight reclaim failed (from={} to={} err={})", inflight_path.display(), original_path.display(), e));
+                    crate::logger::warn(&format!(
+                        "amq: stale inflight reclaim failed (from={} to={} err={})",
+                        inflight_path.display(),
+                        original_path.display(),
+                        e
+                    ));
                 }
             }
         }
@@ -465,10 +492,19 @@ pub fn expire_stale_messages(queue_dir: &Path, max_age: Option<Duration>) -> Res
             match quarantine_expired(&path) {
                 Ok(expired_path) => {
                     expired += 1;
-                    crate::logger::warn(&format!("amq: expired stale AMQ message instead of injecting it (from={} to={} max_age_secs={})", path.display(), expired_path.display(), max_age.as_secs()));
+                    crate::logger::warn(&format!(
+                        "amq: expired stale AMQ message instead of injecting it (from={} to={} max_age_secs={})",
+                        path.display(),
+                        expired_path.display(),
+                        max_age.as_secs()
+                    ));
                 }
                 Err(e) => {
-                    crate::logger::warn(&format!("amq: stale AMQ message expiry failed (path={} err={})", path.display(), e));
+                    crate::logger::warn(&format!(
+                        "amq: stale AMQ message expiry failed (path={} err={})",
+                        path.display(),
+                        e
+                    ));
                 }
             }
         }

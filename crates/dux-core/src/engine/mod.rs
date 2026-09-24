@@ -4,6 +4,7 @@
 //! embeds it and calls it directly, and the web server reaches it through its
 //! engine actor.
 
+pub mod amq;
 pub mod command;
 mod companion;
 pub mod config_saver;
@@ -16,7 +17,6 @@ mod resume_fallback;
 mod spawn_worker;
 pub mod status_op;
 mod watch_tick;
-pub mod amq;
 
 pub use amq::{AmqFocus, AmqRuntime};
 #[cfg(test)]

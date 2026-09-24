@@ -66,13 +66,6 @@ pub struct AmqRuntime {
     /// answer "has the user typed in the last 60 s"; this map can. Stamped
     /// by [`Engine::note_amq_user_input`], never by programmatic writes.
     pub last_user_keystroke: HashMap<String, Instant>,
-    /// Sessions whose watch engine must not observe until the instant, so
-    /// the Worker postscript cannot false-fire auto-clear.
-    ///
-    /// INTEGRATION: herb's watch tick must skip a session while
-    /// `Engine::amq_watch_suppressed(id)` is true and rebaseline once it
-    /// expires (fork `tick_watch_engines`).
-    pub watch_suppress_until: HashMap<String, Instant>,
     /// Orchestrator watchdog: first-seen / last nudge per session.
     pub orchestrator_last_nudged: HashMap<String, Instant>,
     /// Last checkpoint per project, so several orchestrators in one project
@@ -174,16 +167,18 @@ impl Engine {
         if settings.is_default() {
             self.amq.session_settings.remove(session_id);
         } else {
-            self.amq.session_settings.insert(session_id.to_string(), settings.clone());
+            self.amq
+                .session_settings
+                .insert(session_id.to_string(), settings.clone());
         }
         // A mode change re-arms the watchdog's startup-policy bookkeeping.
         if previous.mode != settings.mode {
             self.amq.orchestrator_policy_injected.remove(session_id);
             self.amq.orchestrator_last_nudged.remove(session_id);
         }
-        // INTEGRATION: herb's watch engine must re-apply `watch_rule_arm`
-        // and rebuild the built-in auto-clear rule when mode/auto-clear
-        // change (fork `apply_session_settings_to_runtime`).
+        // The watch engine re-reads `watch_session_settings` every tick and
+        // rebuilds a tab's rules when mode/auto-clear/overrides change, so no
+        // push is needed here.
 
         let system_prompt_changed = previous.system_prompt != settings.system_prompt;
         let needs_respawn = previous.yolo_permissions != settings.yolo_permissions
@@ -210,13 +205,42 @@ impl Engine {
 
     // ─── user input ──────────────────────────────────────────────────
 
+    /// Pause the watch rules on the agent's slot tab (the tab AMQ types into)
+    /// so the Worker postscript's `[task-done]` cannot false-fire auto-clear.
+    fn suppress_watch_for_amq(&mut self, session_id: &str, now: Instant) {
+        if let Some(tab) = self
+            .session_by_id(session_id)
+            .map(|s| s.slot_tab_id().to_owned())
+        {
+            self.suppress_watch_rules(tab.as_ref_id(), now + WATCH_SUPPRESS_AFTER_INJECT);
+        }
+    }
+
+    /// Persist then apply one session's settings, with no title or status
+    /// side effects. A store failure leaves memory untouched.
+    pub(crate) fn persist_session_settings_only(
+        &mut self,
+        session_id: &str,
+        settings: SessionSettings,
+    ) -> anyhow::Result<()> {
+        self.session_store
+            .set_session_settings(session_id, &settings)?;
+        if settings.is_default() {
+            self.amq.session_settings.remove(session_id);
+        } else {
+            self.amq
+                .session_settings
+                .insert(session_id.to_string(), settings);
+        }
+        Ok(())
+    }
+
     /// Drop every per-session AMQ entry for a deleted agent. The DB row (and
     /// its settings column) is removed by the delete itself.
     pub(crate) fn forget_amq_session(&mut self, session_id: &str) {
         let a = &mut self.amq;
         a.session_settings.remove(session_id);
         a.last_user_keystroke.remove(session_id);
-        a.watch_suppress_until.remove(session_id);
         a.cooldown_until.remove(session_id);
         a.pending_enters.remove(session_id);
         a.orchestrator_last_nudged.remove(session_id);
@@ -235,22 +259,16 @@ impl Engine {
 
     /// The session owning a tab id, for surfaces that only hold the tab.
     pub fn session_id_for_tab(&self, tab_id: &str) -> Option<String> {
-        if let Some(s) = self.sessions.iter().find(|s| s.slot_tab_id().as_str() == tab_id) {
+        if let Some(s) = self
+            .sessions
+            .iter()
+            .find(|s| s.slot_tab_id().as_str() == tab_id)
+        {
             return Some(s.id.clone());
         }
         self.agent_tabs
             .get(crate::ids::TabIdRef::new(tab_id))
             .map(|t| t.session_id.clone())
-    }
-
-    /// Whether the watch engine should skip `session_id` right now.
-    ///
-    /// INTEGRATION: herb's watch tick consults this.
-    pub fn amq_watch_suppressed(&self, session_id: &str) -> bool {
-        self.amq
-            .watch_suppress_until
-            .get(session_id)
-            .is_some_and(|until| Instant::now() < *until)
     }
 
     /// Whether AMQ work for this session makes Worker auto-clear unsafe:
@@ -278,7 +296,12 @@ impl Engine {
             return true;
         }
         let receiver = amq_receiver_for_session(session);
-        if self.amq.pending.get(&receiver).is_some_and(|q| !q.is_empty()) {
+        if self
+            .amq
+            .pending
+            .get(&receiver)
+            .is_some_and(|q| !q.is_empty())
+        {
             return true;
         }
         if let Some(dir) = &self.amq.queue_dir
@@ -436,7 +459,11 @@ impl Engine {
                 }
                 continue;
             }
-            let depth = self.amq.pending.get(&pending.receiver).map_or(0, VecDeque::len);
+            let depth = self
+                .amq
+                .pending
+                .get(&pending.receiver)
+                .map_or(0, VecDeque::len);
             if claimed >= MAX_INJECT_CLAIMS_PER_SCAN
                 || total_pending >= MAX_INJECT_PENDING_TOTAL
                 || depth >= MAX_INJECT_PENDING_PER_RECEIVER
@@ -538,7 +565,12 @@ impl Engine {
                 self.log_holding(&receiver, now, HoldReason::NoSession);
                 continue;
             };
-            if self.amq.pending.get(&receiver).is_none_or(VecDeque::is_empty) {
+            if self
+                .amq
+                .pending
+                .get(&receiver)
+                .is_none_or(VecDeque::is_empty)
+            {
                 continue;
             }
             if self.expire_pending_head_if_stale(&receiver, out) {
@@ -626,15 +658,21 @@ impl Engine {
                 self.running_provider_of(&session_id).as_ref(),
             );
             actions += 1;
-            match self.slot_client(&session_id).map(|c| c.write_bytes(&payload)) {
+            match self
+                .slot_client(&session_id)
+                .map(|c| c.write_bytes(&payload))
+            {
                 Some(Ok(())) => {
-                    if let Some(head) = self.amq.pending.get_mut(&receiver).and_then(|q| q.front_mut()) {
+                    if let Some(head) = self
+                        .amq
+                        .pending
+                        .get_mut(&receiver)
+                        .and_then(|q| q.front_mut())
+                    {
                         head.body_typed = true;
                         head.body_typed_at = Some(now);
                     }
-                    self.amq
-                        .watch_suppress_until
-                        .insert(session_id.clone(), now + WATCH_SUPPRESS_AFTER_INJECT);
+                    self.suppress_watch_for_amq(&session_id, now);
                     crate::logger::debug(&format!(
                         "amq: typed wake body for {receiver} (phase 1): {}",
                         queue::preview(&body, 80)
@@ -670,9 +708,9 @@ impl Engine {
             queue::preview(&msg.body, 60)
         ))));
         let now = Instant::now();
-        self.amq
-            .watch_suppress_until
-            .insert(session_id.to_string(), now + WATCH_SUPPRESS_AFTER_INJECT);
+        // Refresh from the moment Enter lands: the postscript must scroll off
+        // before the watch engine reads the pane again.
+        self.suppress_watch_for_amq(session_id, now);
         let cooldown = Duration::from_millis(self.config.amq.inject.post_delivery_cooldown_ms);
         if !cooldown.is_zero() {
             self.amq
@@ -698,7 +736,12 @@ impl Engine {
     }
 
     fn remove_empty_inject_queue(&mut self, receiver: &str) {
-        if self.amq.pending.get(receiver).is_some_and(VecDeque::is_empty) {
+        if self
+            .amq
+            .pending
+            .get(receiver)
+            .is_some_and(VecDeque::is_empty)
+        {
             self.amq.pending.remove(receiver);
             self.amq.last_warned.remove(receiver);
             self.amq.first_pending_at.remove(receiver);
@@ -709,7 +752,11 @@ impl Engine {
 
     /// Drop one stale HELD wake. Only wakes not yet typed expire; a typed
     /// one still gets its Enter so no prompt is left floating (edd6a644).
-    fn expire_pending_head_if_stale(&mut self, receiver: &str, out: &mut Vec<EventReaction>) -> bool {
+    fn expire_pending_head_if_stale(
+        &mut self,
+        receiver: &str,
+        out: &mut Vec<EventReaction>,
+    ) -> bool {
         let max_age_secs = self.config.amq.inject.max_message_age_secs;
         if max_age_secs == 0 {
             return false;
@@ -764,9 +811,7 @@ impl Engine {
         if !due {
             return;
         }
-        self.amq
-            .last_held_logged
-            .insert(receiver.to_string(), now);
+        self.amq.last_held_logged.insert(receiver.to_string(), now);
         let queue = self.amq.pending.get(receiver);
         let depth = queue.map_or(0, VecDeque::len);
         let preview = queue
@@ -871,8 +916,9 @@ impl Engine {
             .collect();
         for session_id in due {
             self.amq.pending_enters.remove(&session_id);
-            let submit =
-                delivery::submit_key_bytes_for_provider(self.running_provider_of(&session_id).as_ref());
+            let submit = delivery::submit_key_bytes_for_provider(
+                self.running_provider_of(&session_id).as_ref(),
+            );
             match self.slot_client(&session_id) {
                 Some(client) => {
                     if let Err(err) = client.write_bytes(submit) {
@@ -898,12 +944,18 @@ impl Engine {
         let orchestrators: Vec<String> = self
             .sessions
             .iter()
-            .filter(|s| self.session_is_live(s) && self.session_mode(&s.id) == ContextMode::Orchestrator)
+            .filter(|s| {
+                self.session_is_live(s) && self.session_mode(&s.id) == ContextMode::Orchestrator
+            })
             .map(|s| s.id.clone())
             .collect();
         let live: HashSet<&String> = orchestrators.iter().collect();
-        self.amq.orchestrator_last_nudged.retain(|id, _| live.contains(id));
-        self.amq.orchestrator_policy_injected.retain(|id| live.contains(id));
+        self.amq
+            .orchestrator_last_nudged
+            .retain(|id, _| live.contains(id));
+        self.amq
+            .orchestrator_policy_injected
+            .retain(|id| live.contains(id));
         let live_projects: HashSet<String> = self
             .sessions
             .iter()
@@ -943,7 +995,9 @@ impl Engine {
                 }
                 orch::build_orchestrator_startup_policy_prompt(&startup_policy, &peers)
             } else {
-                self.amq.orchestrator_policy_injected.insert(session_id.clone());
+                self.amq
+                    .orchestrator_policy_injected
+                    .insert(session_id.clone());
                 let Some(last) = self.amq.orchestrator_last_nudged.get(&session_id).copied() else {
                     // First sighting starts the clock; never poll at startup.
                     self.amq.orchestrator_last_nudged.insert(session_id, now);
@@ -964,7 +1018,11 @@ impl Engine {
 
             // Same idle/busy safeguards as AMQ inject.
             if self.amq.pending_enters.contains_key(&session_id)
-                || self.amq.pending.get(&receiver).is_some_and(|q| !q.is_empty())
+                || self
+                    .amq
+                    .pending
+                    .get(&receiver)
+                    .is_some_and(|q| !q.is_empty())
                 || self
                     .amq
                     .cooldown_until
@@ -1005,7 +1063,9 @@ impl Engine {
                         .orchestrator_last_nudged
                         .insert(session_id.clone(), now);
                     if needs_startup_policy {
-                        self.amq.orchestrator_policy_injected.insert(session_id.clone());
+                        self.amq
+                            .orchestrator_policy_injected
+                            .insert(session_id.clone());
                     } else {
                         self.amq
                             .orchestrator_project_last_checkpoint
@@ -1013,7 +1073,11 @@ impl Engine {
                     }
                     crate::logger::info(&format!(
                         "amq: sent orchestrator {} to {session_id} (peers={})",
-                        if needs_startup_policy { "startup policy" } else { "checkpoint" },
+                        if needs_startup_policy {
+                            "startup policy"
+                        } else {
+                            "checkpoint"
+                        },
                         peers.len()
                     ));
                 }
@@ -1151,4 +1215,570 @@ fn amq_root_for_collaboration_guard() -> PathBuf {
         .or_else(|| std::env::var_os("AMQ_GLOBAL_ROOT"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/data/state/amq"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::engine::test_support::{sample_session, test_engine};
+    use crate::ids::TabId;
+    use crate::pty::PtyClient;
+
+    fn spawn_cat(cwd: &Path) -> PtyClient {
+        // Wide and tall, so prompts neither wrap mid-phrase nor scroll away.
+        PtyClient::spawn_with_env("cat", &[], cwd, 60, 400, 1000, &[]).expect("spawn cat")
+    }
+
+    fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        cond()
+    }
+
+    /// An engine with one live `cat` agent whose AMQ handle is `alice`, and
+    /// the inject queue pointed at a temp dir. Grace and cooldown are zero so
+    /// a test drives delivery tick by tick.
+    fn engine_with_agent() -> (Engine, tempfile::TempDir, PathBuf) {
+        let (mut engine, tmp) = test_engine();
+        let mut session = sample_session("s1", "p1", "feature/x");
+        if let crate::model::AgentWorkspace::Managed(m) = &mut session.workspace {
+            m.worktree_path = tmp.path().join("Alice").to_string_lossy().to_string();
+        }
+        session.status = SessionStatus::Active;
+        engine.session_store.create_session(&session).unwrap();
+        engine
+            .providers
+            .insert(TabId::new("s1-slot"), spawn_cat(tmp.path()));
+        engine.sessions.push(session);
+        let queue = tmp.path().join("queue");
+        let cfg = &mut engine.config.amq.inject;
+        cfg.queue_dir = queue.to_string_lossy().to_string();
+        cfg.startup_grace_ms = 0;
+        cfg.post_delivery_cooldown_ms = 0;
+        cfg.phase_delay_ms = 0;
+        engine.amq.queue_dir = Some(queue.clone());
+        (engine, tmp, queue)
+    }
+
+    fn write_msg(queue: &Path, receiver: &str, name: &str, body: &str) -> PathBuf {
+        let dir = queue.join(receiver);
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        fs::write(&p, body).unwrap();
+        p
+    }
+
+    fn screen(engine: &Engine) -> String {
+        engine.providers[crate::ids::TabIdRef::new("s1-slot")].scan_recent_lines(60)
+    }
+
+    // ─── session settings ───────────────────────────────────────────
+
+    #[test]
+    fn settings_survive_dropping_the_engine_and_reopening_the_db() {
+        let (mut engine, tmp) = test_engine();
+        let session = sample_session("s1", "p1", "feat");
+        engine.session_store.create_session(&session).unwrap();
+        engine.sessions.push(session);
+        let settings = SessionSettings {
+            mode: ContextMode::Worker,
+            yolo_permissions: true,
+            auto_clear_on_task_done: true,
+            system_prompt: Some("be terse".into()),
+            ..SessionSettings::default()
+        };
+        engine
+            .apply(crate::engine::Command::SetSessionSettings {
+                session_id: "s1".into(),
+                settings: Box::new(settings.clone()),
+                title: None,
+            })
+            .unwrap();
+        let db = engine.paths.sessions_db_path.clone();
+        drop(engine);
+
+        // A fresh process (hot reload execs one) rebuilds from the DB.
+        let (mut reopened, _tmp2) = test_engine();
+        reopened.session_store = crate::storage::SessionStore::open(&db).unwrap();
+        reopened.sessions = reopened.session_store.load_sessions().unwrap();
+        assert_eq!(reopened.session_settings("s1"), None, "not loaded yet");
+        reopened.normalize_restored_sessions();
+        assert_eq!(reopened.session_settings("s1"), Some(&settings));
+        drop(tmp);
+    }
+
+    #[test]
+    fn set_session_settings_rolls_back_when_the_store_fails() {
+        let (mut engine, _tmp) = test_engine();
+        let session = sample_session("s1", "p1", "feat");
+        engine.session_store.create_session(&session).unwrap();
+        engine.sessions.push(session);
+        engine
+            .session_store
+            .break_sessions_table_for_test()
+            .unwrap();
+        let result = engine.apply(crate::engine::Command::SetSessionSettings {
+            session_id: "s1".into(),
+            settings: Box::new(SessionSettings {
+                mode: ContextMode::Orchestrator,
+                ..SessionSettings::default()
+            }),
+            title: Some(Some("renamed".into())),
+        });
+        assert!(result.is_err(), "store failure must surface");
+        assert_eq!(engine.session_mode("s1"), ContextMode::Attended);
+        assert_eq!(engine.sessions[0].title.as_deref(), Some("s1-title"));
+    }
+
+    #[test]
+    fn set_session_settings_normalizes_blank_prompt_and_renames() {
+        let (mut engine, _tmp) = test_engine();
+        let session = sample_session("s1", "p1", "feat");
+        engine.session_store.create_session(&session).unwrap();
+        engine.sessions.push(session);
+        engine
+            .apply(crate::engine::Command::SetSessionSettings {
+                session_id: "s1".into(),
+                settings: Box::new(SessionSettings {
+                    system_prompt: Some("  \n ".into()),
+                    ..SessionSettings::default()
+                }),
+                title: Some(Some("  new name ".into())),
+            })
+            .unwrap();
+        assert_eq!(
+            engine.session_settings("s1"),
+            None,
+            "all-default is not stored"
+        );
+        assert_eq!(engine.sessions[0].title.as_deref(), Some("new name"));
+        let stored = engine.session_store.load_sessions().unwrap();
+        assert_eq!(stored[0].title.as_deref(), Some("new name"));
+    }
+
+    #[test]
+    fn deleting_a_session_forgets_its_settings() {
+        let (mut engine, _tmp) = test_engine();
+        let session = sample_session("s1", "p1", "feat");
+        engine.session_store.create_session(&session).unwrap();
+        engine.sessions.push(session);
+        engine
+            .persist_session_settings_only(
+                "s1",
+                SessionSettings {
+                    mode: ContextMode::Worker,
+                    ..SessionSettings::default()
+                },
+            )
+            .unwrap();
+        engine.forget_amq_session("s1");
+        assert_eq!(engine.session_settings("s1"), None);
+    }
+
+    #[test]
+    fn save_summary_lists_changed_knobs() {
+        assert_eq!(
+            build_session_settings_save_summary(false, false, false, false, false),
+            "Session settings saved (no changes)."
+        );
+        assert_eq!(
+            build_session_settings_save_summary(false, true, false, false, false),
+            "Session settings saved: title."
+        );
+        assert_eq!(
+            build_session_settings_save_summary(true, false, true, false, false),
+            "Session settings saved: context mode, auto-clear."
+        );
+        assert_eq!(
+            build_session_settings_save_summary(false, false, false, true, true),
+            "Session settings saved: system prompt, spawn-time settings."
+        );
+    }
+
+    #[test]
+    fn watch_settings_need_worker_mode_and_the_opt_in() {
+        let (mut engine, _tmp) = test_engine();
+        let session = sample_session("s1", "p1", "feat");
+        engine.session_store.create_session(&session).unwrap();
+        engine.sessions.push(session);
+        let mut s = SessionSettings {
+            auto_clear_on_task_done: true,
+            watch_rule_arm: HashMap::from([(3, false), (1, true)]),
+            ..SessionSettings::default()
+        };
+        engine
+            .persist_session_settings_only("s1", s.clone())
+            .unwrap();
+        let w = engine.watch_session_settings("s1");
+        assert!(!w.auto_clear, "attended mode never auto-clears");
+        assert_eq!(w.arm_overrides, vec![(1, true), (3, false)]);
+        s.mode = ContextMode::Worker;
+        engine.persist_session_settings_only("s1", s).unwrap();
+        assert!(engine.watch_session_settings("s1").auto_clear);
+    }
+
+    // ─── inject drainer ─────────────────────────────────────────────
+
+    #[test]
+    fn a_queued_wake_is_typed_then_submitted_then_unlinked() {
+        let (mut engine, _tmp, queue) = engine_with_agent();
+        write_msg(&queue, "alice", "001.msg", "please continue");
+        engine.drain_amq_inject_queue();
+        let inflight = queue.join("alice/.inflight.001.msg");
+        assert!(inflight.exists(), "claimed to inflight");
+
+        engine.tick_amq(AmqFocus::default());
+        assert!(wait_for(|| screen(&engine).contains("please continue")));
+        assert!(
+            inflight.exists(),
+            "phase 1 keeps the claim until Enter lands"
+        );
+        assert!(
+            engine
+                .watch
+                .suppress_until
+                .contains_key(crate::ids::TabIdRef::new("s1-slot")),
+            "typing a wake must pause the tab's watch rules"
+        );
+
+        let reaction = engine.tick_amq(AmqFocus::default());
+        assert!(!inflight.exists(), "phase 2 unlinks the delivered file");
+        assert!(engine.amq.pending.is_empty());
+        assert!(
+            matches!(reaction, EventReaction::Status(s) if s.message.contains("Delivered AMQ wake to alice"))
+        );
+    }
+
+    #[test]
+    fn worker_mode_wakes_carry_the_role_postscript() {
+        let (mut engine, _tmp, queue) = engine_with_agent();
+        engine
+            .persist_session_settings_only(
+                "s1",
+                SessionSettings {
+                    mode: ContextMode::Worker,
+                    ..SessionSettings::default()
+                },
+            )
+            .unwrap();
+        write_msg(&queue, "alice", "001.msg", "do the thing");
+        engine.drain_amq_inject_queue();
+        engine.tick_amq(AmqFocus::default());
+        assert!(wait_for(|| screen(&engine).contains("[Dux Worker mode]")));
+    }
+
+    #[test]
+    fn a_busy_footer_holds_delivery() {
+        let (mut engine, _tmp, queue) = engine_with_agent();
+        engine.providers[crate::ids::TabIdRef::new("s1-slot")]
+            .write_bytes(b"Working (esc to interrupt)\r")
+            .unwrap();
+        assert!(wait_for(|| screen(&engine).contains("esc to interrupt")));
+        write_msg(&queue, "alice", "001.msg", "held body");
+        engine.drain_amq_inject_queue();
+        engine.tick_amq(AmqFocus::default());
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!screen(&engine).contains("held body"));
+        assert!(!engine.amq.pending["alice"][0].body_typed);
+    }
+
+    #[test]
+    fn the_focused_agent_is_held_only_while_the_user_is_typing() {
+        let (mut engine, _tmp, queue) = engine_with_agent();
+        write_msg(&queue, "alice", "001.msg", "quiet body");
+        engine.drain_amq_inject_queue();
+        engine.note_amq_user_input("s1");
+        let focus = AmqFocus {
+            focused_session: Some("s1"),
+            selected_session: Some("s1"),
+        };
+        engine.tick_amq(focus);
+        assert!(!engine.amq.pending["alice"][0].body_typed, "typing holds");
+        // Unfocused, the same keystroke no longer matters.
+        engine.tick_amq(AmqFocus::default());
+        assert!(engine.amq.pending["alice"][0].body_typed);
+    }
+
+    #[test]
+    fn cooldown_holds_the_next_wake_but_never_a_pending_enter() {
+        let (mut engine, _tmp, queue) = engine_with_agent();
+        engine.config.amq.inject.post_delivery_cooldown_ms = 60_000;
+        write_msg(&queue, "alice", "001.msg", "first");
+        write_msg(&queue, "alice", "002.msg", "second");
+        engine.drain_amq_inject_queue();
+        engine.tick_amq(AmqFocus::default()); // type first
+        engine.tick_amq(AmqFocus::default()); // Enter first, starts cooldown
+        assert_eq!(engine.amq.pending["alice"].len(), 1);
+        engine.tick_amq(AmqFocus::default());
+        assert!(
+            !engine.amq.pending["alice"][0].body_typed,
+            "second wake waits out the cooldown"
+        );
+    }
+
+    #[test]
+    fn startup_grace_holds_all_delivery() {
+        let (mut engine, _tmp, queue) = engine_with_agent();
+        engine.amq.startup_grace_until = Some(Instant::now() + Duration::from_secs(60));
+        write_msg(&queue, "alice", "001.msg", "early");
+        engine.drain_amq_inject_queue();
+        engine.tick_amq(AmqFocus::default());
+        assert!(!engine.amq.pending["alice"][0].body_typed);
+    }
+
+    #[test]
+    fn an_unknown_receiver_warns_and_keeps_the_claim() {
+        let (mut engine, _tmp, queue) = engine_with_agent();
+        write_msg(&queue, "nobody", "001.msg", "x");
+        engine.drain_amq_inject_queue();
+        let reaction = engine.tick_amq(AmqFocus::default());
+        assert!(
+            matches!(&reaction, EventReaction::Status(s) if s.message.contains("no agent matches"))
+        );
+        assert!(queue.join("nobody/.inflight.001.msg").exists());
+        // Rate limited: a second tick is silent.
+        assert!(matches!(
+            engine.tick_amq(AmqFocus::default()),
+            EventReaction::Nothing
+        ));
+    }
+
+    #[test]
+    fn unrouted_wakes_go_to_the_selected_agent() {
+        let (mut engine, _tmp, queue) = engine_with_agent();
+        write_msg(&queue, UNROUTED_RECEIVER, "001.msg", "unrouted body");
+        engine.drain_amq_inject_queue();
+        engine.tick_amq(AmqFocus {
+            focused_session: None,
+            selected_session: Some("s1"),
+        });
+        assert!(wait_for(|| screen(&engine).contains("unrouted body")));
+    }
+
+    #[test]
+    fn unsafe_bodies_are_quarantined_not_delivered() {
+        let (mut engine, _tmp, queue) = engine_with_agent();
+        write_msg(&queue, "alice", "001.msg", "\u{3}");
+        let reaction = engine.drain_amq_inject_queue();
+        assert!(matches!(reaction, EventReaction::Status(_)));
+        assert!(queue.join("alice/.rejected/.inflight.001.msg").exists());
+        assert!(engine.amq.pending.is_empty());
+    }
+
+    #[test]
+    fn stale_held_wakes_expire_but_typed_ones_still_get_enter() {
+        let (mut engine, _tmp, queue) = engine_with_agent();
+        engine.config.amq.inject.max_message_age_secs = 60;
+        write_msg(&queue, "alice", "001.msg", "old");
+        engine.drain_amq_inject_queue();
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        engine.amq.pending.get_mut("alice").unwrap()[0].modified_at = Some(old);
+        engine.tick_amq(AmqFocus::default());
+        assert!(engine.amq.pending.is_empty());
+        assert!(queue.join("alice/.expired/.inflight.001.msg").exists());
+
+        write_msg(&queue, "alice", "002.msg", "typed");
+        engine.drain_amq_inject_queue();
+        engine.tick_amq(AmqFocus::default()); // phase 1
+        engine.amq.pending.get_mut("alice").unwrap()[0].modified_at = Some(old);
+        engine.tick_amq(AmqFocus::default()); // phase 2, not expiry
+        assert!(!queue.join("alice/.expired/.inflight.002.msg").exists());
+        assert!(!queue.join("alice/.inflight.002.msg").exists(), "delivered");
+    }
+
+    #[test]
+    fn a_scan_respects_the_per_receiver_budget() {
+        let (mut engine, _tmp, queue) = engine_with_agent();
+        for i in 0..(MAX_INJECT_PENDING_PER_RECEIVER + 5) {
+            write_msg(&queue, "alice", &format!("{i:03}.msg"), "x");
+        }
+        engine.drain_amq_inject_queue();
+        engine.drain_amq_inject_queue();
+        assert_eq!(
+            engine.amq.pending["alice"].len(),
+            MAX_INJECT_PENDING_PER_RECEIVER
+        );
+    }
+
+    #[test]
+    fn stop_amq_ends_the_poll_worker() {
+        let (mut engine, tmp) = test_engine();
+        engine.config.amq.inject.queue_dir = tmp.path().join("q").to_string_lossy().to_string();
+        engine.config.amq.inject.poll_interval_ms = 100;
+        engine.start_amq();
+        assert!(engine.amq.started);
+        engine.start_amq(); // idempotent
+        // The poll worker posts scan requests while running...
+        let saw_scan = wait_for(|| {
+            matches!(
+                engine.worker_rx.try_recv(),
+                Ok(WorkerEvent::AmqInjectScanRequested)
+            )
+        });
+        assert!(saw_scan);
+        engine.stop_amq();
+        std::thread::sleep(Duration::from_millis(300));
+        while engine.worker_rx.try_recv().is_ok() {}
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            !matches!(
+                engine.worker_rx.try_recv(),
+                Ok(WorkerEvent::AmqInjectScanRequested)
+            ),
+            "no scans after stop"
+        );
+    }
+
+    // ─── orchestrator watchdog ──────────────────────────────────────
+
+    fn orchestrator_engine() -> (Engine, tempfile::TempDir) {
+        let (mut engine, tmp, _queue) = engine_with_agent();
+        engine.config.amq.inject.startup_grace_ms = 0;
+        engine.config.amq.orchestrator.poll_interval_secs = 1;
+        engine
+            .persist_session_settings_only(
+                "s1",
+                SessionSettings {
+                    mode: ContextMode::Orchestrator,
+                    ..SessionSettings::default()
+                },
+            )
+            .unwrap();
+        let mut worker = sample_session("w1", "p1", "feature/worker");
+        worker.status = SessionStatus::Active;
+        engine.session_store.create_session(&worker).unwrap();
+        engine
+            .providers
+            .insert(TabId::new("w1-slot"), spawn_cat(tmp.path()));
+        engine.sessions.push(worker);
+        engine
+            .persist_session_settings_only(
+                "w1",
+                SessionSettings {
+                    mode: ContextMode::Worker,
+                    ..SessionSettings::default()
+                },
+            )
+            .unwrap();
+        (engine, tmp)
+    }
+
+    #[test]
+    fn claude_orchestrator_gets_no_typed_policy_and_no_startup_poll() {
+        let (mut engine, _tmp) = orchestrator_engine();
+        engine.tick_amq(AmqFocus::default());
+        std::thread::sleep(Duration::from_millis(150));
+        let s = screen(&engine);
+        assert!(!s.contains("startup policy"), "{s}");
+        assert!(
+            !s.contains("checkpoint"),
+            "first sighting only starts the clock: {s}"
+        );
+    }
+
+    #[test]
+    fn codex_orchestrator_gets_the_policy_once_then_a_checkpoint() {
+        let (mut engine, _tmp) = orchestrator_engine();
+        engine.sessions[0].provider = crate::model::ProviderKind::new("codex");
+        engine.tick_amq(AmqFocus::default());
+        // The policy is longer than the test pane, so assert on its tail.
+        assert!(wait_for(
+            || screen(&engine).contains("do not poll them on startup")
+        ));
+        assert!(engine.amq.orchestrator_policy_injected.contains("s1"));
+        assert!(
+            !engine
+                .amq
+                .orchestrator_project_last_checkpoint
+                .contains_key("p1")
+        );
+        engine.tick_amq(AmqFocus::default());
+        assert!(
+            !engine
+                .amq
+                .orchestrator_project_last_checkpoint
+                .contains_key("p1"),
+            "no checkpoint inside the poll interval"
+        );
+        std::thread::sleep(Duration::from_millis(1100));
+        engine.tick_amq(AmqFocus::default()); // flushes Enter, then checkpoint
+        assert!(wait_for(
+            || screen(&engine).contains("dux peer send <handle>")
+        ));
+        assert!(
+            engine
+                .amq
+                .orchestrator_project_last_checkpoint
+                .contains_key("p1")
+        );
+    }
+
+    #[test]
+    fn checkpoint_uses_the_configured_prompt_and_is_once_per_project() {
+        let (mut engine, _tmp) = orchestrator_engine();
+        engine.config.amq.orchestrator.checkpoint_prompt = "CUSTOM NUDGE".into();
+        engine.tick_amq(AmqFocus::default()); // starts the clock
+        std::thread::sleep(Duration::from_millis(1100));
+        engine.tick_amq(AmqFocus::default());
+        assert!(wait_for(|| screen(&engine).contains("CUSTOM NUDGE")));
+        assert!(
+            engine
+                .amq
+                .orchestrator_project_last_checkpoint
+                .contains_key("p1")
+        );
+    }
+
+    #[test]
+    fn no_checkpoint_without_same_project_workers() {
+        let (mut engine, _tmp) = orchestrator_engine();
+        engine
+            .persist_session_settings_only("w1", SessionSettings::default())
+            .unwrap();
+        engine.tick_amq(AmqFocus::default());
+        std::thread::sleep(Duration::from_millis(1100));
+        engine.tick_amq(AmqFocus::default());
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!screen(&engine).contains("checkpoint"));
+    }
+
+    #[test]
+    fn auto_clear_is_blocked_by_queued_wakes_and_busy_footers() {
+        let (mut engine, _tmp, queue) = engine_with_agent();
+        assert!(engine.amq_blocks_auto_clear("s1"), "not a worker");
+        engine
+            .persist_session_settings_only(
+                "s1",
+                SessionSettings {
+                    mode: ContextMode::Worker,
+                    auto_clear_on_task_done: true,
+                    ..SessionSettings::default()
+                },
+            )
+            .unwrap();
+        // An unclaimed queue file for this agent blocks the clear.
+        write_msg(&queue, "alice", "001.msg", "x");
+        assert!(engine.amq_blocks_auto_clear("s1"), "pending inject file");
+        fs::remove_file(queue.join("alice/001.msg")).unwrap();
+        // So does a claimed wake still in memory.
+        write_msg(&queue, "alice", "002.msg", "x");
+        engine.drain_amq_inject_queue();
+        assert!(engine.amq_blocks_auto_clear("s1"), "claimed wake");
+        engine.amq.pending.clear();
+        // And a busy footer.
+        engine.providers[crate::ids::TabIdRef::new("s1-slot")]
+            .write_bytes(b"esc to interrupt\r")
+            .unwrap();
+        assert!(wait_for(|| screen(&engine).contains("esc to interrupt")));
+        assert!(engine.amq_blocks_auto_clear("s1"), "busy footer");
+    }
 }

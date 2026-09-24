@@ -23,7 +23,10 @@ pub struct OrchestratorPeer {
 /// The launch-time policy prompt typed into providers with no system-prompt
 /// flag. It never asks for a poll: polling on startup flooded workers every
 /// restart (931f5ae0).
-pub fn build_orchestrator_startup_policy_prompt(policy: &str, peers: &[OrchestratorPeer]) -> String {
+pub fn build_orchestrator_startup_policy_prompt(
+    policy: &str,
+    peers: &[OrchestratorPeer],
+) -> String {
     let mut out = String::from("[Dux Orchestrator startup policy]\n\n");
     out.push_str(policy.trim());
     if peers.is_empty() {
@@ -152,7 +155,10 @@ mod tests {
             "Checkpoint from the operator: keep the goal moving.\n",
             &[qa()],
         );
-        assert_eq!(prompt, "Checkpoint from the operator: keep the goal moving.");
+        assert_eq!(
+            prompt,
+            "Checkpoint from the operator: keep the goal moving."
+        );
     }
 
     #[test]
@@ -184,11 +190,46 @@ mod tests {
     fn checkpoint_peers_are_live_workers_in_same_project_only() {
         let a = Some("project-a");
         let b = Some("project-b");
-        assert!(is_orchestrator_checkpoint_peer("w1", a, ContextMode::Worker, true, "o1", a));
-        assert!(!is_orchestrator_checkpoint_peer("w2", b, ContextMode::Worker, true, "o1", a));
-        assert!(!is_orchestrator_checkpoint_peer("a1", a, ContextMode::Attended, true, "o1", a));
-        assert!(!is_orchestrator_checkpoint_peer("w3", a, ContextMode::Worker, false, "o1", a));
-        assert!(!is_orchestrator_checkpoint_peer("o1", a, ContextMode::Worker, true, "o1", a));
+        assert!(is_orchestrator_checkpoint_peer(
+            "w1",
+            a,
+            ContextMode::Worker,
+            true,
+            "o1",
+            a
+        ));
+        assert!(!is_orchestrator_checkpoint_peer(
+            "w2",
+            b,
+            ContextMode::Worker,
+            true,
+            "o1",
+            a
+        ));
+        assert!(!is_orchestrator_checkpoint_peer(
+            "a1",
+            a,
+            ContextMode::Attended,
+            true,
+            "o1",
+            a
+        ));
+        assert!(!is_orchestrator_checkpoint_peer(
+            "w3",
+            a,
+            ContextMode::Worker,
+            false,
+            "o1",
+            a
+        ));
+        assert!(!is_orchestrator_checkpoint_peer(
+            "o1",
+            a,
+            ContextMode::Worker,
+            true,
+            "o1",
+            a
+        ));
     }
 
     #[test]

@@ -6,39 +6,20 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use crate::model::ProviderKind;
 use crate::session_settings::ContextMode;
-
-/// The literal sentinel Worker agents are asked to print when a task is
-/// done. The auto-clear watch rule keys off the same string.
-///
-/// INTEGRATION: replace with `crate::watch::builtin::TASK_DONE_SENTINEL`
-/// (watch engine, owned by herb) so the two can never drift.
-pub const TASK_DONE_SENTINEL: &str = "[task-done]";
-
-/// Minimum non-zero gap between body bytes and the Enter keystroke. Values
-/// below this have repeatedly proven too small for typed-body harnesses
-/// under load: body and CR are read as one paste-shaped buffer and the text
-/// stays in the input field. `0` remains a debugging escape hatch.
-pub const MIN_ENTER_PHASE_DELAY_MS: u64 = 250;
 
 /// Windows at or beyond this bound mean "always deliver, never hold": the
 /// documented `u64::MAX` escape hatch, generalized to any implausibly long
 /// value (audit03 P1-19).
 pub const ALWAYS_DELIVER_QUIET_WINDOW: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
 
-const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
-const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
-/// Traditional PTY Enter; also what a real Enter reaches Codex as.
-const RAW_ENTER: &[u8] = b"\r";
-
-pub fn effective_enter_phase_delay(configured_ms: u64) -> Duration {
-    if configured_ms == 0 {
-        Duration::ZERO
-    } else {
-        Duration::from_millis(configured_ms.max(MIN_ENTER_PHASE_DELAY_MS))
-    }
-}
+// The PTY byte encoding is shared with the watch engine: one implementation,
+// so a wake and a watch-rule nudge reach a provider byte-identically.
+pub use crate::watch::builtin::TASK_DONE_SENTINEL;
+pub use crate::watch::delivery::{
+    MIN_ENTER_PHASE_DELAY_MS, effective_enter_phase_delay, inject_body_bytes_for_provider,
+    submit_key_bytes_for_provider,
+};
 
 /// Sanitise a name the same way the AMQ wrappers do: lowercase ASCII, keep
 /// `[a-z0-9_-]`, replace anything else with `-`, trim leading/trailing `-`.
@@ -113,62 +94,6 @@ pub fn apply_inject_postscript(body: &str, mode: ContextMode) -> String {
     }
 }
 
-/// The PTY bytes that place prompt text into a provider's input field.
-///
-/// Claude and Codex get explicit bracketed paste: Claude's rapid-typing
-/// heuristic can move a long burst to its paste cache without submitting it,
-/// and Codex can capture the later Enter as a pasted newline. Other harnesses
-/// get the macro encoding where embedded newlines become Alt-Enter.
-pub fn inject_body_bytes_for_provider(body: &str, provider: Option<&ProviderKind>) -> Vec<u8> {
-    match provider.map(ProviderKind::as_str) {
-        Some(name) if name.eq_ignore_ascii_case("claude") || name.eq_ignore_ascii_case("codex") => {
-            bracketed_paste_payload_bytes(body)
-        }
-        _ => crate::macros::macro_payload_bytes(body),
-    }
-}
-
-fn bracketed_paste_payload_bytes(body: &str) -> Vec<u8> {
-    let sanitized = sanitize_bracketed_paste_text(body);
-    let mut payload = Vec::with_capacity(
-        BRACKETED_PASTE_START.len() + sanitized.len() + BRACKETED_PASTE_END.len(),
-    );
-    payload.extend_from_slice(BRACKETED_PASTE_START);
-    payload.extend_from_slice(sanitized.as_bytes());
-    payload.extend_from_slice(BRACKETED_PASTE_END);
-    payload
-}
-
-/// Normalise line endings and escape control bytes so a body can never close
-/// the paste early (`ESC[201~`) or inject terminal control sequences.
-fn sanitize_bracketed_paste_text(body: &str) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(body.len());
-    let mut chars = body.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\r' => {
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
-                out.push('\n');
-            }
-            '\n' | '\t' => out.push(ch),
-            ch if ch.is_control() || ch == '\u{7f}' || ch == '\u{9b}' => {
-                let _ = write!(out, "\\x{:02x}", ch as u32);
-            }
-            ch => out.push(ch),
-        }
-    }
-    out
-}
-
-/// The PTY bytes that submit a prompt. Raw Enter for every provider today;
-/// kept per provider so a harness that needs another key has one place.
-pub fn submit_key_bytes_for_provider(_provider: Option<&ProviderKind>) -> &'static [u8] {
-    RAW_ENTER
-}
-
 /// Whether a wake aimed at a session the operator is focused on must wait.
 ///
 /// - `quiet == 0`: legacy "always hold while focused".
@@ -207,7 +132,8 @@ pub fn should_hold_for_post_delivery_cooldown(
     cooldown_until: Option<Instant>,
     now: Instant,
 ) -> bool {
-    matches!(phase, Some(DeliveryPhase::TypeBody)) && cooldown_until.is_some_and(|until| now < until)
+    matches!(phase, Some(DeliveryPhase::TypeBody))
+        && cooldown_until.is_some_and(|until| now < until)
 }
 
 /// Soft timeout warning: the first pending instant is established on the
@@ -251,6 +177,7 @@ impl HoldReason<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ProviderKind;
 
     fn c<'a>(id: &'a str, handle: &'a str, branch: &'a str, dir: &'a str) -> ReceiverCandidate<'a> {
         ReceiverCandidate {
@@ -268,7 +195,13 @@ mod tests {
         let mut warned = HashSet::new();
         let t = Duration::from_secs(30);
         assert!(!timeout_warning_due(&mut first, &mut warned, "r", start, t));
-        assert!(timeout_warning_due(&mut first, &mut warned, "r", start + t, t));
+        assert!(timeout_warning_due(
+            &mut first,
+            &mut warned,
+            "r",
+            start + t,
+            t
+        ));
         assert!(!timeout_warning_due(
             &mut first,
             &mut warned,
@@ -319,7 +252,10 @@ mod tests {
     fn non_bracketed_paste_body_uses_macro_payload_newline_encoding() {
         for name in ["gemini", "custom", "jcode"] {
             let p = ProviderKind::from_str(name);
-            assert_eq!(inject_body_bytes_for_provider("a\nb", Some(&p)), b"a\x1b\rb");
+            assert_eq!(
+                inject_body_bytes_for_provider("a\nb", Some(&p)),
+                b"a\x1b\rb"
+            );
         }
         assert_eq!(inject_body_bytes_for_provider("a\nb", None), b"a\x1b\rb");
     }
@@ -424,15 +360,26 @@ mod tests {
     fn postscript_skipped_for_attended_and_orchestrator() {
         let body = "ad-hoc question";
         assert_eq!(apply_inject_postscript(body, ContextMode::Attended), body);
-        assert_eq!(apply_inject_postscript(body, ContextMode::Orchestrator), body);
+        assert_eq!(
+            apply_inject_postscript(body, ContextMode::Orchestrator),
+            body
+        );
     }
 
     #[test]
     fn quiet_window_rules() {
         let now = Instant::now();
         let q = Duration::from_secs(60);
-        assert!(should_hold_for_quiet_window(Some(now - Duration::from_secs(5)), now, q));
-        assert!(!should_hold_for_quiet_window(Some(now - Duration::from_secs(120)), now, q));
+        assert!(should_hold_for_quiet_window(
+            Some(now - Duration::from_secs(5)),
+            now,
+            q
+        ));
+        assert!(!should_hold_for_quiet_window(
+            Some(now - Duration::from_secs(120)),
+            now,
+            q
+        ));
         assert!(!should_hold_for_quiet_window(None, now, q));
         // Boundary: exactly at the edge counts as no longer typing.
         assert!(!should_hold_for_quiet_window(Some(now - q), now, q));
@@ -481,7 +428,9 @@ mod tests {
             now
         ));
         assert!(!should_hold_for_post_delivery_cooldown(
-            Some(DeliveryPhase::SubmitPending { typed_at: Some(now) }),
+            Some(DeliveryPhase::SubmitPending {
+                typed_at: Some(now)
+            }),
             Some(future),
             now
         ));
@@ -490,7 +439,11 @@ mod tests {
             Some(now - Duration::from_secs(1)),
             now
         ));
-        assert!(!should_hold_for_post_delivery_cooldown(None, Some(now), now));
+        assert!(!should_hold_for_post_delivery_cooldown(
+            None,
+            Some(now),
+            now
+        ));
         assert!(!should_hold_for_post_delivery_cooldown(
             Some(DeliveryPhase::TypeBody),
             None,
