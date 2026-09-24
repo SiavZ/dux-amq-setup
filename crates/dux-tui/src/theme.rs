@@ -1526,33 +1526,211 @@ info = "info"
         (tmp, paths)
     }
 
-    /// The name chip is derived, not picked: the foreground is the theme's body
-    /// text and the background is the modal surface moved `NAME_BG_TINT` of the
-    /// way toward that text. The bundled theme's values are pinned outright
-    /// (they are what the proof of concept measured), and every built-in is
-    /// checked against the same derivation run over its own resolved tokens, so
-    /// a registration that runs before the tokens it reads are defaulted fails
-    /// here rather than painting the FALLBACK gray.
-    #[test]
-    fn the_name_chip_derives_from_body_text_and_the_modal_surface_in_every_loadable_theme() {
-        let dux_dark = load_from_str(DUX_DARK_TOML).expect("bundled dux-dark must parse");
-        assert_eq!(dux_dark.name_fg, Color::White);
-        assert_eq!(dux_dark.name_bg, Color::Rgb(0x3a, 0x3a, 0x3a));
+    /// Every loadable theme's name chip, as literal colors: (theme id, name_fg,
+    /// name_bg). The derivation (body text on the modal surface tinted toward
+    /// it) produced these; they are pinned outright so a change to the
+    /// derivation, to the order tokens are defaulted in, or to a built-in's
+    /// palette shows up here as a changed color someone has to look at, rather
+    /// than a recomputation that agrees with itself.
+    const NAME_CHIPS: &[(&str, Color, Color)] = &[
+        (
+            "ayu_dark",
+            Color::Rgb(191, 189, 182),
+            Color::Rgb(41, 44, 48),
+        ),
+        (
+            "ayu_light",
+            Color::Rgb(92, 97, 102),
+            Color::Rgb(226, 227, 228),
+        ),
+        (
+            "ayu_mirage",
+            Color::Rgb(204, 202, 194),
+            Color::Rgb(59, 63, 71),
+        ),
+        (
+            "catppuccin_frappe",
+            Color::Rgb(198, 208, 245),
+            Color::Rgb(72, 77, 98),
+        ),
+        (
+            "catppuccin_latte",
+            Color::Rgb(76, 79, 105),
+            Color::Rgb(205, 208, 218),
+        ),
+        (
+            "catppuccin_macchiato",
+            Color::Rgb(202, 211, 245),
+            Color::Rgb(63, 67, 88),
+        ),
+        (
+            "catppuccin_mocha",
+            Color::Rgb(205, 214, 244),
+            Color::Rgb(58, 59, 78),
+        ),
+        ("dracula", Color::Rgb(248, 248, 242), Color::Rgb(73, 75, 84)),
+        ("dux_dark", Color::White, Color::Rgb(58, 58, 58)),
+        (
+            "everforest_dark",
+            Color::Rgb(211, 198, 170),
+            Color::Rgb(72, 76, 77),
+        ),
+        (
+            "everforest_light",
+            Color::Rgb(92, 106, 114),
+            Color::Rgb(220, 219, 201),
+        ),
+        (
+            "flexoki_dark",
+            Color::Rgb(206, 205, 195),
+            Color::Rgb(56, 55, 53),
+        ),
+        (
+            "flexoki_light",
+            Color::Rgb(16, 15, 15),
+            Color::Rgb(217, 214, 204),
+        ),
+        (
+            "github_dark_dimmed",
+            Color::Rgb(173, 186, 199),
+            Color::Rgb(56, 63, 70),
+        ),
+        (
+            "github_light",
+            Color::Rgb(31, 35, 40),
+            Color::Rgb(219, 220, 221),
+        ),
+        (
+            "gruvbox_dark",
+            Color::Rgb(235, 219, 178),
+            Color::Rgb(71, 69, 62),
+        ),
+        (
+            "gruvbox_light",
+            Color::Rgb(60, 56, 54),
+            Color::Rgb(220, 211, 176),
+        ),
+        (
+            "kanagawa_dragon",
+            Color::Rgb(197, 201, 197),
+            Color::Rgb(47, 47, 44),
+        ),
+        (
+            "kanagawa_lotus",
+            Color::Rgb(84, 84, 100),
+            Color::Rgb(198, 192, 160),
+        ),
+        (
+            "kanagawa_wave",
+            Color::Rgb(220, 215, 186),
+            Color::Rgb(55, 55, 57),
+        ),
+        (
+            "light_owl",
+            Color::Rgb(64, 63, 83),
+            Color::Rgb(221, 221, 224),
+        ),
+        (
+            "monokai_pro",
+            Color::Rgb(252, 252, 250),
+            Color::Rgb(78, 76, 79),
+        ),
+        (
+            "night_owl",
+            Color::Rgb(214, 222, 235),
+            Color::Rgb(35, 54, 70),
+        ),
+        ("nord", Color::Rgb(236, 239, 244), Color::Rgb(76, 82, 93)),
+        (
+            "one_dark",
+            Color::Rgb(171, 178, 191),
+            Color::Rgb(61, 65, 74),
+        ),
+        (
+            "one_light",
+            Color::Rgb(56, 58, 66),
+            Color::Rgb(211, 211, 212),
+        ),
+        (
+            "palenight",
+            Color::Rgb(166, 172, 205),
+            Color::Rgb(61, 65, 85),
+        ),
+        (
+            "rose_pine",
+            Color::Rgb(224, 222, 244),
+            Color::Rgb(62, 60, 78),
+        ),
+        (
+            "rose_pine_dawn",
+            Color::Rgb(87, 82, 121),
+            Color::Rgb(228, 223, 223),
+        ),
+        (
+            "rose_pine_moon",
+            Color::Rgb(224, 222, 244),
+            Color::Rgb(71, 68, 92),
+        ),
+        (
+            "silkcircuit_dawn",
+            Color::Rgb(43, 37, 64),
+            Color::Rgb(209, 204, 224),
+        ),
+        ("silkcircuit_glow", Color::White, Color::Rgb(53, 51, 61)),
+        (
+            "silkcircuit_neon",
+            Color::Rgb(248, 248, 242),
+            Color::Rgb(60, 60, 66),
+        ),
+        (
+            "silkcircuit_soft",
+            Color::Rgb(248, 248, 242),
+            Color::Rgb(67, 63, 74),
+        ),
+        (
+            "silkcircuit_vibrant",
+            Color::Rgb(248, 248, 242),
+            Color::Rgb(56, 52, 67),
+        ),
+        (
+            "solarized_dark",
+            Color::Rgb(131, 148, 150),
+            Color::Rgb(27, 69, 79),
+        ),
+        (
+            "solarized_light",
+            Color::Rgb(101, 123, 131),
+            Color::Rgb(216, 215, 200),
+        ),
+        (
+            "tokyo_night",
+            Color::Rgb(192, 202, 245),
+            Color::Rgb(53, 55, 71),
+        ),
+        (
+            "tokyo_night_moon",
+            Color::Rgb(200, 211, 245),
+            Color::Rgb(61, 64, 85),
+        ),
+        (
+            "tokyo_night_storm",
+            Color::Rgb(192, 202, 245),
+            Color::Rgb(61, 66, 89),
+        ),
+    ];
 
+    #[test]
+    fn every_loadable_theme_draws_the_name_chip_in_its_pinned_colors() {
         let (_tmp, paths) = scratch_paths();
         let listings = discover_available(&paths);
         assert!(
             listings.len() > 1,
             "expected the bundled theme plus built-ins"
         );
-        for listing in listings {
+        let mut actual = Vec::new();
+        for listing in &listings {
             let theme = load(&listing.id, &paths)
                 .unwrap_or_else(|err| panic!("theme {} failed to load: {err}", listing.id));
-            assert_eq!(
-                theme.name_fg, theme.text_fg,
-                "theme {}: a name reads in the body-text color",
-                listing.id
-            );
             assert_ne!(
                 theme.name_bg, theme.overlay_bg,
                 "theme {} draws the name chip invisibly on the modal surface",
@@ -1563,23 +1741,24 @@ info = "info"
                 "theme {} draws a name in its own chip color",
                 listing.id
             );
-            if listing.source == ThemeSource::Opaline {
-                let raw = [listing.id.replace('_', "-"), listing.id.clone()]
-                    .iter()
-                    .find_map(|candidate| opaline::load_by_name(candidate))
-                    .unwrap_or_else(|| panic!("built-in {} must load", listing.id));
-                let mut raw = raw;
-                register_dux_defaults(&mut raw);
-                let text = raw.color("dux.text_fg");
-                let surface = raw.color("dux.overlay_bg");
-                assert_eq!(
-                    theme.name_bg,
-                    into_ratatui(surface.lerp(text, NAME_BG_TINT)),
-                    "theme {}: the chip is the modal surface tinted toward the text",
-                    listing.id
-                );
-            }
+            actual.push((listing.id.clone(), theme.name_fg, theme.name_bg));
         }
+        actual.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut pinned: Vec<(String, Color, Color)> = NAME_CHIPS
+            .iter()
+            .map(|(id, fg, bg)| ((*id).to_string(), *fg, *bg))
+            .collect();
+        pinned.sort_by(|a, b| a.0.cmp(&b.0));
+        let table = actual
+            .iter()
+            .map(|(id, fg, bg)| format!("        (\"{id}\", Color::{fg:?}, Color::{bg:?}),"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            actual == pinned,
+            "the name chip colors differ from the pinned table; if the change is \
+             intended, the table is now:\n{table}"
+        );
     }
 
     /// A theme that names its own chip keeps it: the derivation is a default,
