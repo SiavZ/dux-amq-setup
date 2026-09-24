@@ -29258,7 +29258,14 @@ cyan = "#00ffff"
     /// Block until some viewport row's text starts with `needle`, i.e. the
     /// child echoed back what dux forwarded to its PTY.
     fn wait_for_grid_row(app: &mut App, needle: &str) {
-        for _ in 0..200 {
+        // Deadline rather than a fixed iteration count. This waits on a real
+        // child process to be scheduled, read its input and echo, so the time it
+        // needs belongs to the machine: the old 200 x 10ms budget was two
+        // seconds, which the full suite (a couple of thousand tests competing
+        // for the same cores) can exceed without anything being wrong with dux.
+        // Still bounded, so a child that never echoes fails rather than hangs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
             app.refresh_snapshot_buf();
             let mut rows: std::collections::BTreeMap<u16, String> =
                 std::collections::BTreeMap::new();
@@ -29268,9 +29275,46 @@ cyan = "#00ffff"
             if rows.values().any(|line| line.trim().starts_with(needle)) {
                 return;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never echoed {needle:?} before the deadline"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        panic!("the child never echoed {needle:?} within 2s");
+    }
+
+    /// A `cat` invocation that renders a tab as the two printable characters
+    /// `^I`, spelled the way THIS machine's `cat` spells it.
+    ///
+    /// The two families disagree. GNU `cat` takes `-T`; BSD `cat`, which is what
+    /// macOS ships, has no `-T` at all and spells the same behaviour `-t`. The
+    /// fixture used to hardcode `-vT`, so on macOS the child printed
+    /// `cat: illegal option -- T` and EXITED immediately. Nothing was ever
+    /// reading the PTY, so the keystroke the test forwards went nowhere and the
+    /// test failed waiting for an echo that could not come, with a timeout
+    /// message that pointed at timing rather than at the real cause.
+    ///
+    /// Measured rather than chosen by platform: the probe runs the candidate and
+    /// checks that a real tab comes back as `^I`, so a machine whose `cat` is
+    /// GNU (a Mac with coreutils first on `PATH`) is answered correctly rather
+    /// than by an assumption about the operating system.
+    fn cat_showing_tabs() -> String {
+        for flag in ["-vT", "-vt"] {
+            let Ok(output) = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf 'a\\tb' | cat {flag}"))
+                .output()
+            else {
+                continue;
+            };
+            if output.status.success() && output.stdout == b"a^Ib" {
+                return format!("cat {flag}");
+            }
+        }
+        panic!(
+            "no `cat` on this machine renders a tab as ^I (tried -vT and -vt); \
+             the fixture cannot show what reached the PTY"
+        );
     }
 
     fn tap_center(app: &mut App, code: KeyCode, mods: KeyModifiers) {
@@ -29462,7 +29506,7 @@ cyan = "#00ffff"
     /// of the exact bytes.
     #[test]
     fn tab_and_shift_tab_reach_the_pty_when_the_option_is_on() {
-        let mut app = app_with_minimized_typeable_echo_child("", "cat -vT");
+        let mut app = app_with_minimized_typeable_echo_child("", &cat_showing_tabs());
         app.engine.config.ui.tab_reaches_agent = true;
 
         tap_center(&mut app, KeyCode::Tab, KeyModifiers::NONE);
