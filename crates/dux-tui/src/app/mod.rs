@@ -7601,8 +7601,11 @@ mod tests {
         // alias needs root, so the address is DISCOVERED instead: ask the host
         // which loopback addresses it actually has (a machine may carry extra
         // 127.x aliases for other reasons) and take the first that is not
-        // 127.0.0.1 and that the kernel lets us bind.
-        let second_loopback = crate::app::test_support::bindable_secondary_loopbacks();
+        // 127.0.0.1 and that the kernel lets us bind. 127.0.0.2 is tried
+        // first because on Linux it binds without being listed by `ifconfig`,
+        // and discovery alone would silently skip this test on CI.
+        let second_loopback = std::iter::once(std::net::IpAddr::from([127, 0, 0, 2]))
+            .chain(crate::app::test_support::bindable_secondary_loopbacks());
         let Some((held, ts_ip)) = second_loopback.into_iter().find_map(|ip| {
             let listener = std::net::TcpListener::bind((ip, 0)).ok()?;
             Some((listener, ip))
