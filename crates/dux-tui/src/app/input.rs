@@ -3270,6 +3270,14 @@ impl App {
         dispatch: &mut RawInputDispatch,
     ) -> RawInputFlow {
         dispatch.flush(self);
+        // Keys forwarded BEFORE this mouse event retire the old selection now,
+        // not at the end of the batch: a deferred clear would also wipe the
+        // selection this very gesture starts (a bare Escape still pending
+        // from the previous read is the usual culprit).
+        if dispatch.needs_selection_clear {
+            self.terminal_selection = None;
+            dispatch.needs_selection_clear = false;
+        }
         if self.handle_takeover_card_mouse(&mouse) || self.handle_dormant_card_mouse(&mouse) {
             return RawInputFlow::Continue;
         }
@@ -30873,6 +30881,96 @@ cyan = "#00ffff"
             FocusPane::Left,
             "focus should move to left pane when terminal_return_to_list is set"
         );
+    }
+
+    /// Fork 0befc8e9: a bare Escape still pending when a mouse report arrives
+    /// must not swallow the report's own ESC, or the drag reads as garbage and
+    /// the selection never starts. Upstream's parser keeps a lone ESC before
+    /// another ESC as its own sequence, so this is a regression guard.
+    #[test]
+    fn pending_escape_does_not_swallow_claude_mouse_selection() {
+        let mut app = app_with_interactive_agent_pty();
+        app.engine.sessions[0].provider = ProviderKind::from_str("claude");
+
+        app.process_raw_input_bytes(b"\x1b").unwrap();
+        let mut drag = sgr_mouse_down(30, 5);
+        drag.extend_from_slice(b"\x1b[<32;35;6M");
+        app.process_raw_input_bytes(&drag).unwrap();
+
+        let selection = app
+            .terminal_selection
+            .as_ref()
+            .expect("mouse drag after Escape should start a selection");
+        assert_ne!(selection.anchor, selection.end);
+    }
+
+    /// Fork 83bd3bfd: the STRUCTURED mouse path (crossterm events, not the raw
+    /// interactive byte stream) dismisses a fullscreen agent on a click
+    /// outside it, like the raw path does.
+    #[test]
+    fn structured_click_outside_fullscreen_agent_exits_interactive_mode() {
+        let mut app = app_with_interactive_agent_pty();
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 1));
+
+        assert_eq!(
+            app.input_target,
+            InputTarget::None,
+            "structured mouse clicks outside overlay must exit interactive mode"
+        );
+        assert_eq!(
+            app.fullscreen_overlay,
+            FullscreenOverlay::None,
+            "structured mouse clicks outside overlay must dismiss fullscreen"
+        );
+    }
+
+    #[test]
+    fn structured_click_inside_fullscreen_agent_stays_interactive() {
+        let mut app = app_with_interactive_agent_pty();
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 30, 5));
+
+        assert_eq!(app.input_target, InputTarget::Agent);
+        assert_eq!(app.fullscreen_overlay, FullscreenOverlay::Agent);
+    }
+
+    /// Fork c2c44378: a lone Escape is held back while it could still be the
+    /// prefix of an arrow or Alt sequence, and must reach the child once the
+    /// ambiguity window passes. Upstream resolves it by feeding an empty chunk
+    /// (`resolve_pending_bare_esc` after `ESC_AMBIGUITY_TIMEOUT`), which is the
+    /// seam this drives.
+    #[test]
+    fn bare_escape_flushes_to_pty_after_ambiguity_timeout() {
+        let mut app = test_app(default_bindings());
+        let output_dir = tempdir().expect("tempdir");
+        let output = output_dir.path().join("byte");
+        let args = vec![
+            "-c".to_string(),
+            "stty raw -echo; dd bs=1 count=1 2>/dev/null | od -An -tu1 > \"$1\"".to_string(),
+            "sh".to_string(),
+            output.to_string_lossy().into_owned(),
+        ];
+        let client = PtyClient::spawn("sh", &args, std::path::Path::new("."), 5, 40, 100)
+            .expect("spawn pty");
+        let slot_tab = app.engine.sessions[0].slot_tab_id().to_string();
+        app.engine.providers.insert(TabId::new(slot_tab), client);
+        app.input_target = InputTarget::Agent;
+        app.session_surface = SessionSurface::Agent;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        app.process_raw_input_bytes(b"\x1b").unwrap();
+        assert_eq!(app.raw_input_buf, b"\x1b", "a lone ESC is held back");
+        app.process_raw_input_bytes(&[]).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !std::fs::read_to_string(&output).is_ok_and(|value| value.trim() == "27")
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(output).unwrap().trim(), "27");
+        assert!(app.raw_input_buf.is_empty());
     }
 
     #[test]
