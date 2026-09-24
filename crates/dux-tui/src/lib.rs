@@ -201,7 +201,9 @@ pub fn help_text() -> &'static str {
          Usage:\n\
           dux              Launch the TUI\n\
           dux server       Serve the web UI over the headless engine\n\
-          dux config       Manage the configuration file\n\n\
+          dux config       Manage the configuration file\n\
+          dux peer         Route messages between Dux agent sessions\n\
+                           (`dux peer --help` for send, list, sync-amq)\n\n\
          Server subcommand:\n\
           dux server                     Serve on the configured host and port\n\
           dux server --bind <ADDR:PORT>  Bind this exact address instead\n\
@@ -272,6 +274,17 @@ mod tests {
                 "--help must mention the `dux server` flag {flag}:\n{help}"
             );
         }
+    }
+
+    /// `dux peer` is dispatched by the binary and is how agents message each
+    /// other, so the top-level help must name it.
+    #[test]
+    fn help_lists_the_peer_subcommand() {
+        let help = help_text();
+        assert!(
+            help.contains("dux peer"),
+            "--help must name the `dux peer` subcommand:\n{help}"
+        );
     }
 
     /// The trust model currently appears only deep in the docs. `--help` is the

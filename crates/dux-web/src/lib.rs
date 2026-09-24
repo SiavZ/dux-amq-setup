@@ -403,6 +403,9 @@ fn run_plain_http(paths: DuxPaths, plan: ServerPlan, version: String) -> Result<
     } = plan;
     warn_if_ui_not_built();
     let engine = bootstrap::bootstrap_engine(&paths)?;
+    // Now that the single-instance lock is held: reconcile the shared AMQ
+    // registry and let agent launches reserve their inbox. Never fatal.
+    dux_core::peer::init_for_process(&paths);
     // Build the vite-style CLI console (color from [server] color) + the access-log
     // toggle before the engine moves into the actor thread.
     let (console, access_log) = build_console(&engine.config);

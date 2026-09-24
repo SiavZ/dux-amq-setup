@@ -3616,6 +3616,11 @@ impl App {
 
         logger::init(&config.logging, &paths);
         logger::info("bootstrapping dux");
+        // Reconcile the shared AMQ registry from this store's sessions and let
+        // agent launches reserve their inbox. Under the single-instance lock
+        // the caller holds, after the logger so its outcome is recorded, and
+        // never fatal to the boot.
+        dux_core::peer::init_for_process(&paths);
 
         // Validate and build runtime keybindings from config.
         if let Err(msg) = validate_keys(&config.keys) {

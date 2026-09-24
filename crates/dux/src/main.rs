@@ -23,8 +23,20 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("server") => run_server(args),
+        Some("peer") => run_peer(args),
         _ => run_tui_with_flip(),
     }
+}
+
+/// `dux peer ...`: route a message between agent sessions. Dispatched before
+/// the TUI's argument handling, which treats `--help` anywhere on the line as
+/// a request for the top-level help; a peer message may legitimately contain
+/// that word. Takes no single-instance lock: it runs from inside agents while
+/// the TUI or server holds it, and the AMQ registry has its own lock.
+fn run_peer(args: impl Iterator<Item = String>) -> Result<()> {
+    let args = args.collect::<Vec<_>>();
+    let paths = dux_core::config::DuxPaths::discover()?;
+    dux_core::peer::run_peer(&args, &paths)
 }
 
 /// Write the handoff and replace this process with the newer dux binary.
