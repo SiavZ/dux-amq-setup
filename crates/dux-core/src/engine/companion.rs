@@ -42,7 +42,7 @@ impl Engine {
         // gets the global environment with no project overlay. Falling through
         // to `unwrap_or_default` on a missing project id would hand it an empty
         // environment instead, which is a different and much worse thing.
-        let env = match session.project_id() {
+        let user_env = match session.project_id() {
             Some(project_id) => self
                 .projects
                 .iter()
@@ -57,7 +57,33 @@ impl Engine {
             )
             .unwrap_or_default(),
         };
-
+        // The agent's identity comes first so the user's `[env]` still wins, as
+        // for the provider itself (fork
+        // `companion_terminal_receives_session_identity_env`). A shell opened on
+        // an agent is where the user runs `dux peer send` or the AMQ CLI by
+        // hand, and those read DUX_SESSION_ID / DUX_STORE_ID / DUX_AMQ_HANDLE
+        // to know who is speaking. It uses the persisted handle and reserves
+        // nothing: the terminal is not a second reader on the agent's inbox.
+        let mut env = {
+            let mut identity = Vec::new();
+            match crate::peer::load_or_create_store_id(&self.paths.root) {
+                Ok(store_id) => crate::peer::append_session_env(
+                    &mut identity,
+                    &crate::peer::session_store::peer_session(
+                        &session,
+                        session.agent_handle().to_string(),
+                        false,
+                    ),
+                    &store_id,
+                ),
+                Err(err) => crate::logger::warn(&format!(
+                    "companion terminal for {} opens without DUX_* identity: {err:#}",
+                    crate::sanitize::for_terminal(&session.id)
+                )),
+            }
+            identity
+        };
+        env.extend(user_env);
         self.spawn_terminal(
             TerminalOwner::Session(session_id.to_string()),
             Path::new(session.directory()),
@@ -1193,5 +1219,58 @@ mod tests {
             engine.companion_terminals.is_empty(),
             "no terminal should have been registered"
         );
+    }
+
+    /// Fork `companion_terminal_receives_session_identity_env`: a terminal
+    /// opened on an agent is where the user runs `dux peer send` or the AMQ
+    /// CLI by hand, so it carries the agent's Dux identity, with the
+    /// PERSISTED handle (not one re-derived from the directory).
+    #[test]
+    fn companion_terminal_receives_session_identity_env() {
+        let (mut engine, _tmp) = test_engine();
+        let worktree = tempfile::tempdir().expect("worktree dir");
+        engine.projects.push(sample_project(
+            "p1",
+            worktree.path().to_string_lossy().as_ref(),
+        ));
+        let mut session = sample_session("session-a", "p1", "feature");
+        session.agent_handle = "stable-handle".to_string();
+        session
+            .workspace
+            .as_managed_mut()
+            .expect("managed test session")
+            .worktree_path = worktree.path().to_string_lossy().to_string();
+        engine.sessions.push(session);
+        engine.config.terminal.command = "/bin/sh".to_string();
+        engine.config.terminal.args = vec![
+            "-c".to_string(),
+            "printf '%s|%s|%s\\n' \"$DUX_SESSION_ID\" \"$DUX_STORE_ID\" \"$DUX_AMQ_HANDLE\"; sleep 5"
+                .to_string(),
+        ];
+
+        let (terminal, _) = engine
+            .create_companion_terminal("session-a", 24, 80)
+            .expect("spawn companion terminal");
+        let store_id = crate::peer::load_or_create_store_id(&engine.paths.root).unwrap();
+        let expected = format!("session-a|{store_id}|stable-handle");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let rendered: String = engine.companion_terminals[&terminal]
+                .client
+                .snapshot()
+                .cells
+                .iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect();
+            if rendered.contains(&expected) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "companion terminal did not receive identity env; got: {rendered:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        engine.shutdown_ptys(std::time::Duration::ZERO);
     }
 }
