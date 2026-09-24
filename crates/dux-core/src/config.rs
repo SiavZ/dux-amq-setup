@@ -1200,6 +1200,13 @@ pub struct ProviderCommandConfig {
     ///
     /// See [`WebDragDropPaste`] for what each form means and which CLI needs which.
     pub web_dragdrop_paste: Option<String>,
+    /// Watch rules for this provider, written as `[[providers.<name>.watch]]`
+    /// array entries. Each rule pairs a regex matched against the agent's
+    /// recent terminal output with an action (send text, or wait until a
+    /// parsed reset time and then send text), a backoff schedule, a cooldown
+    /// and a fire budget. Empty (the default) means no automatic input is ever
+    /// typed into the agent. See [`crate::watch`] for the engine.
+    pub watch: Vec<crate::watch::WatchRule>,
 }
 
 /// The form a dragged and dropped file's path takes when the web UI writes it into
@@ -2297,6 +2304,7 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5]
                 // Measured: strips one quote pair then unescapes, so quoting
                 // buys nothing and corrupts an apostrophe.
                 web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
+                watch: Vec::new(),
             },
         ),
         (
@@ -2314,6 +2322,7 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5]
                 // Measured: falls back to POSIX shell lexing and accepts only a
                 // single token, so a bare path with a space fails silently.
                 web_dragdrop_paste: Some(WebDragDropPaste::SingleQuoted.as_str().to_string()),
+                watch: Vec::new(),
             },
         ),
         (
@@ -2330,6 +2339,7 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5]
                 forward_scroll: None,
                 // Measured: strips quote characters and never splits on a space.
                 web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
+                watch: Vec::new(),
             },
         ),
         (
@@ -2351,6 +2361,7 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5]
                 // NOT measured: Copilot CLI is closed source. `bare` is the
                 // do-nothing option and what two of the three verified CLIs want.
                 web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
+                watch: Vec::new(),
             },
         ),
         (
@@ -2399,6 +2410,7 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5]
                 // Measured: jcode strips quotes and unescapes, similar to Claude Code.
                 // Never splits on whitespace, so a space is harmless bare.
                 web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
+                watch: Vec::new(),
             },
         ),
     ]

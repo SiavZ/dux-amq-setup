@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// One watch rule. Loaded from `[[providers.<name>.watch]]` arrays in
 /// `config.toml`. Fields default to safe values so partially-specified rules
 /// in user configs still load.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WatchRule {
     /// Regex pattern matched against each row of the agent's visible
@@ -71,7 +71,7 @@ pub enum WatchRuleKind {
 /// parser, schedules the fire for the resulting instant, then sends
 /// `text`, useful for messages like Claude Code's "5-hour usage limit
 /// reached" where the reset time is encoded in the message body.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum WatchAction {
     /// Write `text` (optionally followed by `\r` to simulate Enter) to the
@@ -161,7 +161,7 @@ pub enum WaitFormat {
 ///
 /// Delay for attempt `n` (0-indexed) is
 /// `min(initial_ms * multiplier^n, max_ms) + uniform_random(0, jitter_ms)`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WatchBackoff {
     pub initial_ms: u64,
@@ -197,7 +197,7 @@ impl WatchBackoff {
 
 /// How many times a rule may fire before disarming itself for the rest of
 /// the session. `0` means unlimited.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WatchBudget {
     pub max_attempts: u32,
