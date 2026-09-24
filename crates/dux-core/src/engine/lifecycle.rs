@@ -1612,6 +1612,54 @@ impl Engine {
             .collect()
     }
 
+    /// Describe every live PTY so the image on the other side of a reload can
+    /// adopt them, and make their descriptors survive the `exec`.
+    ///
+    /// This is the counterpart to [`shutdown_ptys`](Self::shutdown_ptys), and
+    /// the difference is the whole point: shutdown SIGTERMs every child, while
+    /// this leaves them running and arranges for the next image to inherit them.
+    ///
+    /// All or nothing. If any single PTY cannot be handed over, this returns
+    /// `None` and the caller must not exec, because a partial handoff is the
+    /// worst outcome available: the agents that could not cross would keep
+    /// running as orphans nothing can reach or stop, while their rows come back
+    /// looking merely dead. Refusing leaves the user exactly where they were,
+    /// with everything still working.
+    ///
+    /// Companion terminals are included for the same reason agents are: they are
+    /// the user's own shells, and killing them to pick up a new binary is the
+    /// behaviour this feature exists to avoid.
+    pub fn prepare_reload_handoff(&self) -> Option<crate::reload_handoff::Handoff> {
+        let mut ptys = Vec::new();
+
+        for (tab_id, client) in &self.providers {
+            let session_id = self
+                .agent_tabs
+                .get(tab_id.as_ref())
+                .map(|tab| tab.session_id.clone())
+                .or_else(|| {
+                    // A session-slot tab has no `agent_tabs` row: the slot IS the
+                    // session's own tab, so the link runs the other way.
+                    self.sessions
+                        .iter()
+                        .find(|s| s.is_slot_tab(tab_id.as_ref()))
+                        .map(|s| s.id.clone())
+                });
+            let entry = client.prepare_for_reload(tab_id.as_str(), session_id.as_deref())?;
+            ptys.push(entry);
+        }
+
+        for (tab_id, terminal) in &self.companion_terminals {
+            let entry = terminal.client.prepare_for_reload(tab_id.as_str(), None)?;
+            ptys.push(entry);
+        }
+
+        Some(crate::reload_handoff::Handoff {
+            written_by: std::process::id(),
+            ptys,
+        })
+    }
+
     /// Gracefully wind down every running PTY for server shutdown: SIGTERM each
     /// child so agents save state for a later resume, wait up to `grace`, and
     /// mark agent sessions Detached. `desired_running` is left untouched,
@@ -6561,5 +6609,85 @@ mod tests {
             text.contains("force-closed"),
             "one forced tab makes the agent's outcome forced: {text}"
         );
+    }
+
+    /// A live agent in the engine, so the handoff is collected from the same
+    /// shape production has rather than from a hand-built map.
+    fn engine_with_one_live_agent() -> (Engine, TempDir) {
+        let (mut engine, tmp) = test_engine();
+        let worktree = tmp.path();
+        engine
+            .projects
+            .push(sample_project("p1", worktree.to_string_lossy().as_ref()));
+        let session = sample_session("s1", "p1", "feat");
+        let slot = session.slot_tab_id().to_owned();
+        engine.sessions.push(session);
+
+        let client = crate::pty::PtyClient::spawn_with_env(
+            "sleep",
+            &["30".to_string()],
+            worktree,
+            24,
+            80,
+            1000,
+            &[],
+        )
+        .expect("spawn agent");
+        engine.providers.insert(slot, client);
+        (engine, tmp)
+    }
+
+    #[test]
+    fn a_reload_handoff_describes_every_live_agent_and_names_its_session() {
+        // The row has to come back where it was, so the handoff must carry the
+        // session a slot tab belongs to. A slot tab has no `agent_tabs` entry,
+        // which is exactly the case a naive lookup would return None for and
+        // silently orphan the row after the reload.
+        let (engine, _tmp) = engine_with_one_live_agent();
+
+        let handoff = engine
+            .prepare_reload_handoff()
+            .expect("a healthy engine must be able to hand its ptys over");
+
+        assert_eq!(handoff.written_by, std::process::id());
+        assert_eq!(handoff.ptys.len(), 1, "one live agent, one entry");
+        let entry = &handoff.ptys[0];
+        assert_eq!(
+            entry.session_id.as_deref(),
+            Some("s1"),
+            "a session-slot tab must still resolve to its session"
+        );
+        assert!(
+            entry.child_pid.is_some(),
+            "the handoff must name the process it is handing over"
+        );
+    }
+
+    #[test]
+    fn preparing_a_handoff_makes_the_master_survive_an_exec() {
+        // The load-bearing side effect. Collecting the descriptor numbers is
+        // useless unless the kernel also stops closing them on exec, and that
+        // is invisible in the returned value, so it is asserted directly.
+        let (engine, _tmp) = engine_with_one_live_agent();
+
+        let handoff = engine.prepare_reload_handoff().expect("handoff");
+        let fd = handoff.ptys[0].master_fd;
+        assert!(
+            crate::pty_reattach::survives_exec(fd).expect("read the descriptor flags"),
+            "after preparing a handoff the master must survive exec, or the next \
+             image inherits a closed descriptor"
+        );
+    }
+
+    #[test]
+    fn an_engine_with_nothing_running_still_hands_over_cleanly() {
+        // Reloading with no agents is the common case (a quiet session picking
+        // up a new build) and must not be refused: an empty handoff is a valid
+        // one, distinct from the `None` that means "do not exec".
+        let (engine, _tmp) = test_engine();
+        let handoff = engine
+            .prepare_reload_handoff()
+            .expect("an idle engine has nothing to fail at");
+        assert!(handoff.ptys.is_empty());
     }
 }

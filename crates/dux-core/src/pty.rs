@@ -1727,6 +1727,49 @@ impl PtyClient {
         self.child.process_id()
     }
 
+    /// Describe this PTY so the image on the other side of a reload can pick the
+    /// same child back up, and make its master descriptor survive the `exec`.
+    ///
+    /// Both halves have to happen here, together. Recording the descriptor
+    /// number without clearing `FD_CLOEXEC` hands the next image a number the
+    /// kernel already closed; clearing the flag without recording the number
+    /// leaves an inherited descriptor nobody can identify. Doing both in one
+    /// call means a caller cannot get half of it right.
+    ///
+    /// Returns `None` when this PTY cannot be handed over, which the caller must
+    /// treat as "do not reload": a provider that cannot cross the exec would
+    /// come back as a dead row with a live orphan behind it. That happens when
+    /// the master has no descriptor to pass, or when clearing the flag fails.
+    ///
+    /// Does NOT carry the terminal grid. The scrollback lives in this process's
+    /// memory and dies with it, so the replacement image starts the row clean and
+    /// repaints from the child's next output. The agent keeps running either way,
+    /// which is the part that matters.
+    pub fn prepare_for_reload(
+        &self,
+        tab_id: &str,
+        session_id: Option<&str>,
+    ) -> Option<crate::reload_handoff::HandoffPty> {
+        let fd = self.master.as_raw_fd()?;
+        if let Err(err) = crate::pty_reattach::keep_open_across_exec(fd) {
+            logger::warn(&format!(
+                "reload: tab {tab_id} cannot hand over its pty: {err:#}"
+            ));
+            return None;
+        }
+        let (rows, cols) = self.grid_size().unwrap_or((24, 80));
+        Some(crate::reload_handoff::HandoffPty {
+            tab_id: tab_id.to_string(),
+            session_id: session_id.map(str::to_string),
+            master_fd: fd,
+            child_pid: self.child_process_id(),
+            rows,
+            cols,
+            spawn_dir: self.spawn_dir.clone(),
+            scrollback_capacity: self.scrollback_capacity,
+        })
+    }
+
     /// Politely ask the child to exit (SIGTERM, then SIGHUP), so the CLI or the
     /// app running in a terminal can flush state before the hard group `kill()`
     /// in `Drop` (or process teardown) reaps stragglers. Signals the child's
