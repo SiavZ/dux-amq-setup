@@ -77,6 +77,9 @@ pub mod working_copy;
 pub mod working_cue;
 pub mod worktree_file;
 pub mod worktree_manager;
+// Resume-by-provider-session-id and startup auto-resume (resume port).
+pub mod auto_resume;
+pub mod resume_recovery;
 
 /// Display version string ('vX.Y.Z' for release builds, 'development' otherwise), set by build.rs, mirroring the TUI's `DUX_DISPLAY_VERSION`.
 pub fn display_version() -> &'static str {
