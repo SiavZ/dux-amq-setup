@@ -2418,6 +2418,16 @@ impl EngineService {
         // delete also removes its worktree, dispatch that removal now, only after
         // the agent's process is actually gone (the existing
         // `WorktreeRemoveCompleted` path then drives its status).
+        // Watch rules: this sweep is the single tick site for `dux serve`,
+        // exactly like the activity poll above, so a rule fires once.
+        for status in engine.tick_watch_rules() {
+            self.note_mutation();
+            let reaction = dux_core::engine::EventReaction::Status(status);
+            for status in dux_core::wire::wire_statuses_from_reaction(&reaction) {
+                let _ = self.status.send(status);
+            }
+        }
+
         let reaped = engine.reap_terminating_ptys();
         for removal in reaped.removals {
             let _busy = engine.dispatch_deferred_worktree_removal(removal);

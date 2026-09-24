@@ -63,6 +63,7 @@ pub(crate) fn test_engine() -> (Engine, TempDir) {
         providers: HashMap::new(),
         running_provider_pins: HashMap::new(),
         launched_drop_paste: HashMap::new(),
+        watch: Default::default(),
         companion_terminals: HashMap::new(),
         agent_tabs: HashMap::new(),
         terminating_ptys: Vec::new(),

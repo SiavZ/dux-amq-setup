@@ -1916,6 +1916,124 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
         None => out.push_str("# web_dragdrop_paste = \"bare\"\n"),
     }
     out.push('\n');
+    render_provider_watch_rules(out, name, &config.watch);
+}
+
+/// Render the `[[providers.<name>.watch]]` documentation and any rules the user
+/// configured. Claude ships copy-pasteable commented examples tailored to
+/// Anthropic's transient errors. They stay commented because a rule types into
+/// the agent's PTY unprompted, so dux opts users in explicitly.
+///
+/// Configured rules are rendered as real array-of-tables entries (with nested
+/// tables inline) so `dux config restore-docs`, which re-renders the whole file
+/// from the parsed config, keeps them.
+fn render_provider_watch_rules(out: &mut String, name: &str, rules: &[dux_core::watch::WatchRule]) {
+    out.push_str(&format!(
+        "# Watch rules. Each rule pairs a regex against this provider's recent\n\
+         # output with an action; configure as `[[providers.{name}.watch]]` array\n\
+         # entries. Fields:\n\
+         #   pattern     regex matched against the bottom 30 rows of the agent pane\n\
+         #   label       optional name shown in status messages\n\
+         #   action      \"send_text\" (type `text` after the backoff) or\n\
+         #               \"wait_until_capture\" (parse the named `capture` group with\n\
+         #               `format`, wait until that time, then type `text`). Formats:\n\
+         #               unix_seconds, unix_millis, clock_local, in_seconds,\n\
+         #               in_minutes, in_hours\n\
+         #   append_enter  press Enter after `text` (default true)\n\
+         #   backoff     {{ initial_ms, max_ms, multiplier, jitter_ms }}, the delay\n\
+         #               before firing; grows per attempt up to max_ms\n\
+         #   budget      {{ max_attempts }}, fires allowed per session before the rule\n\
+         #               disarms itself (default 5, 0 = unlimited)\n\
+         #   cooldown_ms   a re-match within this window counts as the same\n\
+         #               incident (default 30000)\n\
+         # Patterns run against output that may include content from the project\n\
+         # under edit, so the engine caps regex size and caps each rule's fires by\n\
+         # default. Rules are disarmed and re-armed from the \"watch-rules\" palette.\n"
+    ));
+    if name == "claude" {
+        out.push_str(
+            "#\n\
+             # Example 1: server-throttle auto-retry. Anthropic surfaces a transient\n\
+             # server-side rate-limit (distinct from the 5-hour usage limit). Claude\n\
+             # Code's internal retry budget exhausts in seconds; this rule keeps\n\
+             # retrying with capped exponential backoff until the API recovers.\n\
+             #\n\
+             # [[providers.claude.watch]]\n\
+             # pattern = \"API Error.*Server is temporarily limiting requests\"\n\
+             # action = \"send_text\"\n\
+             # text = \"please continue\"\n\
+             # backoff = { initial_ms = 60000, max_ms = 600000, multiplier = 2.0, jitter_ms = 5000 }\n\
+             # budget = { max_attempts = 0 } # unlimited API retry\n\
+             # cooldown_ms = 30000\n\
+             #\n\
+             # Example 2: 5-hour usage-limit auto-resume (Unix-timestamp variant).\n\
+             # Claude Code emits messages like `Claude AI usage limit reached|<ts>`\n\
+             # where <ts> is a Unix-seconds reset time. The rule captures the\n\
+             # timestamp, waits until then, and resumes. The backoff is the\n\
+             # *fallback* used only if the timestamp fails to parse.\n\
+             #\n\
+             # [[providers.claude.watch]]\n\
+             # pattern = \"Claude AI usage limit reached\\\\|(?<ts>\\\\d+)\"\n\
+             # action = \"wait_until_capture\"\n\
+             # capture = \"ts\"\n\
+             # format = \"unix_seconds\"\n\
+             # text = \"please continue\"\n\
+             # backoff = { initial_ms = 600000, max_ms = 3600000, multiplier = 2.0, jitter_ms = 30000 }\n\
+             # budget = { max_attempts = 3 }\n\
+             # cooldown_ms = 60000\n\
+             #\n\
+             # Example 3: 5-hour usage-limit auto-resume (clock-time variant).\n\
+             # Newer Claude Code builds say \"Your limit will reset at 3pm\". The rule\n\
+             # captures the time, treats it as today's local time (rolling to tomorrow\n\
+             # if already past), and resumes then. The optional `(Timezone)` suffix\n\
+             # is stripped, so set your TZ env var to match the displayed timezone.\n\
+             #\n\
+             # [[providers.claude.watch]]\n\
+             # pattern = \"limit will reset at (?<t>\\\\d{1,2}(?::\\\\d{2})?\\\\s*(?:am|pm)?)\"\n\
+             # action = \"wait_until_capture\"\n\
+             # capture = \"t\"\n\
+             # format = \"clock_local\"\n\
+             # text = \"please continue\"\n\
+             # backoff = { initial_ms = 600000, max_ms = 3600000, multiplier = 2.0, jitter_ms = 30000 }\n\
+             # budget = { max_attempts = 3 }\n\
+             # cooldown_ms = 60000\n\
+             #\n\
+             # Example 4: Anthropic API overload auto-retry. When upstream servers\n\
+             # are saturated the API surfaces an `overloaded_error` (HTTP 529).\n\
+             # Claude Code prints messages like `API Error: Overloaded` or\n\
+             # `API Error · 529 · Overloaded`. Overloads typically clear in tens\n\
+             # of seconds, so the backoff is shorter than the throttle rule above\n\
+             # but still escalates if the condition persists.\n\
+             #\n\
+             # [[providers.claude.watch]]\n\
+             # pattern = \"API Error.*[Oo]verloaded\"\n\
+             # action = \"send_text\"\n\
+             # text = \"please continue\"\n\
+             # backoff = { initial_ms = 30000, max_ms = 600000, multiplier = 2.0, jitter_ms = 5000 }\n\
+             # budget = { max_attempts = 0 } # unlimited API retry\n\
+             # cooldown_ms = 30000\n",
+        );
+    }
+    out.push('\n');
+    for rule in rules {
+        out.push_str(&format!("[[providers.{name}.watch]]\n"));
+        out.push_str(&render_watch_rule_body(rule));
+        out.push('\n');
+    }
+}
+
+/// One watch rule's keys as `key = value` lines, nested tables inline. Goes
+/// through `toml`'s own serializer so every string is escaped exactly as the
+/// parser expects. A rule came from a parsed config, so it always serializes.
+fn render_watch_rule_body(rule: &dux_core::watch::WatchRule) -> String {
+    let Ok(toml::Value::Table(table)) = toml::Value::try_from(rule) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for (key, value) in &table {
+        out.push_str(&format!("{key} = {value}\n"));
+    }
+    out
 }
 
 /// Validate all key bindings in the config. Returns a descriptive error on failure.
@@ -3147,6 +3265,7 @@ agent_scrollback_lines = 10000
             install_hint: None,
             forward_scroll: None,
             web_dragdrop_paste: None,
+            watch: Vec::new(),
         };
         assert_eq!(cfg.interactive_args(false), ["--interactive"]);
         assert_eq!(
@@ -3165,6 +3284,7 @@ agent_scrollback_lines = 10000
             install_hint: None,
             forward_scroll: None,
             web_dragdrop_paste: None,
+            watch: Vec::new(),
         };
         assert_eq!(unsupported.interactive_args(true), ["--interactive"]);
         assert!(!unsupported.supports_session_resume());
@@ -3186,6 +3306,7 @@ agent_scrollback_lines = 10000
                     install_hint: None,
                     forward_scroll: None,
                     web_dragdrop_paste: None,
+                    watch: Vec::new(),
                 },
             )]),
         };
@@ -3217,6 +3338,7 @@ agent_scrollback_lines = 10000
                     install_hint: None,
                     forward_scroll: None,
                     web_dragdrop_paste: None,
+                    watch: Vec::new(),
                 },
             )]),
         };
@@ -3433,6 +3555,7 @@ oneshot_output = "stdout"
                     install_hint: None,
                     forward_scroll: None,
                     web_dragdrop_paste: None,
+                    watch: Vec::new(),
                 },
             )]),
         };
@@ -3839,6 +3962,7 @@ args = [\"-l\"]
             install_hint: Some("brew install gemini-cli".to_string()),
             forward_scroll: None,
             web_dragdrop_paste: None,
+            watch: Vec::new(),
         };
         let mut body = render_default_config();
         render_provider_config(&mut body, "gemini", &stock_gemini);
@@ -4158,5 +4282,175 @@ mod web_dragdrop_paste_render_tests {
             parsed.providers.commands["claude"].resolved_web_dragdrop_paste(),
             dux_core::config::WebDragDropPaste::Bare
         );
+    }
+
+    /// The canonical template ships commented `[[providers.claude.watch]]`
+    /// examples so users discover the feature. All examples are opt-in: a rule
+    /// types into the agent's PTY unprompted.
+    #[test]
+    fn render_provider_config_includes_claude_watch_example() {
+        let rendered = render_default_config();
+        assert!(
+            rendered.contains("# [[providers.claude.watch]]"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("# pattern = \"API Error.*Server is temporarily limiting requests\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .matches("# budget = { max_attempts = 0 } # unlimited API retry")
+                .count()
+                >= 2,
+            "Claude API retry examples must be unlimited:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("# format = \"unix_seconds\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("# format = \"clock_local\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("# action = \"wait_until_capture\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("# pattern = \"API Error.*[Oo]verloaded\""),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("\n[[providers.claude.watch]]"),
+            "watch examples must stay commented in the default template:\n{rendered}"
+        );
+        // The rendered default still parses with zero rules.
+        let parsed: Config = toml::from_str(&rendered).expect("default parses");
+        assert!(parsed.providers.commands["claude"].watch.is_empty());
+    }
+
+    /// The commented examples must be valid rules once uncommented: a user
+    /// copying one must not get a parse error or a rule the engine rejects.
+    #[test]
+    fn claude_watch_examples_parse_and_load_when_uncommented() {
+        let rendered = render_default_config();
+        let mut body = String::new();
+        let mut in_example = false;
+        for line in rendered.lines() {
+            if line == "# [[providers.claude.watch]]" {
+                in_example = true;
+            } else if !line.starts_with("# ") || line.starts_with("# Example") {
+                in_example = false;
+            }
+            if in_example {
+                let uncommented = line.trim_start_matches("# ");
+                let uncommented = uncommented
+                    .split(" # ")
+                    .next()
+                    .expect("split yields a head");
+                body.push_str(uncommented);
+                body.push('\n');
+            }
+        }
+        let parsed: Config =
+            toml::from_str(&format!("[providers.claude]\ncommand = \"claude\"\n{body}"))
+                .expect("uncommented examples parse");
+        let rules = &parsed.providers.commands["claude"].watch;
+        assert_eq!(rules.len(), 4, "{body}");
+        let (engine, errors) = dux_core::watch::WatchEngine::new("s", rules);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(engine.rule_count(), 4);
+        assert_eq!(rules[0].budget.max_attempts, 0);
+    }
+
+    /// Other providers get the field documentation but not Claude's examples.
+    #[test]
+    fn render_provider_config_omits_claude_example_for_other_providers() {
+        let rendered = render_default_config();
+        assert!(
+            rendered.contains("`[[providers.codex.watch]]`"),
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("API Error.*Server is temporarily").count(),
+            1,
+            "{rendered}"
+        );
+    }
+
+    /// User-authored `[[providers.claude.watch]]` rules survive a save
+    /// round-trip, including comments inside the rule body. `patch_providers`
+    /// never touches the watch array.
+    #[test]
+    #[allow(deprecated)] // test drives the sync save path directly, as the fork's test did
+    fn save_config_preserves_user_authored_watch_rules() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let mut body = render_default_config();
+        body.push_str(
+            "\n# user-added: aggressive retry while debugging\n\
+             [[providers.claude.watch]]\n\
+             pattern = \"my custom error\"\n\
+             action = \"send_text\"\n\
+             text = \"keep going\"\n\
+             # tighter cooldown than the default\n\
+             cooldown_ms = 5000\n",
+        );
+        std::fs::write(&config_path, &body).expect("write");
+        let mut config: Config = toml::from_str(&body).expect("parse");
+        config.ui.right_width_pct = 31;
+        let bindings = crate::keybindings::RuntimeBindings::from_keys_config(&config.keys);
+        save_config(&config_path, &config, &bindings).expect("save");
+
+        let saved = std::fs::read_to_string(&config_path).expect("read back");
+        assert!(saved.contains("[[providers.claude.watch]]"), "{saved}");
+        assert!(saved.contains("pattern = \"my custom error\""), "{saved}");
+        assert!(
+            saved.contains("# user-added: aggressive retry while debugging"),
+            "{saved}"
+        );
+        assert!(
+            saved.contains("# tighter cooldown than the default"),
+            "{saved}"
+        );
+        let reloaded: Config = toml::from_str(&saved).expect("reparse");
+        assert!(
+            reloaded.providers.commands["claude"]
+                .watch
+                .iter()
+                .any(|r| r.pattern == "my custom error" && r.cooldown_ms == 5000)
+        );
+    }
+
+    /// `restore-docs` re-renders the whole file from the parsed config, so the
+    /// renderer must emit configured rules as real entries. A rule with every
+    /// field set, including a regex with backslashes and quotes, must survive.
+    #[test]
+    fn restore_docs_keeps_configured_watch_rules() {
+        let raw = "[providers.claude]\ncommand = \"claude\"\n\n\
+                   [[providers.claude.watch]]\n\
+                   pattern = 'reset at (?<t>\\d+) \"now\"'\n\
+                   label = \"usage\"\n\
+                   action = \"wait_until_capture\"\n\
+                   capture = \"t\"\n\
+                   format = \"unix_seconds\"\n\
+                   text = \"go on\"\n\
+                   append_enter = false\n\
+                   backoff = { initial_ms = 1, max_ms = 2, multiplier = 3.5, jitter_ms = 4 }\n\
+                   budget = { max_attempts = 0 }\n\
+                   cooldown_ms = 7\n\n\
+                   [[providers.claude.watch]]\n\
+                   pattern = \"second\"\n\
+                   text = \"x\"\n";
+        let before: Config = toml::from_str(raw).expect("fixture parses");
+        let restored = restore_documentation(raw).expect("restore");
+        let after: Config = toml::from_str(&restored.text).expect("restored parses");
+        assert_eq!(
+            before.providers.commands["claude"].watch, after.providers.commands["claude"].watch,
+            "{}",
+            restored.text
+        );
+        assert_eq!(after.providers.commands["claude"].watch.len(), 2);
     }
 }

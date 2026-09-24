@@ -1658,6 +1658,20 @@ impl PtyClient {
             .unwrap_or(true)
     }
 
+    /// Snapshot the most recent `max_rows` of visible terminal output as a
+    /// single string with `\n` between rows. Trailing whitespace on each row
+    /// is trimmed and empty rows are dropped. Unlike
+    /// [`Self::visible_text_excerpt`], which keeps the TOP rows, this keeps the
+    /// BOTTOM ones: the watch engine ([`crate::watch::WatchEngine`]) needs the
+    /// newest output, where an agent prints its rate-limit or retry message.
+    /// Locks the terminal mutex briefly; a poisoned lock yields an empty scan.
+    pub fn scan_recent_lines(&self, max_rows: usize) -> String {
+        self.terminal
+            .lock()
+            .map(|t| t.scan_recent_lines(max_rows))
+            .unwrap_or_default()
+    }
+
     /// Returns a short plain-text excerpt from the visible terminal viewport.
     pub fn visible_text_excerpt(&self, max_lines: usize) -> String {
         self.terminal
@@ -2477,6 +2491,36 @@ impl TerminalState {
     /// Used to detect failed `--continue` exits that print a short error message.
     fn has_minimal_output(&self, threshold: usize) -> bool {
         self.term.grid().history_size() == 0 && self.visible_line_count() <= threshold
+    }
+
+    /// See [`PtyClient::scan_recent_lines`]. Wide-char spacer cells are skipped
+    /// so a CJK or emoji glyph reads as one character.
+    fn scan_recent_lines(&self, max_rows: usize) -> String {
+        use std::collections::BTreeMap;
+        let mut by_line: BTreeMap<i32, String> = BTreeMap::new();
+        for indexed in self.term.renderable_content().display_iter {
+            if indexed
+                .cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            by_line
+                .entry(indexed.point.line.0)
+                .or_default()
+                .push(indexed.cell.c);
+        }
+        let mut lines: Vec<String> = by_line
+            .into_values()
+            .map(|s| s.trim_end().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if lines.len() > max_rows {
+            let drop = lines.len() - max_rows;
+            lines.drain(..drop);
+        }
+        lines.join("\n")
     }
 
     fn visible_text_excerpt(&self, max_lines: usize) -> String {
@@ -5104,6 +5148,21 @@ mod tests {
         // `104` in the leading resets does not count: a diff is `OSC 4` with an
         // index, and this matches the parameter separator to exclude it.
         assert_eq!(seq.matches("\x1b]4;").count(), 1, "{seq:?}");
+    }
+
+    // The watch engine matches against the NEWEST output, so the scan keeps
+    // the bottom rows (not the top ones like `visible_text_excerpt`), drops
+    // blank rows, trims trailing space, and reads a wide glyph once.
+    #[test]
+    fn scan_recent_lines_keeps_the_bottom_rows_and_skips_wide_spacers() {
+        let mut terminal = TerminalState::new(6, 20, 100);
+        terminal.process(b"one\r\ntwo   \r\n\r\nthree\r\n\xe4\xbd\xa0ok");
+        assert_eq!(terminal.scan_recent_lines(2), "three\n\u{4f60}ok");
+        assert_eq!(
+            terminal.scan_recent_lines(10),
+            "one\ntwo\nthree\n\u{4f60}ok"
+        );
+        assert_eq!(terminal.scan_recent_lines(0), "");
     }
 
     #[test]

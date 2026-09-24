@@ -41,6 +41,10 @@ uuid.workspace = true
 walkdir = "2"
 alacritty_terminal = "0.26.0"
 ureq = "3.3.0"
+# Watch rules (`crate::watch`): linear-time regex with a size cap, plus a
+# small seeded RNG for backoff jitter.
+regex = "1"
+rand = { version = "0.8", features = ["small_rng"] }
 
 [dev-dependencies]
 # AMQ queue expiry tests backdate file mtimes.
