@@ -812,10 +812,11 @@ pub struct App {
     /// Test builds only: the scratch directories this app's paths point into
     /// (its config root, and any repository a test hands it). Holding the
     /// guards here removes them when the app drops, so a test run leaves
-    /// nothing behind in the temp directory. Declared last so it drops after
-    /// every field that may still hold a file inside it open.
+    /// nothing behind in the temp directory; each guard retries while a worker
+    /// thread the test never joined is still writing inside it. Declared last
+    /// so it drops after every field that may still hold a file inside it open.
     #[cfg(test)]
-    pub(crate) test_scratch_dirs: Vec<tempfile::TempDir>,
+    pub(crate) test_scratch_dirs: Vec<test_support::ScratchDir>,
 }
 
 /// Handler-resolved outcome for the server-flip op (see
