@@ -881,6 +881,15 @@ mod tests {
         /// tests must not race.
         fn write_and_settle(log: &RotatingLog, line: &str) {
             log.write_line(line);
+            settle(log);
+        }
+
+        /// Wait for the compression thread to finish. A test that waits for one
+        /// of its effects instead must still call this before it returns: the
+        /// thread outlives the file it produced by a few statements, and one
+        /// still touching the directory while its `TempDir` is removed leaves
+        /// the scratch directory behind in the temp directory.
+        fn settle(log: &RotatingLog) {
             wait_for("the compression thread to finish", || {
                 !log.state.lock().unwrap().compressing
             });
@@ -991,6 +1000,7 @@ mod tests {
             wait_for("the first copy to be compressed", || {
                 dir.path().join("dux.log.1.gz").exists()
             });
+            settle(&log);
             assert!(
                 !dir.path().join("dux.log.1").exists(),
                 "the plain copy must be removed once the gzip is in place"
@@ -1037,6 +1047,7 @@ mod tests {
                         .ends_with(".tmp")
                 })
             });
+            settle(&log);
 
             assert_eq!(
                 fs::read_to_string(dir.path().join("dux.log.1")).unwrap(),
