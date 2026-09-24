@@ -1259,6 +1259,7 @@ impl SessionStore {
                 auto_reopen_agents: row.get(5)?,
                 startup_command: row.get(6)?,
                 env: deserialize_project_env(row.get::<_, String>(7)?.as_str()),
+                workspace_mode: None,
             })
         })?;
 
@@ -2461,6 +2462,7 @@ mod tests {
             auto_reopen_agents: None,
             startup_command: None,
             env: Default::default(),
+            workspace_mode: None,
         }
     }
 
@@ -3791,6 +3793,7 @@ mod tests {
             auto_reopen_agents: None,
             startup_command: None,
             env: BTreeMap::new(),
+            workspace_mode: None,
         };
         let p2 = ProjectConfig {
             id: "p2".to_string(),
@@ -3801,6 +3804,7 @@ mod tests {
             auto_reopen_agents: None,
             startup_command: None,
             env: BTreeMap::new(),
+            workspace_mode: None,
         };
         store.upsert_project(&p1).unwrap();
         store.upsert_project(&p2).unwrap();
@@ -3931,6 +3935,7 @@ mod tests {
             auto_reopen_agents: Some(false),
             startup_command: Some("npm install".to_string()),
             env: BTreeMap::from([("EDITOR".to_string(), "true".to_string())]),
+            workspace_mode: None,
         };
 
         store.upsert_project(&project).unwrap();
@@ -3952,6 +3957,7 @@ mod tests {
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .unwrap();
 
@@ -3965,6 +3971,7 @@ mod tests {
                 auto_reopen_agents: Some(false),
                 startup_command: Some("echo setup".to_string()),
                 env: BTreeMap::from([("API_KEY".to_string(), "${FOO_API_KEY}".to_string())]),
+                workspace_mode: None,
             })
             .unwrap();
 
@@ -4954,6 +4961,7 @@ mod tests {
             auto_reopen_agents: None,
             startup_command: None,
             env: Default::default(),
+            workspace_mode: None,
         };
         store.upsert_project(&mk("a")).unwrap();
         store.upsert_project(&mk("b")).unwrap();

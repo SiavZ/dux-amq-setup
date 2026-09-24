@@ -5136,6 +5136,10 @@ impl App {
                 "Creating a standalone agent \"{name}\" in \"{}\"...",
                 dux_core::home_path::shorten_home(folder)
             ),
+            CreateAgentRequest::SharedWorkspace { project, .. } => format!(
+                "Starting shared-workspace agent \"{name}\" in the checkout of project \"{}\"...",
+                project.name
+            ),
             CreateAgentRequest::ForkSession { source_label, .. } => format!(
                 "Forking agent \"{source_label}\" as \"{name}\" by cloning its current worktree contents into a fresh session...",
             ),
@@ -7910,6 +7914,7 @@ impl App {
             CreateAgentRequest::ForkSession { .. }
             | CreateAgentRequest::ExistingManagedWorktree { .. }
             | CreateAgentRequest::ForkExternalWorktree { .. }
+            | CreateAgentRequest::SharedWorkspace { .. }
             | CreateAgentRequest::Standalone { .. } => unreachable!(),
         };
         if let Err(e) = self.dispatch_create_agent_request(request, msg) {
@@ -10999,7 +11004,8 @@ fn set_create_agent_request_custom_name(request: &mut CreateAgentRequest, name: 
         | CreateAgentRequest::ForkSession { custom_name, .. }
         | CreateAgentRequest::PullRequest { custom_name, .. }
         | CreateAgentRequest::ExistingManagedWorktree { custom_name, .. }
-        | CreateAgentRequest::ForkExternalWorktree { custom_name, .. } => {
+        | CreateAgentRequest::ForkExternalWorktree { custom_name, .. }
+        | CreateAgentRequest::SharedWorkspace { custom_name, .. } => {
             *custom_name = Some(name);
         }
         // A standalone create resolves its title before dispatching (the
@@ -33283,6 +33289,7 @@ cyan = "#00ffff"
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: pinned.env.clone(),
+                workspace_mode: None,
             })
             .expect("seed pinned project");
         app.engine.projects.push(pinned);
@@ -33449,6 +33456,7 @@ cyan = "#00ffff"
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: pinned.env.clone(),
+                workspace_mode: None,
             })
             .expect("seed pinned project");
         app.engine.projects.push(pinned);

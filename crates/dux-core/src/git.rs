@@ -2041,6 +2041,115 @@ fn branch_still_exists(repo_path: &Path, branch_name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The registered project checkouts, expanded to absolute paths, for
+/// [`guard_whole_workspace_removal`]. Fails closed: one project path that does
+/// not expand to a safe absolute path makes the whole inventory an error,
+/// because a guard run against a partial inventory would silently stop
+/// protecting the project it could not read.
+pub fn registered_project_paths<'a>(
+    project_paths: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<PathBuf>> {
+    project_paths
+        .into_iter()
+        .map(|raw| {
+            crate::config::expand_path(raw)
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "registered project path is not a safe absolute path: {}",
+                        crate::sanitize::for_terminal(raw)
+                    )
+                })
+        })
+        .collect()
+}
+
+/// Refuse a whole-worktree (or whole-root) removal whose resolved target
+/// overlaps a registered project checkout in EITHER direction (fork
+/// shared-workspace Phase 5, f4f2257a).
+///
+/// - The target is a project, or inside one: a corrupt row pointing a worktree
+///   at the user's checkout, or at something within it.
+/// - A project is inside the target: removing a parent directory would take
+///   the checkout with it.
+///
+/// Both sides are resolved symlink-aware, including a target that is already
+/// gone (its deepest existing ancestor is canonicalized and the missing suffix
+/// re-appended), so an alias through a symlink cannot slip past. A relative
+/// path or one containing `..` is refused outright.
+///
+/// Called from inside [`remove_worktree_keep_branch`] (and so
+/// [`remove_worktree`]), so every caller is guarded. It is deliberately NOT
+/// applied to contained-file operations such as discarding an untracked
+/// directory inside a checkout, which stay possible.
+pub fn guard_whole_workspace_removal(target: &Path, registered_projects: &[PathBuf]) -> Result<()> {
+    let target = resolve_for_removal(target)?;
+    for project in registered_projects {
+        let project = resolve_for_removal(project)?;
+        if target.starts_with(&project) || project.starts_with(&target) {
+            return Err(anyhow!(
+                "refusing to remove {} because it overlaps the registered project {}",
+                crate::sanitize::for_terminal(&target.display().to_string()),
+                crate::sanitize::for_terminal(&project.display().to_string())
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Symlink-aware "strictly inside `root`" for whole-worktree inventories, that
+/// also works for targets already absent from disk.
+pub fn whole_workspace_target_is_within(root: &Path, target: &Path) -> Result<bool> {
+    let root = resolve_for_removal(root)?;
+    let target = resolve_for_removal(target)?;
+    Ok(target != root && target.starts_with(root))
+}
+
+fn resolve_for_removal(path: &Path) -> Result<PathBuf> {
+    let shown = || crate::sanitize::for_terminal(&path.display().to_string());
+    if !path.is_absolute() {
+        return Err(anyhow!("removal target must be absolute: {}", shown()));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(anyhow!(
+            "removal target contains parent traversal: {}",
+            shown()
+        ));
+    }
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    loop {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) => break,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                suffix.push(
+                    ancestor
+                        .file_name()
+                        .ok_or_else(|| anyhow!("failed to resolve removal target {}", shown()))?
+                        .to_os_string(),
+                );
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| anyhow!("failed to resolve removal target {}", shown()))?;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to inspect {}", shown()));
+            }
+        }
+    }
+    let mut resolved = ancestor
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", shown()))?;
+    for component in suffix.iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
 /// Remove a worktree from disk and from git's registry, and DO NOT touch its
 /// branch.
 ///
@@ -2053,7 +2162,18 @@ fn branch_still_exists(repo_path: &Path, branch_name: &str) -> bool {
 ///
 /// `--force`, so a worktree with uncommitted work is removed anyway: every
 /// caller must confirm with the user first.
-pub fn remove_worktree_keep_branch(repo_path: &Path, worktree_path: &Path) -> Result<()> {
+///
+/// `protected` is every registered project checkout (see
+/// [`registered_project_paths`]). A target that overlaps any of them is
+/// refused before git runs, see [`guard_whole_workspace_removal`]. It is an
+/// explicit argument, not derived from `repo_path`, so every caller has to say
+/// what it protects.
+pub fn remove_worktree_keep_branch(
+    repo_path: &Path,
+    worktree_path: &Path,
+    protected: &[PathBuf],
+) -> Result<()> {
+    guard_whole_workspace_removal(worktree_path, protected)?;
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_path)
@@ -2121,10 +2241,11 @@ pub fn remove_worktree(
     worktree_path: &Path,
     branch_name: &str,
     initial_branch: Option<&str>,
+    protected: &[PathBuf],
 ) -> Result<RemoveResult> {
     // The worktree half is shared with `remove_worktree_keep_branch`; only the
     // branch deletions below are this function's own.
-    remove_worktree_keep_branch(repo_path, worktree_path)?;
+    remove_worktree_keep_branch(repo_path, worktree_path, protected)?;
     let branch = delete_branch_force(repo_path, branch_name)?;
     // Only a DISTINCT, non-empty birth branch is a second thing to delete. An
     // empty one comes from a session record that never had it recorded.
@@ -6648,7 +6769,7 @@ mod tests {
         let wt = add_worktree(repo.path(), "keepme");
         assert!(wt.exists());
 
-        remove_worktree_keep_branch(repo.path(), &wt).unwrap();
+        remove_worktree_keep_branch(repo.path(), &wt, &[]).unwrap();
 
         assert!(!wt.exists(), "the worktree directory must be gone");
         let listed = std::process::Command::new("git")
@@ -6658,6 +6779,101 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&listed.stdout).contains("keepme"),
             "the branch must survive a worktree-only removal"
+        );
+    }
+
+    /// Fork f4f2257a: the guard refuses a target that is a registered project's
+    /// ancestor, one inside it (even one not on disk yet), and a symlink alias
+    /// of it, and lets an unrelated sibling through.
+    #[test]
+    fn whole_workspace_guard_rejects_project_ancestors_descendants_and_symlink_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let managed = temp.path().join("managed");
+        let project = managed.join("nested/project");
+        fs::create_dir_all(&project).unwrap();
+        let projects = vec![project.clone()];
+
+        assert!(guard_whole_workspace_removal(&managed, &projects).is_err());
+        assert!(guard_whole_workspace_removal(&project.join("corrupt-child"), &projects).is_err());
+
+        let alias = temp.path().join("project-alias");
+        symlink(&project, &alias).unwrap();
+        assert!(guard_whole_workspace_removal(&alias, &projects).is_err());
+        assert!(
+            guard_whole_workspace_removal(&temp.path().join("safe-sibling"), &projects).is_ok()
+        );
+    }
+
+    /// A relative target or one with `..` cannot be resolved safely, so the
+    /// guard refuses it instead of guessing.
+    #[test]
+    fn whole_workspace_guard_rejects_relative_and_parent_traversal_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(guard_whole_workspace_removal(Path::new("relative/wt"), &[]).is_err());
+        assert!(
+            guard_whole_workspace_removal(&temp.path().join("a/../b"), &[]).is_err(),
+            "a `..` component must be refused even with no projects registered"
+        );
+    }
+
+    /// Both removal entry points run the guard before git: the worktree and
+    /// its branch survive when the worktree contains, or is inside, a
+    /// registered project.
+    #[test]
+    fn remove_worktree_entry_point_applies_registered_project_guard() {
+        let repo = init_test_repo();
+        for project_is_descendant in [true, false] {
+            let branch = format!("protected-delete-{project_is_descendant}");
+            let worktree = add_worktree(repo.path(), &branch);
+            let project = if project_is_descendant {
+                let nested = worktree.join("nested-project");
+                fs::create_dir_all(&nested).unwrap();
+                nested
+            } else {
+                repo.path().to_path_buf()
+            };
+
+            let result = remove_worktree(
+                repo.path(),
+                &worktree,
+                &branch,
+                None,
+                std::slice::from_ref(&project),
+            );
+            assert!(result.is_err());
+            assert!(worktree.exists());
+            assert!(local_branch_exists(repo.path(), &branch));
+
+            let result = remove_worktree_keep_branch(repo.path(), &worktree, &[project]);
+            assert!(result.is_err());
+            assert!(worktree.exists());
+        }
+    }
+
+    /// The guard is for whole-worktree removals only: discarding an untracked
+    /// directory inside a registered checkout stays possible.
+    #[test]
+    fn untracked_directory_discard_inside_registered_project_remains_allowed() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let untracked = project.join("scratch/nested");
+        fs::create_dir_all(&untracked).unwrap();
+        fs::write(untracked.join("notes.txt"), "temporary").unwrap();
+
+        discard_file(&project, "scratch", true).unwrap();
+
+        assert!(!project.join("scratch").exists());
+        assert!(project.exists());
+    }
+
+    /// An unexpandable or relative project path fails the whole inventory, so
+    /// no caller can run the guard against a partial list.
+    #[test]
+    fn registered_project_paths_fails_closed_on_a_relative_project() {
+        assert!(registered_project_paths(["/abs/project", "relative/project"]).is_err());
+        assert_eq!(
+            registered_project_paths(["/abs/project"]).unwrap(),
+            vec![PathBuf::from("/abs/project")]
         );
     }
 
@@ -6719,7 +6935,7 @@ mod tests {
         );
         let wt = add_worktree(repo.path(), "pr-head");
 
-        remove_worktree(repo.path(), &wt, "pr-head", Some("pr-head")).unwrap();
+        remove_worktree(repo.path(), &wt, "pr-head", Some("pr-head"), &[]).unwrap();
 
         assert!(
             !local_branch_exists(repo.path(), "pr-head"),
@@ -6737,8 +6953,14 @@ mod tests {
         // `git branch` refuses to create a dash-leading name, but plumbing does
         // not, and such a ref is what dux would then be asked to clean up.
         run_git(repo.path(), &["update-ref", "refs/heads/--delete", "HEAD"]);
-        let result =
-            remove_worktree(repo.path(), &repo.path().join("gone"), "--delete", None).unwrap();
+        let result = remove_worktree(
+            repo.path(),
+            &repo.path().join("gone"),
+            "--delete",
+            None,
+            &[],
+        )
+        .unwrap();
         assert_eq!(
             result.branch,
             BranchDeletion::Deleted,
@@ -6971,7 +7193,7 @@ mod tests {
         // `born-here` stays behind, and the poller rewrites `branch_name`.
         run_git(&wt, &["switch", "-c", "drifted"]);
 
-        let result = remove_worktree(repo.path(), &wt, "drifted", Some("born-here")).unwrap();
+        let result = remove_worktree(repo.path(), &wt, "drifted", Some("born-here"), &[]).unwrap();
 
         assert_eq!(result.branch, BranchDeletion::Deleted);
         assert_eq!(
@@ -6997,7 +7219,7 @@ mod tests {
         let repo = init_test_repo();
         let wt = add_worktree(repo.path(), "steady");
 
-        let result = remove_worktree(repo.path(), &wt, "steady", Some("steady")).unwrap();
+        let result = remove_worktree(repo.path(), &wt, "steady", Some("steady"), &[]).unwrap();
 
         assert_eq!(result.branch, BranchDeletion::Deleted);
         assert_eq!(result.initial_branch, None);
@@ -7013,7 +7235,7 @@ mod tests {
         run_git(&wt, &["switch", "-c", "drifted"]);
         run_git(repo.path(), &["branch", "-D", "--", "born-here"]);
 
-        let result = remove_worktree(repo.path(), &wt, "drifted", Some("born-here")).unwrap();
+        let result = remove_worktree(repo.path(), &wt, "drifted", Some("born-here"), &[]).unwrap();
 
         assert_eq!(result.initial_branch, Some(BranchDeletion::AlreadyGone));
         assert_eq!(
@@ -7036,7 +7258,7 @@ mod tests {
         let holder = add_worktree(repo.path(), "born-here");
         assert!(holder.exists());
 
-        let result = remove_worktree(repo.path(), &wt, "drifted", Some("born-here")).unwrap();
+        let result = remove_worktree(repo.path(), &wt, "drifted", Some("born-here"), &[]).unwrap();
 
         let Some(BranchDeletion::Refused { reason }) = result.initial_branch.clone() else {
             panic!("expected a refusal, got {:?}", result.initial_branch);
@@ -7106,7 +7328,7 @@ mod tests {
         let holder = add_worktree(repo.path(), "held-elsewhere");
         assert!(holder.exists());
 
-        let result = remove_worktree(repo.path(), &wt, "held-elsewhere", None).unwrap();
+        let result = remove_worktree(repo.path(), &wt, "held-elsewhere", None, &[]).unwrap();
 
         assert!(
             matches!(result.branch, BranchDeletion::Refused { .. }),
@@ -7131,6 +7353,7 @@ mod tests {
             &repo.path().join("gone"),
             "no-such-branch",
             None,
+            &[],
         )
         .unwrap();
 
@@ -7170,7 +7393,7 @@ mod tests {
         // and such a ref really can reach dux.
         run_git(repo.path(), &["update-ref", "refs/heads/--delete", "HEAD"]);
 
-        let result = remove_worktree(repo.path(), &wt, "drifted", Some("--delete")).unwrap();
+        let result = remove_worktree(repo.path(), &wt, "drifted", Some("--delete"), &[]).unwrap();
 
         assert_eq!(
             result.initial_branch,
@@ -7191,7 +7414,7 @@ mod tests {
         let repo = init_test_repo();
         let wt = add_worktree(repo.path(), "steady");
 
-        let result = remove_worktree(repo.path(), &wt, "steady", Some("")).unwrap();
+        let result = remove_worktree(repo.path(), &wt, "steady", Some(""), &[]).unwrap();
 
         assert_eq!(result.initial_branch, None);
     }

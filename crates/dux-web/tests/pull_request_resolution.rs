@@ -73,6 +73,7 @@ async fn boot(projects: &[(&str, &str, &str)], hosts: &[&str]) -> (SocketAddr, t
                     auto_reopen_agents: None,
                     startup_command: None,
                     env: Default::default(),
+                    workspace_mode: None,
                 })
                 .unwrap();
         }

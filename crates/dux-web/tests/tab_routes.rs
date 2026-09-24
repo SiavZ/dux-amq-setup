@@ -81,6 +81,7 @@ async fn boot_with_tab_per_agent(tab_per_agent: u32) -> (SocketAddr, tempfile::T
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .unwrap();
         store
@@ -160,6 +161,7 @@ async fn boot_with_broken_provider_and_claude(
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .unwrap();
         store

@@ -58,6 +58,9 @@
 //! fn wants_a_tab(_: &TabIdRef) {}
 //! # let session = dux_core::model::AgentSession {
 //! #     id: "s1".to_string(),
+//! #     agent_handle: "s1".to_string(),
+//! #     shared_workspace: false,
+//! #     deleted_at: None,
 //! #     slot_tab_id: "slot-1".to_string(),
 //! #     provider: dux_core::model::ProviderKind::new("claude"),
 //! #     workspace: dux_core::model::AgentWorkspace::Folder(dux_core::model::FolderWorkspace {

@@ -655,6 +655,26 @@ pub(crate) fn branch_kept_reason(
 /// It names the folder, because the whole point is to reassure the user that
 /// the directory they pointed dux at is still theirs, and it says what to do
 /// instead rather than only saying no.
+/// The refusal for a worktree-removing delete of an agent whose directory dux
+/// never removes: a standalone agent's folder, or a shared agent's registered
+/// project checkout.
+pub fn delete_directory_refusal(session: &AgentSession) -> String {
+    if session.shared_workspace() {
+        return shared_delete_directory_refusal(&session.display_label(), session.directory());
+    }
+    standalone_delete_directory_refusal(&session.display_label(), session.directory())
+}
+
+/// Shared main-workspace mode: the agent runs in the project's own checkout.
+pub fn shared_delete_directory_refusal(agent_name: &str, checkout: &str) -> String {
+    format!(
+        "Agent \"{agent_name}\" runs in the shared project checkout \"{}\", and dux never \
+         removes it. Delete the agent on its own to remove dux's record of it; the checkout \
+         and its branch stay exactly as they are.",
+        crate::home_path::shorten_home(std::path::Path::new(checkout))
+    )
+}
+
 pub fn standalone_delete_directory_refusal(agent_name: &str, folder: &str) -> String {
     format!(
         "Agent \"{agent_name}\" is a standalone agent: it runs in \"{}\", a folder you already \
@@ -861,11 +881,22 @@ impl Engine {
         worktree_path: &str,
         exclude_id: &str,
     ) -> Option<DetachedSession> {
+        // Shared main-workspace mode: several agents in one checkout is the
+        // point, not a conflict. The second-writer consent asked the user before
+        // this launch, so neither side is detached when either one is shared.
+        if self
+            .sessions
+            .iter()
+            .any(|s| s.id == exclude_id && s.shared_workspace())
+        {
+            return None;
+        }
         let conflicting = self
             .sessions
             .iter()
             .find(|s| {
                 s.id != exclude_id
+                    && !s.shared_workspace()
                     // Canonical comparison, like every other place dux asks
                     // whether two agents occupy one directory (the
                     // occupied-directory refusal at create, the worktree
@@ -1463,6 +1494,13 @@ impl Engine {
         self.pty_pointer.remove(terminal_id);
     }
 
+    /// Every registered project checkout, for the whole-worktree removal guard
+    /// (`git::guard_whole_workspace_removal`). Fails closed on a project path
+    /// that does not expand to a safe absolute one.
+    pub fn registered_project_paths(&self) -> anyhow::Result<Vec<std::path::PathBuf>> {
+        crate::git::registered_project_paths(self.projects.iter().map(|p| p.path.as_str()))
+    }
+
     /// Engine half of the session-deletion cascade: remove the session from the
     /// store, the providers, the runtime maps and the sessions vector, refresh
     /// branch-sync entries and spawn the startup-log deletion worker. `Ok(None)`
@@ -1651,11 +1689,8 @@ impl Engine {
         // about a destructive request, and the user would come away believing
         // dux had cleaned something up. The default is already false, so only
         // a caller that asked on purpose can reach this.
-        if delete_worktree && !session.workspace.deletion_may_remove_directory() {
-            anyhow::bail!(standalone_delete_directory_refusal(
-                &session.display_label(),
-                session.directory()
-            ));
+        if delete_worktree && !session.deletion_may_remove_directory() {
+            anyhow::bail!(delete_directory_refusal(&session));
         }
         logger::info(&format!(
             "deleting session {} at {} (delete_worktree={}, sync)",
@@ -1684,7 +1719,11 @@ impl Engine {
         // `removal_target` is `None` and the block is unreachable rather than
         // guarded: deleting one removes dux's record and nothing else.
         let removal_target = match (project.as_ref(), session.workspace.as_managed()) {
-            (Some(project), Some(managed)) if delete_worktree && !other_sessions_on_worktree => {
+            (Some(project), Some(managed))
+                if delete_worktree
+                    && !other_sessions_on_worktree
+                    && session.deletion_may_remove_directory() =>
+            {
                 Some((project, managed))
             }
             _ => None,
@@ -1753,6 +1792,17 @@ impl Engine {
             // as `delete_branch`. Deciding it here means the project-delete
             // cascade, which calls this per agent with no answer, inherits the
             // provenance default.
+            // Every registered checkout is protected from this whole-worktree
+            // removal, not only this agent's own project: a corrupt row can
+            // point a worktree at ANY project. An unreadable inventory refuses
+            // the removal rather than running it half-guarded.
+            let protected = match self.registered_project_paths() {
+                Ok(protected) => protected,
+                Err(err) => {
+                    self.closing_sessions.remove(session_id);
+                    return Err(err);
+                }
+            };
             let result = if managed
                 .branch_provenance
                 .resolve_branch_deletion(delete_branch)
@@ -1765,6 +1815,7 @@ impl Engine {
                     // worktree drifted onto, so deleting only that leaves the
                     // original behind and recreating the agent collides with it.
                     Some(managed.initial_branch.as_str()),
+                    &protected,
                 ) {
                     Ok(result) => RemovedBranches::Deleted(result),
                     Err(err) => {
@@ -1776,6 +1827,7 @@ impl Engine {
                 match crate::git::remove_worktree_keep_branch(
                     std::path::Path::new(&project.path),
                     std::path::Path::new(&managed.worktree_path),
+                    &protected,
                 ) {
                     Ok(()) => RemovedBranches::Kept(branch_kept_reason(
                         managed.branch_provenance,
@@ -1886,12 +1938,9 @@ impl Engine {
         // Same explicit contract as the synchronous path: a worktree-removing
         // delete of a standalone agent is refused rather than silently
         // downgraded to an ordinary one.
-        if delete_worktree && !session.workspace.deletion_may_remove_directory() {
+        if delete_worktree && !session.deletion_may_remove_directory() {
             return BeginDeleteSessionOutcome::Refused {
-                message: standalone_delete_directory_refusal(
-                    &session.display_label(),
-                    session.directory(),
-                ),
+                message: delete_directory_refusal(&session),
             };
         }
         // Blanket precondition: refuse while ANY tab of this session has a launch
@@ -1922,7 +1971,7 @@ impl Engine {
                 && crate::project_browser::same_directory(s.directory(), session.directory())
         });
         let should_remove_worktree = delete_worktree
-            && session.workspace.deletion_may_remove_directory()
+            && session.deletion_may_remove_directory()
             && !other_sessions_on_worktree
             && project.is_some();
 
@@ -2047,9 +2096,16 @@ impl Engine {
         self.deletion_busy_messages
             .insert(session_id.clone(), busy_message.clone());
         let tx = self.worker_tx.clone();
+        // Snapshotted now, on the engine thread; the worker cannot read engine
+        // state. An unreadable inventory is carried into the worker as the
+        // error so the removal is refused through the normal completion path.
+        let protected = self
+            .registered_project_paths()
+            .map_err(|e| format!("{e:#}"));
         std::thread::spawn(move || {
             use std::panic::AssertUnwindSafe;
             let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let protected = protected?;
                 // The same gate as the synchronous path: unasked, only branches
                 // dux created are dux's to delete, and the delete dialog's
                 // answer overrides that in either direction.
@@ -2060,6 +2116,7 @@ impl Engine {
                         &branch_name,
                         // The BIRTH branch too; see `git::remove_worktree`.
                         Some(initial_branch.as_str()),
+                        &protected,
                     )
                     .map(RemovedBranches::Deleted)
                     .map_err(|e| format!("{e:#}"))
@@ -2067,6 +2124,7 @@ impl Engine {
                     crate::git::remove_worktree_keep_branch(
                         std::path::Path::new(&project_path),
                         std::path::Path::new(&worktree_path),
+                        &protected,
                     )
                     .map(|()| {
                         RemovedBranches::Kept(branch_kept_reason(branch_provenance, delete_branch))
@@ -3745,6 +3803,54 @@ mod tests {
         );
         // The delete aborted, so the session record survives.
         assert!(engine.sessions.iter().any(|s| s.id == "s1"));
+    }
+
+    /// Fork f4f2257a (`begin_delete_session_applies_registered_project_overlap_guard`):
+    /// a session row whose worktree overlaps ANY registered project, not only
+    /// its own, is refused and nothing on disk is touched.
+    #[test]
+    fn begin_delete_session_applies_registered_project_overlap_guard() {
+        for project_is_descendant in [true, false] {
+            let (mut engine, tmp) = test_engine();
+            let root = tmp.path().join("root");
+            let worktree = root.join("worktree");
+            std::fs::create_dir_all(&worktree).unwrap();
+            let own = tmp.path().join("own-project");
+            std::fs::create_dir_all(&own).unwrap();
+            let protected = if project_is_descendant {
+                let nested = worktree.join("nested-project");
+                std::fs::create_dir_all(&nested).unwrap();
+                nested
+            } else {
+                root.clone()
+            };
+            engine
+                .projects
+                .push(sample_project("p1", own.to_str().unwrap()));
+            engine
+                .projects
+                .push(sample_project("protected", protected.to_str().unwrap()));
+            let mut session = sample_session("s1", "p1", "feat/x");
+            session
+                .workspace
+                .as_managed_mut()
+                .expect("managed test session")
+                .worktree_path = worktree.to_str().unwrap().to_string();
+            engine.session_store.upsert_session(&session).unwrap();
+            engine.sessions.push(session);
+
+            let Err(err) = engine.do_delete_session("s1", true, None) else {
+                panic!("an overlapping worktree removal must be refused");
+            };
+            assert!(
+                format!("{err:#}").contains("overlaps the registered project"),
+                "unexpected error: {err:#}"
+            );
+            assert!(worktree.exists());
+            assert!(protected.exists());
+            assert!(!engine.closing_sessions.contains("s1"));
+            assert!(engine.sessions.iter().any(|s| s.id == "s1"));
+        }
     }
 
     /// The reported journey, end to end through the engine and a REAL repo:
@@ -7538,12 +7644,14 @@ mod tests {
             .session_store
             .upsert_project(&crate::engine::project_to_project_config(
                 &engine.projects[0],
+                &[],
             ))
             .unwrap();
         engine
             .session_store
             .upsert_project(&crate::engine::project_to_project_config(
                 &engine.projects[1],
+                &[],
             ))
             .unwrap();
         let s1 = sample_session("s1", "p1", "feat/a");

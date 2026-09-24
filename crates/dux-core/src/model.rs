@@ -693,6 +693,24 @@ impl AgentSession {
         self.deleted_at.is_some()
     }
 
+    /// Whether deleting this agent may remove the directory it runs in.
+    ///
+    /// Stronger than [`AgentWorkspace::deletion_may_remove_directory`]: a
+    /// shared-workspace agent is stored as a managed workspace (so branch and
+    /// PR features keep working), but its directory is the user's registered
+    /// checkout, which no delete may ever remove. Every teardown decision asks
+    /// the session, not the workspace, so the shared flag cannot be skipped.
+    pub fn deletion_may_remove_directory(&self) -> bool {
+        !self.shared_workspace && self.workspace.deletion_may_remove_directory()
+    }
+
+    /// Whether a rename may run `git branch -m`. Never for a shared agent: its
+    /// branch is whatever the user has checked out in their own checkout, and
+    /// renaming it would rename the user's branch under every other writer.
+    pub fn may_rename_branch(&self) -> bool {
+        !self.shared_workspace && self.supports_branch_git()
+    }
+
     /// Where this agent runs. Both kinds of workspace have a directory; this
     /// one is NOT a promise that git can run in it. See
     /// [`AgentWorkspace::directory`].

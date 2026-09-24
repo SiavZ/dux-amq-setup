@@ -100,6 +100,7 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
             auto_reopen_agents: project.auto_reopen_agents,
             startup_command: project.startup_command.clone(),
             env: project.env.clone(),
+            workspace_mode: None,
         })
         .expect("seed project");
     let session = AgentSession {

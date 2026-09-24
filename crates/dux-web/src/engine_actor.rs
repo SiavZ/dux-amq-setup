@@ -301,6 +301,10 @@ pub enum EngineRequest {
             )>,
         >,
     ),
+    /// The registered-project inventory for the whole-worktree removal guard
+    /// (`Engine::registered_project_paths`). `Err` when a project path does not
+    /// expand to a safe absolute one; the caller refuses the removal.
+    RegisteredProjectPaths(oneshot::Sender<Result<Vec<std::path::PathBuf>, String>>),
     /// Everything the pull-request reference resolver needs: the live project list
     /// and the GitHub host policy. Instant clones, because reading a project's
     /// configured address shells to git and must not run on the engine loop or the
@@ -1562,6 +1566,22 @@ impl EngineHandle {
             .clone()
     }
 
+    /// The registered-project inventory for the whole-worktree removal guard.
+    /// A dead engine reads as an error, so the caller refuses the removal.
+    pub async fn registered_project_paths(&self) -> Result<Vec<std::path::PathBuf>, String> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .req_tx
+            .send(EngineRequest::RegisteredProjectPaths(tx))
+            .await
+            .is_err()
+        {
+            return Err("the engine is not running".to_string());
+        }
+        rx.await
+            .unwrap_or_else(|_| Err("the engine is not running".to_string()))
+    }
+
     /// Snapshot the inputs to classify a project's managed worktrees (project,
     /// paths, sessions). Instant: the git classification runs off-thread in the
     /// caller. `None` when the project id is unknown.
@@ -1898,6 +1918,7 @@ fn request_mutates_spine(req: &EngineRequest) -> bool {
         | EngineRequest::FileDropRefreshTarget(..)
         | EngineRequest::ProjectPath(..)
         | EngineRequest::ProjectWorktreeInputs(..)
+        | EngineRequest::RegisteredProjectPaths(..)
         | EngineRequest::SessionStartupLogContext(..)
         | EngineRequest::ProjectStartupLogContext(..)
         | EngineRequest::EditorDefault(..)
@@ -3847,6 +3868,13 @@ fn handle_request(
                 .cloned()
                 .map(|project| (project, engine.paths.clone(), engine.sessions.clone()));
             let _ = reply.send(inputs);
+        }
+        EngineRequest::RegisteredProjectPaths(reply) => {
+            let _ = reply.send(
+                engine
+                    .registered_project_paths()
+                    .map_err(|e| format!("{e:#}")),
+            );
         }
         EngineRequest::SessionStartupLogContext(session_id, reply) => {
             let context = engine
@@ -7134,6 +7162,11 @@ mod tests {
                 false,
             ),
             (
+                "RegisteredProjectPaths",
+                EngineRequest::RegisteredProjectPaths(dead_reply()),
+                false,
+            ),
+            (
                 "BrowseStartDir",
                 EngineRequest::BrowseStartDir(dead_reply()),
                 false,
@@ -7281,7 +7314,7 @@ mod tests {
         // through with a copied-from-its-neighbour `false` that nothing reads.
         assert_eq!(
             request_kind_answers().len(),
-            43,
+            44,
             "every EngineRequest kind needs a row in request_kind_answers; \
              update the count deliberately when adding one"
         );

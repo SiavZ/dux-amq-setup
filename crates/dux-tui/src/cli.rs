@@ -599,6 +599,13 @@ fn reset_agent_data(paths: &DuxPaths) -> Result<()> {
         match SessionStore::open(&paths.sessions_db_path) {
             Ok(store) => match store.load_sessions() {
                 Ok(sessions) => {
+                    // Every checkout dux knows of is protected from the
+                    // whole-worktree removals below, including the
+                    // unconditional `remove_dir_all` fallback that bypasses
+                    // git. The inventory is the stored projects plus every
+                    // agent's own project path, so a row whose project was
+                    // removed from the list is still covered.
+                    let protected = reset_protected_projects(&store, &sessions);
                     // A standalone agent's folder is the user's and is never
                     // removed, not even by a factory reset; its record goes
                     // with the database below like every other agent's.
@@ -621,7 +628,12 @@ fn reset_agent_data(paths: &DuxPaths) -> Result<()> {
                     let mut removed = 0usize;
                     for session in &sessions {
                         if let Some(managed) = session.workspace.as_managed()
-                            && remove_session_worktree(paths, managed, &occupied_folders)
+                            && remove_session_worktree(
+                                paths,
+                                managed,
+                                &occupied_folders,
+                                &protected,
+                            )
                         {
                             removed += 1;
                         }
@@ -730,10 +742,27 @@ fn removed_worktrees_line(removed: usize) -> String {
     format!("removed {}", count_of(removed, "session worktree"))
 }
 
+/// The checkouts a factory reset must never remove: every stored project and
+/// every agent's own recorded project path. Fails closed on one that does not
+/// expand to a safe absolute path.
+fn reset_protected_projects(
+    store: &SessionStore,
+    sessions: &[dux_core::model::AgentSession],
+) -> Result<Vec<PathBuf>> {
+    let stored = store.load_projects()?;
+    let paths: Vec<&str> = stored
+        .iter()
+        .map(|project| project.path.as_str())
+        .chain(sessions.iter().filter_map(|session| session.project_path()))
+        .collect();
+    git::registered_project_paths(paths)
+}
+
 fn remove_session_worktree(
     paths: &DuxPaths,
     managed: &dux_core::model::ManagedWorkspace,
     occupied: &[PathBuf],
+    protected: &Result<Vec<PathBuf>>,
 ) -> bool {
     let worktree = Path::new(&managed.worktree_path);
     if !git::is_under(&paths.worktrees_root, worktree) {
@@ -751,6 +780,18 @@ fn remove_session_worktree(
         );
         return false;
     }
+    // Refuse before anything runs, git or `remove_dir_all`: a worktree that is,
+    // contains, or sits inside a registered checkout is the user's data. An
+    // inventory that could not be read refuses every removal (fail closed).
+    let guard = protected
+        .as_ref()
+        .map_err(|err| anyhow::anyhow!("{err:#}"))
+        .and_then(|protected| git::guard_whole_workspace_removal(worktree, protected));
+    if let Err(err) = guard {
+        eprintln!("warning: keeping {}: {err:#}", managed.worktree_path);
+        return false;
+    }
+    let protected = protected.as_deref().unwrap_or_default();
 
     // Route through the shared core removal so the worktree is removed with the
     // correct `-C <repo>`, the repo's worktree registration is pruned, and the
@@ -767,9 +808,10 @@ fn remove_session_worktree(
                 worktree,
                 &managed.branch_name,
                 Some(managed.initial_branch.as_str()),
+                protected,
             );
         } else {
-            let _ = git::remove_worktree_keep_branch(Path::new(project_path), worktree);
+            let _ = git::remove_worktree_keep_branch(Path::new(project_path), worktree, protected);
         }
     }
 
@@ -1230,7 +1272,7 @@ mod tests {
             // round-trip below pick whichever one this leaf actually accepts.
             serde_json::Value::String(s) => {
                 let mut candidates = vec![serde_json::json!(format!("{s}-mutated"))];
-                for alternative in ["stdout", "tempfile"] {
+                for alternative in ["stdout", "tempfile", "shared", "worktree"] {
                     if alternative != s {
                         candidates.push(serde_json::json!(alternative));
                     }
@@ -1423,6 +1465,7 @@ mod tests {
             auto_reopen_agents: None,
             startup_command: None,
             env,
+            workspace_mode: None,
         });
 
         let changes = collect_config_changes(&config);
@@ -2000,6 +2043,7 @@ mod tests {
                 .as_managed()
                 .expect("the fixture builds a managed agent"),
             &[],
+            &Ok(Vec::new()),
         );
 
         assert!(!worktree.exists(), "the worktree directory must be removed");
@@ -2098,6 +2142,7 @@ mod tests {
                 .as_managed()
                 .expect("the fixture builds a managed agent"),
             &[],
+            &Ok(Vec::new()),
         );
 
         assert!(!worktree.exists(), "the worktree directory must be removed");

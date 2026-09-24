@@ -181,6 +181,10 @@ pub enum RemovalOutcome {
 
 /// Classify and remove in one hop: the entry point both surfaces call.
 ///
+/// `protected` is the registered-project inventory
+/// (`Engine::registered_project_paths`); the removal is refused if the
+/// worktree overlaps any of them, see `git::guard_whole_workspace_removal`.
+///
 /// Shells to git, so run it off the UI thread and off the async reactor.
 pub fn remove_managed_worktree(
     project: &Project,
@@ -188,6 +192,7 @@ pub fn remove_managed_worktree(
     sessions: &[AgentSession],
     requested: &Path,
     delete_branch: bool,
+    protected: &[PathBuf],
 ) -> Result<RemovalOutcome, String> {
     let repo_path = PathBuf::from(&project.path);
     let worktrees = git::list_worktrees(&repo_path).map_err(|e| format!("{e:#}"))?;
@@ -203,7 +208,7 @@ pub fn remove_managed_worktree(
                 // branch here, because a worktree with no agent has no record of
                 // what it was born on.
                 Some(branch) => {
-                    let removed = git::remove_worktree(&repo_path, &path, branch, None)
+                    let removed = git::remove_worktree(&repo_path, &path, branch, None, protected)
                         .map_err(|e| format!("{e:#}"))?;
                     Ok(RemovalOutcome::Removed {
                         path,
@@ -216,7 +221,7 @@ pub fn remove_managed_worktree(
                 // Either the request did not ask, or the worktree is detached
                 // and there is no branch to delete. Worktree only.
                 None => {
-                    git::remove_worktree_keep_branch(&repo_path, &path)
+                    git::remove_worktree_keep_branch(&repo_path, &path, protected)
                         .map_err(|e| format!("{e:#}"))?;
                     Ok(RemovalOutcome::Removed { path, branch: None })
                 }
@@ -551,7 +556,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (project, paths, worktree) = real_repo(root.path());
         let repo = PathBuf::from(&project.path);
-        let outcome = remove_managed_worktree(&project, &paths, &[], &worktree, false).unwrap();
+        let outcome =
+            remove_managed_worktree(&project, &paths, &[], &worktree, false, &[]).unwrap();
         assert!(matches!(
             outcome,
             RemovalOutcome::Removed { branch: None, .. }
@@ -565,7 +571,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (project, paths, worktree) = real_repo(root.path());
         let repo = PathBuf::from(&project.path);
-        let outcome = remove_managed_worktree(&project, &paths, &[], &worktree, true).unwrap();
+        let outcome = remove_managed_worktree(&project, &paths, &[], &worktree, true, &[]).unwrap();
         let RemovalOutcome::Removed {
             branch: Some(branch),
             ..
@@ -585,7 +591,7 @@ mod tests {
         let (project, paths, worktree) = real_repo(root.path());
         let sessions = vec![session(&worktree)];
         let outcome =
-            remove_managed_worktree(&project, &paths, &sessions, &worktree, true).unwrap();
+            remove_managed_worktree(&project, &paths, &sessions, &worktree, true, &[]).unwrap();
         assert_eq!(outcome, RemovalOutcome::Attached);
         assert!(worktree.exists(), "the attached worktree must survive");
         assert!(branch_exists(Path::new(&project.path), "free"));

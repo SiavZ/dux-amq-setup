@@ -1055,6 +1055,7 @@ impl Engine {
                 auto_reopen_agents: project.auto_reopen_agents,
                 startup_command: project.startup_command.clone(),
                 env: project.env.clone(),
+                workspace_mode: None,
             })?;
         let project_id = project.id.clone();
         let previous_config_projects = self.config.projects.clone();
@@ -2142,6 +2143,7 @@ mod tests {
                     auto_reopen_agents: None,
                     startup_command: None,
                     env: Default::default(),
+                    workspace_mode: None,
                 })
                 .unwrap();
         }

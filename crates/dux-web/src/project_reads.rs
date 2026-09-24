@@ -265,6 +265,12 @@ async fn delete_worktree(
     let Some((project, paths, sessions)) = state.engine.project_worktree_inputs(id).await else {
         return (StatusCode::NOT_FOUND, "unknown project").into_response();
     };
+    // Every registered checkout is protected from the removal; an unreadable
+    // inventory refuses it outright rather than removing half-guarded.
+    let protected = match state.engine.registered_project_paths().await {
+        Ok(protected) => protected,
+        Err(error) => return (StatusCode::CONFLICT, error).into_response(),
+    };
 
     let requested = PathBuf::from(&query.path);
     let delete_branch = query.delete_branch;
@@ -280,6 +286,7 @@ async fn delete_worktree(
             &sessions,
             &requested,
             delete_branch,
+            &protected,
         )
     })
     .await;

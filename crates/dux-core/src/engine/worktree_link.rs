@@ -17,17 +17,10 @@ impl Engine {
     /// one of its agents runs in a managed worktree. A project whose agents all
     /// run in the shared checkout has no worktrees to show.
     pub fn project_wants_worktrees_link(&self, project: &Project) -> bool {
-        // INTEGRATION: shared-workspace link predicate (evergreen/pig). Until
-        // that workstream publishes a named predicate, "has a non-shared agent
-        // in a managed worktree" is computed here from evergreen's
-        // AgentSession::shared_workspace().
-        !project.path_missing
-            && self.sessions.iter().any(|session| {
-                session.project_id() == Some(project.id.as_str())
-                    && !session.is_deleted()
-                    && !session.shared_workspace()
-                    && session.managed_worktree().is_some()
-            })
+        // The shared-only skip is shared-workspace's predicate (evergreen/pig,
+        // 170e93b4): a project whose agents all run in its own checkout has
+        // no worktrees to expose and must not gain a link or exclude entry.
+        !project.path_missing && self.project_link_allowed(&project.id)
     }
 
     /// Ensure the link for every eligible project, on one background worker.
@@ -100,7 +93,7 @@ mod tests {
     use crate::engine::test_support::{sample_project, sample_session, test_engine};
 
     #[test]
-    fn shared_only_project_skips_link_but_isolated_agent_wants_it() {
+    fn worktree_link_eligibility_follows_the_shared_workspace_predicate() {
         let (mut engine, tmp) = test_engine();
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
