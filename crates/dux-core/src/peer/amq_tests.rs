@@ -623,6 +623,15 @@ fn rust_and_wrapper_claims_serialize_on_config_lock() {
         );
         return;
     }
+    // The wrapper refuses to register without jq (atomic config.json edit),
+    // before it ever reaches the lock, so without jq there is no race to see.
+    if !has("jq") {
+        eprintln!(
+            "skipping rust_and_wrapper_claims_serialize_on_config_lock: no jq, \
+             which claude-amq requires before it takes the lock"
+        );
+        return;
+    }
 
     let dir = tempdir().unwrap();
     let root = dir.path().join("amq");

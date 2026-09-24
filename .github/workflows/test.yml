@@ -63,6 +63,13 @@ jobs:
       # under whatever identity git can see, exactly as it does for a user. A
       # hosted runner has no identity to see, so the test that adopts a plain
       # folder gets git's "unable to auto-detect email" and a deferred 202.
+      # dux-core's rust_and_wrapper_claims_serialize_on_config_lock runs the real
+      # dux-amq/wrappers/claude-amq, which needs flock(1) (util-linux) and jq and
+      # skips without them. Both ship on the runner image; installing them here
+      # keeps an image change from silently turning that test into a skip.
+      - name: Tools the overlay wrapper test runs
+        run: sudo apt-get update && sudo apt-get install -y util-linux jq
+
       - name: Give git the identity a developer's machine has
         run: |
           git config --global user.name "dux ci"
