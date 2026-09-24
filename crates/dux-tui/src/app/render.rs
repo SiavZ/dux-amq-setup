@@ -10781,11 +10781,10 @@ impl App {
                             Span::styled(" - ", Style::default().fg(self.theme.input_label_fg)),
                         ];
                         let text_preview = text.replace('\n', "↵");
-                        // " " + name + " (label)" + " - ", counted in CHARACTERS:
-                        // a macro name or surface label can hold multi-byte text
-                        // just as the preview can.
+                        // " " + name + " (label)" + " - ", counted in COLUMNS: a
+                        // macro name can be CJK or emoji just as the preview can.
                         let prefix_len =
-                            1 + name.chars().count() + surface_label.chars().count() + 3;
+                            1 + display_width(name) + display_width(&surface_label) + 3;
                         let max_len = (list_area.width as usize).saturating_sub(prefix_len + 2);
                         spans.push(Span::styled(
                             truncate_macro_preview(&text_preview, max_len),
@@ -11609,7 +11608,7 @@ impl App {
         // ── List block (bottom, connected borders) ──
         let name_col = filtered
             .iter()
-            .map(|&(name, _)| name.chars().count())
+            .map(|&(name, _)| display_width(name))
             .max()
             .unwrap_or(0);
         let inner_w = list_area.width.saturating_sub(3) as usize; // borders + padding
@@ -11625,7 +11624,12 @@ impl App {
             filtered
                 .iter()
                 .map(|&(name, text)| {
-                    let name_padded = format!("{name:name_col$}");
+                    // `{:width$}` pads by chars, so pad by columns by hand: a
+                    // CJK name would otherwise misalign every preview column.
+                    let name_padded = format!(
+                        "{name}{}",
+                        " ".repeat(name_col.saturating_sub(display_width(name)))
+                    );
                     let mut spans = vec![Span::styled(
                         name_padded,
                         Style::default()
@@ -11635,15 +11639,11 @@ impl App {
                     let text_preview = text.replace('\n', "↵");
                     let desc_avail = inner_w.saturating_sub(name_col + gap);
                     let desc_display =
-                        if text_preview.chars().count() > desc_avail && desc_avail > 1 {
-                            let end = text_preview
-                                .char_indices()
-                                .nth(desc_avail - 1)
-                                .map(|(i, _)| i)
-                                .unwrap_or(text_preview.len());
-                            format!("  {}\u{2026}", &text_preview[..end])
+                        if display_width(&text_preview) > desc_avail && desc_avail > 1 {
+                            format!("  {}", truncate_macro_preview(&text_preview, desc_avail))
                         } else {
-                            format!("  {text_preview:desc_avail$}")
+                            let pad = desc_avail.saturating_sub(display_width(&text_preview));
+                            format!("  {text_preview}{}", " ".repeat(pad))
                         };
                     spans.push(Span::styled(
                         desc_display,
@@ -12583,10 +12583,13 @@ pub(crate) fn centered_rect_exact(width: u16, height: u16, area: Rect) -> Rect {
 /// panicked whenever the cut landed inside a multi-byte character, which any
 /// macro body holding an accent or an emoji could arrange.
 fn truncate_macro_preview(text: &str, max_len: usize) -> String {
-    if text.chars().count() <= max_len {
+    // Columns, not chars (fork bebeb8a2): a preview of CJK or emoji text
+    // measured in chars is twice as wide as the room it was cut for.
+    if display_width(text) <= max_len {
         return text.to_string();
     }
-    let mut out: String = text.chars().take(max_len.saturating_sub(1)).collect();
+    let budget = u16::try_from(max_len.saturating_sub(1)).unwrap_or(u16::MAX);
+    let mut out = truncate_to_width(text, budget);
     out.push('…');
     out
 }
@@ -12912,16 +12915,16 @@ fn set_cell(buf: &mut ratatui::buffer::Buffer, x: u16, y: u16, symbol: &str, sty
 /// trimmed. Using char-based counting avoids panics when the text contains
 /// multi-byte UTF-8 (e.g. box-drawing or block characters).
 fn truncate_status_text(text: &str, available: usize) -> String {
-    let char_count = text.chars().count();
-    if char_count <= available {
+    // Measured in terminal COLUMNS (fork bebeb8a2): a char count lets a line of
+    // CJK or emoji run to twice its budget and push the footer off the row.
+    if display_width(text) <= available {
         return text.to_owned();
     }
-
     match available {
         0 => String::new(),
-        1 => "…".to_string(),
         _ => {
-            let mut truncated: String = text.chars().take(available - 1).collect();
+            let budget = u16::try_from(available - 1).unwrap_or(u16::MAX);
+            let mut truncated = truncate_to_width(text, budget);
             truncated.push('…');
             truncated
         }
@@ -19369,7 +19372,7 @@ mod tests {
         // Box-drawing char ─ is 3 bytes but 1 char.
         let text = "Copied: ─────end";
         let result = truncate_status_text(text, 10);
-        assert_eq!(result.chars().count(), 10);
+        assert_eq!(Line::from(result.clone()).width(), 10);
         assert!(result.ends_with('…'));
     }
 
@@ -19378,8 +19381,39 @@ mod tests {
         // Block characters like ██▛▘ are multi-byte; slicing by byte would panic.
         let text = "██▛▘ Opus 4.6 (1M context) · Claude Max";
         let result = truncate_status_text(text, 12);
-        assert_eq!(result.chars().count(), 12);
+        assert_eq!(Line::from(result.clone()).width(), 12);
         assert!(result.ends_with('…'));
+    }
+
+    /// Fork bebeb8a2: status text is cut by terminal COLUMNS, never splits a
+    /// double-width glyph, and never renders wider than the room it was given.
+    #[test]
+    fn truncate_status_text_handles_cjk_emoji_and_combining_boundaries() {
+        for (text, widths) in [
+            ("A界B", vec![(1, "…"), (2, "A…"), (3, "A…"), (4, "A界B")]),
+            ("🙂x", vec![(1, "…"), (2, "…"), (3, "🙂x")]),
+            ("e\u{301}x", vec![(1, "…"), (2, "e\u{301}x")]),
+        ] {
+            for (available, expected) in widths {
+                let rendered = truncate_status_text(text, available);
+                assert_eq!(rendered, expected, "{text:?} at {available}");
+                assert!(Line::from(rendered).width() <= available);
+            }
+        }
+    }
+
+    /// Fork bebeb8a2: the caret over a multi-byte character keeps the whole
+    /// character (the fork split at `cursor + 1` bytes). Upstream steps by
+    /// `len_utf8`; this pins it.
+    #[test]
+    fn render_single_line_cursor_input_preserves_multibyte_cursor_character() {
+        let line =
+            render_single_line_cursor_input(" ", "a🙂界", 1, Color::White, Color::Black, true);
+
+        assert_eq!(line.spans[0].content.as_ref(), " ");
+        assert_eq!(line.spans[1].content.as_ref(), "a");
+        assert_eq!(line.spans[2].content.as_ref(), "🙂");
+        assert_eq!(line.spans[3].content.as_ref(), "界");
     }
 
     #[test]
@@ -23113,15 +23147,20 @@ mod tests {
     #[test]
     fn truncate_macro_preview_never_splits_a_character() {
         let text = "áéíóú 🙂🙃🙁 ñ";
-        for max_len in 0..=text.chars().count() + 4 {
+        for max_len in 0..=display_width(text) + 4 {
             let out = truncate_macro_preview(text, max_len);
             assert!(
-                out.chars().count() <= max_len.max(1),
+                display_width(&out) <= max_len.max(1),
                 "max_len={max_len} produced {out:?}"
             );
         }
         assert_eq!(truncate_macro_preview("áé🙂", 10), "áé🙂");
+        // Columns: "áé" is 2, the emoji 2 more, so 3 columns keep "áé…".
         assert_eq!(truncate_macro_preview("áé🙂ñ", 3), "áé…");
+        assert_eq!(truncate_macro_preview("áé🙂ñ", 5), "áé🙂ñ");
+        assert_eq!(truncate_macro_preview("áé🙂ñ", 4), "áé…");
+        // A char count would have kept three CJK glyphs (6 columns) in 4.
+        assert_eq!(truncate_macro_preview("界界界界", 4), "界…");
     }
 
     #[test]

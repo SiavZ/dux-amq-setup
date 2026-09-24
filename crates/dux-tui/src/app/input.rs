@@ -30883,6 +30883,63 @@ cyan = "#00ffff"
         );
     }
 
+    /// Fork bebeb8a2 + e80151ad: the macro list renders CJK and emoji names and
+    /// previews at a narrow width, truncating the preview by terminal COLUMNS.
+    /// A char-count cut left a double-width preview twice as wide as its room,
+    /// running it through the list's right border.
+    #[test]
+    fn macro_list_renders_cjk_and_emoji_at_narrow_width() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_app(default_bindings());
+        app.engine.config.macros.entries.insert(
+            "界🙂".to_string(),
+            crate::config::MacroEntry {
+                text: "🙂界🙂界🙂界🙂界🙂界🙂界🙂界🙂界".to_string(),
+                surface: crate::config::MacroSurface::Agent,
+            },
+        );
+        app.open_edit_macros();
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 24)).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render narrow macro list");
+        let buffer = terminal.backend().buffer().clone();
+        // Rows as cells, one symbol each; a wide glyph's trailing spacer cell
+        // is part of the row, so the name reads "界 🙂" here.
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
+        let rendered = rows.join("\n");
+
+        assert!(rendered.contains('界'), "CJK macro name was not rendered");
+        assert!(
+            rendered.contains('🙂'),
+            "emoji macro content was not rendered"
+        );
+        let row = rows
+            .iter()
+            .find(|row| row.contains('界') && row.contains('🙂'))
+            .unwrap_or_else(|| panic!("the macro row:\n{rendered}"));
+        assert!(
+            row.contains('…'),
+            "long macro preview was not truncated: {row:?}"
+        );
+        // The row still ends on the list's right border: the preview did not
+        // run through it.
+        let trimmed = row.trim_end();
+        assert!(
+            trimmed.ends_with('│'),
+            "the preview overflowed the list border: {row:?}"
+        );
+    }
+
     /// Fork 0befc8e9: a bare Escape still pending when a mouse report arrives
     /// must not swallow the report's own ESC, or the drag reads as garbage and
     /// the selection never starts. Upstream's parser keeps a lone ESC before
