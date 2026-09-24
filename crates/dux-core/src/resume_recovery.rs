@@ -649,7 +649,7 @@ pub struct RecoveryReport {
 }
 
 #[derive(Clone, Debug)]
-struct RecoveryIdentity {
+pub struct RecoveryIdentity {
     session_id: String,
     provider: String,
     agent_handle: String,
@@ -673,6 +673,8 @@ struct RecoveryMatches {
     warnings: Vec<String>,
 }
 
+/// Recover and persist in one call: [`scan_stranded_histories`] followed by
+/// [`persist_recovered_ids`]. For callers that already own the store.
 pub fn recover_stranded_histories(
     sessions: &[AgentSession],
     projects: &[Project],
@@ -681,6 +683,22 @@ pub fn recover_stranded_histories(
     store: &SessionStore,
 ) -> Result<RecoveryReport> {
     let identities = recovery_identities(sessions, projects, store);
+    let mut report = scan_stranded_histories(identities, worktrees_root, roots)?;
+    persist_recovered_ids(&mut report, store);
+    Ok(report)
+}
+
+/// The recovery work that touches only the provider directories: scan the
+/// transcripts, match them to agents, and copy Claude artifacts into each
+/// agent's current project directory. Safe on a worker thread because it
+/// never opens the session store (every `SessionStore::open` runs migrate(),
+/// which must not race the engine's own writes). The ids it finds are in
+/// `report.updates` and are NOT persisted yet: see [`persist_recovered_ids`].
+pub fn scan_stranded_histories(
+    identities: Vec<RecoveryIdentity>,
+    worktrees_root: &Path,
+    roots: &ProviderDataRoots,
+) -> Result<RecoveryReport> {
     if identities.is_empty() {
         return Ok(RecoveryReport::default());
     }
@@ -731,25 +749,38 @@ pub fn recover_stranded_histories(
         else {
             continue;
         };
-        match store.set_provider_session_id_if_missing(
-            &identity.session_id,
-            &identity.provider,
-            &latest.id,
-        ) {
-            Ok(true) => report.updates.push(ProviderSessionUpdate {
-                session_id: identity.session_id,
-                provider: identity.provider,
-                provider_session_id: latest.id.clone(),
-            }),
-            Ok(false) => {}
-            Err(err) => report.warnings.push(format!(
-                "Could not persist recovered {} UUID for session \"{}\": {err:#}",
-                printable(&identity.provider),
-                printable(&identity.session_id),
-            )),
-        }
+        report.updates.push(ProviderSessionUpdate {
+            session_id: identity.session_id,
+            provider: identity.provider,
+            provider_session_id: latest.id.clone(),
+        });
     }
     Ok(report)
+}
+
+/// Persist the ids a scan found, never over an id recorded since (a launch
+/// that captured one while the scan ran wins). Updates that did not write are
+/// dropped from the report, so it lists exactly what recovery recorded.
+pub fn persist_recovered_ids(report: &mut RecoveryReport, store: &SessionStore) {
+    let mut warnings = Vec::new();
+    report.updates.retain(|update| {
+        match store.set_provider_session_id_if_missing(
+            &update.session_id,
+            &update.provider,
+            &update.provider_session_id,
+        ) {
+            Ok(wrote) => wrote,
+            Err(err) => {
+                warnings.push(format!(
+                    "Could not persist recovered {} UUID for session \"{}\": {err:#}",
+                    printable(&update.provider),
+                    printable(&update.session_id),
+                ));
+                false
+            }
+        }
+    });
+    report.warnings.extend(warnings);
 }
 
 /// Whether any agent could gain an id from [`recover_stranded_histories`]:
@@ -763,7 +794,9 @@ pub fn recovery_has_candidates(
     !recovery_identities(sessions, projects, store).is_empty()
 }
 
-fn recovery_identities(
+/// The agent/provider pairs recovery looks for: started Claude or Codex
+/// providers with no recorded id. Read on the thread that owns the store.
+pub fn recovery_identities(
     sessions: &[AgentSession],
     projects: &[Project],
     store: &SessionStore,

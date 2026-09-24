@@ -724,7 +724,8 @@ pub enum WorkerEvent {
         result: Result<String, String>,
     },
     /// The one-time recovery of provider histories stranded under old per-agent
-    /// worktrees finished. Its ids are already persisted.
+    /// worktrees finished. Its ids are not persisted yet: the engine writes
+    /// them with its own store (`resume_recovery::persist_recovered_ids`).
     ResumeRecoveryCompleted(Result<crate::resume_recovery::RecoveryReport, String>),
     /// The AMQ inject-queue watcher (or its polling fallback) noticed a
     /// change under the queue root. No payload: the engine re-scans the

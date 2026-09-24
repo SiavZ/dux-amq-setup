@@ -1036,7 +1036,11 @@ fn run_create_standalone_agent_job(
             session.provider.as_str(),
             &provider_cfg,
         ),
-        yolo_args: launch_yolo_args(&paths, &session.id, &session.provider),
+        // A brand-new agent has no saved settings yet, so YOLO adds nothing.
+        // Never read the store here: `SessionStore::open` runs migrate(), whose
+        // orphan-tab sweep can delete a row the engine just inserted.
+        yolo_args: crate::session_settings::SessionSettings::default()
+            .yolo_launch_args(&session.provider),
         session,
         provider_config: provider_cfg,
         env,
@@ -1203,7 +1207,11 @@ fn run_create_shared_agent_job(
             session.provider.as_str(),
             &provider_cfg,
         ),
-        yolo_args: launch_yolo_args(&paths, &session.id, &session.provider),
+        // A brand-new agent has no saved settings yet, so YOLO adds nothing.
+        // Never read the store here: `SessionStore::open` runs migrate(), whose
+        // orphan-tab sweep can delete a row the engine just inserted.
+        yolo_args: crate::session_settings::SessionSettings::default()
+            .yolo_launch_args(&session.provider),
         session,
         provider_config: provider_cfg,
         env,
@@ -1434,7 +1442,11 @@ fn launch_managed_create(
         } else {
             crate::resume_recovery::fresh_capture_for(session.provider.as_str(), &provider_cfg)
         },
-        yolo_args: launch_yolo_args(&paths, &session.id, &session.provider),
+        // A brand-new agent has no saved settings yet, so YOLO adds nothing.
+        // Never read the store here: `SessionStore::open` runs migrate(), whose
+        // orphan-tab sweep can delete a row the engine just inserted.
+        yolo_args: crate::session_settings::SessionSettings::default()
+            .yolo_launch_args(&session.provider),
         session,
         provider_config: provider_cfg,
         env,
@@ -1650,21 +1662,6 @@ pub fn run_agent_launch_job(request: AgentLaunchRequest, worker_tx: Sender<Worke
     // row is only written when its launch-ready event is processed, and the id
     // has nowhere to go before that.
     report_fresh_capture(capture, &session_id, process_id, &worker_tx);
-}
-
-/// The session's YOLO launch args for a create job, read from the store the
-/// same way `agent_env::session_settings_env` reads the launch env: create
-/// jobs run on worker threads with only the paths. A store that cannot be
-/// read means defaults (no extra args), never a blocked launch.
-fn launch_yolo_args(
-    paths: &DuxPaths,
-    session_id: &str,
-    provider: &crate::model::ProviderKind,
-) -> Vec<String> {
-    crate::storage::SessionStore::open(&paths.sessions_db_path)
-        .and_then(|store| store.load_session_settings_for(session_id))
-        .unwrap_or_default()
-        .yolo_launch_args(provider)
 }
 
 /// Hand a started launch's capture back to the engine: a Claude id at once

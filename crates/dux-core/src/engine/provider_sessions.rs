@@ -173,30 +173,29 @@ impl Engine {
     /// whether a worker was started: with nothing to recover it is not, so a
     /// normal startup never scans the provider directories at all.
     pub fn dispatch_resume_recovery(&self) -> bool {
-        if !resume_recovery::recovery_has_candidates(
+        // Who to look for is read here, on the engine's own store. The worker
+        // never opens a store (`SessionStore::open` runs migrate(), which
+        // must not race the engine); it only scans and copies, and the
+        // engine persists what it found in `process_resume_recovery_completed`.
+        let identities = resume_recovery::recovery_identities(
             &self.sessions,
             &self.projects,
             &self.session_store,
-        ) {
+        );
+        if identities.is_empty() {
             return false;
         }
-        let sessions = self.sessions.clone();
-        let projects = self.projects.clone();
         let worktrees_root = self.paths.worktrees_root.clone();
-        let db_path = self.paths.sessions_db_path.clone();
         let tx = self.worker_tx.clone();
         let spawned = std::thread::Builder::new()
             .name("provider-session-recovery".to_string())
             .spawn(move || {
-                let result = crate::storage::SessionStore::open(&db_path)
-                    .and_then(|store| {
-                        let roots = resume_recovery::ProviderDataRoots::from_home()?;
-                        resume_recovery::recover_stranded_histories(
-                            &sessions,
-                            &projects,
+                let result = resume_recovery::ProviderDataRoots::from_home()
+                    .and_then(|roots| {
+                        resume_recovery::scan_stranded_histories(
+                            identities,
                             &worktrees_root,
                             &roots,
-                            &store,
                         )
                     })
                     .map_err(|err| format!("{err:#}"));
@@ -212,7 +211,8 @@ impl Engine {
         // Whatever the outcome, startup launches waiting for it may go now.
         self.startup_launches.release();
         match result {
-            Ok(report) => {
+            Ok(mut report) => {
+                resume_recovery::persist_recovered_ids(&mut report, &self.session_store);
                 crate::logger::info(&format!(
                     "provider history recovery: {} agent(s) recovered, {} artifact(s) copied, {} warning(s)",
                     report.updates.len(),
