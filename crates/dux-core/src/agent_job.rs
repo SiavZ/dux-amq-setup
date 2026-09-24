@@ -1568,7 +1568,7 @@ pub fn run_agent_launch_job(request: AgentLaunchRequest, worker_tx: Sender<Worke
             ));
             crate::resume_recovery::PreparedCapture::None
         });
-    let launch_args = match crate::resume_recovery::launch_args(
+    let mut launch_args = match crate::resume_recovery::launch_args(
         &request.provider_config,
         request.provider.as_str(),
         &request.provider_session,
@@ -1586,6 +1586,9 @@ pub fn run_agent_launch_job(request: AgentLaunchRequest, worker_tx: Sender<Worke
             return;
         }
     };
+    // After the resume, resume-by-id or fresh args: YOLO flags modify the
+    // launch whichever way it reaches its conversation.
+    launch_args.extend(request.yolo_args.iter().cloned());
     let (rows, cols) = request.pty_size;
     logger::debug(&format!(
         "spawning PTY {:?} {:?} in {} ({}x{}, resume_supported={})",
@@ -1653,7 +1656,11 @@ pub fn run_agent_launch_job(request: AgentLaunchRequest, worker_tx: Sender<Worke
 /// same way `agent_env::session_settings_env` reads the launch env: create
 /// jobs run on worker threads with only the paths. A store that cannot be
 /// read means defaults (no extra args), never a blocked launch.
-fn launch_yolo_args(paths: &DuxPaths, session_id: &str, provider: &ProviderKind) -> Vec<String> {
+fn launch_yolo_args(
+    paths: &DuxPaths,
+    session_id: &str,
+    provider: &crate::model::ProviderKind,
+) -> Vec<String> {
     crate::storage::SessionStore::open(&paths.sessions_db_path)
         .and_then(|store| store.load_session_settings_for(session_id))
         .unwrap_or_default()

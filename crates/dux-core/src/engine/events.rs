@@ -7102,6 +7102,7 @@ mod tests {
                 wants_fullscreen: false,
                 status_quiet: QuietSurfaces::LOUD,
                 provider_session: Default::default(),
+                yolo_args: Vec::new(),
             },
             message: message.to_string(),
         }
@@ -7194,6 +7195,7 @@ mod tests {
                 wants_fullscreen: false,
                 status_quiet: QuietSurfaces::LOUD,
                 provider_session: Default::default(),
+                yolo_args: Vec::new(),
             },
             client: latecomer,
         };
@@ -7391,6 +7393,7 @@ mod tests {
                 wants_fullscreen: false,
                 status_quiet: QuietSurfaces::LOUD,
                 provider_session: Default::default(),
+                yolo_args: Vec::new(),
             },
             message: message.to_string(),
         }
@@ -8239,6 +8242,7 @@ mod tests {
             wants_fullscreen: false,
             status_quiet: QuietSurfaces::LOUD,
             provider_session: Default::default(),
+            yolo_args: Vec::new(),
         };
         let reaction = engine
             .apply(crate::engine::Command::DispatchAgentLaunch {

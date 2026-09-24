@@ -202,10 +202,8 @@ impl SessionSettings {
     /// Extra CLI args YOLO adds for providers that take it as a flag rather
     /// than through a wrapper env var (fork c2c44378: OpenCode `--auto`).
     /// Appended after the provider's own args, resume args included.
-    ///
-    /// INTEGRATION: the agent launch argv builder (resume worker, palmtree,
-    /// with the peer worker's launch env) must append these for a session
-    /// whose settings have `yolo_permissions`.
+    /// The launch request builders carry them in `AgentLaunchRequest::yolo_args`
+    /// and `run_agent_launch_job` appends them.
     pub fn yolo_launch_args(&self, provider: &ProviderKind) -> Vec<String> {
         if !self.yolo_permissions {
             return Vec::new();

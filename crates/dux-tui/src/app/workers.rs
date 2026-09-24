@@ -3128,6 +3128,7 @@ mod tests {
             wants_fullscreen: false,
             status_quiet: dux_core::statusline::QuietSurfaces::LOUD,
             provider_session: Default::default(),
+            yolo_args: Vec::new(),
         };
 
         dux_core::agent_job::run_agent_launch_job(request, worker_tx);

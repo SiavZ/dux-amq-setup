@@ -717,6 +717,88 @@ mod tests {
         assert_eq!(engine.shared_targeted_resume_warning("shared"), None);
     }
 
+    /// Launch an opencode session through the real builder and launch job,
+    /// with a provider command that prints the args it was given, and return
+    /// that line.
+    fn launched_argv(yolo: bool) -> String {
+        let (mut engine, tmp) = test_engine();
+        // `sh -c '...' argv0 <args>`: the script echoes every arg dux appends.
+        engine.config.providers.commands.insert(
+            "opencode".to_string(),
+            crate::config::ProviderCommandConfig {
+                command: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "echo \"ARGV:$*:END\"; sleep 5".to_string(),
+                    "sh".to_string(),
+                ],
+                ..Default::default()
+            },
+        );
+        let session = session_in(tmp.path(), "s1", "opencode");
+        engine.session_store.create_session(&session).unwrap();
+        engine.sessions.push(session.clone());
+        let settings = crate::session_settings::SessionSettings {
+            yolo_permissions: yolo,
+            ..Default::default()
+        };
+        engine
+            .set_session_settings("s1", settings, None)
+            .expect("settings persist");
+
+        let request = engine.build_agent_launch_request(
+            session,
+            false,
+            (24, 80),
+            AgentLaunchKind::Reconnect {
+                status_message: String::new(),
+            },
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::agent_job::run_agent_launch_job(request, tx);
+        let client = loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(WorkerEvent::AgentLaunchReady(data)) => break data.client,
+                Ok(WorkerEvent::AgentLaunchFailed(data)) => {
+                    panic!("launch failed: {}", data.message)
+                }
+                Ok(_) => continue,
+                Err(err) => panic!("no launch event: {err}"),
+            }
+        };
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let text = client.scan_recent_lines(10);
+            if let Some(line) = text
+                .lines()
+                .find(|line| line.contains("ARGV:") && line.contains(":END"))
+            {
+                return line.to_string();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "provider never printed its argv: {text:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// YOLO on appends OpenCode's `--auto` to the launch argv, after every
+    /// other arg; YOLO off leaves it out (fork c2c44378).
+    #[test]
+    fn opencode_yolo_launch_appends_auto_only_when_yolo_is_on() {
+        let on = launched_argv(true);
+        assert!(
+            on.contains("--auto:END"),
+            "argv must end with --auto: {on:?}"
+        );
+        let off = launched_argv(false);
+        assert!(
+            !off.contains("--auto"),
+            "argv must not carry --auto: {off:?}"
+        );
+    }
+
     /// The pump never has more than `concurrency` startup launches in flight.
     #[test]
     fn pump_respects_concurrency() {
