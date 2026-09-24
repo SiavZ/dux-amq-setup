@@ -4057,6 +4057,8 @@ impl App {
         self.engine.spawn_branch_sync_worker();
         self.engine.spawn_project_branch_status_checks();
         self.engine.spawn_gh_status_check();
+        // Idempotent: the web flip hands this same engine over and re-calls it.
+        self.engine.start_amq();
         // The background server assumes these process-wide workers are already running.
         self.start_background_server_from_config();
     }

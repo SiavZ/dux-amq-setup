@@ -1299,6 +1299,183 @@ fn config_schema() -> Vec<ConfigEntry> {
             value_fn: |c| FieldValue::Usize(c.server.file_drop_max_concurrency as usize),
         },
         ConfigEntry::Blank,
+        ConfigEntry::Comment(
+            "# AMQ inject-queue drainer.\n\
+             #\n\
+             # When the dux-amq companion is installed, peer agents wake each other\n\
+             # through `amq wake`. Inside dux the bridge writes each verified wake body\n\
+             # to ~/.local/share/dux-amq/inject-queue/<receiver>/*.msg, and dux types\n\
+             # it into the matching agent only when that agent is idle: typing while a\n\
+             # provider streams can land the text in its input but drop the Enter,\n\
+             # leaving the message stuck until someone presses Enter by hand.",
+        ),
+        ConfigEntry::Section("amq.inject"),
+        ConfigEntry::Field {
+            key: "enabled",
+            comment: Some(CommentSource::Static(
+                "# Master switch for the drainer. When false no queue files are consumed;\n\
+                 # bodies stay on disk under the queue directory. Default true.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.amq.inject.enabled),
+        },
+        ConfigEntry::Field {
+            key: "queue_dir",
+            comment: Some(CommentSource::Static(
+                "# Override the queue root. Empty means ~/.local/share/dux-amq/inject-queue\n\
+                 # ($XDG_DATA_HOME/dux-amq/inject-queue when XDG_DATA_HOME is set). Read at\n\
+                 # startup.",
+            )),
+            value_fn: |c| FieldValue::Str(c.amq.inject.queue_dir.clone()),
+        },
+        ConfigEntry::Field {
+            key: "busy_markers",
+            comment: Some(CommentSource::Static(
+                "# Bottom-of-screen text meaning the agent is busy, so delivery waits. Plain,\n\
+                 # case-sensitive substrings (no regex). Tune for your providers' footers.",
+            )),
+            value_fn: |c| FieldValue::StrList(c.amq.inject.busy_markers.clone()),
+        },
+        ConfigEntry::Field {
+            key: "busy_scan_lines",
+            comment: Some(CommentSource::Static(
+                "# How many of the newest non-blank rows are searched for a busy marker.\n\
+                 # Smaller is cheaper but can miss a footer that scrolled. Default 5.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.amq.inject.busy_scan_lines),
+        },
+        ConfigEntry::Field {
+            key: "delivery_timeout_secs",
+            comment: Some(CommentSource::Static(
+                "# Warn once when a queued message has waited this many seconds (agent busy,\n\
+                 # gone, or unmatched). The file stays on disk. 0 turns the warning off.\n\
+                 # Default 600.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.delivery_timeout_secs),
+        },
+        ConfigEntry::Field {
+            key: "max_message_age_secs",
+            comment: Some(CommentSource::Static(
+                "# Wake files older than this move to the receiver's .expired/ directory\n\
+                 # instead of being typed: stale .msg files at startup, files a crash left\n\
+                 # in flight, and messages held in memory too long. A message already typed\n\
+                 # still gets its Enter. 0 replays everything. Default 0.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.max_message_age_secs),
+        },
+        ConfigEntry::Field {
+            key: "poll_interval_ms",
+            comment: Some(CommentSource::Static(
+                "# Polling fallback (milliseconds) beside the file watcher, for filesystems\n\
+                 # where change notification is lossy (NFS, 9p, some FUSE). Floored at 100.\n\
+                 # Read at startup. Default 5000.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.poll_interval_ms),
+        },
+        ConfigEntry::Field {
+            key: "max_message_bytes",
+            comment: Some(CommentSource::Static(
+                "# Queue files larger than this are rejected and moved to .rejected/.\n\
+                 # Default 65536 (64 KiB).",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.max_message_bytes),
+        },
+        ConfigEntry::Field {
+            key: "verify_envelope",
+            comment: Some(CommentSource::Static(
+                "# Strict HMAC verification of wake envelopes by the bridge, exported to\n\
+                 # agents as DUX_AMQ_VERIFY. When false, signed envelopes are still\n\
+                 # unwrapped and plain `amq send` bodies pass through. The secret is\n\
+                 # readable by every process of your user, so strict mode only adds a\n\
+                 # boundary when wakes cross hosts. A session can override it in its\n\
+                 # settings. Takes effect when an agent starts. Default false.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.amq.inject.verify_envelope),
+        },
+        ConfigEntry::Field {
+            key: "active_session_quiet_secs",
+            comment: Some(CommentSource::Static(
+                "# While you are typing into an agent, a wake for it waits until you have\n\
+                 # not typed for this many seconds, so it never lands inside your prompt.\n\
+                 # 0 holds for as long as you are focused on that agent; a value of ten\n\
+                 # years or more always delivers (and may corrupt a half-typed prompt).\n\
+                 # Default 60.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.active_session_quiet_secs),
+        },
+        ConfigEntry::Field {
+            key: "phase_delay_ms",
+            comment: Some(CommentSource::Static(
+                "# Gap in milliseconds between typing a wake body and pressing Enter. Sent\n\
+                 # together, an Ink-based CLI reads the Enter as part of a paste and the text\n\
+                 # sits unsubmitted. Non-zero values below 250 are raised to 250; 0 is a\n\
+                 # debugging escape hatch. Default 250.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.phase_delay_ms),
+        },
+        ConfigEntry::Field {
+            key: "startup_grace_ms",
+            comment: Some(CommentSource::Static(
+                "# Hold all delivery for this long after dux starts, so restored agents\n\
+                 # finish booting before old wakes are typed into them. Default 10000.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.startup_grace_ms),
+        },
+        ConfigEntry::Field {
+            key: "post_delivery_cooldown_ms",
+            comment: Some(CommentSource::Static(
+                "# After one wake is submitted to an agent, wait this long before typing the\n\
+                 # next one into it, so a backlog cannot outrun the agent showing it is\n\
+                 # busy. Never delays the Enter of a wake already typed. Default 10000.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.post_delivery_cooldown_ms),
+        },
+        ConfigEntry::Field {
+            key: "auto_clear_collaboration_quiet_secs",
+            comment: Some(CommentSource::Static(
+                "# A Worker's auto-clear waits while it collaborates: unread or unsent AMQ\n\
+                 # mail and queued wakes always block it, and so does AMQ activity newer\n\
+                 # than this many seconds. 0 disables only the recent-activity window.\n\
+                 # Default 1800.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.auto_clear_collaboration_quiet_secs),
+        },
+        ConfigEntry::Blank,
+        ConfigEntry::Comment(
+            "# Orchestrator watchdog.\n\
+             #\n\
+             # Agents in Orchestrator mode get a built-in role policy at launch (typed\n\
+             # once for CLIs with no system-prompt flag). While same-project Worker\n\
+             # agents are live, dux also wakes one orchestrator per project with a\n\
+             # checkpoint prompt to poll them. Delivery uses the same idle and busy\n\
+             # safeguards as the inject queue above.",
+        ),
+        ConfigEntry::Section("amq.orchestrator"),
+        ConfigEntry::Field {
+            key: "enabled",
+            comment: Some(CommentSource::Static(
+                "# Master switch for the watchdog. Only Orchestrator-mode agents are\n\
+                 # affected. Default true.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.amq.orchestrator.enabled),
+        },
+        ConfigEntry::Field {
+            key: "poll_interval_secs",
+            comment: Some(CommentSource::Static(
+                "# Seconds between checkpoint prompts per project. There is never one at\n\
+                 # startup. 0 stops checkpoints (and the typed launch policy). Default 900.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.orchestrator.poll_interval_secs),
+        },
+        ConfigEntry::Field {
+            key: "checkpoint_prompt",
+            comment: Some(CommentSource::Static(
+                "# Replacement checkpoint text, typed verbatim instead of the built-in one\n\
+                 # that lists live workers and how to poll them. Empty uses the built-in.\n\
+                 # The launch-time policy is unaffected.",
+            )),
+            value_fn: |c| FieldValue::Str(c.amq.orchestrator.checkpoint_prompt.clone()),
+        },
+        ConfigEntry::Blank,
         ConfigEntry::Keys,
         ConfigEntry::Blank,
         ConfigEntry::Macros,
@@ -3063,6 +3240,28 @@ name = "test"
             rendered.contains("logs a warning once"),
             "the comment must say the clamp is announced: {rendered}"
         );
+    }
+
+    #[test]
+    fn amq_settings_round_trip_through_the_documented_template() {
+        let mut config = Config::default();
+        config.amq.inject.enabled = false;
+        config.amq.inject.queue_dir = "/var/spool/dux-amq".into();
+        config.amq.inject.busy_markers = vec!["busy \"now\"".into()];
+        config.amq.inject.phase_delay_ms = 500;
+        config.amq.inject.max_message_age_secs = 3600;
+        config.amq.orchestrator.poll_interval_secs = 0;
+        config.amq.orchestrator.checkpoint_prompt = "Line one\nline \"two\"".into();
+        let rendered = render_config_default(&config);
+        for header in ["[amq.inject]", "[amq.orchestrator]"] {
+            assert!(rendered.contains(header), "{header} missing");
+        }
+        assert!(
+            rendered.contains("# Replacement checkpoint text"),
+            "documented"
+        );
+        let parsed: Config = toml::from_str(&rendered).expect("parses");
+        assert_eq!(parsed.amq, config.amq);
     }
 
     #[test]

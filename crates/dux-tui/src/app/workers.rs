@@ -107,6 +107,7 @@ impl App {
         self.apply_resume_fallback_sweep();
         self.apply_reaped_terminations();
         self.apply_watch_rules_tick();
+        self.apply_amq_tick();
         let maintenance = self.apply_pruned_pty_events();
         self.note_companion_maintenance(&maintenance);
         self.refresh_resource_monitor_if_due();
@@ -376,6 +377,28 @@ impl App {
             self.notify_companion(&reaction);
             self.apply_routed_reaction(reaction, &routing);
         }
+    }
+
+    /// Drive AMQ wake delivery and the Orchestrator watchdog one tick. Same
+    /// single-tick-site contract as the watch rules. The agent the user is
+    /// typing into is held by the quiet window; the selected agent receives
+    /// wakes that name no receiver.
+    pub(crate) fn apply_amq_tick(&mut self) {
+        let selected = self.selected_session().map(|s| s.id.clone());
+        let focused = selected
+            .clone()
+            .filter(|_| self.input_target == InputTarget::Agent);
+        let reaction = self.engine.tick_amq(dux_core::engine::AmqFocus {
+            focused_session: focused.as_deref(),
+            selected_session: selected.as_deref(),
+        });
+        if matches!(reaction, EventReaction::Nothing) {
+            return;
+        }
+        self.mark_frame_dirty();
+        let routing = self.companion_routing();
+        self.notify_companion(&reaction);
+        self.apply_routed_reaction(reaction, &routing);
     }
 
     /// Apply one reaper pass: dispatch the worktree removals that were waiting

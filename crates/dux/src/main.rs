@@ -58,6 +58,12 @@ fn exec_reload(
     };
 
     // Past this point the descriptors must stay open for the successor.
+    // The AMQ watcher and poll worker are this image's; stop them so the
+    // successor starts its own. Claims are only ever taken on the engine
+    // thread, which is here and idle, so none is held mid-delivery: an
+    // in-flight wake stays `.inflight.*.msg` and the successor reclaims it.
+    let mut engine = engine;
+    engine.stop_amq();
     let engine = Box::leak(engine);
     let err = match dux_core::reload_policy::exec_into_reload(&exe, &handoff_path) {
         Ok(never) => match never {},

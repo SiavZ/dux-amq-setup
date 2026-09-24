@@ -1584,6 +1584,11 @@ impl Engine {
     /// keep showing the agent as working.
     pub fn note_pty_input(&mut self, tab_id: &str) {
         self.pty_input.insert(tab_id.to_string(), Instant::now());
+        // The AMQ quiet window needs "last typed" per agent over minutes, which
+        // `pty_input` (a 1.25 s window, cleared with the tab) cannot answer.
+        if let Some(session_id) = self.session_id_for_tab(tab_id) {
+            self.note_amq_user_input(&session_id);
+        }
     }
 
     /// Record that a forwarded POINTER report just reached this PTY. This is
