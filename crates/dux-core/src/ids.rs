@@ -71,6 +71,9 @@
 //! #     created_at: chrono::Utc::now(),
 //! #     updated_at: chrono::Utc::now(),
 //! #     last_focused_tab: None,
+//! #     agent_handle: "s1".to_string(),
+//! #     shared_workspace: false,
+//! #     deleted_at: None,
 //! # };
 //! wants_a_tab(session.slot_tab_id());
 //! ```

@@ -3510,9 +3510,11 @@ oneshot_output = "stdout"
     fn default_provider_commands_excludes_retired_gemini() {
         let providers = default_provider_commands();
         assert_eq!(
-            providers.len(),
-            5,
-            "five providers ship as defaults: claude, codex, opencode, copilot, jcode"
+            providers.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            [
+                "claude", "cline", "codex", "opencode", "kilocode", "ntl", "copilot", "jcode"
+            ],
+            "eight providers ship as defaults, in picker order"
         );
         assert!(
             providers.iter().all(|(name, _)| *name != "gemini"),
@@ -3646,6 +3648,131 @@ oneshot_output = "stdout"
         );
         assert_eq!(providers.get("opencode").unwrap().command, "opencode");
         assert_eq!(providers.get("copilot").unwrap().command, "copilot");
+    }
+
+    // -- Cline, Kilo Code, NTL (fork c2c44378) --
+
+    #[test]
+    fn ensure_defaults_adds_builtin_providers() {
+        let mut providers = ProvidersConfig {
+            commands: indexmap::IndexMap::new(),
+        };
+        providers.ensure_defaults();
+        for (name, command) in [
+            ("claude", "claude"),
+            ("cline", "cline"),
+            ("codex", "codex"),
+            ("opencode", "opencode"),
+            ("kilocode", "kilo"),
+            ("ntl", "ntl"),
+            ("copilot", "copilot"),
+            ("jcode", "jcode"),
+        ] {
+            assert_eq!(
+                providers.get(name).map(|cfg| cfg.command.as_str()),
+                Some(command),
+                "{name} should be added"
+            );
+        }
+        assert!(providers.get("gemini").is_none());
+    }
+
+    #[test]
+    fn default_cline_uses_tui_and_plain_prompt() {
+        let providers = default_provider_commands();
+        let cfg = &providers.iter().find(|(n, _)| *n == "cline").unwrap().1;
+        assert_eq!(cfg.command, "cline");
+        assert_eq!(cfg.args, vec!["--tui"]);
+        assert!(!cfg.supports_session_resume());
+        assert_eq!(cfg.install_hint.as_deref(), Some("npm install -g cline"));
+        // Upstream removed AI commit messages (90122fd2): no oneshot fields.
+        assert!(cfg.oneshot_args.is_empty());
+    }
+
+    /// Kilo Code is an opencode fork: same `--continue` resume with the same
+    /// 3s fallback to a fresh start.
+    #[test]
+    fn default_kilocode_resumes_with_continue_and_falls_back_after_3s() {
+        let providers = default_provider_commands();
+        let cfg = &providers.iter().find(|(n, _)| *n == "kilocode").unwrap().1;
+        assert_eq!(cfg.command, "kilo");
+        assert_eq!(cfg.resume_args, Some(vec!["--continue".to_string()]));
+        assert_eq!(cfg.resume_wait_timeout_ms, Some(3_000));
+        assert!(cfg.supports_session_resume());
+        assert_eq!(
+            cfg.install_hint.as_deref(),
+            Some("npm install -g @kilocode/cli")
+        );
+        assert!(cfg.oneshot_args.is_empty());
+    }
+
+    #[test]
+    fn default_ntl_uses_agent_repl() {
+        let providers = default_provider_commands();
+        let cfg = &providers.iter().find(|(n, _)| *n == "ntl").unwrap().1;
+        assert_eq!(cfg.command, "ntl");
+        assert_eq!(cfg.args, vec!["--agent"]);
+        assert!(!cfg.supports_session_resume());
+        assert!(cfg.oneshot_args.is_empty());
+    }
+
+    #[test]
+    fn providers_use_expected_scrollback_defaults() {
+        let config = Config::default();
+        for (name, expected) in [
+            ("cline", Some(true)),
+            ("kilocode", Some(true)),
+            ("ntl", Some(false)),
+            ("jcode", Some(true)),
+        ] {
+            assert_eq!(
+                config.providers.get(name).unwrap().forward_scroll,
+                expected,
+                "{name} forward_scroll"
+            );
+        }
+        // Upstream's own providers use the auto policy.
+        for name in ["claude", "codex", "opencode", "copilot"] {
+            assert_eq!(config.providers.get(name).unwrap().forward_scroll, None);
+        }
+    }
+
+    /// The new providers render into the documented template and survive a
+    /// round trip through both config writers.
+    #[test]
+    fn new_default_providers_render_and_round_trip() {
+        let rendered = render_default_config();
+        for header in [
+            "[providers.cline]",
+            "[providers.kilocode]",
+            "[providers.ntl]",
+        ] {
+            assert!(rendered.contains(header), "missing {header}");
+        }
+        // Compared on the fields these providers set. How an absent resume
+        // field renders is the resume workstream's (palmtree) business.
+        let key = |c: &Config, name: &str| {
+            let p = c.providers.get(name).unwrap();
+            (
+                p.command.clone(),
+                p.args.clone(),
+                p.install_hint.clone(),
+                p.forward_scroll,
+                p.web_dragdrop_paste.clone(),
+            )
+        };
+        let parsed: Config = toml::from_str(&rendered).unwrap();
+        let core: Config = toml::from_str(&dux_core::config_write::render_config_plain(
+            &Config::default(),
+        ))
+        .unwrap();
+        for name in ["cline", "kilocode", "ntl"] {
+            assert_eq!(key(&parsed, name), key(&Config::default(), name), "{name}");
+            assert_eq!(key(&core, name), key(&Config::default(), name), "{name}");
+        }
+        let kilo = parsed.providers.get("kilocode").unwrap();
+        assert_eq!(kilo.resume_args, Some(vec!["--continue".to_string()]));
+        assert_eq!(kilo.resume_wait_timeout_ms, Some(3_000));
     }
 
     #[test]

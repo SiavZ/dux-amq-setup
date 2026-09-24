@@ -2280,7 +2280,7 @@ pub fn default_terminal_args() -> Vec<String> {
 /// normalizer over the bytes dux sends. The table of what each one does, and the
 /// caveat that Copilot's value is a guess because it is closed source, lives on
 /// [`WebDragDropPaste`]. Read it before changing a value here.
-pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5] {
+pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8] {
     [
         (
             "claude",
@@ -2296,6 +2296,28 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5]
                 forward_scroll: None,
                 // Measured: strips one quote pair then unescapes, so quoting
                 // buys nothing and corrupts an apostrophe.
+                web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
+            },
+        ),
+        // Cline, Kilo Code and NTL: fork c2c44378. Order is the picker order,
+        // which the fork shipped as claude, cline, codex, opencode, kilocode,
+        // ntl, copilot, jcode. Their paste forms are NOT measured, so they get
+        // `bare`, the do-nothing form (see copilot below).
+        (
+            "cline",
+            ProviderCommandConfig {
+                command: "cline".to_string(),
+                // `--tui` keeps cline in its interactive UI; without it the CLI
+                // runs one task and exits.
+                args: vec!["--tui".to_string()],
+                // No cwd-scoped resume-latest.
+                resume_args: None,
+                resume_wait_timeout_ms: None,
+                resume_by_id_args: None,
+                oneshot_args: Vec::new(),
+                oneshot_output: OneshotOutput::Stdout,
+                install_hint: Some("npm install -g cline".to_string()),
+                forward_scroll: Some(true),
                 web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
             },
         ),
@@ -2329,6 +2351,43 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5]
                 install_hint: Some("curl -fsSL https://opencode.ai/install | bash".to_string()),
                 forward_scroll: None,
                 // Measured: strips quote characters and never splits on a space.
+                web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
+            },
+        ),
+        (
+            "kilocode",
+            ProviderCommandConfig {
+                // The Kilo Code CLI installs as `kilo`.
+                command: "kilo".to_string(),
+                args: Vec::new(),
+                resume_args: Some(vec!["--continue".to_string()]),
+                // Like opencode (its upstream): a `--continue` with nothing to
+                // continue can come up empty, so fall back to fresh after 3s.
+                resume_wait_timeout_ms: Some(3_000),
+                resume_by_id_args: None,
+                oneshot_args: Vec::new(),
+                oneshot_output: OneshotOutput::Stdout,
+                install_hint: Some("npm install -g @kilocode/cli".to_string()),
+                forward_scroll: Some(true),
+                web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
+            },
+        ),
+        (
+            "ntl",
+            ProviderCommandConfig {
+                command: "ntl".to_string(),
+                // `--agent` is NTL's interactive agent REPL.
+                args: vec!["--agent".to_string()],
+                resume_args: None,
+                resume_wait_timeout_ms: None,
+                resume_by_id_args: None,
+                oneshot_args: Vec::new(),
+                oneshot_output: OneshotOutput::Stdout,
+                install_hint: Some(
+                    "curl -fsSL https://notokenlimit.com/install.sh | bash".to_string(),
+                ),
+                // A plain line-mode REPL: dux's own scrollback is the history.
+                forward_scroll: Some(false),
                 web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
             },
         ),
@@ -5383,6 +5442,9 @@ mod agent_tabs_cap_tests {
             ("opencode", WebDragDropPaste::Bare),
             ("codex", WebDragDropPaste::SingleQuoted),
             ("copilot", WebDragDropPaste::Bare),
+            ("cline", WebDragDropPaste::Bare),
+            ("kilocode", WebDragDropPaste::Bare),
+            ("ntl", WebDragDropPaste::Bare),
         ] {
             assert_eq!(
                 providers

@@ -30292,6 +30292,46 @@ cyan = "#00ffff"
         assert_eq!(app.focus, FocusPane::Center);
     }
 
+    /// Port of fork c2c44378: a lone Escape the ambiguity timeout proves is not
+    /// the prefix of an arrow/function/Alt sequence reaches the agent as ESC
+    /// (it cancels a running turn in Claude Code and friends). Upstream already
+    /// resolves the timeout (`resolve_pending_bare_esc`); this guards that the
+    /// byte is forwarded, not only consumed as a binding.
+    #[test]
+    fn bare_escape_flushes_to_pty_after_ambiguity_timeout() {
+        let mut app = test_app(default_bindings());
+        let slot_tab = app.engine.sessions[0].slot_tab_id().to_string();
+        let output_dir = tempdir().expect("tempdir");
+        let output = output_dir.path().join("byte");
+        let args = vec![
+            "-c".to_string(),
+            "stty raw -echo; dd bs=1 count=1 2>/dev/null | od -An -tu1 > \"$1\"".to_string(),
+            "sh".to_string(),
+            output.to_string_lossy().into_owned(),
+        ];
+        let client = PtyClient::spawn("sh", &args, std::path::Path::new("."), 5, 40, 100)
+            .expect("spawn pty");
+        app.engine.providers.insert(TabId::new(slot_tab), client);
+        app.input_target = InputTarget::Agent;
+        app.session_surface = SessionSurface::Agent;
+        app.fullscreen_overlay = FullscreenOverlay::Agent;
+        // Let `stty raw` land before the byte is written.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        app.process_raw_input_bytes(b"\x1b").unwrap();
+        assert_eq!(app.raw_input_buf, b"\x1b", "held while ambiguous");
+        app.process_raw_input_bytes(&[]).unwrap();
+        assert!(app.raw_input_buf.is_empty());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !std::fs::read_to_string(&output).is_ok_and(|value| value.trim() == "27")
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(output).unwrap().trim(), "27");
+    }
+
     #[test]
     fn timed_out_bare_esc_can_exit_interactive() {
         let bindings = bindings_with_overrides(&[(Action::ToggleFullscreen, &["esc"])]);
