@@ -29,13 +29,15 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # rsync is used by finalize-claude-migration.sh and its bats tests; the
-      # image ships it today, but naming it here keeps an image change from
-      # turning into a confusing test failure.
-      - name: Install shellcheck, bats, jq, rsync
+      # rsync (finalize-claude-migration.sh), curl (dux-amq/install.sh preflight)
+      # and sqlite3 (the doctor's read-only DB test, which skips without it) are
+      # on the runner image today; naming them keeps an image change from
+      # turning into a confusing failure or a silent skip. Verified in a bare
+      # ubuntu:24.04: without curl the idempotency test fails.
+      - name: Install shellcheck, bats, jq, rsync, curl, sqlite3
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck bats jq rsync
+          sudo apt-get install -y shellcheck bats jq rsync curl sqlite3
 
       - name: shellcheck overlay scripts
         run: make overlay-shellcheck
