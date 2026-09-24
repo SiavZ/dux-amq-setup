@@ -1,0 +1,44 @@
+name: overlay-ci
+
+# Baseline CI for the dux-amq overlay (audit01 Phase 00): ShellCheck over every
+# executable overlay/installer script and the bats suite in dux-amq/tests.
+# `make overlay-test` runs the same two steps locally.
+#
+# The Rust side of the overlay contract (dux-amq/config/dux-config.sed and
+# dux-config-changes.toml against the current config schema) is a cargo test,
+# crates/dux/tests/overlay_config.rs, so it runs in pr.yml / test.yml.
+
+on:
+  pull_request:
+  # Push runs only for main (audit02 Phase 24, P2-9): the PR run already covers
+  # feature branches.
+  push:
+    branches: [main]
+
+# Least privilege: the job only reads source.
+permissions:
+  contents: read
+
+concurrency:
+  group: overlay-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # rsync is used by finalize-claude-migration.sh and its bats tests; the
+      # image ships it today, but naming it here keeps an image change from
+      # turning into a confusing test failure.
+      - name: Install shellcheck, bats, jq, rsync
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck bats jq rsync
+
+      - name: shellcheck overlay scripts
+        run: make overlay-shellcheck
+
+      - name: bats overlay tests
+        run: bats dux-amq/tests
