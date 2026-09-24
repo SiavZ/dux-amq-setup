@@ -4661,7 +4661,7 @@ mod tests {
             pending_config_reload_op: None,
             project_chooser_context: None,
             agent_filter: None,
-            test_scratch_dirs: vec![tmp.into()],
+            test_scratch_dirs: tmp.into(),
         };
         app.interactive_patterns = app.bindings.interactive_byte_patterns();
         app.rebuild_left_items();

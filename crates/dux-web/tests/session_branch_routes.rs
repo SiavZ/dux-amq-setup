@@ -93,7 +93,7 @@ fn standalone_session(id: &str, folder: &str) -> dux_core::model::AgentSession {
 struct Fixture {
     addr: SocketAddr,
     repo: std::path::PathBuf,
-    _tmp: tempfile::TempDir,
+    _tmp: dux_core::test_scratch::ScratchDir,
 }
 
 /// Boot a server over a real repo with three agents:
@@ -102,7 +102,7 @@ struct Fixture {
 /// - `duxs`, on a branch dux created for it,
 /// - `folder`, a standalone agent.
 async fn boot() -> Fixture {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
 
     let repo = root.join("repo");

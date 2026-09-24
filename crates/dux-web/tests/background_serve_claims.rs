@@ -56,8 +56,9 @@ fn sample_session(id: &str, worktree: &str) -> dux_core::model::AgentSession {
 /// An engine with agent `s1` running (`cat`, so typing echoes) and a standalone
 /// terminal running, in the state the terminal UI leaves it in before serving:
 /// its global workers already up.
-fn engine_with_an_agent_and_a_terminal_running() -> (Engine, String, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().unwrap();
+fn engine_with_an_agent_and_a_terminal_running()
+-> (Engine, String, dux_core::test_scratch::ScratchDir) {
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
     let paths = DuxPaths {
         root: root.clone(),

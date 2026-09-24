@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use axum::Router;
-use tempfile::TempDir;
+use dux_core::test_scratch::ScratchDir;
 
 use crate::engine_actor::EngineHandle;
 use crate::server;
@@ -44,8 +44,8 @@ pub(crate) fn test_engine_handle(tmp: &Path) -> EngineHandle {
 
 /// A fresh temp dir + an engine-backed router. Returns the `TempDir` so the
 /// caller keeps it alive for the test's duration.
-pub(crate) fn router_no_auth() -> (TempDir, Router) {
-    let tmp = tempfile::tempdir().unwrap();
+pub(crate) fn router_no_auth() -> (ScratchDir, Router) {
+    let tmp = ScratchDir::new();
     let router = server::router(test_engine_handle(tmp.path()));
     (tmp, router)
 }
@@ -55,8 +55,8 @@ pub(crate) fn router_no_auth() -> (TempDir, Router) {
 /// issue real HTTP/WebSocket requests against it. The `TempDir` is kept alive by
 /// the returned guard; drop it to clean up the engine's on-disk state.
 #[allow(dead_code)]
-pub(crate) async fn boot_plain_test_server() -> (TempDir, SocketAddr) {
-    let tmp = tempfile::tempdir().unwrap();
+pub(crate) async fn boot_plain_test_server() -> (ScratchDir, SocketAddr) {
+    let tmp = ScratchDir::new();
     let app = server::router(test_engine_handle(tmp.path()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

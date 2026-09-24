@@ -34,7 +34,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 
 struct Fixture {
     addr: SocketAddr,
-    tmp: tempfile::TempDir,
+    tmp: dux_core::test_scratch::ScratchDir,
     repo: PathBuf,
     /// The commit only `feature` has.
     feature_commit: String,
@@ -97,7 +97,7 @@ fn repo_on_a_feature_branch(root: &Path) -> (PathBuf, String) {
 }
 
 async fn boot() -> Fixture {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let (repo, feature_commit) = repo_on_a_feature_branch(tmp.path());
 
     let state = tmp.path().join("dux");

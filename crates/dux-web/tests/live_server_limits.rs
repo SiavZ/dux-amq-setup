@@ -41,9 +41,9 @@ fn sample_session(id: &str, worktree: &str) -> dux_core::model::AgentSession {
 async fn boot() -> (
     SocketAddr,
     std::sync::Arc<LiveServerLimits>,
-    tempfile::TempDir,
+    dux_core::test_scratch::ScratchDir,
 ) {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
     let wt1 = root.join("wt1");
     std::fs::create_dir_all(&wt1).unwrap();

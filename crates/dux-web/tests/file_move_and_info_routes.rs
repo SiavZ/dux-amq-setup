@@ -67,8 +67,12 @@ fn git(repo: &Path, args: &[&str]) {
 /// Boot a server with one session (`s1`) whose worktree is a real git
 /// repository holding a committed file, a subdirectory to move into, and a
 /// file with a non-Latin name.
-async fn boot() -> (SocketAddr, tempfile::TempDir, std::path::PathBuf) {
-    let tmp = tempfile::tempdir().unwrap();
+async fn boot() -> (
+    SocketAddr,
+    dux_core::test_scratch::ScratchDir,
+    std::path::PathBuf,
+) {
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
     let wt = root.join("wt1");
     std::fs::create_dir_all(&wt).unwrap();

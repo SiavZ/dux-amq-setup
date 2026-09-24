@@ -109,8 +109,8 @@ macro_rules! require_real_ui_build {
     };
 }
 
-fn temp_paths() -> (tempfile::TempDir, DuxPaths) {
-    let tmp = tempfile::tempdir().unwrap();
+fn temp_paths() -> (dux_core::test_scratch::ScratchDir, DuxPaths) {
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
     let paths = DuxPaths {
         root: root.clone(),
@@ -210,7 +210,7 @@ async fn unknown_path_falls_back_to_index() {
 }
 
 /// Build a router backed by a throwaway engine for static-asset assertions.
-fn test_router() -> (tempfile::TempDir, axum::Router) {
+fn test_router() -> (dux_core::test_scratch::ScratchDir, axum::Router) {
     let (tmp, paths) = temp_paths();
     let mut engine = bootstrap_engine(&paths).unwrap();
     dux_core::test_provider::defuse_config(&mut engine.config);

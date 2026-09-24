@@ -15917,7 +15917,7 @@ not_a_real_action = ["x"]
         // Point the second project at a real repo so branch inspection can run.
         let scratch = tempfile::tempdir().expect("tempdir");
         let repo = scratch.path().join("second-repo");
-        app.test_scratch_dirs.push(scratch.into());
+        app.test_scratch_dirs.push(scratch);
         std::fs::create_dir_all(&repo).unwrap();
         init_test_repo(&repo);
         app.engine.projects.push(Project {
@@ -36141,7 +36141,7 @@ cyan = "#00ffff"
     fn scratch_unborn_repo(app: &mut App) -> String {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().to_path_buf();
-        app.test_scratch_dirs.push(dir.into());
+        app.test_scratch_dirs.push(dir);
         run_git(&path, &["init", "-b", "main"]);
         run_git(&path, &["config", "user.name", "test"]);
         run_git(&path, &["config", "user.email", "t@t"]);
@@ -36153,7 +36153,7 @@ cyan = "#00ffff"
     fn scratch_plain_dir(app: &mut App) -> String {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().to_path_buf();
-        app.test_scratch_dirs.push(dir.into());
+        app.test_scratch_dirs.push(dir);
         path.to_string_lossy().to_string()
     }
 

@@ -40,8 +40,8 @@ fn sample_session(id: &str, worktree: &str) -> dux_core::model::AgentSession {
 /// Boot a server with one session (`s1`) whose worktree holds a dotfile, a
 /// plain file, and a subdirectory with a child file, so the tree listing has
 /// content to assert on.
-async fn boot() -> (SocketAddr, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().unwrap();
+async fn boot() -> (SocketAddr, dux_core::test_scratch::ScratchDir) {
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
     let wt1 = root.join("wt1");
     std::fs::create_dir_all(&wt1).unwrap();

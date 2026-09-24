@@ -48,8 +48,8 @@ fn sample_session(id: &str, project_id: &str, worktree: &str) -> dux_core::model
 
 /// Boot a server with one project and one session, both companion terminals and
 /// the provider overridden to `cat` so a create actually spawns something.
-async fn boot() -> (SocketAddr, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().unwrap();
+async fn boot() -> (SocketAddr, dux_core::test_scratch::ScratchDir) {
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
     let paths = DuxPaths {
         root: root.clone(),

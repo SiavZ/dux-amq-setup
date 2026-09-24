@@ -5911,7 +5911,7 @@ mod tests {
 
     /// An engine with one managed agent that has one extra tab, for the
     /// slot-tab resolvers.
-    fn engine_with_an_extra_tab() -> (Engine, tempfile::TempDir) {
+    fn engine_with_an_extra_tab() -> (Engine, crate::test_scratch::ScratchDir) {
         let (mut engine, tmp) = test_engine();
         engine
             .projects
@@ -6066,7 +6066,8 @@ mod tests {
     /// and skip the second: a plain folder has no branch to watch and no
     /// repository to ask GitHub about, and enrolling it would burn a git or
     /// `gh` call per cycle to produce an error nobody can act on.
-    fn engine_with_a_standalone_agent() -> (Engine, tempfile::TempDir, tempfile::TempDir) {
+    fn engine_with_a_standalone_agent()
+    -> (Engine, crate::test_scratch::ScratchDir, tempfile::TempDir) {
         let (mut engine, tmp) = test_engine();
         let folder = tempfile::tempdir().expect("folder");
         engine

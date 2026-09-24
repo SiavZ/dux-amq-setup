@@ -366,7 +366,7 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
         pending_config_reload_op: None,
         project_chooser_context: None,
         agent_filter: None,
-        test_scratch_dirs: vec![tmp.into()],
+        test_scratch_dirs: tmp.into(),
     };
     app.interactive_patterns = app.bindings.interactive_byte_patterns();
     app.rebuild_left_items();
@@ -581,85 +581,6 @@ fn test_app_opens_worktrees_only_in_the_stand_in_editor() {
         .open_worktree_in_editor(&path, "agent", &real)
         .unwrap_err();
     assert!(err.to_string().starts_with("test guard:"), "{err}");
-}
-
-/// A scratch directory a test app holds. Tests leave worker threads running
-/// that nobody joins (a dispatch running a subprocess, a worktree write), so
-/// one may still be writing into the directory at the moment the app drops. A
-/// single `remove_dir_all` then loses the race with ENOTEMPTY and `TempDir`
-/// swallows the error, leaving the directory behind. This guard retries for a
-/// bounded window instead. The window is a heuristic, not a guarantee: a worker
-/// still writing after it closes wins, and the guard then names the leftover
-/// path on stderr, so a leak is visible rather than silent.
-pub(crate) struct ScratchDir(Option<tempfile::TempDir>);
-
-impl ScratchDir {
-    /// How long a drop keeps trying before it gives up and reports the leak.
-    const REMOVAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
-    /// The pause between attempts, long enough for a writer to finish a file.
-    const RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
-}
-
-impl From<tempfile::TempDir> for ScratchDir {
-    fn from(dir: tempfile::TempDir) -> Self {
-        Self(Some(dir))
-    }
-}
-
-impl Drop for ScratchDir {
-    fn drop(&mut self) {
-        let Some(dir) = self.0.take() else { return };
-        // Take the path out of `TempDir` so its own single, silent attempt
-        // does not run; this drop owns the removal from here on.
-        let path = dir.keep();
-        let deadline = std::time::Instant::now() + Self::REMOVAL_WINDOW;
-        loop {
-            match std::fs::remove_dir_all(&path) {
-                Ok(()) => return,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
-                Err(err) if std::time::Instant::now() >= deadline => {
-                    eprintln!(
-                        "test scratch directory {} was left behind: {err}",
-                        path.display()
-                    );
-                    return;
-                }
-                Err(_) => std::thread::sleep(Self::RETRY_PAUSE),
-            }
-        }
-    }
-}
-
-/// A worker still writing into a scratch directory when the app drops must not
-/// leave the directory behind.
-#[test]
-fn a_scratch_dir_is_removed_while_a_worker_is_still_writing_into_it() {
-    use std::time::{Duration, Instant};
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().to_path_buf();
-    let guard = ScratchDir::from(dir);
-    let (first_write_tx, first_write_rx) = mpsc::channel();
-    let writer_path = path.clone();
-    let writer = std::thread::spawn(move || {
-        let until = Instant::now() + Duration::from_millis(300);
-        let mut n = 0u64;
-        while Instant::now() < until {
-            if std::fs::write(writer_path.join(format!("f{n}")), b"x").is_ok() && n == 0 {
-                let _ = first_write_tx.send(());
-            }
-            n += 1;
-        }
-    });
-    first_write_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("the writer started");
-    drop(guard);
-    writer.join().expect("the writer finished");
-    assert!(
-        !path.exists(),
-        "the scratch directory {} outlived its guard",
-        path.display()
-    );
 }
 
 /// The repository every test app is built on never signs a commit, even for a

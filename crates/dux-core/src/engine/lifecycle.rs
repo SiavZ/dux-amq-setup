@@ -1994,7 +1994,7 @@ mod recreate_tests {
     use crate::engine::test_support::{sample_project, sample_session, test_engine};
 
     /// An engine with one managed agent whose working copy has been deleted.
-    fn engine_with_a_missing_working_copy() -> (Engine, tempfile::TempDir) {
+    fn engine_with_a_missing_working_copy() -> (Engine, crate::test_scratch::ScratchDir) {
         let (mut engine, tmp) = test_engine();
         engine.projects.push(sample_project("p1", "/tmp/p1"));
         engine.sessions.push(sample_session("s1", "p1", "feat"));
@@ -3672,7 +3672,9 @@ mod tests {
     ///
     /// Returns once the child is reaped, and ASSERTS the premise, so a shell
     /// that behaved differently fails loudly rather than passing vacuously.
-    fn engine_with_reaped_but_undrained_agent(worktree: &Path) -> (Engine, TempDir) {
+    fn engine_with_reaped_but_undrained_agent(
+        worktree: &Path,
+    ) -> (Engine, crate::test_scratch::ScratchDir) {
         let (mut engine, tmp) = test_engine();
         engine
             .projects
@@ -3822,7 +3824,7 @@ mod tests {
         worktree: &Path,
         tab_id: &str,
         linger: &str,
-    ) -> (Engine, TempDir) {
+    ) -> (Engine, crate::test_scratch::ScratchDir) {
         let (mut engine, tmp) = test_engine();
         engine
             .projects
@@ -4342,7 +4344,7 @@ mod tests {
     /// a worktree that exists on disk (the tempdir), a project with no opt-out,
     /// and a resume-capable provider (claude). Each matrix test flips exactly
     /// one condition off and asserts the candidate disappears.
-    fn auto_reopen_fixture() -> (Engine, TempDir, tempfile::TempDir) {
+    fn auto_reopen_fixture() -> (Engine, crate::test_scratch::ScratchDir, tempfile::TempDir) {
         let (mut engine, tmp) = test_engine();
         engine.config.ui.auto_reopen_agents = true;
         let worktree = tempfile::tempdir().expect("worktree dir");
@@ -4514,7 +4516,8 @@ mod tests {
     /// the fact that the question was never answered deliberately. The
     /// structural switch is what this pins: folder exists, provider can resume,
     /// no project consult.
-    fn standalone_auto_reopen_fixture() -> (Engine, TempDir, tempfile::TempDir) {
+    fn standalone_auto_reopen_fixture()
+    -> (Engine, crate::test_scratch::ScratchDir, tempfile::TempDir) {
         let (mut engine, tmp) = test_engine();
         engine.config.ui.auto_reopen_agents = true;
         let folder = tempfile::tempdir().expect("folder");
@@ -6236,7 +6239,7 @@ mod tests {
         }
     }
 
-    fn detach_test_engine() -> (Engine, TempDir, TempDir) {
+    fn detach_test_engine() -> (Engine, crate::test_scratch::ScratchDir, TempDir) {
         let (mut engine, tmp) = test_engine();
         let worktree = tempfile::tempdir().expect("worktree dir");
         engine.projects.push(sample_project(

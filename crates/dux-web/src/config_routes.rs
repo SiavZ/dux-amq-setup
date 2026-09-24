@@ -593,11 +593,11 @@ mod tests {
         answer: dux_core::config::TailscaleModeOutcome,
         forced_no: bool,
     ) -> (
-        tempfile::TempDir,
+        dux_core::test_scratch::ScratchDir,
         axum::Router,
         std::sync::Arc<std::sync::Mutex<Vec<dux_core::config::TailscaleMode>>>,
     ) {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = crate::test_support::test_engine_handle(tmp.path());
         let (control, mut requests) = crate::serve_legs::TailscaleModeControl::new(
             tokio::runtime::Handle::current(),

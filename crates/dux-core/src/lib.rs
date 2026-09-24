@@ -71,6 +71,8 @@ pub mod terminal_title;
 pub mod test_git;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_provider;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_scratch;
 pub mod text;
 pub mod theme;
 pub mod urls;

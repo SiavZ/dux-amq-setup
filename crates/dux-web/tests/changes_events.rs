@@ -78,8 +78,8 @@ fn init_repo_with_unstaged(dir: &std::path::Path) {
 ///
 /// Also injects a test-only gated probe route `/api/_interest` returning the bus's
 /// currently-interested session ids (so a test can assert interest exactness).
-async fn boot() -> (SocketAddr, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().unwrap();
+async fn boot() -> (SocketAddr, dux_core::test_scratch::ScratchDir) {
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
 
     let wt1 = root.join("wt1");

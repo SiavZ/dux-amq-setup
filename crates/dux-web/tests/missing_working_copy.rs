@@ -58,7 +58,11 @@ fn sample_session(id: &str, worktree: &str, branch: &str) -> dux_core::model::Ag
 
 /// A server with one managed agent in a REAL worktree of a real project
 /// repository, so the recreate has a repository to check the branch out from.
-async fn boot() -> (SocketAddr, tempfile::TempDir, std::path::PathBuf) {
+async fn boot() -> (
+    SocketAddr,
+    dux_core::test_scratch::ScratchDir,
+    std::path::PathBuf,
+) {
     let (addr, tmp, worktree, _repo) = boot_with_repo().await;
     (addr, tmp, worktree)
 }
@@ -67,11 +71,11 @@ async fn boot() -> (SocketAddr, tempfile::TempDir, std::path::PathBuf) {
 /// tests that need to look at what git holds.
 async fn boot_with_repo() -> (
     SocketAddr,
-    tempfile::TempDir,
+    dux_core::test_scratch::ScratchDir,
     std::path::PathBuf,
     std::path::PathBuf,
 ) {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
 
     let repo = root.join("repo");

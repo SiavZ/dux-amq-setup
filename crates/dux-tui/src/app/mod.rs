@@ -816,7 +816,7 @@ pub struct App {
     /// thread the test never joined is still writing inside it. Declared last
     /// so it drops after every field that may still hold a file inside it open.
     #[cfg(test)]
-    pub(crate) test_scratch_dirs: Vec<test_support::ScratchDir>,
+    pub(crate) test_scratch_dirs: dux_core::test_scratch::ScratchDirs,
 }
 
 /// Handler-resolved outcome for the server-flip op (see
@@ -4002,7 +4002,7 @@ impl App {
             project_chooser_context: None,
             agent_filter: None,
             #[cfg(test)]
-            test_scratch_dirs: Vec::new(),
+            test_scratch_dirs: dux_core::test_scratch::ScratchDirs::new(),
         };
         // First boot relaunches prior sessions; a resume must not, because the
         // engine handed back from the web server already owns the live providers, and

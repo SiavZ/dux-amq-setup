@@ -3732,7 +3732,7 @@ mod tests {
     /// handler is wired and resolves the worktree before doing any git work).
     #[tokio::test]
     async fn nested_git_unknown_session_is_404() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         let app = build_app(handle, Router::new(), RouterParams::plain_http());
 
@@ -3786,7 +3786,7 @@ mod tests {
     /// `id_within_bound` guard before any engine lookup runs.
     #[tokio::test]
     async fn nested_git_oversized_id_is_404() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         let app = build_app(handle, Router::new(), RouterParams::plain_http());
 
@@ -3805,7 +3805,7 @@ mod tests {
     /// write handler resolves the worktree before touching the filesystem).
     #[tokio::test]
     async fn nested_file_unknown_session_is_404() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         let app = build_app(handle, Router::new(), RouterParams::plain_http());
 
@@ -3901,7 +3901,7 @@ mod tests {
     /// `id_within_bound` guard before any engine lookup runs.
     #[tokio::test]
     async fn nested_file_oversized_id_is_404() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         let app = build_app(handle, Router::new(), RouterParams::plain_http());
 
@@ -4076,7 +4076,7 @@ mod tests {
     /// they now fall through to the SPA static fallback.
     #[tokio::test]
     async fn removed_project_git_routes_are_gone() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         let app = build_app(handle, Router::new(), RouterParams::plain_http());
 
@@ -4113,7 +4113,7 @@ mod tests {
     /// 404 (they resolve the worktree before dispatching any work).
     #[tokio::test]
     async fn session_actions_unknown_session_is_404() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         let app = build_app(handle, Router::new(), RouterParams::plain_http());
 
@@ -4138,7 +4138,7 @@ mod tests {
     /// 404 (they check existence before dispatching).
     #[tokio::test]
     async fn project_actions_unknown_project_is_404() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         let app = build_app(handle, Router::new(), RouterParams::plain_http());
 
@@ -4165,7 +4165,7 @@ mod tests {
     /// an unknown project both reject before any worker spawns.
     #[tokio::test]
     async fn create_routes_reject_bad_input_with_400() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         let app = build_app(handle, Router::new(), RouterParams::plain_http());
 
@@ -4210,7 +4210,7 @@ mod tests {
     /// to the SPA fallback, which never returns the handler's 404.
     #[tokio::test]
     async fn nested_git_and_file_routes_reach_handlers() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         let app = build_app(handle, Router::new(), RouterParams::plain_http());
 
@@ -4684,7 +4684,7 @@ mod tests {
     /// the session layer) is exercised, and captured via the console writer seam.
     #[tokio::test]
     async fn access_log_emits_request_lines_and_skips_healthz() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         let (console, sink) = Console::test_capture(false);
         let params = RouterParams::plain_http().with_console(console, true);
@@ -4750,7 +4750,7 @@ mod tests {
     /// console is active.
     #[tokio::test]
     async fn access_log_toggle_off_emits_nothing() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         let (console, sink) = Console::test_capture(false);
         // access_log = false.
@@ -4778,7 +4778,7 @@ mod tests {
     /// reload writes, not the value frozen into the router at bind time.
     #[tokio::test]
     async fn a_reloaded_access_log_toggle_takes_effect_on_the_next_request() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         let limits = handle.live_limits();
         let (console, sink) = Console::test_capture(false);
@@ -4819,7 +4819,7 @@ mod tests {
     /// This is the flip zero-stdout regression guard at the middleware layer.
     #[tokio::test]
     async fn access_log_noop_console_emits_nothing() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         // The default plain_http params carry a no-op console; force access_log on
         // to prove the console-activity gate (not just the toggle) suppresses it.
@@ -5673,7 +5673,7 @@ mod tests {
     /// expects (the 11 fields moved off the per-tick ViewModel).
     #[tokio::test]
     async fn bootstrap_route_returns_expected_fields() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         let app = build_app(handle, Router::new(), RouterParams::plain_http());
 
@@ -5750,7 +5750,7 @@ mod tests {
     /// is the chain a `config`-subscribed client relies on to refetch bootstrap.
     #[tokio::test]
     async fn real_config_reload_emits_config_changed_on_the_bus() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         let bus = Arc::new(EventBus::new());
         let mut bus_rx = bus.subscribe();
@@ -5781,7 +5781,7 @@ mod tests {
     /// `PersistGlobalEnv`, `SetChangesPaneVisible`) share this chain.
     #[tokio::test]
     async fn macro_save_emits_config_changed_on_the_bus() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         let bus = Arc::new(EventBus::new());
         let mut bus_rx = bus.subscribe();
@@ -5812,7 +5812,7 @@ mod tests {
     /// `config.changed` so clients refetch bootstrap.
     #[tokio::test]
     async fn global_env_save_emits_config_changed_on_the_bus() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         let bus = Arc::new(EventBus::new());
         let mut bus_rx = bus.subscribe();
@@ -5839,7 +5839,7 @@ mod tests {
     /// with 403 before reaching any handler; `localhost` passes through.
     #[tokio::test]
     async fn host_guard_rejects_unknown_host_and_allows_localhost() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         let app = build_app(
             handle,
@@ -5895,7 +5895,7 @@ mod tests {
         // The router is built once per serve and the mode can change under it, so
         // the whole stack (not just the allowlist) has to answer differently on
         // the same app instance.
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         let literals = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let app = build_app(
@@ -5932,7 +5932,7 @@ mod tests {
 
     #[tokio::test]
     async fn host_guard_serves_a_tailnet_host_while_only_loopback_is_bound() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         let app = build_app(
             handle,
@@ -5986,7 +5986,7 @@ mod tests {
     /// request forgery defense). The Origin authority does not match Host.
     #[tokio::test]
     async fn cross_origin_post_mutation_is_403() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         let app = build_app(handle, Router::new(), RouterParams::plain_http());
 
@@ -6016,7 +6016,7 @@ mod tests {
     /// NOT fall through to the no-Origin allow path.
     #[tokio::test]
     async fn post_with_null_origin_is_403() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         // No host guard needed -- the Origin check fires independently.
         let app = build_app(handle, Router::new(), RouterParams::plain_http());
@@ -6046,7 +6046,7 @@ mod tests {
     /// client is trusted to not be a hijacked browser tab.
     #[tokio::test]
     async fn post_with_no_origin_reaches_handler() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         let app = build_app(handle, Router::new(), RouterParams::plain_http());
 

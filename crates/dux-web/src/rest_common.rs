@@ -527,8 +527,9 @@ mod tests {
     /// no permission games and so behaves the same under root. The wait for the
     /// final to reach the snapshot is what makes the assertions below about a
     /// PRESENT final rather than an absent one.
-    async fn engine_with_a_failed_add() -> (tempfile::TempDir, EngineHandle, String) {
-        let tmp = tempfile::tempdir().unwrap();
+    async fn engine_with_a_failed_add() -> (dux_core::test_scratch::ScratchDir, EngineHandle, String)
+    {
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let engine = crate::test_support::test_engine_handle(tmp.path());
 
         let repo = tmp.path().join("staged-repo");

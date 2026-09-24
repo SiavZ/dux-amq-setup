@@ -251,7 +251,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_resources_returns_dux_and_total_rows() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let router = crate::server::router(test_engine_handle(tmp.path()));
 
         let resp = router
@@ -284,7 +284,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_resources_503_when_engine_gone() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = test_engine_handle(tmp.path());
         let router = crate::server::router(handle.clone());
         // Stop the actor loop: the handle's round-trip now fails, which must read
@@ -305,7 +305,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_resource_requests_collapse_to_one_collection() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let svc = ResourceService::new(test_engine_handle(tmp.path()));
 
         // Many browsers hitting a cold cache at once must not each walk the
@@ -327,7 +327,7 @@ mod tests {
 
     #[tokio::test]
     async fn resource_cache_serves_within_ttl() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let svc = ResourceService::new(test_engine_handle(tmp.path()));
 
         assert!(svc.get().await.is_some());
@@ -346,7 +346,7 @@ mod tests {
 
     #[tokio::test]
     async fn resource_sample_walks_again_once_the_ttl_expires() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let svc = ResourceService::new(test_engine_handle(tmp.path()));
 
         assert!(svc.get().await.is_some());

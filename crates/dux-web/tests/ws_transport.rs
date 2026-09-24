@@ -47,8 +47,8 @@ fn sample_session(
     }
 }
 
-async fn boot() -> (SocketAddr, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().unwrap();
+async fn boot() -> (SocketAddr, dux_core::test_scratch::ScratchDir) {
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
     let paths = DuxPaths {
         root: root.clone(),
@@ -119,8 +119,8 @@ async fn boot() -> (SocketAddr, tempfile::TempDir) {
 /// Like `boot()`, but the session's worktree is a REAL git repo: `f.txt` is
 /// committed with three lines, then its working copy is modified WITHOUT a
 /// commit so a working-tree-vs-HEAD diff exists.
-async fn boot_with_repo() -> (SocketAddr, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().unwrap();
+async fn boot_with_repo() -> (SocketAddr, dux_core::test_scratch::ScratchDir) {
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
 
     // Build the git repo at the worktree root.
@@ -391,7 +391,7 @@ async fn http_file_raw_serves_bytes_and_rejects_traversal() {
 /// `git worktree add` succeeds, and no session is seeded (the test creates one).
 /// `pull_before_creating_agent_by_default` is disabled because the test repo has
 /// no remote, so a pre-create pull would fail.
-async fn boot_for_create_agent() -> (SocketAddr, tempfile::TempDir) {
+async fn boot_for_create_agent() -> (SocketAddr, dux_core::test_scratch::ScratchDir) {
     boot_for_create_agent_window(None, |_, _| {}).await
 }
 
@@ -407,8 +407,8 @@ const DEFERRED_WINDOW: Duration = Duration::from_millis(1);
 async fn boot_for_create_agent_window(
     create_await: Option<Duration>,
     prepare: impl FnOnce(&mut dux_core::engine::Engine, &std::path::Path),
-) -> (SocketAddr, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().unwrap();
+) -> (SocketAddr, dux_core::test_scratch::ScratchDir) {
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
 
     let run = |args: &[&str]| {
@@ -627,8 +627,12 @@ async fn saw_status_tone(ws: &mut ClientWs, tone: &str, timeout: Duration) -> Op
 ///
 /// Returns the FIFO path; writing anything to it lets the command exit and the
 /// keyed final arrive.
-async fn boot_with_gated_startup_command() -> (SocketAddr, std::path::PathBuf, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().unwrap();
+async fn boot_with_gated_startup_command() -> (
+    SocketAddr,
+    std::path::PathBuf,
+    dux_core::test_scratch::ScratchDir,
+) {
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
     let gate = root.join("startup-gate");
     let made = std::process::Command::new("mkfifo")
@@ -1489,8 +1493,8 @@ async fn rest_create_session_idempotency_replays_same_session() {
 /// Like `boot()`, but seeds TWO sessions (`s1`, `s2`) under `p1`, so the nested
 /// terminal PTY socket's session-ownership enforcement can be exercised (a `:tid`
 /// created under `s1` must be rejected on the `s2` path).
-async fn boot_two_sessions() -> (SocketAddr, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().unwrap();
+async fn boot_two_sessions() -> (SocketAddr, dux_core::test_scratch::ScratchDir) {
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
     let paths = DuxPaths {
         root: root.clone(),

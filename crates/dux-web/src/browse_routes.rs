@@ -509,7 +509,7 @@ mod tests {
         // the layered `rest_mutation_origin_check`.
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path().to_string_lossy().to_string();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = crate::test_support::test_engine_handle(tmp.path());
         let app = crate::server::build_app(
             handle,

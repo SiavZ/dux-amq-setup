@@ -62,7 +62,7 @@ fn sample_session(id: &str, worktree: &str) -> dux_core::model::AgentSession {
 
 struct Fixture {
     addr: SocketAddr,
-    _tmp: tempfile::TempDir,
+    _tmp: dux_core::test_scratch::ScratchDir,
     /// An adoptable, clean managed worktree.
     free: PathBuf,
     /// An adoptable managed worktree holding an untracked file.
@@ -76,7 +76,7 @@ struct Fixture {
 /// Boot a server over a real repo (project `p1`, name `repo`) with three managed
 /// worktrees plus one external one, and a single session holding `held`.
 async fn boot() -> Fixture {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
 
     let repo = root.join("repo");

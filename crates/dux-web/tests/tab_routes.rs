@@ -46,12 +46,14 @@ fn sample_session(id: &str, worktree: &str) -> dux_core::model::AgentSession {
 /// provider `claude` is overridden to `cat` (a runnable program that holds its
 /// stdin open) so a created tab's async launch succeeds and its row persists for
 /// the assertions that follow.
-async fn boot() -> (SocketAddr, tempfile::TempDir) {
+async fn boot() -> (SocketAddr, dux_core::test_scratch::ScratchDir) {
     boot_with_tab_per_agent(dux_core::config::DEFAULT_MAX_WEBSOCKET_TABS_PER_AGENT).await
 }
 
-async fn boot_with_tab_per_agent(tab_per_agent: u32) -> (SocketAddr, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().unwrap();
+async fn boot_with_tab_per_agent(
+    tab_per_agent: u32,
+) -> (SocketAddr, dux_core::test_scratch::ScratchDir) {
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
     let wt1 = root.join("wt1");
     let wt2 = root.join("wt2");
@@ -123,7 +125,7 @@ async fn boot_with_tab_per_agent(tab_per_agent: u32) -> (SocketAddr, tempfile::T
 /// Like `boot()`, but also configures a `"broken"` provider whose command is a
 /// nonexistent binary, so a tab created against it fails its async launch
 /// instead of coming up live.
-async fn boot_with_broken_provider() -> (SocketAddr, tempfile::TempDir) {
+async fn boot_with_broken_provider() -> (SocketAddr, dux_core::test_scratch::ScratchDir) {
     boot_with_broken_provider_and_claude("cat").await
 }
 
@@ -132,8 +134,8 @@ async fn boot_with_broken_provider() -> (SocketAddr, tempfile::TempDir) {
 /// to make the slot tab's launch fail the way a broken resume does.
 async fn boot_with_broken_provider_and_claude(
     claude_command: &str,
-) -> (SocketAddr, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().unwrap();
+) -> (SocketAddr, dux_core::test_scratch::ScratchDir) {
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
     let wt1 = root.join("wt1");
     std::fs::create_dir_all(&wt1).unwrap();

@@ -620,7 +620,7 @@ mod tests {
     }
 
     /// A resumed provider that exited after printing `rows` lines.
-    fn engine_with_an_exited_resume(rows: &[&str]) -> (Engine, tempfile::TempDir) {
+    fn engine_with_an_exited_resume(rows: &[&str]) -> (Engine, crate::test_scratch::ScratchDir) {
         engine_with_an_exited_resume_printing(&(rows.join("\\n") + "\\n"))
     }
 
@@ -630,7 +630,9 @@ mod tests {
     /// fresh relaunch fails at once instead of starting a real CLI on this
     /// machine. Returns once the child has exited, which is the state the
     /// maintenance order below expects.
-    fn engine_with_an_exited_resume_printing(payload: &str) -> (Engine, tempfile::TempDir) {
+    fn engine_with_an_exited_resume_printing(
+        payload: &str,
+    ) -> (Engine, crate::test_scratch::ScratchDir) {
         use crate::pty::PtyClient;
         use std::time::Instant;
 

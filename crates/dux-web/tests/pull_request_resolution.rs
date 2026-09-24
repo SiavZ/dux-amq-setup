@@ -44,8 +44,11 @@ fn git_isolated(dir: &Path, args: &[&str]) {
 
 /// Boot a server whose projects are `(id, name, origin address)`, with GitHub
 /// integration on and the given hosts eligible.
-async fn boot(projects: &[(&str, &str, &str)], hosts: &[&str]) -> (SocketAddr, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().unwrap();
+async fn boot(
+    projects: &[(&str, &str, &str)],
+    hosts: &[&str],
+) -> (SocketAddr, dux_core::test_scratch::ScratchDir) {
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
     let paths = DuxPaths {
         root: root.clone(),
