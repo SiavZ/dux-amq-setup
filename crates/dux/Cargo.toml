@@ -11,3 +11,5 @@ anyhow.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+chrono.workspace = true
+toml = "1.1.2"
