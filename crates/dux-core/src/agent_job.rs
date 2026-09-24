@@ -1034,6 +1034,16 @@ fn run_create_standalone_agent_job(
         // A brand-new standalone agent starts a fresh conversation; the dynamic
         // per-provider resume rule applies to later launches like any agent's.
         resume: false,
+        // A fresh conversation: capture its id so the next launch resumes it.
+        provider_session: crate::resume_recovery::fresh_capture_for(
+            session.provider.as_str(),
+            &provider_cfg,
+        ),
+        // A brand-new agent has no saved settings yet, so YOLO adds nothing.
+        // Never read the store here: `SessionStore::open` runs migrate(), whose
+        // orphan-tab sweep can delete a row the engine just inserted.
+        yolo_args: crate::session_settings::SessionSettings::default()
+            .yolo_launch_args(&session.provider),
         session,
         provider_config: provider_cfg,
         env,
@@ -1194,6 +1204,17 @@ fn run_create_shared_agent_job(
         tab_id: session.slot_tab_id().to_owned(),
         provider: session.provider.clone(),
         resume: false,
+        // A shared agent can only ever resume by id, so its fresh conversation
+        // must be captured from the very first launch.
+        provider_session: crate::resume_recovery::fresh_capture_for(
+            session.provider.as_str(),
+            &provider_cfg,
+        ),
+        // A brand-new agent has no saved settings yet, so YOLO adds nothing.
+        // Never read the store here: `SessionStore::open` runs migrate(), whose
+        // orphan-tab sweep can delete a row the engine just inserted.
+        yolo_args: crate::session_settings::SessionSettings::default()
+            .yolo_launch_args(&session.provider),
         session,
         provider_config: provider_cfg,
         env,
@@ -1419,6 +1440,19 @@ fn launch_managed_create(
         // session.provider. (Evaluated before `session` is moved.)
         tab_id: session.slot_tab_id().to_owned(),
         provider: session.provider.clone(),
+        // A create that continues an existing worktree's conversation resumes
+        // the provider's latest one there (no id is known yet); a fresh one
+        // captures its id so the next launch resumes exactly it.
+        provider_session: if launch_with_resume {
+            crate::resume_recovery::ProviderSessionLaunch::Plain
+        } else {
+            crate::resume_recovery::fresh_capture_for(session.provider.as_str(), &provider_cfg)
+        },
+        // A brand-new agent has no saved settings yet, so YOLO adds nothing.
+        // Never read the store here: `SessionStore::open` runs migrate(), whose
+        // orphan-tab sweep can delete a row the engine just inserted.
+        yolo_args: crate::session_settings::SessionSettings::default()
+            .yolo_launch_args(&session.provider),
         session,
         provider_config: provider_cfg,
         env,
@@ -1514,18 +1548,6 @@ pub fn run_create_agent_job(
     );
 }
 pub fn run_agent_launch_job(request: AgentLaunchRequest, worker_tx: Sender<WorkerEvent>) {
-    let launch_args = request.provider_config.interactive_args(request.resume);
-    let (rows, cols) = request.pty_size;
-    logger::debug(&format!(
-        "spawning PTY {:?} {:?} in {} ({}x{}, resume_supported={})",
-        request.provider_config.command,
-        launch_args,
-        request.session.directory(),
-        cols,
-        rows,
-        request.provider_config.supports_session_resume()
-    ));
-
     if let Err(message) = check_provider_available(&request.provider_config) {
         logger::error(&format!(
             "provider availability check failed for {}: {message}",
@@ -1547,6 +1569,54 @@ pub fn run_agent_launch_job(request: AgentLaunchRequest, worker_tx: Sender<Worke
         return;
     }
 
+    // Anything that can go wrong before the spawn here fails CLOSED to the
+    // upstream launch: an uncaptured conversation is still a working agent.
+    let capture = crate::resume_recovery::ProviderDataRoots::from_home()
+        .and_then(|roots| {
+            crate::resume_recovery::prepare_fresh_capture(
+                &request.provider_session,
+                Path::new(request.session.directory()),
+                &roots,
+            )
+        })
+        .unwrap_or_else(|err| {
+            logger::warn(&format!(
+                "conversation capture skipped for {}: {err:#}",
+                request.session.id
+            ));
+            crate::resume_recovery::PreparedCapture::None
+        });
+    let mut launch_args = match crate::resume_recovery::launch_args(
+        &request.provider_config,
+        request.provider.as_str(),
+        &request.provider_session,
+        request.resume,
+        capture.claude_session_id(),
+        Path::new(request.session.directory()),
+    ) {
+        Ok(args) => args,
+        Err(err) => {
+            capture.abort();
+            let message = format!("{err:#}");
+            let _ = worker_tx.send(WorkerEvent::AgentLaunchFailed(Box::new(
+                AgentLaunchFailedData { request, message },
+            )));
+            return;
+        }
+    };
+    // After the resume, resume-by-id or fresh args: YOLO flags modify the
+    // launch whichever way it reaches its conversation.
+    launch_args.extend(request.yolo_args.iter().cloned());
+    let (rows, cols) = request.pty_size;
+    logger::debug(&format!(
+        "spawning PTY {:?} {:?} in {} ({}x{}, resume_supported={})",
+        request.provider_config.command,
+        launch_args,
+        request.session.directory(),
+        cols,
+        rows,
+        request.provider_config.supports_session_resume()
+    ));
     let client = match crate::pty::PtyClient::spawn_with_env_opts(
         &request.provider_config.command,
         &launch_args,
@@ -1562,6 +1632,7 @@ pub fn run_agent_launch_job(request: AgentLaunchRequest, worker_tx: Sender<Worke
     ) {
         Ok(client) => client,
         Err(err) => {
+            capture.abort();
             logger::error(&format!(
                 "PTY spawn failed for {}: {err}",
                 request.session.id
@@ -1588,9 +1659,69 @@ pub fn run_agent_launch_job(request: AgentLaunchRequest, worker_tx: Sender<Worke
         }
     };
     logger::info(&format!("PTY session started for {}", request.session.id));
+    let session_id = request.session.id.clone();
+    let process_id = client.child_process_id();
     let _ = worker_tx.send(WorkerEvent::AgentLaunchReady(Box::new(
         AgentLaunchReadyData { request, client },
     )));
+    // After the ready event, on the same FIFO channel: a newly created agent's
+    // row is only written when its launch-ready event is processed, and the id
+    // has nowhere to go before that.
+    report_fresh_capture(capture, &session_id, process_id, &worker_tx);
+}
+
+/// Hand a started launch's capture back to the engine: a Claude id at once
+/// (the launch that uses it is up, so it can replace the previous id now), a
+/// Codex id once Codex writes the rollout for its first turn, which can be
+/// minutes later, so that wait runs on its own thread.
+fn report_fresh_capture(
+    capture: crate::resume_recovery::PreparedCapture,
+    session_id: &str,
+    process_id: Option<u32>,
+    worker_tx: &Sender<WorkerEvent>,
+) {
+    match capture {
+        crate::resume_recovery::PreparedCapture::None => {}
+        crate::resume_recovery::PreparedCapture::Claude(id) => {
+            let _ = worker_tx.send(WorkerEvent::ProviderSessionCaptured {
+                session_id: session_id.to_string(),
+                provider: "claude".to_string(),
+                result: Ok(id),
+            });
+        }
+        crate::resume_recovery::PreparedCapture::Codex(capture) => {
+            let tx = worker_tx.clone();
+            let session_id = session_id.to_string();
+            // If the thread cannot start, dropping the still-active capture
+            // fails closed in its coordinator (see `CodexCapture`'s `Drop`).
+            let _ = std::thread::Builder::new()
+                .name("codex-session-capture".to_string())
+                .spawn(move || {
+                    let result = match capture.wait_for_id(None, process_id) {
+                        Ok(Some(id)) => {
+                            capture.resolve();
+                            Ok(id)
+                        }
+                        // Codex exited before writing a rollout: nothing to
+                        // capture, and nothing went wrong.
+                        Ok(None) => {
+                            capture.abort();
+                            return;
+                        }
+                        Err(err) => {
+                            let message = format!("{err:#}");
+                            capture.block(&message);
+                            Err(message)
+                        }
+                    };
+                    let _ = tx.send(WorkerEvent::ProviderSessionCaptured {
+                        session_id,
+                        provider: "codex".to_string(),
+                        result,
+                    });
+                });
+        }
+    }
 }
 
 #[cfg(test)]

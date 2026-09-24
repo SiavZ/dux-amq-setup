@@ -132,6 +132,7 @@ pub(crate) fn test_engine() -> (Engine, TempDir) {
         live_status_keys: Default::default(),
         last_created_op_id: None,
         created_session_by_op: HashMap::new(),
+        startup_launches: Default::default(),
     };
     (engine, tmp)
 }

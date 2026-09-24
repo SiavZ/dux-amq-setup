@@ -88,6 +88,9 @@ pub mod working_copy;
 pub mod working_cue;
 pub mod worktree_file;
 pub mod worktree_manager;
+// Resume-by-provider-session-id and startup auto-resume (resume port).
+pub mod auto_resume;
+pub mod resume_recovery;
 // Fork port: AMQ inject/orchestrator and per-session settings.
 pub mod amq;
 pub mod session_settings;

@@ -437,6 +437,17 @@ fn config_schema() -> Vec<ConfigEntry> {
             )),
             value_fn: |c| FieldValue::Bool(c.defaults.copy_uncommitted_changes_by_default),
         },
+        ConfigEntry::Field {
+            key: "auto_resume_on_start",
+            comment: Some(CommentSource::Static(
+                "# When true, every agent whose directory still exists is relaunched at\n\
+                 # startup, so all panes are live as soon as dux opens, not just the ones\n\
+                 # ui.auto_reopen_agents would reopen. Launches resume each agent's own\n\
+                 # conversation where dux knows it. Throttled by [auto_resume].\n\
+                 # Caveat: N agents at once means N provider processes (CPU/RAM). Default false.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.defaults.auto_resume_on_start),
+        },
         ConfigEntry::Blank,
         ConfigEntry::Env,
         ConfigEntry::Blank,
@@ -933,6 +944,33 @@ fn config_schema() -> Vec<ConfigEntry> {
                 "# Preferred editor for \"open in editor\": the TUI's open-worktree action\n# and the web code editor's \"Open editor\" menu (the web menu lets you pick per\n# open and is only enabled for local-access URLs; this is its fallback). Supported\n# values are matched against popular editor CLIs on PATH (for example: cursor,\n# vscode/code, zed, vscodium, sublime).",
             )),
             value_fn: |c| FieldValue::Str(c.editor.default.clone()),
+        },
+        ConfigEntry::Blank,
+        ConfigEntry::Section("auto_resume"),
+        ConfigEntry::Field {
+            key: "concurrency",
+            comment: Some(CommentSource::Static(
+                "# Throttle for startup relaunches (ui.auto_reopen_agents and\n\
+                 # defaults.auto_resume_on_start). At most this many agents start at once.\n\
+                 # Lower = slower startup but less load on provider APIs. 0 means 1. Default 4.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.auto_resume.concurrency),
+        },
+        ConfigEntry::Field {
+            key: "stale_days",
+            comment: Some(CommentSource::Static(
+                "# Do not relaunch an agent at startup whose directory has not been modified\n\
+                 # within this many days. 0 disables the filter. Default 30.",
+            )),
+            value_fn: |c| FieldValue::U32(c.auto_resume.stale_days),
+        },
+        ConfigEntry::Field {
+            key: "stagger_ms",
+            comment: Some(CommentSource::Static(
+                "# Minimum gap in milliseconds between two startup relaunches, so many\n\
+                 # agents do not all open their provider connection at once. Default 250.",
+            )),
+            value_fn: |c| FieldValue::U64(c.auto_resume.stagger_ms),
         },
         ConfigEntry::Blank,
         ConfigEntry::Section("server"),
@@ -2102,6 +2140,21 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
         "resume_wait_timeout_ms = {}\n",
         config.resume_wait_timeout_ms.unwrap_or(0)
     ));
+    out.push_str(
+        "# Optional args that resume ONE specific conversation by its id. dux replaces the\n\
+         # exact token \"{session_id}\" with the id it recorded for this agent, so several\n\
+         # agents in one directory each get their own conversation back. Preferred over\n\
+         # resume_args whenever dux knows the id; resume_args stays the fallback.\n\
+         # These args replace `args`, so repeat any base flag you still need here.\n\
+         # Leave the key absent for CLIs with no resume-by-id; set [] to opt out.\n",
+    );
+    match &config.resume_by_id_args {
+        Some(args) => out.push_str(&format!(
+            "resume_by_id_args = {}\n",
+            render_string_list(args)
+        )),
+        None => out.push_str("# resume_by_id_args = [\"--resume\", \"{session_id}\"]\n"),
+    }
     if let Some(hint) = &config.install_hint {
         out.push_str("# Hint shown to the user when the provider command is not found on PATH.\n");
         out.push_str(&format!(
@@ -2359,6 +2412,43 @@ mod tests {
         let bindings =
             crate::keybindings::RuntimeBindings::from_keys_config(&KeysConfig::default());
         render_config(config, &bindings)
+    }
+
+    /// A user's own `resume_by_id_args` and the comment beside it survive an
+    /// unrelated save.
+    #[test]
+    fn save_config_preserves_targeted_resume_args_and_adjacent_comment() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let mut body = render_default_config();
+        let default_line = body
+            .lines()
+            .find(|line| line.starts_with("resume_by_id_args = "))
+            .expect("Claude targeted resume line")
+            .to_string();
+        body = body.replacen(
+            &default_line,
+            "# keep my exact provider flags\nresume_by_id_args = [\"--resume\", \"{session_id}\", \"--custom\"]",
+            1,
+        );
+        fs::write(&config_path, &body).expect("write config");
+
+        let mut config: Config = toml::from_str(&body).expect("parse config");
+        config.ui.right_width_pct = 31;
+        let bindings = crate::keybindings::RuntimeBindings::from_keys_config(&config.keys);
+        save_config(&config_path, &config, &bindings).expect("save config");
+
+        let saved = fs::read_to_string(&config_path).expect("read config");
+        assert!(saved.contains("# keep my exact provider flags"));
+        let reloaded: Config = toml::from_str(&saved).expect("reload config");
+        assert_eq!(
+            reloaded.providers.commands["claude"].resume_by_id_args,
+            Some(vec![
+                "--resume".to_string(),
+                "{session_id}".to_string(),
+                "--custom".to_string(),
+            ])
+        );
     }
 
     /// Every provider block documents `forward_mouse` inline; the ones that ship
@@ -2918,6 +3008,45 @@ mod tests {
         validate_server_host(&config).expect("0.0.0.0 is a valid host");
         config.server.host = "127.0.0.1".to_string();
         validate_server_host(&config).expect("loopback is a valid host");
+    }
+
+    /// Every shipped provider's targeted-resume args survive the documented
+    /// render and a raw parse back. A default that only lives in memory is lost
+    /// the moment a user edits the provider block, and is undocumented.
+    /// The documented render carries `auto_resume_on_start` and `[auto_resume]`
+    /// with their docs, and they parse back to the values rendered.
+    #[test]
+    fn documented_render_round_trips_auto_resume_settings() {
+        let rendered = render_default_config();
+        assert!(rendered.contains("auto_resume_on_start = false"));
+        assert!(rendered.contains("[auto_resume]"));
+        assert!(rendered.contains("# Throttle for startup relaunches"));
+        let mut config = Config::default();
+        config.defaults.auto_resume_on_start = true;
+        config.auto_resume.concurrency = 2;
+        config.auto_resume.stagger_ms = 10;
+        let parsed: Config =
+            toml::from_str(&render_config_documented(&config)).expect("rendered config parses");
+        assert!(parsed.defaults.auto_resume_on_start);
+        assert_eq!(parsed.auto_resume, config.auto_resume);
+    }
+
+    #[test]
+    fn documented_render_round_trips_every_default_resume_by_id_args() {
+        let rendered = render_default_config();
+        let parsed: Config = toml::from_str(&rendered).expect("rendered config parses");
+        for (name, stock) in dux_core::config::default_provider_commands() {
+            let got = parsed
+                .providers
+                .commands
+                .get(name)
+                .unwrap_or_else(|| panic!("provider {name} missing from render"));
+            assert_eq!(
+                got.resume_by_id_args, stock.resume_by_id_args,
+                "providers.{name}.resume_by_id_args did not round-trip"
+            );
+        }
+        assert!(rendered.contains("{session_id}"));
     }
 
     #[test]
@@ -3642,8 +3771,6 @@ agent_scrollback_lines = 10000
             resume_args: Some(vec!["--resume".to_string(), "--last".to_string()]),
             resume_wait_timeout_ms: Some(2_000),
             resume_by_id_args: None,
-            oneshot_args: Vec::new(),
-            oneshot_output: Default::default(),
             install_hint: None,
             forward_scroll: None,
             forward_mouse: None,
@@ -3662,8 +3789,6 @@ agent_scrollback_lines = 10000
             resume_args: None,
             resume_wait_timeout_ms: None,
             resume_by_id_args: None,
-            oneshot_args: Vec::new(),
-            oneshot_output: Default::default(),
             install_hint: None,
             forward_scroll: None,
             forward_mouse: None,
@@ -3685,8 +3810,6 @@ agent_scrollback_lines = 10000
                     resume_args: None,
                     resume_wait_timeout_ms: None,
                     resume_by_id_args: None,
-                    oneshot_args: Vec::new(),
-                    oneshot_output: Default::default(),
                     install_hint: None,
                     forward_scroll: None,
                     forward_mouse: None,
@@ -3718,8 +3841,6 @@ agent_scrollback_lines = 10000
                     resume_args: Some(Vec::new()),
                     resume_wait_timeout_ms: None,
                     resume_by_id_args: None,
-                    oneshot_args: Vec::new(),
-                    oneshot_output: Default::default(),
                     install_hint: None,
                     forward_scroll: None,
                     forward_mouse: None,
@@ -3936,8 +4057,6 @@ oneshot_output = "stdout"
                     resume_args: Some(vec!["--continue".to_string()]),
                     resume_wait_timeout_ms: None,
                     resume_by_id_args: None,
-                    oneshot_args: Vec::new(),
-                    oneshot_output: Default::default(),
                     install_hint: None,
                     forward_scroll: None,
                     forward_mouse: None,
@@ -4386,8 +4505,6 @@ args = [\"-l\"]
             resume_args: Some(vec!["--resume".to_string()]),
             resume_wait_timeout_ms: None,
             resume_by_id_args: None,
-            oneshot_args: Vec::new(),
-            oneshot_output: Default::default(),
             install_hint: Some("brew install gemini-cli".to_string()),
             forward_scroll: None,
             forward_mouse: None,

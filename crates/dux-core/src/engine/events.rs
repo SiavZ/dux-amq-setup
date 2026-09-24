@@ -1114,7 +1114,7 @@ impl Engine {
             // truth from the first frame instead of starting at "not looked
             // yet" (which fails closed). A no-op for every other kind.
             self.spawn_folder_repo_probe(&session.id);
-            if inserted.kept() && request.resume {
+            if inserted.kept() && request.resumes_a_conversation() {
                 self.note_resume_launch(&tab_id);
             }
             self.update_branch_sync_sessions();
@@ -1227,7 +1227,7 @@ impl Engine {
             .flatten();
         if inserted.kept() {
             self.record_launched_drop_paste(&tab_id, &request.provider, &request.provider_config);
-            if request.resume {
+            if request.resumes_a_conversation() {
                 self.note_resume_launch(&tab_id);
             }
         }
@@ -3487,11 +3487,24 @@ impl Engine {
                 message,
             } => self.process_create_agent_failed(status_op_id, message),
             WorkerEvent::AgentLaunchReady(boxed) => {
+                // A shared agent that just started fresh because its provider
+                // cannot resume by id is told why, after the launch's own final.
+                let shared_warning = (!boxed.request.resumes_a_conversation()
+                    && boxed.request.session.is_slot_tab(&boxed.request.tab_id))
+                .then(|| self.shared_targeted_resume_warning(&boxed.request.session.id))
+                .flatten();
                 let (outcome, create_final) = self.process_agent_launch_ready(*boxed);
-                Self::launch_view_with_final(
+                let view = Self::launch_view_with_final(
                     EventReaction::AgentLaunchReadyView(Box::new(outcome)),
                     create_final,
-                )
+                );
+                match shared_warning {
+                    Some(warning) => EventReaction::Multi(vec![
+                        view,
+                        EventReaction::Status(StatusUpdate::warning(warning)),
+                    ]),
+                    None => view,
+                }
             }
             WorkerEvent::AgentLaunchFailed(boxed) => {
                 let (outcome, create_final) = self.process_agent_launch_failed(*boxed);
@@ -3665,6 +3678,14 @@ impl Engine {
             }
             WorkerEvent::TailscaleModeApplied { mode, outcome } => {
                 EventReaction::TailscaleModeApplied { mode, outcome }
+            }
+            WorkerEvent::ProviderSessionCaptured {
+                session_id,
+                provider,
+                result,
+            } => self.process_provider_session_captured(&session_id, &provider, result),
+            WorkerEvent::ResumeRecoveryCompleted(result) => {
+                self.process_resume_recovery_completed(result)
             }
         }
     }
@@ -7080,6 +7101,8 @@ mod tests {
                 kind,
                 wants_fullscreen: false,
                 status_quiet: QuietSurfaces::LOUD,
+                provider_session: Default::default(),
+                yolo_args: Vec::new(),
             },
             message: message.to_string(),
         }
@@ -7171,6 +7194,8 @@ mod tests {
                 },
                 wants_fullscreen: false,
                 status_quiet: QuietSurfaces::LOUD,
+                provider_session: Default::default(),
+                yolo_args: Vec::new(),
             },
             client: latecomer,
         };
@@ -7367,6 +7392,8 @@ mod tests {
                 },
                 wants_fullscreen: false,
                 status_quiet: QuietSurfaces::LOUD,
+                provider_session: Default::default(),
+                yolo_args: Vec::new(),
             },
             message: message.to_string(),
         }
@@ -8214,6 +8241,8 @@ mod tests {
             },
             wants_fullscreen: false,
             status_quiet: QuietSurfaces::LOUD,
+            provider_session: Default::default(),
+            yolo_args: Vec::new(),
         };
         let reaction = engine
             .apply(crate::engine::Command::DispatchAgentLaunch {

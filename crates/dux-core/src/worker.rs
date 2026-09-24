@@ -299,6 +299,15 @@ pub struct AgentLaunchRequest {
     /// relaunches a pane and streams into it confirms nothing; one that lands on
     /// an empty transcript still has to say why it is empty.
     pub status_quiet: crate::statusline::QuietSurfaces,
+    /// How this launch reaches the provider's own conversation id: resume one
+    /// by id, capture the id of a fresh one, or neither (upstream behaviour).
+    /// Decided with `resume` by `Engine::build_tab_launch_request`.
+    pub provider_session: crate::resume_recovery::ProviderSessionLaunch,
+    /// Extra CLI args the session's YOLO setting adds for this provider
+    /// (`SessionSettings::yolo_launch_args`, e.g. OpenCode `--auto`), appended
+    /// after the resume, resume-by-id or fresh args. Filled by the request
+    /// builders; the launch job only appends.
+    pub yolo_args: Vec<String>,
 }
 
 impl AgentLaunchRequest {
@@ -308,6 +317,13 @@ impl AgentLaunchRequest {
     pub fn quiet_status_on(mut self, quiet_on: crate::statusline::QuietSurfaces) -> Self {
         self.status_quiet = quiet_on;
         self
+    }
+
+    /// Whether this launch continues a prior conversation, by the provider's
+    /// resume-latest flag or by a recorded id. Either kind can find nothing to
+    /// continue, so both arm the resume-fallback sweep.
+    pub fn resumes_a_conversation(&self) -> bool {
+        self.resume || self.provider_session.is_resume_id()
     }
 }
 
@@ -699,6 +715,18 @@ pub enum WorkerEvent {
         mode: crate::config::TailscaleMode,
         outcome: crate::config::TailscaleModeOutcome,
     },
+    /// A provider conversation id was captured for an agent (the UUID a fresh
+    /// Claude launch was given, or the rollout a fresh Codex launch wrote), or
+    /// the capture failed closed. Persisting it is the engine's job.
+    ProviderSessionCaptured {
+        session_id: String,
+        provider: String,
+        result: Result<String, String>,
+    },
+    /// The one-time recovery of provider histories stranded under old per-agent
+    /// worktrees finished. Its ids are not persisted yet: the engine writes
+    /// them with its own store (`resume_recovery::persist_recovered_ids`).
+    ResumeRecoveryCompleted(Result<crate::resume_recovery::RecoveryReport, String>),
     /// The AMQ inject-queue watcher (or its polling fallback) noticed a
     /// change under the queue root. No payload: the engine re-scans the
     /// directory, claims new `.msg` files, and delivers them from

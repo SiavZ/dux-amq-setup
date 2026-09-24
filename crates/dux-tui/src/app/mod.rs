@@ -3831,6 +3831,7 @@ impl App {
             live_status_keys,
             last_created_op_id: None,
             created_session_by_op: HashMap::new(),
+            startup_launches: Default::default(),
         };
         Self::assemble(
             engine,
@@ -4385,14 +4386,25 @@ impl App {
         self.auto_reopen_eligible_sessions();
     }
 
-    /// Dispatch the startup auto-reopen launches. The ELIGIBILITY rule is
-    /// core-owned (`Engine::auto_reopen_candidates`, shared with the web
-    /// server's startup pass); only the TUI-side launch dispatch lives here.
+    /// Queue the startup relaunches and release the first ones. The
+    /// ELIGIBILITY rule is core-owned (`Engine::startup_launch_candidates`,
+    /// built on `auto_reopen_candidates` and shared with the web server's
+    /// startup pass), and so is the `[auto_resume]` throttle that releases the
+    /// rest one tick at a time (`pump_startup_launches`, from `drain_events`).
+    ///
+    /// The one-time recovery of stranded provider histories starts here too,
+    /// off the engine thread; ids it finds serve every later launch.
     fn auto_reopen_eligible_sessions(&mut self) {
-        for session in self.engine.auto_reopen_candidates() {
-            let request =
-                self.agent_launch_request(session, true, AgentLaunchKind::StartupAutoReopen);
-            self.dispatch_agent_launch(request);
+        let recovering = self.engine.dispatch_resume_recovery();
+        self.engine.queue_startup_launches(recovering);
+        self.pump_startup_launches();
+    }
+
+    /// Release the startup relaunches the `[auto_resume]` throttle allows now.
+    pub(crate) fn pump_startup_launches(&mut self) {
+        let pty_size = self.pty_size_for_launch();
+        for reaction in self.engine.pump_startup_launches(pty_size) {
+            self.apply_reaction(reaction);
         }
     }
 

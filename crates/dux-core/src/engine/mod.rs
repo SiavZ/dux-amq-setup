@@ -13,6 +13,7 @@ mod followup;
 mod in_flight;
 mod lifecycle;
 mod pr_sync_control;
+mod provider_sessions;
 mod resume_fallback;
 mod shared_workspace;
 mod spawn_worker;
@@ -753,6 +754,11 @@ pub struct Engine {
     /// past [`CREATED_SESSION_TTL`] or whose session no longer exists, so a
     /// long-running server cannot accumulate stale entries.
     pub created_session_by_op: HashMap<String, (String, Instant)>,
+
+    /// Startup relaunches waiting for an `[auto_resume]` throttle slot. Filled
+    /// once at boot by [`Engine::queue_startup_launches`] and drained each tick
+    /// by [`Engine::pump_startup_launches`]. Empty on every later tick.
+    pub startup_launches: crate::auto_resume::StartupLaunchQueue,
     /// AMQ runtime: per-session settings, the inject-queue drainer and the
     /// Orchestrator watchdog (see [`amq`]). Construct with `Default`; load
     /// settings with [`Engine::load_session_settings_from_store`].
@@ -4934,7 +4940,12 @@ impl Engine {
     /// judged against `provider`, not `session.provider`.
     pub fn should_resume_provider(&self, session: &AgentSession, provider: &ProviderKind) -> bool {
         let cfg = crate::config::provider_config(&self.config, provider);
-        cfg.supports_session_resume() && session.has_started_provider(provider)
+        cfg.supports_session_resume()
+            && session.has_started_provider(provider)
+            // A "latest conversation in this directory" selector picks another
+            // agent's conversation in a shared directory, so a shared agent
+            // only ever resumes by id (fork a38187f3).
+            && !crate::resume_recovery::session_is_shared(session)
     }
 
     /// The provider whose *live* conversation a tab currently owns, for

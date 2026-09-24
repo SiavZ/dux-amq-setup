@@ -1487,6 +1487,9 @@ impl App {
         };
     }
 
+    /// The startup pass now builds its requests in core
+    /// (`Engine::pump_startup_launches`), leaving tests as the only caller.
+    #[cfg(test)]
     pub(crate) fn agent_launch_request(
         &self,
         session: AgentSession,
@@ -4561,6 +4564,7 @@ mod tests {
             live_status_keys: Default::default(),
             last_created_op_id: None,
             created_session_by_op: std::collections::HashMap::new(),
+            startup_launches: Default::default(),
         };
         let app_live_status_keys = engine.live_status_keys.clone();
         let mut app = App {
@@ -4882,6 +4886,7 @@ mod tests {
             live_status_keys: Default::default(),
             last_created_op_id: None,
             created_session_by_op: std::collections::HashMap::new(),
+            startup_launches: Default::default(),
         }
     }
 

@@ -244,7 +244,33 @@ fn apply_patches(doc: &mut DocumentMut, config: &Config) {
         "copy_uncommitted_changes_by_default",
         config.defaults.copy_uncommitted_changes_by_default,
     );
+    patch_table_bool(
+        doc,
+        "defaults",
+        "auto_resume_on_start",
+        config.defaults.auto_resume_on_start,
+    );
     remove_table_key(doc, "defaults", "prompt_for_name");
+
+    // --- [auto_resume] (resume port) ---
+    patch_table_usize(
+        doc,
+        "auto_resume",
+        "concurrency",
+        config.auto_resume.concurrency,
+    );
+    patch_table_u32(
+        doc,
+        "auto_resume",
+        "stale_days",
+        config.auto_resume.stale_days,
+    );
+    patch_table_u64(
+        doc,
+        "auto_resume",
+        "stagger_ms",
+        config.auto_resume.stagger_ms,
+    );
 
     // --- [env] ---
     patch_env_table(doc, "env", &config.env);
@@ -833,6 +859,20 @@ fn patch_providers(doc: &mut DocumentMut, providers: &ProvidersConfig) {
         tbl["resume_args"] = toml_edit::value(resume);
         if let Some(timeout_ms) = config.resume_wait_timeout_ms {
             tbl["resume_wait_timeout_ms"] = toml_edit::value(timeout_ms as i64);
+        }
+        // Targeted resume. Absent means "this CLI cannot resume by id"; an
+        // explicit `[]` is the user's opt-out and is written back as such.
+        match &config.resume_by_id_args {
+            Some(args) => {
+                let mut by_id = Array::new();
+                for a in args {
+                    by_id.push(a.as_str());
+                }
+                tbl["resume_by_id_args"] = toml_edit::value(by_id);
+            }
+            None => {
+                tbl.remove("resume_by_id_args");
+            }
         }
 
         // The AI commit-message feature was removed; drop the obsolete oneshot
@@ -2228,6 +2268,46 @@ build = { text = \"cargo build\", surface = \"terminal\" }
             parsed.server.release_notes_max_concurrency, 5,
             "saved:\n{saved}"
         );
+    }
+
+    /// The plain render (web's first-creation fallback and recovery path) must
+    /// carry every shipped provider's targeted-resume args, and a user who set
+    /// none keeps none after a save.
+    /// `auto_resume_on_start` and `[auto_resume]` survive a save and a reload.
+    #[test]
+    fn plain_render_round_trips_auto_resume_settings() {
+        let mut config = Config::default();
+        config.defaults.auto_resume_on_start = true;
+        config.auto_resume.concurrency = 7;
+        config.auto_resume.stale_days = 0;
+        config.auto_resume.stagger_ms = 900;
+        let parsed: Config =
+            toml::from_str(&render_config_plain(&config)).expect("rendered config parses");
+        assert!(parsed.defaults.auto_resume_on_start);
+        assert_eq!(parsed.auto_resume, config.auto_resume);
+    }
+
+    #[test]
+    fn plain_render_round_trips_every_default_resume_by_id_args() {
+        let mut config = Config::default();
+        let rendered = render_config_plain(&config);
+        let parsed: Config = toml::from_str(&rendered).expect("rendered config parses");
+        for (name, stock) in crate::config::default_provider_commands() {
+            assert_eq!(
+                parsed.providers.commands[name].resume_by_id_args, stock.resume_by_id_args,
+                "providers.{name}.resume_by_id_args did not round-trip"
+            );
+        }
+
+        config
+            .providers
+            .commands
+            .get_mut("jcode")
+            .expect("jcode ships")
+            .resume_by_id_args = None;
+        let parsed: Config =
+            toml::from_str(&render_config_plain(&config)).expect("rendered config parses");
+        assert_eq!(parsed.providers.commands["jcode"].resume_by_id_args, None);
     }
 
     #[test]

@@ -114,6 +114,10 @@ pub struct Defaults {
     pub pull_before_creating_agent_by_default: bool,
     #[serde(default = "default_true")]
     pub copy_uncommitted_changes_by_default: bool,
+    /// Relaunch every restorable agent at startup, not just the ones
+    /// `ui.auto_reopen_agents` would (478c9e3c). Throttled by `[auto_resume]`.
+    /// Off by default: N agents at once means N provider processes.
+    pub auto_resume_on_start: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1152,17 +1156,6 @@ pub fn server_console_settings_changed(prev: &ServerConfig, next: &ServerConfig)
     prev.color != next.color
 }
 
-/// Where a provider's oneshot command writes its output.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum OneshotOutput {
-    /// Read from stdout (default).
-    #[default]
-    Stdout,
-    /// Read from a temporary file path passed via placeholder.
-    Tempfile,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProviderCommandConfig {
@@ -1177,12 +1170,6 @@ pub struct ProviderCommandConfig {
     /// This is distinct from `resume_args` which resumes the "most recent" or
     /// "last in CWD" session without needing an ID.
     pub resume_by_id_args: Option<Vec<String>>,
-    /// Arguments for one-shot command execution. Uses `{prompt}` placeholder.
-    /// Example: `["run", "--quiet", "{prompt}"]` for sending a single message
-    /// and exiting without entering interactive mode.
-    pub oneshot_args: Vec<String>,
-    /// Where to read oneshot command output from.
-    pub oneshot_output: OneshotOutput,
     pub install_hint: Option<String>,
     /// Scroll-forwarding policy for the wheel and PgUp/PgDn over this
     /// provider's embedded PTY. Tri-state:
@@ -2030,6 +2017,7 @@ impl Default for Defaults {
             enable_randomized_pet_name_by_default: false,
             pull_before_creating_agent_by_default: true,
             copy_uncommitted_changes_by_default: true,
+            auto_resume_on_start: false,
         }
     }
 }
@@ -2276,6 +2264,12 @@ impl ProvidersConfig {
                     if entry.get().resume_wait_timeout_ms.is_none() {
                         entry.get_mut().resume_wait_timeout_ms = config.resume_wait_timeout_ms;
                     }
+                    // A config written before `resume_by_id_args` was rendered has
+                    // the key absent. Fill in the shipped value; an explicit `[]`
+                    // is `Some` and so stays the user's opt-out.
+                    if entry.get().resume_by_id_args.is_none() {
+                        entry.get_mut().resume_by_id_args = config.resume_by_id_args;
+                    }
                     // A config written before `web_dragdrop_paste` existed has the key
                     // absent, and absent resolves to `bare`. That is wrong for
                     // codex, so fill in the shipped form here rather than letting
@@ -2326,9 +2320,10 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5]
                 args: Vec::new(),
                 resume_args: Some(vec!["--continue".to_string()]),
                 resume_wait_timeout_ms: None,
-                resume_by_id_args: None,
-                oneshot_args: Vec::new(),
-                oneshot_output: OneshotOutput::Stdout,
+                // dux assigns each fresh Claude conversation its own UUID with
+                // `--session-id` and resumes exactly that one, so agents that
+                // share a directory never pick up each other's conversation.
+                resume_by_id_args: Some(vec!["--resume".to_string(), "{session_id}".to_string()]),
                 install_hint: Some("curl -fsSL https://claude.ai/install.sh | bash".to_string()),
                 forward_scroll: None,
                 // Keep a plain drag as a dux selection so agent output can be
@@ -2347,9 +2342,9 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5]
                 args: Vec::new(),
                 resume_args: Some(vec!["resume".to_string(), "--last".to_string()]),
                 resume_wait_timeout_ms: None,
-                resume_by_id_args: None,
-                oneshot_args: Vec::new(),
-                oneshot_output: OneshotOutput::Stdout,
+                // dux records the rollout id Codex writes for each fresh
+                // conversation and resumes exactly that one (plus `-C <dir>`).
+                resume_by_id_args: Some(vec!["resume".to_string(), "{session_id}".to_string()]),
                 install_hint: Some("brew install --cask codex".to_string()),
                 forward_scroll: None,
                 // Keep a plain drag as a dux selection so agent output can be
@@ -2369,8 +2364,6 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5]
                 resume_args: Some(vec!["--continue".to_string()]),
                 resume_wait_timeout_ms: Some(3_000),
                 resume_by_id_args: None,
-                oneshot_args: Vec::new(),
-                oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("curl -fsSL https://opencode.ai/install | bash".to_string()),
                 forward_scroll: None,
                 // Keep a plain drag as a dux selection so agent output can be
@@ -2393,8 +2386,6 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5]
                 resume_args: None,
                 resume_wait_timeout_ms: None,
                 resume_by_id_args: None,
-                oneshot_args: Vec::new(),
-                oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("curl -fsSL https://gh.io/copilot-install | bash".to_string()),
                 forward_scroll: None,
                 forward_mouse: None,
@@ -2430,18 +2421,6 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5]
                     "--resume".to_string(),
                     "{session_id}".to_string(),
                 ]),
-                // `jcode run` sends one message and exits; `--quiet`
-                // suppresses status output. Caveat: jcode still writes a
-                // trailing `[Tokens] upload: ...` line to stdout, so it lands
-                // in generated commit messages. `--json` returns a clean
-                // `{"text": ...}` object, but dux has no JSON extraction for
-                // oneshot output.
-                oneshot_args: vec![
-                    "run".to_string(),
-                    "--quiet".to_string(),
-                    "{prompt}".to_string(),
-                ],
-                oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("brew tap 1jehuang/jcode && brew install jcode".to_string()),
                 // jcode is an alt-screen TUI with its own scrollback (like
                 // claude/gemini): forward wheel events to it. Host scrollback
@@ -2810,6 +2789,9 @@ pub struct Config {
     pub server: ServerConfig,
     pub keys: KeysConfig,
     pub macros: MacrosConfig,
+    /// Throttle for startup relaunches (07d9b0ba). See [`AutoResumeConfig`].
+    #[serde(default)]
+    pub auto_resume: AutoResumeConfig,
     /// Shared main-workspace mode (fork shared-workspace Phase 4). `None` means
     /// this config predates workspace modes and keeps worktree isolation, the
     /// guarantee it was installed under. A freshly created config always
@@ -2820,6 +2802,36 @@ pub struct Config {
     /// watchdog. See [`crate::amq`].
     #[serde(default)]
     pub amq: AmqConfig,
+}
+
+/// Tunables for startup relaunches: `defaults.auto_resume_on_start` and
+/// upstream's `ui.auto_reopen_agents` both dispatch through them.
+///
+/// Relaunching many agents in one tight loop starts that many provider
+/// processes and TLS handshakes at the same instant, which several providers
+/// rate-limit. Launches are therefore bounded by [`Self::concurrency`] in
+/// flight, spaced by [`Self::stagger_ms`], and agents whose directory has not
+/// been touched for [`Self::stale_days`] days are left alone.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoResumeConfig {
+    /// Maximum startup launches in flight at once. 0 is treated as 1.
+    pub concurrency: usize,
+    /// Skip agents whose directory was last modified more than this many days
+    /// ago. 0 disables the filter.
+    pub stale_days: u32,
+    /// Minimum gap in milliseconds between two startup launches.
+    pub stagger_ms: u64,
+}
+
+impl Default for AutoResumeConfig {
+    fn default() -> Self {
+        Self {
+            concurrency: 4,
+            stale_days: 30,
+            stagger_ms: 250,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2901,6 +2913,7 @@ impl Default for Config {
             server: ServerConfig::default(),
             keys: KeysConfig::default(),
             macros: MacrosConfig::default(),
+            auto_resume: AutoResumeConfig::default(),
             workspace: Some(WorkspaceConfig::default()),
             amq: AmqConfig::default(),
         }
@@ -3790,6 +3803,26 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    /// Only the exact `{session_id}` token is replaced: an id embedded in a
+    /// larger argument is left alone, so no argument is half-substituted.
+    #[test]
+    fn targeted_resume_substitutes_only_the_exact_session_id_token() {
+        let cfg = ProviderCommandConfig {
+            resume_by_id_args: Some(vec![
+                "resume".to_string(),
+                "{session_id}".to_string(),
+                "prefix-{session_id}".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+
+        assert_eq!(
+            cfg.resume_by_id_args(&id).unwrap(),
+            vec!["resume".to_string(), id, "prefix-{session_id}".to_string()]
+        );
+    }
 
     #[test]
     fn shutdown_grace_converts_and_clamps_to_the_ceiling() {
