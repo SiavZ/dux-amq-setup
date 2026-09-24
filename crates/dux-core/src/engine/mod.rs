@@ -4,6 +4,7 @@
 //! embeds it and calls it directly, and the web server reaches it through its
 //! engine actor.
 
+pub mod backup;
 pub mod command;
 mod companion;
 pub mod config_saver;

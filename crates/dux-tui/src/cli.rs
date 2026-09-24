@@ -1669,6 +1669,60 @@ mod tests {
         run_diff_summary(&defaults).expect("diff summary");
     }
 
+    /// Fork 773a6b04 (P1-26): `dux config diff` reports a change in every
+    /// typed section, provider arguments included. Upstream's differ is
+    /// structural, so this guards that no section (the ported [limits] and
+    /// [storage] among them) is silently skipped.
+    #[test]
+    fn diff_summary_covers_every_typed_section_and_provider_arguments() {
+        fn assert_reports(config: &Config, path: &str) {
+            let changes = collect_config_changes(config);
+            assert!(
+                changes.iter().any(|change| change.starts_with(path)),
+                "missing {path} in {changes:#?}"
+            );
+        }
+        let edits: Vec<(&str, fn(&mut Config))> = vec![
+            ("defaults.provider:", |c| {
+                c.defaults.provider = "codex".into()
+            }),
+            ("providers.claude.args:", |c| {
+                c.providers.commands["claude"].args.push("--audit03".into())
+            }),
+            ("terminal.command:", |c| {
+                c.terminal.command = "/bin/audit03".into()
+            }),
+            ("logging.level:", |c| c.logging.level = "debug".into()),
+            ("projects:", |c| {
+                c.projects
+                    .push(toml::from_str("id = \"audit03\"\npath = \"/tmp/audit03\"\n").unwrap())
+            }),
+            ("ui.left_width_pct:", |c| c.ui.left_width_pct += 1),
+            ("editor.default:", |c| c.editor.default = "audit03".into()),
+            ("keys.show_terminal_keys:", |c| {
+                c.keys.show_terminal_keys = !c.keys.show_terminal_keys
+            }),
+            ("macros:", |c| {
+                c.macros.entries.insert(
+                    "audit03".into(),
+                    dux_core::config::MacroEntry {
+                        text: "proof".into(),
+                        surface: dux_core::config::MacroSurface::Both,
+                    },
+                );
+            }),
+            ("limits.max_panes:", |c| c.limits.max_panes = 3),
+            ("storage.backup_interval_minutes:", |c| {
+                c.storage.backup_interval_minutes += 1
+            }),
+        ];
+        for (path, edit) in edits {
+            let mut config = Config::default();
+            edit(&mut config);
+            assert_reports(&config, path);
+        }
+    }
+
     #[test]
     fn config_path_subcommand() {
         // Just verify it doesn't error.

@@ -2825,6 +2825,9 @@ pub struct Config {
     /// the defaults: no hard pane cap, a warning at 16 live agents.
     #[serde(default)]
     pub limits: LimitsConfig,
+    /// Session database maintenance (`[storage]`).
+    #[serde(default)]
+    pub storage: StorageConfig,
     /// Shared main-workspace mode (fork shared-workspace Phase 4). `None` means
     /// this config predates workspace modes and keeps worktree isolation, the
     /// guarantee it was installed under. A freshly created config always
@@ -2913,6 +2916,7 @@ impl Default for Config {
             keys: KeysConfig::default(),
             macros: MacrosConfig::default(),
             limits: LimitsConfig::default(),
+            storage: StorageConfig::default(),
             workspace: Some(WorkspaceConfig::default()),
         }
     }
@@ -3073,6 +3077,28 @@ pub fn validate_shared_project_paths(config: &Config, paths: &DuxPaths) -> Resul
     }
     Ok(())
 }
+
+/// The `[storage]` section (fork 10d2266d, P1-W).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StorageConfig {
+    /// Minutes between automatic copies of `sessions.sqlite3` to
+    /// `sessions.sqlite3.bak`, taken with SQLite's online backup so a running
+    /// dux never has to stop. The integrity check on open points a user with a
+    /// corrupt database at that file. `0` turns the copies off.
+    pub backup_interval_minutes: u32,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            backup_interval_minutes: DEFAULT_BACKUP_INTERVAL_MINUTES,
+        }
+    }
+}
+
+/// Default for [`StorageConfig::backup_interval_minutes`].
+pub const DEFAULT_BACKUP_INTERVAL_MINUTES: u32 = 30;
 
 /// The `[limits]` section: runtime resource guards (fork audit02 P1-AA, later
 /// softened in fork #13).

@@ -4070,6 +4070,7 @@ impl App {
         self.engine.spawn_branch_sync_worker();
         self.engine.spawn_limits_watchdogs();
         self.engine.spawn_project_worktree_links();
+        self.engine.spawn_backup_worker();
         self.engine.spawn_project_branch_status_checks();
         self.engine.spawn_gh_status_check();
         // The background server assumes these process-wide workers are already running.

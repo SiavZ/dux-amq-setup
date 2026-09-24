@@ -1398,6 +1398,18 @@ fn config_schema() -> Vec<ConfigEntry> {
             )),
             value_fn: |c| FieldValue::Bool(c.limits.enable_scrollback_overflow_autodetach),
         },
+        ConfigEntry::Blank,
+        ConfigEntry::Section("storage"),
+        ConfigEntry::Field {
+            key: "backup_interval_minutes",
+            comment: Some(CommentSource::Static(
+                "# Minutes between automatic copies of the session database to\n\
+                 # sessions.sqlite3.bak beside it, taken while dux runs. If the database\n\
+                 # is ever corrupted, dux refuses to open it and points you at this copy.\n\
+                 # Default 30. Set to 0 to turn the copies off. Read at startup.",
+            )),
+            value_fn: |c| FieldValue::U32(c.storage.backup_interval_minutes),
+        },
     ]
 }
 

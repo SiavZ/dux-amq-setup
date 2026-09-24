@@ -691,6 +691,14 @@ fn apply_patches(doc: &mut DocumentMut, config: &Config) {
 
     // --- [limits] (port-misc: fork P1-AA resource guards) ---
     patch_limits(doc, &config.limits);
+
+    // --- [storage] (port-misc: fork P1-W periodic backup) ---
+    patch_table_u32(
+        doc,
+        "storage",
+        "backup_interval_minutes",
+        config.storage.backup_interval_minutes,
+    );
 }
 
 fn patch_limits(doc: &mut DocumentMut, limits: &crate::config::LimitsConfig) {

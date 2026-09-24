@@ -47,6 +47,9 @@ pub struct LimitsRuntime {
     disk_alert_shown: bool,
     disk_watchdog_started: Arc<AtomicBool>,
     scrollback_watchdog_started: Arc<AtomicBool>,
+    /// The `[storage]` backup worker's single-instance flag (engine/backup.rs).
+    /// Kept with the other watchdog flags so the engine gains one field.
+    pub(crate) backup_worker_started: Arc<AtomicBool>,
 }
 
 impl Engine {
