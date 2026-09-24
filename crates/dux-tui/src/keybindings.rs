@@ -3245,6 +3245,7 @@ mod tests {
             "reconnect-agent",
             "recreate-working-copy",
             "refresh-changes",
+            "reload-binary",
             "reload-config",
             "remove-project",
             "rename-agent",
