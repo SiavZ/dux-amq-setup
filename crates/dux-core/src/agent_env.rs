@@ -10,6 +10,7 @@
 
 use crate::config::{Config, DuxPaths};
 use crate::model::AgentSession;
+use crate::session_settings::SessionSettings;
 
 /// Compose the launch environment for `session`'s tab `tab_id`.
 ///
@@ -21,6 +22,7 @@ pub fn agent_launch_env(
     paths: &DuxPaths,
     config: &Config,
     session: &AgentSession,
+    settings: &SessionSettings,
     tab_id: &str,
     user_env: Vec<(String, String)>,
 ) -> Vec<(String, String)> {
@@ -28,37 +30,26 @@ pub fn agent_launch_env(
     if tab_id == session.slot_tab_id().as_str() {
         env.extend(crate::peer::launch_env_for_session(paths, session));
     }
-    env.extend(session_settings_env(paths, config, session));
+    env.extend(session_settings_env(config, session, settings));
     env.extend(user_env);
     env
 }
 
 /// Per-session settings exported to the provider: the fork's YOLO,
 /// envelope-verify and custom system prompt switches
-/// ([`SessionSettings::to_pty_env`](crate::session_settings::SessionSettings::to_pty_env)),
-/// which the AMQ wrappers read to choose CLI flags.
+/// ([`SessionSettings::to_pty_env`]), which the AMQ wrappers read to choose
+/// CLI flags.
 ///
-/// Read from the store rather than the engine's in-memory map because the
-/// create and reconnect jobs build the env on worker threads with only the
-/// paths and config; the settings row is the persisted source of truth and
-/// is written before any change is applied (persist-before-mutate), so the
-/// two never disagree at launch. A store that cannot be read yields the
-/// defaults with a warning rather than blocking the launch.
+/// Pure: the caller passes the settings it already holds (the engine's
+/// in-memory map, which is loaded at restore and written only after the row
+/// persists). Launch paths must never open a second store connection: every
+/// `SessionStore::open` runs the migration, whose orphan-tab sweep can delete
+/// a tab row another connection has just inserted.
 pub fn session_settings_env(
-    paths: &DuxPaths,
     config: &Config,
     session: &AgentSession,
+    settings: &SessionSettings,
 ) -> Vec<(String, String)> {
-    let settings = crate::storage::SessionStore::open(&paths.sessions_db_path)
-        .and_then(|store| store.load_session_settings_for(&session.id))
-        .unwrap_or_else(|err| {
-            crate::logger::warn(&format!(
-                "could not read session settings for {}; launching with defaults: {}",
-                crate::sanitize::for_terminal(&session.id),
-                crate::sanitize::for_terminal(&format!("{err:#}"))
-            ));
-            crate::session_settings::SessionSettings::default()
-        });
     settings
         .to_pty_env(&session.provider, config.amq.inject.verify_envelope)
         .vars
@@ -114,6 +105,7 @@ mod tests {
             &paths(dir.path()),
             &Config::default(),
             &session(dir.path()),
+            &SessionSettings::default(),
             "slot",
             user,
         );
@@ -146,6 +138,7 @@ mod tests {
             &paths(dir.path()),
             &Config::default(),
             &session(dir.path()),
+            &SessionSettings::default(),
             "extra-tab",
             user.clone(),
         );
@@ -161,32 +154,29 @@ mod tests {
         );
     }
 
-    /// Stored per-session settings reach the launch env: YOLO maps to the
-    /// provider's wrapper variable, the verify override wins over the global
-    /// default, and a custom system prompt is exported. The fork applied these
-    /// at every create and reconnect; without it the settings modal saved
-    /// values no agent ever saw.
+    /// A session's settings reach the launch env: YOLO maps to the provider's
+    /// wrapper variable, the verify override wins over the global default,
+    /// and a custom system prompt is exported. The fork applied these at every
+    /// create and reconnect; without it the settings modal saved values no
+    /// agent ever saw.
     #[test]
-    fn stored_session_settings_reach_the_launch_env() {
+    fn session_settings_reach_the_launch_env() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = paths(dir.path());
-        std::fs::create_dir_all(&paths.root).unwrap();
-        let session = session(dir.path());
-        let store = crate::storage::SessionStore::open(&paths.sessions_db_path).unwrap();
-        store.create_session(&session).unwrap();
-        store
-            .set_session_settings(
-                &session.id,
-                &crate::session_settings::SessionSettings {
-                    yolo_permissions: true,
-                    verify_envelope_override: Some(true),
-                    system_prompt: Some("be terse".to_string()),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let settings = SessionSettings {
+            yolo_permissions: true,
+            verify_envelope_override: Some(true),
+            system_prompt: Some("be terse".to_string()),
+            ..Default::default()
+        };
 
-        let env = agent_launch_env(&paths, &Config::default(), &session, "slot", Vec::new());
+        let env = agent_launch_env(
+            &paths(dir.path()),
+            &Config::default(),
+            &session(dir.path()),
+            &settings,
+            "slot",
+            Vec::new(),
+        );
         let get = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
 
         assert_eq!(get("CLAUDE_AMQ_YOLO"), Some("1"));
