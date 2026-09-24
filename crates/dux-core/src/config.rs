@@ -112,6 +112,10 @@ pub struct Defaults {
     pub pull_before_creating_agent_by_default: bool,
     #[serde(default = "default_true")]
     pub copy_uncommitted_changes_by_default: bool,
+    /// Relaunch every restorable agent at startup, not just the ones
+    /// `ui.auto_reopen_agents` would (478c9e3c). Throttled by `[auto_resume]`.
+    /// Off by default: N agents at once means N provider processes.
+    pub auto_resume_on_start: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1989,6 +1993,7 @@ impl Default for Defaults {
             enable_randomized_pet_name_by_default: false,
             pull_before_creating_agent_by_default: true,
             copy_uncommitted_changes_by_default: true,
+            auto_resume_on_start: false,
         }
     }
 }
@@ -2278,7 +2283,10 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5]
                 args: Vec::new(),
                 resume_args: Some(vec!["--continue".to_string()]),
                 resume_wait_timeout_ms: None,
-                resume_by_id_args: None,
+                // dux assigns each fresh Claude conversation its own UUID with
+                // `--session-id` and resumes exactly that one, so agents that
+                // share a directory never pick up each other's conversation.
+                resume_by_id_args: Some(vec!["--resume".to_string(), "{session_id}".to_string()]),
                 install_hint: Some("curl -fsSL https://claude.ai/install.sh | bash".to_string()),
                 forward_scroll: None,
                 // Measured: strips one quote pair then unescapes, so quoting
@@ -2293,7 +2301,9 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 5]
                 args: Vec::new(),
                 resume_args: Some(vec!["resume".to_string(), "--last".to_string()]),
                 resume_wait_timeout_ms: None,
-                resume_by_id_args: None,
+                // dux records the rollout id Codex writes for each fresh
+                // conversation and resumes exactly that one (plus `-C <dir>`).
+                resume_by_id_args: Some(vec!["resume".to_string(), "{session_id}".to_string()]),
                 install_hint: Some("brew install --cask codex".to_string()),
                 forward_scroll: None,
                 // Measured: falls back to POSIX shell lexing and accepts only a
@@ -2726,6 +2736,39 @@ pub struct Config {
     pub server: ServerConfig,
     pub keys: KeysConfig,
     pub macros: MacrosConfig,
+    /// Throttle for startup relaunches (07d9b0ba). See [`AutoResumeConfig`].
+    #[serde(default)]
+    pub auto_resume: AutoResumeConfig,
+}
+
+/// Tunables for startup relaunches: `defaults.auto_resume_on_start` and
+/// upstream's `ui.auto_reopen_agents` both dispatch through them.
+///
+/// Relaunching many agents in one tight loop starts that many provider
+/// processes and TLS handshakes at the same instant, which several providers
+/// rate-limit. Launches are therefore bounded by [`Self::concurrency`] in
+/// flight, spaced by [`Self::stagger_ms`], and agents whose directory has not
+/// been touched for [`Self::stale_days`] days are left alone.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoResumeConfig {
+    /// Maximum startup launches in flight at once. 0 is treated as 1.
+    pub concurrency: usize,
+    /// Skip agents whose directory was last modified more than this many days
+    /// ago. 0 disables the filter.
+    pub stale_days: u32,
+    /// Minimum gap in milliseconds between two startup launches.
+    pub stagger_ms: u64,
+}
+
+impl Default for AutoResumeConfig {
+    fn default() -> Self {
+        Self {
+            concurrency: 4,
+            stale_days: 30,
+            stagger_ms: 250,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2807,6 +2850,7 @@ impl Default for Config {
             server: ServerConfig::default(),
             keys: KeysConfig::default(),
             macros: MacrosConfig::default(),
+            auto_resume: AutoResumeConfig::default(),
         }
     }
 }

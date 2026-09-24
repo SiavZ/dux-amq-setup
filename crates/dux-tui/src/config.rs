@@ -390,6 +390,17 @@ fn config_schema() -> Vec<ConfigEntry> {
             )),
             value_fn: |c| FieldValue::Bool(c.defaults.copy_uncommitted_changes_by_default),
         },
+        ConfigEntry::Field {
+            key: "auto_resume_on_start",
+            comment: Some(CommentSource::Static(
+                "# When true, every agent whose directory still exists is relaunched at\n\
+                 # startup, so all panes are live as soon as dux opens, not just the ones\n\
+                 # ui.auto_reopen_agents would reopen. Launches resume each agent's own\n\
+                 # conversation where dux knows it. Throttled by [auto_resume].\n\
+                 # Caveat: N agents at once means N provider processes (CPU/RAM). Default false.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.defaults.auto_resume_on_start),
+        },
         ConfigEntry::Blank,
         ConfigEntry::Env,
         ConfigEntry::Blank,
@@ -864,6 +875,33 @@ fn config_schema() -> Vec<ConfigEntry> {
                 "# Preferred editor for \"open in editor\": the TUI's open-worktree action\n# and the web code editor's \"Open editor\" menu (the web menu lets you pick per\n# open and is only enabled for local-access URLs; this is its fallback). Supported\n# values are matched against popular editor CLIs on PATH (for example: cursor,\n# vscode/code, zed, vscodium, sublime).",
             )),
             value_fn: |c| FieldValue::Str(c.editor.default.clone()),
+        },
+        ConfigEntry::Blank,
+        ConfigEntry::Section("auto_resume"),
+        ConfigEntry::Field {
+            key: "concurrency",
+            comment: Some(CommentSource::Static(
+                "# Throttle for startup relaunches (ui.auto_reopen_agents and\n\
+                 # defaults.auto_resume_on_start). At most this many agents start at once.\n\
+                 # Lower = slower startup but less load on provider APIs. 0 means 1. Default 4.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.auto_resume.concurrency),
+        },
+        ConfigEntry::Field {
+            key: "stale_days",
+            comment: Some(CommentSource::Static(
+                "# Do not relaunch an agent at startup whose directory has not been modified\n\
+                 # within this many days. 0 disables the filter. Default 30.",
+            )),
+            value_fn: |c| FieldValue::U32(c.auto_resume.stale_days),
+        },
+        ConfigEntry::Field {
+            key: "stagger_ms",
+            comment: Some(CommentSource::Static(
+                "# Minimum gap in milliseconds between two startup relaunches, so many\n\
+                 # agents do not all open their provider connection at once. Default 250.",
+            )),
+            value_fn: |c| FieldValue::U64(c.auto_resume.stagger_ms),
         },
         ConfigEntry::Blank,
         ConfigEntry::Section("server"),
@@ -2513,6 +2551,24 @@ mod tests {
     /// Every shipped provider's targeted-resume args survive the documented
     /// render and a raw parse back. A default that only lives in memory is lost
     /// the moment a user edits the provider block, and is undocumented.
+    /// The documented render carries `auto_resume_on_start` and `[auto_resume]`
+    /// with their docs, and they parse back to the values rendered.
+    #[test]
+    fn documented_render_round_trips_auto_resume_settings() {
+        let rendered = render_default_config();
+        assert!(rendered.contains("auto_resume_on_start = false"));
+        assert!(rendered.contains("[auto_resume]"));
+        assert!(rendered.contains("# Throttle for startup relaunches"));
+        let mut config = Config::default();
+        config.defaults.auto_resume_on_start = true;
+        config.auto_resume.concurrency = 2;
+        config.auto_resume.stagger_ms = 10;
+        let parsed: Config =
+            toml::from_str(&render_config_documented(&config)).expect("rendered config parses");
+        assert!(parsed.defaults.auto_resume_on_start);
+        assert_eq!(parsed.auto_resume, config.auto_resume);
+    }
+
     #[test]
     fn documented_render_round_trips_every_default_resume_by_id_args() {
         let rendered = render_default_config();

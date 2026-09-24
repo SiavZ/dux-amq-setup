@@ -244,7 +244,33 @@ fn apply_patches(doc: &mut DocumentMut, config: &Config) {
         "copy_uncommitted_changes_by_default",
         config.defaults.copy_uncommitted_changes_by_default,
     );
+    patch_table_bool(
+        doc,
+        "defaults",
+        "auto_resume_on_start",
+        config.defaults.auto_resume_on_start,
+    );
     remove_table_key(doc, "defaults", "prompt_for_name");
+
+    // --- [auto_resume] (resume port) ---
+    patch_table_usize(
+        doc,
+        "auto_resume",
+        "concurrency",
+        config.auto_resume.concurrency,
+    );
+    patch_table_u32(
+        doc,
+        "auto_resume",
+        "stale_days",
+        config.auto_resume.stale_days,
+    );
+    patch_table_u64(
+        doc,
+        "auto_resume",
+        "stagger_ms",
+        config.auto_resume.stagger_ms,
+    );
 
     // --- [env] ---
     patch_env_table(doc, "env", &config.env);
@@ -2133,6 +2159,20 @@ build = { text = \"cargo build\", surface = \"terminal\" }
     /// The plain render (web's first-creation fallback and recovery path) must
     /// carry every shipped provider's targeted-resume args, and a user who set
     /// none keeps none after a save.
+    /// `auto_resume_on_start` and `[auto_resume]` survive a save and a reload.
+    #[test]
+    fn plain_render_round_trips_auto_resume_settings() {
+        let mut config = Config::default();
+        config.defaults.auto_resume_on_start = true;
+        config.auto_resume.concurrency = 7;
+        config.auto_resume.stale_days = 0;
+        config.auto_resume.stagger_ms = 900;
+        let parsed: Config =
+            toml::from_str(&render_config_plain(&config)).expect("rendered config parses");
+        assert!(parsed.defaults.auto_resume_on_start);
+        assert_eq!(parsed.auto_resume, config.auto_resume);
+    }
+
     #[test]
     fn plain_render_round_trips_every_default_resume_by_id_args() {
         let mut config = Config::default();
