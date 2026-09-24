@@ -99,6 +99,9 @@ pub enum BranchRenameRejection {
     MalformedName,
     /// A branch rename is already in flight for this session.
     AlreadyInFlight,
+    /// The agent runs in the shared project checkout, whose branch is the
+    /// user's own: dux renames only its display title, never that branch.
+    SharedWorkspaceBranch,
 }
 
 /// The parameters a surface needs to dispatch the git branch-rename worker and

@@ -13,6 +13,7 @@ mod in_flight;
 mod lifecycle;
 mod pr_sync_control;
 mod resume_fallback;
+mod shared_workspace;
 mod spawn_worker;
 pub mod status_op;
 
@@ -43,6 +44,7 @@ pub use lifecycle::{
 };
 pub use pr_sync_control::PrSyncControl;
 pub use resume_fallback::ResumeFallbackOutcome;
+pub use shared_workspace::{SharedMultiWriterSummary, project_link_allowed};
 pub use spawn_worker::{
     BackgroundSpawn, BackgroundWorkerSpec, CommandWorkerSpec, LoopControl, LoopWorkerSpec,
     format_panic_payload,
@@ -3939,6 +3941,18 @@ impl Engine {
         let name = new_name.trim().to_string();
         if name.is_empty() {
             return BranchRenamePlan::Rejected(BranchRenameRejection::EmptyName);
+        }
+        // Shared main-workspace mode: the branch is the user's checkout, shared
+        // with every other writer, so asking to rename it is refused before any
+        // state changes. A title-only rename goes through below.
+        if rename_branch
+            && self
+                .sessions
+                .iter()
+                .find(|s| s.id == session_id)
+                .is_some_and(|s| s.shared_workspace())
+        {
+            return BranchRenamePlan::Rejected(BranchRenameRejection::SharedWorkspaceBranch);
         }
         // The refname rules apply only when the name really does become a git
         // branch. A STANDALONE agent's name is a label: creation takes it

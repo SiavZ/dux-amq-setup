@@ -4381,6 +4381,7 @@ mod workspace_mode_tests {
     /// `[workspace]` (which would flip it to shared), and a project's override
     /// survives a save.
     #[test]
+    #[allow(deprecated)] // sync-direct save, like the other save_config tests
     fn save_config_preserves_legacy_workspace_absence_and_project_override() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config_path = dir.path().join("config.toml");

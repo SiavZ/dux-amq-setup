@@ -655,6 +655,26 @@ pub(crate) fn branch_kept_reason(
 /// It names the folder, because the whole point is to reassure the user that
 /// the directory they pointed dux at is still theirs, and it says what to do
 /// instead rather than only saying no.
+/// The refusal for a worktree-removing delete of an agent whose directory dux
+/// never removes: a standalone agent's folder, or a shared agent's registered
+/// project checkout.
+pub fn delete_directory_refusal(session: &AgentSession) -> String {
+    if session.shared_workspace() {
+        return shared_delete_directory_refusal(&session.display_label(), session.directory());
+    }
+    standalone_delete_directory_refusal(&session.display_label(), session.directory())
+}
+
+/// Shared main-workspace mode: the agent runs in the project's own checkout.
+pub fn shared_delete_directory_refusal(agent_name: &str, checkout: &str) -> String {
+    format!(
+        "Agent \"{agent_name}\" runs in the shared project checkout \"{}\", and dux never \
+         removes it. Delete the agent on its own to remove dux's record of it; the checkout \
+         and its branch stay exactly as they are.",
+        crate::home_path::shorten_home(std::path::Path::new(checkout))
+    )
+}
+
 pub fn standalone_delete_directory_refusal(agent_name: &str, folder: &str) -> String {
     format!(
         "Agent \"{agent_name}\" is a standalone agent: it runs in \"{}\", a folder you already \
@@ -861,11 +881,22 @@ impl Engine {
         worktree_path: &str,
         exclude_id: &str,
     ) -> Option<DetachedSession> {
+        // Shared main-workspace mode: several agents in one checkout is the
+        // point, not a conflict. The second-writer consent asked the user before
+        // this launch, so neither side is detached when either one is shared.
+        if self
+            .sessions
+            .iter()
+            .any(|s| s.id == exclude_id && s.shared_workspace())
+        {
+            return None;
+        }
         let conflicting = self
             .sessions
             .iter()
             .find(|s| {
                 s.id != exclude_id
+                    && !s.shared_workspace()
                     // Canonical comparison, like every other place dux asks
                     // whether two agents occupy one directory (the
                     // occupied-directory refusal at create, the worktree
@@ -1653,11 +1684,8 @@ impl Engine {
         // about a destructive request, and the user would come away believing
         // dux had cleaned something up. The default is already false, so only
         // a caller that asked on purpose can reach this.
-        if delete_worktree && !session.workspace.deletion_may_remove_directory() {
-            anyhow::bail!(standalone_delete_directory_refusal(
-                &session.display_label(),
-                session.directory()
-            ));
+        if delete_worktree && !session.deletion_may_remove_directory() {
+            anyhow::bail!(delete_directory_refusal(&session));
         }
         logger::info(&format!(
             "deleting session {} at {} (delete_worktree={}, sync)",
@@ -1686,7 +1714,11 @@ impl Engine {
         // `removal_target` is `None` and the block is unreachable rather than
         // guarded: deleting one removes dux's record and nothing else.
         let removal_target = match (project.as_ref(), session.workspace.as_managed()) {
-            (Some(project), Some(managed)) if delete_worktree && !other_sessions_on_worktree => {
+            (Some(project), Some(managed))
+                if delete_worktree
+                    && !other_sessions_on_worktree
+                    && session.deletion_may_remove_directory() =>
+            {
                 Some((project, managed))
             }
             _ => None,
@@ -1901,12 +1933,9 @@ impl Engine {
         // Same explicit contract as the synchronous path: a worktree-removing
         // delete of a standalone agent is refused rather than silently
         // downgraded to an ordinary one.
-        if delete_worktree && !session.workspace.deletion_may_remove_directory() {
+        if delete_worktree && !session.deletion_may_remove_directory() {
             return BeginDeleteSessionOutcome::Refused {
-                message: standalone_delete_directory_refusal(
-                    &session.display_label(),
-                    session.directory(),
-                ),
+                message: delete_directory_refusal(&session),
             };
         }
         // Blanket precondition: refuse while ANY tab of this session has a launch
@@ -1937,7 +1966,7 @@ impl Engine {
                 && crate::project_browser::same_directory(s.directory(), session.directory())
         });
         let should_remove_worktree = delete_worktree
-            && session.workspace.deletion_may_remove_directory()
+            && session.deletion_may_remove_directory()
             && !other_sessions_on_worktree
             && project.is_some();
 

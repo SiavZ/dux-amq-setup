@@ -6318,6 +6318,13 @@ impl App {
                 );
                 return;
             }
+            BranchRenamePlan::Rejected(BranchRenameRejection::SharedWorkspaceBranch) => {
+                self.set_error(
+                    "This agent runs in the shared project checkout, and dux never renames \
+                     the branch checked out there. Rename the title only.",
+                );
+                return;
+            }
             BranchRenamePlan::Rejected(BranchRenameRejection::AlreadyInFlight) => {
                 self.set_error(
                     "A rename is already in progress for this agent. Wait for it to finish before renaming again.",

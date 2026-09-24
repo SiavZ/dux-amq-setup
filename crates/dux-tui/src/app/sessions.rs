@@ -833,7 +833,8 @@ impl App {
         let initial_name = match &request {
             CreateAgentRequest::NewProject { custom_name, .. }
             | CreateAgentRequest::ForkSession { custom_name, .. }
-            | CreateAgentRequest::ForkExternalWorktree { custom_name, .. } => custom_name.clone(),
+            | CreateAgentRequest::ForkExternalWorktree { custom_name, .. }
+            | CreateAgentRequest::SharedWorkspace { custom_name, .. } => custom_name.clone(),
             // A standalone create already has its title (resolved from the
             // folder), so the prompt opens pre-filled with it.
             CreateAgentRequest::Standalone { title, .. } => Some(title.clone()),
