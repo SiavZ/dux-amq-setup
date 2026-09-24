@@ -264,7 +264,7 @@ impl App {
                     && pty.agent_detached
                     && reported != Some(pty.id.as_str())
             })
-            .map(|pty| dux_core::engine::detached_agent_notice(pty, &remedy))
+            .map(|pty| dux_core::engine::detached_agent_notice(pty, &remedy).into())
             .collect();
         for notice in notices {
             self.set_warning(notice);
@@ -1003,7 +1003,7 @@ impl App {
                 if let Err(error) = self.finish_delete_session(&session_id, removal, false) {
                     self.set_error(format!("Failed to delete agent: {error:#}"));
                 } else {
-                    let op = self.build_delete_status_op(&session_id, busy_message);
+                    let op = self.build_delete_status_op(&session_id, busy_message.to_string());
                     let pending = self.engine.begin_status_op(&op);
                     self.apply_reaction(EventReaction::Status(pending));
                     self.pending_delete_ops.insert(session_id, op);
@@ -1774,7 +1774,7 @@ fn pruned_agent_exit_message(pty: &PrunedPty, reconnect_key: &str) -> String {
     if let Some(warning) = pty.refused_resume_excerpt.as_deref().and_then(|excerpt| {
         dux_core::tab_verdict::refused_resume_warning(&pty.label, excerpt, &remedy)
     }) {
-        return warning;
+        return warning.to_string();
     }
     agent_exit_status_message(
         pty.exit_success,

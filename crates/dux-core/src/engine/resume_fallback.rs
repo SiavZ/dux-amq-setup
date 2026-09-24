@@ -366,18 +366,24 @@ impl Engine {
             );
             let location = self.session_location_phrase(&session);
             let status_message = match decision {
-                ResumeFallbackDecision::RetryExitedSilent => format!(
-                    "No prior session to resume for agent \"{}\". Started a fresh {} session in {}.",
-                    session.display_label(),
-                    provider.as_str(),
+                ResumeFallbackDecision::RetryExitedSilent => crate::status_text![
+                    "No prior session to resume for agent ",
+                    q(session.display_label()),
+                    ". Started a fresh ",
+                    n(provider.as_str()),
+                    " session in ",
                     location,
-                ),
-                ResumeFallbackDecision::RetryHungTimeout => format!(
-                    "Resume timed out for agent \"{}\" with no visible output. Started a fresh {} session in {}.",
-                    session.display_label(),
-                    provider.as_str(),
+                    "."
+                ],
+                ResumeFallbackDecision::RetryHungTimeout => crate::status_text![
+                    "Resume timed out for agent ",
+                    q(session.display_label()),
+                    " with no visible output. Started a fresh ",
+                    n(provider.as_str()),
+                    " session in ",
                     location,
-                ),
+                    "."
+                ],
                 ResumeFallbackDecision::DropSpokenExit => {
                     // The provider left words on screen: drop the candidate and
                     // let the exit-prune path detach the agent normally, keeping

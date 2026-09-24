@@ -354,8 +354,12 @@ pub fn recreate_confirm_prose(
 }
 
 /// The busy sentence while the recreate runs.
-pub fn recreate_busy_message(agent_label: &str) -> String {
-    format!("Recreating the working copy for agent \"{agent_label}\"...")
+pub fn recreate_busy_message(agent_label: &str) -> crate::status_text::StatusText {
+    crate::status_text![
+        "Recreating the working copy for agent ",
+        q(agent_label),
+        "..."
+    ]
 }
 
 /// The success sentence, naming the path and what actually happened to the
@@ -375,27 +379,43 @@ pub fn recreate_success_message(
     branch_name: &str,
     outcome: &RecreatedBranch,
     live_providers: &[String],
-) -> String {
+) -> crate::status_text::StatusText {
     let branch_outcome = match outcome {
-        RecreatedBranch::RecreatedFrom(source) => format!(
-            "branch \"{branch_name}\" was recreated from \"{source}\", so it holds none of the \
+        RecreatedBranch::RecreatedFrom(source) => crate::status_text![
+            "branch ",
+            q(branch_name),
+            " was recreated from ",
+            q(source),
+            ", so it holds none of the \
              commits it held before"
-        ),
-        RecreatedBranch::RecreatedFromRemote(remote) => format!(
-            "branch \"{branch_name}\" was gone locally and was recreated from \"{remote}\", so it \
+        ],
+        RecreatedBranch::RecreatedFromRemote(remote) => crate::status_text![
+            "branch ",
+            q(branch_name),
+            " was gone locally and was recreated from ",
+            q(remote),
+            ", so it \
              holds what had been pushed there and nothing committed after that"
-        ),
-        RecreatedBranch::CheckedOut => format!("branch \"{branch_name}\" was checked out again"),
+        ],
+        RecreatedBranch::CheckedOut => {
+            crate::status_text!["branch ", q(branch_name), " was checked out again"]
+        }
     };
-    let tail = if live_providers.is_empty() {
-        "Its tabs stay dormant; start one when you want the agent running there.".to_string()
+    let tail: crate::status_text::StatusText = if live_providers.is_empty() {
+        "Its tabs stay dormant; start one when you want the agent running there.".into()
     } else {
-        recreate_running_tab_clause(live_providers)
+        recreate_running_tab_prose(live_providers).into()
     };
-    format!(
-        "Recreated the working copy for agent \"{agent_label}\" at {}: {branch_outcome}. {tail}",
-        shorten_home(worktree)
-    )
+    crate::status_text![
+        "Recreated the working copy for agent ",
+        q(agent_label),
+        " at ",
+        n(shorten_home(worktree)),
+        ": ",
+        branch_outcome,
+        ". ",
+        tail
+    ]
 }
 
 #[cfg(test)]

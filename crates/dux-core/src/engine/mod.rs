@@ -495,7 +495,7 @@ pub struct Engine {
     /// whether the current status-line content was set by this deletion (and
     /// should be cleared) or by an unrelated operation (and should be left
     /// alone). Cleared per-session when the worker event arrives.
-    pub deletion_busy_messages: HashMap<String, String>,
+    pub deletion_busy_messages: HashMap<String, StatusText>,
     pub watched_worktree: Arc<Mutex<Option<PathBuf>>>,
     /// Coalescing state for [`Engine::spawn_changed_files_refresh`]: at most one
     /// reader thread and at most one queued worktree, newest wins. Shared by

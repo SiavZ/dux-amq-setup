@@ -10190,7 +10190,9 @@ mod tests {
             crate::engine::BeginDeleteSessionView {
                 session_id: "s1".to_string(),
                 outcome: BeginDeleteSessionOutcome::AsyncStarted {
-                    busy_message: "Removing worktree for agent \"feat\"\u{2026}".to_string(),
+                    busy_message: "Removing worktree for agent \"feat\"\u{2026}"
+                        .to_string()
+                        .into(),
                 },
             },
         ));
@@ -10240,7 +10242,9 @@ mod tests {
             crate::engine::BeginDeleteSessionView {
                 session_id: "s1".to_string(),
                 outcome: BeginDeleteSessionOutcome::AsyncStarted {
-                    busy_message: "Removing worktree for agent \"feat\"\u{2026}".to_string(),
+                    busy_message: "Removing worktree for agent \"feat\"\u{2026}"
+                        .to_string()
+                        .into(),
                 },
             },
         ));
@@ -10300,7 +10304,9 @@ mod tests {
             crate::engine::BeginDeleteSessionView {
                 session_id: "s1".to_string(),
                 outcome: BeginDeleteSessionOutcome::AsyncStarted {
-                    busy_message: "Removing worktree for agent \"feat\"\u{2026}".to_string(),
+                    busy_message: "Removing worktree for agent \"feat\"\u{2026}"
+                        .to_string()
+                        .into(),
                 },
             },
         ));
@@ -10344,7 +10350,9 @@ mod tests {
             crate::engine::BeginDeleteSessionView {
                 session_id: "s1".to_string(),
                 outcome: BeginDeleteSessionOutcome::AsyncStarted {
-                    busy_message: "Removing worktree for agent \"feat\"\u{2026}".to_string(),
+                    busy_message: "Removing worktree for agent \"feat\"\u{2026}"
+                        .to_string()
+                        .into(),
                 },
             },
         ));
@@ -10378,7 +10386,9 @@ mod tests {
             crate::engine::BeginDeleteSessionView {
                 session_id: "s1".to_string(),
                 outcome: BeginDeleteSessionOutcome::AsyncStarted {
-                    busy_message: "Removing worktree for agent \"feat\"\u{2026}".to_string(),
+                    busy_message: "Removing worktree for agent \"feat\"\u{2026}"
+                        .to_string()
+                        .into(),
                 },
             },
         ));

@@ -189,7 +189,7 @@ pub struct DeferredWorktreeRemoval {
     pub delete_branch: Option<bool>,
     /// The Busy status message to show while the removal runs (set when the
     /// worker is finally spawned, after the PTY is reaped).
-    pub busy_message: String,
+    pub busy_message: crate::status_text::StatusText,
 }
 
 /// A PTY that was SIGTERMed by an individual delete/close and is being given a
@@ -340,15 +340,23 @@ pub struct ClosedTabExit {
 /// The closing clause is only written where it is certainly true: one tab left
 /// means the pane can only be showing that tab, while with siblings still up
 /// the user may be looking at any of them.
-pub fn closed_tab_exit_notice(exit: &ClosedTabExit) -> String {
-    let head = format!(
-        "Tab ({}) of agent \"{}\" exited cleanly and was closed",
-        exit.provider, exit.agent_label
-    );
+pub fn closed_tab_exit_notice(exit: &ClosedTabExit) -> crate::status_text::StatusText {
+    let head = crate::status_text![
+        "Tab (",
+        n(exit.provider),
+        ") of agent ",
+        q(exit.agent_label),
+        " exited cleanly and was closed"
+    ];
     if exit.tabs_remaining == 1 {
-        format!("{head}; the pane now shows its {} tab.", exit.slot_provider)
+        crate::status_text![
+            head,
+            "; the pane now shows its ",
+            n(exit.slot_provider),
+            " tab."
+        ]
     } else {
-        format!("{head}.")
+        crate::status_text![head, "."]
     }
 }
 
@@ -364,9 +372,9 @@ pub fn closed_tab_exit_notice(exit: &ClosedTabExit) -> String {
 /// screen and about to be thrown away with the pane, so the notice quotes the
 /// CLI's own last words and names `remedy`, which is the only part that differs
 /// per surface because the way back does.
-pub fn detached_agent_notice(pruned: &PrunedPty, remedy: &str) -> String {
+pub fn detached_agent_notice(pruned: &PrunedPty, remedy: &str) -> crate::status_text::StatusText {
     refused_resume_notice(pruned, remedy)
-        .unwrap_or_else(|| format!("{}.", agent_exited_head(&pruned.label)))
+        .unwrap_or_else(|| crate::status_text![agent_exited_head(&pruned.label), "."])
 }
 
 /// The same notice, for a surface that also knows a companion terminal of the
@@ -377,23 +385,29 @@ pub fn detached_agent_notice(pruned: &PrunedPty, remedy: &str) -> String {
 /// the other naming neither the agent nor what survived it. A refused resume
 /// still wins, because what the provider said is the more useful sentence and
 /// the terminal is beside the point there.
-pub fn agent_exit_with_companion_notice(pruned: &PrunedPty, remedy: &str) -> String {
+pub fn agent_exit_with_companion_notice(
+    pruned: &PrunedPty,
+    remedy: &str,
+) -> crate::status_text::StatusText {
     refused_resume_notice(pruned, remedy).unwrap_or_else(|| {
-        format!(
-            "{}, and its companion terminal is still running. {remedy}",
-            agent_exited_head(&pruned.label)
-        )
+        crate::status_text![
+            agent_exited_head(&pruned.label),
+            format!(", and its companion terminal is still running. {}", remedy)
+        ]
     })
 }
 
 /// The fact itself, with no full stop, so the sentences that continue past it
 /// can.
-fn agent_exited_head(label: &str) -> String {
-    format!("Agent \"{label}\" exited")
+fn agent_exited_head(label: &str) -> crate::status_text::StatusText {
+    crate::status_text!["Agent ", q(label), " exited"]
 }
 
 /// The provider's own last words, when this exit was a resume it refused.
-fn refused_resume_notice(pruned: &PrunedPty, remedy: &str) -> Option<String> {
+fn refused_resume_notice(
+    pruned: &PrunedPty,
+    remedy: &str,
+) -> Option<crate::status_text::StatusText> {
     crate::tab_verdict::refused_resume_warning(
         &pruned.label,
         pruned.refused_resume_excerpt.as_deref()?,
@@ -406,11 +420,13 @@ fn refused_resume_notice(pruned: &PrunedPty, remedy: &str) -> Option<String> {
 /// Closing a terminal is destructive and the row leaving the sidebar is too
 /// small to stand in for the confirmation, so the sentence says what went with
 /// it as well as what was closed.
-pub fn closed_terminal_notice(label: &str) -> String {
-    format!(
-        "Closed terminal \"{label}\". Its shell has stopped, so anything that was running in it \
+pub fn closed_terminal_notice(label: &str) -> crate::status_text::StatusText {
+    crate::status_text![
+        "Closed terminal ",
+        q(label),
+        ". Its shell has stopped, so anything that was running in it \
          is gone."
-    )
+    ]
 }
 
 /// Whether an exited agent tab's row should be closed along with the prune: any
@@ -541,14 +557,18 @@ pub fn detach_status_key(session_id: &str) -> String {
 }
 
 /// The spinner shown while dux waits for the agent to exit on its own.
-pub fn detach_busy_message(label: &str) -> String {
-    format!("Asking \"{label}\" to shut down…")
+pub fn detach_busy_message(label: &str) -> crate::status_text::StatusText {
+    crate::status_text!["Asking ", q(label), " to shut down…"]
 }
 
 /// The refusal when the agent has no live process. Loud rather than silent: the
 /// row looks the same either way, so silence is indistinguishable from a failure.
-pub fn detach_not_running_message(label: &str) -> String {
-    format!("Agent \"{label}\" is not running, so there is nothing to detach.")
+pub fn detach_not_running_message(label: &str) -> crate::status_text::StatusText {
+    crate::status_text![
+        "Agent ",
+        q(label),
+        " is not running, so there is nothing to detach."
+    ]
 }
 
 /// What replaces the detach spinner. Two genuinely different endings, so two
@@ -568,15 +588,22 @@ pub fn detach_not_running_message(label: &str) -> String {
 /// fixture without that wait reports clean for a child written to survive.
 pub fn detach_final(label: &str, forced: bool, grace_seconds: u64) -> crate::engine::Final {
     if forced {
-        crate::engine::Final::warning(format!(
-            "Agent \"{label}\" did not exit within {grace_seconds} seconds and was \
-             force-closed; it is now detached."
-        ))
+        crate::engine::Final::warning(crate::status_text![
+            "Agent ",
+            q(label),
+            format!(
+                " did not exit within {} seconds and was \
+             force-closed; it is now detached.",
+                grace_seconds
+            )
+        ])
     } else {
-        crate::engine::Final::info(format!(
-            "Agent \"{label}\" shut down and is now detached. Resume it from its row \
+        crate::engine::Final::info(crate::status_text![
+            "Agent ",
+            q(label),
+            " shut down and is now detached. Resume it from its row \
              when you need it again."
-        ))
+        ])
     }
 }
 
@@ -1320,7 +1347,7 @@ impl Engine {
             label,
             key,
             grace_seconds,
-            busy,
+            busy: busy.to_string(),
         }
     }
 
@@ -1898,11 +1925,17 @@ impl Engine {
                             &outcome.live_providers,
                         ))
                     }
-                    Err(err) => crate::engine::Final::error(format!(
-                        "Could not recreate the working copy for agent \"{agent_label}\" at {}: \
-                         {err}",
-                        crate::home_path::shorten_home(&worktree_path)
-                    )),
+                    Err(err) => crate::engine::Final::error(crate::status_text![
+                        "Could not recreate the working copy for agent ",
+                        q(agent_label),
+                        " at ",
+                        n(crate::home_path::shorten_home(&worktree_path)),
+                        format!(
+                            ": \
+                         {}",
+                            err
+                        )
+                    ]),
                 }
             })
             .with_scope(self.current_origin.clone());
@@ -2312,6 +2345,16 @@ mod recreate_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// The tone and the plain words of a final, the terminal UI's reading of
+    /// it. A final built from parts also carries them, which the literal a test
+    /// writes does not, so the words are what these tests compare.
+    fn final_words(outcome: &crate::engine::Final) -> (crate::statusline::StatusTone, &str) {
+        match outcome {
+            crate::engine::Final::Message { tone, text, .. } => (*tone, text.as_str()),
+            crate::engine::Final::Clear => panic!("expected a message, got a clear"),
+        }
+    }
     use crate::ids::{TabId, TabIdRef};
     use crate::tab_verdict::TabRunEnding;
     use std::path::Path;
@@ -6085,7 +6128,7 @@ mod tests {
                     branch_provenance: crate::model::BranchProvenance::CreatedByDux,
                     worktree_path: worktree.path().to_string_lossy().to_string(),
                 },
-                busy_message: "removing".to_string(),
+                busy_message: "removing".to_string().into(),
             },
         });
 
@@ -6311,8 +6354,9 @@ mod tests {
         assert_eq!(finals.len(), 1);
         assert_eq!(finals[0].key, key);
         assert_eq!(
-            finals[0].outcome,
-            crate::engine::Final::info(
+            final_words(&finals[0].outcome),
+            (
+                crate::statusline::StatusTone::Info,
                 "Agent \"s1-title\" shut down and is now detached. Resume it from its \
                  row when you need it again."
             )
@@ -6354,8 +6398,9 @@ mod tests {
         let finals = reap_until_detach_final(&mut engine, Duration::from_secs(10));
         assert_eq!(finals.len(), 1);
         assert_eq!(
-            finals[0].outcome,
-            crate::engine::Final::warning(
+            final_words(&finals[0].outcome),
+            (
+                crate::statusline::StatusTone::Warning,
                 "Agent \"s1-title\" did not exit within 2 seconds and was \
                  force-closed; it is now detached."
             ),

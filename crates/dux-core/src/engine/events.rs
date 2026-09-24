@@ -267,7 +267,7 @@ pub enum EventReaction {
     WorktreeRemoveSucceeded {
         session_id: String,
         branches: RemovedBranches,
-        our_busy_message: Option<String>,
+        our_busy_message: Option<StatusText>,
     },
     WorktreeRemoveFailed {
         session_id: String,
@@ -674,13 +674,16 @@ pub(crate) fn branch_kept_reason(
 /// It names the folder, because the whole point is to reassure the user that
 /// the directory they pointed dux at is still theirs, and it says what to do
 /// instead rather than only saying no.
-pub fn standalone_delete_directory_refusal(agent_name: &str, folder: &str) -> String {
-    format!(
-        "Agent \"{agent_name}\" is a standalone agent: it runs in \"{}\", a folder you already \
+pub fn standalone_delete_directory_refusal(agent_name: &str, folder: &str) -> StatusText {
+    crate::status_text![
+        "Agent ",
+        q(agent_name),
+        " is a standalone agent: it runs in ",
+        q(crate::home_path::shorten_home(std::path::Path::new(folder))),
+        ", a folder you already \
          had, and dux never removes it. Delete the agent on its own to remove dux's \
-         record of it, and remove the folder yourself if you no longer want it.",
-        crate::home_path::shorten_home(std::path::Path::new(folder))
-    )
+         record of it, and remove the folder yourself if you no longer want it."
+    ]
 }
 
 /// What happened to the session's worktree during deletion. Each variant maps
@@ -804,7 +807,7 @@ pub enum BeginDeleteSessionOutcome {
     /// `busy_message`. Once the PTY is reaped, `reap_terminating_ptys` hands the
     /// removal to `dispatch_deferred_worktree_removal`, whose worker posts
     /// `WorktreeRemoveCompleted` and resolves that op.
-    AsyncStarted { busy_message: String },
+    AsyncStarted { busy_message: StatusText },
     /// Inline path: no worktree removal needed (no `delete_worktree` request
     /// or shared with siblings). App should call the existing
     /// `finish_delete_session` wrapper to complete cleanup + emit status.
@@ -813,7 +816,7 @@ pub enum BeginDeleteSessionOutcome {
     /// agent's folder. Nothing was deleted, not even the agent record, and the
     /// message says why. Distinct from every other arm because it is the one
     /// where the DELETE ITSELF did not happen.
-    Refused { message: String },
+    Refused { message: StatusText },
 }
 
 /// View follow-up data for a `Command::FinishDeleteSession`. Wraps the
@@ -1950,10 +1953,11 @@ impl Engine {
                 // the raw answer with the payload is what makes the deferred
                 // path and the synchronous one decide the same thing.
                 delete_branch,
-                busy_message: format!(
-                    "Removing worktree for agent \"{}\"\u{2026}",
-                    session.display_label()
-                ),
+                busy_message: crate::status_text![
+                    "Removing worktree for agent ",
+                    q(session.display_label()),
+                    "\u{2026}"
+                ],
             }),
             _ => None,
         };
@@ -2005,7 +2009,7 @@ impl Engine {
     pub fn dispatch_deferred_worktree_removal(
         &mut self,
         req: super::DeferredWorktreeRemoval,
-    ) -> String {
+    ) -> StatusText {
         let super::DeferredWorktreeRemoval {
             session_id,
             project_path,
@@ -2032,13 +2036,17 @@ impl Engine {
             s.id != session_id
                 && crate::project_browser::same_directory(s.directory(), &worktree_path)
         }) {
-            let message = format!(
-                "Kept the worktree at \"{}\": agent \"{}\" started working in it while this \
+            let message = crate::status_text![
+                "Kept the worktree at ",
+                q(crate::home_path::shorten_home(std::path::Path::new(
+                    &worktree_path
+                ))),
+                ": agent ",
+                q(occupant.display_label()),
+                " started working in it while this \
                  agent was shutting down. Remove it from the worktree manager if you still \
-                 want it gone.",
-                crate::home_path::shorten_home(std::path::Path::new(&worktree_path)),
-                occupant.display_label()
-            );
+                 want it gone."
+            ];
             logger::warn(&message);
             return message;
         }
@@ -3051,10 +3059,13 @@ impl Engine {
                         op.resolve(&crate::engine::WebCheckoutOutcome::Heuristic { current_branch })
                             .into_reaction()
                     } else {
-                        EventReaction::Status(StatusUpdate::error(format!(
-                            "Can't determine the default branch for project \"{}\" while it is on \"{}\". Resolve the default branch in your terminal and retry.",
-                            project.name, current_branch
-                        )))
+                        EventReaction::Status(StatusUpdate::error(crate::status_text![
+                            "Can't determine the default branch for project ",
+                            q(project.name),
+                            " while it is on ",
+                            q(current_branch),
+                            ". Resolve the default branch in your terminal and retry."
+                        ]))
                     }
                 }
                 None => {
@@ -3088,10 +3099,11 @@ impl Engine {
                     op.resolve(&crate::engine::WebCheckoutOutcome::InspectFailed { error })
                         .into_reaction()
                 } else {
-                    EventReaction::Status(StatusUpdate::error(format!(
-                        "Couldn't inspect the default branch for project \"{}\": {error}",
-                        project.name
-                    )))
+                    EventReaction::Status(StatusUpdate::error(crate::status_text![
+                        "Couldn't inspect the default branch for project ",
+                        q(project.name),
+                        format!(": {}", error)
+                    ]))
                 }
             }
         }
@@ -3170,9 +3182,13 @@ impl Engine {
                         }
                     }
                 }
-                EventReaction::Status(StatusUpdate::error(format!(
-                    "Couldn't check out \"{target_branch}\" in {path}. Resolve in your terminal and retry."
-                )))
+                EventReaction::Status(StatusUpdate::error(crate::status_text![
+                    "Couldn't check out ",
+                    q(target_branch),
+                    " in ",
+                    n(path),
+                    ". Resolve in your terminal and retry."
+                ]))
             }
         }
     }
@@ -3246,10 +3262,16 @@ impl Engine {
                     "failed to save \"{branch}\" as the base branch of project {}: {err:#}",
                     project.id
                 ));
-                BaseMove::MovedUnsaved(format!(
-                    "Couldn't save \"{branch}\" as the base branch of project \"{}\": {err:#}. New worktrees branch from it until dux restarts or reloads its config, then from the branch saved before.",
-                    project.name
-                ))
+                BaseMove::MovedUnsaved(crate::status_text![
+                    "Couldn't save ",
+                    q(branch),
+                    " as the base branch of project ",
+                    q(project.name),
+                    format!(
+                        ": {:#}. New worktrees branch from it until dux restarts or reloads its config, then from the branch saved before.",
+                        err
+                    )
+                ])
             }
         }
     }
@@ -3681,7 +3703,7 @@ enum BaseMove {
     /// It moved, in memory and in SQLite.
     Moved,
     /// It moved in memory, but SQLite refused; carries the warning to show.
-    MovedUnsaved(String),
+    MovedUnsaved(StatusText),
 }
 
 impl BaseMove {
@@ -5104,7 +5126,7 @@ mod tests {
                     branch_provenance: crate::model::BranchProvenance::CreatedByDux,
                     worktree_path: worktree.to_string_lossy().to_string(),
                 },
-                busy_message: "Removing worktree\u{2026}".to_string(),
+                busy_message: "Removing worktree\u{2026}".to_string().into(),
             });
 
         assert!(
@@ -6835,9 +6857,10 @@ mod tests {
     fn worktree_remove_completed_ok_clears_state_and_returns_busy_message() {
         let (mut engine, _tmp) = test_engine();
         engine.pending_deletions.insert("s1".to_string());
-        engine
-            .deletion_busy_messages
-            .insert("s1".to_string(), "Deleting agent \"s1\"…".to_string());
+        engine.deletion_busy_messages.insert(
+            "s1".to_string(),
+            "Deleting agent \"s1\"…".to_string().into(),
+        );
 
         let reaction = engine.process_worker_event(WorkerEvent::WorktreeRemoveCompleted {
             session_id: "s1".to_string(),
@@ -6878,7 +6901,7 @@ mod tests {
         engine.pending_deletions.insert("s1".to_string());
         engine
             .deletion_busy_messages
-            .insert("s1".to_string(), "busy".to_string());
+            .insert("s1".to_string(), "busy".to_string().into());
 
         let reaction = engine.process_worker_event(WorkerEvent::WorktreeRemoveCompleted {
             session_id: "s1".to_string(),
@@ -9271,7 +9294,7 @@ mod tests {
                 branch_provenance: crate::model::BranchProvenance::AttachedExisting,
                 worktree_path: worktree.to_string_lossy().to_string(),
             },
-            busy_message: "Removing worktree\u{2026}".to_string(),
+            busy_message: "Removing worktree\u{2026}".to_string().into(),
         });
 
         let event = engine
@@ -9306,7 +9329,7 @@ mod tests {
         engine.pending_deletions.insert("s1".to_string());
         engine
             .deletion_busy_messages
-            .insert("s1".to_string(), "Removing worktree…".to_string());
+            .insert("s1".to_string(), "Removing worktree…".to_string().into());
 
         // Spawn a thread that mimics the catch_unwind wrapper in
         // `begin_delete_session` but with a deliberately panicking body.

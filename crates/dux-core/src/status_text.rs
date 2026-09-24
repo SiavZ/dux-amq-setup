@@ -133,11 +133,11 @@ macro_rules! status_text {
 macro_rules! __status_text_parts {
     ($t:ident;) => {};
     ($t:ident; q($e:expr) $(, $($rest:tt)*)?) => {
-        $t.push_quoted($e);
+        $t.push_quoted(&$e);
         $crate::__status_text_parts!($t; $($($rest)*)?);
     };
     ($t:ident; n($e:expr) $(, $($rest:tt)*)?) => {
-        $t.push_name($e);
+        $t.push_name(&$e);
         $crate::__status_text_parts!($t; $($($rest)*)?);
     };
     ($t:ident; $e:expr $(, $($rest:tt)*)?) => {
