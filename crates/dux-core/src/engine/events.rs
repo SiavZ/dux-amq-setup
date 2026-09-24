@@ -1075,7 +1075,7 @@ impl Engine {
             // truth from the first frame instead of starting at "not looked
             // yet" (which fails closed). A no-op for every other kind.
             self.spawn_folder_repo_probe(&session.id);
-            if inserted.kept() && request.resume {
+            if inserted.kept() && request.resumes_a_conversation() {
                 self.note_resume_launch(&tab_id);
             }
             self.update_branch_sync_sessions();
@@ -1188,7 +1188,7 @@ impl Engine {
             .flatten();
         if inserted.kept() {
             self.record_launched_drop_paste(&tab_id, &request.provider, &request.provider_config);
-            if request.resume {
+            if request.resumes_a_conversation() {
                 self.note_resume_launch(&tab_id);
             }
         }
@@ -3559,6 +3559,14 @@ impl Engine {
             }
             WorkerEvent::TailscaleModeApplied { mode, outcome } => {
                 EventReaction::TailscaleModeApplied { mode, outcome }
+            }
+            WorkerEvent::ProviderSessionCaptured {
+                session_id,
+                provider,
+                result,
+            } => self.process_provider_session_captured(&session_id, &provider, result),
+            WorkerEvent::ResumeRecoveryCompleted(result) => {
+                self.process_resume_recovery_completed(result)
             }
         }
     }
@@ -6776,6 +6784,7 @@ mod tests {
                 kind,
                 wants_fullscreen: false,
                 status_quiet: QuietSurfaces::LOUD,
+                provider_session: Default::default(),
             },
             message: message.to_string(),
         }
@@ -6867,6 +6876,7 @@ mod tests {
                 },
                 wants_fullscreen: false,
                 status_quiet: QuietSurfaces::LOUD,
+                provider_session: Default::default(),
             },
             client: latecomer,
         };
@@ -7063,6 +7073,7 @@ mod tests {
                 },
                 wants_fullscreen: false,
                 status_quiet: QuietSurfaces::LOUD,
+                provider_session: Default::default(),
             },
             message: message.to_string(),
         }
@@ -7908,6 +7919,7 @@ mod tests {
             },
             wants_fullscreen: false,
             status_quiet: QuietSurfaces::LOUD,
+            provider_session: Default::default(),
         };
         let reaction = engine
             .apply(crate::engine::Command::DispatchAgentLaunch {

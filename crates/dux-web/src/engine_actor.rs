@@ -1756,39 +1756,41 @@ pub struct FirstLoadInputs {
 /// per-launch statuses ride the normal worker-event drain once the loop runs.
 /// Returns the number of launches actually dispatched.
 pub(crate) fn auto_reopen_agents_on_startup(engine: &mut Engine) -> usize {
-    let candidates = engine.auto_reopen_candidates();
-    if candidates.is_empty() {
+    // The candidate set and the `[auto_resume]` throttle are core-owned
+    // (`queue_startup_launches` / `pump_startup_launches`, the same the TUI
+    // runs). This releases what the throttle allows now; `run_maintenance`
+    // pumps the rest each tick.
+    let recovering = engine.dispatch_resume_recovery();
+    let queued = engine.queue_startup_launches(recovering);
+    if queued == 0 {
         return 0;
     }
-    dux_core::logger::info(&auto_reopen_log_line(candidates.len()));
+    dux_core::logger::info(&auto_reopen_log_line(queued));
+    count_startup_launches(engine.pump_startup_launches((24, 80)))
+}
+
+/// How many of a startup pump's dispatches actually launched, logging each
+/// refusal the way the unthrottled pass did.
+fn count_startup_launches(reactions: Vec<EventReaction>) -> usize {
     let mut launched = 0;
-    for session in candidates {
-        let id = session.id.clone();
-        let request = engine.build_agent_launch_request(
-            session,
-            true,
-            (24, 80),
-            AgentLaunchKind::StartupAutoReopen,
-        );
-        match engine.apply(Command::DispatchAgentLaunch {
-            request: Box::new(request),
-        }) {
+    for reaction in reactions {
+        match reaction {
             // The chokepoint refuses (closing session, in-flight collision) by
             // returning `launched: false`, not an `Err`; log it like the
             // subscribe path does rather than counting it as a launch.
-            Ok(EventReaction::DispatchAgentLaunchView(view)) if view.launched => launched += 1,
-            Ok(EventReaction::DispatchAgentLaunchView(view)) => {
+            EventReaction::DispatchAgentLaunchView(view) if view.launched => launched += 1,
+            EventReaction::DispatchAgentLaunchView(view) => {
                 let message = view
                     .status
                     .as_ref()
                     .map(|s| s.message.clone())
                     .unwrap_or_else(|| "launch refused".to_string());
-                dux_core::logger::info(&format!("Auto-reopen skipped for {id}: {message}"));
+                dux_core::logger::info(&format!(
+                    "Auto-reopen skipped for {}: {message}",
+                    view.session_id
+                ));
             }
-            Ok(_) => launched += 1,
-            Err(err) => {
-                dux_core::logger::info(&format!("Auto-reopen dispatch failed for {id}: {err}"));
-            }
+            _ => launched += 1,
         }
     }
     launched
@@ -2452,6 +2454,13 @@ impl EngineService {
             for key in followup.clear_keys {
                 self.status.clear(key);
             }
+        }
+
+        // Release the queued startup relaunches the `[auto_resume]` throttle
+        // allows now (a no-op once the startup queue has drained).
+        let started = count_startup_launches(engine.pump_startup_launches((24, 80)));
+        if started > 0 {
+            self.note_mutation();
         }
 
         // Reap agent/terminal PTYs whose child process exited so they stop

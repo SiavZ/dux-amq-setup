@@ -141,8 +141,13 @@ impl Engine {
         kind: AgentLaunchKind,
     ) -> AgentLaunchRequest {
         let provider = tab_provider.unwrap_or_else(|| session.provider.clone());
+        let requested = resume;
         // Resume is decided per-provider in one place; see `tab_resume_decision`.
         let resume = self.tab_resume_decision(&session, &tab_id, &provider, resume);
+        // Resume by the provider's own conversation id when dux knows it,
+        // falling back to `resume` (see `provider_session_launch`).
+        let provider_session =
+            self.provider_session_launch(&session, &tab_id, &provider, requested, resume);
         let provider_config = crate::config::provider_config(&self.config, &provider);
         // A standalone agent has no project to overlay, so it gets the global
         // environment, not the empty one a missed project lookup falls to.
@@ -164,6 +169,7 @@ impl Engine {
             // Loud by default: a caller that quiets its completion says so on
             // the returned request.
             status_quiet: crate::statusline::QuietSurfaces::LOUD,
+            provider_session,
         }
     }
 

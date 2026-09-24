@@ -104,6 +104,9 @@ impl App {
         self.drain_unpushed_count();
         self.drain_pending_diff();
         self.drain_worker_events();
+        // After the drain, so a launch that resolved this tick frees its
+        // `[auto_resume]` slot for the next queued startup relaunch.
+        self.pump_startup_launches();
         self.apply_resume_fallback_sweep();
         self.apply_reaped_terminations();
         let maintenance = self.apply_pruned_pty_events();
@@ -3083,6 +3086,7 @@ mod tests {
             },
             wants_fullscreen: false,
             status_quiet: dux_core::statusline::QuietSurfaces::LOUD,
+            provider_session: Default::default(),
         };
 
         dux_core::agent_job::run_agent_launch_job(request, worker_tx);
