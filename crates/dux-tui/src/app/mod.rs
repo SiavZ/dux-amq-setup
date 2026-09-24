@@ -2968,6 +2968,11 @@ pub(crate) struct MouseLayoutState {
     /// reverse map (see `render::left_row_to_item`, reused for both lists).
     pub(crate) terminal_row_to_item: Vec<usize>,
     pub(crate) agent_term: Option<Rect>,
+    /// The agent pane's scrollbar track, when one is drawn: the pane's right
+    /// border column alongside the terminal rows. Published by the render pass
+    /// only while the grid has scrollback, so a press can only land on a
+    /// scrollbar that is on screen.
+    pub(crate) agent_scrollbar: Option<Rect>,
     /// The take-over card's button, when the card is on screen. Published by the
     /// render pass and cleared with the rest of this state every frame, so a
     /// click can only land on a button that is drawn right now: the card comes
@@ -3004,6 +3009,7 @@ impl MouseLayoutState {
         self.terminal_list = Rect::default();
         self.terminal_row_to_item.clear();
         self.agent_term = None;
+        self.agent_scrollbar = None;
         self.takeover_button = None;
         self.dormant_tab_button = None;
         self.pr_banner = None;
@@ -3298,6 +3304,9 @@ pub(crate) enum ResizeDragState {
     TerminalDivider,
     StagedDivider,
     CommitDivider,
+    /// Dragging the agent pane's scrollbar thumb (fork 670b8c24). Not a pane
+    /// resize: releasing it persists nothing.
+    CenterScrollbar,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

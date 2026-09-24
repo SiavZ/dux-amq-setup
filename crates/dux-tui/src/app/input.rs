@@ -3320,6 +3320,18 @@ impl App {
         if self.continue_raw_mouse_forward(&mouse) {
             return RawInputFlow::Continue;
         }
+        // The scrollbar is host chrome, not the child's grid: a press on it
+        // (and the drag it starts) is a host scroll even in interactive mode,
+        // never a selection, a forwarded click, or a click outside the overlay.
+        if self.center_scrollbar_at_mouse(mouse.column, mouse.row)
+            || self.mouse_drag == Some(ResizeDragState::CenterScrollbar)
+        {
+            self.terminal_selection = None;
+            if self.handle_mouse(mouse) {
+                return RawInputFlow::Return(true);
+            }
+            return RawInputFlow::Continue;
+        }
         if self.raw_mouse_is_outside_overlay(&mouse) {
             self.exit_interactive_mode();
             return RawInputFlow::Return(false);
@@ -9769,6 +9781,10 @@ impl App {
     }
 
     fn update_dragged_panes(&mut self, column: u16, row: u16) {
+        if self.mouse_drag == Some(ResizeDragState::CenterScrollbar) {
+            self.set_center_scrollback_from_mouse(row);
+            return;
+        }
         let body = self.mouse_layout.body;
         if body.width == 0 {
             return;
@@ -9831,8 +9847,49 @@ impl App {
                     }
                 }
             }
-            None => {}
+            Some(ResizeDragState::CenterScrollbar) | None => {}
         }
+    }
+
+    /// True when (`column`, `row`) is on the agent pane's scrollbar track, as
+    /// published by the last render (fork 670b8c24).
+    fn center_scrollbar_at_mouse(&self, column: u16, row: u16) -> bool {
+        self.mouse_layout
+            .agent_scrollbar
+            .is_some_and(|track| contains_point(track, column, row))
+    }
+
+    /// Jump the selected surface's scrollback to the point on the scrollbar
+    /// track under `row`. Goes through `note_user_scroll` so a drag away from
+    /// the live edge enters scroll mode exactly like a wheel or PageUp would.
+    fn set_center_scrollback_from_mouse(&mut self, row: u16) {
+        let Some(track) = self.mouse_layout.agent_scrollbar else {
+            return;
+        };
+        let total = self.snapshot_buf.scrollback_total;
+        let Some(provider) = self.selected_terminal_surface_client() else {
+            return;
+        };
+        provider.set_scrollback(super::render::agent_scrollback_for_row(track, total, row));
+        self.note_user_scroll();
+    }
+
+    /// Start a scrollbar drag if the press landed on the track. Checked before
+    /// the pane-divider hit test because the track sits in the center pane's
+    /// right border column, which is also a divider column; the divider stays
+    /// reachable from the rows beside the hint lane and from the right pane's
+    /// own border.
+    fn begin_center_scrollbar_drag(&mut self, mouse: &MouseEvent) -> bool {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            || !self.center_scrollbar_at_mouse(mouse.column, mouse.row)
+        {
+            return false;
+        }
+        self.mouse_drag = Some(ResizeDragState::CenterScrollbar);
+        self.focus = FocusPane::Center;
+        self.terminal_selection = None;
+        self.set_center_scrollback_from_mouse(mouse.row);
+        true
     }
 
     fn persist_pane_widths(&mut self) {
@@ -10006,6 +10063,7 @@ impl App {
     fn dismiss_noninteractive_fullscreen_mouse(&mut self, mouse: &MouseEvent) -> bool {
         if !matches!(self.fullscreen_overlay, FullscreenOverlay::None)
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && !self.center_scrollbar_at_mouse(mouse.column, mouse.row)
             && !self
                 .mouse_layout
                 .agent_term
@@ -10331,6 +10389,9 @@ impl App {
         // a press on a row still starts its own gesture.
         self.row_drag = None;
         self.end_terminal_selection_drag();
+        if self.begin_center_scrollbar_drag(mouse) {
+            return;
+        }
         if windowed && let Some(drag) = self.resize_drag_at_mouse(mouse.column, mouse.row) {
             self.mouse_drag = Some(drag);
             self.update_dragged_panes(mouse.column, mouse.row);
@@ -10355,7 +10416,10 @@ impl App {
 
     fn route_mouse_wheel(&mut self, mouse: MouseEvent, down: bool) {
         match self.mouse_target(mouse.column, mouse.row) {
-            Some(MouseTarget::LeftRow(_)) => {
+            // The pane's chrome (border, title, blank rows under the last
+            // agent) scrolls the list too (fork aaa59319): a wheel over the
+            // agent list should never be silently dropped.
+            Some(MouseTarget::LeftRow(_) | MouseTarget::LeftPane) => {
                 self.handle_left_mouse_wheel(down, mouse.column, mouse.row)
             }
             Some(MouseTarget::Center) => self.handle_center_mouse_wheel(mouse),
@@ -10391,8 +10455,10 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) if self.mouse_drag.is_some() => {
                 self.update_dragged_panes(mouse.column, mouse.row);
             }
-            MouseEventKind::Up(MouseButton::Left) if self.mouse_drag.take().is_some() => {
-                self.persist_pane_widths();
+            MouseEventKind::Up(MouseButton::Left) if self.mouse_drag.is_some() => {
+                if self.mouse_drag.take() != Some(ResizeDragState::CenterScrollbar) {
+                    self.persist_pane_widths();
+                }
             }
             // A selection drag on the minimized grid. The press that started it
             // cleared the row drag, so the two can never be live at once.
@@ -11211,6 +11277,7 @@ mod tests {
             terminal_list: Rect::default(),
             terminal_row_to_item: Vec::new(),
             agent_term: Some(Rect::new(21, 1, 55, 16)),
+            agent_scrollbar: None,
             takeover_button: None,
             dormant_tab_button: None,
             pr_banner: None,
@@ -30462,6 +30529,125 @@ cyan = "#00ffff"
             0,
             "End should scroll to bottom when scrolled back"
         );
+    }
+
+    // ── Agent pane scrollbar drag (fork 670b8c24) ──────────────────
+
+    /// A scrolled-back PTY with a published scrollbar track at column 60,
+    /// rows 10..15 (the geometry the render pass would publish).
+    fn app_with_scrollbar_track() -> (App, Rect) {
+        let mut app = app_with_scrolled_back_pty();
+        app.refresh_snapshot_buf();
+        assert!(
+            app.snapshot_buf.scrollback_total > 0,
+            "fixture needs history"
+        );
+        let track = Rect::new(60, 10, 1, 5);
+        app.mouse_layout.agent_term = Some(Rect::new(10, 10, 50, 5));
+        app.mouse_layout.agent_scrollbar = Some(track);
+        (app, track)
+    }
+
+    #[test]
+    fn mouse_drag_center_scrollbar_sets_scrollback_offset() {
+        let (mut app, track) = app_with_scrollbar_track();
+        let total = app.snapshot_buf.scrollback_total;
+
+        // Press on the top row: oldest history.
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            track.x,
+            track.y,
+        ));
+        assert_eq!(app.mouse_drag, Some(ResizeDragState::CenterScrollbar));
+        assert_eq!(
+            app.selected_terminal_surface_client()
+                .unwrap()
+                .scrollback_offset(),
+            total
+        );
+
+        // Drag past the bottom: pins to the live edge.
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            track.x,
+            track.y + 20,
+        ));
+        assert_eq!(
+            app.selected_terminal_surface_client()
+                .unwrap()
+                .scrollback_offset(),
+            0
+        );
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            track.x,
+            track.y + 4,
+        ));
+        assert_eq!(app.mouse_drag, None);
+    }
+
+    #[test]
+    fn scrollbar_drag_release_does_not_persist_pane_widths() {
+        let (mut app, track) = app_with_scrollbar_track();
+        app.fullscreen_overlay = FullscreenOverlay::None;
+        app.left_width_pct = app.engine.config.ui.left_width_pct.wrapping_add(1);
+        let before = app.engine.config.ui.left_width_pct;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            track.x,
+            track.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            track.x,
+            track.y,
+        ));
+        assert_eq!(app.engine.config.ui.left_width_pct, before);
+    }
+
+    #[test]
+    fn interactive_mouse_on_scrollbar_uses_host_drag_not_selection() {
+        let (mut app, track) = app_with_scrollbar_track();
+        // SGR coordinates are 1-based.
+        let (cx, cy) = (track.x + 1, track.y + 1);
+        let mut input = sgr_mouse_down(cx, cy);
+        input.extend_from_slice(format!("\x1b[<32;{cx};{}M", cy + 4).as_bytes());
+        input.extend_from_slice(format!("\x1b[<0;{cx};{}m", cy + 4).as_bytes());
+        let exit = app.process_raw_input_bytes(&input).unwrap();
+
+        assert!(!exit);
+        assert_eq!(
+            app.selected_terminal_surface_client()
+                .unwrap()
+                .scrollback_offset(),
+            0,
+            "dragging the thumb to the bottom returns to the live edge"
+        );
+        assert!(app.terminal_selection.is_none());
+        assert_eq!(app.mouse_drag, None);
+        assert_eq!(
+            app.fullscreen_overlay,
+            FullscreenOverlay::Agent,
+            "a press on the scrollbar is not a click outside the overlay"
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_on_left_pane_chrome_moves_selection() {
+        let mut app = test_app(default_bindings());
+        install_mouse_layout(&mut app);
+        app.focus = FocusPane::Center;
+        app.selected_left = 0;
+        // Row 0 is the left pane's top border: inside `left`, outside
+        // `left_list`, so it resolves to LeftPane rather than a row.
+        assert_eq!(app.mouse_target(2, 0), Some(MouseTarget::LeftPane));
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 2, 0));
+
+        assert_eq!(app.focus, FocusPane::Left);
+        assert_eq!(app.selected_left, 1);
     }
 
     // ── Click-outside-fullscreen tests ──────────────────────────────
