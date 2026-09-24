@@ -6,6 +6,7 @@
 pub mod action;
 pub mod activity;
 pub mod add_project_plan;
+pub mod agent_env;
 pub mod agent_job;
 pub mod agent_search;
 pub mod agent_tabs;

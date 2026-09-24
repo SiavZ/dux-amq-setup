@@ -915,7 +915,7 @@ fn run_create_standalone_agent_job(
     folder: PathBuf,
     title: String,
     provider: crate::model::ProviderKind,
-    _paths: DuxPaths,
+    paths: DuxPaths,
     config: Config,
     worker_tx: Sender<WorkerEvent>,
     term_size: (u16, u16),
@@ -978,6 +978,13 @@ fn run_create_standalone_agent_job(
                 return;
             }
         };
+    let env = crate::agent_env::agent_launch_env(
+        &paths,
+        &config,
+        &session,
+        session.slot_tab_id().as_str(),
+        env,
+    );
     let status_message = format!(
         "Created standalone agent \"{title}\" running {} in \"{folder_label}\". \
          dux does not manage a branch or a worktree for it, and never creates, moves \
@@ -1204,6 +1211,15 @@ fn launch_managed_create(
     });
     // crossterm::terminal::size() returns (cols, rows).
     let (cols, rows) = term_size;
+    // The startup command above ran with the user env alone; the provider
+    // additionally gets the Dux identity and session settings.
+    let env = crate::agent_env::agent_launch_env(
+        &paths,
+        &config,
+        &session,
+        session.slot_tab_id().as_str(),
+        env,
+    );
     let request = AgentLaunchRequest {
         // Create is always the session-slot tab, effective provider ==
         // session.provider. (Evaluated before `session` is moved.)
@@ -1666,6 +1682,16 @@ mod tests {
                 .any(|(k, v)| k == "DUX_TEST_GLOBAL" && v == "from-global"),
             "the global environment must reach a project-less agent, got {env:?}"
         );
+        // The Dux peer identity rides along, ahead of the user's `[env]`.
+        let identity = env
+            .iter()
+            .position(|(k, _)| k == "DUX_AMQ_HANDLE")
+            .expect("a created agent exports its Dux peer identity");
+        let global = env
+            .iter()
+            .position(|(k, _)| k == "DUX_TEST_GLOBAL")
+            .unwrap();
+        assert!(identity < global, "user env must come last, got {env:?}");
     }
 
     /// Every entry under `path`, recursively, as sorted relative paths. Used to

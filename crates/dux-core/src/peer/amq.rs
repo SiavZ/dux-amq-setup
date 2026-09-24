@@ -59,25 +59,6 @@ pub fn optional_amq_root(paths: &DuxPaths) -> Option<PathBuf> {
     None
 }
 
-/// The AMQ root agent launches reserve their inbox in, fixed once per process
-/// by [`init_for_process`]. Library code (and therefore every test that builds
-/// a launch request) sees `None` unless an entry point opted in, so a test run
-/// on a machine that exports `AMQ_GLOBAL_ROOT` can never write into the
-/// user's real registry.
-static LAUNCH_AMQ_ROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-
-/// Opt this process into the AMQ registry: remember the shared root for agent
-/// launches and reconcile the registry once. Called by the `dux` TUI and
-/// `dux server` entry points before their engine boots; never fails the boot.
-pub fn init_for_process(paths: &DuxPaths) {
-    let _ = LAUNCH_AMQ_ROOT.set(optional_amq_root(paths));
-    sync_amq_agents_for_bootstrap(paths);
-}
-
-pub(crate) fn launch_amq_root() -> Option<PathBuf> {
-    LAUNCH_AMQ_ROOT.get().cloned().flatten()
-}
-
 pub(crate) fn require_amq_root(paths: &DuxPaths) -> Result<PathBuf> {
     optional_amq_root(paths).ok_or_else(|| {
         anyhow!("AMQ root is not configured; set AMQ_GLOBAL_ROOT or install dux-amq")

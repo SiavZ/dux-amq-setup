@@ -102,7 +102,27 @@ fn try_launch_env_for_session(
     paths: &DuxPaths,
     session: &AgentSession,
 ) -> Result<Vec<(String, String)>> {
-    launch_env_with_root(paths, session, super::amq::launch_amq_root().as_deref())
+    launch_env_with_root(paths, session, launch_amq_root().as_deref())
+}
+
+/// The AMQ root agent launches reserve their inbox in, fixed once per process
+/// by [`init_for_process`]. Library code, and therefore every test that builds
+/// a launch request, sees `None` unless a binary entry point opted in, so a
+/// test run on a machine that exports `AMQ_GLOBAL_ROOT` never writes into the
+/// user's real registry.
+static LAUNCH_AMQ_ROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Opt this process into the shared AMQ registry: remember the root for agent
+/// launches and reconcile the registry once from this store's sessions. The
+/// `dux` TUI and `dux server` entry points call it before their engine boots.
+/// Never fails the boot.
+pub fn init_for_process(paths: &DuxPaths) {
+    let _ = LAUNCH_AMQ_ROOT.set(super::amq::optional_amq_root(paths));
+    super::amq::sync_amq_agents_for_bootstrap(paths);
+}
+
+fn launch_amq_root() -> Option<PathBuf> {
+    LAUNCH_AMQ_ROOT.get().cloned().flatten()
 }
 
 /// Resolve (and on first launch assign) the session's handle. With an AMQ

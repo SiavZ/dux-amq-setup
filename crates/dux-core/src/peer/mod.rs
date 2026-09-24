@@ -28,17 +28,18 @@ use serde::{Deserialize, Serialize};
 
 pub use amq::{
     AmqSyncReport, amq_cleanup_requires_worker, amq_handle_is_exact_owner,
-    amq_handle_is_exact_owner_at_root, free_amq_handle, free_amq_handle_at_root, init_for_process,
-    optional_amq_root, reserve_and_persist_session, reserve_and_persist_session_at_root,
-    sync_amq_agents, sync_amq_agents_for_bootstrap, tombstone_amq_session,
-    tombstone_amq_session_at_root,
+    amq_handle_is_exact_owner_at_root, free_amq_handle, free_amq_handle_at_root, optional_amq_root,
+    reserve_and_persist_session, reserve_and_persist_session_at_root, sync_amq_agents,
+    sync_amq_agents_for_bootstrap, tombstone_amq_session, tombstone_amq_session_at_root,
 };
 pub use handle::{
     AGENT_HANDLE_MAX_LEN, amq_handle, derive_agent_handle, is_valid_agent_handle,
     next_unique_agent_handle, normalize_agent_handle,
 };
 pub use router::run_peer;
-pub use session_store::{append_session_env, launch_env_for_session, load_or_create_store_id};
+pub use session_store::{
+    append_session_env, init_for_process, launch_env_for_session, load_or_create_store_id,
+};
 
 /// What the peer router needs to know about one Dux agent session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
