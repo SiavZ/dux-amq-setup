@@ -7698,34 +7698,40 @@ impl App {
     /// because a silent close is indistinguishable from a checkout that quietly
     /// did nothing.
     pub(super) fn resolve_confirm_checkout_default_branch(&mut self, confirm: bool) -> bool {
-        let (project_id, project_name, stored_base) = match &self.prompt {
+        let (project_id, project_name) = match &self.prompt {
             PromptState::ConfirmCheckoutDefaultBranch {
                 project_id,
                 project_name,
-                stored_base,
                 ..
-            } => (
-                project_id.clone(),
-                project_name.clone(),
-                stored_base.clone(),
-            ),
+            } => (project_id.clone(), project_name.clone()),
             _ => return false,
         };
         self.prompt = PromptState::None;
-        if !confirm {
-            self.set_info(dux_core::engine::checkout_default_branch_cancelled_message(
-                &project_name,
-                stored_base.as_deref(),
-            ));
-            return false;
-        }
-        let Some(project) = self
+        // Both answers ask the project as it is now: the base the dialog was
+        // opened with may have moved, or the project may be gone.
+        let project = self
             .engine
             .projects
             .iter()
             .find(|p| p.id == project_id)
-            .cloned()
-        else {
+            .cloned();
+        if !confirm {
+            match &project {
+                Some(project) => {
+                    self.set_info(dux_core::engine::checkout_default_branch_cancelled_message(
+                        &project.name,
+                        project.leading_branch.as_deref(),
+                    ));
+                }
+                None => self.set_info(format!(
+                    "Cancelled checking out the default branch for project \"{project_name}\". \
+                     The project has been removed from dux since the dialog opened, so there is \
+                     nothing to check out."
+                )),
+            }
+            return false;
+        }
+        let Some(project) = project else {
             self.set_warning(format!(
                 "Project \"{project_name}\" is gone, so there was no default branch to check out."
             ));

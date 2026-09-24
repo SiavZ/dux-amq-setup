@@ -8507,6 +8507,45 @@ mod tests {
         );
     }
 
+    /// The cancel line names the base new worktrees branch from NOW, not the
+    /// one captured when the dialog opened: the base can move underneath an
+    /// open dialog (the browser checked out the default meanwhile).
+    #[test]
+    fn cancelling_names_the_base_as_it_is_when_the_dialog_closes() {
+        let (_root, _repo, mut app) = project_based_on_develop();
+        app.checkout_selected_project_default_branch()
+            .expect("open the confirmation");
+        app.engine.projects[0].leading_branch = Some("main".to_string());
+
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(
+            app.status.text(),
+            "Cancelled checking out the default branch for project \"repo\". Nothing was \
+             checked out, and new worktrees still branch from \"main\"."
+        );
+    }
+
+    /// A project removed while its dialog was open is said to be gone, rather
+    /// than described by a base it no longer has.
+    #[test]
+    fn cancelling_after_the_project_is_gone_says_so() {
+        let (_root, _repo, mut app) = project_based_on_develop();
+        app.checkout_selected_project_default_branch()
+            .expect("open the confirmation");
+        app.engine.projects.clear();
+
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(
+            app.status.text(),
+            "Cancelled checking out the default branch for project \"repo\". The project has \
+             been removed from dux since the dialog opened, so there is nothing to check out."
+        );
+    }
+
     /// One checkout per repository at a time, from either surface: a second
     /// confirmation while one runs is refused with an ordinary warning and
     /// starts nothing, and every ending hands the repository back.
