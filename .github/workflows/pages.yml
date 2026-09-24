@@ -32,6 +32,11 @@ concurrency:
 jobs:
   build:
     name: Build site
+    # getdux.app (website/public/CNAME) is upstream's site and documents
+    # upstream's install paths. This fork must not deploy it: a release here
+    # would otherwise try to publish getdux.app content to the fork's Pages.
+    # website-ci.yml still builds the site on PRs so upstream merges stay green.
+    if: ${{ github.repository == 'patrickdappollonio/dux' }}
     runs-on: ubuntu-latest
     steps:
       - name: Determine checkout ref
@@ -52,7 +57,7 @@ jobs:
             echo "Deploying workflow ref: ${{ github.ref }}"
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ steps.ref.outputs.value }}
 
@@ -63,7 +68,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24
           cache: npm
@@ -121,9 +126,9 @@ jobs:
         working-directory: website
         run: npm run test:search
 
-      - uses: actions/configure-pages@v5
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
         with:
           path: website/dist
 
@@ -136,4 +141,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5

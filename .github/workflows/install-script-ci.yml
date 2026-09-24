@@ -30,7 +30,7 @@ jobs:
     name: Checksum verification unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Syntax-check install.sh
         run: bash -n install.sh
       - name: Run checksum verification tests
@@ -43,13 +43,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: v0.1.0
-            version: v0.1.0
+          # install.sh installs this fork's releases (SiavZ/dux-amq-setup), whose
+          # tags are dux-amq-vX.Y.Z. dux-amq-v0.1.1 publishes only a combined
+          # SHA256SUMS, so this leg exercises the installer's SHA256SUMS fallback
+          # against a real release.
+          - name: dux-amq-v0.1.1
+            version: dux-amq-v0.1.1
           - name: latest
             version: ""
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Run install.sh
         env:
