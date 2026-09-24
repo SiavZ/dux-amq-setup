@@ -662,7 +662,7 @@ mod tests {
     use dux_core::worker::{BranchWarningKind, CreateAgentRequest};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use std::collections::HashSet;
+    use std::collections::{BTreeSet, HashSet};
     use std::path::PathBuf;
     use std::time::Instant;
 
@@ -1162,6 +1162,158 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal.draw(|frame| app.render(frame)).expect("render");
         app.overlay_layout.active
+    }
+
+    /// The variant a prompt is, by name: `Debug` prints it first.
+    fn variant_name(prompt: &PromptState) -> String {
+        format!("{prompt:?}")
+            .chars()
+            .take_while(char::is_ascii_alphanumeric)
+            .collect()
+    }
+
+    /// Every `PromptState` variant, read off the enum's own source, so a
+    /// variant added there is counted here without anyone listing it.
+    fn declared_variants() -> BTreeSet<String> {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("pub(crate) enum PromptState {\n")
+            .expect("the PromptState enum");
+        let body = &source[start..];
+        let body =
+            &body[body.find('\n').expect("enum line") + 1..body.find("\n}\n").expect("enum end")];
+        body.lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("    ")?;
+                if rest.starts_with(' ') || rest.starts_with('/') || rest.starts_with('#') {
+                    return None;
+                }
+                let name: String = rest
+                    .chars()
+                    .take_while(char::is_ascii_alphanumeric)
+                    .collect();
+                name.chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_uppercase())
+                    .then_some(name)
+            })
+            .collect()
+    }
+
+    /// `every_prompt` is the fixture every structural guard below drives, so it
+    /// must hold every variant a user can see. A new `PromptState` variant with
+    /// no fixture fails here, before any guard can silently skip it.
+    #[test]
+    fn every_prompt_covers_every_variant() {
+        let app = test_app(default_bindings());
+        let covered: BTreeSet<String> = every_prompt(&app)
+            .iter()
+            .map(|(name, prompt)| {
+                assert!(
+                    name.starts_with(&variant_name(prompt)),
+                    "the fixture labelled {name:?} is a {:?}",
+                    variant_name(prompt)
+                );
+                variant_name(prompt)
+            })
+            .collect();
+        let mut declared = declared_variants();
+        assert!(declared.len() > 20, "the enum scan found {declared:?}");
+        assert!(declared.remove("None"), "None is a variant, and no modal");
+        assert_eq!(
+            covered, declared,
+            "every PromptState variant needs an entry in every_prompt"
+        );
+    }
+
+    /// Quoted runs a dialog may still show, with the reason each is not a
+    /// name: (variant, the quoted run).
+    const QUOTED_RUNS_ALLOWED: &[(&str, &str)] = &[];
+
+    /// Every straight-quoted run on screen that is not on the same screen with
+    /// no dialog open.
+    fn quoted_runs(screen: &str, baseline: &str) -> Vec<String> {
+        let runs = |text: &str| -> Vec<String> {
+            text.lines()
+                .flat_map(|row| {
+                    let parts: Vec<&str> = row.split('"').collect();
+                    parts
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, part)| {
+                            index % 2 == 1 && index + 1 < parts.len() && !part.trim().is_empty()
+                        })
+                        .map(|(_, part)| format!("\"{part}\""))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let before = runs(baseline);
+        runs(screen)
+            .into_iter()
+            .filter(|run| !before.contains(run))
+            .collect()
+    }
+
+    fn painted(app: &mut App, prompt: PromptState) -> String {
+        app.prompt = prompt;
+        let backend = TestBackend::new(160, 60);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("render");
+        let buf = terminal.backend().buffer().clone();
+        let width = usize::from(buf.area.width);
+        buf.content()
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect::<Vec<_>>()
+            .chunks(width)
+            .map(|row| row.concat())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The terminal UI's half of the chip rule's drift guard: every dialog, as
+    /// the registry's fixtures build it, is painted and read back, and a name in
+    /// straight quotes anywhere in it fails, whichever dialog it is. A new
+    /// dialog is covered the moment it has a fixture, which the test above
+    /// demands.
+    #[test]
+    fn no_dialog_quotes_a_name() {
+        let mut app = test_app(default_bindings());
+        let baseline = painted(&mut app, PromptState::None);
+        let mut offenders = Vec::new();
+        for (name, prompt) in every_prompt(&app) {
+            let screen = painted(&mut app, prompt);
+            for run in quoted_runs(&screen, &baseline) {
+                if !QUOTED_RUNS_ALLOWED.contains(&(name, run.as_str())) {
+                    offenders.push(format!("{name}: {run}"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these dialogs quote a name instead of drawing it as a chip:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// The scan itself, on the shapes it has to catch and the ones it must not.
+    #[test]
+    fn the_quoted_run_scan_finds_quoted_names_only() {
+        assert_eq!(
+            quoted_runs("│ Delete \"feat/x\" now? │", ""),
+            vec!["\"feat/x\"".to_string()]
+        );
+        assert_eq!(
+            quoted_runs("│ a \"b\" c \"d e\" │", ""),
+            vec!["\"b\"".to_string(), "\"d e\"".to_string()]
+        );
+        assert!(quoted_runs("│ Delete  feat/x  now? │", "").is_empty());
+        assert!(quoted_runs("│ a lone \" quote │", "").is_empty());
+        assert!(
+            quoted_runs("│ \"x\" │", "│ \"x\" │").is_empty(),
+            "a run already on screen with no dialog open is not the dialog's"
+        );
     }
 
     /// The registry's `multiline_field` claim, checked against a real instance
