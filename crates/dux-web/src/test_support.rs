@@ -42,7 +42,7 @@ pub(crate) fn test_engine_handle(tmp: &Path) -> EngineHandle {
     handle
 }
 
-/// A fresh temp dir + an engine-backed router. Returns the `TempDir` so the
+/// A fresh scratch dir + an engine-backed router. Returns the `ScratchDir` so the
 /// caller keeps it alive for the test's duration.
 pub(crate) fn router_no_auth() -> (ScratchDir, Router) {
     let tmp = ScratchDir::new();
@@ -52,7 +52,7 @@ pub(crate) fn router_no_auth() -> (ScratchDir, Router) {
 
 /// Bind a real loopback server on an ephemeral port and serve the plain router on
 /// a background task. Returns the bound `SocketAddr` so an integration test can
-/// issue real HTTP/WebSocket requests against it. The `TempDir` is kept alive by
+/// issue real HTTP/WebSocket requests against it. The `ScratchDir` is kept alive by
 /// the returned guard; drop it to clean up the engine's on-disk state.
 #[allow(dead_code)]
 pub(crate) async fn boot_plain_test_server() -> (ScratchDir, SocketAddr) {
