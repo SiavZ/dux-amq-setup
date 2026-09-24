@@ -970,11 +970,12 @@ pub fn checkout_default_branch_confirm_prose(
 
 /// The refusal when a "check out the default branch" is already running for
 /// the project: an ordinary warning, because waiting is all it asks.
-pub fn default_branch_checkout_running_message(project_name: &str) -> String {
-    format!(
-        "dux is already checking out the default branch for project \"{project_name}\". Wait \
-         for it to finish; its result will say where the project's worktrees branch from."
-    )
+pub fn default_branch_checkout_running_message(project_name: &str) -> StatusText {
+    status_text![
+        "dux is already checking out the default branch for project ",
+        q(project_name),
+        ". Wait for it to finish; its result will say where the project's worktrees branch from."
+    ]
 }
 
 /// The status line after the confirmation is dismissed: nothing ran, and the
@@ -992,6 +993,27 @@ pub fn checkout_default_branch_cancelled_message(
         Some(base) => status_text![lead, ", and new worktrees still branch from ", q(base), "."],
         None => status_text![lead, ", and the project's base branch is unchanged."],
     }
+}
+
+/// The status line after the confirmation is dismissed for a project that was
+/// removed from dux while the dialog was open: there is no base left to name.
+pub fn checkout_default_branch_cancelled_project_gone_message(project_name: &str) -> StatusText {
+    status_text![
+        "Cancelled checking out the default branch for project ",
+        q(project_name),
+        ". The project has been removed from dux since the dialog opened, so there is nothing \
+         to check out."
+    ]
+}
+
+/// The refusal when the confirmation is accepted for a project that was
+/// removed from dux while the dialog was open.
+pub fn checkout_default_branch_project_gone_message(project_name: &str) -> StatusText {
+    status_text![
+        "Project ",
+        q(project_name),
+        " is gone, so there was no default branch to check out."
+    ]
 }
 
 fn base_moved_suffix(branch: &str, base_moved: bool) -> StatusText {
@@ -9439,6 +9461,44 @@ mod tests {
     /// and the TUI's reconnect ops) maps each variant to its exact final. Before
     /// this, the TUI carried a byte-identical copy (`reconnect_final`); this pins
     /// the one core source so the wording cannot drift.
+    #[test]
+    fn the_default_branch_checkout_refusals_carry_the_project_as_a_part() {
+        use crate::prose::ProseSegment;
+        let cases = [
+            (
+                default_branch_checkout_running_message("app"),
+                "dux is already checking out the default branch for project \"app\". Wait for \
+                 it to finish; its result will say where the project's worktrees branch from.",
+            ),
+            (
+                checkout_default_branch_cancelled_project_gone_message("app"),
+                "Cancelled checking out the default branch for project \"app\". The project has \
+                 been removed from dux since the dialog opened, so there is nothing to check out.",
+            ),
+            (
+                checkout_default_branch_project_gone_message("app"),
+                "Project \"app\" is gone, so there was no default branch to check out.",
+            ),
+        ];
+        for (status, plain) in cases {
+            assert_eq!(status.message(), plain);
+            let names: Vec<&ProseSegment> = status
+                .segments()
+                .expect("built from parts")
+                .iter()
+                .filter(|segment| matches!(segment, ProseSegment::Name { .. }))
+                .collect();
+            assert_eq!(
+                names,
+                [&ProseSegment::Name {
+                    name: "app".to_string(),
+                    quoted: true
+                }],
+                "exactly the project is a name in {plain}"
+            );
+        }
+    }
+
     #[test]
     fn launch_outcome_final_maps_each_variant_to_its_message() {
         assert_eq!(

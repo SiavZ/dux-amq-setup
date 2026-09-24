@@ -7814,18 +7814,18 @@ impl App {
                         project.leading_branch.as_deref(),
                     ));
                 }
-                None => self.set_info(format!(
-                    "Cancelled checking out the default branch for project \"{project_name}\". \
-                     The project has been removed from dux since the dialog opened, so there is \
-                     nothing to check out."
-                )),
+                None => self.set_info(
+                    dux_core::engine::checkout_default_branch_cancelled_project_gone_message(
+                        &project_name,
+                    ),
+                ),
             }
             return false;
         }
         let Some(project) = project else {
-            self.set_warning(format!(
-                "Project \"{project_name}\" is gone, so there was no default branch to check out."
-            ));
+            self.set_warning(
+                dux_core::engine::checkout_default_branch_project_gone_message(&project_name),
+            );
             return false;
         };
         self.dispatch_checkout_project_default_branch(project);
@@ -7848,13 +7848,9 @@ impl App {
         };
         self.prompt = PromptState::None;
         if !confirm {
-            let kept = match self.project_agent_count(&project_id) {
-                0 => String::new(),
-                1 => ": its agent and its worktree are still here".to_string(),
-                n => format!(": its {n} agents and their worktrees are still here"),
-            };
-            self.set_info(format!(
-                "Cancelled deleting project \"{project_name}\". Nothing was deleted{kept}."
+            self.set_info(dux_core::project_prose::delete_project_cancelled_message(
+                &project_name,
+                self.project_agent_count(&project_id),
             ));
             return false;
         }
@@ -7865,8 +7861,9 @@ impl App {
             .find(|p| p.id == project_id)
             .cloned()
         else {
-            self.set_warning(format!(
-                "Project \"{project_name}\" is gone, so there was nothing to delete."
+            self.set_warning(dux_core::project_prose::project_gone_message(
+                &project_name,
+                dux_core::project_prose::ProjectGoneVerb::Delete,
             ));
             return false;
         };
@@ -7892,12 +7889,15 @@ impl App {
         };
         self.prompt = PromptState::None;
         if !confirm {
-            self.set_info(format!(
-                "Cancelled removing project \"{project_name}\". Nothing was removed."
+            self.set_info(dux_core::project_prose::remove_project_cancelled_message(
+                &project_name,
             ));
             return false;
         }
-        let gone = format!("Project \"{project_name}\" is gone, so there was nothing to remove.");
+        let gone = dux_core::project_prose::project_gone_message(
+            &project_name,
+            dux_core::project_prose::ProjectGoneVerb::Remove,
+        );
         let outcome = if orphaned {
             if self.project_agent_count(&project_id) == 0 {
                 self.set_warning(gone);

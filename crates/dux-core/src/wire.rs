@@ -7654,6 +7654,16 @@ mod tests {
              it to finish; its result will say where the project's worktrees branch from."
         );
         assert_eq!(
+            serde_json::to_value(status.segments.as_ref().expect("built from parts")).unwrap(),
+            serde_json::json!([
+                "dux is already checking out the default branch for project ",
+                {"name": "p1-name", "quoted": true},
+                ". Wait for it to finish; its result will say where the project's worktrees \
+                 branch from."
+            ]),
+            "the refusal carries the project as a part, so the toast chips it"
+        );
+        assert_eq!(
             engine.pending_web_checkout_ops.len(),
             1,
             "the refusal must not start a second chain"
