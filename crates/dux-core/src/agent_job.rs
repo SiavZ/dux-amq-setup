@@ -3241,4 +3241,82 @@ mod tests {
             run.progress
         );
     }
+
+    /// A dux-made worktree on `branch` in `repo`, and a session describing it
+    /// with the given provenance.
+    ///
+    /// The worktree lives OUTSIDE the repo (as dux's managed root does): the
+    /// rollback protects the project checkout, and a nested path would be
+    /// refused as inside it.
+    fn rollback_fixture(
+        repo: &Path,
+        root: &Path,
+        branch: &str,
+        provenance: crate::model::BranchProvenance,
+    ) -> (PathBuf, AgentSession) {
+        let wt = root.join(format!("wt-{branch}"));
+        let out = crate::git::test_support::git_command()
+            .arg("-C")
+            .arg(repo)
+            .args(["worktree", "add", "-b", branch])
+            .arg(&wt)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut session = fork_source_session(&wt);
+        if let crate::model::AgentWorkspace::Managed(managed) = &mut session.workspace {
+            managed.branch_name = branch.to_string();
+            managed.initial_branch = branch.to_string();
+            managed.branch_provenance = provenance;
+        }
+        (wt, session)
+    }
+
+    /// Fork name (24deeeee, backing P1-27). Rolling back a create whose branch
+    /// dux minted removes the worktree AND the branch.
+    #[test]
+    fn remove_worktree_deletes_branch_when_owned() {
+        let repo = init_test_repo();
+        let root = tempfile::tempdir().unwrap();
+        let (wt, session) = rollback_fixture(
+            repo.path(),
+            root.path(),
+            "dux-created",
+            crate::model::BranchProvenance::CreatedByDux,
+        );
+
+        rollback_managed_create(repo.path(), &session, true);
+
+        assert!(!wt.exists(), "worktree should be removed");
+        assert!(
+            !git::local_branch_exists(repo.path(), "dux-created"),
+            "owned branch should be deleted"
+        );
+    }
+
+    /// Fork name. The attach-to-existing-branch rollback removes the worktree
+    /// but must NOT delete the user's pre-existing branch.
+    #[test]
+    fn remove_worktree_preserves_branch_when_not_owned() {
+        let repo = init_test_repo();
+        let root = tempfile::tempdir().unwrap();
+        let (wt, session) = rollback_fixture(
+            repo.path(),
+            root.path(),
+            "preexisting",
+            crate::model::BranchProvenance::AttachedExisting,
+        );
+
+        rollback_managed_create(repo.path(), &session, true);
+
+        assert!(!wt.exists(), "worktree should be removed");
+        assert!(
+            git::local_branch_exists(repo.path(), "preexisting"),
+            "unowned branch must survive cleanup"
+        );
+    }
 }

@@ -528,19 +528,18 @@ mod tests {
         assert_eq!(c.modified, "");
     }
 
-    /// Fork name. A working copy that exists but cannot be read (here, a
-    /// directory where a file is expected) must surface as an error naming
-    /// the path, never collapse to "no working copy" and render as a
-    /// deletion of the HEAD content.
+    /// A working copy that exists but cannot be read (here, a directory where
+    /// a file is expected) must surface as an error naming the path, never
+    /// collapse to "no working copy" and render as a deletion of the HEAD
+    /// content. The TUI twin is `diff_surfaces_worktree_read_errors_instead_of_rendering_deletion`.
     #[test]
-    fn diff_surfaces_worktree_read_errors_instead_of_rendering_deletion() {
+    fn unreadable_working_copy_is_an_error_not_a_deletion() {
         let repo = init_repo();
         std::fs::remove_file(repo.path().join("a.txt")).expect("remove");
         std::fs::create_dir(repo.path().join("a.txt")).expect("mkdir in its place");
 
         let err = file_diff_contents(repo.path(), "a.txt")
-            .err()
-            .expect("unreadable working copy must surface, not render as a deletion");
+            .expect_err("unreadable working copy must surface, not render as a deletion");
         assert!(format!("{err:#}").contains("a.txt"), "{err:#}");
     }
 
