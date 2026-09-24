@@ -434,6 +434,13 @@ impl SessionStore {
             );
             "#,
         )?;
+        // Per-session settings blob (context mode, YOLO, AMQ verify override,
+        // watch-rule overrides, auto-clear, system prompt) as JSON. Nullable:
+        // NULL and malformed values both read as `SessionSettings::default()`,
+        // so old rows and inserts by an older binary stay valid. A database
+        // from the fork's numbered-migration era (schema 0003+) already has
+        // this column and keeps its values.
+        ensure_column(&self.conn, "agent_sessions", "session_settings", "text")?;
         // The slot-tab passes run last: they write `agent_tabs` rows, so the
         // table has to exist, and a failure in any of them aborts the open. A
         // workspace whose first tabs are unaddressable is worse than a startup
@@ -1864,6 +1871,49 @@ impl SessionStore {
             params![id, tab_id],
         )?;
         Ok(())
+    }
+
+    /// Persist one session's settings blob. Default settings are stored as
+    /// NULL so an untouched agent keeps the column empty. Deliberately a
+    /// dedicated setter outside `upsert_session`'s hot path, so status churn
+    /// can never clobber it.
+    pub fn set_session_settings(
+        &self,
+        id: &str,
+        settings: &crate::session_settings::SessionSettings,
+    ) -> Result<()> {
+        let value = (!settings.is_default()).then(|| settings.to_json());
+        let changed = self.conn.execute(
+            "update agent_sessions set session_settings = ?2 where id = ?1",
+            params![id, value],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("no agent session with id {id}");
+        }
+        Ok(())
+    }
+
+    /// Every session's non-default settings, keyed by session id. Malformed
+    /// blobs read as the default (and are therefore omitted).
+    pub fn load_session_settings(
+        &self,
+    ) -> Result<std::collections::HashMap<String, crate::session_settings::SessionSettings>> {
+        let mut stmt = self.conn.prepare(
+            "select id, session_settings from agent_sessions where session_settings is not null",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (id, raw) = row?;
+            let settings =
+                crate::session_settings::SessionSettings::parse_or_default(raw.as_deref());
+            if !settings.is_default() {
+                out.insert(id, settings);
+            }
+        }
+        Ok(out)
     }
 
     pub fn set_auto_reopen_enabled(&self, id: &str, enabled: bool) -> Result<()> {

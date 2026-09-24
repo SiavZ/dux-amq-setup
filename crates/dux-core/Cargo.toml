@@ -43,3 +43,5 @@ alacritty_terminal = "0.26.0"
 ureq = "3.3.0"
 
 [dev-dependencies]
+# AMQ queue expiry tests backdate file mtimes.
+filetime = "0.2"

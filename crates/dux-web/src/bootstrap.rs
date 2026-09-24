@@ -195,6 +195,7 @@ pub fn bootstrap_engine(paths: &DuxPaths) -> Result<Engine> {
         pty_progress: HashMap::new(),
         agent_viewed: HashMap::new(),
         last_foreground_refresh: None,
+        amq: Default::default(),
     };
 
     engine.normalize_restored_sessions();

@@ -1525,6 +1525,10 @@ impl Engine {
     /// worktree vanished is `Exited`, persisted through `mark_session_status`.
     /// Auto-reopens nothing.
     pub fn normalize_restored_sessions(&mut self) {
+        // Per-session settings (mode, YOLO, ...) live beside the session rows,
+        // not in `AgentSession`; both surfaces restore through here, including
+        // after a hot reload's exec, so this is where they come back.
+        self.load_session_settings_from_store();
         let ids: Vec<(String, bool)> = self
             .sessions
             .iter()

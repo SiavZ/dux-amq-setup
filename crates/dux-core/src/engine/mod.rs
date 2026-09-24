@@ -15,7 +15,9 @@ mod pr_sync_control;
 mod resume_fallback;
 mod spawn_worker;
 pub mod status_op;
+pub mod amq;
 
+pub use amq::{AmqFocus, AmqRuntime};
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -743,6 +745,10 @@ pub struct Engine {
     /// past [`CREATED_SESSION_TTL`] or whose session no longer exists, so a
     /// long-running server cannot accumulate stale entries.
     pub created_session_by_op: HashMap<String, (String, Instant)>,
+    /// AMQ runtime: per-session settings, the inject-queue drainer and the
+    /// Orchestrator watchdog (see [`amq`]). Construct with `Default`; load
+    /// settings with [`Engine::load_session_settings_from_store`].
+    pub amq: amq::AmqRuntime,
 }
 
 /// Handler-computed outcome for a create-agent op (see

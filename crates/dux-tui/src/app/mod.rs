@@ -3752,6 +3752,7 @@ impl App {
             pty_progress: HashMap::new(),
             agent_viewed: HashMap::new(),
             last_foreground_refresh: None,
+            amq: Default::default(),
             pending_web_checkout_ops: HashMap::new(),
             pending_web_add_project_ops: HashMap::new(),
             pending_web_pr_lookup_ops: HashMap::new(),

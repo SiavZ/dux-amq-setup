@@ -686,6 +686,11 @@ pub enum WorkerEvent {
         mode: crate::config::TailscaleMode,
         outcome: crate::config::TailscaleModeOutcome,
     },
+    /// The AMQ inject-queue watcher (or its polling fallback) noticed a
+    /// change under the queue root. No payload: the engine re-scans the
+    /// directory, claims new `.msg` files, and delivers them from
+    /// [`crate::engine::Engine::tick_amq`].
+    AmqInjectScanRequested,
 }
 
 /// How a successful (non-erroring) pull worker run ended. `current_branch` is
