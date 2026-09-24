@@ -79,6 +79,7 @@ async fn boot(projects: &[(&str, &str, &str)], hosts: &[&str]) -> (SocketAddr, t
     }
 
     let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     engine.github_integration_enabled = true;
     // Point the probe at a stand-in `gh` that reports exactly `hosts`. Starting
     // the engine thread starts the REAL host probe, so placing an answer here

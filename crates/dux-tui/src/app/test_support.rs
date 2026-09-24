@@ -562,8 +562,9 @@ fn test_app_cannot_launch_a_real_agent_cli() {
 /// one may still be writing into the directory at the moment the app drops. A
 /// single `remove_dir_all` then loses the race with ENOTEMPTY and `TempDir`
 /// swallows the error, leaving the directory behind. This guard retries for a
-/// bounded window instead, and says so on stderr when it still cannot remove
-/// the directory, so a leak is visible rather than silent.
+/// bounded window instead. The window is a heuristic, not a guarantee: a worker
+/// still writing after it closes wins, and the guard then names the leftover
+/// path on stderr, so a leak is visible rather than silent.
 pub(crate) struct ScratchDir(Option<tempfile::TempDir>);
 
 impl ScratchDir {

@@ -5,10 +5,12 @@
 //! found on the developer's `PATH`, in whatever directory the test happened to
 //! point it at, including the home directory. Two halves stop that:
 //!
-//! - [`defuse_providers`] and [`harmless_config`] give the shared test fixtures a
+//! - [`defuse_config`] and [`harmless_config`] give the shared test fixtures a
 //!   provider table whose names are the stock ones but whose command is a plain
 //!   `cat` behind `sh`, so a test that needs "the claude provider" keeps the name
-//!   and launches nothing real.
+//!   and launches nothing real. They also point terminals at a plain `sh`, since
+//!   a terminal's default command is the machine's `$SHELL` and it spawns
+//!   through the same guarded chokepoint.
 //! - [`refuse_unlisted_spawn`] is called from the PTY spawn chokepoint in test
 //!   builds only, and refuses to exec any command that is not one of the
 //!   [`ALLOWED_TEST_COMMANDS`]. Any CLI can be a provider, so a list of the agent
@@ -25,13 +27,14 @@ use crate::config::{Config, ProviderCommandConfig, default_provider_commands};
 /// exactly against the command's file name, so `/bin/sh` is allowed and `Claude`
 /// is not (on a case-insensitive filesystem that name is the real `claude`).
 ///
-/// The shells are here because a terminal's default command is `$SHELL`, which
-/// differs from one developer's machine to the next; the rest are the stand-ins
-/// and one-shot helpers the suites use. To allow another program, add its file
+/// These are the stand-ins and one-shot helpers the suites use. No test depends
+/// on the developer's own `$SHELL`, because [`defuse_config`] replaces the
+/// terminal command with [`HARMLESS_TERMINAL_COMMAND`]; a test that needs a real
+/// shell names one of these explicitly. To allow another program, add its file
 /// name here, and only if running it can touch nothing outside the test's own
 /// scratch directory.
 pub const ALLOWED_TEST_COMMANDS: &[&str] = &[
-    "sh", "bash", "dash", "zsh", "fish", "cat", "sleep", "true", "false", "printf", "echo", "env",
+    "sh", "bash", "cat", "sleep", "true", "printf", "echo", "env",
 ];
 
 /// The stand-in every defused provider runs. `sh -c 'exec cat'` rather than a bare
@@ -39,6 +42,11 @@ pub const ALLOWED_TEST_COMMANDS: &[&str] = &[
 /// `resume --last`) after `args`: `sh` takes them as positional parameters the
 /// script never reads, where `cat` would try to open them and exit at once.
 pub const HARMLESS_PROVIDER_COMMAND: &str = "sh";
+
+/// The command every defused terminal runs: a plain interactive `sh` with no
+/// arguments, so it reads no login profile and behaves the same on every
+/// machine whatever the developer's own shell is.
+pub const HARMLESS_TERMINAL_COMMAND: &str = "sh";
 
 /// The arguments that go with [`HARMLESS_PROVIDER_COMMAND`]. The trailing word is
 /// `$0`, so a `ps` listing names what the process is.
@@ -68,7 +76,7 @@ pub fn refuse_unlisted_spawn(command: &str) -> anyhow::Result<()> {
         let message = format!(
             "test guard: refused to spawn '{command}', which is not one of the programs tests \
              may run. If a test resolved a provider to a real agent CLI, build its config with \
-             dux_core::test_provider::harmless_config() or defuse_providers(). If the program is \
+             dux_core::test_provider::harmless_config() or defuse_config(). If the program is \
              a harmless helper the test genuinely needs, add its file name to \
              dux_core::test_provider::ALLOWED_TEST_COMMANDS."
         );
@@ -78,11 +86,18 @@ pub fn refuse_unlisted_spawn(command: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Point every provider and the terminal in `config` at the harmless stand-ins.
+pub fn defuse_config(config: &mut Config) {
+    defuse_providers(config);
+    config.terminal.command = HARMLESS_TERMINAL_COMMAND.to_string();
+    config.terminal.args = Vec::new();
+}
+
 /// Point every provider in `config` at the harmless stand-in, keeping each
 /// provider's name, resume arguments and paste form. Every stock provider is
 /// (re)inserted first, because a provider missing from the table resolves to a
 /// command equal to its own name, which for `claude` is the real CLI.
-pub fn defuse_providers(config: &mut Config) {
+fn defuse_providers(config: &mut Config) {
     for (name, stock) in default_provider_commands() {
         config
             .providers
@@ -100,16 +115,16 @@ fn defuse_provider(provider: &mut ProviderCommandConfig) {
     provider.args = harmless_provider_args();
 }
 
-/// `Config::default()` with every provider defused. The config every shared test
-/// fixture starts from.
+/// `Config::default()` with every provider and the terminal defused. The config
+/// every shared test fixture starts from.
 pub fn harmless_config() -> Config {
     let mut config = Config::default();
-    defuse_providers(&mut config);
+    defuse_config(&mut config);
     config
 }
 
-/// Asserts a fixture's config can launch no real agent CLI: not for any
-/// stock provider, and not for its default provider.
+/// Asserts a fixture's config can launch nothing but a stand-in: not for any
+/// stock provider, not for its default provider, and not for a terminal.
 pub fn assert_fixture_config_is_harmless(config: &Config) {
     let mut providers: Vec<crate::model::ProviderKind> = default_provider_commands()
         .iter()
@@ -124,6 +139,11 @@ pub fn assert_fixture_config_is_harmless(config: &Config) {
             provider.as_str()
         );
     }
+    assert!(
+        is_allowed_test_command(&config.terminal.command),
+        "the fixture's terminal command is '{}', which is not a harmless stand-in",
+        config.terminal.command
+    );
 }
 
 #[cfg(test)]
@@ -228,6 +248,39 @@ mod tests {
         assert!(is_allowed_test_command(
             &provider_config(&config, &config.default_provider()).command
         ));
+    }
+
+    /// Terminals spawn through the same guarded chokepoint as providers, and
+    /// their default command is the machine's `$SHELL`, so a fixture must not
+    /// depend on which shell the developer happens to use.
+    #[test]
+    fn a_harmless_config_points_terminals_at_the_stand_in_whatever_the_shell() {
+        let config = harmless_config();
+        assert_eq!(config.terminal.command, HARMLESS_TERMINAL_COMMAND);
+        assert!(
+            config.terminal.args.is_empty(),
+            "{:?}",
+            config.terminal.args
+        );
+
+        let mut config = Config::default();
+        config.terminal.command = "/usr/bin/zsh".to_string();
+        config.terminal.args = vec!["-l".to_string()];
+        defuse_config(&mut config);
+        assert_eq!(config.terminal.command, HARMLESS_TERMINAL_COMMAND);
+        assert!(
+            config.terminal.args.is_empty(),
+            "{:?}",
+            config.terminal.args
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "terminal")]
+    fn the_fixture_check_refuses_a_terminal_that_is_not_a_stand_in() {
+        let mut config = harmless_config();
+        config.terminal.command = "/usr/bin/zsh".to_string();
+        assert_fixture_config_is_harmless(&config);
     }
 
     #[test]

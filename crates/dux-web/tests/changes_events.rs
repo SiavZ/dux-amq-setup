@@ -147,7 +147,8 @@ async fn boot() -> (SocketAddr, tempfile::TempDir) {
             ))
             .unwrap();
     }
-    let engine = bootstrap_engine(&paths).unwrap();
+    let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     let (handle, _join) = spawn_engine_thread(engine);
 
     let probe: Router<AppState> = Router::new()

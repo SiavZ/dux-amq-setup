@@ -117,7 +117,8 @@ async fn boot_with_repo() -> (
             ))
             .unwrap();
     }
-    let engine = bootstrap_engine(&paths).unwrap();
+    let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     let (handle, _join) = spawn_engine_thread(engine);
     let app = build_app(handle, axum::Router::new(), RouterParams::plain_http());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

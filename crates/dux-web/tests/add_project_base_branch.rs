@@ -110,6 +110,7 @@ async fn boot() -> Fixture {
     };
     std::fs::create_dir_all(&paths.worktrees_root).unwrap();
     let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     // The agent CLI is the one thing that cannot run here; `cat` stands in for
     // it so the create journey spawns a real PTY.
     engine.config.providers.commands.insert(

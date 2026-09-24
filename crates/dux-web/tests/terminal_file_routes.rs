@@ -100,6 +100,7 @@ async fn boot() -> Harness {
             .unwrap();
     }
     let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     engine.config.terminal.command = "cat".to_string();
     engine.config.terminal.args = vec![];
     let (handle, _join) = spawn_engine_thread(engine);

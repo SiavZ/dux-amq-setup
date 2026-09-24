@@ -78,6 +78,7 @@ async fn boot() -> (SocketAddr, tempfile::TempDir) {
             .unwrap();
     }
     let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     engine.config.providers.commands.insert(
         "claude".to_string(),
         ProviderCommandConfig {

@@ -14,14 +14,15 @@ use crate::engine_actor::EngineHandle;
 use crate::server;
 
 /// [`crate::bootstrap::bootstrap_engine`] for tests: the same boot, with every
-/// provider pointed at a harmless stand-in under its stock name, so no test that
-/// creates or launches an agent can exec the developer's real agent CLI. Every
+/// provider pointed at a harmless stand-in under its stock name and terminals at
+/// a plain `sh`, so no test that creates or launches an agent can exec the
+/// developer's real agent CLI, and none depends on the developer's `$SHELL`. Every
 /// test in this crate boots through here rather than the production function.
 pub(crate) fn bootstrap_test_engine(
     paths: &dux_core::config::DuxPaths,
 ) -> anyhow::Result<dux_core::engine::Engine> {
     let mut engine = crate::bootstrap::bootstrap_engine(paths)?;
-    dux_core::test_provider::defuse_providers(&mut engine.config);
+    dux_core::test_provider::defuse_config(&mut engine.config);
     Ok(engine)
 }
 

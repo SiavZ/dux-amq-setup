@@ -139,7 +139,8 @@ async fn boot() -> Fixture {
             .create_session(&sample_session("s1", held.to_string_lossy().as_ref()))
             .unwrap();
     }
-    let engine = bootstrap_engine(&paths).unwrap();
+    let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     let (handle, _join) = spawn_engine_thread(engine);
     let app = build_app(
         handle,

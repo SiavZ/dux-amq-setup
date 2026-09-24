@@ -4201,7 +4201,7 @@ mod tests {
     #[test]
     fn announcing_a_reload_leaves_the_live_limits_where_they_were() {
         let (_tmp, paths) = temp_paths();
-        let engine = bootstrap_engine(&paths).expect("engine");
+        let engine = crate::test_support::bootstrap_test_engine(&paths).expect("engine");
         let (handle, ends) = build_actor_channels(&engine);
         let limits = handle.live_limits();
         limits.set_search_index_max_files(9);
@@ -4226,7 +4226,7 @@ mod tests {
     #[test]
     fn a_web_side_producer_can_post_onto_the_lane_both_surfaces_drain() {
         let (_tmp, paths) = temp_paths();
-        let mut engine = bootstrap_engine(&paths).expect("engine");
+        let mut engine = crate::test_support::bootstrap_test_engine(&paths).expect("engine");
         let (handle, ends) = build_actor_channels(&engine);
         let mut statuses = handle.subscribe_status();
         let mut svc = EngineService::new(&engine, ends, ShutdownEcho::Silent);
@@ -4263,7 +4263,7 @@ mod tests {
     #[test]
     fn announcing_a_reload_keys_it_so_the_apply_outcome_replaces_it() {
         let (_tmp, paths) = temp_paths();
-        let engine = bootstrap_engine(&paths).expect("engine");
+        let engine = crate::test_support::bootstrap_test_engine(&paths).expect("engine");
         let (handle, ends) = build_actor_channels(&engine);
         let mut statuses = handle.subscribe_status();
         let mut svc = EngineService::new(&engine, ends, ShutdownEcho::Silent);
@@ -4319,7 +4319,7 @@ mod tests {
     #[test]
     fn noting_an_applied_config_moves_the_live_limits() {
         let (_tmp, paths) = temp_paths();
-        let engine = bootstrap_engine(&paths).expect("engine");
+        let engine = crate::test_support::bootstrap_test_engine(&paths).expect("engine");
         let (handle, ends) = build_actor_channels(&engine);
         let limits = handle.live_limits();
         limits.set_search_index_max_files(9);
@@ -4347,7 +4347,7 @@ mod tests {
     #[test]
     fn an_engine_change_the_web_cannot_see_needs_the_mutation_bump_to_reach_clients() {
         let (_tmp, paths) = temp_paths();
-        let mut engine = bootstrap_engine(&paths).expect("engine");
+        let mut engine = crate::test_support::bootstrap_test_engine(&paths).expect("engine");
         let (handle, ends) = build_actor_channels(&engine);
         let mut spine_changes = handle.subscribe_spine_changes();
         let mut svc = EngineService::new(&engine, ends, ShutdownEcho::Silent);
@@ -4397,7 +4397,7 @@ mod tests {
     #[test]
     fn the_drain_seam_carries_worker_finals_to_clients_and_nothing_else() {
         let (_tmp, paths) = temp_paths();
-        let mut engine = bootstrap_engine(&paths).expect("engine");
+        let mut engine = crate::test_support::bootstrap_test_engine(&paths).expect("engine");
         let (handle, ends) = build_actor_channels(&engine);
         let mut statuses = handle.subscribe_status();
         let mut svc = EngineService::new(&engine, ends, ShutdownEcho::Silent);
@@ -4460,7 +4460,7 @@ mod tests {
     #[test]
     fn a_prune_the_terminal_ui_swept_still_reaches_browsers() {
         let (_tmp, paths) = temp_paths();
-        let engine = bootstrap_engine(&paths).expect("engine");
+        let engine = crate::test_support::bootstrap_test_engine(&paths).expect("engine");
         let (handle, ends) = build_actor_channels(&engine);
         let mut statuses = handle.subscribe_status();
         let mut svc = EngineService::new(&engine, ends, ShutdownEcho::Silent);
@@ -4491,7 +4491,7 @@ mod tests {
     #[test]
     fn a_foreground_change_the_terminal_ui_observed_opens_the_gate() {
         let (_tmp, paths) = temp_paths();
-        let engine = bootstrap_engine(&paths).expect("engine");
+        let engine = crate::test_support::bootstrap_test_engine(&paths).expect("engine");
         let (handle, ends) = build_actor_channels(&engine);
         let mut svc = EngineService::new(&engine, ends, ShutdownEcho::Silent);
 
@@ -7220,7 +7220,7 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let (_tmp, paths) = temp_paths();
-        let mut engine = bootstrap_engine(&paths).expect("engine");
+        let mut engine = crate::test_support::bootstrap_test_engine(&paths).expect("engine");
         let flag = Arc::clone(&engine.has_active_processes);
 
         engine = one_loop_iteration(engine);
@@ -7291,7 +7291,7 @@ mod tests {
     #[tokio::test]
     async fn a_detach_outcome_reaches_the_web_status_stream() {
         let (_tmp, paths) = temp_paths();
-        let mut engine = bootstrap_engine(&paths).expect("engine");
+        let mut engine = crate::test_support::bootstrap_test_engine(&paths).expect("engine");
         let (handle, ends) = build_actor_channels(&engine);
         let mut svc = EngineService::new(&engine, ends, ShutdownEcho::Silent);
         let mut statuses = handle.subscribe_status();

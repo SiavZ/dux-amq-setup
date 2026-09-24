@@ -84,6 +84,7 @@ async fn boot() -> (SocketAddr, tempfile::TempDir) {
             .unwrap();
     }
     let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     // The sample session's provider is "claude", which isn't on PATH in CI. Override
     // it with `cat`, a runnable program that echoes stdin so the real launch flow
     // spawns a streaming PTY (the marker the streaming tests send is echoed back).
@@ -173,6 +174,7 @@ async fn boot_with_repo() -> (SocketAddr, tempfile::TempDir) {
             .unwrap();
     }
     let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     engine.config.providers.commands.insert(
         "claude".to_string(),
         ProviderCommandConfig {
@@ -449,6 +451,7 @@ async fn boot_for_create_agent_window(
             .unwrap();
     }
     let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     // The spawned agent provider defaults to "claude"; override with `cat` so the
     // launch flow spawns a runnable PTY in CI.
     engine.config.providers.commands.insert(
@@ -667,6 +670,7 @@ async fn boot_with_gated_startup_command() -> (SocketAddr, std::path::PathBuf, t
             .unwrap();
     }
     let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     // Pin the shell so the gate command is interpreted identically everywhere,
     // rather than depending on whatever login shell the host defaults to.
     engine.config.startup_command_terminal.command = "sh".to_string();
@@ -1528,6 +1532,7 @@ async fn boot_two_sessions() -> (SocketAddr, tempfile::TempDir) {
             .unwrap();
     }
     let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     engine.config.providers.commands.insert(
         "claude".to_string(),
         ProviderCommandConfig {
