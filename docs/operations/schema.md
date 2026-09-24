@@ -12,8 +12,6 @@ its own appended block in `migrate()`.
 
 ## `agent_sessions`
 
-<!-- INTEGRATION: path pending evergreen (shared-workspace columns in crates/dux-core/src/storage.rs) -->
-
 The shared-workspace block adds:
 
 - `shared_workspace INTEGER NOT NULL DEFAULT 0`: durable lifecycle mode.
@@ -22,14 +20,15 @@ The shared-workspace block adds:
   lowercase ASCII letters, digits, `_`, and `-`, unique per store.
 - `deleted_at TEXT`: nullable RFC 3339 tombstone timestamp.
 
-Existing handles are derived from the worktree-path basename in primary-key
-order. Collisions receive deterministic `-2`, `-3`, ... suffixes. Uniqueness and
-the handle format need constraints `ALTER TABLE ADD COLUMN` cannot express, so
-this step rebuilds the table in one transaction (rebuild, Rust backfill,
-`session_prs` copy, index recreation, `foreign_key_check`) and detects on later
-opens that it already ran.
-
-<!-- INTEGRATION: path pending palmtree (provider_session_ids column) -->
+Existing handles are derived from the working directory's basename (falling
+back to branch, then id), in primary-key order. Collisions receive
+deterministic `-2`, `-3`, ... suffixes. Upstream has no numbered migrations,
+so the columns land as additive `ensure_column` calls with defaults. SQLite
+cannot add a CHECK to an existing table, so the handle alphabet is enforced
+in Rust (`normalize_agent_handle`, `is_valid_agent_handle`) and uniqueness by
+a partial unique index over non-empty handles; a database the fork wrote
+(fork schema 0006) keeps its stored handles byte for byte, because AMQ
+inboxes on disk are named after them.
 
 The resume block adds `provider_session_ids TEXT NOT NULL DEFAULT '{}'`. The
 JSON object maps a provider name to that agent's exact provider conversation
@@ -45,12 +44,13 @@ work succeeds.
 ## `session_prs`
 
 `session_prs(session_id)` references `agent_sessions(id) ON DELETE CASCADE`.
-The shared-workspace table rebuild copies this table inside the same
-transaction so PR rows and the foreign key survive the parent-table rebuild.
+The connection never enables `PRAGMA foreign_keys`, so the cascade does not
+fire; `delete_session` and `remove_project_records` delete these rows
+explicitly. Under upstream's idempotent-migration layout the table is created
+with `create table if not exists` and gains columns through `ensure_column`,
+so there is no parent-table rebuild to survive.
 
 ## AMQ ownership metadata
-
-<!-- INTEGRATION: path pending maple (AMQ ownership records) -->
 
 Each DUX_HOME has a stable UUID in `store-id`. Creation is serialized by
 `.store-id.lock`. The UUID is written and synced once, then reused across

@@ -37,7 +37,7 @@ Building from source instead? `cargo build` is the whole story, though it also b
 
 ## Install
 
-> **This is a fork.** [SiavZ/dux-amq-setup](https://github.com/SiavZ/dux-amq-setup) builds on [patrickdappollonio/dux](https://github.com/patrickdappollonio/dux) and adds shared-workspace agents, multi-agent messaging (AMQ), peer routing, watch rules, per-agent session resume, and the `dux-amq` overlay. The Homebrew, npm and shell installers below install *upstream* dux, which lacks those features. Fork releases are tagged `dux-amq-vX.Y.Z` so they never collide with upstream's tags; install one with `curl -sSfL https://github.com/SiavZ/dux-amq-setup/releases/latest/download/install.sh | bash` (the script accepts the same `DUX_INSTALL_DIR` and `DUX_VERSION` overrides). The AMQ overlay (multi-agent wrappers, message queue, doctor tooling) is installed separately, see [`dux-amq/README.md`](dux-amq/README.md). <!-- INTEGRATION: path pending ant -->
+> **This is a fork.** [SiavZ/dux-amq-setup](https://github.com/SiavZ/dux-amq-setup) builds on [patrickdappollonio/dux](https://github.com/patrickdappollonio/dux) and adds shared-workspace agents, multi-agent messaging (AMQ), peer routing, watch rules, per-agent session resume, and the `dux-amq` overlay. The Homebrew, npm and shell installers below install *upstream* dux, which lacks those features. Fork releases are tagged `dux-amq-vX.Y.Z` so they never collide with upstream's tags; install one with `curl -sSfL https://github.com/SiavZ/dux-amq-setup/releases/latest/download/install.sh | bash` (the script accepts the same `DUX_INSTALL_DIR` and `DUX_VERSION` overrides). The AMQ overlay (multi-agent wrappers, message queue, doctor tooling) is installed separately, see [`dux-amq/README.md`](dux-amq/README.md).
 
 dux targets macOS and Linux only. There is no native Windows build; Windows users run dux through WSL2, which is Linux.
 
@@ -253,8 +253,6 @@ Forking always creates an isolated worktree, even when the project normally runs
 
 ### Workspace Modes
 
-<!-- INTEGRATION: path pending evergreen (shared workspace), palmtree (exact-ID resume) -->
-
 An agent can run in its own git worktree or directly in the project's registered checkout (a shared workspace). Freshly generated configs default new agents to the shared checkout:
 
 ```toml
@@ -287,8 +285,6 @@ dux peer sync-amq
 `dux peer send` sends to a Claude agent over Claude Peers and to every other provider over AMQ; pass `--transport amq` to override. If either end is in a shared workspace, dux always routes through AMQ by the agent's immutable handle, because matching peers by working directory would be ambiguous. Every agent is launched with `DUX_SESSION_ID`, `DUX_STORE_ID`, `DUX_PROVIDER` and `DUX_AMQ_HANDLE`, and dux refreshes AMQ's agent registry from `sessions.sqlite3` when the TUI or `dux server` starts, and on `dux peer sync-amq`.
 
 ### Per-Session Settings
-
-<!-- INTEGRATION: path pending maple (session settings, orchestrator modes), herb (watch rules) -->
 
 Every agent has its own settings drawer (the `session-settings` palette command, or its keybinding) covering context mode (Attended, Orchestrator or Worker), YOLO permissions (including OpenCode's `--auto` mode), per-rule arm and disarm for watch rules, auto-clear after a task is done, and an AMQ verify-envelope override. The defaults are cautious on purpose: a missing or corrupt settings record always loads as Attended with no YOLO and no auto-clear, so tampering with the database cannot escalate a session into autonomous mode. Settings persist in `sessions.sqlite3` and follow the agent across detach and reconnect.
 
@@ -371,12 +367,9 @@ and writes a timestamped backup first.
 
 Override the config directory with the `DUX_HOME` environment variable.
 
-<!-- INTEGRATION: path pending evergreen (fail-closed reset --all) -->
 `dux config reset --all` fails closed: it needs a loadable config, a valid store ID and project inventory, and a loadable session and tombstone database when one exists. If it aborts, repair the item it names (regenerate the config, restore `sessions.sqlite3.bak`, or restore the original store ID) and retry. If the identity cannot be restored, verify and remove the associated data by hand before deleting metadata, because a replacement store ID cannot prove old AMQ ownership.
 
 ### Data Lifecycle
-
-<!-- INTEGRATION: path pending evergreen (dux session purge) -->
 
 dux keeps per-session data in several places: the worktree on disk, a row in `sessions.sqlite3`, the exact-owner AMQ inbox (`agents/<agent_handle>/` under the AMQ root), the provider's own chat history for that directory, and log lines tagged with the session. Most workflows leave all of it alone. `dux config reset --all` is the holistic factory reset described above.
 
@@ -411,28 +404,32 @@ Deleting a whole worktree or reset root is also blocked whenever the target is a
 
 ### Operations Settings
 
-<!-- INTEGRATION: sections pending port: [limits] and [storage] backup_interval_minutes (cow), [auto_resume] (palmtree), `dux doctor` CLI side (cow) with the dux-amq-doctor script (ant). Verify each key below exists in the rendered config once merged. -->
-
 The fork also ships settings for running many agents on one host. Each is documented inline in `config.toml`:
 
 ```toml
 [limits]
-max_panes = 16                # hard cap on simultaneously active panes
-max_companion_terminals = 4   # cap on companion terminals
-max_total_scrollback_mb = 256 # soft cap on scrollback memory
-disk_high_water_pct = 95      # refuse new agents above this disk usage
-disk_warn_pct = 80            # status-line warning above this disk usage
+max_panes = 0                                # hard cap on live agent panes, 0 means no cap
+max_panes_soft_warn = 16                     # warn (do not block) at this many live panes, 0 silences
+max_companion_terminals = 0                  # hard cap on companion terminals, 0 means no cap
+max_total_scrollback_mb = 256                # scrollback memory budget, acted on only with the flag below
+enable_scrollback_overflow_autodetach = false # stop the oldest agent over the budget (off by default)
+disk_high_water_pct = 95                     # refuse new agents at this disk usage
 
 [auto_resume]
-concurrency = 4   # max parallel PTY spawns when resuming at startup
-stale_days = 30   # skip sessions whose worktree is older than this
-stagger_ms = 250  # delay between spawn attempts
+concurrency = 4   # max parallel startup launches, 0 is treated as 1
+stale_days = 30   # skip agents untouched for this many days, 0 disables
+stagger_ms = 250  # minimum gap between two startup launches
 
 [storage]
 backup_interval_minutes = 30  # periodic sessions.sqlite3.bak, 0 disables
 ```
 
-`dux doctor` (`--json`, `--anonymize`) prints a read-only triage dump to attach to a support thread: database integrity and counts, plus AMQ queue health and encryption posture when the `dux-amq` overlay is installed. For encrypting agent state at rest, see [docs/operations/encryption-at-rest.md](docs/operations/encryption-at-rest.md); for the threat model, [docs/operations/threat-model.md](docs/operations/threat-model.md).
+`disk_warn_pct` (default 80) rounds out `[limits]`: a status-line warning
+before the high-water refusal. Every guard defaults to off or to a warning,
+because dux never refuses to start an agent unless the user asked for a hard
+cap; the one refusal on by default is a nearly full disk.
+
+`dux doctor` (`--json`, `--anonymize`) prints a read-only triage dump to attach to a support thread: database integrity and session counts from the Rust side, plus versions, disk usage, AMQ queue health and recent errors from the `dux-amq-doctor` script when the `dux-amq` overlay is installed. For encrypting agent state at rest, see [docs/operations/encryption-at-rest.md](docs/operations/encryption-at-rest.md); for the threat model, [docs/operations/threat-model.md](docs/operations/threat-model.md).
 
 ### Themes
 
