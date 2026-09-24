@@ -55,6 +55,7 @@ their own VM has plaintext access to all of the above under the cloud
 default. Application-layer or filesystem-layer encryption closes that
 gap.
 
+<!-- INTEGRATION: path pending ant -->
 See [`SECURITY.md`](../../SECURITY.md) for the broader threat model and
 disclosure policy.
 
@@ -90,6 +91,7 @@ sudo dnf install -y gocryptfs
 ```
 
 The package is also in Homebrew on macOS, but this overlay's persistent
+<!-- INTEGRATION: path pending ant (dux-amq overlay) -->
 disk model is documented as Linux-only in `dux-amq/README.md`, so the
 playbook focuses on Linux.
 
@@ -114,6 +116,7 @@ agent is part of the threat surface this layer is meant to mitigate.
 ### One-time bootstrap
 
 The repository ships a helper at
+<!-- INTEGRATION: path pending ant (dux-amq overlay) -->
 [`dux-amq/scripts/install-gocryptfs.sh`](../../dux-amq/scripts/install-gocryptfs.sh).
 It is **opt-in** — `dux-amq/install.sh`'s main flow does not call it,
 because adding mandatory encryption would change the deployment story
@@ -312,7 +315,7 @@ header:   /dev/disk/by-id/... (luksDump available to root)
 If neither, the doctor should print a one-line warning pointing back
 to this playbook so the operator has an actionable next step. The
 implementation lives in Phase 20; this playbook only specifies the
-expected output. See `docs/plans/audits/audit02/artifacts/25-doctor-followup.txt`
+expected output. See `docs/plans/rustport/20-dux-amq-rust-doctor-and-installer.md`
 for the open follow-up item.
 
 ## 6. GDPR Article 32 note

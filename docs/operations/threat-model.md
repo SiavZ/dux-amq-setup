@@ -1,14 +1,20 @@
 # Threat Model — long-form companion
 
+<!-- INTEGRATION: path pending ant (SECURITY.md is owned by the release/CI workstream) -->
 This document is the long-form companion to the STRIDE table in
 [`/SECURITY.md`](../../SECURITY.md). For each row T1–T20 we capture
 the concrete attack scenario, the mitigation in code (with
-file:line references taken from `docs/audits/audit02.md`), the
+file:line references taken from `docs/audits/audit02/audit02.md`), the
 residual risk after mitigation, and the detection mechanism — what
 shows up in `dux.log` or `dux-amq doctor` output when the threat
 fires.
 
+Code paths below point at the crates workspace (`crates/dux-core`,
+`crates/dux-tui`). Line numbers from the audits refer to the older
+single-crate layout, so treat them as hints and search by symbol.
+
 The audit reports in `docs/audits/` are point-in-time snapshots.
+<!-- INTEGRATION: path pending ant -->
 This file and `SECURITY.md` are the living artifacts and must be
 updated whenever new attack surface is added.
 
@@ -38,6 +44,7 @@ OpenCode's native `--auto` launch argument; OpenCode receives no such
 argument when the setting is false. Codex hook trust review is a
 separate control and remains enabled even in YOLO mode. Disabling that
 review requires the explicit `CODEX_AMQ_BYPASS_HOOK_TRUST=1` opt-in in
+<!-- INTEGRATION: path pending ant (dux-amq overlay) -->
 `dux-amq/wrappers/codex-amq`. The wrappers also fail closed below the
 reviewed provider-CLI floors (Claude 2.1.163, Codex 0.39.0, Gemini
 0.39.1), including when a version string cannot be parsed.
@@ -77,6 +84,7 @@ way to verify the sender; AMQ wrappers
 
 **Why the original Phase 08 HMAC mitigation does not actually defend
 this surface.** Phase 08 added an HMAC-signed envelope: each
+<!-- INTEGRATION: path pending ant (dux-amq overlay) -->
 `amq send` (via `dux-amq/scripts/amq-send-signed`) reads a per-VM
 secret from `$AMQ_SECRET_PATH` (default
 `$HOME/.local/share/dux-amq/amq-secret`, mode 0600) and signs the
@@ -86,6 +94,7 @@ recipient to their actual handle, preserve body bytes, and use atomic
 directory creation so simultaneous replay checks have one winner.
 Implementation-wise this works as designed.
 
+<!-- INTEGRATION: path pending ant -->
 But the trust model in [SECURITY.md](../../SECURITY.md) explicitly
 states: *"dux runs as a single-user, single-Linux-account TUI. All
 panes spawned by dux share the same `$HOME`, the same filesystem
@@ -190,7 +199,7 @@ expected vs actual sha pair.
 ## T4 — Spot-VM preemption mid-sqlite write
 
 **Attack scenario.** dux runs on a GCE spot VM. The VM is
-preempted while `src/storage.rs` is mid-transaction on
+preempted while `crates/dux-core/src/storage.rs` is mid-transaction on
 `sessions.sqlite3`. Because the database opened with the default
 rollback journal and no `synchronous=NORMAL`/WAL settings
 (`storage.rs:22`), the operator returns to find a session row
@@ -251,7 +260,7 @@ risk`. The installer prints the same warning at first run.
 
 **Attack scenario.** A customer requests deletion of their data
 under GDPR Art. 17. The operator runs the existing
-`reset_agent_data` (`src/cli.rs:464`), which removes worktrees,
+`reset_agent_data` (`crates/dux-tui/src/cli.rs`), which removes worktrees,
 sqlite, and `dux.log`. It does **not** touch
 `~/.claude/projects/<encoded>/*.jsonl` or
 `/data/state/{codex,gemini}/`. Every prompt and response with
@@ -335,7 +344,7 @@ logged and left untouched.
 
 **Attack scenario.** Producers feed unfiltered byte streams into
 `logger.rs:84-92`: `String::from_utf8_lossy(&output.stderr)` from
-`src/git.rs`, GitHub PR titles via `gh pr view`,
+`crates/dux-core/src/git.rs`, GitHub PR titles via `gh pr view`,
 `/proc/<pid>/comm` from `pty.rs:521-525`, arbitrary user paths.
 A hostile branch name, PR title, or process name with embedded
 ANSI/OSC/DCS bytes lands verbatim in `dux.log`. When the operator
@@ -346,11 +355,12 @@ sequences can corrupt subsequent rendering. Same incident class
 as Rails CVE-2025-55193.
 
 **Mitigation in code.** Phase 03 introduces
+<!-- INTEGRATION: path pending seedling (fork main had src/sanitize.rs) -->
 `sanitize_for_terminal(s: &str) -> String` (lives in
-`src/sanitizer.rs`) which strips
+`crates/dux-core/src/sanitize.rs`) which strips
 `[\x00-\x08\x0b-\x1f\x7f\x1b]`. Every `logger::*` call and every
-`set_error`/`set_info` status-line writer (`src/app/workers.rs`,
-`src/app/sessions.rs`, `src/app/input.rs`) now routes through
+`set_error`/`set_info` status-line writer (`crates/dux-tui/src/app/workers.rs`,
+`crates/dux-tui/src/app/sessions.rs`, `crates/dux-tui/src/app/input.rs`) now routes through
 the sanitizer. The 17 `git.rs` `anyhow!` sites listed in P0-C
 are wrapped at the consumer side.
 
@@ -378,7 +388,7 @@ memory cap and no PTY-count cap.
 **Mitigation in code.** Phase 16 adds a `[limits]` config block:
 `max_panes` (default 32), `max_companion_terminals` (default 8),
 `max_total_scrollback_mb` (default 256). The agent-creation path
-(`src/app/sessions.rs::create_agent`) consults the caps and
+(`crates/dux-tui/src/app/sessions.rs::create_agent`) consults the caps and
 refuses with a status-line error when exceeded. A disk watchdog
 refuses new agents when free space drops below 5%.
 
@@ -436,6 +446,7 @@ audit lists this as `future`. The intended mitigation is a
 launch-time check in `dux-amq doctor` and the dux startup path
 that resolves `~/.claude` and refuses to launch (or warns
 loudly) if the resolved target is not the recorded canonical
+<!-- INTEGRATION: path pending ant -->
 path. Until then, `SECURITY.md` documents this as a known gap.
 
 **Residual risk.** Until the check ships, this threat is
@@ -452,7 +463,7 @@ they diverge.
 
 **Attack scenario.** A spot VM is preempted with 50 active dux
 sessions. On reboot, `auto_resume_all_sessions`
-(`src/app/mod.rs:1380-1410`) iterates sequentially but unbounded:
+(`crates/dux-tui/src/app/mod.rs`) iterates sequentially but unbounded:
 all 50 sessions try to spawn PTYs and complete TLS handshakes to
 the upstream API at once. The result is API rate-limit responses,
 exhausted file descriptors, and OOM during the resume burst —
@@ -499,7 +510,8 @@ bytes back into the agent. Two distinct abuse paths follow:
    user with a custom rule (e.g. an "auto-yes" pattern) could be
    tricked into auto-confirming dangerous actions.
 
-**Mitigation in code** (`src/watch/`, `src/app/mod.rs`).
+<!-- INTEGRATION: path pending herb -->
+**Mitigation in code** (`crates/dux-core/src/watch/`, `crates/dux-tui/src/app/mod.rs`).
 
 - *Linear-time matching.* Rules compile via the `regex` crate's
   NFA engine, which is guaranteed linear in input length —
@@ -633,7 +645,8 @@ makes the parser the primary attack surface.
 **Mitigation in code.** Asymmetric-default policy at the parse
 boundary:
 
-- `SessionSettings::parse_or_default(raw)` (in `src/model.rs`)
+<!-- INTEGRATION: path pending maple (SessionSettings in model.rs) -->
+- `SessionSettings::parse_or_default(raw)` (in `crates/dux-core/src/model.rs`)
   returns `Self::default()` for `None`, empty string, or any blob
   that fails `serde_json::from_str`. The fallback emits a `warn!`
   with `target: "dux::session_settings"` carrying `err` and the
@@ -648,9 +661,10 @@ boundary:
   `verify_envelope_override = None` (inherit the global config
   default).
 - Every consumer reads through this filter:
-  `src/app/workers.rs` and `src/app/sessions.rs` call
+  `crates/dux-tui/src/app/workers.rs` and `crates/dux-tui/src/app/sessions.rs` call
   `session.settings.to_pty_env(...)` at PTY spawn, and
-  `src/app/inject_runtime.rs::deliver_inject_body` /
+  <!-- INTEGRATION: path pending maple -->
+  `crates/dux-tui/src/app/inject_runtime.rs::deliver_inject_body` /
   `apply_inject_postscript` consult `session.settings.mode` for the
   postscript decision. None of those paths read the raw column text
   directly.
@@ -761,7 +775,8 @@ Claude copy, an existing destination could be overwritten, or a large provider
 tree could exhaust memory, CPU, or inodes. Concurrent fresh Codex launches in
 one shared CWD could also race and swap their newly-created rollout UUIDs.
 
-**Mitigation in code.** `src/resume_recovery.rs` reads provider originals and
+<!-- INTEGRATION: path pending palmtree -->
+**Mitigation in code.** `crates/dux-core/src/resume_recovery.rs` reads provider originals and
 never moves, edits, or deletes them. Recovery accepts only regular JSONLs with
 valid UUIDs and an absolute recorded CWD that is exactly
 `<historical-worktrees-root>/<registered-project-name>/<agent-dir>`. It checks
@@ -871,6 +886,7 @@ removing or overriding `[providers.jcode]` disables the provider.
 ## Maintenance
 
 When you add or change attack surface in this codebase, you must
+<!-- INTEGRATION: path pending ant -->
 update both `SECURITY.md` (the table) and this file (the
 paragraph). PRs that touch the surface listed above without
 updating these documents are blocked at review.
@@ -881,4 +897,5 @@ threats are kept in the table with a `~~strikethrough~~` and a
 note pointing to the PR that retired them. Threats that move to
 **accepted-risk in single-user-VM mode** keep their original ID,
 get a `Status:` line at the top of their long-form section, and
+<!-- INTEGRATION: path pending ant -->
 remain referenced from `SECURITY.md`'s "Accepted risks" list.
