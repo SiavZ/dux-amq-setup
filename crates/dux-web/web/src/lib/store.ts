@@ -62,7 +62,7 @@ import {
   notifyWarning,
   setStatusClearSeconds,
 } from "./notify"
-import { chip, prose, wireProse } from "./prose"
+import { chip, type Prose, prose, wireProse } from "./prose"
 import { publishConnectionTiming } from "./connectionTiming"
 import { clearServerValidated, noteServerValidated } from "./serverValidated"
 import { registerPageLifecycle } from "./pageLifecycle"
@@ -4184,9 +4184,9 @@ function providerIsConfigured(provider: string): boolean {
 }
 
 // The same refusal the server gives, so a pre-flight toast and a refused
-// request read alike.
-function providerNotConfigured(provider: string): string {
-  return `Provider "${provider}" is not configured. Pick one of the configured providers.`
+// request read alike; the browser raises this one itself, so it chips the name.
+function providerNotConfigured(provider: string): Prose {
+  return prose`Provider ${chip(provider)} is not configured. Pick one of the configured providers.`
 }
 
 // Ask the server to swap which provider a session uses. The provider is validated

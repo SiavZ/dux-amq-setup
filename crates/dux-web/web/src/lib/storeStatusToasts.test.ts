@@ -612,3 +612,20 @@ describe("an engine status that names things", () => {
     })
   })
 })
+
+describe("a refusal the browser raises itself", () => {
+  it("draws the provider it refuses as a chip", async () => {
+    const mod = await loadStoreWithBootstrap()
+    const { toast } = await import("sonner")
+
+    // The bootstrap configures no provider, so the pre-flight refuses.
+    expect(await mod.changeAgentProvider("s1", "nope")).toBe(false)
+    expect(toast.error).toHaveBeenCalledTimes(1)
+    const [body] = vi.mocked(toast.error).mock.calls[0]
+    expect(typeof body).not.toBe("string")
+    const html = renderToStaticMarkup(body as ReactElement)
+    expect(html).toMatch(/<code data-slot="inline-code"[^>]*>nope<\/code>/)
+    expect(html).not.toContain("&quot;nope&quot;")
+    expect(html).toContain("is not configured. Pick one of the configured providers.")
+  })
+})

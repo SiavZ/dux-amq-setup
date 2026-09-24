@@ -109,6 +109,49 @@ const ALLOWED: { file: string; line: string; reason: string }[] = [
     line: '<span className="truncate font-mono text-sm">{entry.branch_name}</span>',
     reason: "A worktree row that is only its branch: a list row, out of the chip rule's scope.",
   },
+  // The files below are scanned because they build toast prose, not because
+  // they are dialogs; each line is something other than a name in a sentence.
+  {
+    file: "components/EditorBody.tsx",
+    line: '<span className="min-w-0 flex-1 truncate text-left font-mono text-sm [direction:rtl]">',
+    reason:
+      "The editor header's open path and a search result row: a path that is the whole element, not a name in a sentence.",
+  },
+  {
+    file: "components/EditorBody.tsx",
+    line: '<span className="max-w-full shrink-0 truncate font-mono text-xs text-muted-foreground">',
+    reason: "The caption under a previewed image: only the file's path, not a sentence.",
+  },
+  {
+    file: "lib/favicon.ts",
+    line: '`<svg xmlns="http://www.w3.org/2000/svg" viewBox="${DUCK_VIEWBOX}">` +',
+    reason: "SVG markup for the favicon: an attribute value, not prose.",
+  },
+  {
+    file: "lib/favicon.ts",
+    line: '`<path fill="${fill}" fill-rule="evenodd" d="${DUCK_PATH}"/>` +',
+    reason: "SVG markup for the favicon: attribute values, not prose.",
+  },
+  {
+    file: "lib/fileDrop.ts",
+    line: "return `'${path.replaceAll(\"'\", `'\\\\''`)}'`",
+    reason: "Shell quoting of a pasted path: the quotes are the text the terminal receives.",
+  },
+  {
+    file: "lib/fileDrop.ts",
+    line: 'return `"${path.replaceAll(/[\\\\"$`]/g, (c) => `\\\\${c}`)}"`',
+    reason: "Shell quoting of a pasted path: the quotes are the text the terminal receives.",
+  },
+  {
+    file: "lib/notify.ts",
+    line: 'return `Still waiting on the server for "${message}" after ${seconds} seconds. The request has not been answered yet; nothing has been lost, and the outcome will replace this as soon as it arrives.`',
+    reason: "Quotes the stranded spinner's own sentence, which is relayed text rather than a name.",
+  },
+  {
+    file: "lib/notify.ts",
+    line: 'return `No word from dux about "${message}" for ${seconds} seconds. The operation may still be running, and the connection may simply have dropped. Check dux.log if it never reports back.`',
+    reason: "Quotes the stranded spinner's own sentence, which is relayed text rather than a name.",
+  },
 ]
 
 describe("the name-delimiter detector", () => {
