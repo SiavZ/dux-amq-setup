@@ -1015,3 +1015,167 @@ fn opening_a_database_this_build_created_is_a_no_op_the_second_time() {
         Some("abc")
     );
 }
+
+/// `sessions.sqlite3` as the FORK's `main` left it at schema version 6
+/// (`PRAGMA user_version = 6`): migrations 0001 to 0006 applied, the last one
+/// adding `provider_session_ids`. Transcribed from the fork's
+/// `src/storage/migrations/0005_shared_workspace.sql` (the table rebuild) plus
+/// `0006_provider_session_ids.sql`, not invented. The fork kept projects in
+/// `config.toml`, so there is no `projects` table.
+const FORK_SCHEMA_6: &str = r#"
+create table agent_sessions (
+    id text primary key,
+    project_id text not null,
+    provider text not null,
+    source_branch text not null,
+    branch_name text not null,
+    worktree_path text not null,
+    title text,
+    project_path text,
+    started_providers text not null default '[]',
+    status text not null,
+    created_at text not null,
+    updated_at text not null,
+    state_json text,
+    session_settings text,
+    sort_order integer not null default 0,
+    shared_workspace integer not null default 0,
+    agent_handle text not null unique check (
+        agent_handle glob '[a-z0-9_-]*'
+        and agent_handle not glob '*[^a-z0-9_-]*'
+        and length(agent_handle) between 1 and 64
+    ),
+    deleted_at text,
+    provider_session_ids text not null default '{}'
+);
+create table session_prs (
+    session_id text not null,
+    pr_number integer not null,
+    owner_repo text not null,
+    state text not null default 'OPEN',
+    title text not null default '',
+    primary key (session_id, pr_number),
+    foreign key (session_id) references agent_sessions(id) on delete cascade
+);
+create index idx_agent_sessions_sort_order
+    on agent_sessions(sort_order, updated_at desc, id);
+pragma user_version = 6;
+"#;
+
+/// A fork user's provider session ids are the whole point of the column: they
+/// must come through the upgrade readable and writable, and the ALTER that adds
+/// the column for everyone else must be a no-op on a database that has it.
+#[test]
+fn a_fork_schema_6_database_opens_and_keeps_its_provider_session_ids() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("sessions.sqlite3");
+    let conn = Connection::open(&path).expect("open");
+    conn.execute_batch(FORK_SCHEMA_6).expect("fork schema 6");
+    conn.execute_batch(
+        r#"
+        insert into agent_sessions
+          (id, project_id, provider, source_branch, branch_name, worktree_path,
+           title, project_path, started_providers, status, created_at, updated_at,
+           sort_order, shared_workspace, agent_handle, provider_session_ids)
+        values
+          ('fork-1', 'proj-1', 'claude', 'main', 'dux/otter', '/wt/proj/otter',
+           'otter', '/code/proj', '["claude","codex"]', 'active',
+           '2026-09-01T00:00:00Z', '2026-09-02T00:00:00Z', 0, 0, 'otter',
+           '{"claude":"6f1c3f0e-1111-4222-8333-944455556666","codex":"0199aaaa-bbbb-4ccc-8ddd-eeeeffff0000"}'),
+          ('fork-2', 'proj-1', 'jcode', 'main', 'dux/heron', '/wt/proj/heron',
+           null, '/code/proj', '["jcode"]', 'detached',
+           '2026-09-01T00:00:00Z', '2026-09-03T00:00:00Z', 1, 0, 'heron', '{}');
+        "#,
+    )
+    .expect("seed fork rows");
+    drop(conn);
+
+    let store = SessionStore::open(&path).expect("a fork schema-6 database must open");
+    let sessions = store.load_sessions().expect("load");
+    assert_eq!(sessions.len(), 2, "{sessions:#?}");
+    assert_eq!(session(&sessions, "fork-1").provider.as_str(), "claude");
+    assert_eq!(
+        session(&sessions, "fork-1").started_providers,
+        vec!["claude".to_string(), "codex".to_string()]
+    );
+
+    assert_eq!(
+        store
+            .provider_session_id("fork-1", "claude")
+            .expect("read")
+            .as_deref(),
+        Some("6f1c3f0e-1111-4222-8333-944455556666")
+    );
+    assert_eq!(
+        store
+            .provider_session_id("fork-1", "codex")
+            .expect("read")
+            .as_deref(),
+        Some("0199aaaa-bbbb-4ccc-8ddd-eeeeffff0000")
+    );
+    assert_eq!(
+        store.provider_session_id("fork-2", "jcode").expect("read"),
+        None
+    );
+
+    // Writable after the upgrade, and a second open changes nothing.
+    store
+        .set_provider_session_id("fork-2", "jcode", "session_heron_1790000000000_abc123")
+        .expect("write");
+    drop(store);
+    let store = SessionStore::open(&path).expect("reopen");
+    assert_eq!(
+        store
+            .provider_session_id("fork-2", "jcode")
+            .expect("read")
+            .as_deref(),
+        Some("session_heron_1790000000000_abc123")
+    );
+    assert_eq!(
+        store.provider_session_ids("fork-1").expect("read").len(),
+        2,
+        "the reopen must not reset the map"
+    );
+}
+
+/// An upstream-era database has no `provider_session_ids`; the open adds it at
+/// its documented default and every existing agent reads as "no id recorded".
+#[test]
+fn provider_session_ids_arrive_empty_on_an_upstream_database() {
+    let (_tmp, path) = old_database();
+    let store = SessionStore::open(&path).expect("open");
+    for id in ["sess-1", "sess-2", "sess-3"] {
+        assert!(store.provider_session_ids(id).expect("read").is_empty());
+    }
+    assert!(
+        store
+            .provider_session_ids("no-such-agent")
+            .expect("read")
+            .is_empty(),
+        "an unknown agent has no ids rather than an error"
+    );
+    assert!(
+        store
+            .set_provider_session_id("no-such-agent", "claude", "x")
+            .is_err(),
+        "a capture that raced a delete must be reported, not dropped"
+    );
+    assert!(
+        store
+            .set_provider_session_id_if_missing("sess-1", "claude", "first")
+            .expect("write")
+    );
+    assert!(
+        !store
+            .set_provider_session_id_if_missing("sess-1", "claude", "second")
+            .expect("write"),
+        "recovery must never override an id captured at launch"
+    );
+    assert_eq!(
+        store
+            .provider_session_id("sess-1", "claude")
+            .expect("read")
+            .as_deref(),
+        Some("first")
+    );
+}

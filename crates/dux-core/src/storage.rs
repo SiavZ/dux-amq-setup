@@ -319,6 +319,23 @@ impl SessionStore {
         // Both passes run after `create table if not exists agent_tabs` further
         // down, because they write rows into it.
         ensure_column(&self.conn, "agent_sessions", "slot_tab_id", "text")?;
+        // Each provider's own id for this agent's conversation, as a JSON
+        // object keyed by provider name (`{"claude": "<uuid>"}`). Lets a
+        // relaunch resume THAT conversation by id instead of the provider's
+        // "latest in this directory" selector, which picks the wrong one as
+        // soon as two conversations share a directory. A map because one agent
+        // can run several providers over its life.
+        //
+        // Same additive rationale as above, and a database from the fork's
+        // schema 0006 already has this exact column, so the ALTER is a no-op
+        // there. Owned by `set_provider_session_id*`, never by `upsert_session`,
+        // so status churn cannot erase a captured id.
+        ensure_column(
+            &self.conn,
+            "agent_sessions",
+            "provider_session_ids",
+            "text not null default '{}'",
+        )?;
         self.conn.execute_batch(
             r#"
             create table if not exists session_prs (
@@ -1864,6 +1881,84 @@ impl SessionStore {
             params![id, tab_id],
         )?;
         Ok(())
+    }
+
+    /// Every provider session id recorded for `session_id`, keyed by provider
+    /// name. Empty for an agent with none, or one that no longer exists.
+    pub fn provider_session_ids(&self, session_id: &str) -> Result<BTreeMap<String, String>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "select provider_session_ids from agent_sessions where id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match raw {
+            Some(raw) => {
+                serde_json::from_str(&raw).context("stored provider_session_ids is not valid JSON")
+            }
+            None => Ok(BTreeMap::new()),
+        }
+    }
+
+    /// The id `provider` gave this agent's conversation, if dux recorded one.
+    pub fn provider_session_id(&self, session_id: &str, provider: &str) -> Result<Option<String>> {
+        Ok(self.provider_session_ids(session_id)?.remove(provider))
+    }
+
+    /// Record (or replace) the id `provider` gave this agent's conversation.
+    /// Errors when the agent does not exist, so a capture that raced a delete
+    /// is reported rather than silently dropped.
+    pub fn set_provider_session_id(
+        &self,
+        session_id: &str,
+        provider: &str,
+        provider_session_id: &str,
+    ) -> Result<()> {
+        self.write_provider_session_id(session_id, provider, provider_session_id, false)?;
+        Ok(())
+    }
+
+    /// Record the id only when none is stored for `provider` yet. Returns
+    /// whether it wrote. Used by the one-time history recovery, which must
+    /// never override an id captured at launch.
+    pub fn set_provider_session_id_if_missing(
+        &self,
+        session_id: &str,
+        provider: &str,
+        provider_session_id: &str,
+    ) -> Result<bool> {
+        self.write_provider_session_id(session_id, provider, provider_session_id, true)
+    }
+
+    fn write_provider_session_id(
+        &self,
+        session_id: &str,
+        provider: &str,
+        provider_session_id: &str,
+        only_if_missing: bool,
+    ) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let raw: String = tx
+            .query_row(
+                "select provider_session_ids from agent_sessions where id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("session {session_id:?} was not found"))?;
+        let mut ids: BTreeMap<String, String> =
+            serde_json::from_str(&raw).context("stored provider_session_ids is not valid JSON")?;
+        if only_if_missing && ids.contains_key(provider) {
+            return Ok(false);
+        }
+        ids.insert(provider.to_string(), provider_session_id.to_string());
+        tx.execute(
+            "update agent_sessions set provider_session_ids = ?1 where id = ?2",
+            params![serde_json::to_string(&ids)?, session_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn set_auto_reopen_enabled(&self, id: &str, enabled: bool) -> Result<()> {
