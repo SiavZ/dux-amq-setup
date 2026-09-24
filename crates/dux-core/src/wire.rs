@@ -7733,6 +7733,30 @@ mod tests {
         );
     }
 
+    /// A failed inspection ends the chain with a toast that times out, so the
+    /// log is the only lasting record of why, the same as a failed switch.
+    #[test]
+    fn a_failed_default_branch_inspection_is_logged() {
+        let (mut engine, _tmp) = test_engine();
+        let project = sample_project("p1", "/srv/repo-inspect");
+        engine.projects.push(project.clone());
+
+        let (_, lines) = crate::logger::capture_for_test(|| {
+            engine.process_worker_event(WorkerEvent::CheckoutProjectDefaultBranchInspected {
+                project,
+                result: Err("fatal: not a git repository".to_string()),
+                status_op_id: None,
+            })
+        });
+
+        assert!(
+            lines.iter().any(|line| line.starts_with("ERROR")
+                && line.contains("/srv/repo-inspect")
+                && line.contains("fatal: not a git repository")),
+            "{lines:?}"
+        );
+    }
+
     #[test]
     fn apply_wire_checkout_project_default_branch_switches_from_feature() {
         // A project whose persisted leading branch ("trunk") differs from HEAD

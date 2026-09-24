@@ -3095,6 +3095,10 @@ impl Engine {
                 }
             },
             Err(error) => {
+                logger::error(&format!(
+                    "default branch inspection failed for {}: {error}",
+                    project.path
+                ));
                 if let Some(id) = status_op_id
                     && let Some(op) = self.pending_web_checkout_ops.remove(&id)
                 {

@@ -169,7 +169,30 @@ pub fn current_level() -> &'static str {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static CAPTURED: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` and return every line it logged on THIS thread, as `"LEVEL message"`,
+/// whatever the configured level. Thread-local, so tests running in parallel
+/// never see each other's lines and none of them moves global logger state.
+#[cfg(test)]
+pub(crate) fn capture_for_test<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+    CAPTURED.with(|cell| *cell.borrow_mut() = Some(Vec::new()));
+    let result = f();
+    let lines = CAPTURED.with(|cell| cell.borrow_mut().take().unwrap_or_default());
+    (result, lines)
+}
+
 fn log(level: LogLevel, message: &str) {
+    #[cfg(test)]
+    CAPTURED.with(|cell| {
+        if let Some(lines) = cell.borrow_mut().as_mut() {
+            lines.push(format!("{} {message}", level.as_str()));
+        }
+    });
     if level > LogLevel::from_u8(LEVEL.load(Ordering::Relaxed)) {
         return;
     }
