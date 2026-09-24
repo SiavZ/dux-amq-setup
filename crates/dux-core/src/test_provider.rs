@@ -43,9 +43,8 @@ use crate::config::{Config, ProviderCommandConfig, default_provider_commands};
 /// shell names one of these explicitly. To allow another program, add its file
 /// name here, and only if running it can touch nothing outside the test's own
 /// scratch directory.
-pub const ALLOWED_TEST_COMMANDS: &[&str] = &[
-    "sh", "bash", "cat", "sleep", "true", "printf", "echo", "env",
-];
+pub const ALLOWED_TEST_COMMANDS: &[&str] =
+    &["sh", "bash", "cat", "sleep", "true", "printf", "echo"];
 
 /// The stand-in every defused provider runs. `sh -c 'exec cat'` rather than a bare
 /// `cat` because a launch appends the provider's resume arguments (`--continue`,
@@ -211,6 +210,10 @@ mod tests {
         }
         assert!(!is_allowed_test_command("claude"));
         assert!(!is_allowed_test_command("Cat"));
+        // `env` runs whatever program it is handed, so allowing it would allow
+        // everything; no test needs it.
+        assert!(!is_allowed_test_command("env"));
+        assert!(!is_allowed_test_command("/usr/bin/env"));
         assert!(!is_allowed_test_command("/bin/claude-notes"));
         assert!(!is_allowed_test_command(""));
     }
