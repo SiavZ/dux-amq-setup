@@ -146,6 +146,23 @@ fn sidecar_path(db: &std::path::Path, suffix: &str) -> std::path::PathBuf {
 
 impl SessionStore {
     pub fn open(path: &std::path::Path) -> Result<Self> {
+        let store = Self::connect(path)?;
+        store.migrate()?;
+        Ok(store)
+    }
+
+    /// A second connection to a database this process has ALREADY opened and
+    /// migrated, for a worker thread that only reads rows or makes a narrow
+    /// compare-and-swap. It skips `migrate()`: the migration's repair passes
+    /// (the orphan-tab sweep, the slot-tab backfill) assume nobody else is
+    /// writing, and running them from a worker while the engine inserts a tab
+    /// can delete that tab. Anything that may be the first open of a database
+    /// must use [`Self::open`].
+    pub fn open_existing(path: &std::path::Path) -> Result<Self> {
+        Self::connect(path)
+    }
+
+    fn connect(path: &std::path::Path) -> Result<Self> {
         let conn =
             Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
         // The engine keeps one connection open for the lifetime of the process
@@ -200,9 +217,7 @@ impl SessionStore {
         ] {
             crate::file_modes::restrict_to_owner_best_effort(&path, "session database");
         }
-        let store = Self { conn };
-        store.migrate()?;
-        Ok(store)
+        Ok(Self { conn })
     }
 
     fn migrate(&self) -> Result<()> {
@@ -3029,6 +3044,31 @@ mod tests {
             .map(|t| t.id)
             .collect();
         assert_eq!(loaded, vec!["slot-1".to_string(), "t1".to_string()]);
+    }
+
+    /// A worker's second connection must not run the migration's repair
+    /// passes. `open_existing` connects without migrating, so a tab the main
+    /// connection inserted for a session it has not persisted yet survives;
+    /// a full `open` would sweep it as an orphan. The launch path hit exactly
+    /// this before it moved to `open_existing`.
+    #[test]
+    fn open_existing_runs_no_migration_so_a_live_insert_is_not_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sessions.sqlite3");
+        let main = SessionStore::open(&db).unwrap();
+        main.insert_agent_tab(&test_tab("fresh", "not-yet-persisted", 1))
+            .unwrap();
+
+        let worker = SessionStore::open_existing(&db).unwrap();
+        drop(worker);
+        assert_eq!(main.load_agent_tabs().unwrap().len(), 1, "survives");
+
+        // The contrast that makes the distinction load-bearing.
+        drop(SessionStore::open(&db).unwrap());
+        assert!(
+            main.load_agent_tabs().unwrap().is_empty(),
+            "a full open sweeps it"
+        );
     }
 
     #[test]

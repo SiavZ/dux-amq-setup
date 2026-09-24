@@ -127,7 +127,9 @@ fn launch_env_with_root(
     amq_root: Option<&Path>,
 ) -> Result<Vec<(String, String)>> {
     let store_id = load_or_create_store_id(&paths.root)?;
-    let store = SessionStore::open(&paths.sessions_db_path)
+    // The engine has already opened and migrated this database; a launch only
+    // reads handles and may swap one, so it must not rerun the migration.
+    let store = SessionStore::open_existing(&paths.sessions_db_path)
         .with_context(|| format!("failed to open {}", paths.sessions_db_path.display()))?;
     let rows = store.load_sessions_including_deleted()?;
     // The stored row is authoritative: a global backfill may have moved this
