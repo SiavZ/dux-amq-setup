@@ -70,6 +70,7 @@ pub mod terminal_title;
 pub mod text;
 pub mod theme;
 pub mod urls;
+pub mod version;
 pub mod viewmodel;
 pub mod watch;
 pub mod welcome;

@@ -20,11 +20,12 @@ use crate::theme::Theme;
 pub(crate) const MIN_BUTTON_WIDTH: u16 = 16;
 
 /// Width that fits `label` between two rounded borders with one column of
-/// padding on each side, never narrower than [`MIN_BUTTON_WIDTH`]. Counted in
-/// chars, not UTF-8 bytes.
+/// padding on each side, never narrower than [`MIN_BUTTON_WIDTH`]. Measured in
+/// terminal columns (the renderer's own `Line::width`), so a double-width CJK
+/// glyph or emoji counts two and a combining mark counts none.
 pub(crate) fn button_width_for(label: &str) -> u16 {
-    let label_chars = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
-    MIN_BUTTON_WIDTH.max(label_chars.saturating_add(4))
+    let label_width = u16::try_from(Line::from(label).width()).unwrap_or(u16::MAX);
+    MIN_BUTTON_WIDTH.max(label_width.saturating_add(4))
 }
 
 /// Largest [`button_width_for`] across `labels`, so buttons sharing a row keep
@@ -229,9 +230,9 @@ impl<'a> Button<'a> {
         block.render(area, frame.buffer_mut());
         // Centred through the shared helper, not `Alignment::Center`, so the odd
         // column of slack falls on the right like every other centred thing in
-        // the app. Measured in chars, the unit `button_width_for` sizes the
-        // button in.
-        let label_w = u16::try_from(self.label.chars().count()).unwrap_or(u16::MAX);
+        // the app. Measured in terminal columns, the unit `button_width_for`
+        // sizes the button in.
+        let label_w = u16::try_from(Line::from(self.label).width()).unwrap_or(u16::MAX);
         let label_area = Rect {
             x: centered_x(inner, label_w),
             width: label_w.min(inner.width),
@@ -302,6 +303,18 @@ mod tests {
         // CJK character "世" is 3 UTF-8 bytes but 1 visible char.
         // Helper must measure by visible width, not byte length.
         assert_eq!(button_width_for("世界"), MIN_BUTTON_WIDTH);
+    }
+
+    /// Fork 7d715a02: a label is sized by the terminal columns it occupies, not
+    /// by its scalar count, or a CJK label overflows its own border.
+    #[test]
+    fn button_width_for_uses_terminal_display_width() {
+        // "世界日本語" = 5 chars but 10 columns -> 10 + 4 = 14, under the minimum.
+        assert_eq!(button_width_for("世界日本語"), MIN_BUTTON_WIDTH);
+        // Seven CJK chars = 14 columns -> 14 + 4 = 18 > minimum.
+        assert_eq!(button_width_for("一二三四五六七"), 18);
+        // A base letter plus a combining acute accent is one column.
+        assert_eq!(button_width_for("e\u{301}"), MIN_BUTTON_WIDTH);
     }
 
     #[test]

@@ -34,7 +34,8 @@ pub fn ensure_config(paths: &DuxPaths) -> Result<Config> {
     let migrations_changed = dux_core::config_migrate::apply_load_migrations(&mut doc)?;
     let retired_keys_changed = prune_retired_key_actions(&mut doc);
     let folded_keys_changed = fold_legacy_key_actions(&mut doc);
-    if migrations_changed || retired_keys_changed || folded_keys_changed {
+    let unbound_keys_changed = unbind_retired_default_keys(&mut doc);
+    if migrations_changed || retired_keys_changed || folded_keys_changed || unbound_keys_changed {
         // blessed sync-direct: deprecation/retirement migration also runs at boot before the queue exists
         dux_core::config_write::write_config_secure(&paths.config_path, &doc.to_string())
             .with_context(|| format!("failed to write {}", paths.config_path.display()))?;
@@ -227,6 +228,49 @@ fn fold_legacy_key_actions(doc: &mut DocumentMut) -> bool {
                      because it could not be merged into the \"{current}\" value already there"
                 ));
             }
+        }
+    }
+    changed
+}
+
+// ---------------------------------------------------------------------------
+// Retired default keys
+//
+// dux writes resolved default bindings into `[keys]` as real rows, so a default
+// that is later removed lives on in every existing config. These are rows whose
+// value is EXACTLY a retired default; they are cleared (the action stays, now
+// unbound) so the retirement reaches existing users. Any other value, including
+// the retired key alongside another one, is a choice and is left alone.
+// ---------------------------------------------------------------------------
+
+/// `(action, retired default keys)` pairs, matched as the whole row.
+const RETIRED_DEFAULT_KEYS: &[(&str, &[&str])] = &[
+    // Plain `o` launched an external editor from the sidebar, which a stray
+    // keypress did far too easily (fork d945e200).
+    ("open_worktree_in_editor", &["o"]),
+];
+
+/// Clear `[keys]` rows that still hold exactly a retired default. Returns
+/// whether the document changed.
+fn unbind_retired_default_keys(doc: &mut DocumentMut) -> bool {
+    let Some(keys) = doc.get_mut("keys").and_then(Item::as_table_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    for (action, retired) in RETIRED_DEFAULT_KEYS {
+        let is_retired_default = keys.get(action).and_then(key_string_list).is_some_and(|k| {
+            k.len() == retired.len()
+                && k.iter()
+                    .zip(retired.iter())
+                    .all(|(a, b)| a.trim().eq_ignore_ascii_case(b))
+        });
+        if is_retired_default {
+            keys[action] = toml_edit::value(toml_edit::Array::new());
+            changed = true;
+            dux_core::logger::info(&format!(
+                "[keys] {action} no longer defaults to {retired:?}; unbound it. To keep \
+                 {retired:?}, bind it together with another key, e.g. [\"o\", \"ctrl-o\"]"
+            ));
         }
     }
     changed
@@ -2051,6 +2095,21 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
         None => out.push_str("# forward_scroll = true\n"),
     }
     out.push_str(
+        "# Whether a plain left-button drag over this agent's pane goes to the\n\
+         # provider once it has turned on mouse reporting. Terminal UI only.\n\
+         #   (unset) or true = forward presses and drags to the provider, as a\n\
+         #                     terminal emulator does.\n\
+         #   false           = keep a plain drag in dux as a text selection so it\n\
+         #                     can be copied; a click that did not move is still\n\
+         #                     sent to the provider when the button comes up.\n\
+         # Shift+drag always selects in dux. The wheel is governed by\n\
+         # forward_scroll above, not by this key.\n",
+    );
+    match config.forward_mouse {
+        Some(value) => out.push_str(&format!("forward_mouse = {value}\n")),
+        None => out.push_str("# forward_mouse = false\n"),
+    }
+    out.push_str(
         "# What a dragged, dropped or pasted file's path looks like when the web UI\n\
          # writes it into this provider's prompt.\n\
          #\n\
@@ -2269,6 +2328,34 @@ mod tests {
         let bindings =
             crate::keybindings::RuntimeBindings::from_keys_config(&KeysConfig::default());
         render_config(config, &bindings)
+    }
+
+    /// Every provider block documents `forward_mouse` inline; the ones that ship
+    /// a value write it, the rest carry the commented example. The rendered
+    /// document must also load back to the same policy.
+    #[test]
+    fn rendered_config_documents_forward_mouse_per_provider() {
+        let rendered = render_config_default(&Config::default());
+        for name in ["claude", "codex", "opencode", "copilot", "jcode"] {
+            let section = rendered
+                .split(&format!("[providers.{name}]\n"))
+                .nth(1)
+                .and_then(|s| s.split("\n[").next())
+                .unwrap_or_else(|| panic!("{name} section"));
+            assert!(
+                section.contains("# Whether a plain left-button drag"),
+                "{name} must document forward_mouse: {section}"
+            );
+            let expected = if matches!(name, "claude" | "codex" | "opencode") {
+                "\nforward_mouse = false\n"
+            } else {
+                "\n# forward_mouse = false\n"
+            };
+            assert!(section.contains(expected), "{name}: {section}");
+        }
+        let parsed: Config = toml::from_str(&rendered).expect("rendered config parses");
+        assert!(!parsed.providers.commands["claude"].forwards_mouse());
+        assert_eq!(parsed.providers.commands["jcode"].forward_mouse, None);
     }
 
     // -----------------------------------------------------------------------
@@ -3514,6 +3601,7 @@ agent_scrollback_lines = 10000
             oneshot_output: Default::default(),
             install_hint: None,
             forward_scroll: None,
+            forward_mouse: None,
             web_dragdrop_paste: None,
             watch: Vec::new(),
         };
@@ -3533,6 +3621,7 @@ agent_scrollback_lines = 10000
             oneshot_output: Default::default(),
             install_hint: None,
             forward_scroll: None,
+            forward_mouse: None,
             web_dragdrop_paste: None,
             watch: Vec::new(),
         };
@@ -3555,6 +3644,7 @@ agent_scrollback_lines = 10000
                     oneshot_output: Default::default(),
                     install_hint: None,
                     forward_scroll: None,
+                    forward_mouse: None,
                     web_dragdrop_paste: None,
                     watch: Vec::new(),
                 },
@@ -3587,6 +3677,7 @@ agent_scrollback_lines = 10000
                     oneshot_output: Default::default(),
                     install_hint: None,
                     forward_scroll: None,
+                    forward_mouse: None,
                     web_dragdrop_paste: None,
                     watch: Vec::new(),
                 },
@@ -3804,6 +3895,7 @@ oneshot_output = "stdout"
                     oneshot_output: Default::default(),
                     install_hint: None,
                     forward_scroll: None,
+                    forward_mouse: None,
                     web_dragdrop_paste: None,
                     watch: Vec::new(),
                 },
@@ -4151,6 +4243,48 @@ args = [\"-l\"]
         );
     }
 
+    /// Fork d945e200 (`config_v1_removes_only_the_legacy_open_worktree_binding`).
+    /// There is no config schema number here, so the fork's v1 migration arm is a
+    /// load rule: a `[keys]` row that is EXACTLY the retired plain `o` default is
+    /// cleared and the change persisted, while a customized row is kept.
+    #[test]
+    fn config_v1_removes_only_the_legacy_open_worktree_binding() {
+        let seed = |value: &str| {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let root = dir.path().to_path_buf();
+            let paths = dux_core::config::DuxPaths {
+                config_path: root.join("config.toml"),
+                sessions_db_path: root.join("sessions.sqlite3"),
+                lock_path: root.join("dux.lock"),
+                worktrees_root: root.join("worktrees"),
+                root,
+            };
+            let body = format!("[keys]\nopen_worktree_in_editor = {value}\n");
+            fs::write(&paths.config_path, body).expect("seed config");
+            (dir, paths)
+        };
+
+        let (_dir, paths) = seed("[\"o\"]");
+        let migrated = ensure_config(&paths).expect("load and persist migration");
+        assert_eq!(
+            migrated.keys.bindings["open_worktree_in_editor"],
+            Vec::<String>::new()
+        );
+        let persisted: Config =
+            toml::from_str(&fs::read_to_string(&paths.config_path).expect("read migrated config"))
+                .expect("parse migrated config");
+        assert!(persisted.keys.bindings["open_worktree_in_editor"].is_empty());
+
+        for custom in ["[\"ctrl-o\"]", "[\"o\", \"ctrl-o\"]"] {
+            let (_dir, paths) = seed(custom);
+            let kept = ensure_config(&paths).expect("load");
+            assert!(
+                !kept.keys.bindings["open_worktree_in_editor"].is_empty(),
+                "a customized binding {custom} must be kept"
+            );
+        }
+    }
+
     /// The terminal UI never goes through `load_config`, so the correction that
     /// keeps the engine tick from re-warning has to happen here too. Without it
     /// the surface with the fastest tick is the one that floods.
@@ -4211,6 +4345,7 @@ args = [\"-l\"]
             oneshot_output: Default::default(),
             install_hint: Some("brew install gemini-cli".to_string()),
             forward_scroll: None,
+            forward_mouse: None,
             web_dragdrop_paste: None,
             watch: Vec::new(),
         };
@@ -4631,9 +4766,10 @@ mod web_dragdrop_paste_render_tests {
 
     /// User-authored `[[providers.claude.watch]]` rules survive a save
     /// round-trip, including comments inside the rule body. `patch_providers`
-    /// never touches the watch array.
+    /// never touches the watch array. The test drives the deprecated sync save
+    /// path directly, as the fork's test did.
     #[test]
-    #[allow(deprecated)] // test drives the sync save path directly, as the fork's test did
+    #[allow(deprecated)]
     fn save_config_preserves_user_authored_watch_rules() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let config_path = dir.path().join("config.toml");
@@ -4673,9 +4809,9 @@ mod web_dragdrop_paste_render_tests {
         );
     }
 
-    /// `restore-docs` re-renders the whole file from the parsed config, so the
-    /// renderer must emit configured rules as real entries. A rule with every
-    /// field set, including a regex with backslashes and quotes, must survive.
+    /// Configured rules survive `restore-docs` and a first-creation render. A
+    /// rule with every field set, including a regex with backslashes and
+    /// quotes, must round-trip exactly.
     #[test]
     fn restore_docs_keeps_configured_watch_rules() {
         let raw = "[providers.claude]\ncommand = \"claude\"\n\n\
@@ -4692,6 +4828,7 @@ mod web_dragdrop_paste_render_tests {
                    cooldown_ms = 7\n\n\
                    [[providers.claude.watch]]\n\
                    pattern = \"second\"\n\
+                   action = \"send_text\"\n\
                    text = \"x\"\n";
         let before: Config = toml::from_str(raw).expect("fixture parses");
         let restored = restore_documentation(raw).expect("restore");
@@ -4702,5 +4839,16 @@ mod web_dragdrop_paste_render_tests {
             restored.text
         );
         assert_eq!(after.providers.commands["claude"].watch.len(), 2);
+
+        // First creation writes the documented render of the in-memory config
+        // with no original file to merge from, so the renderer itself must emit
+        // the rules or a config born from them (dux serve's bootstrap, a web
+        // save onto a missing file) would lose them.
+        let rendered = render_config_documented(&before);
+        let reparsed: Config = toml::from_str(&rendered).expect("rendered parses");
+        assert_eq!(
+            before.providers.commands["claude"].watch, reparsed.providers.commands["claude"].watch,
+            "{rendered}"
+        );
     }
 }

@@ -667,6 +667,12 @@ pub const PALETTE_COMMANDS: &[PaletteCommand] = &[
         description: "Move the selected terminal to the bottom (sorting becomes manual)",
     },
     PaletteCommand {
+        action: Action::WatchRules,
+        name: "watch-rules",
+        description: "List watch rules on running tabs; disarm or re-arm one",
+        // TUI-only for now: the web has no watch-rules surface yet.
+    },
+    PaletteCommand {
         action: Action::SessionSettings,
         name: "session-settings",
         description: "Per-session settings: mode, YOLO, system prompt, watch rules, AMQ verify",

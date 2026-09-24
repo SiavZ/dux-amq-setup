@@ -217,6 +217,7 @@ pub fn help_text() -> &'static str {
           dux              Launch the TUI\n\
           dux server       Serve the web UI over the headless engine\n\
           dux config       Manage the configuration file\n\
+          dux --version    Print the version and the git commit it was built from\n\
           dux peer         Route messages between Dux agent sessions\n\
                            (`dux peer --help` for send, list, sync-amq)\n\n\
          Server subcommand:\n\
@@ -316,5 +317,11 @@ mod tests {
             help.contains("shares"),
             "--help must state that reachable clients share the workspace:\n{help}"
         );
+    }
+
+    #[test]
+    fn help_lists_the_version_flag() {
+        let help = help_text();
+        assert!(help.contains("dux --version"), "{help}");
     }
 }

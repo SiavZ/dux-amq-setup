@@ -1594,6 +1594,15 @@ pub(crate) fn agent_info_lines(
     lines
 }
 
+/// The watch-rules list: every rule on every live agent tab, with Enter to
+/// disarm or re-arm the highlighted one. Rows are a snapshot refreshed after
+/// each toggle.
+#[derive(Clone, Debug)]
+pub(crate) struct WatchRulesPrompt {
+    pub(crate) rows: Vec<dux_core::engine::WatchRuleRow>,
+    pub(crate) selected: usize,
+}
+
 /// One row of the Tailscale-mode picker.
 #[derive(Clone, Debug)]
 pub(crate) struct SetTailscaleModeOption {
@@ -2198,6 +2207,7 @@ pub(crate) enum PromptState {
     ChangeDefaultProvider(ChangeDefaultProviderPrompt),
     ChangeProjectDefaultProvider(ChangeProjectDefaultProviderPrompt),
     SetTailscaleMode(SetTailscaleModePrompt),
+    WatchRules(WatchRulesPrompt),
     /// The per-session settings modal (AMQ + orchestrator workstream).
     /// Boxed: the draft carries two text inputs and the rule list.
     SessionSettings(Box<SessionSettingsPrompt>),
@@ -3629,7 +3639,7 @@ impl App {
         let mut config = ensure_config(&paths)?;
 
         logger::init(&config.logging, &paths);
-        logger::info("bootstrapping dux");
+        logger::info(&format!("bootstrapping dux {}", dux_core::version::long()));
         // Reconcile the shared AMQ registry from this store's sessions and let
         // agent launches reserve their inbox. Under the single-instance lock
         // the caller holds, after the logger so its outcome is recorded, and
@@ -5057,6 +5067,10 @@ impl App {
             "change-project-default-provider" => self.open_change_project_default_provider_prompt(),
             "change-theme" => self.open_change_theme_prompt(),
             "reload-config" => self.reload_config_from_disk(),
+            "watch-rules" => {
+                self.open_watch_rules_prompt();
+                Ok(())
+            }
             "reload-binary" => {
                 // Every refusal is reported by `request_reload` on the status
                 // line, so there is no error to return here: an `Err` would be
@@ -6777,6 +6791,21 @@ impl App {
                 provider_config(&self.engine.config, &provider).forward_scroll
             }
             SessionSurface::Terminal => None,
+        }
+    }
+
+    /// Whether a plain left press/drag over the selected surface goes to a
+    /// mouse-reporting child (`true`) or stays a dux text selection (`false`).
+    /// Agents resolve it from their running provider's `forward_mouse`;
+    /// companion terminals have no provider config and always forward, as a
+    /// terminal emulator does.
+    pub(crate) fn selected_surface_forwards_mouse(&self) -> bool {
+        match self.session_surface {
+            SessionSurface::Agent => self.selected_session().is_none_or(|session| {
+                let provider = self.focused_tab_provider(session);
+                provider_config(&self.engine.config, &provider).forwards_mouse()
+            }),
+            SessionSurface::Terminal => true,
         }
     }
 

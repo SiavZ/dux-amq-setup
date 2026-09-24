@@ -10,5 +10,6 @@ dux-core.workspace = true
 anyhow.workspace = true
 
 [dev-dependencies]
-chrono.workspace = true
 tempfile.workspace = true
+chrono.workspace = true
+toml = "1.1.2"

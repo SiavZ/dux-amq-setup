@@ -1904,7 +1904,8 @@ impl App {
             | PromptState::ChangeAgentProvider(_)
             | PromptState::ChangeDefaultProvider(_)
             | PromptState::ChangeProjectDefaultProvider(_)
-            | PromptState::SetTailscaleMode(_) => {}
+            | PromptState::SetTailscaleMode(_)
+            | PromptState::WatchRules(_) => {}
         }
         if refresh_path_completions {
             self.refresh_path_editor_completions();
@@ -3291,6 +3292,14 @@ impl App {
         dispatch: &mut RawInputDispatch,
     ) -> RawInputFlow {
         dispatch.flush(self);
+        // Keys forwarded BEFORE this mouse event retire the old selection now,
+        // not at the end of the batch: a deferred clear would also wipe the
+        // selection this very gesture starts (a bare Escape still pending
+        // from the previous read is the usual culprit).
+        if dispatch.needs_selection_clear {
+            self.terminal_selection = None;
+            dispatch.needs_selection_clear = false;
+        }
         if self.handle_takeover_card_mouse(&mouse) || self.handle_dormant_card_mouse(&mouse) {
             return RawInputFlow::Continue;
         }
@@ -3321,8 +3330,17 @@ impl App {
             .unwrap_or((false, false));
         if should_forward_wheel(forward_scroll, alt_screen, mouse_mode) {
             self.terminal_selection = None;
-            if self.write_into_focused_pty(raw) {
-                dispatch.forwarded.note(raw);
+            // The host reports the wheel in SCREEN coordinates; the child
+            // expects them relative to its own grid, exactly like a click. A
+            // tick outside the pane (a border, the sidebar under a maximized
+            // overlay's edge) translates to nothing and must not leak through.
+            if let Some(term_area) = self.mouse_layout.agent_term
+                && contains_point(term_area, mouse_event.column, mouse_event.row)
+                && let Some(translated) =
+                    crate::raw_input::translate_sgr_mouse(raw, term_area.x, term_area.y)
+                && self.write_into_focused_pty(&translated)
+            {
+                dispatch.forwarded.note(&translated);
             }
         } else if self.handle_mouse(mouse_event) {
             return RawInputFlow::Return(true);
@@ -3424,8 +3442,27 @@ impl App {
         let shift_held = mouse
             .modifiers
             .contains(crossterm::event::KeyModifiers::SHIFT);
-        if !child_wants_mouse || shift_held {
+        // `forward_mouse = false`: a plain left gesture on a mouse-reporting
+        // child is a dux selection, so agent output can be copied. A click that
+        // never moved is replayed to the child when the button comes up.
+        let select_plain_left = child_wants_mouse
+            && !self.selected_surface_forwards_mouse()
+            && matches!(
+                mouse.kind,
+                MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::Drag(MouseButton::Left)
+                    | MouseEventKind::Up(MouseButton::Left)
+            );
+        if !child_wants_mouse || shift_held || select_plain_left {
+            let replay_click = select_plain_left
+                && !shift_held
+                && !dispatch.is_scrolled_back
+                && matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
+                && self.selection_is_unmoved_click();
             self.handle_terminal_selection_mouse(mouse);
+            if replay_click {
+                self.replay_click_to_center_child(&mouse);
+            }
         } else if !dispatch.is_scrolled_back {
             // SGR coordinates are screen-absolute; the child expects them
             // relative to the embedded terminal grid.
@@ -4445,6 +4482,24 @@ impl App {
         Ok(Some(false))
     }
 
+    fn handle_watch_rules_prompt_key(&mut self, key: KeyEvent) -> Option<bool> {
+        let PromptState::WatchRules(prompt) = &mut self.prompt else {
+            return None;
+        };
+        let palette_action = self.bindings.lookup(&key, BindingScope::Palette);
+        let dialog_action = self.bindings.lookup(&key, BindingScope::Dialog);
+        match palette_action.or(dialog_action) {
+            Some(Action::CloseOverlay) => self.prompt = PromptState::None,
+            Some(Action::MoveDown) if prompt.selected + 1 < prompt.rows.len() => {
+                prompt.selected += 1;
+            }
+            Some(Action::MoveUp) if prompt.selected > 0 => prompt.selected -= 1,
+            Some(Action::Confirm) => self.toggle_selected_watch_rule(),
+            _ => {}
+        }
+        Some(false)
+    }
+
     fn handle_set_tailscale_mode_prompt_key(&mut self, key: KeyEvent) -> Option<bool> {
         let PromptState::SetTailscaleMode(prompt) = &mut self.prompt else {
             return None;
@@ -5340,6 +5395,9 @@ impl App {
         }
         if let Some(which) = provider_picker_kind(&self.prompt) {
             return Ok(Some(self.handle_provider_picker_key(key, which)?));
+        }
+        if let Some(exit) = self.handle_watch_rules_prompt_key(key) {
+            return Ok(Some(exit));
         }
         if let Some(exit) = self.handle_set_tailscale_mode_prompt_key(key) {
             return Ok(Some(exit));
@@ -9399,14 +9457,28 @@ impl App {
             // from screen-absolute coordinates to child-relative ones via the
             // terminal content area's origin. ScrollUp = button 64, down = 65.
             // crossterm coordinates are 0-based; the SGR wire format is 1-based.
-            let cb = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+            let mut cb: u16 = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
                 64
             } else {
                 65
             };
+            // Modifier bits, as a real emulator reports them (Shift 4, Alt 8,
+            // Ctrl 16): an app may bind Ctrl+wheel or Shift+wheel differently.
+            if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                cb |= 4;
+            }
+            if mouse.modifiers.contains(KeyModifiers::ALT) {
+                cb |= 8;
+            }
+            if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+                cb |= 16;
+            }
             let screen_seq =
                 format!("\x1b[<{cb};{};{}M", mouse.column + 1, mouse.row + 1).into_bytes();
+            // A tick over the pane's border or chrome is outside the child's
+            // grid: translating it would hand the child a cell it does not have.
             let forwarded = if let Some(term_area) = self.mouse_layout.agent_term
+                && contains_point(term_area, mouse.column, mouse.row)
                 && let Some(translated) =
                     crate::raw_input::translate_sgr_mouse(&screen_seq, term_area.x, term_area.y)
             {
@@ -9675,7 +9747,35 @@ impl App {
         if !mouse.modifiers.is_empty() {
             return false;
         }
+        // `forward_mouse = false` keeps a plain left press for dux's own
+        // selection; the windowed selection path replays it as a click on
+        // release if it never moved. Other buttons still forward.
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && !self.selected_surface_forwards_mouse()
+        {
+            return false;
+        }
         self.begin_center_mouse_forward_ignoring_modifiers(mouse)
+    }
+
+    /// Whether the live selection gesture is a click that never moved: the
+    /// button went down and nothing was dragged. Read BEFORE the release is
+    /// handed to [`Self::handle_terminal_selection_mouse`], which clears such
+    /// a selection.
+    fn selection_is_unmoved_click(&self) -> bool {
+        self.terminal_selection
+            .as_ref()
+            .is_some_and(|selection| selection.dragging && selection.anchor == selection.end)
+    }
+
+    /// Send a completed left click (press then release) to the selected
+    /// surface's child, at the release position. Used by `forward_mouse = false`,
+    /// where the press was held back as a possible selection and only turned out
+    /// to be a click when the button came up.
+    fn replay_click_to_center_child(&mut self, mouse: &MouseEvent) {
+        let cb = sgr_button_code(MouseButton::Left);
+        self.write_center_mouse_report(cb, b'M', mouse.column, mouse.row);
+        self.write_center_mouse_report(cb, b'm', mouse.column, mouse.row);
     }
 
     /// The same forward, minus the modifier gate: the Ctrl hatch's press is a
@@ -10455,7 +10555,21 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
                 if windowed && self.terminal_selection_is_dragging() =>
             {
+                // `forward_mouse = false` held a plain press back from a
+                // mouse-reporting child; if it never moved it was a click, so
+                // hand the child the click it would otherwise have had.
+                let replay_click = matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
+                    && mouse.modifiers.is_empty()
+                    && self.selection_is_unmoved_click()
+                    && !self.selected_surface_forwards_mouse()
+                    && !self.scroll_mode_active()
+                    && self
+                        .selected_terminal_surface_client()
+                        .is_some_and(|p| p.has_mouse_mode());
                 self.handle_terminal_selection_mouse(mouse);
+                if replay_click {
+                    self.replay_click_to_center_child(&mouse);
+                }
             }
             // The divider drag returns before the sidebar hit-test ever runs, so
             // a pane resize and a row reorder can never be live at once; these
@@ -17712,6 +17826,7 @@ not_a_real_action = ["x"]
     /// every byte the child receives in caret notation, so the child's own
     /// grid is the proof of what was forwarded.
     fn install_mouse_forward_child(app: &mut App, decsets: &str) {
+        pin_forward_mouse(app, true);
         let slot_tab = app.engine.sessions[0].slot_tab_id().to_string();
         let cmd = format!("stty raw -echo; printf '{decsets}'; exec cat -v");
         let client = PtyClient::spawn(
@@ -17745,6 +17860,24 @@ not_a_real_action = ["x"]
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("the child never enabled mouse tracking");
+    }
+
+    /// Pin the selected agent's provider to a fixed `forward_mouse`. The
+    /// fixture provider (codex) ships `forward_mouse = false`, which holds a
+    /// plain left press back for dux's selection; the windowed forwarding
+    /// tests exercise a provider that forwards it.
+    fn pin_forward_mouse(app: &mut App, forward: bool) {
+        let provider = app.engine.sessions[0].provider.as_str().to_string();
+        app.engine
+            .config
+            .providers
+            .commands
+            .entry(provider.clone())
+            .or_insert_with(|| dux_core::config::ProviderCommandConfig {
+                command: provider,
+                ..Default::default()
+            })
+            .forward_mouse = Some(forward);
     }
 
     fn forwarded_echo(app: &App) -> String {
@@ -19370,6 +19503,7 @@ not_a_real_action = ["x"]
     #[test]
     fn release_is_not_written_when_the_child_dropped_mouse_mode_mid_drag() {
         let mut app = test_app(default_bindings());
+        pin_forward_mouse(&mut app, true);
         let slot_tab = app.engine.sessions[0].slot_tab_id().to_string();
         // Enable tracking, swallow the 10-byte press report, then DISABLE
         // tracking, then echo everything else: the release (if wrongly
@@ -21416,6 +21550,183 @@ not_a_real_action = ["x"]
             .into_iter()
             .filter_map(|binding| binding.palette_name)
             .collect()
+    }
+
+    // ── Watch-rules palette modal (fork 042ac638) ─────────────────────
+
+    fn make_watch_rule(label: &str, pattern: &str) -> dux_core::watch::WatchRule {
+        dux_core::watch::WatchRule {
+            pattern: pattern.to_string(),
+            label: label.to_string(),
+            action: dux_core::watch::WatchAction::SendText {
+                text: "please continue".to_string(),
+                append_enter: true,
+            },
+            backoff: dux_core::watch::WatchBackoff::default(),
+            budget: dux_core::watch::WatchBudget { max_attempts: 5 },
+            cooldown_ms: 1_000,
+            ..Default::default()
+        }
+    }
+
+    /// A test app whose agent's slot tab is live (a `cat` PTY) and whose
+    /// provider (codex, the fixture's) carries `rules`, with one engine tick
+    /// run so the engines are attached exactly as in production.
+    fn watch_app(rules: Vec<dux_core::watch::WatchRule>) -> App {
+        let mut app = test_app(default_bindings());
+        let mut codex = dux_core::config::ProviderCommandConfig {
+            command: "codex".to_string(),
+            ..Default::default()
+        };
+        codex.watch = rules;
+        app.engine
+            .config
+            .providers
+            .commands
+            .insert("codex".to_string(), codex);
+        app.engine.providers.insert(
+            app.engine.sessions[0].slot_tab_id().to_owned(),
+            PtyClient::spawn("cat", &[], &std::env::temp_dir(), 24, 80, 100).expect("cat"),
+        );
+        app.engine.tick_watch_rules();
+        app
+    }
+
+    fn watch_prompt(app: &App) -> &crate::app::WatchRulesPrompt {
+        let PromptState::WatchRules(prompt) = &app.prompt else {
+            panic!("expected the watch-rules prompt, got {:?}", app.prompt);
+        };
+        prompt
+    }
+
+    /// Fork name for the empty-state palette check (042ac638): with no engines
+    /// attached the command still opens the modal.
+    #[test]
+    fn watch_rules_palette_command_opens_modal() {
+        let mut app = test_app(default_bindings());
+        app.execute_command("watch-rules".to_string())
+            .expect("execute_command");
+        assert!(matches!(app.prompt, PromptState::WatchRules(_)));
+    }
+
+    #[test]
+    fn the_watch_rules_command_opens_the_list_from_the_palette() {
+        let app = palette_app("watch", 0);
+        assert!(palette_names(&app, "watch").contains(&"watch-rules"));
+        let mut app = watch_app(vec![make_watch_rule("throttle", "rate limited")]);
+        app.execute_command("watch-rules".to_string())
+            .expect("watch-rules");
+        assert_eq!(watch_prompt(&app).rows.len(), 1);
+    }
+
+    /// No engines loaded: an empty list, and the renderer points at config.toml.
+    #[test]
+    fn open_watch_rules_prompt_empty_state() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_app(default_bindings());
+        app.open_watch_rules_prompt();
+        assert!(watch_prompt(&app).rows.is_empty());
+        assert_eq!(watch_prompt(&app).selected, 0);
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("render");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("No watch rules are loaded"), "{rendered}");
+    }
+
+    #[test]
+    fn open_watch_rules_prompt_lists_attached_rules() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = watch_app(vec![
+            make_watch_rule("throttle", "rate limited"),
+            make_watch_rule("usage-limit", "Claude usage limit reached"),
+        ]);
+        app.open_watch_rules_prompt();
+        let prompt = watch_prompt(&app);
+        assert_eq!(prompt.rows.len(), 2);
+        assert_eq!(prompt.rows[0].snapshot.label, "throttle");
+        assert_eq!(prompt.rows[1].snapshot.label, "usage-limit");
+        assert_eq!(prompt.rows[0].session_id, app.engine.sessions[0].id);
+        assert!(matches!(
+            prompt.rows[0].snapshot.state,
+            dux_core::watch::RuleStateKind::Idle
+        ));
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("render");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("armed"), "{rendered}");
+        assert!(rendered.contains("usage-limit"), "{rendered}");
+        assert!(rendered.contains("0/5"), "{rendered}");
+    }
+
+    /// Enter disarms, Enter again re-arms, and the row's badge follows without
+    /// reopening the list.
+    #[test]
+    fn toggle_selected_watch_rule_disarms_then_rearms() {
+        let mut app = watch_app(vec![make_watch_rule("test", "trigger")]);
+        app.open_watch_rules_prompt();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("enter");
+        assert!(matches!(
+            watch_prompt(&app).rows[0].snapshot.state,
+            dux_core::watch::RuleStateKind::Disarmed
+        ));
+        let tab = app.engine.sessions[0].slot_tab_id().to_owned();
+        assert!(app.engine.watch.attached[&tab].engine.is_disarmed(0));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("enter");
+        assert!(matches!(
+            watch_prompt(&app).rows[0].snapshot.state,
+            dux_core::watch::RuleStateKind::Idle
+        ));
+        assert!(!app.engine.watch.attached[&tab].engine.is_disarmed(0));
+    }
+
+    #[test]
+    fn watch_rules_modal_closes_on_close_overlay_action() {
+        let mut app = watch_app(vec![make_watch_rule("test", "trigger")]);
+        app.open_watch_rules_prompt();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("esc");
+        assert!(matches!(app.prompt, PromptState::None), "{:?}", app.prompt);
+    }
+
+    #[test]
+    fn watch_rules_modal_navigates_with_arrows() {
+        let mut app = watch_app(vec![
+            make_watch_rule("a", "p1"),
+            make_watch_rule("b", "p2"),
+            make_watch_rule("c", "p3"),
+        ]);
+        app.open_watch_rules_prompt();
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        app.handle_key(down).expect("down");
+        assert_eq!(watch_prompt(&app).selected, 1);
+        app.handle_key(down).expect("down");
+        assert_eq!(watch_prompt(&app).selected, 2);
+        app.handle_key(down).expect("down");
+        assert_eq!(watch_prompt(&app).selected, 2, "clamps at the end");
+        app.handle_key(up).expect("up");
+        assert_eq!(watch_prompt(&app).selected, 1);
     }
 
     #[test]
@@ -30638,6 +30949,153 @@ cyan = "#00ffff"
         );
     }
 
+    /// Fork bebeb8a2 + e80151ad: the macro list renders CJK and emoji names and
+    /// previews at a narrow width, truncating the preview by terminal COLUMNS.
+    /// A char-count cut left a double-width preview twice as wide as its room,
+    /// running it through the list's right border.
+    #[test]
+    fn macro_list_renders_cjk_and_emoji_at_narrow_width() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_app(default_bindings());
+        app.engine.config.macros.entries.insert(
+            "界🙂".to_string(),
+            crate::config::MacroEntry {
+                text: "🙂界🙂界🙂界🙂界🙂界🙂界🙂界🙂界".to_string(),
+                surface: crate::config::MacroSurface::Agent,
+            },
+        );
+        app.open_edit_macros();
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 24)).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render narrow macro list");
+        let buffer = terminal.backend().buffer().clone();
+        // Rows as cells, one symbol each; a wide glyph's trailing spacer cell
+        // is part of the row, so the name reads "界 🙂" here.
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
+        let rendered = rows.join("\n");
+
+        assert!(rendered.contains('界'), "CJK macro name was not rendered");
+        assert!(
+            rendered.contains('🙂'),
+            "emoji macro content was not rendered"
+        );
+        let row = rows
+            .iter()
+            .find(|row| row.contains('界') && row.contains('🙂'))
+            .unwrap_or_else(|| panic!("the macro row:\n{rendered}"));
+        assert!(
+            row.contains('…'),
+            "long macro preview was not truncated: {row:?}"
+        );
+        // The row still ends on the list's right border: the preview did not
+        // run through it.
+        let trimmed = row.trim_end();
+        assert!(
+            trimmed.ends_with('│'),
+            "the preview overflowed the list border: {row:?}"
+        );
+    }
+
+    /// Fork 0befc8e9: a bare Escape still pending when a mouse report arrives
+    /// must not swallow the report's own ESC, or the drag reads as garbage and
+    /// the selection never starts. Upstream's parser keeps a lone ESC before
+    /// another ESC as its own sequence, so this is a regression guard.
+    #[test]
+    fn pending_escape_does_not_swallow_claude_mouse_selection() {
+        let mut app = app_with_interactive_agent_pty();
+        app.engine.sessions[0].provider = ProviderKind::from_str("claude");
+
+        app.process_raw_input_bytes(b"\x1b").unwrap();
+        let mut drag = sgr_mouse_down(30, 5);
+        drag.extend_from_slice(b"\x1b[<32;35;6M");
+        app.process_raw_input_bytes(&drag).unwrap();
+
+        let selection = app
+            .terminal_selection
+            .as_ref()
+            .expect("mouse drag after Escape should start a selection");
+        assert_ne!(selection.anchor, selection.end);
+    }
+
+    /// Fork 83bd3bfd: the STRUCTURED mouse path (crossterm events, not the raw
+    /// interactive byte stream) dismisses a fullscreen agent on a click
+    /// outside it, like the raw path does.
+    #[test]
+    fn structured_click_outside_fullscreen_agent_exits_interactive_mode() {
+        let mut app = app_with_interactive_agent_pty();
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 1));
+
+        assert_eq!(
+            app.input_target,
+            InputTarget::None,
+            "structured mouse clicks outside overlay must exit interactive mode"
+        );
+        assert_eq!(
+            app.fullscreen_overlay,
+            FullscreenOverlay::None,
+            "structured mouse clicks outside overlay must dismiss fullscreen"
+        );
+    }
+
+    #[test]
+    fn structured_click_inside_fullscreen_agent_stays_interactive() {
+        let mut app = app_with_interactive_agent_pty();
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 30, 5));
+
+        assert_eq!(app.input_target, InputTarget::Agent);
+        assert_eq!(app.fullscreen_overlay, FullscreenOverlay::Agent);
+    }
+
+    /// Fork c2c44378: a lone Escape is held back while it could still be the
+    /// prefix of an arrow or Alt sequence, and must reach the child once the
+    /// ambiguity window passes. Upstream resolves it by feeding an empty chunk
+    /// (`resolve_pending_bare_esc` after `ESC_AMBIGUITY_TIMEOUT`), which is the
+    /// seam this drives.
+    #[test]
+    fn bare_escape_flushes_to_pty_after_ambiguity_timeout() {
+        let mut app = test_app(default_bindings());
+        let output_dir = tempdir().expect("tempdir");
+        let output = output_dir.path().join("byte");
+        let args = vec![
+            "-c".to_string(),
+            "stty raw -echo; dd bs=1 count=1 2>/dev/null | od -An -tu1 > \"$1\"".to_string(),
+            "sh".to_string(),
+            output.to_string_lossy().into_owned(),
+        ];
+        let client = PtyClient::spawn("sh", &args, std::path::Path::new("."), 5, 40, 100)
+            .expect("spawn pty");
+        let slot_tab = app.engine.sessions[0].slot_tab_id().to_string();
+        app.engine.providers.insert(TabId::new(slot_tab), client);
+        app.input_target = InputTarget::Agent;
+        app.session_surface = SessionSurface::Agent;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        app.process_raw_input_bytes(b"\x1b").unwrap();
+        assert_eq!(app.raw_input_buf, b"\x1b", "a lone ESC is held back");
+        app.process_raw_input_bytes(&[]).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !std::fs::read_to_string(&output).is_ok_and(|value| value.trim() == "27")
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(output).unwrap().trim(), "27");
+        assert!(app.raw_input_buf.is_empty());
+    }
+
     #[test]
     fn scrolled_back_allows_click_outside_exit() {
         // Use the scrolled-back helper (which prints enough lines to create
@@ -36728,5 +37186,377 @@ cyan = "#00ffff"
             "Killed 1 terminal. In-progress CLI work was stopped, but the worktree files are \
              still available for review or relaunch."
         );
+    }
+
+    // -- Ported fork input fixes (scope C): wheel ownership, forward_mouse --
+
+    /// A live `cat -v` child for the selected session's SLOT tab that first
+    /// prints `prelude` (DECSET modes and a READY marker), with the synthetic
+    /// mouse layout installed. `cat -v` echoes every byte the child receives in
+    /// caret notation, so the child's own grid is the proof of what reached it.
+    fn install_echo_child_for_selected(app: &mut App, provider: &str, prelude: &str) {
+        app.engine.sessions[0].provider = ProviderKind::from_str(provider);
+        let slot_tab = app.engine.sessions[0].slot_tab_id().to_string();
+        let cmd = format!("stty raw -echo; printf '{prelude}READY'; exec cat -v");
+        let client = PtyClient::spawn(
+            "/bin/sh",
+            &["-c".to_string(), cmd],
+            std::path::Path::new("."),
+            24,
+            80,
+            100,
+        )
+        .expect("spawn pty");
+        app.engine.providers.insert(TabId::new(slot_tab), client);
+        app.selected_left = 1;
+        app.session_surface = SessionSurface::Agent;
+        app.center_mode = CenterMode::Agent;
+        install_mouse_layout(app);
+        wait_for_forwarded_echo(app, "READY");
+    }
+
+    fn provider_entry<'a>(
+        app: &'a mut App,
+        name: &str,
+    ) -> &'a mut dux_core::config::ProviderCommandConfig {
+        app.engine
+            .config
+            .providers
+            .commands
+            .get_mut(name)
+            .unwrap_or_else(|| panic!("{name} provider"))
+    }
+
+    /// Fork 38963398: wheel ownership follows the VISIBLE surface and the
+    /// provider actually running, not keyboard focus. Upstream answers it with
+    /// `selected_surface_forward_scroll`, which this pins: with no keyboard
+    /// focus a jcode pane still owns its wheel, a companion terminal never
+    /// inherits the agent's policy, explicit config wins, and a pinned running
+    /// provider beats the session's recorded one.
+    #[test]
+    fn jcode_scroll_policy_respects_surface_config_and_running_provider() {
+        let mut app = test_app(default_bindings());
+        app.engine.sessions[0].provider = ProviderKind::from_str("jcode");
+        app.session_surface = SessionSurface::Agent;
+        app.input_target = InputTarget::None;
+        assert_eq!(app.selected_surface_forward_scroll(), Some(true));
+        app.input_target = InputTarget::Agent;
+        assert_eq!(app.selected_surface_forward_scroll(), Some(true));
+
+        app.session_surface = SessionSurface::Terminal;
+        app.input_target = InputTarget::Terminal;
+        assert_eq!(
+            app.selected_surface_forward_scroll(),
+            None,
+            "a companion terminal must not inherit the agent's forwarding policy"
+        );
+
+        app.session_surface = SessionSurface::Agent;
+        app.input_target = InputTarget::None;
+        provider_entry(&mut app, "jcode").forward_scroll = Some(false);
+        assert_eq!(
+            app.selected_surface_forward_scroll(),
+            Some(false),
+            "explicit config must be respected"
+        );
+
+        provider_entry(&mut app, "jcode").forward_scroll = Some(true);
+        let slot_tab = app.engine.sessions[0].slot_tab_id().to_string();
+        app.engine
+            .running_provider_pins
+            .insert(TabId::new(slot_tab), ProviderKind::from_str("jcode"));
+        app.engine.sessions[0].provider = ProviderKind::from_str("codex");
+        provider_entry(&mut app, "codex").forward_scroll = Some(false);
+        assert_eq!(
+            app.selected_surface_forward_scroll(),
+            Some(true),
+            "use the provider actually running"
+        );
+    }
+
+    /// Fork 38963398 + 16186dae: with jcode's `forward_scroll = true` the wheel
+    /// reaches the child in the windowed pane with no keyboard focus AND in
+    /// interactive fullscreen, translated to pane-relative coordinates, with the
+    /// emulator's modifier bits, and never for a tick outside the pane.
+    /// `forward_mouse = false` (the affected machine's config) must not stop it.
+    #[test]
+    fn jcode_mouse_wheel_reaches_pty_in_view_and_interactive_modes() {
+        let mut app = test_app(default_bindings());
+        install_echo_child_for_selected(&mut app, "jcode", "");
+        {
+            let cfg = provider_entry(&mut app, "jcode");
+            cfg.forward_scroll = Some(false);
+            cfg.forward_mouse = Some(false);
+        }
+        app.input_target = InputTarget::None;
+        // agent_term is (21,1,55,16): screen (30,5) is child cell (10,5).
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 30, 5));
+        app.input_target = InputTarget::Agent;
+        app.fullscreen_overlay = FullscreenOverlay::Agent;
+        app.process_raw_input_bytes(b"\x1b[<64;31;6M")
+            .expect("raw wheel");
+        app.selected_terminal_surface_client()
+            .expect("provider")
+            .write_bytes(b"DISABLED")
+            .expect("marker");
+        let rendered = wait_for_forwarded_echo(&app, "DISABLED");
+        assert!(
+            !rendered.contains("^[[<"),
+            "disabled forwarding must keep the wheel in dux; got {rendered:?}"
+        );
+
+        provider_entry(&mut app, "jcode").forward_scroll = Some(true);
+        app.input_target = InputTarget::None;
+        app.fullscreen_overlay = FullscreenOverlay::None;
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 30, 5));
+        wait_for_forwarded_echo(&app, "^[[<64;10;5M");
+        let mut modified = mouse(MouseEventKind::ScrollDown, 30, 5);
+        modified.modifiers = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        app.handle_mouse(modified);
+        wait_for_forwarded_echo(&app, "^[[<85;10;5M");
+
+        app.input_target = InputTarget::Agent;
+        app.fullscreen_overlay = FullscreenOverlay::Agent;
+        app.process_raw_input_bytes(b"\x1b[<65;31;6M")
+            .expect("raw wheel");
+        wait_for_forwarded_echo(&app, "^[[<65;10;5M");
+        // Out-of-pane coordinates must not leak to the child.
+        app.process_raw_input_bytes(b"\x1b[<64;100;20M")
+            .expect("raw wheel outside");
+        app.input_target = InputTarget::None;
+        app.fullscreen_overlay = FullscreenOverlay::None;
+        // Column 76 is the pane's right border, outside agent_term.
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 76, 5));
+        app.selected_terminal_surface_client()
+            .expect("provider")
+            .write_bytes(b"END")
+            .expect("marker");
+        let rendered = wait_for_forwarded_echo(&app, "END");
+        assert!(!rendered.contains("^[[<64;100;20M"), "{rendered:?}");
+        assert!(!rendered.contains("^[[<64;79;19M"), "{rendered:?}");
+        assert!(!rendered.contains("^[[<64;56;5M"), "{rendered:?}");
+    }
+
+    /// Fork 16186dae: a wheel tick forwarded from interactive fullscreen reaches
+    /// the child in pane-relative coordinates. Upstream wrote the host's raw
+    /// screen-absolute report straight through, so the child scrolled whatever
+    /// sat under a different cell.
+    #[test]
+    fn forwarded_mouse_scroll_uses_terminal_relative_coordinates() {
+        let mut app = test_app(default_bindings());
+        install_echo_child_for_selected(&mut app, "codex", "");
+        provider_entry(&mut app, "codex").forward_scroll = Some(true);
+        app.input_target = InputTarget::Agent;
+        app.fullscreen_overlay = FullscreenOverlay::Agent;
+        app.mouse_layout.agent_term = Some(Rect::new(5, 3, 40, 10));
+
+        app.process_raw_input_bytes(b"\x1b[<64;20;10M")
+            .expect("process scroll");
+
+        let rendered = wait_for_forwarded_echo(&app, "^[[<64;15;7M");
+        assert!(
+            !rendered.contains("^[[<64;20;10M"),
+            "raw screen coordinates must not be forwarded; got: {rendered:?}"
+        );
+    }
+
+    /// Fork 55ce75f3 + e92a4dff (+ bc3a9eec's `forward_mouse`): OpenCode turns
+    /// on mouse reporting, and with its shipped `forward_mouse = false` a plain
+    /// drag selects text in dux, a click that did not move still reaches
+    /// OpenCode as a translated press+release, and the wheel is forwarded.
+    #[test]
+    fn opencode_clicks_selects_text_and_forwards_scroll() {
+        let mut app = test_app(default_bindings());
+        provider_entry(&mut app, "opencode").forward_mouse = None;
+        app.engine.config.providers.ensure_defaults();
+        assert!(
+            !app.engine.config.providers.commands["opencode"].forwards_mouse(),
+            "ensure_defaults must fill in OpenCode's shipped forward_mouse"
+        );
+        install_echo_child_for_selected(&mut app, "opencode", "\\033[?1000h");
+        assert!(
+            app.selected_terminal_surface_client()
+                .expect("provider")
+                .has_mouse_mode(),
+            "fixture must emulate OpenCode mouse capture"
+        );
+        app.input_target = InputTarget::Agent;
+        app.fullscreen_overlay = FullscreenOverlay::Agent;
+        app.mouse_layout.agent_term = Some(Rect::new(5, 3, 40, 10));
+
+        app.process_raw_input_bytes(&sgr_mouse_down(10, 5))
+            .expect("start selection");
+        app.process_raw_input_bytes(b"\x1b[<32;20;6M")
+            .expect("drag selection");
+        let selection = app
+            .terminal_selection
+            .as_ref()
+            .expect("plain drag should select in Dux");
+        assert_ne!(selection.anchor, selection.end);
+        app.process_raw_input_bytes(b"\x1b[<0;20;6m")
+            .expect("finish selection");
+
+        app.process_raw_input_bytes(&sgr_mouse_down(12, 5))
+            .expect("start click");
+        app.process_raw_input_bytes(b"\x1b[<0;12;5m")
+            .expect("finish click");
+        app.process_raw_input_bytes(b"\x1b[<64;20;10M")
+            .expect("process scroll");
+
+        let rendered = wait_for_forwarded_echo(&app, "^[[<64;15;7M");
+        assert!(
+            rendered.contains("^[[<0;7;2M^[[<0;7;2m"),
+            "click should be translated and forwarded on release; got: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("^[[<0;5;2M") && !rendered.contains("^[[<32;"),
+            "the selection drag must not reach the child; got: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("^[[<64;20;10M"),
+            "raw screen coordinates must not be forwarded; got: {rendered:?}"
+        );
+    }
+
+    /// The windowed (minimized) half of `forward_mouse = false`: the press is
+    /// not forwarded, a drag selects, and an unmoved click is replayed to the
+    /// child on release. `forward_mouse` unset keeps upstream's forward-on-press.
+    #[test]
+    fn windowed_forward_mouse_false_selects_drags_and_replays_clicks() {
+        let mut app = test_app(default_bindings());
+        install_echo_child_for_selected(&mut app, "claude", "\\033[?1002h");
+        assert!(!app.engine.config.providers.commands["claude"].forwards_mouse());
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 30, 5));
+        assert_eq!(app.center_mouse_forward, None, "the press is held back");
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 40, 6));
+        let selection = app.terminal_selection.as_ref().expect("drag selects");
+        assert_ne!(selection.anchor, selection.end);
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 40, 6));
+
+        // Clear the double-click window so the second press is a fresh click.
+        app.last_mouse_click = None;
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 30, 5));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 30, 5));
+        let rendered = wait_for_forwarded_echo(&app, "^[[<0;10;5M^[[<0;10;5m");
+        assert!(
+            !rendered.contains("^[[<32;"),
+            "the drag must not reach the child; got {rendered:?}"
+        );
+
+        provider_entry(&mut app, "claude").forward_mouse = None;
+        app.last_mouse_click = None;
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 35, 7));
+        assert_eq!(
+            app.center_mouse_forward,
+            Some(0),
+            "unset forward_mouse keeps forwarding the press"
+        );
+    }
+
+    /// Fork bc3a9eec: Claude and Codex ship `forward_mouse = false` so their
+    /// output can be selected and copied; the others keep the emulator default.
+    #[test]
+    fn claude_codex_and_opencode_keep_plain_drags_in_dux_by_default() {
+        let config = Config::default();
+        for name in ["claude", "codex", "opencode"] {
+            assert!(
+                !config.providers.commands[name].forwards_mouse(),
+                "{name} should keep plain drags as dux selections"
+            );
+        }
+        for name in ["copilot", "jcode"] {
+            assert!(
+                config.providers.commands[name].forwards_mouse(),
+                "{name} should forward drags to the provider"
+            );
+        }
+    }
+
+    /// Fork fc57e65b: Codex keeps its scrollback in dux. It shipped as
+    /// `forward_scroll = false` there; upstream's auto mode gets the same
+    /// answer from the child itself, because Codex never raises the alt screen
+    /// (measured: it emits only ?1004h/?2004h/?2026h), so a PgUp at the live
+    /// edge pages dux's own scrollback.
+    #[test]
+    fn codex_page_up_at_bottom_uses_host_scrollback() {
+        let mut app = app_with_scrolled_back_pty();
+        assert_eq!(app.engine.sessions[0].provider.as_str(), "codex");
+        assert_eq!(app.selected_surface_forward_scroll(), None);
+        app.selected_terminal_surface_client()
+            .unwrap()
+            .set_scrollback(0);
+        app.reconcile_scroll_mode();
+
+        let result = app.process_raw_input_bytes(b"\x1b[5~").unwrap();
+
+        assert!(!result);
+        assert!(
+            app.selected_terminal_surface_client()
+                .unwrap()
+                .scrollback_offset()
+                > 0,
+            "PgUp should engage Dux host scrollback"
+        );
+    }
+
+    /// Fork 0d6fa312: a provider that owns its scrollback (`forward_scroll =
+    /// true`) gets PgUp at the live edge; dux does not page its own history.
+    #[test]
+    fn forward_scroll_provider_page_up_at_bottom_does_not_use_host_scrollback() {
+        let mut app = app_with_scrolled_back_pty();
+        set_forward_scroll(&mut app, true);
+        app.selected_terminal_surface_client()
+            .unwrap()
+            .set_scrollback(0);
+        app.reconcile_scroll_mode();
+
+        let result = app.process_raw_input_bytes(b"\x1b[5~").unwrap();
+
+        assert!(!result);
+        assert_eq!(
+            app.selected_terminal_surface_client()
+                .unwrap()
+                .scrollback_offset(),
+            0,
+            "PgUp should be forwarded to the provider instead of engaging Dux host scrollback"
+        );
+    }
+
+    /// Fork 0d6fa312 / c2c44378 (`terminal_tui_providers_forward_scroll_by_default`,
+    /// later `providers_use_expected_scrollback_defaults`). The fork pinned a
+    /// bool per provider; upstream's tri-state leaves the shipped TUIs on auto
+    /// and decides from what the child does, which gives the fork's final
+    /// answers for each one:
+    ///
+    /// - Claude and Codex emit no mouse or alt-screen mode (measured on claude
+    ///   2.x and codex 0.155: only ?1004h/?2004h/?2026h), so auto keeps the
+    ///   wheel and PgUp in dux host scrollback, which is what fork fc57e65b
+    ///   settled on for both. Forwarding a wheel to them is dropped on the
+    ///   floor, as the fork found.
+    /// - OpenCode and jcode raise ?1049h plus mouse reporting, so auto forwards
+    ///   to them; jcode pins `Some(true)` so the wheel works before its first
+    ///   frame.
+    #[test]
+    fn providers_use_expected_scrollback_defaults() {
+        use super::{should_forward_page, should_forward_wheel};
+        let config = Config::default();
+        for name in ["claude", "codex", "opencode", "copilot"] {
+            assert_eq!(
+                config.providers.commands[name].forward_scroll, None,
+                "{name} should ship on auto"
+            );
+        }
+        assert_eq!(
+            config.providers.commands["jcode"].forward_scroll,
+            Some(true)
+        );
+
+        // A normal-buffer TUI without mouse reporting (Claude, Codex) keeps both.
+        assert!(!should_forward_wheel(None, false, false));
+        assert!(!should_forward_page(None, false));
+        // A fullscreen mouse-aware TUI (OpenCode, jcode) gets both.
+        assert!(should_forward_wheel(None, true, true));
+        assert!(should_forward_page(None, true));
     }
 }

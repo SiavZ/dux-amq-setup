@@ -199,7 +199,10 @@ pub(crate) fn modal_spec(prompt: &PromptState) -> Option<ModalSpec> {
         | PromptState::ChangeProjectDefaultProvider(_)
         // Three modes, the saved one marked, and picking one applies it. Rows and
         // nothing else, so no buttons and no focus concept.
-        | PromptState::SetTailscaleMode(_) => ModalSpec::new(Picker, false, false),
+        | PromptState::SetTailscaleMode(_)
+        // Rules on live tabs; Enter toggles the highlighted one's arm state
+        // and the list stays open. Rows only, no buttons.
+        | PromptState::WatchRules(_) => ModalSpec::new(Picker, false, false),
 
         // The one picker that keeps its buttons: they are distinct actions (kill
         // the hovered runtime, kill the marked ones, kill everything the filter
@@ -284,7 +287,8 @@ pub(crate) fn prompt_text_inputs(prompt: &PromptState) -> Vec<&TextInput> {
         | PromptState::ChangeAgentProvider(_)
         | PromptState::ChangeDefaultProvider(_)
         | PromptState::ChangeProjectDefaultProvider(_)
-        | PromptState::SetTailscaleMode(_) => Vec::new(),
+        | PromptState::SetTailscaleMode(_)
+        | PromptState::WatchRules(_) => Vec::new(),
 
         PromptState::Command { input, .. }
         | PromptState::ConfigureStartupCommand { input, .. }
