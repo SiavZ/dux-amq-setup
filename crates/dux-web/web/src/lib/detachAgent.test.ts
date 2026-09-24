@@ -2,13 +2,15 @@ import { describe, expect, it } from "vitest"
 
 import {
   agentIsDetachable,
-  detachConfirmBody,
   detachConfirmProse,
-  forceStopConfirmBody,
   forceStopConfirmProse,
   shutdownGraceSeconds,
 } from "./detachAgent"
 import { proseText, quotedChip } from "./prose"
+
+const detachText = (label: string, grace: number, tabs: number) =>
+  proseText(detachConfirmProse(label, grace, tabs))
+const forceStopText = (label: string) => proseText(forceStopConfirmProse(label))
 
 describe("shutdownGraceSeconds", () => {
   it("uses the number the server projected", () => {
@@ -25,14 +27,14 @@ describe("shutdownGraceSeconds", () => {
   })
 })
 
-describe("detachConfirmBody", () => {
+describe("detachConfirmProse", () => {
   // The exact sentences, pinned verbatim. The Rust half asserts these same two
   // strings (`the_confirm_body_reads_the_same_on_both_surfaces` in
   // crates/dux-core/src/engine/lifecycle.rs), so a change to either surface's
   // copy fails on the side that changed instead of quietly leaving the two
   // dialogs disagreeing about the same act.
   it("reads exactly as the terminal UI's does, for one running tab", () => {
-    expect(detachConfirmBody("feat/login", 30, 1)).toBe(
+    expect(detachText("feat/login", 30, 1)).toBe(
       'dux will ask "feat/login" to shut down and wait up to 30 seconds for it ' +
         "to exit before forcing it. The agent stays in the list as Detached, and " +
         "you can resume it later. Anything the agent is doing right now is " +
@@ -41,7 +43,7 @@ describe("detachConfirmBody", () => {
   })
 
   it("reads exactly as the terminal UI's does, for three running tabs", () => {
-    expect(detachConfirmBody("feat/login", 45, 3)).toBe(
+    expect(detachText("feat/login", 45, 3)).toBe(
       'dux will ask "feat/login" to shut down and wait up to 45 seconds for it ' +
         "to exit before forcing it. The agent stays in the list as Detached, and " +
         "you can resume it later. Anything the agent is doing right now is " +
@@ -50,29 +52,28 @@ describe("detachConfirmBody", () => {
   })
 
   it("adds no tail below two running tabs", () => {
-    expect(detachConfirmBody("a", 30, 0)).not.toContain("stop together")
-    expect(detachConfirmBody("a", 30, 1)).not.toContain("stop together")
+    expect(detachText("a", 30, 0)).not.toContain("stop together")
+    expect(detachText("a", 30, 1)).not.toContain("stop together")
   })
 
   it("never hardcodes the default wait", () => {
-    expect(detachConfirmBody("a", 7, 1)).toContain("7 seconds")
-    expect(detachConfirmBody("a", 7, 1)).not.toContain("30 seconds")
+    expect(detachText("a", 7, 1)).toContain("7 seconds")
+    expect(detachText("a", 7, 1)).not.toContain("30 seconds")
   })
 })
 
-// The web draws the agent's name as a chip; the plain-text spelling of the same
-// structure is the terminal UI's string pinned above.
+// The web draws the agent's name as a chip.
 describe("the stop confirmations as names in prose", () => {
   it("marks the agent's name in the detach body", () => {
-    const prose = detachConfirmProse("feat/login", 45, 3)
-    expect(prose).toContainEqual(quotedChip("feat/login"))
-    expect(proseText(prose)).toBe(detachConfirmBody("feat/login", 45, 3))
+    expect(detachConfirmProse("feat/login", 45, 3)).toContainEqual(
+      quotedChip("feat/login"),
+    )
   })
 
   it("marks the agent's name in the force-stop body", () => {
-    const prose = forceStopConfirmProse("fix-auth")
-    expect(prose).toContainEqual(quotedChip("fix-auth"))
-    expect(proseText(prose)).toBe(forceStopConfirmBody("fix-auth"))
+    expect(forceStopConfirmProse("fix-auth")).toContainEqual(
+      quotedChip("fix-auth"),
+    )
   })
 })
 
@@ -105,11 +106,11 @@ describe("agentIsDetachable", () => {
   })
 })
 
-describe("forceStopConfirmBody", () => {
+describe("forceStopConfirmProse", () => {
   it("promises no wait at all and says the agent survives as detached", () => {
     // The Task Manager's own words. It must not quote a grace period: there is
     // none, and the whole point of that surface is that it acts at once.
-    expect(forceStopConfirmBody("fix-auth")).toBe(
+    expect(forceStopText("fix-auth")).toBe(
       'dux will stop "fix-auth" immediately, with no shutdown wait. Anything ' +
         "it is doing right now is lost. The agent stays in the list as " +
         "Detached, and you can resume it later.",
@@ -117,7 +118,7 @@ describe("forceStopConfirmBody", () => {
   })
 
   it("never quotes the grace the polite body is built around", () => {
-    expect(forceStopConfirmBody("feat")).not.toContain("wait up to")
-    expect(detachConfirmBody("feat", 30, 1)).toContain("wait up to 30 seconds")
+    expect(forceStopText("feat")).not.toContain("wait up to")
+    expect(detachText("feat", 30, 1)).toContain("wait up to 30 seconds")
   })
 })

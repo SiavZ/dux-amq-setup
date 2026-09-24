@@ -96,27 +96,9 @@ function recreateRunningTabProse(providers: string[]): Prose {
  * cannot happen, and the same path buys it nothing.
  *
  * `providers` are the providers of the tabs running right now, or the agent's
- * own when none is, from `recreateRunningProviders`. */
-export function recreateConfirmBody(
-  worktreeLabel: string,
-  branchName: string,
-  sourceBranch: string,
-  conversationResumes: boolean,
-  providers: string[],
-): string {
-  return proseText(
-    recreateConfirmProse(
-      worktreeLabel,
-      branchName,
-      sourceBranch,
-      conversationResumes,
-      providers,
-    ),
-  )
-}
-
-/** The same body with the path and every branch marked, for the web to chip.
- * Its plain-text spelling is `recreateConfirmBody`. dux-core's
+ * own when none is, from `recreateRunningProviders`.
+ *
+ * The path and every branch are marked for the web to chip. dux-core's
  * `recreate_confirm_prose` builds the same segments for the terminal UI, and
  * both are pinned by `crates/dux-core/tests/fixtures/prose_cross_language.json`. */
 export function recreateConfirmProse(

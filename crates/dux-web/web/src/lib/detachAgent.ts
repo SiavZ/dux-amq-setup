@@ -9,7 +9,7 @@ import {
   DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
   type Bootstrap,
 } from "./bootstrapApi"
-import { type Prose, proseText, quotedChip } from "./prose"
+import { type Prose, quotedChip } from "./prose"
 
 /** How long dux waits for an agent to exit before forcing it, in seconds.
  * The server clamps and projects it; an older server that omits it falls back
@@ -23,26 +23,14 @@ export function shutdownGraceSeconds(
     : DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
 }
 
-/** The body of the detach confirmation. Mirrors
- * `dux_core::engine::detach_confirm_body`, word for word, so the browser and
- * the terminal UI promise the same thing. Each side has a test asserting these
- * exact strings, so a change on one fails on the side that changed.
+/** The body of the detach confirmation, the agent's name marked for the web
+ * to chip. dux-core's `detach_confirm_prose` builds the same segments for the
+ * terminal UI, and both are pinned by
+ * `crates/dux-core/tests/fixtures/prose_cross_language.json`.
  *
  * `liveTabs` is how many of the agent's tabs are running. Past one it earns a
  * sentence: the menu names one agent and the act ends several conversations,
  * which is a scope the user has to be told about before agreeing. */
-export function detachConfirmBody(
-  label: string,
-  graceSeconds: number,
-  liveTabs: number,
-): string {
-  return proseText(detachConfirmProse(label, graceSeconds, liveTabs))
-}
-
-/** The same body with the agent's name marked, for the web to chip. Its
- * plain-text spelling is `detachConfirmBody`. dux-core's `detach_confirm_prose`
- * builds the same segments for the terminal UI, and both are pinned by
- * `crates/dux-core/tests/fixtures/prose_cross_language.json`. */
 export function detachConfirmProse(
   label: string,
   graceSeconds: number,
@@ -62,16 +50,11 @@ export function detachConfirmProse(
 }
 
 /** The body of the Task Manager's force-stop confirmation, the immediate
- * sibling of `detachConfirmBody`. Separate copy rather than a parameter on the
- * polite one, because the two now promise DIFFERENT things: the Task Manager is
- * the panic surface and ends the processes at once, while the agent menu's
- * Detach agent asks first and waits out the configured grace. No number appears
- * here, because there is no wait to quote. */
-export function forceStopConfirmBody(label: string): string {
-  return proseText(forceStopConfirmProse(label))
-}
-
-/** The same body with the agent's name marked, for the web to chip. */
+ * sibling of `detachConfirmProse`. Separate copy rather than a parameter on the
+ * polite one, because the two promise DIFFERENT things: the Task Manager is the
+ * panic surface and ends the processes at once, while the agent menu's Detach
+ * agent asks first and waits out the configured grace. No number appears here,
+ * because there is no wait to quote. */
 export function forceStopConfirmProse(label: string): Prose {
   return [
     "dux will stop ",
