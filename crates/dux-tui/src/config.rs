@@ -1850,6 +1850,21 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
         "resume_wait_timeout_ms = {}\n",
         config.resume_wait_timeout_ms.unwrap_or(0)
     ));
+    out.push_str(
+        "# Optional args that resume ONE specific conversation by its id. dux replaces the\n\
+         # exact token \"{session_id}\" with the id it recorded for this agent, so several\n\
+         # agents in one directory each get their own conversation back. Preferred over\n\
+         # resume_args whenever dux knows the id; resume_args stays the fallback.\n\
+         # These args replace `args`, so repeat any base flag you still need here.\n\
+         # Leave the key absent for CLIs with no resume-by-id; set [] to opt out.\n",
+    );
+    match &config.resume_by_id_args {
+        Some(args) => out.push_str(&format!(
+            "resume_by_id_args = {}\n",
+            render_string_list(args)
+        )),
+        None => out.push_str("# resume_by_id_args = [\"--resume\", \"{session_id}\"]\n"),
+    }
     if let Some(hint) = &config.install_hint {
         out.push_str("# Hint shown to the user when the provider command is not found on PATH.\n");
         out.push_str(&format!(
@@ -2493,6 +2508,27 @@ mod tests {
         validate_server_host(&config).expect("0.0.0.0 is a valid host");
         config.server.host = "127.0.0.1".to_string();
         validate_server_host(&config).expect("loopback is a valid host");
+    }
+
+    /// Every shipped provider's targeted-resume args survive the documented
+    /// render and a raw parse back. A default that only lives in memory is lost
+    /// the moment a user edits the provider block, and is undocumented.
+    #[test]
+    fn documented_render_round_trips_every_default_resume_by_id_args() {
+        let rendered = render_default_config();
+        let parsed: Config = toml::from_str(&rendered).expect("rendered config parses");
+        for (name, stock) in dux_core::config::default_provider_commands() {
+            let got = parsed
+                .providers
+                .commands
+                .get(name)
+                .unwrap_or_else(|| panic!("provider {name} missing from render"));
+            assert_eq!(
+                got.resume_by_id_args, stock.resume_by_id_args,
+                "providers.{name}.resume_by_id_args did not round-trip"
+            );
+        }
+        assert!(rendered.contains("{session_id}"));
     }
 
     #[test]

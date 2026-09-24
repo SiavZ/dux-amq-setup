@@ -2229,6 +2229,12 @@ impl ProvidersConfig {
                     if entry.get().resume_wait_timeout_ms.is_none() {
                         entry.get_mut().resume_wait_timeout_ms = config.resume_wait_timeout_ms;
                     }
+                    // A config written before `resume_by_id_args` was rendered has
+                    // the key absent. Fill in the shipped value; an explicit `[]`
+                    // is `Some` and so stays the user's opt-out.
+                    if entry.get().resume_by_id_args.is_none() {
+                        entry.get_mut().resume_by_id_args = config.resume_by_id_args;
+                    }
                     // A config written before `web_dragdrop_paste` existed has the key
                     // absent, and absent resolves to `bare`. That is wrong for
                     // codex, so fill in the shipped form here rather than letting
