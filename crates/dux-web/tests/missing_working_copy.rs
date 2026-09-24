@@ -199,8 +199,12 @@ async fn a_deleted_working_copy_answers_with_its_own_verdict() {
 
     let workspace = wait_for_missing(addr, true).await;
     let reason = workspace["quiet_reason"].as_str().unwrap_or_default();
+    // User-facing sentences print paths through `shorten_home`, so a temp dir
+    // under $HOME (a developer machine with TMPDIR in the home tree) shows as
+    // `~/...`. Compare against the form production actually prints.
+    let shown = dux_core::home_path::shorten_home(&worktree);
     assert!(
-        reason.contains(worktree.to_string_lossy().as_ref()),
+        reason.contains(&shown),
         "the sentence names the path: {reason}"
     );
     assert!(
@@ -405,10 +409,8 @@ async fn the_editor_refuses_a_directory_that_is_gone_in_the_same_sentence() {
     // the directory cannot answer.
     assert_eq!(resp.status(), 409);
     let body = resp.text().await.unwrap();
-    assert!(
-        body.contains(worktree.to_string_lossy().as_ref()),
-        "the refusal names the path: {body}"
-    );
+    let shown = dux_core::home_path::shorten_home(&worktree);
+    assert!(body.contains(&shown), "the refusal names the path: {body}");
     assert!(body.contains("recreated"), "and the way back: {body}");
 
     // The write door is shut too, not only the read one.
