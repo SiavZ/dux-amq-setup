@@ -51,7 +51,7 @@ fn sample_session(id: &str, worktree: &str) -> dux_core::model::AgentSession {
 }
 
 fn git(repo: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
+    let out = dux_core::test_git::fixture_git()
         .args(args)
         .current_dir(repo)
         .output()

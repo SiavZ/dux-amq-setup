@@ -11395,7 +11395,6 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
     use ratatui::text::Line;
-    use std::process::Command;
     use tempfile::tempdir;
 
     #[test]
@@ -13023,17 +13022,17 @@ not_a_real_action = ["x"]
         );
         std::fs::create_dir_all(worktree).expect("worktree dir");
 
-        Command::new("git")
+        dux_core::test_git::fixture_git()
             .args(["init"])
             .current_dir(worktree)
             .output()
             .expect("git init");
-        Command::new("git")
+        dux_core::test_git::fixture_git()
             .args(["config", "user.email", "test@example.com"])
             .current_dir(worktree)
             .output()
             .expect("git email");
-        Command::new("git")
+        dux_core::test_git::fixture_git()
             .args(["config", "user.name", "Test User"])
             .current_dir(worktree)
             .output()
@@ -13044,12 +13043,12 @@ not_a_real_action = ["x"]
             std::fs::create_dir_all(parent).expect("file parent");
         }
         std::fs::write(&file_path, original).expect("write original");
-        Command::new("git")
+        dux_core::test_git::fixture_git()
             .args(["add", relative_path])
             .current_dir(worktree)
             .output()
             .expect("git add");
-        Command::new("git")
+        dux_core::test_git::fixture_git()
             .args(["commit", "-m", "initial"])
             .current_dir(worktree)
             .output()
@@ -13245,7 +13244,7 @@ not_a_real_action = ["x"]
     /// something to open.
     fn select_a_modified_file_in_a_repo(app: &mut App, repo: &std::path::Path) {
         let git = |args: &[&str]| {
-            std::process::Command::new("git")
+            dux_core::test_git::fixture_git()
                 .args(args)
                 .current_dir(repo)
                 .output()
@@ -23266,7 +23265,7 @@ cyan = "#00ffff"
         let outside = tempdir().expect("outside tempdir");
         let run = |args: &[&str]| {
             assert!(
-                std::process::Command::new("git")
+                dux_core::test_git::fixture_git()
                     .args(args)
                     .current_dir(outside.path())
                     .output()
@@ -26488,7 +26487,7 @@ cyan = "#00ffff"
         .to_path_buf();
         std::fs::create_dir_all(&worktree).expect("worktree dir");
         let git = |args: &[&str]| {
-            Command::new("git")
+            dux_core::test_git::fixture_git()
                 .args(args)
                 .current_dir(&worktree)
                 .output()
@@ -26569,7 +26568,7 @@ cyan = "#00ffff"
         .to_path_buf();
         std::fs::create_dir_all(&worktree).expect("worktree dir");
         let git = |args: &[&str]| {
-            Command::new("git")
+            dux_core::test_git::fixture_git()
                 .args(args)
                 .current_dir(&worktree)
                 .output()

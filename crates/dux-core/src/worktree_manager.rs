@@ -489,7 +489,7 @@ mod tests {
     }
 
     fn git_in(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
+        let out = crate::test_git::fixture_git()
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -529,7 +529,7 @@ mod tests {
     }
 
     fn branch_exists(repo: &Path, branch: &str) -> bool {
-        std::process::Command::new("git")
+        crate::test_git::fixture_git()
             .arg("-C")
             .arg(repo)
             .args([

@@ -492,7 +492,7 @@ mod tests {
     }
 
     fn branch_exists(repo: &std::path::Path, branch: &str) -> bool {
-        std::process::Command::new("git")
+        dux_core::test_git::fixture_git()
             .arg("-C")
             .arg(repo)
             .args([

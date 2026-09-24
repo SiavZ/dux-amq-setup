@@ -3978,8 +3978,13 @@ pub(crate) mod test_support {
     /// purpose. dux WANTS `insteadOf` rewrites applied when it runs for real,
     /// because the rewritten URL is the one git would actually contact; do not
     /// "fix" production by isolating it from the user's configuration.
+    ///
+    /// Hiding the global file from the FIXTURE's commands does not stop the
+    /// production git commands a test runs inside that fixture from reading it,
+    /// so the repositories this helper creates also come from the fixture
+    /// template (see [`crate::test_git`]) and refuse to sign on their own.
     pub(crate) fn git_command() -> std::process::Command {
-        let mut command = std::process::Command::new("git");
+        let mut command = crate::test_git::fixture_git();
         isolate_git_config(&mut command);
         command
     }

@@ -826,7 +826,7 @@ mod tests {
     }
 
     fn run_git(cwd: &std::path::Path, args: &[&str]) {
-        let ok = std::process::Command::new("git")
+        let ok = dux_core::test_git::fixture_git()
             .args(args)
             .current_dir(cwd)
             .status()

@@ -25,7 +25,7 @@ use dux_web::server::{AppState, RouterParams, build_app};
 /// production read is deliberately left alone: a rewrite SHOULD apply there,
 /// because the rewritten address is the one git would really contact.
 fn git_isolated(dir: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
+    let out = dux_core::test_git::fixture_git()
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_NOSYSTEM", "1")

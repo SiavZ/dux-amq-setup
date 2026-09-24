@@ -19,7 +19,7 @@ use dux_web::engine_actor::spawn_engine_thread;
 use dux_web::server::router;
 
 fn git(dir: &Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
+    let out = dux_core::test_git::fixture_git()
         .args(args)
         .current_dir(dir)
         .output()
@@ -221,7 +221,7 @@ async fn create_agent(f: &Fixture, project_id: &str) -> PathBuf {
 }
 
 fn contains_commit(worktree: &Path, commit: &str) -> bool {
-    std::process::Command::new("git")
+    dux_core::test_git::fixture_git()
         .args(["merge-base", "--is-ancestor", commit, "HEAD"])
         .current_dir(worktree)
         .status()

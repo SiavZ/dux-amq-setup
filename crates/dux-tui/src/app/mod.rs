@@ -8390,12 +8390,12 @@ leading_branch = "main"
         paths.ensure_dirs().expect("dirs");
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).expect("repo");
-        std::process::Command::new("git")
+        dux_core::test_git::fixture_git()
             .arg("init")
             .arg(&repo)
             .output()
             .expect("git init");
-        std::process::Command::new("git")
+        dux_core::test_git::fixture_git()
             .arg("checkout")
             .arg("-b")
             .arg("main")

@@ -4421,7 +4421,7 @@ mod tests {
             // an inherited rewrite of its own competes with it and this test
             // fails for a reason that belongs to nobody's code, which is the
             // exact defect it exists to close.)
-            let mut demonstration = std::process::Command::new("git");
+            let mut demonstration = crate::test_git::fixture_git();
             demonstration.args(get_url);
             crate::git::test_support::isolate_git_config(&mut demonstration);
             demonstration.envs(channel.iter().copied());
@@ -4432,7 +4432,7 @@ mod tests {
                 "{channel:?} must really rewrite, or the assertion below proves nothing",
             );
 
-            let mut isolated = std::process::Command::new("git");
+            let mut isolated = crate::test_git::fixture_git();
             isolated.args(get_url).envs(channel.iter().copied());
             crate::git::test_support::isolate_git_config(&mut isolated);
             let out = isolated.output().unwrap();

@@ -44,7 +44,7 @@ pub(crate) fn run_git(cwd: &std::path::Path, args: &[&str]) {
 
 /// [`run_git`], returning the command's trimmed stdout.
 pub(crate) fn run_git_output(cwd: &std::path::Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = dux_core::test_git::fixture_git()
         .args(args)
         .current_dir(cwd)
         .output()
@@ -660,4 +660,38 @@ fn a_scratch_dir_is_removed_while_a_worker_is_still_writing_into_it() {
         "the scratch directory {} outlived its guard",
         path.display()
     );
+}
+
+/// The repository every test app is built on never signs a commit, even for a
+/// developer whose global config signs everything: the app's own git commands
+/// inherit that global config, so the answer has to live in the repository.
+#[test]
+fn the_shared_fixture_repository_never_signs_under_a_signing_global_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let global = dir.path().join("global-gitconfig");
+    std::fs::write(
+        &global,
+        "[commit]\n\tgpgsign = true\n[tag]\n\tgpgsign = true\n",
+    )
+    .expect("write the simulated global config");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    init_test_repo(&repo);
+    for key in ["commit.gpgsign", "tag.gpgsign"] {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["config", "--get", key])
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .output()
+            .expect("run git config");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "false",
+            "{key} in the shared fixture repository"
+        );
+    }
 }

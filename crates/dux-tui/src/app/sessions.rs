@@ -5201,7 +5201,7 @@ mod tests {
     /// path string.
     fn init_unborn_repo() -> (tempfile::TempDir, String) {
         fn run_git(cwd: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
+            let out = dux_core::test_git::fixture_git()
                 .args(args)
                 .current_dir(cwd)
                 .output()
@@ -5331,7 +5331,7 @@ mod tests {
         // precedence over the non-default-branch heuristic warning: the user
         // just created this branch; warning "that's not main" would be noise.
         fn run_git(cwd: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
+            let out = dux_core::test_git::fixture_git()
                 .args(args)
                 .current_dir(cwd)
                 .output()
@@ -5470,7 +5470,7 @@ mod tests {
     #[test]
     fn checkout_inspect_op_known_case_keeps_one_spinner_across_the_chain() {
         fn run_git(cwd: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
+            let out = dux_core::test_git::fixture_git()
                 .args(args)
                 .current_dir(cwd)
                 .output()
@@ -8670,7 +8670,7 @@ mod tests {
     }
 
     fn worktree_has_commit(worktree: &Path, commit: &str) -> bool {
-        std::process::Command::new("git")
+        dux_core::test_git::fixture_git()
             .args(["merge-base", "--is-ancestor", commit, "HEAD"])
             .current_dir(worktree)
             .status()

@@ -125,7 +125,7 @@ async fn boot_with_repo() -> (SocketAddr, tempfile::TempDir) {
 
     // Build the git repo at the worktree root.
     let run = |args: &[&str]| {
-        let ok = std::process::Command::new("git")
+        let ok = dux_core::test_git::fixture_git()
             .args(args)
             .current_dir(&root)
             .status()
@@ -300,7 +300,7 @@ async fn http_file_diff_answers_a_huge_tracked_file_with_the_diff_head() {
     let (addr, tmp) = boot_with_repo().await;
     let root = tmp.path().to_path_buf();
     let run = |args: &[&str]| {
-        let ok = std::process::Command::new("git")
+        let ok = dux_core::test_git::fixture_git()
             .args(args)
             .current_dir(&root)
             .status()
@@ -412,7 +412,7 @@ async fn boot_for_create_agent_window(
     let root = tmp.path().to_path_buf();
 
     let run = |args: &[&str]| {
-        let ok = std::process::Command::new("git")
+        let ok = dux_core::test_git::fixture_git()
             .args(args)
             .current_dir(&root)
             .status()
@@ -1221,7 +1221,7 @@ async fn rest_create_session_422_when_the_create_fails() {
     let (addr, tmp) = boot_for_create_agent_window(None, |_, _| {}).await;
     // A branch for the requested name to collide with, in the repo the fixture
     // registered as project `p1`.
-    let ok = std::process::Command::new("git")
+    let ok = dux_core::test_git::fixture_git()
         .args(["branch", "blocked"])
         .current_dir(tmp.path())
         .status()

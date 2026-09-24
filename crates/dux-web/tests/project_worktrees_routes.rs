@@ -22,7 +22,7 @@ use dux_web::engine_actor::spawn_engine_thread;
 use dux_web::server::{AppState, RouterParams, build_app};
 
 fn git(dir: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
+    let out = dux_core::test_git::fixture_git()
         .args(args)
         .current_dir(dir)
         .output()
@@ -205,7 +205,7 @@ async fn delete_with(addr: SocketAddr, project: &str, path: &Path, extra: &str) 
 
 /// Whether the repo still has a local branch by this name.
 fn branch_exists(repo: &Path, branch: &str) -> bool {
-    let out = std::process::Command::new("git")
+    let out = dux_core::test_git::fixture_git()
         .args(["for-each-ref", "--format=%(refname:short)", "refs/heads/"])
         .current_dir(repo)
         .output()
@@ -282,7 +282,7 @@ async fn deleting_a_worktree_does_not_delete_its_branch() {
     let f = boot().await;
     let (status, body) = delete(f.addr, "p1", &f.free).await;
     assert_eq!(status, 200, "got {body}");
-    let out = std::process::Command::new("git")
+    let out = dux_core::test_git::fixture_git()
         .args(["branch", "--list", "free"])
         .current_dir(f._tmp.path().join("repo"))
         .output()

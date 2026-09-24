@@ -18,7 +18,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 
 fn run_git(cwd: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
+    let out = dux_core::test_git::fixture_git()
         .args(args)
         .current_dir(cwd)
         .output()
@@ -452,7 +452,7 @@ async fn recreating_one_working_copy_leaves_an_unreachable_sibling_alone() {
     wait_for_missing(addr, false).await;
 
     std::fs::rename(&stashed, &sibling).expect("the sibling's mount comes back");
-    let listed = std::process::Command::new("git")
+    let listed = dux_core::test_git::fixture_git()
         .args(["-C", &repo.to_string_lossy(), "worktree", "list"])
         .output()
         .expect("git runs");
@@ -461,7 +461,7 @@ async fn recreating_one_working_copy_leaves_an_unreachable_sibling_alone() {
         listing.contains("[other]"),
         "the sibling's registration survived: {listing}"
     );
-    let status = std::process::Command::new("git")
+    let status = dux_core::test_git::fixture_git()
         .args(["-C", &sibling.to_string_lossy(), "status", "--porcelain=v1"])
         .output()
         .expect("git runs");

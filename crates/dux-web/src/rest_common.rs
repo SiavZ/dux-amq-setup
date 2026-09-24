@@ -534,7 +534,7 @@ mod tests {
         let repo = tmp.path().join("staged-repo");
         std::fs::create_dir_all(&repo).unwrap();
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = dux_core::test_git::fixture_git()
                 .args(args)
                 .current_dir(&repo)
                 .output()

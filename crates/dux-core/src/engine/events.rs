@@ -3833,7 +3833,7 @@ mod tests {
     #[test]
     fn deleting_an_agent_whose_branch_drifted_removes_the_branch_it_was_born_on() {
         fn git(dir: &std::path::Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
+            let out = crate::test_git::fixture_git()
                 .args(args)
                 .current_dir(dir)
                 .output()
@@ -3902,7 +3902,7 @@ mod tests {
             },
             "both branches must be reported so the status line can name them"
         );
-        let listed = std::process::Command::new("git")
+        let listed = crate::test_git::fixture_git()
             .args(["-C", repo.to_str().unwrap(), "branch", "--list"])
             .output()
             .unwrap();
@@ -3930,7 +3930,7 @@ mod tests {
     #[test]
     fn a_drifted_delete_removes_exactly_the_branches_the_dialog_named() {
         fn git(dir: &std::path::Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
+            let out = crate::test_git::fixture_git()
                 .args(args)
                 .current_dir(dir)
                 .output()
@@ -3942,7 +3942,7 @@ mod tests {
             );
         }
         fn branches(repo: &std::path::Path) -> std::collections::BTreeSet<String> {
-            let out = std::process::Command::new("git")
+            let out = crate::test_git::fixture_git()
                 .args([
                     "-C",
                     repo.to_str().unwrap(),
@@ -4023,7 +4023,7 @@ mod tests {
     #[cfg(test)]
     fn repo_with_branches(root: &std::path::Path, branches: &[&str]) -> std::path::PathBuf {
         fn git(dir: &std::path::Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
+            let out = crate::test_git::fixture_git()
                 .args(args)
                 .current_dir(dir)
                 .output()
@@ -4053,7 +4053,7 @@ mod tests {
     #[cfg(test)]
     fn attach_worktree(repo: &std::path::Path, branch: &str) -> std::path::PathBuf {
         let worktree = repo.parent().unwrap().join(format!("wt-{branch}"));
-        let out = std::process::Command::new("git")
+        let out = crate::test_git::fixture_git()
             .args(["worktree", "add", worktree.to_str().unwrap(), branch])
             .current_dir(repo)
             .output()
@@ -4068,7 +4068,7 @@ mod tests {
 
     #[cfg(test)]
     fn branch_list(repo: &std::path::Path) -> String {
-        let out = std::process::Command::new("git")
+        let out = crate::test_git::fixture_git()
             .args(["-C", repo.to_str().unwrap(), "branch", "--list"])
             .output()
             .unwrap();
@@ -4248,7 +4248,7 @@ mod tests {
         let (mut engine, tmp) = test_engine();
         let repo = repo_with_branches(tmp.path(), &["develop"]);
         let worktree = attach_worktree(&repo, "develop");
-        let out = std::process::Command::new("git")
+        let out = crate::test_git::fixture_git()
             .args(["switch", "-c", "feature-x"])
             .current_dir(&worktree)
             .output()
@@ -5900,7 +5900,7 @@ mod tests {
     #[test]
     fn an_unresolvable_origin_default_refuses_rather_than_checking_out_the_stored_base() {
         fn git(dir: &std::path::Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
+            let out = crate::test_git::fixture_git()
                 .args(args)
                 .current_dir(dir)
                 .output()

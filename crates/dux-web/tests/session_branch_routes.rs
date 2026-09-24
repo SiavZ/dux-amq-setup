@@ -24,7 +24,7 @@ use dux_web::server::{AppState, RouterParams, build_app};
 use futures_util::StreamExt;
 
 fn git(dir: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
+    let out = dux_core::test_git::fixture_git()
         .args(args)
         .current_dir(dir)
         .output()
@@ -338,7 +338,7 @@ where
 }
 
 fn branches(repo: &Path) -> Vec<String> {
-    let out = std::process::Command::new("git")
+    let out = dux_core::test_git::fixture_git()
         .args(["for-each-ref", "--format=%(refname:short)", "refs/heads/"])
         .current_dir(repo)
         .output()
