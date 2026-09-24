@@ -263,6 +263,17 @@ pub enum Command {
     /// drain. Returns `EventReaction::Nothing`, because the refreshed ViewModel
     /// broadcast is the feedback rather than a toast on every selection.
     WatchChangedFiles { session_id: Option<String> },
+
+    /// Replace one agent's per-session settings (context mode, YOLO, AMQ
+    /// verify override, watch-rule overrides, auto-clear, system prompt) and,
+    /// optionally, its title. Persists BEFORE touching live memory and leaves
+    /// memory untouched on a store failure (fork 773a6b04, audit03 P1-16).
+    SetSessionSettings {
+        session_id: String,
+        settings: Box<crate::session_settings::SessionSettings>,
+        /// `Some` renames the agent; `Some(None)` clears a custom title.
+        title: Option<Option<String>>,
+    },
 }
 
 impl Engine {
@@ -680,6 +691,12 @@ impl Engine {
                     branch_name,
                 ))))
             }
+
+            Command::SetSessionSettings {
+                session_id,
+                settings,
+                title,
+            } => self.set_session_settings(&session_id, *settings, title),
 
             Command::DeleteTerminal { terminal_id } => {
                 // Graceful close: SIGTERM the terminal and move it to the

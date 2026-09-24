@@ -750,6 +750,44 @@ impl Drop for ReaderWaiting {
     }
 }
 
+/// A master with no descriptor to hand over, so `prepare_for_reload` refuses
+/// it. Lets a test stage the one PTY in a workspace that cannot cross a reload.
+#[cfg(test)]
+struct FdlessMaster;
+
+#[cfg(test)]
+impl MasterPty for FdlessMaster {
+    fn resize(&self, _size: PtySize) -> Result<()> {
+        Ok(())
+    }
+    fn get_size(&self) -> Result<PtySize> {
+        Ok(PtySize::default())
+    }
+    fn try_clone_reader(&self) -> Result<Box<dyn std::io::Read + Send>> {
+        Ok(Box::new(std::io::empty()))
+    }
+    fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>> {
+        Ok(Box::new(std::io::sink()))
+    }
+    fn process_group_leader(&self) -> Option<libc::pid_t> {
+        None
+    }
+    fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        None
+    }
+    fn tty_name(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+}
+
+#[cfg(test)]
+impl PtyClient {
+    /// Make this client's PTY impossible to hand over across a reload.
+    pub(crate) fn make_unhandoverable_for_test(&mut self) {
+        self.master = Box::new(FdlessMaster);
+    }
+}
+
 /// A PTY-based client that spawns a CLI tool in a pseudo-terminal and keeps a
 /// full terminal grid with scrollback using `alacritty_terminal`.
 pub struct PtyClient {

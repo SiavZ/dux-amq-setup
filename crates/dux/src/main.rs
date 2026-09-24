@@ -29,8 +29,20 @@ fn main() -> Result<()> {
             println!("dux {}", dux_core::version::long());
             Ok(())
         }
+        Some("peer") => run_peer(args),
         _ => run_tui_with_flip(),
     }
+}
+
+/// `dux peer ...`: route a message between agent sessions. Dispatched before
+/// the TUI's argument handling, which treats `--help` anywhere on the line as
+/// a request for the top-level help; a peer message may legitimately contain
+/// that word. Takes no single-instance lock: it runs from inside agents while
+/// the TUI or server holds it, and the AMQ registry has its own lock.
+fn run_peer(args: impl Iterator<Item = String>) -> Result<()> {
+    let args = args.collect::<Vec<_>>();
+    let paths = dux_core::config::DuxPaths::discover()?;
+    dux_core::peer::run_peer(&args, &paths)
 }
 
 /// Write the handoff and replace this process with the newer dux binary.
@@ -39,44 +51,60 @@ fn main() -> Result<()> {
 /// is precisely what keeps the process, its agent children, and their inherited
 /// descriptors alive across the swap.
 ///
-/// `engine` is taken by value and deliberately leaked before the exec. Dropping
-/// an `Engine` drops every `PtyClient`, and dropping those closes the PTY
-/// masters the replacement image is about to inherit, killing the agents this
-/// whole feature exists to keep running. On the success path the process is
-/// replaced anyway, so nothing is really leaked; on the failure paths below the
-/// engine is dropped normally, because there is no successor to inherit
-/// anything.
+/// `engine` stays alive, owned by this frame, right up to the exec. Dropping an
+/// `Engine` drops every `PtyClient`, which closes the PTY masters the
+/// replacement image is about to inherit and SIGKILLs the agents this feature
+/// exists to keep running. `exec` itself runs no destructors, so simply not
+/// dropping it is enough: no leak and no `unsafe` needed.
+///
+/// On failure the engine is handed BACK, still intact, with close-on-exec
+/// restored on every master, so the caller can put the user straight back in
+/// the TUI. Failing a reload must cost a status line, not the agents.
 fn exec_reload(
     engine: Box<dux_core::engine::Engine>,
     handoff: dux_core::reload_handoff::Handoff,
-) -> Result<()> {
+) -> std::result::Result<std::convert::Infallible, (Box<dux_core::engine::Engine>, String)> {
     let handoff_path =
         dux_core::reload_handoff::Handoff::path_for(&engine.paths.root, std::process::id());
-    if let Err(err) = handoff.write(&handoff_path) {
-        // The agents are untouched and this image is intact, so the honest
-        // outcome is an ordinary exit rather than a half-done reload.
-        return Err(err.context("writing the reload handoff"));
-    }
-
-    let Ok(exe) = std::env::current_exe() else {
-        let _ = std::fs::remove_file(&handoff_path);
-        anyhow::bail!("cannot reload: dux could not find its own binary");
+    let give_back = |engine, reason: String| {
+        handoff.abandon();
+        Err((engine, reason))
     };
 
-    // Past this point the descriptors must stay open for the successor.
-    let engine = Box::leak(engine);
+    if let Err(err) = handoff.write(&handoff_path) {
+        return give_back(
+            engine,
+            format!("Reload failed: could not write the handoff ({err:#}). Nothing was changed."),
+        );
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        let _ = std::fs::remove_file(&handoff_path);
+        return give_back(
+            engine,
+            "Reload failed: dux could not find its own binary. Nothing was changed.".to_string(),
+        );
+    };
+
+    // The last step before the exec, once nothing can refuse the reload any
+    // more: wind down this image's background workers (AMQ watcher and poll
+    // thread, settling every inbox claim) so the successor starts its own.
+    // If the exec then fails, `resume_after_failed_reload` runs the TUI's
+    // `start_run_services` again, which restarts them.
+    let mut engine = engine;
+    engine.quiesce_for_exec();
     let err = match dux_core::reload_policy::exec_into_reload(&exe, &handoff_path) {
         Ok(never) => match never {},
         Err(err) => err,
     };
-
-    // exec failed, so this image is still running and still owns everything.
-    // Take the engine back so the agents are shut down properly instead of
-    // being abandoned, and clear the handoff nobody will read.
+    // Still this image, still owning everything. Nobody will read the handoff.
     let _ = std::fs::remove_file(&handoff_path);
-    let engine = unsafe { Box::from_raw(engine as *mut dux_core::engine::Engine) };
-    drop(engine);
-    Err(anyhow::Error::from(err).context(format!("exec onto {}", exe.display())))
+    give_back(
+        engine,
+        format!(
+            "Reload failed: could not start {} ({err}). Your agents are untouched.",
+            exe.display()
+        ),
+    )
 }
 
 /// Default arm: run the TUI, and when it flips to the web server, serve the same
@@ -90,7 +118,12 @@ fn run_tui_with_flip() -> Result<()> {
         match next {
             dux_tui::TuiExit::Done => break,
             dux_tui::TuiExit::Reload { engine, handoff } => {
-                return exec_reload(engine, handoff);
+                let Err((engine, reason)) = exec_reload(engine, handoff);
+                next = dux_tui::resume_after_failed_reload(
+                    engine,
+                    Box::new(companion::WebCompanion::new()),
+                    reason,
+                )?;
             }
             dux_tui::TuiExit::FlipToServer {
                 engine,

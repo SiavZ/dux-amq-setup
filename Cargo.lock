@@ -741,6 +741,7 @@ dependencies = [
  "chrono",
  "compact_str",
  "content_inspector",
+ "filetime",
  "flate2",
  "home",
  "indexmap",

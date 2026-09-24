@@ -15,6 +15,8 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub use crate::amq::config::{AmqConfig, AmqInjectConfig, AmqOrchestratorConfig};
+
 /// Which surface(s) a macro is available on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -2803,6 +2805,10 @@ pub struct Config {
     pub server: ServerConfig,
     pub keys: KeysConfig,
     pub macros: MacrosConfig,
+    /// The dux-amq companion: the inject-queue drainer and the Orchestrator
+    /// watchdog. See [`crate::amq`].
+    #[serde(default)]
+    pub amq: AmqConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2884,6 +2890,7 @@ impl Default for Config {
             server: ServerConfig::default(),
             keys: KeysConfig::default(),
             macros: MacrosConfig::default(),
+            amq: AmqConfig::default(),
         }
     }
 }

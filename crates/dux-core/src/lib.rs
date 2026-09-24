@@ -6,6 +6,7 @@
 pub mod action;
 pub mod activity;
 pub mod add_project_plan;
+pub mod agent_env;
 pub mod agent_job;
 pub mod agent_search;
 pub mod agent_tabs;
@@ -40,6 +41,7 @@ pub mod logger;
 pub mod macros;
 pub mod model;
 pub mod palette;
+pub mod peer;
 pub mod poller_status;
 pub mod pr_reference;
 pub mod project_browser;
@@ -79,6 +81,9 @@ pub mod working_copy;
 pub mod working_cue;
 pub mod worktree_file;
 pub mod worktree_manager;
+// Fork port: AMQ inject/orchestrator and per-session settings.
+pub mod amq;
+pub mod session_settings;
 
 /// Display version string ('vX.Y.Z' for release builds, 'development' otherwise), set by build.rs, mirroring the TUI's `DUX_DISPLAY_VERSION`.
 pub fn display_version() -> &'static str {

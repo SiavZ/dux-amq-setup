@@ -59,12 +59,20 @@ struct DesiredWatch {
 
 impl Engine {
     /// Settings the watch engine needs for `session_id`.
-    ///
-    /// INTEGRATION: read from Engine::session_settings (maple). Until the
-    /// session-settings store lands this reports the safe default: no
-    /// auto-clear and no arm overrides, so only config rules run.
-    pub fn watch_session_settings(&self, _session_id: &str) -> WatchSessionSettings {
-        WatchSessionSettings::default()
+    /// Auto-clear needs BOTH Worker mode and the explicit opt-in (the
+    /// operator opts in twice); a missing record is the safe default.
+    pub fn watch_session_settings(&self, session_id: &str) -> WatchSessionSettings {
+        let Some(s) = self.session_settings(session_id) else {
+            return WatchSessionSettings::default();
+        };
+        let mut arm_overrides: Vec<(usize, bool)> =
+            s.watch_rule_arm.iter().map(|(i, a)| (*i, *a)).collect();
+        arm_overrides.sort_unstable();
+        WatchSessionSettings {
+            auto_clear: s.mode == crate::session_settings::ContextMode::Worker
+                && s.auto_clear_on_task_done,
+            arm_overrides,
+        }
     }
 
     /// Whether the built-in auto-clear rule must hold off this tick: the agent
@@ -72,12 +80,11 @@ impl Engine {
     /// suppressed tick rebaselines the rule, so a sentinel seen while held
     /// never fires later.
     ///
-    /// INTEGRATION: the AMQ orchestrator (maple) owns the busy markers, the
-    /// pending-inject queue and the collaboration quiet window. Until it lands
-    /// this always suppresses, the safe answer (a missed clear is harmless, a
-    /// clear mid-collaboration is not).
-    pub fn watch_auto_clear_suppressed(&self, _tab_id: &TabIdRef, _session_id: &str) -> bool {
-        true
+    /// The AMQ side owns the answer (busy markers, queued wakes, pending
+    /// mail, the collaboration quiet window): see
+    /// [`Engine::amq_blocks_auto_clear`].
+    pub fn watch_auto_clear_suppressed(&self, _tab_id: &TabIdRef, session_id: &str) -> bool {
+        self.amq_blocks_auto_clear(session_id)
     }
 
     /// Pause a tab's watch rules until `until`. An AMQ inject calls this after
@@ -326,9 +333,9 @@ impl Engine {
     /// Disarm an armed rule or re-arm a disarmed one on a live tab. Returns
     /// the status line to show, or `None` when the tab or rule is gone.
     ///
-    /// INTEGRATION: persist the new arm state into the session's
-    /// `watch_rule_arm` through Engine::session_settings (maple), so a manual
-    /// disarm survives restart. Until then it lasts for the tab's run.
+    /// The new arm state is persisted into the session's `watch_rule_arm`,
+    /// so a manual disarm survives restart (and the next sync, which rebuilds
+    /// from the persisted overrides, agrees with what the user chose).
     pub fn toggle_watch_rule(&mut self, tab: &TabIdRef, idx: usize) -> Option<StatusUpdate> {
         let attached = self.watch.attached.get_mut(tab)?;
         if Some(idx) == attached.auto_clear_idx {
@@ -345,6 +352,25 @@ impl Engine {
             attached.engine.disarm(idx);
             "disarmed"
         };
+        if let Some(session_id) = self.owning_session_for_tab(tab.as_str()) {
+            let mut settings = self.session_settings_or_default(&session_id);
+            settings.watch_rule_arm.insert(idx, disarmed);
+            if let Err(err) = self.persist_session_settings_only(&session_id, settings) {
+                // The live engine keeps the toggle; its recorded overrides stay
+                // matched to the (unchanged) saved settings, so the next sync
+                // does not rebuild it and the toggle lasts for this run.
+                return Some(StatusUpdate::warning(format!(
+                    "Watch rule \"{}\" {verb} for this run, but saving it failed: {err}",
+                    snapshot.label
+                )));
+            }
+            // Saved: record the new overrides so the next sync sees the live
+            // engine already matches the settings and keeps it.
+            let saved = self.watch_session_settings(&session_id).arm_overrides;
+            if let Some(attached) = self.watch.attached.get_mut(tab) {
+                attached.arm_overrides = saved;
+            }
+        }
         Some(StatusUpdate::info(format!(
             "Watch rule \"{}\" {verb}.",
             snapshot.label
@@ -544,6 +570,37 @@ mod tests {
         engine.config.providers.commands["claude"].watch = vec![instant_rule("x", "changed")];
         engine.tick_watch_rules();
         assert!(!engine.watch.attached[tab].engine.is_disarmed(0));
+    }
+
+    /// A manual disarm is saved into the session's `watch_rule_arm`, so a
+    /// fresh process (restart or hot reload) rebuilds the rule disarmed.
+    #[test]
+    fn a_toggled_rule_is_persisted_into_the_session_settings() {
+        let client = PtyClient::spawn("cat", &[], &std::env::temp_dir(), 24, 80, 100).expect("cat");
+        let (mut engine, _guard) = engine_with_tab(client, vec![instant_rule("x", "y")]);
+        let session = engine.sessions[0].clone();
+        engine.session_store.create_session(&session).unwrap();
+        engine.tick_watch_rules();
+        let tab = TabIdRef::new("s1-slot");
+        engine.toggle_watch_rule(tab, 0).expect("toggle");
+        assert_eq!(
+            engine
+                .session_settings("s1")
+                .map(|s| s.watch_rule_arm.get(&0).copied()),
+            Some(Some(false))
+        );
+        let stored = engine.session_store.load_session_settings().unwrap();
+        assert_eq!(stored["s1"].watch_rule_arm.get(&0), Some(&false));
+
+        // Forget the live engine; a rebuild from settings comes back disarmed.
+        engine.watch.attached.clear();
+        engine.tick_watch_rules();
+        assert!(engine.watch.attached[tab].engine.is_disarmed(0));
+
+        // Re-arming persists too.
+        engine.toggle_watch_rule(tab, 0).expect("toggle back");
+        let stored = engine.session_store.load_session_settings().unwrap();
+        assert_eq!(stored["s1"].watch_rule_arm.get(&0), Some(&true));
     }
 
     #[test]

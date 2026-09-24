@@ -4,6 +4,7 @@
 //! embeds it and calls it directly, and the web server reaches it through its
 //! engine actor.
 
+pub mod amq;
 pub mod command;
 mod companion;
 pub mod config_saver;
@@ -17,6 +18,7 @@ mod spawn_worker;
 pub mod status_op;
 mod watch_tick;
 
+pub use amq::{AmqFocus, AmqRuntime};
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -749,6 +751,10 @@ pub struct Engine {
     /// past [`CREATED_SESSION_TTL`] or whose session no longer exists, so a
     /// long-running server cannot accumulate stale entries.
     pub created_session_by_op: HashMap<String, (String, Instant)>,
+    /// AMQ runtime: per-session settings, the inject-queue drainer and the
+    /// Orchestrator watchdog (see [`amq`]). Construct with `Default`; load
+    /// settings with [`Engine::load_session_settings_from_store`].
+    pub amq: amq::AmqRuntime,
 }
 
 /// Handler-computed outcome for a create-agent op (see
@@ -1578,6 +1584,11 @@ impl Engine {
     /// keep showing the agent as working.
     pub fn note_pty_input(&mut self, tab_id: &str) {
         self.pty_input.insert(tab_id.to_string(), Instant::now());
+        // The AMQ quiet window needs "last typed" per agent over minutes, which
+        // `pty_input` (a 1.25 s window, cleared with the tab) cannot answer.
+        if let Some(session_id) = self.session_id_for_tab(tab_id) {
+            self.note_amq_user_input(&session_id);
+        }
     }
 
     /// Record that a forwarded POINTER report just reached this PTY. This is

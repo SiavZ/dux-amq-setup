@@ -2208,6 +2208,9 @@ pub(crate) enum PromptState {
     ChangeProjectDefaultProvider(ChangeProjectDefaultProviderPrompt),
     SetTailscaleMode(SetTailscaleModePrompt),
     WatchRules(WatchRulesPrompt),
+    /// The per-session settings modal (AMQ + orchestrator workstream).
+    /// Boxed: the draft carries two text inputs and the rule list.
+    SessionSettings(Box<SessionSettingsPrompt>),
     ChangeTheme(ChangeThemePrompt),
     ConfigureStartupCommand {
         project_id: String,
@@ -2818,6 +2821,8 @@ pub(crate) enum InputTarget {
     /// rather than a reuse of `StartupCommand` so a future reader cannot mistake
     /// one modal's engage state for the other's.
     MacroText,
+    /// The session-settings modal's system-prompt editor is engaged.
+    SessionSettingsPrompt,
 }
 
 #[derive(Clone, Copy)]
@@ -3176,6 +3181,13 @@ pub(crate) enum OverlayMouseLayout {
         input: Rect,
         cancel_button: Rect,
         save_button: Rect,
+    },
+    /// The session-settings modal. Its variable-length row rects live on the
+    /// prompt (`SessionSettingsPrompt::hit_rows`), since this type is `Copy`.
+    SessionSettings {
+        title_input: Rect,
+        save_button: Rect,
+        cancel_button: Rect,
     },
     KillRunning {
         input: Option<Rect>,
@@ -3565,7 +3577,9 @@ mod redraw;
 pub(crate) use redraw::RedrawGate;
 mod render;
 mod reorder;
+mod session_settings;
 mod sessions;
+pub(crate) use session_settings::{SessionSettingsPrompt, SettingsFocus};
 #[cfg(test)]
 mod test_support;
 pub(crate) mod text_input;
@@ -3626,6 +3640,11 @@ impl App {
 
         logger::init(&config.logging, &paths);
         logger::info(&format!("bootstrapping dux {}", dux_core::version::long()));
+        // Reconcile the shared AMQ registry from this store's sessions and let
+        // agent launches reserve their inbox. Under the single-instance lock
+        // the caller holds, after the logger so its outcome is recorded, and
+        // never fatal to the boot.
+        dux_core::peer::init_for_process(&paths);
 
         // Validate and build runtime keybindings from config.
         if let Err(msg) = validate_keys(&config.keys) {
@@ -3763,6 +3782,7 @@ impl App {
             pty_progress: HashMap::new(),
             agent_viewed: HashMap::new(),
             last_foreground_refresh: None,
+            amq: Default::default(),
             pending_web_checkout_ops: HashMap::new(),
             pending_web_add_project_ops: HashMap::new(),
             pending_web_pr_lookup_ops: HashMap::new(),
@@ -4066,6 +4086,8 @@ impl App {
         self.engine.spawn_branch_sync_worker();
         self.engine.spawn_project_branch_status_checks();
         self.engine.spawn_gh_status_check();
+        // Idempotent: the web flip hands this same engine over and re-calls it.
+        self.engine.start_amq();
         // The background server assumes these process-wide workers are already running.
         self.start_background_server_from_config();
     }
@@ -5086,6 +5108,7 @@ impl App {
             "delete-agent" => self.confirm_delete_selected_session(),
             "rename-agent" => self.open_rename_session(),
             "agent-info" => self.open_agent_info(),
+            "session-settings" => self.open_session_settings(),
             "kill-running" => self.open_kill_running(),
             "detach-agent" => self.confirm_detach_selected_session(),
             "recreate-working-copy" => self.confirm_recreate_selected_working_copy(),
@@ -7631,8 +7654,11 @@ mod tests {
         // alias needs root, so the address is DISCOVERED instead: ask the host
         // which loopback addresses it actually has (a machine may carry extra
         // 127.x aliases for other reasons) and take the first that is not
-        // 127.0.0.1 and that the kernel lets us bind.
-        let second_loopback = crate::app::test_support::bindable_secondary_loopbacks();
+        // 127.0.0.1 and that the kernel lets us bind. 127.0.0.2 is tried
+        // first because on Linux it binds without being listed by `ifconfig`,
+        // and discovery alone would silently skip this test on CI.
+        let second_loopback = std::iter::once(std::net::IpAddr::from([127, 0, 0, 2]))
+            .chain(crate::app::test_support::bindable_secondary_loopbacks());
         let Some((held, ts_ip)) = second_loopback.into_iter().find_map(|ip| {
             let listener = std::net::TcpListener::bind((ip, 0)).ok()?;
             Some((listener, ip))

@@ -1524,6 +1524,7 @@ impl Engine {
         // those; this cleans up the remaining pin/activity/input/in-flight entries.
         self.clear_session_tab_runtime(&session.id);
         self.sessions.retain(|candidate| candidate.id != session.id);
+        self.forget_amq_session(&session.id);
         let removed_terminals: Vec<String> = self
             .companion_terminals
             .iter()
@@ -3534,6 +3535,7 @@ impl Engine {
                     self.process_project_persistence_completed(action, result, status_op_id);
                 EventReaction::ProjectPersistenceOutcome(Box::new(outcome))
             }
+            WorkerEvent::AmqInjectScanRequested => self.drain_amq_inject_queue(),
             WorkerEvent::StartupCommandLogsLoaded {
                 scope_label,
                 result,

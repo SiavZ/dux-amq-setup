@@ -2428,6 +2428,18 @@ impl EngineService {
             }
         }
 
+        // AMQ wake delivery and the Orchestrator watchdog: single tick site
+        // for `dux serve`, like the watch rules. No agent is "focused" in the
+        // TUI sense here, so only recent keystrokes gate delivery, and a wake
+        // with no receiver has no selected agent to fall back to.
+        let amq = engine.tick_amq(dux_core::engine::AmqFocus::default());
+        if !matches!(amq, dux_core::engine::EventReaction::Nothing) {
+            self.note_mutation();
+            for status in dux_core::wire::wire_statuses_from_reaction(&amq) {
+                let _ = self.status.send(status);
+            }
+        }
+
         let reaped = engine.reap_terminating_ptys();
         for removal in reaped.removals {
             let _busy = engine.dispatch_deferred_worktree_removal(removal);

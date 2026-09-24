@@ -672,6 +672,13 @@ pub const PALETTE_COMMANDS: &[PaletteCommand] = &[
         description: "List watch rules on running tabs; disarm or re-arm one",
         // TUI-only for now: the web has no watch-rules surface yet.
     },
+    PaletteCommand {
+        action: Action::SessionSettings,
+        name: "session-settings",
+        description: "Per-session settings: mode, YOLO, system prompt, watch rules, AMQ verify",
+        // Per-session. The web drives the same Command through the
+        // `set_session_settings` wire command; it has no dialog for it yet.
+    },
 ];
 
 /// Look up a palette command by the action it dispatches.

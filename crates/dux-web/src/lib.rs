@@ -403,6 +403,9 @@ fn run_plain_http(paths: DuxPaths, plan: ServerPlan, version: String) -> Result<
     } = plan;
     warn_if_ui_not_built();
     let engine = bootstrap::bootstrap_engine(&paths)?;
+    // Now that the single-instance lock is held: reconcile the shared AMQ
+    // registry and let agent launches reserve their inbox. Never fatal.
+    dux_core::peer::init_for_process(&paths);
     // Build the vite-style CLI console (color from [server] color) + the access-log
     // toggle before the engine moves into the actor thread.
     let (console, access_log) = build_console(&engine.config);
@@ -469,6 +472,12 @@ fn run_plain_http(paths: DuxPaths, plan: ServerPlan, version: String) -> Result<
 
         // Spawn the engine on its own std thread (it runs the synchronous engine
         // loop, not a tokio task).
+        //
+        // AMQ starts here and at the flip, not in `spawn_global_workers`: it
+        // claims files from the user's real inject queue, which the many test
+        // engines built on `spawn_engine_thread` must never touch.
+        let mut engine = engine;
+        engine.start_amq();
         let (handle, _join) = engine_actor::spawn_engine_thread(engine);
 
         // The shared shutdown primitive: a SIGINT/SIGTERM or a first-listener
@@ -1788,6 +1797,9 @@ pub fn serve_with_engine(
     let console = Console::capture(activity);
     let (handle, ends) = engine_actor::build_actor_channels(&engine);
     engine_actor::spawn_global_workers(&mut engine);
+    // AMQ is not started here: the flip hands over a TUI engine whose drainer
+    // is already running (`App::start_run_services`), and a test flip must
+    // never claim files from the user's real inject queue.
 
     // Grab the teardown flag before the handle moves into the router. `ServeCore`
     // trips it the instant serving ends (before axum graceful shutdown) so any
@@ -2056,13 +2068,21 @@ pub(crate) fn secondary_loopback_addrs() -> Vec<std::net::IpAddr> {
     found
 }
 
-/// The first [`secondary_loopback_addrs`] entry this process can actually bind,
-/// which is the only proof that matters: an address can be listed and still be
-/// unusable.
+/// The first second-loopback address this process can actually bind, which is
+/// the only proof that matters: an address can be listed and still be
+/// unusable, and it can be usable without being listed.
+///
+/// `127.0.0.2` is tried FIRST, before asking the interface list. On Linux the
+/// whole 127.0.0.0/8 range binds with no configuration, but `ifconfig` there
+/// shows only `127.0.0.1` on `lo`, so interface discovery alone would find
+/// nothing and every two-leg test would silently stop running on the platform
+/// CI uses. CI caught exactly that. Discovery is the fallback for macOS, where
+/// 127.0.0.2 is refused unless an alias was configured.
 #[cfg(test)]
 pub(crate) fn bindable_secondary_loopback() -> Option<std::net::IpAddr> {
-    secondary_loopback_addrs()
-        .into_iter()
+    let direct = std::net::IpAddr::from([127, 0, 0, 2]);
+    std::iter::once(direct)
+        .chain(secondary_loopback_addrs())
         .find(|ip| std::net::TcpListener::bind((*ip, 0)).is_ok())
 }
 
@@ -2928,6 +2948,11 @@ mod live_tailscale_mode_tests {
 
     #[tokio::test]
     async fn switching_to_no_drops_the_leg_stops_the_watcher_and_closes_the_host_rule() {
+        if skip_without_leg_ip(
+            "switching_to_no_drops_the_leg_stops_the_watcher_and_closes_the_host_rule",
+        ) {
+            return;
+        }
         let (_primary, primary_addr) = primary_listener();
         let leg = SocketAddr::new(leg_ip(), primary_addr.port());
         let h = Harness::start(
@@ -3042,6 +3067,9 @@ mod live_tailscale_mode_tests {
 
     #[tokio::test]
     async fn switching_from_yes_to_auto_keeps_the_leg_that_is_already_serving() {
+        if skip_without_leg_ip("switching_from_yes_to_auto_keeps_the_leg_that_is_already_serving") {
+            return;
+        }
         let (_primary, primary_addr) = primary_listener();
         let leg = SocketAddr::new(leg_ip(), primary_addr.port());
         let h = Harness::start(
@@ -3064,6 +3092,9 @@ mod live_tailscale_mode_tests {
 
     #[tokio::test]
     async fn a_run_started_with_no_tailscale_refuses_and_changes_nothing() {
+        if skip_without_leg_ip("a_run_started_with_no_tailscale_refuses_and_changes_nothing") {
+            return;
+        }
         let (_primary, primary_addr) = primary_listener();
         let h = Harness::start(
             TailscaleMode::No,
