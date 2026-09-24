@@ -2,7 +2,7 @@
 //!
 //! Every branch, path, file, command, and agent, project, terminal or provider
 //! name a dialog sentence carries renders as one span in the theme's
-//! `name_fg` on `name_bg`, padded by one no-break cell on each side, with no bold and no
+//! `name_fg` on `name_bg`, padded by one cell on each side, with no bold and no
 //! quotes: the chip is the delimiter. A padded chip is exactly as wide as the
 //! quoted text it replaces, so a sentence that used to quote its names keeps
 //! its width. It is the terminal counterpart of the web's inline code chip.
@@ -15,22 +15,18 @@ use dux_core::prose::{Prose, ProseSegment};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use super::wrap_lines::NO_BREAK_SPACE;
 use crate::theme::Theme;
 
 /// One name as a chip.
 ///
-/// The padding is the no-break space, so a wrapping body moves the chip to the
-/// next row whole instead of breaking at a pad and starting the row with a
-/// chip that has lost its left edge. ratatui's own wrapper and
-/// [`super::wrap_styled_lines`] both refuse to break there. The cost is that a
-/// selection copied out of the host terminal carries U+00A0 at the edges of a
-/// name when it takes the padding with it.
+/// The padding is an ordinary space, so a name copied out of the host
+/// terminal carries nothing invisible. What keeps the chip whole when a body
+/// wraps is [`super::wrap_styled_lines`], which treats a span in the chip style
+/// as one unbreakable unit, inner spaces and pads included. A chip must
+/// therefore reach the screen through that wrapper: ratatui's own `Wrap` would
+/// break at a pad or between the words of "My Cool Project".
 pub(crate) fn name_chip(name: &str, theme: &Theme) -> Span<'static> {
-    Span::styled(
-        format!("{NO_BREAK_SPACE}{name}{NO_BREAK_SPACE}"),
-        theme.name_style(),
-    )
+    Span::styled(format!(" {name} "), theme.name_style())
 }
 
 /// A sentence as spans: constant words in `text_style`, every name as a chip.
@@ -105,7 +101,10 @@ mod tests {
     #[test]
     fn a_name_is_padded_by_one_cell_in_the_chip_colors_and_never_bold() {
         let chip = name_chip("feat/login", &theme());
-        assert_eq!(chip.content, "\u{a0}feat/login\u{a0}");
+        assert_eq!(
+            chip.content, " feat/login ",
+            "the pads are ordinary spaces, so a copied name carries nothing invisible"
+        );
         assert_eq!(chip.style.fg, Some(Color::Rgb(1, 2, 3)));
         assert_eq!(chip.style.bg, Some(Color::Rgb(4, 5, 6)));
         assert!(!chip.style.add_modifier.contains(Modifier::BOLD));
@@ -132,13 +131,7 @@ mod tests {
         let contents: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(
             contents,
-            vec![
-                "Delete ",
-                "\u{a0}feat/login\u{a0}",
-                " in ",
-                "\u{a0}~/src/dux\u{a0}",
-                "?"
-            ]
+            vec!["Delete ", " feat/login ", " in ", " ~/src/dux ", "?"]
         );
         assert_eq!(spans[0].style, text);
         assert_eq!(spans[1].style, theme().name_style());
@@ -152,7 +145,7 @@ mod tests {
         let label = Style::default().fg(Color::Gray);
         let line = labelled_name(" Agent: ", "feat/login", label, &theme());
         let contents: Vec<&str> = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(contents, vec![" Agent: ", "\u{a0}feat/login\u{a0}"]);
+        assert_eq!(contents, vec![" Agent: ", " feat/login "]);
         assert_eq!(line.spans[0].style, label);
         assert_eq!(line.spans[1].style, theme().name_style());
     }
@@ -172,11 +165,7 @@ mod tests {
             .collect();
         assert_eq!(
             texts,
-            vec![
-                " Recreate at \u{a0}~/wt\u{a0}?",
-                " ",
-                " If branch \u{a0}main\u{a0} exists."
-            ]
+            vec![" Recreate at  ~/wt ?", " ", " If branch  main  exists."]
         );
         assert_eq!(lines[2].spans[2].style, theme().name_style());
     }

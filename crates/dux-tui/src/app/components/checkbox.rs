@@ -110,7 +110,7 @@ impl<'a> Checkbox<'a> {
                 .collect(),
             CheckboxLabel::Prose(prose, theme) => {
                 let sentence = prose_lines(prose, "", label_style, theme);
-                let wrapped = wrap_styled_lines(&sentence, label_width);
+                let wrapped = wrap_styled_lines(&sentence, label_width, theme);
                 if wrapped.is_empty() {
                     vec![Vec::new()]
                 } else {
@@ -345,7 +345,7 @@ mod tests {
             .collect();
         assert_eq!(
             rows,
-            vec![" [x] Also delete the", "     branch \u{a0}feat/login\u{a0}"]
+            vec![" [x] Also delete the", "     branch  feat/login "]
         );
         assert_eq!(layout.height, 2);
         let chip = layout.lines[1]

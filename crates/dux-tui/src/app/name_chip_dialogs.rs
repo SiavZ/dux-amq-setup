@@ -84,7 +84,7 @@ fn assert_chipped(app: &App, buf: &Buffer, name: &str) {
             let cell = &buf[(pad, y)];
             assert_eq!(
                 (cell.symbol(), cell.bg),
-                ("\u{a0}", theme.name_bg),
+                (" ", theme.name_bg),
                 "{name:?} at ({x},{y}) has no chip padding at column {pad}:\n{shown}"
             );
         }
@@ -167,6 +167,39 @@ fn the_checkout_default_branch_dialog_chips_the_project_and_its_base() {
     );
     assert_chipped(&app, &buf, "proj-co");
     assert_chipped(&app, &buf, "base-co");
+}
+
+/// A name with spaces in it is one chip: at every width the dialog can be
+/// drawn at, the whole name sits on one row between its two pads, whatever
+/// the wrap does to the words around it.
+#[test]
+fn a_multi_word_name_is_never_split_across_rows() {
+    for width in 24..=90u16 {
+        let mut app = test_app(default_bindings());
+        app.prompt = PromptState::ConfirmCheckoutDefaultBranch {
+            project_id: "p1".to_string(),
+            project_name: "My Cool Project".to_string(),
+            stored_base: Some("base-co".to_string()),
+            focus: ConfirmFocus::Cancel,
+        };
+        let buf = render_at(&mut app, width, HEIGHT);
+        assert_chipped(&app, &buf, "My Cool Project");
+
+        // A fixed-size dialog, whose body the renderer wraps at paint time. Its
+        // body is a share of the screen, so below this width the chip is wider
+        // than a whole row and has to be cut, which no wrapper can avoid.
+        if width < 44 {
+            continue;
+        }
+        app.prompt = PromptState::ConfirmDeleteTerminal {
+            terminal_id: "t1".to_string(),
+            terminal_label: "My Cool Terminal".to_string(),
+            foreground_cmd: Some("vim".to_string()),
+            focus: ConfirmFocus::Cancel,
+        };
+        let buf = render_at(&mut app, width, HEIGHT);
+        assert_chipped(&app, &buf, "My Cool Terminal");
+    }
 }
 
 #[test]
@@ -399,7 +432,7 @@ fn assert_chipped_on_row(app: &App, buf: &Buffer, row_marker: &str, name: &str) 
         for pad in [x.checked_sub(1), Some(x + len)].into_iter().flatten() {
             assert_eq!(
                 (buf[(pad, y)].symbol(), buf[(pad, y)].bg),
-                ("\u{a0}", theme.name_bg),
+                (" ", theme.name_bg),
                 "{name:?} at ({x},{y}) has no chip padding:\n{shown}"
             );
         }
@@ -685,4 +718,53 @@ fn the_macro_dialogs_chip_the_macro() {
         },
     );
     assert_chipped(&app, &buf, "macro-ed");
+}
+
+/// The production half of a source file: everything before its test module.
+fn production_source(source: &str) -> &str {
+    source
+        .find("#[cfg(test)]\nmod tests")
+        .map_or(source, |end| &source[..end])
+}
+
+/// ratatui's `Wrap` breaks at a chip's pads and between the words of a
+/// multi-word name, so a body that can carry a chip must be pre-wrapped by the
+/// shared wrapper instead. A paragraph that genuinely never carries one says
+/// so on the line before, with its reason.
+#[test]
+fn no_paragraph_that_can_carry_a_chip_is_wrapped_by_ratatui() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut stack = vec![src];
+    let mut offenders = Vec::new();
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read src") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("read source");
+            let lines: Vec<&str> = production_source(&source).lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                if !line.contains(concat!(".wrap(", "Wrap {")) {
+                    continue;
+                }
+                let reasoned = index
+                    .checked_sub(1)
+                    .is_some_and(|prev| lines[prev].contains("chip-free:"));
+                if !reasoned {
+                    offenders.push(format!("{}:{}", path.display(), index + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these paragraphs wrap with ratatui's Wrap; pre-wrap them with \
+         wrap_styled_lines (render_wrapped_body) or mark them `// chip-free: <reason>`:\n{}",
+        offenders.join("\n")
+    );
 }

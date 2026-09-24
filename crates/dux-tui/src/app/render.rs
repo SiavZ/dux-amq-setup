@@ -1131,14 +1131,26 @@ pub(super) fn indented_body_lines(text: &str, inner_width: u16) -> Vec<String> {
     lines.into_iter().map(|line| format!(" {line}")).collect()
 }
 
+/// Paint a dialog body into `area`, wrapped by the shared wrapper rather than
+/// by the `Paragraph`, so a name chip in it stays whole on one row with both
+/// pads. A body that already fits is painted exactly as it was built.
+fn render_wrapped_body(
+    lines: &[Line<'_>],
+    area: Rect,
+    buf: &mut ratatui::buffer::Buffer,
+    theme: &Theme,
+) {
+    Paragraph::new(wrap_styled_lines(lines, usize::from(area.width), theme)).render(area, buf);
+}
+
 /// A dialog body pre-wrapped to `inner_width`, with its row count.
 ///
 /// The bodies that carry name chips are wrapped here rather than by the
 /// `Paragraph`, because a chip changes where a word ends and the estimate in
 /// [`wrapped_line_count`] counts characters rather than words: a height that is
 /// one row short clips the last line of a body that does not scroll.
-fn exact_body(lines: &[Line<'_>], inner_width: u16) -> (Vec<Line<'static>>, u16) {
-    let wrapped = wrap_styled_lines(lines, usize::from(inner_width));
+fn exact_body(lines: &[Line<'_>], inner_width: u16, theme: &Theme) -> (Vec<Line<'static>>, u16) {
+    let wrapped = wrap_styled_lines(lines, usize::from(inner_width), theme);
     let height = u16::try_from(wrapped.len()).unwrap_or(u16::MAX);
     (wrapped, height)
 }
@@ -1264,9 +1276,7 @@ impl App {
             ])
             .areas(inner);
 
-        Paragraph::new(body_lines)
-            .wrap(Wrap { trim: false })
-            .render(body_area, frame.buffer_mut());
+        render_wrapped_body(&body_lines, body_area, frame.buffer_mut(), &self.theme);
 
         let btn_width = 16u16;
         let gap = 2u16;
@@ -1332,7 +1342,7 @@ impl App {
     fn prose_body(&self, prose: &Prose, inner_width: u16) -> (Vec<Line<'static>>, u16) {
         let mut lines = vec![Line::from("")];
         lines.extend(prose_lines(prose, " ", Style::default(), &self.theme));
-        exact_body(&lines, inner_width)
+        exact_body(&lines, inner_width, &self.theme)
     }
 
     /// [`indented_body_lines`] for a sentence that names something: every row
@@ -1346,7 +1356,7 @@ impl App {
     ) -> Vec<Line<'static>> {
         let sentence = prose_lines(prose, "", style, &self.theme);
         let width = usize::from(inner_width).saturating_sub(1).max(1);
-        wrap_styled_lines(&sentence, width)
+        wrap_styled_lines(&sentence, width, &self.theme)
             .into_iter()
             .map(|row| {
                 let mut spans = vec![Span::styled(" ", style)];
@@ -2914,7 +2924,7 @@ impl App {
         let sources: Vec<Vec<Line<'static>>> =
             blocks.iter().map(|block| self.card_source(block)).collect();
         let measure = |index: usize, width: u16| {
-            u16::try_from(wrap_styled_lines(&sources[index], width as usize).len())
+            u16::try_from(wrap_styled_lines(&sources[index], width as usize, &self.theme).len())
                 .unwrap_or(u16::MAX)
         };
 
@@ -2944,7 +2954,7 @@ impl App {
         // line in the wrong place.
         let wrapped: Vec<Vec<Line<'static>>> = sources
             .iter()
-            .map(|source| wrap_styled_lines(source, plan.content_width as usize))
+            .map(|source| wrap_styled_lines(source, plan.content_width as usize, &self.theme))
             .collect();
         self.paint_pane_card(frame, title, &plan, blocks, &wrapped, &kept)
     }
@@ -3244,7 +3254,7 @@ impl App {
             render_centered_lines(
                 frame.buffer_mut(),
                 Rect::new(tip_x, tip_y, tip_width, TIP_MAX_LINES),
-                &wrap_styled_lines(&[tip_line], usize::from(tip_width)),
+                &wrap_styled_lines(&[tip_line], usize::from(tip_width), &self.theme),
                 Style::default(),
             );
         }
@@ -3904,6 +3914,7 @@ impl App {
                 Style::default().fg(self.theme.hint_desc_fg),
             ))],
             prose_w as usize,
+            &self.theme,
         );
         let prose_rows = u16::try_from(prose_lines.len()).unwrap_or(u16::MAX);
 
@@ -4999,6 +5010,7 @@ impl App {
         let (status_line, status_bg) = self.footer_status_line(status_area);
         Paragraph::new(status_line)
             .style(Style::default().bg(status_bg))
+            // chip-free: the status line is outside the chip rule, names and all.
             .wrap(Wrap { trim: false })
             .render(status_area, frame.buffer_mut());
     }
@@ -5411,7 +5423,7 @@ impl App {
         // clamp below is built from the line count, and a wrapping paragraph
         // renders more rows than it has lines without reporting how many.
         // Pre-wrapping makes `wrapped.len()` the rendered height by construction.
-        let wrapped = wrap_styled_lines(&lines, content_area.width as usize);
+        let wrapped = wrap_styled_lines(&lines, content_area.width as usize, &self.theme);
 
         // Track content size for scroll clamping in input handler.
         let total_lines = u16::try_from(wrapped.len()).unwrap_or(u16::MAX);
@@ -6830,7 +6842,7 @@ impl App {
                 &self.theme,
             )),
         }
-        let (body_lines, body_height) = exact_body(&body_lines, inner_width);
+        let (body_lines, body_height) = exact_body(&body_lines, inner_width, &self.theme);
         let checkbox_spacing = u16::from(has_checkbox);
         let area = centered_rect_exact(
             dialog_width,
@@ -6855,9 +6867,7 @@ impl App {
             ])
             .areas(inner);
 
-        Paragraph::new(body_lines)
-            .wrap(Wrap { trim: false })
-            .render(body_area, frame.buffer_mut());
+        render_wrapped_body(&body_lines, body_area, frame.buffer_mut(), &self.theme);
 
         let checkbox_rect = if has_checkbox {
             let checkbox_state = if prompt.focus == DeleteWorktreeFocus::Checkbox {
@@ -7283,9 +7293,7 @@ impl App {
                 Style::default().fg(self.theme.hint_desc_fg),
             )),
         ];
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .render(body_area, frame.buffer_mut());
+        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
 
         let btn_width = 16u16;
         let gap = 2u16;
@@ -7591,9 +7599,7 @@ impl App {
             .constraints([Constraint::Length(body_height), Constraint::Length(3)])
             .areas(inner);
 
-        Paragraph::new(body_lines)
-            .wrap(Wrap { trim: false })
-            .render(body_area, frame.buffer_mut());
+        render_wrapped_body(&body_lines, body_area, frame.buffer_mut(), &self.theme);
 
         let btn_width = shared_button_width(&["Close"]);
         let close_area = Rect {
@@ -7664,9 +7670,7 @@ impl App {
                 Style::default().fg(self.theme.warning_fg),
             )));
         }
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .render(body_area, frame.buffer_mut());
+        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
 
         let btn_width = 16u16;
         let gap = 2u16;
@@ -7771,7 +7775,7 @@ impl App {
         // exactly where the promotion sentence has to be readable.
         let dialog_width = 60u16.min(frame.area().width.max(1));
         let inner_width = dialog_width.saturating_sub(2);
-        let (lines, body_height) = exact_body(&lines, inner_width);
+        let (lines, body_height) = exact_body(&lines, inner_width, &self.theme);
         let area = centered_rect_exact(dialog_width, 2 + body_height + 1 + 3, frame.area());
         self.clear_overlay_area(frame, area);
         let outer = self.themed_overlay_block("Close Tab");
@@ -7787,9 +7791,7 @@ impl App {
             ])
             .areas(inner);
 
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .render(body_area, frame.buffer_mut());
+        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
 
         let btn_width = 16u16;
         let gap = 2u16;
@@ -7876,9 +7878,7 @@ impl App {
             ])
             .areas(inner);
 
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .render(body_area, frame.buffer_mut());
+        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
 
         let btn_width = 16u16;
         let gap = 2u16;
@@ -7971,9 +7971,7 @@ impl App {
             ])
             .areas(inner);
 
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .render(body_area, frame.buffer_mut());
+        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
 
         let btn_width = 16u16;
         let gap = 2u16;
@@ -8057,9 +8055,7 @@ impl App {
             ])
             .areas(inner);
 
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .render(body_area, frame.buffer_mut());
+        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
 
         let btn_width = shared_button_width(&["Cancel", CHECKOUT_DEFAULT_BRANCH_LABEL]);
         let gap = 2u16;
@@ -8154,9 +8150,7 @@ impl App {
                 Style::default().fg(self.theme.hint_desc_fg),
             )),
         ];
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .render(body_area, frame.buffer_mut());
+        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
 
         let btn_width = 16u16;
         let gap = 2u16;
@@ -8238,9 +8232,7 @@ impl App {
                 Style::default().fg(self.theme.warning_fg),
             )),
         ];
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .render(body_area, frame.buffer_mut());
+        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
 
         let btn_width = 16u16;
         let gap = 2u16;
@@ -8324,9 +8316,7 @@ impl App {
                 Style::default().fg(self.theme.hint_desc_fg),
             )),
         ];
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .render(body_area, frame.buffer_mut());
+        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
 
         let btn_width = 22u16;
         let gap = 2u16;
@@ -8431,9 +8421,7 @@ impl App {
             " Your existing files are left untouched (untracked).",
             Style::default().fg(self.theme.hint_desc_fg),
         )));
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .render(body_area, frame.buffer_mut());
+        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
 
         let btn_width = 22u16;
         let gap = 2u16;
@@ -8622,9 +8610,7 @@ impl App {
             ])
             .areas(inner);
 
-        Paragraph::new(body_lines)
-            .wrap(Wrap { trim: false })
-            .render(body_area, frame.buffer_mut());
+        render_wrapped_body(&body_lines, body_area, frame.buffer_mut(), &self.theme);
 
         let checkbox_rect = if has_checkbox {
             let BranchWarningKind::Known { default_branch } = kind else {
@@ -8756,9 +8742,7 @@ impl App {
             " allowing you to continue working on it.",
             Style::default().fg(self.theme.warning_fg),
         )));
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .render(body_area, frame.buffer_mut());
+        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
 
         let btn_width = 16u16;
         let gap = 2u16;
@@ -10011,6 +9995,7 @@ impl App {
             Span::raw("  "),
         ]);
         Paragraph::new(legend)
+            // chip-free: a fixed legend of constant words, never a name.
             .wrap(Wrap { trim: false })
             .render(legend_area, frame.buffer_mut());
 
@@ -10300,9 +10285,7 @@ impl App {
             ])
             .areas(inner);
 
-        Paragraph::new(body_lines)
-            .wrap(Wrap { trim: false })
-            .render(body_area, frame.buffer_mut());
+        render_wrapped_body(&body_lines, body_area, frame.buffer_mut(), &self.theme);
 
         let checkbox_rect = if offers_checkbox {
             let checkbox_state = if *focus == DeleteAgentFocus::WorktreeCheckbox {
@@ -11275,9 +11258,7 @@ impl App {
             ]),
             Line::from(""),
         ];
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .render(body_area, frame.buffer_mut());
+        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
 
         let btn_width = 16u16;
         let gap = 2u16;
@@ -11912,7 +11893,7 @@ impl App {
         // scroll clamp and the marker are measured in. A wrapping paragraph draws
         // more rows than it has lines and never reports how many, the trap the
         // help page hit, where the bottom of the page was unreachable.
-        let wrapped = wrap_styled_lines(&body_lines, inner_width as usize);
+        let wrapped = wrap_styled_lines(&body_lines, inner_width as usize, &self.theme);
         let total_rows = u16::try_from(wrapped.len()).unwrap_or(u16::MAX);
 
         // Cap the message pane so the dialog still fits the terminal WITH its
@@ -13117,7 +13098,7 @@ mod tests {
     use crate::pty::PtyClient;
 
     /// How `prose` reads on screen: its words, and every name as the chip's
-    /// text (the name between its two no-break pads), quotes gone.
+    /// text (the name between its two pads), quotes gone.
     fn on_screen(prose: &Prose) -> String {
         prose
             .segments()
@@ -13125,7 +13106,7 @@ mod tests {
             .map(|segment| match segment {
                 dux_core::prose::ProseSegment::Text(text) => text.clone(),
                 dux_core::prose::ProseSegment::Name { name, .. } => {
-                    format!("\u{a0}{name}\u{a0}")
+                    format!(" {name} ")
                 }
             })
             .collect()
@@ -20456,7 +20437,7 @@ mod tests {
                 })
                 .expect("render frame");
 
-            let wrapped = wrap_styled_lines(&lines, width as usize);
+            let wrapped = wrap_styled_lines(&lines, width as usize, &app.theme);
             let mut ours = Terminal::new(TestBackend::new(width, height)).expect("terminal");
             ours.draw(|frame| {
                 Paragraph::new(wrapped.clone()).render(frame.area(), frame.buffer_mut());
@@ -23164,7 +23145,7 @@ mod tests {
             "the modal must name what it creates:\n{screen}"
         );
         assert!(
-            screen.contains("defaults to \u{a0}notes\u{a0}"),
+            screen.contains("defaults to  notes "),
             "an empty field must promise the folder's own name:\n{screen}"
         );
         assert!(
@@ -23613,10 +23594,7 @@ mod tests {
             !title.contains('\u{2014}'),
             "shipped title still holds an em-dash: {title:?}"
         );
-        assert!(
-            title.contains("Edit Macro: \u{a0}greet\u{a0}"),
-            "got {title:?}"
-        );
+        assert!(title.contains("Edit Macro:  greet "), "got {title:?}");
     }
 
     /// A drifted agent gives up two branches, and the box names both: the one
@@ -24121,8 +24099,11 @@ mod tests {
         let column = rows[first][..byte].chars().count();
         for row in &rows[first..=last] {
             let cells: Vec<char> = row.chars().collect();
+            // A row may open on a chip, whose left pad is an ordinary space
+            // followed by the name: that is the chip, not a deeper indent.
+            let indented_further = cells[column] == ' ' && cells[column + 1] == ' ';
             assert_eq!(
-                (cells[column - 2], cells[column - 1], cells[column] == ' '),
+                (cells[column - 2], cells[column - 1], indented_further),
                 ('│', ' ', false),
                 "every warning row starts one column in from the frame, {row:?} does not:\n{screen}"
             );
@@ -24978,7 +24959,7 @@ mod tests {
         let (text, fg, _) = render_branch_dialog(&mut app, "feature", true);
 
         assert!(
-            text.contains("New worktrees will branch from \u{a0}main\u{a0}."),
+            text.contains("New worktrees will branch from  main ."),
             "{text}"
         );
         assert_ne!(fg, app.theme.warning_fg, "the default branch is no warning");
@@ -24991,7 +24972,7 @@ mod tests {
         let (text, fg, _) = render_branch_dialog(&mut app, "feature", false);
 
         assert!(
-            text.contains("New worktrees will branch from \u{a0}feature\u{a0}."),
+            text.contains("New worktrees will branch from  feature ."),
             "{text}"
         );
         assert_eq!(fg, app.theme.warning_fg);

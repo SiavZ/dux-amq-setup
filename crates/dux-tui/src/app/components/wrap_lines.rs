@@ -15,12 +15,18 @@
 //!   the whitespace that fits in the row it just ended.
 //! - A word too long to fit a row is hard-broken at the row edge.
 //! - Every span keeps its own style; a wrapped row can carry several.
+//! - A name chip (a span in the theme's name style) is one unbreakable unit,
+//!   spaces inside it and its two padding cells included, so a multi-word name
+//!   moves to the next row whole rather than splitting or losing a pad. This is
+//!   the one rule ratatui's own wrapper has no way to express.
 //!
 //! Not [`crate::diff::wrap_diff_lines`], which is diff-specific: it re-emits
 //! the line-number gutter on every continuation row and indents past it.
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+
+use crate::theme::Theme;
 
 /// Display width of `s`, via ratatui's own unicode-width measurement, so the
 /// wrapper agrees with the renderer about how wide a CJK glyph or an emoji is.
@@ -48,20 +54,29 @@ pub(crate) fn char_display_width(c: char) -> usize {
 /// without `Wrap` puts exactly one on each row and `result.len()` is the
 /// rendered height. A `width` of 0 yields nothing, matching a `Paragraph`
 /// given no room.
-pub(crate) fn wrap_styled_lines(lines: &[Line<'_>], width: usize) -> Vec<Line<'static>> {
+///
+/// `theme` names the chip style: every span drawn in it is kept whole. Every
+/// caller passes it, chips or not, so no body can be wrapped by a wrapper that
+/// forgot about them.
+pub(crate) fn wrap_styled_lines(
+    lines: &[Line<'_>],
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     if width == 0 {
         return Vec::new();
     }
+    let chip = theme.name_style();
     let mut out: Vec<Line<'static>> = Vec::with_capacity(lines.len());
     for line in lines {
-        wrap_one(line, width, &mut out);
+        wrap_one(line, width, chip, &mut out);
     }
     out
 }
 
 /// Whether a row may break at `ch`. Whitespace does, except the no-break
 /// space, which glues its neighbours exactly as ratatui's own wrapper treats
-/// it: the name chip pads a name with it so the chip wraps as one piece.
+/// it.
 fn breaks_a_row(ch: char) -> bool {
     ch.is_whitespace() && ch != NO_BREAK_SPACE
 }
@@ -70,7 +85,7 @@ fn breaks_a_row(ch: char) -> bool {
 pub(crate) const NO_BREAK_SPACE: char = '\u{a0}';
 
 /// Append the wrapped rows of a single line.
-fn wrap_one(line: &Line<'_>, width: usize, out: &mut Vec<Line<'static>>) {
+fn wrap_one(line: &Line<'_>, width: usize, chip: Style, out: &mut Vec<Line<'static>>) {
     // Already fits: emit it verbatim, spans and all, so the common case stays
     // byte-identical to the un-wrapped paragraph, styled trailing padding included.
     if line.width() <= width {
@@ -82,8 +97,11 @@ fn wrap_one(line: &Line<'_>, width: usize, out: &mut Vec<Line<'static>>) {
     let mut word: Vec<(char, Style)> = Vec::new();
     let mut word_width = 0usize;
     for span in &line.spans {
+        // A chip joins the word it touches, pads and inner spaces alike, so
+        // the only break points around it are the whitespace outside it.
+        let whole = span.style == chip;
         for ch in span.content.chars() {
-            if breaks_a_row(ch) {
+            if !whole && breaks_a_row(ch) {
                 if !word.is_empty() {
                     wrapper.push_word(std::mem::take(&mut word), word_width);
                     word_width = 0;
@@ -253,6 +271,7 @@ fn cells_to_line(cells: Vec<(char, Style)>) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::Theme;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::{Color, Modifier};
@@ -265,7 +284,7 @@ mod tests {
     #[test]
     fn a_line_that_fits_is_untouched() {
         let lines = vec![Line::from("short enough")];
-        let wrapped = wrap_styled_lines(&lines, 20);
+        let wrapped = wrap_styled_lines(&lines, 20, &Theme::default_dark());
         assert_eq!(texts(&wrapped), vec!["short enough".to_string()]);
     }
 
@@ -273,13 +292,16 @@ mod tests {
     fn empty_and_blank_lines_survive_as_rows() {
         // A blank line is a row: dropping it would shift every offset below it.
         let lines = vec![Line::from(""), Line::from("x"), Line::from("")];
-        assert_eq!(wrap_styled_lines(&lines, 10).len(), 3);
+        assert_eq!(
+            wrap_styled_lines(&lines, 10, &Theme::default_dark()).len(),
+            3
+        );
     }
 
     #[test]
     fn wrapping_breaks_at_whitespace_and_drops_the_break_space() {
         let lines = vec![Line::from("aaa bbb ccc")];
-        let wrapped = wrap_styled_lines(&lines, 7);
+        let wrapped = wrap_styled_lines(&lines, 7, &Theme::default_dark());
         assert_eq!(texts(&wrapped), vec!["aaa bbb".to_string(), "ccc".into()]);
     }
 
@@ -288,7 +310,7 @@ mod tests {
         // This is what `trim: false` does, and what the help overlay's two-space
         // keybinding indent relies on. Continuation rows are NOT re-indented.
         let lines = vec![Line::from("  alpha beta gamma")];
-        let wrapped = wrap_styled_lines(&lines, 12);
+        let wrapped = wrap_styled_lines(&lines, 12, &Theme::default_dark());
         assert_eq!(
             texts(&wrapped),
             vec!["  alpha beta".to_string(), "gamma".into()]
@@ -298,7 +320,7 @@ mod tests {
     #[test]
     fn an_overlong_word_is_hard_broken_at_the_row_edge() {
         let lines = vec![Line::from("abcdefghij")];
-        let wrapped = wrap_styled_lines(&lines, 4);
+        let wrapped = wrap_styled_lines(&lines, 4, &Theme::default_dark());
         assert_eq!(
             texts(&wrapped),
             vec!["abcd".to_string(), "efgh".into(), "ij".into()]
@@ -315,7 +337,7 @@ mod tests {
             Line::from("supercalifragilisticexpialidocious-".repeat(4)),
         ];
         for width in [1usize, 3, 7, 12, 40, 55] {
-            for line in wrap_styled_lines(&lines, width) {
+            for line in wrap_styled_lines(&lines, width, &Theme::default_dark()) {
                 assert!(
                     line.width() <= width,
                     "row {:?} is {} wide, over the {width}-column limit",
@@ -336,7 +358,7 @@ mod tests {
             Span::styled("<Ctrl-g>", key),
             Span::styled(" exit the typed path mode", desc),
         ])];
-        let wrapped = wrap_styled_lines(&lines, 14);
+        let wrapped = wrap_styled_lines(&lines, 14, &Theme::default_dark());
         assert_eq!(
             texts(&wrapped),
             vec![
@@ -358,7 +380,7 @@ mod tests {
         // Four CJK glyphs are eight columns wide, so a six-column row holds
         // three of them.
         let lines = vec![Line::from("日本語です")];
-        let wrapped = wrap_styled_lines(&lines, 6);
+        let wrapped = wrap_styled_lines(&lines, 6, &Theme::default_dark());
         assert_eq!(texts(&wrapped), vec!["日本語".to_string(), "です".into()]);
         for line in &wrapped {
             assert!(line.width() <= 6);
@@ -368,7 +390,7 @@ mod tests {
     #[test]
     fn zero_width_yields_nothing() {
         // A paragraph with no room renders no rows, so the count must be 0 too.
-        assert!(wrap_styled_lines(&[Line::from("anything")], 0).is_empty());
+        assert!(wrap_styled_lines(&[Line::from("anything")], 0, &Theme::default_dark()).is_empty());
     }
 
     /// The appearance guarantee, MEASURED rather than argued: pre-wrapping and
@@ -424,7 +446,7 @@ mod tests {
                 })
                 .expect("draw");
 
-            let wrapped = wrap_styled_lines(&lines, width as usize);
+            let wrapped = wrap_styled_lines(&lines, width as usize, &Theme::default_dark());
             let mut ours = Terminal::new(TestBackend::new(width, height)).expect("term");
             ours.draw(|frame| {
                 Paragraph::new(wrapped.clone()).render(frame.area(), frame.buffer_mut());
@@ -446,8 +468,7 @@ mod tests {
     }
 
     /// A no-break space glues what is on either side of it, as it does in
-    /// ratatui's own wrapper, so a name chip padded with it wraps as one piece
-    /// and never starts a row without its left padding.
+    /// ratatui's own wrapper.
     #[test]
     fn a_no_break_space_never_breaks_a_row() {
         let chip = Style::default().bg(Color::Blue);
@@ -456,7 +477,7 @@ mod tests {
             Span::styled("\u{a0}feat/login\u{a0}", chip),
             Span::raw(" to stop"),
         ]);
-        let wrapped = wrap_styled_lines(std::slice::from_ref(&line), 20);
+        let wrapped = wrap_styled_lines(std::slice::from_ref(&line), 20, &Theme::default_dark());
         assert_eq!(
             texts(&wrapped),
             vec!["ask the agent", "\u{a0}feat/login\u{a0} to stop"]
@@ -477,6 +498,26 @@ mod tests {
         }
     }
 
+    /// A chip is one unit: a name with spaces inside it, padded by ordinary
+    /// spaces, moves to the next row whole and keeps both pads, instead of
+    /// breaking at a pad or between its words.
+    #[test]
+    fn a_chip_is_never_broken_inside_or_at_its_padding() {
+        let theme = crate::theme::Theme::default_dark();
+        let line = Line::from(vec![
+            Span::raw("ask the agent "),
+            Span::styled(" My Cool Project ", theme.name_style()),
+            Span::raw(" to stop"),
+        ]);
+        let wrapped = wrap_styled_lines(std::slice::from_ref(&line), 20, &theme);
+        assert_eq!(
+            texts(&wrapped),
+            vec!["ask the agent", " My Cool Project  to", "stop"]
+        );
+        assert_eq!(wrapped[1].spans[0].content, " My Cool Project ");
+        assert_eq!(wrapped[1].spans[0].style, theme.name_style());
+    }
+
     /// The one place this wrapper deliberately differs from `Wrap { trim: false
     /// }`, recorded so it is a decision rather than a surprise.
     ///
@@ -489,7 +530,10 @@ mod tests {
     #[test]
     fn trailing_whitespace_overflow_does_not_earn_a_second_row() {
         let line = Line::from("text                                  ");
-        assert_eq!(wrap_styled_lines(std::slice::from_ref(&line), 10).len(), 1);
+        assert_eq!(
+            wrap_styled_lines(std::slice::from_ref(&line), 10, &Theme::default_dark()).len(),
+            1
+        );
 
         let mut ratatui_side = Terminal::new(TestBackend::new(10, 4)).expect("term");
         ratatui_side
