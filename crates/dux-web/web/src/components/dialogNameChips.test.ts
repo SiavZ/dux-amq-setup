@@ -5,41 +5,52 @@
 // render, and fails on the two shapes the drift takes: a quote opened right
 // before an interpolation, and a hand-rolled monospace span standing in for the
 // chip. Toasts and the terminal UI are out of scope.
-import { readdirSync, readFileSync } from "node:fs"
+import { readdirSync, readFileSync, statSync } from "node:fs"
+import { join, relative } from "node:path"
 import { fileURLToPath } from "node:url"
 import { describe, expect, it } from "vitest"
 
-const componentsDir = fileURLToPath(new URL(".", import.meta.url))
-const libDir = fileURLToPath(new URL("../lib/", import.meta.url))
+const srcDir = fileURLToPath(new URL("../", import.meta.url))
 
-// The dialogs themselves, found by name so a new one is covered the day it
-// lands, plus the non-dialog files whose strings a dialog renders.
-function scannedFiles(): { name: string; source: string }[] {
-  const dialogs = readdirSync(componentsDir)
-    .filter((f) => /Dialog.*\.tsx$/.test(f) && !f.includes(".test."))
-    .map((f) => ({ name: `components/${f}`, path: componentsDir + f }))
-  const copy = [
-    ["components/createAgentDialogView.ts", componentsDir + "createAgentDialogView.ts"],
-    ["components/startupLogsCopy.ts", componentsDir + "startupLogsCopy.ts"],
-    ["lib/addProjectWarning.ts", libDir + "addProjectWarning.ts"],
-    ["lib/checkoutDefaultBranch.ts", libDir + "checkoutDefaultBranch.ts"],
-    ["lib/detachAgent.ts", libDir + "detachAgent.ts"],
-    ["lib/recreateWorkingCopy.ts", libDir + "recreateWorkingCopy.ts"],
-  ].map(([name, path]) => ({ name, path }))
-  return [...dialogs, ...copy].map(({ name, path }) => ({
-    name,
-    source: readFileSync(path, "utf-8"),
-  }))
+function walk(dir: string): string[] {
+  return readdirSync(dir).flatMap((entry) => {
+    const path = join(dir, entry)
+    return statSync(path).isDirectory() ? walk(path) : [path]
+  })
 }
 
-// A quote that opens immediately before a JSX expression or element, or a
-// straight quote opening immediately before a template interpolation, is a quote
-// delimiting a name. A quote around fixed UI words ("Reload config") is not, and
-// is not matched.
-const QUOTE_BEFORE_NAME = /(&ldquo;|“)\s*[{<]|"\$\{/g
-// The ad hoc chip the shared component replaced.
-const HAND_ROLLED_CHIP =
-  /<span\s+className="[^"]*(font-mono[^"]*break-all|break-all[^"]*font-mono)[^"]*"/g
+// A file that builds prose imports the prose helpers; that is how a copy
+// builder is recognised, so a new one is scanned the day it is written.
+const PROSE_IMPORT = /from\s+["'](?:\.\/prose|@\/lib\/prose)["']/
+
+// Which files the guard reads, by rule rather than by list: every dialog under
+// components/ (subdirectories included), found by name, and every file under
+// components/ or lib/ that builds prose. The prose helpers themselves are the
+// definition of a chip, not a user of one.
+function isScanned(name: string, source: string): boolean {
+  if (!/\.tsx?$/.test(name) || name.includes(".test.")) return false
+  if (name === "lib/prose.tsx") return false
+  const isDialog = name.startsWith("components/") && /Dialog[^/]*\.tsx$/.test(name)
+  return isDialog || PROSE_IMPORT.test(source)
+}
+
+function scannedFiles(): { name: string; source: string }[] {
+  return [...walk(join(srcDir, "components")), ...walk(join(srcDir, "lib"))]
+    .map((path) => ({
+      name: relative(srcDir, path),
+      source: readFileSync(path, "utf-8"),
+    }))
+    .filter(({ name, source }) => isScanned(name, source))
+}
+
+// A quote that opens immediately before a JSX expression or element, or before
+// a template interpolation, is a quote delimiting a name: curly or straight,
+// double or single, typed or as an entity. A quote around fixed UI words
+// ("Reload config") is not, and is not matched.
+const QUOTE_BEFORE_NAME =
+  /(&ldquo;|“|&lsquo;|‘|&quot;|&#34;|&#39;|&apos;)[ \t]*[{<]|["'][{<]|["']\$\{/g
+// The ad hoc chip the shared component replaced: any monospace span.
+const HAND_ROLLED_CHIP = /<span\s+className="[^"]*\bfont-mono\b[^"]*"/g
 
 function nameDelimiterViolations(source: string): string[] {
   return [
@@ -63,6 +74,41 @@ const ALLOWED: { file: string; line: string; reason: string }[] = [
     reason:
       "A placeholder is an attribute and can hold no markup, so the quotes are the only delimiter available.",
   },
+  {
+    file: "components/FirstLoadDialog.tsx",
+    line: '<span className="font-mono">{state.notes?.version ?? ""}</span>',
+    reason: "A release number in the heading's badge: a version, not a name in a sentence.",
+  },
+  {
+    file: "components/NewAgentPickerDialog.tsx",
+    line: '<span className="shrink-0 font-mono text-xs text-muted-foreground">',
+    reason: "The trailing label of a picker row, and a row is out of the chip rule's scope.",
+  },
+  {
+    file: "components/TaskManagerDialog.tsx",
+    line: '<span className="whitespace-nowrap font-mono text-xs text-muted-foreground">',
+    reason: "A process row's command detail: a table cell, out of the chip rule's scope.",
+  },
+  {
+    file: "components/TaskManagerDialog.tsx",
+    line: '<span className="whitespace-nowrap font-mono">',
+    reason: "A child process's name in a table cell, out of the chip rule's scope.",
+  },
+  {
+    file: "components/TaskManagerDialog.tsx",
+    line: '<span className="truncate font-mono">',
+    reason: "A child process's name in the phone layout's row, out of the chip rule's scope.",
+  },
+  {
+    file: "components/WorktreesDialog.tsx",
+    line: '<span className="font-mono">{entry.branch_name}</span>',
+    reason: "The tooltip that recovers a truncated worktree row: part of the row, not a sentence.",
+  },
+  {
+    file: "components/WorktreesDialog.tsx",
+    line: '<span className="truncate font-mono text-sm">{entry.branch_name}</span>',
+    reason: "A worktree row that is only its branch: a list row, out of the chip rule's scope.",
+  },
 ]
 
 describe("the name-delimiter detector", () => {
@@ -74,6 +120,18 @@ describe("the name-delimiter detector", () => {
       "`dux will ask \"${label}\" to shut down`",
       '<span className="font-mono break-all">{path}</span>',
       '<span className="break-all font-mono">{path}</span>',
+      '<span className="font-mono">{path}</span>',
+      '<span className="truncate font-mono text-xs">{path}</span>',
+      '<p>Delete "{name}"?</p>',
+      '<p>Delete "<b>{name}</b>"?</p>',
+      "<p>Delete '{name}'?</p>",
+      "`dux will ask '${label}' to shut down`",
+      "Delete &lsquo;{name}&rsquo; now.",
+      "Delete ‘{name}’ now.",
+      "Delete &quot;{name}&quot; now.",
+      "Delete &#34;{name}&#34; now.",
+      "Delete &#39;{name}&#39; now.",
+      "Delete &apos;{name}&apos; now.",
     ]) {
       expect(nameDelimiterViolations(bad), bad).toHaveLength(1)
     }
@@ -85,6 +143,9 @@ describe("the name-delimiter detector", () => {
       "Tick “Use randomized pet name” to autofill",
       "Delete <InlineCode>{path}</InlineCode>?",
       '<p className="truncate font-mono text-sm">{destination}</p>',
+      "The agent&apos;s folder stays where it is.",
+      "Don't {verb} it.",
+      'const label = "Reload config"',
     ]) {
       expect(nameDelimiterViolations(fine), fine).toEqual([])
     }
@@ -95,8 +156,21 @@ describe("every name a modal shows is the shared chip", () => {
   const files = scannedFiles()
 
   it("scans the dialogs and the copy they render", () => {
+    const names = files.map((f) => f.name)
     expect(files.length).toBeGreaterThan(30)
-    expect(files.map((f) => f.name)).toContain("components/DeleteSessionDialog.tsx")
+    expect(names).toContain("components/DeleteSessionDialog.tsx")
+    // Found by the prose import, not by a list.
+    expect(names).toContain("lib/addProjectWarning.ts")
+    expect(names).toContain("components/createAgentDialogView.ts")
+  })
+
+  it("finds dialogs and copy builders by rule", () => {
+    expect(isScanned("components/terminal/SomeDialog.tsx", "")).toBe(true)
+    expect(isScanned("lib/newCopy.ts", 'import { chip } from "./prose"')).toBe(true)
+    expect(isScanned("lib/newCopy.ts", 'import { chip } from "@/lib/prose"')).toBe(true)
+    expect(isScanned("lib/unrelated.ts", 'import { x } from "./y"')).toBe(false)
+    expect(isScanned("components/SomeDialog.test.tsx", "")).toBe(false)
+    expect(isScanned("lib/prose.tsx", "")).toBe(false)
   })
 
   it("has no quote delimiting a name and no hand-rolled chip", () => {
