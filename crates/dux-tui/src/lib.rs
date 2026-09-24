@@ -132,6 +132,25 @@ pub fn run(
         return Ok(TuiExit::Done);
     }
 
+    // `dux session purge|purge-all`: GDPR hard purge. Every mutating form
+    // takes the single-instance lock, so a purge can never race a running dux
+    // that would recreate what it deletes. `--help` and a missing root need no
+    // lock and must not create the root just to take one.
+    if args.first().map(|s| s.as_str()) == Some("session") {
+        let session_args = &args[1..];
+        let _lock = match session_args.first().map(|s| s.as_str()) {
+            Some("purge" | "purge-all") if paths.root.exists() => {
+                Some(acquire_lock_or_exit(&paths.lock_path))
+            }
+            _ => None,
+        };
+        let code = cli::run_session(session_args, &paths)?;
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(TuiExit::Done);
+    }
+
     // TUI: always create the root directory (so the lockfile can be
     // opened), acquire the lock, then let bootstrap create everything
     // else. A losing process never touches shared state beyond the
@@ -159,6 +178,21 @@ pub fn resume_after_server(
     // terminal it is only now taking back.
     engine.discard_passthrough_backlog();
     let app = app::App::resume(*engine)?;
+    run_app(app, companion)
+}
+
+/// Resume the TUI after a reload's `exec` failed, with `reason` on the status
+/// line.
+///
+/// The engine never left this process, so this is the same rebuild as coming
+/// back from the web server: no session relaunch, every provider still live.
+pub fn resume_after_failed_reload(
+    engine: Box<Engine>,
+    companion: Box<dyn dux_core::background_serve::BackgroundServeCompanion>,
+    reason: String,
+) -> Result<TuiExit> {
+    let mut app = app::App::resume(*engine)?;
+    app.set_error(reason);
     run_app(app, companion)
 }
 
@@ -218,7 +252,11 @@ pub fn help_text() -> &'static str {
           dux              Launch the TUI\n\
           dux server       Serve the web UI over the headless engine\n\
           dux config       Manage the configuration file\n\
-          dux doctor       Print a diagnostic dump (--json, --anonymize)\n\n\
+          dux doctor       Print a diagnostic dump (--json, --anonymize)\n\
+          dux --version    Print the version and the git commit it was built from\n\
+          dux peer         Route messages between Dux agent sessions\n\
+                           (`dux peer --help` for send, list, sync-amq)\n\
+          dux session      Permanently purge an agent's data (dux session --help)\n\n\
          Server subcommand:\n\
           dux server                     Serve on the configured host and port\n\
           dux server --bind <ADDR:PORT>  Bind this exact address instead\n\
@@ -291,6 +329,17 @@ mod tests {
         }
     }
 
+    /// `dux peer` is dispatched by the binary and is how agents message each
+    /// other, so the top-level help must name it.
+    #[test]
+    fn help_lists_the_peer_subcommand() {
+        let help = help_text();
+        assert!(
+            help.contains("dux peer"),
+            "--help must name the `dux peer` subcommand:\n{help}"
+        );
+    }
+
     /// The trust model currently appears only deep in the docs. `--help` is the
     /// one place a user is guaranteed to look, so it must say that there is no
     /// login and that everyone who can reach the address shares the workspace.
@@ -305,5 +354,11 @@ mod tests {
             help.contains("shares"),
             "--help must state that reachable clients share the workspace:\n{help}"
         );
+    }
+
+    #[test]
+    fn help_lists_the_version_flag() {
+        let help = help_text();
+        assert!(help.contains("dux --version"), "{help}");
     }
 }

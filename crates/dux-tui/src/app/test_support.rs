@@ -136,7 +136,12 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
         worker_tx.clone(),
     );
     let engine = dux_core::engine::Engine {
-        config: Config::default(),
+        // An existing install (no `[workspace]` section), so the harness keeps
+        // upstream's worktree create flow. Shared-mode tests opt in explicitly.
+        config: Config {
+            workspace: None,
+            ..Config::default()
+        },
         paths,
         session_store,
         projects: vec![project],
@@ -160,6 +165,7 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
         providers: std::collections::HashMap::new(),
         running_provider_pins: std::collections::HashMap::new(),
         launched_drop_paste: Default::default(),
+        watch: Default::default(),
         companion_terminals: std::collections::HashMap::new(),
         agent_tabs: std::collections::HashMap::new(),
         terminating_ptys: Vec::new(),
@@ -209,6 +215,7 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
         agent_viewed: std::collections::HashMap::new(),
         last_foreground_refresh: None,
         limits: Default::default(),
+        amq: Default::default(),
         pending_web_checkout_ops: std::collections::HashMap::new(),
         pending_web_add_project_ops: std::collections::HashMap::new(),
         pending_web_pr_lookup_ops: std::collections::HashMap::new(),
@@ -258,6 +265,7 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
         pending_first_load: None,
         unpushed_count_rx: None,
         notes_fetch_rx: None,
+        orphan_worktrees_rx: None,
         deferred_first_load_notes: None,
         notes_fetch_explicit_request: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
             false,

@@ -15,6 +15,8 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub use crate::amq::config::{AmqConfig, AmqInjectConfig, AmqOrchestratorConfig};
+
 /// Which surface(s) a macro is available on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1192,6 +1194,16 @@ pub struct ProviderCommandConfig {
     /// - `Some(true)`: always forward scroll and page keys to the child.
     /// - `Some(false)`: never forward; always use dux host scrollback.
     pub forward_scroll: Option<bool>,
+    /// Whether a plain LEFT-button press and drag over this provider's pane is
+    /// forwarded to the child once it has turned on mouse reporting. `None`
+    /// (key absent) and `Some(true)` forward, which is the terminal-emulator
+    /// default. `Some(false)` keeps the drag in dux as a text selection (so it
+    /// can be copied) and forwards only a click that did not move, as a press
+    /// plus release sent when the button comes up. Other buttons and the wheel
+    /// are unaffected (the wheel has `forward_scroll`), and Shift still forces a
+    /// dux selection either way. Terminal UI only: the web terminal selects
+    /// through the browser. See [`Self::forwards_mouse`].
+    pub forward_mouse: Option<bool>,
     /// How the WEB UI writes a dropped file's path into this provider's prompt.
     /// The raw config string, parsed at use through [`WebDragDropPaste`] so a typo
     /// degrades gracefully instead of failing the whole config load (the
@@ -1200,6 +1212,13 @@ pub struct ProviderCommandConfig {
     ///
     /// See [`WebDragDropPaste`] for what each form means and which CLI needs which.
     pub web_dragdrop_paste: Option<String>,
+    /// Watch rules for this provider, written as `[[providers.<name>.watch]]`
+    /// array entries. Each rule pairs a regex matched against the agent's
+    /// recent terminal output with an action (send text, or wait until a
+    /// parsed reset time and then send text), a backoff schedule, a cooldown
+    /// and a fire budget. Empty (the default) means no automatic input is ever
+    /// typed into the agent. See [`crate::watch`] for the engine.
+    pub watch: Vec<crate::watch::WatchRule>,
 }
 
 /// The form a dragged and dropped file's path takes when the web UI writes it into
@@ -2026,6 +2045,12 @@ impl Default for ProvidersConfig {
 }
 
 impl ProviderCommandConfig {
+    /// The resolved [`Self::forward_mouse`] policy: forward plain left drags to a
+    /// mouse-reporting child unless the provider explicitly opted out.
+    pub fn forwards_mouse(&self) -> bool {
+        self.forward_mouse.unwrap_or(true)
+    }
+
     pub fn interactive_args(&self, resume_session: bool) -> Vec<String> {
         let mut args = self.args.clone();
         if resume_session
@@ -2259,6 +2284,13 @@ impl ProvidersConfig {
                     if entry.get().web_dragdrop_paste.is_none() {
                         entry.get_mut().web_dragdrop_paste = config.web_dragdrop_paste;
                     }
+                    // Same rule for `forward_mouse`: a config written before the
+                    // key existed gets the shipped policy (claude, codex and
+                    // opencode keep plain drags as dux selections); an explicit
+                    // value wins.
+                    if entry.get().forward_mouse.is_none() {
+                        entry.get_mut().forward_mouse = config.forward_mouse;
+                    }
                 }
             }
         }
@@ -2299,9 +2331,13 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8]
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("curl -fsSL https://claude.ai/install.sh | bash".to_string()),
                 forward_scroll: None,
+                // Keep a plain drag as a dux selection so agent output can be
+                // copied; a click that did not move still reaches the app.
+                forward_mouse: Some(false),
                 // Measured: strips one quote pair then unescapes, so quoting
                 // buys nothing and corrupts an apostrophe.
                 web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
+                watch: Vec::new(),
             },
         ),
         // Cline, Kilo Code and NTL: fork c2c44378. Order is the picker order,
@@ -2324,6 +2360,9 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8]
                 install_hint: Some("npm install -g cline".to_string()),
                 forward_scroll: Some(true),
                 web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
+                // The fork's value (c2c44378): auto mouse policy.
+                forward_mouse: None,
+                watch: Vec::new(),
             },
         ),
         (
@@ -2338,9 +2377,13 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8]
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("brew install --cask codex".to_string()),
                 forward_scroll: None,
+                // Keep a plain drag as a dux selection so agent output can be
+                // copied; a click that did not move still reaches the app.
+                forward_mouse: Some(false),
                 // Measured: falls back to POSIX shell lexing and accepts only a
                 // single token, so a bare path with a space fails silently.
                 web_dragdrop_paste: Some(WebDragDropPaste::SingleQuoted.as_str().to_string()),
+                watch: Vec::new(),
             },
         ),
         (
@@ -2355,8 +2398,12 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8]
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("curl -fsSL https://opencode.ai/install | bash".to_string()),
                 forward_scroll: None,
+                // Keep a plain drag as a dux selection so agent output can be
+                // copied; a click that did not move still reaches the app.
+                forward_mouse: Some(false),
                 // Measured: strips quote characters and never splits on a space.
                 web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
+                watch: Vec::new(),
             },
         ),
         (
@@ -2375,6 +2422,9 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8]
                 install_hint: Some("npm install -g @kilocode/cli".to_string()),
                 forward_scroll: Some(true),
                 web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
+                // The fork's value (c2c44378): auto mouse policy.
+                forward_mouse: None,
+                watch: Vec::new(),
             },
         ),
         (
@@ -2394,6 +2444,9 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8]
                 // A plain line-mode REPL: dux's own scrollback is the history.
                 forward_scroll: Some(false),
                 web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
+                // The fork's value (c2c44378): auto mouse policy.
+                forward_mouse: None,
+                watch: Vec::new(),
             },
         ),
         (
@@ -2412,9 +2465,11 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8]
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("curl -fsSL https://gh.io/copilot-install | bash".to_string()),
                 forward_scroll: None,
+                forward_mouse: None,
                 // NOT measured: Copilot CLI is closed source. `bare` is the
                 // do-nothing option and what two of the three verified CLIs want.
                 web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
+                watch: Vec::new(),
             },
         ),
         (
@@ -2460,9 +2515,11 @@ pub fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 8]
                 // claude/gemini): forward wheel events to it. Host scrollback
                 // is empty for alt-screen apps and reads as a dead wheel.
                 forward_scroll: Some(true),
+                forward_mouse: None,
                 // Measured: jcode strips quotes and unescapes, similar to Claude Code.
                 // Never splits on whitespace, so a space is harmless bare.
                 web_dragdrop_paste: Some(WebDragDropPaste::Bare.as_str().to_string()),
+                watch: Vec::new(),
             },
         ),
     ]
@@ -2834,6 +2891,10 @@ pub struct Config {
     /// renders the section, so only a new install defaults to shared.
     #[serde(default)]
     pub workspace: Option<WorkspaceConfig>,
+    /// The dux-amq companion: the inject-queue drainer and the Orchestrator
+    /// watchdog. See [`crate::amq`].
+    #[serde(default)]
+    pub amq: AmqConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2918,6 +2979,7 @@ impl Default for Config {
             limits: LimitsConfig::default(),
             storage: StorageConfig::default(),
             workspace: Some(WorkspaceConfig::default()),
+            amq: AmqConfig::default(),
         }
     }
 }
@@ -5686,6 +5748,28 @@ mod agent_tabs_cap_tests {
             WebDragDropPaste::Bare,
             "config wins for an explicit preference"
         );
+    }
+
+    /// Fork bc3a9eec shipped `forward_mouse = false` for Claude and Codex (and
+    /// 55ce75f3 for OpenCode) so agent output can be selected and copied. An
+    /// existing config written before the key existed gets that policy through
+    /// `ensure_defaults`; an explicit value wins.
+    #[test]
+    fn ensure_defaults_fills_forward_mouse_but_keeps_an_explicit_value() {
+        let mut config: Config = toml::from_str(
+            "[providers.claude]\ncommand = \"claude\"\n\
+             [providers.codex]\ncommand = \"codex\"\nforward_mouse = true\n",
+        )
+        .expect("parse config");
+        assert_eq!(config.providers.commands["claude"].forward_mouse, None);
+        config.providers.ensure_defaults();
+        assert!(!config.providers.commands["claude"].forwards_mouse());
+        assert!(!config.providers.commands["opencode"].forwards_mouse());
+        assert!(
+            config.providers.commands["codex"].forwards_mouse(),
+            "config wins for an explicit preference"
+        );
+        assert!(config.providers.commands["jcode"].forwards_mouse());
     }
 
     #[test]

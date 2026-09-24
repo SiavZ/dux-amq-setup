@@ -150,6 +150,9 @@ pub enum Action {
     DebugInput,
     ToggleDiffLineNumbers,
     ResourceMonitor,
+    /// Review and remove git-registered worktrees under dux's root that no
+    /// agent (live or soft-deleted) owns. Palette-only, per-item confirmation.
+    PruneOrphanWorktrees,
     ToggleGithubIntegration,
     RecheckGithub,
     ToggleCopyOnSelect,
@@ -212,6 +215,13 @@ pub enum Action {
     MoveTerminalDown,
     MoveTerminalTop,
     MoveTerminalBottom,
+    /// Palette-only: list every watch rule on the live agent tabs with its
+    /// state, and disarm or re-arm the selected one.
+    WatchRules,
+    /// Open the per-session settings modal for the selected agent: context
+    /// mode, YOLO, system prompt, watch-rule overrides, auto-clear, AMQ
+    /// verify override. Default Ctrl-Shift-S (fork d0e601c5).
+    SessionSettings,
 }
 
 impl Action {
@@ -321,6 +331,7 @@ impl Action {
             Action::DebugInput => "debug_input",
             Action::ToggleDiffLineNumbers => "toggle_diff_line_numbers",
             Action::ResourceMonitor => "resource_monitor",
+            Action::PruneOrphanWorktrees => "prune_orphan_worktrees",
             Action::ToggleGithubIntegration => "toggle_github_integration",
             Action::RecheckGithub => "recheck_github",
             Action::ToggleCopyOnSelect => "toggle_copy_on_select",
@@ -355,6 +366,8 @@ impl Action {
             Action::MoveTerminalDown => "move_terminal_down",
             Action::MoveTerminalTop => "move_terminal_top",
             Action::MoveTerminalBottom => "move_terminal_bottom",
+            Action::WatchRules => "watch_rules",
+            Action::SessionSettings => "session_settings",
         }
     }
 
@@ -531,6 +544,9 @@ impl Action {
             Action::DebugInput => "Open input event debugger to inspect keyboard and mouse events.",
             Action::ToggleDiffLineNumbers => "Toggle line numbers in diff view.",
             Action::ResourceMonitor => "Show CPU and memory usage for dux and all running agents.",
+            Action::PruneOrphanWorktrees => {
+                "List Dux-root Git worktrees with no active or tombstoned session."
+            }
             Action::ToggleGithubIntegration => "Toggle GitHub PR integration.",
             Action::RecheckGithub => {
                 "Ask the gh CLI again whether GitHub features can be used, without restarting dux."
@@ -616,6 +632,10 @@ impl Action {
             }
             Action::MoveTerminalBottom => {
                 "Move the selected terminal to the bottom (switches sorting to manual)."
+            }
+            Action::WatchRules => "List the watch rules on running tabs and disarm or re-arm one.",
+            Action::SessionSettings => {
+                "Open the selected agent's session settings (mode, YOLO, system prompt, watch rules, auto-clear, AMQ verify)."
             }
         }
     }
@@ -718,6 +738,7 @@ impl Action {
             | Action::DebugInput
             | Action::ToggleDiffLineNumbers
             | Action::ResourceMonitor
+            | Action::PruneOrphanWorktrees
             | Action::ToggleGithubIntegration
             | Action::RecheckGithub
             | Action::ToggleCopyOnSelect
@@ -756,7 +777,9 @@ impl Action {
             | Action::MoveTerminalUp
             | Action::MoveTerminalDown
             | Action::MoveTerminalTop
-            | Action::MoveTerminalBottom => None,
+            | Action::MoveTerminalBottom
+            | Action::WatchRules => None,
+            Action::SessionSettings => Some("Global"),
         }
     }
 }

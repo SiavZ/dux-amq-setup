@@ -1499,6 +1499,7 @@ impl Engine {
         self.providers.remove(tab_id);
         self.running_provider_pins.remove(tab_id);
         self.launched_drop_paste.remove(tab_id);
+        self.watch.forget(tab_id);
         self.resume_fallback_candidates.remove(tab_id);
         self.resumed_tab_runs.remove(tab_id);
         self.pty_activity.remove(tab_id.as_str());
@@ -1618,6 +1619,7 @@ impl Engine {
         // those; this cleans up the remaining pin/activity/input/in-flight entries.
         self.clear_session_tab_runtime(&session.id);
         self.sessions.retain(|candidate| candidate.id != session.id);
+        self.forget_amq_session(&session.id);
         let removed_terminals: Vec<String> = self
             .companion_terminals
             .iter()
@@ -3712,6 +3714,7 @@ impl Engine {
                     self.process_project_persistence_completed(action, result, status_op_id);
                 EventReaction::ProjectPersistenceOutcome(Box::new(outcome))
             }
+            WorkerEvent::AmqInjectScanRequested => self.drain_amq_inject_queue(),
             WorkerEvent::StartupCommandLogsLoaded {
                 scope_label,
                 result,

@@ -173,6 +173,7 @@ pub(crate) fn modal_spec(prompt: &PromptState) -> Option<ModalSpec> {
         | PromptState::ConfirmCreateInitialCommit { .. }
         | PromptState::ConfirmNonDefaultBranch { .. }
         | PromptState::ConfirmUseExistingBranch { .. }
+        | PromptState::ConfirmSharedWriter { .. }
         // Prose, a conditional checkbox and a Cancel/Delete pair; horizontal
         // keys move focus and Space acts on what has it.
         | PromptState::ConfirmDeleteWorktree(_)
@@ -193,13 +194,19 @@ pub(crate) fn modal_spec(prompt: &PromptState) -> Option<ModalSpec> {
         // REMOVABLE worktrees, and a confirm key that acts on the selection by
         // raising the removal confirmation. No buttons, so no confirm button.
         | PromptState::ManageWorktrees(_)
+        // The orphan cleaner: rows plus a per-item keyboard confirmation that
+        // publishes no buttons.
+        | PromptState::OrphanWorktrees(_)
         | PromptState::ChangeTheme(_)
         | PromptState::ChangeAgentProvider(_)
         | PromptState::ChangeDefaultProvider(_)
         | PromptState::ChangeProjectDefaultProvider(_)
         // Three modes, the saved one marked, and picking one applies it. Rows and
         // nothing else, so no buttons and no focus concept.
-        | PromptState::SetTailscaleMode(_) => ModalSpec::new(Picker, false, false),
+        | PromptState::SetTailscaleMode(_)
+        // Rules on live tabs; Enter toggles the highlighted one's arm state
+        // and the list stays open. Rows only, no buttons.
+        | PromptState::WatchRules(_) => ModalSpec::new(Picker, false, false),
 
         // The one picker that keeps its buttons: they are distinct actions (kill
         // the hovered runtime, kill the marked ones, kill everything the filter
@@ -224,6 +231,11 @@ pub(crate) fn modal_spec(prompt: &PromptState) -> Option<ModalSpec> {
         PromptState::ConfigureStartupCommand { .. }
         | PromptState::ConfigureProjectEnv { .. }
         | PromptState::ConfigureGlobalEnv { .. } => ModalSpec::new(Form, true, true),
+
+        // Session settings: a single-line title, the multiline system-prompt
+        // editor, radios and checkboxes, and Cancel/Save. The Save button is
+        // what keeps it dual-mode compliant.
+        PromptState::SessionSettings(_) => ModalSpec::new(Form, true, true),
 
         // ── The one variant that is two modals ──────────────────────────
         // `EditMacros` serves two families depending on its own state, so the
@@ -271,15 +283,18 @@ pub(crate) fn prompt_text_inputs(prompt: &PromptState) -> Vec<&TextInput> {
         | PromptState::ConfirmCreateInitialCommit { .. }
         | PromptState::ConfirmNonDefaultBranch { .. }
         | PromptState::ConfirmUseExistingBranch { .. }
+        | PromptState::ConfirmSharedWriter { .. }
         | PromptState::PickEditor { .. }
         | PromptState::PickProjectWorktree(_)
         | PromptState::ManageWorktrees(_)
         | PromptState::ConfirmDeleteWorktree(_)
+        | PromptState::OrphanWorktrees(_)
         | PromptState::ChangeTheme(_)
         | PromptState::ChangeAgentProvider(_)
         | PromptState::ChangeDefaultProvider(_)
         | PromptState::ChangeProjectDefaultProvider(_)
-        | PromptState::SetTailscaleMode(_) => Vec::new(),
+        | PromptState::SetTailscaleMode(_)
+        | PromptState::WatchRules(_) => Vec::new(),
 
         PromptState::Command { input, .. }
         | PromptState::ConfigureStartupCommand { input, .. }
@@ -292,6 +307,9 @@ pub(crate) fn prompt_text_inputs(prompt: &PromptState) -> Vec<&TextInput> {
         | PromptState::NameNewAgent { input, .. } => vec![input],
 
         PromptState::StartupCommandLogs(prompt) => vec![&prompt.filter],
+        PromptState::SessionSettings(prompt) => {
+            vec![&prompt.draft_title, &prompt.draft_system_prompt]
+        }
         PromptState::PickProject { list, .. } => vec![&list.filter],
         PromptState::KillRunning(prompt) => vec![&prompt.list.filter],
         PromptState::ConfirmKillRunning(prompt) => vec![&prompt.previous.list.filter],
@@ -370,8 +388,10 @@ pub(crate) fn layout_publishes_confirm_button(layout: &OverlayMouseLayout) -> bo
         | OverlayMouseLayout::ConfirmInitRepo { .. }
         | OverlayMouseLayout::ConfirmNonDefaultBranch { .. }
         | OverlayMouseLayout::ConfirmUseExistingBranch { .. }
+        | OverlayMouseLayout::ConfirmSharedWriter { .. }
         | OverlayMouseLayout::ConfigReloadFailed { .. }
         | OverlayMouseLayout::ConfigureStartupCommand { .. }
+        | OverlayMouseLayout::SessionSettings { .. }
         | OverlayMouseLayout::EditMacros { .. } => true,
     }
 }
@@ -860,6 +880,19 @@ mod tests {
                 },
             ),
             (
+                "SessionSettings",
+                PromptState::SessionSettings(Box::new(crate::app::SessionSettingsPrompt {
+                    session_id: app.engine.sessions[0].id.clone(),
+                    session_label: "demo".to_string(),
+                    draft: Default::default(),
+                    draft_title: TextInput::with_text("demo".to_string()),
+                    draft_system_prompt: TextInput::new().with_multiline(4),
+                    focus: crate::app::SettingsFocus::ModeAttended,
+                    rules: Vec::new(),
+                    hit_rows: Vec::new(),
+                })),
+            ),
+            (
                 "StartupCommandLogs",
                 PromptState::StartupCommandLogs(StartupCommandLogPrompt {
                     scope_label: "demo".to_string(),
@@ -1124,11 +1157,30 @@ mod tests {
                 },
             ),
             (
+                "ConfirmSharedWriter",
+                PromptState::ConfirmSharedWriter {
+                    existing_agent: "other".to_string(),
+                    action: crate::app::SharedWriterAction::Create {
+                        request: Box::new(new_project_request(&project)),
+                        busy_message: "creating".to_string(),
+                    },
+                    focus: ConfirmFocus::Cancel,
+                },
+            ),
+            (
                 "DebugInput",
                 PromptState::DebugInput {
                     lines: Vec::new(),
                     scroll_offset: 0,
                 },
+            ),
+            (
+                "OrphanWorktrees",
+                PromptState::OrphanWorktrees(crate::app::orphan_worktrees::OrphanWorktreesPrompt {
+                    candidates: Vec::new(),
+                    selected: 0,
+                    stage: crate::app::orphan_worktrees::OrphanWorktreesStage::List,
+                }),
             ),
             (
                 "ResourceMonitor",

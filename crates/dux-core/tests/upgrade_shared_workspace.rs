@@ -279,3 +279,70 @@ fn an_upstream_database_gets_derived_valid_unique_handles_for_every_row() {
     }
     assert_eq!(store.load_sessions().unwrap().len(), 4);
 }
+
+/// Fork efb8224e/5ba99d54 (`tests/session_state.rs`): the fork persisted a
+/// typed session state in `state_json`, including an interrupted `Spawning`
+/// that had to come back as a reconnectable (Retryable) row rather than a
+/// stuck one. Upstream has no typed state machine: a row carries only the
+/// three-word `status`, and every restored agent is normalized to
+/// Detached/Exited at boot. So the property that must survive the upgrade
+/// is: a fork row whose `state_json` says Spawning, Retryable, Detached,
+/// Created or Exited loads (the column is ignored, not a parse failure) with
+/// a status that lets the user reconnect it, and the legacy `status` column
+/// the fork kept writing is what decides it.
+#[test]
+fn fork_state_json_rows_load_as_reconnectable_sessions() {
+    let (_tmp, path) = fork_main_database();
+    let conn = Connection::open(&path).unwrap();
+    for (id, handle, status, state_json) in [
+        (
+            "spawning-1",
+            "spawning-1",
+            "detached",
+            r#"{"kind":"spawning","since":"2026-03-01T00:00:00Z"}"#,
+        ),
+        (
+            "retryable-1",
+            "retryable-1",
+            "detached",
+            r#"{"kind":"retryable","interrupted_at":"2026-03-01T00:00:00Z"}"#,
+        ),
+        (
+            "exited-1",
+            "exited-1",
+            "exited",
+            r#"{"kind":"exited","exit_code":137,"exited_at":"2026-03-01T00:00:00Z"}"#,
+        ),
+    ] {
+        conn.execute(
+            r#"insert into agent_sessions
+                 (id, project_id, provider, source_branch, branch_name, worktree_path, title,
+                  project_path, started_providers, status, created_at, updated_at, state_json,
+                  session_settings, sort_order, shared_workspace, agent_handle, deleted_at,
+                  provider_session_ids)
+               values (?1, 'proj-1', 'claude', 'main', ?1, '/tmp/' || ?1, null, '/home/ada/widget',
+                       '[]', ?3, '2026-03-01T00:00:00Z', '2026-03-01T00:00:00Z', ?4, null, 9, 0,
+                       ?2, null, '{}')"#,
+            rusqlite::params![id, handle, status, state_json],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let store = SessionStore::open(&path).expect("open");
+    let live = store.load_sessions().expect("load");
+    let status_of = |id: &str| {
+        live.iter()
+            .find(|s| s.id == id)
+            .unwrap_or_else(|| panic!("{id} lost in the upgrade"))
+            .status
+    };
+    use dux_core::model::SessionStatus;
+    assert_eq!(
+        status_of("spawning-1"),
+        SessionStatus::Detached,
+        "an interrupted spawn must be reconnectable, not stuck"
+    );
+    assert_eq!(status_of("retryable-1"), SessionStatus::Detached);
+    assert_eq!(status_of("exited-1"), SessionStatus::Exited);
+}

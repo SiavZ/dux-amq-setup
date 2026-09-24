@@ -142,6 +142,26 @@ impl Handoff {
             .with_context(|| format!("parsing the reload handoff at {}", path.display()))
     }
 
+    /// Undo what preparing this handoff did to the descriptors, for a reload
+    /// that will not happen after all (the exec failed, or writing the manifest
+    /// did).
+    ///
+    /// Preparing cleared close-on-exec on every master so it could cross the
+    /// exec. With no exec coming, leaving it cleared would hand a copy of each
+    /// agent's terminal to every process this image spawns from now on.
+    /// Best effort per entry: one descriptor that cannot be fixed must not stop
+    /// the rest from being.
+    pub fn abandon(&self) {
+        for entry in &self.ptys {
+            if let Err(err) = crate::pty_reattach::set_close_on_exec(entry.master_fd) {
+                crate::logger::warn(&format!(
+                    "reload: could not restore close-on-exec on tab {}: {err:#}",
+                    entry.tab_id
+                ));
+            }
+        }
+    }
+
     /// Where to put a handoff for the process that is about to exec.
     ///
     /// Keyed by pid so two dux instances reloading at the same moment cannot

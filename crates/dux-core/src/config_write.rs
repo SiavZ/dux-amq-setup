@@ -658,6 +658,9 @@ fn apply_patches(doc: &mut DocumentMut, config: &Config) {
         &config.startup_command_terminal.args,
     );
 
+    // --- [amq.inject] / [amq.orchestrator] ---
+    patch_amq(doc, &config.amq);
+
     // --- [keys] ---
     patch_table_bool(
         doc,
@@ -826,6 +829,58 @@ fn patch_table_string_array(doc: &mut DocumentMut, section: &str, key: &str, val
     table[key] = toml_edit::value(arr);
 }
 
+/// Patch `[amq.inject]` and `[amq.orchestrator]`. `[amq]` itself is an
+/// implicit parent so the file shows only the two leaf headers. TOML integers
+/// are i64, so a u64 above `i64::MAX` (the documented "always deliver" value
+/// for `active_session_quiet_secs`) saturates, which keeps its meaning.
+fn patch_amq(doc: &mut DocumentMut, amq: &crate::config::AmqConfig) {
+    fn int(v: u64) -> Item {
+        toml_edit::value(i64::try_from(v).unwrap_or(i64::MAX))
+    }
+    let parent = doc
+        .entry("amq")
+        .or_insert_with(|| {
+            let mut t = Table::new();
+            t.set_implicit(true);
+            Item::Table(t)
+        })
+        .as_table_mut()
+        .expect("[amq] is a table");
+    let inject = parent
+        .entry("inject")
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
+        .expect("[amq.inject] is a table");
+    let i = &amq.inject;
+    inject["enabled"] = toml_edit::value(i.enabled);
+    inject["queue_dir"] = toml_edit::value(i.queue_dir.as_str());
+    let mut markers = Array::new();
+    for m in &i.busy_markers {
+        markers.push(m.as_str());
+    }
+    inject["busy_markers"] = toml_edit::value(markers);
+    inject["busy_scan_lines"] = int(i.busy_scan_lines as u64);
+    inject["delivery_timeout_secs"] = int(i.delivery_timeout_secs);
+    inject["max_message_age_secs"] = int(i.max_message_age_secs);
+    inject["poll_interval_ms"] = int(i.poll_interval_ms);
+    inject["max_message_bytes"] = int(i.max_message_bytes);
+    inject["verify_envelope"] = toml_edit::value(i.verify_envelope);
+    inject["active_session_quiet_secs"] = int(i.active_session_quiet_secs);
+    inject["phase_delay_ms"] = int(i.phase_delay_ms);
+    inject["startup_grace_ms"] = int(i.startup_grace_ms);
+    inject["post_delivery_cooldown_ms"] = int(i.post_delivery_cooldown_ms);
+    inject["auto_clear_collaboration_quiet_secs"] = int(i.auto_clear_collaboration_quiet_secs);
+    let orch = parent
+        .entry("orchestrator")
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
+        .expect("[amq.orchestrator] is a table");
+    let o = &amq.orchestrator;
+    orch["enabled"] = toml_edit::value(o.enabled);
+    orch["poll_interval_secs"] = int(o.poll_interval_secs);
+    orch["checkpoint_prompt"] = toml_edit::value(o.checkpoint_prompt.as_str());
+}
+
 fn patch_providers(doc: &mut DocumentMut, providers: &ProvidersConfig) {
     let providers_table = doc
         .entry("providers")
@@ -873,6 +928,15 @@ fn patch_providers(doc: &mut DocumentMut, providers: &ProvidersConfig) {
             Some(value) => tbl["forward_scroll"] = toml_edit::value(value),
             None => {
                 tbl.remove("forward_scroll");
+            }
+        }
+
+        // Write `forward_mouse` only when set, like `forward_scroll`: an absent
+        // key means the terminal-emulator default (forward drags).
+        match config.forward_mouse {
+            Some(value) => tbl["forward_mouse"] = toml_edit::value(value),
+            None => {
+                tbl.remove("forward_mouse");
             }
         }
 
@@ -1790,6 +1854,33 @@ build = { text = \"cargo build\", surface = \"terminal\" }
     }
 
     #[test]
+    fn amq_sections_render_plain_and_patch_surgically() {
+        let mut config = Config::default();
+        config.amq.inject.active_session_quiet_secs = u64::MAX;
+        config.amq.orchestrator.checkpoint_prompt = "nudge".into();
+        let plain = render_config_plain(&config);
+        assert!(plain.contains("[amq.inject]") && plain.contains("[amq.orchestrator]"));
+        assert!(
+            !plain.contains("\n[amq]\n"),
+            "the parent stays implicit:\n{plain}"
+        );
+        let parsed: Config = toml::from_str(&plain).expect("plain render parses");
+        // u64::MAX saturates to i64::MAX, still past the always-deliver bound.
+        assert_eq!(parsed.amq.inject.active_session_quiet_secs, i64::MAX as u64);
+        assert_eq!(parsed.amq.orchestrator.checkpoint_prompt, "nudge");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "[amq.inject]\n# keep me\nphase_delay_ms = 999\n").unwrap();
+        config.amq.inject.phase_delay_ms = 400;
+        patch_config_file_with(&path, &config, Durability::NoFsync).expect("patch");
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# keep me"), "{saved}");
+        let parsed: Config = toml::from_str(&saved).expect("parses");
+        assert_eq!(parsed.amq.inject.phase_delay_ms, 400);
+    }
+
+    #[test]
     fn zero_timeout_round_trips() {
         let config = Config {
             shutdown_timeout_seconds: 0,
@@ -2340,6 +2431,40 @@ build = { text = \"cargo build\", surface = \"terminal\" }
         assert!(
             !claude_section.contains("forward_scroll"),
             "None must omit forward_scroll; got: {claude_section}"
+        );
+    }
+
+    #[test]
+    fn patch_round_trips_forward_mouse_and_omits_it_when_unset() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            "[providers.claude]\ncommand = \"claude\"\nforward_mouse = true\n",
+        )
+        .expect("write initial");
+
+        let mut config = Config::default();
+        config.providers.commands["claude"].forward_mouse = Some(false);
+        config.providers.commands["jcode"].forward_mouse = None;
+        patch_config_file(&config_path, &config).expect("patch");
+        let saved = fs::read_to_string(&config_path).expect("read back");
+
+        let parsed: Config = toml::from_str(&saved).expect("reparse");
+        assert_eq!(
+            parsed.providers.commands["claude"].forward_mouse,
+            Some(false),
+            "an explicit value must be written: {saved}"
+        );
+        assert_eq!(parsed.providers.commands["jcode"].forward_mouse, None);
+        let jcode_section = saved
+            .split("[providers.jcode]")
+            .nth(1)
+            .and_then(|s| s.split("[providers.").next())
+            .unwrap_or("");
+        assert!(
+            !jcode_section.contains("forward_mouse"),
+            "None must omit forward_mouse; got: {jcode_section}"
         );
     }
 

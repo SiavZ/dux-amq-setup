@@ -63,6 +63,19 @@ async fn boot(projects: &[(&str, &str, &str)], hosts: &[&str]) -> (SocketAddr, t
             std::fs::create_dir_all(&dir).unwrap();
             git_isolated(&dir, &["init", "-b", "main"]);
             git_isolated(&dir, &["remote", "add", "origin", origin]);
+            // The production read applies the developer's `url.*.insteadOf`
+            // rules, which is right for real use. A common global rule such as
+            // `url.https://.insteadOf git@` would turn `git@github.com:acme/x`
+            // into `https://github.com:acme/x`, where `:acme` is a PORT, so the
+            // parser refuses it and every scp-style fixture reads as a project
+            // dux could not read. A repo-local rule mapping the address to
+            // itself wins because git picks the LONGEST matching prefix, so
+            // this fixture reads back exactly what it wrote on any machine,
+            // while production still honours real rewrites everywhere else.
+            git_isolated(
+                &dir,
+                &["config", &format!("url.{origin}.insteadOf"), origin],
+            );
             store
                 .upsert_project(&ProjectConfig {
                     id: (*id).to_string(),
@@ -80,6 +93,9 @@ async fn boot(projects: &[(&str, &str, &str)], hosts: &[&str]) -> (SocketAddr, t
     }
 
     let mut engine = bootstrap_engine(&paths).unwrap();
+    // A worktree-mode install: these fixtures register dux's own root as the
+    // project, which shared mode rightly refuses to run agents in.
+    engine.config.workspace = None;
     engine.github_integration_enabled = true;
     // Point the probe at a stand-in `gh` that reports exactly `hosts`. Starting
     // the engine thread starts the REAL host probe, so placing an answer here

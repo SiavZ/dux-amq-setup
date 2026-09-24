@@ -453,6 +453,9 @@ const LEFT_PANE_GUTTER: u16 = 1;
 /// Badge glyph marking a pull request on the agent row, standing in for the
 /// letters "PR" to save a column. U+2387 (ALTERNATIVE KEY SYMBOL) renders as a
 /// branch fork in most terminals and is width-1; the `#<number>` follows it.
+/// The sidebar badge on a shared main-workspace agent's row.
+pub(crate) const SHARED_WORKSPACE_BADGE: &str = "SHARED ";
+
 const PR_BADGE_GLYPH: &str = "⎇";
 
 /// Truncate `s` to at most `max_w` display columns, measured by real
@@ -1386,6 +1389,20 @@ impl App {
         // rather than ellipsizing, and a running network listener is not visible
         // anywhere else, while its siblings are recoverable from the panes.
         self.push_live_header_chip(&mut spans, self.serving_chip());
+        // Shared main-workspace mode (fork d0ce0afc): a persistent warning while
+        // more than one agent writes in one checkout. Derived from live state
+        // every frame, so it cannot be overwritten by an unrelated status, and
+        // honest about its scope: another dux home is invisible from here.
+        if let Some(summary) = self.engine.shared_multi_writer_summary() {
+            spans.push(Span::styled(" ╱ ", Style::default().fg(sep_fg).bg(bg)));
+            spans.push(Span::styled(
+                summary.badge(),
+                Style::default()
+                    .fg(self.theme.warning_fg)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         // A standalone agent has no project and no branch, so it gets the folder
         // it runs in, home-collapsed, in the slot the project crumb occupies.
         // Its own arm rather than a hole in the project arm: gating the bar's
@@ -1513,6 +1530,20 @@ impl App {
             }
             self.push_live_header_chip(&mut spans, self.running_terminals_chip());
         }
+        // The BUILD, last: every development build says "development", so the
+        // commit is what tells two of them apart. It trails rather than riding
+        // on the version because this header clips its tail, and the crumbs
+        // before it (above all the serving chip) matter more on a narrow
+        // terminal than a build id that `dux --version` also reports.
+        spans.push(Span::styled(" ╱ ", Style::default().fg(sep_fg).bg(bg)));
+        spans.push(Span::styled(
+            "build: ",
+            Style::default().fg(label_fg).bg(bg),
+        ));
+        spans.push(Span::styled(
+            dux_core::version::GIT_COMMIT,
+            Style::default().fg(self.theme.branch_fg).bg(bg),
+        ));
         Paragraph::new(Line::from(spans))
             .style(self.theme.header_style())
             .render(area, frame.buffer_mut());
@@ -1801,9 +1832,22 @@ impl App {
         // the marker, state word, and tab count fully visible and truncates the
         // project name and branch to fit (matching the web's per-field shrink),
         // rather than ellipsizing the whole run and dropping the tab count first.
-        let line1 = match pr_badge {
-            Some(badge) => right_align_line(line1_left, vec![badge], text_width, 2),
-            None => ellipsize_spans(line1_left, text_width),
+        // Shared main-workspace agents wear a SHARED badge (fork 73c597ae):
+        // the row runs in the user's own checkout, which changes what delete
+        // and rename may do, so it must be visible at a glance.
+        let shared_badge = session.shared_workspace().then(|| {
+            Span::styled(
+                SHARED_WORKSPACE_BADGE,
+                Style::default()
+                    .fg(self.theme.warning_fg)
+                    .add_modifier(Modifier::BOLD),
+            )
+        });
+        let right: Vec<Span<'static>> = shared_badge.into_iter().chain(pr_badge).collect();
+        let line1 = if right.is_empty() {
+            ellipsize_spans(line1_left, text_width)
+        } else {
+            right_align_line(line1_left, right, text_width, 2)
         };
         // Line two renders two more searched fields (project name, branch), so
         // a live filter hit inside either gets the same emphasis as the name on
@@ -5496,6 +5540,102 @@ impl App {
         };
     }
 
+    fn render_watch_rules_prompt(&mut self, frame: &mut Frame) {
+        let PromptState::WatchRules(prompt) = &self.prompt else {
+            return;
+        };
+        self.render_dim_overlay(frame);
+        let area = centered_rect(72, 60, frame.area());
+        self.clear_overlay_area(frame, area);
+
+        let move_down = self.bindings.label_for(Action::MoveDown);
+        let move_up = self.bindings.label_for(Action::MoveUp);
+        let confirm_key = self.bindings.label_for(Action::Confirm);
+        let close_key = self.bindings.label_for(Action::CloseOverlay);
+        let key = Style::default().fg(self.theme.hint_key_fg);
+        let desc = Style::default().fg(self.theme.hint_desc_fg);
+        let bottom_spans = vec![
+            Span::styled(format!(" {move_up}/{move_down} "), key),
+            Span::styled("move  ", desc),
+            Span::styled(format!("{confirm_key} "), key),
+            Span::styled("disarm / re-arm", desc),
+            Span::styled(format!("  {close_key} "), key),
+            Span::styled("close ", desc),
+        ];
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(self.theme.overlay_border))
+            .style(Style::default().bg(self.theme.overlay_bg))
+            .title(" Watch rules ")
+            .title_style(
+                Style::default()
+                    .fg(self.theme.title_focused)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .title_bottom(Line::from(bottom_spans));
+
+        if prompt.rows.is_empty() {
+            let body = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    " No watch rules are loaded on a running tab.",
+                    Style::default().fg(self.theme.text_fg),
+                )),
+                Line::from(Span::styled(
+                    " Add [[providers.<name>.watch]] entries to config.toml; the file has \
+                     commented examples under [providers.claude].",
+                    desc,
+                )),
+            ])
+            .wrap(Wrap { trim: false })
+            .block(block);
+            frame.render_widget(body, area);
+            return;
+        }
+
+        let items = prompt
+            .rows
+            .iter()
+            .map(|row| {
+                let (badge, color) = watch_rule_badge(row.snapshot.state, &self.theme);
+                let budget = if row.snapshot.max_attempts == 0 {
+                    format!("{}/unlimited", row.snapshot.attempts_made)
+                } else {
+                    format!(
+                        "{}/{}",
+                        row.snapshot.attempts_made, row.snapshot.max_attempts
+                    )
+                };
+                let session = self
+                    .engine
+                    .session_by_id(&row.session_id)
+                    .map(|s| s.display_label())
+                    .unwrap_or_else(|| row.session_id.clone());
+                let built_in = if row.built_in { " (built-in)" } else { "" };
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!(" {badge:<9}"),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("{}{built_in}", row.snapshot.label),
+                        Style::default().fg(self.theme.text_fg),
+                    ),
+                    Span::styled(format!("  {session} · {budget}"), desc),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        let mut state =
+            ListState::default().with_selected(Some(prompt.selected.min(prompt.rows.len() - 1)));
+        StatefulWidget::render(
+            List::new(items)
+                .block(block)
+                .highlight_style(self.theme.selection_style()),
+            area,
+            frame.buffer_mut(),
+            &mut state,
+        );
+    }
+
     fn render_set_tailscale_mode_prompt(&mut self, frame: &mut Frame) {
         let PromptState::SetTailscaleMode(prompt) = &self.prompt else {
             return;
@@ -8542,6 +8682,97 @@ impl App {
         };
     }
 
+    /// Shared main-workspace second-writer consent (fork d0ce0afc).
+    fn render_confirm_shared_writer_prompt(&mut self, frame: &mut Frame) {
+        let PromptState::ConfirmSharedWriter {
+            existing_agent,
+            focus,
+            ..
+        } = &self.prompt
+        else {
+            return;
+        };
+        let existing_agent = existing_agent.clone();
+        let focus = *focus;
+        self.render_dim_overlay(frame);
+        let area = centered_rect(60, 30, frame.area());
+        self.clear_overlay_area(frame, area);
+        let outer = self.themed_overlay_block("Another Agent Is Writing Here");
+        let inner = outer.inner(area);
+        outer.render(area, frame.buffer_mut());
+
+        let [body_area, _, buttons_area] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(3),
+            ])
+            .areas(inner);
+        let lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::raw(" Agent "),
+                Span::styled(
+                    existing_agent,
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" is already running in this shared checkout."),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                " Two agents editing the same files can overwrite each other's work.",
+                Style::default().fg(self.theme.warning_fg),
+            )),
+            Line::from(Span::styled(
+                " Start a second writer anyway?",
+                Style::default().fg(self.theme.warning_fg),
+            )),
+        ];
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(body_area, frame.buffer_mut());
+
+        let btn_width = 16u16;
+        let gap = 2u16;
+        let total = btn_width * 2 + gap;
+        let left_offset = buttons_area.width.saturating_sub(total) / 2;
+        let cancel_area = Rect {
+            x: buttons_area.x + left_offset,
+            y: buttons_area.y,
+            width: btn_width,
+            height: 3,
+        };
+        let start_area = Rect {
+            x: cancel_area.x + btn_width + gap,
+            y: buttons_area.y,
+            width: btn_width,
+            height: 3,
+        };
+        Button::new("Cancel")
+            .kind(ButtonKind::Confirm)
+            .state(button_state_for(
+                ButtonPressedTarget::ConfirmSharedWriterCancel,
+                self.pressed_button,
+                !focus.is_confirm(),
+                true,
+            ))
+            .render(frame, cancel_area, &self.theme);
+        Button::new("Start Anyway")
+            .kind(ButtonKind::Danger)
+            .state(button_state_for(
+                ButtonPressedTarget::ConfirmSharedWriterStart,
+                self.pressed_button,
+                focus.is_confirm(),
+                true,
+            ))
+            .render(frame, start_area, &self.theme);
+        self.overlay_layout.active = OverlayMouseLayout::ConfirmSharedWriter {
+            cancel_button: cancel_area,
+            start_button: start_area,
+        };
+    }
+
     fn render_confirm_use_existing_branch_prompt(&mut self, frame: &mut Frame) {
         let PromptState::ConfirmUseExistingBranch {
             branch_name,
@@ -9956,6 +10187,11 @@ impl App {
     }
 
     fn render_confirm_delete_agent_prompt(&mut self, frame: &mut Frame) {
+        let shared_checkout = matches!(
+            &self.prompt,
+            PromptState::ConfirmDeleteAgent { session_id, .. }
+                if self.engine.sessions.iter().any(|s| &s.id == session_id && s.shared_workspace())
+        );
         let PromptState::ConfirmDeleteAgent {
             agent_label,
             target,
@@ -10055,7 +10291,11 @@ impl App {
         };
         if worktree_shared {
             body_lines.push(Line::from(Span::styled(
-                " Worktree is shared with another agent and will be preserved.",
+                if shared_checkout {
+                    " Runs in the shared project checkout, which is preserved."
+                } else {
+                    " Worktree is shared with another agent and will be preserved."
+                },
                 Style::default().fg(self.theme.hint_desc_fg),
             )));
         } else if *delete_worktree {
@@ -10281,8 +10521,14 @@ impl App {
                 " External worktree will be copied into a fresh managed dux worktree: {}.",
                 source_worktree_path.display()
             )),
+            // Shared main-workspace mode: say plainly that no worktree is made.
+            CreateAgentRequest::SharedWorkspace { project, .. } => Some(format!(
+                " SHARED: runs directly in the project checkout {}; no worktree or branch is created.",
+                dux_core::home_path::shorten_home(std::path::Path::new(&project.path))
+            )),
             _ => None,
         };
+        let shared_create = matches!(request, CreateAgentRequest::SharedWorkspace { .. });
         let context_height = u16::from(context_line.is_some());
         let area = centered_rect_exact(
             dialog_width,
@@ -10296,7 +10542,11 @@ impl App {
         );
         self.clear_overlay_area(frame, area);
 
-        let outer = self.themed_overlay_block("Name New Agent");
+        let outer = self.themed_overlay_block(if shared_create {
+            "Name New Agent \u{b7} SHARED WORKSPACE"
+        } else {
+            "Name New Agent"
+        });
         let inner = outer.inner(area);
         outer.render(area, frame.buffer_mut());
 
@@ -10515,10 +10765,12 @@ impl App {
                 self.render_change_project_default_provider_prompt(frame)
             }
             PromptState::SetTailscaleMode(_) => self.render_set_tailscale_mode_prompt(frame),
+            PromptState::WatchRules(_) => self.render_watch_rules_prompt(frame),
             PromptState::ChangeTheme(_) => self.render_change_theme_prompt(frame),
             PromptState::StartupCommandLogs(_) => self.render_startup_command_logs_prompt(frame),
             PromptState::PickEditor { .. } => self.render_pick_editor_prompt(frame),
             PromptState::ManageWorktrees(_) => self.render_manage_worktrees_prompt(frame),
+            PromptState::OrphanWorktrees(_) => self.render_orphan_worktrees_prompt(frame),
             PromptState::PickProjectWorktree(_) => self.render_pick_project_worktree_prompt(frame),
             PromptState::PickProject { .. } => self.render_pick_project_prompt(frame),
             PromptState::KillRunning(_) => self.render_kill_running_prompt(frame),
@@ -10566,6 +10818,9 @@ impl App {
             PromptState::ConfirmUseExistingBranch { .. } => {
                 self.render_confirm_use_existing_branch_prompt(frame)
             }
+            PromptState::ConfirmSharedWriter { .. } => {
+                self.render_confirm_shared_writer_prompt(frame)
+            }
             _ => return false,
         }
         true
@@ -10576,6 +10831,7 @@ impl App {
             PromptState::ConfigureStartupCommand { .. }
             | PromptState::ConfigureProjectEnv { .. }
             | PromptState::ConfigureGlobalEnv { .. } => self.render_configure_prompt(frame),
+            PromptState::SessionSettings(_) => self.render_session_settings(frame),
             PromptState::RenameSession { .. } => self.render_rename_session_prompt(frame),
             PromptState::EditMacros { .. } => self.render_edit_macros(frame),
             PromptState::ResourceMonitor { .. } => {
@@ -10701,11 +10957,10 @@ impl App {
                             Span::styled(" - ", Style::default().fg(self.theme.input_label_fg)),
                         ];
                         let text_preview = text.replace('\n', "↵");
-                        // " " + name + " (label)" + " - ", counted in CHARACTERS:
-                        // a macro name or surface label can hold multi-byte text
-                        // just as the preview can.
+                        // " " + name + " (label)" + " - ", counted in COLUMNS: a
+                        // macro name can be CJK or emoji just as the preview can.
                         let prefix_len =
-                            1 + name.chars().count() + surface_label.chars().count() + 3;
+                            1 + display_width(name) + display_width(&surface_label) + 3;
                         let max_len = (list_area.width as usize).saturating_sub(prefix_len + 2);
                         spans.push(Span::styled(
                             truncate_macro_preview(&text_preview, max_len),
@@ -11028,7 +11283,7 @@ impl App {
     /// to, so a focused and unfocused pair built from the two is one colour in
     /// every shipped theme. `engaged_exit_key`, when present, marks the field as
     /// engaged and names the key that leaves edit mode.
-    fn render_modal_text_field_frame(
+    pub(super) fn render_modal_text_field_frame(
         &self,
         frame: &mut Frame,
         area: Rect,
@@ -11529,7 +11784,7 @@ impl App {
         // ── List block (bottom, connected borders) ──
         let name_col = filtered
             .iter()
-            .map(|&(name, _)| name.chars().count())
+            .map(|&(name, _)| display_width(name))
             .max()
             .unwrap_or(0);
         let inner_w = list_area.width.saturating_sub(3) as usize; // borders + padding
@@ -11545,7 +11800,12 @@ impl App {
             filtered
                 .iter()
                 .map(|&(name, text)| {
-                    let name_padded = format!("{name:name_col$}");
+                    // `{:width$}` pads by chars, so pad by columns by hand: a
+                    // CJK name would otherwise misalign every preview column.
+                    let name_padded = format!(
+                        "{name}{}",
+                        " ".repeat(name_col.saturating_sub(display_width(name)))
+                    );
                     let mut spans = vec![Span::styled(
                         name_padded,
                         Style::default()
@@ -11555,15 +11815,11 @@ impl App {
                     let text_preview = text.replace('\n', "↵");
                     let desc_avail = inner_w.saturating_sub(name_col + gap);
                     let desc_display =
-                        if text_preview.chars().count() > desc_avail && desc_avail > 1 {
-                            let end = text_preview
-                                .char_indices()
-                                .nth(desc_avail - 1)
-                                .map(|(i, _)| i)
-                                .unwrap_or(text_preview.len());
-                            format!("  {}\u{2026}", &text_preview[..end])
+                        if display_width(&text_preview) > desc_avail && desc_avail > 1 {
+                            format!("  {}", truncate_macro_preview(&text_preview, desc_avail))
                         } else {
-                            format!("  {text_preview:desc_avail$}")
+                            let pad = desc_avail.saturating_sub(display_width(&text_preview));
+                            format!("  {text_preview}{}", " ".repeat(pad))
                         };
                     spans.push(Span::styled(
                         desc_display,
@@ -12503,10 +12759,13 @@ pub(crate) fn centered_rect_exact(width: u16, height: u16, area: Rect) -> Rect {
 /// panicked whenever the cut landed inside a multi-byte character, which any
 /// macro body holding an accent or an emoji could arrange.
 fn truncate_macro_preview(text: &str, max_len: usize) -> String {
-    if text.chars().count() <= max_len {
+    // Columns, not chars (fork bebeb8a2): a preview of CJK or emoji text
+    // measured in chars is twice as wide as the room it was cut for.
+    if display_width(text) <= max_len {
         return text.to_string();
     }
-    let mut out: String = text.chars().take(max_len.saturating_sub(1)).collect();
+    let budget = u16::try_from(max_len.saturating_sub(1)).unwrap_or(u16::MAX);
+    let mut out = truncate_to_width(text, budget);
     out.push('…');
     out
 }
@@ -12867,16 +13126,16 @@ fn set_cell(buf: &mut ratatui::buffer::Buffer, x: u16, y: u16, symbol: &str, sty
 /// trimmed. Using char-based counting avoids panics when the text contains
 /// multi-byte UTF-8 (e.g. box-drawing or block characters).
 fn truncate_status_text(text: &str, available: usize) -> String {
-    let char_count = text.chars().count();
-    if char_count <= available {
+    // Measured in terminal COLUMNS (fork bebeb8a2): a char count lets a line of
+    // CJK or emoji run to twice its budget and push the footer off the row.
+    if display_width(text) <= available {
         return text.to_owned();
     }
-
     match available {
         0 => String::new(),
-        1 => "…".to_string(),
         _ => {
-            let mut truncated: String = text.chars().take(available - 1).collect();
+            let budget = u16::try_from(available - 1).unwrap_or(u16::MAX);
+            let mut truncated = truncate_to_width(text, budget);
             truncated.push('…');
             truncated
         }
@@ -12927,6 +13186,17 @@ fn confirm_close_tab_tail(will_detach: bool, successor: Option<&str>) -> String 
         ));
     }
     tail
+}
+
+/// The state word and color for one watch-rule row.
+fn watch_rule_badge(state: dux_core::watch::RuleStateKind, theme: &Theme) -> (&'static str, Color) {
+    use dux_core::watch::RuleStateKind;
+    match state {
+        RuleStateKind::Idle => ("armed", theme.status_info_fg),
+        RuleStateKind::Pending => ("pending", theme.status_busy_fg),
+        RuleStateKind::Cooling => ("cooling", theme.hint_desc_fg),
+        RuleStateKind::Disarmed => ("disarmed", theme.warning_fg),
+    }
 }
 
 #[cfg(test)]
@@ -13172,6 +13442,32 @@ mod tests {
     /// The old bar wrapped its entire body in "if a project is selected", so a
     /// project-less agent got the dux name and version and nothing else, losing
     /// the provider and the terminal count with it.
+    /// The header identifies the BUILD: every development build shares the
+    /// "development" label, so the commit rides along to tell them apart.
+    #[test]
+    fn the_top_bar_names_the_commit_the_binary_was_built_from() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_app(default_bindings());
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render frame");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            rendered.contains(&format!("build: {}", dux_core::version::GIT_COMMIT)),
+            "the header must show build: {}; got:\n{rendered}",
+            dux_core::version::GIT_COMMIT
+        );
+    }
+
     #[test]
     fn the_top_bar_names_a_standalone_agents_folder_and_provider() {
         use ratatui::Terminal;
@@ -19429,7 +19725,7 @@ mod tests {
         // Box-drawing char ─ is 3 bytes but 1 char.
         let text = "Copied: ─────end";
         let result = truncate_status_text(text, 10);
-        assert_eq!(result.chars().count(), 10);
+        assert_eq!(Line::from(result.clone()).width(), 10);
         assert!(result.ends_with('…'));
     }
 
@@ -19438,8 +19734,39 @@ mod tests {
         // Block characters like ██▛▘ are multi-byte; slicing by byte would panic.
         let text = "██▛▘ Opus 4.6 (1M context) · Claude Max";
         let result = truncate_status_text(text, 12);
-        assert_eq!(result.chars().count(), 12);
+        assert_eq!(Line::from(result.clone()).width(), 12);
         assert!(result.ends_with('…'));
+    }
+
+    /// Fork bebeb8a2: status text is cut by terminal COLUMNS, never splits a
+    /// double-width glyph, and never renders wider than the room it was given.
+    #[test]
+    fn truncate_status_text_handles_cjk_emoji_and_combining_boundaries() {
+        for (text, widths) in [
+            ("A界B", vec![(1, "…"), (2, "A…"), (3, "A…"), (4, "A界B")]),
+            ("🙂x", vec![(1, "…"), (2, "…"), (3, "🙂x")]),
+            ("e\u{301}x", vec![(1, "…"), (2, "e\u{301}x")]),
+        ] {
+            for (available, expected) in widths {
+                let rendered = truncate_status_text(text, available);
+                assert_eq!(rendered, expected, "{text:?} at {available}");
+                assert!(Line::from(rendered).width() <= available);
+            }
+        }
+    }
+
+    /// Fork bebeb8a2: the caret over a multi-byte character keeps the whole
+    /// character (the fork split at `cursor + 1` bytes). Upstream steps by
+    /// `len_utf8`; this pins it.
+    #[test]
+    fn render_single_line_cursor_input_preserves_multibyte_cursor_character() {
+        let line =
+            render_single_line_cursor_input(" ", "a🙂界", 1, Color::White, Color::Black, true);
+
+        assert_eq!(line.spans[0].content.as_ref(), " ");
+        assert_eq!(line.spans[1].content.as_ref(), "a");
+        assert_eq!(line.spans[2].content.as_ref(), "🙂");
+        assert_eq!(line.spans[3].content.as_ref(), "界");
     }
 
     #[test]
@@ -23173,15 +23500,20 @@ mod tests {
     #[test]
     fn truncate_macro_preview_never_splits_a_character() {
         let text = "áéíóú 🙂🙃🙁 ñ";
-        for max_len in 0..=text.chars().count() + 4 {
+        for max_len in 0..=display_width(text) + 4 {
             let out = truncate_macro_preview(text, max_len);
             assert!(
-                out.chars().count() <= max_len.max(1),
+                display_width(&out) <= max_len.max(1),
                 "max_len={max_len} produced {out:?}"
             );
         }
         assert_eq!(truncate_macro_preview("áé🙂", 10), "áé🙂");
+        // Columns: "áé" is 2, the emoji 2 more, so 3 columns keep "áé…".
         assert_eq!(truncate_macro_preview("áé🙂ñ", 3), "áé…");
+        assert_eq!(truncate_macro_preview("áé🙂ñ", 5), "áé🙂ñ");
+        assert_eq!(truncate_macro_preview("áé🙂ñ", 4), "áé…");
+        // A char count would have kept three CJK glyphs (6 columns) in 4.
+        assert_eq!(truncate_macro_preview("界界界界", 4), "界…");
     }
 
     #[test]

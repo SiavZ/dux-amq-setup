@@ -39,7 +39,12 @@ pub(crate) fn test_engine() -> (Engine, TempDir) {
         worker_tx.clone(),
     );
     let engine = Engine {
-        config: Config::default(),
+        // An existing install (no `[workspace]` section): worktree mode, so
+        // upstream's create tests keep their meaning. Shared tests opt in.
+        config: Config {
+            workspace: None,
+            ..Config::default()
+        },
         paths,
         session_store,
         projects: Vec::new(),
@@ -63,6 +68,7 @@ pub(crate) fn test_engine() -> (Engine, TempDir) {
         providers: HashMap::new(),
         running_provider_pins: HashMap::new(),
         launched_drop_paste: HashMap::new(),
+        watch: Default::default(),
         companion_terminals: HashMap::new(),
         agent_tabs: HashMap::new(),
         terminating_ptys: Vec::new(),
@@ -114,6 +120,7 @@ pub(crate) fn test_engine() -> (Engine, TempDir) {
         agent_viewed: HashMap::new(),
         last_foreground_refresh: None,
         limits: Default::default(),
+        amq: Default::default(),
         pending_web_checkout_ops: HashMap::new(),
         pending_web_add_project_ops: HashMap::new(),
         pending_web_pr_lookup_ops: HashMap::new(),
