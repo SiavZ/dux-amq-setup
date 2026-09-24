@@ -49,10 +49,21 @@ enum HeadMismatch {
 /// untouched, and a caller holding a folder workspace cannot name the argument.
 fn rollback_created_worktree(repo_path: &Path, managed: &ManagedWorkspace) {
     let worktree_path = Path::new(&managed.worktree_path);
+    // The worktree was created seconds ago inside dux's managed root; the one
+    // checkout a bad path could realistically hit is the project it was made
+    // from, so that is what is protected here. The engine's delete paths pass
+    // the full registered-project inventory.
+    let protected = [repo_path.to_path_buf()];
     if managed.branch_provenance.dux_may_delete_branch() {
-        let _ = git::remove_worktree(repo_path, worktree_path, &managed.branch_name, None);
+        let _ = git::remove_worktree(
+            repo_path,
+            worktree_path,
+            &managed.branch_name,
+            None,
+            &protected,
+        );
     } else {
-        let _ = git::remove_worktree_keep_branch(repo_path, worktree_path);
+        let _ = git::remove_worktree_keep_branch(repo_path, worktree_path, &protected);
     }
 }
 
@@ -100,6 +111,14 @@ impl CreatePlanContext<'_> {
                 logger::error("standalone create reached managed provisioning");
                 self.send_failure(
                     "Could not create the standalone agent: dux took the wrong internal path. Nothing was created and no folder was touched. Please report this with the contents of dux.log."
+                        .to_string(),
+                );
+                None
+            }
+            CreateAgentRequest::SharedWorkspace { .. } => {
+                logger::error("shared-workspace create reached managed provisioning");
+                self.send_failure(
+                    "Could not create the shared-workspace agent: dux took the wrong internal path. Nothing was created and the project checkout was not touched. Please report this with the contents of dux.log."
                         .to_string(),
                 );
                 None
@@ -915,7 +934,7 @@ fn run_create_standalone_agent_job(
     folder: PathBuf,
     title: String,
     provider: crate::model::ProviderKind,
-    _paths: DuxPaths,
+    paths: DuxPaths,
     config: Config,
     worker_tx: Sender<WorkerEvent>,
     term_size: (u16, u16),
@@ -934,12 +953,20 @@ fn run_create_standalone_agent_job(
         });
         return;
     }
+    let id = Uuid::new_v4().to_string();
+    let folder_string = folder.to_string_lossy().to_string();
+    // Basename-first, like a managed agent. Local uniqueness is settled by
+    // `SessionStore::assign_unique_agent_handle` right before the first insert.
+    let agent_handle = crate::model::derive_agent_handle(&folder_string, "", &id);
     let session = AgentSession {
-        id: Uuid::new_v4().to_string(),
+        id,
+        agent_handle,
+        shared_workspace: false,
+        deleted_at: None,
         slot_tab_id: Uuid::new_v4().to_string(),
         provider: provider.clone(),
         workspace: AgentWorkspace::Folder(FolderWorkspace {
-            folder_path: folder.to_string_lossy().to_string(),
+            folder_path: folder_string,
         }),
         // Always set. Every row label falls back through the branch name when
         // there is no title, and this agent has no branch, so a title-less
@@ -978,6 +1005,13 @@ fn run_create_standalone_agent_job(
                 return;
             }
         };
+    let env = crate::agent_env::agent_launch_env(
+        &paths,
+        &config,
+        &session,
+        session.slot_tab_id().as_str(),
+        env,
+    );
     let status_message = format!(
         "Created standalone agent \"{title}\" running {} in \"{folder_label}\". \
          dux does not manage a branch or a worktree for it, and never creates, moves \
@@ -1023,6 +1057,167 @@ fn run_create_standalone_agent_job(
         wants_fullscreen: false,
         // Loud: dux's promise about never touching the user's folder is the
         // whole point of the sentence and is nowhere on screen.
+        status_quiet: crate::statusline::QuietSurfaces::LOUD,
+    };
+    run_agent_launch_job(request, worker_tx);
+}
+
+/// The label a shared agent's branch fields carry while the checkout's HEAD is
+/// detached: there is no branch, and a real name would be a lie.
+pub const SHARED_DETACHED_HEAD_LABEL: &str = "detached HEAD";
+
+/// Create an agent in shared main-workspace mode (fork shared-workspace Phase 4).
+///
+/// The provider runs in the registered project checkout. dux creates no
+/// worktree and no branch, switches nothing, runs no startup command (it is a
+/// per-worktree bootstrap and the checkout is already the user's), and never
+/// writes `.git/info/exclude`. A failure leaves nothing to roll back: the row
+/// is only persisted once the launch is ready.
+///
+/// Refused up front, before any row exists, when the checkout sits inside
+/// dux's own state tree (see `config::validate_shared_workspace_path`).
+#[allow(clippy::too_many_arguments)]
+fn run_create_shared_agent_job(
+    project: crate::model::Project,
+    custom_name: Option<String>,
+    paths: DuxPaths,
+    config: Config,
+    worker_tx: Sender<WorkerEvent>,
+    term_size: (u16, u16),
+    create_key: String,
+    identity: crate::term_identity::TerminalIdentity,
+) {
+    let checkout = PathBuf::from(&project.path);
+    let fail = |message: String| {
+        let _ = worker_tx.send(WorkerEvent::CreateAgentFailed {
+            status_op_id: create_key.clone(),
+            message,
+        });
+    };
+    if let Err(err) = crate::config::validate_shared_workspace_path(&project.path, &paths) {
+        fail(format!(
+            "Cannot create a shared-workspace agent for project \"{}\": {err:#}",
+            project.name
+        ));
+        return;
+    }
+    if !checkout.is_dir() {
+        fail(format!(
+            "Cannot create a shared-workspace agent for project \"{}\": the checkout at {} \
+             does not exist.",
+            project.name,
+            crate::home_path::shorten_home(&checkout)
+        ));
+        return;
+    }
+    // The live HEAD, read once: a shared agent never switches the checkout, so
+    // it records whatever the user has there, including a detached HEAD.
+    let branch = match git::current_branch_opt(&checkout) {
+        Ok(Some(branch)) => branch,
+        Ok(None) => SHARED_DETACHED_HEAD_LABEL.to_string(),
+        Err(err) => {
+            fail(format!(
+                "Cannot create a shared-workspace agent for project \"{}\": {err:#}",
+                project.name
+            ));
+            return;
+        }
+    };
+    let managed = ManagedWorkspace {
+        project_id: project.id.clone(),
+        project_path: Some(project.path.clone()),
+        source_branch: branch.clone(),
+        initial_branch: branch.clone(),
+        // The checkout and its branch predate the agent and are the user's:
+        // no delete may ever take them. Adopted is the provenance that says so.
+        branch_provenance: BranchProvenance::Adopted,
+        branch_name: branch,
+        worktree_path: project.path.clone(),
+    };
+    let id = Uuid::new_v4().to_string();
+    let title = custom_name.filter(|name| !name.trim().is_empty());
+    // Handle seed: the typed name, else the project folder's basename. The
+    // storage layer makes it locally unique right before the first insert.
+    let agent_handle = crate::model::derive_agent_handle(
+        title.as_deref().unwrap_or(&project.path),
+        &managed.branch_name,
+        &id,
+    );
+    let session = AgentSession {
+        id,
+        agent_handle,
+        shared_workspace: true,
+        deleted_at: None,
+        slot_tab_id: Uuid::new_v4().to_string(),
+        provider: project.default_provider.clone(),
+        workspace: AgentWorkspace::Managed(managed),
+        title,
+        started_providers: Vec::new(),
+        desired_running: true,
+        auto_reopen_enabled: true,
+        status: SessionStatus::Active,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        last_focused_tab: None,
+    };
+    let provider_cfg = provider_config(&config, &session.provider);
+    if let Err(hint) = check_provider_available(&provider_cfg) {
+        logger::error(&format!("provider not found for {}: {hint}", session.id));
+        fail(hint);
+        return;
+    }
+    let env = match crate::config::resolve_agent_env(&config.env, &project.env) {
+        Ok(env) => env,
+        Err(err) => {
+            fail(format!(
+                "Invalid environment variables for project \"{}\": {err:#}",
+                project.name
+            ));
+            return;
+        }
+    };
+    let checkout_label = crate::home_path::shorten_home(&checkout);
+    let status_message = format!(
+        "Created shared-workspace agent \"{}\" running {} in the project checkout \
+         \"{checkout_label}\". dux created no worktree or branch for it and never \
+         removes that checkout.",
+        session.display_label(),
+        session.provider.as_str()
+    );
+    let _ = worker_tx.send(WorkerEvent::CreateAgentProgress {
+        status_op_id: create_key.clone(),
+        message: format!(
+            "Launching {} in the shared checkout \"{checkout_label}\"...",
+            session.provider.as_str()
+        ),
+    });
+    let (cols, rows) = term_size;
+    let request = AgentLaunchRequest {
+        tab_id: session.slot_tab_id().to_owned(),
+        provider: session.provider.clone(),
+        resume: false,
+        // A shared agent can only ever resume by id, so its fresh conversation
+        // must be captured from the very first launch.
+        provider_session: crate::resume_recovery::fresh_capture_for(
+            session.provider.as_str(),
+            &provider_cfg,
+        ),
+        session,
+        provider_config: provider_cfg,
+        env,
+        identity,
+        pty_size: (rows, cols),
+        scrollback_lines: config.ui.agent_scrollback_lines,
+        kind: AgentLaunchKind::Create {
+            status_message,
+            repo_path: project.path.clone(),
+            // dux did not make this directory: a failed launch never removes it.
+            owns_worktree: false,
+            startup_result: None,
+            status_op_id: create_key,
+        },
+        wants_fullscreen: false,
+        // Loud: that dux left the checkout alone is nowhere on screen.
         status_quiet: crate::statusline::QuietSurfaces::LOUD,
     };
     run_agent_launch_job(request, worker_tx);
@@ -1087,8 +1282,14 @@ fn launch_managed_create(
         branch_name,
         worktree_path: worktree_path.to_string_lossy().to_string(),
     };
+    let id = Uuid::new_v4().to_string();
+    let agent_handle =
+        crate::model::derive_agent_handle(&managed.worktree_path, &managed.branch_name, &id);
     let session = AgentSession {
-        id: Uuid::new_v4().to_string(),
+        id,
+        agent_handle,
+        shared_workspace: false,
+        deleted_at: None,
         slot_tab_id: Uuid::new_v4().to_string(),
         provider,
         workspace: AgentWorkspace::Managed(managed.clone()),
@@ -1209,6 +1410,15 @@ fn launch_managed_create(
     });
     // crossterm::terminal::size() returns (cols, rows).
     let (cols, rows) = term_size;
+    // The startup command above ran with the user env alone; the provider
+    // additionally gets the Dux identity and session settings.
+    let env = crate::agent_env::agent_launch_env(
+        &paths,
+        &config,
+        &session,
+        session.slot_tab_id().as_str(),
+        env,
+    );
     let request = AgentLaunchRequest {
         // Create is always the session-slot tab, effective provider ==
         // session.provider. (Evaluated before `session` is moved.)
@@ -1271,6 +1481,25 @@ pub fn run_create_agent_job(
     {
         run_create_standalone_agent_job(
             folder, title, provider, paths, config, worker_tx, term_size, create_key, identity,
+        );
+        return;
+    }
+    // Shared agents run in the project checkout itself: nothing to provision
+    // and nothing to roll back.
+    if let CreateAgentRequest::SharedWorkspace {
+        project,
+        custom_name,
+    } = request
+    {
+        run_create_shared_agent_job(
+            project,
+            custom_name,
+            paths,
+            config,
+            worker_tx,
+            term_size,
+            create_key,
+            identity,
         );
         return;
     }
@@ -1640,6 +1869,9 @@ mod tests {
     fn fork_source_session(worktree: &Path) -> AgentSession {
         AgentSession {
             id: "src-1".to_string(),
+            agent_handle: "src-1".to_string(),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: "src-1-slot".to_string(),
             provider: ProviderKind::new("cat"),
             title: None,
@@ -1705,6 +1937,154 @@ mod tests {
                 .as_deref()
                 .is_some_and(|message| message.contains("has no commits yet"))
         );
+    }
+
+    /// Fork shared-workspace Phase 4: a shared create runs in the real
+    /// checkout and provisions nothing. No worktree, no branch, no switch, no
+    /// link, and `.git/info/exclude` byte for byte as it was.
+    #[test]
+    fn shared_create_uses_real_checkout_without_worktree_or_link() {
+        let repo = init_test_repo();
+        git_in(repo.path(), &["switch", "-c", "feature"]);
+        let exclude_path = repo.path().join(".git/info/exclude");
+        let exclude_before = std::fs::read(&exclude_path).ok();
+        let before = folder_snapshot(repo.path());
+        let branches_before = git_stdout(repo.path(), &["branch", "--list"]);
+        let worktrees_before = git_stdout(repo.path(), &["worktree", "list", "--porcelain"]);
+
+        let run = drive_create_job_run(
+            repo.path(),
+            CreateAgentRequest::SharedWorkspace {
+                project: test_project(repo.path()),
+                custom_name: Some("shared-agent".into()),
+            },
+        );
+
+        let session = run
+            .session
+            .unwrap_or_else(|| panic!("launch: {:?}", run.failure));
+        assert!(session.shared_workspace());
+        assert_eq!(session.directory(), repo.path().to_string_lossy());
+        assert_eq!(session.branch_name(), Some("feature"));
+        assert_eq!(session.title.as_deref(), Some("shared-agent"));
+        assert_eq!(session.agent_handle(), "shared-agent");
+        assert_eq!(
+            session.branch_provenance(),
+            Some(BranchProvenance::Adopted),
+            "the checkout's branch is the user's"
+        );
+        assert!(!session.deletion_may_remove_directory());
+        assert_eq!(folder_snapshot(repo.path()), before);
+        assert_eq!(std::fs::read(&exclude_path).ok(), exclude_before);
+        assert_eq!(
+            git_stdout(repo.path(), &["branch", "--list"]),
+            branches_before
+        );
+        assert_eq!(
+            git_stdout(repo.path(), &["worktree", "list", "--porcelain"]),
+            worktrees_before
+        );
+        assert!(
+            run.status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("never removes that checkout"))
+        );
+    }
+
+    /// A checkout inside dux's own state tree is refused before anything,
+    /// including the session row, exists.
+    #[test]
+    fn shared_create_rejects_managed_root_before_persisting() {
+        let repo = init_test_repo();
+        let paths_root = tempfile::tempdir().unwrap();
+        let inside = paths_root.path().join("worktrees/project");
+        std::fs::create_dir_all(&inside).unwrap();
+        let paths = DuxPaths {
+            root: paths_root.path().to_path_buf(),
+            config_path: paths_root.path().join("config.toml"),
+            sessions_db_path: paths_root.path().join("sessions.sqlite3"),
+            worktrees_root: paths_root.path().join("worktrees"),
+            lock_path: paths_root.path().join("dux.lock"),
+        };
+        let (tx, rx) = mpsc::channel();
+        run_create_agent_job(
+            CreateAgentRequest::SharedWorkspace {
+                project: test_project(&inside),
+                custom_name: Some("shared-agent".into()),
+            },
+            paths.clone(),
+            Config::default(),
+            tx,
+            (80, 24),
+            "op-1".to_string(),
+            crate::term_identity::TerminalIdentity::default(),
+        );
+        let events: Vec<_> = rx.try_iter().collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            WorkerEvent::CreateAgentFailed { message, .. } if message.contains("inside Dux-managed state")
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, WorkerEvent::AgentLaunchReady(_))),
+            "nothing may launch"
+        );
+        assert!(!paths.sessions_db_path.exists(), "no row may be written");
+        drop(repo);
+    }
+
+    /// A detached checkout is a valid shared workspace: dux records the
+    /// detached label and never checks anything out to "fix" it.
+    #[test]
+    fn shared_registration_accepts_detached_head_without_checkout() {
+        let repo = init_test_repo();
+        let head = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+        git_in(repo.path(), &["checkout", "--detach", head.trim()]);
+
+        let run = drive_create_job_run(
+            repo.path(),
+            CreateAgentRequest::SharedWorkspace {
+                project: test_project(repo.path()),
+                custom_name: None,
+            },
+        );
+
+        let session = run
+            .session
+            .unwrap_or_else(|| panic!("launch: {:?}", run.failure));
+        assert_eq!(session.branch_name(), Some(SHARED_DETACHED_HEAD_LABEL));
+        assert_eq!(
+            crate::git::current_branch_opt(repo.path()).unwrap(),
+            None,
+            "the checkout stays detached"
+        );
+        assert!(!session.agent_handle().is_empty());
+    }
+
+    /// Forking a shared agent still makes an isolated worktree agent: a fork
+    /// is a copy, and a copy in the same checkout would be no copy at all.
+    #[test]
+    fn fork_from_shared_session_still_creates_isolated_worktree_row() {
+        let repo = init_test_repo();
+        let mut source = fork_source_session(repo.path());
+        source.shared_workspace = true;
+        let run = drive_create_job_run(
+            repo.path(),
+            CreateAgentRequest::ForkSession {
+                project: test_project(repo.path()),
+                source_session: Box::new(source),
+                source_label: "source".into(),
+                custom_name: Some("fork-agent".into()),
+            },
+        );
+
+        let session = run
+            .session
+            .unwrap_or_else(|| panic!("launch: {:?}", run.failure));
+        assert!(!session.shared_workspace());
+        assert_ne!(session.directory(), repo.path().to_string_lossy());
+        assert!(std::path::Path::new(session.directory()).exists());
     }
 
     /// THE RECORD-ONLY ROLLBACK PIN. A standalone create that fails must leave
@@ -1773,6 +2153,16 @@ mod tests {
                 .any(|(k, v)| k == "DUX_TEST_GLOBAL" && v == "from-global"),
             "the global environment must reach a project-less agent, got {env:?}"
         );
+        // The Dux peer identity rides along, ahead of the user's `[env]`.
+        let identity = env
+            .iter()
+            .position(|(k, _)| k == "DUX_AMQ_HANDLE")
+            .expect("a created agent exports its Dux peer identity");
+        let global = env
+            .iter()
+            .position(|(k, _)| k == "DUX_TEST_GLOBAL")
+            .unwrap();
+        assert!(identity < global, "user env must come last, got {env:?}");
     }
 
     /// Every entry under `path`, recursively, as sorted relative paths. Used to

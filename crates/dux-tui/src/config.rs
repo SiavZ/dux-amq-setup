@@ -34,7 +34,8 @@ pub fn ensure_config(paths: &DuxPaths) -> Result<Config> {
     let migrations_changed = dux_core::config_migrate::apply_load_migrations(&mut doc)?;
     let retired_keys_changed = prune_retired_key_actions(&mut doc);
     let folded_keys_changed = fold_legacy_key_actions(&mut doc);
-    if migrations_changed || retired_keys_changed || folded_keys_changed {
+    let unbound_keys_changed = unbind_retired_default_keys(&mut doc);
+    if migrations_changed || retired_keys_changed || folded_keys_changed || unbound_keys_changed {
         // blessed sync-direct: deprecation/retirement migration also runs at boot before the queue exists
         dux_core::config_write::write_config_secure(&paths.config_path, &doc.to_string())
             .with_context(|| format!("failed to write {}", paths.config_path.display()))?;
@@ -45,6 +46,9 @@ pub fn ensure_config(paths: &DuxPaths) -> Result<Config> {
     config.providers.ensure_defaults();
     validate_server_host(&config)?;
     validate_project_envs(&config)?;
+    // A shared project runs in its real checkout, which must never sit inside
+    // dux's own state tree where a cleanup could remove it.
+    dux_core::config::validate_shared_project_paths(&config, paths)?;
     // Warn once here (TUI startup and reload both funnel through ensure_config) on
     // an unrecognized clipboard_passthrough so the per-tick host forward can parse
     // silently. The warning is from_config_str's side effect.
@@ -233,6 +237,49 @@ fn fold_legacy_key_actions(doc: &mut DocumentMut) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Retired default keys
+//
+// dux writes resolved default bindings into `[keys]` as real rows, so a default
+// that is later removed lives on in every existing config. These are rows whose
+// value is EXACTLY a retired default; they are cleared (the action stays, now
+// unbound) so the retirement reaches existing users. Any other value, including
+// the retired key alongside another one, is a choice and is left alone.
+// ---------------------------------------------------------------------------
+
+/// `(action, retired default keys)` pairs, matched as the whole row.
+const RETIRED_DEFAULT_KEYS: &[(&str, &[&str])] = &[
+    // Plain `o` launched an external editor from the sidebar, which a stray
+    // keypress did far too easily (fork d945e200).
+    ("open_worktree_in_editor", &["o"]),
+];
+
+/// Clear `[keys]` rows that still hold exactly a retired default. Returns
+/// whether the document changed.
+fn unbind_retired_default_keys(doc: &mut DocumentMut) -> bool {
+    let Some(keys) = doc.get_mut("keys").and_then(Item::as_table_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    for (action, retired) in RETIRED_DEFAULT_KEYS {
+        let is_retired_default = keys.get(action).and_then(key_string_list).is_some_and(|k| {
+            k.len() == retired.len()
+                && k.iter()
+                    .zip(retired.iter())
+                    .all(|(a, b)| a.trim().eq_ignore_ascii_case(b))
+        });
+        if is_retired_default {
+            keys[action] = toml_edit::value(toml_edit::Array::new());
+            changed = true;
+            dux_core::logger::info(&format!(
+                "[keys] {action} no longer defaults to {retired:?}; unbound it. To keep \
+                 {retired:?}, bind it together with another key, e.g. [\"o\", \"ctrl-o\"]"
+            ));
+        }
+    }
+    changed
+}
+
+// ---------------------------------------------------------------------------
 // Config schema: defines the layout, comments, and value accessors for the
 // TOML config file. Adding a new setting means adding a struct field, its
 // Default value, and one entry here: comments live in exactly one place.
@@ -403,6 +450,28 @@ fn config_schema() -> Vec<ConfigEntry> {
         },
         ConfigEntry::Blank,
         ConfigEntry::Env,
+        ConfigEntry::Blank,
+        ConfigEntry::Section("workspace"),
+        ConfigEntry::Field {
+            key: "default_mode",
+            comment: Some(CommentSource::Static(
+                "# Where newly created project agents run: \"shared\" runs directly in the\n\
+                 # registered project checkout (dux never creates, moves or removes it);\n\
+                 # \"worktree\" creates an isolated git worktree per agent.\n\
+                 # A config written before this section existed keeps worktree mode until\n\
+                 # you add it. Override one project with workspace_mode in its [[projects]] entry.",
+            )),
+            value_fn: |c| FieldValue::Str(c.default_workspace_mode().as_str().to_string()),
+        },
+        ConfigEntry::Field {
+            key: "auto_resume_shared",
+            comment: Some(CommentSource::Static(
+                "# When true, shared-workspace agents also reopen on startup (with auto-reopen).\n\
+                 # Default false: shared agents run in the real checkout, so a boot would\n\
+                 # otherwise fire every shared agent into the live repo at once.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.auto_resume_shared()),
+        },
         ConfigEntry::Blank,
         ConfigEntry::Projects,
         ConfigEntry::Blank,
@@ -1337,6 +1406,183 @@ fn config_schema() -> Vec<ConfigEntry> {
             value_fn: |c| FieldValue::Usize(c.server.file_drop_max_concurrency as usize),
         },
         ConfigEntry::Blank,
+        ConfigEntry::Comment(
+            "# AMQ inject-queue drainer.\n\
+             #\n\
+             # When the dux-amq companion is installed, peer agents wake each other\n\
+             # through `amq wake`. Inside dux the bridge writes each verified wake body\n\
+             # to ~/.local/share/dux-amq/inject-queue/<receiver>/*.msg, and dux types\n\
+             # it into the matching agent only when that agent is idle: typing while a\n\
+             # provider streams can land the text in its input but drop the Enter,\n\
+             # leaving the message stuck until someone presses Enter by hand.",
+        ),
+        ConfigEntry::Section("amq.inject"),
+        ConfigEntry::Field {
+            key: "enabled",
+            comment: Some(CommentSource::Static(
+                "# Master switch for the drainer. When false no queue files are consumed;\n\
+                 # bodies stay on disk under the queue directory. Default true.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.amq.inject.enabled),
+        },
+        ConfigEntry::Field {
+            key: "queue_dir",
+            comment: Some(CommentSource::Static(
+                "# Override the queue root. Empty means ~/.local/share/dux-amq/inject-queue\n\
+                 # ($XDG_DATA_HOME/dux-amq/inject-queue when XDG_DATA_HOME is set). Read at\n\
+                 # startup.",
+            )),
+            value_fn: |c| FieldValue::Str(c.amq.inject.queue_dir.clone()),
+        },
+        ConfigEntry::Field {
+            key: "busy_markers",
+            comment: Some(CommentSource::Static(
+                "# Bottom-of-screen text meaning the agent is busy, so delivery waits. Plain,\n\
+                 # case-sensitive substrings (no regex). Tune for your providers' footers.",
+            )),
+            value_fn: |c| FieldValue::StrList(c.amq.inject.busy_markers.clone()),
+        },
+        ConfigEntry::Field {
+            key: "busy_scan_lines",
+            comment: Some(CommentSource::Static(
+                "# How many of the newest non-blank rows are searched for a busy marker.\n\
+                 # Smaller is cheaper but can miss a footer that scrolled. Default 5.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.amq.inject.busy_scan_lines),
+        },
+        ConfigEntry::Field {
+            key: "delivery_timeout_secs",
+            comment: Some(CommentSource::Static(
+                "# Warn once when a queued message has waited this many seconds (agent busy,\n\
+                 # gone, or unmatched). The file stays on disk. 0 turns the warning off.\n\
+                 # Default 600.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.delivery_timeout_secs),
+        },
+        ConfigEntry::Field {
+            key: "max_message_age_secs",
+            comment: Some(CommentSource::Static(
+                "# Wake files older than this move to the receiver's .expired/ directory\n\
+                 # instead of being typed: stale .msg files at startup, files a crash left\n\
+                 # in flight, and messages held in memory too long. A message already typed\n\
+                 # still gets its Enter. 0 replays everything. Default 0.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.max_message_age_secs),
+        },
+        ConfigEntry::Field {
+            key: "poll_interval_ms",
+            comment: Some(CommentSource::Static(
+                "# Polling fallback (milliseconds) beside the file watcher, for filesystems\n\
+                 # where change notification is lossy (NFS, 9p, some FUSE). Floored at 100.\n\
+                 # Read at startup. Default 5000.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.poll_interval_ms),
+        },
+        ConfigEntry::Field {
+            key: "max_message_bytes",
+            comment: Some(CommentSource::Static(
+                "# Queue files larger than this are rejected and moved to .rejected/.\n\
+                 # Default 65536 (64 KiB).",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.max_message_bytes),
+        },
+        ConfigEntry::Field {
+            key: "verify_envelope",
+            comment: Some(CommentSource::Static(
+                "# Strict HMAC verification of wake envelopes by the bridge, exported to\n\
+                 # agents as DUX_AMQ_VERIFY. When false, signed envelopes are still\n\
+                 # unwrapped and plain `amq send` bodies pass through. The secret is\n\
+                 # readable by every process of your user, so strict mode only adds a\n\
+                 # boundary when wakes cross hosts. A session can override it in its\n\
+                 # settings. Takes effect when an agent starts. Default false.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.amq.inject.verify_envelope),
+        },
+        ConfigEntry::Field {
+            key: "active_session_quiet_secs",
+            comment: Some(CommentSource::Static(
+                "# While you are typing into an agent, a wake for it waits until you have\n\
+                 # not typed for this many seconds, so it never lands inside your prompt.\n\
+                 # 0 holds for as long as you are focused on that agent; a value of ten\n\
+                 # years or more always delivers (and may corrupt a half-typed prompt).\n\
+                 # Default 60.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.active_session_quiet_secs),
+        },
+        ConfigEntry::Field {
+            key: "phase_delay_ms",
+            comment: Some(CommentSource::Static(
+                "# Gap in milliseconds between typing a wake body and pressing Enter. Sent\n\
+                 # together, an Ink-based CLI reads the Enter as part of a paste and the text\n\
+                 # sits unsubmitted. Non-zero values below 250 are raised to 250; 0 is a\n\
+                 # debugging escape hatch. Default 250.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.phase_delay_ms),
+        },
+        ConfigEntry::Field {
+            key: "startup_grace_ms",
+            comment: Some(CommentSource::Static(
+                "# Hold all delivery for this long after dux starts, so restored agents\n\
+                 # finish booting before old wakes are typed into them. Default 10000.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.startup_grace_ms),
+        },
+        ConfigEntry::Field {
+            key: "post_delivery_cooldown_ms",
+            comment: Some(CommentSource::Static(
+                "# After one wake is submitted to an agent, wait this long before typing the\n\
+                 # next one into it, so a backlog cannot outrun the agent showing it is\n\
+                 # busy. Never delays the Enter of a wake already typed. Default 10000.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.post_delivery_cooldown_ms),
+        },
+        ConfigEntry::Field {
+            key: "auto_clear_collaboration_quiet_secs",
+            comment: Some(CommentSource::Static(
+                "# A Worker's auto-clear waits while it collaborates: unread or unsent AMQ\n\
+                 # mail and queued wakes always block it, and so does AMQ activity newer\n\
+                 # than this many seconds. 0 disables only the recent-activity window.\n\
+                 # Default 1800.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.inject.auto_clear_collaboration_quiet_secs),
+        },
+        ConfigEntry::Blank,
+        ConfigEntry::Comment(
+            "# Orchestrator watchdog.\n\
+             #\n\
+             # Agents in Orchestrator mode get a built-in role policy at launch (typed\n\
+             # once for CLIs with no system-prompt flag). While same-project Worker\n\
+             # agents are live, dux also wakes one orchestrator per project with a\n\
+             # checkpoint prompt to poll them. Delivery uses the same idle and busy\n\
+             # safeguards as the inject queue above.",
+        ),
+        ConfigEntry::Section("amq.orchestrator"),
+        ConfigEntry::Field {
+            key: "enabled",
+            comment: Some(CommentSource::Static(
+                "# Master switch for the watchdog. Only Orchestrator-mode agents are\n\
+                 # affected. Default true.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.amq.orchestrator.enabled),
+        },
+        ConfigEntry::Field {
+            key: "poll_interval_secs",
+            comment: Some(CommentSource::Static(
+                "# Seconds between checkpoint prompts per project. There is never one at\n\
+                 # startup. 0 stops checkpoints (and the typed launch policy). Default 900.",
+            )),
+            value_fn: |c| FieldValue::U64(c.amq.orchestrator.poll_interval_secs),
+        },
+        ConfigEntry::Field {
+            key: "checkpoint_prompt",
+            comment: Some(CommentSource::Static(
+                "# Replacement checkpoint text, typed verbatim instead of the built-in one\n\
+                 # that lists live workers and how to poll them. Empty uses the built-in.\n\
+                 # The launch-time policy is unaffected.",
+            )),
+            value_fn: |c| FieldValue::Str(c.amq.orchestrator.checkpoint_prompt.clone()),
+        },
+        ConfigEntry::Blank,
         ConfigEntry::Keys,
         ConfigEntry::Blank,
         ConfigEntry::Macros,
@@ -1732,6 +1978,8 @@ fn render_project_configs(out: &mut String, projects: &[ProjectConfig]) {
          # Paths may use $HOME, ${HOME}, or ~ for portability across machines.\n\
          # startup_command runs in each new agent worktree before the provider launches.\n\
          # env defines per-project variables passed to agent and companion terminal PTYs.\n\
+         # workspace_mode may be \"shared\" or \"worktree\"; omit it to inherit\n\
+         # [workspace].default_mode.\n\
          # Values may reference existing environment variables with $VAR or ${VAR}.\n\
          #\n\
          # `id` is generated by dux and is how a project is matched to its agents and\n\
@@ -1749,7 +1997,8 @@ fn render_project_configs(out: &mut String, projects: &[ProjectConfig]) {
              # default_provider = \"codex\"\n\
              # auto_reopen_agents = true\n\
              # startup_command = \"npm install\"\n\
-             # env = { EDITOR = \"true\", API_KEY = \"${FOOBAR_API_KEY}\" }\n\n",
+             # env = { EDITOR = \"true\", API_KEY = \"${FOOBAR_API_KEY}\" }\n\
+             # workspace_mode = \"worktree\"\n\n",
         );
         return;
     }
@@ -1788,6 +2037,9 @@ fn render_project_configs(out: &mut String, projects: &[ProjectConfig]) {
                 out.push_str(&format!("{} = \"{}\"", key, escape_toml_string(value)));
             }
             out.push_str(" }\n");
+        }
+        if let Some(mode) = project.workspace_mode {
+            out.push_str(&format!("workspace_mode = \"{}\"\n", mode.as_str()));
         }
         out.push('\n');
     }
@@ -1927,6 +2179,21 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
         None => out.push_str("# forward_scroll = true\n"),
     }
     out.push_str(
+        "# Whether a plain left-button drag over this agent's pane goes to the\n\
+         # provider once it has turned on mouse reporting. Terminal UI only.\n\
+         #   (unset) or true = forward presses and drags to the provider, as a\n\
+         #                     terminal emulator does.\n\
+         #   false           = keep a plain drag in dux as a text selection so it\n\
+         #                     can be copied; a click that did not move is still\n\
+         #                     sent to the provider when the button comes up.\n\
+         # Shift+drag always selects in dux. The wheel is governed by\n\
+         # forward_scroll above, not by this key.\n",
+    );
+    match config.forward_mouse {
+        Some(value) => out.push_str(&format!("forward_mouse = {value}\n")),
+        None => out.push_str("# forward_mouse = false\n"),
+    }
+    out.push_str(
         "# What a dragged, dropped or pasted file's path looks like when the web UI\n\
          # writes it into this provider's prompt.\n\
          #\n\
@@ -1969,6 +2236,124 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
         None => out.push_str("# web_dragdrop_paste = \"bare\"\n"),
     }
     out.push('\n');
+    render_provider_watch_rules(out, name, &config.watch);
+}
+
+/// Render the `[[providers.<name>.watch]]` documentation and any rules the user
+/// configured. Claude ships copy-pasteable commented examples tailored to
+/// Anthropic's transient errors. They stay commented because a rule types into
+/// the agent's PTY unprompted, so dux opts users in explicitly.
+///
+/// Configured rules are rendered as real array-of-tables entries (with nested
+/// tables inline) so `dux config restore-docs`, which re-renders the whole file
+/// from the parsed config, keeps them.
+fn render_provider_watch_rules(out: &mut String, name: &str, rules: &[dux_core::watch::WatchRule]) {
+    out.push_str(&format!(
+        "# Watch rules. Each rule pairs a regex against this provider's recent\n\
+         # output with an action; configure as `[[providers.{name}.watch]]` array\n\
+         # entries. Fields:\n\
+         #   pattern     regex matched against the bottom 30 rows of the agent pane\n\
+         #   label       optional name shown in status messages\n\
+         #   action      \"send_text\" (type `text` after the backoff) or\n\
+         #               \"wait_until_capture\" (parse the named `capture` group with\n\
+         #               `format`, wait until that time, then type `text`). Formats:\n\
+         #               unix_seconds, unix_millis, clock_local, in_seconds,\n\
+         #               in_minutes, in_hours\n\
+         #   append_enter  press Enter after `text` (default true)\n\
+         #   backoff     {{ initial_ms, max_ms, multiplier, jitter_ms }}, the delay\n\
+         #               before firing; grows per attempt up to max_ms\n\
+         #   budget      {{ max_attempts }}, fires allowed per session before the rule\n\
+         #               disarms itself (default 5, 0 = unlimited)\n\
+         #   cooldown_ms   a re-match within this window counts as the same\n\
+         #               incident (default 30000)\n\
+         # Patterns run against output that may include content from the project\n\
+         # under edit, so the engine caps regex size and caps each rule's fires by\n\
+         # default. Rules are disarmed and re-armed from the \"watch-rules\" palette.\n"
+    ));
+    if name == "claude" {
+        out.push_str(
+            "#\n\
+             # Example 1: server-throttle auto-retry. Anthropic surfaces a transient\n\
+             # server-side rate-limit (distinct from the 5-hour usage limit). Claude\n\
+             # Code's internal retry budget exhausts in seconds; this rule keeps\n\
+             # retrying with capped exponential backoff until the API recovers.\n\
+             #\n\
+             # [[providers.claude.watch]]\n\
+             # pattern = \"API Error.*Server is temporarily limiting requests\"\n\
+             # action = \"send_text\"\n\
+             # text = \"please continue\"\n\
+             # backoff = { initial_ms = 60000, max_ms = 600000, multiplier = 2.0, jitter_ms = 5000 }\n\
+             # budget = { max_attempts = 0 } # unlimited API retry\n\
+             # cooldown_ms = 30000\n\
+             #\n\
+             # Example 2: 5-hour usage-limit auto-resume (Unix-timestamp variant).\n\
+             # Claude Code emits messages like `Claude AI usage limit reached|<ts>`\n\
+             # where <ts> is a Unix-seconds reset time. The rule captures the\n\
+             # timestamp, waits until then, and resumes. The backoff is the\n\
+             # *fallback* used only if the timestamp fails to parse.\n\
+             #\n\
+             # [[providers.claude.watch]]\n\
+             # pattern = \"Claude AI usage limit reached\\\\|(?<ts>\\\\d+)\"\n\
+             # action = \"wait_until_capture\"\n\
+             # capture = \"ts\"\n\
+             # format = \"unix_seconds\"\n\
+             # text = \"please continue\"\n\
+             # backoff = { initial_ms = 600000, max_ms = 3600000, multiplier = 2.0, jitter_ms = 30000 }\n\
+             # budget = { max_attempts = 3 }\n\
+             # cooldown_ms = 60000\n\
+             #\n\
+             # Example 3: 5-hour usage-limit auto-resume (clock-time variant).\n\
+             # Newer Claude Code builds say \"Your limit will reset at 3pm\". The rule\n\
+             # captures the time, treats it as today's local time (rolling to tomorrow\n\
+             # if already past), and resumes then. The optional `(Timezone)` suffix\n\
+             # is stripped, so set your TZ env var to match the displayed timezone.\n\
+             #\n\
+             # [[providers.claude.watch]]\n\
+             # pattern = \"limit will reset at (?<t>\\\\d{1,2}(?::\\\\d{2})?\\\\s*(?:am|pm)?)\"\n\
+             # action = \"wait_until_capture\"\n\
+             # capture = \"t\"\n\
+             # format = \"clock_local\"\n\
+             # text = \"please continue\"\n\
+             # backoff = { initial_ms = 600000, max_ms = 3600000, multiplier = 2.0, jitter_ms = 30000 }\n\
+             # budget = { max_attempts = 3 }\n\
+             # cooldown_ms = 60000\n\
+             #\n\
+             # Example 4: Anthropic API overload auto-retry. When upstream servers\n\
+             # are saturated the API surfaces an `overloaded_error` (HTTP 529).\n\
+             # Claude Code prints messages like `API Error: Overloaded` or\n\
+             # `API Error · 529 · Overloaded`. Overloads typically clear in tens\n\
+             # of seconds, so the backoff is shorter than the throttle rule above\n\
+             # but still escalates if the condition persists.\n\
+             #\n\
+             # [[providers.claude.watch]]\n\
+             # pattern = \"API Error.*[Oo]verloaded\"\n\
+             # action = \"send_text\"\n\
+             # text = \"please continue\"\n\
+             # backoff = { initial_ms = 30000, max_ms = 600000, multiplier = 2.0, jitter_ms = 5000 }\n\
+             # budget = { max_attempts = 0 } # unlimited API retry\n\
+             # cooldown_ms = 30000\n",
+        );
+    }
+    out.push('\n');
+    for rule in rules {
+        out.push_str(&format!("[[providers.{name}.watch]]\n"));
+        out.push_str(&render_watch_rule_body(rule));
+        out.push('\n');
+    }
+}
+
+/// One watch rule's keys as `key = value` lines, nested tables inline. Goes
+/// through `toml`'s own serializer so every string is escaped exactly as the
+/// parser expects. A rule came from a parsed config, so it always serializes.
+fn render_watch_rule_body(rule: &dux_core::watch::WatchRule) -> String {
+    let Ok(toml::Value::Table(table)) = toml::Value::try_from(rule) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for (key, value) in &table {
+        out.push_str(&format!("{key} = {value}\n"));
+    }
+    out
 }
 
 /// Validate all key bindings in the config. Returns a descriptive error on failure.
@@ -2027,6 +2412,34 @@ mod tests {
         let bindings =
             crate::keybindings::RuntimeBindings::from_keys_config(&KeysConfig::default());
         render_config(config, &bindings)
+    }
+
+    /// Every provider block documents `forward_mouse` inline; the ones that ship
+    /// a value write it, the rest carry the commented example. The rendered
+    /// document must also load back to the same policy.
+    #[test]
+    fn rendered_config_documents_forward_mouse_per_provider() {
+        let rendered = render_config_default(&Config::default());
+        for name in ["claude", "codex", "opencode", "copilot", "jcode"] {
+            let section = rendered
+                .split(&format!("[providers.{name}]\n"))
+                .nth(1)
+                .and_then(|s| s.split("\n[").next())
+                .unwrap_or_else(|| panic!("{name} section"));
+            assert!(
+                section.contains("# Whether a plain left-button drag"),
+                "{name} must document forward_mouse: {section}"
+            );
+            let expected = if matches!(name, "claude" | "codex" | "opencode") {
+                "\nforward_mouse = false\n"
+            } else {
+                "\n# forward_mouse = false\n"
+            };
+            assert!(section.contains(expected), "{name}: {section}");
+        }
+        let parsed: Config = toml::from_str(&rendered).expect("rendered config parses");
+        assert!(!parsed.providers.commands["claude"].forwards_mouse());
+        assert_eq!(parsed.providers.commands["jcode"].forward_mouse, None);
     }
 
     // -----------------------------------------------------------------------
@@ -2143,6 +2556,17 @@ mod tests {
         // stronger check than a handful of spot assertions.
         let mut normalized = after.clone();
         normalized.keys.bindings = before.keys.bindings.clone();
+        // 3. A config with no `[workspace]` section is rendered with its
+        //    EFFECTIVE mode (worktree), which resolves exactly like the absent
+        //    section and so records the same consent explicitly.
+        if before.workspace.is_none() {
+            assert_eq!(
+                after.default_workspace_mode(),
+                before.default_workspace_mode()
+            );
+            assert_eq!(after.auto_resume_shared(), before.auto_resume_shared());
+            normalized.workspace = None;
+        }
         for (name, provider) in normalized.providers.commands.iter_mut() {
             if before.providers.commands[name]
                 .resume_wait_timeout_ms
@@ -2360,6 +2784,7 @@ mod tests {
             auto_reopen_agents: None,
             startup_command: None,
             env: BTreeMap::new(),
+            workspace_mode: None,
         });
 
         dux_core::config_write::save_config_with(
@@ -2839,6 +3264,7 @@ mod tests {
             auto_reopen_agents: None,
             startup_command: Some("npm install".to_string()),
             env: Default::default(),
+            workspace_mode: None,
         });
         let rendered = render_config_default(&config);
         assert!(rendered.contains("[[projects]]"));
@@ -2983,6 +3409,7 @@ name = "test"
             auto_reopen_agents: None,
             startup_command: Some("echo ready".to_string()),
             env: Default::default(),
+            workspace_mode: None,
         });
         let bindings = crate::keybindings::RuntimeBindings::from_keys_config(&config.keys);
         save_config(&config_path, &config, &bindings).expect("save config");
@@ -3037,6 +3464,79 @@ name = "test"
             rendered.contains("logs a warning once"),
             "the comment must say the clamp is announced: {rendered}"
         );
+    }
+
+    #[test]
+    fn amq_settings_round_trip_through_the_documented_template() {
+        let mut config = Config::default();
+        config.amq.inject.enabled = false;
+        config.amq.inject.queue_dir = "/var/spool/dux-amq".into();
+        config.amq.inject.busy_markers = vec!["busy \"now\"".into()];
+        config.amq.inject.phase_delay_ms = 500;
+        config.amq.inject.max_message_age_secs = 3600;
+        config.amq.orchestrator.poll_interval_secs = 0;
+        config.amq.orchestrator.checkpoint_prompt = "Line one\nline \"two\"".into();
+        let rendered = render_config_default(&config);
+        for header in ["[amq.inject]", "[amq.orchestrator]"] {
+            assert!(rendered.contains(header), "{header} missing");
+        }
+        assert!(
+            rendered.contains("# Replacement checkpoint text"),
+            "documented"
+        );
+        let parsed: Config = toml::from_str(&rendered).expect("parses");
+        assert_eq!(parsed.amq, config.amq);
+    }
+
+    #[test]
+    fn amq_inject_phase_delay_ms_round_trips() {
+        for value in [0, 50, 200] {
+            let mut cfg = Config::default();
+            cfg.amq.inject.phase_delay_ms = value;
+            let parsed: Config =
+                toml::from_str(&render_config_default(&cfg)).expect("config should parse");
+            assert_eq!(parsed.amq.inject.phase_delay_ms, value);
+        }
+    }
+
+    /// Strict mode is opt-in and reaches the bridge as DUX_AMQ_VERIFY at
+    /// spawn, so both values must survive a render and parse.
+    #[test]
+    fn amq_inject_verify_envelope_round_trips() {
+        for value in [true, false] {
+            let mut cfg = Config::default();
+            cfg.amq.inject.verify_envelope = value;
+            let parsed: Config =
+                toml::from_str(&render_config_default(&cfg)).expect("config should parse");
+            assert_eq!(parsed.amq.inject.verify_envelope, value);
+        }
+    }
+
+    #[test]
+    fn default_config_round_trips_amq_inject() {
+        let mut config = Config::default();
+        let i = &mut config.amq.inject;
+        i.busy_markers = vec!["thinking…".to_string(), "ctrl-c to cancel".to_string()];
+        i.queue_dir = "/tmp/inject".to_string();
+        i.busy_scan_lines = 12;
+        i.delivery_timeout_secs = 90;
+        i.max_message_age_secs = 91;
+        i.poll_interval_ms = 1234;
+        i.max_message_bytes = 4096;
+        i.enabled = false;
+        i.phase_delay_ms = 777;
+        i.startup_grace_ms = 4_321;
+        i.post_delivery_cooldown_ms = 9_876;
+        i.auto_clear_collaboration_quiet_secs = 2_222;
+        i.active_session_quiet_secs = 42;
+        i.verify_envelope = true;
+        config.amq.orchestrator.enabled = false;
+        config.amq.orchestrator.poll_interval_secs = 333;
+        config.amq.orchestrator.checkpoint_prompt =
+            "Keep the goal moving.\nUnblock stalled workers.".to_string();
+        let parsed: Config =
+            toml::from_str(&render_config_default(&config)).expect("config should parse");
+        assert_eq!(parsed.amq, config.amq);
     }
 
     #[test]
@@ -3236,7 +3736,9 @@ agent_scrollback_lines = 10000
             resume_by_id_args: None,
             install_hint: None,
             forward_scroll: None,
+            forward_mouse: None,
             web_dragdrop_paste: None,
+            watch: Vec::new(),
         };
         assert_eq!(cfg.interactive_args(false), ["--interactive"]);
         assert_eq!(
@@ -3252,7 +3754,9 @@ agent_scrollback_lines = 10000
             resume_by_id_args: None,
             install_hint: None,
             forward_scroll: None,
+            forward_mouse: None,
             web_dragdrop_paste: None,
+            watch: Vec::new(),
         };
         assert_eq!(unsupported.interactive_args(true), ["--interactive"]);
         assert!(!unsupported.supports_session_resume());
@@ -3271,7 +3775,9 @@ agent_scrollback_lines = 10000
                     resume_by_id_args: None,
                     install_hint: None,
                     forward_scroll: None,
+                    forward_mouse: None,
                     web_dragdrop_paste: None,
+                    watch: Vec::new(),
                 },
             )]),
         };
@@ -3300,7 +3806,9 @@ agent_scrollback_lines = 10000
                     resume_by_id_args: None,
                     install_hint: None,
                     forward_scroll: None,
+                    forward_mouse: None,
                     web_dragdrop_paste: None,
+                    watch: Vec::new(),
                 },
             )]),
         };
@@ -3514,7 +4022,9 @@ oneshot_output = "stdout"
                     resume_by_id_args: None,
                     install_hint: None,
                     forward_scroll: None,
+                    forward_mouse: None,
                     web_dragdrop_paste: None,
+                    watch: Vec::new(),
                 },
             )]),
         };
@@ -3860,6 +4370,48 @@ args = [\"-l\"]
         );
     }
 
+    /// Fork d945e200 (`config_v1_removes_only_the_legacy_open_worktree_binding`).
+    /// There is no config schema number here, so the fork's v1 migration arm is a
+    /// load rule: a `[keys]` row that is EXACTLY the retired plain `o` default is
+    /// cleared and the change persisted, while a customized row is kept.
+    #[test]
+    fn config_v1_removes_only_the_legacy_open_worktree_binding() {
+        let seed = |value: &str| {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let root = dir.path().to_path_buf();
+            let paths = dux_core::config::DuxPaths {
+                config_path: root.join("config.toml"),
+                sessions_db_path: root.join("sessions.sqlite3"),
+                lock_path: root.join("dux.lock"),
+                worktrees_root: root.join("worktrees"),
+                root,
+            };
+            let body = format!("[keys]\nopen_worktree_in_editor = {value}\n");
+            fs::write(&paths.config_path, body).expect("seed config");
+            (dir, paths)
+        };
+
+        let (_dir, paths) = seed("[\"o\"]");
+        let migrated = ensure_config(&paths).expect("load and persist migration");
+        assert_eq!(
+            migrated.keys.bindings["open_worktree_in_editor"],
+            Vec::<String>::new()
+        );
+        let persisted: Config =
+            toml::from_str(&fs::read_to_string(&paths.config_path).expect("read migrated config"))
+                .expect("parse migrated config");
+        assert!(persisted.keys.bindings["open_worktree_in_editor"].is_empty());
+
+        for custom in ["[\"ctrl-o\"]", "[\"o\", \"ctrl-o\"]"] {
+            let (_dir, paths) = seed(custom);
+            let kept = ensure_config(&paths).expect("load");
+            assert!(
+                !kept.keys.bindings["open_worktree_in_editor"].is_empty(),
+                "a customized binding {custom} must be kept"
+            );
+        }
+    }
+
     /// The terminal UI never goes through `load_config`, so the correction that
     /// keeps the engine tick from re-warning has to happen here too. Without it
     /// the surface with the fastest tick is the one that floods.
@@ -3918,7 +4470,9 @@ args = [\"-l\"]
             resume_by_id_args: None,
             install_hint: Some("brew install gemini-cli".to_string()),
             forward_scroll: None,
+            forward_mouse: None,
             web_dragdrop_paste: None,
+            watch: Vec::new(),
         };
         let mut body = render_default_config();
         render_provider_config(&mut body, "gemini", &stock_gemini);
@@ -4238,5 +4792,416 @@ mod web_dragdrop_paste_render_tests {
             parsed.providers.commands["claude"].resolved_web_dragdrop_paste(),
             dux_core::config::WebDragDropPaste::Bare
         );
+    }
+
+    /// The canonical template ships commented `[[providers.claude.watch]]`
+    /// examples so users discover the feature. All examples are opt-in: a rule
+    /// types into the agent's PTY unprompted.
+    #[test]
+    fn render_provider_config_includes_claude_watch_example() {
+        let rendered = render_default_config();
+        assert!(
+            rendered.contains("# [[providers.claude.watch]]"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("# pattern = \"API Error.*Server is temporarily limiting requests\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .matches("# budget = { max_attempts = 0 } # unlimited API retry")
+                .count()
+                >= 2,
+            "Claude API retry examples must be unlimited:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("# format = \"unix_seconds\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("# format = \"clock_local\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("# action = \"wait_until_capture\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("# pattern = \"API Error.*[Oo]verloaded\""),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("\n[[providers.claude.watch]]"),
+            "watch examples must stay commented in the default template:\n{rendered}"
+        );
+        // The rendered default still parses with zero rules.
+        let parsed: Config = toml::from_str(&rendered).expect("default parses");
+        assert!(parsed.providers.commands["claude"].watch.is_empty());
+    }
+
+    /// The commented examples must be valid rules once uncommented: a user
+    /// copying one must not get a parse error or a rule the engine rejects.
+    #[test]
+    fn claude_watch_examples_parse_and_load_when_uncommented() {
+        let rendered = render_default_config();
+        let mut body = String::new();
+        let mut in_example = false;
+        for line in rendered.lines() {
+            if line == "# [[providers.claude.watch]]" {
+                in_example = true;
+            } else if !line.starts_with("# ") || line.starts_with("# Example") {
+                in_example = false;
+            }
+            if in_example {
+                let uncommented = line.trim_start_matches("# ");
+                let uncommented = uncommented
+                    .split(" # ")
+                    .next()
+                    .expect("split yields a head");
+                body.push_str(uncommented);
+                body.push('\n');
+            }
+        }
+        let parsed: Config =
+            toml::from_str(&format!("[providers.claude]\ncommand = \"claude\"\n{body}"))
+                .expect("uncommented examples parse");
+        let rules = &parsed.providers.commands["claude"].watch;
+        assert_eq!(rules.len(), 4, "{body}");
+        let (engine, errors) = dux_core::watch::WatchEngine::new("s", rules);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(engine.rule_count(), 4);
+        assert_eq!(rules[0].budget.max_attempts, 0);
+    }
+
+    /// Other providers get the field documentation but not Claude's examples.
+    #[test]
+    fn render_provider_config_omits_claude_example_for_other_providers() {
+        let rendered = render_default_config();
+        assert!(
+            rendered.contains("`[[providers.codex.watch]]`"),
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("API Error.*Server is temporarily").count(),
+            1,
+            "{rendered}"
+        );
+    }
+
+    /// User-authored `[[providers.claude.watch]]` rules survive a save
+    /// round-trip, including comments inside the rule body. `patch_providers`
+    /// never touches the watch array. The test drives the deprecated sync save
+    /// path directly, as the fork's test did.
+    #[test]
+    #[allow(deprecated)]
+    fn save_config_preserves_user_authored_watch_rules() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let mut body = render_default_config();
+        body.push_str(
+            "\n# user-added: aggressive retry while debugging\n\
+             [[providers.claude.watch]]\n\
+             pattern = \"my custom error\"\n\
+             action = \"send_text\"\n\
+             text = \"keep going\"\n\
+             # tighter cooldown than the default\n\
+             cooldown_ms = 5000\n",
+        );
+        std::fs::write(&config_path, &body).expect("write");
+        let mut config: Config = toml::from_str(&body).expect("parse");
+        config.ui.right_width_pct = 31;
+        let bindings = crate::keybindings::RuntimeBindings::from_keys_config(&config.keys);
+        save_config(&config_path, &config, &bindings).expect("save");
+
+        let saved = std::fs::read_to_string(&config_path).expect("read back");
+        assert!(saved.contains("[[providers.claude.watch]]"), "{saved}");
+        assert!(saved.contains("pattern = \"my custom error\""), "{saved}");
+        assert!(
+            saved.contains("# user-added: aggressive retry while debugging"),
+            "{saved}"
+        );
+        assert!(
+            saved.contains("# tighter cooldown than the default"),
+            "{saved}"
+        );
+        let reloaded: Config = toml::from_str(&saved).expect("reparse");
+        assert!(
+            reloaded.providers.commands["claude"]
+                .watch
+                .iter()
+                .any(|r| r.pattern == "my custom error" && r.cooldown_ms == 5000)
+        );
+    }
+
+    /// Configured rules survive `restore-docs` and a first-creation render. A
+    /// rule with every field set, including a regex with backslashes and
+    /// quotes, must round-trip exactly.
+    #[test]
+    fn restore_docs_keeps_configured_watch_rules() {
+        let raw = "[providers.claude]\ncommand = \"claude\"\n\n\
+                   [[providers.claude.watch]]\n\
+                   pattern = 'reset at (?<t>\\d+) \"now\"'\n\
+                   label = \"usage\"\n\
+                   action = \"wait_until_capture\"\n\
+                   capture = \"t\"\n\
+                   format = \"unix_seconds\"\n\
+                   text = \"go on\"\n\
+                   append_enter = false\n\
+                   backoff = { initial_ms = 1, max_ms = 2, multiplier = 3.5, jitter_ms = 4 }\n\
+                   budget = { max_attempts = 0 }\n\
+                   cooldown_ms = 7\n\n\
+                   [[providers.claude.watch]]\n\
+                   pattern = \"second\"\n\
+                   action = \"send_text\"\n\
+                   text = \"x\"\n";
+        let before: Config = toml::from_str(raw).expect("fixture parses");
+        let restored = restore_documentation(raw).expect("restore");
+        let after: Config = toml::from_str(&restored.text).expect("restored parses");
+        assert_eq!(
+            before.providers.commands["claude"].watch, after.providers.commands["claude"].watch,
+            "{}",
+            restored.text
+        );
+        assert_eq!(after.providers.commands["claude"].watch.len(), 2);
+
+        // First creation writes the documented render of the in-memory config
+        // with no original file to merge from, so the renderer itself must emit
+        // the rules or a config born from them (dux serve's bootstrap, a web
+        // save onto a missing file) would lose them.
+        let rendered = render_config_documented(&before);
+        let reparsed: Config = toml::from_str(&rendered).expect("rendered parses");
+        assert_eq!(
+            before.providers.commands["claude"].watch, reparsed.providers.commands["claude"].watch,
+            "{rendered}"
+        );
+    }
+}
+
+/// Shared main-workspace mode config (fork shared-workspace Phase 4, be131ef8
+/// and 8eb821e6). Fork test names are kept.
+#[cfg(test)]
+mod workspace_mode_tests {
+    use super::*;
+    use dux_core::config::{ProjectConfig, WorkspaceConfig, WorkspaceMode};
+
+    fn test_paths(root: &std::path::Path) -> dux_core::config::DuxPaths {
+        dux_core::config::DuxPaths {
+            root: root.to_path_buf(),
+            config_path: root.join("config.toml"),
+            sessions_db_path: root.join("sessions.sqlite3"),
+            worktrees_root: root.join("worktrees"),
+            lock_path: root.join("dux.lock"),
+        }
+    }
+
+    fn project(path: &str, mode: Option<WorkspaceMode>) -> ProjectConfig {
+        ProjectConfig {
+            id: "project".to_string(),
+            path: path.to_string(),
+            name: None,
+            default_provider: None,
+            leading_branch: None,
+            auto_reopen_agents: None,
+            startup_command: None,
+            env: Default::default(),
+            workspace_mode: mode,
+        }
+    }
+
+    /// An install whose config predates workspace modes keeps worktree
+    /// isolation, and loading it does not write the section in.
+    #[test]
+    fn workspace_mode_absent_section_preserves_worktree_consent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(dir.path());
+        fs::write(&paths.config_path, "[ui]\nleft_width_pct = 20\n").expect("legacy config");
+        let config = ensure_config(&paths).expect("load legacy config");
+        assert!(config.workspace.is_none());
+        assert_eq!(config.default_workspace_mode(), WorkspaceMode::Worktree);
+        assert!(!config.auto_resume_shared());
+        assert!(
+            !fs::read_to_string(&paths.config_path)
+                .unwrap()
+                .contains("[workspace]")
+        );
+    }
+
+    #[test]
+    fn workspace_mode_explicit_shared_and_worktree_resolve_exactly() {
+        for (value, expected) in [
+            ("shared", WorkspaceMode::Shared),
+            ("worktree", WorkspaceMode::Worktree),
+        ] {
+            let config: Config =
+                toml::from_str(&format!("[workspace]\ndefault_mode = \"{value}\"\n"))
+                    .expect("explicit workspace config");
+            assert_eq!(config.default_workspace_mode(), expected);
+        }
+        assert!(
+            toml::from_str::<Config>("[[projects]]\npath = \"/p\"\nworkspace_mode = \"bogus\"\n")
+                .is_err(),
+            "an unknown project mode must not silently inherit"
+        );
+    }
+
+    /// Only a brand-new install defaults to shared, and the rendered file
+    /// documents both keys.
+    #[test]
+    fn freshly_created_config_renders_and_loads_shared_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(dir.path());
+        let config = ensure_config(&paths).expect("fresh config");
+
+        assert_eq!(config.default_workspace_mode(), WorkspaceMode::Shared);
+        let written = fs::read_to_string(&paths.config_path).expect("fresh config text");
+        assert!(written.contains("[workspace]"));
+        assert!(written.contains("default_mode = \"shared\""));
+        assert!(written.contains("auto_resume_shared = false"));
+        assert!(written.contains("# workspace_mode may be \"shared\" or \"worktree\""));
+    }
+
+    #[test]
+    fn project_workspace_override_inherits_or_overrides_global() {
+        let mut config = Config::default();
+        let mut project = project("/tmp/project", None);
+        assert_eq!(
+            config.workspace_mode_for_project(&project),
+            WorkspaceMode::Shared
+        );
+        project.workspace_mode = Some(WorkspaceMode::Worktree);
+        assert_eq!(
+            config.workspace_mode_for_project(&project),
+            WorkspaceMode::Worktree
+        );
+        config.workspace = None;
+        project.workspace_mode = None;
+        assert_eq!(
+            config.workspace_mode_for_project(&project),
+            WorkspaceMode::Worktree
+        );
+
+        let parsed: Config = toml::from_str(
+            "[workspace]\ndefault_mode = \"shared\"\n\n[[projects]]\npath = \"/tmp/project\"\nworkspace_mode = \"\"\n",
+        )
+        .expect("empty project mode");
+        assert_eq!(
+            parsed.workspace_mode_for_project(&parsed.projects[0]),
+            WorkspaceMode::Shared
+        );
+        assert_eq!(
+            parsed.workspace_mode_for_project_id("unknown"),
+            WorkspaceMode::Shared
+        );
+    }
+
+    #[test]
+    fn config_load_rejects_shared_project_inside_managed_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(dir.path());
+        paths.ensure_dirs().expect("state dirs");
+        let project = paths.worktrees_root.join("nested-project");
+        fs::create_dir_all(&project).expect("project dir");
+        fs::write(
+            &paths.config_path,
+            format!(
+                "[workspace]\ndefault_mode = \"shared\"\n\n[[projects]]\nid = \"p\"\npath = \"{}\"\n",
+                escape_toml_string(&project.to_string_lossy())
+            ),
+        )
+        .expect("config");
+
+        let err = ensure_config(&paths).expect_err("managed shared path must fail");
+        assert!(format!("{err:#}").contains("inside Dux-managed state"));
+
+        // The same project in worktree mode is fine: only a shared agent runs
+        // in the checkout itself.
+        fs::write(
+            &paths.config_path,
+            format!(
+                "[workspace]\ndefault_mode = \"shared\"\n\n[[projects]]\nid = \"p\"\npath = \"{}\"\nworkspace_mode = \"worktree\"\n",
+                escape_toml_string(&project.to_string_lossy())
+            ),
+        )
+        .expect("config");
+        ensure_config(&paths).expect("a worktree-mode project may live anywhere");
+    }
+
+    #[test]
+    fn shared_eligibility_resolves_existing_symlink_ancestor_for_missing_child() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(&dir.path().join("state"));
+        paths.ensure_dirs().expect("state dirs");
+        let alias = dir.path().join("state-alias");
+        std::os::unix::fs::symlink(&paths.root, &alias).expect("state alias");
+
+        let err = dux_core::config::validate_shared_workspace_path(
+            &alias.join("not-created-yet").to_string_lossy(),
+            &paths,
+        )
+        .expect_err("symlinked managed child must fail");
+
+        assert!(format!("{err:#}").contains("inside Dux-managed state"));
+        dux_core::config::validate_shared_workspace_path(
+            &dir.path().join("elsewhere").to_string_lossy(),
+            &paths,
+        )
+        .expect("a checkout outside dux state is eligible");
+    }
+
+    /// Saving an unrelated setting on a legacy install must not add
+    /// `[workspace]` (which would flip it to shared), and a project's override
+    /// survives a save.
+    #[test]
+    #[allow(deprecated)] // sync-direct save, like the other save_config tests
+    fn save_config_preserves_legacy_workspace_absence_and_project_override() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            "[ui]\nleft_width_pct = 20\n\n[[projects]]\nid = \"project\"\npath = \"/tmp/project\"\nworkspace_mode = \"shared\"\n",
+        )
+        .expect("legacy config");
+        let mut config: Config =
+            toml::from_str(&fs::read_to_string(&config_path).unwrap()).expect("parse");
+        config.ui.left_width_pct = 25;
+        let bindings = crate::keybindings::RuntimeBindings::from_keys_config(&config.keys);
+        save_config(&config_path, &config, &bindings).expect("save");
+
+        let saved = fs::read_to_string(&config_path).expect("read");
+        assert!(!saved.contains("[workspace]"), "{saved}");
+        let reloaded: Config = toml::from_str(&saved).expect("parse saved");
+        assert!(reloaded.workspace.is_none());
+        assert_eq!(
+            reloaded.projects[0].workspace_mode,
+            Some(WorkspaceMode::Shared)
+        );
+
+        let mut config = reloaded;
+        config.workspace = Some(WorkspaceConfig {
+            default_mode: WorkspaceMode::Worktree,
+            auto_resume_shared: true,
+        });
+        save_config(&config_path, &config, &bindings).expect("save");
+        let reloaded: Config =
+            toml::from_str(&fs::read_to_string(&config_path).unwrap()).expect("parse saved");
+        assert_eq!(reloaded.default_workspace_mode(), WorkspaceMode::Worktree);
+        assert!(reloaded.auto_resume_shared());
+    }
+
+    /// The diff renderer shows the effective mode of a legacy config, not a
+    /// fabricated shared default (fork cli.rs test).
+    #[test]
+    fn raw_diff_renders_legacy_workspace_consent_as_worktree() {
+        let config = Config {
+            workspace: None,
+            ..Config::default()
+        };
+        let bindings = crate::keybindings::RuntimeBindings::from_keys_config(&config.keys);
+
+        let rendered = render_config_with(&config, &bindings);
+
+        assert!(rendered.contains("default_mode = \"worktree\""));
+        assert!(!rendered.contains("default_mode = \"shared\""));
     }
 }

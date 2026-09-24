@@ -29,45 +29,20 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::config::ProviderCommandConfig;
-use crate::model::{AgentSession, Project};
+use crate::model::{AgentSession, Project, normalize_agent_handle};
 use crate::storage::SessionStore;
 
-/// Whether `session` runs in a directory it shares with other agents.
-///
-/// INTEGRATION: stubbed to `false` until the shared-workspace port lands its
-/// `AgentSession` field; wire it to that field at merge. Every shared-only rule
-/// in this port (never resume-latest, transcript check, recovery) reads this.
-pub fn session_is_shared(_session: &AgentSession) -> bool {
-    false
+/// Whether `session` runs in a directory it shares with other agents. Every
+/// shared-only rule in this module (never resume-latest, the Claude transcript
+/// check) reads this.
+pub fn session_is_shared(session: &AgentSession) -> bool {
+    session.shared_workspace()
 }
 
 /// The agent's stable handle, used to match a stranded history's old worktree
 /// directory name to the agent it belonged to.
-///
-/// INTEGRATION: derived from the directory basename until the shared-workspace
-/// port lands `AgentSession::agent_handle`; wire it to that field at merge (a
-/// shared agent's directory is the project checkout, so the basename is wrong
-/// for exactly the agents recovery exists for).
 pub fn agent_handle(session: &AgentSession) -> String {
-    Path::new(session.directory())
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(normalize_agent_handle)
-        .unwrap_or_default()
-}
-
-/// The fork's handle alphabet: lowercase ASCII, digits, `_` and `-`, anything
-/// else folded to `-`, no leading or trailing `-`, at most 64 characters.
-pub fn normalize_agent_handle(candidate: &str) -> String {
-    let mapped: String = candidate
-        .chars()
-        .map(|ch| match ch {
-            'a'..='z' | '0'..='9' | '_' | '-' => ch,
-            'A'..='Z' => ch.to_ascii_lowercase(),
-            _ => '-',
-        })
-        .collect();
-    mapped.trim_matches('-').chars().take(64).collect()
+    session.agent_handle.clone()
 }
 
 /// Escape control characters so an id or path read from a provider's files
@@ -1335,6 +1310,9 @@ mod tests {
                 branch_provenance: BranchProvenance::CreatedByDux,
                 worktree_path: worktree.to_string_lossy().to_string(),
             }),
+            agent_handle: normalize_agent_handle(id),
+            shared_workspace: false,
+            deleted_at: None,
             title: None,
             started_providers: vec![provider.to_string()],
             desired_running: false,
@@ -1527,8 +1505,9 @@ mod tests {
         let project_path = temp.path().join("project-checkout");
         let claude_projects = temp.path().join("claude-projects");
         let old_provider_dir = claude_projects.join("old-encoded-dir");
-        // The agent now runs in a directory whose basename is its handle.
-        let destination_cwd = temp.path().join("now").join("agent-one");
+        // A shared agent now runs in the project checkout itself, so only its
+        // stored handle can tie it to its old per-agent worktree.
+        let destination_cwd = project_path.clone();
         fs::create_dir_all(&old_provider_dir).unwrap();
         fs::create_dir_all(&destination_cwd).unwrap();
         fs::create_dir_all(&project_path).unwrap();
@@ -1553,7 +1532,9 @@ mod tests {
             fs::write(old_provider_dir.join(id).join("tool.txt"), id).unwrap();
         }
 
-        let session = managed_session("session-one", "claude", &project_path, &destination_cwd);
+        let mut session = managed_session("session-one", "claude", &project_path, &destination_cwd);
+        session.agent_handle = "agent-one".to_string();
+        session.shared_workspace = true;
         let project = project("demo", &project_path);
         let store = SessionStore::open(&temp.path().join("sessions.sqlite3")).unwrap();
         store.create_session(&session).unwrap();

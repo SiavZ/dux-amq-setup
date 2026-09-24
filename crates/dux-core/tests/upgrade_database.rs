@@ -668,6 +668,9 @@ fn old_state_survives_a_write_a_close_and_a_reopen() {
         store
             .upsert_session(&AgentSession {
                 id: "sess-folder".to_string(),
+                agent_handle: "sess-folder".to_string(),
+                shared_workspace: false,
+                deleted_at: None,
                 slot_tab_id: "sess-folder-slot".to_string(),
                 provider: ProviderKind::from_str("claude"),
                 title: Some("My Notes".to_string()),
@@ -796,6 +799,9 @@ fn a_migrated_title_is_not_re_frozen_when_a_later_agent_leaves_it_null() {
     store
         .upsert_session(&AgentSession {
             id: "sess-new".to_string(),
+            agent_handle: "sess-new".to_string(),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: "sess-new-slot".to_string(),
             provider: ProviderKind::new("claude"),
             title: None,
@@ -959,11 +965,15 @@ fn opening_a_database_this_build_created_is_a_no_op_the_second_time() {
                 auto_reopen_agents: Some(true),
                 startup_command: Some("just setup".to_string()),
                 env: std::collections::BTreeMap::from([("TOKEN".to_string(), "abc".to_string())]),
+                workspace_mode: None,
             })
             .expect("upsert project");
         store
             .create_session(&AgentSession {
                 id: "s1".to_string(),
+                agent_handle: "s1".to_string(),
+                shared_workspace: false,
+                deleted_at: None,
                 slot_tab_id: "s1-slot".to_string(),
                 provider: ProviderKind::new("codex"),
                 title: Some("fresh".to_string()),

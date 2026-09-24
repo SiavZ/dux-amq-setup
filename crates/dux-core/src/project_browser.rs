@@ -637,6 +637,9 @@ mod tests {
         };
         let sessions = vec![AgentSession {
             id: "session-1".to_string(),
+            agent_handle: "session-1".to_string(),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: "session-1-slot".to_string(),
             provider: ProviderKind::new("codex"),
             title: None,
@@ -762,6 +765,9 @@ mod tests {
         std::os::unix::fs::symlink(&occupied, &link).unwrap();
         let sessions = vec![AgentSession {
             id: "sa1".to_string(),
+            agent_handle: "sa1".to_string(),
+            shared_workspace: false,
+            deleted_at: None,
             slot_tab_id: "sa1-slot".to_string(),
             provider: ProviderKind::new("claude"),
             title: Some("notes".to_string()),
@@ -814,6 +820,7 @@ mod tests {
             auto_reopen_agents: None,
             startup_command: None,
             env: Default::default(),
+            workspace_mode: None,
         };
         let config = Config::default();
         let mut created_ats = HashMap::new();

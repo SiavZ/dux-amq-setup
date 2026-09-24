@@ -372,6 +372,18 @@ pub enum CreateAgentRequest {
         source_branch: String,
         custom_name: Option<String>,
     },
+    /// Shared main-workspace mode (fork shared-workspace Phase 4): run the
+    /// provider directly in the registered project checkout. Provisions
+    /// nothing: no worktree, no branch, no checkout, no startup command, no
+    /// `.git/info/exclude` edit. The row is a managed workspace whose
+    /// directory is the project path and whose `shared_workspace` flag is set,
+    /// so branch and PR display keep working while every teardown path keeps
+    /// its hands off the checkout.
+    SharedWorkspace {
+        project: Project,
+        /// The agent's title, and the seed for its AMQ handle.
+        custom_name: Option<String>,
+    },
     /// A standalone agent: run the provider in a folder the user already has.
     ///
     /// It carries no project, because a standalone agent belongs to none, and its
@@ -404,6 +416,7 @@ impl CreateAgentRequest {
             Self::ForkSession { project, .. } => Some(&project.id),
             Self::ExistingManagedWorktree { project, .. } => Some(&project.id),
             Self::ForkExternalWorktree { project, .. } => Some(&project.id),
+            Self::SharedWorkspace { project, .. } => Some(&project.id),
             Self::Standalone { .. } => None,
         }
     }
@@ -708,6 +721,11 @@ pub enum WorkerEvent {
     /// The one-time recovery of provider histories stranded under old per-agent
     /// worktrees finished. Its ids are already persisted.
     ResumeRecoveryCompleted(Result<crate::resume_recovery::RecoveryReport, String>),
+    /// The AMQ inject-queue watcher (or its polling fallback) noticed a
+    /// change under the queue root. No payload: the engine re-scans the
+    /// directory, claims new `.msg` files, and delivers them from
+    /// [`crate::engine::Engine::tick_amq`].
+    AmqInjectScanRequested,
 }
 
 /// How a successful (non-erroring) pull worker run ended. `current_branch` is

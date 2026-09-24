@@ -224,14 +224,12 @@ impl Engine {
     /// whose directory is older than `[auto_resume].stale_days` are dropped.
     ///
     /// Shared-directory agents join the widened set only with
-    /// `[workspace].auto_resume_shared`. INTEGRATION: `session_is_shared` and
-    /// that flag are owned by the shared-workspace port (evergreen); until it
-    /// lands no agent is shared and the flag is read as `false`.
+    /// `[workspace].auto_resume_shared` (8eb821e6): a boot must not fire every
+    /// shared agent into the real checkout unasked.
     pub fn startup_launch_candidates(&self) -> Vec<AgentSession> {
         let mut candidates = self.auto_reopen_candidates();
         if self.config.defaults.auto_resume_on_start {
-            // INTEGRATION: read `[workspace].auto_resume_shared` (evergreen).
-            let include_shared = false;
+            let include_shared = self.config.auto_resume_shared();
             for session in &self.sessions {
                 if candidates.iter().any(|c| c.id == session.id) {
                     continue;
@@ -518,6 +516,66 @@ mod tests {
         assert!(engine.startup_launch_candidates().is_empty());
         engine.config.auto_resume.stale_days = 0;
         assert_eq!(engine.startup_launch_candidates().len(), 1);
+    }
+
+    fn startup_fixture() -> (Engine, tempfile::TempDir) {
+        let (mut engine, tmp) = test_engine();
+        let dir = tmp.path().join("checkout");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut shared = session_in(&dir, "shared", "claude");
+        shared.shared_workspace = true;
+        shared.desired_running = false;
+        let mut worktree = session_in(&dir, "worktree", "claude");
+        worktree.desired_running = false;
+        engine.sessions.push(shared);
+        engine.sessions.push(worktree);
+        engine.config.defaults.auto_resume_on_start = true;
+        (engine, tmp)
+    }
+
+    fn candidate_ids(engine: &Engine) -> Vec<String> {
+        engine
+            .startup_launch_candidates()
+            .into_iter()
+            .map(|s| s.id)
+            .collect()
+    }
+
+    /// 8eb821e6: a boot must not fire every shared agent into the real
+    /// checkout unasked, so shared agents are excluded by default.
+    #[test]
+    fn startup_auto_resume_excludes_shared_sessions_by_default() {
+        let (engine, _tmp) = startup_fixture();
+        assert_eq!(candidate_ids(&engine), vec!["worktree".to_string()]);
+    }
+
+    /// `[workspace].auto_resume_shared = true` opts shared agents back in.
+    #[test]
+    fn startup_auto_resume_includes_shared_sessions_when_opted_in() {
+        let (mut engine, _tmp) = startup_fixture();
+        let mut workspace = engine.config.workspace.clone().unwrap_or_default();
+        workspace.auto_resume_shared = true;
+        engine.config.workspace = Some(workspace);
+        assert_eq!(
+            candidate_ids(&engine),
+            vec!["shared".to_string(), "worktree".to_string()]
+        );
+    }
+
+    /// A shared agent waiting for startup is held until history recovery
+    /// reports, because launching it first would start it fresh (it has no
+    /// resume-latest fallback) and lose the conversation recovery would find.
+    #[test]
+    fn startup_queue_waits_for_recovery_when_a_shared_agent_is_queued() {
+        let (mut engine, _tmp) = startup_fixture();
+        let mut workspace = engine.config.workspace.clone().unwrap_or_default();
+        workspace.auto_resume_shared = true;
+        engine.config.workspace = Some(workspace);
+        engine.config.auto_resume.stagger_ms = 0;
+        assert_eq!(engine.queue_startup_launches(true), 2);
+        assert!(engine.pump_startup_launches((24, 80)).is_empty());
+        engine.process_worker_event(WorkerEvent::ResumeRecoveryCompleted(Ok(Default::default())));
+        assert!(!engine.startup_launches.is_held());
     }
 
     /// The pump never has more than `concurrency` startup launches in flight.

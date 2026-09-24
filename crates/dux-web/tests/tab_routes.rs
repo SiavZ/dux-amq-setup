@@ -20,6 +20,9 @@ fn sample_session(id: &str, worktree: &str) -> dux_core::model::AgentSession {
     let n = chrono::Utc::now();
     dux_core::model::AgentSession {
         id: id.to_string(),
+        agent_handle: dux_core::model::normalize_agent_handle(id),
+        shared_workspace: false,
+        deleted_at: None,
         slot_tab_id: format!("{id}-slot"),
         provider: dux_core::model::ProviderKind::new("claude"),
         title: None,
@@ -78,6 +81,7 @@ async fn boot_with_tab_per_agent(tab_per_agent: u32) -> (SocketAddr, tempfile::T
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .unwrap();
         store
@@ -88,6 +92,9 @@ async fn boot_with_tab_per_agent(tab_per_agent: u32) -> (SocketAddr, tempfile::T
             .unwrap();
     }
     let mut engine = bootstrap_engine(&paths).unwrap();
+    // A worktree-mode install: these fixtures register dux's own root as the
+    // project, which shared mode rightly refuses to run agents in.
+    engine.config.workspace = None;
     engine.config.providers.commands.insert(
         "claude".to_string(),
         ProviderCommandConfig {
@@ -157,6 +164,7 @@ async fn boot_with_broken_provider_and_claude(
                 auto_reopen_agents: None,
                 startup_command: None,
                 env: Default::default(),
+                workspace_mode: None,
             })
             .unwrap();
         store
@@ -164,6 +172,9 @@ async fn boot_with_broken_provider_and_claude(
             .unwrap();
     }
     let mut engine = bootstrap_engine(&paths).unwrap();
+    // A worktree-mode install: these fixtures register dux's own root as the
+    // project, which shared mode rightly refuses to run agents in.
+    engine.config.workspace = None;
     engine.config.providers.commands.insert(
         "claude".to_string(),
         ProviderCommandConfig {

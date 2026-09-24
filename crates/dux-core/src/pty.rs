@@ -750,6 +750,44 @@ impl Drop for ReaderWaiting {
     }
 }
 
+/// A master with no descriptor to hand over, so `prepare_for_reload` refuses
+/// it. Lets a test stage the one PTY in a workspace that cannot cross a reload.
+#[cfg(test)]
+struct FdlessMaster;
+
+#[cfg(test)]
+impl MasterPty for FdlessMaster {
+    fn resize(&self, _size: PtySize) -> Result<()> {
+        Ok(())
+    }
+    fn get_size(&self) -> Result<PtySize> {
+        Ok(PtySize::default())
+    }
+    fn try_clone_reader(&self) -> Result<Box<dyn std::io::Read + Send>> {
+        Ok(Box::new(std::io::empty()))
+    }
+    fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>> {
+        Ok(Box::new(std::io::sink()))
+    }
+    fn process_group_leader(&self) -> Option<libc::pid_t> {
+        None
+    }
+    fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        None
+    }
+    fn tty_name(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+}
+
+#[cfg(test)]
+impl PtyClient {
+    /// Make this client's PTY impossible to hand over across a reload.
+    pub(crate) fn make_unhandoverable_for_test(&mut self) {
+        self.master = Box::new(FdlessMaster);
+    }
+}
+
 /// A PTY-based client that spawns a CLI tool in a pseudo-terminal and keeps a
 /// full terminal grid with scrollback using `alacritty_terminal`.
 pub struct PtyClient {
@@ -1658,6 +1696,20 @@ impl PtyClient {
             .unwrap_or(true)
     }
 
+    /// Snapshot the most recent `max_rows` of visible terminal output as a
+    /// single string with `\n` between rows. Trailing whitespace on each row
+    /// is trimmed and empty rows are dropped. Unlike
+    /// [`Self::visible_text_excerpt`], which keeps the TOP rows, this keeps the
+    /// BOTTOM ones: the watch engine ([`crate::watch::WatchEngine`]) needs the
+    /// newest output, where an agent prints its rate-limit or retry message.
+    /// Locks the terminal mutex briefly; a poisoned lock yields an empty scan.
+    pub fn scan_recent_lines(&self, max_rows: usize) -> String {
+        self.terminal
+            .lock()
+            .map(|t| t.scan_recent_lines(max_rows))
+            .unwrap_or_default()
+    }
+
     /// Returns a short plain-text excerpt from the visible terminal viewport.
     pub fn visible_text_excerpt(&self, max_lines: usize) -> String {
         self.terminal
@@ -2200,51 +2252,74 @@ fn pointer_from_button_bits(cb: u32) -> PointerReport {
 
 impl Drop for PtyClient {
     fn drop(&mut self) {
-        // Kill the child's whole process group, not just the direct child. The
+        // Signal the child's whole process group, not just the direct child. The
         // child is its own session/process-group leader (portable-pty calls
         // `setsid` before exec, so its PGID equals its PID), and anything it
-        // spawned inherits both that group and the PTY slave fd. If we killed
-        // only the direct child, a surviving grandchild that ignores the
-        // kernel's SIGHUP (or escapes it) would keep the slave open, the master
-        // read would never see EOF, and the `join` below would block the
-        // dropping thread (the UI thread) indefinitely. SIGKILL to the group
-        // reaps those descendants so the slave is released. A job-control
-        // FOREGROUND app (in its own group under an interactive shell) is also
-        // reached, via the foreground-group signal in `signal_process_groups`.
-        // (A descendant that has left both groups, such as a double-forked daemon
-        // or a job-control BACKGROUND job, is still out of reach here. A well-behaved
-        // daemon redirects its inherited
-        // terminal fds away before detaching so it will not hold the slave
-        // open; a misbehaving one that keeps the slave open could still stall
-        // the join, though that has not been observed with the supported
-        // providers.)
-        // SIGKILL the child's group AND the foreground group when a job-controlled
-        // app owns a different one (see `signal_process_groups`). ESRCH just means
-        // a group already exited (benign). Anything else (e.g. EPERM) means a kill
-        // did not happen, so the reader join below could stall; leave a
-        // breadcrumb in the log.
-        if let Err(err) = self.signal_process_groups(rustix::process::Signal::KILL)
+        // spawned inherits both that group and the PTY slave fd. If only the
+        // direct child died, a surviving grandchild would keep the slave open,
+        // the master read would never see EOF, and the `join` below would block
+        // the dropping thread (the UI thread) indefinitely. A job-control
+        // FOREGROUND app in its own group is reached too, via
+        // `signal_process_groups`. (A descendant that left both groups, such as
+        // a double-forked daemon, is still out of reach; a well-behaved one
+        // redirects its terminal fds before detaching.)
+        //
+        // Never signal a pid that has already been reaped (fork 101c1db5):
+        // portable-pty keeps reporting it, and once reaped it may have been
+        // recycled into another agent's process group. `try_wait` caches the
+        // first observed status, so a child reaped earlier by the engine's
+        // reaper also counts.
+        let child_running = self.try_wait().is_none();
+        if child_running {
+            // HUP first, as a real terminal hangup does, so a provider can run
+            // its hangup handler (flush a transcript, save a session) before
+            // anything is killed.
+            self.signal_groups_logged(rustix::process::Signal::HUP);
+        }
+        let Some(handle) = self.reader_thread.take() else {
+            if child_running {
+                self.signal_groups_logged(rustix::process::Signal::KILL);
+                let _ = self.child.kill();
+            }
+            let _ = self.child.wait();
+            return;
+        };
+        // Give the HUP a moment to end the group; the reader sees EOF as soon as
+        // the last holder of the slave is gone.
+        let deadline = Instant::now() + PTY_DROP_HUP_GRACE;
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if !handle.is_finished() && child_running {
+            // Something ignored the hangup (or holds the slave): escalate.
+            self.signal_groups_logged(rustix::process::Signal::KILL);
+            let _ = self.child.kill();
+        }
+        // Reap the direct child so it does not linger as a zombie.
+        if child_running {
+            let _ = self.child.wait();
+        }
+        // With the group dead the slave is released, the master read returns
+        // EOF and the reader thread returns. Join it so the thread does not
+        // outlive this client.
+        let _ = handle.join();
+    }
+}
+
+/// How long `PtyClient::drop` waits after SIGHUP for the child group to exit on
+/// its own before escalating to SIGKILL.
+const PTY_DROP_HUP_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
+impl PtyClient {
+    /// Signal the child's (and foreground) process groups, logging anything
+    /// other than "already gone".
+    fn signal_groups_logged(&self, sig: rustix::process::Signal) {
+        if let Err(err) = self.signal_process_groups(sig)
             && err != rustix::io::Errno::SRCH
         {
             logger::debug(&format!(
-                "PtyClient::drop: kill_process_group failed: {err}"
+                "PtyClient::drop: signalling the process group failed: {err}"
             ));
-        }
-        // Reap the direct child so it does not linger as a zombie. After the
-        // group kill the child is already dead, so this `kill` returns at once;
-        // it remains the fallback that actually signals the child when its PID
-        // was unavailable above (without it, `wait` could block on a child that
-        // nothing has asked to exit).
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        // With the child group dead, the PTY slave is fully released (the slave
-        // fd itself was dropped at spawn time; the child group held the last
-        // references). The master read then returns EOF (on Linux, EIO, which
-        // portable-pty maps to Ok(0)) and the reader thread returns. Join it so
-        // the thread does not outlive this client; otherwise detached reader
-        // threads accumulate across a long session and across the test suite.
-        if let Some(handle) = self.reader_thread.take() {
-            let _ = handle.join();
         }
     }
 }
@@ -2477,6 +2552,36 @@ impl TerminalState {
     /// Used to detect failed `--continue` exits that print a short error message.
     fn has_minimal_output(&self, threshold: usize) -> bool {
         self.term.grid().history_size() == 0 && self.visible_line_count() <= threshold
+    }
+
+    /// See [`PtyClient::scan_recent_lines`]. Wide-char spacer cells are skipped
+    /// so a CJK or emoji glyph reads as one character.
+    fn scan_recent_lines(&self, max_rows: usize) -> String {
+        use std::collections::BTreeMap;
+        let mut by_line: BTreeMap<i32, String> = BTreeMap::new();
+        for indexed in self.term.renderable_content().display_iter {
+            if indexed
+                .cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            by_line
+                .entry(indexed.point.line.0)
+                .or_default()
+                .push(indexed.cell.c);
+        }
+        let mut lines: Vec<String> = by_line
+            .into_values()
+            .map(|s| s.trim_end().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if lines.len() > max_rows {
+            let drop = lines.len() - max_rows;
+            lines.drain(..drop);
+        }
+        lines.join("\n")
     }
 
     fn visible_text_excerpt(&self, max_lines: usize) -> String {
@@ -3124,6 +3229,21 @@ fn apply_terminal_env_from_parent(
     if let Some(colorterm) = parent_colorterm.filter(|value| !value.is_empty()) {
         cmd.env("COLORTERM", colorterm);
     }
+
+    // `DUX_PANE` is the marker the dux-amq inject bridge
+    // (dux-amq/scripts/dux-amq-inject-bridge) uses to detect that it runs
+    // inside a dux-spawned process tree. When present, the bridge skips its
+    // tmux send-keys path and writes to the file queue that dux's AMQ drainer
+    // (`crate::amq`) consumes only when the agent is idle; without it a wake
+    // is typed straight into whatever the agent is doing ("stuck in input
+    // field"). `DUX_PID` lets long-lived `amq wake` daemons inherited from
+    // this pane stop once this dux exits instead of refilling the queue for a
+    // dead UI. Set on every PTY child (agents and companion terminals) because
+    // a wake can be started from either. A hot reload execs in place, which
+    // keeps the pid, so agents adopted across a reload still carry the right
+    // DUX_PID without being told again.
+    cmd.env("DUX_PANE", "1");
+    cmd.env("DUX_PID", std::process::id().to_string());
 }
 
 fn resolve_term_from_parent(parent_term: Option<&OsStr>) -> String {
@@ -5106,6 +5226,21 @@ mod tests {
         assert_eq!(seq.matches("\x1b]4;").count(), 1, "{seq:?}");
     }
 
+    // The watch engine matches against the NEWEST output, so the scan keeps
+    // the bottom rows (not the top ones like `visible_text_excerpt`), drops
+    // blank rows, trims trailing space, and reads a wide glyph once.
+    #[test]
+    fn scan_recent_lines_keeps_the_bottom_rows_and_skips_wide_spacers() {
+        let mut terminal = TerminalState::new(6, 20, 100);
+        terminal.process(b"one\r\ntwo   \r\n\r\nthree\r\n\xe4\xbd\xa0ok");
+        assert_eq!(terminal.scan_recent_lines(2), "three\n\u{4f60}ok");
+        assert_eq!(
+            terminal.scan_recent_lines(10),
+            "one\ntwo\nthree\n\u{4f60}ok"
+        );
+        assert_eq!(terminal.scan_recent_lines(0), "");
+    }
+
     #[test]
     fn a_replay_carries_the_childs_cursor_shape_and_palette() {
         // End to end through the real replay path: a child sets a beam cursor and
@@ -5600,6 +5735,27 @@ mod tests {
         assert_eq!(
             cmd.get_env("COLORTERM").and_then(|value| value.to_str()),
             Some("truecolor")
+        );
+    }
+
+    #[test]
+    fn apply_terminal_env_marks_children_as_under_dux() {
+        // Every PTY-spawned child must see DUX_PANE=1 so the
+        // dux-amq-inject-bridge knows to write to the file queue
+        // instead of using tmux send-keys. Dropping this would
+        // re-introduce the "stuck in input field" bug.
+        let mut cmd = CommandBuilder::new("printf");
+        apply_terminal_env_from_parent(&mut cmd, Some(OsStr::new("xterm-256color")), None);
+        assert_eq!(
+            cmd.get_env("DUX_PANE").and_then(|value| value.to_str()),
+            Some("1"),
+            "PTY children must have DUX_PANE exported for the inject-bridge to detect dux"
+        );
+        let expected_pid = std::process::id().to_string();
+        assert_eq!(
+            cmd.get_env("DUX_PID").and_then(|value| value.to_str()),
+            Some(expected_pid.as_str()),
+            "PTY children must have DUX_PID exported so stale wake daemons stop queueing"
         );
     }
 
@@ -7543,6 +7699,163 @@ mod tests {
         assert!(
             matches!(rx2.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
             "rx2 should still be live (Empty), not disconnected"
+        );
+    }
+
+    // -- Ported fork PTY teardown tests (c2c44378/a387d005/101c1db5) --
+
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    struct ReapedChildReportingPid(u32);
+
+    impl portable_pty::ChildKiller for ReapedChildReportingPid {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(Self(self.0))
+        }
+    }
+
+    impl portable_pty::Child for ReapedChildReportingPid {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(Some(portable_pty::ExitStatus::with_exit_code(0)))
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Ok(portable_pty::ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(self.0)
+        }
+    }
+
+    #[test]
+    fn dropping_pty_client_returns_promptly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = PtyClient::spawn(
+            "/bin/sh",
+            &["-c".to_string(), "sleep 5".to_string()],
+            tmp.path(),
+            24,
+            80,
+            100,
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(client);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("dropping PtyClient should not hang");
+    }
+
+    #[test]
+    fn dropping_pty_client_with_background_descendant_returns_promptly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = PtyClient::spawn(
+            "/bin/sh",
+            &[
+                "-c".to_string(),
+                "trap '' HUP; (trap '' HUP; sleep 30) & echo $! > descendant.pid; wait".to_string(),
+            ],
+            tmp.path(),
+            24,
+            80,
+            100,
+        )
+        .unwrap();
+        let pid_file = tmp.path().join("descendant.pid");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !pid_file.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(pid_file.exists(), "background descendant did not start");
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(client);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("background descendant must not make PtyClient::drop hang");
+    }
+
+    #[test]
+    fn dropping_pty_client_allows_hup_handler_to_flush() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = PtyClient::spawn(
+            "/bin/sh",
+            &[
+                "-c".to_string(),
+                "trap 'printf flushed > hup.marker; exit 0' HUP; : > ready; while :; do sleep 30; done"
+                    .to_string(),
+            ],
+            tmp.path(),
+            24,
+            80,
+            100,
+        )
+        .unwrap();
+        let ready = tmp.path().join("ready");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !ready.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "test child did not install its HUP handler");
+
+        drop(client);
+
+        assert_eq!(
+            std::fs::read(tmp.path().join("hup.marker")).unwrap(),
+            b"flushed"
+        );
+    }
+
+    #[test]
+    fn dropping_reaped_pty_client_returns_without_signalling_its_old_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut unrelated = PtyClient::spawn(
+            "/bin/sh",
+            &["-c".to_string(), "sleep 30".to_string()],
+            tmp.path(),
+            24,
+            80,
+            100,
+        )
+        .unwrap();
+        let unrelated_pid = unrelated.child_process_id().unwrap();
+
+        let mut client = PtyClient::spawn(
+            "/bin/sh",
+            &["-c".to_string(), "exit 0".to_string()],
+            tmp.path(),
+            24,
+            80,
+            100,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while client.try_wait().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            client.try_wait().is_some(),
+            "test child must be reaped before Drop exercises the recycled-pid branch"
+        );
+        client.child = Box::new(ReapedChildReportingPid(unrelated_pid));
+
+        drop(client);
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            unrelated.try_wait().is_none(),
+            "Drop signalled the process group reported by an already-reaped child"
         );
     }
 }

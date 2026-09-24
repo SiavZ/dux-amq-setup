@@ -99,11 +99,13 @@ pub(super) fn outside_click_policy(prompt: &PromptState) -> OutsideClickPolicy {
         | PromptState::PickEditor { .. }
         | PromptState::PickProjectWorktree(_)
         | PromptState::ManageWorktrees(_)
+        | PromptState::OrphanWorktrees(_)
         | PromptState::PickProject { .. }
         | PromptState::ChangeAgentProvider(_)
         | PromptState::ChangeDefaultProvider(_)
         | PromptState::ChangeProjectDefaultProvider(_)
         | PromptState::SetTailscaleMode(_)
+        | PromptState::WatchRules(_)
         | PromptState::ChangeTheme(_)
         | PromptState::AddProjectFailed { .. }
         | PromptState::ConfigReloadFailed { .. }
@@ -124,6 +126,7 @@ pub(super) fn outside_click_policy(prompt: &PromptState) -> OutsideClickPolicy {
         | PromptState::ConfirmCreateInitialCommit { .. }
         | PromptState::ConfirmNonDefaultBranch { .. }
         | PromptState::ConfirmUseExistingBranch { .. }
+        | PromptState::ConfirmSharedWriter { .. }
         // The worktree-removal confirm cancels back to the manager it was
         // raised from, exactly as its Esc arm does.
         | PromptState::ConfirmDeleteWorktree(_) => Cancel,
@@ -162,7 +165,8 @@ pub(super) fn outside_click_policy(prompt: &PromptState) -> OutsideClickPolicy {
         | PromptState::AttachPullRequestInput { .. }
         | PromptState::NameStandaloneAgent { .. }
         | PromptState::NameNewAgent { .. }
-        | PromptState::KillRunning(_) => Blink,
+        | PromptState::KillRunning(_)
+        | PromptState::SessionSettings(_) => Blink,
     }
 }
 
@@ -241,6 +245,7 @@ impl App {
             | PromptState::ChangeDefaultProvider(_)
             | PromptState::ChangeProjectDefaultProvider(_)
             | PromptState::SetTailscaleMode(_)
+            | PromptState::WatchRules(_)
             | PromptState::Command { .. }
             | PromptState::ConfirmNonDefaultBranch { .. } => {
                 self.prompt = PromptState::None;
@@ -302,6 +307,8 @@ impl App {
             PromptState::ConfirmDeleteWorktree(_) => {
                 self.resolve_confirm_delete_worktree(false);
             }
+            // Same as its Esc: a confirmation steps back to the list.
+            PromptState::OrphanWorktrees(_) => self.cancel_orphan_worktrees_prompt(),
             PromptState::ConfirmDeleteTerminal { .. } => {
                 self.resolve_confirm_delete_terminal(false);
             }
@@ -322,6 +329,9 @@ impl App {
             }
             PromptState::ConfirmUseExistingBranch { .. } => {
                 self.resolve_confirm_use_existing_branch(false);
+            }
+            PromptState::ConfirmSharedWriter { .. } => {
+                self.resolve_confirm_shared_writer(false);
             }
 
             // The nested macro delete-confirm: clears the confirm and leaves
@@ -361,7 +371,8 @@ impl App {
             | PromptState::AttachPullRequestInput { .. }
             | PromptState::NameStandaloneAgent { .. }
             | PromptState::NameNewAgent { .. }
-            | PromptState::KillRunning(_) => return false,
+            | PromptState::KillRunning(_)
+            | PromptState::SessionSettings(_) => return false,
         }
         true
     }

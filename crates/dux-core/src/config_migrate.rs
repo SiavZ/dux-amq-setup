@@ -262,9 +262,13 @@ fn retired_stock_gemini() -> ProviderCommandConfig {
         resume_by_id_args: None,
         install_hint: Some("brew install gemini-cli".to_string()),
         forward_scroll: None,
+        // gemini was retired before `forward_mouse` existed.
+        forward_mouse: None,
         // gemini was retired before `web_dragdrop_paste` existed, so the stock
         // block dux shipped never carried the key.
         web_dragdrop_paste: None,
+        // Watch rules postdate gemini's retirement too.
+        watch: Vec::new(),
     }
 }
 
@@ -319,7 +323,10 @@ fn table_matches_provider_config(table: &Table, stock: &ProviderCommandConfig) -
         && user.resume_wait_timeout_ms.unwrap_or(0) == stock.resume_wait_timeout_ms.unwrap_or(0)
         && user.install_hint == stock.install_hint
         && user.forward_scroll == stock.forward_scroll
+        && user.forward_mouse == stock.forward_mouse
         && user.web_dragdrop_paste == stock.web_dragdrop_paste
+        // A block carrying user-authored watch rules is customized: keep it.
+        && user.watch == stock.watch
 }
 
 #[cfg(test)]
@@ -415,6 +422,28 @@ mod tests {
             "[providers.gemini]\ncommand = \"/opt/my-gemini\"\nargs = []\nresume_args = [\"--resume\"]\nresume_wait_timeout_ms = 0\n",
         );
         // Only the customized block is present; nothing else to migrate.
+        assert!(!apply_load_migrations(&mut d).expect("migrate"));
+        assert!(d.get("providers").and_then(|p| p.get("gemini")).is_some());
+    }
+
+    /// A stock gemini block the user added watch rules to is customized and
+    /// must not be pruned, or the rules would be deleted with it.
+    #[test]
+    fn keeps_a_stock_gemini_block_that_carries_watch_rules() {
+        let mut d = doc(
+            "[providers.gemini]\ncommand = \"gemini\"\nargs = []\nresume_args = [\"--resume\"]\nresume_wait_timeout_ms = 0\ninstall_hint = \"brew install gemini-cli\"\n\n[[providers.gemini.watch]]\npattern = \"quota\"\ntext = \"retry\"\n",
+        );
+        assert!(!apply_load_migrations(&mut d).expect("migrate"));
+        assert!(d.get("providers").and_then(|p| p.get("gemini")).is_some());
+    }
+
+    /// `forward_mouse` postdates gemini's retirement, so a gemini block that
+    /// sets it was edited by the user and must survive the prune.
+    #[test]
+    fn keeps_a_stock_gemini_block_that_sets_forward_mouse() {
+        let mut d = doc(
+            "[providers.gemini]\ncommand = \"gemini\"\nargs = []\nresume_args = [\"--resume\"]\nresume_wait_timeout_ms = 0\ninstall_hint = \"brew install gemini-cli\"\nforward_mouse = false\n",
+        );
         assert!(!apply_load_migrations(&mut d).expect("migrate"));
         assert!(d.get("providers").and_then(|p| p.get("gemini")).is_some());
     }
