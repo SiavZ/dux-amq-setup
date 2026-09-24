@@ -150,6 +150,7 @@ impl Engine {
             &self.paths,
             &self.config,
             &session,
+            &self.session_settings_or_default(&session.id),
             tab_id.as_str(),
             self.session_env(&session),
         );

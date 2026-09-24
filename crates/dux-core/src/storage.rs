@@ -2319,25 +2319,6 @@ impl SessionStore {
         Ok(())
     }
 
-    /// One session's settings, or the default when the row has none or its
-    /// blob is malformed (the same tolerance as [`Self::load_session_settings`]).
-    pub fn load_session_settings_for(
-        &self,
-        id: &str,
-    ) -> Result<crate::session_settings::SessionSettings> {
-        let raw: Option<Option<String>> = self
-            .conn
-            .query_row(
-                "select session_settings from agent_sessions where id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(crate::session_settings::SessionSettings::parse_or_default(
-            raw.flatten().as_deref(),
-        ))
-    }
-
     /// Every session's non-default settings, keyed by session id. Malformed
     /// blobs read as the default (and are therefore omitted).
     pub fn load_session_settings(

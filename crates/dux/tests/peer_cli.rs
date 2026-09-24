@@ -25,7 +25,8 @@ fn dux(home: &Path, amq: &Path, args: &[&str]) -> Output {
 fn session(id: &str, provider: &str, folder: &Path, status: SessionStatus) -> AgentSession {
     AgentSession {
         id: id.to_string(),
-        agent_handle: dux_core::model::normalize_agent_handle(id),
+        // What the create job assigns: the folder's basename, normalized.
+        agent_handle: dux_core::model::derive_agent_handle(&folder.display().to_string(), "", id),
         shared_workspace: false,
         deleted_at: None,
         slot_tab_id: format!("{id}-slot"),
