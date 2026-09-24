@@ -53,10 +53,19 @@ jobs:
       - name: Determine release version
         id: release_version
         run: |
+          # This fork's tags are namespaced `dux-amq-vX.Y.Z` so they never collide
+          # with upstream's `vX.Y.Z` sequence (upstream owns v0.1.0 onwards, and
+          # every one of those tags is upstream code). Strip both prefixes to get
+          # the bare semver the manifest needs, and refuse anything that does not
+          # yield one: `dux-amq-v0.1.0-rc1` once reached `cargo set-version`
+          # unstripped and could never have built (244b33c6).
           VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${VERSION#dux-amq-}"
           VERSION="${VERSION#v}"
-          if [ -z "$VERSION" ]; then
-            echo "Failed to extract version from ${{ github.event.release.tag_name }}"
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "Tag '${{ github.event.release.tag_name }}' does not yield a semver" >&2
+            echo "after stripping 'dux-amq-' and 'v' prefixes (got '$VERSION')." >&2
+            echo "Tag releases as 'dux-amq-vX.Y.Z'." >&2
             exit 1
           fi
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
@@ -76,6 +85,14 @@ jobs:
     name: Build ${{ matrix.archive }}
     needs: [prepare-release, no-ui-build-hatch]
     runs-on: ${{ matrix.runner }}
+    # actions/attest-build-provenance needs id-token (to mint the OIDC token that
+    # signs the attestation) and attestations (to store it) on the SAME job that
+    # produces the subject. The job itself never touches the release, so it only
+    # reads contents.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       # Deliberately NOT fail-fast. Nothing this job produces is publicly
       # reachable (it uploads artifacts, not release assets), so letting the
@@ -99,7 +116,7 @@ jobs:
             archive: dux-darwin-arm64.tar.gz
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
@@ -113,23 +130,82 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install cargo-edit
-        run: cargo install cargo-edit --locked
+      # macOS runners ship BSD tar, and the reproducible package step below needs
+      # GNU tar's --sort/--owner/--mtime flags.
+      - name: Install GNU tar (macOS)
+        if: contains(matrix.runner, 'macos')
+        run: brew install gnu-tar
 
+      # cargo-auditable embeds the dependency tree in the binary so published
+      # artifacts can be re-scanned later (`cargo audit bin`, trivy, grype).
+      # cargo-cyclonedx writes a CycloneDX SBOM per target. Both pinned to a
+      # reviewed version (audit03 P1-10): an unpinned install resolves
+      # whatever was published that morning.
+      - name: Install cargo-auditable and cargo-cyclonedx
+        run: |
+          cargo install --locked cargo-auditable --version 0.7.5
+          cargo install --locked cargo-cyclonedx --version 0.5.9
+
+      # Replaces `cargo set-version` from cargo-edit (a8ea7e79): cargo-edit is a
+      # whole extra toolchain dependency for a one-line edit, and a release of it
+      # once raised its MSRV past the toolchain and broke every build job. The
+      # workspace keeps a single version in [workspace.package] that every crate
+      # inherits, so this rewrites exactly that line, refuses to guess if the
+      # manifest shape changes, and reads the value back.
       - name: Set version from tag
-        run: cargo set-version "${{ needs.prepare-release.outputs.version }}"
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: .github/scripts/set_workspace_version.sh "$VERSION"
 
-      - name: Build
+      - name: Build (auditable)
         env:
           DUX_RELEASE_BUILD: "1"
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo auditable build --release --target ${{ matrix.target }}
 
       # Symbol stripping happens in Cargo ([profile.release] strip = "symbols"),
       # so local release builds and CI produce the same binary and there is
       # exactly one stripping mechanism.
 
-      - name: Package
-        run: tar czf ${{ matrix.archive }} -C target/${{ matrix.target }}/release dux
+      # The SBOM covers the binary crate's dependency graph, which is everything
+      # linked into the shipped executable (the dux crate pulls in dux-core,
+      # dux-tui and dux-web). cargo-cyclonedx also writes one file per workspace
+      # member; only the binary's is kept. Limitation: bundled C code
+      # (rusqlite's vendored SQLite) is not enumerated, so treat it as
+      # Rust-deps-only.
+      - name: Generate SBOM
+        run: |
+          set -euo pipefail
+          cargo cyclonedx --manifest-path crates/dux/Cargo.toml --format json \
+            --target ${{ matrix.target }} --override-filename "sbom-${{ matrix.target }}.cdx"
+          mv "crates/dux/sbom-${{ matrix.target }}.cdx.json" .
+          rm -f crates/*/sbom-*.cdx.json
+          ls -la "sbom-${{ matrix.target }}.cdx.json"
+
+      # Reproducible packaging (audit02 P0-I, 4f572aac, audit03 P1-09): member
+      # metadata pinned to the source commit's numeric epoch, and `gzip -n` so the
+      # gzip header carries no wall-clock time. Packaged twice across a second
+      # boundary and compared, so the check cannot pass by timing luck again.
+      - name: Package (reproducible)
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          if command -v gtar >/dev/null 2>&1; then TAR=gtar; else TAR=tar; fi
+          package() {
+            "$TAR" --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime="@${SOURCE_DATE_EPOCH}" \
+              --use-compress-program='gzip -n' \
+              -cf "$1" -C "target/${{ matrix.target }}/release" dux
+          }
+          package "${{ matrix.archive }}.first"
+          sleep 2
+          package "${{ matrix.archive }}"
+          if ! cmp "${{ matrix.archive }}.first" "${{ matrix.archive }}"; then
+            echo "Reproducibility check FAILED: two identical packagings differ." >&2
+            od -An -tx1 -N16 "${{ matrix.archive }}.first" >&2
+            od -An -tx1 -N16 "${{ matrix.archive }}" >&2
+            exit 1
+          fi
+          rm "${{ matrix.archive }}.first"
 
       # One "<archive>.sha256" beside each archive, in sha256sum's own format
       # (hex digest, two spaces, file name) so `sha256sum -c` and `shasum -a 256
@@ -165,6 +241,24 @@ jobs:
       - name: Smoke-test the packaged archive
         run: .github/scripts/smoke_archive.sh ${{ matrix.archive }} ${{ matrix.target }}
 
+      # Every upstream `v*` tag is upstream code, and until 244b33c6 this
+      # workflow had only ever shipped upstream binaries under this fork's name:
+      # no AMQ, peer or watch features, none of the Rust-side threat-model
+      # mitigations. Refuse to publish an archive that is not fork lineage. Runs
+      # BEFORE the artifact upload, so a wrong-lineage build never reaches the
+      # publish gate.
+      - name: Verify the archive is fork lineage
+        run: .github/scripts/verify_fork_lineage.sh ${{ matrix.archive }} ${{ matrix.target }}
+
+      # OIDC-keyless build provenance. Verify with
+      #   gh attestation verify dux-linux-amd64.tar.gz --owner SiavZ
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            ${{ matrix.archive }}
+            sbom-${{ matrix.target }}.cdx.json
+
       # NOTE: this job deliberately does NOT touch the release. It hands the
       # archive to publish-archives as a workflow artifact instead, so a platform
       # that fails cannot leave the other three downloadable against a tag that
@@ -173,12 +267,13 @@ jobs:
       # The .sha256 rides along so the combined-checksums step can concatenate the
       # four of them without recomputing anything.
       - name: Upload archive artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-${{ matrix.archive }}
           path: |
             ${{ matrix.archive }}
             ${{ matrix.archive }}.sha256
+            sbom-${{ matrix.target }}.cdx.json
           retention-days: 1
           if-no-files-found: error
 
@@ -208,7 +303,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download release archive artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: release-*
           path: dist/artifacts
@@ -252,23 +347,28 @@ jobs:
           set -euo pipefail
           cd dist/artifacts
           gh release upload "${{ github.event.release.tag_name }}" --clobber \
-            *.tar.gz *.tar.gz.sha256 dux-checksums.txt
+            *.tar.gz *.tar.gz.sha256 dux-checksums.txt sbom-*.cdx.json
           echo "Published:"
           ls -1
 
+  # The npm package is upstream's `@patrickdappollonio/dux`. This fork publishes
+  # no npm package and holds no token for that scope, so both npm jobs run only
+  # in upstream's repository. The condition keeps the job definitions identical
+  # to upstream's, which keeps future upstream merges of this file mechanical.
   build-npm-package:
     name: Build npm package
     needs: [prepare-release, build]
+    if: ${{ github.repository == 'patrickdappollonio/dux' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24
 
       - name: Download release archive artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: release-*
           path: dist/artifacts
@@ -281,7 +381,7 @@ jobs:
         run: node npm/scripts/build_npm_package.mjs
 
       - name: Upload npm package artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: npm-package
           path: dist/npm/dux-npm-*.tgz
@@ -291,14 +391,14 @@ jobs:
   publish-npm:
     name: Publish npm package
     needs: [prepare-release, build-npm-package]
-    if: ${{ needs.build-npm-package.result == 'success' }}
+    if: ${{ github.repository == 'patrickdappollonio/dux' && needs.build-npm-package.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       actions: read
       contents: read
       id-token: write
     steps:
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
@@ -308,7 +408,7 @@ jobs:
         run: npm install -g npm@latest
 
       - name: Download npm package artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: npm-package
           path: dist/npm
@@ -350,7 +450,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [publish-archives]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Upload install script
         env:
           GH_TOKEN: ${{ github.token }}
@@ -361,7 +461,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build, publish-archives, upload-install-script]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Append install section to release notes
         env:
