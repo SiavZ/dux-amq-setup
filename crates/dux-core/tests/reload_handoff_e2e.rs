@@ -30,6 +30,8 @@ use dux_core::reload_handoff::Handoff;
 
 const ROLE_VAR: &str = "DUX_RELOAD_ROLE";
 const HANDOFF_VAR: &str = "DUX_RELOAD_HANDOFF";
+const AMBIENT_VAR: &str = "DUX_RELOAD_AMBIENT_FDS";
+const LOCK_VAR: &str = "DUX_RELOAD_LOCK";
 
 type Case = (&'static str, fn());
 
@@ -46,14 +48,32 @@ const CASES: &[Case] = &[
         "the_handoff_is_not_left_behind_for_a_later_run_to_adopt",
         the_handoff_is_not_left_behind_for_a_later_run_to_adopt,
     ),
+    (
+        "preparing_a_reload_makes_only_the_master_inheritable",
+        preparing_a_reload_makes_only_the_master_inheritable,
+    ),
+    (
+        "nothing_inheritable_is_left_open_after_the_reload_adopts",
+        nothing_inheritable_is_left_open_after_the_reload_adopts,
+    ),
+    (
+        "the_next_image_can_take_the_single_instance_lock_again",
+        the_next_image_can_take_the_single_instance_lock_again,
+    ),
 ];
 
 fn main() {
     match std::env::var(ROLE_VAR).as_deref() {
         Ok("gen1") => return generation_one(&handoff_from_env()),
         Ok("gen2") => return generation_two(&handoff_from_env()),
+        Ok("fd-audit") => return fd_audit(),
         _ => {}
     }
+
+    // Recorded before this runner opens anything of its own, and inherited
+    // by every child through the environment.
+    // SAFETY: single-threaded at this point; nothing else reads the env yet.
+    unsafe { std::env::set_var(AMBIENT_VAR, format_fds(&raw_inheritable_fds())) };
 
     // The runner. Honours the two things cargo and nextest pass a test binary
     // that matter here: `--list` and a name filter. Every other flag
@@ -173,6 +193,14 @@ fn generation_one(handoff_path: &Path) {
     .write(handoff_path)
     .expect("write the handoff");
 
+    // Hold the single-instance lock across the exec the way dux does: it lives
+    // inside the engine, and the engine is never dropped before the exec.
+    if let Ok(lock_path) = std::env::var(LOCK_VAR) {
+        let lock = dux_core::lockfile::SingleInstanceLock::acquire(Path::new(&lock_path))
+            .expect("generation 1 takes the lock");
+        std::mem::forget(lock);
+    }
+
     // The client owns the master. Dropping it would close the descriptor the
     // next image is about to inherit and kill the agent with it, so ownership
     // is deliberately leaked into the exec.
@@ -191,6 +219,21 @@ fn generation_one(handoff_path: &Path) {
 fn generation_two(handoff_path: &Path) {
     let handoff = Handoff::consume(handoff_path).expect("read the handoff");
     let entry = handoff.ptys.first().expect("one pty in the handoff");
+
+    // The new image takes the lock the way a fresh dux does. It is the SAME
+    // process as the holder, so if the old lock's descriptor had survived the
+    // exec this would find its own lock held and refuse (or, with a blocking
+    // flock, wait on itself forever).
+    if let Ok(lock_path) = std::env::var(LOCK_VAR) {
+        let outcome = match dux_core::lockfile::SingleInstanceLock::acquire(Path::new(&lock_path)) {
+            Ok(lock) => {
+                std::mem::forget(lock);
+                "ok".to_string()
+            }
+            Err(err) => format!("refused: {err}"),
+        };
+        println!("LOCK_REACQUIRED={outcome}");
+    }
 
     // SAFETY: inherited through the exec; nothing else in this image owns it.
     let client = unsafe {
@@ -217,6 +260,81 @@ fn generation_two(handoff_path: &Path) {
     println!("CHILD_PID={}", client.child_process_id().unwrap_or(0));
     println!("CLIENT_LIVE={}", client.is_live());
     println!("REPLY={}", reply.replace('\n', "\\n"));
+    // Everything this image holds open that the NEXT exec (or any child it
+    // spawns) would inherit. After adoption this must be nothing: the master
+    // is ours again and goes back to close-on-exec, and nothing else of the
+    // previous image's should have crossed at all.
+    println!("GEN2_INHERITABLE={}", format_fds(&inheritable_fds()));
+}
+
+/// Every descriptor above stdio that would survive an `exec`.
+///
+/// Read from `/dev/fd`, the kernel's own list on both macOS and Linux, rather
+/// than from what the code under test says it opened, so an fd nobody knew
+/// about is caught too. Only meaningful in a single-threaded process, which is
+/// why the audits run in their own child of this harness-less binary.
+///
+/// Descriptors this test binary was itself STARTED with are excluded: whatever
+/// launched `cargo test` (a shell, an IDE, an agent harness) may have leaked
+/// some into it, and they say nothing about dux. The runner records that set
+/// once in [`AMBIENT_VAR`] and every child it spawns subtracts it.
+fn inheritable_fds() -> Vec<i32> {
+    let ambient: Vec<i32> = std::env::var(AMBIENT_VAR)
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    let mut fds = raw_inheritable_fds();
+    fds.retain(|fd| !ambient.contains(fd));
+    fds
+}
+
+fn raw_inheritable_fds() -> Vec<i32> {
+    let mut fds: Vec<i32> = std::fs::read_dir("/dev/fd")
+        .expect("list /dev/fd")
+        .filter_map(|e| e.ok()?.file_name().into_string().ok()?.parse().ok())
+        .filter(|fd| *fd > 2)
+        .filter(|fd| {
+            // SAFETY: `F_GETFD` only reads this descriptor's flags. The fd the
+            // `read_dir` itself used is closed by now and answers EBADF.
+            let flags = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
+            flags >= 0 && flags & libc::FD_CLOEXEC == 0
+        })
+        .collect();
+    fds.sort_unstable();
+    fds
+}
+
+fn format_fds(fds: &[i32]) -> String {
+    fds.iter().map(i32::to_string).collect::<Vec<_>>().join(",")
+}
+
+/// Spawn an agent, then prepare it for a reload, reporting which descriptors
+/// were inheritable before and after.
+fn fd_audit() {
+    let client = PtyClient::spawn_with_env(
+        "/bin/sh",
+        &["-c".to_string(), "sleep 30".to_string()],
+        &std::env::current_dir().expect("cwd"),
+        24,
+        80,
+        1000,
+        &[],
+    )
+    .expect("spawn agent");
+    // A bound listener and an open file alongside, standing in for the
+    // background web server's sockets and the lock and log files: none of them
+    // may become inheritable, or the new image double-binds and double-locks.
+    let _listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a listener");
+    let _file = tempfile::tempfile().expect("open a file");
+    let before = inheritable_fds();
+    let entry = client
+        .prepare_for_reload("audit-tab", None)
+        .expect("prepare the pty for reload");
+    let after = inheritable_fds();
+    println!("BEFORE={}", format_fds(&before));
+    println!("AFTER={}", format_fds(&after));
+    println!("MASTER={}", entry.master_fd);
 }
 
 /// Wait until the rebuilt client's terminal shows `needle`.
@@ -337,5 +455,75 @@ fn the_handoff_is_not_left_behind_for_a_later_run_to_adopt() {
         !handoff.exists(),
         "the image that consumed the handoff must remove it, but {} remains",
         handoff.display()
+    );
+}
+
+fn preparing_a_reload_makes_only_the_master_inheritable() {
+    // Clearing close-on-exec is how a master crosses the exec. It must be the
+    // ONLY descriptor that does: anything else left inheritable leaks into the
+    // new image (a socket that stays bound, a lock that is never released).
+    let output = Command::new(std::env::current_exe().expect("test exe"))
+        .env(ROLE_VAR, "fd-audit")
+        .output()
+        .expect("run the fd audit");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "the fd audit failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let master = field(&stdout, "MASTER=").expect("master fd");
+    assert_eq!(
+        field(&stdout, "BEFORE="),
+        Some(""),
+        "nothing may be inheritable before the reload asks for it:\n{stdout}"
+    );
+    assert_eq!(
+        field(&stdout, "AFTER="),
+        Some(master),
+        "exactly the handed-off master, and nothing else, may lose \
+         close-on-exec:\n{stdout}"
+    );
+}
+
+fn nothing_inheritable_is_left_open_after_the_reload_adopts() {
+    // The master crossed the exec with close-on-exec cleared. Once the new
+    // image owns it again it must go back on, or every git, gh, editor and
+    // agent spawned after a reload inherits a copy of the old agent's terminal
+    // (and the reader and writer clones, which are dup'd from it).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handoff = Handoff::path_for(dir.path(), std::process::id());
+
+    let (stdout, stderr, ok) = run_reload(&handoff);
+    assert!(ok, "the reload failed:\n{stderr}\n{stdout}");
+    assert_eq!(
+        field(&stdout, "GEN2_INHERITABLE="),
+        Some(""),
+        "after adoption no descriptor may still be inheritable:\n{stdout}"
+    );
+}
+
+fn the_next_image_can_take_the_single_instance_lock_again() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handoff = Handoff::path_for(dir.path(), std::process::id());
+    let lock = dir.path().join("dux.lock");
+
+    let output = Command::new(std::env::current_exe().expect("test exe"))
+        .env(ROLE_VAR, "gen1")
+        .env(HANDOFF_VAR, &handoff)
+        .env(LOCK_VAR, &lock)
+        .output()
+        .expect("run the reload generations");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "the reload failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        field(&stdout, "LOCK_REACQUIRED="),
+        Some("ok"),
+        "the reloaded image must be able to take the lock its predecessor \
+         held, or dux refuses to start against itself:\n{stdout}"
     );
 }

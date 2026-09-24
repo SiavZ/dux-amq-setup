@@ -1664,7 +1664,43 @@ impl Engine {
     /// behaviour this feature exists to avoid.
     pub fn prepare_reload_handoff(&self) -> Option<crate::reload_handoff::Handoff> {
         let mut ptys = Vec::new();
+        let Some(()) = self.collect_reload_ptys(&mut ptys) else {
+            // Refused partway: the masters collected so far already had
+            // close-on-exec cleared. There is no exec coming, so put it back,
+            // or every git, gh or editor process this image spawns from now on
+            // inherits a copy of those agents' terminals.
+            crate::reload_handoff::Handoff {
+                written_by: std::process::id(),
+                ptys,
+            }
+            .abandon();
+            return None;
+        };
+        self.pre_exec_quiesce();
+        Some(crate::reload_handoff::Handoff {
+            written_by: std::process::id(),
+            ptys,
+        })
+    }
 
+    /// Stop everything that must not straddle the reload exec, other than the
+    /// PTYs (which are handed over, not stopped).
+    ///
+    /// Runs once the handoff is known to be complete, immediately before the
+    /// caller execs. Every descriptor this process holds WITHOUT close-on-exec,
+    /// other than the PTY masters named in the handoff, is a leak into the new
+    /// image, and every background thread holding a lock or a claim simply
+    /// vanishes at the exec without releasing it. This is the one place that
+    /// winds such things down.
+    pub fn pre_exec_quiesce(&self) {
+        // INTEGRATION: stop AMQ inject workers + release claims (maple), close peer listeners (seedling)
+    }
+
+    /// Describe every provider and companion terminal into `ptys`, clearing
+    /// close-on-exec on each master as it goes. `None` as soon as one cannot be
+    /// handed over, with `ptys` holding the ones already prepared so the caller
+    /// can undo them.
+    fn collect_reload_ptys(&self, ptys: &mut Vec<crate::reload_handoff::HandoffPty>) -> Option<()> {
         for (tab_id, client) in &self.providers {
             let session_id = self
                 .agent_tabs
@@ -1709,10 +1745,7 @@ impl Engine {
             ptys.push(entry);
         }
 
-        Some(crate::reload_handoff::Handoff {
-            written_by: std::process::id(),
-            ptys,
-        })
+        Some(())
     }
 
     /// Adopt the PTYs a previous image handed over, putting each back in the row
@@ -6973,6 +7006,57 @@ mod tests {
         assert!(
             !receiver.providers.contains_key(TabIdRef::new("broken")),
             "the unusable entry must be dropped, not stood up as a dead row"
+        );
+    }
+
+    /// A reload refused partway must not leave the masters it already prepared
+    /// inheritable: no exec is coming, and every git, gh or editor process
+    /// spawned afterwards would get a copy of those agents' terminals.
+    #[test]
+    fn a_refused_handoff_puts_close_on_exec_back_on_the_masters_it_touched() {
+        let (mut engine, tmp) = engine_with_one_live_agent();
+        // Providers are collected before terminals, so the healthy agent is
+        // prepared (flag cleared) before the terminal that cannot cross.
+        let mut bad = crate::pty::PtyClient::spawn_with_env(
+            "sleep",
+            &["30".to_string()],
+            tmp.path(),
+            24,
+            80,
+            1000,
+            &[],
+        )
+        .expect("spawn terminal");
+        bad.make_unhandoverable_for_test();
+        engine.companion_terminals.insert(
+            "term-1".to_string(),
+            crate::model::CompanionTerminal {
+                owner: crate::model::TerminalOwner::Standalone,
+                label: "t".to_string(),
+                foreground_cmd: None,
+                client: bad,
+                sort_order: 1,
+                created_at: chrono::Utc::now(),
+            },
+        );
+        let good_fd = engine
+            .providers
+            .values()
+            .next()
+            .expect("the fixture's agent")
+            .prepare_for_reload("probe", None)
+            .expect("the healthy agent can be prepared")
+            .master_fd;
+        // Undo the probe so the test starts from the real resting state.
+        crate::pty_reattach::set_close_on_exec(good_fd).unwrap();
+
+        assert!(
+            engine.prepare_reload_handoff().is_none(),
+            "premise: one pty cannot cross, so the reload is refused"
+        );
+        assert!(
+            !crate::pty_reattach::survives_exec(good_fd).unwrap(),
+            "a refused reload must leave the agent's master close-on-exec"
         );
     }
 
