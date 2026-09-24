@@ -801,3 +801,29 @@ fn tombstone_ignores_a_handle_this_session_does_not_own() {
         MarkerState::Owner(o) if o.store_id == "store-b"
     ));
 }
+
+/// A corrupt shared `meta/config.json` must not brick the TUI or server
+/// boot: the store id is still created, the error is logged, and the
+/// registry bytes are left exactly as found for a human to repair.
+#[test]
+fn bootstrap_amq_sync_degrades_on_corrupt_shared_config() {
+    // The root resolves through the sibling rule only when no override is
+    // exported, and an exported root must never be written by a test.
+    if std::env::var_os("AMQ_GLOBAL_ROOT").is_some() || std::env::var_os("AM_ROOT").is_some() {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let amq_root = dir.path().join("amq");
+    fs::create_dir_all(amq_root.join("meta")).unwrap();
+    fs::write(amq_root.join("meta/config.json"), b"{not-json").unwrap();
+    let paths = test_paths(&dir.path().join("dux"));
+    assert_eq!(optional_amq_root(&paths), Some(amq_root.clone()));
+
+    sync_amq_agents_for_bootstrap(&paths);
+
+    assert!(paths.root.join("store-id").is_file());
+    assert_eq!(
+        fs::read(amq_root.join("meta/config.json")).unwrap(),
+        b"{not-json"
+    );
+}

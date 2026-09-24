@@ -135,6 +135,13 @@ mod tests {
     }
 
     #[test]
+    fn amq_handle_matches_wrapper_rules() {
+        assert_eq!(amq_handle("Feature/Login"), "feature-login");
+        assert_eq!(amq_handle("--Already_OK--"), "already_ok");
+        assert_eq!(amq_handle("!!!"), "");
+    }
+
+    #[test]
     fn derived_handle_prefers_basename_then_branch_then_id() {
         assert_eq!(
             derive_agent_handle("/w/Feature Login", Some("x"), "id"),
