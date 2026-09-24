@@ -3858,12 +3858,15 @@ impl Engine {
                 // `NonDefaultBranchCheckoutCompleted` resolves the right op.
                 let status_op_id = status_op_id.clone();
                 let worker_tx = self.worker_tx.clone();
+                // A panic in the switch still answers, or the repository's
+                // in-flight key and the keyed busy would never be released.
                 std::thread::spawn(move || {
-                    crate::project_browser::run_add_project_checkout_job(
+                    crate::project_browser::run_checkout_job_reporting_panics(
                         action,
                         target_branch,
                         worker_tx,
                         status_op_id,
+                        crate::project_browser::run_add_project_checkout_job,
                     );
                 });
                 vec![]
@@ -7672,6 +7675,53 @@ mod tests {
         let statuses = drive_checkout_chain(&mut engine);
         assert_eq!(statuses.last().expect("final").tone, "info");
         assert_checkout_accepted_again(&engine, "p1");
+    }
+
+    /// The event a panicking switch worker is turned into (see
+    /// `run_checkout_job_reporting_panics`) is a failed completion, and that
+    /// failure must release the repository like any other ending, so the next
+    /// request is accepted rather than refused as a duplicate forever.
+    #[test]
+    fn a_failed_switch_completion_releases_the_repository_for_the_next_request() {
+        let repo = init_repo_on_feature_branch("trunk");
+        let (mut engine, _tmp) = test_engine();
+        let mut project = sample_project("p1", repo.path().to_string_lossy().as_ref());
+        project.leading_branch = Some("trunk".to_string());
+        project.current_branch = "feature".to_string();
+        project.branch_status = ProjectBranchStatus::NotLeading;
+        engine.projects.push(project.clone());
+
+        engine
+            .apply_wire(WireCommand::CheckoutProjectDefaultBranch {
+                project_id: "p1".to_string(),
+            })
+            .expect("first checkout");
+        let op_id = engine
+            .pending_web_checkout_ops
+            .keys()
+            .next()
+            .cloned()
+            .expect("the web op");
+        assert!(engine.is_in_flight(&InFlightKey::CheckoutDefaultBranch(project.path.clone())));
+
+        engine.process_worker_event(WorkerEvent::NonDefaultBranchCheckoutCompleted {
+            action: NonDefaultBranchAction::CheckoutProjectDefault { project },
+            target_branch: "trunk".to_string(),
+            result: Err("Worker panicked: the switch blew up".to_string()),
+            status_op_id: Some(op_id),
+        });
+
+        assert_checkout_accepted_again(&engine, "p1");
+        let again = engine
+            .apply_wire(WireCommand::CheckoutProjectDefaultBranch {
+                project_id: "p1".to_string(),
+            })
+            .expect("second checkout");
+        assert_eq!(
+            again.status.expect("busy").tone,
+            "busy",
+            "the second request starts a chain of its own"
+        );
     }
 
     #[test]

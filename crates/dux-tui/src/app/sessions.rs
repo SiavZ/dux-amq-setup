@@ -936,32 +936,13 @@ impl App {
         };
         let worker_tx = self.engine.worker_tx.clone();
         thread::spawn(move || {
-            use std::panic::AssertUnwindSafe;
-            // Pre-clone the values needed for the panic-path event before
-            // they are moved into the job closure.
-            let tx_panic = worker_tx.clone();
-            let action_panic = action.clone();
-            let branch_panic = target_branch.clone();
-            let op_id_panic = status_op_id.clone();
-            if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                dux_core::project_browser::run_add_project_checkout_job(
-                    action,
-                    target_branch,
-                    worker_tx,
-                    Some(status_op_id),
-                );
-            })) {
-                let reason = dux_core::engine::format_panic_payload(payload);
-                dux_core::logger::error(&format!(
-                    "non-default-branch-checkout worker panicked: {reason}"
-                ));
-                let _ = tx_panic.send(WorkerEvent::NonDefaultBranchCheckoutCompleted {
-                    action: action_panic,
-                    target_branch: branch_panic,
-                    result: Err(format!("Worker panicked: {reason}")),
-                    status_op_id: Some(op_id_panic),
-                });
-            }
+            dux_core::project_browser::run_checkout_job_reporting_panics(
+                action,
+                target_branch,
+                worker_tx,
+                Some(status_op_id),
+                dux_core::project_browser::run_add_project_checkout_job,
+            );
         });
     }
 

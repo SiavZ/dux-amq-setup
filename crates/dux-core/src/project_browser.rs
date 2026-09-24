@@ -355,6 +355,39 @@ pub fn run_add_project_checkout_job(
     });
 }
 
+/// Run a checkout job (normally `run_add_project_checkout_job`) so that a panic
+/// inside it still ends the chain: the panic is logged and turned into a failed
+/// `NonDefaultBranchCheckoutCompleted`, because that event is the only thing
+/// that resolves the keyed busy and releases the repository's in-flight key.
+/// Both surfaces spawn their checkout worker through this.
+pub fn run_checkout_job_reporting_panics(
+    action: NonDefaultBranchAction,
+    target_branch: String,
+    worker_tx: Sender<WorkerEvent>,
+    status_op_id: Option<String>,
+    job: impl FnOnce(NonDefaultBranchAction, String, Sender<WorkerEvent>, Option<String>),
+) {
+    use std::panic::AssertUnwindSafe;
+    let tx_panic = worker_tx.clone();
+    let action_panic = action.clone();
+    let branch_panic = target_branch.clone();
+    let op_id_panic = status_op_id.clone();
+    if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        job(action, target_branch, worker_tx, status_op_id);
+    })) {
+        let reason = crate::engine::format_panic_payload(payload);
+        crate::logger::error(&format!(
+            "non-default-branch-checkout worker panicked: {reason}"
+        ));
+        let _ = tx_panic.send(WorkerEvent::NonDefaultBranchCheckoutCompleted {
+            action: action_panic,
+            target_branch: branch_panic,
+            result: Err(format!("Worker panicked: {reason}")),
+            status_op_id: op_id_panic,
+        });
+    }
+}
+
 /// Background job for the initial-commit-then-add flow: creates an empty
 /// initial commit in the (unborn) source repo and reports the outcome via
 /// `WorkerEvent::InitialCommitCreated`. Shared by the TUI and the web so the
@@ -507,6 +540,57 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::model::{ProviderKind, SessionStatus};
+
+    fn checkout_action() -> NonDefaultBranchAction {
+        NonDefaultBranchAction::AddProject {
+            path: "/nowhere/repo".to_string(),
+            name: "repo".to_string(),
+            leading_branch: "main".to_string(),
+        }
+    }
+
+    /// A checkout worker that panics must still answer: the chain's in-flight
+    /// key and its keyed busy are released only by the completion event, so a
+    /// silent panic would wedge every later request for that repository.
+    #[test]
+    fn a_panicking_checkout_job_still_reports_a_failed_completion() {
+        let (tx, rx) = mpsc::channel();
+        run_checkout_job_reporting_panics(
+            checkout_action(),
+            "main".to_string(),
+            tx,
+            Some("op-7".to_string()),
+            |_, _, _, _| panic!("the switch blew up"),
+        );
+        let event = rx.try_recv().expect("the panic is turned into an event");
+        let WorkerEvent::NonDefaultBranchCheckoutCompleted {
+            target_branch,
+            result,
+            status_op_id,
+            ..
+        } = event
+        else {
+            panic!("expected a checkout completion");
+        };
+        assert_eq!(target_branch, "main");
+        assert_eq!(status_op_id.as_deref(), Some("op-7"));
+        let reason = result.expect_err("a panic is a failure");
+        assert!(reason.contains("the switch blew up"), "{reason}");
+        assert!(rx.try_recv().is_err(), "exactly one completion");
+    }
+
+    #[test]
+    fn a_checkout_job_that_returns_adds_no_event_of_its_own() {
+        let (tx, rx) = mpsc::channel();
+        run_checkout_job_reporting_panics(
+            checkout_action(),
+            "main".to_string(),
+            tx,
+            None,
+            |_, _, _, _| {},
+        );
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn resolve_start_dir_prefers_an_existing_configured_directory() {
