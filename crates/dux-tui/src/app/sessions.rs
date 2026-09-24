@@ -881,6 +881,7 @@ impl App {
 
         self.input_target = InputTarget::None;
         self.fullscreen_overlay = FullscreenOverlay::None;
+        let extras = Box::new(self.new_agent_extras_for(&request));
         self.prompt = PromptState::NameNewAgent {
             request,
             input,
@@ -892,6 +893,7 @@ impl App {
                 .defaults
                 .copy_uncommitted_changes_by_default,
             focus: NameNewAgentFocus::Input,
+            extras,
         };
         Ok(())
     }
@@ -1288,6 +1290,7 @@ impl App {
         request: CreateAgentRequest,
         busy_message: String,
     ) -> Result<()> {
+        self.arm_new_agent_settings(&request);
         let term_size = crossterm::terminal::size().unwrap_or((80, 24));
         // Armed only once the dispatch is known accepted, and taking the
         // in-flight key is what says so. The engine allows one create at a time
@@ -4628,6 +4631,8 @@ mod tests {
             last_pty_resize_target: None,
             tui_launched_ptys: Default::default(),
             create_agent_started_here: false,
+            pending_new_agent_settings: None,
+            armed_new_agent_settings: None,
             pending_pty_takeover: None,
             last_refused_pty_resize: None,
             grid_generation: 0,

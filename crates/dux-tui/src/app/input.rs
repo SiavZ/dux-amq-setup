@@ -263,6 +263,8 @@ enum PromptMouseTarget {
     Checkbox(OverlayCheckboxId),
     RenameInput,
     NameNewAgentInput,
+    /// A harness, Advanced or settings row of the new-agent modal.
+    NameNewAgentRow(super::NameNewAgentFocus),
     PullRequestInput,
     PullRequestChooseProject,
     AttachPullRequestInput,
@@ -427,6 +429,7 @@ impl ButtonPressedTarget {
             | PromptMouseTarget::Checkbox(_)
             | PromptMouseTarget::RenameInput
             | PromptMouseTarget::NameNewAgentInput
+            | PromptMouseTarget::NameNewAgentRow(_)
             | PromptMouseTarget::PullRequestInput
             | PromptMouseTarget::AttachPullRequestInput
             | PromptMouseTarget::NameStandaloneAgentInput
@@ -5294,11 +5297,16 @@ impl App {
         let PromptState::NameNewAgent {
             mut request,
             copy_changes,
+            extras,
             ..
         } = old_prompt
         else {
             unreachable!()
         };
+        // The chosen harness and the Advanced draft (fork 6448c3f5). The name
+        // goes on first because it is part of the draft's create tag.
+        set_create_agent_request_custom_name(&mut request, name.clone());
+        self.take_new_agent_choices(&extras, &mut request);
         if let CreateAgentRequest::NewProject {
             copy_uncommitted_changes,
             ..
@@ -5332,10 +5340,9 @@ impl App {
         let PromptState::NameNewAgent { focus, .. } = &self.prompt else {
             return Ok(None);
         };
-        let checkbox_focused = matches!(
-            focus,
-            NameNewAgentFocus::RandomizedNameCheckbox | NameNewAgentFocus::CopyChangesCheckbox
-        );
+        // Every control but the name field (the checkboxes, and the harness,
+        // Advanced and settings rows of fork 6448c3f5) takes Space, not text.
+        let checkbox_focused = !matches!(focus, NameNewAgentFocus::Input);
         let action = if !checkbox_focused && text_field_owns_key(key) {
             None
         } else {
@@ -6787,7 +6794,12 @@ impl App {
                 input,
                 checkbox,
                 copy_checkbox,
-            } => Self::name_new_agent_target(input, checkbox, copy_checkbox, column, row),
+            } => Self::name_new_agent_target(input, checkbox, copy_checkbox, column, row).or_else(
+                || {
+                    self.new_agent_row_hit(column, row)
+                        .map(PromptMouseTarget::NameNewAgentRow)
+                },
+            ),
         }
     }
 
@@ -8292,30 +8304,41 @@ impl App {
     }
 
     fn focus_next_name_new_agent_control(&mut self, forward: bool) {
-        if let PromptState::NameNewAgent { request, focus, .. } = &mut self.prompt {
+        if let PromptState::NameNewAgent {
+            request,
+            focus,
+            extras,
+            ..
+        } = &mut self.prompt
+        {
             // Only fresh project agents expose the copy checkbox: forks always
             // copy, and the other flows never do.
-            let has_copy_checkbox = matches!(request, CreateAgentRequest::NewProject { .. });
-            *focus = if has_copy_checkbox {
-                match (*focus, forward) {
-                    (NameNewAgentFocus::Input, true) => NameNewAgentFocus::RandomizedNameCheckbox,
-                    (NameNewAgentFocus::RandomizedNameCheckbox, true) => {
-                        NameNewAgentFocus::CopyChangesCheckbox
-                    }
-                    (NameNewAgentFocus::CopyChangesCheckbox, true) => NameNewAgentFocus::Input,
-                    (NameNewAgentFocus::Input, false) => NameNewAgentFocus::CopyChangesCheckbox,
-                    (NameNewAgentFocus::CopyChangesCheckbox, false) => {
-                        NameNewAgentFocus::RandomizedNameCheckbox
-                    }
-                    (NameNewAgentFocus::RandomizedNameCheckbox, false) => NameNewAgentFocus::Input,
-                }
+            let mut order = vec![
+                NameNewAgentFocus::Input,
+                NameNewAgentFocus::RandomizedNameCheckbox,
+            ];
+            if matches!(request, CreateAgentRequest::NewProject { .. }) {
+                order.push(NameNewAgentFocus::CopyChangesCheckbox);
+            }
+            // Harness and Advanced (fork 6448c3f5); the setting rows only
+            // while Advanced is open.
+            order.push(NameNewAgentFocus::Provider);
+            order.push(NameNewAgentFocus::AdvancedToggle);
+            if extras.show_advanced {
+                order.extend(
+                    extras
+                        .setting_rows()
+                        .into_iter()
+                        .map(NameNewAgentFocus::Setting),
+                );
+            }
+            let at = order.iter().position(|f| f == focus).unwrap_or(0);
+            let len = order.len();
+            *focus = order[if forward {
+                (at + 1) % len
             } else {
-                match *focus {
-                    NameNewAgentFocus::Input => NameNewAgentFocus::RandomizedNameCheckbox,
-                    NameNewAgentFocus::RandomizedNameCheckbox
-                    | NameNewAgentFocus::CopyChangesCheckbox => NameNewAgentFocus::Input,
-                }
-            };
+                (at + len - 1) % len
+            }];
         }
     }
 
@@ -8330,6 +8353,7 @@ impl App {
             }
             NameNewAgentFocus::CopyChangesCheckbox => self.toggle_name_new_agent_copy_changes(),
             NameNewAgentFocus::Input => {}
+            other => self.activate_new_agent_row(other),
         }
     }
 
@@ -8650,7 +8674,7 @@ impl App {
         }
     }
 
-    fn handle_prompt_mouse(&mut self, mouse: MouseEvent) -> bool {
+    pub(crate) fn handle_prompt_mouse(&mut self, mouse: MouseEvent) -> bool {
         if let Some(result) = self.handle_first_load_prompt_mouse(&mouse) {
             return result;
         }
@@ -8913,6 +8937,7 @@ impl App {
             PromptMouseTarget::NameNewAgentInput => {
                 self.set_name_new_agent_cursor_from_mouse(mouse.column);
             }
+            PromptMouseTarget::NameNewAgentRow(target) => self.activate_new_agent_row(target),
             PromptMouseTarget::PullRequestInput => {
                 self.set_pull_request_cursor_from_mouse(mouse.column);
             }
@@ -11222,7 +11247,7 @@ impl App {
     }
 }
 
-fn set_create_agent_request_custom_name(request: &mut CreateAgentRequest, name: String) {
+pub(crate) fn set_create_agent_request_custom_name(request: &mut CreateAgentRequest, name: String) {
     match request {
         CreateAgentRequest::NewProject { custom_name, .. }
         | CreateAgentRequest::ForkSession { custom_name, .. }
@@ -15374,6 +15399,7 @@ not_a_real_action = ["x"]
             randomized_name: None,
             copy_changes: false,
             focus: NameNewAgentFocus::Input,
+            extras: Default::default(),
         };
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -15414,6 +15440,7 @@ not_a_real_action = ["x"]
             randomized_name: None,
             copy_changes: false,
             focus: NameNewAgentFocus::Input,
+            extras: Default::default(),
         };
 
         app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
@@ -15463,6 +15490,7 @@ not_a_real_action = ["x"]
             randomized_name: None,
             copy_changes: false,
             focus: NameNewAgentFocus::Input,
+            extras: Default::default(),
         };
 
         let focus_now = |app: &App| match &app.prompt {
@@ -15476,6 +15504,14 @@ not_a_real_action = ["x"]
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(focus_now(&app), NameNewAgentFocus::CopyChangesCheckbox);
+        // The harness and Advanced rows (fork 6448c3f5) close the cycle; the
+        // settings rows only join it once Advanced is open.
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(focus_now(&app), NameNewAgentFocus::Provider);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(focus_now(&app), NameNewAgentFocus::AdvancedToggle);
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(focus_now(&app), NameNewAgentFocus::Input);
@@ -15484,9 +15520,14 @@ not_a_real_action = ["x"]
             .unwrap();
         assert_eq!(
             focus_now(&app),
-            NameNewAgentFocus::CopyChangesCheckbox,
+            NameNewAgentFocus::AdvancedToggle,
             "Shift-Tab should cycle backward"
         );
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(focus_now(&app), NameNewAgentFocus::CopyChangesCheckbox);
         app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
             .unwrap();
         assert_eq!(focus_now(&app), NameNewAgentFocus::RandomizedNameCheckbox);
@@ -15508,6 +15549,7 @@ not_a_real_action = ["x"]
             randomized_name: None,
             copy_changes: false,
             focus: NameNewAgentFocus::Input,
+            extras: Default::default(),
         };
 
         for c in ['h', 'l'] {
@@ -15548,6 +15590,7 @@ not_a_real_action = ["x"]
             randomized_name: None,
             copy_changes: false,
             focus: NameNewAgentFocus::Input,
+            extras: Default::default(),
         };
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -16491,8 +16534,9 @@ not_a_real_action = ["x"]
         }
     }
 
-    /// The fresh-agent prompt has exactly three focus stops (input, pet-name
-    /// checkbox, copy checkbox) and no pull-before-create checkbox.
+    /// The fresh-agent prompt's focus stops are input, pet-name checkbox, copy
+    /// checkbox, then the harness and Advanced rows (fork 6448c3f5), and no
+    /// pull-before-create checkbox.
     #[test]
     fn fresh_agent_prompt_does_not_expose_pull_before_create_checkbox() {
         let mut app = test_app(default_bindings());
@@ -16518,13 +16562,19 @@ not_a_real_action = ["x"]
             .unwrap();
         expect_focus(&app, NameNewAgentFocus::CopyChangesCheckbox);
 
-        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
-            .unwrap();
-        expect_focus(&app, NameNewAgentFocus::Input);
+        for next in [
+            NameNewAgentFocus::Provider,
+            NameNewAgentFocus::AdvancedToggle,
+            NameNewAgentFocus::Input,
+        ] {
+            app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+                .unwrap();
+            expect_focus(&app, next);
+        }
     }
 
     /// Fork prompts never show the copy checkbox: forks always copy, so the
-    /// focus cycle stays two stops.
+    /// cycle goes from the pet-name checkbox straight to the harness row.
     #[test]
     fn fork_prompt_has_no_copy_checkbox_focus_stop() {
         let mut app = test_app(default_bindings());
@@ -16549,7 +16599,9 @@ not_a_real_action = ["x"]
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .unwrap();
         match &app.prompt {
-            PromptState::NameNewAgent { focus, .. } => assert_eq!(*focus, NameNewAgentFocus::Input),
+            PromptState::NameNewAgent { focus, .. } => {
+                assert_eq!(*focus, NameNewAgentFocus::Provider)
+            }
             other => panic!("expected NameNewAgent prompt, got {other:?}"),
         }
     }
@@ -16577,6 +16629,7 @@ not_a_real_action = ["x"]
             randomized_name: None,
             copy_changes: true,
             focus: NameNewAgentFocus::Input,
+            extras: Default::default(),
         };
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -34799,6 +34852,7 @@ cyan = "#00ffff"
             randomized_name: None,
             copy_changes: false,
             focus,
+            extras: Default::default(),
         }
     }
 
@@ -35535,6 +35589,7 @@ cyan = "#00ffff"
             randomized_name: None,
             copy_changes: false,
             focus: NameNewAgentFocus::Input,
+            extras: Default::default(),
         };
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -36827,6 +36882,7 @@ cyan = "#00ffff"
                     randomized_name: None,
                     copy_changes: false,
                     focus: NameNewAgentFocus::Input,
+                    extras: Default::default(),
                 };
                 tap(&mut app, KeyCode::Enter);
             }

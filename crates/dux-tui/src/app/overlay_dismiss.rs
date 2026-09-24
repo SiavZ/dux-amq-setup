@@ -625,6 +625,7 @@ mod tests {
             randomized_name: None,
             copy_changes: false,
             focus: NameNewAgentFocus::Input,
+            extras: Default::default(),
         }
     }
 

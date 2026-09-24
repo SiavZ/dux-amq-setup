@@ -10466,11 +10466,13 @@ impl App {
             randomize_name,
             copy_changes,
             focus,
+            extras,
             ..
         } = &self.prompt
         else {
             return;
         };
+        let extras_lines = super::new_agent_settings::extras_lines(extras);
         self.render_dim_overlay(frame);
         let randomize_checkbox = Checkbox::new("Use randomized pet name")
             .checked(*randomize_name)
@@ -10537,6 +10539,8 @@ impl App {
                 + randomize_checkbox_height
                 + copy_checkbox_spacing
                 + copy_checkbox_height
+                + 1
+                + extras_lines.len() as u16
                 + footer_spacing,
             frame.area(),
         );
@@ -10559,6 +10563,8 @@ impl App {
             _,
             copy_checkbox_area,
             _,
+            extras_area,
+            _,
             hint_area,
         ] = Layout::default()
             .direction(Direction::Vertical)
@@ -10570,6 +10576,8 @@ impl App {
                 Constraint::Length(randomize_checkbox_height),
                 Constraint::Length(copy_checkbox_spacing),
                 Constraint::Length(copy_checkbox_height),
+                Constraint::Length(1),
+                Constraint::Length(extras_lines.len() as u16),
                 Constraint::Length(footer_spacing),
                 Constraint::Min(1),
             ])
@@ -10691,6 +10699,10 @@ impl App {
             Style::default().fg(self.theme.hint_desc_fg),
         ));
         Paragraph::new(Line::from(hints)).render(hint_area, frame.buffer_mut());
+        let hit_rows = self.render_new_agent_extras(frame, extras_area, &extras_lines);
+        if let PromptState::NameNewAgent { extras, .. } = &mut self.prompt {
+            extras.hit_rows = hit_rows;
+        }
         self.overlay_layout.active = OverlayMouseLayout::NameNewAgent {
             input: input_inner,
             checkbox: Some(OverlayCheckbox {
@@ -22448,6 +22460,7 @@ mod tests {
                 randomized_name,
                 copy_changes,
                 focus,
+                extras: Default::default(),
             },
             other => panic!("expected NameNewAgent, got {other:?}"),
         };
@@ -22861,6 +22874,7 @@ mod tests {
             randomized_name: None,
             copy_changes: false,
             focus: NameNewAgentFocus::Input,
+            extras: Default::default(),
         }
     }
 
@@ -23202,6 +23216,7 @@ mod tests {
             randomized_name: None,
             copy_changes: false,
             focus,
+            extras: Default::default(),
         }
     }
 

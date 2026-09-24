@@ -403,6 +403,15 @@ pub struct App {
     /// engine allows exactly one create at a time (`InFlightKey::CreateAgent`),
     /// and it is spent by the create's own outcome, success or failure.
     pub(crate) create_agent_started_here: bool,
+    /// A creation-time session-settings draft, tagged with the create it
+    /// belongs to, held between the new-agent modal's confirm and the
+    /// dispatch (a branch-exists confirm can sit between them).
+    pub(crate) pending_new_agent_settings: Option<(
+        new_agent_settings::CreateTag,
+        dux_core::session_settings::SessionSettings,
+    )>,
+    /// The draft for the create in flight, applied when it commits.
+    pub(crate) armed_new_agent_settings: Option<dux_core::session_settings::SessionSettings>,
     /// How many times the selected surface's grid has been REBUILT (see
     /// `refresh_snapshot_buf`). Not a clock and not a line count: it only
     /// answers "has the grid moved since I looked?", which is the one question
@@ -2129,6 +2138,13 @@ pub(crate) enum NameNewAgentFocus {
     /// Only reachable for `CreateAgentRequest::NewProject`: forks always
     /// copy and the other flows never do, so only fresh agents show the box.
     CopyChangesCheckbox,
+    /// The harness row (fork 6448c3f5): Space picks the next configured one.
+    Provider,
+    /// The "Advanced settings" disclosure row.
+    AdvancedToggle,
+    /// A session-settings row in the Advanced section, shared with the
+    /// session settings modal so a row means the same thing in both.
+    Setting(SettingsFocus),
 }
 
 /// What the folder browser is picking a directory for.
@@ -2463,6 +2479,8 @@ pub(crate) enum PromptState {
         /// `CreateAgentRequest::NewProject`.
         copy_changes: bool,
         focus: NameNewAgentFocus,
+        /// Harness picker and the Advanced session settings (fork 6448c3f5).
+        extras: Box<new_agent_settings::NewAgentExtras>,
     },
     PickEditor {
         session_label: String,
@@ -3622,6 +3640,7 @@ mod overlay_dismiss;
 mod pty_ownership;
 mod redraw;
 pub(crate) use redraw::RedrawGate;
+mod new_agent_settings;
 mod render;
 mod reorder;
 mod session_settings;
@@ -3940,6 +3959,8 @@ impl App {
             last_pty_resize_target: None,
             tui_launched_ptys: Default::default(),
             create_agent_started_here: false,
+            pending_new_agent_settings: None,
+            armed_new_agent_settings: None,
             pending_pty_takeover: None,
             last_refused_pty_resize: None,
             grid_generation: 0,
