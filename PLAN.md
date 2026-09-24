@@ -1,4 +1,16 @@
 # Plan: shared main-workspace mode for dux agents
+
+> **Historical record, pre-workspace paths.** File paths in this document
+> refer to the fork-main single-crate layout, before the `crates/`
+> restructure. Mapping: `src/` -> `crates/dux-core/src/` (engine, config,
+> storage, pty, git, model) or `crates/dux-tui/src/` (`src/app/`, `src/cli.rs`,
+> keys, rendering); `tests/` -> `crates/*/tests/`. Storage no longer uses
+> numbered migrations (`src/storage/migrations/000N_*.sql`, `PRAGMA
+> user_version`): it uses idempotent `ensure_column` calls in
+> `crates/dux-core/src/storage.rs`. See
+> [docs/contributing/schema-policy.md](docs/contributing/schema-policy.md).
+> The body is left as written.
+
 _Locked via grill — by Claude + Siavash. Revised after Codex review rounds 1–4._
 
 ## Goal
