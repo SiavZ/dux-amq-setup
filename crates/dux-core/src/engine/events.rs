@@ -7292,6 +7292,12 @@ mod tests {
             crate::model::BranchProvenance::CreatedByDux,
         );
         wait_gone(&worktree);
+        // The rollback thread removes the worktree first and deletes the
+        // branch after, so poll for the branch too before asserting.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while branch_exists(&branch) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert!(
             !worktree.exists(),
             "the unrecorded worktree must be removed"
