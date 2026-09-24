@@ -1385,7 +1385,7 @@ mod tests {
     }
 
     #[test]
-    fn save_summary_lists_changed_knobs() {
+    fn build_session_settings_save_summary_lists_changed_knobs() {
         assert_eq!(
             build_session_settings_save_summary(false, false, false, false, false),
             "Session settings saved (no changes)."
