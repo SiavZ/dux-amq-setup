@@ -94,7 +94,7 @@ fn the_overlay_config_snippet_uses_only_keys_the_schema_knows() {
 #[test]
 fn the_schema_check_rejects_unknown_and_retired_keys() {
     let bad: toml::Table = toml::from_str(
-        "[defaults]\nprompt_for_name = true\n\n[providers.claude]\ncommand = \"claude-amq\"\nforward_mouse = false\n",
+        "[defaults]\nprompt_for_name = true\n\n[providers.claude]\ncommand = \"claude-amq\"\nforward_mouse = false\nforward_mous = false\n",
     )
     .expect("parse");
     let mismatches = schema_mismatches(&bad);
@@ -104,16 +104,18 @@ fn the_schema_check_rejects_unknown_and_retired_keys() {
             .any(|m| m.starts_with("defaults.prompt_for_name")),
         "{mismatches:?}"
     );
+    // A misspelling is exactly what the lenient loader would swallow.
     assert!(
         mismatches
             .iter()
-            .any(|m| m.starts_with("providers.claude.forward_mouse")),
+            .any(|m| m.starts_with("providers.claude.forward_mous:")),
         "{mismatches:?}"
     );
     assert!(
         !mismatches
             .iter()
-            .any(|m| m.starts_with("providers.claude.command")),
+            .any(|m| m.starts_with("providers.claude.command")
+                || m.starts_with("providers.claude.forward_mouse:")),
         "a known key with the right value must not be reported: {mismatches:?}"
     );
 }
@@ -234,4 +236,41 @@ fn the_installer_sed_wraps_a_gemini_block_the_user_kept() {
     let gemini = &config.providers.commands["gemini"];
     assert_eq!(gemini.command, "gemini-amq");
     assert_eq!(gemini.forward_scroll, Some(true));
+}
+
+/// Current dux already renders `forward_mouse = false` for claude and codex,
+/// so a fresh config never exercises the overlay's forward_mouse rules. A
+/// config the user edited can carry an explicit `true`; the overlay must still
+/// pin it off so plain drags stay in dux and pane text can be copied
+/// (bc3a9eec). (A commented-out or absent key needs no rule: the loader fills
+/// it with the shipped `false`. The codex leg checks that stays true.)
+#[test]
+fn the_installer_sed_pins_forward_mouse_off_in_a_kept_config() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let stock = regenerate_stock_config(tmp.path());
+    let mut section = "";
+    let kept: String = stock
+        .lines()
+        .map(|line| {
+            if line.starts_with('[') {
+                section = line;
+            }
+            match (section, line) {
+                ("[providers.claude]", "forward_mouse = false") => "forward_mouse = true",
+                ("[providers.codex]", "forward_mouse = false") => "# forward_mouse = true",
+                _ => line,
+            }
+        })
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert_ne!(kept, stock, "the fixture must actually flip forward_mouse");
+    let patched = run_overlay_sed(tmp.path(), &kept);
+    let config = load(tmp.path(), &patched);
+    for name in ["claude", "codex"] {
+        assert_eq!(
+            config.providers.commands[name].forward_mouse,
+            Some(false),
+            "{name}: forward_mouse is not pinned off"
+        );
+    }
 }

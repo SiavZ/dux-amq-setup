@@ -32,8 +32,11 @@
 /^\[providers\.claude\]$/,/^\[/ s|^resume_args = \["--continue"\]$|resume_args = ["--continue", "--fork-session"]|
 /^\[providers\.claude\]$/,/^\[/ s|^# forward_scroll = true$|forward_scroll = true|
 /^\[providers\.claude\]$/,/^\[/ s|^forward_scroll = false$|forward_scroll = true|
-# INTEGRATION: forward_mouse = false (herb, restores copying from agent panes, bc3a9eec)
-# /^\[providers\.claude\]$/,/^\[/ s|^forward_mouse = true$|forward_mouse = false|
+# forward_mouse = false keeps plain drags in dux so text in the pane can be
+# selected and copied (bc3a9eec). Current dux renders it false for claude, and
+# fills an absent key with that on load; only an explicit `true` in a kept
+# config needs rewriting.
+/^\[providers\.claude\]$/,/^\[/ s|^forward_mouse = true$|forward_mouse = false|
 
 # codex: run inline (no alt screen) so its output lands in dux's host
 # scrollback, and therefore never forward scroll to it.
@@ -50,7 +53,10 @@ resume_by_id_args = ["--no-alt-screen", "resume", "{session_id}"]
 /^\[providers\.codex\]$/,/^\[/ s|^resume_args = \["resume", "--last"\]$|resume_args = ["--no-alt-screen", "resume", "--last"]|
 /^\[providers\.codex\]$/,/^\[/ s|^# forward_scroll = true$|forward_scroll = false|
 /^\[providers\.codex\]$/,/^\[/ s|^forward_scroll = true$|forward_scroll = false|
-# INTEGRATION: forward_mouse = false (herb, restores copying from agent panes, bc3a9eec)
-# /^\[providers\.codex\]$/,/^\[/ s|^forward_mouse = true$|forward_mouse = false|
+# forward_mouse = false keeps plain drags in dux so text in the pane can be
+# selected and copied (bc3a9eec). Current dux renders it false for codex, and
+# fills an absent key with that on load; only an explicit `true` in a kept
+# config needs rewriting.
+/^\[providers\.codex\]$/,/^\[/ s|^forward_mouse = true$|forward_mouse = false|
 
 /^\[providers\.gemini\]$/,/^\[/ s|^forward_scroll = false$|forward_scroll = true|

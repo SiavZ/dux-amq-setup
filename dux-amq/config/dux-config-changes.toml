@@ -24,7 +24,8 @@ resume_args = ["--continue", "--fork-session"]
 # Tri-state since upstream: absent is auto. Pin it so the wheel always reaches
 # Claude's renderer.
 forward_scroll = true
-# INTEGRATION: forward_mouse = false (herb, restores copying from agent panes, bc3a9eec)
+# Plain drags stay in dux so pane text can be selected and copied (bc3a9eec).
+forward_mouse = false
 
 [providers.codex]
 command = "codex-amq"
@@ -33,7 +34,8 @@ args = ["--no-alt-screen"]
 resume_args = ["--no-alt-screen", "resume", "--last"]
 resume_by_id_args = ["--no-alt-screen", "resume", "{session_id}"]
 forward_scroll = false
-# INTEGRATION: forward_mouse = false (herb, restores copying from agent panes, bc3a9eec)
+# Plain drags stay in dux so pane text can be selected and copied (bc3a9eec).
+forward_mouse = false
 
 [providers.jcode]
 command = "jcode-amq"
