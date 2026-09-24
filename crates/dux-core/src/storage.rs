@@ -169,15 +169,6 @@ impl SessionStore {
         Ok(Self { conn })
     }
 
-    /// Test-only: make every later write on this handle fail, so a test can
-    /// drive a persistence-failure path without a broken filesystem.
-    #[cfg(test)]
-    pub(crate) fn make_read_only_for_test(&self) {
-        self.conn
-            .execute_batch("pragma query_only = on;")
-            .expect("set query_only");
-    }
-
     pub fn open(path: &std::path::Path) -> Result<Self> {
         let conn =
             Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
@@ -2438,6 +2429,20 @@ fn test_tab(id: &str, session_id: &str, sort_order: i64) -> crate::model::AgentT
         provider: crate::model::ProviderKind::new("codex"),
         sort_order,
         created_at: Utc::now(),
+    }
+}
+
+// Kept after every production item: a storage test scans this file's source
+// up to the first `#[cfg(test)]` for `ensure_column` call sites.
+#[cfg(test)]
+impl SessionStore {
+    /// Test-only: make every later write on this handle fail, so a test can
+    /// drive a persistence-failure path without a broken filesystem.
+    #[cfg(test)]
+    pub(crate) fn make_read_only_for_test(&self) {
+        self.conn
+            .execute_batch("pragma query_only = on;")
+            .expect("set query_only");
     }
 }
 

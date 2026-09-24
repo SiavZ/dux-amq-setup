@@ -989,7 +989,8 @@ impl WireStatus {
     pub fn new(tone: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             tone: tone.into(),
-            message: message.into(),
+            // Sanitized like the TUI's status controller (fork 2d9423ae).
+            message: crate::sanitize::for_terminal(&message.into()),
             key: None,
             scope: StatusScope::All,
             sticky: false,
@@ -1005,7 +1006,7 @@ impl WireStatus {
     ) -> Self {
         Self {
             tone: tone.into(),
-            message: message.into(),
+            message: crate::sanitize::for_terminal(&message.into()),
             key: Some(key.into()),
             scope: StatusScope::All,
             sticky: false,
@@ -1048,7 +1049,7 @@ impl WireStatus {
     pub fn from_update(update: &StatusUpdate) -> Self {
         Self {
             tone: update.tone.as_wire().to_string(),
-            message: update.message.clone(),
+            message: crate::sanitize::for_terminal(&update.message),
             key: update.key.clone(),
             scope: update.scope.clone(),
             sticky: update.sticky,
@@ -5319,6 +5320,19 @@ mod tests {
              came with the worktree this agent adopted and was kept. Delete it yourself \
              with git branch -D \"main\" if you no longer need it."
         );
+    }
+
+    /// Fork 2d9423ae (P0-C): a web toast never carries raw terminal escapes.
+    #[test]
+    fn wire_statuses_are_sanitized() {
+        let hostile = "branch \x1b]0;pwned\x07";
+        for status in [
+            WireStatus::new("error", hostile),
+            WireStatus::from_update(&StatusUpdate::error(hostile)),
+        ] {
+            assert!(!status.message.contains('\u{1b}'), "{:?}", status.message);
+            assert!(status.message.contains("\\x1b"), "{:?}", status.message);
+        }
     }
 
     #[test]
