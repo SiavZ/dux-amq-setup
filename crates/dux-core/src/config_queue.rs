@@ -36,6 +36,12 @@ pub struct ConfigWriteQueue {
     tx: Sender<WriteMsg>,
     writer: Option<JoinHandle<()>>,
     lazy_inflight: Arc<AtomicUsize>,
+    /// Set when the writer thread could not be started (fork 773a6b04: the
+    /// config-save worker degrades to synchronous on spawn failure). Every
+    /// save then writes inline at `Fsync` durability, which blocks the caller
+    /// for the write but loses nothing, where a missing writer would drop
+    /// every preference silently. `None` in the normal threaded case.
+    synchronous_path: Option<PathBuf>,
 }
 
 /// Holds a reload/recover barrier open. The writer is paused (drained) while the
@@ -87,25 +93,67 @@ impl ConfigWriteQueue {
     }
 
     fn build(config_path: PathBuf, status_lane: Option<Sender<WorkerEvent>>) -> Self {
+        Self::build_with(config_path, status_lane, |builder, body| {
+            builder.spawn(body)
+        })
+    }
+
+    /// [`Self::build`] with the thread spawn injectable, so a test can take the
+    /// spawn-failure path without exhausting the process table.
+    fn build_with<S>(
+        config_path: PathBuf,
+        status_lane: Option<Sender<WorkerEvent>>,
+        spawn: S,
+    ) -> Self
+    where
+        S: FnOnce(
+            thread::Builder,
+            Box<dyn FnOnce() + Send + 'static>,
+        ) -> std::io::Result<JoinHandle<()>>,
+    {
         let (tx, rx) = mpsc::channel();
         let lazy_inflight = Arc::new(AtomicUsize::new(0));
-        let writer = thread::Builder::new()
-            .name("config-writer".into())
-            .spawn({
-                let lazy_inflight = lazy_inflight.clone();
-                move || writer_loop(rx, config_path, lazy_inflight, status_lane)
-            })
-            .expect("spawn config-writer thread");
-        ConfigWriteQueue {
-            tx,
-            writer: Some(writer),
-            lazy_inflight,
+        let body: Box<dyn FnOnce() + Send + 'static> = Box::new({
+            let lazy_inflight = lazy_inflight.clone();
+            let config_path = config_path.clone();
+            move || writer_loop(rx, config_path, lazy_inflight, status_lane)
+        });
+        match spawn(thread::Builder::new().name("config-writer".into()), body) {
+            Ok(writer) => ConfigWriteQueue {
+                tx,
+                writer: Some(writer),
+                lazy_inflight,
+                synchronous_path: None,
+            },
+            Err(err) => {
+                crate::logger::error(&format!(
+                    "could not start the config writer thread ({err}); \
+                     config saves will be written synchronously"
+                ));
+                ConfigWriteQueue {
+                    tx,
+                    writer: None,
+                    lazy_inflight,
+                    synchronous_path: Some(config_path),
+                }
+            }
         }
+    }
+
+    /// The inline write used when there is no writer thread.
+    fn save_synchronously(path: &std::path::Path, config: &Config) -> Result<(), String> {
+        save_config_with(path, config, Durability::Fsync).map_err(|err| format!("{err:#}"))
     }
 
     /// Deferred, coalesced, fire-and-forget. A dead writer is surfaced lazily via
     /// the next eager/flush; lazy itself never blocks.
     pub fn save_lazy(&self, config: Config) {
+        if let Some(path) = &self.synchronous_path {
+            if let Err(err) = Self::save_synchronously(path, &config) {
+                crate::logger::error(&format!("config save failed: {err}"));
+            }
+            return;
+        }
         // Bound in-flight lazy snapshots so a stalled or paused writer cannot let
         // the channel grow without limit. Lazy writes are coalesced anyway, so
         // dropping a snapshot at the cap is acceptable: the fixed deadline still
@@ -128,6 +176,9 @@ impl ConfigWriteQueue {
     /// Awaited write: blocks (a few ms) for the result, ~2 s timeout. On a dead
     /// writer it returns an error rather than hanging.
     pub fn save_eager(&self, config: Config) -> Result<(), String> {
+        if let Some(path) = &self.synchronous_path {
+            return Self::save_synchronously(path, &config);
+        }
         let (reply, rx) = mpsc::sync_channel(1);
         if self.tx.send(WriteMsg::Eager { config, reply }).is_err() {
             return Err("config writer thread is gone; config was not saved".into());
@@ -157,6 +208,9 @@ impl ConfigWriteQueue {
 
     /// Exit-time drain: write any pending lazy, bounded by a timeout.
     pub fn flush(&self) {
+        if self.synchronous_path.is_some() {
+            return; // every save already landed inline
+        }
         let (ack, rx) = mpsc::sync_channel(0);
         if self.tx.send(WriteMsg::Flush(ack)).is_ok() {
             match rx.recv_timeout(FLUSH_TIMEOUT) {
@@ -179,6 +233,13 @@ impl ConfigWriteQueue {
     /// if `false`, the writer never confirmed the pause (timeout or dead writer) and
     /// the write must be aborted to avoid racing a still-running writer.
     pub fn quiesce(&self) -> QuiesceGuard {
+        if self.synchronous_path.is_some() {
+            // No writer thread exists to race, so the barrier holds trivially.
+            return QuiesceGuard {
+                tx: self.tx.clone(),
+                acknowledged: true,
+            };
+        }
         let (ack, rx) = mpsc::sync_channel(0);
         let acknowledged = if self.tx.send(WriteMsg::Pause(ack)).is_ok() {
             match rx.recv_timeout(FLUSH_TIMEOUT) {
@@ -219,6 +280,7 @@ impl ConfigWriteQueue {
             tx,
             writer: None,
             lazy_inflight: Arc::new(AtomicUsize::new(0)),
+            synchronous_path: None,
         }
     }
 }
@@ -462,6 +524,34 @@ fn flush_pending(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fork 773a6b04: when the writer thread cannot start, saves degrade to
+    /// synchronous writes instead of every preference being silently lost.
+    #[test]
+    fn a_failed_writer_spawn_degrades_to_synchronous_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let queue = ConfigWriteQueue::build_with(path.clone(), None, |_, _| {
+            Err(std::io::Error::other("injected spawn failure"))
+        });
+
+        let mut config = Config::default();
+        config.ui.left_width_pct = 31;
+        queue.save_lazy(config.clone());
+        let written: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written.ui.left_width_pct, 31, "a lazy save lands inline");
+
+        config.ui.left_width_pct = 32;
+        queue
+            .save_eager(config)
+            .expect("an eager save reports success");
+        let written: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written.ui.left_width_pct, 32);
+
+        assert!(queue.quiesce().is_acknowledged(), "no writer to race");
+        queue.flush();
+    }
+
     use crate::config::Config;
 
     fn read(path: &std::path::Path) -> String {

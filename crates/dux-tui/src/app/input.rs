@@ -30681,6 +30681,32 @@ cyan = "#00ffff"
         assert_eq!(app.mouse_drag, None);
     }
 
+    /// Fork 773a6b04 (P1-23): the key or mouse handler that changes a pane
+    /// width must not do the config write itself, so a slow disk can never
+    /// stall input. Proven by the file NOT existing yet when the handler
+    /// returns (the writer thread waits out its quiet window first), and
+    /// existing, with the new width, once the writer is flushed.
+    #[test]
+    fn config_persistence_delay_does_not_block_input_handler() {
+        let mut app = test_app(default_bindings());
+        let path = app.engine.paths.config_path.clone();
+        let _ = std::fs::remove_file(&path);
+        app.left_width_pct = app.left_width_pct.saturating_add(1);
+
+        let started = std::time::Instant::now();
+        app.persist_pane_widths();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(150),
+            "input handler waited for config I/O"
+        );
+        assert!(!path.exists(), "the handler wrote the config inline");
+
+        app.engine.config_writer.flush();
+        let on_disk: dux_core::config::Config =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk.ui.left_width_pct, app.left_width_pct);
+    }
+
     #[test]
     fn scrollbar_drag_release_does_not_persist_pane_widths() {
         let (mut app, track) = app_with_scrollbar_track();
