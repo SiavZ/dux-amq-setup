@@ -3265,6 +3265,57 @@ name = "test"
     }
 
     #[test]
+    fn amq_inject_phase_delay_ms_round_trips() {
+        for value in [0, 50, 200] {
+            let mut cfg = Config::default();
+            cfg.amq.inject.phase_delay_ms = value;
+            let parsed: Config =
+                toml::from_str(&render_config_default(&cfg)).expect("config should parse");
+            assert_eq!(parsed.amq.inject.phase_delay_ms, value);
+        }
+    }
+
+    /// Strict mode is opt-in and reaches the bridge as DUX_AMQ_VERIFY at
+    /// spawn, so both values must survive a render and parse.
+    #[test]
+    fn amq_inject_verify_envelope_round_trips() {
+        for value in [true, false] {
+            let mut cfg = Config::default();
+            cfg.amq.inject.verify_envelope = value;
+            let parsed: Config =
+                toml::from_str(&render_config_default(&cfg)).expect("config should parse");
+            assert_eq!(parsed.amq.inject.verify_envelope, value);
+        }
+    }
+
+    #[test]
+    fn default_config_round_trips_amq_inject() {
+        let mut config = Config::default();
+        let i = &mut config.amq.inject;
+        i.busy_markers = vec!["thinking…".to_string(), "ctrl-c to cancel".to_string()];
+        i.queue_dir = "/tmp/inject".to_string();
+        i.busy_scan_lines = 12;
+        i.delivery_timeout_secs = 90;
+        i.max_message_age_secs = 91;
+        i.poll_interval_ms = 1234;
+        i.max_message_bytes = 4096;
+        i.enabled = false;
+        i.phase_delay_ms = 777;
+        i.startup_grace_ms = 4_321;
+        i.post_delivery_cooldown_ms = 9_876;
+        i.auto_clear_collaboration_quiet_secs = 2_222;
+        i.active_session_quiet_secs = 42;
+        i.verify_envelope = true;
+        config.amq.orchestrator.enabled = false;
+        config.amq.orchestrator.poll_interval_secs = 333;
+        config.amq.orchestrator.checkpoint_prompt =
+            "Keep the goal moving.\nUnblock stalled workers.".to_string();
+        let parsed: Config =
+            toml::from_str(&render_config_default(&config)).expect("config should parse");
+        assert_eq!(parsed.amq, config.amq);
+    }
+
+    #[test]
     fn default_config_round_trips_through_toml() {
         let rendered = render_default_config();
         let parsed: Config = toml::from_str(&rendered).expect("default config should parse");

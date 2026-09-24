@@ -435,12 +435,19 @@ impl SessionStore {
             "#,
         )?;
         // Per-session settings blob (context mode, YOLO, AMQ verify override,
-        // watch-rule overrides, auto-clear, system prompt) as JSON. Nullable:
-        // NULL and malformed values both read as `SessionSettings::default()`,
-        // so old rows and inserts by an older binary stay valid. A database
-        // from the fork's numbered-migration era (schema 0003+) already has
-        // this column and keeps its values.
-        ensure_column(&self.conn, "agent_sessions", "session_settings", "text")?;
+        // watch-rule overrides, auto-clear, system prompt) as JSON.
+        // `{}`, NULL and malformed values all read as
+        // `SessionSettings::default()`. A database from the fork's
+        // numbered-migration era (schema 0003+) already has this column as a
+        // nullable `text`, keeps its values, and may hold NULLs, so readers
+        // must keep tolerating NULL even though new databases never write it.
+        // (AMQ + orchestrator workstream.)
+        ensure_column(
+            &self.conn,
+            "agent_sessions",
+            "session_settings",
+            "text not null default '{}'",
+        )?;
         // The slot-tab passes run last: they write `agent_tabs` rows, so the
         // table has to exist, and a failure in any of them aborts the open. A
         // workspace whose first tabs are unaddressable is worse than a startup
@@ -1874,7 +1881,7 @@ impl SessionStore {
     }
 
     /// Persist one session's settings blob. Default settings are stored as
-    /// NULL so an untouched agent keeps the column empty. Deliberately a
+    /// `{}` (the column is `not null` on new databases). Deliberately a
     /// dedicated setter outside `upsert_session`'s hot path, so status churn
     /// can never clobber it.
     pub fn set_session_settings(
@@ -1882,7 +1889,11 @@ impl SessionStore {
         id: &str,
         settings: &crate::session_settings::SessionSettings,
     ) -> Result<()> {
-        let value = (!settings.is_default()).then(|| settings.to_json());
+        let value = if settings.is_default() {
+            "{}".to_string()
+        } else {
+            settings.to_json()
+        };
         let changed = self.conn.execute(
             "update agent_sessions set session_settings = ?2 where id = ?1",
             params![id, value],

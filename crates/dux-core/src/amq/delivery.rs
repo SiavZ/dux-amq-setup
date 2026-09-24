@@ -261,8 +261,14 @@ mod tests {
     }
 
     #[test]
-    fn every_provider_submits_with_raw_enter() {
-        for name in ["claude", "codex", "gemini", "custom"] {
+    fn codex_submit_uses_raw_enter() {
+        let p = ProviderKind::from_str("codex");
+        assert_eq!(submit_key_bytes_for_provider(Some(&p)), b"\r");
+    }
+
+    #[test]
+    fn non_codex_submit_uses_raw_enter() {
+        for name in ["claude", "gemini", "custom", "jcode"] {
             let p = ProviderKind::from_str(name);
             assert_eq!(submit_key_bytes_for_provider(Some(&p)), b"\r");
         }
@@ -270,14 +276,35 @@ mod tests {
     }
 
     #[test]
-    fn sanitise_matches_the_wrappers() {
+    fn sanitise_lowercases_uppercase_letters() {
         assert_eq!(sanitise_handle("ALICE"), "alice");
+        assert_eq!(sanitise_handle("Feature"), "feature");
+    }
+
+    #[test]
+    fn sanitise_replaces_disallowed_chars_with_dash() {
         assert_eq!(sanitise_handle("Feature/Login.v2"), "feature-login-v2");
         assert_eq!(sanitise_handle("foo bar"), "foo-bar");
+        assert_eq!(sanitise_handle("foo/bar/baz"), "foo-bar-baz");
+    }
+
+    #[test]
+    fn sanitise_strips_leading_and_trailing_dashes() {
         assert_eq!(sanitise_handle("--foo--"), "foo");
         assert_eq!(sanitise_handle("///foo///"), "foo");
+        assert_eq!(sanitise_handle("foo--"), "foo");
+    }
+
+    #[test]
+    fn sanitise_preserves_existing_lowercase_handles() {
         assert_eq!(sanitise_handle("watch-rules-phase3"), "watch-rules-phase3");
         assert_eq!(sanitise_handle("a1b2_c3"), "a1b2_c3");
+    }
+
+    /// Mirrors the bridge's `.unrouted` fallback: an empty sanitised name
+    /// makes the wrapper write nothing and the bridge route to `.unrouted/`.
+    #[test]
+    fn sanitise_collapses_to_empty_for_pure_garbage() {
         assert_eq!(sanitise_handle("..."), "");
         assert_eq!(sanitise_handle("///"), "");
     }
@@ -296,13 +323,18 @@ mod tests {
     }
 
     #[test]
-    fn match_receiver_falls_back_to_branch_name() {
-        let s = [c("id2", "worker-2", "feature-login", "/some/path/legacy")];
-        assert_eq!(match_receiver(&s, "feature-login"), Some("id2"));
+    fn match_receiver_falls_back_to_branch_name_when_basename_does_not_match() {
+        let s = [c(
+            "session-uuid-2",
+            "worker-2",
+            "feature-login",
+            "/some/path/legacy-name-from-creation",
+        )];
+        assert_eq!(match_receiver(&s, "feature-login"), Some("session-uuid-2"));
     }
 
     #[test]
-    fn match_receiver_accepts_session_id_for_operator_addressing() {
+    fn match_receiver_falls_back_to_session_id_for_operator_addressing() {
         let s = [c("af882c2d", "worker-3", "fix/foo", "/wt/Bar")];
         assert_eq!(match_receiver(&s, "af882c2d"), Some("af882c2d"));
     }
@@ -314,11 +346,12 @@ mod tests {
             c("id2", "worker-2", "dev", "/wt/dev"),
         ];
         assert_eq!(match_receiver(&s, "front-end-qa"), None);
-        assert_eq!(match_receiver(&[], "anything"), None);
     }
 
+    /// The wrapper's primary path inside dux is basename($PWD), so a
+    /// worktree-basename match outranks another session's branch match.
     #[test]
-    fn match_receiver_basename_beats_branch() {
+    fn match_receiver_basename_priority_beats_branch_priority() {
         let s = [
             c("idA", "worker-a", "fix/random", "/wt/Alice"),
             c("idB", "worker-b", "alice", "/wt/something-else"),
@@ -326,6 +359,19 @@ mod tests {
         assert_eq!(match_receiver(&s, "alice"), Some("idA"));
     }
 
+    #[test]
+    fn match_receiver_branch_match_wins_when_no_basename_match() {
+        let s = [c("idA", "worker-a", "alice", "/wt/random-dir")];
+        assert_eq!(match_receiver(&s, "alice"), Some("idA"));
+    }
+
+    #[test]
+    fn match_receiver_handles_empty_session_list() {
+        assert_eq!(match_receiver(&[], "anything"), None);
+    }
+
+    /// The persisted AMQ handle outranks every legacy alias (basename,
+    /// branch) of every other session.
     #[test]
     fn handle_beats_every_alias() {
         let s = [
@@ -346,14 +392,20 @@ mod tests {
         assert_eq!(match_receiver(&s, "development"), None);
     }
 
+    /// audit03 Phase 5: Worker-mode receivers get a sentinel-required
+    /// postscript that makes the current role authoritative (c69a09f0).
     #[test]
-    fn postscript_appended_for_worker_mode_and_overrides_orchestrator_role() {
+    fn postscript_appended_for_worker_mode() {
         let body = "Please review the design doc.";
         let out = apply_inject_postscript(body, ContextMode::Worker);
-        assert!(out.starts_with(body));
-        assert!(out.contains(TASK_DONE_SENTINEL));
-        assert!(out.contains("[Dux Worker mode]"));
-        assert!(out.contains("supersedes any earlier Dux Orchestrator-mode instruction"));
+        assert!(out.starts_with(body), "original body must come first");
+        assert!(out.contains("[task-done]"), "{out}");
+        assert!(
+            out.contains("[Dux Worker mode]")
+                && out.contains("supersedes any earlier Dux Orchestrator-mode instruction"),
+            "{out}"
+        );
+        assert!(out.len() > body.len());
     }
 
     #[test]
@@ -366,29 +418,53 @@ mod tests {
         );
     }
 
+    /// Pins the postscript to the watch engine's sentinel constant, so a
+    /// change there cannot silently break auto-clear.
     #[test]
-    fn quiet_window_rules() {
-        let now = Instant::now();
-        let q = Duration::from_secs(60);
-        assert!(should_hold_for_quiet_window(
-            Some(now - Duration::from_secs(5)),
-            now,
-            q
-        ));
-        assert!(!should_hold_for_quiet_window(
-            Some(now - Duration::from_secs(120)),
-            now,
-            q
-        ));
-        assert!(!should_hold_for_quiet_window(None, now, q));
-        // Boundary: exactly at the edge counts as no longer typing.
-        assert!(!should_hold_for_quiet_window(Some(now - q), now, q));
+    fn postscript_uses_canonical_sentinel_constant() {
+        let out = apply_inject_postscript("body", ContextMode::Worker);
+        assert!(out.contains(crate::watch::builtin::TASK_DONE_SENTINEL));
     }
 
+    #[test]
+    fn quiet_window_holds_when_user_typed_recently() {
+        let now = Instant::now();
+        let last = now - Duration::from_secs(5);
+        assert!(should_hold_for_quiet_window(
+            Some(last),
+            now,
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn quiet_window_delivers_after_idle_long_enough() {
+        let now = Instant::now();
+        let last = now - Duration::from_secs(120);
+        assert!(!should_hold_for_quiet_window(
+            Some(last),
+            now,
+            Duration::from_secs(60)
+        ));
+    }
+
+    /// No recorded keystroke: the operator counts as idle.
+    #[test]
+    fn quiet_window_delivers_when_no_keystroke_recorded() {
+        let now = Instant::now();
+        assert!(!should_hold_for_quiet_window(
+            None,
+            now,
+            Duration::from_secs(60)
+        ));
+    }
+
+    /// `active_session_quiet_secs = 0` restores always-hold-while-focused.
     #[test]
     fn quiet_window_zero_always_holds() {
         let now = Instant::now();
         assert!(should_hold_for_quiet_window(None, now, Duration::ZERO));
+        assert!(should_hold_for_quiet_window(Some(now), now, Duration::ZERO));
         assert!(should_hold_for_quiet_window(
             Some(now - Duration::from_secs(10_000)),
             now,
@@ -397,10 +473,19 @@ mod tests {
     }
 
     #[test]
-    fn quiet_window_huge_values_always_deliver() {
+    fn quiet_window_max_always_delivers() {
+        let now = Instant::now();
+        let q = Duration::from_secs(u64::MAX);
+        assert!(!should_hold_for_quiet_window(None, now, q));
+        assert!(!should_hold_for_quiet_window(Some(now), now, q));
+    }
+
+    /// A large but finite window also means "always deliver", not "hold
+    /// effectively forever" (audit03 P1-19 review N2).
+    #[test]
+    fn quiet_window_large_finite_value_always_delivers() {
         let now = Instant::now();
         for q in [
-            Duration::from_secs(u64::MAX),
             Duration::from_secs(u64::MAX / 2),
             Duration::from_secs(100 * 365 * 24 * 60 * 60),
         ] {
@@ -408,6 +493,34 @@ mod tests {
         }
         let below = ALWAYS_DELIVER_QUIET_WINDOW - Duration::from_secs(1);
         assert!(should_hold_for_quiet_window(Some(now), now, below));
+    }
+
+    /// A keystroke exactly at the edge counts as no longer typing.
+    #[test]
+    fn quiet_window_boundary_releases_at_exact_edge() {
+        let now = Instant::now();
+        let q = Duration::from_secs(60);
+        assert!(!should_hold_for_quiet_window(Some(now - q), now, q));
+    }
+
+    #[test]
+    fn phase_delay_holds_when_typed_too_recently() {
+        let now = Instant::now();
+        let typed_at = now - Duration::from_millis(10);
+        assert!(now.duration_since(typed_at) < effective_enter_phase_delay(50));
+    }
+
+    #[test]
+    fn phase_delay_releases_after_configured_delay() {
+        let now = Instant::now();
+        let typed_at = now - Duration::from_millis(300);
+        assert!(now.duration_since(typed_at) >= effective_enter_phase_delay(50));
+    }
+
+    /// 0 is the debugging escape hatch: the Enter goes on the next tick.
+    #[test]
+    fn phase_delay_zero_releases_immediately() {
+        assert_eq!(effective_enter_phase_delay(0), Duration::ZERO);
     }
 
     #[test]
@@ -434,6 +547,11 @@ mod tests {
             Some(future),
             now
         ));
+    }
+
+    #[test]
+    fn post_delivery_cooldown_releases_when_elapsed_or_empty() {
+        let now = Instant::now();
         assert!(!should_hold_for_post_delivery_cooldown(
             Some(DeliveryPhase::TypeBody),
             Some(now - Duration::from_secs(1)),

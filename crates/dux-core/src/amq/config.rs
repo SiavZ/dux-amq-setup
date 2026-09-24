@@ -125,9 +125,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_match_the_fork() {
+    fn amq_inject_defaults_match_constants() {
         let c = AmqConfig::default();
         assert!(c.inject.enabled);
+        assert!(c.inject.queue_dir.is_empty());
+        assert!(
+            c.inject
+                .busy_markers
+                .iter()
+                .any(|m| m == "esc to interrupt"),
+            "default busy markers should include Claude Code's footer"
+        );
         assert_eq!(c.inject.busy_scan_lines, 5);
         assert_eq!(c.inject.delivery_timeout_secs, 600);
         assert_eq!(c.inject.max_message_age_secs, 0);
