@@ -2217,6 +2217,19 @@ impl SessionStore {
         Ok(sessions)
     }
 
+    /// Overwrite a row's `agent_handle` with no validation, to fabricate the
+    /// corrupt database that load-time validation must refuse. Test-only: it
+    /// exists so destructive paths in other crates (factory reset, purge) can
+    /// prove they fail closed on a malformed row.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn corrupt_agent_handle_for_test(&self, id: &str, handle: &str) -> Result<()> {
+        self.conn.execute(
+            "update agent_sessions set agent_handle = ?2 where id = ?1",
+            params![id, handle],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_session(&self, id: &str) -> Result<()> {
         // Delete the session and all of its dependent rows atomically. These
         // tables declare ON DELETE CASCADE FKs to `agent_sessions`, but the

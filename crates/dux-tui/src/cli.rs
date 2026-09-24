@@ -345,6 +345,9 @@ Subcommands:
                            redact it before sharing.
   dux config reset         Remove config and logs (keeps agents and worktrees)
   dux config reset --all   Full factory reset: remove config, logs, sessions, and worktrees
+                           Fails closed: a config, session row, or project
+                           inventory that cannot be read aborts before any
+                           change; repair the named file or row, then retry.
   dux config regenerate    Preview a fresh default config (shows diff)
   dux config regenerate --yes
                            Overwrite the config file with fresh defaults
@@ -860,64 +863,189 @@ fn print_unified_diff(label_a: &str, label_b: &str, a: &str, b: &str) {
 // ---------------------------------------------------------------------------
 
 fn reset_agent_data(paths: &DuxPaths) -> Result<()> {
+    reset_agent_data_at_amq_root(paths, reset_amq_root(paths).as_deref())
+}
+
+/// The AMQ root a factory reset frees owned inboxes under.
+///
+/// Tests see only the `amq` directory beside the dux home and never the
+/// `AMQ_GLOBAL_ROOT`/`AM_ROOT` environment: a developer machine that exports
+/// those would otherwise have every reset test lock and inspect the real bus.
+fn reset_amq_root(paths: &DuxPaths) -> Option<PathBuf> {
+    if cfg!(test) {
+        return paths
+            .root
+            .parent()
+            .map(|parent| parent.join("amq"))
+            .filter(|root| root.exists());
+    }
+    // INTEGRATION: free_amq_handle (seedling). Swap for
+    // `dux_core::peer::amq::optional_amq_root(paths)` at merge.
+    dux_core::purge_amq::optional_amq_root(paths)
+}
+
+/// The factory reset, failing closed before its first mutation (fork
+/// 454d8bca).
+///
+/// Every read-only inventory completes first: the config (strictly: a config
+/// that does not parse would read as "no projects" and protect none), the
+/// session rows including tombstones, the protected-checkout list, the store
+/// identity, and the exact ownership of every AMQ inbox. Then every planned
+/// whole-worktree removal is checked: the protected-workspace guard on the
+/// worktrees root itself, and for each isolated managed agent, containment in
+/// the managed root plus the guard. Any failure aborts with the file or row to
+/// repair, and nothing has been touched.
+///
+/// Only then does it mutate, in the order that strands nothing: exact-owned
+/// AMQ inboxes are freed while the rows that prove ownership still exist, then
+/// the worktrees, then the root, then the database and its WAL sidecars, and
+/// last the store identity.
+///
+/// Never removed: a shared-workspace agent's checkout (it is the user's
+/// project), a standalone agent's folder, and anything a registered project
+/// overlaps.
+fn reset_agent_data_at_amq_root(paths: &DuxPaths, amq_root: Option<&Path>) -> Result<()> {
+    use anyhow::Context;
+    let config_path = dux_core::sanitize::for_terminal(&paths.config_path.display().to_string());
+    let database_path =
+        dux_core::sanitize::for_terminal(&paths.sessions_db_path.display().to_string());
+    let store_id_path =
+        dux_core::sanitize::for_terminal(&paths.root.join("store-id").display().to_string());
+    let abort = "reset aborted before mutation";
+
+    let config = dux_core::purge::load_config_strict(paths).with_context(|| {
+        format!("{abort}: repair {config_path} or run `dux config regenerate --yes`, then retry")
+    })?;
+    let (store, sessions) = if paths.sessions_db_path.exists() {
+        let store = SessionStore::open(&paths.sessions_db_path).with_context(|| {
+            format!(
+                "{abort}: repair {database_path} or restore {database_path}.bak, then retry; \
+                 otherwise inventory its data manually before removal"
+            )
+        })?;
+        let sessions = store.load_sessions_including_deleted().with_context(|| {
+            format!(
+                "{abort}: repair the named row in {database_path} or restore \
+                 {database_path}.bak, then retry; otherwise inventory its data manually \
+                 before removal"
+            )
+        })?;
+        (Some(store), sessions)
+    } else {
+        (None, Vec::new())
+    };
+    let protected = match &store {
+        Some(store) => dux_core::purge::protected_project_paths(&config, store, &sessions),
+        None => git::registered_project_paths(config.projects.iter().map(|p| p.path.as_str())),
+    }
+    .with_context(|| {
+        format!("{abort}: repair the project inventory in {config_path}, then retry")
+    })?;
+    drop(store);
+
+    // The store identity proves which AMQ inboxes are this store's. Without an
+    // AMQ root there are none to prove, and an install that never ran the AMQ
+    // layer has never minted one, so its absence only matters when a root is
+    // there.
+    let amq_root = amq_root.filter(|root| root.exists());
+    let store_id = match (dux_core::storage::load_store_id(&paths.root), amq_root) {
+        (Ok(id), _) => Some(id),
+        (Err(_), None) => None,
+        (Err(err), Some(_)) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "{abort}: restore {store_id_path}, then retry; without it, exact AMQ \
+                     ownership cannot be proven and those directories require manual \
+                     verification and removal"
+                )
+            });
+        }
+    };
+
+    // The guard runs first, on the root wipe itself: a project inside the
+    // worktrees root, or a root inside a project, stops everything.
+    git::guard_whole_workspace_removal(&paths.worktrees_root, &protected).with_context(|| {
+        format!("{abort}: repair overlapping project paths in {config_path}, then retry")
+    })?;
+    let isolated_managed = || {
+        sessions.iter().filter_map(|session| {
+            (!session.shared_workspace())
+                .then(|| session.workspace.as_managed().map(|m| (session, m)))
+                .flatten()
+        })
+    };
+    for (session, managed) in isolated_managed() {
+        let worktree = Path::new(&managed.worktree_path);
+        let session_id = dux_core::sanitize::for_terminal(&session.id);
+        git::guard_whole_workspace_removal(worktree, &protected).with_context(|| {
+            format!(
+                "{abort}: repair session {session_id:?} in {database_path} or the project \
+                 inventory in {config_path}, then retry"
+            )
+        })?;
+        let within = git::whole_workspace_target_is_within(&paths.worktrees_root, worktree)
+            .with_context(|| {
+                format!("{abort}: repair session {session_id:?} in {database_path}, then retry")
+            })?;
+        if !within {
+            bail!(
+                "{abort}: session {session_id:?} in {database_path} points outside the managed \
+                 root to {}; repair or remove that row, then retry",
+                dux_core::sanitize::for_terminal(&managed.worktree_path)
+            );
+        }
+    }
+    let mut owned_amq = Vec::new();
+    if let (Some(root), Some(store_id)) = (amq_root, store_id.as_deref()) {
+        for session in &sessions {
+            // INTEGRATION: free_amq_handle (seedling). purge_amq is the stand-in.
+            let owned =
+                dux_core::purge_amq::amq_handle_is_exact_owner_at_root(root, store_id, session)
+                    .with_context(|| {
+                        format!(
+                            "{abort}: repair the AMQ ownership marker for session {:?}, then \
+                             retry; if ownership cannot be restored, verify and remove that \
+                             inbox manually first",
+                            dux_core::sanitize::for_terminal(&session.id)
+                        )
+                    })?;
+            if owned {
+                owned_amq.push(session);
+            }
+        }
+    }
+
+    // ---- Mutation starts here; everything above was read-only. ----
+
+    // AMQ first, while the rows proving ownership still exist. A failure here
+    // stops before any worktree or row is gone, so the reset can be re-run.
+    if let (Some(root), Some(store_id)) = (amq_root, store_id.as_deref()) {
+        for session in owned_amq {
+            // INTEGRATION: free_amq_handle (seedling). purge_amq is the stand-in.
+            dux_core::purge_amq::free_amq_handle_at_root(root, store_id, session)?;
+        }
+    }
+
     // Folders a standalone agent occupies: the sweep of the whole worktrees
     // root below is otherwise indiscriminate, and nothing stops a user pointing
     // a standalone agent at a directory inside dux's managed area, which dux
-    // did not make.
-    let mut occupied_folders: Vec<PathBuf> = Vec::new();
-    if paths.sessions_db_path.exists() {
-        match SessionStore::open(&paths.sessions_db_path) {
-            Ok(store) => match store.load_sessions() {
-                Ok(sessions) => {
-                    // Every checkout dux knows of is protected from the
-                    // whole-worktree removals below, including the
-                    // unconditional `remove_dir_all` fallback that bypasses
-                    // git. The inventory is the stored projects plus every
-                    // agent's own project path, so a row whose project was
-                    // removed from the list is still covered.
-                    let protected = reset_protected_projects(&store, &sessions);
-                    // A standalone agent's folder is the user's and is never
-                    // removed, not even by a factory reset; its record goes
-                    // with the database below like every other agent's.
-                    //
-                    // The filter is on the workspace, not on the managed-root
-                    // path check inside the removal: a standalone agent pointed
-                    // at a directory under dux's managed root sails past that
-                    // check and has the ground deleted from under it.
-                    //
-                    // Collect in a pass of its own, before any removal: a
-                    // managed worktree that contains or is such a folder ends in
-                    // an unconditional `remove_dir_all`, so a half-filled list
-                    // makes the folder's survival depend on row order.
-                    for session in &sessions {
-                        if session.workspace.as_managed().is_none() {
-                            occupied_folders
-                                .push(canonical_or_original(Path::new(session.directory())));
-                        }
-                    }
-                    let mut removed = 0usize;
-                    for session in &sessions {
-                        if let Some(managed) = session.workspace.as_managed()
-                            && remove_session_worktree(
-                                paths,
-                                managed,
-                                &occupied_folders,
-                                &protected,
-                            )
-                        {
-                            removed += 1;
-                        }
-                    }
-                    println!("{}", removed_worktrees_line(removed));
-                }
-                Err(error) => {
-                    eprintln!("warning: could not load sessions from database: {error}");
-                }
-            },
-            Err(error) => {
-                eprintln!("warning: could not open session database: {error}");
-            }
+    // did not make. A shared agent's checkout is spared the same way. The list
+    // is complete before any removal: a managed worktree that contains or is
+    // such a folder ends in an unconditional `remove_dir_all`, so a half-filled
+    // list would make the folder's survival depend on row order.
+    let occupied_folders: Vec<PathBuf> = sessions
+        .iter()
+        .filter(|session| session.workspace.as_managed().is_none() || session.shared_workspace())
+        .map(|session| canonical_or_original(Path::new(session.directory())))
+        .collect();
+    let mut removed = 0usize;
+    for (_, managed) in isolated_managed() {
+        if remove_session_worktree(paths, managed, &occupied_folders, &Ok(protected.clone())) {
+            removed += 1;
         }
+    }
+    if paths.sessions_db_path.exists() {
+        println!("{}", removed_worktrees_line(removed));
     }
 
     // The sweep that finishes the job: whatever the per-session loop could not
@@ -925,13 +1053,23 @@ fn reset_agent_data(paths: &DuxPaths) -> Result<()> {
     // goes with the root, except a folder a standalone agent occupies, which
     // removing the root wholesale would undo the filter above for. When one is
     // in the way, the root's other entries are removed individually and the
-    // root itself is left standing around them.
+    // root itself is left standing around them. The guard runs again right
+    // before, as it does inside every per-worktree removal.
+    git::guard_whole_workspace_removal(&paths.worktrees_root, &protected)?;
     if occupied_folders.is_empty() {
         remove_dir_with_message(&paths.worktrees_root)?;
     } else {
         remove_worktrees_root_sparing(&paths.worktrees_root, &occupied_folders)?;
     }
     remove_file_with_message(&paths.sessions_db_path)?;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = paths.sessions_db_path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        remove_file_with_message(Path::new(&sidecar))?;
+    }
+    // Last: every inbox this identity could prove it owned is gone, and a
+    // fresh install should mint a fresh one.
+    dux_core::storage::remove_store_identity(&paths.root)?;
     Ok(())
 }
 
@@ -1010,22 +1148,6 @@ fn worktree_holds_occupied_folder(worktree: &Path, occupied: &[PathBuf]) -> bool
 /// The factory reset's stdout summary, counting the worktrees it removed.
 fn removed_worktrees_line(removed: usize) -> String {
     format!("removed {}", count_of(removed, "session worktree"))
-}
-
-/// The checkouts a factory reset must never remove: every stored project and
-/// every agent's own recorded project path. Fails closed on one that does not
-/// expand to a safe absolute path.
-fn reset_protected_projects(
-    store: &SessionStore,
-    sessions: &[dux_core::model::AgentSession],
-) -> Result<Vec<PathBuf>> {
-    let stored = store.load_projects()?;
-    let paths: Vec<&str> = stored
-        .iter()
-        .map(|project| project.path.as_str())
-        .chain(sessions.iter().filter_map(|session| session.project_path()))
-        .collect();
-    git::registered_project_paths(paths)
 }
 
 fn remove_session_worktree(
@@ -1932,6 +2054,240 @@ mod tests {
     }
 
     #[test]
+    fn reset_all_preserves_existing_worktree_behavior_for_missing_session_directory() {
+        let harness = ResetHarness::new();
+        harness.write_config_with_log_path("dux.log");
+        let worktree = harness.create_session("already-missing");
+        fs::remove_dir_all(&worktree).unwrap();
+
+        run_reset(&harness.paths, true).expect("reset");
+
+        assert!(!harness.paths.root.exists());
+    }
+
+    #[test]
+    fn reset_all_never_removes_a_shared_registered_checkout() {
+        let harness = ResetHarness::new();
+        let managed_worktree = harness.create_session("managed");
+        harness.create_session("shared");
+        let checkout = harness.paths.root.parent().unwrap().join("real-checkout");
+        fs::create_dir_all(&checkout).unwrap();
+        fs::write(checkout.join("uncommitted.txt"), "keep me").unwrap();
+        let store = SessionStore::open(&harness.paths.sessions_db_path).unwrap();
+        let mut session = store
+            .load_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|session| session.id == "shared")
+            .unwrap();
+        session.shared_workspace = true;
+        let managed = session.workspace.as_managed_mut().unwrap();
+        managed.worktree_path = checkout.to_string_lossy().into_owned();
+        managed.project_path = Some(managed.worktree_path.clone());
+        store.upsert_session(&session).unwrap();
+        drop(store);
+        harness.write_config_with_projects(&[&checkout]);
+
+        run_reset(&harness.paths, true).unwrap();
+
+        assert!(checkout.join("uncommitted.txt").exists());
+        assert!(!managed_worktree.exists());
+    }
+
+    #[test]
+    fn reset_all_aborts_before_mutation_on_incomplete_config_or_database_inventory() {
+        let corrupt_config = ResetHarness::new();
+        let worktree = corrupt_config.create_session("agent-1");
+        fs::write(&corrupt_config.paths.config_path, "not = [valid").unwrap();
+        let error = format!("{:#}", run_reset(&corrupt_config.paths, true).unwrap_err());
+        assert!(error.contains(&corrupt_config.paths.config_path.display().to_string()));
+        assert!(error.contains("dux config regenerate --yes"));
+        assert!(error.contains("retry"));
+        assert!(worktree.exists());
+        assert!(corrupt_config.paths.sessions_db_path.exists());
+        assert!(corrupt_config.paths.root.join("store-id").exists());
+
+        let corrupt_database = ResetHarness::new();
+        corrupt_database.write_config_with_log_path("dux.log");
+        dux_core::storage::load_or_create_store_id(&corrupt_database.paths.root).unwrap();
+        fs::write(&corrupt_database.paths.sessions_db_path, "not sqlite").unwrap();
+        let orphan = corrupt_database.paths.worktrees_root.join("orphan");
+        fs::create_dir_all(&orphan).unwrap();
+        let error = format!(
+            "{:#}",
+            run_reset(&corrupt_database.paths, true).unwrap_err()
+        );
+        assert!(
+            error.contains(
+                &corrupt_database
+                    .paths
+                    .sessions_db_path
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(error.contains("restore"));
+        assert!(error.contains("sessions.sqlite3.bak"));
+        assert!(error.contains("retry"));
+        assert!(orphan.exists());
+        assert_eq!(
+            fs::read_to_string(&corrupt_database.paths.sessions_db_path).unwrap(),
+            "not sqlite"
+        );
+
+        // Upstream installs never minted a store id, so its absence only
+        // aborts when there is an AMQ root whose ownership it must prove.
+        let missing_store_id = ResetHarness::new();
+        missing_store_id.write_config_with_log_path("dux.log");
+        let worktree = missing_store_id.create_session("agent-1");
+        fs::remove_file(missing_store_id.paths.root.join("store-id")).unwrap();
+        let amq_root = missing_store_id.paths.root.parent().unwrap().join("amq");
+        fs::create_dir_all(&amq_root).unwrap();
+        let error = format!(
+            "{:#}",
+            reset_agent_data_at_amq_root(&missing_store_id.paths, Some(&amq_root)).unwrap_err()
+        );
+        assert!(
+            error.contains(
+                &missing_store_id
+                    .paths
+                    .root
+                    .join("store-id")
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(error.contains("exact AMQ ownership cannot be proven"));
+        assert!(error.contains("retry"));
+        assert!(worktree.exists());
+        assert!(missing_store_id.paths.sessions_db_path.exists());
+
+        let invalid_handle = ResetHarness::new();
+        invalid_handle.write_config_with_log_path("dux.log");
+        let worktree = invalid_handle.create_session("agent-1");
+        let store = SessionStore::open(&invalid_handle.paths.sessions_db_path).unwrap();
+        store
+            .corrupt_agent_handle_for_test("agent-1", "Bad/handle")
+            .unwrap();
+        drop(store);
+        let error = format!("{:#}", run_reset(&invalid_handle.paths, true).unwrap_err());
+        assert!(error.contains("agent-1"), "{error}");
+        assert!(error.contains(&invalid_handle.paths.sessions_db_path.display().to_string()));
+        assert!(error.contains("named row"));
+        assert!(error.contains("retry"));
+        assert!(worktree.exists());
+        assert!(invalid_handle.paths.sessions_db_path.exists());
+        assert!(invalid_handle.paths.root.join("store-id").exists());
+
+        let outside_root = ResetHarness::new();
+        outside_root.write_config_with_log_path("dux.log");
+        let worktree = outside_root.create_session("agent-1");
+        let store = SessionStore::open(&outside_root.paths.sessions_db_path).unwrap();
+        let mut session = store.load_sessions().unwrap().remove(0);
+        let outside = outside_root.paths.root.parent().unwrap().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        session.workspace.as_managed_mut().unwrap().worktree_path =
+            outside.to_string_lossy().into_owned();
+        store.upsert_session(&session).unwrap();
+        drop(store);
+        let error = format!("{:#}", run_reset(&outside_root.paths, true).unwrap_err());
+        assert!(error.contains("agent-1"));
+        assert!(error.contains(&outside_root.paths.sessions_db_path.display().to_string()));
+        assert!(error.contains("repair or remove that row"));
+        assert!(error.contains("retry"));
+        assert!(worktree.exists());
+        assert!(outside.exists());
+        assert!(outside_root.paths.sessions_db_path.exists());
+    }
+
+    #[test]
+    fn reset_all_frees_exact_owned_amq_before_deleting_database() {
+        let harness = ResetHarness::new();
+        harness.write_config_with_log_path("dux.log");
+        harness.create_session("agent-1");
+        let store = SessionStore::open(&harness.paths.sessions_db_path).unwrap();
+        store.soft_delete_session("agent-1").unwrap();
+        let session = store.load_sessions_including_deleted().unwrap().remove(0);
+        drop(store);
+        let amq_root = harness.paths.root.parent().unwrap().join("amq");
+        let agent_dir = amq_root.join("agents").join(session.agent_handle());
+        fs::create_dir_all(agent_dir.join("inbox")).unwrap();
+        fs::create_dir_all(amq_root.join("meta")).unwrap();
+        fs::write(
+            agent_dir.join(".dux-amq-source"),
+            format!(
+                r#"{{"store_id":"{}","session_id":"{}"}}"#,
+                dux_core::storage::load_store_id(&harness.paths.root).unwrap(),
+                session.id
+            ),
+        )
+        .unwrap();
+        let amq_config = amq_root.join("meta/config.json");
+        fs::write(&amq_config, "not json").unwrap();
+
+        assert!(reset_agent_data_at_amq_root(&harness.paths, Some(&amq_root)).is_err());
+        assert!(agent_dir.exists());
+        assert!(harness.paths.sessions_db_path.exists());
+
+        fs::write(
+            &amq_config,
+            format!(r#"{{"agents":["{}"]}}"#, session.agent_handle()),
+        )
+        .unwrap();
+
+        reset_agent_data_at_amq_root(&harness.paths, Some(&amq_root)).unwrap();
+
+        assert!(!agent_dir.exists());
+        assert!(!harness.paths.sessions_db_path.exists());
+        assert!(
+            !harness.paths.root.join("store-id").exists(),
+            "the identity goes last, once nothing it proves ownership of remains"
+        );
+    }
+
+    #[test]
+    fn reset_root_wipe_rejects_registered_project_overlap_in_both_directions() {
+        for descendant_project in [true, false] {
+            let harness = ResetHarness::new();
+            let worktree = harness.create_session("agent-1");
+            let project_path = if descendant_project {
+                worktree.join("nested-project")
+            } else {
+                harness.paths.root.parent().unwrap().to_path_buf()
+            };
+            fs::create_dir_all(&project_path).unwrap();
+            harness.write_config_with_projects(&[&project_path]);
+
+            assert!(reset_agent_data(&harness.paths).is_err());
+            assert!(worktree.exists());
+            assert!(harness.paths.sessions_db_path.exists());
+        }
+    }
+
+    /// The root-wipe guard is the FIRST check, not just the last one: a project
+    /// registered inside the worktrees root that no agent's worktree overlaps
+    /// must stop the reset before any agent's worktree is touched. Without the
+    /// up-front check the per-agent removals run first and only the final
+    /// sweep refuses, which is exactly the half-done reset 454d8bca forbids.
+    #[test]
+    fn reset_root_guard_refuses_before_any_worktree_is_removed() {
+        let harness = ResetHarness::new();
+        let worktree = harness.create_session("agent-1");
+        let project = harness.paths.worktrees_root.join("a-real-project");
+        fs::create_dir_all(&project).unwrap();
+        harness.write_config_with_projects(&[&project]);
+
+        let error = format!("{:#}", reset_agent_data(&harness.paths).unwrap_err());
+        assert!(error.contains("reset aborted before mutation"), "{error}");
+        assert!(
+            worktree.exists(),
+            "no worktree may go before the guard runs"
+        );
+        assert!(project.exists());
+        assert!(harness.paths.sessions_db_path.exists());
+    }
+
+    #[test]
     fn diff_summary_reports_no_differences_for_defaults() {
         // Just verify it runs without error on defaults.
         let defaults = Config::default();
@@ -2187,6 +2543,29 @@ mod tests {
             fs::write(&self.paths.config_path, body).expect("config");
         }
 
+        /// A config registering `projects`, the inventory the factory reset's
+        /// protected-workspace guard reads.
+        fn write_config_with_projects(&self, projects: &[&Path]) {
+            let config = Config {
+                projects: projects
+                    .iter()
+                    .enumerate()
+                    .map(|(index, path)| crate::config::ProjectConfig {
+                        id: format!("protected-{index}"),
+                        path: path.to_string_lossy().into_owned(),
+                        name: Some(format!("protected-{index}")),
+                        default_provider: None,
+                        leading_branch: None,
+                        auto_reopen_agents: None,
+                        startup_command: None,
+                        env: Default::default(),
+                    })
+                    .collect(),
+                ..Config::default()
+            };
+            fs::write(&self.paths.config_path, toml::to_string(&config).unwrap()).expect("config");
+        }
+
         fn write_log(&self, relative_path: &str) {
             let path = self.paths.root.join(relative_path);
             if let Some(parent) = path.parent() {
@@ -2196,6 +2575,7 @@ mod tests {
         }
 
         fn create_session(&self, id: &str) -> PathBuf {
+            dux_core::storage::load_or_create_store_id(&self.paths.root).expect("store id");
             fs::create_dir_all(&self.paths.worktrees_root).expect("worktrees root");
             let worktree = self.paths.worktrees_root.join(id);
             fs::create_dir_all(&worktree).expect("worktree");
