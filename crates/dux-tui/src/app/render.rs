@@ -10488,6 +10488,7 @@ impl App {
             PromptState::StartupCommandLogs(_) => self.render_startup_command_logs_prompt(frame),
             PromptState::PickEditor { .. } => self.render_pick_editor_prompt(frame),
             PromptState::ManageWorktrees(_) => self.render_manage_worktrees_prompt(frame),
+            PromptState::OrphanWorktrees(_) => self.render_orphan_worktrees_prompt(frame),
             PromptState::PickProjectWorktree(_) => self.render_pick_project_worktree_prompt(frame),
             PromptState::PickProject { .. } => self.render_pick_project_prompt(frame),
             PromptState::KillRunning(_) => self.render_kill_running_prompt(frame),

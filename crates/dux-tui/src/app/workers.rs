@@ -102,6 +102,7 @@ impl App {
         // `StatusOpCompleted`), so fold it in on the same tick.
         self.drain_notes_fetch();
         self.drain_unpushed_count();
+        self.drain_orphan_worktrees();
         self.drain_pending_diff();
         self.drain_worker_events();
         self.apply_resume_fallback_sweep();

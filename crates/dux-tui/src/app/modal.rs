@@ -193,6 +193,9 @@ pub(crate) fn modal_spec(prompt: &PromptState) -> Option<ModalSpec> {
         // REMOVABLE worktrees, and a confirm key that acts on the selection by
         // raising the removal confirmation. No buttons, so no confirm button.
         | PromptState::ManageWorktrees(_)
+        // The orphan cleaner: rows plus a per-item keyboard confirmation that
+        // publishes no buttons.
+        | PromptState::OrphanWorktrees(_)
         | PromptState::ChangeTheme(_)
         | PromptState::ChangeAgentProvider(_)
         | PromptState::ChangeDefaultProvider(_)
@@ -275,6 +278,7 @@ pub(crate) fn prompt_text_inputs(prompt: &PromptState) -> Vec<&TextInput> {
         | PromptState::PickProjectWorktree(_)
         | PromptState::ManageWorktrees(_)
         | PromptState::ConfirmDeleteWorktree(_)
+        | PromptState::OrphanWorktrees(_)
         | PromptState::ChangeTheme(_)
         | PromptState::ChangeAgentProvider(_)
         | PromptState::ChangeDefaultProvider(_)
@@ -1129,6 +1133,14 @@ mod tests {
                     lines: Vec::new(),
                     scroll_offset: 0,
                 },
+            ),
+            (
+                "OrphanWorktrees",
+                PromptState::OrphanWorktrees(crate::app::orphan_worktrees::OrphanWorktreesPrompt {
+                    candidates: Vec::new(),
+                    selected: 0,
+                    stage: crate::app::orphan_worktrees::OrphanWorktreesStage::List,
+                }),
             ),
             (
                 "ResourceMonitor",
