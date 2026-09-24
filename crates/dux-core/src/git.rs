@@ -1201,6 +1201,178 @@ fn ref_exists(repo_path: &Path, ref_name: &str) -> bool {
         .is_some_and(|o| o.status.success())
 }
 
+/// Name of the link dux places in a project checkout pointing at that
+/// project's managed worktrees (port of fork 1d69de16).
+pub const PROJECT_WORKTREES_LINK_NAME: &str = "dux-worktrees";
+/// The `.git/info/exclude` line that keeps [`PROJECT_WORKTREES_LINK_NAME`] out
+/// of `git status`.
+pub const PROJECT_WORKTREES_EXCLUDE_PATTERN: &str = "/dux-worktrees";
+
+/// Expose a project's dux-managed agent worktrees inside the project checkout,
+/// as an ignored `dux-worktrees` symlink to `<worktrees_root>/<project_name>`.
+///
+/// Agent worktrees live under the dux state directory so they stay isolated,
+/// which leaves an editor opened on the project root blind to them. The link
+/// brings them back into view without copying anything.
+///
+/// Safe by construction: an existing symlink is repointed only when it targets
+/// somewhere else, and anything that is NOT a symlink at that name is refused
+/// rather than replaced, so a user's own `dux-worktrees` file or directory is
+/// never touched.
+///
+/// The ignore line goes into the repository's `info/exclude` on purpose. The
+/// link sits in the MAIN checkout, so the main repository's exclude is exactly
+/// the right place, and unlike a tracked `.gitignore` it never shows up as a
+/// change. (This is the opposite of the upload directory, which lives inside
+/// an agent worktree and so must never write the shared exclude; see
+/// `file_drop::UPLOADS_GITIGNORE`.)
+pub fn ensure_project_worktrees_link(
+    repo_path: &Path,
+    worktrees_root: &Path,
+    project_name: &str,
+) -> Result<PathBuf> {
+    let project_worktrees_root = worktrees_root.join(project_name);
+    fs::create_dir_all(&project_worktrees_root)
+        .with_context(|| format!("failed to create {}", project_worktrees_root.display()))?;
+    let project_worktrees_root = project_worktrees_root
+        .canonicalize()
+        .unwrap_or(project_worktrees_root);
+
+    // Ignore first: a link that appeared before its ignore line would show in
+    // `git status` if the exclude write then failed.
+    ensure_project_worktrees_link_ignored(repo_path)?;
+
+    let link_path = repo_path.join(PROJECT_WORKTREES_LINK_NAME);
+    let link = |path: &Path| {
+        symlink(&project_worktrees_root, path).with_context(|| {
+            format!(
+                "failed to link {} to {}",
+                path.display(),
+                project_worktrees_root.display()
+            )
+        })
+    };
+    match fs::symlink_metadata(&link_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let existing = fs::read_link(&link_path)
+                .with_context(|| format!("failed to inspect {}", link_path.display()))?;
+            let existing = if existing.is_absolute() {
+                existing
+            } else {
+                repo_path.join(existing)
+            };
+            let existing = existing.canonicalize().unwrap_or(existing);
+            if existing != project_worktrees_root {
+                fs::remove_file(&link_path)
+                    .with_context(|| format!("failed to replace {}", link_path.display()))?;
+                link(&link_path)?;
+            }
+        }
+        Ok(_) => {
+            return Err(anyhow!(
+                "{} already exists and is not a symlink; refusing to overwrite it",
+                link_path.display()
+            ));
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => link(&link_path)?,
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect {}", link_path.display()));
+        }
+    }
+    Ok(link_path)
+}
+
+/// Append [`PROJECT_WORKTREES_EXCLUDE_PATTERN`] to the repository's
+/// `info/exclude` unless a line already says it.
+///
+/// Byte-preserving (the file is handled as bytes, so a non-UTF-8 line the user
+/// wrote survives), fail-closed (a read error aborts before anything is
+/// written, so the existing file is never truncated) and atomic (a sibling temp
+/// with the original mode, fsync'd, renamed over the original). Fork 18a13536.
+fn ensure_project_worktrees_link_ignored(repo_path: &Path) -> Result<()> {
+    use std::io::{Read, Write};
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .output()
+        .with_context(|| format!("failed to locate git excludes for {}", repo_path.display()))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git rev-parse --git-path info/exclude failed for {}: {}",
+            repo_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut raw = output.stdout;
+    while raw.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+        raw.pop();
+    }
+    let exclude_path = PathBuf::from(std::ffi::OsString::from_vec(raw));
+    let exclude_path = if exclude_path.is_absolute() {
+        exclude_path
+    } else {
+        repo_path.join(exclude_path)
+    };
+    let parent = exclude_path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent", exclude_path.display()))?
+        .to_path_buf();
+    fs::create_dir_all(&parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+
+    let (mut contents, permissions) = match fs::File::open(&exclude_path) {
+        Ok(mut file) => {
+            let permissions = file
+                .metadata()
+                .with_context(|| format!("failed to inspect {}", exclude_path.display()))?
+                .permissions();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .with_context(|| format!("failed to read {}", exclude_path.display()))?;
+            (bytes, Some(permissions))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => (Vec::new(), None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", exclude_path.display()));
+        }
+    };
+    if contents
+        .split(|byte| *byte == b'\n')
+        .any(|line| line.trim_ascii() == PROJECT_WORKTREES_EXCLUDE_PATTERN.as_bytes())
+    {
+        return Ok(());
+    }
+    if !contents.is_empty() && !contents.ends_with(b"\n") {
+        contents.push(b'\n');
+    }
+    contents.extend_from_slice(b"# dux local agent worktree explorer link\n");
+    contents.extend_from_slice(PROJECT_WORKTREES_EXCLUDE_PATTERN.as_bytes());
+    contents.push(b'\n');
+
+    let mut replacement = tempfile::NamedTempFile::new_in(&parent)
+        .with_context(|| format!("failed to stage update for {}", exclude_path.display()))?;
+    if let Some(permissions) = permissions {
+        replacement
+            .as_file()
+            .set_permissions(permissions)
+            .with_context(|| format!("failed to preserve mode on {}", exclude_path.display()))?;
+    }
+    replacement
+        .write_all(&contents)
+        .with_context(|| format!("failed to stage update for {}", exclude_path.display()))?;
+    replacement
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("failed to sync update for {}", exclude_path.display()))?;
+    replacement
+        .persist(&exclude_path)
+        .map_err(|err| err.error)
+        .with_context(|| format!("failed to replace {}", exclude_path.display()))?;
+    Ok(())
+}
+
 /// Creates a worktree that checks out an **existing** branch (no `-b`).
 ///
 /// When the branch exists only as a remote tracking ref, git automatically
@@ -4854,6 +5026,115 @@ mod tests {
     #[test]
     fn docker_name_uses_dash() {
         assert!(docker_style_name().contains('-'));
+    }
+
+    // ── Project worktree explorer link (fork 1d69de16, 18a13536, e80151ad) ──
+
+    #[test]
+    fn ensure_project_worktrees_link_creates_ignored_symlink() {
+        let repo = init_test_repo();
+        let worktrees_root = repo.path().join("dux-state").join("worktrees");
+
+        let link =
+            ensure_project_worktrees_link(repo.path(), &worktrees_root, "Demo-Project").unwrap();
+
+        let target = worktrees_root.join("Demo-Project").canonicalize().unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+        assert!(target.is_dir());
+
+        let status = test_support::git_command()
+            .arg("-C")
+            .arg(repo.path())
+            .args(["status", "--porcelain=v1", "--untracked-files=all"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        let porcelain = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            !porcelain.contains(PROJECT_WORKTREES_LINK_NAME),
+            "the link must be ignored by git status: {porcelain}"
+        );
+        let exclude =
+            fs::read_to_string(repo.path().join(".git").join("info").join("exclude")).unwrap();
+        assert!(exclude.contains(PROJECT_WORKTREES_EXCLUDE_PATTERN));
+
+        // Idempotent: a second call neither duplicates the exclude line nor
+        // replaces the link.
+        ensure_project_worktrees_link(repo.path(), &worktrees_root, "Demo-Project").unwrap();
+        let again =
+            fs::read_to_string(repo.path().join(".git").join("info").join("exclude")).unwrap();
+        assert_eq!(again, exclude);
+    }
+
+    #[test]
+    fn ensure_project_worktrees_link_refuses_real_path() {
+        let repo = init_test_repo();
+        let worktrees_root = repo.path().join("dux-state").join("worktrees");
+        let real = repo.path().join(PROJECT_WORKTREES_LINK_NAME);
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("mine.txt"), "user data").unwrap();
+
+        let result = ensure_project_worktrees_link(repo.path(), &worktrees_root, "Demo-Project");
+
+        assert!(result.is_err());
+        let metadata = fs::symlink_metadata(&real).unwrap();
+        assert!(metadata.file_type().is_dir());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(
+            fs::read_to_string(real.join("mine.txt")).unwrap(),
+            "user data"
+        );
+    }
+
+    #[test]
+    fn ensure_project_worktrees_link_preserves_non_utf8_exclude_bytes() {
+        let repo = init_test_repo();
+        let worktrees_root = repo.path().join("dux-state").join("worktrees");
+        let exclude = repo.path().join(".git").join("info").join("exclude");
+        let original = b"# user bytes\n\xff\xfe\n";
+        fs::write(&exclude, original).unwrap();
+        fs::set_permissions(&exclude, fs::Permissions::from_mode(0o640)).unwrap();
+
+        ensure_project_worktrees_link(repo.path(), &worktrees_root, "Demo-Project").unwrap();
+
+        let updated = fs::read(&exclude).unwrap();
+        assert!(updated.starts_with(original));
+        assert!(updated.ends_with(b"# dux local agent worktree explorer link\n/dux-worktrees\n"));
+        assert_eq!(
+            fs::metadata(&exclude).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "the exclude file keeps its mode"
+        );
+    }
+
+    /// Fail closed: an exclude that cannot be read is left exactly as it was
+    /// and no link appears.
+    #[test]
+    fn ensure_project_worktrees_link_leaves_an_unreadable_exclude_untouched() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads through a 0o000 mode
+        }
+        let repo = init_test_repo();
+        let worktrees_root = repo.path().join("dux-state").join("worktrees");
+        let exclude = repo.path().join(".git").join("info").join("exclude");
+        fs::write(&exclude, b"keep me\n").unwrap();
+        fs::set_permissions(&exclude, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = ensure_project_worktrees_link(repo.path(), &worktrees_root, "Demo-Project");
+
+        fs::set_permissions(&exclude, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(result.is_err());
+        assert_eq!(fs::read(&exclude).unwrap(), b"keep me\n");
+        assert!(
+            fs::symlink_metadata(repo.path().join(PROJECT_WORKTREES_LINK_NAME)).is_err(),
+            "no link without its ignore line"
+        );
     }
 
     // ── Helpers for git-backed tests ─────────────────────────────

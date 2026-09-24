@@ -3716,8 +3716,11 @@ impl App {
             && !editor::matches_configured_editor(&selected_editor, &configured_default)
         {
             self.set_info(format!(
-                "Opened agent \"{session_label}\" in {} via {} (configured default \"{}\" was not found on PATH).",
-                selected_editor.label, selected_editor.command, configured_default
+                "Opened agent \"{session_label}\" in {} via {} at {} (configured default \"{}\" was not found on PATH).",
+                selected_editor.label,
+                selected_editor.command,
+                session.directory(),
+                configured_default
             ));
         }
 
@@ -3763,7 +3766,7 @@ impl App {
     ) -> Result<()> {
         editor::launch_editor(editor_choice, Path::new(worktree_path))?;
         self.set_info(format!(
-            "Opened agent \"{session_label}\" in {} via {}.",
+            "Opened agent \"{session_label}\" in {} via {} at {worktree_path}.",
             editor_choice.label, editor_choice.command
         ));
         Ok(())

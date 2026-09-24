@@ -16,6 +16,7 @@ mod pr_sync_control;
 mod resume_fallback;
 mod spawn_worker;
 pub mod status_op;
+mod worktree_link;
 
 #[cfg(test)]
 pub(crate) mod test_support;

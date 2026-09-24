@@ -1083,6 +1083,11 @@ impl Engine {
             // truth from the first frame instead of starting at "not looked
             // yet" (which fails closed). A no-op for every other kind.
             self.spawn_folder_repo_probe(&session.id);
+            // The new worktree should show up under the project's
+            // `dux-worktrees` link (port of fork 1d69de16).
+            if let Some(project_id) = session.project_id() {
+                self.spawn_project_worktree_link_for(project_id);
+            }
             if inserted.kept() && request.resume {
                 self.note_resume_launch(&tab_id);
             }
