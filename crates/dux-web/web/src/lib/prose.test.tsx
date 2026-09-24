@@ -13,6 +13,7 @@ import {
 } from "./addProjectWarning"
 import { checkoutDefaultBranchProse } from "./checkoutDefaultBranch"
 import { detachConfirmProse } from "./detachAgent"
+import { deleteProjectProse, removeProjectProse } from "./projectConfirm"
 import {
   chip,
   type Prose,
@@ -112,6 +113,16 @@ describe("the sentences both surfaces print", () => {
         return worktreeBaseNoteProse(args.branch as string)
       case "add_project_heuristic_note":
         return HEURISTIC_BRANCH_NOTE_PROSE
+      case "delete_project_confirm":
+        return deleteProjectProse(
+          (args.project_name as string | null) ?? undefined,
+          args.agent_count as number,
+        )
+      case "remove_project_confirm":
+        return removeProjectProse(
+          (args.project_name as string | null) ?? undefined,
+          args.agent_count as number,
+        )
       default:
         throw new Error(`the fixture names a sentence this test cannot build: ${sentence}`)
     }

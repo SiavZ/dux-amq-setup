@@ -226,6 +226,124 @@
       "segments": [
         "Dux can't confidently identify this repo's default\nbranch, so it won't change branches for you."
       ]
+    },
+    {
+      "what": "deleting a project with no agents",
+      "sentence": "delete_project_confirm",
+      "args": {
+        "project_name": "dux",
+        "agent_count": 0
+      },
+      "segments": [
+        "This deletes ",
+        {
+          "name": "dux",
+          "quoted": true
+        },
+        " from dux. This is irreversible. The source checkout is kept."
+      ]
+    },
+    {
+      "what": "deleting a project with one agent",
+      "sentence": "delete_project_confirm",
+      "args": {
+        "project_name": "dux",
+        "agent_count": 1
+      },
+      "segments": [
+        "This deletes ",
+        {
+          "name": "dux",
+          "quoted": true
+        },
+        ", its 1 agent, and its worktree on disk from dux. This is irreversible. The source checkout is kept."
+      ]
+    },
+    {
+      "what": "deleting a project with several agents",
+      "sentence": "delete_project_confirm",
+      "args": {
+        "project_name": "dux",
+        "agent_count": 3
+      },
+      "segments": [
+        "This deletes ",
+        {
+          "name": "dux",
+          "quoted": true
+        },
+        ", its 3 agents, and their worktrees on disk from dux. This is irreversible. The source checkout is kept."
+      ]
+    },
+    {
+      "what": "deleting a project whose name is not known",
+      "sentence": "delete_project_confirm",
+      "args": {
+        "project_name": null,
+        "agent_count": 2
+      },
+      "segments": [
+        "This deletes this project, its 2 agents, and their worktrees on disk from dux. This is irreversible. The source checkout is kept."
+      ]
+    },
+    {
+      "what": "removing a project with no agents",
+      "sentence": "remove_project_confirm",
+      "args": {
+        "project_name": "dux",
+        "agent_count": 0
+      },
+      "segments": [
+        "This removes ",
+        {
+          "name": "dux",
+          "quoted": true
+        },
+        " from dux. Worktrees on disk are kept."
+      ]
+    },
+    {
+      "what": "removing a project with one agent",
+      "sentence": "remove_project_confirm",
+      "args": {
+        "project_name": "dux",
+        "agent_count": 1
+      },
+      "segments": [
+        "This removes ",
+        {
+          "name": "dux",
+          "quoted": true
+        },
+        " and deletes its 1 agent from dux. Worktrees on disk are kept."
+      ]
+    },
+    {
+      "what": "removing an orphaned project group with several agents",
+      "sentence": "remove_project_confirm",
+      "args": {
+        "project_name": "3f2a9c1b",
+        "agent_count": 2
+      },
+      "segments": [
+        "This removes ",
+        {
+          "name": "3f2a9c1b",
+          "quoted": true
+        },
+        " and deletes its 2 agents from dux. Worktrees on disk are kept."
+      ]
+    },
+    {
+      "what": "removing a project whose name is not known",
+      "sentence": "remove_project_confirm",
+      "args": {
+        "project_name": null,
+        "agent_count": 0
+      },
+      "segments": [
+        "This removes this project from dux. Worktrees on disk are kept."
+      ]
     }
   ]
 }

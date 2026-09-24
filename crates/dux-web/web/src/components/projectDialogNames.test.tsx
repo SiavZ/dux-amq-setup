@@ -81,6 +81,23 @@ describe("project confirmations name the project as a chip", () => {
     expect(body.textContent).toContain("This removes duck-pond from dux.")
   })
 
+  it("Remove project names its agents and focuses Cancel, the safe answer", () => {
+    seed({
+      removeProjectTarget: "p1",
+      spine: {
+        projects: [project],
+        sessions: [{ id: "s1", workspace: { kind: "managed", project_id: "p1" } }],
+        sidebar: { groups: [] },
+      },
+    } as unknown as Partial<DuxState>)
+    render(<RemoveProjectDialog />)
+    const body = screen.getByText(/This removes/)
+    expect(body.textContent).toBe(
+      "This removes duck-pond and deletes its 1 agent from dux. Worktrees on disk are kept.",
+    )
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Cancel" }))
+  })
+
   it("Check out default branch names the project and its current base", () => {
     seed({ checkoutDefaultBranchTarget: "p1" } as Partial<DuxState>)
     render(<CheckoutDefaultBranchDialog />)

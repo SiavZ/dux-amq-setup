@@ -46,6 +46,7 @@ pub mod poller_status;
 pub mod pr_reference;
 pub mod project_browser;
 pub mod project_order;
+pub mod project_prose;
 pub mod prose;
 pub mod provider;
 pub mod pty;

@@ -260,6 +260,14 @@ mod tests {
                 crate::add_project_prose::worktree_base_note_prose(&s("branch"))
             }
             "add_project_heuristic_note" => crate::add_project_prose::heuristic_branch_note_prose(),
+            "delete_project_confirm" => crate::project_prose::delete_project_confirm_prose(
+                args["project_name"].as_str(),
+                args["agent_count"].as_u64().expect("agent_count") as usize,
+            ),
+            "remove_project_confirm" => crate::project_prose::remove_project_confirm_prose(
+                args["project_name"].as_str(),
+                args["agent_count"].as_u64().expect("agent_count") as usize,
+            ),
             other => panic!("the fixture names a sentence this test cannot build: {other}"),
         }
     }
