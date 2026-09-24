@@ -11,3 +11,9 @@ dux-tui = { path = "../dux-tui" }
 dux-web = { path = "../dux-web" }
 dux-core.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+# tests/overlay_config.rs parses dux-amq's config snippet and a sed-patched
+# config through dux-core's own types.
+tempfile.workspace = true
+toml = { version = "1.1.2", features = ["preserve_order"] }
