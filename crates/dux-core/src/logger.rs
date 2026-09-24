@@ -80,6 +80,7 @@ pub fn init(config: &LoggingConfig, paths: &DuxPaths) {
     set_rotation(config);
     if let Ok(log) = RotatingLog::open(path.clone(), Arc::clone(&ROTATION)) {
         let _ = LOGGER.set(Logger { log });
+        install_tracing_layer();
         info(&format!("logger initialized at {}", path.display()));
         install_panic_hook();
     }
@@ -176,13 +177,147 @@ fn log(level: LogLevel, message: &str) {
     let Some(logger) = LOGGER.get() else {
         return;
     };
-    let line = format!(
-        "{} {:<5} {}\n",
-        Utc::now().to_rfc3339(),
-        level.as_str(),
-        message
+    logger.log.write_line(&legacy_line(level, message));
+}
+
+/// The record a free-function call writes: the message, sanitized, under
+/// [`LEGACY_TARGET`]. Sanitized as well as JSON-escaped so a grep of the raw
+/// file shows `\x1b` rather than an escaped control character.
+fn legacy_line(level: LogLevel, message: &str) -> String {
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "message".to_string(),
+        serde_json::Value::String(crate::sanitize::for_terminal(message)),
     );
-    logger.log.write_line(&line);
+    json_line(level, LEGACY_TARGET, fields)
+}
+
+/// Target every `logger::{info,warn,error,debug}` line carries, so a reader can
+/// tell a free-text line from a structured `tracing` record.
+pub const LEGACY_TARGET: &str = "dux::legacy";
+
+/// One JSON Lines record: `timestamp`, `level`, `target` and a `fields` object
+/// holding `message` plus any structured key-value pairs.
+///
+/// The shape is the one `tracing-subscriber`'s JSON formatter writes, which is
+/// what the fork's log consumers read: the purge redacts records whose
+/// `fields.session_id` matches, and the doctor filters on `.level == "ERROR"` and
+/// prints `.fields.message`. A JSON string cannot carry a raw control byte, so a
+/// hostile message cannot rewrite the terminal of whoever runs `tail dux.log`.
+fn json_line(
+    level: LogLevel,
+    target: &str,
+    fields: serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let record = serde_json::json!({
+        "timestamp": Utc::now().to_rfc3339(),
+        "level": level.as_str(),
+        "target": target,
+        "fields": serde_json::Value::Object(fields),
+    });
+    let mut line = record.to_string();
+    line.push('\n');
+    line
+}
+
+/// A `tracing` layer that writes every enabled event through the same rotating
+/// `dux.log` as the free functions above, so `tracing::warn!(target:
+/// "dux::amq", session_id = %id, "...")` produces a structured record with
+/// `fields.session_id` instead of a message someone has to parse.
+///
+/// It gates on the same [`LEVEL`] a config reload retunes, which is why every
+/// callsite is registered as `sometimes`: a cached `never` would survive a
+/// reload that raised the level.
+struct JsonLinesLayer;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for JsonLinesLayer {
+    fn register_callsite(
+        &self,
+        _metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn enabled(
+        &self,
+        metadata: &tracing::Metadata<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        tracing_level(metadata.level()) <= LogLevel::from_u8(LEVEL.load(Ordering::Relaxed))
+    }
+
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let Some(logger) = LOGGER.get() else {
+            return;
+        };
+        let metadata = event.metadata();
+        let mut visitor = JsonFieldVisitor(serde_json::Map::new());
+        event.record(&mut visitor);
+        logger.log.write_line(&json_line(
+            tracing_level(metadata.level()),
+            metadata.target(),
+            visitor.0,
+        ));
+    }
+}
+
+/// dux has four levels; `trace` folds into `debug`.
+fn tracing_level(level: &tracing::Level) -> LogLevel {
+    match *level {
+        tracing::Level::ERROR => LogLevel::Error,
+        tracing::Level::WARN => LogLevel::Warn,
+        tracing::Level::INFO => LogLevel::Info,
+        _ => LogLevel::Debug,
+    }
+}
+
+/// Collects an event's fields as JSON values. Strings (including `%display` and
+/// `?debug` captures) are sanitized, exactly like a free-function message.
+struct JsonFieldVisitor(serde_json::Map<String, serde_json::Value>);
+
+impl tracing::field::Visit for JsonFieldVisitor {
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.0.insert(field.name().to_string(), value.into());
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0.insert(field.name().to_string(), value.into());
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.0.insert(field.name().to_string(), value.into());
+    }
+
+    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+        self.0.insert(field.name().to_string(), value.into());
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(
+            field.name().to_string(),
+            crate::sanitize::for_terminal(value).into(),
+        );
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(
+            field.name().to_string(),
+            crate::sanitize::for_terminal(&format!("{value:?}")).into(),
+        );
+    }
+}
+
+/// Install [`JsonLinesLayer`] as the process's `tracing` subscriber. Best
+/// effort: a host that already installed one (a test harness, an embedding
+/// binary) keeps its own, and the free functions still reach `dux.log`.
+fn install_tracing_layer() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let subscriber = tracing_subscriber::registry().with(JsonLinesLayer);
+    let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
 /// What the rotation machinery reads on every line written.
@@ -830,6 +965,131 @@ mod tests {
             before,
             "nothing should have been changed"
         );
+    }
+
+    #[test]
+    fn legacy_shim_does_not_panic_when_logger_uninit() {
+        // Many call sites fire during early startup and most tests never call
+        // `init`, so the free functions and a `tracing` macro must be no-ops
+        // rather than panics when no logger exists yet.
+        super::error("uninitialized: error");
+        super::warn("uninitialized: warn");
+        super::info("uninitialized: info");
+        super::debug("uninitialized: debug");
+        tracing::warn!(target: "dux::probe", n = 1i64, "uninitialized: tracing");
+    }
+
+    /// A message carrying terminal escapes must reach the file with the ESC
+    /// rewritten as the literal text `\x1b`, so `tail dux.log` cannot retitle or
+    /// paste-inject the operator's terminal.
+    #[test]
+    fn legacy_shim_sanitizes_control_bytes() {
+        let line = legacy_line(LogLevel::Error, "\x1b]0;evil\x07 and \x1b[31mred");
+        assert!(line.ends_with('\n'));
+        let parsed: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        let message = parsed["fields"]["message"].as_str().unwrap();
+        assert!(!message.contains('\u{1b}'), "raw ESC leaked: {message:?}");
+        assert!(!message.contains('\u{7}'), "raw BEL leaked: {message:?}");
+        assert!(message.contains("\\x1b]0;evil\\x07"), "got {message:?}");
+        assert_eq!(parsed["target"], LEGACY_TARGET);
+        assert_eq!(parsed["level"], "ERROR");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(parsed["timestamp"].as_str().unwrap()).is_ok()
+        );
+    }
+
+    fn fake_paths(root: &str) -> DuxPaths {
+        let root = PathBuf::from(root);
+        DuxPaths {
+            config_path: root.join("config.toml"),
+            sessions_db_path: root.join("sessions.sqlite3"),
+            worktrees_root: root.join("worktrees"),
+            lock_path: root.join("dux.lock"),
+            root,
+        }
+    }
+
+    fn logging_with_path(path: &str) -> LoggingConfig {
+        LoggingConfig {
+            path: path.to_string(),
+            ..LoggingConfig::default()
+        }
+    }
+
+    #[test]
+    fn resolve_log_path_uses_root_for_empty_config() {
+        assert_eq!(
+            resolve_log_path(&logging_with_path(""), &fake_paths("/tmp/dux")),
+            PathBuf::from("/tmp/dux/dux.log")
+        );
+    }
+
+    #[test]
+    fn resolve_log_path_joins_relative_path_onto_root() {
+        assert_eq!(
+            resolve_log_path(&logging_with_path("logs/dux.log"), &fake_paths("/tmp/dux")),
+            PathBuf::from("/tmp/dux/logs/dux.log")
+        );
+    }
+
+    #[test]
+    fn resolve_log_path_respects_absolute_path() {
+        assert_eq!(
+            resolve_log_path(
+                &logging_with_path("/var/log/dux.log"),
+                &fake_paths("/tmp/dux")
+            ),
+            PathBuf::from("/var/log/dux.log")
+        );
+    }
+
+    /// The JSON layer turns `tracing` fields into typed JSON values, and a
+    /// string field is sanitized like a message.
+    #[test]
+    fn tracing_fields_become_typed_json_values() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        // A layer that records the visitor output instead of writing a file,
+        // because the real one only writes once the process logger exists.
+        struct Capture(Arc<Mutex<Vec<serde_json::Map<String, serde_json::Value>>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut visitor = JsonFieldVisitor(serde_json::Map::new());
+                event.record(&mut visitor);
+                self.0.lock().unwrap().push(visitor.0);
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&seen)));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                target: "dux::probe",
+                session_id = "demo\x1b[2J",
+                n = 3i64,
+                ok = true,
+                "hello"
+            );
+        });
+        let seen = seen.lock().unwrap();
+        let fields = &seen[0];
+        assert_eq!(fields["session_id"], "demo\\x1b[2J");
+        assert_eq!(fields["n"], 3);
+        assert_eq!(fields["ok"], true);
+        assert_eq!(fields["message"], "hello");
+    }
+
+    #[test]
+    fn tracing_levels_fold_onto_the_four_dux_levels() {
+        assert_eq!(tracing_level(&tracing::Level::ERROR), LogLevel::Error);
+        assert_eq!(tracing_level(&tracing::Level::WARN), LogLevel::Warn);
+        assert_eq!(tracing_level(&tracing::Level::INFO), LogLevel::Info);
+        assert_eq!(tracing_level(&tracing::Level::DEBUG), LogLevel::Debug);
+        assert_eq!(tracing_level(&tracing::Level::TRACE), LogLevel::Debug);
     }
 
     #[test]

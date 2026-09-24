@@ -176,7 +176,7 @@ The current app provides:
 - A right pane for changed files and diffs
 - Commented user config in the platform-specific dux config directory (`~/.dux/` on macOS, `~/.config/dux/` on Linux)
 - Session persistence in `sessions.sqlite3` alongside the config
-- Logging in `dux.log` alongside the config
+- Logging in `dux.log` alongside the config, as JSON Lines (`timestamp`, `level`, `target`, `fields`). New code may use `tracing::{info,warn,error,debug}!(target: "dux::<module>", session_id = %id, "...")` for structured fields; the `logger::*` free functions write under `dux::legacy`. Both sanitize strings through `dux_core::sanitize::for_terminal`, which must therefore never log.
 - PTY-based agent startup: spawns CLI tools (`claude`, `codex`, `opencode`, `copilot`) directly in a pseudo-terminal
 
 ## Important Constraints

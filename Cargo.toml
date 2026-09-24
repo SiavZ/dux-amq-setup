@@ -26,6 +26,11 @@ content_inspector = "0.2.4"
 tempfile = "3.20.0"
 notify = "7"
 flate2 = "1"
+# Structured logging: `tracing` macros write JSON Lines into dux.log through
+# dux-core's own rotating writer (logger::JsonLinesLayer), so only the
+# registry is needed from tracing-subscriber, not its fmt/json/env-filter.
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
 # 0.36 is a floor, not a preference: 0.35 reports every process's CPU usage as
 # exactly 0.0 on macOS, which is the whole of what the resource panel shows.
 # The 0.36.0 changelog entry is "Linux/macOS: Fix CPU usage update", and the

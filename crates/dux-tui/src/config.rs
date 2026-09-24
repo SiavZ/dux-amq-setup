@@ -412,6 +412,9 @@ fn config_schema() -> Vec<ConfigEntry> {
             key: "path",
             comment: Some(CommentSource::Static(
                 "# Relative paths are resolved from the dux config directory.\n\
+                 # The log is JSON Lines: one object per line with timestamp, level,\n\
+                 # target and a fields object (fields.message, plus session_id and\n\
+                 # similar keys where dux has them), so jq can filter it.\n\
                  # The log file is opened once, so changing this needs a restart.\n\
                  # A symlink here is followed once at startup: the log and its rotated\n\
                  # copies live beside the file it points at, and the link is left alone.",
