@@ -359,4 +359,10 @@ mod tests {
                 .contains("too large")
         );
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_does_not_require_x11_display_variables() {
+        assert!(!no_display());
+    }
 }
