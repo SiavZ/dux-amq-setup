@@ -671,6 +671,19 @@ impl SessionStore {
         self.backfill_slot_tabs()?;
         self.heal_slot_tab_pointers()?;
         self.backfill_agent_handles()?;
+        // Fork migration 0005 (overlay/parity workstream) dropped `session_prs`
+        // rows whose session no longer exists, because copying one into the
+        // rebuilt table under `PRAGMA foreign_keys = ON` would abort the whole
+        // migration and brick startup. Upstream never turns foreign keys on, so
+        // an orphan aborts nothing, but it is not inert either: nothing joins
+        // `session_prs` back to `agent_sessions` on read
+        // (`load_all_latest_prs` selects straight from the table), so a leftover
+        // orphan seeds `pr_statuses` and inflates the "tracking PRs for N
+        // sessions" status count on every boot, forever, because no delete path
+        // touches a row whose session is already gone. Sweeping on open keeps
+        // the table's meaning ("pull requests of sessions that exist") and is
+        // idempotent: a clean database deletes nothing.
+        self.sweep_orphan_session_prs()?;
         Ok(())
     }
 
@@ -796,6 +809,20 @@ impl SessionStore {
                 [],
             )
             .context("failed to sweep tab rows whose agent no longer exists")?;
+        Ok(())
+    }
+
+    /// Drop any `session_prs` row whose owning session is gone: fork
+    /// migration 0005's orphan rule, which upstream needs for a different
+    /// reason. See the call site at the end of [`Self::migrate`] for why this
+    /// still matters even though the connection keeps foreign keys off.
+    fn sweep_orphan_session_prs(&self) -> Result<()> {
+        self.conn
+            .execute(
+                "delete from session_prs where session_id not in (select id from agent_sessions)",
+                [],
+            )
+            .context("failed to sweep pull-request rows whose agent no longer exists")?;
         Ok(())
     }
 
