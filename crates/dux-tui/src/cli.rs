@@ -1125,9 +1125,21 @@ fn remove_worktrees_root_sparing(root: &Path, occupied: &[PathBuf]) -> Result<()
 /// cannot slip past. A worktree strictly INSIDE an occupied folder is not spared
 /// here, deliberately: dux made that worktree and resets what it made, and the
 /// user's folder itself is still standing around it afterwards.
+///
+/// BOTH sides are canonicalized here, not just the worktree: the function's
+/// contract is "any two spellings of the same ground answer truthfully", and
+/// only one of the two callers canonicalizes the occupied list itself (the
+/// factory reset does; the comparison in [`remove_worktrees_root_sparing`]
+/// does too). A caller passing an un-canonicalized spelling (a symlinked temp
+/// root on macOS, where `/var/folders` is reached through `/private/var/folders`)
+/// would otherwise spare nothing, and an un-spared occupied folder is an
+/// unconditional `remove_dir_all` on the user's data. Answering "not occupied"
+/// is the wrong direction to be wrong in.
 fn worktree_holds_occupied_folder(worktree: &Path, occupied: &[PathBuf]) -> bool {
     let worktree = canonical_or_original(worktree);
-    occupied.iter().any(|folder| folder.starts_with(&worktree))
+    occupied
+        .iter()
+        .any(|folder| canonical_or_original(folder).starts_with(&worktree))
 }
 
 /// Remove one agent's managed worktree during a factory reset. Returns whether
@@ -1531,6 +1543,19 @@ mod tests {
         ));
         // Nothing occupied at all is the ordinary reset.
         assert!(!worktree_holds_occupied_folder(&worktree, &[]));
+
+        // The occupied list may arrive in a different spelling than the
+        // worktree: a standalone agent's directory is stored as it was given,
+        // and a symlinked ancestor (macOS `/var` for `/private/var`, an alias
+        // the user made) must not let the skip rule miss the folder it protects.
+        // This is the case the function must answer correctly on its own,
+        // because not every caller canonicalizes the list before passing it.
+        let alias = root.join("wt-alias");
+        std::os::unix::fs::symlink(&worktree, &alias).expect("worktree alias");
+        assert!(
+            worktree_holds_occupied_folder(&worktree, &[alias]),
+            "an occupied folder spelled through a symlink must still match the worktree it is"
+        );
     }
 
     #[test]

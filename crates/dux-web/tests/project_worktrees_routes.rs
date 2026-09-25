@@ -400,18 +400,24 @@ async fn deleting_a_detached_worktree_with_delete_branch_still_works() {
 
     let (status, body) = list(f.addr, "p1").await;
     assert_eq!(status, 200, "got {body}");
+    // The listing reports worktrees by their canonical path, which on macOS
+    // spells the temp dir `/private/var/...` where the fixture built it as
+    // `/var/...`. The client would send the listed spelling back, so compare
+    // against what the route actually returned rather than the fixture's
+    // spelling, and prove the entry exists before using it.
+    let canonical_loose = std::fs::canonicalize(&loose).expect("canonical detached worktree");
     let detached = body["entries"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|e| e["worktree_path"].as_str() == Some(loose.to_string_lossy().as_ref()))
+        .find(|e| e["worktree_path"].as_str() == Some(canonical_loose.to_string_lossy().as_ref()))
         .unwrap_or_else(|| panic!("no entry for the detached worktree in {body}"));
     assert!(
         detached["branch"].is_null(),
         "a detached worktree has no branch: {detached}"
     );
 
-    let (status, body) = delete_with(f.addr, "p1", &loose, "&delete_branch=true").await;
+    let (status, body) = delete_with(f.addr, "p1", &canonical_loose, "&delete_branch=true").await;
 
     assert_eq!(status, 200, "got {body}");
     assert!(
