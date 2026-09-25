@@ -1105,9 +1105,6 @@ mod tests {
 
         use std::os::unix::process::CommandExt;
 
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
         // Four spinning subshells under one `sh`: a real multi-process tree
         // whose aggregate must exceed 100% on a box with cores to spare.
         //
@@ -1129,7 +1126,7 @@ mod tests {
         let idler_pid = idler.id();
 
         std::thread::sleep(Duration::from_millis(400));
-        let sys = fresh_system();
+        let (sys, charged_pct) = sample_with_charged_cpu(burner_pid);
 
         let (burner_cpu, _, burner_count, _) =
             aggregate_tree(&sys, sysinfo::Pid::from_u32(burner_pid));
@@ -1165,51 +1162,97 @@ mod tests {
             "a sleeping process must read about nothing, got {idle_cpu}%"
         );
         // How HIGH the burn reads depends on a PREMISE, not a given: that the
-        // scheduler had cores to hand it. Run alone on an idle machine that is
-        // true; inside the full suite, or on a box already running dozens of
-        // agents and builds, the burners get a fair share of a saturated machine
-        // and read low without anything being wrong with dux (measured here at
-        // a load average of 58 on 18 cores: 3% to 42%).
+        // scheduler actually ran the burners during the window. Run alone on
+        // an idle machine that is true; inside the full suite, or on a box
+        // already running dozens of agents and builds, the burners get a fair
+        // share of a saturated machine and read low without anything being
+        // wrong with dux (measured here at a load average of 58 on 18 cores:
+        // 3% to 42%).
         //
-        // So the premise is measured: `spare` is how much CPU nothing else was
-        // using in the same sample, and each magnitude check runs only when its
-        // premise held. The zero check above is unconditional.
-        let busy_elsewhere: f32 = sys
-            .processes()
-            .iter()
-            .filter(|(pid, _)| pid.as_u32() != burner_pid && pid.as_u32() != idler_pid)
-            .map(|(_, p)| p.cpu_usage())
-            .sum();
-        let spare = (cores as f32 * 100.0) - busy_elsewhere;
-        if spare > 100.0 {
+        // The premise is `charged_pct`: the CPU time the kernel charged the
+        // burner tree over the SAME window, from its raw cumulative counters
+        // (see `sample_with_charged_cpu`), not from the `cpu_usage` rate under
+        // test. An earlier version inferred it as "cores minus what everything
+        // else read", but summing ~800 noisy per-process rates is no measure
+        // of what the burners got: it reported 589% spare in a run where they
+        // read 3%. Each magnitude check runs only when the kernel says the
+        // burners really ran that much, with a 2x margin; the zero check
+        // above is unconditional.
+        if charged_pct > 100.0 {
             assert!(
                 burner_cpu > 50.0,
-                "with {spare:.0}% CPU spare, a tree burning whole cores must read high, \
-                 got {burner_cpu}%"
+                "the kernel charged the burner tree {charged_pct:.0}% of a core in the \
+                 window, so it must read high, got {burner_cpu}%"
             );
         } else {
             eprintln!(
-                "skipping the >50% check: only {spare:.0}% CPU was spare, so the \
-                 scheduler could not give the burn a whole core"
+                "skipping the >50% check: the kernel only charged the burners \
+                 {charged_pct:.0}% of a core in the window"
             );
         }
-        // Four burners can only EXCEED one core in aggregate if the scheduler
-        // can run more than one of them at once, which needs a free core for
-        // each: 400% spare. With less, fair sharing against everything else
-        // runnable can legitimately hold the four under 100% in the window.
-        if cores >= 6 && spare > 400.0 {
+        // Four burners EXCEED one core in aggregate only if the scheduler ran
+        // several at once, which the charged time shows directly. This is the
+        // check a clamp at 100 would fail.
+        if charged_pct > 200.0 {
             assert!(
                 burner_cpu > 100.0,
-                "four busy processes on a {cores}-core box with {spare:.0}% spare \
-                 must exceed 100% aggregate; got {burner_cpu}% (a clamp would pin \
-                 this at exactly 100)"
+                "the kernel charged the four burners {charged_pct:.0}% in the window, \
+                 so the aggregate must exceed 100%; got {burner_cpu}% (a clamp would \
+                 pin this at exactly 100)"
             );
-        } else if cores >= 6 {
+        } else {
             eprintln!(
-                "skipping the >100% aggregate check: only {spare:.0}% CPU was \
-                 spare, so the scheduler could not give the burn whole cores"
+                "skipping the >100% aggregate check: the kernel only charged the \
+                 burners {charged_pct:.0}% in the window"
             );
         }
+    }
+
+    /// `fresh_system`'s two-refresh sample, plus the CPU time the kernel
+    /// charged `root`'s process tree between the two refreshes, as a
+    /// percentage of one core over that window.
+    ///
+    /// The charged time comes from each process's cumulative user+system
+    /// counter (`accumulated_cpu_time`, read from `proc_pidinfo` on macOS and
+    /// `/proc/<pid>/stat` on Linux), differenced across the window. That is a
+    /// different figure from the interval `cpu_usage` rate the test checks,
+    /// so it can state the test's premise ("did the burners actually run")
+    /// without assuming the answer.
+    fn sample_with_charged_cpu(root: u32) -> (sysinfo::System, f32) {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+        let kind = ProcessRefreshKind::nothing().with_cpu().with_memory();
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
+        let before: std::collections::HashMap<Pid, u64> = sys
+            .processes()
+            .iter()
+            .map(|(pid, p)| (*pid, p.accumulated_cpu_time()))
+            .collect();
+        let started = std::time::Instant::now();
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
+        let window_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        let mut tree = vec![Pid::from_u32(root)];
+        let mut i = 0;
+        while i < tree.len() {
+            let parent = tree[i];
+            tree.extend(
+                sys.processes()
+                    .iter()
+                    .filter(|(_, p)| p.parent() == Some(parent) && p.thread_kind().is_none())
+                    .map(|(pid, _)| *pid),
+            );
+            i += 1;
+        }
+        let charged_ms: u64 = tree
+            .iter()
+            .filter_map(|pid| {
+                let now = sys.process(*pid)?.accumulated_cpu_time();
+                Some(now.saturating_sub(*before.get(pid)?))
+            })
+            .sum();
+        (sys, (charged_ms as f64 / window_ms * 100.0) as f32)
     }
 
     /// A leaf target's `children` holds exactly one entry: the root itself.
