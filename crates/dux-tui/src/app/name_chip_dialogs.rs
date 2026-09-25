@@ -1240,3 +1240,58 @@ fn no_paragraph_that_can_carry_a_chip_is_wrapped_by_ratatui() {
         offenders.join("\n")
     );
 }
+
+/// Assert every cell of every occurrence of `words` is the dialog body text:
+/// the theme's `text_fg` on the modal surface, never the host terminal's
+/// default foreground.
+fn assert_body_text(app: &App, buf: &Buffer, words: &str) {
+    let hits = occurrences(buf, words);
+    let shown = screen(buf);
+    assert!(!hits.is_empty(), "{words:?} is not on screen:\n{shown}");
+    let len = words.chars().count() as u16;
+    for (x, y) in hits {
+        for cx in x..x + len {
+            let cell = &buf[(cx, y)];
+            assert_eq!(
+                (cell.fg, cell.bg),
+                (app.theme.text_fg, app.theme.overlay_bg),
+                "{words:?} at ({x},{y}) is not body text at column {cx}:\n{shown}"
+            );
+        }
+    }
+}
+
+/// A light theme is where the terminal's default foreground (white in a dark
+/// terminal) disappears into the modal surface, so the body text is asked
+/// about there: the prose around a chip, and a checkbox label.
+#[test]
+fn dialog_body_text_is_the_themes_text_color_on_a_light_theme() {
+    let mut app = test_app(default_bindings());
+    app.theme = crate::theme::load("github_light", &app.engine.paths).expect("github_light");
+    let project_id = project_with_agents(&mut app, 2);
+    let buf = open(
+        &mut app,
+        PromptState::ConfirmDeleteProject {
+            project_id,
+            project_name: "proj-light".to_string(),
+            agent_count: 2,
+            focus: ConfirmFocus::Cancel,
+        },
+    );
+    assert_body_text(&app, &buf, "This is irreversible.");
+    assert_chipped(&app, &buf, "proj-light");
+
+    let buf = open(
+        &mut app,
+        delete_agent_prompt(
+            DeleteAgentTarget::Managed {
+                branch_name: "light-br".to_string(),
+                initial_branch: "light-br".to_string(),
+                branch_provenance: dux_core::model::BranchProvenance::CreatedByDux,
+                worktree_shared: false,
+            },
+            true,
+        ),
+    );
+    assert_body_text(&app, &buf, "Also delete the worktree");
+}

@@ -720,6 +720,14 @@ impl Theme {
         }
     }
 
+    /// The modal surface as a style: the dialog body text (`text_fg`) on the
+    /// modal background (`overlay_bg`). Every dialog surface is painted in it,
+    /// so body prose that sets no color of its own reads in the theme's text
+    /// color rather than the host terminal's default foreground.
+    pub fn overlay_surface_style(&self) -> Style {
+        Style::default().fg(self.text_fg).bg(self.overlay_bg)
+    }
+
     /// The style of a name chip: the dialog body's own colors swapped, the
     /// modal surface (`overlay_bg`) on the body text (`text_fg`), with no bold.
     /// A chip therefore reads exactly as well as the sentence around it and

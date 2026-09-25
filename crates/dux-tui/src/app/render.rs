@@ -11917,7 +11917,11 @@ impl App {
     }
 
     fn paint_modal_surface(&self, frame: &mut Frame, area: Rect, surface_bg: Color) {
-        let surface_style = Style::default().bg(surface_bg);
+        // The surface carries the body text color as well as its background,
+        // so text a dialog paints with no color of its own reads in the
+        // theme's `text_fg` rather than the host terminal's default
+        // foreground, which is unreadable on a light theme's surface.
+        let surface_style = Style::default().fg(self.theme.text_fg).bg(surface_bg);
         let isolation_style = Style::default()
             .fg(self.theme.overlay_dim_fg)
             .bg(self.theme.overlay_dim_bg);
@@ -11938,7 +11942,7 @@ impl App {
         Clear.render(area, frame.buffer_mut());
         frame
             .buffer_mut()
-            .set_style(area, Style::default().bg(self.theme.overlay_bg));
+            .set_style(area, self.theme.overlay_surface_style());
     }
 
     pub(super) fn themed_overlay_block<'a>(&self, title: &'a str) -> Block<'a> {
@@ -11982,8 +11986,10 @@ impl App {
             // popup cells to `Color::Reset`. Filling the block with overlay_bg
             // means the modal interior (borders, surrounding chrome, the gap
             // around the inner widgets) tracks the active theme instead of
-            // reading terminal-default behind the border ring.
-            .style(Style::default().bg(self.theme.overlay_bg))
+            // reading terminal-default behind the border ring. The body text
+            // color rides along, so prose with no color of its own is drawn
+            // in `text_fg`, never the host terminal's default foreground.
+            .style(self.theme.overlay_surface_style())
     }
 
     /// Lay out and paint the scrollable message pane the error dialogs share, and

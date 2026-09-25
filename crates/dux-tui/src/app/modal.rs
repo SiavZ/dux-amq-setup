@@ -1405,6 +1405,44 @@ mod tests {
         );
     }
 
+    /// No dialog paints text in the host terminal's default foreground. That
+    /// default is whatever the terminal was configured with (white, in a dark
+    /// terminal), so on a light theme's modal surface it is unreadable: text on
+    /// the surface takes a theme color, the body's own `text_fg` when nothing
+    /// more specific applies. Asked on a light theme, where the failure shows.
+    #[test]
+    fn no_dialog_paints_text_in_the_terminal_default_foreground() {
+        let mut app = test_app(default_bindings());
+        app.theme = crate::theme::load("github_light", &app.engine.paths).expect("github_light");
+        let surface = app.theme.overlay_bg;
+        let (width, height) = (100, 40);
+        let baseline = painted_buffer(&mut app, PromptState::None, width, height);
+        let mut offenders = Vec::new();
+        for (name, prompt) in every_prompt(&app) {
+            let buf = painted_buffer(&mut app, prompt, width, height);
+            for y in 0..height {
+                let row: String = (0..width)
+                    .filter(|&x| {
+                        let cell = &buf[(x, y)];
+                        cell != &baseline[(x, y)]
+                            && cell.bg == surface
+                            && cell.fg == ratatui::style::Color::Reset
+                            && !cell.symbol().trim().is_empty()
+                    })
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect();
+                if !row.is_empty() {
+                    offenders.push(format!("{name}, row {y}: {row:?}"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these dialogs paint text in the terminal's default foreground:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     /// The split scan on the shapes it must catch and the ones it must not.
     #[test]
     fn the_split_chip_scan_tells_a_whole_chip_from_half_of_one() {
