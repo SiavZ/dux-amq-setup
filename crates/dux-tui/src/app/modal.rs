@@ -1338,7 +1338,9 @@ mod tests {
     }
 
     /// Every chip-colored run the dialog added to a row that begins mid-name,
-    /// as `(row, run)`. A chip opens on its pad space, so a run that does not
+    /// as `(row, run)`. A cell is chip-colored when it carries the chip's
+    /// foreground AND background: the background alone is the body text's
+    /// color, which a text-input caret may also be painted in. A chip opens on its pad space, so a run that does not
     /// is the continuation of a name the wrap cut across rows. A run that opens
     /// on its pad but ends early is a name clipped by the edge of a row that
     /// does not wrap, which is a different question. Cells already
@@ -1346,14 +1348,16 @@ mod tests {
     fn split_chips(
         buf: &ratatui::buffer::Buffer,
         baseline: &ratatui::buffer::Buffer,
-        name_bg: ratatui::style::Color,
+        chip: (ratatui::style::Color, ratatui::style::Color),
     ) -> Vec<(u16, String)> {
         let area = buf.area;
         let mut found = Vec::new();
         for y in 0..area.height {
             let mut x = 0;
             while x < area.width {
-                let is_chip = |x: u16| buf[(x, y)].bg == name_bg && baseline[(x, y)] != buf[(x, y)];
+                let is_chip = |x: u16| {
+                    (buf[(x, y)].fg, buf[(x, y)].bg) == chip && baseline[(x, y)] != buf[(x, y)]
+                };
                 if !is_chip(x) {
                     x += 1;
                     continue;
@@ -1379,13 +1383,17 @@ mod tests {
     fn no_dialog_splits_a_chip_across_rows() {
         let mut app = test_app(default_bindings());
         app.engine.projects[0].name = "My Cool Project".to_string();
-        let name_bg = app.theme.name_bg;
+        let chip_style = app.theme.name_style();
+        let chip = (
+            chip_style.fg.expect("the chip names its text color"),
+            chip_style.bg.expect("the chip names its background"),
+        );
         let mut offenders = Vec::new();
         for width in 44..=100u16 {
             let baseline = painted_buffer(&mut app, PromptState::None, width, 40);
             for (name, prompt) in every_prompt(&app) {
                 let buf = painted_buffer(&mut app, prompt, width, 40);
-                for (row, run) in split_chips(&buf, &baseline, name_bg) {
+                for (row, run) in split_chips(&buf, &baseline, chip) {
                     offenders.push(format!("{name} at width {width}, row {row}: {run:?}"));
                 }
             }
@@ -1402,31 +1410,38 @@ mod tests {
     fn the_split_chip_scan_tells_a_whole_chip_from_half_of_one() {
         use ratatui::buffer::Buffer;
         use ratatui::style::{Color, Style};
-        let bg = Color::Rgb(1, 2, 3);
-        let chip = Style::default().bg(bg);
+        let colors = (Color::Rgb(4, 5, 6), Color::Rgb(1, 2, 3));
+        let chip = Style::default().fg(colors.0).bg(colors.1);
         let blank = Buffer::empty(Rect::new(0, 0, 12, 2));
         let mut buf = blank.clone();
         buf.set_string(0, 0, "a ", Style::default());
         buf.set_string(2, 0, " My Cool ", chip);
-        assert!(split_chips(&buf, &blank, bg).is_empty(), "a whole chip");
+        assert!(split_chips(&buf, &blank, colors).is_empty(), "a whole chip");
         let mut clipped = blank.clone();
         clipped.set_string(8, 0, " My ", chip);
         clipped.set_string(10, 1, " M", chip);
         assert!(
-            split_chips(&clipped, &blank, bg).is_empty(),
+            split_chips(&clipped, &blank, colors).is_empty(),
             "a chip clipped by the row's edge is not a split"
         );
         let mut cut = blank.clone();
         cut.set_string(9, 0, " My", chip);
         cut.set_string(0, 1, "Cool ", chip);
         assert_eq!(
-            split_chips(&cut, &blank, bg),
+            split_chips(&cut, &blank, colors),
             vec![(1, "Cool ".to_string())],
             "the continuation row is what proves the cut"
         );
         assert!(
-            split_chips(&cut, &cut, bg).is_empty(),
+            split_chips(&cut, &cut, colors).is_empty(),
             "chip colors already on screen with no dialog open are not the dialog's"
+        );
+        let mut caret = blank.clone();
+        caret.set_string(0, 0, "ab", Style::default());
+        caret.set_string(1, 0, "b", Style::default().fg(Color::Black).bg(colors.1));
+        assert!(
+            split_chips(&caret, &blank, colors).is_empty(),
+            "a caret on the chip's background is not half a chip"
         );
     }
 

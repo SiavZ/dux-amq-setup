@@ -124,14 +124,6 @@ ansi_darkgray = "#808080"
 "dux.overlay_dim_bg"       = "#0a0a0a"
 "dux.overlay_dim_fg"       = "ansi_darkgray"
 "dux.prompt_cursor"        = "ansi_cyan"
-# The name chip: every branch, path, file, command, and agent, project,
-# terminal or provider name inside a dialog's sentences is drawn in this
-# pair, padded by one cell on each side, instead of in quotes. Leave either
-# out and it is derived: name_fg is dux.text_fg, and name_bg is
-# dux.overlay_bg moved 16% of the way toward dux.text_fg, which gives a chip
-# one small step off the dialog surface in every theme.
-"dux.name_fg"              = "ansi_white"
-"dux.name_bg"              = "#3a3a3a"
 
 # ── Provider / branch / scrollback ───────────────────────────────────
 "dux.provider_label_fg"    = "#646464"

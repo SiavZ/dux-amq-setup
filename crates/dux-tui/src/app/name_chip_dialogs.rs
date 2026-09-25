@@ -3,9 +3,9 @@
 //!
 //! Each test opens one dialog with distinctive names, renders the whole app
 //! into a test backend, and asserts that every cell of every occurrence of each
-//! name carries the theme's `name_fg` on `name_bg` with no bold, that the chip
-//! is padded by one chip-colored cell on each side, and that no straight quote
-//! is left around it.
+//! name carries the dialog body's colors swapped (`overlay_bg` on `text_fg`) with no
+//! bold, that the chip is padded by one chip-colored cell on each side, and that
+//! no straight quote is left around it.
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -86,7 +86,7 @@ fn assert_chipped(app: &App, buf: &Buffer, name: &str) {
             let cell = &buf[(cx, y)];
             assert_eq!(
                 (cell.fg, cell.bg),
-                (theme.name_fg, theme.name_bg),
+                (theme.overlay_bg, theme.text_fg),
                 "{name:?} at ({x},{y}) is not in the chip colors at column {cx}:\n{shown}"
             );
             assert!(
@@ -101,7 +101,7 @@ fn assert_chipped(app: &App, buf: &Buffer, name: &str) {
             let cell = &buf[(pad, y)];
             assert_eq!(
                 (cell.symbol(), cell.bg),
-                (" ", theme.name_bg),
+                (" ", theme.text_fg),
                 "{name:?} at ({x},{y}) has no chip padding at column {pad}:\n{shown}"
             );
         }
@@ -366,7 +366,12 @@ fn the_close_tab_dialog_chips_the_provider_the_agent_and_the_successor() {
         .collect();
     assert!(!in_dialog.is_empty(), "{}", screen(&buf));
     for (x, y) in in_dialog {
-        assert_eq!(buf[(x, y)].bg, app.theme.name_bg, "{}", screen(&buf));
+        assert_eq!(
+            (buf[(x, y)].fg, buf[(x, y)].bg),
+            (app.theme.overlay_bg, app.theme.text_fg),
+            "{}",
+            screen(&buf)
+        );
     }
 }
 
@@ -673,14 +678,14 @@ fn assert_chipped_on_row(app: &App, buf: &Buffer, row_marker: &str, name: &str) 
             let cell = &buf[(cx, y)];
             assert_eq!(
                 (cell.fg, cell.bg),
-                (theme.name_fg, theme.name_bg),
+                (theme.overlay_bg, theme.text_fg),
                 "{name:?} at ({x},{y}) is not in the chip colors:\n{shown}"
             );
         }
         for pad in [x.checked_sub(1), Some(x + len)].into_iter().flatten() {
             assert_eq!(
                 (buf[(pad, y)].symbol(), buf[(pad, y)].bg),
-                (" ", theme.name_bg),
+                (" ", theme.text_fg),
                 "{name:?} at ({x},{y}) has no chip padding:\n{shown}"
             );
         }
