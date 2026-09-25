@@ -62,10 +62,16 @@ fn urls_to_show(live: Option<Vec<String>>, captured: &[String]) -> Vec<String> {
 impl BackgroundServer {
     /// Start serving `engine` on `listeners`, which the caller already bound: a
     /// bind failure is then a status line message, not a half-torn-down process.
+    ///
+    /// With `claim_before_serving`, every running pty nobody drives is claimed
+    /// for the terminal UI before any listener accepts a connection, and the
+    /// claims are announced once the serve is up. See
+    /// [`dux_core::background_serve::BackgroundServeCompanion::start`].
     pub fn start(
         engine: &mut Engine,
         listeners: Vec<std::net::TcpListener>,
         urls: Vec<String>,
+        claim_before_serving: bool,
     ) -> Result<Self> {
         crate::warn_if_ui_not_built();
         // Writes nowhere: the terminal UI owns this terminal, and nothing on this
@@ -91,6 +97,15 @@ impl BackgroundServer {
             conn_id: owners.next_conn_id(),
             owners,
         };
+        // Seeded BEFORE any leg is spawned below: nothing can be connected yet,
+        // so no browser tab that is already reconnecting can win a plain-attach
+        // claim first, and every handshake reads the terminal UI as the owner.
+        // Announced once the serve is up and its publisher exists.
+        let seeded_claims = if claim_before_serving {
+            ownership.claim_every_running_pty(engine)
+        } else {
+            Vec::new()
+        };
         let publisher = Arc::new(std::sync::OnceLock::new());
         let connections = Arc::new(AtomicUsize::new(0));
         let service = EngineService::new(engine, ends, ShutdownEcho::Silent);
@@ -108,7 +123,7 @@ impl BackgroundServer {
                 connections_gauge: Some(Arc::clone(&connections)),
             },
         )?;
-        Ok(Self {
+        let mut server = Self {
             core,
             service,
             shutdown_flag,
@@ -117,7 +132,9 @@ impl BackgroundServer {
             ownership,
             publisher,
             connections,
-        })
+        };
+        server.publish_ownership_events(&seeded_claims);
+        Ok(server)
     }
 
     /// How many browser tabs are connected to this serve right now. Connections,
@@ -262,7 +279,7 @@ mod tests {
             lock_path: tmp.path().join("dux.lock"),
         };
         std::fs::create_dir_all(&paths.worktrees_root).expect("worktrees dir");
-        let engine = crate::bootstrap::bootstrap_engine(&paths).expect("engine");
+        let engine = crate::test_support::bootstrap_test_engine(&paths).expect("engine");
         // The terminal UI spawned the four global workers before it started
         // serving. Mark the two observable ones as already up, so a test can tell
         // "the background server left them alone" from "nothing ever started".
@@ -321,6 +338,7 @@ mod tests {
             &mut engine,
             vec![listener],
             vec!["http://stale.example:1".to_string()],
+            false,
         )
         .expect("the serve starts");
 
@@ -348,6 +366,7 @@ mod tests {
             &mut engine,
             vec![listener],
             vec![format!("http://{first_addr}")],
+            false,
         )
         .expect("the first serve starts");
         let status = healthz(first_addr).expect("the first serve answers");
@@ -367,6 +386,7 @@ mod tests {
             &mut engine,
             vec![listener],
             vec![format!("http://{second_addr}")],
+            false,
         )
         .expect("the second serve starts");
         let status = healthz(second_addr).expect("the second serve answers");
@@ -387,9 +407,13 @@ mod tests {
     fn stopping_trips_the_teardown_flag_before_dropping_the_runtime() {
         let (mut engine, _tmp) = engine_in_tempdir();
         let (listener, addr) = loopback_listener();
-        let server =
-            BackgroundServer::start(&mut engine, vec![listener], vec![format!("http://{addr}")])
-                .expect("serve starts");
+        let server = BackgroundServer::start(
+            &mut engine,
+            vec![listener],
+            vec![format!("http://{addr}")],
+            false,
+        )
+        .expect("serve starts");
         let flag = std::sync::Arc::clone(&server.shutdown_flag);
         assert!(
             !flag.load(Ordering::SeqCst),
@@ -409,9 +433,13 @@ mod tests {
     fn the_background_serve_installs_no_signal_handlers() {
         let (mut engine, _tmp) = engine_in_tempdir();
         let (listener, addr) = loopback_listener();
-        let server =
-            BackgroundServer::start(&mut engine, vec![listener], vec![format!("http://{addr}")])
-                .expect("serve starts");
+        let server = BackgroundServer::start(
+            &mut engine,
+            vec![listener],
+            vec![format!("http://{addr}")],
+            false,
+        )
+        .expect("serve starts");
         assert!(
             !server.installed_signal_handlers(),
             "the background serve must leave SIGINT/SIGTERM to the terminal UI"
@@ -431,9 +459,13 @@ mod tests {
             .branch_sync_worker_started
             .store(false, Ordering::Relaxed);
         let (listener, addr) = loopback_listener();
-        let server =
-            BackgroundServer::start(&mut engine, vec![listener], vec![format!("http://{addr}")])
-                .expect("serve starts");
+        let server = BackgroundServer::start(
+            &mut engine,
+            vec![listener],
+            vec![format!("http://{addr}")],
+            false,
+        )
+        .expect("serve starts");
         assert!(
             !engine.branch_sync_worker_started.load(Ordering::Relaxed),
             "the background serve must not spawn the global workers a second time"
@@ -449,16 +481,24 @@ mod tests {
         let (mut engine, _tmp) = engine_in_tempdir();
 
         let (listener, addr) = loopback_listener();
-        let server =
-            BackgroundServer::start(&mut engine, vec![listener], vec![format!("http://{addr}")])
-                .expect("first serve");
+        let server = BackgroundServer::start(
+            &mut engine,
+            vec![listener],
+            vec![format!("http://{addr}")],
+            false,
+        )
+        .expect("first serve");
         let first = crate::pty_owners::PtySizeOwners::default().next_conn_id();
         server.stop();
 
         let (listener, addr) = loopback_listener();
-        let server =
-            BackgroundServer::start(&mut engine, vec![listener], vec![format!("http://{addr}")])
-                .expect("second serve");
+        let server = BackgroundServer::start(
+            &mut engine,
+            vec![listener],
+            vec![format!("http://{addr}")],
+            false,
+        )
+        .expect("second serve");
         let second = crate::pty_owners::PtySizeOwners::default().next_conn_id();
         server.stop();
 

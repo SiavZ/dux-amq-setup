@@ -7,7 +7,29 @@
 // never auto-closes at all and which this module's leak guard retires by
 // replacing it with a warning rather than taking it off the screen.
 
+import { createElement, Fragment, type ReactNode } from "react"
 import { toast } from "sonner"
+
+import { type Prose, proseText, renderProse } from "./prose"
+
+/// What a notification says: a finished sentence, or a sentence built from
+/// words and names (`lib/prose.tsx`), whose names are drawn as the shared inline
+/// code chip. An engine status arrives as the second when the server built it
+/// from parts; nothing here ever hunts for a name inside a finished string.
+export type Notice = string | Prose
+
+/// The plain spelling of a notice, for emptiness checks and for any wording that
+/// has to quote it.
+export function noticeText(notice: Notice): string {
+  return typeof notice === "string" ? notice : proseText(notice)
+}
+
+// What sonner is handed. A finished sentence stays the string it always was.
+function noticeBody(notice: Notice): ReactNode {
+  return typeof notice === "string"
+    ? notice
+    : createElement(Fragment, null, ...renderProse(notice))
+}
 
 /// Fallback window (seconds) used before the bootstrap document lands, matching
 /// the config default for `ui.status_clear_seconds`.
@@ -82,7 +104,7 @@ function cancelBusyGuard(id: string): void {
 }
 
 // The one call into sonner for a final tone. Everything above resolves to this.
-function raiseFinal(tone: string, message: string, duration: number, id?: string): void {
+function raiseFinal(tone: string, message: ReactNode, duration: number, id?: string): void {
   const options = id === undefined ? { duration } : { id, duration }
   if (tone === "error") toast.error(message, options)
   else if (tone === "warning") toast.warning(message, options)
@@ -92,34 +114,34 @@ function raiseFinal(tone: string, message: string, duration: number, id?: string
 
 /// Raise a final (non-busy) notification. The window comes from the user's
 /// configured `ui.status_clear_seconds`, graded by tone, unless `sticky` is set.
-export function notify(tone: FinalTone, message: string, opts: NotifyOptions = {}): void {
-  if (!message) return
+export function notify(tone: FinalTone, message: Notice, opts: NotifyOptions = {}): void {
+  if (!noticeText(message)) return
   // This raise supersedes anything on the id, including a spinner whose guard is
   // still pending.
   if (opts.id !== undefined) cancelBusyGuard(opts.id)
   const duration = opts.sticky
     ? Infinity
     : statusToastDuration(tone, configuredStatusClearSeconds)
-  raiseFinal(tone, message, duration, opts.id)
+  raiseFinal(tone, noticeBody(message), duration, opts.id)
 }
 
 /// A neutral, informational notification.
-export function notifyInfo(message: string, opts: NotifyOptions = {}): void {
+export function notifyInfo(message: Notice, opts: NotifyOptions = {}): void {
   notify("info", message, opts)
 }
 
 /// Something the user asked for finished, and finished well.
-export function notifySuccess(message: string, opts: NotifyOptions = {}): void {
+export function notifySuccess(message: Notice, opts: NotifyOptions = {}): void {
   notify("success", message, opts)
 }
 
 /// Something is off but the operation still landed, or it can be retried freely.
-export function notifyWarning(message: string, opts: NotifyOptions = {}): void {
+export function notifyWarning(message: Notice, opts: NotifyOptions = {}): void {
   notify("warning", message, opts)
 }
 
 /// Something failed.
-export function notifyError(message: string, opts: NotifyOptions = {}): void {
+export function notifyError(message: Notice, opts: NotifyOptions = {}): void {
   notify("error", message, opts)
 }
 
@@ -148,10 +170,10 @@ export function strandedBusyMessage(
 /// The guard's warning is deliberately not sticky: the real final still replaces
 /// it whenever it turns up, and one pinned toast per stranded spinner buries the screen.
 export function notifyBusy(
-  message: string,
+  message: Notice,
   opts: { id: string; origin?: BusyOrigin },
 ): void {
-  if (!message) return
+  if (!noticeText(message)) return
   const duration = statusToastDuration("busy", null)
   const origin = opts.origin ?? "wire"
   // Whatever was armed for this id is now stale: this call replaces the toast.
@@ -160,10 +182,10 @@ export function notifyBusy(
     opts.id,
     setTimeout(() => {
       busyGuards.delete(opts.id)
-      notify("warning", strandedBusyMessage(message, origin), { id: opts.id })
+      notify("warning", strandedBusyMessage(noticeText(message), origin), { id: opts.id })
     }, duration),
   )
-  toast.loading(message, { id: opts.id, duration })
+  toast.loading(noticeBody(message), { id: opts.id, duration })
 }
 
 /// Raise a notification whose tone arrived over the wire as a string, correlated
@@ -174,10 +196,10 @@ export function notifyBusy(
 /// `success`, so `Info` is the tone its finished operations report in.
 export function notifyStatus(
   tone: string,
-  message: string,
+  message: Notice,
   opts: { id: string; sticky?: boolean },
 ): void {
-  if (!message) return
+  if (!noticeText(message)) return
   if (tone === "busy") {
     notifyBusy(message, { id: opts.id })
     return

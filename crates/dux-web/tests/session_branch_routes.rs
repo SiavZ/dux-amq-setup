@@ -24,7 +24,7 @@ use dux_web::server::{AppState, RouterParams, build_app};
 use futures_util::StreamExt;
 
 fn git(dir: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
+    let out = dux_core::test_git::fixture_git()
         .args(args)
         .current_dir(dir)
         .output()
@@ -99,7 +99,7 @@ fn standalone_session(id: &str, folder: &str) -> dux_core::model::AgentSession {
 struct Fixture {
     addr: SocketAddr,
     repo: std::path::PathBuf,
-    _tmp: tempfile::TempDir,
+    _tmp: dux_core::test_scratch::ScratchDir,
 }
 
 /// Boot a server over a real repo with three agents:
@@ -108,7 +108,7 @@ struct Fixture {
 /// - `duxs`, on a branch dux created for it,
 /// - `folder`, a standalone agent.
 async fn boot() -> Fixture {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
 
     let repo = root.join("repo");
@@ -205,7 +205,8 @@ async fn boot() -> Fixture {
             ))
             .unwrap();
     }
-    let engine = bootstrap_engine(&paths).unwrap();
+    let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     let (handle, _join) = spawn_engine_thread(engine);
     let app = build_app(
         handle,
@@ -344,7 +345,7 @@ where
 }
 
 fn branches(repo: &Path) -> Vec<String> {
-    let out = std::process::Command::new("git")
+    let out = dux_core::test_git::fixture_git()
         .args(["for-each-ref", "--format=%(refname:short)", "refs/heads/"])
         .current_dir(repo)
         .output()

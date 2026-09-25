@@ -15,12 +15,21 @@
 //!   the whitespace that fits in the row it just ended.
 //! - A word too long to fit a row is hard-broken at the row edge.
 //! - Every span keeps its own style; a wrapped row can carry several.
+//! - A name chip (a span carrying the chip marker, see
+//!   [`crate::theme::is_name_chip`]) is one unbreakable unit, spaces inside it
+//!   and its two padding cells included, so a multi-word name moves to the next
+//!   row whole rather than splitting or losing a pad. This is the one rule
+//!   ratatui's own wrapper has no way to express. A chip is known by its marker
+//!   and never by its colors, which are two ordinary theme colors a caret or a
+//!   highlight may share.
 //!
 //! Not [`crate::diff::wrap_diff_lines`], which is diff-specific: it re-emits
 //! the line-number gutter on every continuation row and indents past it.
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+
+use crate::theme::is_name_chip;
 
 /// Display width of `s`, via ratatui's own unicode-width measurement, so the
 /// wrapper agrees with the renderer about how wide a CJK glyph or an emoji is.
@@ -48,6 +57,8 @@ pub(crate) fn char_display_width(c: char) -> usize {
 /// without `Wrap` puts exactly one on each row and `result.len()` is the
 /// rendered height. A `width` of 0 yields nothing, matching a `Paragraph`
 /// given no room.
+///
+/// Every span carrying the name chip's marker is kept whole.
 pub(crate) fn wrap_styled_lines(lines: &[Line<'_>], width: usize) -> Vec<Line<'static>> {
     if width == 0 {
         return Vec::new();
@@ -58,6 +69,16 @@ pub(crate) fn wrap_styled_lines(lines: &[Line<'_>], width: usize) -> Vec<Line<'s
     }
     out
 }
+
+/// Whether a row may break at `ch`. Whitespace does, except the no-break
+/// space, which glues its neighbours exactly as ratatui's own wrapper treats
+/// it.
+fn breaks_a_row(ch: char) -> bool {
+    ch.is_whitespace() && ch != NO_BREAK_SPACE
+}
+
+/// U+00A0, the space a row never breaks at.
+pub(crate) const NO_BREAK_SPACE: char = '\u{a0}';
 
 /// Append the wrapped rows of a single line.
 fn wrap_one(line: &Line<'_>, width: usize, out: &mut Vec<Line<'static>>) {
@@ -72,8 +93,11 @@ fn wrap_one(line: &Line<'_>, width: usize, out: &mut Vec<Line<'static>>) {
     let mut word: Vec<(char, Style)> = Vec::new();
     let mut word_width = 0usize;
     for span in &line.spans {
+        // A chip joins the word it touches, pads and inner spaces alike, so
+        // the only break points around it are the whitespace outside it.
+        let whole = is_name_chip(span.style);
         for ch in span.content.chars() {
-            if ch.is_whitespace() {
+            if !whole && breaks_a_row(ch) {
                 if !word.is_empty() {
                     wrapper.push_word(std::mem::take(&mut word), word_width);
                     word_width = 0;
@@ -433,6 +457,97 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A no-break space glues what is on either side of it, as it does in
+    /// ratatui's own wrapper.
+    #[test]
+    fn a_no_break_space_never_breaks_a_row() {
+        let chip = Style::default().bg(Color::Blue);
+        let line = Line::from(vec![
+            Span::raw("ask the agent "),
+            Span::styled("\u{a0}feat/login\u{a0}", chip),
+            Span::raw(" to stop"),
+        ]);
+        let wrapped = wrap_styled_lines(std::slice::from_ref(&line), 20);
+        assert_eq!(
+            texts(&wrapped),
+            vec!["ask the agent", "\u{a0}feat/login\u{a0} to stop"]
+        );
+
+        let mut ratatui_side = Terminal::new(TestBackend::new(20, 4)).expect("term");
+        ratatui_side
+            .draw(|frame| {
+                Paragraph::new(vec![line])
+                    .wrap(Wrap { trim: false })
+                    .render(frame.area(), frame.buffer_mut());
+            })
+            .expect("draw");
+        let buf = ratatui_side.backend().buffer().clone();
+        for (y, want) in texts(&wrapped).iter().enumerate() {
+            let got: String = (0..20).map(|x| buf[(x, y as u16)].symbol()).collect();
+            assert_eq!(got.trim_end(), want, "row {y} differs from ratatui's wrap");
+        }
+    }
+
+    /// A chip is one unit: a name with spaces inside it, padded by ordinary
+    /// spaces, moves to the next row whole and keeps both pads, instead of
+    /// breaking at a pad or between its words.
+    #[test]
+    fn a_chip_is_never_broken_inside_or_at_its_padding() {
+        let theme = crate::theme::Theme::default_dark();
+        let line = Line::from(vec![
+            Span::raw("ask the agent "),
+            Span::styled(" My Cool Project ", theme.name_style()),
+            Span::raw(" to stop"),
+        ]);
+        let wrapped = wrap_styled_lines(std::slice::from_ref(&line), 20);
+        assert_eq!(
+            texts(&wrapped),
+            vec!["ask the agent", " My Cool Project  to", "stop"]
+        );
+        assert_eq!(wrapped[1].spans[0].content, " My Cool Project ");
+        assert_eq!(wrapped[1].spans[0].style, theme.name_style());
+    }
+
+    /// The chip colors are two ordinary theme colors (the body's, swapped), and
+    /// a text-input caret is drawn in exactly that pair in themes whose caret
+    /// tokens resolve to them. Only the chip's marker makes a span a chip, so a
+    /// span that merely shares its colors wraps like any other text.
+    #[test]
+    fn a_span_in_the_chip_colors_without_the_marker_wraps_like_any_text() {
+        let theme = crate::theme::Theme::default_dark();
+        let look_alike = Style::default().fg(theme.overlay_bg).bg(theme.text_fg);
+        let line = Line::from(vec![
+            Span::raw("ask the agent "),
+            Span::styled(" My Cool Project ", look_alike),
+            Span::raw(" to stop"),
+        ]);
+        let wrapped = wrap_styled_lines(std::slice::from_ref(&line), 20);
+        assert_eq!(
+            texts(&wrapped),
+            vec!["ask the agent  My", "Cool Project  to", "stop"]
+        );
+    }
+
+    /// A chip a caller restyled (dimmed, recolored) is still a chip, and still
+    /// one unit.
+    #[test]
+    fn a_restyled_chip_is_still_kept_whole() {
+        let theme = crate::theme::Theme::default_dark();
+        let dimmed = theme
+            .name_style()
+            .patch(Style::default().fg(ratatui::style::Color::DarkGray));
+        let line = Line::from(vec![
+            Span::raw("ask the agent "),
+            Span::styled(" My Cool Project ", dimmed),
+            Span::raw(" to stop"),
+        ]);
+        let wrapped = wrap_styled_lines(std::slice::from_ref(&line), 20);
+        assert_eq!(
+            texts(&wrapped),
+            vec!["ask the agent", " My Cool Project  to", "stop"]
+        );
     }
 
     /// The one place this wrapper deliberately differs from `Wrap { trim: false

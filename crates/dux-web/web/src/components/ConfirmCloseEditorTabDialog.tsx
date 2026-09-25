@@ -6,6 +6,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
 import { closeEditorCloseTab, editorCloseTab, useDux } from "@/lib/store"
 import { rootKey } from "@/lib/editorRoot"
@@ -48,7 +49,7 @@ export function ConfirmCloseEditorTabDialog() {
           <DialogTitle>Discard unsaved changes?</DialogTitle>
         </DialogHeader>
         <p className="text-sm text-destructive">
-          Your edits to <span className="font-mono break-all">{path}</span> haven&rsquo;t
+          Your edits to <InlineCode>{path}</InlineCode> haven&rsquo;t
           been saved. They will be lost.
         </p>
         {/* Misclick-safe spacing between the warning and the buttons. */}

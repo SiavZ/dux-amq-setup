@@ -7,33 +7,95 @@ import {
   insideRepoCopy,
   noCommitsCopy,
 } from "./addProjectWarning"
+import { chip, quotedChip } from "./prose"
 
 describe("branchWarningCopy", () => {
   it("names the default branch and offers checkout for a known warning", () => {
     const copy = branchWarningCopy(
       { kind: "known", default_branch: "main" },
       "feature/x",
+      true,
     )
     expect(copy.message).toBe(
-      "This repository is on branch feature/x, but the remote default branch is main.",
+      "This repository is on branch feature/x, but the\nremote default branch is main.",
     )
-    expect(copy.worktreeNote).toBe('New worktrees will branch from "feature/x".')
     expect(copy.heuristicNote).toBeNull()
     expect(copy.canCheckoutDefault).toBe(true)
     expect(copy.defaultBranch).toBe("main")
   })
 
+  it("says worktrees branch from the default, calmly, while the checkout is ticked", () => {
+    const copy = branchWarningCopy(
+      { kind: "known", default_branch: "main" },
+      "feature/x",
+      true,
+    )
+    expect(copy.worktreeNote).toBe('New worktrees will branch from "main".')
+    expect(copy.worktreeTone).toBe("neutral")
+  })
+
+  it("warns that worktrees branch from the current branch once the checkout is unticked", () => {
+    const copy = branchWarningCopy(
+      { kind: "known", default_branch: "main" },
+      "feature/x",
+      false,
+    )
+    expect(copy.worktreeNote).toBe('New worktrees will branch from "feature/x".')
+    expect(copy.worktreeTone).toBe("warning")
+  })
+
   it("warns without offering checkout for a heuristic warning", () => {
-    const copy = branchWarningCopy({ kind: "heuristic" }, "dev")
+    // The box does not exist on this path, so a stale "ticked" changes nothing.
+    const copy = branchWarningCopy({ kind: "heuristic" }, "dev", true)
     expect(copy.message).toBe(
-      "This repository is on branch dev, which doesn't appear to be the main branch.",
+      "This repository is on branch dev,\nwhich doesn't appear to be the main branch.",
     )
     expect(copy.worktreeNote).toBe('New worktrees will branch from "dev".')
+    expect(copy.worktreeTone).toBe("warning")
     expect(copy.heuristicNote).toBe(
-      "Dux can't confidently identify this repo's default branch, so it won't change branches for you.",
+      "Dux can't confidently identify this repo's default\nbranch, so it won't change branches for you.",
     )
     expect(copy.canCheckoutDefault).toBe(false)
     expect(copy.defaultBranch).toBeNull()
+  })
+})
+
+// The web draws every name as a chip, so each sentence also comes as structure.
+// The branch warning's segments are also pinned against the terminal UI's by the
+// shared fixture in prose.test.tsx.
+describe("the add-project copy as names in prose", () => {
+  it("marks both branches in the known warning", () => {
+    const copy = branchWarningCopy(
+      { kind: "known", default_branch: "main" },
+      "feature/x",
+      false,
+    )
+    expect(copy.messageProse).toEqual([
+      "This repository is on branch ",
+      chip("feature/x"),
+      ", but the\nremote default branch is ",
+      chip("main"),
+      ".",
+    ])
+    expect(copy.worktreeNoteProse).toEqual([
+      "New worktrees will branch from ",
+      quotedChip("feature/x"),
+      ".",
+    ])
+  })
+
+  it("marks the branch in the heuristic warning", () => {
+    const copy = branchWarningCopy({ kind: "heuristic" }, "dev", true)
+    expect(copy.messageProse).toContainEqual(chip("dev"))
+  })
+
+  it("marks each seeded candidate and the enclosing root", () => {
+    const init = initRepoCopy(["node_modules", ".venv"])
+    expect(init.noteProse).toContainEqual(chip("node_modules"))
+    expect(init.noteProse).toContainEqual(chip(".venv"))
+
+    const inside = insideRepoCopy("/home/u/repo")
+    expect(inside.messageProse).toContainEqual(chip("/home/u/repo"))
   })
 })
 

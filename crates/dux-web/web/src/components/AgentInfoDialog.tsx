@@ -9,6 +9,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
 import { formatRegularCount } from "@/lib/formatRegularCount"
 import { formatDisplayDate } from "@/lib/projectInfo"
@@ -87,10 +88,16 @@ export function AgentInfoDialog() {
     const tabCount = session.tabs.length
     body = (
       <dl className="flex flex-col gap-3">
-        <InfoRow label="Name">{name}</InfoRow>
-        <InfoRow label="Provider">{session.provider}</InfoRow>
+        <InfoRow label="Name">
+          <InlineCode>{name}</InlineCode>
+        </InfoRow>
+        <InfoRow label="Provider">
+          <InlineCode>{session.provider}</InlineCode>
+        </InfoRow>
         {project?.name ? (
-          <InfoRow label="Project">{project.name}</InfoRow>
+          <InfoRow label="Project">
+            <InlineCode>{project.name}</InlineCode>
+          </InfoRow>
         ) : null}
         {/* The branch rows exist only for a managed agent. A standalone agent
             gets the one thing that is true of it instead: what it is and where
@@ -101,16 +108,12 @@ export function AgentInfoDialog() {
           managed: (workspace) => (
             <>
               <InfoRow label="Current branch">
-                <span className="font-mono break-all">
-                  {workspace.branch_name}
-                </span>
+                <InlineCode>{workspace.branch_name}</InlineCode>
               </InfoRow>
               <InfoRow label="Original branch">
                 {workspace.initial_branch ? (
                   <SimpleTooltip content="The branch this agent was created on (immutable).">
-                    <span className="font-mono break-all">
-                      {workspace.initial_branch}
-                    </span>
+                    <InlineCode>{workspace.initial_branch}</InlineCode>
                   </SimpleTooltip>
                 ) : (
                   <span className="text-muted-foreground">Unknown</span>
@@ -119,9 +122,7 @@ export function AgentInfoDialog() {
               <InfoRow label="Forked from">
                 {workspace.source_branch ? (
                   <SimpleTooltip content="The leading branch this agent was forked from at creation.">
-                    <span className="font-mono break-all">
-                      {workspace.source_branch}
-                    </span>
+                    <InlineCode>{workspace.source_branch}</InlineCode>
                   </SimpleTooltip>
                 ) : (
                   <span className="text-muted-foreground">Unknown</span>
@@ -138,9 +139,7 @@ export function AgentInfoDialog() {
                 </p>
               ) : null}
               <InfoRow label="Worktree">
-                <span className="font-mono break-all">
-                  {workspace.worktree_path}
-                </span>
+                <InlineCode>{workspace.worktree_path}</InlineCode>
               </InfoRow>
               <MissingDirectoryLine workspace={workspace} />
             </>
@@ -150,9 +149,7 @@ export function AgentInfoDialog() {
               <InfoRow label="Kind">Standalone agent</InfoRow>
               <InfoRow label="Folder">
                 <SimpleTooltip content="The folder you pointed this agent at. dux runs the provider here and never creates, moves or removes it.">
-                  <span className="font-mono break-all">
-                    {workspace.folder_label}
-                  </span>
+                  <InlineCode>{workspace.folder_label}</InlineCode>
                 </SimpleTooltip>
               </InfoRow>
               <MissingDirectoryLine workspace={workspace} />
@@ -173,7 +170,8 @@ export function AgentInfoDialog() {
           // Mirrors the TUI Agent Info's "Pull request:" line, including the
           // "manually attached" cue: this row is where a pin says it is one.
           <InfoRow label="Pull request">
-            #{session.pr.number} ({session.pr.state}) {session.pr.title}
+            <InlineCode>#{session.pr.number}</InlineCode> ({session.pr.state}){" "}
+            {session.pr.title}
             {session.pr.overridden ? (
               <span className="text-muted-foreground">
                 {" "}

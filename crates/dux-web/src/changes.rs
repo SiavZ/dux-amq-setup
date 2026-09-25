@@ -829,7 +829,7 @@ mod tests {
     }
 
     fn run_git(cwd: &std::path::Path, args: &[&str]) {
-        let ok = std::process::Command::new("git")
+        let ok = dux_core::test_git::fixture_git()
             .args(args)
             .current_dir(cwd)
             .status()
@@ -898,7 +898,7 @@ mod tests {
                 .create_session(&sample_session("s_err", wt_err.to_string_lossy().as_ref()))
                 .unwrap();
         }
-        let mut engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        let mut engine = crate::test_support::bootstrap_test_engine(&paths).unwrap();
         // The disk watchdog samples the host's real disk at boot and posts
         // its own warning, which the status-order assertions here would pick
         // up first. The guard is covered by dux_core::engine::limits.

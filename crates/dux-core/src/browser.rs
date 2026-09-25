@@ -72,6 +72,9 @@ fn spawn_detached(launcher: &str, url: &str) -> Result<()> {
 /// Separated from the watching policy above so a test can hold the child it
 /// started and prove what it was handed.
 fn spawn_launcher(launcher: &str, url: &str) -> Result<std::process::Child> {
+    // Test builds only: never hand an address to the developer's real browser.
+    #[cfg(any(test, feature = "test-support"))]
+    crate::test_provider::refuse_unlisted_launch("browser", launcher)?;
     Command::new(launcher)
         .arg(url)
         .stdin(Stdio::null())
@@ -118,6 +121,21 @@ mod tests {
         let script = dir.join("probe.sh");
         std::fs::write(&script, body).expect("write the probe script");
         script
+    }
+
+    /// The platform's URL launcher is refused in test builds, whichever surface
+    /// asked for it, and nothing is spawned.
+    #[test]
+    fn opening_an_address_is_refused_in_test_builds() {
+        let err = open_url("https://example.invalid/dux-test").unwrap_err();
+        assert!(err.to_string().starts_with("test guard:"), "{err}");
+        for launcher in ["xdg-open", "open", "gio", "firefox", "google-chrome"] {
+            let err = spawn_launcher(launcher, "https://example.invalid/").unwrap_err();
+            assert!(
+                err.to_string().starts_with("test guard:"),
+                "{launcher}: {err}"
+            );
+        }
     }
 
     #[test]

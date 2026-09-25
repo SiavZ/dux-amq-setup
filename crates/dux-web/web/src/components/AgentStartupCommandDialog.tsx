@@ -9,6 +9,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import { Textarea } from "@/components/ui/textarea"
 import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
 import {
@@ -44,10 +45,12 @@ function AgentStartupCommandForm({
   return (
     <DialogContent showCloseButton={false}>
       <DialogHeader>
-        <DialogTitle>Startup command: {agentName}</DialogTitle>
+        <DialogTitle>
+          Startup command: <InlineCode>{agentName}</InlineCode>
+        </DialogTitle>
         <DialogDescription>
           Runs after each agent or terminal launches in project{" "}
-          <span className="font-medium">{project.name}</span>. This applies to
+          <InlineCode>{project.name}</InlineCode>. This applies to
           every agent in the project, not just this one. Leave empty to clear it.
         </DialogDescription>
       </DialogHeader>

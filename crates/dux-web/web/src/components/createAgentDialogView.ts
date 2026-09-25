@@ -1,5 +1,6 @@
 import { isValidAgentName } from "@/lib/agentName"
 import { sessionLabel } from "@/lib/agentWorkspace"
+import { chip, type Prose } from "@/lib/prose"
 import type { CreateAgentTarget, DuxState } from "@/lib/store"
 
 export type CreateAgentDialogKind = CreateAgentTarget["kind"] | "closed"
@@ -7,7 +8,8 @@ export type CreateAgentDialogKind = CreateAgentTarget["kind"] | "closed"
 export interface CreateAgentDialogView {
   open: boolean
   kind: CreateAgentDialogKind
-  title: string
+  // The project or agent it names is a chip; a generic fallback noun is prose.
+  title: Prose
   description: string
   namePlaceholder: string
   nameAutoFocus: boolean
@@ -37,7 +39,7 @@ function closedDialogView(): CreateAgentDialogView {
   return {
     open: false,
     kind: "closed",
-    title: "New agent",
+    title: ["New agent"],
     description: "",
     namePlaceholder: "Branch name (optional)",
     nameAutoFocus: true,
@@ -53,11 +55,10 @@ function newDialogView(
   target: Extract<CreateAgentTarget, { kind: "new" }>,
   spine: DuxState["spine"],
 ): CreateAgentDialogView {
-  const projectName = findProjectName(spine, target.projectId)
   return {
     open: true,
     kind: "new",
-    title: `New agent in ${projectName}`,
+    title: ["New agent in ", ...projectNamed(spine, target.projectId)],
     description:
       "Creates a git worktree + branch and launches the agent. Tick “Use randomized pet name” to autofill a generated name.",
     namePlaceholder: "Branch name (optional)",
@@ -75,11 +76,10 @@ function forkDialogView(
   spine: DuxState["spine"],
 ): CreateAgentDialogView {
   const session = spine?.sessions.find((item) => item.id === target.sessionId)
-  const sourceLabel = session ? sessionLabel(session) : "agent"
   return {
     open: true,
     kind: "fork",
-    title: `Fork ${sourceLabel}`,
+    title: ["Fork ", session ? chip(sessionLabel(session)) : "agent"],
     description:
       "Forks the agent into a new git worktree + branch (copying its uncommitted and untracked files) and launches a fresh session.",
     namePlaceholder: "Branch name",
@@ -97,11 +97,13 @@ function prDialogView(
   spine: DuxState["spine"],
 ): CreateAgentDialogView {
   if (target.projectId === null) return referenceFirstPrDialogView()
-  const projectName = findProjectName(spine, target.projectId)
   return {
     open: true,
     kind: "pr",
-    title: `New agent from PR in ${projectName}`,
+    title: [
+      "New agent from PR in ",
+      ...projectNamed(spine, target.projectId),
+    ],
     description:
       "Fetches the PR's head branch into a new git worktree and launches the agent. Paste a PR URL or enter a PR number. Leave the name blank to use the PR's branch name.",
     namePlaceholder: "Branch name (optional)",
@@ -118,7 +120,7 @@ function referenceFirstPrDialogView(): CreateAgentDialogView {
   return {
     open: true,
     kind: "pr",
-    title: "New agent from PR",
+    title: ["New agent from PR"],
     description:
       "Paste a pull request link, or type owner/repo#123. dux finds the project that repository is open in, fetches the PR's head branch into a new git worktree and launches the agent. Leave the name blank to use the PR's branch name.",
     namePlaceholder: "Branch name (optional)",
@@ -131,11 +133,9 @@ function referenceFirstPrDialogView(): CreateAgentDialogView {
   }
 }
 
-function findProjectName(spine: DuxState["spine"], projectId: string): string {
-  return (
-    spine?.projects.find((project) => project.id === projectId)?.name ??
-    "project"
-  )
+function projectNamed(spine: DuxState["spine"], projectId: string): Prose {
+  const name = spine?.projects.find((project) => project.id === projectId)?.name
+  return name !== undefined ? [chip(name)] : ["project"]
 }
 
 export function createAgentFormView(

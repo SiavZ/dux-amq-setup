@@ -108,10 +108,6 @@ impl NonDefaultBranchAction {
             Self::CheckoutProjectDefault { project } => &project.path,
         }
     }
-
-    pub fn allows_add_anyway(&self) -> bool {
-        matches!(self, Self::AddProject { .. })
-    }
 }
 
 /// Payload for the "create an empty initial commit, then register the project"
@@ -234,7 +230,7 @@ pub struct BrowserEntry {
 #[derive(Clone, Debug)]
 pub enum AgentLaunchKind {
     Create {
-        status_message: String,
+        status_message: crate::status_text::StatusText,
         repo_path: String,
         owns_worktree: bool,
         startup_result: Option<crate::startup::StartupCommandResult>,
@@ -245,13 +241,13 @@ pub enum AgentLaunchKind {
         status_op_id: String,
     },
     Reconnect {
-        status_message: String,
+        status_message: crate::status_text::StatusText,
     },
     ForceReconnect {
-        status_message: String,
+        status_message: crate::status_text::StatusText,
     },
     ResumeFallback {
-        status_message: String,
+        status_message: crate::status_text::StatusText,
     },
     StartupAutoReopen,
     /// An extra-tab launch. Whether it resumes is decided dynamically, per
@@ -262,7 +258,7 @@ pub enum AgentLaunchKind {
     /// extra tab (whose row is kept and whose real error is surfaced).
     Tab {
         is_fresh: bool,
-        status_message: String,
+        status_message: crate::status_text::StatusText,
     },
 }
 
@@ -455,11 +451,11 @@ pub enum WorkerEvent {
     /// progress update render as one in-place toast that the final state dismisses.
     CreateAgentProgress {
         status_op_id: String,
-        message: String,
+        message: crate::status_text::StatusText,
     },
     CreateAgentFailed {
         status_op_id: String,
-        message: String,
+        message: crate::status_text::StatusText,
     },
     AgentLaunchReady(Box<AgentLaunchReadyData>),
     AgentLaunchFailed(Box<AgentLaunchFailedData>),
@@ -838,7 +834,7 @@ pub struct PrSyncEntry {
 pub enum ProjectPersistenceAction {
     Add {
         project: Project,
-        status_message: String,
+        status_message: crate::status_text::StatusText,
     },
     Remove {
         project_id: String,

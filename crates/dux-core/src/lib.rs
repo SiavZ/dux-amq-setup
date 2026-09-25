@@ -6,12 +6,14 @@
 pub mod action;
 pub mod activity;
 pub mod add_project_plan;
+pub mod add_project_prose;
 pub mod agent_env;
 pub mod agent_job;
 pub mod agent_search;
 pub mod agent_tabs;
 pub mod attention;
 pub mod background_serve;
+pub mod bidi;
 pub mod bounded_command;
 pub mod browser;
 pub mod changes_status;
@@ -46,6 +48,8 @@ pub mod poller_status;
 pub mod pr_reference;
 pub mod project_browser;
 pub mod project_order;
+pub mod project_prose;
+pub mod prose;
 pub mod provider;
 pub mod pty;
 pub mod pty_adopt_child;
@@ -66,14 +70,22 @@ pub mod row_state;
 pub mod sanitize;
 pub mod scroll_hint;
 pub mod scroll_margins;
+pub mod shell_quote;
 pub mod sidebar;
 pub mod startup;
+pub mod status_text;
 pub mod statusline;
 pub mod storage;
 pub mod tab_verdict;
 pub mod tailscale;
 pub mod term_identity;
 pub mod terminal_title;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_git;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_provider;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_scratch;
 pub mod text;
 pub mod theme;
 pub mod urls;

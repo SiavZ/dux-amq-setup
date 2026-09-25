@@ -413,7 +413,7 @@ impl Action {
             }
             Action::RefreshProject => "Git pull the selected project checkout.",
             Action::CheckoutProjectDefaultBranch => {
-                "Check out the default branch for the selected project."
+                "Check out the default branch for the selected project, and branch new worktrees from it."
             }
             Action::ReconnectAgent => "Restart the CLI for the selected agent.",
             Action::DeleteSession => "Delete the selected session and worktree.",

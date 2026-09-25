@@ -8,10 +8,23 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use axum::Router;
-use tempfile::TempDir;
+use dux_core::test_scratch::ScratchDir;
 
 use crate::engine_actor::EngineHandle;
 use crate::server;
+
+/// [`crate::bootstrap::bootstrap_engine`] for tests: the same boot, with every
+/// provider pointed at a harmless stand-in under its stock name and terminals at
+/// a plain `sh`, so no test that creates or launches an agent can exec the
+/// developer's real agent CLI, and none depends on the developer's `$SHELL`. Every
+/// test in this crate boots through here rather than the production function.
+pub(crate) fn bootstrap_test_engine(
+    paths: &dux_core::config::DuxPaths,
+) -> anyhow::Result<dux_core::engine::Engine> {
+    let mut engine = crate::bootstrap::bootstrap_engine(paths)?;
+    dux_core::test_provider::defuse_config(&mut engine.config);
+    Ok(engine)
+}
 
 /// Boot a minimal headless engine handle rooted at `tmp`. The handle just needs
 /// to exist; routing-only tests never drive a real agent through it.
@@ -24,26 +37,26 @@ pub(crate) fn test_engine_handle(tmp: &Path) -> EngineHandle {
         lock_path: tmp.join("dux.lock"),
     };
     std::fs::create_dir_all(&paths.worktrees_root).unwrap();
-    let engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+    let engine = crate::test_support::bootstrap_test_engine(&paths).unwrap();
     let (handle, _join) = crate::engine_actor::spawn_engine_thread(engine);
     handle
 }
 
-/// A fresh temp dir + an engine-backed router. Returns the `TempDir` so the
+/// A fresh scratch dir + an engine-backed router. Returns the `ScratchDir` so the
 /// caller keeps it alive for the test's duration.
-pub(crate) fn router_no_auth() -> (TempDir, Router) {
-    let tmp = tempfile::tempdir().unwrap();
+pub(crate) fn router_no_auth() -> (ScratchDir, Router) {
+    let tmp = ScratchDir::new();
     let router = server::router(test_engine_handle(tmp.path()));
     (tmp, router)
 }
 
 /// Bind a real loopback server on an ephemeral port and serve the plain router on
 /// a background task. Returns the bound `SocketAddr` so an integration test can
-/// issue real HTTP/WebSocket requests against it. The `TempDir` is kept alive by
+/// issue real HTTP/WebSocket requests against it. The `ScratchDir` is kept alive by
 /// the returned guard; drop it to clean up the engine's on-disk state.
 #[allow(dead_code)]
-pub(crate) async fn boot_plain_test_server() -> (TempDir, SocketAddr) {
-    let tmp = tempfile::tempdir().unwrap();
+pub(crate) async fn boot_plain_test_server() -> (ScratchDir, SocketAddr) {
+    let tmp = ScratchDir::new();
     let app = server::router(test_engine_handle(tmp.path()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -55,4 +68,22 @@ pub(crate) async fn boot_plain_test_server() -> (TempDir, SocketAddr) {
         .await;
     });
     (tmp, addr)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_test_boot_cannot_launch_a_real_agent_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = dux_core::config::DuxPaths {
+            root: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            sessions_db_path: tmp.path().join("sessions.sqlite3"),
+            worktrees_root: tmp.path().join("worktrees"),
+            lock_path: tmp.path().join("dux.lock"),
+        };
+        std::fs::create_dir_all(&paths.worktrees_root).unwrap();
+        let engine = super::bootstrap_test_engine(&paths).unwrap();
+        dux_core::test_provider::assert_fixture_config_is_harmless(&engine.config);
+    }
 }

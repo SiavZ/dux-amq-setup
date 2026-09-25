@@ -9,6 +9,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import { Input } from "@/components/ui/input"
 import { validateEntryName } from "@/lib/fileTreeOps"
 
@@ -89,7 +90,9 @@ function RenameEntryDialogBody({
   return (
     <>
       <DialogHeader>
-        <DialogTitle>Rename {finalSegment(target.path)}</DialogTitle>
+        <DialogTitle>
+          Rename <InlineCode>{finalSegment(target.path)}</InlineCode>
+        </DialogTitle>
       </DialogHeader>
       <Input
         value={name}

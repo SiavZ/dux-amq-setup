@@ -6,6 +6,7 @@ vi.mock("sonner", () => ({ toast: { info: vi.fn() } }))
 import { toast } from "sonner"
 
 import { applyAttentionFavicon, applyFavicon } from "./favicon"
+import { toastText } from "@/test/toastText"
 
 const toastInfo = vi.mocked(toast.info)
 
@@ -94,7 +95,7 @@ describe("applyFavicon legacy migration notice", () => {
 
   it("points the toast at the Preferences dialog, not the removed command palette", () => {
     applyFavicon("#863bff")
-    const message = toastInfo.mock.calls[0][0] as string
+    const message = toastText(toastInfo.mock.calls[0][0])
     expect(message).toContain("Preferences dialog")
     expect(message).toContain("cog menu")
     expect(message).not.toMatch(/command palette/i)

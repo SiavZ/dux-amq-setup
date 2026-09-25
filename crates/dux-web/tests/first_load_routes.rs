@@ -93,7 +93,7 @@ impl FakeGithub {
 struct Server {
     addr: SocketAddr,
     paths: DuxPaths,
-    _tmp: tempfile::TempDir,
+    _tmp: dux_core::test_scratch::ScratchDir,
 }
 
 impl Server {
@@ -124,7 +124,7 @@ async fn boot_with(
     api_base: &str,
     tune: impl FnOnce(RouterParams) -> RouterParams,
 ) -> Server {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
     let paths = DuxPaths {
         root: root.clone(),
@@ -142,7 +142,8 @@ async fn boot_with(
         store.set_last_seen_version(version).unwrap();
     }
 
-    let engine = bootstrap_engine(&paths).unwrap();
+    let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     let (handle, _join) = spawn_engine_thread(engine);
     let app = build_app(
         handle,

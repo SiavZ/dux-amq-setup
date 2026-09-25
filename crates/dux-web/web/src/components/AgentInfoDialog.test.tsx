@@ -96,6 +96,12 @@ function renderDialogOpenFor(
   render(<AgentInfoDialog />)
 }
 
+// The pull request row's value, read whole: its number is a chip, so the row's
+// sentence spans more than one element.
+function prRow(): HTMLElement {
+  return screen.getByText("Pull request").nextElementSibling as HTMLElement
+}
+
 beforeEach(() => {
   installBootStubs()
   closeAgentInfoSpy.mockClear()
@@ -107,6 +113,34 @@ afterEach(() => {
 })
 
 describe("AgentInfoDialog", () => {
+  // Every value that is a name is the shared chip, so the panel reads the same
+  // as every other dialog that names things.
+  it("draws every name it shows as the shared chip", () => {
+    renderDialogOpenFor({
+      title: "fix-auth",
+      workspace: {
+        kind: "managed",
+        branch_name: "feat/login",
+        initial_branch: "feat/login",
+        branch_provenance: "created",
+        source_branch: "main",
+      },
+      pr: {
+        number: 42,
+        state: "open",
+        title: "Fix the login",
+        url: "https://example.invalid/pr/42",
+        overridden: false,
+      },
+    } as never)
+    const chips = [...document.querySelectorAll("code")].map(
+      (c) => c.textContent,
+    )
+    for (const name of ["fix-auth", "claude", "Repo", "feat/login", "main", "/tmp/s1", "#42"]) {
+      expect(chips).toContain(name)
+    }
+  })
+
   it("shows current, original, and fork branches and flags drift", () => {
     renderDialogOpenFor({
       title: "server-mode",
@@ -192,7 +226,7 @@ describe("AgentInfoDialog", () => {
         overridden: true,
       },
     })
-    expect(screen.getByText(/#12 \(open\) Fix the frobnicator/)).toBeTruthy()
+    expect(prRow().textContent).toMatch(/#12 \(open\) Fix the frobnicator/)
     expect(screen.getByText(/manually attached/)).toBeTruthy()
   })
 
@@ -214,7 +248,7 @@ describe("AgentInfoDialog", () => {
         overridden: false,
       },
     })
-    expect(screen.getByText(/#12 \(merged\) Fix the frobnicator/)).toBeTruthy()
+    expect(prRow().textContent).toMatch(/#12 \(merged\) Fix the frobnicator/)
     expect(screen.queryByText(/manually attached/)).toBeNull()
   })
 

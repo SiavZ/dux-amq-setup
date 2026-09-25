@@ -120,7 +120,8 @@ describe("WorktreesDialog", () => {
     // action on a row rather than the purpose of a separate dialog.
     seed([entry()])
     render(<WorktreesDialog />)
-    expect(screen.getByText("Worktrees in acme")).toBeTruthy()
+    expect(screen.getByRole("heading").textContent).toBe("Worktrees in acme")
+    expect(screen.getByText("acme", { selector: "code" })).toBeTruthy()
     expect(screen.getByRole("button", { name: "Create agent" })).toBeTruthy()
   })
 
@@ -161,7 +162,9 @@ describe("WorktreesDialog", () => {
     render(<WorktreesDialog />)
     expect(screen.getAllByRole("button", { name: "Worktree actions" }).length).toBe(1)
     // And the attached row names the agent holding it.
-    expect(screen.getByText(/tidy-otter/)).toBeTruthy()
+    // The agent after the "Held by" label is a name, so it is the shared chip.
+    const held = screen.getByText("tidy-otter", { selector: "code" })
+    expect(held.parentElement?.textContent).toBe("Held by tidy-otter")
   })
 
   it("names the branch, the full path and the loss in the delete confirmation", () => {
@@ -209,6 +212,9 @@ describe("WorktreesDialog", () => {
         hidden: true,
       }),
     ).toBeInstanceOf(HTMLElement)
+    expect(
+      screen.getAllByText("messy", { selector: "code" }).length,
+    ).toBeGreaterThan(0)
     const confirm = screen.getByTestId("delete-worktree-confirm")
     expect(confirm.textContent).toContain(
       "will be removed from disk. This action cannot be undone: dux has no trash and removes the directory forcibly.",

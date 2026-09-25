@@ -12,7 +12,7 @@ use crate::app::{
     MouseLayoutState, OverlayMouseLayoutState, PromptState, RedrawGate, RightSection, TextInput,
 };
 use crate::clipboard::Clipboard;
-use crate::config::{Config, DuxPaths, ProjectConfig};
+use crate::config::{DuxPaths, ProjectConfig};
 use crate::keybindings::{BINDING_DEFS, RuntimeBindings};
 use crate::model::{AgentSession, Project, ProjectBranchStatus, ProviderKind, SessionStatus};
 use crate::statusline::KeyedStatusController;
@@ -39,7 +39,12 @@ pub(crate) fn default_bindings() -> RuntimeBindings {
 }
 
 pub(crate) fn run_git(cwd: &std::path::Path, args: &[&str]) {
-    let output = Command::new("git")
+    run_git_output(cwd, args);
+}
+
+/// [`run_git`], returning the command's trimmed stdout.
+pub(crate) fn run_git_output(cwd: &std::path::Path, args: &[&str]) -> String {
+    let output = dux_core::test_git::fixture_git()
         .args(args)
         .current_dir(cwd)
         .output()
@@ -50,6 +55,7 @@ pub(crate) fn run_git(cwd: &std::path::Path, args: &[&str]) {
         args,
         String::from_utf8_lossy(&output.stderr)
     );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 pub(crate) fn init_test_repo(path: &std::path::Path) {
@@ -62,7 +68,6 @@ pub(crate) fn init_test_repo(path: &std::path::Path) {
 pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
     let tmp = tempdir().expect("tempdir");
     let root = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
     init_test_repo(&root);
 
     let paths = DuxPaths {
@@ -138,9 +143,12 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
     let engine = dux_core::engine::Engine {
         // An existing install (no `[workspace]` section), so the harness keeps
         // upstream's worktree create flow. Shared-mode tests opt in explicitly.
-        config: Config {
-            workspace: None,
-            ..Config::default()
+        // Harmless provider commands, so no test in this crate execs the
+        // developer's real agent CLI.
+        config: {
+            let mut config = dux_core::test_provider::harmless_config();
+            config.workspace = None;
+            config
         },
         paths,
         session_store,
@@ -363,7 +371,7 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
         background_server_preflight_pending: false,
         background_server_wanted: false,
         companion_followup_ran: false,
-        pending_background_server_op: None,
+        pending_background_server_start: None,
         pending_tailscale_mode_op: None,
         server_flip_preflight_pending: false,
         pending_persist_ops: std::collections::HashMap::new(),
@@ -380,6 +388,7 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
         pending_config_reload_op: None,
         project_chooser_context: None,
         agent_filter: None,
+        test_scratch_dirs: tmp.into(),
     };
     app.interactive_patterns = app.bindings.interactive_byte_patterns();
     app.rebuild_left_items();
@@ -587,4 +596,90 @@ pub(crate) fn bindable_secondary_loopbacks() -> Vec<std::net::IpAddr> {
         }
     }
     found
+}
+
+/// A test app's scratch root must go when the app does. Every test in this
+/// crate builds one, so a helper that keeps the directory past the app fills the
+/// temp directory one repository at a time (a RAM-backed `/tmp` runs out of
+/// inodes long before it runs out of bytes).
+#[test]
+fn test_app_removes_its_scratch_root_when_dropped() {
+    let app = test_app(default_bindings());
+    let root = app.engine.paths.root.clone();
+    assert!(root.join(".git").exists(), "the fixture repository exists");
+    drop(app);
+    assert!(
+        !root.exists(),
+        "the scratch root {} outlived the app",
+        root.display()
+    );
+}
+
+/// Every test in this crate builds its engine here, so a stock provider table
+/// in the fixture would let any launching test exec the developer's real agent
+/// CLI.
+#[test]
+fn test_app_cannot_launch_a_real_agent_cli() {
+    let app = test_app(default_bindings());
+    dux_core::test_provider::assert_fixture_config_is_harmless(&app.engine.config);
+}
+
+/// Opening a worktree "in an editor" from this crate's tests resolves to the
+/// stand-in and opens nothing, and a real editor command is refused rather
+/// than launched on the developer's desktop.
+#[test]
+fn test_app_opens_worktrees_only_in_the_stand_in_editor() {
+    let mut app = test_app(default_bindings());
+    let worktree = tempfile::tempdir().unwrap();
+    let path = worktree.path().to_string_lossy().into_owned();
+    let editors = crate::editor::detect_installed_editors();
+    let editor = crate::editor::preferred_editor(&editors, &app.engine.config.editor.default)
+        .expect("the fixture always has a stand-in editor");
+    assert_eq!(
+        editor.command,
+        dux_core::test_provider::HARMLESS_EDITOR_COMMAND
+    );
+    app.open_worktree_in_editor(&path, "agent", &editor)
+        .expect("the stand-in launches");
+
+    let mut real = editor.clone();
+    real.command = "code".to_string();
+    let err = app
+        .open_worktree_in_editor(&path, "agent", &real)
+        .unwrap_err();
+    assert!(err.to_string().starts_with("test guard:"), "{err}");
+}
+
+/// The repository every test app is built on never signs a commit, even for a
+/// developer whose global config signs everything: the app's own git commands
+/// inherit that global config, so the answer has to live in the repository.
+#[test]
+fn the_shared_fixture_repository_never_signs_under_a_signing_global_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let global = dir.path().join("global-gitconfig");
+    std::fs::write(
+        &global,
+        "[commit]\n\tgpgsign = true\n[tag]\n\tgpgsign = true\n",
+    )
+    .expect("write the simulated global config");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    init_test_repo(&repo);
+    for key in ["commit.gpgsign", "tag.gpgsign"] {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["config", "--get", key])
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .output()
+            .expect("run git config");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "false",
+            "{key} in the shared fixture repository"
+        );
+    }
 }

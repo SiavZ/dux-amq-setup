@@ -41,6 +41,8 @@ use crate::engine::{
 };
 use crate::ids::{SessionIdRef, TabId, TabIdRef};
 use crate::model::{Project, ProjectBranchStatus, ProviderKind};
+use crate::prose::ProseSegment;
+use crate::status_text::StatusText;
 use crate::statusline::{QuietSurfaces, StatusScope};
 use crate::worker::{
     CreateAgentRequest, NonDefaultBranchAction, ProjectPersistenceAction, PullTarget,
@@ -914,6 +916,12 @@ pub struct WireStatus {
     /// "info" | "busy" | "warning" | "error"
     pub tone: String,
     pub message: String,
+    /// The parts `message` was built from, in the browser's `Prose` shape
+    /// (words as strings, names as `{ name, quoted }`), so a toast draws each
+    /// name as a chip. Absent for a plain sentence, and an older peer that never
+    /// sends it reads as plain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segments: Option<Vec<ProseSegment>>,
     /// `None` = an unkeyed transient (anonymous slot). `Some` = a keyed op whose
     /// later success/error/clear carries the same key so the surfaces correlate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -995,11 +1003,17 @@ fn quiet_web_when(status: WireStatus, quiet: bool) -> WireStatus {
 
 impl WireStatus {
     /// Construct a wire status directly (for non-reaction sources like PTY-exit notices).
-    pub fn new(tone: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn new(tone: impl Into<String>, message: impl Into<StatusText>) -> Self {
+        let (message, segments) = message.into().into_parts();
         Self {
             tone: tone.into(),
             // Sanitized like the TUI's status controller (fork 2d9423ae).
-            message: crate::sanitize::for_terminal(&message.into()),
+            // The structured halves stay in agreement with the sanitized
+            // message, exactly as in `StatusLine::set_scoped`.
+            segments: segments.map(|segments| {
+                crate::sanitize::prose_segments(segments, &crate::sanitize::for_terminal(&message))
+            }),
+            message: crate::sanitize::for_terminal(&message),
             key: None,
             scope: StatusScope::All,
             sticky: false,
@@ -1011,11 +1025,15 @@ impl WireStatus {
     pub fn keyed(
         key: impl Into<String>,
         tone: impl Into<String>,
-        message: impl Into<String>,
+        message: impl Into<StatusText>,
     ) -> Self {
+        let (message, segments) = message.into().into_parts();
         Self {
             tone: tone.into(),
-            message: crate::sanitize::for_terminal(&message.into()),
+            segments: segments.map(|segments| {
+                crate::sanitize::prose_segments(segments, &crate::sanitize::for_terminal(&message))
+            }),
+            message: crate::sanitize::for_terminal(&message),
             key: Some(key.into()),
             scope: StatusScope::All,
             sticky: false,
@@ -1059,6 +1077,12 @@ impl WireStatus {
         Self {
             tone: update.tone.as_wire().to_string(),
             message: crate::sanitize::for_terminal(&update.message),
+            segments: update.segments.clone().map(|segments| {
+                crate::sanitize::prose_segments(
+                    segments,
+                    &crate::sanitize::for_terminal(&update.message),
+                )
+            }),
             key: update.key.clone(),
             scope: update.scope.clone(),
             sticky: update.sticky,
@@ -1178,7 +1202,7 @@ struct WebProjectAdd<'a> {
     display_name: String,
     current_branch: &'a str,
     leading_branch: &'a str,
-    status_message: String,
+    status_message: StatusText,
     /// Prefix for the "git succeeded but registration failed" error message.
     add_failed_prefix: &'a str,
     status_op_id: &'a Option<String>,
@@ -1187,7 +1211,7 @@ struct WebProjectAdd<'a> {
 /// The authoritative "added" status message from a `PersistProject::Add`
 /// reaction (the engine's real outcome: an honest dedup message when a race
 /// hit that path, or the normal success text), or `None` for any other reaction.
-fn added_status_message(reaction: &EventReaction) -> Option<String> {
+fn added_status_message(reaction: &EventReaction) -> Option<StatusText> {
     if let EventReaction::ProjectPersistenceOutcome(outcome) = reaction
         && let ProjectPersistenceView::Added { status_message, .. } = &outcome.view
     {
@@ -1309,21 +1333,21 @@ impl DeleteReportFacts {
     /// How every delete report opens: what went, with the facts that tell one
     /// agent from another. Either half is dropped when it is not known rather
     /// than printed as a gap.
-    fn agent_phrase(&self) -> String {
-        let agent = format!("Deleted {}", self.agent_noun());
+    fn agent_phrase(&self) -> StatusText {
+        let agent = crate::status_text!["Deleted ", self.agent_noun()];
         match &self.project_name {
-            Some(project) => format!("{agent} from project \"{project}\""),
+            Some(project) => crate::status_text![agent, " from project ", q(project)],
             None => agent,
         }
     }
 
     /// Which agent this is, in the words both surfaces use for it. The provider
     /// is dropped when the record could not be read rather than left as a gap.
-    fn agent_noun(&self) -> String {
+    fn agent_noun(&self) -> StatusText {
         if self.provider.is_empty() {
-            format!("agent \"{}\"", self.label)
+            crate::status_text!["agent ", q(self.label)]
         } else {
-            format!("{} agent \"{}\"", self.provider, self.label)
+            crate::status_text![n(self.provider), " agent ", q(self.label)]
         }
     }
 }
@@ -1336,7 +1360,7 @@ impl DeleteReportFacts {
 pub fn delete_session_status_message(
     facts: &DeleteReportFacts,
     removal: &WorktreeRemoval,
-) -> String {
+) -> StatusText {
     let opening = facts.agent_phrase();
     let branch = facts.branch_name.as_str();
     match removal {
@@ -1345,11 +1369,13 @@ pub fn delete_session_status_message(
         // because "Deleted agent X." on its own reads as though something on
         // disk went with it.
         WorktreeRemoval::NothingToRemove { folder_label } => {
-            format!(
-                "{opening}. Its folder \"{folder_label}\" was left untouched: dux never \
-                 creates, moves or removes a standalone agent's folder. Anything the agent \
-                 wrote there is still there."
-            )
+            crate::status_text![
+                opening,
+                ". Its folder ",
+                q(folder_label),
+                " was left untouched: dux never creates, moves or removes a standalone agent's \
+                 folder. Anything the agent wrote there is still there."
+            ]
         }
         // The worktree went and the branches stayed, because they were not dux's
         // to delete. The wording names every kept branch with its own reason and
@@ -1358,56 +1384,70 @@ pub fn delete_session_status_message(
         WorktreeRemoval::Performed {
             branches: crate::engine::RemovedBranches::Kept(reason),
         } => {
-            format!(
-                "{opening} and removed its worktree. {}",
+            crate::status_text![
+                opening,
+                " and removed its worktree. ",
                 reason.kept_branches_note(branch, &facts.initial_branch)
-            )
+            ]
         }
         WorktreeRemoval::Performed {
             branches: crate::engine::RemovedBranches::Deleted(branches),
         } => {
             let mut message = match &branches.branch {
-                crate::git::BranchDeletion::Deleted => {
-                    format!("{opening}, removed its worktree and deleted its branch \"{branch}\".")
-                }
-                crate::git::BranchDeletion::AlreadyGone => format!(
-                    "{opening} and removed its worktree. Its branch \"{branch}\" was already gone."
-                ),
+                crate::git::BranchDeletion::Deleted => crate::status_text![
+                    opening,
+                    ", removed its worktree and deleted its branch ",
+                    q(branch),
+                    "."
+                ],
+                crate::git::BranchDeletion::AlreadyGone => crate::status_text![
+                    opening,
+                    " and removed its worktree. Its branch ",
+                    q(branch),
+                    " was already gone."
+                ],
                 // A branch git REFUSED to delete is still there, so the line
                 // must not claim otherwise: it names the branch, gives git's
                 // reason, and says what the user can do about it.
-                crate::git::BranchDeletion::Refused { reason } => format!(
-                    "{opening} and removed its worktree, but its branch \"{branch}\" is still \
-                     there. {}",
+                crate::git::BranchDeletion::Refused { reason } => crate::status_text![
+                    opening,
+                    " and removed its worktree, but its branch ",
+                    q(branch),
+                    " is still there. ",
                     crate::git::branch_refusal_note(branch, reason)
-                ),
+                ],
             };
             // Said only when the agent DRIFTED off the branch it was born on,
             // so the ordinary case still reads as one branch and the drifted
             // case never leaves the user guessing what became of the other.
             if let Some(note) = branches.initial_branch_note(&facts.initial_branch) {
-                message.push(' ');
-                message.push_str(&note);
+                message.push(" ");
+                message.push(note);
             }
             message
         }
         WorktreeRemoval::PreservedShared => {
-            format!("{opening}. Its worktree was kept because other agents share it.")
+            crate::status_text![
+                opening,
+                ". Its worktree was kept because other agents share it."
+            ]
         }
         WorktreeRemoval::SkippedForSiblings => {
-            format!(
-                "{opening}. Its worktree was kept even though you asked for it to go, because \
-                 other agents still use it."
-            )
+            crate::status_text![
+                opening,
+                ". Its worktree was kept even though you asked for it to go, because other \
+                 agents still use it."
+            ]
         }
         // The user did not ask for the worktree to go, so it is still on disk and
         // the line says where: no dux surface can reach it once the agent is gone.
         WorktreeRemoval::PreservedOrphan => {
-            format!(
-                "{opening}. Its worktree was left on disk at \"{}\"; remove it yourself if you \
-                 no longer need it.",
-                facts.directory
-            )
+            crate::status_text![
+                opening,
+                ". Its worktree was left on disk at ",
+                q(facts.directory),
+                "; remove it yourself if you no longer need it."
+            ]
         }
     }
 }
@@ -1418,12 +1458,17 @@ pub fn delete_session_status_message(
 /// both surfaces. It names the agent whenever the facts are known, because the
 /// row is already gone from the browser by then and a worktree is still on disk;
 /// with nothing to name it falls back to the bare line.
-pub fn delete_session_failure_message(facts: Option<&DeleteReportFacts>, error: &str) -> String {
+pub fn delete_session_failure_message(
+    facts: Option<&DeleteReportFacts>,
+    error: &str,
+) -> StatusText {
     match facts {
-        Some(facts) if !facts.label.is_empty() => {
-            format!("Worktree delete failed for {}: {error}", facts.agent_noun())
-        }
-        _ => format!("Worktree delete failed: {error}"),
+        Some(facts) if !facts.label.is_empty() => crate::status_text![
+            "Worktree delete failed for ",
+            facts.agent_noun(),
+            format!(": {error}")
+        ],
+        _ => format!("Worktree delete failed: {error}").into(),
     }
 }
 
@@ -2158,22 +2203,30 @@ impl Engine {
         if !VALID.contains(&sort) {
             return WireStatus::new(
                 "error",
-                format!(
-                    "Unknown agent sort \"{sort}\". Expected one of: {}.",
-                    VALID.join(", ")
-                ),
+                crate::status_text![
+                    "Unknown agent sort ",
+                    q(sort),
+                    format!(". Expected one of: {}.", VALID.join(", "))
+                ],
             );
         }
         if self.config.ui.agent_sort == sort {
             // Loud: nothing reorders, because the list is already in the order
             // that was asked for, and only this says so.
-            return WireStatus::new("info", format!("Agent sort is already \"{sort}\"."));
+            return WireStatus::new(
+                "info",
+                crate::status_text!["Agent sort is already ", q(sort), "."],
+            );
         }
         self.config.ui.agent_sort = sort.to_string();
         self.config_writer.save_lazy(self.config.clone());
         // Quiet on the web: the whole left pane reorganises under the cursor,
         // which is big and unmistakable, so no confirmation is owed.
-        WireStatus::new("info", format!("Agent list now sorted by \"{sort}\".")).quiet_web()
+        WireStatus::new(
+            "info",
+            crate::status_text!["Agent list now sorted by ", q(sort), "."],
+        )
+        .quiet_web()
     }
 
     /// Save `[server] tailscale` as `mode`, refusing anything outside the
@@ -2316,7 +2369,7 @@ impl Engine {
             return Ok((
                 WireStatus::new(
                     "info",
-                    format!("Agent \"{}\" is not running.", session.display_label()),
+                    crate::status_text!["Agent ", q(session.display_label()), " is not running."],
                 ),
                 detached,
             ));
@@ -2327,10 +2380,11 @@ impl Engine {
             return Ok((
                 WireStatus::new(
                     "info",
-                    format!(
-                        "Closed a tab for agent \"{}\". Its other tabs are still running.",
-                        session.display_label()
-                    ),
+                    crate::status_text![
+                        "Closed a tab for agent ",
+                        q(session.display_label()),
+                        ". Its other tabs are still running."
+                    ],
                 ),
                 false,
             ));
@@ -2338,10 +2392,11 @@ impl Engine {
         Ok((
             WireStatus::new(
                 "info",
-                format!(
-                    "Closed the last tab for agent \"{}\". It is now detached. Reconnect it from the agent menu.",
-                    session.display_label()
-                ),
+                crate::status_text![
+                    "Closed the last tab for agent ",
+                    q(session.display_label()),
+                    ". It is now detached. Reconnect it from the agent menu."
+                ],
             ),
             true,
         ))
@@ -2421,11 +2476,15 @@ impl Engine {
                 stopped,
                 clear_key,
             } => {
-                let message = format!(
-                    "Stopped {} of agent \"{label}\" immediately. It is now detached and \
-                     stays in Projects; reconnect it from the agent menu.",
-                    crate::text::count_of(stopped, "tab"),
-                );
+                let message = crate::status_text![
+                    format!(
+                        "Stopped {} of agent ",
+                        crate::text::count_of(stopped, "tab")
+                    ),
+                    q(label),
+                    " immediately. It is now detached and \
+                     stays in Projects; reconnect it from the agent menu."
+                ];
                 Ok(match clear_key {
                     // Replaces the spinner the overtaken polite detach raised.
                     Some(key) => WireStatus::keyed(key, "info", message),
@@ -2481,23 +2540,27 @@ impl Engine {
             self.session_store.upsert_session(session)?;
         }
         let message = match &new_title {
-            Some(name) => format!("Renamed agent to \"{name}\"."),
+            Some(name) => crate::status_text!["Renamed agent to ", q(name), "."],
             None => {
                 // A standalone agent has no branch to fall back to; its label
                 // falls back to its folder's name instead, so the sentence has
                 // to name whichever one it actually landed on.
                 let session = self.sessions.iter().find(|s| s.id == session_id);
                 match session.and_then(|s| s.branch_name().map(str::to_string)) {
-                    Some(branch) => format!(
-                        "Cleared the custom name. Agent shows its branch name \"{branch}\" again."
-                    ),
+                    Some(branch) => crate::status_text![
+                        "Cleared the custom name. Agent shows its branch name ",
+                        q(branch),
+                        " again."
+                    ],
                     None => {
                         let label = session
                             .map(|s| s.display_label())
                             .unwrap_or_else(|| session_id.to_string());
-                        format!(
-                            "Cleared the custom name. Agent shows its folder's name \"{label}\" again."
-                        )
+                        crate::status_text![
+                            "Cleared the custom name. Agent shows its folder's name ",
+                            q(label),
+                            " again."
+                        ]
                     }
                 }
             }
@@ -2545,11 +2608,13 @@ impl Engine {
             // silence there is indistinguishable from a silent error.
             return Ok(WireStatus::new(
                 "info",
-                format!(
-                    "Agent \"{}\" already uses {}. Pick another provider to swap.",
-                    label,
-                    provider.as_str(),
-                ),
+                crate::status_text![
+                    "Agent ",
+                    q(label),
+                    " already uses ",
+                    n(provider.as_str()),
+                    ". Pick another provider to swap."
+                ],
             ));
         }
 
@@ -2558,13 +2623,17 @@ impl Engine {
         if outcome.running {
             Ok(WireStatus::new(
                 "warning",
-                format!(
-                    "Worktree \"{}\" is set to {}, but the {} agent is still running. Exit it and reconnect the agent to relaunch with {}.",
-                    label,
-                    provider.as_str(),
-                    outcome.previous.as_str(),
-                    provider.as_str(),
-                ),
+                crate::status_text![
+                    "Worktree ",
+                    q(label),
+                    " is set to ",
+                    n(provider.as_str()),
+                    ", but the ",
+                    n(outcome.previous.as_str()),
+                    " agent is still running. Exit it and reconnect the agent to relaunch with ",
+                    n(provider.as_str()),
+                    "."
+                ],
             ))
         } else {
             let resume_note = if outcome.resume_available {
@@ -2574,12 +2643,16 @@ impl Engine {
             };
             Ok(WireStatus::new(
                 "info",
-                format!(
-                    "Worktree \"{}\" will use {} next launch. Reconnect the agent to start it.{}",
-                    label,
-                    provider.as_str(),
-                    resume_note,
-                ),
+                crate::status_text![
+                    "Worktree ",
+                    q(label),
+                    " will use ",
+                    n(provider.as_str()),
+                    format!(
+                        " next launch. Reconnect the agent to start it.{}",
+                        resume_note
+                    )
+                ],
             ))
         }
     }
@@ -2604,14 +2677,20 @@ impl Engine {
             .and_then(|id| self.tab_prose_label(sid, id.as_ref_id()));
         let outcome = self.close_tab(session_id, tab_id)?;
         let message = match (&outcome.promoted, closed.as_deref(), successor.as_deref()) {
-            (Some(_), Some(closed), Some(next)) => format!(
-                "Closed the first tab, {closed}. {next} took its place as the agent's first tab."
-            ),
-            (Some(_), None, Some(next)) => format!(
-                "Closed the agent's first tab. {next} took its place as the agent's first tab."
-            ),
-            (_, Some(closed), _) => format!("Closed the {closed} tab."),
-            (_, None, _) => "Closed the tab.".to_string(),
+            (Some(_), Some(closed), Some(next)) => crate::status_text![
+                "Closed the first tab, ",
+                n(closed),
+                ". ",
+                n(next),
+                " took its place as the agent's first tab."
+            ],
+            (Some(_), None, Some(next)) => crate::status_text![
+                "Closed the agent's first tab. ",
+                n(next),
+                " took its place as the agent's first tab."
+            ],
+            (_, Some(closed), _) => crate::status_text!["Closed the ", n(closed), " tab."],
+            (_, None, _) => "Closed the tab.".into(),
         };
         // Loud: closing a tab deletes the tab, and a pill leaving a strip is
         // too small to stand in for a destructive act's confirmation. The slot
@@ -2641,20 +2720,24 @@ impl Engine {
         if outcome.running {
             Ok(WireStatus::new(
                 "warning",
-                format!(
-                    "This tab is set to {}, but the {} process is still running. Close and reopen the tab to relaunch with {}.",
-                    provider.as_str(),
-                    outcome.previous.as_str(),
-                    provider.as_str(),
-                ),
+                crate::status_text![
+                    "This tab is set to ",
+                    n(provider.as_str()),
+                    ", but the ",
+                    n(outcome.previous.as_str()),
+                    " process is still running. Close and reopen the tab to relaunch with ",
+                    n(provider.as_str()),
+                    "."
+                ],
             ))
         } else {
             Ok(WireStatus::new(
                 "info",
-                format!(
-                    "This tab will use {} on its next launch (it starts fresh).",
-                    provider.as_str(),
-                ),
+                crate::status_text![
+                    "This tab will use ",
+                    n(provider.as_str()),
+                    " on its next launch (it starts fresh)."
+                ],
             ))
         }
     }
@@ -2787,21 +2870,27 @@ impl Engine {
         let branch = managed.branch_name.clone();
         let success_name = project.name.clone();
         let failure_name = project.name.clone();
-        let op = crate::engine::status_op(format!(
-            "Rerunning startup command for agent \"{branch}\"..."
-        ))
+        let op = crate::engine::status_op(crate::status_text![
+            "Rerunning startup command for agent ",
+            q(branch),
+            "..."
+        ])
         .on_success(move |_: &()| {
-            crate::engine::Final::info(format!(
-                "Startup command completed for project \"{success_name}\". Open the agent's startup command logs to view the latest run."
-            ))
+            crate::engine::Final::info(crate::status_text![
+                "Startup command completed for project ",
+                q(success_name),
+                ". Open the agent's startup command logs to view the latest run."
+            ])
         })
         .on_failure(move |err: &String| {
             // STICKY, for the same reason as the agent-side startup failure in
             // `command.rs`: provisioning stopped part-way, so the worktree is in
             // an unknown state, and the message sends the user to the logs.
-            crate::engine::Final::error(format!(
-                "Startup command failed for project \"{failure_name}\": {err}. Open the startup command logs for details."
-            ))
+            crate::engine::Final::error(crate::status_text![
+                "Startup command failed for project ",
+                q(failure_name),
+                format!(": {}. Open the startup command logs for details.", err)
+            ])
             .sticky()
         });
         let run = crate::startup::StartupCommandRun {
@@ -2821,7 +2910,7 @@ impl Engine {
         Ok(wire_status_from_reaction(&reaction).unwrap_or_else(|| {
             WireStatus::new(
                 "info",
-                format!("Rerunning startup command for agent \"{branch}\"..."),
+                crate::status_text!["Rerunning startup command for agent ", q(branch), "..."],
             )
         }))
     }
@@ -2858,12 +2947,17 @@ impl Engine {
                 project.name
             );
         }
+        // One at a time per repository, whichever surface asked first.
+        if let Err(refusal) = self.begin_default_branch_checkout(&project) {
+            return Ok(WireStatus::from_update(&refusal));
+        }
 
         // Spawn worker 1 exactly as the TUI does, with the same busy message.
-        let busy = format!(
-            "Checking the default branch for project \"{}\"...",
-            project.name
-        );
+        let busy = crate::status_text![
+            "Checking the default branch for project ",
+            q(project.name),
+            "..."
+        ];
         // Mint a HandlerStatusOp whose opaque id correlates the busy to its final.
         // The resolver captures the project name and re-emits the byte-identical
         // message for every terminal outcome of the two-worker chain (resolved in
@@ -2873,9 +2967,20 @@ impl Engine {
             move |o: &crate::engine::WebCheckoutOutcome| {
                 use crate::engine::{Final, WebCheckoutOutcome};
                 match o {
-                    WebCheckoutOutcome::Ok { target_branch } => Final::info(format!(
-                        "Checked out \"{target_branch}\" for project \"{project_name}\"."
-                    )),
+                    // STICKY on a failed save: the base did not move, and
+                    // the fix (a full disk, a locked database) is outside the
+                    // toast, followed by running the checkout again.
+                    WebCheckoutOutcome::Ok {
+                        target_branch,
+                        base,
+                    } => match base.save_failure_message(&project_name, target_branch) {
+                        Some(message) => Final::error(message).sticky(),
+                        None => Final::info(crate::engine::checkout_default_branch_message(
+                            &project_name,
+                            target_branch,
+                            base.moved(),
+                        )),
+                    },
                     // STICKY: the checkout stopped part-way and the repository
                     // is left on whatever branch it landed on. The message says
                     // outright that the fix is in the user's terminal, which is
@@ -2883,23 +2988,48 @@ impl Engine {
                     WebCheckoutOutcome::Failed {
                         target_branch,
                         repo_path,
-                    } => Final::error(format!(
-                        "Couldn't check out \"{target_branch}\" in {repo_path}. Resolve in your terminal and retry."
-                    ))
+                    } => Final::error(crate::status_text![
+                        "Couldn't check out ",
+                        q(target_branch),
+                        " in ",
+                        n(repo_path),
+                        ". Resolve in your terminal and retry."
+                    ])
                     .sticky(),
-                    WebCheckoutOutcome::AlreadyLeading { current_branch } => Final::info(format!(
-                        "Project \"{project_name}\" is already on the leading branch \"{current_branch}\"."
-                    )),
+                    // STICKY on a failed save: the base did not move, and
+                    // the fix (a full disk, a locked database) is outside the
+                    // toast, followed by running the checkout again.
+                    WebCheckoutOutcome::AlreadyLeading {
+                        current_branch,
+                        base,
+                    } => match base.save_failure_message(&project_name, current_branch) {
+                        Some(message) => Final::error(message).sticky(),
+                        None => Final::info(crate::engine::already_on_default_branch_message(
+                            &project_name,
+                            current_branch,
+                            base.moved(),
+                        )),
+                    },
                     // STICKY: same shape, same instruction. dux cannot proceed
                     // and is asking the user to go and settle the repository's
                     // default branch by hand before retrying.
-                    WebCheckoutOutcome::Heuristic { current_branch } => Final::error(format!(
-                        "Can't determine the default branch for project \"{project_name}\" while it is on \"{current_branch}\". Resolve the default branch in your terminal and retry."
-                    ))
-                    .sticky(),
-                    WebCheckoutOutcome::InspectFailed { error } => Final::error(format!(
-                        "Couldn't inspect the default branch for project \"{project_name}\": {error}"
-                    )),
+                    WebCheckoutOutcome::Heuristic { current_branch } => {
+                        Final::error(crate::status_text![
+                            "Can't determine the default branch for project ",
+                            q(project_name),
+                            " while it is on ",
+                            q(current_branch),
+                            ". Resolve the default branch in your terminal and retry."
+                        ])
+                        .sticky()
+                    }
+                    WebCheckoutOutcome::InspectFailed { error } => {
+                        Final::error(crate::status_text![
+                            "Couldn't inspect the default branch for project ",
+                            q(project_name),
+                            format!(": {}", error)
+                        ])
+                    }
                 }
             },
         );
@@ -2997,8 +3127,12 @@ impl Engine {
                 ),
             },
         };
-        let leading_branch =
-            crate::project_browser::leading_branch_for_project(&validated, branch.as_deref());
+        let leading_branch = crate::add_project_plan::project_base_at_add(
+            branch.as_deref(),
+            Some(&default_branch),
+            true,
+        )
+        .into_branch();
         let path_str = validated.to_string_lossy().to_string();
         let action = NonDefaultBranchAction::AddProject {
             path: path_str.clone(),
@@ -3007,8 +3141,13 @@ impl Engine {
         };
         // Mirror the TUI's `dispatch_non_default_branch_checkout` busy copy
         // (reason "before adding the project").
-        let busy =
-            format!("Checking out \"{default_branch}\" in {path_str} before adding the project...");
+        let busy = crate::status_text![
+            "Checking out ",
+            q(default_branch),
+            " in ",
+            n(path_str),
+            " before adding the project..."
+        ];
         // Mint a HandlerStatusOp: the SUCCESS final is resolved in
         // `drive_add_project_followup` (after the inline add yields its combined
         // message) and the switch FAILURE in `process_worker_event`; both share
@@ -3027,9 +3166,13 @@ impl Engine {
                     WebAddProjectOutcome::SwitchFailed {
                         target_branch,
                         repo_path,
-                    } => Final::error(format!(
-                        "Couldn't check out \"{target_branch}\" in {repo_path}. Resolve in your terminal and retry."
-                    ))
+                    } => Final::error(crate::status_text![
+                        "Couldn't check out ",
+                        q(target_branch),
+                        " in ",
+                        n(repo_path),
+                        ". Resolve in your terminal and retry."
+                    ])
                     .sticky(),
                     WebAddProjectOutcome::AddFailed { message } => Final::error(message.clone()),
                 }
@@ -3157,9 +3300,13 @@ impl Engine {
                     // This flow never switches branches, so `SwitchFailed` can't be
                     // produced for it, but the op type is shared with the
                     // checkout-add flow, so the match must stay total.
-                    WebAddProjectOutcome::SwitchFailed { repo_path, .. } => Final::error(format!(
-                        "Couldn't add the project at {repo_path} after creating the initial commit."
-                    )),
+                    WebAddProjectOutcome::SwitchFailed { repo_path, .. } => {
+                        Final::error(crate::status_text![
+                            "Couldn't add the project at ",
+                            n(repo_path),
+                            " after creating the initial commit."
+                        ])
+                    }
                 }
             },
         );
@@ -3234,9 +3381,13 @@ impl Engine {
                     WebAddProjectOutcome::AddFailed { message } => Final::error(message.clone()),
                     // This flow never switches branches; the op type is shared
                     // with the checkout-add flow, so the match must stay total.
-                    WebAddProjectOutcome::SwitchFailed { repo_path, .. } => Final::error(format!(
-                        "Couldn't add the project at {repo_path} after initializing the repository."
-                    )),
+                    WebAddProjectOutcome::SwitchFailed { repo_path, .. } => {
+                        Final::error(crate::status_text![
+                            "Couldn't add the project at ",
+                            n(repo_path),
+                            " after initializing the repository."
+                        ])
+                    }
                 }
             },
         );
@@ -3339,7 +3490,7 @@ impl Engine {
         // Spawn the shared lookup worker (the TUI's `dispatch_pull_request_lookup`
         // does the same with `None` for the name). Busy copy mirrors the TUI's
         // `set_busy` in `dispatch_pull_request_lookup`.
-        let busy = format!("Resolving PR for project \"{}\"...", project.name);
+        let busy = crate::status_text!["Resolving PR for project ", q(project.name), "..."];
         // Mint a HandlerStatusOp: on SUCCESS the lookup hands off to the create
         // dispatch (whose busy, keyed by the shared create op's opaque id, takes
         // over), so this op's busy is cleared with no message (resolved in
@@ -3431,12 +3582,15 @@ impl Engine {
                         return WebFollowupStatuses {
                             statuses: vec![WireStatus::new(
                                 "error",
-                                format!(
-                                    "PR #{} has head branch \"{}\", which is not a usable agent \
+                                crate::status_text![
+                                    "PR ",
+                                    n(format!("#{}", pr.number)),
+                                    " has head branch ",
+                                    q(pr.head_ref_name),
+                                    ", which is not a usable agent \
                                      name. Create the agent again and type a name using only \
-                                     letters, digits, dashes, underscores and slashes.",
-                                    pr.number, pr.head_ref_name
-                                ),
+                                     letters, digits, dashes, underscores and slashes."
+                                ],
                             )],
                             clear_keys,
                         };
@@ -3445,10 +3599,15 @@ impl Engine {
                 let resolved_name = custom_name.clone().unwrap_or_default();
                 // Busy copy mirrors the TUI's PR create message (input.rs
                 // NameNewAgent confirm, PullRequest arm).
-                let busy_message = format!(
-                    "Creating a new agent worktree \"{resolved_name}\" from PR #{} for project \"{}\" and launching a fresh session...",
-                    pr.number, pr.project.name
-                );
+                let busy_message = crate::status_text![
+                    "Creating a new agent worktree ",
+                    q(resolved_name),
+                    " from PR ",
+                    n(format!("#{}", pr.number)),
+                    " for project ",
+                    q(pr.project.name),
+                    " and launching a fresh session..."
+                ];
                 let request = CreateAgentRequest::PullRequest {
                     project: pr.project.clone(),
                     host: pr.host.clone(),
@@ -3479,7 +3638,11 @@ impl Engine {
                     Ok(reaction) => wire_statuses_from_reaction(&reaction),
                     Err(e) => vec![WireStatus::new(
                         "error",
-                        format!("Failed to create an agent from PR #{}: {e:#}", pr.number),
+                        crate::status_text![
+                            "Failed to create an agent from PR ",
+                            n(format!("#{}", pr.number)),
+                            format!(": {:#}", e)
+                        ],
                     )],
                 };
                 self.current_origin = crate::statusline::StatusScope::All;
@@ -3532,14 +3695,17 @@ impl Engine {
                 let status_message = format!(
                     "Checked out \"{target_branch}\" and added project \"{display_name}\" to the workspace."
                 );
-                let add_failed_prefix =
-                    format!("Checked out \"{target_branch}\" but couldn't add the project");
+                let add_failed_prefix = crate::status_text![
+                    "Checked out ",
+                    q(target_branch),
+                    " but couldn't add the project"
+                ];
                 self.finish_web_project_add(WebProjectAdd {
                     path,
                     display_name,
                     current_branch: target_branch,
                     leading_branch,
-                    status_message,
+                    status_message: status_message.into(),
                     add_failed_prefix: &add_failed_prefix,
                     status_op_id,
                 })
@@ -3556,17 +3722,23 @@ impl Engine {
             } => {
                 let display_name = display_project_name(name, path);
                 let status_message = if *initialized_repo && *seeded_gitignore {
-                    format!(
-                        "Initialized a git repository, seeded a starter .gitignore, created an initial commit, and added project \"{display_name}\" to the workspace."
-                    )
+                    crate::status_text![
+                        "Initialized a git repository, seeded a starter .gitignore, created an initial commit, and added project ",
+                        q(display_name),
+                        " to the workspace."
+                    ]
                 } else if *initialized_repo {
-                    format!(
-                        "Initialized a git repository, created an initial commit, and added project \"{display_name}\" to the workspace."
-                    )
+                    crate::status_text![
+                        "Initialized a git repository, created an initial commit, and added project ",
+                        q(display_name),
+                        " to the workspace."
+                    ]
                 } else {
-                    format!(
-                        "Created an initial commit and added project \"{display_name}\" to the workspace."
-                    )
+                    crate::status_text![
+                        "Created an initial commit and added project ",
+                        q(display_name),
+                        " to the workspace."
+                    ]
                 };
                 let add_failed_prefix = if *initialized_repo {
                     "Initialized the repository but couldn't add the project"
@@ -3646,7 +3818,7 @@ impl Engine {
         // race hit that path, not this caller's optimistic narrative. Surface
         // that (falling back to the caller's message only if the engine didn't
         // provide one), for both the unkeyed status and the keyed op below.
-        let mut success_message = status_message.clone();
+        let mut success_message: StatusText = status_message.clone();
         let statuses = match self.apply(Command::PersistProject {
             action: Box::new(ProjectPersistenceAction::Add {
                 project,
@@ -3697,7 +3869,7 @@ impl Engine {
                 let message = statuses
                     .iter()
                     .find(|s| s.tone == "error")
-                    .map(|s| s.message.clone())
+                    .map(|s| StatusText::from_parts(s.message.clone(), s.segments.clone()))
                     .unwrap_or_else(|| status_message.clone());
                 crate::engine::WebAddProjectOutcome::AddFailed { message }
             };
@@ -3732,12 +3904,15 @@ impl Engine {
                 // `NonDefaultBranchCheckoutCompleted` resolves the right op.
                 let status_op_id = status_op_id.clone();
                 let worker_tx = self.worker_tx.clone();
+                // A panic in the switch still answers, or the repository's
+                // in-flight key and the keyed busy would never be released.
                 std::thread::spawn(move || {
-                    crate::project_browser::run_add_project_checkout_job(
+                    crate::project_browser::run_checkout_job_reporting_panics(
                         action,
                         target_branch,
                         worker_tx,
                         status_op_id,
+                        crate::project_browser::run_add_project_checkout_job,
                     );
                 });
                 vec![]
@@ -4015,7 +4190,11 @@ impl Engine {
                 } => WebFollowupStatuses {
                     statuses: vec![WireStatus::new(
                         "warning",
-                        format!("Couldn't auto-reopen agent \"{agent_label}\": {message}"),
+                        crate::status_text![
+                            "Couldn't auto-reopen agent ",
+                            q(agent_label),
+                            format!(": {}", message)
+                        ],
                     )],
                     clear_keys: Vec::new(),
                 },
@@ -4035,7 +4214,11 @@ impl Engine {
                     statuses: vec![
                         WireStatus::new(
                             "warning",
-                            format!("Tab launch failed for \"{agent_label}\": {message}"),
+                            crate::status_text![
+                                "Tab launch failed for ",
+                                q(agent_label),
+                                format!(": {}", message)
+                            ],
                         )
                         .with_key(format!("tab-launch-{tab_id}")),
                     ],
@@ -4079,11 +4262,13 @@ impl Engine {
                 crate::engine::Final::Message {
                     tone,
                     text,
+                    segments,
                     sticky,
                     quiet_on,
                 } => WebFollowupStatuses {
                     statuses: vec![{
-                        let s = WireStatus::new(tone.as_wire(), text);
+                        let s =
+                            WireStatus::new(tone.as_wire(), StatusText::from_parts(text, segments));
                         let s = if sticky { s.sticky() } else { s };
                         // The outcome decided its own per-surface answer; this
                         // path carries the web half rather than re-deciding it.
@@ -4125,7 +4310,7 @@ impl Engine {
                 match self.pending_delete_ops_web.remove(session_id) {
                     Some(op) => wire_statuses_from_reaction(
                         &op.resolve(&crate::engine::WebDeleteOutcome::Succeeded {
-                            message,
+                            message: message.clone(),
                             refused,
                         })
                         .into_reaction(),
@@ -4208,10 +4393,10 @@ impl Engine {
                         .worktree_path,
                 ),
                 target: PullTarget::Session,
-                busy_message: "Pulling latest changes from remote\u{2026}".to_string(),
+                busy_message: "Pulling latest changes from remote\u{2026}".to_string().into(),
                 already_running_message:
                     "Pull already in progress for this worktree. Wait for the current pull to finish."
-                        .to_string(),
+                        .to_string().into(),
             },
             command => return Ok(WireCommandMapping::Unhandled(command)),
         };
@@ -4237,14 +4422,16 @@ impl Engine {
                         project_name: project.name.clone(),
                         leading_branch: project.leading_branch.clone(),
                     },
-                    busy_message: format!(
-                        "Refreshing project \"{}\" from remote\u{2026}",
-                        project.name
-                    ),
-                    already_running_message: format!(
-                        "Project refresh already in progress for \"{}\". Wait for the current pull to finish.",
-                        project.name,
-                    ),
+                    busy_message: crate::status_text![
+                        "Refreshing project ",
+                        q(project.name),
+                        " from remote\u{2026}"
+                    ],
+                    already_running_message: crate::status_text![
+                        "Project refresh already in progress for ",
+                        q(project.name),
+                        ". Wait for the current pull to finish."
+                    ],
                 }
             }
             WireCommand::ToggleAgentAutoReopen {
@@ -4328,10 +4515,14 @@ impl Engine {
                     );
                 }
                 let branch = crate::git::current_branch_opt(&validated)?;
-                let leading_branch = crate::project_browser::leading_branch_for_project(
+                // A plain add is the dialog's unticked box: the folder stays
+                // where it is and new worktrees branch from it.
+                let leading_branch = crate::project_browser::project_base_for_add(
                     &validated,
                     branch.as_deref(),
-                );
+                    false,
+                )
+                .into_branch();
                 let path_str = validated.to_string_lossy().to_string();
                 let display_name = if name.trim().is_empty() {
                     validated
@@ -4357,7 +4548,8 @@ impl Engine {
                     path_missing: false,
                     created_at: Some(chrono::Utc::now()),
                 };
-                let status_message = format!("Added project \"{display_name}\" to the workspace.");
+                let status_message =
+                    crate::status_text!["Added project ", q(display_name), " to the workspace."];
                 Command::PersistProject {
                     action: Box::new(ProjectPersistenceAction::Add {
                         project,
@@ -4434,7 +4626,7 @@ impl Engine {
                     project,
                     custom_name,
                 }),
-                busy_message: "Starting a shared-workspace agent\u{2026}".to_string(),
+                busy_message: crate::status_text!["Starting a shared-workspace agent\u{2026}"],
                 term_size: (80, 24),
             });
         }
@@ -4463,7 +4655,7 @@ impl Engine {
         };
         Ok(Command::DispatchCreateAgentRequest {
             request: Box::new(request),
-            busy_message: "Creating a new agent\u{2026}".to_string(),
+            busy_message: "Creating a new agent\u{2026}".to_string().into(),
             term_size: (80, 24),
         })
     }
@@ -4501,10 +4693,14 @@ impl Engine {
             );
         }
         let name = trimmed.to_string();
-        let busy_message = format!(
-            "Forking agent \"{source_label}\" as \"{name}\" by cloning its current \
-             worktree contents into a fresh session...",
-        );
+        let busy_message = crate::status_text![
+            "Forking agent ",
+            q(source_label),
+            " as ",
+            q(name),
+            " by cloning its current \
+             worktree contents into a fresh session..."
+        ];
         let request = CreateAgentRequest::ForkSession {
             project,
             source_session: Box::new(source_session),
@@ -4555,11 +4751,15 @@ impl Engine {
             );
         }
         let display_name = trimmed.to_string();
-        let busy_message = format!(
-            "Starting agent \"{display_name}\" in existing worktree {} for project \"{}\"...",
-            entry.path.display(),
-            project.name
-        );
+        let busy_message = crate::status_text![
+            "Starting agent ",
+            q(display_name),
+            " in existing worktree ",
+            n(entry.path.display()),
+            " for project ",
+            q(project.name),
+            "..."
+        ];
         let request = CreateAgentRequest::ExistingManagedWorktree {
             project,
             worktree_path: entry.path.clone(),
@@ -4821,6 +5021,55 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_status_built_from_parts_carries_its_segments_on_the_wire() {
+        let update = StatusUpdate::info(crate::status_text![
+            "Checked out ",
+            q("main"),
+            " in ",
+            n("/src/app"),
+            "."
+        ]);
+        let wire = WireStatus::from_update(&update);
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(json["message"], "Checked out \"main\" in /src/app.");
+        assert_eq!(
+            json["segments"],
+            serde_json::json!([
+                "Checked out ",
+                {"name": "main", "quoted": true},
+                " in ",
+                {"name": "/src/app", "quoted": false},
+                "."
+            ])
+        );
+        let back: WireStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(back, wire);
+    }
+
+    #[test]
+    fn a_plain_status_leaves_the_segments_field_out() {
+        let wire = WireStatus::from_update(&StatusUpdate::info(format!("plain {}", 1)));
+        let json = serde_json::to_value(&wire).unwrap();
+        assert!(json.get("segments").is_none(), "got {json}");
+        let old: WireStatus =
+            serde_json::from_value(serde_json::json!({"tone": "info", "message": "m"})).unwrap();
+        assert_eq!(old.segments, None);
+    }
+
+    #[test]
+    fn a_resolved_final_carries_its_segments_into_the_reaction() {
+        let final_ = crate::engine::Final::warning(crate::status_text!["Kept ", q("dev"), "."]);
+        let reaction = crate::engine::ResolvedFinal::new("op-1", final_).into_reaction();
+        let statuses = wire_statuses_from_reaction(&reaction);
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].message, "Kept \"dev\".");
+        assert_eq!(
+            statuses[0].segments.as_deref(),
+            crate::status_text!["Kept ", q("dev"), "."].segments()
+        );
+    }
     use crate::engine::test_support::{
         sample_project, sample_session, sample_standalone_session, settle_gh_probe, test_engine,
     };
@@ -5272,6 +5521,7 @@ mod tests {
                     branches: crate::engine::RemovedBranches::Deleted(branches),
                 },
             )
+            .to_string()
         }
 
         // No drift: one branch, named.
@@ -5339,6 +5589,7 @@ mod tests {
                     ),
                 },
             )
+            .to_string()
         }
 
         assert_eq!(
@@ -5349,7 +5600,7 @@ mod tests {
             ),
             "Deleted claude agent \"agent-one\" and removed its worktree. Its branch \"develop\" \
              existed before this agent and was kept. Delete it yourself with \
-             git branch -D \"develop\" if you no longer need it."
+             git branch -D 'develop' if you no longer need it."
         );
         // Drifted: two branches survive, and "existed before this agent" is
         // false of the one the drift created, so each gets its own reason.
@@ -5362,7 +5613,7 @@ mod tests {
             "Deleted claude agent \"agent-one\" and removed its worktree. Its branch \"feature-x\" \
              was created inside this agent's worktree and was kept, and its branch \
              \"develop\" existed before this agent and was kept. Delete either yourself \
-             with git branch -D \"feature-x\" or git branch -D \"develop\" if you no longer \
+             with git branch -D 'feature-x' or git branch -D 'develop' if you no longer \
              need them."
         );
         // An adopted agent's branch came with the worktree, which is a different
@@ -5371,7 +5622,7 @@ mod tests {
             message("main", "main", crate::model::BranchProvenance::Adopted),
             "Deleted claude agent \"agent-one\" and removed its worktree. Its branch \"main\" \
              came with the worktree this agent adopted and was kept. Delete it yourself \
-             with git branch -D \"main\" if you no longer need it."
+             with git branch -D 'main' if you no longer need it."
         );
     }
 
@@ -7122,6 +7373,15 @@ mod tests {
         assert_eq!(status.tone, "busy", "msg: {}", status.message);
         assert_eq!(status.key.as_deref(), Some("detach-agent:s1"));
         assert_eq!(status.message, "Asking \"s1-title\" to shut down…");
+        // The busy toast chips the agent's name like its final does.
+        assert_eq!(
+            serde_json::to_value(status.segments.as_ref().expect("built from parts")).unwrap(),
+            serde_json::json!([
+                "Asking ",
+                {"name": "s1-title", "quoted": true},
+                " to shut down…"
+            ])
+        );
         // EVERY tab's provider is gone, not just the session-slot one.
         assert!(
             !engine.providers.contains_key(TabIdRef::new("s1-slot")),
@@ -7443,6 +7703,219 @@ mod tests {
         statuses
     }
 
+    /// Whatever the chain ended in, the repository is free again: the next
+    /// request for it is not refused as a duplicate.
+    fn assert_checkout_accepted_again(engine: &Engine, project_id: &str) {
+        let path = engine
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .expect("the project")
+            .path
+            .clone();
+        assert!(
+            !engine.is_in_flight(&InFlightKey::CheckoutDefaultBranch(path)),
+            "the checkout's ending must release the repository"
+        );
+    }
+
+    /// A second request for the same repository while one runs is refused with
+    /// an ordinary warning (not an error, not sticky) and starts nothing.
+    #[test]
+    fn apply_wire_checkout_project_default_branch_refuses_a_second_request_while_one_runs() {
+        let repo = init_repo_on_feature_branch("trunk");
+        let (mut engine, _tmp) = test_engine();
+        let mut project = sample_project("p1", repo.path().to_string_lossy().as_ref());
+        project.leading_branch = Some("trunk".to_string());
+        project.current_branch = "feature".to_string();
+        project.branch_status = ProjectBranchStatus::NotLeading;
+        engine.projects.push(project);
+
+        let first = engine
+            .apply_wire(WireCommand::CheckoutProjectDefaultBranch {
+                project_id: "p1".to_string(),
+            })
+            .expect("first checkout");
+        assert_eq!(first.status.expect("busy").tone, "busy");
+        assert_eq!(engine.pending_web_checkout_ops.len(), 1);
+
+        let second = engine
+            .apply_wire(WireCommand::CheckoutProjectDefaultBranch {
+                project_id: "p1".to_string(),
+            })
+            .expect("a repeat is refused with a status, not an error");
+        let status = second.status.expect("the refusal");
+        assert_eq!(status.tone, "warning");
+        assert!(
+            !status.sticky,
+            "a refusal needs no action outside the toast"
+        );
+        assert_eq!(
+            status.message,
+            "dux is already checking out the default branch for project \"p1-name\". Wait for \
+             it to finish; its result will say where the project's worktrees branch from."
+        );
+        assert_eq!(
+            serde_json::to_value(status.segments.as_ref().expect("built from parts")).unwrap(),
+            serde_json::json!([
+                "dux is already checking out the default branch for project ",
+                {"name": "p1-name", "quoted": true},
+                ". Wait for it to finish; its result will say where the project's worktrees \
+                 branch from."
+            ]),
+            "the refusal carries the project as a part, so the toast chips it"
+        );
+        assert_eq!(
+            engine.pending_web_checkout_ops.len(),
+            1,
+            "the refusal must not start a second chain"
+        );
+
+        let statuses = drive_checkout_chain(&mut engine);
+        assert_eq!(statuses.last().expect("final").tone, "info");
+        assert_checkout_accepted_again(&engine, "p1");
+    }
+
+    /// The event a panicking switch worker is turned into (see
+    /// `run_checkout_job_reporting_panics`) is a failed completion, and that
+    /// failure must release the repository like any other ending, so the next
+    /// request is accepted rather than refused as a duplicate forever.
+    #[test]
+    fn a_failed_switch_completion_releases_the_repository_for_the_next_request() {
+        let repo = init_repo_on_feature_branch("trunk");
+        let (mut engine, _tmp) = test_engine();
+        let mut project = sample_project("p1", repo.path().to_string_lossy().as_ref());
+        project.leading_branch = Some("trunk".to_string());
+        project.current_branch = "feature".to_string();
+        project.branch_status = ProjectBranchStatus::NotLeading;
+        engine.projects.push(project.clone());
+
+        engine
+            .apply_wire(WireCommand::CheckoutProjectDefaultBranch {
+                project_id: "p1".to_string(),
+            })
+            .expect("first checkout");
+        let op_id = engine
+            .pending_web_checkout_ops
+            .keys()
+            .next()
+            .cloned()
+            .expect("the web op");
+        assert!(engine.is_in_flight(&InFlightKey::CheckoutDefaultBranch(project.path.clone())));
+
+        engine.process_worker_event(WorkerEvent::NonDefaultBranchCheckoutCompleted {
+            action: NonDefaultBranchAction::CheckoutProjectDefault { project },
+            target_branch: "trunk".to_string(),
+            result: Err("Worker panicked: the switch blew up".to_string()),
+            status_op_id: Some(op_id),
+        });
+
+        assert_checkout_accepted_again(&engine, "p1");
+        let again = engine
+            .apply_wire(WireCommand::CheckoutProjectDefaultBranch {
+                project_id: "p1".to_string(),
+            })
+            .expect("second checkout");
+        assert_eq!(
+            again.status.expect("busy").tone,
+            "busy",
+            "the second request starts a chain of its own"
+        );
+    }
+
+    /// A browser's checkout whose new base SQLite will not save resolves its op
+    /// with the sticky save error, keyed to the op's busy, and the base stays
+    /// what it was: the same ending the terminal UI gets.
+    #[test]
+    fn a_web_checkout_whose_base_cannot_be_saved_resolves_with_the_sticky_error() {
+        let repo = init_repo_on_feature_branch("trunk");
+        let (mut engine, _tmp) = test_engine();
+        // No SQLite row, so the save matches nothing and fails.
+        let mut project = sample_project("p1", repo.path().to_string_lossy().as_ref());
+        project.leading_branch = Some("feature".to_string());
+        project.current_branch = "feature".to_string();
+        project.branch_status = ProjectBranchStatus::NotLeading;
+        engine.projects.push(project.clone());
+
+        let busy = engine
+            .apply_wire(WireCommand::CheckoutProjectDefaultBranch {
+                project_id: "p1".to_string(),
+            })
+            .expect("checkout")
+            .status
+            .expect("busy");
+        let op_id = engine
+            .pending_web_checkout_ops
+            .keys()
+            .next()
+            .cloned()
+            .expect("the web op");
+
+        let reaction =
+            engine.process_worker_event(WorkerEvent::NonDefaultBranchCheckoutCompleted {
+                action: NonDefaultBranchAction::CheckoutProjectDefault { project },
+                target_branch: "trunk".to_string(),
+                result: Ok(()),
+                status_op_id: Some(op_id),
+            });
+
+        let statuses = wire_statuses_from_reaction(&reaction);
+        assert_eq!(statuses.len(), 1, "one final, and it is the error");
+        let status = &statuses[0];
+        assert_eq!(status.tone, "error");
+        assert!(status.sticky);
+        assert_eq!(status.key, busy.key, "the final replaces the busy");
+        assert!(
+            status.message.starts_with(
+                "The folder of project \"p1-name\" is on \"trunk\", but new worktrees still \
+                 branch from \"feature\" because dux could not save the new base ("
+            ),
+            "{}",
+            status.message
+        );
+        let segments =
+            serde_json::to_value(status.segments.as_ref().expect("built from parts")).unwrap();
+        for name in ["p1-name", "trunk", "feature"] {
+            assert!(
+                segments
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!({"name": name, "quoted": true})),
+                "{name} must be a part: {segments}"
+            );
+        }
+        assert_eq!(
+            engine.projects[0].leading_branch.as_deref(),
+            Some("feature")
+        );
+        assert!(engine.pending_web_checkout_ops.is_empty());
+        assert_checkout_accepted_again(&engine, "p1");
+    }
+
+    /// A failed inspection ends the chain with a toast that times out, so the
+    /// log is the only lasting record of why, the same as a failed switch.
+    #[test]
+    fn a_failed_default_branch_inspection_is_logged() {
+        let (mut engine, _tmp) = test_engine();
+        let project = sample_project("p1", "/srv/repo-inspect");
+        engine.projects.push(project.clone());
+
+        let (_, lines) = crate::logger::capture_for_test(|| {
+            engine.process_worker_event(WorkerEvent::CheckoutProjectDefaultBranchInspected {
+                project,
+                result: Err("fatal: not a git repository".to_string()),
+                status_op_id: None,
+            })
+        });
+
+        assert!(
+            lines.iter().any(|line| line.starts_with("ERROR")
+                && line.contains("/srv/repo-inspect")
+                && line.contains("fatal: not a git repository")),
+            "{lines:?}"
+        );
+    }
+
     #[test]
     fn apply_wire_checkout_project_default_branch_switches_from_feature() {
         // A project whose persisted leading branch ("trunk") differs from HEAD
@@ -7473,6 +7946,7 @@ mod tests {
         );
 
         let statuses = drive_checkout_chain(&mut engine);
+        assert_checkout_accepted_again(&engine, "p1");
         let status = statuses.last().expect("final status");
         assert_eq!(status.tone, "info");
         assert!(
@@ -7512,6 +7986,7 @@ mod tests {
         assert_eq!(outcome.status.expect("busy status").tone, "busy");
 
         let statuses = drive_checkout_chain(&mut engine);
+        assert_checkout_accepted_again(&engine, "p1");
         let status = statuses.last().expect("final status");
         assert_eq!(status.tone, "error");
         assert!(
@@ -7550,6 +8025,7 @@ mod tests {
         assert_eq!(outcome.status.expect("busy status").tone, "busy");
 
         let statuses = drive_checkout_chain(&mut engine);
+        assert_checkout_accepted_again(&engine, "p1");
         let status = statuses.last().expect("final status");
         assert_eq!(status.tone, "error");
         assert!(
@@ -7581,6 +8057,7 @@ mod tests {
         assert_eq!(outcome.status.expect("busy status").tone, "busy");
 
         let statuses = drive_checkout_chain(&mut engine);
+        assert_checkout_accepted_again(&engine, "p1");
         let status = statuses.last().expect("final status");
         assert_eq!(status.tone, "info");
         assert!(
@@ -7618,6 +8095,7 @@ mod tests {
         assert_eq!(outcome.status.expect("busy status").tone, "busy");
 
         let statuses = drive_checkout_chain(&mut engine);
+        assert_checkout_accepted_again(&engine, "p1");
         let status = statuses.last().expect("final status");
         assert_eq!(status.tone, "error");
         assert!(
@@ -7702,6 +8180,21 @@ mod tests {
         // resolves the default branch from the clone's origin/HEAD.
         project.leading_branch = None;
         project.path_missing = false;
+        // Stored the way an add leaves it, so recording the base has a row.
+        engine
+            .session_store
+            .upsert_project(&crate::config::ProjectConfig {
+                id: project.id.clone(),
+                path: project.path.clone(),
+                name: Some(project.name.clone()),
+                default_provider: None,
+                leading_branch: None,
+                auto_reopen_agents: None,
+                startup_command: None,
+                env: Default::default(),
+                workspace_mode: None,
+            })
+            .expect("seed the project row");
         engine.projects.push(project);
 
         let busy = engine
@@ -7731,9 +8224,11 @@ mod tests {
         let statuses = wire_statuses_from_reaction(&r2);
         let status = statuses.last().expect("final status");
         assert_eq!(status.tone, "info");
+        // The project had no recorded base, so the checkout records one and
+        // says so.
         assert_eq!(
             status.message,
-            "Checked out \"main\" for project \"p1-name\"."
+            "Checked out \"main\" for project \"p1-name\". New worktrees branch from \"main\" now."
         );
         assert_eq!(
             status.key.as_deref(),
@@ -8621,7 +9116,7 @@ mod tests {
         let add = |id: &str| Command::PersistProject {
             action: Box::new(crate::worker::ProjectPersistenceAction::Add {
                 project: sample_project(id, "/same/path"),
-                status_message: "added".to_string(),
+                status_message: "added".to_string().into(),
             }),
             status_op_id: None,
         };
@@ -8652,7 +9147,7 @@ mod tests {
             .apply(Command::PersistProject {
                 action: Box::new(crate::worker::ProjectPersistenceAction::Add {
                     project: sample_project("winner", "/p"),
-                    status_message: "added".to_string(),
+                    status_message: "added".to_string().into(),
                 }),
                 status_op_id: None,
             })
@@ -8665,7 +9160,8 @@ mod tests {
             leading_branch: "main",
             status_message:
                 "Created an initial commit and added project \"Loser\" to the workspace."
-                    .to_string(),
+                    .to_string()
+                    .into(),
             add_failed_prefix: "Created the initial commit but couldn't add the project",
             status_op_id: &None,
         });
@@ -8938,6 +9434,10 @@ mod tests {
             engine.pending_web_add_project_ops.contains_key(key),
             "the add-project op must be registered under its busy key"
         );
+        // Let the switch worker finish before the fixture repositories drop: a
+        // `git switch` still writing into the clone while its TempDir is being
+        // removed leaves the scratch directory behind in the temp directory.
+        drive_add_project_chain(&mut engine);
     }
 
     // Helper: detach HEAD on a path (requires at least one commit).
@@ -9149,7 +9649,7 @@ mod tests {
             wants_fullscreen: false,
             status_quiet: QuietSurfaces::LOUD,
             view: AgentLaunchReadyView::CreateCommitted {
-                status_message: "Launched agent \"feat\".".to_string(),
+                status_message: "Launched agent \"feat\".".to_string().into(),
                 startup_result_error: None,
             },
         };
@@ -10137,7 +10637,9 @@ mod tests {
             crate::engine::BeginDeleteSessionView {
                 session_id: "s1".to_string(),
                 outcome: BeginDeleteSessionOutcome::AsyncStarted {
-                    busy_message: "Removing worktree for agent \"feat\"\u{2026}".to_string(),
+                    busy_message: "Removing worktree for agent \"feat\"\u{2026}"
+                        .to_string()
+                        .into(),
                 },
             },
         ));
@@ -10187,7 +10689,9 @@ mod tests {
             crate::engine::BeginDeleteSessionView {
                 session_id: "s1".to_string(),
                 outcome: BeginDeleteSessionOutcome::AsyncStarted {
-                    busy_message: "Removing worktree for agent \"feat\"\u{2026}".to_string(),
+                    busy_message: "Removing worktree for agent \"feat\"\u{2026}"
+                        .to_string()
+                        .into(),
                 },
             },
         ));
@@ -10247,7 +10751,9 @@ mod tests {
             crate::engine::BeginDeleteSessionView {
                 session_id: "s1".to_string(),
                 outcome: BeginDeleteSessionOutcome::AsyncStarted {
-                    busy_message: "Removing worktree for agent \"feat\"\u{2026}".to_string(),
+                    busy_message: "Removing worktree for agent \"feat\"\u{2026}"
+                        .to_string()
+                        .into(),
                 },
             },
         ));
@@ -10291,7 +10797,9 @@ mod tests {
             crate::engine::BeginDeleteSessionView {
                 session_id: "s1".to_string(),
                 outcome: BeginDeleteSessionOutcome::AsyncStarted {
-                    busy_message: "Removing worktree for agent \"feat\"\u{2026}".to_string(),
+                    busy_message: "Removing worktree for agent \"feat\"\u{2026}"
+                        .to_string()
+                        .into(),
                 },
             },
         ));
@@ -10325,7 +10833,9 @@ mod tests {
             crate::engine::BeginDeleteSessionView {
                 session_id: "s1".to_string(),
                 outcome: BeginDeleteSessionOutcome::AsyncStarted {
-                    busy_message: "Removing worktree for agent \"feat\"\u{2026}".to_string(),
+                    busy_message: "Removing worktree for agent \"feat\"\u{2026}"
+                        .to_string()
+                        .into(),
                 },
             },
         ));
@@ -11543,6 +12053,45 @@ mod tests {
             first_command_busy_message_opt(&engine).is_none(),
             "no create should have been dispatched"
         );
+    }
+
+    /// The refusal quotes the head branch, which is somebody else's text: the
+    /// toast chip and the plain message both arrive without its bidi controls.
+    #[test]
+    fn drive_pr_lookup_followup_refusal_strips_bidi_controls_from_the_head_branch() {
+        let repo = init_repo_with_commit();
+        let (mut engine, _tmp) = test_engine();
+        let mut project = sample_project("p1", &repo.path().to_string_lossy());
+        project.path_missing = false;
+        engine.projects.push(project.clone());
+
+        let reaction = EventReaction::OpenNewAgentPromptForPr {
+            pr: Box::new(crate::worker::ResolvedPullRequest {
+                project,
+                host: "github.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+                number: 7,
+                title: "Add feature".to_string(),
+                state: "OPEN".to_string(),
+                head_ref_name: "feat\u{202E}txt.exe".to_string(),
+                custom_name: None,
+            }),
+            status_op_id: None,
+        };
+        let followup = engine.drive_pr_lookup_followup(&reaction);
+        let error = followup
+            .statuses
+            .iter()
+            .find(|s| s.tone == "error")
+            .expect("a refusal");
+        assert!(
+            error.message.contains("\"feattxt.exe\""),
+            "{:?}",
+            error.message
+        );
+        let wire = serde_json::to_string(&error.segments).unwrap();
+        assert!(!wire.contains('\u{202E}'), "{wire}");
+        assert!(wire.contains("feattxt.exe"), "{wire}");
     }
 
     #[test]
@@ -13023,14 +13572,14 @@ mod tests {
 
         for view in [
             AgentLaunchReadyView::CreateCommitted {
-                status_message: "Launched.".to_string(),
+                status_message: "Launched.".to_string().into(),
                 startup_result_error: None,
             },
             AgentLaunchReadyView::CreatePersistFailed {
                 error: "db error".to_string(),
             },
             AgentLaunchReadyView::Reconnect {
-                status_message: "ok".to_string(),
+                status_message: "ok".to_string().into(),
             },
             AgentLaunchReadyView::SessionMissing,
             AgentLaunchReadyView::StartupAutoReopen,
@@ -13198,7 +13747,7 @@ mod tests {
 
         let reaction = engine.process_worker_event(WorkerEvent::CreateAgentFailed {
             status_op_id: op_id.clone(),
-            message: "worker panicked".to_string(),
+            message: "worker panicked".to_string().into(),
         });
         // Project the engine reaction through the wire to confirm the web sees the
         // keyed error on the op's id.

@@ -6,6 +6,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
 import {
   closeDeleteTerminal,
@@ -56,14 +57,16 @@ export function ConfirmDeleteTerminalDialog() {
     <Dialog open={isOpen} onOpenChange={handleOpenChange}>
       <DialogContent showCloseButton={false} destructive>
         <DialogHeader>
-          <DialogTitle>Close {title}?</DialogTitle>
+          <DialogTitle>
+            Close <InlineCode>{title}</InlineCode>?
+          </DialogTitle>
         </DialogHeader>
         {/* Only warn about killing a process when an actual app is running in
             the foreground. The bare shell (no foreground command) is not worth
             warning about, so an idle terminal confirms with just the title. */}
         {foreground ? (
           <p className="text-sm text-destructive">
-            <span className="font-mono break-all">{foreground}</span> is running in this
+            <InlineCode>{foreground}</InlineCode> is running in this
             terminal and will be killed.
           </p>
         ) : null}

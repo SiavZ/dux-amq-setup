@@ -23,6 +23,7 @@ import {
   selectStartupLog,
   useDux,
 } from "@/lib/store"
+import { renderProse } from "@/lib/prose"
 import { DUX_TERMINAL_FONT_STACK } from "@/lib/terminalFont"
 import { sessionLabel } from "@/lib/agentWorkspace"
 
@@ -58,7 +59,7 @@ function StartupLogsBody({
   return (
     <DialogContent showCloseButton={false} className="sm:max-w-3xl">
       <DialogHeader>
-        <DialogTitle>{title}</DialogTitle>
+        <DialogTitle>{renderProse(title)}</DialogTitle>
         <DialogDescription>{description}</DialogDescription>
       </DialogHeader>
 

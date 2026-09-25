@@ -17,6 +17,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import { Input } from "@/components/ui/input"
 import {
   addProjectPrimaryAction,
@@ -33,6 +34,7 @@ import type {
   NoCommitsCopy,
 } from "@/lib/addProjectWarning"
 import { browseApi } from "@/lib/browseApi"
+import { renderProse } from "@/lib/prose"
 import {
   addProject,
   addProjectCheckoutDefault,
@@ -190,7 +192,9 @@ function InspectionMessages({
             <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-500" />
             <div className="grid gap-1 text-sm">
               <span>{init.message}</span>
-              <span className="text-xs text-muted-foreground">{init.note}</span>
+              <span className="text-xs text-muted-foreground">
+                {renderProse(init.noteProse)}
+              </span>
             </div>
           </div>
         </div>
@@ -199,7 +203,7 @@ function InspectionMessages({
         <div className="grid gap-2 rounded-md border border-amber-600/40 bg-amber-600/10 p-3">
           <div className="flex items-start gap-2">
             <Ban className="mt-0.5 size-4 shrink-0 text-amber-500" />
-            <span className="text-sm">{blocked.message}</span>
+            <span className="text-sm">{renderProse(blocked.messageProse)}</span>
           </div>
         </div>
       ) : null}
@@ -221,8 +225,19 @@ function InspectionMessages({
           <div className="flex items-start gap-2">
             <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-500" />
             <div className="grid gap-1 text-sm">
-              <span>{branch.message}</span>
-              <span className="text-amber-500">{branch.worktreeNote}</span>
+              <span>{renderProse(branch.messageProse)}</span>
+              {/* Warning tone only when worktrees will NOT branch from the
+                  default; amber matches the panel's own warning glyph. */}
+              <span
+                data-tone={branch.worktreeTone}
+                className={
+                  branch.worktreeTone === "warning"
+                    ? "text-amber-500"
+                    : "text-muted-foreground"
+                }
+              >
+                {renderProse(branch.worktreeNoteProse)}
+              </span>
               {branch.heuristicNote ? (
                 <span className="text-xs text-muted-foreground">
                   {branch.heuristicNote}
@@ -238,7 +253,10 @@ function InspectionMessages({
                   setCheckoutDefault(checked === true)
                 }
               />
-              Check out &ldquo;{branch.defaultBranch}&rdquo; before adding
+              <span>
+                Check out <InlineCode>{branch.defaultBranch}</InlineCode> before
+                adding
+              </span>
             </label>
           ) : null}
         </div>
@@ -347,6 +365,7 @@ function requiresInitialCommit(
 function inspectionBranch(
   inspection: ProjectInspection | null,
   needsInitialCommit: boolean,
+  checkoutDefault: boolean,
 ): BranchWarningCopy | null {
   if (
     needsInitialCommit ||
@@ -357,7 +376,11 @@ function inspectionBranch(
   ) {
     return null
   }
-  return branchWarningCopy(inspection.warning, inspection.currentBranch)
+  return branchWarningCopy(
+    inspection.warning,
+    inspection.currentBranch,
+    checkoutDefault,
+  )
 }
 
 // The explanatory panel under the picker, one field per panel and at most one of
@@ -393,7 +416,7 @@ function inspectionState(
   const inspection = currentInspection(selected, candidate)
   const kind = inspectionKind(inspection)
   const needsInitialCommit = requiresInitialCommit(inspection)
-  const branch = inspectionBranch(inspection, needsInitialCommit)
+  const branch = inspectionBranch(inspection, needsInitialCommit, checkoutDefault)
   const willCheckout = Boolean(branch?.canCheckoutDefault && checkoutDefault)
   const primary = addProjectPrimaryAction({
     kind,

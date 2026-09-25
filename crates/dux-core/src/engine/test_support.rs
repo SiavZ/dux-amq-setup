@@ -5,10 +5,10 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, mpsc};
 
+use crate::test_scratch::ScratchDir;
 use chrono::Utc;
-use tempfile::TempDir;
 
-use crate::config::{Config, DuxPaths};
+use crate::config::DuxPaths;
 use crate::engine::Engine;
 use crate::lockfile::SingleInstanceLock;
 use crate::model::{
@@ -16,11 +16,12 @@ use crate::model::{
 };
 use crate::storage::SessionStore;
 
-/// Construct a minimally-wired `Engine` for tests, alongside the `TempDir`
-/// that backs its on-disk state (sqlite, lockfile). Keep the `TempDir`
-/// alive for the lifetime of the test so it is cleaned up afterwards.
-pub(crate) fn test_engine() -> (Engine, TempDir) {
-    let tmp = tempfile::tempdir().expect("tempdir");
+/// Construct a minimally-wired `Engine` for tests, alongside the scratch
+/// directory that backs its on-disk state (sqlite, lockfile, config writes).
+/// Keep it alive for the test; it is removed with retries on drop, because the
+/// engine's workers may still be writing into it when the test ends.
+pub(crate) fn test_engine() -> (Engine, ScratchDir) {
+    let tmp = ScratchDir::new();
     let root = tmp.path().to_path_buf();
     let paths = DuxPaths {
         config_path: root.join("config.toml"),
@@ -39,11 +40,14 @@ pub(crate) fn test_engine() -> (Engine, TempDir) {
         worker_tx.clone(),
     );
     let engine = Engine {
-        // An existing install (no `[workspace]` section): worktree mode, so
-        // upstream's create tests keep their meaning. Shared tests opt in.
-        config: Config {
-            workspace: None,
-            ..Config::default()
+        // Stock provider names, harmless commands: a test that launches an agent
+        // must never exec the developer's real CLI. An existing install (no
+        // `[workspace]` section): worktree mode, so upstream's create tests keep
+        // their meaning. Shared tests opt in.
+        config: {
+            let mut config = crate::test_provider::harmless_config();
+            config.workspace = None;
+            config
         },
         paths,
         session_store,

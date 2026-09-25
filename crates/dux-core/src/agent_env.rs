@@ -201,7 +201,7 @@ mod tests {
             false,
             (5, 80),
             crate::worker::AgentLaunchKind::Reconnect {
-                status_message: String::new(),
+                status_message: Default::default(),
             },
         );
         let handle = request

@@ -15,6 +15,7 @@ import {
   type DropOutcome,
   type DropPasteProfile,
 } from "./fileDrop"
+import { proseText } from "./prose"
 
 const ALL_FORMS: readonly DragDropPasteForm[] = [
   "bare",
@@ -766,6 +767,34 @@ describe("the attachment length limit", () => {
 
   it("never refuses anything when there is no limit", () => {
     expect(pasteExceedsAttachmentLimit("x".repeat(100_000), null)).toBe(false)
+  })
+})
+
+describe("the names a drop toast draws as chips", () => {
+  const names = (t: { prose: readonly unknown[] }) =>
+    t.prose.flatMap((s) => (typeof s === "string" ? [] : [(s as { name: string }).name]))
+
+  it("chips the file and the folder of a single success, and spells the words as before", () => {
+    const t = dropToastFor([sent("shot.png")], terminal)
+    expect(names(t)).toEqual(["shot.png", "~/code/app"])
+    expect(proseText(t.prose)).toBe(t.message)
+  })
+
+  it("chips a stranded file's name and its full path, the path the user must find", () => {
+    const t = dropToastFor([notSent("a b.txt")], agent)
+    expect(names(t)).toEqual(expect.arrayContaining(["a b.txt", "/home/p/code/app/a b.txt"]))
+    expect(proseText(t.prose)).toBe(t.message)
+  })
+
+  it("chips both names of a rename and the refused file's name", () => {
+    const refused: DropOutcome = {
+      kind: "refused",
+      requestedName: "big.iso",
+      reason: "too large",
+    }
+    const t = dropToastFor([sent("x.png", "x-1.png"), refused], terminal)
+    expect(names(t)).toEqual(expect.arrayContaining(["x.png", "x-1.png", "big.iso"]))
+    expect(proseText(t.prose)).toBe(t.message)
   })
 })
 

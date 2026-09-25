@@ -117,6 +117,23 @@ pub fn leading_branch_for_project(path: &Path, current_branch: Option<&str>) -> 
     }
 }
 
+/// The base a repository gets when it is added as a project:
+/// [`crate::add_project_plan::project_base_at_add`] fed with the repository's
+/// remote default. Every add path records its base through this (or through the
+/// pure rule directly when the default is already resolved), so the "check out
+/// the default branch" box decides the base the same way on both surfaces.
+pub fn project_base_for_add(
+    path: &Path,
+    current_branch: Option<&str>,
+    check_out_default: bool,
+) -> crate::add_project_plan::ProjectBase {
+    crate::add_project_plan::project_base_at_add(
+        current_branch,
+        git::remote_default_branch(path).as_deref(),
+        check_out_default,
+    )
+}
+
 /// Convert a slice of `ProjectConfig` entries (from SQLite) into runtime `Project` values.
 /// Each project gets its path expanded, its provider resolved (falling back to the global
 /// default), and its current branch read from git. Missing or non-git paths are flagged
@@ -284,16 +301,26 @@ pub fn run_checkout_project_default_branch_inspection_job(
     let result = git::current_branch_opt(&repo_path)
         .map(|opt_branch| {
             let branch = opt_branch.unwrap_or_default();
-            let warning_kind = if let Some(leading_branch) = project.leading_branch.as_deref() {
-                if branch == leading_branch {
-                    None
-                } else {
-                    Some(BranchWarningKind::Known {
-                        default_branch: leading_branch.to_string(),
-                    })
+            // The remote's default wins over the stored base: a project added
+            // without the checkout stores the branch it was on, and checking
+            // out "the default" must not mean checking that branch out again.
+            // With no origin at all, the stored base is the best answer dux
+            // has, as it always was. With an origin whose default cannot be
+            // resolved, the default is genuinely unknown and the stored base
+            // may be a feature branch, so the heuristic path answers (and
+            // refuses to switch); a failed probe leans the same safe way.
+            let target = git::remote_default_branch(&repo_path).or_else(|| {
+                match git::has_origin_remote(&repo_path) {
+                    Ok(false) => project.leading_branch.clone(),
+                    Ok(true) | Err(_) => None,
                 }
-            } else {
-                git::branch_warning_kind(&repo_path, &branch)
+            });
+            let warning_kind = match target {
+                Some(target) if branch == target => None,
+                Some(target) => Some(BranchWarningKind::Known {
+                    default_branch: target,
+                }),
+                None => git::branch_warning_kind(&repo_path, &branch),
             };
             (branch, warning_kind)
         })
@@ -326,6 +353,39 @@ pub fn run_add_project_checkout_job(
         result,
         status_op_id,
     });
+}
+
+/// Run a checkout job (normally `run_add_project_checkout_job`) so that a panic
+/// inside it still ends the chain: the panic is logged and turned into a failed
+/// `NonDefaultBranchCheckoutCompleted`, because that event is the only thing
+/// that resolves the keyed busy and releases the repository's in-flight key.
+/// Both surfaces spawn their checkout worker through this.
+pub fn run_checkout_job_reporting_panics(
+    action: NonDefaultBranchAction,
+    target_branch: String,
+    worker_tx: Sender<WorkerEvent>,
+    status_op_id: Option<String>,
+    job: impl FnOnce(NonDefaultBranchAction, String, Sender<WorkerEvent>, Option<String>),
+) {
+    use std::panic::AssertUnwindSafe;
+    let tx_panic = worker_tx.clone();
+    let action_panic = action.clone();
+    let branch_panic = target_branch.clone();
+    let op_id_panic = status_op_id.clone();
+    if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        job(action, target_branch, worker_tx, status_op_id);
+    })) {
+        let reason = crate::engine::format_panic_payload(payload);
+        crate::logger::error(&format!(
+            "non-default-branch-checkout worker panicked: {reason}"
+        ));
+        let _ = tx_panic.send(WorkerEvent::NonDefaultBranchCheckoutCompleted {
+            action: action_panic,
+            target_branch: branch_panic,
+            result: Err(format!("Worker panicked: {reason}")),
+            status_op_id: op_id_panic,
+        });
+    }
 }
 
 /// Background job for the initial-commit-then-add flow: creates an empty
@@ -481,6 +541,57 @@ mod tests {
     use crate::config::Config;
     use crate::model::{ProviderKind, SessionStatus};
 
+    fn checkout_action() -> NonDefaultBranchAction {
+        NonDefaultBranchAction::AddProject {
+            path: "/nowhere/repo".to_string(),
+            name: "repo".to_string(),
+            leading_branch: "main".to_string(),
+        }
+    }
+
+    /// A checkout worker that panics must still answer: the chain's in-flight
+    /// key and its keyed busy are released only by the completion event, so a
+    /// silent panic would wedge every later request for that repository.
+    #[test]
+    fn a_panicking_checkout_job_still_reports_a_failed_completion() {
+        let (tx, rx) = mpsc::channel();
+        run_checkout_job_reporting_panics(
+            checkout_action(),
+            "main".to_string(),
+            tx,
+            Some("op-7".to_string()),
+            |_, _, _, _| panic!("the switch blew up"),
+        );
+        let event = rx.try_recv().expect("the panic is turned into an event");
+        let WorkerEvent::NonDefaultBranchCheckoutCompleted {
+            target_branch,
+            result,
+            status_op_id,
+            ..
+        } = event
+        else {
+            panic!("expected a checkout completion");
+        };
+        assert_eq!(target_branch, "main");
+        assert_eq!(status_op_id.as_deref(), Some("op-7"));
+        let reason = result.expect_err("a panic is a failure");
+        assert!(reason.contains("the switch blew up"), "{reason}");
+        assert!(rx.try_recv().is_err(), "exactly one completion");
+    }
+
+    #[test]
+    fn a_checkout_job_that_returns_adds_no_event_of_its_own() {
+        let (tx, rx) = mpsc::channel();
+        run_checkout_job_reporting_panics(
+            checkout_action(),
+            "main".to_string(),
+            tx,
+            None,
+            |_, _, _, _| {},
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
     #[test]
     fn resolve_start_dir_prefers_an_existing_configured_directory() {
         let dir = tempdir().expect("start tempdir");
@@ -594,6 +705,67 @@ mod tests {
                     warning_kind,
                     Some(BranchWarningKind::Known { default_branch }) if default_branch == "trunk"
                 ));
+            }
+            _ => panic!("expected checkout inspection event"),
+        }
+    }
+
+    /// A project added without the checkout records its feature branch as its
+    /// base. "Check out the default branch" must still mean the REMOTE's
+    /// default, not the stored base, or it would report the folder as already
+    /// there and never move it.
+    #[test]
+    fn checkout_project_default_branch_inspection_prefers_the_remote_default_over_the_stored_base()
+    {
+        let repo = tempdir().expect("repo tempdir");
+        run_git(repo.path(), &["init", "-b", "main"]);
+        run_git(repo.path(), &["config", "user.name", "test"]);
+        run_git(repo.path(), &["config", "user.email", "t@t"]);
+        run_git(repo.path(), &["commit", "--allow-empty", "-m", "init"]);
+        run_git(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        run_git(
+            repo.path(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        run_git(repo.path(), &["switch", "-c", "feature"]);
+
+        let project = Project {
+            id: "project-1".to_string(),
+            name: "demo".to_string(),
+            path: repo.path().to_string_lossy().to_string(),
+            explicit_default_provider: None,
+            default_provider: ProviderKind::from_str("codex"),
+            leading_branch: Some("feature".to_string()),
+            auto_reopen_agents: None,
+            startup_command: None,
+            env: Default::default(),
+            current_branch: "feature".to_string(),
+            branch_status: ProjectBranchStatus::Leading,
+            path_missing: false,
+            created_at: None,
+        };
+        let (worker_tx, worker_rx) = mpsc::channel();
+
+        run_checkout_project_default_branch_inspection_job(project, worker_tx, None);
+
+        match worker_rx.recv().expect("worker event") {
+            WorkerEvent::CheckoutProjectDefaultBranchInspected { result, .. } => {
+                let (current_branch, warning_kind) = result.expect("inspection");
+                assert_eq!(current_branch, "feature");
+                assert!(
+                    matches!(
+                        &warning_kind,
+                        Some(BranchWarningKind::Known { default_branch }) if default_branch == "main"
+                    ),
+                    "expected a checkout of the remote default, got {warning_kind:?}"
+                );
             }
             _ => panic!("expected checkout inspection event"),
         }
@@ -733,7 +905,8 @@ mod tests {
     /// Compared canonically, so a symlinked folder cannot hide the occupant.
     #[test]
     fn a_standalone_agent_occupying_a_managed_worktree_makes_it_unselectable() {
-        let root = tempdir().unwrap().keep();
+        let scratch = tempdir().unwrap();
+        let root = scratch.path().to_path_buf();
         let repo = root.join("repo");
         let occupied = root.join("worktrees").join("demo").join("occupied");
         fs::create_dir_all(&repo).unwrap();
@@ -803,8 +976,6 @@ mod tests {
             !entry.is_selectable,
             "the manager must not offer to remove a directory an agent is living in"
         );
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

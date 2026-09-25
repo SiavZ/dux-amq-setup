@@ -55,8 +55,8 @@ fn sample_session(
 /// `claude` provider and companion terminal both overridden to `cat` so any
 /// spawned PTY is a runnable echo program in CI. Returns the engine plus the
 /// temp dir that must outlive it.
-fn build_engine() -> (Engine, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().unwrap();
+fn build_engine() -> (Engine, dux_core::test_scratch::ScratchDir) {
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
     let paths = DuxPaths {
         root: root.clone(),
@@ -94,6 +94,7 @@ fn build_engine() -> (Engine, tempfile::TempDir) {
     // A worktree-mode install: these fixtures register dux's own root as the
     // project, which shared mode rightly refuses to run agents in.
     engine.config.workspace = None;
+    dux_core::test_provider::defuse_config(&mut engine.config);
     engine.config.providers.commands.insert(
         "claude".to_string(),
         ProviderCommandConfig {

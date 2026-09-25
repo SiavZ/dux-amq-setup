@@ -2714,7 +2714,7 @@ mod tests {
         let repo = tempdir.path().join("repo");
         fs::create_dir_all(&repo).expect("repo dir");
         let git = |cwd: &Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = dux_core::test_git::fixture_git()
                 .args(args)
                 .current_dir(cwd)
                 .output()
@@ -2786,7 +2786,7 @@ mod tests {
         );
 
         assert!(!worktree.exists(), "the worktree directory must be removed");
-        let branches = std::process::Command::new("git")
+        let branches = dux_core::test_git::fixture_git()
             .args(["-C", repo.to_str().unwrap(), "branch", "--list", "develop"])
             .output()
             .expect("git branch --list");
@@ -2808,7 +2808,7 @@ mod tests {
         let repo = tempdir.path().join("repo");
         fs::create_dir_all(&repo).expect("repo dir");
         let git = |cwd: &Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = dux_core::test_git::fixture_git()
                 .args(args)
                 .current_dir(cwd)
                 .output()
@@ -2885,7 +2885,7 @@ mod tests {
         );
 
         assert!(!worktree.exists(), "the worktree directory must be removed");
-        let branches = std::process::Command::new("git")
+        let branches = dux_core::test_git::fixture_git()
             .args([
                 "-C",
                 repo.to_str().unwrap(),
@@ -2899,7 +2899,7 @@ mod tests {
             String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
             "the branch must be deleted (a stale worktree ref would keep it undeletable)",
         );
-        let worktrees = std::process::Command::new("git")
+        let worktrees = dux_core::test_git::fixture_git()
             .args([
                 "-C",
                 repo.to_str().unwrap(),

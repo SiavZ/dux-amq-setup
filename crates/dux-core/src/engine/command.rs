@@ -102,7 +102,7 @@ pub enum Command {
     /// threshold.
     DispatchCreateAgentRequest {
         request: Box<CreateAgentRequest>,
-        busy_message: String,
+        busy_message: crate::status_text::StatusText,
         term_size: (u16, u16),
     },
 
@@ -160,8 +160,8 @@ pub enum Command {
     Pull {
         repo_path: PathBuf,
         target: PullTarget,
-        busy_message: String,
-        already_running_message: String,
+        busy_message: crate::status_text::StatusText,
+        already_running_message: crate::status_text::StatusText,
     },
 
     /// Open a filesystem path via the user's OS handler. Fire-and-forget
@@ -396,10 +396,15 @@ impl Engine {
                                 // worktree is in an unknown state and the
                                 // message sends the user to the startup command
                                 // logs, an action outside the toast.
-                                Final::error(format!(
-                                    "Startup command failed for agent \"{branch_name}\": {error}. \
-                                     Open the startup command logs for details."
-                                ))
+                                Final::error(crate::status_text![
+                                    "Startup command failed for agent ",
+                                    q(branch_name),
+                                    format!(
+                                        ": {}. \
+                                     Open the startup command logs for details.",
+                                        error
+                                    )
+                                ])
                                 .sticky()
                             }
                             CreateLaunchOutcome::PersistFailed { error } => {
@@ -441,7 +446,7 @@ impl Engine {
                         )),
                         panic_event: Some(Box::new(move |reason| WorkerEvent::CreateAgentFailed {
                             status_op_id: op_id_panic,
-                            message: format!("Agent-creation worker panicked: {reason}"),
+                            message: format!("Agent-creation worker panicked: {reason}").into(),
                         })),
                     },
                     move |tx| {
@@ -493,10 +498,11 @@ impl Engine {
                             session_id,
                             tab_id: tab_id_view,
                             launched: false,
-                            status: Some(StatusUpdate::error(format!(
-                                "Agent \"{}\" is being deleted and cannot be launched.",
-                                branch_name,
-                            ))),
+                            status: Some(StatusUpdate::error(crate::status_text![
+                                "Agent ",
+                                q(branch_name),
+                                " is being deleted and cannot be launched."
+                            ])),
                         },
                     )));
                 }
@@ -509,10 +515,11 @@ impl Engine {
                             session_id,
                             tab_id: tab_id_view,
                             launched: false,
-                            status: Some(StatusUpdate::info(format!(
-                                "Agent \"{}\" is already launching.",
-                                branch_name,
-                            ))),
+                            status: Some(StatusUpdate::info(crate::status_text![
+                                "Agent ",
+                                q(branch_name),
+                                " is already launching."
+                            ])),
                         },
                     )));
                 }
@@ -542,9 +549,11 @@ impl Engine {
                             session_id,
                             tab_id: tab_id_view,
                             launched: false,
-                            status: Some(StatusUpdate::info(format!(
-                                "This tab of agent \"{branch_name}\" is already running. Stop it before starting it again.",
-                            ))),
+                            status: Some(StatusUpdate::info(crate::status_text![
+                                "This tab of agent ",
+                                q(branch_name),
+                                " is already running. Stop it before starting it again."
+                            ])),
                         },
                     )));
                 }
@@ -623,11 +632,13 @@ impl Engine {
             } => {
                 crate::git::discard_file(&worktree_path, &path, is_untracked)?;
                 let message = if is_untracked {
-                    format!("Deleted untracked file \"{path}\".")
+                    crate::status_text!["Deleted untracked file ", q(path), "."]
                 } else {
-                    format!(
-                        "Discarded unstaged changes to \"{path}\". Staged changes, if any, are kept."
-                    )
+                    crate::status_text![
+                        "Discarded unstaged changes to ",
+                        q(path),
+                        ". Staged changes, if any, are kept."
+                    ]
                 };
                 Ok(EventReaction::Status(StatusUpdate::info(message)))
             }
@@ -672,11 +683,14 @@ impl Engine {
                 let display = path.display().to_string();
                 let t_ok = target.clone();
                 let t_err = target.clone();
-                let op = crate::engine::status_op(format!("Opening {target}: {display}"))
-                    .on_success(move |_: &()| crate::engine::Final::info(format!("Opened {t_ok}.")))
-                    .on_failure(move |e: &String| {
-                        crate::engine::Final::error(format!("Could not open {t_err}: {e}"))
-                    });
+                let op = crate::engine::status_op(crate::status_text![
+                    format!("Opening {}: ", target),
+                    n(display)
+                ])
+                .on_success(move |_: &()| crate::engine::Final::info(format!("Opened {t_ok}.")))
+                .on_failure(move |e: &String| {
+                    crate::engine::Final::error(format!("Could not open {t_err}: {e}"))
+                });
                 Ok(self.spawn_status_op(op, move || {
                     crate::startup::open_path(&path).map_err(|err| format!("{err:#}"))
                 }))
@@ -699,11 +713,16 @@ impl Engine {
                     self.session_store
                         .set_auto_reopen_enabled(&session_id, new_enabled)?;
                 }
-                Ok(EventReaction::Status(StatusUpdate::info(format!(
-                    "Startup auto-reopen {} for agent \"{}\".",
-                    if new_enabled { "enabled" } else { "disabled" },
-                    branch_name,
-                ))))
+                Ok(EventReaction::Status(StatusUpdate::info(
+                    crate::status_text![
+                        format!(
+                            "Startup auto-reopen {} for agent ",
+                            if new_enabled { "enabled" } else { "disabled" }
+                        ),
+                        q(branch_name),
+                        "."
+                    ],
+                )))
             }
 
             Command::SetSessionSettings {
@@ -865,8 +884,8 @@ impl Engine {
         &mut self,
         repo_path: PathBuf,
         target: PullTarget,
-        busy_message: String,
-        already_running_message: String,
+        busy_message: crate::status_text::StatusText,
+        already_running_message: crate::status_text::StatusText,
     ) -> EventReaction {
         let repo_key = repo_path.to_string_lossy().into_owned();
         let repo_key_for_panic = repo_key.clone();
@@ -934,9 +953,13 @@ impl Engine {
         project_name: &str,
     ) -> anyhow::Result<EventReaction> {
         if self.project_has_pending_deletion(project_id) {
-            return Ok(EventReaction::Status(StatusUpdate::error(format!(
-                "An agent in \"{project_name}\" is still being removed. Try again in a moment."
-            ))));
+            return Ok(EventReaction::Status(StatusUpdate::error(
+                crate::status_text![
+                    "An agent in ",
+                    q(project_name),
+                    " is still being removed. Try again in a moment."
+                ],
+            )));
         }
         let was_real = self.projects.iter().any(|project| project.id == project_id);
         let removed = self.session_store.remove_project_records(project_id)?;
@@ -946,14 +969,25 @@ impl Engine {
         self.remove_project_from_runtime(project_id);
         let detail = removed_agents_detail(removed.len());
         if was_real && let Err(error) = self.persist_projects_to_config() {
-            return Ok(EventReaction::Status(StatusUpdate::error(format!(
-                "Removed \"{project_name}\"{detail} from dux, but updating config.toml failed: \
-                 {error}. The project may reappear on restart. Check the file is writable."
-            ))));
+            return Ok(EventReaction::Status(StatusUpdate::error(
+                crate::status_text![
+                    "Removed ",
+                    q(project_name),
+                    format!(
+                        "{} from dux, but updating config.toml failed: \
+                 {}. The project may reappear on restart. Check the file is writable.",
+                        detail, error
+                    )
+                ],
+            )));
         }
-        Ok(EventReaction::Status(StatusUpdate::info(format!(
-            "Removed project \"{project_name}\"{detail}. Worktrees were kept on disk."
-        ))))
+        Ok(EventReaction::Status(StatusUpdate::info(
+            crate::status_text![
+                "Removed project ",
+                q(project_name),
+                format!("{}. Worktrees were kept on disk.", detail)
+            ],
+        )))
     }
 
     fn delete_project_with_worktrees(
@@ -962,16 +996,24 @@ impl Engine {
         project_name: &str,
     ) -> anyhow::Result<EventReaction> {
         if self.project_has_pending_deletion(project_id) {
-            return Ok(EventReaction::Status(StatusUpdate::error(format!(
-                "Cannot delete project \"{project_name}\" while agent worktree removals are in \
+            return Ok(EventReaction::Status(StatusUpdate::error(
+                crate::status_text![
+                    "Cannot delete project ",
+                    q(project_name),
+                    " while agent worktree removals are in \
                  progress. Wait for them to finish, then try again."
-            ))));
+                ],
+            )));
         }
         if self.project_has_launching_tab(project_id) {
-            return Ok(EventReaction::Status(StatusUpdate::error(format!(
-                "Cannot delete project \"{project_name}\" while an agent tab is still launching. \
+            return Ok(EventReaction::Status(StatusUpdate::error(
+                crate::status_text![
+                    "Cannot delete project ",
+                    q(project_name),
+                    " while an agent tab is still launching. \
                  Wait a moment, then try again."
-            ))));
+                ],
+            )));
         }
         let was_real = self.projects.iter().any(|project| project.id == project_id);
         let session_ids: Vec<String> = self
@@ -994,14 +1036,25 @@ impl Engine {
         self.remove_project_from_runtime(project_id);
         let detail = removed_agents_detail(removed);
         if was_real && let Err(error) = self.persist_projects_to_config() {
-            return Ok(EventReaction::Status(StatusUpdate::error(format!(
-                "Deleted \"{project_name}\"{detail} from dux, but updating config.toml failed: \
-                 {error}. The project may reappear on restart. Check the file is writable."
-            ))));
+            return Ok(EventReaction::Status(StatusUpdate::error(
+                crate::status_text![
+                    "Deleted ",
+                    q(project_name),
+                    format!(
+                        "{} from dux, but updating config.toml failed: \
+                 {}. The project may reappear on restart. Check the file is writable.",
+                        detail, error
+                    )
+                ],
+            )));
         }
-        Ok(EventReaction::Status(StatusUpdate::info(format!(
-            "Deleted project \"{project_name}\"{detail}. Worktrees were removed."
-        ))))
+        Ok(EventReaction::Status(StatusUpdate::info(
+            crate::status_text![
+                "Deleted project ",
+                q(project_name),
+                format!("{}. Worktrees were removed.", detail)
+            ],
+        )))
     }
 
     fn project_has_pending_deletion(&self, project_id: &str) -> bool {
@@ -1045,7 +1098,7 @@ impl Engine {
     fn add_project_inline(
         &mut self,
         project: Project,
-        status_message: String,
+        status_message: crate::status_text::StatusText,
     ) -> anyhow::Result<EventReaction> {
         if let Some((project_id, project_name)) = self
             .projects
@@ -1053,9 +1106,11 @@ impl Engine {
             .find(|existing| existing.path == project.path)
             .map(|existing| (existing.id.clone(), existing.name.clone()))
         {
-            let message = format!(
-                "Project at this path is already in the workspace as \"{project_name}\"; nothing new was added."
-            );
+            let message = crate::status_text![
+                "Project at this path is already in the workspace as ",
+                q(project_name),
+                "; nothing new was added."
+            ];
             return Ok(project_added_reaction(project, project_id, message));
         }
 
@@ -1120,16 +1175,20 @@ impl Engine {
         } else if self.companion_terminals.contains_key(target_id) {
             crate::model::SessionSurface::Terminal
         } else {
-            return Ok(EventReaction::Status(StatusUpdate::error(format!(
-                "No live agent or terminal for target \"{target_id}\". Reconnect it and try again."
-            ))));
+            return Ok(EventReaction::Status(StatusUpdate::error(
+                crate::status_text![
+                    "No live agent or terminal for target ",
+                    q(target_id),
+                    ". Reconnect it and try again."
+                ],
+            )));
         };
 
         // Resolve the macro entry by name. Unknown → error naming it.
         let Some(entry) = self.config.macros.entries.get(name) else {
-            return Ok(EventReaction::Status(StatusUpdate::error(format!(
-                "Macro \"{name}\" does not exist."
-            ))));
+            return Ok(EventReaction::Status(StatusUpdate::error(
+                crate::status_text!["Macro ", q(name), " does not exist."],
+            )));
         };
 
         // Surface gate: refuse a macro whose surface doesn't match the target.
@@ -1139,10 +1198,17 @@ impl Engine {
                 crate::model::SessionSurface::Agent => "agent",
                 crate::model::SessionSurface::Terminal => "terminal",
             };
-            return Ok(EventReaction::Status(StatusUpdate::error(format!(
-                "Macro \"{name}\" is not available on {target_kind} targets ({}).",
-                entry.surface.label()
-            ))));
+            return Ok(EventReaction::Status(StatusUpdate::error(
+                crate::status_text![
+                    "Macro ",
+                    q(name),
+                    format!(
+                        " is not available on {} targets ({}).",
+                        target_kind,
+                        entry.surface.label()
+                    )
+                ],
+            )));
         }
 
         let payload = crate::macros::macro_payload_bytes(&entry.text);
@@ -1155,9 +1221,9 @@ impl Engine {
         if let Some(client) = client {
             client.write_bytes(&payload)?;
         }
-        Ok(EventReaction::Status(StatusUpdate::info(format!(
-            "Sent macro \"{name}\"."
-        ))))
+        Ok(EventReaction::Status(StatusUpdate::info(
+            crate::status_text!["Sent macro ", q(name), "."],
+        )))
     }
 
     /// Validate and apply a new per-project session order. See
@@ -1265,7 +1331,7 @@ impl Engine {
 fn project_added_reaction(
     project: Project,
     project_id: String,
-    status_message: String,
+    status_message: crate::status_text::StatusText,
 ) -> EventReaction {
     EventReaction::ProjectPersistenceOutcome(Box::new(ProjectPersistenceOutcome {
         action: ProjectPersistenceAction::Add {
@@ -1355,24 +1421,37 @@ fn reorder_in_place<T>(items: &mut Vec<T>, position: impl Fn(&T) -> Option<usize
 /// warning rather than an error: the refresh is best-effort and the project
 /// keeps working from local branch state.
 fn project_refresh_status_op(
-    busy_message: String,
+    busy_message: crate::status_text::StatusText,
     project_name: &str,
 ) -> crate::engine::StatusOp<crate::worker::PullOutcome, String> {
     let pn_ok = project_name.to_string();
     let pn_err = project_name.to_string();
     crate::engine::status_op(busy_message)
         .on_success(move |outcome: &crate::worker::PullOutcome| match outcome {
-            crate::worker::PullOutcome::Pulled { .. } => crate::engine::Final::info(format!(
-                "Refreshed project \"{pn_ok}\". Local branch is up to date with remote."
-            )),
-            crate::worker::PullOutcome::NoOrigin { .. } => crate::engine::Final::info(format!(
-                "Project \"{pn_ok}\" has no origin remote; nothing to pull. Local branch state refreshed."
-            )),
+            crate::worker::PullOutcome::Pulled { .. } => {
+                crate::engine::Final::info(crate::status_text![
+                    "Refreshed project ",
+                    q(pn_ok),
+                    ". Local branch is up to date with remote."
+                ])
+            }
+            crate::worker::PullOutcome::NoOrigin { .. } => {
+                crate::engine::Final::info(crate::status_text![
+                    "Project ",
+                    q(pn_ok),
+                    " has no origin remote; nothing to pull. Local branch state refreshed."
+                ])
+            }
         })
         .on_failure(move |e: &String| {
-            crate::engine::Final::warning(format!(
-                "Could not refresh \"{pn_err}\" from origin: {e}. Continuing from the local branch state."
-            ))
+            crate::engine::Final::warning(crate::status_text![
+                "Could not refresh ",
+                q(pn_err),
+                format!(
+                    " from origin: {}. Continuing from the local branch state.",
+                    e
+                )
+            ])
         })
 }
 
@@ -1456,8 +1535,8 @@ mod tests {
             .apply(Command::Pull {
                 repo_path: tmp.path().to_path_buf(),
                 target: PullTarget::Session,
-                busy_message: "Pulling latest changes\u{2026}".to_string(),
-                already_running_message: "A pull is already running.".to_string(),
+                busy_message: "Pulling latest changes\u{2026}".to_string().into(),
+                already_running_message: "A pull is already running.".to_string().into(),
             })
             .expect("apply succeeds");
         let pull_busy = match engine.worker_rx.try_recv() {
@@ -1617,7 +1696,7 @@ mod tests {
             .apply(Command::PersistProject {
                 action: Box::new(ProjectPersistenceAction::Add {
                     project: duplicate,
-                    status_message: "Added losing request".to_string(),
+                    status_message: "Added losing request".to_string().into(),
                 }),
                 status_op_id: Some("ignored-for-inline-add".to_string()),
             })
@@ -1817,7 +1896,7 @@ mod tests {
             false,
             (24, 80),
             crate::worker::AgentLaunchKind::Reconnect {
-                status_message: String::new(),
+                status_message: crate::status_text::StatusText::default(),
             },
         );
         let reaction = engine
@@ -1867,7 +1946,7 @@ mod tests {
             false,
             (24, 80),
             crate::worker::AgentLaunchKind::Reconnect {
-                status_message: String::new(),
+                status_message: crate::status_text::StatusText::default(),
             },
         );
         let reaction = engine
@@ -1918,7 +1997,7 @@ mod tests {
             false,
             (24, 80),
             crate::worker::AgentLaunchKind::Reconnect {
-                status_message: String::new(),
+                status_message: crate::status_text::StatusText::default(),
             },
         );
         let reaction = engine
@@ -1948,7 +2027,7 @@ mod tests {
             false,
             (24, 80),
             crate::worker::AgentLaunchKind::Reconnect {
-                status_message: String::new(),
+                status_message: crate::status_text::StatusText::default(),
             },
         );
         let _ = engine
@@ -2991,7 +3070,7 @@ mod tests {
         }
 
         // The op maps the no-origin outcome to an INFO final.
-        let op = project_refresh_status_op("Refreshing...".to_string(), "demo");
+        let op = project_refresh_status_op("Refreshing...".to_string().into(), "demo");
         let resolved = op.resolve(&Ok(outcome));
         match resolved.outcome {
             crate::engine::Final::Message { tone, text, .. } => {
@@ -3016,7 +3095,7 @@ mod tests {
         let result = run_project_refresh(repo.path(), Some("main".to_string()));
         assert!(result.is_err(), "the pull must fail");
 
-        let op = project_refresh_status_op("Refreshing...".to_string(), "demo");
+        let op = project_refresh_status_op("Refreshing...".to_string().into(), "demo");
         let resolved = op.resolve(&result);
         match resolved.outcome {
             crate::engine::Final::Message { tone, text, .. } => {

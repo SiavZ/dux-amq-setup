@@ -22,7 +22,7 @@ use dux_web::engine_actor::spawn_engine_thread;
 use dux_web::server::{AppState, RouterParams, build_app};
 
 fn git(dir: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
+    let out = dux_core::test_git::fixture_git()
         .args(args)
         .current_dir(dir)
         .output()
@@ -65,7 +65,7 @@ fn sample_session(id: &str, worktree: &str) -> dux_core::model::AgentSession {
 
 struct Fixture {
     addr: SocketAddr,
-    _tmp: tempfile::TempDir,
+    _tmp: dux_core::test_scratch::ScratchDir,
     /// An adoptable, clean managed worktree.
     free: PathBuf,
     /// An adoptable managed worktree holding an untracked file.
@@ -79,7 +79,7 @@ struct Fixture {
 /// Boot a server over a real repo (project `p1`, name `repo`) with three managed
 /// worktrees plus one external one, and a single session holding `held`.
 async fn boot() -> Fixture {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
 
     let repo = root.join("repo");
@@ -143,7 +143,8 @@ async fn boot() -> Fixture {
             .create_session(&sample_session("s1", held.to_string_lossy().as_ref()))
             .unwrap();
     }
-    let engine = bootstrap_engine(&paths).unwrap();
+    let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     let (handle, _join) = spawn_engine_thread(engine);
     let app = build_app(
         handle,
@@ -208,7 +209,7 @@ async fn delete_with(addr: SocketAddr, project: &str, path: &Path, extra: &str) 
 
 /// Whether the repo still has a local branch by this name.
 fn branch_exists(repo: &Path, branch: &str) -> bool {
-    let out = std::process::Command::new("git")
+    let out = dux_core::test_git::fixture_git()
         .args(["for-each-ref", "--format=%(refname:short)", "refs/heads/"])
         .current_dir(repo)
         .output()
@@ -285,7 +286,7 @@ async fn deleting_a_worktree_does_not_delete_its_branch() {
     let f = boot().await;
     let (status, body) = delete(f.addr, "p1", &f.free).await;
     assert_eq!(status, 200, "got {body}");
-    let out = std::process::Command::new("git")
+    let out = dux_core::test_git::fixture_git()
         .args(["branch", "--list", "free"])
         .current_dir(f._tmp.path().join("repo"))
         .output()

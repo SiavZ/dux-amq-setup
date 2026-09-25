@@ -326,7 +326,7 @@ mod tests {
             lock_path: cfg_root.path().join("dux.lock"),
         };
         std::fs::create_dir_all(&paths.worktrees_root).unwrap();
-        let engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        let engine = crate::test_support::bootstrap_test_engine(&paths).unwrap();
         let (handle, _join) = crate::engine_actor::spawn_engine_thread(engine);
         let app = crate::server::router(handle);
 
@@ -531,7 +531,7 @@ mod tests {
         // the layered `rest_mutation_origin_check`.
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path().to_string_lossy().to_string();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dux_core::test_scratch::ScratchDir::new();
         let handle = crate::test_support::test_engine_handle(tmp.path());
         let app = crate::server::build_app(
             handle,

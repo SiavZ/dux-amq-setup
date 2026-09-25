@@ -286,7 +286,7 @@ mod tests {
         engine.providers.insert(tab, client);
     }
 
-    fn engine_with(sessions: &[&str]) -> (Engine, tempfile::TempDir) {
+    fn engine_with(sessions: &[&str]) -> (Engine, crate::test_scratch::ScratchDir) {
         let (mut engine, tmp) = test_engine();
         for id in sessions {
             engine

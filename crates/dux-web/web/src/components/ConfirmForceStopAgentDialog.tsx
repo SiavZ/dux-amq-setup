@@ -9,7 +9,8 @@ import {
 } from "@/components/ui/dialog"
 import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
 import { sessionLabel } from "@/lib/agentWorkspace"
-import { forceStopConfirmBody } from "@/lib/detachAgent"
+import { forceStopConfirmProse } from "@/lib/detachAgent"
+import { renderProse } from "@/lib/prose"
 import { closeForceStopAgent, killSessionPty, useDux } from "@/lib/store"
 
 // The confirmation behind the Task Manager's Force stop on an agent row.
@@ -52,7 +53,9 @@ export function ConfirmForceStopAgentDialog() {
       <DialogContent showCloseButton={false} destructive>
         <DialogHeader>
           <DialogTitle>Force stop agent?</DialogTitle>
-          <DialogDescription>{forceStopConfirmBody(label)}</DialogDescription>
+          <DialogDescription>
+            {renderProse(forceStopConfirmProse(label))}
+          </DialogDescription>
         </DialogHeader>
         {/* Misclick-safe spacing between the body and the buttons. */}
         <div className="h-2" />

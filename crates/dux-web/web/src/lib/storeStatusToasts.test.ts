@@ -1,3 +1,5 @@
+import type { ReactElement } from "react"
+import { renderToStaticMarkup } from "react-dom/server"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { BUSY_TOAST_MAX_MS } from "./notify"
@@ -562,5 +564,68 @@ describe("an engine status that says it waits for the user", () => {
       id: "ordinary",
       duration: 24000,
     })
+  })
+})
+
+describe("an engine status that names things", () => {
+  // The frame `crates/dux-web/src/server.rs` sends for the checkout
+  // confirmation: the plain sentence the terminal UI prints, and the parts it
+  // was built from.
+  const frame = {
+    event: "status",
+    key: "op-9",
+    tone: "info",
+    message: 'Checked out "main" for project "app".',
+    segments: [
+      "Checked out ",
+      { name: "main", quoted: true },
+      " for project ",
+      { name: "app", quoted: true },
+      ".",
+    ],
+  }
+
+  it("reaches the toast with every name drawn as a chip", async () => {
+    const mod = await loadStoreWithBootstrap()
+    const { toast } = await import("sonner")
+
+    mod.eventsSocket.onEvent(frame)
+    expect(toast.success).toHaveBeenCalledTimes(1)
+    const [body, options] = vi.mocked(toast.success).mock.calls[0]
+    expect(options).toEqual({ id: "op-9", duration: 6000 })
+    expect(typeof body).not.toBe("string")
+    const html = renderToStaticMarkup(body as ReactElement)
+    expect(html).toContain('<code data-slot="inline-code"')
+    expect(html).toMatch(/>main<\/code>/)
+    expect(html).toMatch(/>app<\/code>/)
+    expect(html).not.toContain("&quot;main&quot;")
+  })
+
+  it("falls back to the plain sentence when the parts do not spell it", async () => {
+    const mod = await loadStoreWithBootstrap()
+    const { toast } = await import("sonner")
+
+    mod.eventsSocket.onEvent({ ...frame, segments: ["something else"] })
+    expect(toast.success).toHaveBeenCalledWith(frame.message, {
+      id: "op-9",
+      duration: 6000,
+    })
+  })
+})
+
+describe("a refusal the browser raises itself", () => {
+  it("draws the provider it refuses as a chip", async () => {
+    const mod = await loadStoreWithBootstrap()
+    const { toast } = await import("sonner")
+
+    // The bootstrap configures no provider, so the pre-flight refuses.
+    expect(await mod.changeAgentProvider("s1", "nope")).toBe(false)
+    expect(toast.error).toHaveBeenCalledTimes(1)
+    const [body] = vi.mocked(toast.error).mock.calls[0]
+    expect(typeof body).not.toBe("string")
+    const html = renderToStaticMarkup(body as ReactElement)
+    expect(html).toMatch(/<code data-slot="inline-code"[^>]*>nope<\/code>/)
+    expect(html).not.toContain("&quot;nope&quot;")
+    expect(html).toContain("is not configured. Pick one of the configured providers.")
   })
 })

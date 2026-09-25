@@ -31,7 +31,8 @@ describe("RenameEntryDialog", () => {
         onSubmit={() => Promise.resolve()}
       />,
     )
-    expect(screen.getByText("Rename old.ts")).toBeTruthy()
+    expect(screen.getByRole("heading").textContent).toBe("Rename old.ts")
+    expect(screen.getByText("old.ts", { selector: "code" })).toBeTruthy()
   })
 
   it("a dirty target shows the blocking message and disables Confirm", () => {

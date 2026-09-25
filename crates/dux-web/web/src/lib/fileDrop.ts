@@ -1,6 +1,9 @@
 // Pure helpers for a file drop onto a terminal or agent pane. dux saves the file
 // and pastes its path: no agent CLI reads a file from its input stream.
 
+import { chip, endProse, joinProse, type Prose, prose, proseText } from "./prose"
+import { singleQuoted } from "./shellQuote"
+
 /// How many file names one toast spells out before it points at the folder
 /// instead.
 export const MAX_NAMED_FILES = 5
@@ -104,6 +107,10 @@ function notDelivered(ctx: DropContext): string {
 
 export type DropToast = {
   tone: "success" | "warning" | "error"
+  /// The sentence with every file name, path and folder marked as a name, which
+  /// is what the toast draws.
+  prose: Prose
+  /// The same sentence spelled as plain text.
   message: string
   /// Whether this report waits for the user instead of for a clock. The bar is
   /// deliberately high (see `NotifyOptions.sticky` in `lib/notify.ts`): recovery
@@ -263,13 +270,6 @@ export function tooLongToAttachReason(limit: number): string {
 /// unreadable for the users most likely to have one, for no lexical gain.
 const SHELL_SIGNIFICANT = /[\s"#$&'()*;<>?[\\\]`{|}~]/g
 
-/// Wrap in single quotes, closing and reopening around each embedded apostrophe.
-/// Inside POSIX single quotes nothing else is special, so nothing else is
-/// escaped, and leaving the quotes is the only way to include an apostrophe.
-function singleQuoted(path: string): string {
-  return `'${path.replaceAll("'", `'\\''`)}'`
-}
-
 /// Wrap in double quotes, escaping all four characters a double-quoted string
 /// gives meaning to: `"`, `\`, `$` and a backtick. Shell lexing removes the
 /// backslash again, so escaping all four is lossless and stays safe if the paste
@@ -315,22 +315,22 @@ function foldersOf(saved: SavedFile[]): string[] {
 /// One phrase for where the drop went, or empty when the files landed in more
 /// than one folder and no single phrase is true. Callers then use
 /// `folderBreakdown`.
-function folderPhrase(saved: SavedFile[], ctx: DropContext): string {
+function folderPhrase(saved: SavedFile[], ctx: DropContext): Prose {
   const folders = foldersOf(saved)
-  if (folders.length === 1) return folders[0]
+  if (folders.length === 1) return [chip(folders[0])]
   // An empty label from the server still needs something true to say.
   if (folders.length === 0) {
     return ctx.kind === "agent"
-      ? "the agent's upload folder"
-      : "the terminal's folder"
+      ? ["the agent's upload folder"]
+      : ["the terminal's folder"]
   }
-  return ""
+  return []
 }
 
 /// The per-folder listing used when one phrase cannot cover the drop, grouped by
 /// folder so three files in two folders read as two clauses instead of three.
-function folderBreakdown(saved: SavedFile[], ctx: DropContext): string {
-  if (folderPhrase(saved, ctx) !== "") return ""
+function folderBreakdown(saved: SavedFile[], ctx: DropContext): Prose {
+  if (folderPhrase(saved, ctx).length > 0) return []
   const order: string[] = []
   const byFolder = new Map<string, string[]>()
   for (const s of saved) {
@@ -343,23 +343,26 @@ function folderBreakdown(saved: SavedFile[], ctx: DropContext): string {
   }
   const clauses = order.map((folder) => {
     const names = byFolder.get(folder) ?? []
-    const listed =
+    const listed: Prose =
       names.length > MAX_NAMED_FILES
-        ? `${names.length} files`
-        : names.join(" and ")
-    return `${listed} to ${folder}`
+        ? [`${names.length} files`]
+        : joinProse(
+            names.map((name) => [chip(name)]),
+            " and ",
+          )
+    return prose`${listed} to ${chip(folder)}`
   })
   // Only a terminal can scatter a drop across folders, so only it has a why.
   const why =
     ctx.kind === "terminal" ? "A terminal moves, so they" : "They"
-  return ` ${why} did not all land together: ${clauses.join(", ")}.`
+  return prose` ${why} did not all land together: ${joinProse(clauses, ", ")}.`
 }
 
 /// `to <somewhere>` when one phrase covers the drop, and nothing when it does
 /// not, because `folderBreakdown` then says it properly.
-function toPhrase(saved: SavedFile[], ctx: DropContext): string {
+function toPhrase(saved: SavedFile[], ctx: DropContext): Prose {
   const where = folderPhrase(saved, ctx)
-  return where === "" ? "" : ` to ${where}`
+  return where.length === 0 ? [] : prose` to ${where}`
 }
 
 /// The stranded files that share a reason, grouped, in the order the reasons
@@ -379,13 +382,15 @@ function strandedByReason(
 
 /// Stranded files named with their full paths, since the user has to find them
 /// by hand. Capped, with the remainder counted rather than dropped silently.
-function strandedList(files: SavedFile[]): string {
-  const named = files
-    .slice(0, MAX_NAMED_FILES)
-    .map((f) => `${f.savedName} (${f.path})`)
-    .join(", ")
+function strandedList(files: SavedFile[]): Prose {
+  const named = joinProse(
+    files
+      .slice(0, MAX_NAMED_FILES)
+      .map((f) => prose`${chip(f.savedName)} (${chip(f.path)})`),
+    ", ",
+  )
   return files.length > MAX_NAMED_FILES
-    ? `${named} and ${files.length - MAX_NAMED_FILES} more`
+    ? prose`${named} and ${files.length - MAX_NAMED_FILES} more`
     : named
 }
 
@@ -406,28 +411,42 @@ export function asClause(text: string): string {
 
 /// The refused files, named with their reasons. Deliberately does not end in a
 /// period: one caller continues the sentence afterwards.
-function reasonList(items: { requestedName: string; reason: string }[]): string {
+function reasonList(items: { requestedName: string; reason: string }[]): Prose {
   if (items.length > MAX_NAMED_FILES) {
-    return `${items.length} files were refused; the first was ${items[0].requestedName} (${asClause(items[0].reason)})`
+    return prose`${items.length} files were refused; the first was ${chip(items[0].requestedName)} (${asClause(items[0].reason)})`
   }
-  return items.map((r) => `${r.requestedName} (${asClause(r.reason)})`).join(", ")
+  return joinProse(
+    items.map((r) => prose`${chip(r.requestedName)} (${asClause(r.reason)})`),
+    ", ",
+  )
 }
 
 /// The renamed-file note, applied to every saved file at every rung: a file that
 /// was renamed and whose path never went out is one the user must find by hand
 /// under a name they were never told.
-function renameNote(saved: SavedFile[], ctx: DropContext): string {
+function renameNote(saved: SavedFile[], ctx: DropContext): Prose {
   const renamed = saved.filter((s) => s.requestedName !== s.savedName)
-  if (renamed.length === 0) return ""
+  if (renamed.length === 0) return []
   // Named, never counted: a count does not say what the file is now called.
   if (renamed.length > MAX_NAMED_FILES) {
     const where = folderPhrase(renamed, ctx)
-    return ` ${renamed.length} already existed and were saved under new names, which are listed in ${where === "" ? "the folders above" : where}.`
+    const listedIn: Prose = where.length === 0 ? ["the folders above"] : where
+    return prose` ${renamed.length} already existed and were saved under new names, which are listed in ${listedIn}.`
   }
-  const pairs = renamed
-    .map((r) => `${r.requestedName} was saved as ${r.savedName}`)
-    .join(", ")
-  return ` ${pairs}, so nothing was overwritten.`
+  const pairs = joinProse(
+    renamed.map((r) => prose`${chip(r.requestedName)} was saved as ${chip(r.savedName)}`),
+    ", ",
+  )
+  return prose` ${pairs}, so nothing was overwritten.`
+}
+
+/// A rung's report: the sentence, and its plain spelling beside it.
+function dropToast(
+  tone: DropToast["tone"],
+  sticky: boolean,
+  sentence: Prose,
+): DropToast {
+  return { tone, sticky, prose: sentence, message: proseText(sentence) }
 }
 
 /// The one toast for a whole drop, so a handful of files cannot bury the screen.
@@ -449,16 +468,13 @@ export function dropToastFor(
   const anySaved = outcomes.some(
     (o) => o.kind === "sent" || o.kind === "saved-not-sent",
   )
-  return {
-    ...report,
+  return dropToast(
+    report.tone,
     // Sticky: dux cancelled the paste, so a text paste that saved nothing
     // survives only on the clipboard and the recovery line is the way back.
-    sticky: report.sticky || !anySaved,
-    message:
-      pastedTextLead(ctx.pastedTextChars, anySaved, ctx) +
-      report.message +
-      PASTED_TEXT_RECOVERY,
-  }
+    report.sticky || !anySaved,
+    prose`${pastedTextLead(ctx.pastedTextChars, anySaved, ctx)}${report.prose}${PASTED_TEXT_RECOVERY}`,
+  )
 }
 
 /// The sentence in front of every rung when the "files" were one long text
@@ -496,65 +512,58 @@ function savedFilesToast(
   // 1. Nothing saved.
   if (savedFiles.length === 0) {
     if (refused.length === 1) {
-      return {
-        tone: "error",
-        sticky: false,
-        message: endSentence(
-          `Could not save ${refused[0].requestedName}: ${refused[0].reason}`,
+      return dropToast(
+        "error",
+        false,
+        endProse(
+          prose`Could not save ${chip(refused[0].requestedName)}: ${refused[0].reason}`,
         ),
-      }
+      )
     }
-    return {
-      tone: "error",
-      sticky: false,
-      message: endSentence(
-        `Could not save any of the ${refused.length} dropped files. ${reasonList(refused)}`,
+    return dropToast(
+      "error",
+      false,
+      endProse(
+        prose`Could not save any of the ${refused.length} dropped files. ${reasonList(refused)}`,
       ),
-    }
+    )
   }
 
   // 2. Something saved whose path never went out: we do not hold input, or the
   // socket was closed. This is the rung where the user finds the file by hand.
   if (notSent.length > 0) {
     const groups = strandedByReason(notSent)
-    const alsoRefused =
-      refused.length > 0 ? ` ${reasonList(refused)} was not saved at all.` : ""
+    const alsoRefused: Prose =
+      refused.length > 0 ? prose` ${reasonList(refused)} was not saved at all.` : []
     // One reason for all of them is the only case where a single "not sent:
     // <why>" clause is true of every stranded file.
     const head =
       groups.length === 1
-        ? `Saved${toPhrase(savedFiles, ctx)}, but the path was ${notDelivered(ctx)}: ${endSentence(groups[0].reason)} ` +
-          `The file is at ${strandedList(groups[0].files)}.`
-        : `Saved${toPhrase(savedFiles, ctx)}, but ${notSent.length} paths were ${notDelivered(ctx)}: ` +
-          `${groups
-            .map((g) => `${strandedList(g.files)} because ${asClause(g.reason)}`)
-            .join("; ")}.`
-    return {
-      tone: "warning",
+        ? prose`Saved${toPhrase(savedFiles, ctx)}, but the path was ${notDelivered(ctx)}: ${endSentence(groups[0].reason)} The file is at ${strandedList(groups[0].files)}.`
+        : prose`Saved${toPhrase(savedFiles, ctx)}, but ${notSent.length} paths were ${notDelivered(ctx)}: ${joinProse(
+            groups.map(
+              (g) => prose`${strandedList(g.files)} because ${asClause(g.reason)}`,
+            ),
+            "; ",
+          )}.`
+    return dropToast(
+      "warning",
       // Sticky: nothing else on screen names the path of a file that is on disk
       // and was never given to the agent.
-      sticky: true,
-      message:
-        head +
-        alsoRefused +
-        renameNote(savedFiles, ctx) +
-        folderBreakdown(savedFiles, ctx),
-    }
+      true,
+      prose`${head}${alsoRefused}${renameNote(savedFiles, ctx)}${folderBreakdown(savedFiles, ctx)}`,
+    )
   }
 
   // 3. Everything that saved was sent, but something was refused outright.
   if (refused.length > 0) {
     const total = outcomes.length
-    return {
-      tone: "warning",
+    return dropToast(
+      "warning",
       // Not sticky: the originals are still wherever they were dragged from.
-      sticky: false,
-      message:
-        `Saved ${savedFiles.length} of ${total} files${toPhrase(savedFiles, ctx)} and ${deliveredMany(ctx)}. ` +
-        `Refused: ${endSentence(reasonList(refused))}` +
-        renameNote(savedFiles, ctx) +
-        folderBreakdown(savedFiles, ctx),
-    }
+      false,
+      prose`Saved ${savedFiles.length} of ${total} files${toPhrase(savedFiles, ctx)} and ${deliveredMany(ctx)}. Refused: ${endProse(reasonList(refused))}${renameNote(savedFiles, ctx)}${folderBreakdown(savedFiles, ctx)}`,
+    )
   }
 
   // 4. Everything worked.
@@ -563,18 +572,15 @@ function savedFilesToast(
     const where = toPhrase(savedFiles, ctx)
     const named =
       one.requestedName === one.savedName
-        ? `Saved ${one.savedName}${where} and ${deliveredOne(ctx)}.`
-        : `Saved ${one.requestedName}${where} as ${one.savedName}, so nothing was overwritten, and ${deliveredOne(ctx)}.`
-    return { tone: "success", sticky: false, message: named }
+        ? prose`Saved ${chip(one.savedName)}${where} and ${deliveredOne(ctx)}.`
+        : prose`Saved ${chip(one.requestedName)}${where} as ${chip(one.savedName)}, so nothing was overwritten, and ${deliveredOne(ctx)}.`
+    return dropToast("success", false, named)
   }
-  return {
-    tone: "success",
-    sticky: false,
-    message:
-      `Saved ${savedFiles.length} files${toPhrase(savedFiles, ctx)} and ${deliveredMany(ctx)}.` +
-      renameNote(savedFiles, ctx) +
-      folderBreakdown(savedFiles, ctx),
-  }
+  return dropToast(
+    "success",
+    false,
+    prose`Saved ${savedFiles.length} files${toPhrase(savedFiles, ctx)} and ${deliveredMany(ctx)}.${renameNote(savedFiles, ctx)}${folderBreakdown(savedFiles, ctx)}`,
+  )
 }
 
 /// The toast id one drop lives on: its per-file spinners and its final report,

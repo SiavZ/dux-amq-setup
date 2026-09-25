@@ -446,7 +446,7 @@ mod tests {
     /// Init a repo with `git init` but NO commit (unborn HEAD).
     fn init_repo_no_commit(dir: &Path) {
         let run = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
+            let ok = dux_core::test_git::fixture_git()
                 .args(args)
                 .current_dir(dir)
                 .output()
@@ -796,7 +796,7 @@ mod tests {
     fn init_repo_with_commit(dir: &Path) {
         init_repo_no_commit(dir);
         let run = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
+            let ok = dux_core::test_git::fixture_git()
                 .args(args)
                 .current_dir(dir)
                 .output()
@@ -809,7 +809,7 @@ mod tests {
     }
 
     fn commit_count(dir: &Path) -> String {
-        let out = std::process::Command::new("git")
+        let out = dux_core::test_git::fixture_git()
             .args(["rev-list", "--count", "HEAD"])
             .current_dir(dir)
             .output()
@@ -911,7 +911,7 @@ mod tests {
             })
             .unwrap();
         drop(store);
-        let mut engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        let mut engine = crate::test_support::bootstrap_test_engine(&paths).unwrap();
         engine.mark_in_flight(dux_core::engine::InFlightKey::AgentLaunch(
             engine
                 .slot_tab_id_of(dux_core::ids::SessionIdRef::new("s1"))
@@ -984,7 +984,7 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let run = |args: &[&str]| {
             assert!(
-                std::process::Command::new("git")
+                dux_core::test_git::fixture_git()
                     .args(args)
                     .current_dir(repo.path())
                     .output()

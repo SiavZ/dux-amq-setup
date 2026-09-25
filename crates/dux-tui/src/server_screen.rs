@@ -254,6 +254,7 @@ impl ServerStatusScreen {
             let header_text: Vec<Line> = header.iter().map(|s| line_for(s, theme)).collect();
             let header_para = Paragraph::new(header_text)
                 .alignment(Alignment::Center)
+                // chip-free: the serving screen's header is constant words and URLs.
                 .wrap(Wrap { trim: false })
                 .style(Style::default().bg(theme.app_bg));
             frame.render_widget(header_para, chunks[0]);

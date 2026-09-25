@@ -68,7 +68,12 @@ export const configApi = {
   // second copy written here is how the two drift apart.
   setTailscaleMode: async (
     mode: string,
-  ): Promise<{ mode: string; warning: boolean; message: string }> => {
+  ): Promise<{
+    mode: string
+    warning: boolean
+    message: string
+    segments?: unknown
+  }> => {
     const headers: Record<string, string> = {
       "content-type": "application/json",
     }

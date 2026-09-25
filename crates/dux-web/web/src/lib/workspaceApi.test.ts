@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import { WorkspaceFetchError, fetchWorkspace } from "./workspaceApi"
+import {
+  type RawWorkspace,
+  WorkspaceFetchError,
+  fetchWorkspace,
+  normalizeWorkspace,
+} from "./workspaceApi"
 
 // The spine client is a thin GET wrapper (mirrors bootstrapApi/changesApi): on
 // 2xx it returns the parsed JSON (coercing each session's `tabs` to an array so
@@ -328,5 +333,40 @@ describe("fetchWorkspace", () => {
     const err = await fetchWorkspace().catch((e) => e)
     expect(err).toBeInstanceOf(WorkspaceFetchError)
     expect(err.status).toBe(0)
+  })
+})
+
+describe("a pull request title from the wire", () => {
+  // Someone else's text: the controls that would reorder the words around it are
+  // stripped once, where the workspace enters the store, so no screen that draws
+  // the title has to remember to.
+  it("loses its bidi controls at the ingestion boundary", () => {
+    const raw = {
+      projects: [],
+      sessions: [
+        {
+          id: "s1",
+          project_id: "p1",
+          pr: {
+            number: 42,
+            state: "open",
+            title: "Fix login \u202Eexe.txt\u202C",
+            url: "https://example.com/pr/42",
+          },
+        },
+      ],
+      sidebar: { groups: [], agentless_start: null },
+    } as unknown as RawWorkspace
+    const spine = normalizeWorkspace(raw)
+    expect(spine.sessions[0].pr?.title).toBe("Fix login exe.txt")
+  })
+
+  it("leaves a session without a pull request without one", () => {
+    const raw = {
+      projects: [],
+      sessions: [{ id: "s1", project_id: "p1" }],
+      sidebar: { groups: [], agentless_start: null },
+    } as unknown as RawWorkspace
+    expect("pr" in normalizeWorkspace(raw).sessions[0]).toBe(false)
   })
 })

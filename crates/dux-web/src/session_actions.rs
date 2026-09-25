@@ -1046,7 +1046,7 @@ mod tests {
     }
 
     fn run_git(cwd: &std::path::Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
+        let out = dux_core::test_git::fixture_git()
             .args(args)
             .current_dir(cwd)
             .output()
@@ -1083,7 +1083,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let mut engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        let mut engine = crate::test_support::bootstrap_test_engine(&paths).unwrap();
         ignore_host_disk_fullness(&mut engine);
         let (handle, _join) = crate::engine_actor::spawn_engine_thread(engine);
         (tmp, crate::server::router(handle), "p1".to_string())
@@ -1236,7 +1236,7 @@ mod tests {
             })
             .unwrap();
         drop(store);
-        let mut engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        let mut engine = crate::test_support::bootstrap_test_engine(&paths).unwrap();
         ignore_host_disk_fullness(&mut engine);
         prepare(&mut engine, tmp.path());
         let (handle, _join) = crate::engine_actor::spawn_engine_thread(engine);
@@ -1388,7 +1388,7 @@ mod tests {
             })
             .unwrap();
         drop(store);
-        let mut engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        let mut engine = crate::test_support::bootstrap_test_engine(&paths).unwrap();
         // The gate the dispatch checks, preset so the PUT cannot race the boot
         // probe; the probe itself is pointed at the stand-in gh so enabling
         // the integration never runs a real gh.

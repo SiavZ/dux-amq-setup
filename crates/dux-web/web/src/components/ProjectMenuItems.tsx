@@ -85,7 +85,7 @@ export function ProjectMenuItems({ id }: { id: string }) {
           </DropdownMenuItem>
           <DropdownMenuItem onClick={() => openCheckoutDefaultBranch(id)}>
             <GitBranch />
-            Checkout default branch…
+            Check out default branch…
           </DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem onClick={() => openProjectInfo(id)}>

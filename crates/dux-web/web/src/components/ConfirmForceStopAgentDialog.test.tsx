@@ -1,5 +1,11 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { DuxState } from "@/lib/store"
@@ -109,7 +115,9 @@ describe("ConfirmForceStopAgentDialog", () => {
 
     expect(await screen.findByText("Force stop agent?")).toBeTruthy()
     const body = await screen.findByText(/dux will stop/)
-    expect(body.textContent).toContain('"fix-auth"')
+    // The agent's name is a chip, and the chip replaces the quotes.
+    expect(within(body).getByText("fix-auth", { selector: "code" })).toBeTruthy()
+    expect(body.textContent).toContain("dux will stop fix-auth immediately")
     expect(body.textContent).toContain("immediately, with no shutdown wait")
     expect(body.textContent).toContain("stays in the list as Detached")
     // The polite dialog's promise must not leak into this one.

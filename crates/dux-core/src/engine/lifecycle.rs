@@ -189,7 +189,7 @@ pub struct DeferredWorktreeRemoval {
     pub delete_branch: Option<bool>,
     /// The Busy status message to show while the removal runs (set when the
     /// worker is finally spawned, after the PTY is reaped).
-    pub busy_message: String,
+    pub busy_message: crate::status_text::StatusText,
 }
 
 /// A PTY that was SIGTERMed by an individual delete/close and is being given a
@@ -340,15 +340,23 @@ pub struct ClosedTabExit {
 /// The closing clause is only written where it is certainly true: one tab left
 /// means the pane can only be showing that tab, while with siblings still up
 /// the user may be looking at any of them.
-pub fn closed_tab_exit_notice(exit: &ClosedTabExit) -> String {
-    let head = format!(
-        "Tab ({}) of agent \"{}\" exited cleanly and was closed",
-        exit.provider, exit.agent_label
-    );
+pub fn closed_tab_exit_notice(exit: &ClosedTabExit) -> crate::status_text::StatusText {
+    let head = crate::status_text![
+        "Tab (",
+        n(exit.provider),
+        ") of agent ",
+        q(exit.agent_label),
+        " exited cleanly and was closed"
+    ];
     if exit.tabs_remaining == 1 {
-        format!("{head}; the pane now shows its {} tab.", exit.slot_provider)
+        crate::status_text![
+            head,
+            "; the pane now shows its ",
+            n(exit.slot_provider),
+            " tab."
+        ]
     } else {
-        format!("{head}.")
+        crate::status_text![head, "."]
     }
 }
 
@@ -364,9 +372,9 @@ pub fn closed_tab_exit_notice(exit: &ClosedTabExit) -> String {
 /// screen and about to be thrown away with the pane, so the notice quotes the
 /// CLI's own last words and names `remedy`, which is the only part that differs
 /// per surface because the way back does.
-pub fn detached_agent_notice(pruned: &PrunedPty, remedy: &str) -> String {
+pub fn detached_agent_notice(pruned: &PrunedPty, remedy: &str) -> crate::status_text::StatusText {
     refused_resume_notice(pruned, remedy)
-        .unwrap_or_else(|| format!("{}.", agent_exited_head(&pruned.label)))
+        .unwrap_or_else(|| crate::status_text![agent_exited_head(&pruned.label), "."])
 }
 
 /// The same notice, for a surface that also knows a companion terminal of the
@@ -377,23 +385,29 @@ pub fn detached_agent_notice(pruned: &PrunedPty, remedy: &str) -> String {
 /// the other naming neither the agent nor what survived it. A refused resume
 /// still wins, because what the provider said is the more useful sentence and
 /// the terminal is beside the point there.
-pub fn agent_exit_with_companion_notice(pruned: &PrunedPty, remedy: &str) -> String {
+pub fn agent_exit_with_companion_notice(
+    pruned: &PrunedPty,
+    remedy: &str,
+) -> crate::status_text::StatusText {
     refused_resume_notice(pruned, remedy).unwrap_or_else(|| {
-        format!(
-            "{}, and its companion terminal is still running. {remedy}",
-            agent_exited_head(&pruned.label)
-        )
+        crate::status_text![
+            agent_exited_head(&pruned.label),
+            format!(", and its companion terminal is still running. {}", remedy)
+        ]
     })
 }
 
 /// The fact itself, with no full stop, so the sentences that continue past it
 /// can.
-fn agent_exited_head(label: &str) -> String {
-    format!("Agent \"{label}\" exited")
+fn agent_exited_head(label: &str) -> crate::status_text::StatusText {
+    crate::status_text!["Agent ", q(label), " exited"]
 }
 
 /// The provider's own last words, when this exit was a resume it refused.
-fn refused_resume_notice(pruned: &PrunedPty, remedy: &str) -> Option<String> {
+fn refused_resume_notice(
+    pruned: &PrunedPty,
+    remedy: &str,
+) -> Option<crate::status_text::StatusText> {
     crate::tab_verdict::refused_resume_warning(
         &pruned.label,
         pruned.refused_resume_excerpt.as_deref()?,
@@ -406,11 +420,13 @@ fn refused_resume_notice(pruned: &PrunedPty, remedy: &str) -> Option<String> {
 /// Closing a terminal is destructive and the row leaving the sidebar is too
 /// small to stand in for the confirmation, so the sentence says what went with
 /// it as well as what was closed.
-pub fn closed_terminal_notice(label: &str) -> String {
-    format!(
-        "Closed terminal \"{label}\". Its shell has stopped, so anything that was running in it \
+pub fn closed_terminal_notice(label: &str) -> crate::status_text::StatusText {
+    crate::status_text![
+        "Closed terminal ",
+        q(label),
+        ". Its shell has stopped, so anything that was running in it \
          is gone."
-    )
+    ]
 }
 
 /// Whether an exited agent tab's row should be closed along with the prune: any
@@ -502,8 +518,10 @@ pub enum DetachSessionOutcome {
         key: String,
         /// The wait the request promised, in seconds.
         grace_seconds: u64,
-        /// The busy sentence to show while the wait runs.
-        busy: String,
+        /// The busy sentence to show while the wait runs, built from parts so
+        /// the web's busy toast chips the agent's name; the terminal UI prints
+        /// its plain message.
+        busy: crate::status_text::StatusText,
     },
 }
 
@@ -541,14 +559,18 @@ pub fn detach_status_key(session_id: &str) -> String {
 }
 
 /// The spinner shown while dux waits for the agent to exit on its own.
-pub fn detach_busy_message(label: &str) -> String {
-    format!("Asking \"{label}\" to shut down…")
+pub fn detach_busy_message(label: &str) -> crate::status_text::StatusText {
+    crate::status_text!["Asking ", q(label), " to shut down…"]
 }
 
 /// The refusal when the agent has no live process. Loud rather than silent: the
 /// row looks the same either way, so silence is indistinguishable from a failure.
-pub fn detach_not_running_message(label: &str) -> String {
-    format!("Agent \"{label}\" is not running, so there is nothing to detach.")
+pub fn detach_not_running_message(label: &str) -> crate::status_text::StatusText {
+    crate::status_text![
+        "Agent ",
+        q(label),
+        " is not running, so there is nothing to detach."
+    ]
 }
 
 /// What replaces the detach spinner. Two genuinely different endings, so two
@@ -568,15 +590,22 @@ pub fn detach_not_running_message(label: &str) -> String {
 /// fixture without that wait reports clean for a child written to survive.
 pub fn detach_final(label: &str, forced: bool, grace_seconds: u64) -> crate::engine::Final {
     if forced {
-        crate::engine::Final::warning(format!(
-            "Agent \"{label}\" did not exit within {grace_seconds} seconds and was \
-             force-closed; it is now detached."
-        ))
+        crate::engine::Final::warning(crate::status_text![
+            "Agent ",
+            q(label),
+            format!(
+                " did not exit within {} seconds and was \
+             force-closed; it is now detached.",
+                grace_seconds
+            )
+        ])
     } else {
-        crate::engine::Final::info(format!(
-            "Agent \"{label}\" shut down and is now detached. Resume it from its row \
+        crate::engine::Final::info(crate::status_text![
+            "Agent ",
+            q(label),
+            " shut down and is now detached. Resume it from its row \
              when you need it again."
-        ))
+        ])
     }
 }
 
@@ -594,14 +623,29 @@ pub fn detach_final(label: &str, forced: bool, grace_seconds: u64) -> crate::eng
 /// each asserting the exact sentence, so a change on one side fails visibly on
 /// the side that changed.
 pub fn detach_confirm_body(label: &str, grace_seconds: u64, live_tabs: usize) -> String {
-    let mut body = format!(
-        "dux will ask \"{label}\" to shut down and wait up to {grace_seconds} seconds \
-         for it to exit before forcing it. The agent stays in the list as Detached, \
-         and you can resume it later. Anything the agent is doing right now is \
-         interrupted."
-    );
+    detach_confirm_prose(label, grace_seconds, live_tabs).plain()
+}
+
+/// [`detach_confirm_body`] as prose, the agent's name marked so each surface
+/// draws it as a chip. The dialogs render this; the string is its plain-text
+/// spelling. Pinned against the browser's `detachConfirmProse` by
+/// `tests/fixtures/prose_cross_language.json`.
+pub fn detach_confirm_prose(
+    label: &str,
+    grace_seconds: u64,
+    live_tabs: usize,
+) -> crate::prose::Prose {
+    let mut body = crate::prose::Prose::new()
+        .text("dux will ask ")
+        .quoted(label)
+        .text(format!(
+            " to shut down and wait up to {grace_seconds} seconds \
+             for it to exit before forcing it. The agent stays in the list as Detached, \
+             and you can resume it later. Anything the agent is doing right now is \
+             interrupted."
+        ));
     if live_tabs > 1 {
-        body.push_str(&format!(" All {live_tabs} running tabs stop together."));
+        body.push_text(format!(" All {live_tabs} running tabs stop together."));
     }
     body
 }
@@ -1204,6 +1248,25 @@ impl Engine {
             .into_iter()
             .filter(|id| self.providers.contains_key(id.as_ref_id()))
             .collect()
+    }
+
+    /// Every pty in the workspace with a process behind it right now: each live
+    /// provider tab, the first tab and extra tabs alike, and each terminal
+    /// whatever owns it. Sorted, so a caller announcing one fact per pty
+    /// announces them in a stable order.
+    ///
+    /// Read straight from the two maps a process lives in, so a dormant tab (a
+    /// row with no process) is never in it, and neither is a launch that has not
+    /// produced its pty yet.
+    pub fn running_pty_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .providers
+            .keys()
+            .map(|id| id.as_str().to_string())
+            .chain(self.companion_terminals.keys().cloned())
+            .collect();
+        ids.sort();
+        ids
     }
 
     /// How many of an agent's tabs are running. The confirmation copy's count.
@@ -2122,11 +2185,17 @@ impl Engine {
                             &outcome.live_providers,
                         ))
                     }
-                    Err(err) => crate::engine::Final::error(format!(
-                        "Could not recreate the working copy for agent \"{agent_label}\" at {}: \
-                         {err}",
-                        crate::home_path::shorten_home(&worktree_path)
-                    )),
+                    Err(err) => crate::engine::Final::error(crate::status_text![
+                        "Could not recreate the working copy for agent ",
+                        q(agent_label),
+                        " at ",
+                        n(crate::home_path::shorten_home(&worktree_path)),
+                        format!(
+                            ": \
+                         {}",
+                            err
+                        )
+                    ]),
                 }
             })
             .with_scope(self.current_origin.clone());
@@ -2183,7 +2252,7 @@ mod recreate_tests {
     use crate::engine::test_support::{sample_project, sample_session, test_engine};
 
     /// An engine with one managed agent whose working copy has been deleted.
-    fn engine_with_a_missing_working_copy() -> (Engine, tempfile::TempDir) {
+    fn engine_with_a_missing_working_copy() -> (Engine, crate::test_scratch::ScratchDir) {
         let (mut engine, tmp) = test_engine();
         engine.projects.push(sample_project("p1", "/tmp/p1"));
         engine.sessions.push(sample_session("s1", "p1", "feat"));
@@ -2536,6 +2605,16 @@ mod recreate_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// The tone and the plain words of a final, the terminal UI's reading of
+    /// it. A final built from parts also carries them, which the literal a test
+    /// writes does not, so the words are what these tests compare.
+    fn final_words(outcome: &crate::engine::Final) -> (crate::statusline::StatusTone, &str) {
+        match outcome {
+            crate::engine::Final::Message { tone, text, .. } => (*tone, text.as_str()),
+            crate::engine::Final::Clear => panic!("expected a message, got a clear"),
+        }
+    }
     use crate::ids::{TabId, TabIdRef};
     use crate::tab_verdict::TabRunEnding;
     use std::path::Path;
@@ -3853,7 +3932,9 @@ mod tests {
     /// that behaved differently fails loudly rather than passing vacuously.
     /// `None` when this kernel cannot stage the state at all, in which case the
     /// caller returns without asserting. See `pty::pty_capability`.
-    fn engine_with_reaped_but_undrained_agent(worktree: &Path) -> Option<(Engine, TempDir)> {
+    fn engine_with_reaped_but_undrained_agent(
+        worktree: &Path,
+    ) -> Option<(Engine, crate::test_scratch::ScratchDir)> {
         if crate::pty::pty_capability::skip_unless_pty_survives_leader_exit(
             "engine_with_reaped_but_undrained_agent",
         ) {
@@ -4016,7 +4097,7 @@ mod tests {
         worktree: &Path,
         tab_id: &str,
         linger: &str,
-    ) -> Option<(Engine, TempDir)> {
+    ) -> Option<(Engine, crate::test_scratch::ScratchDir)> {
         if crate::pty::pty_capability::skip_unless_eof_precedes_exit(
             "engine_with_drained_but_unreaped_agent",
         ) {
@@ -4550,7 +4631,7 @@ mod tests {
     /// a worktree that exists on disk (the tempdir), a project with no opt-out,
     /// and a resume-capable provider (claude). Each matrix test flips exactly
     /// one condition off and asserts the candidate disappears.
-    fn auto_reopen_fixture() -> (Engine, TempDir, tempfile::TempDir) {
+    fn auto_reopen_fixture() -> (Engine, crate::test_scratch::ScratchDir, tempfile::TempDir) {
         let (mut engine, tmp) = test_engine();
         engine.config.ui.auto_reopen_agents = true;
         let worktree = tempfile::tempdir().expect("worktree dir");
@@ -4722,7 +4803,8 @@ mod tests {
     /// the fact that the question was never answered deliberately. The
     /// structural switch is what this pins: folder exists, provider can resume,
     /// no project consult.
-    fn standalone_auto_reopen_fixture() -> (Engine, TempDir, tempfile::TempDir) {
+    fn standalone_auto_reopen_fixture()
+    -> (Engine, crate::test_scratch::ScratchDir, tempfile::TempDir) {
         let (mut engine, tmp) = test_engine();
         engine.config.ui.auto_reopen_agents = true;
         let folder = tempfile::tempdir().expect("folder");
@@ -6340,7 +6422,7 @@ mod tests {
                     branch_provenance: crate::model::BranchProvenance::CreatedByDux,
                     worktree_path: worktree.path().to_string_lossy().to_string(),
                 },
-                busy_message: "removing".to_string(),
+                busy_message: "removing".to_string().into(),
             },
         });
 
@@ -6446,7 +6528,7 @@ mod tests {
         }
     }
 
-    fn detach_test_engine() -> (Engine, TempDir, TempDir) {
+    fn detach_test_engine() -> (Engine, crate::test_scratch::ScratchDir, TempDir) {
         let (mut engine, tmp) = test_engine();
         let worktree = tempfile::tempdir().expect("worktree dir");
         engine.projects.push(sample_project(
@@ -6566,8 +6648,9 @@ mod tests {
         assert_eq!(finals.len(), 1);
         assert_eq!(finals[0].key, key);
         assert_eq!(
-            finals[0].outcome,
-            crate::engine::Final::info(
+            final_words(&finals[0].outcome),
+            (
+                crate::statusline::StatusTone::Info,
                 "Agent \"s1-title\" shut down and is now detached. Resume it from its \
                  row when you need it again."
             )
@@ -6609,8 +6692,9 @@ mod tests {
         let finals = reap_until_detach_final(&mut engine, Duration::from_secs(10));
         assert_eq!(finals.len(), 1);
         assert_eq!(
-            finals[0].outcome,
-            crate::engine::Final::warning(
+            final_words(&finals[0].outcome),
+            (
+                crate::statusline::StatusTone::Warning,
                 "Agent \"s1-title\" did not exit within 2 seconds and was \
                  force-closed; it is now detached."
             ),
@@ -6825,7 +6909,7 @@ mod tests {
 
     /// A live agent in the engine, so the handoff is collected from the same
     /// shape production has rather than from a hand-built map.
-    fn engine_with_one_live_agent() -> (Engine, TempDir) {
+    fn engine_with_one_live_agent() -> (Engine, crate::test_scratch::ScratchDir) {
         let (mut engine, tmp) = test_engine();
         let worktree = tmp.path();
         engine
@@ -7197,6 +7281,65 @@ mod tests {
         assert!(
             new_order > 9,
             "a new terminal must sort after every adopted one, got {new_order}"
+        );
+    }
+
+    /// Every pty with a process behind it, and nothing else: each live provider
+    /// tab (the slot tab and an extra one alike) and each terminal whatever owns
+    /// it. A dormant tab is a row with no process, so it is not a pty at all.
+    /// Sorted, so a caller that announces one fact per pty announces them in the
+    /// same order every time.
+    #[test]
+    fn running_pty_ids_names_every_live_tab_and_terminal_and_no_dormant_tab() {
+        let (mut engine, _tmp) = test_engine();
+        let dir = tempfile::tempdir().expect("working dir");
+        let path = dir.path().to_string_lossy().to_string();
+        engine.projects.push(sample_project("p1", &path));
+        let mut session = sample_session("s1", "p1", "feat");
+        session
+            .workspace
+            .as_managed_mut()
+            .expect("managed test session")
+            .worktree_path = path.clone();
+        engine.sessions.push(session);
+        engine.config.terminal.command = "cat".to_string();
+        engine.config.terminal.args = vec![];
+
+        engine
+            .providers
+            .insert(TabId::new("s1-slot"), spawn_cat(dir.path()));
+        engine
+            .providers
+            .insert(TabId::new("s1-tab-2"), spawn_cat(dir.path()));
+        // An extra tab with a row and no process: dormant.
+        engine.agent_tabs.insert(
+            TabId::new("s1-tab-3"),
+            sample_tab("s1-tab-3", "s1", "claude", 2),
+        );
+        let (session_terminal, _) = engine
+            .create_companion_terminal("s1", 24, 80)
+            .expect("session terminal");
+        let (project_terminal, _) = engine
+            .create_project_terminal("p1", 24, 80)
+            .expect("project terminal");
+        let (standalone_terminal, _) = engine
+            .create_standalone_terminal(24, 80)
+            .expect("standalone terminal");
+
+        let mut expected = vec![
+            "s1-slot".to_string(),
+            "s1-tab-2".to_string(),
+            session_terminal,
+            project_terminal,
+            standalone_terminal,
+        ];
+        expected.sort();
+        assert_eq!(engine.running_pty_ids(), expected);
+
+        engine.providers.remove(TabIdRef::new("s1-tab-2"));
+        assert!(
+            !engine.running_pty_ids().contains(&"s1-tab-2".to_string()),
+            "a tab whose process is gone is no longer a pty"
         );
     }
 }

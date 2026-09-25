@@ -209,7 +209,7 @@ describe("AddProjectDialog picker", () => {
     expect(
       screen.getByText("This folder is not a git repository."),
     ).toBeTruthy()
-    expect(screen.getByText(/node_modules/)).toBeTruthy()
+    expect(screen.getByText("node_modules", { selector: "code" })).toBeTruthy()
 
     const primary = screen
       .getAllByRole("button")
@@ -234,11 +234,11 @@ describe("AddProjectDialog picker", () => {
     fireEvent.click(screen.getByText("Use this folder").closest("button")!)
     rerender(<AddProjectDialog />)
 
-    expect(
-      screen.getByText(
-        "This folder is inside the git repository at /home/u. Add that repository instead.",
-      ),
-    ).toBeTruthy()
+    const blocked = screen.getByText(/This folder is inside the git repository at/)
+    expect(blocked.textContent).toBe(
+      "This folder is inside the git repository at /home/u. Add that repository instead.",
+    )
+    expect(within(blocked).getByText("/home/u", { selector: "code" })).toBeTruthy()
     const primary = screen
       .getAllByRole("button")
       .find((b) => b.textContent === "Add project")!
@@ -308,5 +308,52 @@ describe("AddProjectDialog picker", () => {
     expect(closeAddProject).not.toHaveBeenCalled()
     expect(screen.queryByPlaceholderText("Folder name")).toBeNull()
     expect(screen.getByRole("button", { name: /new folder/i })).toBeTruthy()
+  })
+})
+
+describe("AddProjectDialog non-default branch", () => {
+  const onFeature = (path: string) => ({
+    path,
+    kind: "repo" as const,
+    repoRoot: null,
+    gitignoreCandidates: [],
+    currentBranch: "feature",
+    warning: { kind: "known" as const, default_branch: "main" },
+    hasCommits: true,
+    error: null,
+    loading: false,
+  })
+
+  it("names the branch new worktrees start from, following the checkout box", () => {
+    seed({
+      projectPathInspection: onFeature("/home/u/notes"),
+    } as Partial<DuxState>)
+    render(<AddProjectDialog />)
+    fireEvent.click(screen.getByText("Use this folder").closest("button")!)
+
+    // Both branches in the headline are chips.
+    const headline = screen.getByText(/This repository is on branch/)
+    expect(
+      [...headline.querySelectorAll("code")].map((c) => c.textContent),
+    ).toEqual(["feature", "main"])
+
+    // The checkbox label names the default branch as a chip, with no quotes.
+    const label = screen.getByRole("checkbox").closest("label")!
+    expect(label.textContent).toBe("Check out main before adding")
+    expect(within(label).getByText("main", { selector: "code" })).toBeTruthy()
+
+    // Ticked by default: the default branch, and nothing to warn about.
+    const note = () => screen.getByText(/New worktrees will branch from/)
+    expect(note().textContent).toBe("New worktrees will branch from main.")
+    expect(within(note()).getByText("main", { selector: "code" })).toBeTruthy()
+    expect(note().getAttribute("data-tone")).toBe("neutral")
+
+    fireEvent.click(screen.getByRole("checkbox"))
+
+    expect(note().textContent).toBe("New worktrees will branch from feature.")
+    expect(
+      within(note()).getByText("feature", { selector: "code" }),
+    ).toBeTruthy()
+    expect(note().getAttribute("data-tone")).toBe("warning")
   })
 })

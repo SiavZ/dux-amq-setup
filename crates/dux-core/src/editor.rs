@@ -69,12 +69,47 @@ const EDITOR_SPECS: &[EditorSpec] = &[
     },
 ];
 
+/// The editors this machine has, found by scanning `PATH`.
+///
+/// Test builds never scan the developer's `PATH`: they report one stand-in per
+/// supported editor whose command is the harmless
+/// [`HARMLESS_EDITOR_COMMAND`](crate::test_provider::HARMLESS_EDITOR_COMMAND),
+/// so a test that opens a worktree "in VS Code" runs the whole path and opens
+/// nothing. A test of the scan itself calls [`detect_editors_on_path`] with a
+/// `PATH` it controls.
 pub fn detect_installed_editors() -> Vec<DetectedEditor> {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        stand_in_editors()
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        detect_editors_on_path(&env::var_os("PATH").unwrap_or_default())
+    }
+}
+
+/// Every supported editor, each launching the harmless stand-in command, in the
+/// same order a real scan reports them.
+#[cfg(any(test, feature = "test-support"))]
+fn stand_in_editors() -> Vec<DetectedEditor> {
+    EDITOR_SPECS
+        .iter()
+        .map(|spec| DetectedEditor {
+            kind: spec.kind,
+            label: spec.label,
+            config_key: spec.config_key,
+            command: crate::test_provider::HARMLESS_EDITOR_COMMAND.to_string(),
+        })
+        .collect()
+}
+
+/// The supported editors whose CLI is in one of the directories of `path`, a
+/// `PATH`-style list.
+pub fn detect_editors_on_path(path: &OsStr) -> Vec<DetectedEditor> {
     let mut executable_names = Vec::new();
     let mut seen_dirs = HashSet::new();
-    let path = env::var_os("PATH").unwrap_or_default();
 
-    for dir in env::split_paths(&path) {
+    for dir in env::split_paths(path) {
         if !seen_dirs.insert(dir.clone()) {
             continue;
         }
@@ -137,6 +172,11 @@ pub fn launch_editor(editor: &DetectedEditor, path: &Path) -> Result<()> {
     if !path.exists() {
         return Err(anyhow!("Path does not exist: {}", path.display()));
     }
+
+    // Test builds only: launch nothing but the harmless stand-ins, so no test
+    // can open the developer's real editor.
+    #[cfg(any(test, feature = "test-support"))]
+    crate::test_provider::refuse_unlisted_launch("editor", &editor.command)?;
 
     Command::new(&editor.command)
         .args(editor_launch_args(editor, path, path.is_dir()))
@@ -222,6 +262,82 @@ mod tests {
             .map(|editor| editor.label)
             .collect::<Vec<_>>();
         assert_eq!(labels, vec!["Cursor", "VS Code", "Zed"]);
+    }
+
+    /// Test builds report stand-ins, never what the developer has on `PATH`, and
+    /// every stand-in launches the harmless command.
+    #[test]
+    fn test_builds_detect_only_stand_in_editors() {
+        let detected = detect_installed_editors();
+        assert_eq!(detected.len(), EDITOR_SPECS.len());
+        for editor in &detected {
+            assert_eq!(
+                editor.command,
+                crate::test_provider::HARMLESS_EDITOR_COMMAND,
+                "{}",
+                editor.label
+            );
+        }
+        let preferred = preferred_editor(&detected, "vscode").expect("a stand-in resolves");
+        assert_eq!(preferred.label, "VS Code");
+        assert_eq!(
+            preferred.command,
+            crate::test_provider::HARMLESS_EDITOR_COMMAND
+        );
+    }
+
+    #[test]
+    fn launching_a_stand_in_editor_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let detected = detect_installed_editors();
+        let editor = preferred_editor(&detected, "vscode").expect("a stand-in resolves");
+        launch_editor(&editor, tmp.path()).expect("the stand-in launches");
+    }
+
+    /// The guard sits at the launch itself, so an editor that did come from a
+    /// real scan is refused before anything is spawned.
+    #[test]
+    fn launching_a_real_editor_is_refused_in_test_builds() {
+        let tmp = tempfile::tempdir().unwrap();
+        for command in [
+            "code",
+            "code-insiders",
+            "cursor",
+            "zed",
+            "subl",
+            "/usr/bin/code",
+        ] {
+            let mut editor = detect_editors_from_names(["code"].iter().copied())
+                .pop()
+                .expect("code is a supported editor");
+            editor.command = command.to_string();
+            let err = launch_editor(&editor, tmp.path()).unwrap_err();
+            assert!(
+                err.to_string().starts_with("test guard:"),
+                "{command}: {err}"
+            );
+        }
+    }
+
+    /// The real scan, pointed at a `PATH` the test controls.
+    #[test]
+    fn detect_editors_on_path_reads_only_the_given_directories() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::write(first.path().join("zed"), "").unwrap();
+        std::fs::write(second.path().join("code"), "").unwrap();
+        std::fs::write(second.path().join("unrelated"), "").unwrap();
+        let path = env::join_paths([first.path(), second.path(), first.path()]).unwrap();
+        let labels = detect_editors_on_path(&path)
+            .iter()
+            .map(|e| (e.label, e.command.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![("VS Code", "code".to_string()), ("Zed", "zed".to_string())]
+        );
+        let empty = tempfile::tempdir().unwrap();
+        assert!(detect_editors_on_path(empty.path().as_os_str()).is_empty());
     }
 
     #[test]

@@ -232,7 +232,7 @@ impl Engine {
                 pty_size,
                 AgentLaunchKind::Tab {
                     is_fresh: false,
-                    status_message,
+                    status_message: status_message.into(),
                 },
             )
             .quiet_status_on(if resume {
@@ -251,7 +251,7 @@ impl Engine {
         &mut self,
         tab_id: &str,
         pty_size: (u16, u16),
-        status_message: String,
+        status_message: crate::status_text::StatusText,
     ) -> ResumeFallbackOutcome {
         // Transport-facing entry point: named here, at the door.
         let tab_id = TabIdRef::new(tab_id);
@@ -383,18 +383,24 @@ impl Engine {
             );
             let location = self.session_location_phrase(&session);
             let status_message = match decision {
-                ResumeFallbackDecision::RetryExitedSilent => format!(
-                    "No prior session to resume for agent \"{}\". Started a fresh {} session in {}.",
-                    session.display_label(),
-                    provider.as_str(),
+                ResumeFallbackDecision::RetryExitedSilent => crate::status_text![
+                    "No prior session to resume for agent ",
+                    q(session.display_label()),
+                    ". Started a fresh ",
+                    n(provider.as_str()),
+                    " session in ",
                     location,
-                ),
-                ResumeFallbackDecision::RetryHungTimeout => format!(
-                    "Resume timed out for agent \"{}\" with no visible output. Started a fresh {} session in {}.",
-                    session.display_label(),
-                    provider.as_str(),
+                    "."
+                ],
+                ResumeFallbackDecision::RetryHungTimeout => crate::status_text![
+                    "Resume timed out for agent ",
+                    q(session.display_label()),
+                    " with no visible output. Started a fresh ",
+                    n(provider.as_str()),
+                    " session in ",
                     location,
-                ),
+                    "."
+                ],
                 ResumeFallbackDecision::DropSpokenExit => {
                     // The provider left words on screen: drop the candidate and
                     // let the exit-prune path detach the agent normally, keeping
@@ -631,7 +637,7 @@ mod tests {
     }
 
     /// A resumed provider that exited after printing `rows` lines.
-    fn engine_with_an_exited_resume(rows: &[&str]) -> (Engine, tempfile::TempDir) {
+    fn engine_with_an_exited_resume(rows: &[&str]) -> (Engine, crate::test_scratch::ScratchDir) {
         engine_with_an_exited_resume_printing(&(rows.join("\\n") + "\\n"))
     }
 
@@ -641,7 +647,9 @@ mod tests {
     /// fresh relaunch fails at once instead of starting a real CLI on this
     /// machine. Returns once the child has exited, which is the state the
     /// maintenance order below expects.
-    fn engine_with_an_exited_resume_printing(payload: &str) -> (Engine, tempfile::TempDir) {
+    fn engine_with_an_exited_resume_printing(
+        payload: &str,
+    ) -> (Engine, crate::test_scratch::ScratchDir) {
         use crate::pty::PtyClient;
         use std::time::Instant;
 
@@ -863,7 +871,7 @@ mod tests {
             .insert(TabId::new("s1-slot"), Instant::now());
         engine.mark_in_flight(InFlightKey::AgentLaunch(TabId::new("s1-slot")));
 
-        let outcome = engine.retry_resume_fallback("s1-slot", (24, 80), "msg".to_string());
+        let outcome = engine.retry_resume_fallback("s1-slot", (24, 80), "msg".to_string().into());
 
         assert!(matches!(outcome, ResumeFallbackOutcome::InFlight));
         // Protected: candidate still present, in-flight key untouched.
@@ -888,7 +896,7 @@ mod tests {
             crate::model::ProviderKind::new("claude"),
         );
 
-        let outcome = engine.retry_resume_fallback("s1-slot", (24, 80), "fresh".to_string());
+        let outcome = engine.retry_resume_fallback("s1-slot", (24, 80), "fresh".to_string().into());
 
         assert!(matches!(outcome, ResumeFallbackOutcome::Retried { .. }));
         // Candidate and pin were torn down. The providers check is
@@ -950,7 +958,7 @@ mod tests {
             .resume_fallback_candidates
             .insert(TabId::new("tab-1"), Instant::now());
 
-        let outcome = engine.retry_resume_fallback("tab-1", (24, 80), "fresh".to_string());
+        let outcome = engine.retry_resume_fallback("tab-1", (24, 80), "fresh".to_string().into());
         assert!(matches!(outcome, ResumeFallbackOutcome::Retried { .. }));
         // The pin is torn down as part of the retry regardless of which
         // provider was captured.
@@ -1011,7 +1019,7 @@ mod tests {
             .resume_fallback_candidates
             .insert(TabId::new("tab-1"), Instant::now());
 
-        let outcome = engine.retry_resume_fallback("tab-1", (24, 80), "fresh".to_string());
+        let outcome = engine.retry_resume_fallback("tab-1", (24, 80), "fresh".to_string().into());
 
         assert!(matches!(outcome, ResumeFallbackOutcome::Retried { .. }));
         // Candidate torn down; the fresh relaunch is in flight under the TAB id.
@@ -1098,7 +1106,7 @@ mod tests {
             .agent_viewed
             .insert(TabId::new("s1-slot"), Instant::now());
 
-        let outcome = engine.retry_resume_fallback("s1-slot", (24, 80), "fresh".to_string());
+        let outcome = engine.retry_resume_fallback("s1-slot", (24, 80), "fresh".to_string().into());
         assert!(matches!(outcome, ResumeFallbackOutcome::Retried { .. }));
 
         // Drive the launch to its FAILURE through the real event path, so this
@@ -1168,7 +1176,7 @@ mod tests {
         engine.sessions.push(session);
         // No resume_fallback_candidates entry seeded.
 
-        let outcome = engine.retry_resume_fallback("s1-slot", (24, 80), "msg".to_string());
+        let outcome = engine.retry_resume_fallback("s1-slot", (24, 80), "msg".to_string().into());
 
         assert!(matches!(outcome, ResumeFallbackOutcome::NotCandidate));
         assert!(!engine.is_in_flight(&InFlightKey::AgentLaunch(TabId::new("s1"))));
@@ -1182,7 +1190,7 @@ mod tests {
             .resume_fallback_candidates
             .insert(TabId::new("ghost"), Instant::now());
 
-        let outcome = engine.retry_resume_fallback("ghost", (24, 80), "msg".to_string());
+        let outcome = engine.retry_resume_fallback("ghost", (24, 80), "msg".to_string().into());
 
         assert!(matches!(outcome, ResumeFallbackOutcome::NotCandidate));
         assert!(

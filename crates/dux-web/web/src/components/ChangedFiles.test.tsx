@@ -13,6 +13,7 @@ import type * as React from "react"
 
 import type { ChangesSlice, DuxState } from "@/lib/store"
 import { stubMatchMedia, type MatchMediaStub } from "@/test/matchMedia"
+import { toastText } from "@/test/toastText"
 
 // The Changes pane's "Refresh changes" item has exactly one job that a reader
 // cannot see by looking at it: it must take the FORCING path. The store's
@@ -1019,7 +1020,7 @@ describe("the multi-file discard confirm", () => {
     await act(() => discardMany.mock.results[0]!.value as Promise<unknown>)
 
     expect(notifyError).toHaveBeenCalledTimes(1)
-    expect(String(notifyError.mock.calls[0]![0])).toContain("a.ts")
+    expect(toastText(notifyError.mock.calls[0]![0])).toContain("a.ts")
     expect(notifySuccess).not.toHaveBeenCalled()
     expect(notifyWarning).not.toHaveBeenCalled()
   })

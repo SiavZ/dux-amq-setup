@@ -75,7 +75,9 @@ describe("ConfirmCloseTabDialog", () => {
     render(<ConfirmCloseTabDialog />)
     expect(screen.getByText(/last live tab, so the agent detaches/)).toBeTruthy()
     // The provider name is named in the body.
-    expect(screen.getByText(/ends the claude session/)).toBeTruthy()
+    expect(screen.getByText(/This ends the/).textContent).toContain(
+      "This ends the claude session",
+    )
   })
 
   // The way back from a closed tab is a NEW tab, and a new tab always starts
@@ -138,11 +140,14 @@ describe("ConfirmCloseTabDialog", () => {
       "t1",
     )
     render(<ConfirmCloseTabDialog />)
-    expect(
-      screen.getByText(
-        /The next tab, Codex, takes its place as the agent's first tab/,
-      ),
-    ).toBeTruthy()
+    const body = screen.getByText(/This ends the/)
+    expect(body.textContent).toContain("This ends the claude session")
+    expect(screen.getByText("claude", { selector: "code" })).toBeTruthy()
+    expect(body.textContent).toMatch(
+      /The next tab, Codex, takes its place as the agent’s first tab/,
+    )
+    // The tab's name is the shared chip.
+    expect(screen.getByText("Codex", { selector: "code" })).toBeTruthy()
   })
 
   // Two tabs on the same provider are told apart by the strip's own suffix, and
@@ -157,11 +162,12 @@ describe("ConfirmCloseTabDialog", () => {
       "t1",
     )
     render(<ConfirmCloseTabDialog />)
-    expect(
-      screen.getByText(
-        /The next tab, Codex 2, takes its place as the agent's first tab/,
-      ),
-    ).toBeTruthy()
+    const body = screen.getByText(/This ends the/)
+    expect(body.textContent).toContain("This ends the codex session")
+    expect(body.textContent).toMatch(
+      /The next tab, Codex 2, takes its place as the agent’s first tab/,
+    )
+    expect(screen.getByText("Codex 2", { selector: "code" })).toBeTruthy()
   })
 
   it("says nothing about a successor when closing an extra tab", () => {
@@ -190,11 +196,14 @@ describe("ConfirmCloseTabDialog", () => {
     )
     render(<ConfirmCloseTabDialog />)
     expect(screen.getByText(/last live tab, so the agent detaches/)).toBeTruthy()
-    expect(
-      screen.getByText(
-        /The next tab, Codex, takes its place as the agent's first tab/,
-      ),
-    ).toBeTruthy()
+    const body = screen.getByText(/This ends the/)
+    expect(body.textContent).toContain("This ends the claude session")
+    expect(screen.getByText("claude", { selector: "code" })).toBeTruthy()
+    expect(body.textContent).toMatch(
+      /The next tab, Codex, takes its place as the agent’s first tab/,
+    )
+    // The tab's name is the shared chip.
+    expect(screen.getByText("Codex", { selector: "code" })).toBeTruthy()
   })
 
   // The vanished-target guard: the tab (or its session) disappearing from the

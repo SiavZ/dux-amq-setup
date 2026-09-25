@@ -409,12 +409,20 @@ mod tests {
         }
     }
 
-    /// A PTY child that prints `banner`, then records every byte it is sent,
-    /// raw and unechoed, into `log`. Lets a test see exactly what dux typed and
-    /// in how many writes.
+    /// A PTY child that prints `banner`, switches its terminal to raw mode, and
+    /// records every byte typed at it, unechoed, into `log`. Lets a test see
+    /// exactly what dux typed and in how many writes.
+    ///
+    /// `stty raw` has to finish before anything is typed: in cooked mode the
+    /// line discipline echoes and line-buffers the input, so a pasted body
+    /// without a newline never reaches `cat` and the log stays empty. The
+    /// child therefore creates `<log>.ready` once raw mode is in effect, and
+    /// [`wait_until_raw`] waits for that file rather than guessing with a
+    /// sleep, which under a loaded full-suite run was sometimes too short.
     fn recording_pty(banner: &str, log: &std::path::Path) -> PtyClient {
         let script = format!(
-            "printf '%s\\n' '{banner}'; stty raw -echo; exec cat > '{}'",
+            "printf '%s\\n' '{banner}'; stty raw -echo; : > '{}.ready'; exec cat > '{}'",
+            log.display(),
             log.display()
         );
         PtyClient::spawn(
@@ -439,13 +447,28 @@ mod tests {
         cond()
     }
 
+    /// Wait until a [`recording_pty`] child has put its terminal in raw mode.
+    /// `exec cat` follows the marker within one shell step, and bytes typed in
+    /// that gap wait in the PTY's (now raw) input queue for `cat` to read.
+    fn wait_until_raw(log: &std::path::Path) {
+        let ready = log.with_extension("log.ready");
+        assert!(
+            wait_for(|| ready.exists()),
+            "the recording child never reached raw mode ({})",
+            ready.display()
+        );
+    }
+
     fn read_log(path: &std::path::Path) -> Vec<u8> {
         std::fs::read(path).unwrap_or_default()
     }
 
     /// An engine with one claude agent whose slot tab runs `client`, and
     /// `rules` configured for claude.
-    fn engine_with_tab(client: PtyClient, rules: Vec<WatchRule>) -> (Engine, tempfile::TempDir) {
+    fn engine_with_tab(
+        client: PtyClient,
+        rules: Vec<WatchRule>,
+    ) -> (Engine, crate::test_scratch::ScratchDir) {
         let (mut engine, tmp) = test_engine();
         engine.sessions.push(sample_session("s1", "p1", "feature"));
         let mut claude = crate::config::ProviderCommandConfig {
@@ -462,13 +485,13 @@ mod tests {
         (engine, tmp)
     }
 
-    fn log_path(tmp: &tempfile::TempDir) -> PathBuf {
+    fn log_path(tmp: &crate::test_scratch::ScratchDir) -> PathBuf {
         tmp.path().join("typed.log")
     }
 
     #[test]
     fn a_matching_rule_types_the_body_then_submits_it_in_a_later_write() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_scratch::ScratchDir::new();
         let log = log_path(&tmp);
         let client = recording_pty("API Error: rate limited", &log);
         let (mut engine, _guard) = engine_with_tab(
@@ -478,8 +501,7 @@ mod tests {
         assert!(wait_for(|| engine.providers[TabIdRef::new("s1-slot")]
             .scan_recent_lines(WATCH_SCAN_ROWS)
             .contains("rate limited")));
-        // `stty raw` runs after the banner: give it time before anything is typed.
-        std::thread::sleep(Duration::from_millis(200));
+        wait_until_raw(&log);
 
         // Tick 1 notices the match and schedules; tick 2 fires the body.
         let first = engine.tick_watch_rules();
@@ -513,7 +535,7 @@ mod tests {
 
     #[test]
     fn a_tab_the_user_just_typed_into_is_left_alone() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_scratch::ScratchDir::new();
         let log = log_path(&tmp);
         let client = recording_pty("rate limited", &log);
         let (mut engine, _guard) =
@@ -521,6 +543,9 @@ mod tests {
         assert!(wait_for(|| engine.providers[TabIdRef::new("s1-slot")]
             .scan_recent_lines(WATCH_SCAN_ROWS)
             .contains("rate limited")));
+        // Raw mode first, or an empty log could mean "nothing got through"
+        // rather than "nothing was typed".
+        wait_until_raw(&log);
         engine.note_pty_input("s1-slot");
         for _ in 0..3 {
             assert!(engine.tick_watch_rules().is_empty());
@@ -622,7 +647,7 @@ mod tests {
 
     #[test]
     fn a_suppression_window_holds_the_tab_then_rebaselines_stale_matches() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_scratch::ScratchDir::new();
         let log = log_path(&tmp);
         let client = recording_pty("[task-done]", &log);
         let (mut engine, _guard) =
@@ -631,6 +656,9 @@ mod tests {
         assert!(wait_for(|| engine.providers[tab]
             .scan_recent_lines(WATCH_SCAN_ROWS)
             .contains("[task-done]")));
+        // Raw mode first, or an empty log could mean "nothing got through"
+        // rather than "nothing was typed".
+        wait_until_raw(&log);
         engine.suppress_watch_rules(tab, Instant::now() + Duration::from_millis(150));
         engine.tick_watch_rules();
         std::thread::sleep(Duration::from_millis(200));

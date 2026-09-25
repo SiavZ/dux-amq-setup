@@ -8,6 +8,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
 import {
   folderWorkspace,
@@ -15,6 +16,7 @@ import {
   sessionLabel,
   type AgentWorkspaceWire,
 } from "@/lib/agentWorkspace"
+import { chip, type Prose, renderProse } from "@/lib/prose"
 import { sessionsApi } from "@/lib/sessionsApi"
 import type { SessionView } from "@/lib/types"
 import { closeDelete, deleteSession, useDux } from "@/lib/store"
@@ -22,19 +24,24 @@ import { closeDelete, deleteSession, useDux } from "@/lib/store"
 // Why a branch predates the agent, one clause per provenance; an unrecognized
 // provenance gets its own, since nothing here can claim the branch is older.
 // `subject` names the branch once there are two on screen.
-function existedBeforeSentence(provenance: string, subject: string): string {
+function existedBeforeSentence(provenance: string, subject: Prose): Prose {
   if (provenance === "adopted")
-    return `${subject} came with the worktree this agent adopted.`
-  if (provenance === "unknown") return `${subject} is not one dux created.`
-  return `${subject} existed before the agent.`
+    return [...subject, " came with the worktree this agent adopted."]
+  if (provenance === "unknown") return [...subject, " is not one dux created."]
+  return [...subject, " existed before the agent."]
 }
 
 // The branch checkbox's label, naming EVERY branch the tick would delete: a box
 // promising one deletion and performing two takes consent it was not given.
-function branchCheckboxLabel(branches: string[]): string {
-  if (branches.length === 0) return ""
-  if (branches.length === 1) return `Also delete the branch ${branches[0]}`
-  return `Also delete the branches ${branches.join(" and ")}`
+function branchCheckboxLabel(branches: string[]): Prose {
+  if (branches.length === 0) return []
+  if (branches.length === 1) return ["Also delete the branch ", chip(branches[0])]
+  return [
+    "Also delete the branches ",
+    ...branches.flatMap((branch, index): Prose =>
+      index === 0 ? [chip(branch)] : [" and ", chip(branch)],
+    ),
+  ]
 }
 
 type UnpushedCount = { count: number; has_remote_refs: boolean } | null
@@ -74,24 +81,31 @@ function branchWarning(
   provenance: string,
   branches: string[],
   unpushed: UnpushedCount,
-): string | null {
+): Prose | null {
   const drifted = branches.length > 1
   const predates = provenance !== "created"
   if (!drifted && !predates) return null
-  const parts: string[] = []
+  const parts: Prose[] = []
   if (drifted) {
-    parts.push(
-      `The worktree moved from ${branches[1]} onto ${branches[0]}, so deleting the agent removes both.`,
-    )
+    parts.push([
+      "The worktree moved from ",
+      chip(branches[1]),
+      " onto ",
+      chip(branches[0]),
+      ", so deleting the agent removes both.",
+    ])
   }
   if (predates) {
     parts.push(
-      existedBeforeSentence(provenance, drifted ? branches[1] : "This branch"),
+      existedBeforeSentence(
+        provenance,
+        drifted ? [chip(branches[1])] : ["This branch"],
+      ),
     )
   }
   const unpushedText = unpushedSentence(unpushed, drifted)
-  if (unpushedText !== null) parts.push(unpushedText)
-  return parts.join(" ")
+  if (unpushedText !== null) parts.push([unpushedText])
+  return parts.flatMap((part, index) => (index === 0 ? part : [" ", ...part]))
 }
 
 type ManagedWorkspace = Extract<AgentWorkspaceWire, { kind: "managed" }>
@@ -119,7 +133,7 @@ interface DeleteSessionView {
   folder: Extract<AgentWorkspaceWire, { kind: "folder" }> | null
   branchIsDuxs: boolean
   branches: string[]
-  warning: string | null
+  warning: Prose | null
 }
 
 function deleteSessionView(
@@ -231,15 +245,15 @@ export function DeleteSessionDialog() {
           <DialogTitle>Delete agent?</DialogTitle>
         </DialogHeader>
         <p className="text-sm text-muted-foreground">
-          This removes the agent session &ldquo;{name}&rdquo; from dux.
+          This removes the agent session <InlineCode>{name}</InlineCode> from
+          dux.
         </p>
         {folder && (
           // Said out loud because the sentence above reads as though something on
           // disk goes too: a standalone agent's folder is left exactly as it was.
           <p className="text-sm text-muted-foreground">
-            Its folder &ldquo;
-            <span className="break-all font-mono">{folder.folder_label}</span>
-            &rdquo; is left untouched: dux never creates, moves or removes a
+            Its folder <InlineCode>{folder.folder_label}</InlineCode> is left
+            untouched: dux never creates, moves or removes a
             standalone agent&rsquo;s folder. Anything the agent wrote there is
             still there.
           </p>
@@ -265,15 +279,15 @@ export function DeleteSessionDialog() {
               checked={deleteBranch}
               onCheckedChange={setBranchAnswer}
             />
-            <label htmlFor="delete-branch" className="break-all text-sm">
-              {branchCheckboxLabel(branches)}
+            <label htmlFor="delete-branch" className="min-w-0 text-sm">
+              {renderProse(branchCheckboxLabel(branches))}
             </label>
           </div>
         )}
         {managed && deleteWorktree && warning !== null && (
           // The danger sits in the warning text, never in a red checkbox: the box is
           // an ordinary control and the sentence under it says what is at stake.
-          <p className="text-sm text-destructive">{warning}</p>
+          <p className="text-sm text-destructive">{renderProse(warning)}</p>
         )}
         <div className="h-2" />
         <DialogFooter>

@@ -10,6 +10,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { dirIconKind } from "@/lib/fileIcons"
 import { fileApi } from "@/lib/fileApi"
@@ -172,8 +173,8 @@ function MoveEntryDialogBody({
   return (
     <>
       <DialogHeader>
-        <DialogTitle className="truncate">
-          Move {basename(target.path)}
+        <DialogTitle>
+          Move <InlineCode>{basename(target.path)}</InlineCode>
         </DialogTitle>
       </DialogHeader>
 
@@ -181,9 +182,14 @@ function MoveEntryDialogBody({
       <div className="flex flex-col gap-1">
         <p className="text-sm text-muted-foreground">
           Destination folder:{" "}
-          <span className="font-mono break-all text-foreground">
-            {dir === "" ? "/ (worktree root)" : dir}
-          </span>
+          {dir === "" ? (
+            <>
+              <InlineCode className="text-foreground">/</InlineCode> (worktree
+              root)
+            </>
+          ) : (
+            <InlineCode className="text-foreground">{dir}</InlineCode>
+          )}
         </p>
         <p className="truncate font-mono text-sm">{destination}</p>
       </div>

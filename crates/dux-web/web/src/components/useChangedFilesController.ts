@@ -10,6 +10,7 @@ import {
 import { formatRegularCount } from "@/lib/formatRegularCount"
 import { git } from "@/lib/git"
 import { notifyError, notifySuccess, notifyWarning } from "@/lib/notify"
+import { chip, prose } from "@/lib/prose"
 import type { ChangesSlice } from "@/lib/store"
 import type { ChangedFileView } from "@/lib/types"
 
@@ -128,7 +129,7 @@ function discardResultToast(result: {
   }
   if (result.done.length === 0) {
     notifyError(
-      `Nothing was discarded. ${result.failed[0]!.path}: ${result.failed[0]!.message}`,
+      prose`Nothing was discarded. ${chip(result.failed[0]!.path)}: ${result.failed[0]!.message}`,
     )
     return
   }

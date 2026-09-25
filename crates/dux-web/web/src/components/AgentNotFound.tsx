@@ -9,6 +9,7 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from "@/components/ui/empty"
+import { InlineCode } from "@/components/ui/inline-code"
 import { navigateUp } from "@/lib/store"
 
 // What a URL naming an agent this workspace does not have renders. Saying so is
@@ -26,9 +27,7 @@ export function AgentNotFound({ sessionId }: { sessionId: string }) {
         <EmptyDescription>
           This link points at an agent that is no longer in this workspace,
           probably because it was deleted. Its id was{" "}
-          <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs break-all">
-            {sessionId}
-          </code>
+          <InlineCode>{sessionId}</InlineCode>
           .
         </EmptyDescription>
       </EmptyHeader>

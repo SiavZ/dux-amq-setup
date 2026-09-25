@@ -8,6 +8,8 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
+import { checkoutDefaultBranchProse } from "@/lib/checkoutDefaultBranch"
+import { renderProse } from "@/lib/prose"
 import {
   checkoutDefaultBranch,
   closeCheckoutDefaultBranch,
@@ -46,19 +48,19 @@ export function CheckoutDefaultBranchDialog() {
     <Dialog open={isOpen} onOpenChange={handleOpenChange}>
       <DialogContent showCloseButton={false}>
         <DialogHeader>
-          <DialogTitle>Checkout default branch?</DialogTitle>
+          <DialogTitle>Check out default branch?</DialogTitle>
           <DialogDescription>
-            This switches the source checkout for &ldquo;{name}&rdquo; back to its
-            default branch, moving HEAD in the shared repository. New agents
-            branch from whatever the source checkout is on, so this affects every
-            new worktree.
+            {renderProse(
+              checkoutDefaultBranchProse(name, project?.leading_branch ?? null),
+            )}
           </DialogDescription>
         </DialogHeader>
         <DialogFooter>
           <Button variant="outline" onClick={closeCheckoutDefaultBranch}>
             Cancel
           </Button>
-          <Button onClick={handleConfirm}>Checkout default branch</Button>
+          {/* The terminal UI's confirm button reads the same. */}
+          <Button onClick={handleConfirm}>Check out default branch</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

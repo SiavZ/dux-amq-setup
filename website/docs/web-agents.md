@@ -21,7 +21,9 @@ Repositories carry a small "git" badge. Pick one, give it an optional name, and 
 show a pre-flight step first:
 
 - If the repo is checked out to something other than its default branch, it offers to check
-  that branch out before adding.
+  that branch out before adding. Leave the box ticked and new agents branch from the
+  default branch; untick it and your folder stays where it is, and new agents branch from
+  the branch it is on. The dialog names the branch either way.
 - If the repo has no commits yet (a fresh `git init`), it offers to make the initial commit
   for you. If git on the server cannot work out an identity for that commit, dux fills in
   `dux@localhost` as the address so the add still succeeds; see

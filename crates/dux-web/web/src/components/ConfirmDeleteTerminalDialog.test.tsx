@@ -95,7 +95,8 @@ describe("ConfirmDeleteTerminalDialog", () => {
     // opened.
     seedProjectTerminal(term({ id: "pt-1", label: "Terminal 3" }))
     render(<ConfirmDeleteTerminalDialog />)
-    expect(screen.getByText("Close Terminal 3?")).toBeTruthy()
+    expect(screen.getByRole("heading").textContent).toBe("Close Terminal 3?")
+    expect(screen.getByText("Terminal 3").tagName).toBe("CODE")
     expect(screen.getByText("Close terminal")).toBeTruthy()
   })
 
@@ -113,7 +114,8 @@ describe("ConfirmDeleteTerminalDialog", () => {
     // confirms with just the title and no "will be killed" line.
     seed(term({ foreground_cmd: null }))
     render(<ConfirmDeleteTerminalDialog />)
-    expect(screen.getByText("Close Terminal 1?")).toBeTruthy()
+    expect(screen.getByRole("heading").textContent).toBe("Close Terminal 1?")
+    expect(screen.getByText("Terminal 1").tagName).toBe("CODE")
     expect(screen.queryByText(/will be killed/)).toBeNull()
   })
 })

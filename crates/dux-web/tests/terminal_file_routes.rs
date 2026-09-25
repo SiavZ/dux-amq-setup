@@ -51,14 +51,14 @@ fn sample_session(id: &str, worktree: &str) -> dux_core::model::AgentSession {
 struct Harness {
     addr: SocketAddr,
     repo: std::path::PathBuf,
-    _tmp: tempfile::TempDir,
+    _tmp: dux_core::test_scratch::ScratchDir,
 }
 
 /// Boot a server with two projects (`p1` at a populated repo root, `p2` empty)
 /// and one session `s1`. The terminal command is `cat`, so every terminal in
 /// these tests is a cheap long-lived child rather than a real shell.
 async fn boot() -> Harness {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
     let repo = root.join("repo");
     let other = root.join("other");
@@ -107,6 +107,7 @@ async fn boot() -> Harness {
     // A worktree-mode install: these fixtures register dux's own root as the
     // project, which shared mode rightly refuses to run agents in.
     engine.config.workspace = None;
+    dux_core::test_provider::defuse_config(&mut engine.config);
     engine.config.terminal.command = "cat".to_string();
     engine.config.terminal.args = vec![];
     let (handle, _join) = spawn_engine_thread(engine);
