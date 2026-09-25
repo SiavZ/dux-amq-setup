@@ -4555,7 +4555,15 @@ mod tests {
         let config_writer =
             dux_core::config_queue::ConfigWriteQueue::new(paths.config_path.clone());
         let engine = dux_core::engine::Engine {
-            config: dux_core::test_provider::harmless_config(),
+            // Worktree mode: the fork's `[workspace]` default is shared, which
+            // refuses the non-default-branch dialog and the checkout-default
+            // add these tests drive; the upstream behaviours assume a
+            // worktree-mode install, and shared tests opt in explicitly.
+            config: {
+                let mut config = dux_core::test_provider::harmless_config();
+                config.workspace = None;
+                config
+            },
             paths,
             session_store,
             projects,
@@ -4902,8 +4910,11 @@ mod tests {
             .expect("single-instance lock for test engine");
         let (worker_tx, worker_rx) = mpsc::channel();
         // auto_reopen on so bootstrap WOULD relaunch, proving resume's skip.
+        // Worktree mode: the fork's `[workspace]` default is shared (see
+        // test_app_with_sessions).
         let mut config = dux_core::test_provider::harmless_config();
         config.ui.auto_reopen_agents = true;
+        config.workspace = None;
         let config_writer =
             dux_core::config_queue::ConfigWriteQueue::new(paths.config_path.clone());
         let engine = dux_core::engine::Engine {
