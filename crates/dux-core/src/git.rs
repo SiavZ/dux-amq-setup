@@ -84,6 +84,12 @@ struct StatusEntry {
 
 const NULL_DEVICE: &str = "/dev/null";
 
+/// The object id of git's empty tree, the fixed point every empty repo shares
+/// (`git hash-object -t tree /dev/null` on any git, any platform). Public so
+/// tests can reproduce exactly the tree the initial-commit bootstrap builds
+/// when they need to assert against the same plumbing.
+pub const EMPTY_TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
 /// How much of a file git looks at before deciding it is binary
 /// (`buffer_is_binary`'s `FIRST_FEW_BYTES`). Matched exactly so dux and git
 /// call the same files binary.
@@ -767,6 +773,10 @@ pub fn create_initial_commit(path: &Path) -> Result<String> {
         &["hash-object", "-t", "tree", NULL_DEVICE],
         "compute the empty tree",
     )?;
+    debug_assert_eq!(
+        empty_tree, EMPTY_TREE_SHA,
+        "git's empty tree object id is fixed across versions and platforms"
+    );
     let commit = match commit_tree(path, &empty_tree, &[]) {
         Ok(sha) => sha,
         Err(refusal) if is_identity_failure(&refusal) => {

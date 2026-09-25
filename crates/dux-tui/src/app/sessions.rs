@@ -5309,8 +5309,14 @@ mod tests {
 
     #[test]
     fn create_initial_commit_gate_is_released_after_a_failed_commit() {
-        // A failed bootstrap (read-only object store) must still clear the
-        // in-flight gate so the user can retry, and must surface an error.
+        // A failed bootstrap must still clear the in-flight gate so the user can
+        // retry, and must surface an error. The failure is induced by making the
+        // repo's object store unwritable: the empty-tree bootstrap writes its
+        // commit object with `git commit-tree`, which fails loudly on every
+        // platform when it cannot create the object (verified on Linux and
+        // macOS/APFS, both as the ordinary user; the root escape hatch below is
+        // for CI containers running as root, where mode bits grant no
+        // protection).
         if std::process::Command::new("id")
             .arg("-u")
             .output()
@@ -5326,20 +5332,43 @@ mod tests {
         let mut ro = original.clone();
         ro.set_readonly(true);
         std::fs::set_permissions(&objects, ro).unwrap();
+        // Prove the premise before relying on it: the bootstrap must be unable
+        // to write its commit object. If some environment ever permits the
+        // write anyway, this fails here with a named cause instead of letting
+        // the test pass for the wrong reason (a succeeded commit also releases
+        // the gate, which would prove nothing about the failure path).
+        let probe = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(["-c", "user.name=probe", "-c", "user.email=probe@probe"])
+            .args(["commit-tree", dux_core::git::EMPTY_TREE_SHA])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("probe commit-tree");
+        assert!(
+            !probe.status.success(),
+            "premise: an unwritable .git/objects must make the bootstrap commit fail; \
+             commit-tree succeeded instead: {}",
+            String::from_utf8_lossy(&probe.stdout)
+        );
 
         let mut app = test_app_with_sessions(Vec::new(), Vec::new());
         app.add_project(path.clone(), "Fresh".to_string())
             .expect("add_project");
         app.resolve_confirm_create_initial_commit(true);
+        // The wait is on the ERROR TONE, not merely on the gate: the gate is
+        // released by the same event that reports the failure, but the keyed
+        // BUSY the dispatch posted is only retired when that event has been
+        // DRAINED, so waiting on the gate alone can observe the release while
+        // the busy is still on the line and then read the busy as the tone.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while app
-            .engine
-            .is_in_flight(&dux_core::engine::InFlightKey::InitialCommit(path.clone()))
+        while app.status.tone() != dux_core::statusline::StatusTone::Error
             && std::time::Instant::now() < deadline
         {
             app.drain_events();
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        app.drain_events();
 
         std::fs::set_permissions(&objects, original).unwrap();
 
