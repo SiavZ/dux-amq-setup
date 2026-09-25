@@ -857,6 +857,24 @@ mod tests {
                 }),
             ),
             (
+                "WatchRules",
+                PromptState::WatchRules(crate::app::WatchRulesPrompt {
+                    rows: vec![dux_core::engine::WatchRuleRow {
+                        tab_id: dux_core::ids::TabId::new("s1-slot"),
+                        session_id: "s1".to_string(),
+                        snapshot: dux_core::watch::RuleSnapshot {
+                            idx: 0,
+                            label: "rate limited".to_string(),
+                            attempts_made: 1,
+                            max_attempts: 0,
+                            state: dux_core::watch::RuleStateKind::Idle,
+                        },
+                        built_in: false,
+                    }],
+                    selected: 0,
+                }),
+            ),
+            (
                 "ChangeTheme",
                 PromptState::ChangeTheme(ChangeThemePrompt {
                     options: crate::theme::discover_available(&app.engine.paths),

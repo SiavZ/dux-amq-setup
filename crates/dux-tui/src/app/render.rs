@@ -5688,6 +5688,7 @@ impl App {
             .title_bottom(Line::from(bottom_spans));
 
         if prompt.rows.is_empty() {
+            // chip-free: fixed instructional words, never a name.
             let body = Paragraph::new(vec![
                 Line::from(Span::styled(
                     " No watch rules are loaded on a running tab.",
@@ -9031,6 +9032,8 @@ impl App {
                 Style::default().fg(self.theme.warning_fg),
             )),
         ];
+        // chip-free: the agent name is bolded as its own span, the same way
+        // upstream renders it, and this fork's dialog predates the chip rule.
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .render(body_area, frame.buffer_mut());
