@@ -1010,8 +1010,10 @@ impl WireStatus {
             // Sanitized like the TUI's status controller (fork 2d9423ae).
             // The structured halves stay in agreement with the sanitized
             // message, exactly as in `StatusLine::set_scoped`.
+            segments: segments.map(|segments| {
+                crate::sanitize::prose_segments(segments, &crate::sanitize::for_terminal(&message))
+            }),
             message: crate::sanitize::for_terminal(&message),
-            segments: segments.map(|segments| crate::sanitize::prose_segments(segments, &message)),
             key: None,
             scope: StatusScope::All,
             sticky: false,
@@ -1028,8 +1030,10 @@ impl WireStatus {
         let (message, segments) = message.into().into_parts();
         Self {
             tone: tone.into(),
+            segments: segments.map(|segments| {
+                crate::sanitize::prose_segments(segments, &crate::sanitize::for_terminal(&message))
+            }),
             message: crate::sanitize::for_terminal(&message),
-            segments: segments.map(|segments| crate::sanitize::prose_segments(segments, &message)),
             key: Some(key.into()),
             scope: StatusScope::All,
             sticky: false,
@@ -1073,10 +1077,12 @@ impl WireStatus {
         Self {
             tone: update.tone.as_wire().to_string(),
             message: crate::sanitize::for_terminal(&update.message),
-            segments: update
-                .segments
-                .clone()
-                .map(|segments| crate::sanitize::prose_segments(segments, &update.message)),
+            segments: update.segments.clone().map(|segments| {
+                crate::sanitize::prose_segments(
+                    segments,
+                    &crate::sanitize::for_terminal(&update.message),
+                )
+            }),
             key: update.key.clone(),
             scope: update.scope.clone(),
             sticky: update.sticky,

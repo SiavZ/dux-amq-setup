@@ -88,6 +88,11 @@ pub fn amq_handle(name: &str) -> String {
 /// shows. Names and text segments are filtered with [`for_terminal`], and a
 /// part whose sanitized spelling no longer matches the sentence built from
 /// the sanitized message drops the parts rather than disagreeing with them.
+///
+/// `sanitized_message` must be the message AFTER [`for_terminal`]. Filtering is
+/// per character, so cleaned parts spell exactly the cleaned message; compared
+/// against the raw message they would never agree when anything was cleaned,
+/// and every such status would lose its name chips on the web.
 pub fn prose_segments(
     segments: Vec<crate::prose::ProseSegment>,
     sanitized_message: &str,

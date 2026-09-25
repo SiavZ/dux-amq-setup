@@ -674,8 +674,10 @@ impl KeyedStatusController {
             // every surface; escapes show as `\x1b` text instead. Upstream's
             // structured halves stay: the plain text and the parts must stay
             // in agreement, so both are built from the sanitized message.
+            segments: segments.map(|segments| {
+                crate::sanitize::prose_segments(segments, &crate::sanitize::for_terminal(&message))
+            }),
             message: crate::sanitize::for_terminal(&message),
-            segments: segments.map(|segments| crate::sanitize::prose_segments(segments, &message)),
             scope,
             sticky,
             // Nobody has said otherwise yet; `mark_unwatched` is called by the
@@ -1783,6 +1785,42 @@ mod tests {
             held.segments.is_some(),
             "clean parts survive the chokepoint"
         );
+    }
+
+    /// A name that needed sanitizing still reaches the web as a CHIP. The
+    /// sanitizer maps each escape to the same visible text in the message and
+    /// in the part, so the cleaned parts spell the cleaned message exactly;
+    /// comparing them against the RAW message instead dropped the parts for
+    /// every status that had anything to clean, turning its names into plain
+    /// prose (a CLAUDE.md rule: names in web toasts use the shared chip).
+    #[test]
+    fn a_sanitized_name_keeps_its_chip_on_both_status_paths() {
+        let expect_chip = |segments: Option<&Vec<crate::prose::ProseSegment>>, what: &str| {
+            let segments = segments.unwrap_or_else(|| panic!("{what}: the parts were dropped"));
+            assert!(
+                segments.iter().any(|segment| matches!(
+                    segment,
+                    crate::prose::ProseSegment::Name { name, .. }
+                        if name.contains("\\x1b") && !name.contains('\u{1b}')
+                )),
+                "{what}: the sanitized name must stay a chip: {segments:?}"
+            );
+        };
+        let poisoned = || crate::status_text!["Checked out ", q("feat\u{1b}[2Jx"), "."];
+
+        let mut status = KeyedStatusController::with_clear_after(Duration::from_secs(6));
+        status.set_scoped(
+            Instant::now(),
+            None,
+            StatusTone::Info,
+            poisoned(),
+            super::StatusScope::All,
+            false,
+        );
+        expect_chip(status.snapshot()[0].segments.as_ref(), "status line");
+
+        let wire = crate::wire::WireStatus::new("info", poisoned());
+        expect_chip(wire.segments.as_ref(), "wire status");
     }
 
     #[test]
