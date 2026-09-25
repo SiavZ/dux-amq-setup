@@ -255,8 +255,9 @@ jobs:
     # even though it runs on macos-latest as upstream does: it has not been
     # proven on a macos-14 runner, and pinning an unverified image would risk
     # the one required macOS gate. Upstream calls it `Clippy and test (macOS)`;
-    # do not take that name back in an upstream merge. It currently runs
-    # clippy only (see the note on cargo test at the end of the job).
+    # do not take that name back in an upstream merge. It runs clippy and then
+    # the full test suite on macOS (the platform-specific arms run nowhere
+    # else).
     name: Test (macos-14)
     runs-on: macos-latest
     needs: no-ui-build-hatch
@@ -280,14 +281,16 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      # cargo test is deliberately NOT run here yet. Twelve dux-core lifecycle
-      # and file-drop tests build deliberately racy PTY states whose fixture
-      # premises do not hold under macOS PTY semantics on shared runners (each
-      # fails its own "without this the test proves nothing" check, before any
-      # product code runs). Greening those fixtures on BSD-style PTYs is a
-      # tracked follow-up that needs iteration on a Mac; until then this job is
-      # the compile-and-lint gate, which is the half that catches the
-      # platform-gated rot the Ubuntu jobs cannot see.
+      # The macOS suite runs the same tests the Ubuntu jobs do plus the
+      # platform-specific arms. A git identity is needed for the same reason the
+      # Ubuntu job needs one: the bootstrap-commit tests shell out to git, and a
+      # hosted runner has no user configured for them to pick up.
+      - name: Give git the identity a developer's machine has
+        run: |
+          git config --global user.name "dux ci"
+          git config --global user.email "ci@getdux.app"
+      - name: Run tests
+        run: cargo test --all-features
 
   # Supply-chain gate (audit02 P0-I, audit03 P1-13), carried over from this
   # fork's pre-workspace CI. `cargo audit --deny warnings` fails on any RUSTSEC
