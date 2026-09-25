@@ -8910,6 +8910,74 @@ mod tests {
         assert!(engine.pr_last_checked.get("s1").copied().unwrap() > five_ago);
     }
 
+    #[test]
+    fn spawn_pr_check_for_session_refuses_at_the_global_cap_without_stamping_debounce() {
+        let (mut engine, _tmp) = test_engine();
+        engine.github_integration_enabled = true;
+        engine.gh_status = GhStatus::Available;
+        for n in 0..4 {
+            engine
+                .sessions
+                .push(sample_session(&format!("s{n}"), "p1", "feat/x"));
+        }
+        // The cap's default is 4: fill the in-flight set with four OTHER
+        // sessions' checks, exactly the way four concurrent refs-watcher
+        // events would leave it before their workers finish.
+        for n in 0..4 {
+            engine.mark_in_flight(InFlightKey::PrCheck(format!("busy{n}")));
+        }
+        assert_eq!(engine.pr_checks_in_flight(), 4, "precondition: at the cap");
+
+        // The next session's check is refused, and its debounce is NOT
+        // recorded: a stamp would tell the rate limiter a check just happened
+        // when none did, hiding the agent from the next trigger too.
+        assert!(
+            !engine.spawn_pr_check_for_session("s1", std::time::Duration::from_secs(0)),
+            "a check at the cap must be refused"
+        );
+        assert!(
+            !engine.pr_last_checked.contains_key("s1"),
+            "a refused check must not stamp the debounce"
+        );
+        assert!(!engine.is_in_flight(&InFlightKey::PrCheck("s1".to_string())));
+
+        // Once one clears (its PrStatusReady landed), the same call goes
+        // through: the refusal was capacity, not a rate-limit decision.
+        engine.clear_in_flight(&InFlightKey::PrCheck("busy0".to_string()));
+        assert!(engine.spawn_pr_check_for_session("s1", std::time::Duration::from_secs(0)));
+        assert!(engine.is_in_flight(&InFlightKey::PrCheck("s1".to_string())));
+        assert!(engine.pr_last_checked.contains_key("s1"));
+    }
+
+    #[test]
+    fn a_zero_pr_check_cap_is_unlimited() {
+        let (mut engine, _tmp) = test_engine();
+        engine.github_integration_enabled = true;
+        engine.gh_status = GhStatus::Available;
+        engine.config.ui.max_concurrent_pr_checks = 0;
+        // Far past the default cap, none of it in flight for the tested
+        // session itself.
+        for n in 0..9 {
+            engine.mark_in_flight(InFlightKey::PrCheck(format!("busy{n}")));
+        }
+        engine.sessions.push(sample_session("s1", "p1", "feat/x"));
+        assert!(
+            engine.spawn_pr_check_for_session("s1", std::time::Duration::from_secs(0)),
+            "0 means unlimited: nine in flight must not refuse a tenth"
+        );
+    }
+
+    #[test]
+    fn pr_checks_in_flight_counts_only_pr_check_keys() {
+        let (mut engine, _tmp) = test_engine();
+        engine.mark_in_flight(InFlightKey::PrCheck("a".to_string()));
+        engine.mark_in_flight(InFlightKey::PrCheck("b".to_string()));
+        // Other variants share the set and must not count towards the cap.
+        engine.mark_in_flight(InFlightKey::Pull("c".to_string()));
+        engine.mark_in_flight(InFlightKey::FolderRepoProbe("d".to_string()));
+        assert_eq!(engine.pr_checks_in_flight(), 2);
+    }
+
     fn backoff_map() -> std::sync::Arc<std::sync::Mutex<crate::gh::BackoffSnapshot>> {
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
     }

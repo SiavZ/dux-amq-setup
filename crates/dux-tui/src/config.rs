@@ -667,6 +667,13 @@ fn config_schema() -> Vec<ConfigEntry> {
             value_fn: |c| FieldValue::U32(c.ui.pr_poll_inactive_interval_seconds),
         },
         ConfigEntry::Field {
+            key: "max_concurrent_pr_checks",
+            comment: Some(CommentSource::Static(
+                "# Maximum number of single-agent PR checks dux runs at the same moment,\n# across ALL agents. Every event-driven check (a branch push noticed by the\n# refs watcher, an agent exiting, focusing an agent) runs one `gh` subprocess\n# that can sit on the network for up to its 10-second timeout, and each agent\n# has its own rate limit, so a big workspace pushing many branches at once\n# could otherwise start dozens of `gh` processes in one event storm. At the\n# cap a check is simply skipped, WITHOUT stamping its debounce, so the next\n# trigger for that agent re-attempts it as soon as a slot frees.\n# Set to 0 for no limit (the old behaviour before this cap existed).\n# Applied live: a config reload changes the cap for the next check.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.ui.max_concurrent_pr_checks),
+        },
+        ConfigEntry::Field {
             key: "copy_on_select",
             comment: Some(CommentSource::Static(
                 "# Web UI only: auto-copy selected terminal text to the clipboard\n# (X11-style \"highlight to copy\"). When enabled, dragging a selection in\n# the browser terminal copies it, and so does lifting your finger after a\n# press-and-hold selection on a touch screen; Ctrl-Shift-c / Ctrl-Insert (or\n# Cmd-c on a Mac) copy regardless. Change it at runtime from the web UI's\n# Preferences dialog.",
@@ -3284,6 +3291,7 @@ mod tests {
         assert!(rendered.contains("[ui]"));
         assert!(rendered.contains("agent_scrollback_lines = 10000"));
         assert!(rendered.contains("pr_poll_interval_seconds = 180"));
+        assert!(rendered.contains("max_concurrent_pr_checks = 4"));
         assert!(rendered.contains("empty_project_separator_min_projects = 5"));
         assert!(rendered.contains("copy_on_select = true"));
         assert!(rendered.contains("terminal_font_family = \"\""));
@@ -3865,6 +3873,47 @@ name = "test"
         let rendered = render_config_default(&config);
         let parsed: Config = toml::from_str(&rendered).expect("config should parse");
         assert_eq!(parsed.ui.agent_scrollback_lines, 12_345);
+    }
+
+    #[test]
+    fn default_config_round_trips_max_concurrent_pr_checks() {
+        // Both directions matter: a custom cap must survive the documented
+        // render, and 0 (the unlimited escape hatch) must survive it as 0,
+        // because the serde default would silently re-enable the cap.
+        let mut config = Config::default();
+        config.ui.max_concurrent_pr_checks = 9;
+        let parsed: Config = toml::from_str(&render_config_default(&config)).expect("parses");
+        assert_eq!(parsed.ui.max_concurrent_pr_checks, 9);
+
+        config.ui.max_concurrent_pr_checks = 0;
+        let parsed: Config = toml::from_str(&render_config_default(&config)).expect("parses");
+        assert_eq!(parsed.ui.max_concurrent_pr_checks, 0);
+
+        // The project tenet: the rendered config is the documentation, so the
+        // inline comment must say what the number does and what 0 means.
+        let rendered = render_config_default(&config);
+        let doc_line = rendered
+            .lines()
+            .find(|l| l.starts_with("max_concurrent_pr_checks"))
+            .expect("key renders");
+        assert_eq!(doc_line, "max_concurrent_pr_checks = 0");
+        let above: Vec<&str> = rendered
+            .lines()
+            .take(rendered.lines().position(|l| l == doc_line).unwrap())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .take_while(|l| l.starts_with('#') || l.trim().is_empty())
+            .collect::<Vec<_>>();
+        let joined = above.join("\n");
+        assert!(
+            joined.contains("`gh` subprocess"),
+            "the comment must explain the subprocess storm the cap prevents:\n{joined}"
+        );
+        assert!(
+            joined.contains("Set to 0 for no limit"),
+            "the comment must document the 0 escape hatch:\n{joined}"
+        );
     }
 
     #[test]

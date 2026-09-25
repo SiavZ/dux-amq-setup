@@ -398,6 +398,12 @@ fn apply_patches(doc: &mut DocumentMut, config: &Config) {
         "pr_poll_inactive_interval_seconds",
         config.ui.pr_poll_inactive_interval_seconds,
     );
+    patch_table_usize(
+        doc,
+        "ui",
+        "max_concurrent_pr_checks",
+        config.ui.max_concurrent_pr_checks,
+    );
     patch_table_u16(
         doc,
         "ui",
@@ -1918,6 +1924,39 @@ build = { text = \"cargo build\", surface = \"terminal\" }
         assert!(saved.contains("# keep me"), "{saved}");
         let parsed: Config = toml::from_str(&saved).expect("parses");
         assert_eq!(parsed.amq.inject.phase_delay_ms, 400);
+    }
+
+    #[test]
+    fn max_concurrent_pr_checks_renders_plain_and_patches_surgically() {
+        // The plain render is the fallback renderer and the shape every patch
+        // starts from, so the key must appear there and round-trip; the patch
+        // path must then UPDATE the value in an existing user file without
+        // eating the comment above it (a config edit from the editor).
+        let mut config = Config::default();
+        let plain = render_config_plain(&config);
+        assert!(
+            plain.contains("max_concurrent_pr_checks = 4"),
+            "the default cap must render: {plain}"
+        );
+        let parsed: Config = toml::from_str(&plain).expect("plain render parses");
+        assert_eq!(parsed.ui.max_concurrent_pr_checks, 4);
+
+        // 0 is the unlimited escape hatch and must survive the round trip as
+        // itself, not be dropped or defaulted.
+        config.ui.max_concurrent_pr_checks = 0;
+        let parsed: Config =
+            toml::from_str(&render_config_plain(&config)).expect("zero render parses");
+        assert_eq!(parsed.ui.max_concurrent_pr_checks, 0);
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "[ui]\n# keep me\nmax_concurrent_pr_checks = 1\n").unwrap();
+        config.ui.max_concurrent_pr_checks = 7;
+        patch_config_file_with(&path, &config, Durability::NoFsync).expect("patch");
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# keep me"), "{saved}");
+        let parsed: Config = toml::from_str(&saved).expect("patched file parses");
+        assert_eq!(parsed.ui.max_concurrent_pr_checks, 7);
     }
 
     #[test]

@@ -28,3 +28,9 @@ docs/server-mode-summary.md
 
 # Inter-agent mailbox scratch, not part of the project
 .agent-mail/
+
+# Local agent (Claude Code) settings and state. Machine-local by design: the
+# upstream repo tracked .claude/settings.local.json once, removed it in 6c70a23b,
+# and a later commit re-added it by accident; ignoring the directory keeps any
+# local agent configuration from ever being committed again.
+.claude/
