@@ -437,6 +437,15 @@ pub fn normalized_pr_poll_inactive_interval(seconds: u32) -> u32 {
     seconds
 }
 
+/// Default maximum number of single-session PR checks running at the same
+/// moment. The one-shot checks (a refs-watcher event, an agent exit, focusing
+/// an agent) each run one `gh` subprocess that can hang for up to
+/// [`crate::gh`]'s call timeout, and nothing else bounds how many can pile up
+/// across DIFFERENT sessions when many agents push at once; four keeps a burst
+/// of events from turning into a subprocess storm while still answering a
+/// normal workspace instantly.
+pub const DEFAULT_MAX_CONCURRENT_PR_CHECKS: usize = 4;
+
 /// Default seconds between re-checks of `gh` while dux cannot use it. Five
 /// minutes is short enough that a rate limit or a brief outage clears itself
 /// long before anyone thinks to restart dux, and long enough that a machine
@@ -1570,6 +1579,17 @@ pub struct UiConfig {
     /// moment they become active again, and on the deliberate one-shot
     /// triggers. Clamped to [`MAX_PR_POLL_INACTIVE_INTERVAL_SECONDS`].
     pub pr_poll_inactive_interval_seconds: u32,
+    /// Maximum number of single-session PR checks that may run at the same
+    /// moment, across ALL agents. Each one-shot check (a refs-watcher event,
+    /// an agent exiting, focusing an agent) runs one `gh` subprocess that can
+    /// take up to the per-call timeout, and the per-session debounce cannot
+    /// stop N different agents' events from spawning N concurrent subprocesses;
+    /// this cap is what does. A check refused at the cap is skipped without
+    /// stamping its debounce, so the next trigger for that agent re-attempts
+    /// as soon as a slot frees (or the deliberate trigger fires again).
+    /// `0` means unlimited (the fork-era behaviour before the cap existed).
+    /// Reloaded live: a config reload applies the new cap to the next check.
+    pub max_concurrent_pr_checks: usize,
     /// Seconds between re-checks of the `gh` CLI while dux cannot use it.
     ///
     /// dux asks `gh` once at startup. When that answer is anything but "installed
@@ -2233,6 +2253,7 @@ impl Default for UiConfig {
             github_integration: true,
             pr_poll_interval_seconds: DEFAULT_PR_POLL_INTERVAL_SECONDS,
             pr_poll_inactive_interval_seconds: DEFAULT_PR_POLL_INACTIVE_INTERVAL_SECONDS,
+            max_concurrent_pr_checks: DEFAULT_MAX_CONCURRENT_PR_CHECKS,
             github_probe_interval_secs: DEFAULT_GITHUB_PROBE_INTERVAL_SECONDS,
             copy_on_select: true,
             terminal_font_family: String::new(),
@@ -2967,6 +2988,7 @@ impl Default for Config {
                 github_integration: true,
                 pr_poll_interval_seconds: DEFAULT_PR_POLL_INTERVAL_SECONDS,
                 pr_poll_inactive_interval_seconds: DEFAULT_PR_POLL_INACTIVE_INTERVAL_SECONDS,
+                max_concurrent_pr_checks: DEFAULT_MAX_CONCURRENT_PR_CHECKS,
                 github_probe_interval_secs: DEFAULT_GITHUB_PROBE_INTERVAL_SECONDS,
                 copy_on_select: true,
                 terminal_font_family: String::new(),
@@ -5681,6 +5703,25 @@ mod agent_tabs_cap_tests {
         assert_eq!(
             UiConfig::default().pr_poll_inactive_interval_seconds,
             DEFAULT_PR_POLL_INACTIVE_INTERVAL_SECONDS
+        );
+    }
+
+    #[test]
+    fn the_pr_check_concurrency_cap_defaults_to_four() {
+        // The default mirrors the fork's hardcoded MAX_PR_CHECKS_IN_FLIGHT so a
+        // ported workspace behaves as the fork did out of the box.
+        assert_eq!(DEFAULT_MAX_CONCURRENT_PR_CHECKS, 4);
+        assert_eq!(
+            UiConfig::default().max_concurrent_pr_checks,
+            DEFAULT_MAX_CONCURRENT_PR_CHECKS
+        );
+        // `[ui]` carries #[serde(default)], so a config whose table omits the
+        // key must arrive at the same default rather than 0 (which would mean
+        // UNLIMITED, silently disabling the subprocess bound).
+        let parsed: UiConfig = toml::from_str("").expect("empty [ui] parses from defaults");
+        assert_eq!(
+            parsed.max_concurrent_pr_checks,
+            DEFAULT_MAX_CONCURRENT_PR_CHECKS
         );
     }
 

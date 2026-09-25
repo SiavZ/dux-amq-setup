@@ -1,8 +1,14 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fetchJson } from "./remote-json";
 
 // `fetchJson` memoizes per URL and suppresses a repeated warning per LABEL, both
 // for the life of the module, so every case here uses fresh values for each.
+//
+// These cases read the degradation line off `console.warn`, which is where it
+// goes on a terminal. Under GitHub Actions `emitDegradation` sends it to
+// `console.log` as a `::warning::` command instead (pinned in
+// remote-failure.test.ts), so `GITHUB_ACTIONS` is cleared for each case here, or
+// the suite passes locally and fails on every CI run.
 function stubFetch(impl: () => unknown) {
   vi.stubGlobal("fetch", vi.fn(impl));
 }
@@ -11,8 +17,13 @@ function spyWarn() {
   return vi.spyOn(console, "warn").mockImplementation(() => {});
 }
 
+beforeEach(() => {
+  vi.stubEnv("GITHUB_ACTIONS", "");
+});
+
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
 
