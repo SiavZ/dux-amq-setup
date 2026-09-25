@@ -57,11 +57,23 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: website/package-lock.json
+          # Both projects: the site's figure test renders the web UI's real
+          # components, so the app's dependencies are part of this job too.
+          cache-dependency-path: |
+            website/package-lock.json
+            crates/dux-web/web/package-lock.json
 
       - name: Install dependencies
         working-directory: website
         run: npm ci
+
+      # The unit tests run before `npm run build`, whose `prep` step is what
+      # installs the web app's dependencies on a fresh clone. The figure test
+      # resolves React through the app's node_modules, so without this it fails
+      # on every CI run with "Cannot find module .../react-dom-server.mjs".
+      - name: Install the web app's dependencies (the figure test renders it)
+        working-directory: crates/dux-web/web
+        run: npm ci --no-audit --no-fund
 
       - name: Unit tests
         working-directory: website
