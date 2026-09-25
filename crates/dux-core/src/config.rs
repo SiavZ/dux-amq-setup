@@ -5799,6 +5799,71 @@ mod agent_tabs_cap_tests {
         assert!(config.providers.commands["jcode"].forwards_mouse());
     }
 
+    fn default_provider(name: &str) -> ProviderCommandConfig {
+        default_provider_commands()
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("no default provider {name}"))
+            .1
+    }
+
+    /// Fork name. The fork's `oneshot_*` asserts are gone with AI commit
+    /// messages (upstream 90122fd2); the launch invariants stay.
+    #[test]
+    fn default_jcode_pins_binary_and_disables_latest_resume() {
+        let cfg = default_provider("jcode");
+        assert_eq!(cfg.command, "jcode");
+        // jcode auto-updates by default on release builds; a provider that
+        // swaps its own binary mid-session must not run on a long-lived PTY.
+        assert!(
+            cfg.args.iter().any(|a| a == "--no-update"),
+            "jcode must be launched with --no-update so the pane's binary is pinned",
+        );
+        // `--resume` with no argument LISTS sessions and waits on a picker,
+        // which would hang the PTY spawn. There is no "resume latest" form.
+        assert!(
+            !cfg.supports_session_resume(),
+            "jcode has no cwd-scoped resume-latest selector",
+        );
+        // Targeted resume repeats --no-update: resume args replace the base
+        // args, and an unpinned resumed pane would self-update mid-session.
+        assert_eq!(
+            cfg.resume_by_id_args.as_deref(),
+            Some(
+                [
+                    "--no-update".to_string(),
+                    "--resume".to_string(),
+                    "{session_id}".to_string(),
+                ]
+                .as_slice()
+            ),
+        );
+        // Alt-screen TUI with its own scrollback: the wheel must forward to
+        // jcode or scrolling reads as dead inside the pane.
+        assert_eq!(cfg.forward_scroll, Some(true));
+    }
+
+    /// Fork name; the `--chat -p` oneshot half is obsolete (90122fd2).
+    #[test]
+    fn default_ntl_uses_agent_repl_and_chat_oneshot() {
+        let cfg = default_provider("ntl");
+        assert_eq!(cfg.command, "ntl");
+        assert_eq!(cfg.args, vec!["--agent"]);
+        assert!(!cfg.supports_session_resume());
+    }
+
+    /// Fork name; the `run {prompt}` oneshot half is obsolete (90122fd2). The
+    /// launch half: the Kilo CLI binary is `kilo`, and both resume with
+    /// `--continue`.
+    #[test]
+    fn default_opencode_and_kilocode_oneshot_use_run_subcommand() {
+        for (name, command) in [("opencode", "opencode"), ("kilocode", "kilo")] {
+            let cfg = default_provider(name);
+            assert_eq!(cfg.command, command);
+            assert_eq!(cfg.resume_args, Some(vec!["--continue".to_string()]));
+        }
+    }
+
     #[test]
     fn a_provider_is_identified_by_its_command_file_name_not_its_block_name() {
         // The two are independent, and the per-CLI paste-length table used to be

@@ -1433,20 +1433,28 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         help: None,
         hint_contexts: &[],
     },
-    // Manual reordering: palette-only (no default keys, no help section), the TUI
-    // equivalent of the web's drag-to-reorder.
+    // Manual reordering, the TUI equivalent of the web's drag-to-reorder. Up
+    // and down one row are on Shift-K / Shift-J in the sidebar (fork 3da9bc6f,
+    // the capital twins of k / j); in the terminals section
+    // the same keys move the selected terminal. Top/bottom stay palette-only.
     BindingDef {
         action: Action::MoveAgentUp,
-        default_keys: &[],
-        scopes: &[],
-        help: None,
+        default_keys: &[key!(shift - k)],
+        scopes: &[BindingScope::Left],
+        help: Some(HelpEntry {
+            section: "Projects pane",
+            description: "Move the selected agent or terminal up (sorting becomes manual)",
+        }),
         hint_contexts: &[],
     },
     BindingDef {
         action: Action::MoveAgentDown,
-        default_keys: &[],
-        scopes: &[],
-        help: None,
+        default_keys: &[key!(shift - j)],
+        scopes: &[BindingScope::Left],
+        help: Some(HelpEntry {
+            section: "Projects pane",
+            description: "Move the selected agent or terminal down (sorting becomes manual)",
+        }),
         hint_contexts: &[],
     },
     BindingDef {
@@ -3385,6 +3393,35 @@ mod tests {
         assert_eq!(
             bindings.lookup(&f, BindingScope::Left),
             Some(Action::ForkAgent)
+        );
+    }
+
+    /// Fork 3da9bc6f: capital J / K reorder the selected sidebar row. Both the
+    /// plain `Char('J')`+SHIFT event and a bare `Char('J')` (some terminals drop
+    /// the modifier on capitals) must resolve.
+    #[test]
+    fn left_scope_resolves_shift_jk_to_reorder_actions() {
+        let bindings = default_bindings();
+        let down = KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT);
+        let up = KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT);
+        assert_eq!(
+            bindings.lookup(&down, BindingScope::Left),
+            Some(Action::MoveAgentDown)
+        );
+        assert_eq!(
+            bindings.lookup(&up, BindingScope::Left),
+            Some(Action::MoveAgentUp)
+        );
+        let bare_down = KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE);
+        assert_eq!(
+            bindings.lookup(&bare_down, BindingScope::Left),
+            Some(Action::MoveAgentDown)
+        );
+        // Lowercase j / k still navigate.
+        let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(
+            bindings.lookup(&j, BindingScope::Left),
+            Some(Action::MoveDown)
         );
     }
     #[test]

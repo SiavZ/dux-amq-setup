@@ -2507,10 +2507,25 @@ fn rename_source(status: char, source: &Option<String>) -> Option<String> {
     }
 }
 
+/// Every git process `changed_files` starts goes through here, so a test can
+/// count them: the panel is polled, and a per-file subprocess (the fork's
+/// P1-24, one `git diff --no-index` per untracked file) turns a big untracked
+/// tree into hundreds of spawns per tick.
+fn changed_files_git_command() -> Command {
+    #[cfg(test)]
+    CHANGED_FILES_GIT_COMMANDS.with(|count| count.set(count.get() + 1));
+    Command::new("git")
+}
+
+#[cfg(test)]
+thread_local! {
+    static CHANGED_FILES_GIT_COMMANDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<ChangedFile>)> {
     let wt = worktree_path.as_os_str();
 
-    let output = Command::new("git")
+    let output = changed_files_git_command()
         .arg("-C")
         .arg(wt)
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
@@ -2621,7 +2636,7 @@ pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<Chan
 /// empty map rather than an error: it is one of two independent sources feeding
 /// the unstaged rows, and the other one still has something to say.
 fn unstaged_numstat(worktree: &std::ffi::OsStr) -> HashMap<String, DiffStat> {
-    Command::new("git")
+    changed_files_git_command()
         .arg("-C")
         .arg(worktree)
         .args(["diff", "--numstat", "-z"])
@@ -2635,7 +2650,7 @@ fn unstaged_numstat(worktree: &std::ffi::OsStr) -> HashMap<String, DiffStat> {
 /// Per-path line counts for the staged changes in `worktree`. Answers with an
 /// empty map on a failed call, for the same reason [`unstaged_numstat`] does.
 fn staged_numstat(worktree: &std::ffi::OsStr) -> HashMap<String, DiffStat> {
-    Command::new("git")
+    changed_files_git_command()
         .arg("-C")
         .arg(worktree)
         .args(["diff", "--cached", "--numstat", "-z"])
@@ -2690,7 +2705,7 @@ fn paths_excluded_from_diffs(worktree: &std::ffi::OsStr, paths: &[String]) -> Ha
         return HashSet::new();
     }
 
-    let Ok(mut child) = Command::new("git")
+    let Ok(mut child) = changed_files_git_command()
         .arg("-C")
         .arg(worktree)
         .args(["check-attr", "-z", "--stdin", "diff"])
@@ -2815,7 +2830,7 @@ fn file_prefix_on_disk(path: &Path) -> Option<Vec<u8>> {
 fn index_blob_prefix(worktree_path: &Path, rel_path: &str) -> Option<Vec<u8>> {
     use std::io::Read as _;
 
-    let mut child = Command::new("git")
+    let mut child = changed_files_git_command()
         .arg("-C")
         .arg(worktree_path)
         .args(["cat-file", "-p", &format!(":{rel_path}")])
@@ -3625,17 +3640,66 @@ pub fn push(worktree_path: &Path) -> Result<String> {
 }
 
 /// Return the contents of a file as raw bytes as it exists at HEAD, or `None`
-/// for new (untracked) files. Uses the plumbing command `cat-file` which is
-/// immune to user configuration.
+/// when HEAD has no entry at `path` (a new/untracked file). Plumbing only
+/// (`ls-tree` + `cat-file`), so user configuration cannot change the answer.
+///
+/// "Absent at HEAD" is decided by an empty `ls-tree` listing, NOT by a failed
+/// `cat-file`: a git failure (not a repository, a corrupt object store, git
+/// missing) is an `Err`, never `None`. Collapsing the two would render every
+/// file of a broken checkout as fully added (fork 24deeeee, audit03 P1-22).
 pub fn file_bytes_at_head(worktree_path: &Path, path: &str) -> Result<Option<Vec<u8>>> {
+    let listing = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["ls-tree", "-z", "HEAD", "--", path])
+        .output()?;
+    if !listing.status.success() {
+        // An unborn HEAD (a repository with no commits yet) has no entry at
+        // any path: every file is new. Only on this failure path, so the hot
+        // path stays one process. `rev-parse --verify --quiet` exits 1 for an
+        // unborn HEAD and 128 outside a repository.
+        let head = Command::new("git")
+            .arg("-C")
+            .arg(worktree_path)
+            .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+            .output()?;
+        if head.status.code() == Some(1) {
+            return Ok(None);
+        }
+        return Err(anyhow!(
+            "git ls-tree failed: {}",
+            crate::sanitize::utf8_lossy(&listing.stderr)
+        ));
+    }
+    let record = listing
+        .stdout
+        .split(|byte| *byte == 0)
+        .next()
+        .unwrap_or_default();
+    if record.is_empty() {
+        return Ok(None);
+    }
+    // `<mode> SP <type> SP <object> TAB <path>`
+    let metadata = record
+        .split(|byte| *byte == b'\t')
+        .next()
+        .unwrap_or_default();
+    let metadata = std::str::from_utf8(metadata).context("git ls-tree metadata was not UTF-8")?;
+    let mut fields = metadata.split_ascii_whitespace();
+    let _mode = fields.next();
+    let (Some("blob"), Some(object_id)) = (fields.next(), fields.next()) else {
+        return Err(anyhow!("git ls-tree did not return a blob for {path:?}"));
+    };
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree_path)
-        .args(["cat-file", "-p", &format!("HEAD:{path}")])
+        .args(["cat-file", "blob", object_id])
         .output()?;
     if !output.status.success() {
-        // File doesn't exist at HEAD (new/untracked file).
-        return Ok(None);
+        return Err(anyhow!(
+            "git cat-file failed: {}",
+            crate::sanitize::utf8_lossy(&output.stderr)
+        ));
     }
     Ok(Some(output.stdout))
 }
@@ -10819,6 +10883,87 @@ mod tests {
         run_git(p, &["commit", "-m", "second"]);
         run_git(p, &["checkout", "--detach", "HEAD~1"]);
         assert_eq!(current_branch_opt(p).unwrap(), None);
+    }
+
+    /// Fork name. Upstream has no `head_branch`; `current_branch_opt` is the
+    /// same contract (attached = Some, detached = None) and `current_branch`
+    /// is the strict variant that refuses a detached HEAD.
+    #[test]
+    fn head_branch_distinguishes_attached_and_detached_head() {
+        let repo = init_test_repo();
+        assert_eq!(
+            current_branch_opt(repo.path()).unwrap().as_deref(),
+            Some("main")
+        );
+        let head = head_commit(repo.path()).unwrap();
+        run_git(repo.path(), &["checkout", "--detach", &head]);
+
+        assert_eq!(current_branch_opt(repo.path()).unwrap(), None);
+        assert!(current_branch(repo.path()).is_err());
+    }
+
+    /// Fork name (24deeeee, audit03 P1-22): present, deleted-in-worktree, new,
+    /// and git-failure answers are four different things.
+    #[test]
+    fn file_bytes_at_head_distinguishes_new_deleted_binary_and_git_errors() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "head-bytes-cases");
+        fs::write(wt.join("tracked.bin"), [0_u8, 1, 2, 255]).unwrap();
+        run_git(&wt, &["add", "tracked.bin"]);
+        run_git(&wt, &["commit", "-m", "binary"]);
+
+        assert_eq!(
+            file_bytes_at_head(&wt, "tracked.bin").unwrap(),
+            Some(vec![0, 1, 2, 255])
+        );
+        fs::remove_file(wt.join("tracked.bin")).unwrap();
+        assert_eq!(
+            file_bytes_at_head(&wt, "tracked.bin").unwrap(),
+            Some(vec![0, 1, 2, 255]),
+            "deleted working-tree files still have HEAD bytes"
+        );
+        fs::write(wt.join("new.txt"), "new").unwrap();
+        assert_eq!(file_bytes_at_head(&wt, "new.txt").unwrap(), None);
+
+        let non_repo = tempfile::tempdir().unwrap();
+        assert!(
+            file_bytes_at_head(non_repo.path(), "anything").is_err(),
+            "a git failure must not read as a new file"
+        );
+
+        // A repository with no commits yet: every file is new, not an error.
+        let unborn = init_test_repo_no_commit();
+        fs::write(unborn.path().join("first.txt"), "x").unwrap();
+        assert_eq!(
+            file_bytes_at_head(unborn.path(), "first.txt").unwrap(),
+            None
+        );
+    }
+
+    /// Fork name (P1-24). The Changes panel is polled, so the number of git
+    /// processes one `changed_files` sweep starts must not grow with the
+    /// number of untracked files.
+    #[test]
+    fn changed_files_git_process_count_is_bounded_with_untracked_growth() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "bounded-untracked-processes");
+
+        fs::write(wt.join("one.txt"), "one\n").unwrap();
+        CHANGED_FILES_GIT_COMMANDS.with(|count| count.set(0));
+        changed_files(&wt).unwrap();
+        let one_file_count = CHANGED_FILES_GIT_COMMANDS.with(std::cell::Cell::get);
+
+        for index in 0..100 {
+            fs::write(wt.join(format!("many-{index:03}.txt")), "line\n").unwrap();
+        }
+        CHANGED_FILES_GIT_COMMANDS.with(|count| count.set(0));
+        let (_, files) = changed_files(&wt).unwrap();
+        let many_file_count = CHANGED_FILES_GIT_COMMANDS.with(std::cell::Cell::get);
+
+        assert_eq!(files.len(), 101);
+        // status + unstaged numstat + staged numstat.
+        assert_eq!(one_file_count, 3);
+        assert_eq!(many_file_count, one_file_count);
     }
 
     #[test]

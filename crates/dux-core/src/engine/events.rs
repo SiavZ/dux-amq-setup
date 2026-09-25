@@ -7349,6 +7349,72 @@ mod tests {
     /// Left armed, a survivor that simply stayed quiet past its resume wait was
     /// read as a hung resume, and the sweep tore the tab down and SIGKILLed a
     /// healthy agent.
+    /// Fork name (5531378f). The fork persisted the row before spawn and the
+    /// ready event consumed it; upstream writes the row AT ready, in one
+    /// transaction with the slot tab. Same observable contract: a create whose
+    /// row lands reports success, the session is live in memory and on disk,
+    /// and the worktree is kept (the failure twin is
+    /// `create_agent_db_failure_removes_owned_worktree_without_success`).
+    #[test]
+    fn create_agent_ready_consumes_the_already_persisted_row() {
+        let (mut engine, tmp) = test_engine();
+        let worktree = tmp.path().join("wt-created");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let session = sample_session("created", "project-1", "agent-created");
+        let client = crate::pty::PtyClient::spawn_with_env("cat", &[], &worktree, 24, 80, 100, &[])
+            .expect("spawn cat");
+        let tab = session.slot_tab_id().to_owned();
+        let data = AgentLaunchReadyData {
+            request: AgentLaunchRequest {
+                tab_id: tab.clone(),
+                provider: session.provider.clone(),
+                session,
+                provider_config: ProviderCommandConfig::default(),
+                env: Vec::new(),
+                identity: Default::default(),
+                resume: false,
+                pty_size: (24, 80),
+                scrollback_lines: 1000,
+                kind: AgentLaunchKind::Create {
+                    status_message: "ready from persisted row".into(),
+                    repo_path: tmp.path().to_string_lossy().into_owned(),
+                    owns_worktree: true,
+                    startup_result: None,
+                    status_op_id: String::new(),
+                },
+                wants_fullscreen: false,
+                status_quiet: QuietSurfaces::LOUD,
+                provider_session: Default::default(),
+                yolo_args: Vec::new(),
+            },
+            client,
+        };
+
+        let (outcome, _) = engine.process_agent_launch_ready(data);
+
+        match outcome.view {
+            AgentLaunchReadyView::CreateCommitted { status_message, .. } => {
+                assert!(status_message.contains("ready from persisted row"));
+            }
+            _ => panic!("a persisted create must report success"),
+        }
+        assert!(!engine.is_in_flight(&InFlightKey::CreateAgent));
+        assert!(engine.sessions.iter().any(|s| s.id == "created"));
+        assert!(engine.providers.contains_key(&tab));
+        let stored = engine.session_store.load_sessions().unwrap();
+        assert!(stored.iter().any(|s| s.id == "created"), "row persisted");
+        // The slot tab row is written only by the create's own transaction
+        // (a later re-upsert of the session never adds it), so it proves the
+        // row was committed at ready rather than patched in afterwards.
+        let tabs = engine.session_store.load_agent_tabs().unwrap();
+        assert!(
+            tabs.iter()
+                .any(|t| t.id == tab.as_str() && t.session_id == "created"),
+            "the create must commit the slot tab with the session"
+        );
+        assert!(worktree.exists(), "persisted worktree must be retained");
+    }
+
     /// Fork 773a6b04 (P1-27): a create whose session row cannot be written
     /// must not leave behind the worktree and branch it just minted, which
     /// nothing would point at after a restart. A branch dux did not mint

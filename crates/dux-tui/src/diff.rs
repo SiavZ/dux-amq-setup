@@ -294,7 +294,17 @@ fn diff_file(
 ) -> Result<DiffOutput> {
     let old_bytes = crate::git::file_bytes_at_head(worktree_path, rel_path)?.unwrap_or_default();
     let abs_path = worktree_path.join(rel_path);
-    let new_bytes = std::fs::read(&abs_path).unwrap_or_default();
+    // Only an ABSENT working copy is a deletion. Any other read failure (a
+    // directory in the file's place, permissions, I/O) surfaces: rendering it
+    // as "every line deleted" would tell the user their file is gone (fork
+    // 24deeeee, audit03 P1-22).
+    let new_bytes = match std::fs::read(&abs_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => {
+            return Err(anyhow::Error::new(err).context(format!("read {}", abs_path.display())));
+        }
+    };
 
     if old_bytes == new_bytes {
         return Ok(DiffOutput {
@@ -927,6 +937,23 @@ mod tests {
 
         std::fs::write(&file, modified).unwrap();
         dir
+    }
+
+    #[test]
+    fn diff_surfaces_worktree_read_errors_instead_of_rendering_deletion() {
+        let dir = setup_text_repo("not-a-file", "committed\n", "committed\n");
+        std::fs::remove_file(dir.path().join("not-a-file")).unwrap();
+        std::fs::create_dir(dir.path().join("not-a-file")).unwrap();
+        let result = diff_file(
+            dir.path(),
+            "not-a-file",
+            &AppTheme::default_dark(),
+            &SyntaxCache::new(),
+            false,
+            4,
+        );
+        let err = result.err().expect("directory read must surface");
+        assert!(format!("{err:#}").contains("not-a-file"), "{err:#}");
     }
 
     #[test]
