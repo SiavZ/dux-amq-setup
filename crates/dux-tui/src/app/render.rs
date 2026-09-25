@@ -15906,14 +15906,24 @@ mod tests {
         app.center_mode = CenterMode::Agent;
         app.focus = FocusPane::Center;
         let (_, _) = draw_caret_frame(&mut app);
-        for _ in 0..300 {
+        // The scrollbar draws only when the child both made history AND has
+        // been marked as having output. The reader thread updates the grid
+        // under the terminal lock but stores `has_output` after releasing it,
+        // so under load a snapshot can already show history while the flag is
+        // still false. Wait for both premises the render checks.
+        let has_output = |app: &App| {
+            app.selected_terminal_surface_client()
+                .is_some_and(|provider| provider.has_output())
+        };
+        for _ in 0..500 {
             app.refresh_snapshot_buf();
-            if app.snapshot_buf.scrollback_total > 0 {
+            if app.snapshot_buf.scrollback_total > 0 && has_output(&app) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(app.snapshot_buf.scrollback_total > 0, "child made history");
+        assert!(has_output(&app), "child's output was recorded");
 
         let (terminal, term_area) = draw_caret_frame(&mut app);
         let track = app
