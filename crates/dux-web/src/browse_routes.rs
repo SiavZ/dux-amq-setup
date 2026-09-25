@@ -1,0 +1,580 @@
+//! Two stateless reads the add-project and new-agent dialogs need:
+//!
+//! - `GET /api/v1/browse?path=` lists a directory. An absent or empty `path`
+//!   resolves `defaults.start_directory` from the live engine config, falling back
+//!   to `$HOME` when the engine is gone. The reply echoes the resolved path.
+//! - `GET /api/v1/agent-name` generates a two-word pet name for the new-agent
+//!   dialog's randomized-name preview.
+//!
+//! Filesystem reads run off the async reactor, through `spawn_blocking`.
+//!
+//! Read this before extending `?path=`: browse has no root restriction and no
+//! sandbox, so any client that can reach the server can list any directory the
+//! server process can read. That follows from the single-tenant trusted-access
+//! model, and the app-wide Host allowlist and same-origin check do not narrow it
+//! (the latter covers mutations only, so it reaches `mkdir` and not these GETs).
+//! The only boundary is who can reach the listening address.
+
+use axum::{
+    Json, Router,
+    extract::{Query, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use serde::{Deserialize, Serialize};
+
+use crate::server::AppState;
+
+/// Upper bound on the `?path=` query value before any filesystem touch. Generous
+/// (well above `PATH_MAX` on supported platforms) so it rejects only an abusive
+/// string, never a legitimate directory path.
+const MAX_PATH_LEN: usize = 4096;
+
+/// The utility read routes.
+pub fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/api/v1/browse", get(browse))
+        .route("/api/v1/browse/mkdir", post(mkdir))
+        .route("/api/v1/agent-name", get(agent_name))
+}
+
+#[derive(Deserialize)]
+struct BrowseQuery {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// A single directory entry in the project picker, mirroring the frontend's
+/// `DirEntryView` (`browseApi.ts` / `types.ts`).
+#[derive(Serialize)]
+struct DirEntryView {
+    path: String,
+    label: String,
+    is_git_repo: bool,
+    is_parent: bool,
+}
+
+/// The browse reply: the resolved directory plus its child entries.
+#[derive(Serialize)]
+struct BrowseReply {
+    path: String,
+    entries: Vec<DirEntryView>,
+}
+
+async fn browse(State(state): State<AppState>, Query(query): Query<BrowseQuery>) -> Response {
+    // Absent or empty means the configured default, read from the live engine
+    // config so a reload is reflected; `$HOME` then `/` if the engine is gone.
+    let dir = match query.path.filter(|p| !p.is_empty()) {
+        Some(p) => p,
+        None => match state.engine.browse_start_dir().await {
+            Some(dir) => dir,
+            None => std::env::var("HOME").unwrap_or_else(|_| "/".to_string()),
+        },
+    };
+
+    if dir.chars().count() > MAX_PATH_LEN {
+        return (StatusCode::BAD_REQUEST, "path is too long").into_response();
+    }
+
+    // Filesystem read off the reactor (the `browse_dir` precedent).
+    let result = tokio::task::spawn_blocking(move || {
+        let p = std::path::Path::new(&dir);
+        let entries = dux_core::project_browser::browser_entries(p)
+            .into_iter()
+            .map(|e| DirEntryView {
+                path: e.path.to_string_lossy().to_string(),
+                label: e.label,
+                is_git_repo: e.is_git_repo,
+                is_parent: e.is_parent,
+            })
+            .collect::<Vec<_>>();
+        (dir, entries)
+    })
+    .await;
+
+    match result {
+        Ok((path, entries)) => Json(BrowseReply { path, entries }).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("browse failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct MkdirBody {
+    parent: String,
+    name: String,
+}
+
+/// The mkdir reply: the created directory's full path.
+#[derive(Serialize)]
+struct MkdirReply {
+    path: String,
+}
+
+/// `POST /api/v1/browse/mkdir`: create one new directory inside an existing
+/// parent, for the add-project picker's "New folder" affordance.
+///
+/// This endpoint's job is shape discipline and non-destructiveness, not
+/// containment: the GET above already browses the whole filesystem. `name` must
+/// be a single path component (no `/`, no NUL, not `.` or `..`), so the path is
+/// one `join` of an absolute parent with a vetted component and there is no
+/// arithmetic to defeat. `create_dir` never overwrites, follows, or removes.
+/// The joined target is bounded on the same character cap the parent carries,
+/// so a maximal parent and a maximal name cannot build a folder the inspect
+/// route then refuses to look at.
+async fn mkdir(State(_state): State<AppState>, Json(body): Json<MkdirBody>) -> Response {
+    let parent = body.parent;
+    // The parent is checked as a path string: present, absolute and bounded.
+    // Classifying what is there is the inspect endpoint's job, not this route's.
+    if parent.is_empty() {
+        return (StatusCode::BAD_REQUEST, "parent is required").into_response();
+    }
+    if !std::path::Path::new(&parent).is_absolute() {
+        // A relative parent would silently resolve against the server cwd.
+        return (StatusCode::BAD_REQUEST, "path must be absolute").into_response();
+    }
+    if parent.chars().count() > MAX_PATH_LEN {
+        return (StatusCode::BAD_REQUEST, "path is too long").into_response();
+    }
+    // `name` must be exactly one path component.
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "folder name is required").into_response();
+    }
+    if name.len() > 255 {
+        return (StatusCode::BAD_REQUEST, "folder name is too long").into_response();
+    }
+    if name.contains('/') || name.contains('\0') {
+        return (
+            StatusCode::BAD_REQUEST,
+            "folder name can't contain path separators",
+        )
+            .into_response();
+    }
+    if name == "." || name == ".." {
+        return (StatusCode::BAD_REQUEST, "that folder name is reserved").into_response();
+    }
+    if name.starts_with('.') {
+        // The picker hides dotfolders, so a dot-named folder would be created
+        // invisible and unreachable.
+        return (
+            StatusCode::BAD_REQUEST,
+            "folder names starting with a dot are hidden in the picker; pick another name",
+        )
+            .into_response();
+    }
+    // The parent and the name each fit; their join still has to. Measured in
+    // characters, the unit the parent check above uses.
+    let target = std::path::Path::new(&parent).join(&name);
+    if target.to_string_lossy().chars().count() > MAX_PATH_LEN {
+        return (
+            StatusCode::BAD_REQUEST,
+            "the folder's full path is too long",
+        )
+            .into_response();
+    }
+
+    // Filesystem write off the reactor (the browse precedent). `create_dir`,
+    // not `create_dir_all`: the picker only navigates existing directories, so
+    // a missing parent is an error, not a request.
+    let result = tokio::task::spawn_blocking(move || {
+        std::fs::create_dir(&target).map(|()| target.to_string_lossy().to_string())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(path)) => Json(MkdirReply { path }).into_response(),
+        Ok(Err(err)) => match err.kind() {
+            // Measured: AlreadyExists covers an existing dir, file, dangling
+            // symlink, and symlink-to-dir, with no follow-through.
+            std::io::ErrorKind::AlreadyExists => (
+                StatusCode::CONFLICT,
+                "a file or folder with that name already exists",
+            )
+                .into_response(),
+            std::io::ErrorKind::NotFound => (
+                StatusCode::BAD_REQUEST,
+                "the parent folder no longer exists",
+            )
+                .into_response(),
+            _ => (
+                StatusCode::BAD_REQUEST,
+                format!("couldn't create the folder: {err}"),
+            )
+                .into_response(),
+        },
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("mkdir failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// The agent-name reply: a freshly generated pet name.
+#[derive(Serialize)]
+struct AgentNameReply {
+    name: String,
+}
+
+async fn agent_name(State(_state): State<AppState>) -> Response {
+    // Pure, fast, and self-contained: answer directly without round-tripping
+    // through the engine thread.
+    let name = dux_core::git::docker_style_name();
+    Json(AgentNameReply { name }).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    use crate::test_support::router_no_auth;
+
+    /// Percent-encode the bytes a directory path could carry in a query value so a
+    /// space or other reserved char does not corrupt the request line. Small,
+    /// dependency-free (the crate has no urlencoding dep).
+    fn encode(s: &str) -> String {
+        let mut out = String::new();
+        for b in s.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                    out.push(b as char)
+                }
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn browse_lists_a_directory_and_echoes_the_resolved_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("alpha")).unwrap();
+        std::fs::create_dir(dir.path().join("beta")).unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/browse?path={}", encode(&path)))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["path"], path);
+        let labels: Vec<&str> = value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["label"].as_str().unwrap())
+            .collect();
+        assert!(labels.contains(&"alpha/"));
+        assert!(labels.contains(&"beta/"));
+
+        // The parent ("../") row carries is_parent == true; the real child
+        // directories carry is_parent == false. This is the typed flag the web
+        // picker branches on rather than matching the "../" label string.
+        let entries = value["entries"].as_array().unwrap();
+        let parent = entries
+            .iter()
+            .find(|e| e["label"] == "../")
+            .expect("a parent row is synthesized");
+        assert_eq!(parent["is_parent"], true);
+        let alpha = entries
+            .iter()
+            .find(|e| e["label"] == "alpha/")
+            .expect("alpha is listed");
+        assert_eq!(alpha["is_parent"], false);
+    }
+
+    /// With `path` omitted, the picker must open at the configured
+    /// `defaults.start_directory` (resolved through the live engine), not `$HOME`.
+    /// This is the web side of the start-directory wiring (the TUI already honored
+    /// it). Boots a real engine from a config.toml that points start_directory at a
+    /// temp dir and asserts the no-path browse echoes that dir.
+    #[tokio::test]
+    async fn browse_without_a_path_opens_the_configured_start_directory() {
+        let cfg_root = tempfile::tempdir().unwrap();
+        let start = tempfile::tempdir().unwrap();
+        std::fs::create_dir(start.path().join("alpha")).unwrap();
+        let start_path = start.path().to_string_lossy().to_string();
+
+        // Minimal config: only set the one key under test; everything else defaults.
+        std::fs::write(
+            cfg_root.path().join("config.toml"),
+            format!("[defaults]\nstart_directory = \"{start_path}\"\n"),
+        )
+        .unwrap();
+
+        let paths = dux_core::config::DuxPaths {
+            root: cfg_root.path().to_path_buf(),
+            config_path: cfg_root.path().join("config.toml"),
+            sessions_db_path: cfg_root.path().join("sessions.sqlite3"),
+            worktrees_root: cfg_root.path().join("worktrees"),
+            lock_path: cfg_root.path().join("dux.lock"),
+        };
+        std::fs::create_dir_all(&paths.worktrees_root).unwrap();
+        let engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        let (handle, _join) = crate::engine_actor::spawn_engine_thread(engine);
+        let app = crate::server::router(handle);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/browse")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["path"], start_path);
+        let labels: Vec<&str> = value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["label"].as_str().unwrap())
+            .collect();
+        assert!(labels.contains(&"alpha/"));
+    }
+
+    #[tokio::test]
+    async fn browse_rejects_an_overlong_path() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/browse?path={}",
+                        "x".repeat(MAX_PATH_LEN + 1)
+                    ))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    async fn post_mkdir(app: axum::Router, parent: &str, name: &str) -> axum::response::Response {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/browse/mkdir")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({ "parent": parent, "name": name }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn mkdir_creates_a_folder_and_returns_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().to_string_lossy().to_string();
+        let (_tmp, app) = router_no_auth();
+        let resp = post_mkdir(app, &parent, "projects").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let created = value["path"].as_str().unwrap();
+        assert_eq!(created, dir.path().join("projects").to_string_lossy());
+        assert!(dir.path().join("projects").is_dir());
+    }
+
+    #[tokio::test]
+    async fn mkdir_rejects_malformed_names_and_parents() {
+        // Catches traversal-by-name, cwd-relative writes, and invisible
+        // dot-folders (the picker hides them).
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().to_string_lossy().to_string();
+        for bad_name in ["a/b", ".", "..", ".hidden", ""] {
+            let (_tmp, app) = router_no_auth();
+            let resp = post_mkdir(app, &parent, bad_name).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "name {bad_name:?} must be rejected"
+            );
+        }
+        let (_tmp, app) = router_no_auth();
+        let resp = post_mkdir(app, "relative/parent", "ok").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a relative parent must be rejected"
+        );
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "no rejected request may have created anything"
+        );
+    }
+
+    /// Create a real directory whose absolute path is exactly `target_len`
+    /// characters, nesting components that each stay well inside the 255-byte
+    /// name limit.
+    ///
+    /// `None` when the OPERATING SYSTEM will not hold a path that long.
+    /// [`MAX_PATH_LEN`] is 4096, which is Linux's `PATH_MAX`; macOS caps a path
+    /// at 1024 bytes and refuses anything longer with `ENAMETOOLONG`, so a
+    /// fixture asking for a near-4096 path dies in setup there rather than
+    /// reaching the behaviour under test. Measured: the nesting fails at a
+    /// total length just over 1024 on this platform.
+    fn deep_dir(base: &std::path::Path, target_len: usize) -> Option<std::path::PathBuf> {
+        let mut remaining = target_len - base.to_string_lossy().chars().count();
+        // Every component costs one separator plus its own length, so pick a
+        // final component that leaves a whole number of 100-char ones.
+        let mut last = (remaining - 1) % 101;
+        if last == 0 {
+            last = 101;
+        }
+        let mut path = base.to_path_buf();
+        remaining -= 1 + last;
+        while remaining > 0 {
+            path.push("d".repeat(100));
+            remaining -= 101;
+        }
+        path.push("d".repeat(last));
+        assert_eq!(path.to_string_lossy().chars().count(), target_len);
+        match std::fs::create_dir_all(&path) {
+            Ok(()) => Some(path),
+            // This OS's path limit is below what the caller asked for. Nothing
+            // about dux can be observed through a path that cannot exist.
+            // `InvalidFilename` is how std reports `ENAMETOOLONG` here, and is
+            // used in place of the raw errno so this needs no `libc` dependency.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidFilename => {
+                eprintln!(
+                    "skipping: this OS will not hold a {target_len}-character \
+                     path ({e})"
+                );
+                None
+            }
+            Err(e) => panic!("creating the deep fixture directory failed: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mkdir_rejects_a_join_that_overruns_the_path_cap() {
+        // Catches the gap between the two bounded strings: a parent inside the
+        // cap plus a name inside its own limit can still join into a path the
+        // inspect route would refuse to look at.
+        let dir = tempfile::tempdir().unwrap();
+        let Some(deep) = deep_dir(dir.path(), MAX_PATH_LEN - 6) else {
+            return;
+        };
+        let parent = deep.to_string_lossy().to_string();
+
+        let long_name = "n".repeat(32);
+        let (_tmp, app) = router_no_auth();
+        let resp = post_mkdir(app, &parent, &long_name).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            String::from_utf8(bytes.to_vec()).unwrap(),
+            "the folder's full path is too long"
+        );
+        assert!(
+            !deep.join(&long_name).exists(),
+            "a refused join must create nothing"
+        );
+
+        // The same parent still works for a name the join can carry.
+        let (_tmp, app) = router_no_auth();
+        let resp = post_mkdir(app, &parent, "ok").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(deep.join("ok").is_dir());
+    }
+
+    #[tokio::test]
+    async fn mkdir_conflicts_on_existing_and_400s_on_missing_parent() {
+        // Catches clobbering: an existing entry (dir or file) is a 409, never
+        // an overwrite; a vanished parent is a 400, not a create_dir_all.
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().to_string_lossy().to_string();
+        std::fs::create_dir(dir.path().join("taken")).unwrap();
+        std::fs::write(dir.path().join("file"), b"x").unwrap();
+
+        let (_tmp, app) = router_no_auth();
+        let resp = post_mkdir(app, &parent, "taken").await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let (_tmp, app) = router_no_auth();
+        let resp = post_mkdir(app, &parent, "file").await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(std::fs::read(dir.path().join("file")).unwrap(), b"x");
+
+        let missing = dir.path().join("gone").to_string_lossy().to_string();
+        let (_tmp, app) = router_no_auth();
+        let resp = post_mkdir(app, &missing, "child").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mkdir_with_a_mismatched_origin_is_403() {
+        // Catches cross-site directory creation: the new POST must sit inside
+        // the layered `rest_mutation_origin_check`.
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().to_string_lossy().to_string();
+        let tmp = tempfile::tempdir().unwrap();
+        let handle = crate::test_support::test_engine_handle(tmp.path());
+        let app = crate::server::build_app(
+            handle,
+            axum::Router::new(),
+            crate::server::RouterParams::plain_http(),
+        );
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/browse/mkdir")
+                    .header("Host", "localhost")
+                    .header("Origin", "http://evil.example.com")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "parent": parent, "name": "pwned" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !dir.path().join("pwned").exists(),
+            "the cross-origin request must not have created anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_name_returns_a_hyphenated_pet_name() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/agent-name")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(value["name"].as_str().unwrap().contains('-'));
+    }
+}

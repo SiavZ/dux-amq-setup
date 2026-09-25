@@ -1,0 +1,3052 @@
+//! The `Command` enum, the engine-operation vocabulary. Every mutation or
+//! background spawn the Engine performs is named here and dispatched through
+//! `Engine::apply`.
+
+use std::path::PathBuf;
+
+use crate::engine::events::{
+    BeginDeleteSessionView, DeleteTerminalView, DispatchAgentLaunchView, DoDeleteSessionView,
+    EventReaction, FinishDeleteSessionView, ProjectPersistenceOutcome, ProjectPersistenceView,
+    StatusUpdate, WorktreeRemoval,
+};
+use crate::engine::{CommandWorkerSpec, Engine, InFlightKey};
+use crate::ids::TabIdRef;
+use crate::model::Project;
+use crate::text::count_of;
+use crate::worker::{
+    AgentLaunchFailedData, AgentLaunchRequest, CreateAgentRequest, ProjectPersistenceAction,
+    PullOutcome, PullTarget, WorkerEvent,
+};
+
+/// What the Engine should do. Variants carry their payload: the caller computes
+/// the context and supplies it, the Engine does the domain work and returns an
+/// `EventReaction` describing any view follow-up.
+pub enum Command {
+    /// Complete a deletion that's already past its git step. Used by both
+    /// the synchronous `do_delete_session` path (after `git::remove_worktree`)
+    /// and the async `WorktreeRemoveCompleted` callback.
+    FinishDeleteSession {
+        session_id: String,
+        removal: WorktreeRemoval,
+        update_status: bool,
+    },
+    /// Synchronous deletion: lookup → optional `git::remove_worktree` → full
+    /// finish cascade. Used by `delete_selected_project`'s cascade.
+    DoDeleteSession {
+        session_id: String,
+        delete_worktree: bool,
+        /// The delete dialog's "also delete the branch" answer, or `None` for a
+        /// caller with no dialog behind it, which keeps the provenance default.
+        /// See [`crate::model::BranchProvenance::resolve_branch_deletion`].
+        delete_branch: Option<bool>,
+    },
+    /// Modal entrypoint: branches between async git-removal worker and
+    /// inline finish.
+    BeginDeleteSession {
+        session_id: String,
+        delete_worktree: bool,
+        /// The delete dialog's "also delete the branch" answer. See
+        /// [`crate::model::BranchProvenance::resolve_branch_deletion`].
+        delete_branch: Option<bool>,
+    },
+    /// Persist a project mutation. `Add` is handled inline: the handler writes
+    /// SQLite and config.toml in `apply` and returns
+    /// `EventReaction::ProjectPersistenceOutcome(Added)`, or an error-toned
+    /// `EventReaction::Status` once the add has rolled back. Every other action
+    /// goes through the background worker, whose
+    /// `WorkerEvent::ProjectPersistenceCompleted` surfaces as
+    /// `EventReaction::ProjectPersistenceOutcome` on a later drain.
+    ///
+    /// Boxed to keep the enum size within the clippy `large_enum_variant`
+    /// threshold.
+    ///
+    /// `status_op_id` correlates a [`crate::engine::HandlerStatusOp`] whose final
+    /// is decided in the completion handler, because the post-worker config
+    /// write is fallible and produces a third outcome the worker never sees. It
+    /// rides from the dispatch site through the worker and back on
+    /// `ProjectPersistenceOutcome`. `None` for callers that drive no
+    /// handler-resolved status.
+    PersistProject {
+        action: Box<ProjectPersistenceAction>,
+        status_op_id: Option<String>,
+    },
+
+    /// Remove a project and cascade-delete its agents' records and runtime,
+    /// keeping their worktrees on disk. Tolerates a ghost project id that exists
+    /// only through orphaned sessions: those are cleared and the project-record
+    /// delete is a no-op. The record and config removal run in the persistence
+    /// worker.
+    RemoveProject {
+        project_id: String,
+        project_name: String,
+    },
+
+    /// Delete a project and cascade-delete its agents' records and runtime,
+    /// removing their worktrees from disk. The destructive counterpart to
+    /// `RemoveProject`, which keeps them. Each session goes through the shared
+    /// `do_delete_session` path with `delete_worktree == true`, so the kill,
+    /// worktree removal and record cleanup stay single-source. Guards the whole
+    /// project up front against an in-flight worktree removal or a launching
+    /// tab, so a partial delete cannot report success while stranding a session.
+    DeleteProject {
+        project_id: String,
+        project_name: String,
+    },
+
+    /// Spawn the create-agent worker. Returns an error status if another create
+    /// is already in flight; otherwise marks `InFlightKey::CreateAgent`, spawns
+    /// the worker and returns the busy status. `term_size` comes from the caller
+    /// because `crossterm::terminal::size()` is binary-only.
+    ///
+    /// Boxed to keep the enum size within the clippy `large_enum_variant`
+    /// threshold.
+    DispatchCreateAgentRequest {
+        request: Box<CreateAgentRequest>,
+        busy_message: String,
+        term_size: (u16, u16),
+    },
+
+    /// Spawn the agent-launch worker. Returns a typed view carrying
+    /// `launched: bool` so callers can do their per-site post-action; an
+    /// already-in-flight launch carries `launched: false` and an info status.
+    ///
+    /// Boxed to keep the enum size within the clippy `large_enum_variant`
+    /// threshold.
+    DispatchAgentLaunch { request: Box<AgentLaunchRequest> },
+
+    /// Stage a single file. Synchronous git call (microseconds for the
+    /// typical case). Returns `EventReaction::Nothing` on success; an `Err`
+    /// propagates to the App caller which surfaces it.
+    StageFile {
+        worktree_path: PathBuf,
+        path: String,
+    },
+
+    /// Unstage a single file. Same shape as `StageFile`: synchronous git
+    /// call, `EventReaction::Nothing` on success, `Err` on failure.
+    UnstageFile {
+        worktree_path: PathBuf,
+        path: String,
+    },
+
+    /// Discard a single unstaged file's changes. A synchronous git call, with
+    /// `is_untracked` selecting `git checkout -- <path>` or `rm`. Destructive:
+    /// it permanently throws away working-tree changes, or deletes an untracked
+    /// file outright. An `Err` propagates to the caller on failure.
+    DiscardFile {
+        worktree_path: PathBuf,
+        path: String,
+        is_untracked: bool,
+    },
+
+    /// Run `git commit -m <message>` synchronously. The caller pre-formats
+    /// `success_message` because it depends on view-side bindings the engine
+    /// cannot resolve.
+    CommitChanges {
+        worktree_path: PathBuf,
+        message: String,
+        success_message: String,
+    },
+
+    /// Spawn a `git push` worker. Returns `EventReaction::Status(Busy("Pushing
+    /// to remote\u{2026}"))` immediately; completion is reported via
+    /// `WorkerEvent::PushCompleted`.
+    Push { worktree_path: PathBuf },
+
+    /// Spawn a `git pull` worker for either a project's leading branch or the
+    /// current session's branch. Returns the busy status when the in-flight
+    /// guard accepts, or a warning when another pull is already running for the
+    /// same repo path. Completion arrives as `WorkerEvent::PullCompleted`.
+    Pull {
+        repo_path: PathBuf,
+        target: PullTarget,
+        busy_message: String,
+        already_running_message: String,
+    },
+
+    /// Open a filesystem path via the user's OS handler. Fire-and-forget
+    /// spawn; result posts back as `WorkerEvent::OpenPathCompleted` which the
+    /// existing reaction handler surfaces as a status message.
+    OpenPath { path: PathBuf, target: String },
+
+    /// Toggle a session's `auto_reopen_enabled` flag. The caller passes the new
+    /// value and the branch name, captured before the mutation. The engine
+    /// upserts in place, falling back to `session_store.set_auto_reopen_enabled`
+    /// when the session was removed in flight.
+    ToggleAgentAutoReopen {
+        session_id: String,
+        branch_name: String,
+        new_enabled: bool,
+    },
+
+    /// Remove a companion terminal from the engine (drops `PtyClient`, killing
+    /// the child). Returns a typed view carrying the terminal's label so the
+    /// App can format status + reconcile `active_terminal_id` (view field).
+    DeleteTerminal { terminal_id: String },
+
+    /// Persist the global `env` block to the user config file. The engine
+    /// eager-saves through `Engine::config_writer` and reports the result
+    /// synchronously, rolling the in-memory env back if the write fails.
+    PersistGlobalEnv {
+        env: std::collections::BTreeMap<String, String>,
+    },
+
+    /// Reload the user config from disk, validate it, and resync project
+    /// records against the session store. Opens a reload barrier, quiescing the
+    /// config writer and deferring config-mutating commands, and starts the
+    /// surface's reload worker; `WorkerEvent::ConfigReloadReady` closes it.
+    ReloadConfig,
+
+    /// Write a canonical, fully-templated config to disk, overwriting the
+    /// existing file, to restore a known-good config after a failed reload.
+    /// Renders through `Engine::surface` and writes synchronously through
+    /// `config_write::write_config_secure`.
+    RecoverConfig,
+
+    /// Persist a custom display order for the agent sessions within a single
+    /// project. `session_ids` must be exactly the full set of that project's
+    /// sessions, with no omissions, extras or duplicates, or the engine returns
+    /// an actionable error and touches nothing. On success it writes the order
+    /// to storage and reorders the matching rows of `self.sessions` in place,
+    /// leaving other projects' rows in their relative positions. Silent success:
+    /// reorders are high-frequency during a drag, so the refreshed view is the
+    /// feedback.
+    ReorderSessions {
+        project_id: String,
+        session_ids: Vec<String>,
+    },
+
+    /// Persist a global custom order for every agent. `session_ids` must be
+    /// exactly the full set of all session ids. On success it writes one global
+    /// `sort_order` permutation and re-sorts `self.sessions` to match. Silent:
+    /// the refreshed view is the feedback.
+    ReorderAgents { session_ids: Vec<String> },
+
+    /// Persist a custom display order for the workspace's projects.
+    /// `project_ids` must be exactly the full set of known project ids, under
+    /// the same strict validation as [`Command::ReorderSessions`]. On success it
+    /// writes the order to storage and reorders `self.projects` to match.
+    ReorderProjects { project_ids: Vec<String> },
+
+    /// Persist a global runtime order for every companion terminal, whatever its
+    /// owner. `terminal_ids` must be exactly the full set of current terminal
+    /// ids; each terminal's runtime `sort_order` is stamped to match, with no
+    /// storage write, because terminals are runtime-only. Silent success: the
+    /// refreshed view is the feedback.
+    ReorderTerminals { terminal_ids: Vec<String> },
+
+    /// Run a configured text macro against a live PTY target. `target_id` names
+    /// either an agent session (surface `Agent`) or a companion terminal
+    /// (surface `Terminal`), resolved by a providers-then-terminals lookup. An
+    /// unknown macro name and a surface mismatch both return an error Status;
+    /// otherwise the text is transformed by
+    /// `dux_core::macros::macro_payload_bytes` and written to the target's PTY.
+    RunMacro { target_id: String, name: String },
+
+    /// Wholesale-replace the `[macros]` config and persist it. Adopts `macros`
+    /// into the running `config.macros` immediately, so the ViewModel refreshes
+    /// without a reload, then eager-saves through `Engine::config_writer` and
+    /// reports the result synchronously. Keep and report: a failed write leaves
+    /// the new macros active for the session.
+    ///
+    /// Last write wins. The replacement is the editor's whole set, seeded from a
+    /// pre-edit snapshot, so a save clobbers any hand-edit to the `[macros]`
+    /// block made on disk in between. Acceptable under the single-operator
+    /// model; a multi-writer setup would need read-modify-merge.
+    UpdateMacros { macros: crate::config::MacrosConfig },
+
+    /// Point the changed-files watch at a session's worktree, or clear it with
+    /// `None`. Keeps git off the engine actor thread: resolving the session,
+    /// setting `watched_worktree` and `watched_session_id` and emptying the
+    /// lists are synchronous, then a one-shot worker computes the staged and
+    /// unstaged lists and its `ChangedFilesReady` populates the pane on a later
+    /// drain. Returns `EventReaction::Nothing`, because the refreshed ViewModel
+    /// broadcast is the feedback rather than a toast on every selection.
+    WatchChangedFiles { session_id: Option<String> },
+
+    /// Replace one agent's per-session settings (context mode, YOLO, AMQ
+    /// verify override, watch-rule overrides, auto-clear, system prompt) and,
+    /// optionally, its title. Persists BEFORE touching live memory and leaves
+    /// memory untouched on a store failure (fork 773a6b04, audit03 P1-16).
+    SetSessionSettings {
+        session_id: String,
+        settings: Box<crate::session_settings::SessionSettings>,
+        /// `Some` renames the agent; `Some(None)` clears a custom title.
+        title: Option<Option<String>>,
+    },
+}
+
+impl Engine {
+    /// Single dispatch point for every engine-affecting operation, whether the
+    /// `Command` came from a key event or off the wire. Returns an
+    /// `EventReaction` the caller routes through its view-applier.
+    #[allow(deprecated)] // blessed sync-direct: Command::RecoverConfig quiesces the writer and writes directly
+    pub fn apply(&mut self, command: Command) -> anyhow::Result<EventReaction> {
+        // Count every command taken, deferred ones included: the counter's
+        // reader only asks whether anything happened this iteration. Counted at
+        // the top so an early return cannot skip it.
+        self.command_applies = self.command_applies.wrapping_add(1);
+        // While a config reload barrier is open, hold any config-mutating
+        // command until the reload lands, so it re-applies against the fresh
+        // config instead of racing it.
+        if self.reloading && Self::is_config_mutating(&command) {
+            self.deferred_commands.push(command);
+            return Ok(EventReaction::Nothing);
+        }
+        match command {
+            Command::FinishDeleteSession {
+                session_id,
+                removal,
+                update_status,
+            } => {
+                let Some(outcome) = self.finish_delete_session(&session_id)? else {
+                    return Ok(EventReaction::Nothing);
+                };
+                Ok(EventReaction::FinishDeleteSessionView(Box::new(
+                    FinishDeleteSessionView {
+                        session_id,
+                        outcome,
+                        removal,
+                        update_status,
+                    },
+                )))
+            }
+            Command::DoDeleteSession {
+                session_id,
+                delete_worktree,
+                delete_branch,
+            } => {
+                let Some(outcome) =
+                    self.do_delete_session(&session_id, delete_worktree, delete_branch)?
+                else {
+                    return Ok(EventReaction::Nothing);
+                };
+                Ok(EventReaction::DoDeleteSessionView(Box::new(
+                    DoDeleteSessionView {
+                        session_id,
+                        outcome,
+                    },
+                )))
+            }
+            Command::BeginDeleteSession {
+                session_id,
+                delete_worktree,
+                delete_branch,
+            } => {
+                let outcome =
+                    self.begin_delete_session(&session_id, delete_worktree, delete_branch);
+                Ok(EventReaction::BeginDeleteSessionView(Box::new(
+                    BeginDeleteSessionView {
+                        session_id,
+                        outcome,
+                    },
+                )))
+            }
+            Command::PersistProject {
+                action,
+                status_op_id,
+            } => self.apply_project_persistence(*action, status_op_id),
+
+            Command::RemoveProject {
+                project_id,
+                project_name,
+            } => self.remove_project_keep_worktrees(&project_id, &project_name),
+
+            Command::DeleteProject {
+                project_id,
+                project_name,
+            } => self.delete_project_with_worktrees(&project_id, &project_name),
+
+            Command::DispatchCreateAgentRequest {
+                request,
+                busy_message,
+                term_size,
+            } => {
+                // Pre-check the in-flight guard before minting the op, so a
+                // rejected dispatch cannot leak an unresolved op into
+                // `pending_create_ops`. `spawn_command_worker` applies the same
+                // guard only after consuming the spec, by which point the op
+                // would already exist.
+                if self.is_in_flight(&InFlightKey::CreateAgent) {
+                    return Ok(EventReaction::Status(StatusUpdate::error(
+                        "An agent is already being created or forked.",
+                    )));
+                }
+                // `[limits]` (port-misc, fork P1-AA/#13): a hard cap refuses
+                // before any op is minted; the soft pane warning rides beside
+                // the create's own reaction and never stops it.
+                if let Some(reason) = self.refuse_agent_spawn_for_limits() {
+                    return Ok(EventReaction::Status(StatusUpdate::error(reason)));
+                }
+                let limits_warning = self.soft_warn_for_pane_count();
+                // Mint the shared create-agent `HandlerStatusOp`: its opaque id
+                // correlates the dispatch busy, every progress re-emit and the
+                // final the launch-ready and launch-failed handlers resolve from
+                // a `CreateLaunchOutcome`, so both surfaces word it identically.
+                let op = crate::engine::status_op(busy_message)
+                    .resolve_in_handler(|o: &crate::engine::CreateLaunchOutcome| {
+                        use crate::engine::{CreateLaunchOutcome, Final};
+                        match o {
+                            CreateLaunchOutcome::Committed {
+                                status_message,
+                                quiet_on,
+                            } => Final::info(status_message.clone()).quiet_on(*quiet_on),
+                            CreateLaunchOutcome::StartupFailed { branch_name, error } => {
+                                // Sticky: provisioning stopped part-way, so the
+                                // worktree is in an unknown state and the
+                                // message sends the user to the startup command
+                                // logs, an action outside the toast.
+                                Final::error(format!(
+                                    "Startup command failed for agent \"{branch_name}\": {error}. \
+                                     Open the startup command logs for details."
+                                ))
+                                .sticky()
+                            }
+                            CreateLaunchOutcome::PersistFailed { error } => {
+                                // Sticky: the worktree exists but its session row
+                                // does not, so dux forgets it on restart and the
+                                // user is left the directory to clean up.
+                                Final::error(format!("Failed to persist session: {error}")).sticky()
+                            }
+                            CreateLaunchOutcome::Failed { message } => {
+                                Final::error(message.clone())
+                            }
+                        }
+                    })
+                    // Stamp the originating connection so the busy, every progress
+                    // re-emit, and the eventual final reach only it (the followups
+                    // resolve in later ticks, after `current_origin` was reset).
+                    .with_scope(self.current_origin.clone());
+                let op_id = op.id().to_string();
+                // Surface this create's op id to a synchronous `apply_wire`
+                // caller, which reads `WireCommandOutcome.created_op_id` to
+                // correlate its own new session through `created_session_for_op`.
+                // Cleared at the top of every `apply_wire`, so it cannot leak
+                // into an unrelated command's outcome.
+                self.last_created_op_id = Some(op_id.clone());
+                let op_id_for_job = op_id.clone();
+                let op_id_panic = op_id.clone();
+                let pending = op.pending_status();
+                self.pending_create_ops.insert(op_id.clone(), op);
+                let paths = self.paths.clone();
+                let config = self.config.clone();
+                let identity = self.resolved_identity();
+                let reaction = self.spawn_command_worker(
+                    CommandWorkerSpec {
+                        label: "create-agent".into(),
+                        in_flight_key: Some(InFlightKey::CreateAgent),
+                        busy_status: Some(pending),
+                        already_running_status: Some(StatusUpdate::error(
+                            "An agent is already being created or forked.",
+                        )),
+                        panic_event: Some(Box::new(move |reason| WorkerEvent::CreateAgentFailed {
+                            status_op_id: op_id_panic,
+                            message: format!("Agent-creation worker panicked: {reason}"),
+                        })),
+                    },
+                    move |tx| {
+                        crate::agent_job::run_create_agent_job(
+                            *request,
+                            paths,
+                            config,
+                            tx,
+                            term_size,
+                            op_id_for_job,
+                            identity,
+                        );
+                    },
+                );
+                Ok(match limits_warning {
+                    Some(warning) => EventReaction::Multi(vec![
+                        EventReaction::Status(StatusUpdate::warning(warning)),
+                        reaction,
+                    ]),
+                    None => reaction,
+                })
+            }
+
+            Command::DispatchAgentLaunch { request } => {
+                let branch_name = request.session.display_label();
+                let session_id = request.session.id.clone();
+                // The in-flight launch lock is keyed by tab id, one per tab, so
+                // two tabs of one session can launch concurrently. The View
+                // keeps `session_id` for UI correlation.
+                let tab_id = request.tab_id.clone();
+                // The View is a surface payload, so it carries the id as a plain
+                // string; the engine-side decisions above keep the typed form.
+                let tab_id_view = tab_id.as_str().to_string();
+                // Guard the shared launch chokepoint against a session whose
+                // worktree is mid-removal. Every launch path funnels through
+                // this command, so checking once here covers them all, the
+                // residual window included where a transient
+                // `finish_delete_session` DB failure leaves the record in
+                // `closing_sessions` past the synchronous delete.
+                if self.closing_sessions.contains(&session_id) {
+                    // Log the refusal so it shows up in dux.log even when a
+                    // caller ignores the returned view's `launched` flag, as
+                    // dux-web's `launch_agent` does.
+                    crate::logger::warn(&format!(
+                        "refused to launch tab \"{tab_id}\" for agent \"{branch_name}\": session \"{session_id}\" is being deleted"
+                    ));
+                    return Ok(EventReaction::DispatchAgentLaunchView(Box::new(
+                        DispatchAgentLaunchView {
+                            session_id,
+                            tab_id: tab_id_view,
+                            launched: false,
+                            status: Some(StatusUpdate::error(format!(
+                                "Agent \"{}\" is being deleted and cannot be launched.",
+                                branch_name,
+                            ))),
+                        },
+                    )));
+                }
+                // Pre-check in-flight so the View carries the exact "already
+                // launching" message regardless of the primitive's generic
+                // already-running fallback.
+                if self.is_in_flight(&InFlightKey::AgentLaunch(tab_id.clone())) {
+                    return Ok(EventReaction::DispatchAgentLaunchView(Box::new(
+                        DispatchAgentLaunchView {
+                            session_id,
+                            tab_id: tab_id_view,
+                            launched: false,
+                            status: Some(StatusUpdate::info(format!(
+                                "Agent \"{}\" is already launching.",
+                                branch_name,
+                            ))),
+                        },
+                    )));
+                }
+                // A live process already holds this tab, and launching over it
+                // would replace the entry in `providers`, whose displaced client
+                // SIGKILLs the child it names on drop. Every legitimate relaunch
+                // path tears the runtime down before it dispatches, so reaching
+                // here with a live provider means the launch is redundant.
+                //
+                // `PtyClient::is_live` is the right question because it excludes
+                // both a child at end of input and one already reaped: each is
+                // waiting to be pruned, and refusing for either would refuse the
+                // relaunch of a tab that just died.
+                if let Some(client) = self.providers.get(&tab_id)
+                    && client.is_live()
+                {
+                    let pid = client
+                        .child_process_id()
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    crate::logger::warn(&format!(
+                        "refused to launch tab \"{tab_id}\" for agent \"{branch_name}\": \
+                         process {pid} is already running in it"
+                    ));
+                    return Ok(EventReaction::DispatchAgentLaunchView(Box::new(
+                        DispatchAgentLaunchView {
+                            session_id,
+                            tab_id: tab_id_view,
+                            launched: false,
+                            status: Some(StatusUpdate::info(format!(
+                                "This tab of agent \"{branch_name}\" is already running. Stop it before starting it again.",
+                            ))),
+                        },
+                    )));
+                }
+                // Clone for the panic event closure before the job closure
+                // consumes `request`, so panic recovery can take the same path
+                // as `process_agent_launch_failed`.
+                let panic_request = (*request).clone();
+                let reaction = self.spawn_command_worker(
+                    CommandWorkerSpec {
+                        label: format!("agent-launch:{tab_id}"),
+                        in_flight_key: Some(InFlightKey::AgentLaunch(tab_id.clone())),
+                        busy_status: None, // View variant carries the user-facing status
+                        already_running_status: None, // handled by the pre-check above
+                        panic_event: Some(Box::new(move |reason| {
+                            WorkerEvent::AgentLaunchFailed(Box::new(AgentLaunchFailedData {
+                                request: panic_request,
+                                message: format!("Agent-launch worker panicked: {reason}"),
+                            }))
+                        })),
+                    },
+                    move |tx| {
+                        crate::agent_job::run_agent_launch_job(*request, tx);
+                    },
+                );
+                // Wrap the primitive's return into the View variant so App
+                // callers keep a single pattern-match shape.
+                match reaction {
+                    EventReaction::Nothing => {
+                        // A launch is on its way, so the previous run's verdict
+                        // stops counting. Clearing it at the one chokepoint
+                        // every launch funnels through is what gets an explicit
+                        // start past the diagnosis card with no surface asking.
+                        // A refusal leaves the verdict standing: nothing ran.
+                        self.clear_tab_run_failure(&tab_id);
+                        Ok(EventReaction::DispatchAgentLaunchView(Box::new(
+                            DispatchAgentLaunchView {
+                                session_id,
+                                tab_id: tab_id_view.clone(),
+                                launched: true,
+                                status: None,
+                            },
+                        )))
+                    }
+                    EventReaction::Status(status) => Ok(EventReaction::DispatchAgentLaunchView(
+                        Box::new(DispatchAgentLaunchView {
+                            session_id,
+                            tab_id: tab_id_view,
+                            launched: false,
+                            status: Some(status),
+                        }),
+                    )),
+                    other => Ok(other),
+                }
+            }
+
+            Command::StageFile {
+                worktree_path,
+                path,
+            } => {
+                crate::git::stage_file(&worktree_path, &path)?;
+                Ok(EventReaction::Nothing)
+            }
+
+            Command::UnstageFile {
+                worktree_path,
+                path,
+            } => {
+                crate::git::unstage_file(&worktree_path, &path)?;
+                Ok(EventReaction::Nothing)
+            }
+
+            Command::DiscardFile {
+                worktree_path,
+                path,
+                is_untracked,
+            } => {
+                crate::git::discard_file(&worktree_path, &path, is_untracked)?;
+                let message = if is_untracked {
+                    format!("Deleted untracked file \"{path}\".")
+                } else {
+                    format!(
+                        "Discarded unstaged changes to \"{path}\". Staged changes, if any, are kept."
+                    )
+                };
+                Ok(EventReaction::Status(StatusUpdate::info(message)))
+            }
+
+            Command::CommitChanges {
+                worktree_path,
+                message,
+                success_message,
+            } => match crate::git::commit(&worktree_path, &message) {
+                Ok(_) => Ok(EventReaction::Status(StatusUpdate::info(success_message))),
+                // Commit failures leave the index and typed message intact, so
+                // recovery stays inside the UI and does not require a sticky status.
+                Err(e) => Ok(EventReaction::Status(StatusUpdate::error(format!(
+                    "Commit failed: {e}"
+                )))),
+            },
+
+            Command::Push { worktree_path } => {
+                let op = crate::engine::status_op("Pushing to remote\u{2026}")
+                    .on_success(|_: &()| {
+                        crate::engine::Final::info(
+                            "Pushed to remote successfully. Your changes are now available to collaborators.",
+                        )
+                    })
+                    .on_failure(|e: &String| {
+                        crate::engine::Final::error(format!("Push to remote failed: {e}"))
+                    });
+                let wt = worktree_path.clone();
+                Ok(self.spawn_status_op(op, move || {
+                    crate::git::push(&wt).map(|_| ()).map_err(|e| e.to_string())
+                }))
+            }
+
+            Command::Pull {
+                repo_path,
+                target,
+                busy_message,
+                already_running_message,
+            } => Ok(self.dispatch_pull(repo_path, target, busy_message, already_running_message)),
+
+            Command::OpenPath { path, target } => {
+                let display = path.display().to_string();
+                let t_ok = target.clone();
+                let t_err = target.clone();
+                let op = crate::engine::status_op(format!("Opening {target}: {display}"))
+                    .on_success(move |_: &()| crate::engine::Final::info(format!("Opened {t_ok}.")))
+                    .on_failure(move |e: &String| {
+                        crate::engine::Final::error(format!("Could not open {t_err}: {e}"))
+                    });
+                Ok(self.spawn_status_op(op, move || {
+                    crate::startup::open_path(&path).map_err(|err| format!("{err:#}"))
+                }))
+            }
+
+            Command::ToggleAgentAutoReopen {
+                session_id,
+                branch_name,
+                new_enabled,
+            } => {
+                if let Some(current) = self.sessions.iter_mut().find(|c| c.id == session_id) {
+                    // Persist first so a DB failure leaves in-memory state
+                    // untouched and the UI keeps showing the still-true value.
+                    let mut candidate = current.clone();
+                    candidate.auto_reopen_enabled = new_enabled;
+                    candidate.updated_at = chrono::Utc::now();
+                    self.session_store.upsert_session(&candidate)?;
+                    *current = candidate;
+                } else {
+                    self.session_store
+                        .set_auto_reopen_enabled(&session_id, new_enabled)?;
+                }
+                Ok(EventReaction::Status(StatusUpdate::info(format!(
+                    "Startup auto-reopen {} for agent \"{}\".",
+                    if new_enabled { "enabled" } else { "disabled" },
+                    branch_name,
+                ))))
+            }
+
+            Command::SetSessionSettings {
+                session_id,
+                settings,
+                title,
+            } => self.set_session_settings(&session_id, *settings, title),
+
+            Command::DeleteTerminal { terminal_id } => {
+                // Graceful close: SIGTERM the terminal and move it to the
+                // terminating set so the reaper force-kills it after the grace,
+                // rather than dropping it here for an immediate SIGKILL. The
+                // terminal leaves the UI now and the child winds down behind it.
+                let label = self.begin_close_companion_terminal(&terminal_id);
+                Ok(EventReaction::DeleteTerminalView(Box::new(
+                    DeleteTerminalView { terminal_id, label },
+                )))
+            }
+
+            Command::PersistGlobalEnv { env } => {
+                // Eager save through the queue, with rollback: swap the new env
+                // in, persist synchronously, and restore the previous env if the
+                // write fails so in-memory state never diverges from disk.
+                let previous = std::mem::replace(&mut self.config.env, env);
+                if let Err(e) = self.config_writer.save_eager(self.config.clone()) {
+                    self.config.env = previous;
+                    return Ok(EventReaction::Status(StatusUpdate::error(format!(
+                        "Couldn't save global environment variables: {e}"
+                    ))));
+                }
+                let msg = if self.config.env.is_empty() {
+                    "Global environment variables cleared.".to_string()
+                } else {
+                    saved_global_env_message(self.config.env.len())
+                };
+                Ok(EventReaction::Status(StatusUpdate::info(msg)))
+            }
+
+            Command::ReloadConfig => {
+                // Reject a reentrant reload: a second one would drop the live
+                // `reload_guard`, resuming the writer mid-reload, and spawn a
+                // worker whose completion closes a barrier it never opened.
+                if self.reloading {
+                    return Ok(EventReaction::Status(StatusUpdate::info(
+                        "A config reload is already in progress.",
+                    )));
+                }
+                // Open the reload barrier: quiesce the writer so no queued save
+                // races the reload, mark `reloading` so config-mutating commands
+                // defer, and start the surface's reload worker. The barrier
+                // closes when `ConfigReloadReady` lands.
+                //
+                // An unacknowledged pause means no barrier: a still-running
+                // writer could clobber the reload's config write, so abort and
+                // let the caller retry.
+                let guard = self.config_writer.quiesce();
+                if !guard.is_acknowledged() {
+                    return Ok(EventReaction::Status(StatusUpdate::error(
+                        "Config writer is busy; please retry.",
+                    )));
+                }
+                self.reloading = true;
+                self.reload_guard = Some(guard);
+                self.surface
+                    .reload(self.paths.clone(), self.worker_tx.clone());
+                Ok(EventReaction::Nothing)
+            }
+
+            Command::RecoverConfig => {
+                // Reject recovery while a reload barrier is open: the reload
+                // holds the writer quiesce, and a second quiesce would resume
+                // the writer mid-reload when its guard dropped.
+                if self.reloading {
+                    return Ok(EventReaction::Status(StatusUpdate::info(
+                        "A config reload is in progress; try recovering again in a moment.",
+                    )));
+                }
+                // Overwrite a corrupt on-disk config with a fresh render of the
+                // in-memory config. Quiesce the writer for the duration of the
+                // direct write so a queued save can't clobber the recovery.
+                let guard = self.config_writer.quiesce();
+                if !guard.is_acknowledged() {
+                    // The writer never confirmed the pause (timeout or dead). Performing
+                    // the direct write would race a still-running writer. Abort and let
+                    // the caller retry once the writer is responsive.
+                    return Ok(EventReaction::Status(StatusUpdate::error(
+                        "Config writer is busy; please retry.",
+                    )));
+                }
+                let body = self.surface.recover_render(&self.config);
+                match crate::config_write::write_config_secure(&self.paths.config_path, &body) {
+                    Ok(()) => Ok(EventReaction::Status(StatusUpdate::info(
+                        "Restored the last working configuration to config.toml.",
+                    ))),
+                    Err(e) => Ok(EventReaction::Status(StatusUpdate::error(format!(
+                        "Couldn't restore the last working configuration: {e:#}"
+                    )))),
+                }
+            }
+
+            Command::ReorderSessions {
+                project_id,
+                session_ids,
+            } => {
+                self.reorder_sessions(&project_id, &session_ids)?;
+                Ok(EventReaction::Nothing)
+            }
+
+            Command::ReorderAgents { session_ids } => {
+                self.reorder_agents(&session_ids)?;
+                Ok(EventReaction::Nothing)
+            }
+
+            Command::ReorderProjects { project_ids } => {
+                self.reorder_projects(&project_ids)?;
+                Ok(EventReaction::Nothing)
+            }
+
+            Command::ReorderTerminals { terminal_ids } => {
+                self.reorder_terminals(&terminal_ids)?;
+                Ok(EventReaction::Nothing)
+            }
+
+            Command::RunMacro { target_id, name } => self.run_macro(&target_id, &name),
+
+            Command::UpdateMacros { macros } => {
+                // Keep and report, never roll back: the new macros go live so
+                // the ViewModel reflects them, and a failed write is reported as
+                // a possibly stale file rather than reverting the user's change.
+                self.config.macros = macros;
+                let count = self.config.macros.entries.len();
+                if let Err(e) = self.config_writer.save_eager(self.config.clone()) {
+                    return Ok(EventReaction::Status(StatusUpdate::error(format!(
+                        "Macros updated this session, but saving to config failed: {e}"
+                    ))));
+                }
+                let msg = if count == 0 {
+                    "All macros removed. The macro list is now empty.".to_string()
+                } else {
+                    saved_macros_message(count)
+                };
+                Ok(EventReaction::Status(StatusUpdate::info(msg)))
+            }
+
+            Command::WatchChangedFiles { session_id } => {
+                // Resolving and setting the watch runs no git, so it is cheap on
+                // the actor thread; the changed files are computed off-thread.
+                // `ChangedFilesReady` path-checks the worktree, so a watch that
+                // moved meanwhile drops the stale result.
+                if let Some(worktree) = self.set_watched_session(session_id.as_deref()) {
+                    self.spawn_changed_files_refresh(worktree);
+                }
+                Ok(EventReaction::Nothing)
+            }
+        }
+    }
+
+    fn dispatch_pull(
+        &mut self,
+        repo_path: PathBuf,
+        target: PullTarget,
+        busy_message: String,
+        already_running_message: String,
+    ) -> EventReaction {
+        let repo_key = repo_path.to_string_lossy().into_owned();
+        let repo_key_for_panic = repo_key.clone();
+        let target_for_panic = target.clone();
+        let op = match &target {
+            PullTarget::Project { project_name, .. } => {
+                project_refresh_status_op(busy_message, project_name)
+            }
+            PullTarget::Session => crate::engine::status_op(busy_message)
+                .on_success(|_: &PullOutcome| {
+                    crate::engine::Final::info(
+                        "Pulled latest changes from remote successfully. Local branch is up to date.",
+                    )
+                })
+                .on_failure(|error: &String| {
+                    crate::engine::Final::error(format!("Pull from remote failed: {error}"))
+                }),
+        };
+        let pending = op.pending_status();
+        let panic_key = op.key().to_string();
+        let origin = self.current_origin.clone();
+        let origin_for_panic = origin.clone();
+        self.spawn_command_worker(
+            CommandWorkerSpec {
+                label: format!("pull:{repo_key}"),
+                in_flight_key: Some(InFlightKey::Pull(repo_key.clone())),
+                busy_status: Some(pending),
+                already_running_status: Some(StatusUpdate::warning(already_running_message)),
+                panic_event: Some(Box::new(move |reason| WorkerEvent::PullCompleted {
+                    repo_path: repo_key_for_panic,
+                    target: target_for_panic,
+                    result: Err(format!("Pull worker panicked: {reason}")),
+                    status: crate::engine::ResolvedFinal::error(
+                        panic_key,
+                        format!("Pull worker panicked: {reason}"),
+                    )
+                    .with_scope(origin_for_panic.clone()),
+                })),
+            },
+            move |tx| {
+                let result = match &target {
+                    PullTarget::Project { leading_branch, .. } => {
+                        run_project_refresh(&repo_path, leading_branch.clone())
+                    }
+                    PullTarget::Session => crate::git::pull_current_branch(&repo_path)
+                        .map(|_| PullOutcome::Pulled {
+                            current_branch: None,
+                        })
+                        .map_err(|error| error.to_string()),
+                };
+                let status = op.resolve(&result).with_scope(origin.clone());
+                let _ = tx.send(WorkerEvent::PullCompleted {
+                    repo_path: repo_key,
+                    target,
+                    result,
+                    status,
+                });
+            },
+        )
+    }
+
+    fn remove_project_keep_worktrees(
+        &mut self,
+        project_id: &str,
+        project_name: &str,
+    ) -> anyhow::Result<EventReaction> {
+        if self.project_has_pending_deletion(project_id) {
+            return Ok(EventReaction::Status(StatusUpdate::error(format!(
+                "An agent in \"{project_name}\" is still being removed. Try again in a moment."
+            ))));
+        }
+        let was_real = self.projects.iter().any(|project| project.id == project_id);
+        let removed = self.session_store.remove_project_records(project_id)?;
+        for session_id in &removed {
+            self.finish_delete_session_memory(session_id);
+        }
+        self.remove_project_from_runtime(project_id);
+        let detail = removed_agents_detail(removed.len());
+        if was_real && let Err(error) = self.persist_projects_to_config() {
+            return Ok(EventReaction::Status(StatusUpdate::error(format!(
+                "Removed \"{project_name}\"{detail} from dux, but updating config.toml failed: \
+                 {error}. The project may reappear on restart. Check the file is writable."
+            ))));
+        }
+        Ok(EventReaction::Status(StatusUpdate::info(format!(
+            "Removed project \"{project_name}\"{detail}. Worktrees were kept on disk."
+        ))))
+    }
+
+    fn delete_project_with_worktrees(
+        &mut self,
+        project_id: &str,
+        project_name: &str,
+    ) -> anyhow::Result<EventReaction> {
+        if self.project_has_pending_deletion(project_id) {
+            return Ok(EventReaction::Status(StatusUpdate::error(format!(
+                "Cannot delete project \"{project_name}\" while agent worktree removals are in \
+                 progress. Wait for them to finish, then try again."
+            ))));
+        }
+        if self.project_has_launching_tab(project_id) {
+            return Ok(EventReaction::Status(StatusUpdate::error(format!(
+                "Cannot delete project \"{project_name}\" while an agent tab is still launching. \
+                 Wait a moment, then try again."
+            ))));
+        }
+        let was_real = self.projects.iter().any(|project| project.id == project_id);
+        let session_ids: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|session| session.project_id() == Some(project_id))
+            .map(|session| session.id.clone())
+            .collect();
+        let mut removed = 0usize;
+        for session_id in &session_ids {
+            // `None` for the branch: the project-removal dialog asks about the
+            // project rather than each agent's branch, so nobody answered that
+            // question and the provenance default stands. That is what keeps a
+            // project removal from taking a user's `develop` with it.
+            if self.do_delete_session(session_id, true, None)?.is_some() {
+                removed += 1;
+            }
+        }
+        self.session_store.remove_project_records(project_id)?;
+        self.remove_project_from_runtime(project_id);
+        let detail = removed_agents_detail(removed);
+        if was_real && let Err(error) = self.persist_projects_to_config() {
+            return Ok(EventReaction::Status(StatusUpdate::error(format!(
+                "Deleted \"{project_name}\"{detail} from dux, but updating config.toml failed: \
+                 {error}. The project may reappear on restart. Check the file is writable."
+            ))));
+        }
+        Ok(EventReaction::Status(StatusUpdate::info(format!(
+            "Deleted project \"{project_name}\"{detail}. Worktrees were removed."
+        ))))
+    }
+
+    fn project_has_pending_deletion(&self, project_id: &str) -> bool {
+        self.sessions.iter().any(|session| {
+            session.project_id() == Some(project_id) && self.pending_deletions.contains(&session.id)
+        })
+    }
+
+    fn project_has_launching_tab(&self, project_id: &str) -> bool {
+        self.sessions.iter().any(|session| {
+            session.project_id() == Some(project_id)
+                && self
+                    .tab_ids_for_session(&session.id)
+                    .iter()
+                    .any(|tab_id| self.is_in_flight(&InFlightKey::AgentLaunch(tab_id.clone())))
+        })
+    }
+
+    fn remove_project_from_runtime(&mut self, project_id: &str) {
+        self.begin_close_project_terminals(project_id);
+        self.projects.retain(|project| project.id != project_id);
+    }
+
+    fn apply_project_persistence(
+        &mut self,
+        action: ProjectPersistenceAction,
+        status_op_id: Option<String>,
+    ) -> anyhow::Result<EventReaction> {
+        match action {
+            ProjectPersistenceAction::Add {
+                project,
+                status_message,
+            } => self.add_project_inline(project, status_message),
+            action => {
+                self.spawn_project_persistence(action, status_op_id);
+                Ok(EventReaction::Nothing)
+            }
+        }
+    }
+
+    fn add_project_inline(
+        &mut self,
+        project: Project,
+        status_message: String,
+    ) -> anyhow::Result<EventReaction> {
+        if let Some((project_id, project_name)) = self
+            .projects
+            .iter()
+            .find(|existing| existing.path == project.path)
+            .map(|existing| (existing.id.clone(), existing.name.clone()))
+        {
+            let message = format!(
+                "Project at this path is already in the workspace as \"{project_name}\"; nothing new was added."
+            );
+            return Ok(project_added_reaction(project, project_id, message));
+        }
+
+        self.session_store
+            .upsert_project(&crate::config::ProjectConfig {
+                id: project.id.clone(),
+                path: project.path.clone(),
+                name: Some(project.name.clone()),
+                default_provider: project
+                    .explicit_default_provider
+                    .as_ref()
+                    .map(|provider| provider.as_str().to_string()),
+                leading_branch: project.leading_branch.clone(),
+                auto_reopen_agents: project.auto_reopen_agents,
+                startup_command: project.startup_command.clone(),
+                env: project.env.clone(),
+                workspace_mode: None,
+            })?;
+        let project_id = project.id.clone();
+        let previous_config_projects = self.config.projects.clone();
+        self.projects.push(project.clone());
+        match self.persist_projects_to_config() {
+            Ok(()) => Ok(project_added_reaction(project, project_id, status_message)),
+            Err(error) => {
+                Ok(self.rollback_project_add(&project_id, previous_config_projects, error))
+            }
+        }
+    }
+
+    fn rollback_project_add(
+        &mut self,
+        project_id: &str,
+        previous_config_projects: Vec<crate::config::ProjectConfig>,
+        config_error: anyhow::Error,
+    ) -> EventReaction {
+        self.projects.retain(|project| project.id != project_id);
+        self.config.projects = previous_config_projects;
+        if let Err(database_error) = self.session_store.delete_project(project_id) {
+            return EventReaction::Status(
+                StatusUpdate::error(format!(
+                    "Project add failed and couldn't be cleaned up, it may reappear on restart. \
+                     Config error: {config_error:#}. DB cleanup error: {database_error:#}"
+                ))
+                .sticky(),
+            );
+        }
+        EventReaction::Status(StatusUpdate::error(format!(
+            "Project add failed and was rolled back; config.toml could not be updated: \
+             {config_error:#}"
+        )))
+    }
+
+    /// Run a configured text macro against a live PTY target: resolve the macro
+    /// by name, gate it by the target's surface, translate newlines through the
+    /// shared core transform and write to the PTY. See [`Command::RunMacro`].
+    fn run_macro(&mut self, target_id: &str, name: &str) -> anyhow::Result<EventReaction> {
+        // `target_id` is a PTY id of unknown kind: a macro target may be an
+        // agent tab or a companion terminal, and this probe decides which. It
+        // is named as a tab id only for the tab-keyed lookup.
+        let surface = if self.providers.contains_key(TabIdRef::new(target_id)) {
+            crate::model::SessionSurface::Agent
+        } else if self.companion_terminals.contains_key(target_id) {
+            crate::model::SessionSurface::Terminal
+        } else {
+            return Ok(EventReaction::Status(StatusUpdate::error(format!(
+                "No live agent or terminal for target \"{target_id}\". Reconnect it and try again."
+            ))));
+        };
+
+        // Resolve the macro entry by name. Unknown → error naming it.
+        let Some(entry) = self.config.macros.entries.get(name) else {
+            return Ok(EventReaction::Status(StatusUpdate::error(format!(
+                "Macro \"{name}\" does not exist."
+            ))));
+        };
+
+        // Surface gate: refuse a macro whose surface doesn't match the target.
+        // The TUI bar simply omits mismatches; the wire returns an explicit error.
+        if !crate::macros::macro_matches_surface(entry.surface, surface) {
+            let target_kind = match surface {
+                crate::model::SessionSurface::Agent => "agent",
+                crate::model::SessionSurface::Terminal => "terminal",
+            };
+            return Ok(EventReaction::Status(StatusUpdate::error(format!(
+                "Macro \"{name}\" is not available on {target_kind} targets ({}).",
+                entry.surface.label()
+            ))));
+        }
+
+        let payload = crate::macros::macro_payload_bytes(&entry.text);
+        // Unified PTY lookup: providers first, then companion terminals, the
+        // same order the web actor's `pty_for` uses.
+        let client = self
+            .providers
+            .get(TabIdRef::new(target_id))
+            .or_else(|| self.companion_terminals.get(target_id).map(|t| &t.client));
+        if let Some(client) = client {
+            client.write_bytes(&payload)?;
+        }
+        Ok(EventReaction::Status(StatusUpdate::info(format!(
+            "Sent macro \"{name}\"."
+        ))))
+    }
+
+    /// Validate and apply a new per-project session order. See
+    /// [`Command::ReorderSessions`] for the strict-set contract. The store is
+    /// written first, then `self.sessions` is re-sorted so the project's rows
+    /// follow `session_ids` and every other project's keep their order.
+    fn reorder_sessions(&mut self, project_id: &str, session_ids: &[String]) -> anyhow::Result<()> {
+        let current: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|s| s.project_id() == Some(project_id))
+            .map(|s| s.id.clone())
+            .collect();
+        validate_reorder(&current, session_ids, "agent")?;
+
+        self.session_store
+            .reorder_sessions(project_id, session_ids)?;
+
+        // Stably re-sort the whole Vec: rows inside this project sort by their
+        // new position, rows outside by their existing index. Stability plus
+        // out-of-project keys that preserve the original index is what leaves
+        // cross-project relative order untouched.
+        let new_pos: std::collections::HashMap<&str, usize> = session_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), i))
+            .collect();
+        reorder_in_place(&mut self.sessions, |s| {
+            if s.project_id() == Some(project_id) {
+                new_pos.get(s.id.as_str()).copied()
+            } else {
+                None
+            }
+        });
+        Ok(())
+    }
+
+    /// Validate and apply a new global agent order. Unlike [`reorder_sessions`],
+    /// which is project-scoped, `session_ids` must be the complete set of all
+    /// sessions and the whole Vec is re-sorted to match, because a dragged agent
+    /// can land anywhere. The store is written first, then the in-memory Vec.
+    fn reorder_agents(&mut self, session_ids: &[String]) -> anyhow::Result<()> {
+        let current: Vec<String> = self.sessions.iter().map(|s| s.id.clone()).collect();
+        validate_reorder(&current, session_ids, "agent")?;
+
+        self.session_store.set_global_session_order(session_ids)?;
+
+        let new_pos: std::collections::HashMap<&str, usize> = session_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), i))
+            .collect();
+        reorder_in_place(&mut self.sessions, |s| new_pos.get(s.id.as_str()).copied());
+        Ok(())
+    }
+
+    /// Validate and apply a new global order for every companion terminal.
+    /// `terminal_ids` must be exactly the full set of current terminal ids; each
+    /// terminal's runtime `sort_order` is stamped to its index. Like
+    /// [`reorder_agents`] but with no storage call, because terminals are
+    /// runtime-only, so the order resets to creation order on restart. A pure
+    /// permutation of `sort_order`: reordering is not activity, so it leaves
+    /// `pty_activity` and `updated_at` alone.
+    fn reorder_terminals(&mut self, terminal_ids: &[String]) -> anyhow::Result<()> {
+        let current: Vec<String> = self.companion_terminals.keys().cloned().collect();
+        validate_reorder(&current, terminal_ids, "terminal")?;
+
+        for (index, id) in terminal_ids.iter().enumerate() {
+            if let Some(terminal) = self.companion_terminals.get_mut(id) {
+                terminal.sort_order = index as u64;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate and apply a new project order. See [`Command::ReorderProjects`].
+    fn reorder_projects(&mut self, project_ids: &[String]) -> anyhow::Result<()> {
+        let current: Vec<String> = self.projects.iter().map(|p| p.id.clone()).collect();
+        validate_reorder(&current, project_ids, "project")?;
+
+        self.session_store.reorder_projects(project_ids)?;
+
+        let new_pos: std::collections::HashMap<&str, usize> = project_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), i))
+            .collect();
+        reorder_in_place(&mut self.projects, |p| new_pos.get(p.id.as_str()).copied());
+        Ok(())
+    }
+
+    /// Persist the current in-memory session order to storage, per project, so a
+    /// sort action's chosen order survives a reload and matches every surface by
+    /// construction. Does not re-sort the Vec, which is already in the desired
+    /// order; it only writes each project's ordered id list.
+    pub fn persist_session_order(&self) -> anyhow::Result<()> {
+        // Agents are one global list, so the in-memory Vec order is persisted
+        // as a single global `sort_order` permutation rather than per project.
+        let ids: Vec<String> = self.sessions.iter().map(|s| s.id.clone()).collect();
+        self.session_store.set_global_session_order(&ids)?;
+        Ok(())
+    }
+}
+
+fn project_added_reaction(
+    project: Project,
+    project_id: String,
+    status_message: String,
+) -> EventReaction {
+    EventReaction::ProjectPersistenceOutcome(Box::new(ProjectPersistenceOutcome {
+        action: ProjectPersistenceAction::Add {
+            project,
+            status_message: status_message.clone(),
+        },
+        view: ProjectPersistenceView::Added {
+            project_id,
+            status_message,
+        },
+        status_op_id: None,
+    }))
+}
+
+/// The status line confirming a global environment save, counting the
+/// variables and matching the pronoun that refers back to them.
+fn saved_global_env_message(count: usize) -> String {
+    let them = if count == 1 { "it" } else { "them" };
+    format!(
+        "Saved {}. New agents and terminals will receive {them} unless a project overrides \
+         the same key.",
+        count_of(count, "global environment variable")
+    )
+}
+
+/// The status line confirming a macro save, counting the macros written.
+fn saved_macros_message(count: usize) -> String {
+    format!("Saved {}.", count_of(count, "macro"))
+}
+
+fn removed_agents_detail(removed: usize) -> String {
+    match removed {
+        0 => String::new(),
+        1 => " and its agent".to_string(),
+        count => format!(" and its {count} agents"),
+    }
+}
+
+/// Strict reorder validation: `requested` must be a permutation of `current`
+/// (same elements, no missing, no extras, no duplicates). `noun` names the
+/// entity for the error message (e.g. "agent", "project").
+fn validate_reorder(current: &[String], requested: &[String], noun: &str) -> anyhow::Result<()> {
+    use std::collections::HashSet;
+    let current_set: HashSet<&str> = current.iter().map(String::as_str).collect();
+    let requested_set: HashSet<&str> = requested.iter().map(String::as_str).collect();
+
+    if requested.len() != requested_set.len() {
+        anyhow::bail!("Cannot reorder {noun}s: the new order contains duplicate ids.");
+    }
+    if requested_set != current_set {
+        anyhow::bail!(
+            "Cannot reorder {noun}s: the new order must list exactly the current {noun}s (expected {} ids, got {}).",
+            current.len(),
+            requested.len(),
+        );
+    }
+    Ok(())
+}
+
+/// Re-sort `items` so elements for which `position` returns `Some(p)` are
+/// ordered by `p` among themselves, while elements returning `None` keep their
+/// original relative order. Only each group's internal relative order is
+/// guaranteed: interleaving between the two groups may change, because
+/// positioned items can compact toward the front of the range they sort into.
+fn reorder_in_place<T>(items: &mut Vec<T>, position: impl Fn(&T) -> Option<usize>) {
+    // A stable sort of the original indices by (key, original_index), where the
+    // key is the new position for positioned items and the original index for
+    // the rest. The reordered elements are written back into the same slot
+    // sequence, which is what preserves the relative order of the None items.
+    let mut indices: Vec<usize> = (0..items.len()).collect();
+    indices.sort_by(|&a, &b| {
+        let ka = position(&items[a]).unwrap_or(a);
+        let kb = position(&items[b]).unwrap_or(b);
+        ka.cmp(&kb).then(a.cmp(&b))
+    });
+
+    // Move out every element, then re-collect in the sorted index order. Works
+    // for non-Clone `T` (Project/AgentSession are not trivially copyable here).
+    let mut taken: Vec<Option<T>> = items.drain(..).map(Some).collect();
+    *items = indices
+        .into_iter()
+        .map(|i| taken[i].take().expect("each index visited once"))
+        .collect();
+}
+
+/// The tri-state status op for a `PullTarget::Project` refresh. A failure is a
+/// warning rather than an error: the refresh is best-effort and the project
+/// keeps working from local branch state.
+fn project_refresh_status_op(
+    busy_message: String,
+    project_name: &str,
+) -> crate::engine::StatusOp<crate::worker::PullOutcome, String> {
+    let pn_ok = project_name.to_string();
+    let pn_err = project_name.to_string();
+    crate::engine::status_op(busy_message)
+        .on_success(move |outcome: &crate::worker::PullOutcome| match outcome {
+            crate::worker::PullOutcome::Pulled { .. } => crate::engine::Final::info(format!(
+                "Refreshed project \"{pn_ok}\". Local branch is up to date with remote."
+            )),
+            crate::worker::PullOutcome::NoOrigin { .. } => crate::engine::Final::info(format!(
+                "Project \"{pn_ok}\" has no origin remote; nothing to pull. Local branch state refreshed."
+            )),
+        })
+        .on_failure(move |e: &String| {
+            crate::engine::Final::warning(format!(
+                "Could not refresh \"{pn_err}\" from origin: {e}. Continuing from the local branch state."
+            ))
+        })
+}
+
+/// Body of the `PullTarget::Project` refresh worker. A dirty checkout never
+/// gates the refresh: git itself refuses a fast-forward only when it would clobber a
+/// locally edited file, which surfaces through the error path.
+fn run_project_refresh(
+    repo_path: &std::path::Path,
+    leading_branch: Option<String>,
+) -> Result<crate::worker::PullOutcome, String> {
+    use crate::worker::PullOutcome;
+    let leading_branch = match leading_branch {
+        Some(branch) => branch,
+        None => crate::git::current_branch_opt(repo_path)
+            .map(|opt_branch| {
+                crate::project_browser::leading_branch_for_project(repo_path, opt_branch.as_deref())
+            })
+            .map_err(|e| e.to_string())?,
+    };
+    crate::git::switch_branch_if_needed(repo_path, &leading_branch).map_err(|e| e.to_string())?;
+    if !crate::git::has_origin_remote(repo_path).map_err(|e| e.to_string())? {
+        // Nothing to pull, and that is fine; still re-read the current branch
+        // so the sidebar stays fresh.
+        return Ok(PullOutcome::NoOrigin {
+            current_branch: crate::git::current_branch(repo_path).ok(),
+        });
+    }
+    crate::git::pull_branch(repo_path, &leading_branch).map_err(|e| e.to_string())?;
+    Ok(PullOutcome::Pulled {
+        current_branch: crate::git::current_branch(repo_path).ok(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::test_support::{sample_project, sample_session, test_engine};
+    use crate::ids::TabId;
+    use crate::statusline::StatusTone;
+
+    /// Feed a status update into a controller the way a surface's reaction
+    /// handler does.
+    fn show(status: &mut crate::statusline::KeyedStatusController, update: &StatusUpdate) {
+        status.set(
+            std::time::Instant::now(),
+            update.key.clone(),
+            update.tone,
+            update.message.clone(),
+        );
+    }
+
+    #[test]
+    fn push_and_pull_keep_their_spinners_while_their_workers_run() {
+        // Neither of these operations has an op registry of its own, so the
+        // first cut of liveness (which enumerated the registries) still called
+        // both of them timed out twenty seconds in, whatever the network was
+        // doing. Registration happens in the two spawn primitives instead, so
+        // both are covered without either dispatch site knowing about it.
+        let (mut engine, tmp) = test_engine();
+        let mut status = crate::statusline::KeyedStatusController::emitting_finals()
+            .with_live_keys(engine.live_status_keys.clone());
+        let t0 = std::time::Instant::now();
+
+        // Push goes through `spawn_status_op`; its busy rides the reaction.
+        let reaction = engine
+            .apply(Command::Push {
+                worktree_path: tmp.path().to_path_buf(),
+            })
+            .expect("apply succeeds");
+        let push_busy = match reaction {
+            EventReaction::Status(s) => s,
+            _ => panic!("expected a pending busy from the push dispatch"),
+        };
+        let push_key = push_busy.key.clone().expect("the push busy is keyed");
+        assert_eq!(push_busy.tone, StatusTone::Busy);
+        show(&mut status, &push_busy);
+
+        // Pull goes through `spawn_command_worker`; its busy rides the worker
+        // channel, posted ahead of anything the worker can send.
+        engine
+            .apply(Command::Pull {
+                repo_path: tmp.path().to_path_buf(),
+                target: PullTarget::Session,
+                busy_message: "Pulling latest changes\u{2026}".to_string(),
+                already_running_message: "A pull is already running.".to_string(),
+            })
+            .expect("apply succeeds");
+        let pull_busy = match engine.worker_rx.try_recv() {
+            Ok(WorkerEvent::CommandWorkerStarted(s)) => s,
+            _ => panic!("expected the pull busy ahead of anything the worker sends"),
+        };
+        let pull_key = pull_busy.key.clone().expect("the pull busy is keyed");
+        show(&mut status, &pull_busy);
+
+        assert!(engine.status_op_is_live(&push_key));
+        assert!(engine.status_op_is_live(&pull_key));
+
+        let changes = c_tick(&mut status, t0);
+        assert!(
+            changes.upgraded.is_empty(),
+            "neither may be called timed out while its worker runs, got {:?}",
+            changes.upgraded
+        );
+        assert_eq!(
+            changes.refreshed.len(),
+            2,
+            "both spinners are re-sent instead, got {:?}",
+            changes.refreshed
+        );
+
+        // Each is retired by its own final, and only its own.
+        show(
+            &mut status,
+            &StatusUpdate::info("Pushed.").with_key(push_key.clone()),
+        );
+        assert!(!engine.status_op_is_live(&push_key));
+        assert!(
+            engine.status_op_is_live(&pull_key),
+            "one final must not retire the other operation"
+        );
+        show(
+            &mut status,
+            &StatusUpdate::error("Pull failed.").with_key(pull_key.clone()),
+        );
+        assert!(!engine.status_op_is_live(&pull_key));
+        assert!(
+            engine.live_status_keys.is_empty(),
+            "and nothing is left registered: {:?}",
+            engine.live_status_keys
+        );
+    }
+
+    fn c_tick(
+        status: &mut crate::statusline::KeyedStatusController,
+        t0: std::time::Instant,
+    ) -> crate::statusline::StatusTickChanges {
+        status.tick(
+            t0 + crate::statusline::BUSY_TIMEOUT + std::time::Duration::from_secs(1),
+            crate::statusline::BUSY_TIMEOUT,
+        )
+    }
+
+    #[test]
+    fn a_worker_that_cannot_be_spawned_takes_its_spinner_and_its_op_with_it() {
+        // The one path that emits a busy and can then never produce a final.
+        // Abandoning the operation is what stops the spinner outliving the
+        // process: the keyed error replaces it on screen, and dropping the
+        // registration stops liveness heartbeating it in the meantime.
+        let (mut engine, _tmp) = test_engine();
+        let op = crate::engine::status_op("Creating a new agent\u{2026}").resolve_in_handler(
+            |_: &crate::engine::CreateLaunchOutcome| crate::engine::Final::clear(),
+        );
+        let op_id = op.id().to_string();
+        let _ = engine.begin_status_op(&op);
+        engine.pending_create_ops.insert(op_id.clone(), op);
+        assert!(engine.status_op_is_live(&op_id));
+
+        engine.abandon_status_op(&op_id);
+
+        assert!(
+            !engine.status_op_is_live(&op_id),
+            "a spinner nothing will ever answer must not be heartbeated"
+        );
+        assert!(
+            engine.pending_create_ops.is_empty(),
+            "and the op it would have resolved is dropped with it"
+        );
+    }
+
+    fn session_ids_for(engine: &Engine, project_id: &str) -> Vec<String> {
+        engine
+            .sessions
+            .iter()
+            .filter(|s| s.project_id() == Some(project_id))
+            .map(|s| s.id.clone())
+            .collect()
+    }
+
+    /// The counter behind "did this surface change anything on this iteration?".
+    /// It has to move for EVERY apply, including one the reload barrier defers,
+    /// because the caller is asking about activity, not about success.
+    #[test]
+    fn every_applied_command_moves_the_apply_counter() {
+        let (mut engine, _tmp) = test_engine();
+        let before = engine.command_applies;
+        let _ = engine.apply(Command::RecoverConfig);
+        assert_eq!(
+            engine.command_applies,
+            before.wrapping_add(1),
+            "an ordinary apply must be counted"
+        );
+
+        engine.reloading = true;
+        let deferred_before = engine.command_applies;
+        let _ = engine.apply(Command::ReloadConfig);
+        assert_eq!(
+            engine.command_applies,
+            deferred_before.wrapping_add(1),
+            "a deferred apply is still a caller asking for something"
+        );
+    }
+
+    #[test]
+    fn config_mutation_is_deferred_unchanged_while_reload_barrier_is_open() {
+        let (mut engine, _tmp) = test_engine();
+        engine.reloading = true;
+        let original_macros = engine.config.macros.clone();
+        let mut deferred_macros = original_macros.clone();
+        deferred_macros.entries.insert(
+            "deferred".to_string(),
+            crate::config::MacroEntry {
+                text: "echo deferred".to_string(),
+                surface: crate::config::MacroSurface::Both,
+            },
+        );
+
+        let reaction = engine
+            .apply(Command::UpdateMacros {
+                macros: deferred_macros,
+            })
+            .expect("defer config mutation");
+
+        assert!(matches!(reaction, EventReaction::Nothing));
+        assert_eq!(engine.config.macros, original_macros);
+        assert_eq!(engine.deferred_commands.len(), 1);
+        assert!(matches!(
+            engine.deferred_commands.first(),
+            Some(Command::UpdateMacros { .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_project_add_reports_the_registered_project_without_adding_a_second_row() {
+        let (mut engine, tmp) = test_engine();
+        let path = tmp.path().join("shared-project");
+        let registered = sample_project("registered", path.to_string_lossy().as_ref());
+        engine.projects.push(registered.clone());
+
+        let mut duplicate = sample_project("duplicate", path.to_string_lossy().as_ref());
+        duplicate.name = "Losing request".to_string();
+        let reaction = engine
+            .apply(Command::PersistProject {
+                action: Box::new(ProjectPersistenceAction::Add {
+                    project: duplicate,
+                    status_message: "Added losing request".to_string(),
+                }),
+                status_op_id: Some("ignored-for-inline-add".to_string()),
+            })
+            .expect("deduplicate project add");
+
+        let EventReaction::ProjectPersistenceOutcome(outcome) = reaction else {
+            panic!("expected an inline project persistence outcome");
+        };
+        assert!(matches!(
+            outcome.view,
+            ProjectPersistenceView::Added {
+                ref project_id,
+                ref status_message,
+            } if project_id == "registered"
+                && status_message.contains(&registered.name)
+        ));
+        assert_eq!(outcome.status_op_id, None);
+        assert_eq!(engine.projects.len(), 1);
+        assert_eq!(engine.projects[0].id, "registered");
+    }
+
+    #[test]
+    fn remove_project_closes_project_terminals_but_not_other_projects() {
+        let (mut engine, _tmp) = test_engine();
+        let repo1 = tempfile::tempdir().expect("p1 dir");
+        let repo2 = tempfile::tempdir().expect("p2 dir");
+        engine.projects.push(sample_project(
+            "p1",
+            repo1.path().to_string_lossy().as_ref(),
+        ));
+        engine.projects.push(sample_project(
+            "p2",
+            repo2.path().to_string_lossy().as_ref(),
+        ));
+        engine.config.terminal.command = "cat".to_string();
+        engine.config.terminal.args = vec![];
+        let (t1, _) = engine
+            .create_project_terminal("p1", 24, 80)
+            .expect("terminal on p1");
+        let (t2, _) = engine
+            .create_project_terminal("p2", 24, 80)
+            .expect("terminal on p2");
+
+        engine
+            .apply(Command::RemoveProject {
+                project_id: "p1".to_string(),
+                project_name: "p1".to_string(),
+            })
+            .expect("remove project");
+
+        assert!(
+            !engine.companion_terminals.contains_key(&t1),
+            "removing a project must close its project terminals"
+        );
+        assert!(
+            engine.terminating_ptys.iter().any(|t| t.id == t1),
+            "the closed terminal is reaped gracefully via the terminating set"
+        );
+        assert!(
+            engine.companion_terminals.contains_key(&t2),
+            "another project's terminal must be untouched"
+        );
+        // Pin the surviving project by name: "p1 is absent" alone is also true
+        // of a remove that wiped every project.
+        assert_eq!(
+            engine
+                .projects
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p2"],
+            "only the removed project is gone",
+        );
+    }
+
+    #[test]
+    fn delete_project_removes_its_sessions_worktrees_and_project() {
+        // The worktree-deleting project delete (distinct from RemoveProject, which
+        // keeps worktrees) cascades every session through the shared
+        // `do_delete_session` path, then drops the project row + memory. We use a
+        // non-existent worktree path so `git::remove_worktree` takes its
+        // already-gone Ok branch without needing a real git checkout (the worktree
+        // removal itself is covered by do_delete_session's own tests).
+        let (mut engine, tmp) = test_engine();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        engine
+            .projects
+            .push(sample_project("p1", proj.to_str().unwrap()));
+        let mut session = sample_session("s1", "p1", "feat/x");
+        session
+            .workspace
+            .as_managed_mut()
+            .expect("managed test session")
+            .worktree_path = tmp.path().join("wt-gone").to_str().unwrap().to_string();
+        engine.session_store.upsert_session(&session).unwrap();
+        engine.sessions.push(session);
+
+        let reaction = engine
+            .apply(Command::DeleteProject {
+                project_id: "p1".to_string(),
+                project_name: "p1".to_string(),
+            })
+            .expect("delete project");
+
+        match reaction {
+            EventReaction::Status(status) => {
+                assert_eq!(status.tone, StatusTone::Info, "expected a success status");
+                assert!(
+                    status.message.contains("its agent"),
+                    "message should mention the removed agent: {}",
+                    status.message
+                );
+            }
+            _ => panic!("expected a Status reaction"),
+        }
+        assert!(
+            engine.projects.iter().all(|p| p.id != "p1"),
+            "project must be gone from memory"
+        );
+        assert!(
+            engine.sessions.iter().all(|s| s.id != "s1"),
+            "session must be gone from memory"
+        );
+    }
+
+    #[test]
+    fn delete_project_refuses_while_a_session_delete_is_pending() {
+        let (mut engine, _tmp) = test_engine();
+        engine.projects.push(sample_project("p1", "/tmp/p1"));
+        let session = sample_session("s1", "p1", "feat/x");
+        engine.sessions.push(session);
+        engine.pending_deletions.insert("s1".to_string());
+
+        let reaction = engine
+            .apply(Command::DeleteProject {
+                project_id: "p1".to_string(),
+                project_name: "p1".to_string(),
+            })
+            .expect("apply returns Ok");
+
+        match reaction {
+            EventReaction::Status(status) => {
+                assert_eq!(status.tone, StatusTone::Error);
+            }
+            _ => panic!("expected an error Status"),
+        }
+        assert!(
+            engine.projects.iter().any(|p| p.id == "p1"),
+            "the project must be untouched when the pending guard fires"
+        );
+        assert!(engine.sessions.iter().any(|s| s.id == "s1"));
+    }
+
+    #[test]
+    fn delete_project_refuses_while_a_tab_is_launching() {
+        let (mut engine, _tmp) = test_engine();
+        engine.projects.push(sample_project("p1", "/tmp/p1"));
+        let session = sample_session("s1", "p1", "feat/x");
+        engine.sessions.push(session);
+        // Mark the session-slot tab's launch in flight, under the id
+        // `AgentSession::slot_tab_id` resolves to for this fixture.
+        engine.mark_in_flight(InFlightKey::AgentLaunch(TabId::new("s1-slot")));
+
+        let reaction = engine
+            .apply(Command::DeleteProject {
+                project_id: "p1".to_string(),
+                project_name: "p1".to_string(),
+            })
+            .expect("apply returns Ok");
+
+        match reaction {
+            EventReaction::Status(status) => {
+                assert_eq!(status.tone, StatusTone::Error);
+            }
+            _ => panic!("expected an error Status"),
+        }
+        assert!(
+            engine.projects.iter().any(|p| p.id == "p1"),
+            "the project must be untouched when the launch guard fires"
+        );
+    }
+
+    #[test]
+    fn dispatch_agent_launch_refuses_a_closing_session() {
+        // The shared launch chokepoint must refuse a launch into
+        // a session that is mid-deletion (`closing_sessions`), covering every
+        // launch path (reconnect, resume-fallback, web-dormant-relaunch,
+        // session-slot reconnect) that funnels through DispatchAgentLaunch.
+        let (mut engine, _tmp) = test_engine();
+        let session = sample_session("s1", "p1", "feat/x");
+        engine.sessions.push(session.clone());
+        engine.closing_sessions.insert("s1".to_string());
+
+        let request = engine.build_agent_launch_request(
+            session,
+            false,
+            (24, 80),
+            crate::worker::AgentLaunchKind::Reconnect {
+                status_message: String::new(),
+            },
+        );
+        let reaction = engine
+            .apply(Command::DispatchAgentLaunch {
+                request: Box::new(request),
+            })
+            .expect("apply");
+
+        match reaction {
+            EventReaction::DispatchAgentLaunchView(view) => {
+                assert!(!view.launched, "a closing session must not launch");
+                let status = view.status.expect("a refusal status");
+                assert!(
+                    status.message.contains("being deleted"),
+                    "msg: {}",
+                    status.message
+                );
+            }
+            _ => panic!("expected DispatchAgentLaunchView"),
+        }
+        // No in-flight launch key was set (the guard returned before dispatch).
+        assert!(!engine.is_in_flight(&InFlightKey::AgentLaunch(TabId::new("s1"))));
+    }
+
+    /// A launch over a tab that already has a LIVE process is refused before
+    /// anything is spawned. Letting it through would replace the entry in
+    /// `providers`, and the displaced client's drop SIGKILLs the child it names,
+    /// so a working agent would be killed by a redundant launch with nothing
+    /// said anywhere.
+    #[test]
+    fn dispatch_agent_launch_refuses_a_tab_that_is_already_running() {
+        let (mut engine, _tmp) = test_engine();
+        let worktree = tempfile::tempdir().expect("worktree dir");
+        let session = sample_session("s1", "p1", "feat/x");
+        engine.sessions.push(session.clone());
+        // `cat` sits waiting on its input, so this provider is genuinely live.
+        let live =
+            crate::pty::PtyClient::spawn_with_env("cat", &[], worktree.path(), 24, 80, 100, &[])
+                .expect("spawn cat");
+        let live_pid = live.child_process_id();
+        engine
+            .providers
+            .insert(session.slot_tab_id().to_owned(), live);
+
+        let request = engine.build_agent_launch_request(
+            session.clone(),
+            false,
+            (24, 80),
+            crate::worker::AgentLaunchKind::Reconnect {
+                status_message: String::new(),
+            },
+        );
+        let reaction = engine
+            .apply(Command::DispatchAgentLaunch {
+                request: Box::new(request),
+            })
+            .expect("apply");
+
+        match reaction {
+            EventReaction::DispatchAgentLaunchView(view) => {
+                assert!(!view.launched, "a tab with a live process must not launch");
+                let status = view.status.expect("a refusal status");
+                assert!(
+                    status.message.contains("already running"),
+                    "msg: {}",
+                    status.message
+                );
+            }
+            _ => panic!("expected DispatchAgentLaunchView"),
+        }
+        assert_eq!(
+            engine
+                .providers
+                .get(session.slot_tab_id())
+                .and_then(crate::pty::PtyClient::child_process_id),
+            live_pid,
+            "the running child must still be the one in the tab"
+        );
+    }
+
+    /// A dispatched launch clears the tab's recorded failure, and a REFUSED one
+    /// leaves it standing. This one chokepoint is why an explicit start, a
+    /// reconnect and a create all get past the diagnosis card without any of
+    /// them asking for it, and why a refusal (which ran nothing) does not.
+    #[test]
+    fn dispatch_agent_launch_clears_a_recorded_failure_only_when_it_launches() {
+        let (mut engine, _tmp) = test_engine();
+        let session = sample_session("s1", "p1", "feat/x");
+        engine.sessions.push(session.clone());
+        engine.mark_tab_run_failed(
+            session.slot_tab_id(),
+            crate::tab_verdict::TabRunEnding::ExitedWithStatus { status: 1 },
+            Vec::new(),
+        );
+
+        let request = engine.build_agent_launch_request(
+            session.clone(),
+            false,
+            (24, 80),
+            crate::worker::AgentLaunchKind::Reconnect {
+                status_message: String::new(),
+            },
+        );
+        let reaction = engine
+            .apply(Command::DispatchAgentLaunch {
+                request: Box::new(request),
+            })
+            .expect("apply");
+        assert!(
+            matches!(reaction, EventReaction::DispatchAgentLaunchView(ref v) if v.launched),
+            "the launch must actually dispatch for this test to say anything"
+        );
+        assert!(!engine.tab_last_run_failed(session.slot_tab_id().as_str()));
+
+        // Now the refusal side: a closing session runs nothing, so the verdict
+        // it would have replaced must survive.
+        let (mut engine, _tmp) = test_engine();
+        let session = sample_session("s2", "p1", "feat/y");
+        engine.sessions.push(session.clone());
+        engine.closing_sessions.insert("s2".to_string());
+        engine.mark_tab_run_failed(
+            session.slot_tab_id(),
+            crate::tab_verdict::TabRunEnding::ExitedWithStatus { status: 1 },
+            Vec::new(),
+        );
+        let request = engine.build_agent_launch_request(
+            session.clone(),
+            false,
+            (24, 80),
+            crate::worker::AgentLaunchKind::Reconnect {
+                status_message: String::new(),
+            },
+        );
+        let _ = engine
+            .apply(Command::DispatchAgentLaunch {
+                request: Box::new(request),
+            })
+            .expect("apply");
+        assert!(
+            engine.tab_last_run_failed(session.slot_tab_id().as_str()),
+            "a refused dispatch launched nothing, so it clears nothing"
+        );
+    }
+
+    #[test]
+    fn reorder_sessions_happy_path_reorders_vec_and_persists() {
+        let (mut engine, _tmp) = test_engine();
+        for id in ["a", "b", "c"] {
+            let session = sample_session(id, "p1", id);
+            engine.session_store.upsert_session(&session).unwrap();
+            engine.sessions.push(session);
+        }
+
+        let reaction = engine
+            .apply(Command::ReorderSessions {
+                project_id: "p1".to_string(),
+                session_ids: vec!["c".into(), "a".into(), "b".into()],
+            })
+            .expect("apply");
+        assert!(matches!(reaction, EventReaction::Nothing));
+
+        // In-memory Vec follows the new order.
+        assert_eq!(session_ids_for(&engine, "p1"), vec!["c", "a", "b"]);
+        // Persisted: reload from the store reflects the same order.
+        let reloaded: Vec<String> = engine
+            .session_store
+            .load_sessions()
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.project_id().expect("managed test session") == "p1")
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(reloaded, vec!["c", "a", "b"]);
+    }
+
+    #[test]
+    fn reorder_sessions_keeps_other_projects_relative_order() {
+        let (mut engine, _tmp) = test_engine();
+        // Interleave two projects in the Vec: p1-a, p2-x, p1-b, p2-y.
+        for (id, proj) in [("a", "p1"), ("x", "p2"), ("b", "p1"), ("y", "p2")] {
+            let session = sample_session(id, proj, id);
+            engine.session_store.upsert_session(&session).unwrap();
+            engine.sessions.push(session);
+        }
+
+        engine
+            .apply(Command::ReorderSessions {
+                project_id: "p1".to_string(),
+                session_ids: vec!["b".into(), "a".into()],
+            })
+            .expect("apply");
+
+        // p1 reordered to b, a.
+        assert_eq!(session_ids_for(&engine, "p1"), vec!["b", "a"]);
+        // p2's relative order (x before y) is untouched.
+        assert_eq!(session_ids_for(&engine, "p2"), vec!["x", "y"]);
+    }
+
+    #[test]
+    fn reorder_agents_moves_across_projects_globally_and_persists() {
+        let (mut engine, _tmp) = test_engine();
+        // Two projects interleaved: p1-a, p1-b, p2-x, p2-y (Vec order).
+        for (id, proj) in [("a", "p1"), ("b", "p1"), ("x", "p2"), ("y", "p2")] {
+            let session = sample_session(id, proj, id);
+            engine.session_store.upsert_session(&session).unwrap();
+            engine.sessions.push(session);
+        }
+
+        // Global reorder: interleave across project boundaries, with x (p2) between the
+        // two p1 agents. Impossible under the old project-grouped model; the whole
+        // point of the flat model.
+        engine
+            .apply(Command::ReorderAgents {
+                session_ids: vec!["a".into(), "x".into(), "b".into(), "y".into()],
+            })
+            .expect("apply");
+
+        let vec_order: Vec<String> = engine.sessions.iter().map(|s| s.id.clone()).collect();
+        assert_eq!(vec_order, vec!["a", "x", "b", "y"]);
+
+        // Persisted: reload reflects the same global order (load_sessions orders by
+        // the now-global sort_order).
+        let reloaded: Vec<String> = engine
+            .session_store
+            .load_sessions()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(reloaded, vec!["a", "x", "b", "y"]);
+    }
+
+    #[test]
+    fn reorder_agents_rejects_incomplete_set() {
+        let (mut engine, _tmp) = test_engine();
+        for (id, proj) in [("a", "p1"), ("b", "p2")] {
+            let session = sample_session(id, proj, id);
+            engine.session_store.upsert_session(&session).unwrap();
+            engine.sessions.push(session);
+        }
+        // Only one of the two sessions, not the complete set.
+        let err = engine
+            .apply(Command::ReorderAgents {
+                session_ids: vec!["a".into()],
+            })
+            .map(|_| ())
+            .expect_err("incomplete set must error");
+        assert!(
+            err.to_string().contains("exactly the current"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn reorder_sessions_rejects_missing_id() {
+        let (mut engine, _tmp) = test_engine();
+        for id in ["a", "b"] {
+            engine.sessions.push(sample_session(id, "p1", id));
+        }
+        let err = engine
+            .apply(Command::ReorderSessions {
+                project_id: "p1".to_string(),
+                session_ids: vec!["a".into()], // missing "b"
+            })
+            .map(|_| ())
+            .expect_err("missing id must error");
+        assert!(
+            err.to_string().contains("exactly the current"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn reorder_sessions_rejects_extra_id() {
+        let (mut engine, _tmp) = test_engine();
+        engine.sessions.push(sample_session("a", "p1", "a"));
+        let err = engine
+            .apply(Command::ReorderSessions {
+                project_id: "p1".to_string(),
+                session_ids: vec!["a".into(), "ghost".into()],
+            })
+            .map(|_| ())
+            .expect_err("extra id must error");
+        assert!(
+            err.to_string().contains("exactly the current"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn reorder_sessions_rejects_duplicate_id() {
+        let (mut engine, _tmp) = test_engine();
+        for id in ["a", "b"] {
+            engine.sessions.push(sample_session(id, "p1", id));
+        }
+        let err = engine
+            .apply(Command::ReorderSessions {
+                project_id: "p1".to_string(),
+                session_ids: vec!["a".into(), "a".into()],
+            })
+            .map(|_| ())
+            .expect_err("duplicate id must error");
+        assert!(err.to_string().contains("duplicate"), "err: {err}");
+    }
+
+    #[test]
+    fn reorder_sessions_rejects_foreign_id() {
+        let (mut engine, _tmp) = test_engine();
+        engine.sessions.push(sample_session("a", "p1", "a"));
+        engine.sessions.push(sample_session("b", "p2", "b"));
+        // "b" belongs to p2, not p1; reordering p1 with it is rejected.
+        let err = engine
+            .apply(Command::ReorderSessions {
+                project_id: "p1".to_string(),
+                session_ids: vec!["a".into(), "b".into()],
+            })
+            .map(|_| ())
+            .expect_err("foreign id must error");
+        assert!(
+            err.to_string().contains("exactly the current"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn reorder_projects_happy_path_reorders_and_persists() {
+        let (mut engine, _tmp) = test_engine();
+        for id in ["a", "b", "c"] {
+            engine
+                .projects
+                .push(sample_project(id, &format!("/repo/{id}")));
+            engine
+                .session_store
+                .upsert_project(&crate::config::ProjectConfig {
+                    id: id.to_string(),
+                    path: format!("/repo/{id}"),
+                    name: Some(id.to_string()),
+                    default_provider: None,
+                    leading_branch: Some("main".to_string()),
+                    auto_reopen_agents: None,
+                    startup_command: None,
+                    env: Default::default(),
+                    workspace_mode: None,
+                })
+                .unwrap();
+        }
+
+        let reaction = engine
+            .apply(Command::ReorderProjects {
+                project_ids: vec!["c".into(), "a".into(), "b".into()],
+            })
+            .expect("apply");
+        assert!(matches!(reaction, EventReaction::Nothing));
+
+        let ids: Vec<String> = engine.projects.iter().map(|p| p.id.clone()).collect();
+        assert_eq!(ids, vec!["c", "a", "b"]);
+        let reloaded: Vec<String> = engine
+            .session_store
+            .load_projects()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(reloaded, vec!["c", "a", "b"]);
+    }
+
+    #[test]
+    fn reorder_projects_rejects_wrong_set() {
+        let (mut engine, _tmp) = test_engine();
+        engine.projects.push(sample_project("a", "/repo/a"));
+        engine.projects.push(sample_project("b", "/repo/b"));
+
+        // Missing one.
+        let err = engine
+            .apply(Command::ReorderProjects {
+                project_ids: vec!["a".into()],
+            })
+            .map(|_| ())
+            .expect_err("missing id must error");
+        assert!(
+            err.to_string().contains("exactly the current"),
+            "err: {err}"
+        );
+
+        // Duplicate.
+        let err = engine
+            .apply(Command::ReorderProjects {
+                project_ids: vec!["a".into(), "a".into()],
+            })
+            .map(|_| ())
+            .expect_err("duplicate id must error");
+        assert!(err.to_string().contains("duplicate"), "err: {err}");
+    }
+
+    #[test]
+    fn persist_session_order_writes_current_vec_order() {
+        let (mut engine, _tmp) = test_engine();
+        for id in ["a", "b", "c"] {
+            let session = sample_session(id, "p1", id);
+            engine.session_store.upsert_session(&session).unwrap();
+            engine.sessions.push(session);
+        }
+        // Manually reorder the in-memory Vec (as a TUI sort action would), then
+        // persist. A reload must reflect the same order.
+        engine.sessions.reverse(); // c, b, a
+        engine.persist_session_order().expect("persist");
+
+        let reloaded: Vec<String> = engine
+            .session_store
+            .load_sessions()
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.project_id().expect("managed test session") == "p1")
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(reloaded, vec!["c", "b", "a"]);
+    }
+
+    /// Init a temp git repo with a committed `a.txt` so discard tests can both
+    /// restore a tracked file and create an untracked one.
+    fn discard_test_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let ok = crate::git::test_support::git_command()
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .expect("spawn git")
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(dir.path().join("a.txt"), "original\n").expect("write file");
+        run(&["add", "a.txt"]);
+        run(&["commit", "-q", "-m", "init"]);
+        dir
+    }
+
+    #[test]
+    fn discard_file_restores_tracked_file_from_head() {
+        let repo = discard_test_repo();
+        let file = repo.path().join("a.txt");
+        std::fs::write(&file, "modified\n").expect("modify");
+        let (mut engine, _tmp) = test_engine();
+
+        let reaction = engine
+            .apply(Command::DiscardFile {
+                worktree_path: repo.path().to_path_buf(),
+                path: "a.txt".to_string(),
+                is_untracked: false,
+            })
+            .expect("apply");
+
+        match reaction {
+            EventReaction::Status(update) => {
+                assert_eq!(update.tone, StatusTone::Info);
+                assert!(
+                    update
+                        .message
+                        .contains("Discarded unstaged changes to \"a.txt\"")
+                );
+                assert!(update.message.contains("Staged changes, if any, are kept"));
+            }
+            _ => panic!("expected Info status reaction"),
+        }
+        // The working copy is back to the committed content.
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "original\n");
+    }
+
+    #[test]
+    fn discard_file_deletes_untracked_file() {
+        let repo = discard_test_repo();
+        let untracked = repo.path().join("new.txt");
+        std::fs::write(&untracked, "scratch\n").expect("write untracked");
+        let (mut engine, _tmp) = test_engine();
+
+        let reaction = engine
+            .apply(Command::DiscardFile {
+                worktree_path: repo.path().to_path_buf(),
+                path: "new.txt".to_string(),
+                is_untracked: true,
+            })
+            .expect("apply");
+
+        match reaction {
+            EventReaction::Status(update) => {
+                assert_eq!(update.tone, StatusTone::Info);
+                assert!(
+                    update
+                        .message
+                        .contains("Deleted untracked file \"new.txt\"")
+                );
+            }
+            _ => panic!("expected Info status reaction"),
+        }
+        assert!(!untracked.exists(), "untracked file should be deleted");
+    }
+
+    // ── Command::RunMacro ───────────────────────────────────────────────────
+
+    use crate::config::{MacroEntry, MacroSurface};
+    use crate::pty::PtyClient;
+
+    /// Spawn a `cat -v` PTY in raw mode (control bytes render as caret notation:
+    /// ESC → `^[`, CR → `^M`), the same fixture the TUI macro-bar PTY test uses,
+    /// so a RunMacro write can be observed in the terminal snapshot.
+    fn spawn_cat_v_pty() -> PtyClient {
+        let client = PtyClient::spawn(
+            "sh",
+            &["-c".to_string(), "stty raw -echo; exec cat -v".to_string()],
+            std::path::Path::new("."),
+            5,
+            80,
+            100,
+        )
+        .expect("spawn pty");
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        client
+    }
+
+    fn rendered_snapshot(client: &PtyClient) -> String {
+        client
+            .snapshot()
+            .cells
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect()
+    }
+
+    /// Poll a PTY render until every `needle` shows up, for at most 10s, and
+    /// return the last render. A fixed sleep here raced the PTY echo whenever
+    /// the machine was busy and failed spuriously; the caller's assertions are
+    /// unchanged, so a genuine miss still fails, just after the deadline.
+    fn wait_for_render(render: impl Fn() -> String, needles: &[&str]) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let rendered = render();
+            if needles.iter().all(|n| rendered.contains(n)) || std::time::Instant::now() >= deadline
+            {
+                return rendered;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn insert_macro(engine: &mut Engine, name: &str, text: &str, surface: MacroSurface) {
+        engine.config.macros.entries.insert(
+            name.to_string(),
+            MacroEntry {
+                text: text.to_string(),
+                surface,
+            },
+        );
+    }
+
+    /// Register a companion terminal directly in the map for reorder tests, with a
+    /// deliberately scrambled `sort_order` so a passing test proves the reorder
+    /// (not the insertion order) set the field.
+    fn insert_terminal(engine: &mut Engine, id: &str, sort_order: u64) {
+        use crate::model::{CompanionTerminal, TerminalOwner};
+        engine.companion_terminals.insert(
+            id.to_string(),
+            CompanionTerminal {
+                owner: TerminalOwner::Session("s1".to_string()),
+                label: id.to_string(),
+                foreground_cmd: None,
+                client: spawn_cat_v_pty(),
+                sort_order,
+                created_at: chrono::Utc::now(),
+            },
+        );
+    }
+
+    #[test]
+    fn reorder_terminals_stamps_sort_order_to_full_set_order() {
+        let (mut engine, _tmp) = test_engine();
+        // Three terminals whose stored sort_order does not match the requested one.
+        insert_terminal(&mut engine, "term-1", 99);
+        insert_terminal(&mut engine, "term-2", 5);
+        insert_terminal(&mut engine, "term-3", 42);
+
+        engine
+            .apply(Command::ReorderTerminals {
+                terminal_ids: vec!["term-3".into(), "term-1".into(), "term-2".into()],
+            })
+            .expect("apply");
+
+        // Each terminal's sort_order is now its index in the requested order.
+        assert_eq!(engine.companion_terminals["term-3"].sort_order, 0);
+        assert_eq!(engine.companion_terminals["term-1"].sort_order, 1);
+        assert_eq!(engine.companion_terminals["term-2"].sort_order, 2);
+    }
+
+    #[test]
+    fn reorder_terminals_rejects_incomplete_set() {
+        let (mut engine, _tmp) = test_engine();
+        insert_terminal(&mut engine, "term-1", 0);
+        insert_terminal(&mut engine, "term-2", 1);
+
+        // Only one of the two terminals, not the complete set.
+        let err = engine
+            .apply(Command::ReorderTerminals {
+                terminal_ids: vec!["term-1".into()],
+            })
+            .map(|_| ())
+            .expect_err("incomplete set must error");
+        assert!(
+            err.to_string().contains("exactly the current"),
+            "err: {err}"
+        );
+        // The rejected reorder left the stored order untouched.
+        assert_eq!(engine.companion_terminals["term-1"].sort_order, 0);
+        assert_eq!(engine.companion_terminals["term-2"].sort_order, 1);
+    }
+
+    #[test]
+    fn run_macro_writes_to_agent_provider_pty() {
+        let (mut engine, _tmp) = test_engine();
+        engine
+            .providers
+            .insert(TabId::new("sess-1"), spawn_cat_v_pty());
+        insert_macro(&mut engine, "greet", "first\nsecond", MacroSurface::Agent);
+
+        let reaction = engine
+            .apply(Command::RunMacro {
+                target_id: "sess-1".to_string(),
+                name: "greet".to_string(),
+            })
+            .expect("apply");
+        match reaction {
+            EventReaction::Status(update) => {
+                assert_eq!(update.tone, StatusTone::Info);
+                assert_eq!(update.message, "Sent macro \"greet\".");
+            }
+            _ => panic!("expected Info status reaction"),
+        }
+
+        let rendered = wait_for_render(
+            || rendered_snapshot(engine.providers.get(TabIdRef::new("sess-1")).unwrap()),
+            &["first", "second", "^[", "^M"],
+        );
+        assert!(
+            rendered.contains("first") && rendered.contains("second"),
+            "both halves should be visible; got: {rendered:?}"
+        );
+        // Newline translated to ESC+CR (Alt+Enter) by the shared core transform.
+        assert!(
+            rendered.contains("^[") && rendered.contains("^M"),
+            "newline should become ESC+CR; got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn run_macro_writes_to_companion_terminal_pty() {
+        use crate::model::CompanionTerminal;
+        let (mut engine, _tmp) = test_engine();
+        engine.companion_terminals.insert(
+            "term-1".to_string(),
+            CompanionTerminal {
+                owner: crate::model::TerminalOwner::Session("sess-1".to_string()),
+                label: "term".to_string(),
+                foreground_cmd: None,
+                client: spawn_cat_v_pty(),
+                sort_order: 1,
+                created_at: chrono::Utc::now(),
+            },
+        );
+        insert_macro(&mut engine, "ls", "ls -la", MacroSurface::Terminal);
+
+        let reaction = engine
+            .apply(Command::RunMacro {
+                target_id: "term-1".to_string(),
+                name: "ls".to_string(),
+            })
+            .expect("apply");
+        match reaction {
+            EventReaction::Status(update) => {
+                assert_eq!(update.tone, StatusTone::Info);
+                assert_eq!(update.message, "Sent macro \"ls\".");
+            }
+            _ => panic!("expected Info status reaction"),
+        }
+
+        let rendered = wait_for_render(
+            || rendered_snapshot(&engine.companion_terminals.get("term-1").unwrap().client),
+            &["ls -la"],
+        );
+        assert!(
+            rendered.contains("ls -la"),
+            "macro text should reach the terminal PTY; got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn run_macro_unknown_name_errors() {
+        let (mut engine, _tmp) = test_engine();
+        engine
+            .providers
+            .insert(TabId::new("sess-1"), spawn_cat_v_pty());
+
+        let reaction = engine
+            .apply(Command::RunMacro {
+                target_id: "sess-1".to_string(),
+                name: "nope".to_string(),
+            })
+            .expect("apply");
+        match reaction {
+            EventReaction::Status(update) => {
+                assert_eq!(update.tone, StatusTone::Error);
+                assert!(
+                    update.message.contains("Macro \"nope\" does not exist"),
+                    "got: {}",
+                    update.message
+                );
+            }
+            _ => panic!("expected Error status reaction"),
+        }
+    }
+
+    #[test]
+    fn run_macro_wrong_surface_errors() {
+        let (mut engine, _tmp) = test_engine();
+        // Agent target, but the macro is terminal-only.
+        engine
+            .providers
+            .insert(TabId::new("sess-1"), spawn_cat_v_pty());
+        insert_macro(&mut engine, "ls", "ls -la", MacroSurface::Terminal);
+
+        let reaction = engine
+            .apply(Command::RunMacro {
+                target_id: "sess-1".to_string(),
+                name: "ls".to_string(),
+            })
+            .expect("apply");
+        match reaction {
+            EventReaction::Status(update) => {
+                assert_eq!(update.tone, StatusTone::Error);
+                assert!(
+                    update.message.contains("not available on agent targets"),
+                    "got: {}",
+                    update.message
+                );
+            }
+            _ => panic!("expected Error status reaction"),
+        }
+    }
+
+    #[test]
+    fn run_macro_unknown_target_errors() {
+        let (mut engine, _tmp) = test_engine();
+        insert_macro(&mut engine, "greet", "hi", MacroSurface::Both);
+
+        let reaction = engine
+            .apply(Command::RunMacro {
+                target_id: "ghost".to_string(),
+                name: "greet".to_string(),
+            })
+            .expect("apply");
+        match reaction {
+            EventReaction::Status(update) => {
+                assert_eq!(update.tone, StatusTone::Error);
+                assert!(
+                    update.message.contains("No live agent or terminal"),
+                    "got: {}",
+                    update.message
+                );
+            }
+            _ => panic!("expected Error status reaction"),
+        }
+    }
+
+    // ── Command::UpdateMacros ───────────────────────────────────────────────
+
+    #[test]
+    fn update_macros_adopts_into_engine_config_and_writes_through_queue() {
+        let (mut engine, _tmp) = test_engine();
+        let mut macros = crate::config::MacrosConfig::default();
+        macros.entries.insert(
+            "greet".to_string(),
+            MacroEntry {
+                text: "hi".to_string(),
+                surface: MacroSurface::Both,
+            },
+        );
+
+        let reaction = engine
+            .apply(Command::UpdateMacros {
+                macros: macros.clone(),
+            })
+            .expect("apply");
+        // Eager save reports synchronously.
+        match reaction {
+            EventReaction::Status(update) => {
+                assert_eq!(update.tone, StatusTone::Info);
+                assert!(
+                    update.message.contains("Saved 1 macro"),
+                    "got: {}",
+                    update.message
+                );
+            }
+            _ => panic!("expected Info status reaction"),
+        }
+        // The engine adopted the new macros immediately so the ViewModel refreshes.
+        assert!(engine.config.macros.entries.contains_key("greet"));
+        // The eager save lands on disk through the queue.
+        engine.config_writer.flush();
+        let written = std::fs::read_to_string(&engine.paths.config_path).expect("read back");
+        assert!(written.contains("greet"), "macro persisted: {written}");
+    }
+
+    #[test]
+    fn update_macros_keeps_macros_when_write_fails() {
+        // Keep-and-report: a failed write means the on-disk file can't be updated,
+        // but the new macros stay active for the session AND the existing config
+        // file is left intact (the atomic temp-file-then-rename primitive never
+        // truncates or partially-writes the real file on failure).
+        let (mut engine, _tmp) = test_engine();
+
+        // Seed a known-good, parseable config on disk so we can prove a failed
+        // write does not corrupt or truncate it.
+        let original = "[defaults]\nprovider = \"claude\"\n\n[env]\nSEED = \"keep-me\"\n";
+        std::fs::write(&engine.paths.config_path, original).expect("seed config");
+
+        engine.config_writer = crate::config_queue::ConfigWriteQueue::with_dead_writer(
+            engine.paths.config_path.clone(),
+        );
+        let mut macros = crate::config::MacrosConfig::default();
+        macros.entries.insert(
+            "greet".to_string(),
+            MacroEntry {
+                text: "hi".to_string(),
+                surface: MacroSurface::Both,
+            },
+        );
+
+        let reaction = engine
+            .apply(Command::UpdateMacros { macros })
+            .expect("apply");
+        match reaction {
+            EventReaction::Status(update) => {
+                assert_eq!(update.tone, StatusTone::Error);
+                assert!(
+                    update.message.contains("Macros updated this session"),
+                    "got: {}",
+                    update.message
+                );
+            }
+            _ => panic!("expected Error status reaction"),
+        }
+        // Despite the failed write, the macros are still active in memory.
+        assert!(engine.config.macros.entries.contains_key("greet"));
+
+        // The on-disk file is byte-for-byte the original (not truncated, emptied,
+        // or partially overwritten) and still parses as valid config.
+        let on_disk = std::fs::read_to_string(&engine.paths.config_path).expect("read back");
+        assert_eq!(
+            on_disk, original,
+            "a failed write must leave config.toml untouched"
+        );
+        let parsed: crate::config::Config = toml::from_str(&on_disk).expect("config still valid");
+        assert_eq!(parsed.env.get("SEED").map(String::as_str), Some("keep-me"));
+        assert!(
+            !parsed.macros.entries.contains_key("greet"),
+            "the failed write must not have leaked the new macro to disk"
+        );
+    }
+
+    // ── Engine::set_watched_session + spawn_changed_files_refresh +
+    //    Command::WatchChangedFiles ─────────────────────────────────────────
+
+    /// A temp git repo with one STAGED change (`staged.txt` added to the index)
+    /// and one UNSTAGED change (`unstaged.txt` is a new, untracked file) so a
+    /// `changed_files` read returns a non-empty entry in each list.
+    fn watch_test_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let ok = crate::git::test_support::git_command()
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .expect("spawn git")
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(dir.path().join("base.txt"), "base\n").expect("write base");
+        run(&["add", "base.txt"]);
+        run(&["commit", "-q", "-m", "init"]);
+        // Staged: a new file added to the index.
+        std::fs::write(dir.path().join("staged.txt"), "staged\n").expect("write staged");
+        run(&["add", "staged.txt"]);
+        // Unstaged: a new untracked file (never added).
+        std::fs::write(dir.path().join("unstaged.txt"), "unstaged\n").expect("write unstaged");
+        dir
+    }
+
+    fn session_in_repo(id: &str, repo: &std::path::Path) -> crate::model::AgentSession {
+        let mut session = sample_session(id, "p1", id);
+        session
+            .workspace
+            .as_managed_mut()
+            .expect("managed test session")
+            .worktree_path = repo.to_string_lossy().into_owned();
+        session
+    }
+
+    fn sample_changed_file(path: &str) -> crate::model::ChangedFile {
+        crate::model::ChangedFile {
+            status: "M".to_string(),
+            path: path.to_string(),
+            additions: 1,
+            deletions: 0,
+            binary: false,
+            diff_excluded: false,
+            renamed_from: None,
+        }
+    }
+
+    /// Block on the engine's worker channel for the next `ChangedFilesReady`
+    /// event (the one-shot refresh worker sends exactly one), then feed it back
+    /// through `process_worker_event` so the engine adopts the computed lists,
+    /// exactly what the actor loop / TUI drain does. Panics if no such event
+    /// arrives within a few seconds.
+    fn drain_changed_files_refresh(engine: &mut Engine) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let event = engine
+                .worker_rx
+                .recv_timeout(remaining)
+                .expect("ChangedFilesReady within deadline");
+            if matches!(event, WorkerEvent::ChangedFilesReady { .. }) {
+                engine.process_worker_event(event);
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn set_watched_session_records_id_clears_lists_and_returns_path() {
+        let repo = watch_test_repo();
+        let (mut engine, _tmp) = test_engine();
+        engine.sessions.push(session_in_repo("s1", repo.path()));
+        // Seed stale lists so we can prove the cheap set EMPTIES them (the
+        // watched_session_id invariant: never show the previous watch's files).
+        engine.staged_files = vec![sample_changed_file("stale.txt")];
+        engine.unstaged_files = vec![sample_changed_file("stale.txt")];
+
+        let path = engine.set_watched_session(Some("s1"));
+
+        // Cheap: no git ran, the lists are EMPTY, and the worktree is returned.
+        assert_eq!(path.as_deref(), Some(repo.path()));
+        assert_eq!(engine.watched_session_id.as_deref(), Some("s1"));
+        assert!(engine.staged_files.is_empty());
+        assert!(engine.unstaged_files.is_empty());
+        // The poller's shared watched-worktree handle now points at the repo.
+        assert_eq!(
+            engine.watched_worktree.lock().unwrap().as_deref(),
+            Some(repo.path())
+        );
+    }
+
+    #[test]
+    fn set_watched_session_none_clears_everything_and_returns_none() {
+        let repo = watch_test_repo();
+        let (mut engine, _tmp) = test_engine();
+        engine.sessions.push(session_in_repo("s1", repo.path()));
+        engine.staged_files = vec![sample_changed_file("a.txt")];
+
+        let path = engine.set_watched_session(None);
+
+        assert!(path.is_none());
+        assert!(engine.watched_session_id.is_none());
+        assert!(engine.staged_files.is_empty());
+        assert!(engine.unstaged_files.is_empty());
+        assert!(engine.watched_worktree.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn set_watched_session_unknown_id_clears_and_returns_none() {
+        let repo = watch_test_repo();
+        let (mut engine, _tmp) = test_engine();
+        engine.sessions.push(session_in_repo("s1", repo.path()));
+        let _ = engine.set_watched_session(Some("s1"));
+        engine.staged_files = vec![sample_changed_file("a.txt")];
+
+        // A stale/unknown id must clear (so it never shows another session's files).
+        let path = engine.set_watched_session(Some("ghost"));
+
+        assert!(path.is_none());
+        assert!(engine.watched_session_id.is_none());
+        assert!(engine.staged_files.is_empty());
+        assert!(engine.unstaged_files.is_empty());
+        assert!(engine.watched_worktree.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn spawn_changed_files_refresh_emits_ready_with_computed_lists() {
+        let repo = watch_test_repo();
+        let (mut engine, _tmp) = test_engine();
+        engine.sessions.push(session_in_repo("s1", repo.path()));
+        // Arm the watch (cheap) so the ChangedFilesReady drain accepts the event.
+        let path = engine.set_watched_session(Some("s1")).expect("path");
+
+        engine.spawn_changed_files_refresh(path);
+
+        // The one-shot worker posts ChangedFilesReady tagged with the worktree.
+        let event = crate::engine::test_support::recv_changed_files_ready(&mut engine);
+        match event {
+            WorkerEvent::ChangedFilesReady { outcome, worktree } => {
+                let (staged, unstaged) = outcome.expect("git read the worktree");
+                assert_eq!(worktree.as_path(), repo.path());
+                assert!(staged.iter().any(|f| f.path == "staged.txt"), "{staged:?}");
+                assert!(
+                    unstaged.iter().any(|f| f.path == "unstaged.txt"),
+                    "{unstaged:?}"
+                );
+            }
+            _ => panic!("expected ChangedFilesReady"),
+        }
+    }
+
+    #[test]
+    fn watch_command_arms_watch_and_queues_refresh_worker() {
+        let repo = watch_test_repo();
+        let (mut engine, _tmp) = test_engine();
+        engine.sessions.push(session_in_repo("s1", repo.path()));
+
+        let reaction = engine
+            .apply(Command::WatchChangedFiles {
+                session_id: Some("s1".to_string()),
+            })
+            .expect("apply");
+        // The actor thread did only the cheap set + spawn: Nothing, watch armed,
+        // lists EMPTY (population is now async via the worker, not inline).
+        assert!(matches!(reaction, EventReaction::Nothing));
+        assert_eq!(engine.watched_session_id.as_deref(), Some("s1"));
+        assert!(engine.staged_files.is_empty());
+        assert!(engine.unstaged_files.is_empty());
+
+        // The off-thread worker computed and queued the lists; draining it (as
+        // the actor loop would) populates the engine.
+        drain_changed_files_refresh(&mut engine);
+        assert!(engine.staged_files.iter().any(|f| f.path == "staged.txt"));
+        assert!(
+            engine
+                .unstaged_files
+                .iter()
+                .any(|f| f.path == "unstaged.txt")
+        );
+    }
+
+    #[test]
+    fn changed_files_empty_before_watch_populated_after_drain() {
+        let repo = watch_test_repo();
+        let (mut engine, _tmp) = test_engine();
+        engine.sessions.push(session_in_repo("s1", repo.path()));
+
+        // Before the watch the engine carries empty lists and no watched id,
+        // exactly what the web saw (the pane showed nothing).
+        assert!(engine.staged_files.is_empty());
+        assert!(engine.unstaged_files.is_empty());
+        assert!(engine.watched_session_id.is_none());
+
+        // The command arms the watch (id visible immediately) but population is
+        // now async: the watched id is set with EMPTY lists until the worker
+        // event drains.
+        engine
+            .apply(Command::WatchChangedFiles {
+                session_id: Some("s1".to_string()),
+            })
+            .expect("apply");
+        assert_eq!(engine.watched_session_id.as_deref(), Some("s1"));
+        assert!(engine.staged_files.is_empty());
+        assert!(engine.unstaged_files.is_empty());
+
+        // After the worker lands the lists are populated and still tagged.
+        drain_changed_files_refresh(&mut engine);
+        assert_eq!(engine.watched_session_id.as_deref(), Some("s1"));
+        assert!(engine.staged_files.iter().any(|f| f.path == "staged.txt"));
+        assert!(
+            engine
+                .unstaged_files
+                .iter()
+                .any(|f| f.path == "unstaged.txt")
+        );
+    }
+
+    // ── run_project_refresh / project_refresh_status_op ──────────────────
+
+    fn refresh_test_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = crate::git::test_support::git_command()
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.name", "test"]);
+        run(&["config", "user.email", "t@t"]);
+        std::fs::write(dir.path().join("tracked.txt"), "base\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-m", "base"]);
+        dir
+    }
+
+    fn git_ok(cwd: &std::path::Path, args: &[&str]) {
+        let out = crate::git::test_support::git_command()
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Kills the old blanket dirty gate: a dirty tracked file no longer blocks
+    /// the refresh, and git fast-forwards when nothing conflicts.
+    #[test]
+    fn project_refresh_proceeds_with_dirty_checkout() {
+        let repo = refresh_test_repo();
+        let bare = tempfile::tempdir().unwrap();
+        git_ok(bare.path(), &["init", "--bare", "-b", "main"]);
+        git_ok(
+            repo.path(),
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        );
+        git_ok(repo.path(), &["push", "origin", "main"]);
+        // The dirt that used to abort the refresh.
+        std::fs::write(repo.path().join("tracked.txt"), "dirty\n").unwrap();
+
+        let outcome = run_project_refresh(repo.path(), Some("main".to_string()))
+            .expect("a dirty checkout must not block the refresh");
+        match outcome {
+            PullOutcome::Pulled { current_branch } => {
+                assert_eq!(current_branch.as_deref(), Some("main"));
+            }
+            other => panic!("expected Pulled, got {other:?}"),
+        }
+    }
+
+    /// A local-only repo is "nothing to pull", not a failure, and the current
+    /// branch is still re-read so the sidebar stays fresh.
+    #[test]
+    fn project_refresh_without_origin_is_nothing_to_pull_info() {
+        let repo = refresh_test_repo();
+
+        let outcome = run_project_refresh(repo.path(), Some("main".to_string()))
+            .expect("no origin must not be an error");
+        match &outcome {
+            PullOutcome::NoOrigin { current_branch } => {
+                assert_eq!(current_branch.as_deref(), Some("main"));
+            }
+            other => panic!("expected NoOrigin, got {other:?}"),
+        }
+
+        // The op maps the no-origin outcome to an INFO final.
+        let op = project_refresh_status_op("Refreshing...".to_string(), "demo");
+        let resolved = op.resolve(&Ok(outcome));
+        match resolved.outcome {
+            crate::engine::Final::Message { tone, text, .. } => {
+                assert_eq!(tone, StatusTone::Info);
+                assert!(text.contains("no origin remote"), "got: {text}");
+            }
+            other => panic!("expected a message final, got {other:?}"),
+        }
+    }
+
+    /// Catches both the old error tone and over-softening to info: a failed
+    /// refresh resolves as a WARNING that says the project continues from the
+    /// local branch state.
+    #[test]
+    fn project_refresh_pull_failure_resolves_warning_not_error() {
+        let repo = refresh_test_repo();
+        git_ok(
+            repo.path(),
+            &["remote", "add", "origin", "/nonexistent/dux-test-origin"],
+        );
+
+        let result = run_project_refresh(repo.path(), Some("main".to_string()));
+        assert!(result.is_err(), "the pull must fail");
+
+        let op = project_refresh_status_op("Refreshing...".to_string(), "demo");
+        let resolved = op.resolve(&result);
+        match resolved.outcome {
+            crate::engine::Final::Message { tone, text, .. } => {
+                assert_eq!(tone, StatusTone::Warning, "got: {text}");
+                assert!(
+                    text.contains("Continuing from the local branch state"),
+                    "got: {text}"
+                );
+            }
+            other => panic!("expected a message final, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn saved_env_vars_message_counts_the_variables() {
+        assert_eq!(
+            saved_global_env_message(1),
+            "Saved 1 global environment variable. New agents and terminals will receive it \
+             unless a project overrides the same key."
+        );
+        assert_eq!(
+            saved_global_env_message(3),
+            "Saved 3 global environment variables. New agents and terminals will receive them \
+             unless a project overrides the same key."
+        );
+    }
+
+    #[test]
+    fn saved_macros_message_counts_the_macros() {
+        assert_eq!(saved_macros_message(1), "Saved 1 macro.");
+        assert_eq!(saved_macros_message(3), "Saved 3 macros.");
+    }
+}

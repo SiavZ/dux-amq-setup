@@ -1,0 +1,94 @@
+import { useState } from "react"
+
+import { Button } from "@/components/ui/button"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import { Textarea } from "@/components/ui/textarea"
+import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
+import { envToText, parseEnv } from "@/lib/env"
+import { closeAgentEnv, updateProjectSettings, useDux } from "@/lib/store"
+import type { ProjectView, SessionView } from "@/lib/types"
+import { sessionLabel, workspaceProjectId } from "@/lib/agentWorkspace"
+
+// Edit environment variables from an agent's menu. Env is project-scoped, so this
+// edits the agent's PROJECT env, layered over the global env, and the copy says so.
+// Mounted only while open and a project resolves; state seeds lazily from it.
+function AgentEnvForm({
+  session,
+  project,
+}: {
+  session: SessionView
+  project: ProjectView
+}) {
+  const [text, setText] = useState(() => envToText(project.env))
+  const agentName = sessionLabel(session)
+
+  async function handleSave() {
+    const env = parseEnv(text)
+    // No-op when unchanged (skips the request and just closes).
+    const patch =
+      JSON.stringify(env) === JSON.stringify(project.env) ? {} : { env }
+    if (await updateProjectSettings(project.id, patch)) closeAgentEnv()
+  }
+
+  return (
+    <DialogContent showCloseButton={false}>
+      <DialogHeader>
+        <DialogTitle>Environment: {agentName}</DialogTitle>
+        <DialogDescription>
+          KEY=VALUE per line, applied to every agent and terminal in project{" "}
+          <span className="font-medium">{project.name}</span> (layered over the
+          global env). This applies to the whole project, not just this agent.
+        </DialogDescription>
+      </DialogHeader>
+      <Textarea
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        placeholder="KEY=VALUE"
+        className="min-h-48 font-mono"
+        autoFocus
+      />
+      <DialogFooter>
+        <Button variant="outline" onClick={closeAgentEnv}>
+          Cancel
+        </Button>
+        <Button onClick={() => void handleSave()}>Save</Button>
+      </DialogFooter>
+    </DialogContent>
+  )
+}
+
+export function AgentEnvDialog() {
+  const { spine, agentEnvTarget } = useDux()
+  const session = spine?.sessions.find((s) => s.id === agentEnvTarget)
+  const project = spine?.projects.find(
+    (p) =>
+      session !== undefined && p.id === workspaceProjectId(session.workspace),
+  )
+  // Closes the dialog when the agent or its project vanishes from the
+  // ViewModel; see the hook.
+  const open = useVanishedTargetGuard(
+    agentEnvTarget !== null,
+    session !== undefined && project !== undefined,
+    closeAgentEnv,
+  )
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(o) => {
+        if (!o) closeAgentEnv()
+      }}
+    >
+      {open && session && project && (
+        <AgentEnvForm session={session} project={project} />
+      )}
+    </Dialog>
+  )
+}

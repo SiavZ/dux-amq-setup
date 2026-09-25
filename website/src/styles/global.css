@@ -1,0 +1,725 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink: #07070d;
+  --color-panel: #11111d;
+  --color-panel-2: #161628;
+  --color-highlight: #1f2138;
+  --color-active: #2a2c4a;
+  --color-border: #2a2e4c;
+  --color-border-soft: #1c1f36;
+  --color-text: #f4f7ff;
+  --color-muted: #aab2d5;
+  --color-dim: #828bac;
+  --color-accent: #00d4ff;
+  --color-accent-soft: #38bdf8;
+  --color-pink: #ff4fd8;
+  --color-purple: #8b5cf6;
+  --color-success: #4ade80;
+  --color-warning: #facc15;
+  --color-error: #fb7185;
+
+  --font-display: "JetBrains Mono", "Fira Code", "SF Mono", ui-monospace,
+    SFMono-Regular, Menlo, Monaco, Consolas, "Courier New", monospace;
+  --font-mono: "JetBrains Mono", "Fira Code", "SF Mono", ui-monospace,
+    SFMono-Regular, Menlo, Monaco, Consolas, "Courier New", monospace;
+  --font-sans: "Inter", system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html {
+    background: var(--color-ink);
+    color: var(--color-text);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background:
+      radial-gradient(1100px 600px at 12% -10%, color-mix(in oklab, var(--color-accent) 8%, transparent), transparent 70%),
+      radial-gradient(900px 500px at 95% 8%, color-mix(in oklab, var(--color-pink) 8%, transparent), transparent 60%),
+      radial-gradient(900px 700px at 60% 110%, color-mix(in oklab, var(--color-purple) 10%, transparent), transparent 70%),
+      var(--color-ink);
+    background-attachment: fixed;
+    min-height: 100dvh;
+  }
+
+  ::selection {
+    background: color-mix(in oklab, var(--color-accent) 35%, transparent);
+    color: white;
+  }
+
+  /* Anything clickable gets a pointer. Native buttons default to the arrow
+     cursor, so make every interactive control consistent. */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  summary,
+  label[for],
+  a[href] {
+    cursor: pointer;
+  }
+
+  button:disabled,
+  [aria-disabled="true"] {
+    cursor: not-allowed;
+  }
+
+  /* External-link glyph appended by the link-hardening script. Sized relative
+     to the surrounding text and tinted to the link color via currentColor. */
+  .ext-icon {
+    display: inline-block;
+    width: 0.78em;
+    height: 0.78em;
+    margin-left: 0.18em;
+    vertical-align: -0.1em;
+    opacity: 0.6;
+    flex-shrink: 0;
+  }
+
+  /* Inline code chips for paths/commands in prose. Scoped to NOT touch
+     <pre><code> blocks (those keep their own styling). */
+  :not(pre) > code {
+    font-family: var(--font-mono);
+    font-size: 0.85em;
+    background: color-mix(in oklab, var(--color-panel-2) 88%, var(--color-accent) 12%);
+    border: 1px solid var(--color-border-soft);
+    border-radius: 0.35em;
+    padding: 0.08em 0.4em;
+    color: var(--color-text);
+    white-space: nowrap;
+  }
+}
+
+@layer components {
+  /* One width for the whole site, so the homepage and the docs cannot drift.
+     Widened from `max-w-6xl` (1152px) because the docs' three-column layout was
+     squeezing its middle column: 1088px of content minus a 240px sidebar, a
+     208px table of contents and two 40px gutters left the prose about 560px
+     wide, narrower than the sidebar and the contents put together. It went to
+     1280px, then to 1344px, which gives that column about 752px: a reading
+     measure rather than a slot. Past roughly this width the homepage's
+     full-width prose starts running to uncomfortably long lines, so the next
+     step is a second column or shorter copy, not more width. */
+  .container-app {
+    @apply mx-auto w-full max-w-[84rem] px-5 sm:px-8;
+  }
+
+  .grid-bg {
+    background-image:
+      linear-gradient(to right, color-mix(in oklab, var(--color-border-soft) 60%, transparent) 1px, transparent 1px),
+      linear-gradient(to bottom, color-mix(in oklab, var(--color-border-soft) 60%, transparent) 1px, transparent 1px);
+    background-size: 44px 44px;
+    background-position: -1px -1px;
+    mask-image: radial-gradient(ellipse at top, black 30%, transparent 75%);
+  }
+
+  .pill {
+    @apply inline-flex items-center gap-2 rounded-full border border-[color:var(--color-border)] bg-[color:var(--color-panel)]/70 px-3 py-1 text-xs font-medium text-[color:var(--color-muted)] backdrop-blur;
+  }
+
+  /* A tile-sized derivative of `.pill`: same shape, same tokens, smaller and
+     quieter. Used for the feature grid's Web / Terminal / Both surface markers,
+     where the pill answers a question rather than announcing a section. It
+     carries no colour of its own on purpose: the word is the whole signal. */
+  .pill-xs {
+    @apply gap-1 px-2 py-0.5 text-[10px] tracking-wide text-[color:var(--color-dim)];
+  }
+
+  .btn-primary,
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 rounded-md border px-4 py-2.5 text-sm font-semibold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--color-accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[color:var(--color-ink)];
+  }
+
+  .btn-primary {
+    @apply border-[color:var(--color-accent)]/60 bg-[color:var(--color-accent)]/15 text-[color:var(--color-accent)] hover:bg-[color:var(--color-accent)]/25 hover:border-[color:var(--color-accent)];
+  }
+
+  .btn-ghost {
+    @apply border-[color:var(--color-border)] bg-[color:var(--color-panel)]/60 text-[color:var(--color-text)] hover:bg-[color:var(--color-panel-2)] hover:border-[color:var(--color-accent)]/50;
+  }
+
+  .card {
+    @apply rounded-xl border border-[color:var(--color-border)] bg-[color:var(--color-panel)]/80 backdrop-blur;
+  }
+
+  .heading {
+    font-family: var(--font-display);
+    letter-spacing: -0.025em;
+  }
+
+  .mono {
+    font-family: var(--font-mono);
+  }
+
+  .term {
+    @apply rounded-xl border border-[color:var(--color-border)] bg-[color:var(--color-panel)]/80 backdrop-blur overflow-hidden;
+    box-shadow:
+      0 0 0 1px color-mix(in oklab, var(--color-accent) 8%, transparent),
+      0 20px 60px -20px color-mix(in oklab, var(--color-accent) 25%, transparent),
+      0 40px 120px -40px color-mix(in oklab, var(--color-pink) 20%, transparent);
+  }
+
+  .term-bar {
+    @apply flex flex-wrap items-center gap-2 border-b border-[color:var(--color-border-soft)] bg-[color:var(--color-panel-2)] px-3 py-2;
+  }
+
+  .term-dot {
+    width: 11px;
+    height: 11px;
+    border-radius: 999px;
+    display: inline-block;
+  }
+
+  .scanlines::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: repeating-linear-gradient(
+      to bottom,
+      transparent 0,
+      transparent 2px,
+      color-mix(in oklab, white 2%, transparent) 3px
+    );
+    mix-blend-mode: overlay;
+  }
+
+  .blink::after {
+    content: "▌";
+    color: var(--color-accent);
+    animation: blink 1s steps(1) infinite;
+    margin-left: 1px;
+  }
+
+  @keyframes blink {
+    50% { opacity: 0; }
+  }
+
+  /* Anchor targets sit on the first content wrapper inside a section, not on
+     the padded section itself, whose top padding would land as an empty band
+     under the header. So this only has to clear the sticky header (h-14,
+     3.5rem, plus its 1px bottom border) and leave a little air. */
+  .anchor-offset {
+    scroll-margin-top: 4.5rem;
+  }
+
+  /* Recommendation blocks (Recommended tools page). */
+  .tool-grid {
+    display: grid;
+    gap: 1rem;
+    grid-template-columns: 1fr;
+    margin: 1.25rem 0;
+  }
+  @media (min-width: 640px) {
+    .tool-grid {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+  .tool-card {
+    display: flex;
+    flex-direction: column;
+    /* Reset the inherited prose line-height (1.75); the description sets its
+       own below, and the title/subtitle are tightened individually. */
+    line-height: 1.4;
+    border: 1px solid var(--color-border);
+    background: color-mix(in oklab, var(--color-panel) 80%, transparent);
+    border-radius: 0.75rem;
+    padding: 1.1rem 1.15rem;
+  }
+  .tool-card-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+  /* Title, tag, and subtitle share one wrapping flex row. The subtitle takes a
+     full line of its own; the tag sits next to the title when there's room and
+     drops below the subtitle when there isn't (see the container query). */
+  .tool-card-head-text {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    column-gap: 0.4rem;
+    row-gap: 0.2rem;
+    container-type: inline-size;
+  }
+  .tool-card-repo {
+    flex-basis: 100%;
+    order: 1;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    line-height: 1.2;
+    color: var(--color-dim);
+    word-break: break-word;
+  }
+  /* Too narrow to fit the tag beside the title: move it below the subtitle
+     rather than wedging it between the title and subtitle. */
+  @container (max-width: 400px) {
+    .tool-card-tag {
+      order: 2;
+    }
+  }
+  /* No repo subtitle (e.g. a non-GitHub link): keep a fair gap between the
+     title and the description instead of letting them sit too close. */
+  .tool-card-head:not(:has(.tool-card-repo)) {
+    margin-bottom: 0.35rem;
+  }
+  .tool-card-title {
+    font-family: var(--font-display);
+    font-size: 1rem;
+    font-weight: 600;
+    line-height: 1.2;
+    letter-spacing: -0.01em;
+    color: var(--color-text);
+    margin: 0;
+  }
+  .tool-card-tag {
+    display: inline-flex;
+    align-items: center;
+    white-space: nowrap;
+    line-height: 1;
+    /* Slightly more top than bottom padding: uppercase has no descenders, so
+       symmetric padding reads top-heavy. This optically centers the caps. */
+    padding: 0.3em 0.55em 0.2em;
+    border-radius: 999px;
+    font-size: 0.6rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-pink);
+    background: color-mix(in oklab, var(--color-pink) 14%, transparent);
+    border: 1px solid color-mix(in oklab, var(--color-pink) 30%, transparent);
+  }
+  .tool-card-desc {
+    flex: 1;
+    margin: 0.5rem 0 0.9rem;
+    font-size: 0.875rem;
+    line-height: 1.55;
+    color: var(--color-muted);
+  }
+  .gh-stars {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    flex-shrink: 0;
+    white-space: nowrap;
+    padding: 0.1rem 0.45rem;
+    border-radius: 999px;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--color-warning);
+    background: color-mix(in oklab, var(--color-warning) 12%, transparent);
+    border: 1px solid color-mix(in oklab, var(--color-warning) 25%, transparent);
+  }
+  .gh-stars svg {
+    width: 0.8em;
+    height: 0.8em;
+  }
+  .tool-card-btn {
+    align-self: flex-start;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.35rem 0.7rem;
+    border: 1px solid var(--color-border);
+    border-radius: 0.5rem;
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: var(--color-muted);
+    transition:
+      color 0.15s ease,
+      border-color 0.15s ease,
+      background-color 0.15s ease;
+  }
+  .tool-card-btn:hover {
+    color: var(--color-accent);
+    border-color: color-mix(in oklab, var(--color-accent) 50%, transparent);
+    background: color-mix(in oklab, var(--color-accent) 6%, transparent);
+  }
+
+  /* Markdown docs prose. Styles bare elements emitted by the Markdown
+     renderer, scoped so anything inside a `.not-prose` subtree (e.g. the
+     card grid on the docs index) is left alone. */
+  .prose-docs {
+    color: var(--color-muted);
+    font-size: 0.95rem;
+    line-height: 1.75;
+  }
+  .prose-docs > :first-child {
+    margin-top: 0;
+  }
+  .prose-docs :where(h2):not(:where(.not-prose *)) {
+    font-family: var(--font-sans);
+    letter-spacing: -0.02em;
+    color: var(--color-text);
+    font-size: 1.5rem;
+    font-weight: 700;
+    margin-top: 2.75rem;
+    margin-bottom: 1rem;
+    padding-bottom: 0.4rem;
+    border-bottom: 1px solid var(--color-border-soft);
+    scroll-margin-top: 5rem;
+  }
+  .prose-docs :where(h3):not(:where(.not-prose *)) {
+    font-family: var(--font-sans);
+    color: var(--color-text);
+    font-size: 1.2rem;
+    font-weight: 600;
+    margin-top: 2rem;
+    margin-bottom: 0.75rem;
+    scroll-margin-top: 5rem;
+  }
+  .prose-docs :where(h4):not(:where(.not-prose *)) {
+    color: var(--color-text);
+    font-weight: 600;
+    margin-top: 1.5rem;
+    margin-bottom: 0.5rem;
+    scroll-margin-top: 5rem;
+  }
+  .prose-docs :where(p):not(:where(.not-prose *)) {
+    margin: 1rem 0;
+  }
+  .prose-docs :where(a):not(:where(.not-prose *)) {
+    color: var(--color-accent);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    text-decoration-color: color-mix(in oklab, var(--color-accent) 40%, transparent);
+  }
+  .prose-docs :where(a):not(:where(.not-prose *)):hover {
+    text-decoration-color: var(--color-accent);
+  }
+  .prose-docs :where(strong):not(:where(.not-prose *)) {
+    color: var(--color-text);
+    font-weight: 600;
+  }
+  .prose-docs :where(ul, ol):not(:where(.not-prose *)) {
+    margin: 1rem 0;
+    padding-left: 1.5rem;
+  }
+  .prose-docs :where(ul):not(:where(.not-prose *)) {
+    list-style: disc;
+  }
+  .prose-docs :where(ol):not(:where(.not-prose *)) {
+    list-style: decimal;
+  }
+  .prose-docs :where(li):not(:where(.not-prose *)) {
+    margin: 0.4rem 0;
+  }
+  .prose-docs :where(li):not(:where(.not-prose *))::marker {
+    color: var(--color-dim);
+  }
+  /* Let long inline paths/commands wrap on narrow screens instead of
+     overflowing (the global chip style sets nowrap). */
+  .prose-docs :where(:not(pre) > code):not(:where(.not-prose *)) {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .prose-docs :where(pre):not(:where(.not-prose *)) {
+    margin: 1.25rem 0;
+    padding: 1rem 1.25rem;
+    border-radius: 0.6rem;
+    border: 1px solid var(--color-border);
+    overflow-x: auto;
+    font-size: 0.85rem;
+    line-height: 1.6;
+  }
+  .prose-docs :where(blockquote):not(:where(.not-prose *)) {
+    border-left: 3px solid var(--color-accent);
+    padding-left: 1rem;
+    margin: 1.25rem 0;
+    color: var(--color-muted);
+    font-style: italic;
+  }
+  .prose-docs :where(hr):not(:where(.not-prose *)) {
+    border: 0;
+    border-top: 1px solid var(--color-border-soft);
+    margin: 2.5rem 0;
+  }
+  /* GitHub-style admonitions. A `> [!NOTE]` blockquote is rewritten to
+     `<div class="admonition admonition-note">` by src/lib/remark-admonitions.mjs;
+     the per-type accent (mapped to the site's semantic colors below) drives the
+     border, the octicon, and the title. */
+  .prose-docs :where(.admonition):not(:where(.not-prose *)) {
+    --admonition-accent: var(--color-accent);
+    margin: 1.5rem 0;
+    padding: 0.85rem 1.1rem;
+    /* One even border all the way round, in a softened accent: a heavier left
+       edge alone reads as a stripe rather than a box, and the full-strength
+       accent on four sides shouts over the text it frames. */
+    border: 3px solid color-mix(in oklab, var(--admonition-accent) 45%, var(--color-border-soft));
+    border-radius: 0.6rem;
+    background: color-mix(in oklab, var(--admonition-accent) 7%, var(--color-panel));
+  }
+  /* Trim the outer margins of the callout's own content so the box hugs its text
+     (the title is the first child; the last paragraph is the last child). */
+  .prose-docs :where(.admonition > :first-child):not(:where(.not-prose *)) {
+    margin-top: 0;
+  }
+  .prose-docs :where(.admonition > :last-child):not(:where(.not-prose *)) {
+    margin-bottom: 0;
+  }
+  .admonition-title {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 0.82rem;
+    letter-spacing: 0.02em;
+    color: var(--admonition-accent);
+  }
+  .admonition-icon {
+    width: 1.05em;
+    height: 1.05em;
+    flex: none;
+  }
+  .admonition-note {
+    --admonition-accent: var(--color-accent);
+  }
+  .admonition-tip {
+    --admonition-accent: var(--color-success);
+  }
+  .admonition-important {
+    --admonition-accent: var(--color-purple);
+  }
+  .admonition-warning {
+    --admonition-accent: var(--color-warning);
+  }
+  .admonition-caution {
+    --admonition-accent: var(--color-error);
+  }
+  .prose-docs :where(table):not(:where(.not-prose *)) {
+    display: block;
+    width: 100%;
+    border-collapse: collapse;
+    overflow-x: auto;
+    margin: 1.25rem 0;
+    font-size: 0.875rem;
+  }
+  .prose-docs :where(th, td):not(:where(.not-prose *)) {
+    border: 1px solid var(--color-border-soft);
+    padding: 0.5rem 0.75rem;
+    text-align: left;
+  }
+  .prose-docs :where(th):not(:where(.not-prose *)) {
+    background: var(--color-panel-2);
+    color: var(--color-text);
+    font-weight: 600;
+  }
+  .prose-docs :where(img):not(:where(.not-prose *)) {
+    max-width: 100%;
+    height: auto;
+    border-radius: 0.5rem;
+    margin: 1.25rem 0;
+    /* Centered by default: most screenshots are narrower than the column,
+     and a left-hugging image reads as a layout accident. The alignment
+     hashes below still override. */
+    margin-inline: auto;
+    display: block;
+}
+  /* Image layout helpers for prose. The classes are applied from Markdown via
+     a URL-hash convention (`![alt](/img.png#right)`) handled by the
+     rehype-prose-images plugin, never hand-written HTML. `full-width` fills
+     the column; `align-left`/`align-right` float the image so text wraps beside
+     it; `align-center` centers a block. On narrow screens the floats drop to
+     full width so they're never squeezed into an unreadable sliver. */
+  .prose-docs img.full-width {
+    width: 100%;
+  }
+  .prose-docs img.align-center {
+    display: block;
+    margin-inline: auto;
+  }
+  .prose-docs img.align-left {
+    float: left;
+    width: min(45%, 14rem);
+    margin: 0.35rem 1.5rem 1rem 0;
+  }
+  .prose-docs img.align-right {
+    float: right;
+    width: min(45%, 14rem);
+    margin: 0.35rem 0 1rem 1.5rem;
+  }
+  @media (max-width: 640px) {
+    .prose-docs img.align-left,
+    .prose-docs img.align-right {
+      float: none;
+      width: 100%;
+      margin: 1.25rem 0;
+    }
+  }
+  /* The <picture> wrapper (rehype-prose-images, for webp) is layout-neutral so
+     the alignment/sizing on the inner <img> behaves as if it were in the flow
+     directly. */
+  .prose-docs picture {
+    display: contents;
+  }
+  /* Clickable "#" appended to each heading by rehype-autolink-headings. The
+     anchor itself is empty; the glyph is drawn here so it stays out of the
+     heading text the table of contents is generated from. */
+  .prose-docs .heading-anchor {
+    color: var(--color-dim);
+    text-decoration: none;
+    opacity: 0;
+    transition: opacity 0.15s ease, color 0.15s ease;
+  }
+  .prose-docs .heading-anchor::after {
+    content: "#";
+    margin-left: 0.4rem;
+  }
+  .prose-docs :where(h2, h3, h4):hover .heading-anchor {
+    opacity: 1;
+  }
+  .prose-docs .heading-anchor:hover {
+    color: var(--color-accent);
+  }
+
+  /* ── Graphviz diagrams ────────────────────────────────────────────────────
+     Inline SVG produced at build time from DOT (src/lib/graphviz.mjs), used by
+     both the ```dot fences in the docs and the <Diagram> component on the
+     homepage. Graphviz writes its colors as presentation attributes
+     (fill="lightgrey", stroke="black"), which lose to any CSS rule, so every
+     color a reader sees comes from the tokens below and the DOT sources name
+     no colors at all. Colors ONLY: the CSS here never sets font-family or
+     font-size, because Graphviz measured every box against the metrics it
+     emitted, and a wider face at render time would push labels out of their
+     boxes.
+
+     Sizing: the renderer strips Graphviz's fixed pt width/height, keeps the
+     viewBox, and publishes the intrinsic width as --diagram-width plus a
+     readability floor as --diagram-min-width. The figure scrolls in its own box
+     rather than shrinking labels into nothing on a phone. */
+  .diagram {
+    /* Capped and centred rather than stretched across a full-width section
+       around a thin drawing. The cap is the diagram's OWN intrinsic width where
+       that is smaller, so a narrow vertical topology (around 260px) sits in a
+       card that fits it, while a wide left-to-right one gets the room it needs
+       instead of being squeezed back down by a fixed cap. 46rem is the ceiling
+       for the widest of them; on a phone neither limit applies because the
+       viewport is smaller than both. */
+    max-width: min(46rem, max(var(--diagram-width, 34rem), 20rem));
+    margin: 1.75rem auto;
+    padding: 1.1rem 0.75rem 0.9rem;
+    border: 1px solid var(--color-border-soft);
+    border-radius: 0.75rem;
+    background: color-mix(in oklab, var(--color-panel) 55%, transparent);
+  }
+  /* Full bleed within its section, for a diagram that IS the illustration
+     rather than an aside inside prose. The capped card is right in the docs,
+     where a diagram sits between paragraphs and a full-width drawing would
+     break the reading column. On the homepage the section has nothing else in
+     that row, so the cap only made a wide diagram look squished inside an
+     unnecessary box. */
+  .diagram--full {
+    max-width: none;
+  }
+
+  /* The SVG normally stops at its own intrinsic width so a small diagram is not
+     blown up to fill a column. A full-bleed one is the opposite case: it should
+     take the section. Scaling up costs nothing here because it is vector, and
+     the labels get larger rather than fuzzier. */
+  .diagram--full .diagram-svg {
+    width: 100%;
+    max-width: none;
+  }
+
+  .diagram-scroll {
+    overflow-x: auto;
+    display: flex;
+    justify-content: center;
+  }
+  .diagram-svg {
+    height: auto;
+    max-width: var(--diagram-width);
+    min-width: var(--diagram-min-width);
+  }
+  .diagram-caption {
+    margin-top: 0.85rem;
+    padding-top: 0.7rem;
+    border-top: 1px solid var(--color-border-soft);
+    text-align: center;
+    font-size: 0.8rem;
+    line-height: 1.5;
+    color: var(--color-dim);
+  }
+
+  /* Nodes: a filled rounded box (Graphviz emits a <path> for rounded corners
+     and a <polygon> for square ones, so both are covered). */
+  .diagram .node > path,
+  .diagram .node > polygon {
+    fill: var(--color-panel-2);
+    stroke: var(--color-border);
+  }
+  .diagram .node > text {
+    fill: var(--color-text);
+  }
+  /* The secondary label line is authored at 9pt in the DOT source and dimmed
+     here. Graphviz gives no per-line hook, and the point size is the one thing
+     it does emit that identifies the line; if a DOT source changes that size,
+     change it here too. */
+  .diagram .node > text[font-size="9.00"] {
+    fill: var(--color-dim);
+  }
+
+  /* Edges: line, arrowhead, and the label riding beside it. */
+  .diagram .edge > path {
+    stroke: var(--color-dim);
+  }
+  .diagram .edge > polygon {
+    fill: var(--color-dim);
+    stroke: var(--color-dim);
+  }
+  .diagram .edge > text {
+    fill: var(--color-dim);
+  }
+
+  /* Clusters: the dashed enclosure and its title. */
+  .diagram .cluster > path,
+  .diagram .cluster > polygon {
+    fill: color-mix(in oklab, var(--color-accent) 4%, transparent);
+    stroke: color-mix(in oklab, var(--color-border) 70%, transparent);
+    stroke-dasharray: 4 4;
+  }
+  .diagram .cluster > text {
+    fill: var(--color-dim);
+  }
+
+  /* Semantic node roles. A DOT source picks one of these by class; it never
+     picks a color. `d-outside` is the untrusted side of the boundary,
+     `d-gate` is whatever authenticates, `d-app` is dux itself, and `d-plain`
+     is scenery. */
+  .diagram .d-outside > path,
+  .diagram .d-outside > polygon {
+    fill: transparent;
+    stroke: var(--color-border);
+    stroke-dasharray: 4 3;
+  }
+  .diagram .d-outside > text {
+    fill: var(--color-muted);
+  }
+  .diagram .d-gate > path,
+  .diagram .d-gate > polygon {
+    fill: color-mix(in oklab, var(--color-accent) 12%, var(--color-panel-2));
+    stroke: color-mix(in oklab, var(--color-accent) 65%, transparent);
+  }
+  .diagram .d-app > path,
+  .diagram .d-app > polygon {
+    fill: color-mix(in oklab, var(--color-pink) 10%, var(--color-panel-2));
+    stroke: color-mix(in oklab, var(--color-pink) 55%, transparent);
+  }
+  .diagram .d-tls > path,
+  .diagram .d-tls > polygon {
+    fill: color-mix(in oklab, var(--color-success) 10%, var(--color-panel-2));
+    stroke: color-mix(in oklab, var(--color-success) 50%, transparent);
+  }
+}

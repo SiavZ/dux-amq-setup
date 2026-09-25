@@ -1,26 +1,29 @@
-# audit02 Phase 24 (P2-1) — code owners for review routing.
+# audit02 Phase 24 (P2-1): code owners for review routing.
 #
 # CODEOWNERS only takes effect when branch protection enables
 # "Require review from Code Owners". Without that, this file is
-# informational. See docs/plans/audits/audit02/26-* for the
-# branch-protection rollout.
+# informational. See .github/BRANCH_PROTECTION.md.
 
 # Default owner for the repository
-*                              @SiavZ
+*                                   @SiavZ
 
-# Rust patches to upstream files require sharper review
-src/clipboard.rs               @SiavZ
-src/app/mod.rs                 @SiavZ
-src/app/render.rs              @SiavZ
-src/config.rs                  @SiavZ
+# Upstream files this fork patches: review changes here with the
+# fork's deltas in mind, since upstream merges touch them too.
+crates/dux-tui/src/clipboard.rs     @SiavZ
+crates/dux-tui/src/app/mod.rs       @SiavZ
+crates/dux-tui/src/app/render.rs    @SiavZ
+crates/dux-core/src/config.rs       @SiavZ
 
-# Audit deliverables
-docs/audits/                   @SiavZ
-docs/plans/audits/             @SiavZ
+# Audit deliverables and the living security docs
+docs/audits/                        @SiavZ
+docs/operations/                    @SiavZ
+SECURITY.md                         @SiavZ
 
 # Supply-chain critical
-.github/workflows/             @SiavZ
-.github/dependabot.yml         @SiavZ
-dux-amq/install.sh             @SiavZ
-deny.toml                      @SiavZ
-rust-toolchain.toml            @SiavZ
+.github/workflows/                  @SiavZ
+.github/scripts/                    @SiavZ
+.github/dependabot.yml              @SiavZ
+install.sh                          @SiavZ
+dux-amq/install.sh                  @SiavZ
+deny.toml                           @SiavZ
+Cargo.lock                          @SiavZ

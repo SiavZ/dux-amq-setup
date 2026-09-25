@@ -175,9 +175,9 @@ EOF
   local output_file="$BATS_TEST_TMPDIR/doctor.json"
   "$DOCTOR" --json --anonymize >"$output_file"
   jq -e . "$output_file" >/dev/null
-  ! grep -Fq -- "$HOME" "$output_file"
-  ! grep -Fq -- '"alpha"' "$output_file"
-  ! grep -Fq -- '"bravo"' "$output_file"
+  ! grep -Fq -- "$HOME" "$output_file" || false
+  ! grep -Fq -- '"alpha"' "$output_file" || false
+  ! grep -Fq -- '"bravo"' "$output_file" || false
   grep -Fq -- 'agent-1' "$output_file"
 }
 

@@ -1,0 +1,1493 @@
+//! REST write verbs for the config-mutating operations. Each dispatches its
+//! [`WireCommand`] through [`EngineHandle::apply_wire_scoped`] with a
+//! per-connection [`StatusScope`] taken from the optional `X-Connection-Id`
+//! header, the same pattern as `session_actions`.
+//!
+//! Any client that can reach the address can rewrite `config.toml`: that follows
+//! from the single-tenant trusted-access model, and the Host allowlist and
+//! same-origin check are not authentication.
+//!
+//! A successful config change makes the engine emit `config.changed`, so clients
+//! refetch `/api/v1/bootstrap`; no handler here echoes the new state.
+
+use std::collections::BTreeMap;
+
+use axum::{
+    Json, Router,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, patch, post, put},
+};
+use serde::{Deserialize, Serialize};
+
+use dux_core::wire::{SettingsPatch, WireCommand, WireMacroEntry};
+
+use crate::rest_common::scope_from_headers;
+use crate::server::AppState;
+
+/// The config-mutation routes.
+pub fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/api/v1/macros", put(update_macros))
+        .route("/api/v1/global-env", put(persist_global_env))
+        .route("/api/v1/ui/changes-pane", put(set_changes_pane))
+        .route("/api/v1/config/reload", post(reload_config))
+        .route(
+            "/api/v1/defaults/toggle-randomized-pet-name",
+            post(toggle_randomized_pet_name_default),
+        )
+        .route(
+            "/api/v1/ui/toggle-pr-banner-position",
+            post(toggle_pr_banner_position),
+        )
+        .route("/api/v1/ui/agent-sort", post(set_agent_sort))
+        .route(
+            "/api/v1/ui/toggle-github-integration",
+            post(toggle_github_integration),
+        )
+        .route("/api/v1/github/recheck", post(recheck_github))
+        .route(
+            "/api/v1/ui/toggle-copy-on-select",
+            post(toggle_copy_on_select),
+        )
+        .route(
+            "/api/v1/ui/toggle-always-show-tab-strip",
+            post(toggle_always_show_tab_strip),
+        )
+        .route(
+            "/api/v1/config/instance-identity",
+            post(set_instance_identity),
+        )
+        .route("/api/v1/config/settings", patch(set_settings))
+        .route("/api/v1/server/tailscale-mode", post(set_tailscale_mode))
+        .route(
+            "/api/v1/config/raw",
+            // A config.toml is a few KB; 256 KB is generous. The cap stops a
+            // client from streaming a multi-MB body that the engine thread would
+            // then parse and fsync.
+            get(read_raw_config)
+                .put(write_raw_config)
+                .layer(axum::extract::DefaultBodyLimit::max(256 * 1024)),
+        )
+}
+
+// ── Macros ───────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct UpdateMacrosBody {
+    /// The whole macro set, in order. `WireMacroEntry` is `{name, text, surface}`,
+    /// matching the frontend's `MacroView`. The engine validates wholesale
+    /// (empty/duplicate names, empty text, unknown surface all rejected).
+    entries: Vec<WireMacroEntry>,
+}
+
+async fn update_macros(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateMacrosBody>,
+) -> Response {
+    dispatch(
+        &state,
+        &headers,
+        WireCommand::UpdateMacros {
+            entries: body.entries,
+        },
+    )
+    .await
+}
+
+// ── Global env ─────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct GlobalEnvBody {
+    /// The whole workspace-wide env map (replace-wholesale).
+    env: BTreeMap<String, String>,
+}
+
+async fn persist_global_env(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<GlobalEnvBody>,
+) -> Response {
+    dispatch(
+        &state,
+        &headers,
+        WireCommand::PersistGlobalEnv { env: body.env },
+    )
+    .await
+}
+
+// ── Changes pane ───────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ChangesPaneBody {
+    visible: bool,
+}
+
+async fn set_changes_pane(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ChangesPaneBody>,
+) -> Response {
+    dispatch(
+        &state,
+        &headers,
+        WireCommand::SetChangesPaneVisible {
+            visible: body.visible,
+        },
+    )
+    .await
+}
+
+// ── Reload ─────────────────────────────────────────────────────────────────────
+
+/// `POST /api/v1/config/reload`. No body is required (the frontend sends `{}`),
+/// so no `Json` extractor is used. A config reload re-reads `config.toml` from disk.
+async fn reload_config(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    dispatch(&state, &headers, WireCommand::ReloadConfig {}).await
+}
+
+// Each preference toggle below is a parameterless POST: the server owns the
+// current value and flips it, so two surfaces never disagree about the next state.
+
+/// `POST /api/v1/defaults/toggle-randomized-pet-name`. Flip the random pet-name
+/// default (`defaults.enable_randomized_pet_name_by_default`).
+async fn toggle_randomized_pet_name_default(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    dispatch(
+        &state,
+        &headers,
+        WireCommand::ToggleRandomizedPetNameDefault {},
+    )
+    .await
+}
+
+/// `POST /api/v1/ui/toggle-pr-banner-position`. Swap the PR banner between the
+/// top and bottom of the agent pane (`ui.pr_banner_position`).
+async fn toggle_pr_banner_position(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    dispatch(&state, &headers, WireCommand::TogglePrBannerPosition {}).await
+}
+
+#[derive(Deserialize)]
+struct AgentSortBody {
+    sort: String,
+}
+
+/// `POST /api/v1/ui/agent-sort`. Set the web agent-list sort mode
+/// (`ui.agent_sort`) to an explicit value. The engine validates it and rejects
+/// unknown modes. The sidebar's sort control and a drag-reorder both call this.
+async fn set_agent_sort(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AgentSortBody>,
+) -> Response {
+    dispatch(
+        &state,
+        &headers,
+        WireCommand::SetAgentSort { sort: body.sort },
+    )
+    .await
+}
+
+/// `POST /api/v1/ui/toggle-github-integration`. Flip GitHub PR integration
+/// (`ui.github_integration`) and its engine-side PR-sync side effects.
+async fn toggle_github_integration(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    dispatch(&state, &headers, WireCommand::ToggleGithubIntegration {}).await
+}
+
+/// `POST /api/v1/github/recheck`. Ask `gh` again right now. Writes no config;
+/// the reply is the routed status, and a change in availability separately
+/// nudges every client to refetch its bootstrap document.
+async fn recheck_github(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    dispatch(&state, &headers, WireCommand::RecheckGithub {}).await
+}
+
+/// `POST /api/v1/ui/toggle-copy-on-select`. Flip whether selecting text in the
+/// web terminal auto-copies it (`ui.copy_on_select`).
+async fn toggle_copy_on_select(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    dispatch(&state, &headers, WireCommand::ToggleCopyOnSelect {}).await
+}
+
+/// `POST /api/v1/ui/toggle-always-show-tab-strip`. Flip whether the agent tab
+/// strip is always shown, even with a single tab (`ui.always_show_tab_strip`).
+async fn toggle_always_show_tab_strip(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    dispatch(&state, &headers, WireCommand::ToggleAlwaysShowTabStrip {}).await
+}
+
+// ── Instance identity (customize-webapp dialog) ──────────────────────────────
+
+/// The instance identity body. Both fields are `#[serde(default)]` so a single-field
+/// body (`{"favicon":"amber"}`) or an empty body (`{}`) both deserialize: the
+/// handler only touches the fields that are present, and an empty body is a no-op.
+#[derive(Deserialize, Default)]
+struct InstanceIdentityBody {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    favicon: Option<String>,
+}
+
+/// `POST /api/v1/config/instance-identity`. Persist this instance's browser tab
+/// title (`config.server.title`) and favicon color (`config.server.favicon`). Bare
+/// `200`, or plain-text `400` when the engine rejects an unknown favicon color.
+async fn set_instance_identity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<InstanceIdentityBody>,
+) -> Response {
+    dispatch(
+        &state,
+        &headers,
+        WireCommand::SetInstanceIdentity {
+            title: body.title,
+            favicon: body.favicon,
+        },
+    )
+    .await
+}
+
+// The settings-PATCH body nests typed sub-structs by config section, each
+// `#[serde(default, deny_unknown_fields)]` with `Option<T>` fields: a flat map
+// could enforce neither per-field types nor unknown-key rejection, and flat
+// dotted-rename keys fight `deny_unknown_fields` across two groups.
+
+/// The `[ui]` half of a settings-PATCH body. Every field is optional; an
+/// absent field is left untouched. Unknown fields are rejected (400) so a
+/// typo or a client/server drift surfaces immediately instead of silently
+/// no-opping.
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct UiSettingsPatch {
+    copy_on_select: Option<bool>,
+    compose_bar: Option<String>,
+    mobile_accessory_bar: Option<bool>,
+    /// Whether the agent upload directory keeps a self-ignoring `.gitignore`.
+    /// Its companion `upload_directory` is deliberately not settable here: it
+    /// is a path, and the web has no directory picker to edit one with.
+    upload_write_gitignore: Option<bool>,
+    /// How many characters a text paste onto an agent pane may run to before
+    /// the web saves it as a file and pastes the path. Out-of-range values are
+    /// clamped engine-side (see `normalized_upload_pasted_text_chars`), not
+    /// rejected here.
+    upload_pasted_text_chars: Option<usize>,
+    auto_reopen_agents: Option<bool>,
+    show_changes_pane: Option<bool>,
+    always_show_tab_strip: Option<bool>,
+    tab_reaches_agent: Option<bool>,
+    status_clear_seconds: Option<u16>,
+    attention_grace_seconds: Option<u64>,
+    attention_indicator: Option<bool>,
+    attention_on_bell: Option<bool>,
+    pr_banner_position: Option<String>,
+    /// Suppresses the AUTOMATIC first-run welcome screen only; the app menu's
+    /// on-demand entry still opens it.
+    disable_automated_welcome_screen: Option<bool>,
+    /// Suppresses the AUTOMATIC what's-new screen only; the app menu's on-demand
+    /// entry still opens it.
+    disable_release_notes: Option<bool>,
+    /// A font name installed on the viewing device, placed ahead of dux's
+    /// bundled web terminal font stack. Empty string is a valid value (it
+    /// means "use the bundled stack only"). Web UI only.
+    terminal_font_family: Option<String>,
+    /// The web terminal's font size in pixels. Out-of-range values are
+    /// normalized engine-side (see `normalized_terminal_font_size`), not
+    /// rejected here.
+    terminal_font_size: Option<u16>,
+}
+
+/// The `[capabilities]` half of a settings-PATCH body. Same optional/
+/// unknown-field-rejecting shape as [`UiSettingsPatch`].
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct CapabilitiesSettingsPatch {
+    web_notifications: Option<bool>,
+    hyperlinks: Option<bool>,
+}
+
+/// The `[defaults]` half of a settings-PATCH body, shaped like [`UiSettingsPatch`].
+/// `provider` is the global default for new agents in projects with no override of
+/// their own, validated engine-side against the configured provider list; a
+/// project's `default_provider` has its own wire path.
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct DefaultsSettingsPatch {
+    enable_randomized_pet_name_by_default: Option<bool>,
+    provider: Option<String>,
+}
+
+/// `PATCH /api/v1/config/settings` body: every group and every leaf optional.
+/// `title` and `favicon` stay on `POST /api/v1/config/instance-identity`, and
+/// `ui.github_integration` keeps its own endpoint because flipping it arms or
+/// disarms background PR syncing.
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct SettingsBody {
+    ui: UiSettingsPatch,
+    capabilities: CapabilitiesSettingsPatch,
+    defaults: DefaultsSettingsPatch,
+    /// Suppress this request's info status. Top-level because it is not a settings
+    /// field, and honored by the engine only for a patch confined to the
+    /// accessory-bar field, so it can silence no other settings write.
+    quiet: bool,
+}
+
+/// `PATCH /api/v1/config/settings`. Set explicit values for the Settings modal's
+/// fields in one request; an omitted field is left untouched and an empty body is
+/// a no-op `200`. A validation error is a plain-text `400` and mutates nothing.
+/// The engine clamps numeric fields server-side, so a client's own bounds are
+/// UX-only and the saved value comes from the post-save bootstrap refetch.
+async fn set_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<SettingsBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    // Deliberately unlike `set_instance_identity`, which lets axum answer a bad
+    // body with its default 422: this route's nested `deny_unknown_fields` structs
+    // turn a client typo or field-set drift into a deserialize rejection, so it is
+    // mapped to the same plain-text 400 its own validation failures use and a
+    // caller need only branch on ok versus 4xx-with-a-message.
+    let Json(body) = match body {
+        Ok(json) => json,
+        Err(rejection) => {
+            return (StatusCode::BAD_REQUEST, rejection.body_text()).into_response();
+        }
+    };
+    dispatch(
+        &state,
+        &headers,
+        // The regrouping from the body's config-section groups onto the flat
+        // patch is real work, so it stays hand-written: this is the contract
+        // boundary between the public HTTP shape and the wire command.
+        WireCommand::SetSettings(SettingsPatch {
+            copy_on_select: body.ui.copy_on_select,
+            compose_bar: body.ui.compose_bar,
+            mobile_accessory_bar: body.ui.mobile_accessory_bar,
+            upload_write_gitignore: body.ui.upload_write_gitignore,
+            upload_pasted_text_chars: body.ui.upload_pasted_text_chars,
+            auto_reopen_agents: body.ui.auto_reopen_agents,
+            show_changes_pane: body.ui.show_changes_pane,
+            web_notifications: body.capabilities.web_notifications,
+            always_show_tab_strip: body.ui.always_show_tab_strip,
+            tab_reaches_agent: body.ui.tab_reaches_agent,
+            status_clear_seconds: body.ui.status_clear_seconds,
+            attention_grace_seconds: body.ui.attention_grace_seconds,
+            attention_indicator: body.ui.attention_indicator,
+            attention_on_bell: body.ui.attention_on_bell,
+            pr_banner_position: body.ui.pr_banner_position,
+            hyperlinks: body.capabilities.hyperlinks,
+            enable_randomized_pet_name_by_default: body
+                .defaults
+                .enable_randomized_pet_name_by_default,
+            default_provider: body.defaults.provider,
+            disable_automated_welcome_screen: body.ui.disable_automated_welcome_screen,
+            disable_release_notes: body.ui.disable_release_notes,
+            terminal_font_family: body.ui.terminal_font_family,
+            terminal_font_size: body.ui.terminal_font_size,
+            quiet: body.quiet,
+        }),
+    )
+    .await
+}
+
+// ── Raw config editor (Monaco) ───────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct RawConfigBody {
+    /// The raw `config.toml` text, verbatim from disk (or the plain render of the
+    /// running config when no file exists yet).
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct WriteRawConfigBody {
+    content: String,
+}
+
+/// `GET /api/v1/config/raw`. Return the raw `config.toml` text for the editor. A
+/// read failure, or a missing engine, is a `503` so the editor surfaces an error
+/// instead of opening on blank content.
+async fn read_raw_config(State(state): State<AppState>) -> Response {
+    match state.engine.read_raw_config().await {
+        Ok(content) => Json(RawConfigBody { content }).into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+    }
+}
+
+/// `PUT /api/v1/config/raw`. Validate and write the raw `config.toml` text
+/// verbatim, `400` with the parse or IO error otherwise. Persists only: the
+/// running config is untouched and no `config.changed` fires until
+/// `POST /api/v1/config/reload`, which is the single apply point.
+async fn write_raw_config(
+    State(state): State<AppState>,
+    Json(body): Json<WriteRawConfigBody>,
+) -> Response {
+    match state.engine.write_raw_config(body.content).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+// ── The live Tailscale mode ─────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct TailscaleModeBody {
+    /// One of `auto` | `yes` | `no`. Validated by the engine, which refuses
+    /// anything else rather than degrading it.
+    mode: String,
+}
+
+/// What the mode change did, for the browser to raise as a toast. The sentence
+/// travels rather than being rebuilt client-side: the terminal UI shows the same
+/// one, and a second copy in TypeScript is how the two drift apart.
+#[derive(Serialize)]
+struct TailscaleModeReply {
+    /// The mode that was saved, canonicalized.
+    mode: String,
+    /// Whether the sentence is a warning rather than plain information.
+    warning: bool,
+    message: String,
+}
+
+/// `POST /api/v1/server/tailscale-mode`. Save `[server] tailscale`, then apply it
+/// to the running listener: the write comes first so the choice survives whatever
+/// happens to the listener, and the reply says so when nothing is serving.
+///
+/// A browser on the Tailscale leg choosing `no` cuts its own connection; the reply
+/// is written before the unbind lands so this response still arrives.
+async fn set_tailscale_mode(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TailscaleModeBody>,
+) -> Response {
+    if let Err(e) = state
+        .engine
+        .apply_wire_scoped(
+            WireCommand::SetTailscaleMode {
+                mode: body.mode.clone(),
+            },
+            scope_from_headers(&headers, &state.connections),
+        )
+        .await
+    {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+    // Parsing again rather than threading the engine's answer back: the engine
+    // has already refused anything outside the tri-state, so this cannot fail,
+    // and it keeps the reply's `mode` canonical.
+    let mode = dux_core::config::TailscaleMode::parse(&body.mode).unwrap_or_default();
+    let outcome = match state.tailscale_mode.as_ref() {
+        Some(control) => control.set_mode(mode).await,
+        None => dux_core::config::TailscaleModeOutcome::NotServing,
+    };
+    let report = outcome.report(mode);
+    Json(TailscaleModeReply {
+        mode: mode.as_str().to_string(),
+        warning: report.warning,
+        message: report.message,
+    })
+    .into_response()
+}
+
+// ── Shared dispatch ─────────────────────────────────────────────────────────────
+
+/// Dispatch a config-mutating wire command, scoping its status toasts to the
+/// originating connection. `200 OK` on success; `400` with the engine's
+/// user-facing validation message otherwise.
+async fn dispatch(state: &AppState, headers: &HeaderMap, cmd: WireCommand) -> Response {
+    match state
+        .engine
+        .apply_wire_scoped(cmd, scope_from_headers(headers, &state.connections))
+        .await
+    {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    use crate::test_support::router_no_auth;
+
+    fn json_req(method: &str, uri: &str, body: &str) -> Request<axum::body::Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn setting_the_tailscale_mode_saves_it_and_says_it_applies_when_a_listener_starts() {
+        // Nothing is serving behind a test router, which is the honest half of
+        // the answer: the choice is saved, and the listener half happens later.
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .clone()
+            .oneshot(json_req(
+                "POST",
+                "/api/v1/server/tailscale-mode",
+                r#"{"mode":"no"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let reply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reply["mode"], "no");
+        assert_eq!(reply["warning"], false);
+        assert!(
+            reply["message"]
+                .as_str()
+                .expect("a sentence")
+                .contains("applies when a listener starts"),
+            "{reply}"
+        );
+
+        // And the write really happened: the next bootstrap carries it.
+        let boot = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/bootstrap")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let boot = axum::body::to_bytes(boot.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let boot: serde_json::Value = serde_json::from_slice(&boot).unwrap();
+        assert_eq!(boot["tailscale_mode"], "no");
+        assert_eq!(
+            boot["tailscale_forced_no"], false,
+            "a test router is not a --no-tailscale run"
+        );
+    }
+
+    /// A router with a serve behind its Tailscale route: a stub loop that
+    /// records every mode it is asked for and answers each with `answer`. The
+    /// real loop's decisions are covered where the loop lives; what a route test
+    /// needs is that the request reaches the serve and its answer reaches the
+    /// reply body.
+    fn tailscale_router(
+        answer: dux_core::config::TailscaleModeOutcome,
+        forced_no: bool,
+    ) -> (
+        tempfile::TempDir,
+        axum::Router,
+        std::sync::Arc<std::sync::Mutex<Vec<dux_core::config::TailscaleMode>>>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let handle = crate::test_support::test_engine_handle(tmp.path());
+        let (control, mut requests) = crate::serve_legs::TailscaleModeControl::new(
+            tokio::runtime::Handle::current(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Some(request) = requests.recv().await {
+                recorder.lock().expect("not poisoned").push(request.mode);
+                let _ = request.reply.send(answer);
+            }
+        });
+        let app = crate::server::build_app(
+            handle,
+            axum::Router::new(),
+            crate::server::RouterParams::plain_http()
+                .with_tailscale_mode_control(control, forced_no),
+        );
+        (tmp, app, seen)
+    }
+
+    async fn reply_of(app: axum::Router, mode: &str) -> serde_json::Value {
+        let resp = app
+            .oneshot(json_req(
+                "POST",
+                "/api/v1/server/tailscale-mode",
+                &format!(r#"{{"mode":"{mode}"}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_run_started_with_no_tailscale_answers_the_route_with_its_refusal() {
+        // The flag outranks the config for as long as the run lasts, so the
+        // reply has to say that AND that the choice is saved for the next one.
+        let (_tmp, app, seen) = tailscale_router(
+            dux_core::config::TailscaleModeOutcome::RefusedForcedNo,
+            true,
+        );
+        let reply = reply_of(app.clone(), "yes").await;
+        assert_eq!(reply["mode"], "yes");
+        assert_eq!(reply["warning"], true, "{reply}");
+        let message = reply["message"].as_str().expect("a sentence");
+        assert!(message.contains("--no-tailscale"), "{message}");
+        assert!(
+            message.contains("saved as \"yes\""),
+            "the saved half is the other half of the answer: {message}"
+        );
+        assert_eq!(
+            *seen.lock().expect("not poisoned"),
+            vec![dux_core::config::TailscaleMode::Yes],
+            "the serve is asked exactly once"
+        );
+
+        // The write still happened, and the bootstrap tells the browser why the
+        // row it just saved cannot take effect yet.
+        let boot = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/bootstrap")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let boot = axum::body::to_bytes(boot.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let boot: serde_json::Value = serde_json::from_slice(&boot).unwrap();
+        assert_eq!(boot["tailscale_mode"], "yes");
+        assert_eq!(boot["tailscale_forced_no"], true);
+    }
+
+    #[tokio::test]
+    async fn the_route_answers_with_what_the_serve_did_to_the_listener() {
+        let leg: std::net::SocketAddr = "100.64.0.5:8080".parse().unwrap();
+        let (_tmp, app, seen) = tailscale_router(
+            dux_core::config::TailscaleModeOutcome::Applied { bound: Some(leg) },
+            false,
+        );
+
+        let reply = reply_of(app, "yes").await;
+        assert_eq!(reply["mode"], "yes");
+        assert_eq!(reply["warning"], false, "{reply}");
+        assert!(
+            reply["message"]
+                .as_str()
+                .expect("a sentence")
+                .contains("100.64.0.5:8080"),
+            "the reply names the address the leg landed on: {reply}"
+        );
+        assert_eq!(
+            *seen.lock().expect("not poisoned"),
+            vec![dux_core::config::TailscaleMode::Yes]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tailscale_mode_outside_the_tri_state_is_refused() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .oneshot(json_req(
+                "POST",
+                "/api/v1/server/tailscale-mode",
+                r#"{"mode":"maybe"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let message = String::from_utf8(body.to_vec()).unwrap();
+        assert!(message.contains("maybe"), "{message}");
+        assert!(
+            message.contains("auto") && message.contains("yes") && message.contains("no"),
+            "the refusal must list the valid values: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_macros_accepts_a_valid_set() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .oneshot(json_req(
+                "PUT",
+                "/api/v1/macros",
+                r#"{"entries":[{"name":"greet","text":"hi","surface":"agent"}]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn update_macros_rejects_an_empty_name_with_400() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .oneshot(json_req(
+                "PUT",
+                "/api/v1/macros",
+                r#"{"entries":[{"name":"","text":"hi","surface":"agent"}]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn persist_global_env_accepts_a_map() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .oneshot(json_req(
+                "PUT",
+                "/api/v1/global-env",
+                r#"{"env":{"FOO":"bar"}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn set_changes_pane_accepts_a_flag() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .oneshot(json_req(
+                "PUT",
+                "/api/v1/ui/changes-pane",
+                r#"{"visible":false}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Read the raw `config.toml` text back through `GET /api/v1/config/raw` so a
+    /// persistence assertion sees what actually landed on disk / in the running
+    /// config, not just the POST's status code.
+    async fn read_raw_config_text(app: &Router) -> String {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/config/raw")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        v["content"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn instance_identity_accepts_a_single_field_body() {
+        // `#[serde(default)]` on both fields: a favicon-only body deserializes.
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .clone()
+            .oneshot(json_req(
+                "POST",
+                "/api/v1/config/instance-identity",
+                r#"{"favicon":"amber"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn instance_identity_persists_a_valid_post() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .clone()
+            .oneshot(json_req(
+                "POST",
+                "/api/v1/config/instance-identity",
+                r#"{"title":"dux prod","favicon":"amber"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let raw = read_raw_config_text(&app).await;
+        assert!(
+            raw.contains("title = \"dux prod\""),
+            "title should persist: {raw}"
+        );
+        assert!(
+            raw.contains("favicon = \"amber\""),
+            "favicon should persist: {raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn instance_identity_empty_body_resets_to_default() {
+        // The dialog's "Reset to default" button POSTs empty strings for both
+        // fields. Empty title normalizes back to "dux" and empty favicon back to
+        // "" (the default full-colour duck). First set a non-default identity, then
+        // reset, and confirm the re-read config reflects the defaults.
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .clone()
+            .oneshot(json_req(
+                "POST",
+                "/api/v1/config/instance-identity",
+                r#"{"title":"x","favicon":"amber"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(json_req(
+                "POST",
+                "/api/v1/config/instance-identity",
+                r#"{"title":"","favicon":""}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let raw = read_raw_config_text(&app).await;
+        assert!(
+            raw.contains("title = \"dux\""),
+            "empty title should reset to \"dux\": {raw}"
+        );
+        assert!(
+            raw.contains("favicon = \"\""),
+            "empty favicon should reset to the default (empty): {raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn instance_identity_rejects_bad_favicon_and_leaves_config_unchanged() {
+        let (_tmp, app) = router_no_auth();
+        let before = read_raw_config_text(&app).await;
+
+        let resp = app
+            .clone()
+            .oneshot(json_req(
+                "POST",
+                "/api/v1/config/instance-identity",
+                r#"{"favicon":"mauve"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let after = read_raw_config_text(&app).await;
+        assert_eq!(before, after, "a rejected favicon must not mutate config");
+        assert!(!after.contains("mauve"));
+    }
+
+    #[tokio::test]
+    async fn instance_identity_empty_body_is_a_noop() {
+        let (_tmp, app) = router_no_auth();
+        let before = read_raw_config_text(&app).await;
+
+        let resp = app
+            .clone()
+            .oneshot(json_req("POST", "/api/v1/config/instance-identity", "{}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let after = read_raw_config_text(&app).await;
+        assert_eq!(before, after, "an empty body must not mutate config");
+    }
+
+    #[tokio::test]
+    async fn reload_config_accepts_an_empty_body() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .oneshot(json_req("POST", "/api/v1/config/reload", "{}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn read_raw_config_returns_ok() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/config/raw")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn read_then_write_round_trips_with_200() {
+        let (_tmp, app) = router_no_auth();
+        // Read the current raw config and confirm the body carries `content`.
+        let get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/config/raw")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(get.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let content = parsed["content"]
+            .as_str()
+            .expect("read body must carry a content string")
+            .to_string();
+        assert!(!content.is_empty(), "content must not be empty");
+
+        // Write it back unchanged: valid TOML with an unchanged [server] section,
+        // so the happy path returns 200 (exercises the Ok arm of the persist).
+        let body = serde_json::json!({ "content": content }).to_string();
+        let put = app
+            .oneshot(json_req("PUT", "/api/v1/config/raw", &body))
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn write_raw_config_rejects_invalid_toml_with_400() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .oneshot(json_req(
+                "PUT",
+                "/api/v1/config/raw",
+                r#"{"content":"this is = = not valid toml"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── Settings PATCH (grouped Settings modal) ──────────────────────────────
+
+    #[tokio::test]
+    async fn set_settings_accepts_a_valid_ui_patch() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .clone()
+            .oneshot(json_req(
+                "PATCH",
+                "/api/v1/config/settings",
+                r#"{"ui":{"copy_on_select":false,"always_show_tab_strip":true,"pr_banner_position":"top"}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let raw = read_raw_config_text(&app).await;
+        assert!(raw.contains("copy_on_select = false"), "raw: {raw}");
+        assert!(raw.contains("always_show_tab_strip = true"), "raw: {raw}");
+        assert!(raw.contains("pr_banner_position = \"top\""), "raw: {raw}");
+    }
+
+    /// The top-level `quiet` flag rides beside the groups (it is not a
+    /// settings field) and still persists the accessory-bar write; the engine
+    /// drops the info status for such a request (pinned in
+    /// `dux_core::wire`'s `set_settings_quiet_*` tests).
+    #[tokio::test]
+    async fn set_settings_accepts_the_quiet_flag() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .clone()
+            .oneshot(json_req(
+                "PATCH",
+                "/api/v1/config/settings",
+                r#"{"ui":{"mobile_accessory_bar":false},"quiet":true}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let raw = read_raw_config_text(&app).await;
+        assert!(raw.contains("mobile_accessory_bar = false"), "raw: {raw}");
+    }
+
+    #[tokio::test]
+    async fn set_settings_clamps_out_of_range_status_clear_seconds() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .clone()
+            .oneshot(json_req(
+                "PATCH",
+                "/api/v1/config/settings",
+                r#"{"ui":{"status_clear_seconds":65535}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let raw = read_raw_config_text(&app).await;
+        assert!(
+            raw.contains(&format!(
+                "status_clear_seconds = {}",
+                dux_core::config::MAX_STATUS_CLEAR_SECONDS
+            )),
+            "expected the clamped ceiling to persist: {raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_settings_degrades_an_out_of_range_terminal_font_size_to_the_default() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .clone()
+            .oneshot(json_req(
+                "PATCH",
+                "/api/v1/config/settings",
+                r#"{"ui":{"terminal_font_size":200}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let raw = read_raw_config_text(&app).await;
+        assert!(
+            raw.contains(&format!(
+                "terminal_font_size = {}",
+                dux_core::config::DEFAULT_TERMINAL_FONT_SIZE
+            )),
+            "expected the out-of-range value to degrade to the default: {raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_settings_accepts_zero_for_attention_grace_seconds() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .clone()
+            .oneshot(json_req(
+                "PATCH",
+                "/api/v1/config/settings",
+                r#"{"ui":{"attention_grace_seconds":0}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let raw = read_raw_config_text(&app).await;
+        assert!(
+            raw.contains("attention_grace_seconds = 0"),
+            "0 must persist as a real value, not a clamp/default: {raw}"
+        );
+    }
+
+    /// CROSS-LANGUAGE PIN. The Preferences modal's PATCH keys live twice: in
+    /// `SettingsBody` here, and in the `writeTarget: "settings"` descriptors in
+    /// `crates/dux-web/web/src/lib/settingsDescriptors.ts`. There is no codegen
+    /// between them, so both halves are pinned by a loud test. This is the
+    /// server half; the twin is the set-equality assertion in
+    /// `settingsDescriptors.test.ts` ("the settings-PATCH key set matches the
+    /// server's accepted fields").
+    ///
+    /// This PATCHes every key that modal can emit, in one body, across all
+    /// three groups. Because `SettingsBody` is `deny_unknown_fields`, a key the
+    /// modal sends but the server dropped fails here with a 400 rather than
+    /// being silently ignored. Each value is asserted to land, so a key that
+    /// parses but is never mapped fails too.
+    ///
+    /// `ui.show_changes_pane` is deliberately absent: the server accepts it,
+    /// but the modal routes that row to the dedicated Changes-pane endpoint.
+    /// `ui.github_integration` and `server.title`/`favicon` are absent for the
+    /// same reason, each keeping its own endpoint.
+    #[tokio::test]
+    async fn set_settings_accepts_every_key_the_modal_can_send() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .clone()
+            .oneshot(json_req(
+                "PATCH",
+                "/api/v1/config/settings",
+                r#"{
+                    "ui": {
+                        "copy_on_select": false,
+                        "compose_bar": "never",
+                        "mobile_accessory_bar": false,
+                        "upload_write_gitignore": false,
+                        "auto_reopen_agents": true,
+                        "always_show_tab_strip": true,
+                        "tab_reaches_agent": true,
+                        "status_clear_seconds": 42,
+                        "attention_grace_seconds": 11,
+                        "attention_indicator": false,
+                        "attention_on_bell": false,
+                        "pr_banner_position": "top",
+                        "disable_automated_welcome_screen": true,
+                        "disable_release_notes": true,
+                        "terminal_font_family": "Fira Code",
+                        "terminal_font_size": 18
+                    },
+                    "capabilities": {
+                        "web_notifications": true,
+                        "hyperlinks": false
+                    },
+                    "defaults": {
+                        "enable_randomized_pet_name_by_default": true,
+                        "provider": "codex"
+                    }
+                }"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "every key the modal can send must be accepted"
+        );
+
+        let raw = read_raw_config_text(&app).await;
+        for expected in [
+            "copy_on_select = false",
+            "compose_bar = \"never\"",
+            "mobile_accessory_bar = false",
+            "upload_write_gitignore = false",
+            "auto_reopen_agents = true",
+            "always_show_tab_strip = true",
+            "tab_reaches_agent = true",
+            "status_clear_seconds = 42",
+            "attention_grace_seconds = 11",
+            "attention_indicator = false",
+            "attention_on_bell = false",
+            "pr_banner_position = \"top\"",
+            "web_notifications = true",
+            "hyperlinks = false",
+            "enable_randomized_pet_name_by_default = true",
+            "provider = \"codex\"",
+            "disable_automated_welcome_screen = true",
+            "disable_release_notes = true",
+            "terminal_font_family = \"Fira Code\"",
+            "terminal_font_size = 18",
+        ] {
+            assert!(
+                raw.contains(expected),
+                "expected {expected:?} to persist, got:\n{raw}"
+            );
+        }
+    }
+
+    /// The `defaults` group is the one that drifted out of the TS body type
+    /// unnoticed, so pin it end to end at the HTTP boundary on its own.
+    #[tokio::test]
+    async fn set_settings_applies_the_defaults_group_end_to_end() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .clone()
+            .oneshot(json_req(
+                "PATCH",
+                "/api/v1/config/settings",
+                r#"{"defaults":{"enable_randomized_pet_name_by_default":true,"provider":"codex"}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let raw = read_raw_config_text(&app).await;
+        assert!(
+            raw.contains("enable_randomized_pet_name_by_default = true"),
+            "the defaults group must persist: {raw}"
+        );
+        assert!(
+            raw.contains("provider = \"codex\""),
+            "the defaults group must persist: {raw}"
+        );
+    }
+
+    /// A rejected value must take the WHOLE patch down, including valid fields
+    /// in OTHER groups. `set_settings_rejects_an_unconfigured_default_provider_with_400`
+    /// covers the lone-invalid-field case; this covers the all-or-nothing part,
+    /// which is the half a partial apply would break.
+    #[tokio::test]
+    async fn set_settings_rejects_a_whole_patch_when_one_group_is_invalid() {
+        let (_tmp, app) = router_no_auth();
+        let before = read_raw_config_text(&app).await;
+
+        let resp = app
+            .clone()
+            .oneshot(json_req(
+                "PATCH",
+                "/api/v1/config/settings",
+                r#"{"ui":{"copy_on_select":false},"defaults":{"provider":"not-a-real-provider"}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let after = read_raw_config_text(&app).await;
+        assert_eq!(
+            before, after,
+            "a rejected provider must not partially apply the rest of the patch"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_settings_rejects_unknown_enum_value_with_400() {
+        let (_tmp, app) = router_no_auth();
+        let before = read_raw_config_text(&app).await;
+
+        let resp = app
+            .clone()
+            .oneshot(json_req(
+                "PATCH",
+                "/api/v1/config/settings",
+                r#"{"ui":{"pr_banner_position":"sideways"}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let after = read_raw_config_text(&app).await;
+        assert_eq!(
+            before, after,
+            "a rejected enum value must not mutate config"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_settings_empty_patch_is_a_noop_200() {
+        let (_tmp, app) = router_no_auth();
+        let before = read_raw_config_text(&app).await;
+
+        let resp = app
+            .clone()
+            .oneshot(json_req("PATCH", "/api/v1/config/settings", "{}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let after = read_raw_config_text(&app).await;
+        assert_eq!(before, after, "an empty patch must not mutate config");
+    }
+
+    #[tokio::test]
+    async fn set_settings_ignores_absent_fields() {
+        let (_tmp, app) = router_no_auth();
+
+        // Set the PR banner position first.
+        let resp = app
+            .clone()
+            .oneshot(json_req(
+                "PATCH",
+                "/api/v1/config/settings",
+                r#"{"ui":{"pr_banner_position":"top"}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // A second patch that only touches an unrelated field must leave the
+        // PR banner position untouched.
+        let resp = app
+            .clone()
+            .oneshot(json_req(
+                "PATCH",
+                "/api/v1/config/settings",
+                r#"{"ui":{"status_clear_seconds":8}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let raw = read_raw_config_text(&app).await;
+        assert!(raw.contains("pr_banner_position = \"top\""), "raw: {raw}");
+        assert!(raw.contains("status_clear_seconds = 8"), "raw: {raw}");
+    }
+
+    #[tokio::test]
+    async fn set_settings_rejects_unknown_top_level_key_with_400() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .oneshot(json_req(
+                "PATCH",
+                "/api/v1/config/settings",
+                r#"{"server":{"title":"hacked"}}"#,
+            ))
+            .await
+            .unwrap();
+        // `deny_unknown_fields` rejects a "server" group outright: title/favicon
+        // stay on the dedicated instance-identity endpoint, not this one.
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn set_settings_rejects_unknown_field_within_a_group_with_400() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .oneshot(json_req(
+                "PATCH",
+                "/api/v1/config/settings",
+                r#"{"ui":{"not_a_real_field":true}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn set_settings_accepts_a_capabilities_patch() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .clone()
+            .oneshot(json_req(
+                "PATCH",
+                "/api/v1/config/settings",
+                r#"{"capabilities":{"web_notifications":false,"hyperlinks":false}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let raw = read_raw_config_text(&app).await;
+        assert!(raw.contains("web_notifications = false"), "raw: {raw}");
+        assert!(raw.contains("hyperlinks = false"), "raw: {raw}");
+    }
+
+    // The `[defaults]` group is the first non-`ui`/`capabilities` group on this
+    // PATCH. It exists because the Preferences dialog now carries the random
+    // pet-name default, which used to be a web command-palette toggle. Unlike
+    // `github_integration` (whose flip has PR-sync side effects and therefore
+    // keeps its dedicated endpoint), this is a plain field write, so it rides
+    // the generic settings PATCH.
+    #[tokio::test]
+    async fn set_settings_accepts_a_defaults_patch() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .clone()
+            .oneshot(json_req(
+                "PATCH",
+                "/api/v1/config/settings",
+                r#"{"defaults":{"enable_randomized_pet_name_by_default":true}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let raw = read_raw_config_text(&app).await;
+        assert!(
+            raw.contains("enable_randomized_pet_name_by_default = true"),
+            "raw: {raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_settings_rejects_unknown_field_within_defaults_with_400() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .oneshot(json_req(
+                "PATCH",
+                "/api/v1/config/settings",
+                r#"{"defaults":{"not_a_real_field":true}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // `defaults.provider` is the GLOBAL default provider (distinct from a
+    // project's own `default_provider` override). It rides this generic patch
+    // because, like the pet-name default, flipping it is a plain field write
+    // with no side effects.
+    #[tokio::test]
+    async fn set_settings_accepts_a_valid_default_provider_patch() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .clone()
+            .oneshot(json_req(
+                "PATCH",
+                "/api/v1/config/settings",
+                r#"{"defaults":{"provider":"codex"}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let raw = read_raw_config_text(&app).await;
+        assert!(raw.contains("provider = \"codex\""), "raw: {raw}");
+    }
+
+    // Test engines default to the four built-in providers (claude, codex,
+    // opencode, copilot; see `Config::default()`/`default_provider_commands()`),
+    // so a name outside that set is unconfigured and must be rejected with a
+    // plain-text 400, mirroring `set_settings_rejects_unknown_enum_value_with_400`
+    // for `pr_banner_position`.
+    #[tokio::test]
+    async fn set_settings_rejects_an_unconfigured_default_provider_with_400() {
+        let (_tmp, app) = router_no_auth();
+        let before = read_raw_config_text(&app).await;
+
+        let resp = app
+            .clone()
+            .oneshot(json_req(
+                "PATCH",
+                "/api/v1/config/settings",
+                r#"{"defaults":{"provider":"not-a-real-provider"}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let after = read_raw_config_text(&app).await;
+        assert_eq!(
+            before, after,
+            "an unconfigured provider must not mutate config"
+        );
+    }
+
+    #[tokio::test]
+    async fn preference_toggles_accept_a_post_with_no_body() {
+        for uri in [
+            "/api/v1/defaults/toggle-randomized-pet-name",
+            "/api/v1/ui/toggle-pr-banner-position",
+            "/api/v1/ui/toggle-github-integration",
+            "/api/v1/ui/toggle-copy-on-select",
+            "/api/v1/ui/toggle-always-show-tab-strip",
+        ] {
+            let (_tmp, app) = router_no_auth();
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "POST {uri}");
+        }
+    }
+}

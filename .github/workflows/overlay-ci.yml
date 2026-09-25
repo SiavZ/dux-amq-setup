@@ -1,36 +1,44 @@
 name: overlay-ci
 
-# Audit01 Phase 00 (preflight) baseline CI for the dux-amq overlay.
-# Lints the bash wrappers/install/scripts and runs the bats suite.
-# Cargo build/test stays in `.github/workflows/test.yml` (upstream's).
+# Baseline CI for the dux-amq overlay (audit01 Phase 00): ShellCheck over every
+# executable overlay/installer script and the bats suite in dux-amq/tests.
+# `make overlay-test` runs the same two steps locally.
+#
+# The Rust side of the overlay contract (dux-amq/config/dux-config.sed and
+# dux-config-changes.toml against the current config schema) is a cargo test,
+# crates/dux/tests/overlay_config.rs, so it runs in pr.yml / test.yml.
 
 on:
   pull_request:
-  # audit02 Phase 24 (P2-9) — scope push runs to `main` so feature
-  # branches don't double-spend CI minutes (the PR checks already
-  # cover them).
+  # Push runs only for main (audit02 Phase 24, P2-9): the PR run already covers
+  # feature branches.
   push:
     branches: [main]
 
-# Default to least privilege; the jobs below only read source.
+# Least privilege: the job only reads source.
 permissions:
   contents: read
+
+concurrency:
+  group: overlay-ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   shell:
     runs-on: ubuntu-24.04
     steps:
-      # Pinned by commit SHA per audit01 supply-chain rules
-      # (actions/checkout v4.2.2 — bump SHA when upgrading).
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Install shellcheck + bats + jq
+      # rsync (finalize-claude-migration.sh), curl (dux-amq/install.sh preflight)
+      # and sqlite3 (the doctor's read-only DB test, which skips without it) are
+      # on the runner image today; naming them keeps an image change from
+      # turning into a confusing failure or a silent skip. Verified in a bare
+      # ubuntu:24.04: without curl the idempotency test fails.
+      - name: Install shellcheck, bats, jq, rsync, curl, sqlite3
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck bats jq
+          sudo apt-get install -y shellcheck bats jq rsync curl sqlite3
 
-      # audit02 P1-T — also lint the top-level installer and the
-      # bashrc-additions snippet (the file with the runtime `eval`).
       - name: shellcheck overlay scripts
         run: make overlay-shellcheck
 

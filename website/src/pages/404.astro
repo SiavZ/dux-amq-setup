@@ -1,0 +1,96 @@
+---
+// Astro emits this route as dist/404.html, the file GitHub Pages serves for any
+// unknown path, so no extra config is needed.
+//
+// The general Layout, deliberately not DocsLayout: a 404 is reachable from
+// anywhere, so a docs sidebar would be both wrong context and a false promise
+// that the missing page was a docs page. It needs no sitemap filter either
+// (@astrojs/sitemap hard-excludes the 404 and 500 routes) and is absent from the
+// Pagefind index, which only covers pages carrying `data-pagefind-body`.
+//
+// The search button carries `data-open-search`, the attribute DocsSearch's
+// document-level click handler listens for, rather than re-implementing search.
+import Layout from "../layouts/Layout.astro";
+import Header from "../components/Header.astro";
+import Footer from "../components/Footer.astro";
+import NewsletterStatus from "../components/NewsletterStatus.astro";
+
+const title = "404: no office at this address | getdux.app";
+const description =
+  "That page doesn't exist on getdux.app. Search the docs and the blog, or head back to the documentation index or the home page.";
+---
+
+<Layout title={title} description={description} noIndex emitStructuredData={false}>
+  <Header />
+  <main>
+    {/* Reuses the newsletter status pages' shell as-is rather than growing a
+        second one: a 404 is the same kind of page. */}
+    <NewsletterStatus pill="▸ error 404">
+      <Fragment slot="title">
+        There's no <span class="text-[color:var(--color-accent)]">office</span> at
+        this address.
+      </Fragment>
+
+      <Fragment slot="body">
+        {/* The aside is not a second gag, it is the translation. The heading is
+            a pun on "address" that only lands if you already know what a 404
+            is, and the person most likely to be reading this page is exactly
+            the person who does not. Say the plain thing once, in the same
+            voice, so nobody has to decode a joke to find out what went wrong. */}
+        <p class="text-[color:var(--color-dim)]">
+          (yeah, that's a 404, page not found, okay?)
+        </p>
+        <p>
+          The URL you asked for doesn't match any page on getdux.app. Most
+          likely a typo, a link that aged badly, or a page that has since moved.
+        </p>
+
+        {/* The recovery path: the docs and the blog are both searchable, so a
+            moved page is usually one query away. Styled as a search field, not a
+            button, so it reads as the primary thing to do here. */}
+        <button
+          type="button"
+          data-open-search
+          aria-keyshortcuts="Meta+K Control+K"
+          class="mt-6 flex w-full items-center gap-3 rounded-lg border border-[color:var(--color-border)] bg-[color:var(--color-panel-2)] px-4 py-3 text-left text-sm text-[color:var(--color-muted)] transition-colors hover:border-[color:var(--color-accent)]/50 hover:text-[color:var(--color-text)]"
+        >
+          <svg
+            class="h-4 w-4 shrink-0 text-[color:var(--color-dim)]"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <circle cx="11" cy="11" r="8"></circle>
+            <path d="m21 21-4.3-4.3"></path>
+          </svg>
+          <span class="min-w-0 flex-1 truncate">Search the docs and the blog</span>
+          <kbd
+            class="mono hidden shrink-0 rounded border border-[color:var(--color-border)] bg-[color:var(--color-panel)] px-1.5 py-0.5 text-[10px] text-[color:var(--color-dim)] sm:inline"
+            aria-hidden="true">⌘K</kbd
+          >
+        </button>
+      </Fragment>
+
+      {/* Three escape hatches, chosen because they are where someone who
+          landed here actually wants to go next. The wrapper already wraps and
+          centers them, so they stack cleanly on a phone. */}
+      <Fragment slot="actions">
+        <a href="/docs" class="btn-primary">Documentation</a>
+        <a href="/" class="btn-ghost">Home page</a>
+        <a
+          href="https://github.com/patrickdappollonio/dux"
+          class="btn-ghost">Repository</a
+        >
+      </Fragment>
+
+      <Fragment slot="footnote">
+        If a link on this site sent you here, that's a bug worth reporting.
+      </Fragment>
+    </NewsletterStatus>
+  </main>
+  <Footer />
+</Layout>

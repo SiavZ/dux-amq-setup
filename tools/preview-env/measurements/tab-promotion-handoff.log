@@ -1,0 +1,8 @@
+agent 12aee54c-0569-4de7-9292-19151ba89f6f: first tab 86530f9b-24d9-49ed-b451-8db25aa0b63f (fake), sibling 9ac87225-d7cc-46d4-97d5-f06bf8f98f7f (fake)
+before: {"connectionLost":false,"reconnect":false,"cover":false,"strip":[{"label":"fake","active":true},{"label":"fake 2","active":false}],"toasts":[],"sidebar":"tab-handoffdemo-apiWorking2 tabs","hash":"#/agent/12aee54c-0569-4de7-9292-19151ba89f6f"}
+typed quit at t+0
+t+22ms {"at":22,"connectionLost":false,"reconnect":false,"cover":false,"strip":[{"label":"fake","active":true},{"label":"fake 2","active":false}],"toasts":[],"sidebar":"tab-handoffdemo-apiWorking2 tabs","hash":"#/agent/12aee54c-0569-4de7-9292-19151ba89f6f"}
+t+126ms {"at":126,"connectionLost":false,"reconnect":false,"cover":false,"strip":[{"label":"fake","active":true},{"label":"fake 2","active":false}],"toasts":["Tab (fake) of agent \"tab-handoff\" exited cleanly and was closed; the pane now shows its fake tab."],"sidebar":"tab-handoffdemo-apiWorking2 tabs","hash":"#/agent/12aee54c-0569-4de7-9292-19151ba89f6f"}
+after: {"connectionLost":false,"reconnect":false,"cover":false,"strip":[],"toasts":["Tab (fake) of agent \"tab-handoff\" exited cleanly and was closed; the pane now shows its fake tab."],"sidebar":"tab-handoffdemo-apiWorking","hash":"#/agent/12aee54c-0569-4de7-9292-19151ba89f6f"}
+spine after: slot_tab_id=9ac87225-d7cc-46d4-97d5-f06bf8f98f7f tabs=[["9ac87225-d7cc-46d4-97d5-f06bf8f98f7f","fake",true]] status=active
+sibling promoted: true

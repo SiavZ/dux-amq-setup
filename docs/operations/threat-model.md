@@ -3,10 +3,14 @@
 This document is the long-form companion to the STRIDE table in
 [`/SECURITY.md`](../../SECURITY.md). For each row T1–T20 we capture
 the concrete attack scenario, the mitigation in code (with
-file:line references taken from `docs/audits/audit02.md`), the
+file:line references taken from `docs/audits/audit02/audit02.md`), the
 residual risk after mitigation, and the detection mechanism — what
 shows up in `dux.log` or `dux-amq doctor` output when the threat
 fires.
+
+Code paths below point at the crates workspace (`crates/dux-core`,
+`crates/dux-tui`). Line numbers from the audits refer to the older
+single-crate layout, so treat them as hints and search by symbol.
 
 The audit reports in `docs/audits/` are point-in-time snapshots.
 This file and `SECURITY.md` are the living artifacts and must be
@@ -190,7 +194,7 @@ expected vs actual sha pair.
 ## T4 — Spot-VM preemption mid-sqlite write
 
 **Attack scenario.** dux runs on a GCE spot VM. The VM is
-preempted while `src/storage.rs` is mid-transaction on
+preempted while `crates/dux-core/src/storage.rs` is mid-transaction on
 `sessions.sqlite3`. Because the database opened with the default
 rollback journal and no `synchronous=NORMAL`/WAL settings
 (`storage.rs:22`), the operator returns to find a session row
@@ -251,7 +255,7 @@ risk`. The installer prints the same warning at first run.
 
 **Attack scenario.** A customer requests deletion of their data
 under GDPR Art. 17. The operator runs the existing
-`reset_agent_data` (`src/cli.rs:464`), which removes worktrees,
+`reset_agent_data` (`crates/dux-tui/src/cli.rs`), which removes worktrees,
 sqlite, and `dux.log`. It does **not** touch
 `~/.claude/projects/<encoded>/*.jsonl` or
 `/data/state/{codex,gemini}/`. Every prompt and response with
@@ -335,7 +339,7 @@ logged and left untouched.
 
 **Attack scenario.** Producers feed unfiltered byte streams into
 `logger.rs:84-92`: `String::from_utf8_lossy(&output.stderr)` from
-`src/git.rs`, GitHub PR titles via `gh pr view`,
+`crates/dux-core/src/git.rs`, GitHub PR titles via `gh pr view`,
 `/proc/<pid>/comm` from `pty.rs:521-525`, arbitrary user paths.
 A hostile branch name, PR title, or process name with embedded
 ANSI/OSC/DCS bytes lands verbatim in `dux.log`. When the operator
@@ -346,11 +350,11 @@ sequences can corrupt subsequent rendering. Same incident class
 as Rails CVE-2025-55193.
 
 **Mitigation in code.** Phase 03 introduces
-`sanitize_for_terminal(s: &str) -> String` (lives in
-`src/sanitizer.rs`) which strips
+`for_terminal(s: &str) -> String` (lives in
+`crates/dux-core/src/sanitize.rs`) which strips
 `[\x00-\x08\x0b-\x1f\x7f\x1b]`. Every `logger::*` call and every
-`set_error`/`set_info` status-line writer (`src/app/workers.rs`,
-`src/app/sessions.rs`, `src/app/input.rs`) now routes through
+`set_error`/`set_info` status-line writer (`crates/dux-tui/src/app/workers.rs`,
+`crates/dux-tui/src/app/sessions.rs`, `crates/dux-tui/src/app/input.rs`) now routes through
 the sanitizer. The 17 `git.rs` `anyhow!` sites listed in P0-C
 are wrapped at the consumer side.
 
@@ -360,10 +364,11 @@ confuse a viewer that interprets the file as something other than
 plain text. Operators who `cat dux.log` into a tool that
 re-escapes are on their own.
 
-**Detection.** Any sanitized character logs a debug counter
-`sanitizer: stripped <n> control bytes from <field>`. A spike in
-that counter is the signal that something upstream is producing
-hostile content. `doctor` does not currently surface this; tracked
+**Detection.** The sanitizer replaces each stripped byte with its
+`\xNN` hex form (see `for_terminal`), so a hostile payload stays visible
+in `dux.log` as escaped bytes rather than vanishing. A spike in those
+escapes is the signal that something upstream is producing hostile
+content. `doctor` does not currently surface a count; tracked
 for a future iteration.
 
 ---
@@ -376,20 +381,26 @@ process RSS. Within a minute the host OOMs. There is no per-pane
 memory cap and no PTY-count cap.
 
 **Mitigation in code.** Phase 16 adds a `[limits]` config block:
-`max_panes` (default 32), `max_companion_terminals` (default 8),
-`max_total_scrollback_mb` (default 256). The agent-creation path
-(`src/app/sessions.rs::create_agent`) consults the caps and
-refuses with a status-line error when exceeded. A disk watchdog
-refuses new agents when free space drops below 5%.
+`max_panes` (default 0, no hard cap), `max_panes_soft_warn`
+(default 16, warns without blocking), `max_companion_terminals`
+(default 0, no cap), `max_total_scrollback_mb` (default 256), and a
+pair of disk thresholds (`disk_high_water_pct` default 95, which
+refuses new agents; `disk_warn_pct` default 80, which warns). The
+agent-creation path (`crates/dux-core/src/engine/command.rs`, via
+`Engine::refuse_agent_spawn_for_limits` and `soft_warn_for_pane_count`)
+consults the caps and refuses with a status-line error when a hard cap is
+set and exceeded. A disk watchdog refuses new agents at the high-water mark.
 
 **Residual risk.** A fork-bomb inside an existing pane (`while :;
 do bash & done`) is invisible to dux's pane counter — that's an
 OS-level concern. Per-pane RSS is not bounded; we count panes,
 not megabytes.
 
-**Detection.** `dux.log` records
-`limits: refused new agent — max_panes reached (32)` at WARN.
-`doctor` reports current pane count vs cap and free disk space.
+**Detection.** `dux.log` records the refusal message from
+`LimitsConfig::refuse_agent_spawn` at WARN, naming the knob that
+blocked the spawn (`limits.max_panes = N` or
+`limits.disk_high_water_pct = N%`) and the way out. `doctor` reports
+disk usage of the state root.
 
 ---
 
@@ -442,38 +453,39 @@ path. Until then, `SECURITY.md` documents this as a known gap.
 unmitigated. Operators on shared hosts should
 `chattr +i ~/.claude` after install.
 
-**Detection.** Once shipped, `dux-amq doctor` will emit
-`~/.claude symlink: <expected> → <actual>` and a red status when
-they diverge.
+**Detection.** `dux-amq doctor`'s Symlinks section already prints
+each of `~/.claude`, `~/.agents`, `~/.codex`, `~/.gemini` with its
+target and warns when the target is not under the state root (or the
+entry is not a symlink at all). Comparing the recorded canonical path
+against a launch-time check remains future work.
 
 ---
 
 ## T12 — Auto-resume thundering herd on spot-VM reboot
 
 **Attack scenario.** A spot VM is preempted with 50 active dux
-sessions. On reboot, `auto_resume_all_sessions`
-(`src/app/mod.rs:1380-1410`) iterates sequentially but unbounded:
-all 50 sessions try to spawn PTYs and complete TLS handshakes to
-the upstream API at once. The result is API rate-limit responses,
-exhausted file descriptors, and OOM during the resume burst —
-which itself triggers another preempt-resume cycle.
+sessions. On reboot, the startup relaunch pass
+(`Engine::queue_startup_launches` + `Engine::pump_startup_launches`)
+would fire every session's PTY spawn and TLS handshake at once: API
+rate-limit responses, exhausted file descriptors, and OOM during the
+resume burst — which itself triggers another preempt-resume cycle.
 
-**Mitigation in code.** Phase 15 introduces a bounded scheduler:
-`auto_resume_concurrency` (default 4) caps the number of
-concurrent resumes via a semaphore. Sessions whose worktree mtime
-exceeds `auto_resume_max_age_days` (default 14) are skipped — a
-cold session is resumed lazily on operator focus instead of
-during the burst.
+**Mitigation in code.** Phase 15 introduces a bounded scheduler
+(`crates/dux-core/src/auto_resume.rs`) driven by the `[auto_resume]`
+config block: `concurrency` (default 4) caps startup launches in
+flight, `stagger_ms` (default 250) spaces two dispatches apart, and
+`stale_days` (default 30) skips agents whose directory went untouched
+for that long, so a cold session is resumed lazily on operator focus
+instead of during the burst.
 
 **Residual risk.** A correctly tuned cap still spends bursts of
 CPU when the user has many fresh sessions. The
-`auto_resume_max_age_days` default is a heuristic; operators
+`stale_days` default is a heuristic; operators
 running long-lived sessions may need to raise it.
 
-**Detection.** `dux.log` records
-`auto_resume: scheduling <n> sessions, concurrency=<k>` at INFO
-on launch, then per-session `auto_resume: <id> started/skipped/failed`.
-`doctor` shows the most recent auto-resume burst summary.
+**Detection.** Per-session outcomes surface as status lines
+through `pump_startup_launches`. `doctor` shows detached and
+exited session counts.
 
 ---
 
@@ -499,7 +511,7 @@ bytes back into the agent. Two distinct abuse paths follow:
    user with a custom rule (e.g. an "auto-yes" pattern) could be
    tricked into auto-confirming dangerous actions.
 
-**Mitigation in code** (`src/watch/`, `src/app/mod.rs`).
+**Mitigation in code** (`crates/dux-core/src/watch/`, `crates/dux-tui/src/app/mod.rs`).
 
 - *Linear-time matching.* Rules compile via the `regex` crate's
   NFA engine, which is guaranteed linear in input length —
@@ -633,11 +645,13 @@ makes the parser the primary attack surface.
 **Mitigation in code.** Asymmetric-default policy at the parse
 boundary:
 
-- `SessionSettings::parse_or_default(raw)` (in `src/model.rs`)
+- `SessionSettings::parse_or_default(raw)` (in
+  `crates/dux-core/src/session_settings.rs`, called by
+  `SessionStore::load_session_settings` in
+  `crates/dux-core/src/storage.rs`)
   returns `Self::default()` for `None`, empty string, or any blob
-  that fails `serde_json::from_str`. The fallback emits a `warn!`
-  with `target: "dux::session_settings"` carrying `err` and the
-  raw (sanitisable) input so post-hoc forensics can see what was
+  that fails `serde_json::from_str`. The fallback emits a WARN
+  carrying the parse error so post-hoc forensics can see what was
   rejected.
 - `SessionSettings::default()` is the safe everything-off shape:
   `mode = Attended` (no postscript, no auto-clear),
@@ -647,13 +661,13 @@ boundary:
   requires the operator to tick the box explicitly), and
   `verify_envelope_override = None` (inherit the global config
   default).
-- Every consumer reads through this filter:
-  `src/app/workers.rs` and `src/app/sessions.rs` call
-  `session.settings.to_pty_env(...)` at PTY spawn, and
-  `src/app/inject_runtime.rs::deliver_inject_body` /
-  `apply_inject_postscript` consult `session.settings.mode` for the
-  postscript decision. None of those paths read the raw column text
-  directly.
+- Every consumer reads through this filter. PTY launches compose the
+  environment through
+  `crates/dux-core/src/agent_env.rs::agent_launch_env` (which layers
+  `SessionSettings::to_pty_env` on the Dux identity variables), and
+  `crates/dux-core/src/amq/delivery.rs::apply_inject_postscript`
+  consults the session's mode for the postscript decision. None of
+  those paths read the raw column text directly.
 
 A successful tamper that produces *valid* JSON enabling autonomous
 behaviour requires the same write access an attacker already needs
@@ -761,7 +775,7 @@ Claude copy, an existing destination could be overwritten, or a large provider
 tree could exhaust memory, CPU, or inodes. Concurrent fresh Codex launches in
 one shared CWD could also race and swap their newly-created rollout UUIDs.
 
-**Mitigation in code.** `src/resume_recovery.rs` reads provider originals and
+**Mitigation in code.** `crates/dux-core/src/resume_recovery.rs` reads provider originals and
 never moves, edits, or deletes them. Recovery accepts only regular JSONLs with
 valid UUIDs and an absolute recorded CWD that is exactly
 `<historical-worktrees-root>/<registered-project-name>/<agent-dir>`. It checks

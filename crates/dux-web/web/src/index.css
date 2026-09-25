@@ -1,0 +1,715 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
+
+/* "Dux Blocks": a tiny (~6.4KB) subset of DejaVu Sans Mono covering Basic Latin
+   plus the full Block Elements range (U+2580-259F), bundled so the block-glyph
+   dux wordmark (U+2591/U+2588 art) renders every glyph (blocks, ASCII, and
+   spaces) from ONE font with ONE advance width. Many system monospace fonts
+   lack Block Elements, so the browser substitutes those glyphs from a different
+   fallback font with a different advance and the art shears device-dependently
+   (seen on Android). See src/assets/fonts/dux-blocks.LICENSE for provenance.
+   font-display: block, because briefly showing nothing beats flashing sheared art. */
+@font-face {
+    font-family: "Dux Blocks";
+    src: url("./assets/fonts/dux-blocks.woff2") format("woff2");
+    font-weight: 400;
+    font-style: normal;
+    font-display: block;
+}
+
+/* "Dux Mono" and "Dux Mono Symbols": the first two faces of the bundled web
+   terminal font stack ("Dux Mono Fill", declared below, is the third).
+   "Dux Mono" is Roboto Mono, used for ordinary text glyphs. "Dux Mono Symbols"
+   is a small subset of JetBrains Mono Nerd Font Mono covering the ranges a TUI
+   actually draws with: arrows, box drawing, block elements, braille, misc
+   symbols/dingbats, and Powerline glyphs. See src/assets/fonts/dux-mono.LICENSE
+   for provenance and the exact reproduction commands.
+
+   The symbols face is listed BEFORE the text face in the terminal font stack
+   (see lib/terminalFont.ts) so structural glyphs always come from a verified
+   single-cell-advance font, never from whatever fallback the browser happens
+   to pick; the text face carries no box drawing, block, or braille glyphs of
+   its own, so it never competes for those code points. */
+@font-face {
+    font-family: "Dux Mono Symbols";
+    src: url("./assets/fonts/dux-mono-symbols.woff2") format("woff2");
+    font-weight: 400;
+    font-style: normal;
+    font-display: swap;
+    unicode-range: U+2190-21FF, U+2300-23FF, U+2500-25FF, U+2600-27BF, U+2800-28FF, U+E0A0-E0D7;
+}
+
+@font-face {
+    font-family: "Dux Mono";
+    src: url("./assets/fonts/dux-mono-regular.woff2") format("woff2");
+    font-weight: 400;
+    font-style: normal;
+    font-display: swap;
+}
+
+@font-face {
+    font-family: "Dux Mono";
+    src: url("./assets/fonts/dux-mono-bold.woff2") format("woff2");
+    font-weight: 700;
+    font-style: normal;
+    font-display: swap;
+}
+
+/* "Dux Mono Fill": the last-resort backstop, a subset of Adwaita Mono Regular
+   holding the symbol-block glyphs the two faces above lack, restricted to the
+   same 0.60 cell advance ratio. Without it a code point neither bundled face
+   carries falls through to the system tail, and a device with no suitable
+   installed font draws tofu. Measured: a Linux desktop with Adwaita Mono and
+   Noto Sans Symbols 2 installed renders them, an Android phone with neither
+   does not.
+
+   The motivating code points are ones agent CLIs really do emit, read off the
+   permission-mode and status icon table in the Claude Code 2.1.226 bundle:
+   U+23F5 is the accept-edits/bypass/auto mode symbol, U+23F8 the manual/plan
+   mode symbol, and U+2714 the check marker.
+
+   It is listed AFTER both curated faces in the terminal font stack (see
+   lib/terminalFont.ts) so it can only ever catch what the faces ahead of it
+   lack.
+
+   Known trade, measured, accepted rather than fixed: the symbols face draws
+   Block Elements (U+2580-259F) on a 1.320 em cell box while this face draws
+   Symbols for Legacy Computing (U+1FB00-1FBFF, 247 glyphs, kept deliberately)
+   on 1.250 em. Art mixing the two blocks, for example chafa sextant output
+   sitting next to U+2588, therefore shows a seam of about 0.77 px at a 14 px
+   font size. Those code points stay, because a hairline seam beats the tofu
+   they produced before. */
+@font-face {
+    font-family: "Dux Mono Fill";
+    src: url("./assets/fonts/dux-mono-fill.woff2") format("woff2");
+    font-weight: 400;
+    font-style: normal;
+    font-display: swap;
+    unicode-range: U+2000-2BFF, U+2E00-2E7F, U+1F000-1FBFF;
+}
+
+html, body, #root { height: 100%; }
+body { overflow: hidden; user-select: none; }
+button, a, [role="button"], [role="menuitem"], [role="option"], [role="tab"], .cursor-pointer { cursor: pointer; }
+input, textarea, .allow-select, .xterm, .xterm * { user-select: text; }
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+    --font-heading: var(--font-sans);
+    --font-sans: 'Geist Variable', sans-serif;
+    /* The block-art wordmark's font stack (`font-blocks`): the bundled
+       "Dux Blocks" subset first (see the @font-face above), system mono only
+       as a fallback. Scoped to the art on purpose: the app-wide --font-mono
+       is deliberately untouched. */
+    --font-blocks: "Dux Blocks", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    --color-sidebar-ring: var(--sidebar-ring);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar: var(--sidebar);
+    --color-chart-5: var(--chart-5);
+    --color-chart-4: var(--chart-4);
+    --color-chart-3: var(--chart-3);
+    --color-chart-2: var(--chart-2);
+    --color-chart-1: var(--chart-1);
+    --color-ring: var(--ring);
+    --color-input: var(--input);
+    --color-border: var(--border);
+    --color-destructive: var(--destructive);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-accent: var(--accent);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-muted: var(--muted);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-secondary: var(--secondary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-primary: var(--primary);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-popover: var(--popover);
+    --color-card-foreground: var(--card-foreground);
+    --color-card: var(--card);
+    --color-foreground: var(--foreground);
+    --color-background: var(--background);
+    /* The "typing" state color: a soft violet matching the dux TUI's bundled
+       dark-theme typing hue (`#c586e0`). Used for the agent/terminal row's
+       "Typing" state word and the typing caret. The one new semantic token this
+       feature adds; its value lives in :root/.dark below. */
+    --color-dux-typing: var(--dux-typing);
+    /* The standalone agent's location tone: a soft slate blue matching the dux
+       TUI's bundled dark-theme standalone-location hue (`#7d96a0`). Used for
+       the row's standalone star and folder label. This is an IDENTITY color
+       ("this agent lives in your folder"), never a state color, so it stays on
+       line two and must read quieter than the working/typing/attention cues.
+       Its value lives in :root/.dark below. */
+    --color-dux-standalone: var(--dux-standalone);
+    /* The marker for a file the repository excludes from diffs (`-diff` in a
+       .gitattributes), matching the dux TUI's bundled dark-theme excluded
+       hue (`#8c8c8c`). Quiet on purpose: nothing is wrong with the file,
+       git just will not count its lines. Its value lives in :root/.dark
+       below. */
+    --color-dux-diff-excluded: var(--dux-diff-excluded);
+    --radius-sm: calc(var(--radius) * 0.6);
+    --radius-md: calc(var(--radius) * 0.8);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) * 1.4);
+    --radius-2xl: calc(var(--radius) * 1.8);
+    --radius-3xl: calc(var(--radius) * 2.2);
+    --radius-4xl: calc(var(--radius) * 2.6);
+    /* The one working cue: the glyph and the state word breathe together while
+       the agent or terminal is busy. The period and the floor are
+       `dux_core::working_cue`'s WORKING_CUE_PERIOD_MS and PULSE_FLOOR, so the
+       browser and the terminal UI pulse on one clock; a test pins them equal.
+       Opacity only, so it rides the compositor, and the surfaces that carry it
+       pair it with `motion-safe:transition-opacity` so a stop eases back to full
+       rather than freezing mid-dip. */
+    --animate-working-pulse: working-pulse 1.6s ease-in-out infinite;
+    /* The ellipsis that runs after the state word: four states over the SAME
+       period, one every ELLIPSIS_STEP_MS, held rather than tweened. It rides in
+       a slot the width of three dots, so the row behind it never shifts.
+
+       It uncovers real dots with `clip-path` rather than animating `content`,
+       which WebKit does not animate at all: on the phone browser this UI is
+       most used from, the content technique left a permanently blank slot and
+       nothing said so. `clip-path` animates everywhere and degrades to the
+       fully-clipped first frame, which is the same empty-and-correctly-sized
+       slot reduced motion asks for. */
+    --animate-working-dots: working-dots 1.6s steps(1, end) infinite;
+    /* The "needs attention" dot rhythm: two quick pulses, then a steady hold,
+       then repeat. Faster and more insistent than Tailwind's stock 2s
+       `animate-pulse` (which this replaced), because the whole point of the dot
+       is to be noticed from the corner of your eye. Pure opacity so reduced
+       motion can drop it wholesale (`motion-reduce:animate-none` on the dot). */
+    --animate-attention-pulse: attention-pulse 2s ease-in-out infinite;
+    /* One-shot fade for the row's state word (Working / Idle / Detached / …) so
+       it transitions on change instead of snapping. Replayed by keying the span
+       on the label, which remounts it each time the state changes. A FADE and
+       nothing else: line two is baseline-aligned, so any vertical motion drops
+       the word below the rest of the line for a frame, and a busy agent
+       changes state often enough that a screenshot will catch it. */
+    --animate-state-word: state-word-swap 0.28s ease-out;
+    /* The typing caret's slow blink. Pure opacity so reduced motion can drop it
+       wholesale (`motion-reduce:animate-none` on the caret, which then rests
+       fully opaque). Slower than a text-cursor blink so it reads as a quiet
+       "typing" cue rather than an editable field. */
+    --animate-typing-caret: typing-caret 1.1s steps(1) infinite;
+}
+
+@keyframes state-word-swap {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+@keyframes typing-caret {
+    0%, 50% { opacity: 1; }
+    50.01%, 100% { opacity: 0.25; }
+}
+
+@keyframes working-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+}
+
+/* Discrete by design: the dots appear and disappear, they never fade. The
+   overlay holds all three and is clipped from the right in exact thirds, so the
+   four states are three dots, two, one, none. */
+@keyframes working-dots {
+    0% { clip-path: inset(0 100% 0 0); }
+    25% { clip-path: inset(0 66.667% 0 0); }
+    50% { clip-path: inset(0 33.333% 0 0); }
+    75% { clip-path: inset(0 0 0 0); }
+    100% { clip-path: inset(0 100% 0 0); }
+}
+
+/* The reserved ellipsis slot after a working state word. Its width is MEASURED
+   rather than declared: a hidden but laid-out "..." sizes the box in the row's
+   own font, so the count and the trailing text behind it stay exactly where they
+   are through all four states and the slot is never wider than the dots it
+   holds. `pre` keeps the dots from being collapsed. */
+.working-dots {
+    position: relative;
+    display: inline-block;
+    white-space: pre;
+}
+
+.working-dots::before {
+    content: "...";
+    visibility: hidden;
+}
+
+/* The dots the reader actually sees, stacked over that reserved box and fully
+   clipped at rest. With no animation (reduced motion, or an engine that cannot
+   animate clip-path) the slot keeps its width and shows nothing, which is the
+   state the cue is meant to degrade to: the word alone says the agent is
+   working. */
+.working-dots::after {
+    content: "...";
+    position: absolute;
+    inset: 0;
+    clip-path: inset(0 100% 0 0);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+    .working-dots::after {
+        animation: var(--animate-working-dots);
+    }
+}
+
+/* Two quick dips (~0.35s each), then the dot holds at full opacity for the rest
+   of the cycle. No trailing fade: with one, the recovering fade-in reads like a
+   third half-blink right before the next pair and the rhythm feels off. Starts
+   and ends at full opacity so the loop is seamless. */
+@keyframes attention-pulse {
+    0%, 36%, 100% { opacity: 1; }
+    9%, 27% { opacity: 0.25; }
+    18% { opacity: 1; }
+}
+
+/* The text spinner's slot (components/GlyphSpinner.tsx), which cycles six arc
+   frames, U+25DC-U+25E1.
+
+   MEASURED: none of the UI font (Geist), "Dux Mono" (Roboto Mono) or "Dux
+   Blocks" carries a single one of those six code points, so the browser drew
+   every frame from whatever fallback it picked. Those substituted glyphs have
+   no common advance width, so the label beside the spinner shifted sideways
+   each time the frame changed. "Dux Mono Fill" is the one bundled face whose
+   subset covers all six, at a single 600/1000em advance (pinned by
+   lib/terminalFonts.test.ts), so naming it first ends the substitution.
+
+   The 1em slot with centered text makes the width independent of the glyph
+   anyway, which is what keeps the label still during the face's own load (the
+   face is `font-display: swap`, so a fallback really does draw first) and on
+   any device where even the bundled face somehow does not arrive. `flex: none`
+   because every caller drops this into a flex row, where a shrinkable item is
+   not a fixed slot. */
+.glyph-spinner {
+    display: inline-block;
+    flex: none;
+    width: 1em;
+    line-height: 1;
+    text-align: center;
+    font-family: "Dux Mono Fill", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Status indicator icons (StatusBadge dots) rest slightly transparent so they
+   read as quiet metadata. `--on` (the active dot while the agent works) PULSES,
+   breathing its opacity between faint and fully opaque so it reads as a live
+   heartbeat. When work stops the class is removed and the opacity reverts to the
+   resting value; the `transition` on the base eases that change, so the dot
+   settles back to rest instead of freezing at the faint part of the pulse (the
+   same "settle, don't snap" idea as the row's working pulse). */
+.agent-status-dot {
+    opacity: 0.6;
+    transition: opacity 400ms ease-out;
+}
+
+.agent-status-dot--on {
+    animation: agent-status-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes agent-status-pulse {
+    0%, 100% { opacity: 0.4; }
+    50% { opacity: 1; }
+}
+
+/* Reduced motion: no pulse. Keep the active dot fully opaque (against the
+   transparent rest of the others) so "active" still reads, just without motion. */
+@media (prefers-reduced-motion: reduce) {
+    .agent-status-dot {
+        transition: none;
+    }
+    .agent-status-dot--on {
+        animation: none;
+        opacity: 1;
+    }
+}
+
+:root {
+    --background: oklch(1 0 0);
+    --foreground: oklch(0.145 0 0);
+    --card: oklch(1 0 0);
+    --card-foreground: oklch(0.145 0 0);
+    --popover: oklch(1 0 0);
+    --popover-foreground: oklch(0.145 0 0);
+    --primary: oklch(0.205 0 0);
+    --primary-foreground: oklch(0.985 0 0);
+    --secondary: oklch(0.97 0 0);
+    --secondary-foreground: oklch(0.205 0 0);
+    --muted: oklch(0.97 0 0);
+    --muted-foreground: oklch(0.556 0 0);
+    --accent: oklch(0.97 0 0);
+    --accent-foreground: oklch(0.205 0 0);
+    --destructive: oklch(0.577 0.245 27.325);
+    --border: oklch(0.922 0 0);
+    --input: oklch(0.922 0 0);
+    --ring: oklch(0.708 0 0);
+    --chart-1: oklch(0.87 0 0);
+    --chart-2: oklch(0.556 0 0);
+    --chart-3: oklch(0.439 0 0);
+    --chart-4: oklch(0.371 0 0);
+    --chart-5: oklch(0.269 0 0);
+    --radius: 0.625rem;
+    --sidebar: oklch(0.985 0 0);
+    --sidebar-foreground: oklch(0.145 0 0);
+    --sidebar-primary: oklch(0.205 0 0);
+    --sidebar-primary-foreground: oklch(0.985 0 0);
+    --sidebar-accent: oklch(0.97 0 0);
+    --sidebar-accent-foreground: oklch(0.205 0 0);
+    --sidebar-border: oklch(0.922 0 0);
+    --sidebar-ring: oklch(0.708 0 0);
+    /* Typing state color, matching the dux TUI bundled dark theme's soft violet
+       (`#c586e0`). Constant across light/dark since the web app is dark-only. */
+    --dux-typing: #c586e0;
+    /* Standalone-location identity color, the oklch reading of the dux TUI
+       bundled dark theme's soft slate blue (`#7d96a0`). Identity, not state.
+       Constant across light/dark since the web app is dark-only. */
+    --dux-standalone: oklch(0.657 0.032 224);
+    /* Diff-excluded marker color, matching the dux TUI bundled dark theme's
+       muted grey (`#8c8c8c`). Constant across light/dark since the web app
+       is dark-only. */
+    --dux-diff-excluded: #8c8c8c;
+    /* The phone action flap's OPAQUE body color: the tab strip's translucent
+       `bg-muted/30` composited over the app background, written out as one
+       opaque value. The flap grows out of the strip, so the two have to be the
+       same pixel color; an alpha composite of the same mix lands one 8-bit step
+       away from the opaque value and reopens the seam between them. */
+    --dux-flap-bg: color-mix(in srgb, var(--muted) 30%, var(--background));
+}
+
+.dark {
+    --background: oklch(0.145 0 0);
+    --foreground: oklch(0.985 0 0);
+    --card: oklch(0.205 0 0);
+    --card-foreground: oklch(0.985 0 0);
+    --popover: oklch(0.205 0 0);
+    --popover-foreground: oklch(0.985 0 0);
+    --primary: oklch(0.922 0 0);
+    --primary-foreground: oklch(0.205 0 0);
+    --secondary: oklch(0.269 0 0);
+    --secondary-foreground: oklch(0.985 0 0);
+    --muted: oklch(0.269 0 0);
+    --muted-foreground: oklch(0.708 0 0);
+    --accent: oklch(0.269 0 0);
+    --accent-foreground: oklch(0.985 0 0);
+    --destructive: oklch(0.704 0.191 22.216);
+    --border: oklch(1 0 0 / 10%);
+    --input: oklch(1 0 0 / 15%);
+    --ring: oklch(0.556 0 0);
+    --chart-1: oklch(0.87 0 0);
+    --chart-2: oklch(0.556 0 0);
+    --chart-3: oklch(0.439 0 0);
+    --chart-4: oklch(0.371 0 0);
+    --chart-5: oklch(0.269 0 0);
+    --sidebar: oklch(0.205 0 0);
+    --sidebar-foreground: oklch(0.985 0 0);
+    --sidebar-primary: oklch(0.488 0.243 264.376);
+    --sidebar-primary-foreground: oklch(0.985 0 0);
+    --sidebar-accent: oklch(0.269 0 0);
+    --sidebar-accent-foreground: oklch(0.985 0 0);
+    --sidebar-border: oklch(1 0 0 / 10%);
+    --sidebar-ring: oklch(0.556 0 0);
+    /* Typing state color (see :root above). */
+    --dux-typing: #c586e0;
+    /* Standalone-location identity color (see :root above). */
+    --dux-standalone: oklch(0.657 0.032 224);
+    /* Diff-excluded marker color (see :root above). */
+    --dux-diff-excluded: #8c8c8c;
+    /* The phone action flap's opaque body color (see :root above). */
+    --dux-flap-bg: color-mix(in srgb, var(--muted) 30%, var(--background));
+}
+
+/* Slim the xterm scrollbar so it doesn't dominate the terminal column. xterm 6
+   draws a CUSTOM DOM scrollbar sized via the Terminal's overviewRuler.width
+   option (TerminalPane reads this same var for it), so the visible bar matches
+   --xterm-scrollbar-width; the terminal-pane button overlay reserves exactly
+   this width so the buttons never sit on top of the scrollbar. The ::-webkit /
+   scrollbar-width rules below slim the native viewport scrollbar defensively:
+   xterm 6 virtualizes the viewport so it usually shows no thumb, but they cost
+   nothing and guard against a fat native bar if a browser ever surfaces one. */
+:root {
+  --xterm-scrollbar-width: 8px;
+}
+.xterm .xterm-viewport {
+  scrollbar-width: thin;
+}
+.xterm .xterm-viewport::-webkit-scrollbar {
+  width: var(--xterm-scrollbar-width);
+}
+.xterm .xterm-viewport::-webkit-scrollbar-track {
+  background: transparent;
+}
+.xterm .xterm-viewport::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 9999px;
+}
+/* Sizing the scrollbar via overviewRuler.width also instantiates an overview-
+   ruler canvas; dux registers no decorations, so it's always empty. xterm sets
+   this canvas's `display` INLINE on every buffer switch (block on the normal
+   buffer), so !important is required. Without it the canvas reappears as an
+   empty foreground-colored streak in the gutter every time an agent exits an
+   alt-screen TUI (vim, a pager, a full-screen provider UI) back to the shell. */
+.xterm .xterm-decoration-overview-ruler {
+  display: none !important;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    }
+  body {
+    @apply bg-background text-foreground;
+    }
+  html {
+    @apply font-sans;
+    }
+}
+
+/* ===========================================================================
+   THE PHONE ACTION CLUSTER'S DETACH FLIGHT.
+
+   Entering theater on a phone does not swap one control for another: the
+   docked flap tears off the tab strip and FLIES to the floating pill's dock as
+   one object, and leaving theater flies it home and re-attaches it. The
+   translation itself is applied inline by the choreography (it is measured, so
+   it cannot be a stylesheet value); everything here is the part that is the
+   same on every flight, which is exactly the part that belongs in CSS.
+
+   Kept out of Tailwind on purpose: these are keyframes and descendant rules
+   driven by a phase class on the pill's root, which utility classes cannot
+   express, and the phase class is what keeps the choreography readable in one
+   place rather than scattered across a dozen conditional `cn()` arms.
+   =========================================================================== */
+
+/* The theater toggle stacks both icons in one cell; `aria-pressed` picks the
+   settled one, and the flight rotates one out while the other rotates in. */
+.dux-icswap > * {
+  grid-area: 1 / 1;
+}
+.dux-ic-min {
+  opacity: 0;
+}
+/* Scoped to the swap itself. Unscoped, any pressed control anywhere in the app
+   claimed these class names, which is a rule waiting for the next component to
+   pick the same word. */
+[aria-pressed="true"] .dux-icswap .dux-ic-min {
+  opacity: 1;
+}
+[aria-pressed="true"] .dux-icswap .dux-ic-max {
+  opacity: 0;
+}
+.dux-flight-out .dux-ic-max,
+.dux-flight-in .dux-ic-min {
+  animation: dux-ic-out 180ms ease 70ms both;
+}
+.dux-flight-out .dux-ic-min,
+.dux-flight-in .dux-ic-max {
+  animation: dux-ic-in 180ms ease 70ms both;
+}
+@keyframes dux-ic-out {
+  from {
+    opacity: 1;
+    transform: none;
+  }
+  to {
+    opacity: 0;
+    transform: rotate(90deg) scale(0.6);
+  }
+}
+@keyframes dux-ic-in {
+  from {
+    opacity: 0;
+    transform: rotate(-90deg) scale(0.6);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* THE FLOATING PILL WEARS THE BAND'S COLOUR, opaque, docked and floating
+   alike. The fill is whatever the flap published for the band it hangs from
+   (the tab strip's composited tone, or the plain app background), which the
+   flight writes onto the pill as `--dux-flap-fill`; a computer has no flap, so
+   the fallback is the strip's tone, which is the band its pane header wears.
+   Declaring it here rather than as an inline style is what lets the flight's
+   own imperative writes clear back to it. */
+.dux-pill-surface {
+  background-color: var(--dux-flap-fill, var(--dux-flap-bg));
+}
+
+/* THE GRIP SLOT IS THE WIDTH THE CLUSTER GAINS IN FLIGHT. The docked flap has
+   no grip and reserves no blank space for one, so the pill starts the detach
+   gripless (its box then equals the flap's exactly, which is what makes the
+   FLIP a pure translation) and the slot widens on the travel's own clock. The
+   negative margin swallows the row's 2px gap at zero width, so a collapsed grip
+   advances the row by exactly nothing. */
+.dux-pill-grip {
+  transition:
+    width 320ms cubic-bezier(0.2, 0, 0, 1),
+    margin-right 320ms cubic-bezier(0.2, 0, 0, 1);
+}
+.dux-pill-gripless .dux-pill-grip {
+  width: 0;
+  margin-right: -2px;
+  padding: 0;
+  overflow: hidden;
+}
+.dux-flight-out .dux-pill-grip {
+  animation: dux-grip-in 380ms 100ms both;
+}
+.dux-flight-in .dux-pill-grip {
+  animation: dux-grip-out 200ms ease both;
+}
+@keyframes dux-grip-in {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes dux-grip-out {
+  to {
+    opacity: 0;
+  }
+}
+
+/* The flap's concave fillets, reproduced on the travelling pill as the same
+   arcs the docked flap draws, so the shape the flight leaves and the shape it
+   re-forms are one object. They shrink away right at pull-off; on the way back
+   they appear only AFTER the capsule has arrived, so the return reads
+   travel-then-snap and never a tab shape flying through the air. */
+.dux-pill-fillet {
+  position: absolute;
+  top: 0;
+  display: none;
+  pointer-events: none;
+}
+.dux-pill-fillet-l {
+  left: -12px;
+  transform-origin: 100% 0;
+}
+.dux-pill-fillet-r {
+  right: -12px;
+  transform-origin: 0 0;
+}
+.dux-flight-out .dux-pill-fillet,
+.dux-flight-attach .dux-pill-fillet {
+  display: block;
+}
+.dux-flight-out .dux-pill-fillet {
+  animation: dux-fillet-out 180ms ease both;
+}
+.dux-flight-attach .dux-pill-fillet {
+  animation: dux-fillet-in 180ms ease both;
+}
+@keyframes dux-fillet-out {
+  from {
+    opacity: 1;
+    transform: none;
+  }
+  to {
+    opacity: 0;
+    transform: scale(0.25);
+  }
+}
+@keyframes dux-fillet-in {
+  from {
+    opacity: 0;
+    transform: scale(0.25);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* A viewer who asked for less motion never reaches a flight at all: the phase
+   machine collapses every stage to an instant swap, so no phase class is ever
+   applied. The grip's own transition is the one rule that is live outside a
+   flight, so it is the one that has to be cut here. */
+@media (prefers-reduced-motion: reduce) {
+  .dux-pill-grip {
+    transition: none;
+  }
+}
+
+/* Projects sidebar: render the nested rows as an actual tree instead of just an
+   indented list. The parent SidebarMenuSub drops its flat left border
+   (`border-l-0`) and each row draws its own guide: a vertical segment that
+   bridges the inter-row gap down to the next sibling, plus a short horizontal
+   tick into the row. The LAST child stops its vertical at the row centre, so the
+   branch terminates in an elbow (└) rather than a line running off the bottom.
+   Applied to both nesting levels (agents under a project, terminals under an
+   agent). Geometry is tuned to the h-7 (28px) sub-row and the sub-list's 0.625rem
+   (px-2.5) left inset and 0.25rem (gap-1) row gap. */
+.dux-tree > li {
+  position: relative;
+}
+.dux-tree > li::before {
+  content: "";
+  position: absolute;
+  left: -0.625rem;
+  top: 0;
+  /* Extend past the row into the gap so the guide meets the next sibling. */
+  height: calc(100% + 0.25rem);
+  border-left: 1px solid var(--sidebar-border);
+}
+.dux-tree > li:last-child::before {
+  /* Elbow: stop the vertical at the row's connector centre. */
+  height: 0.875rem;
+}
+.dux-tree > li::after {
+  content: "";
+  position: absolute;
+  left: -0.625rem;
+  top: 0.875rem;
+  width: 0.75rem;
+  border-top: 1px solid var(--sidebar-border);
+}
+/* ALL-DELETE diff (a deleted or truncated-to-empty file): hide Monaco's
+   phantom trailing "1 +" inserted line. An empty modified TextModel still has
+   one line (Monaco models cannot have zero), so the diff computer reports a
+   real insertion for it (measured on monaco 0.55.1: original [1,N) →
+   modified [1,2) for every original shape), and git reports zero added lines
+   for the same change, so the green row is false content. The marker class is
+   set by EditorBody exactly when isAllDeleteDiff holds; DiffViewer's
+   allDeleteDiffOptions handles the halves CSS cannot (the current-line border
+   on the blanked row, and the overview ruler's canvas-drawn green speck).
+   These four rules blank the insertion DECORATIONS: line background, margin
+   background, char overlay (the empty-range marker rides it), and the +
+   sign. The sign needs the `.monaco-editor` prefix because Monaco ships its
+   own `.monaco-editor .insert-sign { display: flex !important }`, and a bare
+   class rule loses that !important tie on specificity; this form matches it
+   and wins as the later sheet. The final rule hides the phantom row's line
+   number. It MUST scope to `.editor.modified`: the deleted rows' numbers are
+   ORDINARY `.line-numbers` elements too, in the sibling `.editor.original`'s
+   margin (they are not view-zone content: that was measured wrong once and
+   hid them), so an unscoped rule always matches all of them. The modified
+   editor's sole line number in an all-delete diff is the phantom row's. */
+.dux-diff-all-delete .line-insert {
+  display: none !important;
+}
+.dux-diff-all-delete .gutter-insert {
+  display: none !important;
+}
+.dux-diff-all-delete .char-insert {
+  display: none !important;
+}
+.dux-diff-all-delete .monaco-editor .insert-sign {
+  display: none !important;
+}
+/* The `.editor.modified` scope does double duty. It picks WHICH line numbers
+   to hide (only the modified editor's, since the deleted rows' numbers live in the
+   sibling `.editor.original` and must survive), and it is also the LOAD-ORDER
+   guard: Monaco's own `.monaco-editor .margin-view-overlays .line-numbers`
+   rule (display: inline-block, no !important) ships inside the lazy
+   DiffViewer chunk, so it loads AFTER this sheet and wins any specificity tie
+   on source order. This selector out-specifies it (0,4,0 vs 0,3,0) and wins
+   regardless of load order, with no !important needed. (The four rules above
+   DO need their !important, because Monaco's counterparts carry it.) */
+.dux-diff-all-delete .editor.modified .margin-view-overlays .line-numbers {
+  display: none;
+}

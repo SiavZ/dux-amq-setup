@@ -1,0 +1,62 @@
+// The sidebar row's own actions menu, which is where every per-agent action
+// lives.
+const {
+  agents,
+  boxOf,
+  clearToasts,
+  expectMenuOpen,
+  expectNoCover,
+  expectPanePainted,
+  goto,
+  sleep,
+  steadyBox,
+  takeOver,
+} = require("../lib.js")
+
+module.exports = {
+  file: "agent-session-menu.png",
+  viewport: "desktop",
+  async shoot(page) {
+    const by = await agents()
+    await goto(page, `#/agent/${by["fix-login-redirect"].id}`)
+    await takeOver(page)
+    await clearToasts(page)
+    // The pane header carries a Session actions button too, so the row's is
+    // picked by position (inside the sidebar) as well as by the row's own text.
+    const opened = await page.evaluate(() => {
+      const btn = [...document.querySelectorAll('[aria-label="Session actions"]')].find((b) => {
+        if (b.getBoundingClientRect().x > 500) return false
+        return /fix-login-redirect/.test(b.parentElement?.parentElement?.textContent || "")
+      })
+      if (!btn) return false
+      btn.click()
+      return true
+    })
+    if (!opened) throw new Error("no sidebar row menu for fix-login-redirect")
+    await sleep(900)
+    // A click that lands wrong opens nothing, or opens the menu and lets it
+    // close again; either way the crop below still finds something to frame.
+    // This picture went out once with the menu shut and the take-over card up.
+    await expectNoCover(page)
+    await expectPanePainted(page)
+    await expectMenuOpen(page, "Attach a file")
+    // Framed on the menu itself rather than to the bottom of the window: the row
+    // it belongs to can be anywhere in the sidebar, and a menu near the bottom
+    // opens upwards, so the menu's own extent is the only stable frame. The
+    // sidebar comes along because the crop starts at the window's left edge.
+    //
+    // Measured once it has stopped moving: this menu re-positions itself about a
+    // second after it opens, and a rect read before that framed it with forty
+    // pixels of dead black where the twelve asked for below were meant to go.
+    const menu = await steadyBox(() => boxOf(page, ['[role="menu"]']), {
+      what: "the row's actions menu",
+    })
+    const y = Math.max(0, Math.round(menu.y - 12))
+    return {
+      x: 0,
+      y,
+      width: Math.min(1440, Math.round(menu.x + menu.width + 12)),
+      height: Math.min(900 - y, Math.round(menu.y + menu.height + 12 - y)),
+    }
+  },
+}

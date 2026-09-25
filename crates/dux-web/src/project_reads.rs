@@ -1,0 +1,797 @@
+//! REST reads scoped to a single project.
+//!
+//! - `GET /api/v1/projects/:id/worktrees`: the project's managed worktrees for the
+//!   Worktrees manager, adoptable candidates and agent-held alike, each with its
+//!   dirtiness. 404 for an unknown project id.
+//! - `DELETE /api/v1/projects/:id/worktrees?path=`: remove ONE managed worktree.
+//!   Refuses anything that is not a managed worktree of that project (404) and
+//!   anything an agent is attached to (409). Answers 200 with a body reporting what
+//!   happened to the branch, because `git branch -D` can refuse one checked out in
+//!   another worktree and the client must not report its checkbox as the outcome.
+//! - `GET /api/v1/projects/worktree-counts`: how many managed worktrees each project
+//!   has, so the picker can label its rows before the user drills into an empty one.
+//! - `GET /api/v1/projects/inspect?path=`: branch pre-flight for the add-project
+//!   flow. 400 for an empty or relative path: the path must be absolute, because it
+//!   is not a registered project yet and is inspected straight off the filesystem.
+//!
+//! These shell to git, so the classification and inspection run off the async
+//! reactor. The static `inspect` and `worktree-counts` segments coexist with the
+//! parameterized `/api/v1/projects/:id` routes because axum's matcher prefers a
+//! static segment.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use axum::{
+    Json, Router,
+    extract::{Path as AxumPath, Query, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::get,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::rest_common::id_within_bound;
+use crate::server::AppState;
+
+/// Upper bound on the `?path=` query value before any filesystem touch (matches
+/// the bound used by the directory browser).
+const MAX_PATH_LEN: usize = 4096;
+
+/// The project read routes.
+pub fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/api/v1/projects/inspect", get(inspect_path))
+        .route(
+            "/api/v1/projects/worktree-counts",
+            get(list_worktree_counts),
+        )
+        .route(
+            "/api/v1/projects/{id}/worktrees",
+            get(list_worktrees).delete(delete_worktree),
+        )
+}
+
+// ── Worktrees ──────────────────────────────────────────────────────────────────
+
+/// A managed-worktree candidate, mirroring the frontend's
+/// `ProjectWorktreeEntryView` (`projectsApi.ts` / `types.ts`).
+#[derive(Serialize)]
+struct ProjectWorktreeEntryView {
+    worktree_path: String,
+    branch_name: String,
+    /// The real branch, `null` for a detached worktree. `branch_name` is a
+    /// display LABEL that invents a "detached <sha>" string, so it cannot
+    /// answer "is there a branch here to delete?". The delete confirmation
+    /// offers its branch checkbox only when this is set.
+    branch: Option<String>,
+    adoptable: bool,
+    reason: Option<String>,
+    /// Whether the worktree holds uncommitted work (staged, unstaged, or
+    /// untracked). The manager's delete confirmation says so specifically,
+    /// because removal is `--force` and there is no trash.
+    dirty: bool,
+    /// The agent holding this worktree, for a non-adoptable row. The client
+    /// resolves the display name from its own spine (`title || branch_name`) so
+    /// the naming vocabulary stays in one place, and points the user at that
+    /// agent instead of offering a second route to deleting the worktree.
+    agent_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct WorktreesReply {
+    entries: Vec<ProjectWorktreeEntryView>,
+}
+
+#[derive(Serialize)]
+struct WorktreeCountsReply {
+    /// project id → how many managed worktrees it has.
+    counts: BTreeMap<String, usize>,
+}
+
+async fn list_worktrees(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> Response {
+    if !id_within_bound(&id) {
+        return (StatusCode::NOT_FOUND, "unknown project").into_response();
+    }
+    // Resolve the project + classification inputs from the engine (an instant
+    // lookup), then classify off-thread: classification shells to git, so it must
+    // not run on the engine loop or the async reactor (the browse precedent).
+    match state.engine.project_worktree_inputs(id).await {
+        None => (StatusCode::NOT_FOUND, "unknown project").into_response(),
+        Some((project, paths, sessions)) => {
+            match tokio::task::spawn_blocking(move || {
+                classify_managed_worktrees(&project, &paths, &sessions)
+            })
+            .await
+            {
+                Ok(Ok(entries)) => Json(WorktreesReply { entries }).into_response(),
+                Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("worktree listing failed: {e}"),
+                )
+                    .into_response(),
+            }
+        }
+    }
+}
+
+/// Project a project's managed worktrees, under dux's worktrees root and minus the
+/// project checkout, into wire-safe entries. A thin adapter: which worktrees the
+/// manager owns and their dirtiness are decided by
+/// [`dux_core::worktree_manager::list_manageable_worktrees`], shared with the TUI so
+/// the two surfaces cannot classify differently, and only the wire field names and
+/// the reason string are decided here. Runs in `spawn_blocking`, since the listing
+/// shells to git, and returns a user-facing error string when that fails.
+fn classify_managed_worktrees(
+    project: &dux_core::model::Project,
+    paths: &dux_core::config::DuxPaths,
+    sessions: &[dux_core::model::AgentSession],
+) -> Result<Vec<ProjectWorktreeEntryView>, String> {
+    let entries = dux_core::worktree_manager::list_manageable_worktrees(project, paths, sessions)?
+        .into_iter()
+        .map(|entry| ProjectWorktreeEntryView {
+            adoptable: entry.is_removable(),
+            reason: if entry.is_removable() {
+                None
+            } else {
+                Some("Already has an agent.".to_string())
+            },
+            worktree_path: entry.path.to_string_lossy().to_string(),
+            branch_name: entry.label,
+            branch: entry.branch,
+            dirty: entry.dirty,
+            agent_id: entry.attached_session_id,
+        })
+        .collect();
+    Ok(entries)
+}
+
+// ── Worktree counts ────────────────────────────────────────────────────────────
+
+/// How many managed worktrees each project has, so the picker's rows say it before
+/// the user drills in. Empty projects stay listed and clickable: a disabled row
+/// gives no reason and reads as broken. One request rather than one per row, with
+/// all the git work in a single `spawn_blocking`.
+async fn list_worktree_counts(State(state): State<AppState>) -> Response {
+    let Some(spine) = state.engine.spine().await else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "engine unavailable").into_response();
+    };
+    let mut inputs = Vec::new();
+    for project in spine.projects {
+        if let Some(triple) = state
+            .engine
+            .project_worktree_inputs(project.id.clone())
+            .await
+        {
+            inputs.push((project.id, triple));
+        }
+    }
+    match tokio::task::spawn_blocking(move || {
+        let mut counts = BTreeMap::new();
+        for (id, (project, paths, sessions)) in inputs {
+            let n = classify_managed_worktrees(&project, &paths, &sessions)
+                .map(|entries| entries.len())
+                .unwrap_or(0);
+            counts.insert(id, n);
+        }
+        counts
+    })
+    .await
+    {
+        Ok(counts) => Json(WorktreeCountsReply { counts }).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("worktree counting failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+// ── Delete one worktree ────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct DeleteWorktreeQuery {
+    #[serde(default)]
+    path: String,
+    /// Also force-delete the branch the worktree is on. Defaults to false, so a
+    /// missing query parameter never deletes user data (the precedent set by the
+    /// agent-delete route's `delete_worktree`). The manager's confirmation
+    /// dialog defaults its checkbox ON and sends `true`; a detached worktree has
+    /// no branch to name and sends nothing.
+    #[serde(default)]
+    delete_branch: bool,
+}
+
+/// What the removal did to the worktree's branch, when it was asked to touch it at
+/// all. `None` means no deletion was attempted, because the request did not ask or
+/// the worktree is detached, so the client must claim nothing either way: its own
+/// checkbox says what was requested, and `git branch -D` refuses a branch checked
+/// out in another worktree.
+#[derive(Serialize)]
+struct BranchOutcomeReply {
+    /// The branch the removal targeted.
+    name: String,
+    /// `deleted`, `already_gone` or `refused`.
+    outcome: &'static str,
+    /// git's own reason, on `refused` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+impl BranchOutcomeReply {
+    fn from_core(name: String, deletion: &dux_core::git::BranchDeletion) -> Self {
+        match deletion {
+            dux_core::git::BranchDeletion::Deleted => Self {
+                name,
+                outcome: "deleted",
+                reason: None,
+            },
+            dux_core::git::BranchDeletion::AlreadyGone => Self {
+                name,
+                outcome: "already_gone",
+                reason: None,
+            },
+            dux_core::git::BranchDeletion::Refused { reason } => Self {
+                name,
+                outcome: "refused",
+                reason: Some(reason.clone()),
+            },
+        }
+    }
+}
+
+/// The 200 body of a successful removal.
+#[derive(Serialize)]
+struct DeleteWorktreeReply {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch: Option<BranchOutcomeReply>,
+}
+
+async fn delete_worktree(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<DeleteWorktreeQuery>,
+) -> Response {
+    if !id_within_bound(&id) {
+        return (StatusCode::NOT_FOUND, "unknown project").into_response();
+    }
+    if query.path.is_empty() {
+        return (StatusCode::BAD_REQUEST, "path is required").into_response();
+    }
+    if query.path.chars().count() > MAX_PATH_LEN {
+        return (StatusCode::BAD_REQUEST, "path is too long").into_response();
+    }
+    let Some((project, paths, sessions)) = state.engine.project_worktree_inputs(id).await else {
+        return (StatusCode::NOT_FOUND, "unknown project").into_response();
+    };
+    // Every registered checkout is protected from the removal; an unreadable
+    // inventory refuses it outright rather than removing half-guarded.
+    let protected = match state.engine.registered_project_paths().await {
+        Ok(protected) => protected,
+        Err(error) => return (StatusCode::CONFLICT, error).into_response(),
+    };
+
+    let requested = PathBuf::from(&query.path);
+    let delete_branch = query.delete_branch;
+    // Classify and remove in ONE off-thread hop, both because the classification
+    // shells to git and because the removal must be decided against a fresh
+    // listing rather than against whatever the client last saw. Both halves are
+    // core's, shared with the TUI's worktree manager; the route only maps the
+    // three answers onto statuses.
+    let result = tokio::task::spawn_blocking(move || {
+        dux_core::worktree_manager::remove_managed_worktree(
+            &project,
+            &paths,
+            &sessions,
+            &requested,
+            delete_branch,
+            &protected,
+        )
+    })
+    .await;
+
+    match result {
+        // 404: dux will not remove a directory it was not asked about, and an
+        // external worktree or the source checkout is not the manager's to
+        // touch.
+        Ok(Ok(dux_core::worktree_manager::RemovalOutcome::NotManaged)) => (
+            StatusCode::NOT_FOUND,
+            "that is not a managed worktree of this project",
+        )
+            .into_response(),
+        // 409, and this is defence in depth rather than a restatement of the UI
+        // rule: removing a worktree from under a live agent leaves a broken
+        // session, and deleting the agent is the supported route.
+        Ok(Ok(dux_core::worktree_manager::RemovalOutcome::Attached)) => (
+            StatusCode::CONFLICT,
+            "an agent is working in that directory; delete that agent first (deleting a \
+             standalone agent leaves its directory in place)",
+        )
+            .into_response(),
+        // 200 with a body rather than a bare 204: the client has to be
+        // told what happened to the branch, because it cannot infer it from the
+        // checkbox it sent.
+        Ok(Ok(dux_core::worktree_manager::RemovalOutcome::Removed { branch, .. })) => {
+            Json(DeleteWorktreeReply {
+                branch: branch
+                    .map(|branch| BranchOutcomeReply::from_core(branch.name, &branch.deletion)),
+            })
+            .into_response()
+        }
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("worktree removal failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+// ── Inspect ──────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct InspectQuery {
+    #[serde(default)]
+    path: String,
+}
+
+/// The branch-warning classification, mirroring the frontend's `BranchWarningView`
+/// (`{ kind: "known", default_branch } | { kind: "heuristic" }`).
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum BranchWarningView {
+    Known { default_branch: String },
+    Heuristic,
+}
+
+#[derive(Serialize)]
+struct InspectReply {
+    /// How the path classifies for the add flow: `"repo"` (work-tree root),
+    /// `"bare"` (bare root), `"repo_subdir"` (inside a repo or git's internal
+    /// directory, blocked client-side), or `"plain"` (not a repo, and the client
+    /// offers to initialize one). A client treats a missing `kind` as `"repo"`.
+    kind: &'static str,
+    /// The enclosing repository root, for the `repo_subdir` kind. `None` when
+    /// the path is inside git's internal directory (no user-facing root to
+    /// name) and for every other kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_root: Option<String>,
+    /// For the `plain` kind: names of starter-.gitignore candidate directories
+    /// present in the folder, so the client can say what a seed would cover.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    gitignore_candidates: Vec<String>,
+    current_branch: Option<String>,
+    warning: Option<BranchWarningView>,
+    /// `false` for a freshly `git init`'d repo with an unborn HEAD, which the UI
+    /// uses to offer an initial commit before the repo can back worktrees. This is
+    /// `repo_has_commits`'s fail-open bool, so a transient git failure also yields
+    /// `false`; the mutating add path re-checks with the fail-closed
+    /// `repo_commit_state` and never double-commits.
+    has_commits: bool,
+}
+
+async fn inspect_path(
+    State(_state): State<AppState>,
+    Query(query): Query<InspectQuery>,
+) -> Response {
+    let path = query.path;
+    // The path is inspected straight off the filesystem (it is not a registered
+    // project yet), so it must be an absolute path. Reject empty/relative with 400.
+    if path.is_empty() {
+        return (StatusCode::BAD_REQUEST, "path is required").into_response();
+    }
+    if !Path::new(&path).is_absolute() {
+        return (StatusCode::BAD_REQUEST, "path must be absolute").into_response();
+    }
+    if path.chars().count() > MAX_PATH_LEN {
+        return (StatusCode::BAD_REQUEST, "path is too long").into_response();
+    }
+
+    // Bounded git plumbing reads with no working-tree writes, run off the async
+    // reactor. A detached HEAD yields a null `current_branch` and no warning, since
+    // no default branch can be offered from there; a non-repo path returns 400.
+    let result = tokio::task::spawn_blocking(move || {
+        let repo = Path::new(&path);
+        // Classify first so the add flow can distinguish a plain folder (offer
+        // init), a repo subfolder / git-internal dir (blocked), and a bare or
+        // work-tree root (the existing probes). Indeterminate falls through to
+        // the probes, whose error becomes the 400 it always was.
+        let kind = dux_core::git::repo_path_kind(repo);
+        match kind {
+            dux_core::git::RepoPathKind::NotARepo => {
+                let gitignore_candidates = dux_core::gitignore_seed::matched_candidates(repo)
+                    .iter()
+                    .map(|c| c.dir.to_string())
+                    .collect();
+                return Ok(InspectReply {
+                    kind: "plain",
+                    repo_root: None,
+                    gitignore_candidates,
+                    current_branch: None,
+                    warning: None,
+                    has_commits: false,
+                });
+            }
+            dux_core::git::RepoPathKind::InsideWorkTree { root } => {
+                return Ok(InspectReply {
+                    kind: "repo_subdir",
+                    repo_root: Some(root.to_string_lossy().to_string()),
+                    gitignore_candidates: Vec::new(),
+                    current_branch: None,
+                    warning: None,
+                    has_commits: true,
+                });
+            }
+            dux_core::git::RepoPathKind::InsideGitDir { .. } => {
+                // Same blocked treatment client-side; the panel copy degrades
+                // to not naming a root.
+                return Ok(InspectReply {
+                    kind: "repo_subdir",
+                    repo_root: None,
+                    gitignore_candidates: Vec::new(),
+                    current_branch: None,
+                    warning: None,
+                    has_commits: true,
+                });
+            }
+            dux_core::git::RepoPathKind::BareRoot
+            | dux_core::git::RepoPathKind::WorkTreeRoot
+            | dux_core::git::RepoPathKind::Indeterminate => {}
+        }
+        let reply_kind = match kind {
+            dux_core::git::RepoPathKind::BareRoot => "bare",
+            _ => "repo",
+        };
+        let branch = dux_core::git::current_branch_opt(repo).map_err(|e| format!("{e:#}"))?;
+        let has_commits = dux_core::git::repo_has_commits(repo);
+        // Only the warning selection is the shared core-owned decision the TUI's
+        // add_project also consumes; the reply `kind` comes from `RepoPathKind` and
+        // `has_commits` drives the initial-commit offer. A detached HEAD warns not.
+        let branch_warning = branch
+            .as_deref()
+            .and_then(|b| dux_core::git::branch_warning_kind(repo, b));
+        let inspection = dux_core::add_project_plan::AddProjectInspection {
+            path_kind: kind.clone(),
+            current_branch: branch.clone(),
+            branch_warning,
+            has_commits,
+        };
+        let warning = match dux_core::add_project_plan::add_project_plan(&inspection).warning {
+            dux_core::add_project_plan::AddProjectWarning::NotOnDefaultBranch {
+                default_branch,
+            } => Some(BranchWarningView::Known { default_branch }),
+            dux_core::add_project_plan::AddProjectWarning::NotOnDefaultBranchUnknown => {
+                Some(BranchWarningView::Heuristic)
+            }
+            dux_core::add_project_plan::AddProjectWarning::None => None,
+        };
+        Ok::<_, String>(InspectReply {
+            kind: reply_kind,
+            repo_root: None,
+            gitignore_candidates: Vec::new(),
+            current_branch: branch,
+            warning,
+            has_commits,
+        })
+    })
+    .await;
+
+    match result {
+        Ok(Ok(reply)) => Json(reply).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("inspection failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    use crate::test_support::router_no_auth;
+
+    /// Initialize a git repo on `main` with one commit so `current_branch`
+    /// resolves and there is no `origin/HEAD` (the heuristic-warning path).
+    fn init_repo(dir: &Path) {
+        let run = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("README.md"), "hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+    }
+
+    #[tokio::test]
+    async fn inspect_reports_current_branch() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let path = repo.path().to_string_lossy().to_string();
+
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/projects/inspect?path={path}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["current_branch"], "main");
+        // On `main` with no origin, there is no warning.
+        assert!(value["warning"].is_null());
+    }
+
+    #[tokio::test]
+    async fn inspect_rejects_empty_path_with_400() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects/inspect?path=")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn inspect_rejects_relative_path_with_400() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects/inspect?path=relative/dir")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Build a detached-HEAD repo: init on `main`, commit once, then detach.
+    fn init_repo_detached(dir: &Path) {
+        let run = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("README.md"), "hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+        // Detach HEAD at the current commit.
+        run(&["checkout", "--detach"]);
+    }
+
+    #[tokio::test]
+    async fn inspect_detached_head_reports_null_branch_200() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo_detached(repo.path());
+        let path = repo.path().to_string_lossy().to_string();
+
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/projects/inspect?path={path}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // Detached HEAD: branch must be JSON null and no warning emitted.
+        assert!(
+            value["current_branch"].is_null(),
+            "expected null current_branch, got {value}"
+        );
+        assert!(
+            value["warning"].is_null(),
+            "expected null warning, got {value}"
+        );
+    }
+
+    /// Init a repo with `git init` but NO commit (unborn HEAD).
+    fn init_repo_no_commit(dir: &Path) {
+        let run = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "Test"]);
+    }
+
+    #[tokio::test]
+    async fn inspect_reports_has_commits_true_for_repo_with_commit() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let path = repo.path().to_string_lossy().to_string();
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/projects/inspect?path={path}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["has_commits"], true, "got {value}");
+    }
+
+    #[tokio::test]
+    async fn inspect_reports_no_commits_for_unborn_repo() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo_no_commit(repo.path());
+        let path = repo.path().to_string_lossy().to_string();
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/projects/inspect?path={path}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // An unborn repo is still a valid git repo, so inspect succeeds (200)
+        // and simply reports has_commits: false so the UI can offer to create
+        // the initial commit.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["has_commits"], false, "got {value}");
+    }
+
+    async fn inspect_json(path: &str) -> (StatusCode, serde_json::Value) {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/projects/inspect?path={path}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn inspect_classifies_a_plain_folder_with_candidates() {
+        // Was a 400; the adopt-a-folder flow now classifies a non-repo as
+        // `kind: "plain"` and names the starter-.gitignore candidates so the
+        // client can offer to initialize it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("node_modules")).unwrap();
+        let (status, value) = inspect_json(&dir.path().to_string_lossy()).await;
+        assert_eq!(status, StatusCode::OK, "got {value}");
+        assert_eq!(value["kind"], "plain");
+        assert_eq!(value["has_commits"], false);
+        let candidates: Vec<&str> = value["gitignore_candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(candidates, vec!["node_modules"]);
+    }
+
+    #[tokio::test]
+    async fn inspect_classifies_repo_subdirs_and_git_dirs_as_blocked() {
+        // Catches the client offering add (or init) on a folder inside a repo:
+        // the server is the authority over the picker's `.git`-existence label.
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sub = repo.path().join("src");
+        std::fs::create_dir(&sub).unwrap();
+
+        let (status, value) = inspect_json(&sub.to_string_lossy()).await;
+        assert_eq!(status, StatusCode::OK, "got {value}");
+        assert_eq!(value["kind"], "repo_subdir");
+        assert_eq!(
+            value["repo_root"].as_str().unwrap(),
+            repo.path().canonicalize().unwrap().to_string_lossy()
+        );
+
+        let git_dir = repo.path().join(".git");
+        let (status, value) = inspect_json(&git_dir.to_string_lossy()).await;
+        assert_eq!(status, StatusCode::OK, "got {value}");
+        assert_eq!(value["kind"], "repo_subdir");
+        assert!(
+            value.get("repo_root").is_none() || value["repo_root"].is_null(),
+            "a git-internal dir names no user-facing root, got {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_classifies_a_bare_root_with_branch_fields() {
+        // Catches the client offering `git init` on a bare repository.
+        let bare = tempfile::tempdir().unwrap();
+        let ok = std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .current_dir(bare.path())
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok);
+        let (status, value) = inspect_json(&bare.path().to_string_lossy()).await;
+        assert_eq!(status, StatusCode::OK, "got {value}");
+        assert_eq!(value["kind"], "bare");
+        // The existing probes still run for a bare repo.
+        assert_eq!(value["current_branch"], "main");
+        assert_eq!(value["has_commits"], false);
+    }
+
+    #[tokio::test]
+    async fn inspect_work_tree_root_reports_kind_repo() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let (status, value) = inspect_json(&repo.path().to_string_lossy()).await;
+        assert_eq!(status, StatusCode::OK, "got {value}");
+        assert_eq!(value["kind"], "repo");
+        assert_eq!(value["current_branch"], "main");
+    }
+
+    #[tokio::test]
+    async fn worktrees_404_for_unknown_project() {
+        let (_tmp, app) = router_no_auth();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects/nope/worktrees")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+}

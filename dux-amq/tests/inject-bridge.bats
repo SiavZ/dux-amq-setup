@@ -137,7 +137,7 @@ collect_queue_files() {
   grep -Fxq -- "hello-world" "$TMUX_LOG"
   grep -Fxq -- "Enter" "$TMUX_LOG"
   # No file in any subdirectory of the queue when tmux delivery succeeded.
-  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*/*.msg" >/dev/null
+  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*/*.msg" >/dev/null || false
 }
 
 # 13.2 — DUX_TMUX_TARGET is honored.
@@ -164,7 +164,7 @@ collect_queue_files() {
   # tmux must NOT have been called at all.
   [ ! -s "$TMUX_LOG" ]
   # File queue must be empty (no per-receiver subdir created).
-  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*/*.msg" >/dev/null
+  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*/*.msg" >/dev/null || false
 }
 
 # 13.4 — strict mode: MAC-mismatched envelopes are dropped.
@@ -200,7 +200,7 @@ collect_queue_files() {
   [ "${#files[@]}" -eq 1 ]
   grep -Fxq -- "queued-msg" "${files[0]}"
   # No file at the legacy flat path (no top-level *.msg).
-  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*.msg" >/dev/null
+  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*.msg" >/dev/null || false
 }
 
 @test "_unrouted remains a legitimate addressed receiver" {
@@ -215,7 +215,7 @@ collect_queue_files() {
   files=("${QUEUE_FILES[@]}")
   [ "${#files[@]}" -eq 1 ]
   grep -Fxq -- "addressed" "${files[0]}"
-  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/.unrouted/*.msg" >/dev/null
+  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/.unrouted/*.msg" >/dev/null || false
 }
 
 # 13.6 — empty argv: bridge must exit 0 silently (verify dropped it).
@@ -223,7 +223,7 @@ collect_queue_files() {
   unset TMUX
   run dux-amq-inject-bridge ""
   [ "$status" -eq 0 ]
-  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*/*.msg" >/dev/null
+  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*/*.msg" >/dev/null || false
 }
 
 # 13.7 — under dux: DUX_PANE=1 forces the queue path even with TMUX.
@@ -257,7 +257,7 @@ collect_queue_files() {
   run dux-amq-inject-bridge "$msg"
   [ "$status" -eq 0 ]
   [ ! -s "$TMUX_LOG" ]
-  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*/*.msg" >/dev/null
+  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*/*.msg" >/dev/null || false
 }
 
 # 13.7b — under dux with AM_ROOT: bridge auto-drains and queues the
@@ -290,7 +290,7 @@ collect_queue_files() {
   grep -Fq -- "drained-body" "${files[0]}"
   grep -Fq -- "Act on these AMQ messages now" "${files[0]}"
   # Unsafe Ctrl+C from the peer body was stripped before queueing.
-  ! LC_ALL=C grep -q $'\003' "${files[0]}"
+  ! LC_ALL=C grep -q $'\003' "${files[0]}" || false
 }
 
 @test "dux-amq-inject-bridge ignores an empty JSON drain with advisory stderr" {
@@ -304,7 +304,7 @@ collect_queue_files() {
   run dux-amq-inject-bridge "AMQ wake notification"
 
   [ "$status" -eq 0 ]
-  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*/*.msg" >/dev/null
+  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*/*.msg" >/dev/null || false
 }
 
 @test "dux-amq-inject-bridge drains downtime mail after the exact managed wake is ready" {
@@ -361,7 +361,7 @@ collect_queue_files() {
   export AM_ME="bob"
   run dux-amq-inject-bridge $'\003'
   [ "$status" -eq 0 ]
-  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*/*.msg" >/dev/null
+  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/*/*.msg" >/dev/null || false
 }
 
 # 13.8 — receiver path: AM_ME determines the subdirectory.
@@ -411,7 +411,7 @@ collect_queue_files() {
   run dux-amq-inject-bridge "$msg"
   [ "$status" -eq 0 ]
   # The body landed somewhere INSIDE inject-queue/, not above it.
-  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/../*.msg" >/dev/null
+  ! compgen -G "$HOME/.local/share/dux-amq/inject-queue/../*.msg" >/dev/null || false
   # And not in any directory derived from the literal `../../etc`.
   [ ! -e "$HOME/.local/share/etc" ]
 }

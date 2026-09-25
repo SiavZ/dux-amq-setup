@@ -1,0 +1,11383 @@
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, OpenOptions};
+use std::io;
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt, symlink};
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use anyhow::{Context, Result, anyhow};
+use percent_encoding::percent_decode_str;
+use url::Url;
+
+use crate::logger;
+use crate::model::{ChangedFile, ProjectBranchStatus};
+use crate::worker::BranchWarningKind;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitWorktree {
+    pub path: PathBuf,
+    pub head: Option<String>,
+    pub branch_name: Option<String>,
+    pub detached: bool,
+}
+
+impl GitWorktree {
+    pub fn label(&self) -> String {
+        if let Some(branch_name) = &self.branch_name {
+            return branch_name.clone();
+        }
+        if let Some(head) = &self.head {
+            let short = head.chars().take(7).collect::<String>();
+            return format!("detached {short}");
+        }
+        "detached HEAD".to_string()
+    }
+}
+
+/// Where a branch was found when checking for its existence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BranchLocation {
+    /// The branch exists as a local `refs/heads/` ref.
+    Local,
+    /// The branch exists only as a remote tracking ref (`refs/remotes/origin/`).
+    Remote,
+}
+
+/// The create-agent branch preflight decision: whether creating an agent named
+/// `name` in a project starts a genuinely FRESH branch or ATTACHES to an
+/// EXISTING branch's history. One source both surfaces consume, so neither can
+/// silently attach without consent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateAgentBranchPlan {
+    /// No branch of that name exists (local or remote): a new branch is created.
+    Fresh,
+    /// A branch of that name already exists; attaching would adopt its history.
+    ExistingBranch { location: BranchLocation },
+}
+
+/// Inspect whether creating an agent named `name` in the repo at `repo_path`
+/// would attach to an existing branch. Wraps [`branch_exists`] into the typed
+/// [`CreateAgentBranchPlan`] both surfaces branch on. Blocking (a git
+/// subprocess), so callers should run it off the UI thread / in the actor.
+pub fn create_agent_branch_preflight(repo_path: &Path, name: &str) -> CreateAgentBranchPlan {
+    match branch_exists(repo_path, name) {
+        Some(location) => CreateAgentBranchPlan::ExistingBranch { location },
+        None => CreateAgentBranchPlan::Fresh,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DiffStat {
+    Text(usize, usize),
+    Binary,
+}
+
+struct StatusEntry {
+    index_status: char,
+    worktree_status: char,
+    path: String,
+    /// Where a rename or copy came from, as git reports it in the record that
+    /// follows. None for every other kind of change.
+    renamed_from: Option<String>,
+}
+
+const NULL_DEVICE: &str = "/dev/null";
+
+/// The object id of git's empty tree, the fixed point every empty repo shares
+/// (`git hash-object -t tree /dev/null` on any git, any platform). Public so
+/// tests can reproduce exactly the tree the initial-commit bootstrap builds
+/// when they need to assert against the same plumbing.
+pub const EMPTY_TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/// How much of a file git looks at before deciding it is binary
+/// (`buffer_is_binary`'s `FIRST_FEW_BYTES`). Matched exactly so dux and git
+/// call the same files binary.
+const BINARY_SNIFF_BYTES: usize = 8000;
+
+/// How many UNTRACKED files one changed-files sweep counts lines for.
+///
+/// Every untracked file costs a read, and a worktree can hold a hundred thousand
+/// of them while a poller re-reads the panel. Past this many, untracked rows are
+/// still LISTED in full with their status; they carry no line counts, rendering
+/// as an empty file does, and stay out of the panel's totals.
+const UNTRACKED_STATS_MAX_FILES: usize = 2000;
+
+pub fn current_branch(repo_path: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        .with_context(|| format!("failed to inspect {}", repo_path.display()))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git symbolic-ref failed for {}: {}",
+            repo_path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Like [`current_branch`], but tolerates a detached HEAD: `Ok(None)` when HEAD
+/// is not a symbolic ref (`symbolic-ref` exit code 1, `--quiet` suppressing the
+/// message), and `Err` for any real failure (exit 128 = not a repo, git
+/// missing). For inspection sites that must not treat a detached HEAD as fatal.
+pub fn current_branch_opt(repo_path: &Path) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        .with_context(|| format!("failed to inspect {}", repo_path.display()))?;
+    if output.status.success() {
+        return Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        ));
+    }
+    // Exit code 1 = "ref is not a symbolic ref" (detached HEAD). Anything else
+    // (128 = not a repo / fatal) is a real error. `--quiet` silenced stderr for
+    // the detached case only.
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+    Err(anyhow!(
+        "git symbolic-ref failed for {}: {}",
+        repo_path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    ))
+}
+
+/// Returns the default branch name for the `origin` remote by reading
+/// `refs/remotes/origin/HEAD`. `git clone` sets that ref; repos created with
+/// `git init` plus a manual remote typically lack it, so `None` also means
+/// "unknown" and callers fall back to a heuristic.
+pub fn remote_default_branch(repo_path: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let full_ref = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // e.g. "refs/remotes/origin/main" → "main"
+    full_ref
+        .strip_prefix("refs/remotes/origin/")
+        .map(|s| s.to_string())
+}
+
+/// Classifies a checked-out branch against the repo's known default branch.
+///
+/// - `Some(Known { default_branch })` when `origin/HEAD` resolves to a branch
+///   that differs from `branch`.
+/// - `None` when `origin/HEAD` resolves to `branch` (already on default), or
+///   when it's unavailable and `branch` is one of the common defaults
+///   (`main` or `master`).
+/// - `Some(Heuristic)` when `origin/HEAD` is unavailable and `branch` is
+///   neither `main` nor `master`.
+pub fn branch_warning_kind(path: &Path, branch: &str) -> Option<BranchWarningKind> {
+    match remote_default_branch(path) {
+        Some(default) if default != branch => Some(BranchWarningKind::Known {
+            default_branch: default,
+        }),
+        Some(_) => None,
+        None if branch != "main" && branch != "master" => Some(BranchWarningKind::Heuristic),
+        None => None,
+    }
+}
+
+/// Translates a `BranchWarningKind` from [`branch_warning_kind`] into the
+/// corresponding `ProjectBranchStatus`. `Some(_) -> NotLeading`,
+/// `None -> Leading`.
+pub fn branch_status_from_warning(warning_kind: Option<&BranchWarningKind>) -> ProjectBranchStatus {
+    match warning_kind {
+        Some(_) => ProjectBranchStatus::NotLeading,
+        None => ProjectBranchStatus::Leading,
+    }
+}
+
+pub fn is_git_repo(path: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--git-dir"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Where a path sits relative to git repositories, for the add-project and
+/// init-repository gates. Unlike [`is_git_repo`], which must stay loose because
+/// `load_projects` uses it for the `path_missing` flag, this classifies the path
+/// precisely, so a gate can tell a repository root from a folder buried in one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoPathKind {
+    /// The root of a normal (non-bare) work tree.
+    WorkTreeRoot,
+    /// The root of a bare repository.
+    BareRoot,
+    /// A directory inside a work tree but not its root.
+    InsideWorkTree { root: PathBuf },
+    /// A directory inside git's internal directory (`.git/` of a normal repo,
+    /// or the internals of a bare repo such as `objects/`).
+    InsideGitDir { git_dir: PathBuf },
+    /// Not inside any git repository.
+    NotARepo,
+    /// Git could not be consulted (spawn failure, unparseable output). Gates
+    /// fail open on this; mutations fail closed (the [`CommitState`] doctrine).
+    Indeterminate,
+}
+
+/// What the directory an agent lives in is, as far as a changes panel is
+/// concerned. Derived from [`repo_path_kind`]; deliberately no second detector,
+/// because two would drift and this is the decision that keeps dux from staging
+/// into somebody else's repository.
+///
+/// git answers questions by walking UP parent directories, so a folder INSIDE a
+/// repository would report, stage and commit to the parent. A working repository
+/// therefore means the folder is itself the repository's top level, compared on
+/// canonical paths so a symlink cannot fake it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FolderRepoStatus {
+    /// The folder IS a repository's top level. The changes panel works here
+    /// exactly as it does for a managed worktree.
+    WorkingRepo,
+    /// The folder sits inside a repository rooted somewhere else. Quiet, on
+    /// purpose: everything the panel could show would belong to that other
+    /// repository.
+    InsideRepoRootedElsewhere,
+    /// Git sees no repository here at all. Also the answer for a bare
+    /// repository (no work tree to show) and for git's own internals.
+    NoRepo,
+    /// Git could not be consulted. Honest-quiet: the panel says exactly that,
+    /// and every mutation is refused, matching the `CommitState` doctrine of
+    /// failing closed on an unknown answer.
+    Indeterminate,
+    /// Nobody has looked yet: the probe, spawned right after the agent is
+    /// created and again on restore, has not landed.
+    ///
+    /// A variant of its own rather than a second meaning for `Indeterminate`.
+    /// The two gate identically but read differently: "dux is still looking" is
+    /// a wait, while "git could not be consulted" accuses a healthy machine of a
+    /// fault, and a freshly created agent passes through this window.
+    Unprobed,
+    /// The directory itself is gone from disk. Its own verdict rather than a git
+    /// error, because there is nothing to run git in: an agent that deletes its
+    /// own working copy (a CLI merging its branch and removing the worktree from
+    /// inside it) would otherwise report "the repository is busy" once per poll
+    /// cycle about a directory that simply is not there.
+    ///
+    /// Applies to both kinds of agent: a managed working copy and a standalone
+    /// agent's folder can each vanish under dux. The sentence that names the
+    /// path, and the remedy, differ by kind and live in
+    /// [`crate::working_copy`].
+    Missing,
+}
+
+impl FolderRepoStatus {
+    /// Whether the changes panel shows a real repository view here.
+    pub fn changes_panel_works(self) -> bool {
+        match self {
+            Self::WorkingRepo => true,
+            Self::InsideRepoRootedElsewhere
+            | Self::NoRepo
+            | Self::Indeterminate
+            | Self::Unprobed
+            | Self::Missing => false,
+        }
+    }
+
+    /// Whether staging, unstaging, discarding and committing are allowed.
+    /// Fails closed on [`Self::Indeterminate`]: a mutation on a guess is how a
+    /// folder dux does not understand gets written to.
+    pub fn mutations_allowed(self) -> bool {
+        match self {
+            Self::WorkingRepo => true,
+            Self::InsideRepoRootedElsewhere
+            | Self::NoRepo
+            | Self::Indeterminate
+            | Self::Unprobed
+            | Self::Missing => false,
+        }
+    }
+
+    /// Whether git can see files written at this path, which is a DIFFERENT
+    /// question from whether the changes panel works. A folder inside somebody
+    /// else's repository still gets the self-gitignoring seed, though its own
+    /// panel stays quiet, or an unignored upload directory pollutes their
+    /// `git status`. A plain folder and an unconsultable git get nothing.
+    pub fn git_can_see_path(self) -> bool {
+        match self {
+            Self::WorkingRepo | Self::InsideRepoRootedElsewhere => true,
+            Self::NoRepo | Self::Indeterminate | Self::Unprobed | Self::Missing => false,
+        }
+    }
+
+    /// Why the changes region is quiet, in one sentence the user can act on.
+    /// Never "the repository is busy", which is what the non-repo error path
+    /// would otherwise misreport once per poll.
+    pub fn quiet_reason(self) -> &'static str {
+        match self {
+            // Never rendered (the panel works), answered so the match stays
+            // exhaustive and a future caller cannot get a panic.
+            Self::WorkingRepo => "This folder is a git repository.",
+            Self::InsideRepoRootedElsewhere => {
+                "This folder sits inside a repository rooted elsewhere, so dux shows no changes for it. \
+                 Point an agent at that repository's top level, or add it as a project, to work with its changes."
+            }
+            Self::NoRepo => {
+                "This folder has no git repository, so there are no changes to show. \
+                 Run git init in it and reopen this panel if you want dux to track its changes."
+            }
+            Self::Indeterminate => {
+                "dux could not consult git about this folder, so it cannot say whether it has changes. \
+                 Check that git is installed and that the folder is readable, then reopen this panel."
+            }
+            Self::Unprobed => {
+                "dux is still looking at this folder to see whether it is a git repository. \
+                 This should take a moment; nothing is wrong."
+            }
+            // The kind-neutral fallback. Every user-facing surface reaches the
+            // path-naming sentence through `crate::working_copy::quiet_reason`.
+            Self::Missing => {
+                "The directory this agent runs in no longer exists on disk, so dux cannot show \
+                 any changes for it."
+            }
+        }
+    }
+}
+
+/// Whether a directory is really gone, still there, or could not be asked
+/// about at all.
+///
+/// The distinction that keeps "gone" honest. `Path::exists()` answers false for
+/// a stat that failed for ANY reason, so an unreadable parent, a stale handle,
+/// a disconnected network mount and a timeout all read as deleted, and dux
+/// would offer to recreate a working copy sitting safely on a mount that is
+/// merely down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectoryPresence {
+    /// The stat succeeded. Something is at this path.
+    Present,
+    /// The stat failed in one of the two ways that mean nothing is there.
+    Missing,
+    /// The stat failed some other way, so dux does not know.
+    Indeterminate,
+}
+
+/// Ask the filesystem whether a directory is there, classifying the failure.
+///
+/// Measured against the standard library actually installed rather than
+/// assumed: a deleted path answers `NotFound`, a path whose parent is a regular
+/// file answers `NotADirectory`, and a path under a parent with mode 000
+/// answers `PermissionDenied`. Only the first two mean the directory is gone.
+///
+/// `metadata` rather than `symlink_metadata`, also measured: a dangling symlink
+/// answers `Ok` for `symlink_metadata`, because the link itself is there, and
+/// `NotFound` for `metadata`. A working copy whose symlink points at nothing is
+/// gone, not present.
+pub fn directory_presence(path: &Path) -> DirectoryPresence {
+    match fs::metadata(path) {
+        Ok(_) => DirectoryPresence::Present,
+        Err(err) => match err.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+                DirectoryPresence::Missing
+            }
+            _ => DirectoryPresence::Indeterminate,
+        },
+    }
+}
+
+/// Classify a standalone agent's folder per [`FolderRepoStatus`].
+///
+/// A bare repository and git's own internals both answer
+/// [`FolderRepoStatus::NoRepo`] rather than getting variants of their own: to
+/// the changes panel they are one fact, that there is no work tree to show.
+pub fn folder_repo_status(path: &Path) -> FolderRepoStatus {
+    // Asked before git, because git walks UP: run in a directory that is gone
+    // and the answer is about a parent, or an error the poller would report as
+    // "the repository is busy" once per cycle.
+    match directory_presence(path) {
+        DirectoryPresence::Present => {}
+        DirectoryPresence::Missing => return FolderRepoStatus::Missing,
+        // A stat that failed any other way is a question dux could not get an
+        // answer to, which is what Indeterminate already says.
+        DirectoryPresence::Indeterminate => return FolderRepoStatus::Indeterminate,
+    }
+    match repo_path_kind(path) {
+        RepoPathKind::WorkTreeRoot => FolderRepoStatus::WorkingRepo,
+        RepoPathKind::InsideWorkTree { .. } => FolderRepoStatus::InsideRepoRootedElsewhere,
+        RepoPathKind::BareRoot | RepoPathKind::InsideGitDir { .. } | RepoPathKind::NotARepo => {
+            FolderRepoStatus::NoRepo
+        }
+        RepoPathKind::Indeterminate => FolderRepoStatus::Indeterminate,
+    }
+}
+
+/// Classify a MANAGED agent's working copy per [`FolderRepoStatus`].
+///
+/// One question, not the folder classifier's several: dux created this worktree,
+/// so it is a repository by construction and the only thing that can have
+/// changed is whether the directory is still there. Keeping it to a single stat
+/// is what lets every managed agent be probed on the changed-files cadence
+/// without a git subprocess per cycle.
+///
+/// A stat dux could not get an answer to is Indeterminate rather than Missing:
+/// offering to recreate a working copy because its mount is unreachable would
+/// have dux check the branch out somewhere else while the real one is still
+/// sitting there.
+pub fn managed_worktree_status(path: &Path) -> FolderRepoStatus {
+    match directory_presence(path) {
+        DirectoryPresence::Present => FolderRepoStatus::WorkingRepo,
+        DirectoryPresence::Missing => FolderRepoStatus::Missing,
+        DirectoryPresence::Indeterminate => FolderRepoStatus::Indeterminate,
+    }
+}
+
+/// Classify `path` per [`RepoPathKind`] using plumbing only.
+///
+/// The `--is-inside-git-dir` rung exists because inside a normal repo's `.git`
+/// directory `--git-dir` succeeds, `--is-bare-repository` prints `false` and
+/// `--show-toplevel` exits 128 (measured); without it that combination falls to
+/// `Indeterminate`, which the fail-open add gate accepts as a project.
+pub fn repo_path_kind(path: &Path) -> RepoPathKind {
+    let run = |args: &[&str]| -> Option<std::process::Output> {
+        Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .ok()
+    };
+    // Rung 1: is git willing to talk about this path at all?
+    match run(&["rev-parse", "--git-dir"]) {
+        Some(out) if out.status.success() => {}
+        Some(_) => return RepoPathKind::NotARepo,
+        None => return RepoPathKind::Indeterminate,
+    }
+    let capture = |args: &[&str]| -> Option<String> {
+        run(args).filter(|out| out.status.success()).map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .trim_end_matches(['\n', '\r'])
+                .to_string()
+        })
+    };
+    // Path outputs must be decoded from the RAW bytes, never via
+    // `from_utf8_lossy`: git prints path bytes verbatim, and a repo under a
+    // non-UTF8 path (legal on Linux) would have its bytes rewritten to U+FFFD,
+    // fail canonicalization and fall to Indeterminate, which the fail-open add
+    // gate accepts.
+    let capture_path = |args: &[&str]| -> Option<PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        run(args).filter(|out| out.status.success()).map(|out| {
+            let mut bytes = out.stdout.as_slice();
+            while let [rest @ .., b'\n' | b'\r'] = bytes {
+                bytes = rest;
+            }
+            PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+        })
+    };
+    // Rung 2: bare repositories. The bare root is addable; a folder inside a
+    // bare repo (objects/, refs/, ...) is git internals and must not be.
+    match capture(&["rev-parse", "--is-bare-repository"]).as_deref() {
+        Some("true") => {
+            let Some(git_dir) = capture_path(&["rev-parse", "--absolute-git-dir"]) else {
+                return RepoPathKind::Indeterminate;
+            };
+            let (Ok(canon_git_dir), Ok(canon_path)) = (git_dir.canonicalize(), path.canonicalize())
+            else {
+                return RepoPathKind::Indeterminate;
+            };
+            if canon_git_dir == canon_path {
+                return RepoPathKind::BareRoot;
+            }
+            return RepoPathKind::InsideGitDir { git_dir };
+        }
+        Some(_) => {}
+        None => return RepoPathKind::Indeterminate,
+    }
+    // Rung 3: inside a normal repo's .git directory (see the doc above).
+    match capture(&["rev-parse", "--is-inside-git-dir"]).as_deref() {
+        Some("true") => {
+            let Some(git_dir) = capture_path(&["rev-parse", "--absolute-git-dir"]) else {
+                return RepoPathKind::Indeterminate;
+            };
+            return RepoPathKind::InsideGitDir { git_dir };
+        }
+        Some(_) => {}
+        None => return RepoPathKind::Indeterminate,
+    }
+    // Rung 4: work tree root vs a folder inside the work tree.
+    let Some(toplevel) = capture_path(&["rev-parse", "--show-toplevel"]) else {
+        return RepoPathKind::Indeterminate;
+    };
+    let (Ok(canon_top), Ok(canon_path)) = (toplevel.canonicalize(), path.canonicalize()) else {
+        return RepoPathKind::Indeterminate;
+    };
+    if canon_top == canon_path {
+        RepoPathKind::WorkTreeRoot
+    } else {
+        RepoPathKind::InsideWorkTree { root: toplevel }
+    }
+}
+
+/// Initialize a new git repository in `path` (`git init`). Imperative: exit
+/// status only, stdout unparsed, stderr surfaced in the error. Deliberately
+/// honors the user's `init.defaultBranch` (no `-b` override). `git init` runs
+/// no hooks; the initial-commit step already pins `core.hooksPath=/dev/null`,
+/// which also neutralizes hook scripts an `init.templateDir` might copy in.
+pub fn init_repo(path: &Path) -> Result<()> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("init")
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("failed to run git init in {}", path.display()))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "git init failed in {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a repository's HEAD resolves to a commit, distinguishing a real
+/// git failure from a genuinely unborn HEAD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitState {
+    /// HEAD resolves to a commit: the repo has history.
+    Born,
+    /// A valid repo whose HEAD is *unborn* (fresh `git init`, no commits yet):
+    /// the branch named by HEAD does not exist under `refs/heads/` until the
+    /// first commit.
+    Unborn,
+    /// Could not determine (git failed to run, not a repo, permission or I/O
+    /// error). Never conflate this with `Unborn`. A reject or gate site treats
+    /// it as "not unborn" and proceeds, so a transient hiccup blocks nothing; a
+    /// mutation site refuses, so no repo is mutated in a state dux cannot
+    /// confirm.
+    Indeterminate,
+}
+
+/// Precise, fail-closed probe of a repo's commit state. `git rev-parse --verify
+/// --quiet HEAD` exits 0 when HEAD resolves (`Born`), 1 when it does not
+/// (`Unborn`), and anything else, a spawn error included, is `Indeterminate`.
+/// Prefer this over [`repo_has_commits`] wherever a hard decision is made, so a
+/// transient git hiccup cannot be mistaken for "no commits".
+pub fn repo_commit_state(path: &Path) -> CommitState {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+        .stdin(Stdio::null())
+        .output();
+    match out {
+        Ok(o) => match o.status.code() {
+            Some(0) => CommitState::Born,
+            Some(1) => CommitState::Unborn,
+            _ => CommitState::Indeterminate,
+        },
+        Err(_) => CommitState::Indeterminate,
+    }
+}
+
+/// Returns `true` when the repository at `path` has at least one commit. This is
+/// the **fail-open** convenience form (any inability to tell → `false`), fine
+/// for UI hints; use [`repo_commit_state`] where the Born/Unborn/Indeterminate
+/// distinction matters (any hard reject/gate/mutation).
+pub fn repo_has_commits(path: &Path) -> bool {
+    matches!(repo_commit_state(path), CommitState::Born)
+}
+
+/// The address dux signs its own bootstrap commit with when git refuses the
+/// commit for want of one. `localhost` is reserved and can never be a real mail
+/// domain, so the commit reads as the machine-made artifact it is.
+const BOOTSTRAP_IDENTITY_EMAIL: &str = "dux@localhost";
+
+/// The name that goes with it, used only when the repo has no `user.name` to
+/// keep.
+const BOOTSTRAP_IDENTITY_NAME: &str = "dux";
+
+/// git's wording when it refuses a commit because it cannot work out who is
+/// making it. Measured on git 2.55 across the three ways it says so: a hostname
+/// it cannot build an address from, `user.useConfigOnly` with nothing
+/// configured, and a configured name that is empty.
+const IDENTITY_FAILURE_MARKERS: [&str; 4] = [
+    "identity unknown",
+    "unable to auto-detect",
+    "no email was given",
+    "empty ident name",
+];
+
+/// Whether `stderr` is git declining for want of an identity rather than for any
+/// other reason. Only this failure is worth a second attempt.
+fn is_identity_failure(stderr: &str) -> bool {
+    let lowered = stderr.to_ascii_lowercase();
+    IDENTITY_FAILURE_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+}
+
+/// Whether the repo can already tell git a `user.name`. An unreadable or empty
+/// value counts as none, so the retry supplies one.
+fn has_configured_user_name(repo: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["config", "--get", "user.name"])
+        .stdin(Stdio::null())
+        .output()
+        .is_ok_and(|out| {
+            out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+        })
+}
+
+/// Build the empty-tree commit object, with `overrides` prepended as `-c` pairs.
+/// `commit.gpgsign=false` so a signing prompt can't block; hooksPath at
+/// /dev/null so no hook runs at any step of this bootstrap. Returns the commit
+/// sha, or git's stderr.
+fn commit_tree(
+    path: &Path,
+    tree: &str,
+    overrides: &[String],
+) -> std::result::Result<String, String> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(path);
+    command.args([
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+    ]);
+    for override_pair in overrides {
+        command.arg("-c").arg(override_pair);
+    }
+    command.args(["commit-tree", tree, "-m", "Initial commit"]);
+    let out = command
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| format!("failed to run git commit-tree: {err}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Creates an empty initial commit so an otherwise-unborn repo gains a root
+/// commit and can back worktrees.
+///
+/// Returns the short name of the branch the commit landed on, so callers persist
+/// that rather than one resolved separately, which a concurrent HEAD change
+/// could make stale.
+///
+/// Built entirely with **plumbing** (`hash-object`, `commit-tree`,
+/// `update-ref`) rather than `git commit`, for three properties
+/// `git commit --allow-empty` cannot give:
+/// - **No hooks run.** A repo's hook scripts must not execute because dux is
+///   adding the project, and `--no-verify` does not cover them all.
+/// - **Empty tree, always.** Nothing staged in the index at commit time can be
+///   baked in; the user's files, staged or untracked, are left as they were.
+/// - **Atomic and bare-safe.** `update-ref <branch> <sha> ""` is a
+///   compare-and-swap creating the branch only if it does not yet exist, so a
+///   concurrent real commit makes this fail rather than land a second one, and
+///   no step needs a work tree, so a **bare** repo works too.
+///
+/// The commit is attempted with whatever identity git already has. Only if git
+/// refuses it FOR WANT OF ONE is it retried once, adding
+/// `user.email=dux@localhost` and, only where the repo has no `user.name` to
+/// keep, `user.name=dux`. So a machine that can tell git who it is signs
+/// normally, a repo with a name but no address commits as
+/// `Real Person <dux@localhost>`, and a clean CI runner commits as
+/// `dux <dux@localhost>`. The discarded first attempt writes nothing but an
+/// unreferenced object.
+///
+/// Asking git to commit and reading its refusal is the whole probe, deliberately:
+/// `git var GIT_COMMITTER_IDENT` answers a DIFFERENT question, and was measured
+/// to succeed on a `GIT_COMMITTER_*` environment under which `commit-tree` still
+/// fails on the author.
+///
+/// Commits of the USER's work are untouched by this: those still fail loudly,
+/// because signing somebody's work for them is not dux's to do.
+///
+/// Idempotent: a repo that already has a commit, at entry or because the CAS
+/// lost a race, returns `Ok(branch)`. It errors when the index has staged
+/// changes (a courtesy stop, so dux does not add a project over work the user
+/// may want in the first commit), when git's state cannot be determined, on a
+/// detached HEAD, and on a genuine git failure, surfaced verbatim. The CAS is
+/// the cross-process backstop behind the engine's own in-flight gate.
+pub fn create_initial_commit(path: &Path) -> Result<String> {
+    let repo = path.as_os_str();
+    // Fail closed on commit state: only bootstrap a confirmed-unborn repo. A
+    // Born repo is idempotent success, so return the current branch (empty if
+    // detached, which the caller handles as on the normal born path).
+    match repo_commit_state(path) {
+        CommitState::Born => return Ok(current_branch_opt(path)?.unwrap_or_default()),
+        CommitState::Unborn => {}
+        CommitState::Indeterminate => {
+            return Err(anyhow!(
+                "couldn't determine the commit state of {}, so refusing to create an initial commit",
+                path.display()
+            ));
+        }
+    }
+    // Courtesy refuse-if-staged. The commit uses an empty tree and never reads
+    // the index, so this can't leak staged content into history; it just stops
+    // us from quietly adding a project while the user has staged work pending.
+    let staged = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["diff", "--cached", "--quiet"])
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("failed to inspect the index of {}", path.display()))?;
+    match staged.status.code() {
+        Some(0) => {}
+        Some(1) => {
+            return Err(anyhow!(
+                "refusing to create an initial commit in {}: you have staged changes. Commit or unstage them first, then add the project.",
+                path.display()
+            ));
+        }
+        _ => {
+            return Err(anyhow!(
+                "failed to inspect the index of {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&staged.stderr).trim()
+            ));
+        }
+    }
+    // Now confirmed unborn, so the symbolic HEAD is guaranteed to exist. Its
+    // fully-qualified ref (e.g. `refs/heads/main`) is the branch the commit lands
+    // on. (A detached unborn HEAD has no symbolic ref and can't be bootstrapped;
+    // reported rather than guessed.)
+    let head_ref = run_git_capture(
+        path,
+        &["symbolic-ref", "HEAD"],
+        "resolve the current branch",
+    )?;
+    let short = head_ref
+        .strip_prefix("refs/heads/")
+        .unwrap_or(&head_ref)
+        .to_string();
+    // Build the empty-tree commit object with plumbing (no index, no hooks).
+    let empty_tree = run_git_capture(
+        path,
+        &["hash-object", "-t", "tree", NULL_DEVICE],
+        "compute the empty tree",
+    )?;
+    debug_assert_eq!(
+        empty_tree, EMPTY_TREE_SHA,
+        "git's empty tree object id is fixed across versions and platforms"
+    );
+    let commit = match commit_tree(path, &empty_tree, &[]) {
+        Ok(sha) => sha,
+        Err(refusal) if is_identity_failure(&refusal) => {
+            // Supply only what git is missing: the address always, the name only
+            // where the repo has none of its own to keep.
+            let mut overrides = vec![format!("user.email={BOOTSTRAP_IDENTITY_EMAIL}")];
+            if !has_configured_user_name(path) {
+                overrides.push(format!("user.name={BOOTSTRAP_IDENTITY_NAME}"));
+            }
+            commit_tree(path, &empty_tree, &overrides).map_err(|retry| {
+                anyhow!(
+                    "failed to create the initial commit object for {}: {retry}",
+                    path.display()
+                )
+            })?
+        }
+        Err(other) => {
+            return Err(anyhow!(
+                "failed to create the initial commit object for {}: {other}",
+                path.display()
+            ));
+        }
+    };
+    // Land it atomically: CAS with an empty old-value requires the branch to not
+    // yet exist, closing the "a real commit landed concurrently" race. hooksPath
+    // at /dev/null so the ref update runs no `reference-transaction` hook.
+    let update = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "update-ref",
+            &head_ref,
+            &commit,
+            "",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("failed to create initial commit in {}", path.display()))?;
+    if !update.status.success() {
+        // The CAS lost the race, most likely to another writer creating the
+        // first commit. The goal is "the repo has a commit", so a now-Born repo
+        // is idempotent success. Re-resolve the branch fresh, not the pre-race
+        // `short`, so the persisted branch is the one the repo is actually on.
+        // Only a still-unborn or indeterminate repo is a real error.
+        if repo_commit_state(path) == CommitState::Born {
+            return Ok(current_branch_opt(path)?.unwrap_or_default());
+        }
+        return Err(anyhow!(
+            "couldn't create the initial commit in {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&update.stderr).trim()
+        ));
+    }
+    // Return the branch the commit actually landed on (short name) so callers
+    // persist THAT, not a name resolved separately before the commit (which a
+    // concurrent HEAD change could make stale).
+    Ok(short)
+}
+
+/// Run a git command that produces a single trimmed line of stdout (a SHA, a
+/// ref, …). Returns `Err` with the stderr on non-zero exit. Stdin is detached.
+fn run_git_capture(path: &Path, args: &[&str], what: &str) -> Result<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("failed to {what} for {}", path.display()))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "failed to {what} for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+pub fn list_worktrees(repo_path: &Path) -> Result<Vec<GitWorktree>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .output()
+        .with_context(|| format!("failed to list worktrees for {}", repo_path.display()))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git worktree list failed for {}: {}",
+            repo_path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    parse_worktree_list_porcelain_z(&output.stdout)
+}
+
+pub fn parse_worktree_list_porcelain_z(bytes: &[u8]) -> Result<Vec<GitWorktree>> {
+    let mut worktrees = Vec::new();
+    let mut current: Option<GitWorktree> = None;
+
+    for raw in bytes.split(|byte| *byte == 0) {
+        if raw.is_empty() {
+            if let Some(entry) = current.take() {
+                worktrees.push(entry);
+            }
+            continue;
+        }
+        let token = String::from_utf8_lossy(raw);
+        if let Some(path) = token.strip_prefix("worktree ") {
+            if let Some(entry) = current.take() {
+                worktrees.push(entry);
+            }
+            current = Some(GitWorktree {
+                path: PathBuf::from(path),
+                head: None,
+                branch_name: None,
+                detached: false,
+            });
+        } else if let Some(head) = token.strip_prefix("HEAD ") {
+            if let Some(entry) = &mut current {
+                entry.head = Some(head.to_string());
+            }
+        } else if let Some(branch) = token.strip_prefix("branch ") {
+            if let Some(entry) = &mut current {
+                entry.branch_name = Some(
+                    branch
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(branch)
+                        .to_string(),
+                );
+            }
+        } else if token == "detached"
+            && let Some(entry) = &mut current
+        {
+            entry.detached = true;
+        }
+    }
+
+    if let Some(entry) = current {
+        worktrees.push(entry);
+    }
+
+    Ok(worktrees)
+}
+
+pub fn pull_current_branch(repo_path: &Path) -> Result<()> {
+    let branch = match current_branch_opt(repo_path)? {
+        Some(b) => b,
+        None => {
+            return Err(anyhow!(
+                "HEAD is detached; check out a branch before pulling"
+            ));
+        }
+    };
+    pull_origin_branch(repo_path, &branch)
+}
+
+pub fn pull_branch(repo_path: &Path, branch: &str) -> Result<()> {
+    switch_branch_if_needed(repo_path, branch)?;
+    pull_origin_branch(repo_path, branch)
+}
+
+pub fn switch_branch_if_needed(repo_path: &Path, branch: &str) -> Result<()> {
+    // On a detached HEAD there is no current branch to compare against, so we
+    // simply switch. Only skip the switch when already on the target branch.
+    let current = current_branch_opt(repo_path)?;
+    if current.as_deref() != Some(branch) {
+        switch_branch(repo_path, branch)?;
+    }
+    Ok(())
+}
+
+/// True when the repo has an `origin` remote. Exit-status only, per the
+/// git-safety rules for imperative commands.
+pub fn has_origin_remote(repo_path: &Path) -> Result<bool> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["remote", "get-url", "origin"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| {
+            format!(
+                "failed to run git remote get-url in {}",
+                repo_path.display()
+            )
+        })?;
+    Ok(status.success())
+}
+
+/// Fast-forwards `branch` from `origin`.
+///
+/// The refspec is FULLY QUALIFIED (`refs/heads/<branch>`), and that, not a `--`
+/// separator, is what makes an option-looking branch name safe. MEASURED on git
+/// 2.55 with `GIT_TRACE=1`:
+///
+/// ```text
+/// $ git pull --ff-only origin -- --force
+/// trace: run_command: git fetch --update-head-ok origin --force
+/// ```
+///
+/// `pull` consumes the separator and forwards the refspec to an internal
+/// `fetch` carrying none of its own, so `--force`/`--prune`/`--all` are read as
+/// flags and the branch is silently never pulled, while `--depth=1` converts the
+/// user's source checkout to a shallow clone. A `refs/heads/` prefix cannot lead
+/// with a dash, so the internal fetch always reads it as a ref (measured:
+/// `git pull --ff-only origin -- refs/heads/--force` fast-forwards correctly).
+///
+/// Resolving the name to an object id first, the way
+/// `create_worktree_from_start_point` does, is not possible here: the refspec
+/// names a ref on the REMOTE. The `--` stays as defence in depth for the
+/// `origin` argument's sake.
+fn pull_origin_branch(repo_path: &Path, branch: &str) -> Result<()> {
+    let refspec = format!("refs/heads/{branch}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["pull", "--ff-only", "origin", "--", &refspec])
+        .output()?;
+    if !output.status.success() {
+        return Err(git_failure("git pull", repo_path, &output));
+    }
+    Ok(())
+}
+
+/// Switches `repo_path` to `branch_name`. `git switch` rather than `git
+/// checkout` because it is single-purpose and rejects the detached-HEAD and
+/// file-restore surprises `checkout` silently allows. Returns git's raw stderr
+/// on failure so callers can surface the concrete reason. Requires git >= 2.23.
+pub fn switch_branch(repo_path: &Path, branch_name: &str) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args([
+            "switch",
+            // `--` so the branch is read as a REF and never as an option.
+            // Without it `git switch --detach` detaches HEAD instead of
+            // failing. Measured on git 2.55.
+            "--",
+            branch_name,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git switch {branch_name} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Checks whether a branch exists locally or on the `origin` remote.
+///
+/// Uses the plumbing command `git rev-parse --verify --quiet` and inspects
+/// only the exit code: no stdout is parsed.
+pub fn branch_exists(repo_path: &Path, name: &str) -> Option<BranchLocation> {
+    let repo = repo_path.as_os_str();
+    let local_ref = format!("refs/heads/{name}");
+    if ref_exists(repo_path, &local_ref) {
+        return Some(BranchLocation::Local);
+    }
+    let remote_ref = format!("refs/remotes/origin/{name}");
+    let remote = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet", &remote_ref])
+        .output()
+        .ok()
+        .is_some_and(|o| o.status.success());
+    if remote {
+        return Some(BranchLocation::Remote);
+    }
+    None
+}
+
+pub fn local_branch_exists(repo_path: &Path, name: &str) -> bool {
+    ref_exists(repo_path, &format!("refs/heads/{name}"))
+}
+
+/// How much of a branch exists only on this machine, and whether there was
+/// anywhere for it to have been pushed to in the first place.
+///
+/// The two travel together because the number means different things without the
+/// flag: with no remote-tracking refs at all, `--not --remotes` excludes nothing
+/// and the count is the branch's whole history, which reads as an accusation
+/// about work that was never going anywhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnpushedCommits {
+    pub count: u32,
+    /// Whether `refs/remotes/` holds anything. It is about remote-tracking
+    /// refs rather than configured remotes on purpose: a remote that has never
+    /// been fetched excludes nothing either, so it is the same situation.
+    pub has_remote_refs: bool,
+}
+
+/// Whether the repository has any remote-tracking refs at all.
+///
+/// `for-each-ref` is plumbing and prints nothing at all for an empty namespace,
+/// so "no output" is the whole answer and no parsing is involved.
+fn has_remote_tracking_refs(repo_path: &Path) -> bool {
+    let repo = repo_path.as_os_str();
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "for-each-ref",
+            "--count=1",
+            "--format=%(refname)",
+            "refs/remotes/",
+        ])
+        .output()
+        .is_ok_and(|out| out.status.success() && !out.stdout.is_empty())
+}
+
+/// How many commits on `branches` are reachable from no remote-tracking ref,
+/// i.e. how much work on them exists only on this machine.
+///
+/// It shells out to git, so callers run it in a background worker.
+///
+/// It takes a LIST because one delete can remove more than one branch: a drifted
+/// agent gives up both the branch its worktree is on now and the one it was born
+/// on, and a count for one of them understates what ticking the box costs. The
+/// answer is their union, counting a commit both branches reach once.
+///
+/// `--not --remotes` excludes every remote-tracking ref of every remote, so a
+/// repository with NO remotes counts its whole history. That is the honest
+/// answer: there is nowhere for any of it to have been pushed.
+///
+/// Git-config immune by construction: `rev-list --count` is plumbing and prints
+/// one integer, each branch is passed fully qualified as `refs/heads/<name>`,
+/// which cannot begin with a dash, and the trailing `--` pins the pathspec
+/// boundary so nothing after the revision list is read as a path.
+pub fn unpushed_commit_count(repo_path: &Path, branches: &[&str]) -> Result<UnpushedCommits> {
+    // No branches means nothing would be deleted, so nothing is at risk. Git
+    // would refuse an empty revision list, and an error here would read to the
+    // caller as "git could not answer" about a question nobody asked.
+    if branches.is_empty() {
+        return Ok(UnpushedCommits {
+            count: 0,
+            has_remote_refs: has_remote_tracking_refs(repo_path),
+        });
+    }
+    let mut args: Vec<String> = vec!["rev-list".to_string(), "--count".to_string()];
+    args.extend(branches.iter().map(|branch| format!("refs/heads/{branch}")));
+    args.push("--not".to_string());
+    args.push("--remotes".to_string());
+    args.push("--".to_string());
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(&args)
+        .output()?;
+    if !output.status.success() {
+        let named = branches
+            .iter()
+            .map(|branch| format!("\"{branch}\""))
+            .collect::<Vec<_>>()
+            .join(" and ");
+        return Err(anyhow!(
+            "git rev-list failed for branch {named}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let count = text
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| anyhow!("git rev-list printed an unexpected count: {}", text.trim()))?;
+    Ok(UnpushedCommits {
+        count,
+        has_remote_refs: has_remote_tracking_refs(repo_path),
+    })
+}
+
+fn ref_exists(repo_path: &Path, ref_name: &str) -> bool {
+    let repo = repo_path.as_os_str();
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet", ref_name])
+        .output()
+        .ok()
+        .is_some_and(|o| o.status.success())
+}
+
+/// Name of the link dux places in a project checkout pointing at that
+/// project's managed worktrees (port of fork 1d69de16).
+pub const PROJECT_WORKTREES_LINK_NAME: &str = "dux-worktrees";
+/// The `.git/info/exclude` line that keeps [`PROJECT_WORKTREES_LINK_NAME`] out
+/// of `git status`.
+pub const PROJECT_WORKTREES_EXCLUDE_PATTERN: &str = "/dux-worktrees";
+
+/// Expose a project's dux-managed agent worktrees inside the project checkout,
+/// as an ignored `dux-worktrees` symlink to `<worktrees_root>/<project_name>`.
+///
+/// Agent worktrees live under the dux state directory so they stay isolated,
+/// which leaves an editor opened on the project root blind to them. The link
+/// brings them back into view without copying anything.
+///
+/// Safe by construction: an existing symlink is repointed only when it targets
+/// somewhere else, and anything that is NOT a symlink at that name is refused
+/// rather than replaced, so a user's own `dux-worktrees` file or directory is
+/// never touched.
+///
+/// The ignore line goes into the repository's `info/exclude` on purpose. The
+/// link sits in the MAIN checkout, so the main repository's exclude is exactly
+/// the right place, and unlike a tracked `.gitignore` it never shows up as a
+/// change. (This is the opposite of the upload directory, which lives inside
+/// an agent worktree and so must never write the shared exclude; see
+/// `file_drop::UPLOADS_GITIGNORE`.)
+pub fn ensure_project_worktrees_link(
+    repo_path: &Path,
+    worktrees_root: &Path,
+    project_name: &str,
+) -> Result<PathBuf> {
+    let project_worktrees_root = worktrees_root.join(project_name);
+    fs::create_dir_all(&project_worktrees_root)
+        .with_context(|| format!("failed to create {}", project_worktrees_root.display()))?;
+    let project_worktrees_root = project_worktrees_root
+        .canonicalize()
+        .unwrap_or(project_worktrees_root);
+
+    // Ignore first: a link that appeared before its ignore line would show in
+    // `git status` if the exclude write then failed.
+    ensure_project_worktrees_link_ignored(repo_path)?;
+
+    let link_path = repo_path.join(PROJECT_WORKTREES_LINK_NAME);
+    let link = |path: &Path| {
+        symlink(&project_worktrees_root, path).with_context(|| {
+            format!(
+                "failed to link {} to {}",
+                path.display(),
+                project_worktrees_root.display()
+            )
+        })
+    };
+    match fs::symlink_metadata(&link_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let existing = fs::read_link(&link_path)
+                .with_context(|| format!("failed to inspect {}", link_path.display()))?;
+            let existing = if existing.is_absolute() {
+                existing
+            } else {
+                repo_path.join(existing)
+            };
+            let existing = existing.canonicalize().unwrap_or(existing);
+            if existing != project_worktrees_root {
+                fs::remove_file(&link_path)
+                    .with_context(|| format!("failed to replace {}", link_path.display()))?;
+                link(&link_path)?;
+            }
+        }
+        Ok(_) => {
+            return Err(anyhow!(
+                "{} already exists and is not a symlink; refusing to overwrite it",
+                link_path.display()
+            ));
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => link(&link_path)?,
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect {}", link_path.display()));
+        }
+    }
+    Ok(link_path)
+}
+
+/// Append [`PROJECT_WORKTREES_EXCLUDE_PATTERN`] to the repository's
+/// `info/exclude` unless a line already says it.
+///
+/// Byte-preserving (the file is handled as bytes, so a non-UTF-8 line the user
+/// wrote survives), fail-closed (a read error aborts before anything is
+/// written, so the existing file is never truncated) and atomic (a sibling temp
+/// with the original mode, fsync'd, renamed over the original). Fork 18a13536.
+fn ensure_project_worktrees_link_ignored(repo_path: &Path) -> Result<()> {
+    use std::io::{Read, Write};
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .output()
+        .with_context(|| format!("failed to locate git excludes for {}", repo_path.display()))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git rev-parse --git-path info/exclude failed for {}: {}",
+            repo_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut raw = output.stdout;
+    while raw.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+        raw.pop();
+    }
+    let exclude_path = PathBuf::from(std::ffi::OsString::from_vec(raw));
+    let exclude_path = if exclude_path.is_absolute() {
+        exclude_path
+    } else {
+        repo_path.join(exclude_path)
+    };
+    let parent = exclude_path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent", exclude_path.display()))?
+        .to_path_buf();
+    fs::create_dir_all(&parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+
+    let (mut contents, permissions) = match fs::File::open(&exclude_path) {
+        Ok(mut file) => {
+            let permissions = file
+                .metadata()
+                .with_context(|| format!("failed to inspect {}", exclude_path.display()))?
+                .permissions();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .with_context(|| format!("failed to read {}", exclude_path.display()))?;
+            (bytes, Some(permissions))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => (Vec::new(), None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", exclude_path.display()));
+        }
+    };
+    if contents
+        .split(|byte| *byte == b'\n')
+        .any(|line| line.trim_ascii() == PROJECT_WORKTREES_EXCLUDE_PATTERN.as_bytes())
+    {
+        return Ok(());
+    }
+    if !contents.is_empty() && !contents.ends_with(b"\n") {
+        contents.push(b'\n');
+    }
+    contents.extend_from_slice(b"# dux local agent worktree explorer link\n");
+    contents.extend_from_slice(PROJECT_WORKTREES_EXCLUDE_PATTERN.as_bytes());
+    contents.push(b'\n');
+
+    let mut replacement = tempfile::NamedTempFile::new_in(&parent)
+        .with_context(|| format!("failed to stage update for {}", exclude_path.display()))?;
+    if let Some(permissions) = permissions {
+        replacement
+            .as_file()
+            .set_permissions(permissions)
+            .with_context(|| format!("failed to preserve mode on {}", exclude_path.display()))?;
+    }
+    replacement
+        .write_all(&contents)
+        .with_context(|| format!("failed to stage update for {}", exclude_path.display()))?;
+    replacement
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("failed to sync update for {}", exclude_path.display()))?;
+    replacement
+        .persist(&exclude_path)
+        .map_err(|err| err.error)
+        .with_context(|| format!("failed to replace {}", exclude_path.display()))?;
+    Ok(())
+}
+
+/// Creates a worktree that checks out an **existing** branch (no `-b`).
+///
+/// When the branch exists only as a remote tracking ref, git automatically
+/// creates a local branch that tracks the remote.
+pub fn create_worktree_existing_branch(
+    repo_path: &Path,
+    worktrees_root: &Path,
+    project_name: &str,
+    branch_name: &str,
+) -> Result<(String, PathBuf)> {
+    let project_root = worktrees_root.join(project_name);
+    fs::create_dir_all(&project_root)?;
+    let worktree_path = project_root.join(branch_name);
+    let canonical = add_worktree_existing_branch_at(repo_path, &worktree_path, branch_name)?;
+    Ok((branch_name.to_string(), canonical))
+}
+
+/// Check an existing branch out as a worktree at an EXACT path.
+///
+/// The path-taking half of [`create_worktree_existing_branch`], which derives
+/// its path from the worktrees root. Recreating a working copy has to land on
+/// the path the agent already has, so it needs this one.
+///
+/// The `--` separator makes git read the name as a REF, and that is all it
+/// does: git still declines to ATTACH a dash-leading one. MEASURED on git 2.55
+/// against a `refs/heads/--force` created with `update-ref`:
+///
+/// ```text
+/// $ git worktree add ../wt -- --force
+/// Preparing worktree (detached HEAD 3427328)
+/// ```
+///
+/// Exit 0, right commit, wrong HEAD. The DWIM that turns a commit-ish into a
+/// checked-out branch only fires for a plain name, and a fully qualified
+/// `refs/heads/<name>` does not rescue it: measured the same way, that form
+/// detaches for an ORDINARY branch too, and it also loses the DWIM that gives a
+/// remote-only branch a local tracking branch. So the branch is attached in a
+/// second step, `git switch -- <name>`, whose own separator is enough.
+pub fn add_worktree_existing_branch_at(
+    repo_path: &Path,
+    worktree_path: &Path,
+    branch_name: &str,
+) -> Result<PathBuf> {
+    if let Some(parent) = worktree_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let repo = repo_path.as_os_str();
+    let worktree = worktree_path.as_os_str();
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "add"])
+        .arg(worktree)
+        // `--` so the commit-ish is read as a REF and never as an option.
+        // Without it `git worktree add <path> --force` obeys the flag and
+        // checks out HEAD instead. Measured on git 2.55.
+        .args(["--", branch_name])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    // Attach the branch the add left detached. Gated on the local ref so a
+    // commit-ish naming a tag keeps checking out detached, as it does today.
+    let attached = current_branch_opt(worktree_path).unwrap_or(None);
+    if attached.as_deref() != Some(branch_name) && local_branch_exists(repo_path, branch_name) {
+        switch_branch(worktree_path, branch_name)?;
+    }
+    Ok(worktree_path
+        .canonicalize()
+        .unwrap_or_else(|_| worktree_path.to_path_buf()))
+}
+
+/// One worktree registration, as `git worktree list --porcelain -z` reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeRegistration {
+    /// The directory git has this worktree registered at.
+    pub path: PathBuf,
+    /// git's own verdict that the directory behind this registration is gone.
+    pub prunable: bool,
+}
+
+/// Parse `git worktree list --porcelain -z` output into registrations.
+///
+/// `-z` rather than plain `--porcelain`, measured rather than assumed: plain
+/// porcelain writes the path raw and separates records with a blank line, so a
+/// worktree whose path contains a newline is indistinguishable from two
+/// records. Under `-z` every attribute is NUL-terminated and an empty attribute
+/// ends the record, which a path cannot forge.
+pub fn parse_worktree_registrations(output: &[u8]) -> Vec<WorktreeRegistration> {
+    let mut registrations = Vec::new();
+    let mut current: Option<WorktreeRegistration> = None;
+    for field in output.split(|byte| *byte == 0) {
+        if field.is_empty() {
+            if let Some(done) = current.take() {
+                registrations.push(done);
+            }
+            continue;
+        }
+        if let Some(path) = field.strip_prefix(b"worktree ") {
+            if let Some(done) = current.take() {
+                registrations.push(done);
+            }
+            current = Some(WorktreeRegistration {
+                path: PathBuf::from(std::ffi::OsString::from_vec(path.to_vec())),
+                prunable: false,
+            });
+        } else if (field == b"prunable" || field.starts_with(b"prunable "))
+            && let Some(entry) = current.as_mut()
+        {
+            entry.prunable = true;
+        }
+    }
+    if let Some(done) = current.take() {
+        registrations.push(done);
+    }
+    registrations
+}
+
+/// Forget the registration of ONE worktree whose directory is already gone.
+///
+/// Needed before re-adding a worktree at a path whose directory was deleted:
+/// git refuses with "missing but already registered worktree" and holds the
+/// branch as checked out, so both halves of a recreate fail without it.
+///
+/// Deliberately not `git worktree prune`, which is repository-wide. Measured on
+/// git 2.55: with one worktree deleted and a sibling's directory merely renamed
+/// away, a single prune removed BOTH registrations, and moving the sibling's
+/// directory back left it severed, with `git status` in it answering "not a git
+/// repository". A sibling agent on a mount that is down is exactly that case.
+///
+/// So the target is found in the registration list and removed by name, and
+/// only when git itself calls it prunable. `git worktree remove --force` on a
+/// registration whose directory is still there DELETES that directory, also
+/// measured, which is why the prunable check gates the call rather than merely
+/// informing it.
+pub fn forget_missing_worktree_registration(repo_path: &Path, worktree_path: &Path) -> Result<()> {
+    let repo = repo_path.as_os_str();
+    let listed = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .output()?;
+    if !listed.status.success() {
+        return Err(anyhow!(
+            "git worktree list failed: {}",
+            String::from_utf8_lossy(&listed.stderr).trim()
+        ));
+    }
+    let Some(target) = parse_worktree_registrations(&listed.stdout)
+        .into_iter()
+        .find(|entry| same_worktree_path(&entry.path, worktree_path))
+    else {
+        // Nothing registered here, so nothing to forget and the add below is
+        // free to run.
+        return Ok(());
+    };
+    if !target.prunable {
+        return Err(anyhow!(
+            "git still has a working copy registered at {}, so dux left the registration alone \
+             rather than removing a directory that is in use.",
+            target.path.display()
+        ));
+    }
+    let path = target.path.as_os_str();
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "remove", "--force", "--"])
+        .arg(path)
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git worktree remove failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a registered worktree path names the same directory dux is asking
+/// about.
+///
+/// A plain comparison first, then one that canonicalizes the PARENT: the
+/// directory itself is gone by the time this is asked, so it cannot be
+/// canonicalized, while a symlinked ancestor (`/tmp` on macOS) makes git's
+/// resolved path and dux's stored one differ by that link alone.
+fn same_worktree_path(registered: &Path, target: &Path) -> bool {
+    if registered == target {
+        return true;
+    }
+    let resolved = |path: &Path| {
+        let parent = path.parent()?.canonicalize().ok()?;
+        Some(parent.join(path.file_name()?))
+    };
+    match (resolved(registered), resolved(target)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+pub fn fetch_pull_request_head(repo_path: &Path, pr_number: u64, branch_name: &str) -> Result<()> {
+    let repo = repo_path.as_os_str();
+    let refspec = format!("pull/{pr_number}/head:refs/heads/{branch_name}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["fetch", "origin", &refspec])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git fetch failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+pub fn create_worktree_from_start_point(
+    repo_path: &Path,
+    worktrees_root: &Path,
+    project_name: &str,
+    start_point: Option<&str>,
+    custom_name: Option<&str>,
+) -> Result<(String, PathBuf)> {
+    let branch_name = custom_name
+        .map(|s| s.to_string())
+        .unwrap_or_else(docker_style_name);
+    let project_root = worktrees_root.join(project_name);
+    fs::create_dir_all(&project_root)?;
+    let worktree_path = project_root.join(&branch_name);
+    let canonical =
+        add_worktree_new_branch_at(repo_path, &worktree_path, &branch_name, start_point)?;
+    Ok((branch_name, canonical))
+}
+
+/// Create a branch and check it out as a worktree at an EXACT path.
+///
+/// The path-taking half of [`create_worktree_from_start_point`]. Same start
+/// point discipline, for the same measured reason.
+pub fn add_worktree_new_branch_at(
+    repo_path: &Path,
+    worktree_path: &Path,
+    branch_name: &str,
+    start_point: Option<&str>,
+) -> Result<PathBuf> {
+    if let Some(parent) = worktree_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let repo = repo_path.as_os_str();
+    let worktree = worktree_path.as_os_str();
+    // Resolve the start point to an object id BEFORE handing it to
+    // `worktree add`: a `--` separator is not enough at this call shape
+    // (measured on git 2.55), because `worktree add` consumes the separator and
+    // forwards the start point to an internal `git branch <name> <start-point>`
+    // with none of its own, where `--force` or `--quiet` is obeyed as a FLAG,
+    // the worktree is branched from HEAD and git exits 0. An object id can never
+    // be read as an option; `--end-of-options` protects the resolve step itself,
+    // so a start point naming nothing fails loudly here.
+    let resolved_start = match start_point {
+        Some(start_point) => Some(run_git_capture(
+            repo_path,
+            &[
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                &format!("{start_point}^{{commit}}"),
+            ],
+            &format!("resolve start point '{start_point}'"),
+        )?),
+        None => None,
+    };
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "add", "-b", branch_name])
+        .arg(worktree);
+    if let Some(resolved_start) = resolved_start.as_deref() {
+        // Defence in depth alongside the resolve above.
+        command.arg("--").arg(resolved_start);
+    }
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(worktree_path
+        .canonicalize()
+        .unwrap_or_else(|_| worktree_path.to_path_buf()))
+}
+
+pub fn head_commit(repo_path: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .with_context(|| format!("failed to inspect HEAD for {}", repo_path.display()))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git rev-parse HEAD failed for {}: {}",
+            repo_path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[derive(Debug, Default)]
+pub struct UncommittedCopySummary {
+    pub copied: usize,
+    pub deleted: usize,
+    /// Records skipped because the source is not a regular file or symlink:
+    /// dirty submodules (" M dir"), untracked embedded repos ("?? dir/"), and
+    /// non-regular files such as FIFOs, sockets, and devices (which would
+    /// block or fail a byte copy). Relative paths, for the user-facing note.
+    pub skipped_paths: Vec<String>,
+}
+
+#[derive(Default)]
+struct UncommittedCopyPlan {
+    deletions: Vec<PathBuf>,
+    copies: Vec<PathBuf>,
+    skipped_paths: Vec<String>,
+}
+
+/// Copies exactly what `git status --porcelain=v1 -z --untracked-files=all`
+/// reports in `source` into `destination`. Nothing gitignored travels.
+/// PRECONDITION: both worktrees are at the SAME HEAD commit; callers enforce
+/// this with the HEAD-equality guard (agent_job.rs), because status deltas
+/// are relative to the HEAD commit's tree.
+pub fn copy_uncommitted_changes(
+    source: &Path,
+    destination: &Path,
+) -> Result<UncommittedCopySummary> {
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", source.display()))?;
+    let destination = destination
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", destination.display()))?;
+    if source == destination {
+        return Err(anyhow!(
+            "source and destination worktrees must be different"
+        ));
+    }
+
+    let plan = classify_uncommitted_records(&uncommitted_status(&source)?)?;
+    let mut summary = UncommittedCopySummary {
+        skipped_paths: plan.skipped_paths,
+        ..Default::default()
+    };
+    apply_uncommitted_deletions(&destination, &plan.deletions, &mut summary)?;
+    apply_uncommitted_copies(&source, &destination, &plan.copies, &mut summary)?;
+    Ok(summary)
+}
+
+fn uncommitted_status(source: &Path) -> Result<Vec<u8>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(source)
+        .args([
+            // Pin rename/copy detection off so every record carries exactly
+            // one path (rename records are two-path and config-dependent).
+            "-c",
+            "status.renames=false",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(output.stdout)
+}
+
+fn classify_uncommitted_records(status: &[u8]) -> Result<UncommittedCopyPlan> {
+    let mut plan = UncommittedCopyPlan::default();
+    for record in status.split(|byte| *byte == 0) {
+        classify_uncommitted_record(record, &mut plan)?;
+    }
+    Ok(plan)
+}
+
+fn classify_uncommitted_record(record: &[u8], plan: &mut UncommittedCopyPlan) -> Result<()> {
+    if record.len() < 4 {
+        return Ok(());
+    }
+    let index_status = record[0] as char;
+    let worktree_status = record[1] as char;
+    if matches!(index_status, 'R' | 'C') || matches!(worktree_status, 'R' | 'C') {
+        return Err(anyhow!(
+            "rename/copy detection produced a two-path record despite `-c status.renames=false`; this needs git >= 2.18"
+        ));
+    }
+    let path_bytes = &record[3..];
+    let relative: &Path =
+        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(path_bytes).as_ref();
+    if !is_safe_status_path(relative) {
+        return Ok(());
+    }
+    if path_bytes.ends_with(b"/") {
+        plan.skipped_paths
+            .push(relative.to_string_lossy().trim_end_matches('/').to_string());
+    } else if is_unmerged_status(index_status, worktree_status) {
+        plan.copies.push(relative.to_path_buf());
+    } else if worktree_status == 'D' || (index_status == 'D' && worktree_status == ' ') {
+        plan.deletions.push(relative.to_path_buf());
+    } else {
+        plan.copies.push(relative.to_path_buf());
+    }
+    Ok(())
+}
+
+fn is_safe_status_path(relative: &Path) -> bool {
+    let first_is_git_dir = matches!(
+        relative.components().next(),
+        Some(Component::Normal(name)) if name == ".git"
+    );
+    !relative.is_absolute()
+        && !first_is_git_dir
+        && !relative
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+}
+
+fn is_unmerged_status(index_status: char, worktree_status: char) -> bool {
+    index_status == 'U'
+        || worktree_status == 'U'
+        || (index_status == 'A' && worktree_status == 'A')
+        || (index_status == 'D' && worktree_status == 'D')
+}
+
+fn apply_uncommitted_deletions(
+    destination: &Path,
+    deletions: &[PathBuf],
+    summary: &mut UncommittedCopySummary,
+) -> Result<()> {
+    for relative in deletions {
+        remove_path_if_exists(&destination.join(relative))?;
+        summary.deleted += 1;
+        prune_empty_ancestors(destination, relative);
+    }
+    Ok(())
+}
+
+fn apply_uncommitted_copies(
+    source: &Path,
+    destination: &Path,
+    copies: &[PathBuf],
+    summary: &mut UncommittedCopySummary,
+) -> Result<()> {
+    for relative in copies {
+        let source_path = source.join(relative);
+        let destination_path = destination.join(relative);
+        let metadata = match fs::symlink_metadata(&source_path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                remove_path_if_exists(&destination_path)?;
+                summary.deleted += 1;
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if !metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
+            summary
+                .skipped_paths
+                .push(relative.to_string_lossy().to_string());
+            continue;
+        }
+        ensure_destination_parents(source, destination, relative)?;
+        sync_entry(&source_path, &destination_path)?;
+        summary.copied += 1;
+    }
+    Ok(())
+}
+
+/// Best-effort removal of now-empty ancestor directories of `rel` inside
+/// `destination`, walking up toward (never past) `destination` and stopping
+/// at the first non-empty directory. Errors are ignored.
+fn prune_empty_ancestors(destination: &Path, rel: &Path) {
+    let mut ancestor = rel.parent();
+    while let Some(dir) = ancestor {
+        if dir.as_os_str().is_empty() {
+            break;
+        }
+        // `remove_dir` refuses to remove a non-empty directory.
+        if fs::remove_dir(destination.join(dir)).is_err() {
+            break;
+        }
+        ancestor = dir.parent();
+    }
+}
+
+/// Create the missing parent directories of `rel` under `destination`,
+/// copying the corresponding source directory's mode when it exists (see the
+/// umask-safety rationale in `sync_entry`), and tolerating races.
+fn ensure_destination_parents(source: &Path, destination: &Path, rel: &Path) -> Result<()> {
+    let Some(parent) = rel.parent() else {
+        return Ok(());
+    };
+    let mut prefix = PathBuf::new();
+    for component in parent.components() {
+        prefix.push(component);
+        let destination_dir = destination.join(&prefix);
+        if fs::symlink_metadata(&destination_dir).is_ok() {
+            continue;
+        }
+        let mut builder = fs::DirBuilder::new();
+        if let Ok(source_meta) = fs::symlink_metadata(source.join(&prefix))
+            && source_meta.file_type().is_dir()
+        {
+            builder.mode(source_meta.permissions().mode());
+        }
+        match builder.create(&destination_dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Like `remove_path`, but an already-absent path is success.
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => remove_path(path),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// What a worktree removal did to the branches involved.
+///
+/// Two branches, because an agent's branch can DRIFT: `branch_name` is kept in
+/// step with whatever the worktree is on, while `initial_branch` is the branch
+/// the agent was born on and never moves. Delete only the first and the birth
+/// branch survives the agent, which is how "create foo, delete foo, recreate
+/// foo" ends in "branch already exists".
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RemoveResult {
+    /// What happened to the branch the worktree was on.
+    pub branch: BranchDeletion,
+    /// What happened to a DISTINCT birth branch, and `None` when there was no
+    /// distinct birth branch to delete (the agent never drifted, or the caller
+    /// passed none).
+    pub initial_branch: Option<BranchDeletion>,
+}
+
+/// What `git branch -D` did to one branch.
+///
+/// A failed `git branch -D` is distinct from an absent branch: a branch checked
+/// out in another worktree is refused and remains present.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum BranchDeletion {
+    /// git deleted the branch here.
+    #[default]
+    Deleted,
+    /// There was no such branch to delete. Not an error: somebody else already
+    /// removed it, or dux was told about a branch that never existed.
+    AlreadyGone,
+    /// git refused, and the branch is STILL THERE. Carries git's own reason
+    /// line so the message can say why rather than guessing.
+    Refused { reason: String },
+}
+
+impl BranchDeletion {
+    /// git's reason for refusing, or `None` when it did not refuse.
+    pub fn refused_reason(&self) -> Option<&str> {
+        match self {
+            BranchDeletion::Refused { reason } => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+/// The recovery sentence for a branch git REFUSED to delete: what happened, why
+/// in git's own words, and the two ways out. Shared so the TUI status line and
+/// the web toast say the same thing, which both need because a surviving branch
+/// makes recreating an agent under the same name fail far from the deletion that
+/// caused it.
+pub fn branch_refusal_note(branch: &str, reason: &str) -> String {
+    let reason = clean_git_reason(reason);
+    format!(
+        "Git refused to delete branch \"{branch}\": {reason} Delete it yourself with \
+         git branch -D \"{branch}\", or give the next agent a different name."
+    )
+}
+
+/// git's stderr line, tidied for a status message: the "error: " prefix dropped,
+/// since the sentence around it already says something went wrong, and a full
+/// stop added when git did not end with one. An empty reason becomes a plain
+/// statement rather than a dangling colon.
+fn clean_git_reason(reason: &str) -> String {
+    let trimmed = reason.trim();
+    let trimmed = trimmed
+        .strip_prefix("error: ")
+        .or_else(|| trimmed.strip_prefix("fatal: "))
+        .unwrap_or(trimmed);
+    if trimmed.is_empty() {
+        return "git gave no reason.".to_string();
+    }
+    if trimmed.ends_with('.') || trimmed.ends_with('!') || trimmed.ends_with('?') {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.")
+    }
+}
+
+impl RemoveResult {
+    /// Whether git refused either branch, which leaves it on disk for the user
+    /// to remove by hand. The one copy of the question every surface asks.
+    pub fn refused_a_branch(&self) -> bool {
+        self.branch.refused_reason().is_some()
+            || self
+                .initial_branch
+                .as_ref()
+                .is_some_and(|deletion| deletion.refused_reason().is_some())
+    }
+
+    /// A sentence naming what happened to the agent's ORIGINAL branch, for the
+    /// status message. `None` when the agent never drifted, so the message says
+    /// nothing extra rather than mentioning a branch the user never saw.
+    ///
+    /// Lives here so the TUI status line and the web toast say the same thing.
+    pub fn initial_branch_note(&self, initial_branch: &str) -> Option<String> {
+        match self.initial_branch.as_ref()? {
+            BranchDeletion::Deleted => Some(format!(
+                "Its original branch \"{initial_branch}\" was deleted too."
+            )),
+            BranchDeletion::AlreadyGone => Some(format!(
+                "Its original branch \"{initial_branch}\" was already gone."
+            )),
+            BranchDeletion::Refused { reason } => Some(format!(
+                "Its original branch \"{initial_branch}\" is still there. {}",
+                branch_refusal_note(initial_branch, reason)
+            )),
+        }
+    }
+}
+
+/// Force-delete one branch, best effort, reporting which of the three things
+/// happened.
+///
+/// `--` so the name is read as a REF and never as an option: without it a ref
+/// that plumbing created as `--delete` is parsed as the flag and survives the
+/// cleanup (measured on git 2.55). A failure is then disambiguated with PLUMBING
+/// rather than by reading git's prose: `show-ref --verify` answers whether the
+/// ref is still there. `--end-of-options` guards that positional too (MEASURED:
+/// `show-ref` accepts it), belt and braces over a fully qualified
+/// `refs/heads/...` that cannot lead with a dash anyway.
+fn delete_branch_force(repo_path: &Path, branch_name: &str) -> Result<BranchDeletion> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["branch", "-D", "--", branch_name])
+        .output()?;
+    if output.status.success() {
+        return Ok(BranchDeletion::Deleted);
+    }
+    if !branch_still_exists(repo_path, branch_name) {
+        return Ok(BranchDeletion::AlreadyGone);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let reason = stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .to_string();
+    Ok(BranchDeletion::Refused { reason })
+}
+
+/// Force-delete a branch dux minted moments ago and then failed to build the
+/// agent around, best effort.
+///
+/// It covers the one window the worktree rollback cannot: a branch that exists
+/// while its worktree does not, so there is nothing for [`remove_worktree`] to
+/// remove. It routes through `delete_branch_force`, sharing the `--` guard and
+/// the plumbing disambiguation, and discards the outcome: the caller is already
+/// reporting a failure and a stubborn ref is not a second thing to say.
+pub(crate) fn delete_created_branch_best_effort(repo_path: &Path, branch_name: &str) {
+    let _ = delete_branch_force(repo_path, branch_name);
+}
+
+/// Whether `refs/heads/<branch_name>` still resolves. Best effort: a git that
+/// cannot answer is read as "gone", which keeps the old behaviour rather than
+/// inventing a refusal nobody can act on.
+fn branch_still_exists(repo_path: &Path, branch_name: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &format!("refs/heads/{branch_name}"),
+        ])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// The registered project checkouts, expanded to absolute paths, for
+/// [`guard_whole_workspace_removal`]. Fails closed: one project path that does
+/// not expand to a safe absolute path makes the whole inventory an error,
+/// because a guard run against a partial inventory would silently stop
+/// protecting the project it could not read.
+pub fn registered_project_paths<'a>(
+    project_paths: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<PathBuf>> {
+    project_paths
+        .into_iter()
+        .map(|raw| {
+            crate::config::expand_path(raw)
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "registered project path is not a safe absolute path: {}",
+                        crate::sanitize::for_terminal(raw)
+                    )
+                })
+        })
+        .collect()
+}
+
+/// Refuse a whole-worktree (or whole-root) removal whose resolved target
+/// overlaps a registered project checkout in EITHER direction (fork
+/// shared-workspace Phase 5, f4f2257a).
+///
+/// - The target is a project, or inside one: a corrupt row pointing a worktree
+///   at the user's checkout, or at something within it.
+/// - A project is inside the target: removing a parent directory would take
+///   the checkout with it.
+///
+/// Both sides are resolved symlink-aware, including a target that is already
+/// gone (its deepest existing ancestor is canonicalized and the missing suffix
+/// re-appended), so an alias through a symlink cannot slip past. A relative
+/// path or one containing `..` is refused outright.
+///
+/// Called from inside [`remove_worktree_keep_branch`] (and so
+/// [`remove_worktree`]), so every caller is guarded. It is deliberately NOT
+/// applied to contained-file operations such as discarding an untracked
+/// directory inside a checkout, which stay possible.
+pub fn guard_whole_workspace_removal(target: &Path, registered_projects: &[PathBuf]) -> Result<()> {
+    let target = resolve_for_removal(target)?;
+    for project in registered_projects {
+        let project = resolve_for_removal(project)?;
+        if target.starts_with(&project) || project.starts_with(&target) {
+            return Err(anyhow!(
+                "refusing to remove {} because it overlaps the registered project {}",
+                crate::sanitize::for_terminal(&target.display().to_string()),
+                crate::sanitize::for_terminal(&project.display().to_string())
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Symlink-aware "strictly inside `root`" for whole-worktree inventories, that
+/// also works for targets already absent from disk.
+pub fn whole_workspace_target_is_within(root: &Path, target: &Path) -> Result<bool> {
+    let root = resolve_for_removal(root)?;
+    let target = resolve_for_removal(target)?;
+    Ok(target != root && target.starts_with(root))
+}
+
+fn resolve_for_removal(path: &Path) -> Result<PathBuf> {
+    let shown = || crate::sanitize::for_terminal(&path.display().to_string());
+    if !path.is_absolute() {
+        return Err(anyhow!("removal target must be absolute: {}", shown()));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(anyhow!(
+            "removal target contains parent traversal: {}",
+            shown()
+        ));
+    }
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    loop {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) => break,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                suffix.push(
+                    ancestor
+                        .file_name()
+                        .ok_or_else(|| anyhow!("failed to resolve removal target {}", shown()))?
+                        .to_os_string(),
+                );
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| anyhow!("failed to resolve removal target {}", shown()))?;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to inspect {}", shown()));
+            }
+        }
+    }
+    let mut resolved = ancestor
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", shown()))?;
+    for component in suffix.iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
+/// Remove a worktree from disk and from git's registry, and DO NOT touch its
+/// branch.
+///
+/// The half of [`remove_worktree`] for callers who were NOT asked to delete a
+/// branch. `git branch -D` force-deletes even a branch holding commits that
+/// exist nowhere else, so it happens only where the user answered for it: a
+/// worktree manager's confirmation carries a checkbox, and the agent-delete path
+/// routes to one of the two halves on the branch's recorded provenance and on
+/// the delete dialog's answer, in either direction.
+///
+/// `--force`, so a worktree with uncommitted work is removed anyway: every
+/// caller must confirm with the user first.
+///
+/// `protected` is every registered project checkout (see
+/// [`registered_project_paths`]). A target that overlaps any of them is
+/// refused before git runs, see [`guard_whole_workspace_removal`]. It is an
+/// explicit argument, not derived from `repo_path`, so every caller has to say
+/// what it protects.
+pub fn remove_worktree_keep_branch(
+    repo_path: &Path,
+    worktree_path: &Path,
+    protected: &[PathBuf],
+) -> Result<()> {
+    guard_whole_workspace_removal(worktree_path, protected)?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args([
+            "worktree", "remove", "--force",
+            // `--` so a worktree path that begins with a dash is read as a
+            // POSITIONAL and never as an option (the CLAUDE.md rule).
+            "--",
+        ])
+        .arg(worktree_path)
+        .output()?;
+    if !output.status.success() {
+        if worktree_path.exists() {
+            return Err(anyhow!(
+                "git worktree remove failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        // Worktree already gone from disk: prune stale git refs.
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(["worktree", "prune"])
+            .output();
+    }
+    Ok(())
+}
+
+/// Whether the worktree has anything uncommitted: staged changes, unstaged
+/// changes, or untracked files. Untracked files count deliberately, because
+/// `git worktree remove --force` deletes them along with the directory and they
+/// exist in no commit anywhere.
+///
+/// Uses `--porcelain=v1 -z`, the machine-stable form; only the presence of the
+/// records is read, never the paths.
+pub fn worktree_is_dirty(worktree_path: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git status failed for {}: {}",
+            worktree_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(!output.stdout.is_empty())
+}
+
+/// Remove a worktree and delete the branches the agent owned.
+///
+/// `branch_name` is the branch the worktree is on NOW. `initial_branch` is the
+/// branch the agent was born on, and is deleted too when it differs, because a
+/// birth branch left behind makes recreating an agent under its old name fail
+/// with "branch already exists". Pass `None` when the two are the same by
+/// construction.
+///
+/// Both deletions are BEST EFFORT: a branch git will not delete is reported in
+/// the [`RemoveResult`] for the status message, never as an error. Only the
+/// worktree removal itself can fail this call.
+pub fn remove_worktree(
+    repo_path: &Path,
+    worktree_path: &Path,
+    branch_name: &str,
+    initial_branch: Option<&str>,
+    protected: &[PathBuf],
+) -> Result<RemoveResult> {
+    // The worktree half is shared with `remove_worktree_keep_branch`; only the
+    // branch deletions below are this function's own.
+    remove_worktree_keep_branch(repo_path, worktree_path, protected)?;
+    let branch = delete_branch_force(repo_path, branch_name)?;
+    // Only a DISTINCT, non-empty birth branch is a second thing to delete. An
+    // empty one comes from a session record that never had it recorded.
+    let initial = match initial_branch {
+        Some(initial) if !initial.is_empty() && initial != branch_name => {
+            Some(delete_branch_force(repo_path, initial)?)
+        }
+        _ => None,
+    };
+    Ok(RemoveResult {
+        branch,
+        initial_branch: initial,
+    })
+}
+
+/// The file listing returned by [`worktree_files`].
+#[derive(Debug, Clone)]
+pub struct WorktreeFileList {
+    pub files: Vec<String>,
+    /// `true` when the walk hit the caller's `max_files` cap and some entries
+    /// were omitted. The client may surface a subtle hint.
+    pub truncated: bool,
+}
+
+/// Walk the worktree's filesystem and return every file path (worktree-relative)
+/// except the contents of `.git/objects/` and `.git/logs/`, excluded for
+/// performance. The rest of `.git/` is included so the editor can open
+/// `.git/config`, `.git/HEAD` and hooks read-only. Symlinked directories are NOT
+/// recursed (`follow_links(false)`) and appear as leaf entries.
+///
+/// This feeds the web editor's file-SEARCH index, not its tree ([`list_dir`]
+/// backs that). Returns at most `max_files` entries and sets `truncated` if more
+/// exist; `max_files == 0` disables the cap entirely.
+pub fn worktree_files(worktree_path: &Path, max_files: usize) -> Result<WorktreeFileList> {
+    walk_files(worktree_path, max_files, DotDirectories::Walked)
+}
+
+/// The same flat walk for a root that is NOT a worktree: the directory a
+/// terminal was spawned in, backing a terminal-rooted editor's search box.
+///
+/// It differs from [`worktree_files`] in pruning dot DIRECTORIES, which is the
+/// reason it exists. A worktree's are the project's own (`.github`, and `.git`
+/// itself, which the editor opens read-only); a terminal routinely roots in a
+/// home directory, where they are caches and application state that can dwarf
+/// the walk. Plain dotFILES are kept, because a `.bashrc` is what someone opens.
+///
+/// The prune is NOT containment or privacy: such a root may legally be `/`, the
+/// fallback when the home directory cannot be resolved, and pruning does nothing
+/// about `/proc` or `/sys`. What bounds the walk is the same
+/// `[server] search_index_max_files` cap every other walk gets, plus the
+/// single-tenant trusted-access model: a client that reaches this can already
+/// browse the filesystem.
+pub fn rooted_files(root: &Path, max_files: usize) -> Result<WorktreeFileList> {
+    walk_files(root, max_files, DotDirectories::Pruned)
+}
+
+/// Whether a flat walk descends into directories whose name starts with a dot.
+/// Named rather than a bare bool so the two call sites read as the decision they
+/// are; see [`rooted_files`] for why the two roots answer differently.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DotDirectories {
+    Walked,
+    Pruned,
+}
+
+fn walk_files(
+    worktree_path: &Path,
+    max_files: usize,
+    dot_dirs: DotDirectories,
+) -> Result<WorktreeFileList> {
+    use walkdir::WalkDir;
+
+    let wt = worktree_path.to_path_buf();
+    let mut files: Vec<String> = Vec::new();
+    let mut truncated = false;
+
+    let walker = WalkDir::new(worktree_path)
+        .follow_links(false)
+        .min_depth(1)
+        .into_iter()
+        .filter_entry(move |e| {
+            // Prune .git/objects and .git/logs subtrees entirely.
+            if e.file_type().is_dir() {
+                if dot_dirs == DotDirectories::Pruned
+                    && e.file_name().to_string_lossy().starts_with('.')
+                {
+                    return false;
+                }
+                let pruned = e.path().strip_prefix(&wt).is_ok_and(|rel| {
+                    let r = rel.to_string_lossy();
+                    r == ".git/objects"
+                        || r.starts_with(".git/objects/")
+                        || r == ".git/logs"
+                        || r.starts_with(".git/logs/")
+                });
+                if pruned {
+                    return false; // don't descend into this directory
+                }
+            }
+            true
+        });
+
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                // Permission error, broken symlink, etc. Skip and continue;
+                // a broken entry should not blank the entire listing.
+                logger::warn(&format!("worktree_files: skipping entry: {e}"));
+                continue;
+            }
+        };
+        // Only emit leaf paths: directories are structural, not files.
+        // Symlinked dirs appear as Symlink (follow_links=false), so they ARE
+        // emitted here (the symlink target is not recursed).
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        if let Ok(rel) = entry.path().strip_prefix(worktree_path) {
+            if max_files > 0 && files.len() >= max_files {
+                truncated = true;
+                break;
+            }
+            files.push(rel.to_string_lossy().into_owned());
+        }
+    }
+
+    files.sort();
+    Ok(WorktreeFileList { files, truncated })
+}
+
+/// One entry in a single-directory listing for the web editor's lazy file tree.
+/// Produced by [`list_dir`]; unlike [`worktree_files`] this never recurses and
+/// never caps: it reflects exactly one directory's children as they are on disk.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DirEntryInfo {
+    /// The child's own name (final path segment), never a full path.
+    pub name: String,
+    /// The child's worktree-relative path (`parent_rel/name`, or `name` at root).
+    pub path: String,
+    /// True when the entry is a directory (a real dir, OR a symlink that
+    /// resolves to a directory that is still inside the worktree; those are
+    /// expandable).
+    pub is_dir: bool,
+    /// True when the entry is a symlink (of any kind). The UI may badge it; a
+    /// symlinked dir that escapes the worktree is reported with `is_dir = false`
+    /// and `expandable = false` so it can never be walked out of the tree.
+    pub is_symlink: bool,
+    /// True when the UI may request this entry's children via [`list_dir`].
+    /// False for files and for symlinked dirs whose target is outside the
+    /// worktree.
+    pub expandable: bool,
+}
+
+/// List exactly one directory of the worktree for the web editor's lazy file
+/// tree: a single `read_dir`, no recursion, no cap. `rel_dir` is worktree
+/// relative; `""` lists the worktree root. Containment reuses the
+/// read-permissive resolver (`.git/` is listable; traversal, absolute paths,
+/// and symlinks that escape the worktree are refused).
+pub fn list_dir(worktree: &Path, rel_dir: &str) -> Result<Vec<DirEntryInfo>> {
+    let abs_dir = if rel_dir.is_empty() {
+        worktree.to_path_buf()
+    } else {
+        let (abs, _is_git_dir, is_outside) =
+            crate::worktree_file::resolve_worktree_path_for_read(worktree, rel_dir)?;
+        if is_outside {
+            return Err(anyhow!(
+                "directory resolves outside the worktree: {rel_dir}"
+            ));
+        }
+        abs
+    };
+
+    let mut entries: Vec<DirEntryInfo> = Vec::new();
+    for entry in std::fs::read_dir(&abs_dir)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                logger::warn(&format!("list_dir: skipping entry: {e}"));
+                continue;
+            }
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = if rel_dir.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel_dir}/{name}")
+        };
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(e) => {
+                logger::warn(&format!("list_dir: skipping entry {name}: {e}"));
+                continue;
+            }
+        };
+        let is_symlink = ft.is_symlink();
+        let (is_dir, expandable) = if is_symlink {
+            // Follow the link to learn whether the target is a directory; a
+            // dangling symlink is a plain non-expandable leaf.
+            let target_is_dir = std::fs::metadata(entry.path())
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+            if target_is_dir {
+                // Expandable only when the resolved target stays inside the
+                // worktree: an escaping symlinked dir is shown but can never
+                // be walked out of the tree.
+                let in_tree = crate::worktree_file::resolve_worktree_path_for_read(worktree, &path)
+                    .map(|(_, _, is_outside)| !is_outside)
+                    .unwrap_or(false);
+                (in_tree, in_tree)
+            } else {
+                (false, false)
+            }
+        } else {
+            let d = ft.is_dir();
+            (d, d)
+        };
+        entries.push(DirEntryInfo {
+            name,
+            path,
+            is_dir,
+            is_symlink,
+            expandable,
+        });
+    }
+
+    // `file_name().to_string_lossy()` replaces invalid UTF-8 bytes with U+FFFD,
+    // so two distinct non-UTF-8 names can collide onto one lossy `path` and the
+    // client, which keys tree rows by path, would lose one of them. Drop later
+    // duplicates and warn rather than build an escaping scheme.
+    let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    entries.retain(|e| {
+        if seen_paths.insert(e.path.clone()) {
+            true
+        } else {
+            logger::warn(&format!(
+                "list_dir: dropping duplicate entry after lossy UTF-8 name conversion: {}",
+                e.path
+            ));
+            false
+        }
+    });
+
+    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    });
+    Ok(entries)
+}
+
+/// The source path a row carries, which is only ever a rename's or a copy's:
+/// the other side of the same record may be an ordinary modification.
+fn rename_source(status: char, source: &Option<String>) -> Option<String> {
+    if matches!(status, 'R' | 'C') {
+        source.clone()
+    } else {
+        None
+    }
+}
+
+/// Every git process `changed_files` starts goes through here, so a test can
+/// count them: the panel is polled, and a per-file subprocess (the fork's
+/// P1-24, one `git diff --no-index` per untracked file) turns a big untracked
+/// tree into hundreds of spawns per tick.
+fn changed_files_git_command() -> Command {
+    #[cfg(test)]
+    CHANGED_FILES_GIT_COMMANDS.with(|count| count.set(count.get() + 1));
+    Command::new("git")
+}
+
+#[cfg(test)]
+thread_local! {
+    static CHANGED_FILES_GIT_COMMANDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<ChangedFile>)> {
+    let wt = worktree_path.as_os_str();
+
+    let output = changed_files_git_command()
+        .arg("-C")
+        .arg(wt)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let mut staged = Vec::new();
+    let mut unstaged = Vec::new();
+
+    for entry in parse_status_porcelain_z(&output.stdout) {
+        let index_status = entry.index_status;
+        let worktree_status = entry.worktree_status;
+        let path = entry.path;
+        let source = entry.renamed_from;
+
+        if index_status == '?' && worktree_status == '?' {
+            unstaged.push(ChangedFile {
+                status: "?".to_string(),
+                path,
+                additions: 0,
+                deletions: 0,
+                binary: false,
+                diff_excluded: false,
+                renamed_from: None,
+            });
+            continue;
+        }
+
+        if index_status != ' ' {
+            staged.push(ChangedFile {
+                status: index_status.to_string(),
+                path: path.clone(),
+                additions: 0,
+                deletions: 0,
+                binary: false,
+                diff_excluded: false,
+                renamed_from: rename_source(index_status, &source),
+            });
+        }
+
+        if worktree_status != ' ' {
+            unstaged.push(ChangedFile {
+                status: worktree_status.to_string(),
+                path: path.clone(),
+                additions: 0,
+                deletions: 0,
+                binary: false,
+                diff_excluded: false,
+                renamed_from: rename_source(worktree_status, &source),
+            });
+        }
+    }
+
+    // The tracked diff and the untracked counting are two independent sources,
+    // so the git call's answer is resolved to a map FIRST and the loop runs
+    // whatever came back. A failed `git diff` yields an empty map, which costs
+    // tracked rows their line counts and nothing else; running the loop inside
+    // the call's `Ok` would take the untracked files' in-process counts with it.
+    let tracked_stats = unstaged_numstat(wt);
+    let staged_stats = staged_numstat(wt);
+
+    // git prints `-\t-` for a path the repository excludes from diffs in
+    // .gitattributes exactly as it prints it for a real binary, so numstat
+    // alone cannot tell the two apart. One batched `check-attr` over the
+    // countless rows narrows it down, and only those rows: the question is not
+    // asked at all in the ordinary case where every path has a number. The
+    // attribute is not the whole answer (see `paths_excluded_from_diffs`), so
+    // each candidate's own bytes settle it, per side.
+    let attribute_unset =
+        paths_excluded_from_diffs(wt, &countless_paths(&[&tracked_stats, &staged_stats]));
+    let excluded_unstaged = diff_excluded_rows(
+        worktree_path,
+        &attribute_unset,
+        &tracked_stats,
+        ContentSide::Worktree,
+    );
+    let excluded_staged = diff_excluded_rows(
+        worktree_path,
+        &attribute_unset,
+        &staged_stats,
+        ContentSide::Index,
+    );
+
+    apply_unstaged_stats(
+        worktree_path,
+        &mut unstaged,
+        &tracked_stats,
+        &excluded_unstaged,
+    );
+
+    for file in &mut staged {
+        if let Some(stat) = staged_stats.get(&file.path) {
+            apply_stat(file, stat, &excluded_staged);
+        }
+    }
+
+    Ok((staged, unstaged))
+}
+
+/// Per-path line counts for the tracked, unstaged changes in `worktree`.
+///
+/// A git call that could not be run, or that exited non-zero, answers with an
+/// empty map rather than an error: it is one of two independent sources feeding
+/// the unstaged rows, and the other one still has something to say.
+fn unstaged_numstat(worktree: &std::ffi::OsStr) -> HashMap<String, DiffStat> {
+    changed_files_git_command()
+        .arg("-C")
+        .arg(worktree)
+        .args(["diff", "--numstat", "-z"])
+        .output()
+        .ok()
+        .filter(|ns| ns.status.success())
+        .map(|ns| parse_numstat(&ns.stdout))
+        .unwrap_or_default()
+}
+
+/// Per-path line counts for the staged changes in `worktree`. Answers with an
+/// empty map on a failed call, for the same reason [`unstaged_numstat`] does.
+fn staged_numstat(worktree: &std::ffi::OsStr) -> HashMap<String, DiffStat> {
+    changed_files_git_command()
+        .arg("-C")
+        .arg(worktree)
+        .args(["diff", "--cached", "--numstat", "-z"])
+        .output()
+        .ok()
+        .filter(|ns| ns.status.success())
+        .map(|ns| parse_numstat(&ns.stdout))
+        .unwrap_or_default()
+}
+
+/// Every path git answered `-\t-` for, across the numstat maps of one sweep.
+///
+/// Sorted and deduplicated so the follow-up question is asked once per path and
+/// the command line is reproducible.
+fn countless_paths(stats: &[&HashMap<String, DiffStat>]) -> Vec<String> {
+    let mut paths: Vec<String> = stats
+        .iter()
+        .flat_map(|map| map.iter())
+        .filter(|(_, stat)| matches!(stat, DiffStat::Binary))
+        .map(|(path, _)| path.clone())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Which of `paths` carry an UNSET `diff` attribute, which is NECESSARY for a
+/// path to be excluded from diffs and not sufficient on its own.
+///
+/// `-diff` in a `.gitattributes` unsets it, and so does the `binary` macro
+/// (`*.png binary` expands to `-diff -merge -text`), which is how repositories
+/// ordinarily declare their real binaries; a `-diff` path may also hold NUL
+/// bytes and be a genuine binary anyway. Both were measured on git 2.55. So
+/// this answers candidates, and the caller settles each one by sniffing its
+/// content the way git does. `unspecified`, `set` and an explicit value (a diff
+/// driver) are not even candidates: those rows stay binary.
+///
+/// The attributes are read from the WORKTREE's `.gitattributes`, for the staged
+/// side too. Reading the index's copy instead would mean `--cached` and a
+/// second batched call for the staged paths alone, and the disagreement it
+/// would resolve (an uncommitted edit to `.gitattributes`) does not change what
+/// the row says: the content sniff is what decides binary from excluded, and it
+/// reads the right side already.
+///
+/// The paths travel on stdin, NUL-delimited, for two reasons: the batch is
+/// bounded by the pipe rather than by `ARG_MAX`, and nothing on the command
+/// line can be read as an option, so a path beginning with a dash is a path.
+/// A call that could not be run answers with an empty set, which leaves every
+/// row saying binary exactly as it did before this question existed.
+fn paths_excluded_from_diffs(worktree: &std::ffi::OsStr, paths: &[String]) -> HashSet<String> {
+    if paths.is_empty() {
+        return HashSet::new();
+    }
+
+    let Ok(mut child) = changed_files_git_command()
+        .arg("-C")
+        .arg(worktree)
+        .args(["check-attr", "-z", "--stdin", "diff"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    else {
+        return HashSet::new();
+    };
+
+    let Some(mut stdin) = child.stdin.take() else {
+        return HashSet::new();
+    };
+    let mut payload = Vec::new();
+    for path in paths {
+        payload.extend_from_slice(path.as_bytes());
+        payload.push(0);
+    }
+
+    // The writer runs on its own thread: check-attr answers three records per
+    // path, so a large batch can fill the output pipe while dux is still
+    // feeding the input one, and a single-threaded write-then-read deadlocks.
+    let writer = std::thread::spawn(move || {
+        let _ = std::io::Write::write_all(&mut stdin, &payload);
+    });
+
+    let output = child.wait_with_output();
+    let _ = writer.join();
+
+    match output {
+        Ok(out) if out.status.success() => parse_check_attr_z(&out.stdout),
+        _ => HashSet::new(),
+    }
+}
+
+/// Parse `git check-attr -z` output: NUL-delimited records in groups of three
+/// (path, attribute, value), and collect the paths whose value is `unset`.
+fn parse_check_attr_z(raw: &[u8]) -> HashSet<String> {
+    let mut excluded = HashSet::new();
+    let mut fields = raw.split(|byte| *byte == 0);
+    while let (Some(path), Some(_attr), Some(value)) = (fields.next(), fields.next(), fields.next())
+    {
+        if path.is_empty() {
+            continue;
+        }
+        if value == b"unset"
+            && let Ok(path) = std::str::from_utf8(path)
+        {
+            excluded.insert(path.to_string());
+        }
+    }
+    excluded
+}
+
+/// Which side's bytes answer "is this really text", for a countless row whose
+/// `diff` attribute is unset. The two sides genuinely differ: a staged change
+/// is the index's blob, and the working copy may have moved on since.
+#[derive(Clone, Copy)]
+enum ContentSide {
+    Worktree,
+    Index,
+}
+
+/// Of the countless rows in `stats` whose attribute is unset, the ones whose
+/// content really is text and which are therefore excluded from diffs rather
+/// than binary.
+///
+/// The sniff is git's own rule, the same one untracked files are counted by: a
+/// NUL byte within the first [`BINARY_SNIFF_BYTES`]. Anything that cannot be
+/// read stays binary, because promising a text diff dux cannot produce is the
+/// worse of the two wrong answers.
+fn diff_excluded_rows(
+    worktree_path: &Path,
+    attribute_unset: &HashSet<String>,
+    stats: &HashMap<String, DiffStat>,
+    side: ContentSide,
+) -> HashSet<String> {
+    stats
+        .iter()
+        .filter(|(path, stat)| {
+            matches!(stat, DiffStat::Binary) && attribute_unset.contains(path.as_str())
+        })
+        .filter(|(path, _)| content_looks_like_text(worktree_path, path, side))
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+/// Whether one path's content on `side` is text by git's NUL rule. False for
+/// anything that could not be read at all.
+fn content_looks_like_text(worktree_path: &Path, rel_path: &str, side: ContentSide) -> bool {
+    let prefix = match side {
+        // A deleted row has no file on disk any more, and a change git diffed
+        // always has a blob behind it, so the index is the fallback rather than
+        // a second guess.
+        ContentSide::Worktree => file_prefix_on_disk(&worktree_path.join(rel_path))
+            .or_else(|| index_blob_prefix(worktree_path, rel_path)),
+        ContentSide::Index => index_blob_prefix(worktree_path, rel_path),
+    };
+    matches!(prefix, Some(bytes) if !bytes.contains(&0))
+}
+
+/// The first [`BINARY_SNIFF_BYTES`] bytes of a file on disk, or `None` when it
+/// cannot be read.
+fn file_prefix_on_disk(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+
+    let file = fs::File::open(path).ok()?;
+    let mut prefix = Vec::new();
+    file.take(BINARY_SNIFF_BYTES as u64)
+        .read_to_end(&mut prefix)
+        .ok()?;
+    Some(prefix)
+}
+
+/// The first [`BINARY_SNIFF_BYTES`] bytes of a path's INDEX blob, or `None`
+/// when there is no such blob or git could not be run.
+///
+/// `cat-file -p :<path>` is plumbing, so no user configuration can reshape it,
+/// and the revision always starts with a colon, so a dash-leading path can
+/// never be read as an option.
+fn index_blob_prefix(worktree_path: &Path, rel_path: &str) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut child = changed_files_git_command()
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["cat-file", "-p", &format!(":{rel_path}")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut prefix = Vec::new();
+    if let Some(stdout) = child.stdout.as_mut() {
+        stdout
+            .take(BINARY_SNIFF_BYTES as u64)
+            .read_to_end(&mut prefix)
+            .ok()?;
+    }
+    // Drop the pipe before waiting: a blob larger than the sniff gets EPIPE and
+    // exits instead of blocking on a reader that stopped.
+    drop(child.stdout.take());
+    let status = child.wait().ok()?;
+    // A blob that fit inside the sniff exits 0; a larger one is killed by
+    // SIGPIPE, which is success as far as this read is concerned. Only an
+    // absent path (a real non-zero exit with nothing read) answers None.
+    if !status.success() && prefix.is_empty() {
+        return None;
+    }
+    Some(prefix)
+}
+
+/// Put one numstat answer onto its row.
+///
+/// A countless row is either a real binary or a path the repository excludes
+/// from diffs, and `excluded` is the only thing that can tell them apart.
+fn apply_stat(file: &mut ChangedFile, stat: &DiffStat, excluded: &HashSet<String>) {
+    match stat {
+        DiffStat::Text(additions, deletions) => {
+            file.additions = *additions;
+            file.deletions = *deletions;
+        }
+        DiffStat::Binary => {
+            if excluded.contains(&file.path) {
+                file.diff_excluded = true;
+            } else {
+                file.binary = true;
+            }
+        }
+    }
+}
+
+/// Fill in the line counts of the unstaged rows from the two sources that have
+/// them: `tracked` for anything git diffed, and an in-process read for the
+/// untracked files git has no recorded state for.
+///
+/// `tracked` is taken as a plain map rather than computed here, which makes the
+/// independence type-evident: an empty map is what a failed `git diff --numstat`
+/// produces, and the untracked arm below never looks at it.
+///
+/// `excluded` tells a countless tracked row apart from a binary one. The
+/// untracked arm does not consult it: that count is an in-process read of the
+/// bytes rather than a numstat answer, so its binary verdict is git's own
+/// NUL-sniffing rule and not the absence of a number.
+fn apply_unstaged_stats(
+    worktree_path: &Path,
+    unstaged: &mut [ChangedFile],
+    tracked: &HashMap<String, DiffStat>,
+    excluded: &HashSet<String>,
+) {
+    let mut untracked_stats_budget = UNTRACKED_STATS_MAX_FILES;
+    for file in unstaged.iter_mut() {
+        if let Some(stat) = tracked.get(&file.path) {
+            apply_stat(file, stat, excluded);
+        } else if file.status == "?" {
+            if untracked_stats_budget == 0 {
+                continue;
+            }
+            untracked_stats_budget -= 1;
+            match untracked_file_stat(&worktree_path.join(&file.path)) {
+                DiffStat::Text(a, d) => {
+                    file.additions = a;
+                    file.deletions = d;
+                }
+                DiffStat::Binary => {
+                    file.binary = true;
+                }
+            }
+        }
+    }
+}
+
+/// Line counts for one UNTRACKED file, read in this process.
+///
+/// git has no recorded state to diff a file it has never seen against, and
+/// asking it costs one `git diff --no-index` subprocess PER file: a worktree
+/// holding a few thousand untracked files spawns a few thousand processes every
+/// time the changes panel is read, and a poller reads it. Opening the file and
+/// counting newlines is the same answer for a fraction of the cost.
+///
+/// The rules are git's own, so the numbers do not move: a NUL byte anywhere in
+/// the first [`BINARY_SNIFF_BYTES`] bytes makes the file binary (git's
+/// `buffer_is_binary`), and otherwise every line counts as an addition,
+/// including a last line with no newline after it. Encoding does not enter into
+/// it: a latin-1 file with no NUL in it is text to git and is text here.
+///
+/// `.gitattributes` is deliberately not consulted, so a file marked `-diff`
+/// there is counted as text: the accepted cost of not asking git. The file is
+/// streamed rather than read whole.
+fn untracked_file_stat(path: &Path) -> DiffStat {
+    let Ok(file) = fs::File::open(path) else {
+        // Unreadable, or a dangling symlink, or gone between the status sweep
+        // and now. Nothing to count and nothing to claim about it.
+        return DiffStat::Text(0, 0);
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut buffer = [0_u8; 8192];
+    let mut lines = 0_usize;
+    let mut read_so_far = 0_usize;
+    let mut last_byte = None;
+    loop {
+        let filled = match std::io::Read::read(&mut reader, &mut buffer) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(ref err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return DiffStat::Text(0, 0),
+        };
+        let chunk = &buffer[..filled];
+        if read_so_far < BINARY_SNIFF_BYTES {
+            let sniff = &chunk[..filled.min(BINARY_SNIFF_BYTES - read_so_far)];
+            if sniff.contains(&0) {
+                return DiffStat::Binary;
+            }
+        }
+        lines += chunk.iter().filter(|byte| **byte == b'\n').count();
+        last_byte = chunk.last().copied();
+        read_so_far = read_so_far.saturating_add(filled);
+    }
+    // A final line with no newline after it is still a line git counts.
+    if matches!(last_byte, Some(byte) if byte != b'\n') {
+        lines += 1;
+    }
+    DiffStat::Text(lines, 0)
+}
+
+/// The git oracle the in-process counting replaced, kept as the thing the
+/// parity test measures against. Never called outside tests.
+#[cfg(test)]
+fn untracked_file_diff_stat(worktree_path: &Path, rel_path: &str) -> Option<DiffStat> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args([
+            "diff",
+            "--no-index",
+            "--numstat",
+            "-z",
+            "--",
+            NULL_DEVICE,
+            rel_path,
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() && output.status.code() != Some(1) {
+        return None;
+    }
+
+    parse_numstat(&output.stdout).into_values().next()
+}
+
+fn parse_numstat(raw: &[u8]) -> HashMap<String, DiffStat> {
+    let mut stats = HashMap::new();
+    let mut records = raw.split(|byte| *byte == 0).peekable();
+
+    while let Some(record) = records.next() {
+        if record.is_empty() {
+            continue;
+        }
+        let Some((path, stat)) = parse_numstat_record(record, &mut records) else {
+            continue;
+        };
+        stats.insert(path, stat);
+    }
+
+    stats
+}
+
+fn parse_numstat_line(line: &str) -> Option<DiffStat> {
+    let mut parts = line.split('\t');
+    let add = parts.next()?;
+    let del = parts.next()?;
+    if add == "-" || del == "-" {
+        Some(DiffStat::Binary)
+    } else {
+        Some(DiffStat::Text(add.parse().ok()?, del.parse().ok()?))
+    }
+}
+
+/// The porcelain status codes git reports for ONE worktree-relative path.
+/// Both halves are `None` for a tracked file with nothing pending, which is
+/// how "unmodified" is expressed; an untracked file carries `unstaged: "?"`.
+/// The codes are the raw single-character porcelain v1 codes so the surfaces
+/// can reuse the status vocabulary they already render (`FileStatusIcon` and
+/// `fileStatusMeta` on the web).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FileStatusCodes {
+    pub staged: Option<String>,
+    pub unstaged: Option<String>,
+}
+
+/// Ask git for the status of exactly one path, for the web editor's file-info
+/// panel. `Ok(None)` means the directory is not a git repository at all, which
+/// is a real answer the panel shows rather than an error.
+///
+/// Two things about the command line are load-bearing:
+///
+/// - The `--` separator, per CLAUDE.md's positional rule, so a path beginning
+///   with a dash (`--force`) is read as a path and not as an option.
+/// - The `:(literal)` pathspec magic, so a name containing a glob
+///   metacharacter (`star[1].txt`) matches ITSELF. Git pathspecs are globs by
+///   default, so without it dux would answer about a different file.
+///
+/// A failure is classified rather than assumed: a second, cheap `rev-parse`
+/// decides whether git failed because there is no repository (answer `None`)
+/// or for some other reason (a real error the caller surfaces).
+pub fn file_status(worktree: &Path, rel_path: &str) -> Result<Option<FileStatusCodes>> {
+    let wt = worktree.as_os_str();
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(wt)
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+        ])
+        .arg(format!(":(literal){rel_path}"))
+        .output()?;
+    if !output.status.success() {
+        if !is_inside_work_tree(worktree)? {
+            return Ok(None);
+        }
+        return Err(anyhow!(
+            "git status failed for {rel_path}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let entry = parse_status_porcelain_z(&output.stdout)
+        .into_iter()
+        .find(|e| e.path == rel_path);
+    let Some(entry) = entry else {
+        return Ok(Some(FileStatusCodes {
+            staged: None,
+            unstaged: None,
+        }));
+    };
+    // An untracked entry is `??`; report it once, on the worktree side, the
+    // same way `changed_files` files it under `unstaged`.
+    if entry.index_status == '?' && entry.worktree_status == '?' {
+        return Ok(Some(FileStatusCodes {
+            staged: None,
+            unstaged: Some("?".to_string()),
+        }));
+    }
+    let code = |c: char| (c != ' ').then(|| c.to_string());
+    Ok(Some(FileStatusCodes {
+        staged: code(entry.index_status),
+        unstaged: code(entry.worktree_status),
+    }))
+}
+
+/// True when `path` sits inside a git working tree. Used only to classify a
+/// failed `git status` (no repository vs. a real failure).
+///
+/// A SPAWN failure propagates rather than answering `false`: "git is not
+/// installed" and "this is not a repository" are different facts, and the
+/// info panel renders the second as a sentence the user will believe.
+///
+/// That propagation is deliberate and UNTESTED BY CONSTRUCTION, which is also
+/// deliberate. `Command::new("git")` is hardcoded with no seam, so the only
+/// way to make the spawn fail is a process-global `PATH` change, and the test
+/// binary runs every git test in one process: hiding git for this test hides
+/// it for all of them. A seam added only so a test could exist would put an
+/// injection point on a security-relevant git call site to buy one assertion,
+/// so the trade is refused and the gap is written down instead.
+fn is_inside_work_tree(path: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()?;
+    Ok(output.status.success())
+}
+
+/// Which repository owns `dir`, as its top-level working-tree path.
+/// `Ok(None)` means `dir` is in no repository at all; a spawn failure is an
+/// error for the same reason as in [`is_inside_work_tree`].
+///
+/// This is how a NESTED repository is told apart from the worktree it happens
+/// to sit inside. It matters because a nested clone or a submodule is opaque
+/// to the outer repository: `git status` in the worktree lists nothing for
+/// anything under it, which is indistinguishable from "clean" unless somebody
+/// asks this question.
+///
+/// The spawn-failure propagation here is untested by construction for the same
+/// reason as [`is_inside_work_tree`], and deliberately so: no seam, and the
+/// only lever is a process-global `PATH` that every other git test shares.
+/// Note what IS covered, so the gap is not mistaken for a wider one: a
+/// non-zero exit (the ordinary "no repository here" answer) is `Ok(None)` and
+/// is tested; only the failure to spawn git at all is not.
+pub fn repository_root(dir: &Path) -> Result<Option<PathBuf>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(PathBuf::from(root)))
+}
+
+/// True when `rel_path` is ignored by `worktree`'s ignore rules.
+///
+/// An ignored path appears in NO `git status` listing, so without this
+/// question everything under `node_modules`, `target` or `dist` answers
+/// "tracked and unmodified", which is a lie the info panel would print.
+///
+/// The exit status is the whole result: 0 means ignored, 1 means not, and
+/// anything else is a real failure. `--` still guards a dash-leading name, but
+/// the `:(literal)` magic used by [`file_status`] is deliberately absent:
+/// MEASURED on git 2.55, `git check-ignore` rejects pathspec magic outright
+/// ("pathspec magic not supported by this command: 'literal'", exit 128). Its
+/// arguments are plain PATHNAMES rather than pathspecs, so a glob
+/// metacharacter in a name is already matched literally and needs no magic.
+///
+/// `check-ignore` consults the index by default, which is what we want: a
+/// TRACKED file that also matches an ignore rule answers "not ignored".
+pub fn path_is_ignored(worktree: &Path, rel_path: &str) -> Result<bool> {
+    let wt = worktree.as_os_str();
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(wt)
+        .args(["check-ignore", "-q", "--"])
+        .arg(rel_path)
+        .output()?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(anyhow!(
+            "git check-ignore failed for {rel_path}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
+fn parse_status_porcelain_z(raw: &[u8]) -> Vec<StatusEntry> {
+    let mut entries = Vec::new();
+    let mut records = raw.split(|byte| *byte == 0).peekable();
+
+    while let Some(record) = records.next() {
+        if record.len() < 4 {
+            continue;
+        }
+
+        let index_status = record[0] as char;
+        let worktree_status = record[1] as char;
+        // Renames consume an extra NUL-delimited "old path" record. Advance
+        // past it unconditionally so the next record is not misparsed as a
+        // top-level status, even when we end up dropping this entry below.
+        let is_rename = matches!(index_status, 'R' | 'C') || matches!(worktree_status, 'R' | 'C');
+        // A non-UTF-8 source path is dropped the way a destination one is,
+        // leaving the entry itself intact: the source is extra information
+        // about a change that is reported either way.
+        let renamed_from = if is_rename {
+            records
+                .next()
+                .and_then(|old| std::str::from_utf8(old).ok())
+                .filter(|old| !old.is_empty())
+                .map(|old| old.to_string())
+        } else {
+            None
+        };
+
+        // Strict UTF-8: lossy conversion silently substitutes U+FFFD for any
+        // non-UTF-8 bytes in a path. The resulting "string" is then used as
+        // an identifier for staging/discarding, which would no longer match
+        // the real on-disk path. Skip the entry instead so the user sees one
+        // less file rather than a mislabeled one that fails to act on.
+        let path = match std::str::from_utf8(&record[3..]) {
+            Ok(s) if !s.is_empty() => s.to_string(),
+            Ok(_) => continue,
+            Err(_) => {
+                logger::debug("git status: skipping entry with non-UTF-8 path");
+                continue;
+            }
+        };
+
+        entries.push(StatusEntry {
+            index_status,
+            worktree_status,
+            path,
+            renamed_from,
+        });
+    }
+
+    entries
+}
+
+fn parse_numstat_record<'a, I>(
+    record: &[u8],
+    records: &mut std::iter::Peekable<I>,
+) -> Option<(String, DiffStat)>
+where
+    I: Iterator<Item = &'a [u8]>,
+{
+    let first_tab = record.iter().position(|byte| *byte == b'\t')?;
+    let second_tab = record[first_tab + 1..]
+        .iter()
+        .position(|byte| *byte == b'\t')?
+        + first_tab
+        + 1;
+    let stat = parse_numstat_line(std::str::from_utf8(record).ok()?)?;
+    let path_bytes = &record[second_tab + 1..];
+
+    // Strict UTF-8 for the same reason as parse_status_porcelain_z: the path
+    // string is the lookup key into the status map, so a U+FFFD-substituted
+    // string would silently fail to associate stats with the right entry.
+    if !path_bytes.is_empty() {
+        let path = std::str::from_utf8(path_bytes).ok()?.to_string();
+        return Some((path, stat));
+    }
+
+    // Rename record: two trailing NUL-delimited paths follow. Consume both
+    // even on UTF-8 failure so the iterator stays aligned for the next record.
+    let _old_path = records.next()?;
+    let new_path = records.next()?;
+    let path = std::str::from_utf8(new_path).ok()?.to_string();
+    Some((path, stat))
+}
+
+/// Stage every named path in one git call.
+///
+/// Paths are fed on stdin as NUL-delimited records, so a batch is bounded by
+/// the pipe rather than by `ARG_MAX`, and `--literal-pathspecs` makes each
+/// record a name rather than a pathspec: without it a file called `a*b.txt` or
+/// `:!magic.txt` would match, or exclude, its neighbours.
+///
+/// An empty slice is refused: git reads "no pathspec" as "the whole index",
+/// which for [`unstage_files`] means unstaging everything and exiting 0.
+pub fn stage_files(worktree_path: &Path, file_paths: &[String]) -> Result<()> {
+    run_pathspec_batch(worktree_path, &["add"], file_paths, "git add")
+}
+
+/// Unstage every named path in one git call. See [`stage_files`] for why the
+/// paths travel on stdin and why an empty slice is refused.
+pub fn unstage_files(worktree_path: &Path, file_paths: &[String]) -> Result<()> {
+    run_pathspec_batch(
+        worktree_path,
+        &["reset", "--quiet", "HEAD"],
+        file_paths,
+        "git reset",
+    )
+}
+
+fn run_pathspec_batch(
+    worktree_path: &Path,
+    subcommand: &[&str],
+    file_paths: &[String],
+    what: &str,
+) -> Result<()> {
+    if file_paths.is_empty() {
+        return Err(anyhow!(
+            "{what} was asked to act on no files; git would read that as the whole index"
+        ));
+    }
+    let wt = worktree_path.as_os_str();
+    let mut args: Vec<&std::ffi::OsStr> = vec![
+        std::ffi::OsStr::new("--literal-pathspecs"),
+        std::ffi::OsStr::new("-C"),
+        wt,
+    ];
+    args.extend(subcommand.iter().map(std::ffi::OsStr::new));
+    args.extend(["--pathspec-from-file=-", "--pathspec-file-nul"].map(std::ffi::OsStr::new));
+    let mut child = Command::new("git")
+        .args(&args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("{what} failed: could not write the file list to git"))?;
+    let mut payload = Vec::new();
+    for path in file_paths {
+        payload.extend_from_slice(path.as_bytes());
+        payload.push(0);
+    }
+    std::io::Write::write_all(&mut stdin, &payload)?;
+    drop(stdin);
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "{what} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+pub fn stage_file(worktree_path: &Path, file_path: &str) -> Result<()> {
+    let wt = worktree_path.as_os_str();
+    let output = Command::new("git")
+        .arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(wt)
+        .args(["add", "--", file_path])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+pub fn unstage_file(worktree_path: &Path, file_path: &str) -> Result<()> {
+    let wt = worktree_path.as_os_str();
+    let output = Command::new("git")
+        .arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(wt)
+        .args(["reset", "HEAD", "--", file_path])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git reset failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+pub fn discard_file(worktree_path: &Path, file_path: &str, is_untracked: bool) -> Result<()> {
+    if is_untracked {
+        let full = worktree_path.join(file_path);
+        // Defense-in-depth before a destructive remove: callers classify the
+        // path against live `git status` output (which never yields paths
+        // outside the worktree), but a filesystem delete should not rest on
+        // that invariant alone. `is_under` rejects any resolved path that
+        // escapes the worktree (e.g. via a symlinked parent component).
+        if !is_under(worktree_path, &full) {
+            return Err(anyhow!(
+                "refusing to delete \"{file_path}\": it resolves outside the worktree"
+            ));
+        }
+        if full.is_dir() {
+            fs::remove_dir_all(&full)?;
+        } else {
+            fs::remove_file(&full)?;
+        }
+        return Ok(());
+    }
+    let wt = worktree_path.as_os_str();
+    let output = Command::new("git")
+        .arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(wt)
+        .args(["checkout", "--", file_path])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git checkout failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Classify a discard request against the worktree's LIVE git status and return
+/// whether the target file is untracked. Discard is destructive (it deletes
+/// untracked files and restores tracked ones from HEAD via [`discard_file`]), so
+/// the tracked vs untracked distinction must be derived from `git status` at the
+/// moment of the action, never trusted from a client flag or a snapshot captured
+/// earlier: a file's tracked/untracked state can change between when a UI decides
+/// to offer the discard and when the user confirms it. A file that is currently
+/// STAGED cannot be discarded (unstage it first), and a file with no working-tree
+/// change has nothing to discard; both are reported as an error.
+pub fn discard_classify(worktree_path: &Path, path: &str) -> Result<bool> {
+    let (staged, unstaged) = changed_files(worktree_path)?;
+    // Reject when the file is staged (and has no separate unstaged change). The
+    // TUI and web both surface "Unstage the file first to discard changes." for
+    // this case.
+    if staged.iter().any(|f| f.path == path) && !unstaged.iter().any(|f| f.path == path) {
+        anyhow::bail!("Unstage the file first to discard changes.");
+    }
+    match unstaged.iter().find(|f| f.path == path) {
+        Some(file) => Ok(file.status == "?"),
+        None => anyhow::bail!("No unstaged changes to discard for \"{path}\"."),
+    }
+}
+
+/// Return the text of `git diff --cached` for the given worktree.
+/// Uses `-c color.diff=false` to strip ANSI escapes regardless of user config.
+pub fn staged_diff_text(worktree_path: &Path) -> Result<String> {
+    let wt = worktree_path.as_os_str();
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(wt)
+        .args(["-c", "color.diff=false", "diff", "--cached"])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git diff --cached failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The typed outcome of [`commit_preflight`]: the single decision both surfaces
+/// share for whether a commit may proceed. The refusal reasons are stable CODES,
+/// not user-facing strings, so each surface renders its own copy (the TUI status
+/// line vs the web 400 body) without the wording being pinned in core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitPreflight {
+    /// The message is empty or whitespace-only.
+    EmptyMessage,
+    /// The message is fine but nothing is staged (live `git status` has no staged
+    /// entry), so `git commit` would fail. Checked against LIVE status rather than
+    /// a cached changed-files list so the decision matches the worktree as it is
+    /// at commit time, not when the commit UI was last refreshed.
+    NothingStaged,
+    /// A real message and at least one staged change: safe to commit.
+    Ready,
+}
+
+/// Decide whether a commit may proceed from live git status, using the same
+/// empty-message and nothing-staged rules for TUI and web callers.
+pub fn commit_preflight(worktree_path: &Path, message: &str) -> CommitPreflight {
+    if message.trim().is_empty() {
+        return CommitPreflight::EmptyMessage;
+    }
+    match changed_files(worktree_path) {
+        Ok((staged, _unstaged)) if staged.is_empty() => CommitPreflight::NothingStaged,
+        // A git-status error is not a preflight refusal: fall through to Ready and
+        // let the actual `git commit` surface the underlying error. Treating a
+        // transient status failure as "nothing staged" would wrongly block a valid
+        // commit.
+        _ => CommitPreflight::Ready,
+    }
+}
+
+/// Replace the worktree's absolute path with `.` wherever it appears in text
+/// bound for a user-facing message.
+///
+/// git names files by absolute path in a lot of its diagnostics, and on the web
+/// the reader is a browser that may be on a different machine entirely, where
+/// the server's directory layout is noise at best. Stripping the prefix keeps
+/// the part that is actually actionable (which file, which hook, what it said)
+/// and drops the part that is not. The full untouched text still goes to
+/// `dux.log` for the operator.
+///
+/// The match is LITERAL but must land on a path BOUNDARY, meaning the prefix is
+/// followed by a separator or by the end of the path. A plain `str::replace`
+/// was not enough, and the case is not hypothetical: agent worktrees are
+/// siblings under one project root, so `.../proj/agent` and `.../proj/agent-2`
+/// coexist by construction, and a mention of the second one rendered as
+/// `.-2/f.rs`. That is a WRONG path rather than a hidden one, which is worse,
+/// because nothing tells the reader it is not real. A path this function
+/// declines to shorten is still shown in full, which is the same harmless
+/// degradation a miss always had.
+///
+/// The string compared is the one git was handed as `-C`, so it matches what
+/// git echoes back. A trailing separator on it is ignored rather than producing
+/// a doubled slash.
+///
+/// What counts as a boundary depends on whether the path is QUOTED, and it has
+/// to, which was found by a `dux-web` test rather than reasoned about: git
+/// writes `fatal: cannot change to '/wt/proj/agent': No such file or
+/// directory`, a message that names the server's path and nothing else, and a
+/// rule accepting only a separator or the end of the text would leave it in
+/// full. So when the match is immediately preceded by `'` or `"`, the matching
+/// quote closes the path too.
+///
+/// The boundary set is deliberately no wider than that. A space or a comma
+/// cannot join it, because a filename may contain either: with a sibling
+/// worktree named `agent 2`, treating a space as a boundary would shorten
+/// `/wt/proj/agent 2/f.rs` to `./2/f.rs`, which is the exact class of invented
+/// path this rule exists to prevent. Inside a quoted run the quote is safe for
+/// the same reason it is safe to git, since the opening quote is what says a
+/// quoted path is being read at all.
+pub fn redact_worktree_path(text: &str, worktree_path: &Path) -> String {
+    let wt = worktree_path.to_string_lossy();
+    let wt = wt.strip_suffix('/').unwrap_or(wt.as_ref());
+    if wt.is_empty() || wt == "/" {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(wt) {
+        let after = &rest[at + wt.len()..];
+        // The quote that OPENED this path, if any, closes it too.
+        let opening_quote = rest[..at]
+            .chars()
+            .next_back()
+            .filter(|c| *c == '\'' || *c == '"');
+        let next = after.chars().next();
+        // A boundary is a separator, the closing quote, or the end of the text.
+        // Anything else means this is a DIFFERENT path that merely starts with
+        // the same characters, and shortening it would invent one that does not
+        // exist.
+        let at_boundary = match next {
+            None => true,
+            Some('/') => true,
+            Some(c) => Some(c) == opening_quote,
+        };
+        if at_boundary {
+            out.push_str(&rest[..at]);
+            out.push('.');
+        } else {
+            out.push_str(&rest[..at + wt.len()]);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Build the error for a failed git subprocess, carrying BOTH streams.
+///
+/// stderr alone is not enough, and the reason is worth writing down because the
+/// obvious reason is wrong. It is often said that hook frameworks like
+/// `pre-commit` and `lint-staged` print their reports to stdout and are
+/// therefore lost by an stderr-only capture. That was MEASURED on git 2.55 and
+/// is NOT what happens: git redirects a hook's stdout onto its own stderr, so a
+/// rejecting hook's report arrives on stderr either way.
+///
+/// What IS lost is git's own reporting. Measured on git 2.55, `git commit`
+/// writes "nothing to commit, working tree clean" and "no changes added to
+/// commit (use \"git add\"...)" to STDOUT with stderr completely EMPTY, exiting
+/// 1, so an stderr-only capture produced the error "git commit failed: " with
+/// no reason in it at all. The unmerged-files case splits across both streams
+/// (`error: Committing is not possible...` on stderr, `U <file>` on stdout).
+/// Taking both is the only capture that always carries the reason.
+fn git_failure(what: &str, worktree_path: &Path, output: &std::process::Output) -> anyhow::Error {
+    let mut detail = String::new();
+    for stream in [&output.stdout, &output.stderr] {
+        let text = String::from_utf8_lossy(stream);
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if !detail.is_empty() {
+            detail.push('\n');
+        }
+        detail.push_str(text);
+    }
+    if detail.is_empty() {
+        detail.push_str("no output");
+    }
+    anyhow!(
+        "{what} failed: {}",
+        redact_worktree_path(&detail, worktree_path)
+    )
+}
+
+pub fn commit(worktree_path: &Path, message: &str) -> Result<String> {
+    let wt = worktree_path.as_os_str();
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(wt)
+        .args(["commit", "-m", message])
+        .output()?;
+    if !output.status.success() {
+        return Err(git_failure("git commit", worktree_path, &output));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub fn push(worktree_path: &Path) -> Result<String> {
+    let wt = worktree_path.as_os_str();
+    let branch = match current_branch_opt(worktree_path)? {
+        Some(b) => b,
+        None => {
+            return Err(anyhow!(
+                "HEAD is detached; check out a branch before pushing"
+            ));
+        }
+    };
+    let output = Command::new("git")
+        // `--` so the branch is read as a REFSPEC and never as an option.
+        // Without it, a checkout whose HEAD points at a ref named `--all`
+        // pushes EVERY branch to the remote. Measured on git 2.55.
+        .arg("-C")
+        .arg(wt)
+        .args(["push", "-u", "origin", "--", &branch])
+        .output()?;
+    if !output.status.success() {
+        return Err(git_failure("git push", worktree_path, &output));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Return the contents of a file as raw bytes as it exists at HEAD, or `None`
+/// when HEAD has no entry at `path` (a new/untracked file). Plumbing only
+/// (`ls-tree` + `cat-file`), so user configuration cannot change the answer.
+///
+/// "Absent at HEAD" is decided by an empty `ls-tree` listing, NOT by a failed
+/// `cat-file`: a git failure (not a repository, a corrupt object store, git
+/// missing) is an `Err`, never `None`. Collapsing the two would render every
+/// file of a broken checkout as fully added (fork 24deeeee, audit03 P1-22).
+pub fn file_bytes_at_head(worktree_path: &Path, path: &str) -> Result<Option<Vec<u8>>> {
+    let listing = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["ls-tree", "-z", "HEAD", "--", path])
+        .output()?;
+    if !listing.status.success() {
+        // An unborn HEAD (a repository with no commits yet) has no entry at
+        // any path: every file is new. Only on this failure path, so the hot
+        // path stays one process. `rev-parse --verify --quiet` exits 1 for an
+        // unborn HEAD and 128 outside a repository.
+        let head = Command::new("git")
+            .arg("-C")
+            .arg(worktree_path)
+            .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+            .output()?;
+        if head.status.code() == Some(1) {
+            return Ok(None);
+        }
+        return Err(anyhow!(
+            "git ls-tree failed: {}",
+            crate::sanitize::utf8_lossy(&listing.stderr)
+        ));
+    }
+    let record = listing
+        .stdout
+        .split(|byte| *byte == 0)
+        .next()
+        .unwrap_or_default();
+    if record.is_empty() {
+        return Ok(None);
+    }
+    // `<mode> SP <type> SP <object> TAB <path>`
+    let metadata = record
+        .split(|byte| *byte == b'\t')
+        .next()
+        .unwrap_or_default();
+    let metadata = std::str::from_utf8(metadata).context("git ls-tree metadata was not UTF-8")?;
+    let mut fields = metadata.split_ascii_whitespace();
+    let _mode = fields.next();
+    let (Some("blob"), Some(object_id)) = (fields.next(), fields.next()) else {
+        return Err(anyhow!("git ls-tree did not return a blob for {path:?}"));
+    };
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["cat-file", "blob", object_id])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git cat-file failed: {}",
+            crate::sanitize::utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(Some(output.stdout))
+}
+
+/// Return the size in bytes of a file's blob at HEAD via the plumbing command
+/// `cat-file -s` (which reads the object header WITHOUT inflating the whole
+/// blob), or `None` for new (untracked) files. Lets a caller cap a diff/read by
+/// size before buffering the full HEAD content into memory.
+pub fn blob_size_at_head(worktree_path: &Path, path: &str) -> Result<Option<u64>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["cat-file", "-s", &format!("HEAD:{path}")])
+        .output()?;
+    if !output.status.success() {
+        // Not present at HEAD (new/untracked file).
+        return Ok(None);
+    }
+    // A successful `cat-file -s` always prints just the decimal byte size. A parse
+    // failure here means genuinely unexpected output (corrupt store, a wrapper
+    // injecting text); propagate it rather than collapsing it into the `None`
+    // ("absent at HEAD") sentinel, which would silently skip the caller's size cap.
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let size = raw.trim().parse::<u64>().map_err(|e| {
+        anyhow!(
+            "git cat-file -s returned non-numeric output {:?}: {e}",
+            raw.trim()
+        )
+    })?;
+    Ok(Some(size))
+}
+
+/// Return at most `limit` bytes of a file's blob at HEAD, or `None` when the
+/// path is absent at HEAD. Streams `cat-file -p` and stops reading at the
+/// limit, so a hundred-megabyte blob costs a few kilobytes of memory: the
+/// caller only wants enough of the head to classify the content.
+pub fn file_prefix_at_head(
+    worktree_path: &Path,
+    path: &str,
+    limit: usize,
+) -> Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+
+    // Presence is answered by the object header, not by the streaming read's
+    // exit status: closing the pipe early kills git with SIGPIPE, which would
+    // otherwise read as "absent at HEAD".
+    if blob_size_at_head(worktree_path, path)?.is_none() {
+        return Ok(None);
+    }
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["cat-file", "-p", &format!("HEAD:{path}")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut prefix = Vec::new();
+    if let Some(stdout) = child.stdout.as_mut() {
+        stdout.take(limit as u64).read_to_end(&mut prefix)?;
+    }
+    // Drop the pipe so a blob larger than the limit gets EPIPE and exits
+    // instead of blocking forever on a reader that stopped.
+    drop(child.stdout.take());
+    let _ = child.wait();
+    Ok(Some(prefix))
+}
+
+pub fn is_under(base: &Path, candidate: &Path) -> bool {
+    match (base.canonicalize(), candidate.canonicalize()) {
+        (Ok(b), Ok(c)) => c.starts_with(b),
+        _ => false,
+    }
+}
+
+/// The single security boundary for client-supplied worktree-relative paths.
+/// Resolves `rel_path` to its on-disk location under `worktree`, rejecting empty
+/// or absolute paths, any `..`/`.`/root/prefix component, the `.git` directory,
+/// and (for paths that exist) symlinks whose realpath escapes the worktree. A
+/// literal `.` (`Component::CurDir`) component is rejected even though it is
+/// lexically harmless on its own: after a symlink component, POSIX resolves `.`
+/// against the symlink's TARGET directory, so `symlink_metadata` on a path
+/// ending in `.` dereferences the preceding symlink and `Path::parent()` on that
+/// path strips the symlink component entirely, letting a parent-containment
+/// check run against the always-safe worktree root instead of the symlink's
+/// real (possibly escaping) location. UI-supplied paths never legitimately need
+/// `.`, so it is refused outright rather than specially handled. Returns
+/// the joined path, which may not yet exist; existence/file-kind is the caller's
+/// concern.
+///
+/// A DANGLING symlink is checked on its own branch: `exists()` FOLLOWS the link
+/// and so answers false for one, which used to skip the containment checks
+/// entirely and let an escaping link through purely because its target had been
+/// removed. Its destination is resolved through the link's canonicalized
+/// directory and normalized textually, and an escaping or `.git`-bound one is
+/// refused exactly as a live link's is.
+///
+/// Used by every surface that reads or writes a file from a client path (the
+/// diff engine, the web editor endpoints) so the escape check lives in one
+/// tested place and cannot drift between call sites.
+pub fn resolve_worktree_path(worktree: &Path, rel_path: &str) -> anyhow::Result<PathBuf> {
+    let rp = Path::new(rel_path);
+    if rp.as_os_str().is_empty()
+        || rp.is_absolute()
+        || rp.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::Prefix(_) | Component::RootDir
+            )
+        })
+        // `Path::components()` normalizes away a non-leading `.` segment (per its
+        // own docs: "Occurrences of `.` are normalized away, except if they are
+        // at the beginning of the path"), so `a/./b` and `a/.` do NOT surface a
+        // `Component::CurDir` above even though the raw string contains one.
+        // Check the raw, unnormalized string instead so every `.` segment,
+        // anywhere in the path, is caught.
+        || rel_path.split('/').any(|seg| seg == ".")
+    {
+        anyhow::bail!("invalid worktree path: {rel_path}");
+    }
+    // Never touch a git metadata directory. Reject `.git` as ANY path component,
+    // not just the first: editing is gated by containment alone, so a NESTED
+    // repo's `.git` (a vendored dep, a submodule) must be unreachable too.
+    // Case-insensitive for case-folding filesystems (e.g. default macOS).
+    if rp
+        .iter()
+        .any(|c| c.to_str().is_some_and(|c| c.eq_ignore_ascii_case(".git")))
+    {
+        anyhow::bail!("refusing to access the git directory: {rel_path}");
+    }
+    let joined = worktree.join(rel_path);
+    // The literal checks above block `..` and `.git` names, but a symlink inside
+    // the worktree could still point outside it, OR a symlinked directory could
+    // resolve INTO a `.git` dir (sidestepping the literal name check). For paths
+    // that exist, resolve and refuse anything whose realpath escapes the worktree
+    // or lands inside a `.git` directory.
+    if joined.exists() {
+        if !is_under(worktree, &joined) {
+            anyhow::bail!("path escapes worktree: {rel_path}");
+        }
+        if resolves_into_git_dir(worktree, &joined) {
+            anyhow::bail!("refusing to access the git directory: {rel_path}");
+        }
+    } else if std::fs::symlink_metadata(&joined).is_ok_and(|m| m.file_type().is_symlink()) {
+        // A DANGLING symlink. `exists()` FOLLOWS the link, so it answers false
+        // and the containment checks above never ran, which let an escaping
+        // link through purely because its target had been removed: the info
+        // panel then described `secret -> /root/.ssh/id_ed25519` in full,
+        // target string included. `canonicalize` cannot answer for a target
+        // that is not there, so resolve it as far as the filesystem allows and
+        // normalize the missing tail textually.
+        match dangling_link_destination(&joined) {
+            Some(target) => {
+                let root = worktree
+                    .canonicalize()
+                    .unwrap_or_else(|_| worktree.to_path_buf());
+                match target.strip_prefix(&root) {
+                    Ok(rel) => {
+                        if rel.components().any(|comp| {
+                            comp.as_os_str()
+                                .to_str()
+                                .is_some_and(|s| s.eq_ignore_ascii_case(".git"))
+                        }) {
+                            anyhow::bail!("refusing to access the git directory: {rel_path}");
+                        }
+                    }
+                    Err(_) => anyhow::bail!("path escapes worktree: {rel_path}"),
+                }
+            }
+            // The link cannot be read, or its own directory cannot be
+            // resolved: refuse rather than guess, since the only alternative
+            // is to answer about a location we could not establish.
+            None => anyhow::bail!("path escapes worktree: {rel_path}"),
+        }
+    }
+    Ok(joined)
+}
+
+/// Where a DANGLING symlink points, resolved as far as the filesystem allows:
+/// the link's own directory is canonicalized (so every real component on the
+/// way to it is followed), and only the target, whose tail does not exist, is
+/// normalized textually. `None` when the link cannot be read or its directory
+/// cannot be canonicalized.
+fn dangling_link_destination(link: &Path) -> Option<PathBuf> {
+    let target = std::fs::read_link(link).ok()?;
+    let joined = if target.is_absolute() {
+        target
+    } else {
+        link.parent()?.canonicalize().ok()?.join(target)
+    };
+    Some(lexically_normalize(&joined))
+}
+
+/// Collapse `.` and `..` segments textually. Only sound for a path whose
+/// existing prefix has already been canonicalized (see
+/// [`dangling_link_destination`]); on a raw path a `..` after a symlink means
+/// something else entirely.
+fn lexically_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// True when `candidate`'s realpath lies inside a `.git` directory under the
+/// worktree: a literal nested `.git`, or one reached through a symlinked
+/// directory (which the literal component check can't see). Used to close the
+/// symlink-into-`.git` gap on both read/write and on file creation (where the
+/// parent dir is checked). Returns false if either path can't be canonicalized.
+pub(crate) fn resolves_into_git_dir(worktree: &Path, candidate: &Path) -> bool {
+    match (worktree.canonicalize(), candidate.canonicalize()) {
+        (Ok(wt), Ok(c)) => c
+            .strip_prefix(&wt)
+            .map(|rel| {
+                rel.components().any(|comp| {
+                    comp.as_os_str()
+                        .to_str()
+                        .is_some_and(|s| s.eq_ignore_ascii_case(".git"))
+                })
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+pub fn ellipsize_middle(input: &str, max_width: usize) -> String {
+    if input.chars().count() <= max_width {
+        return input.to_string();
+    }
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+    let left = (max_width - 3) / 2;
+    let right = max_width - 3 - left;
+    let start: String = input.chars().take(left).collect();
+    let end: String = input
+        .chars()
+        .rev()
+        .take(right)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{start}...{end}")
+}
+
+/// Truncate `input` to at most `max_width` chars, keeping the END and prefixing
+/// a single `…` when characters are dropped from the front. Used for paths,
+/// where the leaf (the tail) is the informative part and the leading directories
+/// can be elided. Measured in chars, matching [`ellipsize_middle`].
+pub fn ellipsize_start(input: &str, max_width: usize) -> String {
+    let len = input.chars().count();
+    if len <= max_width {
+        return input.to_string();
+    }
+    match max_width {
+        0 => String::new(),
+        1 => "…".to_string(),
+        _ => {
+            let tail: String = input
+                .chars()
+                .rev()
+                .take(max_width - 1)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            format!("…{tail}")
+        }
+    }
+}
+
+/// Shorten `path` for display by stripping a leading `base` directory when
+/// `path` sits under it, returning the remainder relative to `base` (no leading
+/// slash). Matching is boundary-safe: `base = /home/pat` does NOT strip
+/// `/home/patrick/x`. Returns `path` unchanged when `base` is `None`/empty, when
+/// `path` is not under `base`, or when `path` IS exactly `base`.
+pub fn display_path_relative_to(path: &str, base: Option<&str>) -> String {
+    let Some(base) = base else {
+        return path.to_string();
+    };
+    let base = base.trim_end_matches('/');
+    if base.is_empty() {
+        return path.to_string();
+    }
+    if let Some(rest) = path.strip_prefix(base)
+        && let Some(sub) = rest.strip_prefix('/')
+    {
+        let sub = sub.trim_start_matches('/');
+        if !sub.is_empty() {
+            return sub.to_string();
+        }
+    }
+    path.to_string()
+}
+
+/// Upper bound on how long a single `git branch -m` may run before the
+/// rename worker gives up and kills the child. `git branch -m` is normally
+/// instantaneous; a multi-second wait means the process is wedged (a stale
+/// `.git/index.lock`, an NFS stall, etc.). Without this bound a hung child
+/// never posts `BranchRenameCompleted`, so the session's in-flight marker and
+/// `rename_expected` stay set for the process's lifetime, permanently
+/// blocking further renames and deferring drift detection.
+const RENAME_BRANCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Wait for `child` to exit, killing it and returning an error if `timeout`
+/// elapses first. Polls `try_wait` on a short interval rather than blocking on
+/// `wait`/`output`, so a wedged process cannot hang the caller forever. On
+/// timeout the child is killed and reaped before the error is returned so no
+/// zombie is left behind. `what` names the operation for the error message.
+fn wait_child_or_kill(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+    what: &str,
+) -> Result<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!(
+                "{what} timed out after {}s and was terminated",
+                timeout.as_secs()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Rename a git branch inside a worktree. Runs `git branch -m <old> <new>`
+/// from within the worktree directory, bounded by [`RENAME_BRANCH_TIMEOUT`]
+/// so a wedged git invocation can't strand the rename worker forever.
+pub fn rename_branch(worktree_path: &Path, old_name: &str, new_name: &str) -> Result<()> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args([
+            "branch", "-m",
+            // `--` so the two names are read as REFS and never as options.
+            // Measured on git 2.55: `git branch -m --force renamed` obeys the
+            // flag, renames the CURRENT branch forcibly, leaves the requested
+            // branch untouched and exits 0.
+            "--", old_name, new_name,
+        ])
+        .stdout(Stdio::null())
+        // `git branch -m` writes only a short line to stderr on failure, well
+        // under the pipe buffer, so leaving it undrained until the child exits
+        // cannot deadlock. Read it after the wait for the error message.
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let status = wait_child_or_kill(&mut child, RENAME_BRANCH_TIMEOUT, "git branch rename")?;
+    if !status.success() {
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            use std::io::Read;
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        return Err(anyhow!("git branch rename failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
+/// The display name a STANDALONE agent gets: the typed name when the user gave
+/// one, and otherwise a sanitized form of the folder's own name.
+///
+/// The invariant this exists to hold is that the result is NEVER EMPTY. Every
+/// row label in both surfaces falls back through the branch name when there is
+/// no title, and a standalone agent has no branch, so an empty title would
+/// render a nameless row.
+///
+/// The typed name is used verbatim once trimmed: a standalone agent creates no
+/// branch, so [`is_valid_agent_name`] deliberately does NOT apply. Folder names
+/// legally contain spaces, dots and punctuation that a ref name cannot.
+///
+/// The sanitizer is gentle on purpose, because the result is a label and not a
+/// path or a ref: it only collapses whitespace and trims. When the folder's
+/// name has nothing usable left (the filesystem root, a name of only
+/// whitespace), it falls back to a fixed word rather than an empty string.
+///
+/// Char-based throughout: folder names are arbitrary UTF-8.
+pub fn standalone_agent_title(typed: &str, folder: &Path) -> String {
+    let typed = typed.trim();
+    if !typed.is_empty() {
+        return typed.to_string();
+    }
+    let from_folder = folder
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    // Collapse runs of whitespace so a name copied out of a file manager does
+    // not render with a ragged gap in the middle of a row.
+    let collapsed = from_folder.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        // The filesystem root, or a folder whose name is only whitespace. A
+        // fixed word beats an empty label, and the row's second line names the
+        // actual folder anyway.
+        return "Standalone agent".to_string();
+    }
+    collapsed
+}
+
+pub fn docker_style_name() -> String {
+    // Fork e393c1d1 (P1-M): petname returns None only when its RNG or word
+    // lists fail, and a random agent name is not worth a panic in the create
+    // path. A uuid-based name is just as unique.
+    petname::petname(2, "-").unwrap_or_else(fallback_agent_name)
+}
+
+/// The name [`docker_style_name`] falls back to: `agent-` plus 32 hex digits,
+/// which is a valid branch name and never collides in practice.
+fn fallback_agent_name() -> String {
+    format!("agent-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Returns `true` if `name` contains only characters safe for git branch names:
+/// ASCII alphanumeric, dash (`-`), underscore (`_`), and slash (`/`).
+/// Also rejects names that start or end with `/`, contain consecutive slashes,
+/// or start with `-`, since git forbids these patterns in ref names.
+pub fn is_valid_agent_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    if name.starts_with('-') || name.starts_with('/') || name.ends_with('/') {
+        return false;
+    }
+    if name.contains("//") {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/')
+}
+
+/// Input mapper for agent name text fields. Maps characters for insertion,
+/// rejecting those that would make the name invalid per [`is_valid_agent_name`]
+/// rules. Spaces are transparently converted to dashes. Designed for use with
+/// [`TextInput::with_char_map`].
+pub fn agent_name_char_map(text: &str, cursor: usize, ch: char) -> Option<char> {
+    // Transparently convert spaces to dashes.
+    let ch = if ch == ' ' { '-' } else { ch };
+    // Only allow ASCII alphanumeric, '-', '_', '/'
+    if !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '/') {
+        return None;
+    }
+    // First position must be alphanumeric (reject '-', '_', '/')
+    if cursor == 0 && !ch.is_ascii_alphanumeric() {
+        return None;
+    }
+    // Prevent '//' by checking the character before and after the cursor
+    if ch == '/' {
+        if cursor > 0 && text.as_bytes().get(cursor - 1) == Some(&b'/') {
+            return None;
+        }
+        if text.as_bytes().get(cursor) == Some(&b'/') {
+            return None;
+        }
+    }
+    Some(ch)
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// A `git` command that cannot see the developer's own configuration.
+    ///
+    /// EVERY git-shelling test fixture in this crate builds its command here.
+    /// A fixture that shells out to git directly reads whatever the developer
+    /// has configured, and then it passes or fails for reasons that belong to
+    /// nobody's code. The concrete hazard is `url.*.insteadOf`, which
+    /// `git remote get-url` APPLIES: a developer with one configured (a common
+    /// setup, and this repository's own author has exactly that) sees a fixture
+    /// remote resolve to a host nobody wrote down. `gh.rs` demonstrates the
+    /// rewrite happening rather than asserting it from memory.
+    ///
+    /// The isolation is PER COMMAND, set through the child's environment. It
+    /// used to be process-wide, via `std::env::set_var`, which is unsound in a
+    /// threaded test binary (which is why Rust marks it unsafe) and was also
+    /// incomplete: several fixtures never called the helper at all, and any of
+    /// them could run first or run alongside it.
+    ///
+    /// Per-command isolation cannot reach a git command spawned by PRODUCTION
+    /// code, which inherits the test process's environment. That is deliberate
+    /// and is not worked around here: a test whose behaviour depends on git's
+    /// configuration composes the two halves itself, running the git command
+    /// through this helper and handing the output to the pure parser, which is
+    /// the same composition production performs. Production is left alone on
+    /// purpose. dux WANTS `insteadOf` rewrites applied when it runs for real,
+    /// because the rewritten URL is the one git would actually contact; do not
+    /// "fix" production by isolating it from the user's configuration.
+    pub(crate) fn git_command() -> std::process::Command {
+        let mut command = std::process::Command::new("git");
+        isolate_git_config(&mut command);
+        command
+    }
+
+    /// Applies the isolation to an already-built command, which is what makes
+    /// it testable: the removals below have to come AFTER anything that sets
+    /// the variables, exactly as they do for a variable the test process
+    /// inherited.
+    ///
+    /// Git reads configuration from FILES and, separately, from the
+    /// ENVIRONMENT. Pointing the file lookups at `/dev/null` says nothing about
+    /// the environment channel, and the environment channel carries the same
+    /// hazard: `GIT_CONFIG_COUNT=1` with `GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0`
+    /// installs an `url.*.insteadOf` rewrite just as a global config file
+    /// would, and `GIT_CONFIG_PARAMETERS` (git's own transport for `git -c`) is
+    /// a second, independent channel that a zero count does NOT neutralise.
+    /// Both were measured, not assumed. Both are removed: with no
+    /// `GIT_CONFIG_COUNT` git reads no numbered pair at all, so a stray
+    /// `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` needs no enumerating.
+    pub(crate) fn isolate_git_config(command: &mut std::process::Command) {
+        command
+            // Refuses `/etc/gitconfig` on every git version.
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            // The explicit paths (git >= 2.32) also cover `$HOME` and
+            // `$XDG_CONFIG_HOME` lookups, which is what makes the global file
+            // unreachable rather than merely relocated.
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_PARAMETERS");
+    }
+
+    /// Give a fixture repository an `origin` that PRODUCTION code reads back
+    /// verbatim, and return the address it will read.
+    ///
+    /// [`git_command`] isolates the fixture's own WRITES, and the comment there
+    /// is explicit that the isolation cannot reach a git command spawned by
+    /// production code. For a fixture that only writes and then asserts on the
+    /// bytes itself, composing the two halves by hand is enough. A fixture that
+    /// hands the PATH to production (`remote_github_repo`, and everything in
+    /// `pr_reference` built on it) has no such seam: production shells out to
+    /// git itself, inherits the developer's configuration, and
+    /// `git remote get-url` APPLIES `url.*.insteadOf`.
+    ///
+    /// That is not hypothetical. A developer with the common
+    /// `url.https://.insteadOf git@` rule turns the scp-like `git@github.com:acme/widget.git`
+    /// every one of these fixtures writes into `https://github.com:acme/widget.git`,
+    /// where `:acme` is now a PORT rather than the start of the path. The
+    /// address parser correctly refuses it, production reports no GitHub
+    /// remote, and two dozen tests fail on a rule that belongs to the
+    /// developer's machine rather than to anybody's code.
+    ///
+    /// The fix is written into the FIXTURE REPOSITORY instead of around
+    /// production: a repo-local `insteadOf` mapping the address to itself.
+    /// Git resolves `insteadOf` by LONGEST MATCHING PREFIX, so this exact-length
+    /// rule outranks the developer's shorter `git@` one and rewrites the address
+    /// to itself, for any reader of this repository including production.
+    /// Production keeps reading the developer's real configuration everywhere
+    /// else, which is what dux wants when it runs for real.
+    pub(crate) fn set_origin_readable_by_production(path: &std::path::Path, address: &str) {
+        for args in [
+            vec!["remote", "set-url", "origin", address],
+            // Self-mapping: a prefix as long as the address itself, so no
+            // shorter rule can win, and the replacement is the address.
+            vec!["config", &format!("url.{address}.insteadOf"), address],
+        ] {
+            let out = git_command()
+                .args(&args)
+                .current_dir(path)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitHubRemote {
+    pub host: String,
+    pub owner_repo: String,
+}
+
+/// What reading a worktree's `origin` concluded. THREE outcomes, not two,
+/// because a caller that can only see "resolved" and "nothing" cannot tell an
+/// address it may not ask about from an address it could not read, and those
+/// two want opposite handling.
+///
+/// The distinction is load-bearing in the PR poller: an unresolved address may
+/// fall back to the host remembered with the agent's last known pull request,
+/// because nothing is known about where this agent pushes. A DENIED one may
+/// not. Collapsing them sent dux to the remembered host, which is a host this
+/// agent's address does not name, and the eligibility gate after the choice
+/// could not recover because the live address was already gone by then.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemoteResolution {
+    /// git could not read an `origin`, or what it read is not an address dux
+    /// can parse into a host and an `owner/repo`.
+    Unresolved,
+    /// A readable address whose host the policy does not allow. dux knows where
+    /// this agent pushes and knows it may not ask about it, so the answer is to
+    /// ask nothing rather than to ask elsewhere.
+    Denied,
+    /// A readable address on a host dux may name when it calls `gh`.
+    Allowed(GitHubRemote),
+}
+
+impl RemoteResolution {
+    /// The allowed remote, for callers whose only question is whether they have
+    /// one they may use.
+    pub fn allowed(self) -> Option<GitHubRemote> {
+        match self {
+            Self::Allowed(remote) => Some(remote),
+            Self::Unresolved | Self::Denied => None,
+        }
+    }
+}
+
+/// Returns the GitHub host and `"owner/repo"` parsed from the `origin` remote
+/// URL, or `None` if the remote doesn't point to GitHub or the command fails.
+pub fn remote_github_repo(
+    worktree_path: &Path,
+    policy: &crate::gh::GithubHostPolicy,
+) -> Option<GitHubRemote> {
+    resolve_remote_github_repo(worktree_path, policy).allowed()
+}
+
+/// [`remote_github_repo`] keeping the reason it has no answer. See
+/// [`RemoteResolution`].
+pub fn resolve_remote_github_repo(
+    worktree_path: &Path,
+    policy: &crate::gh::GithubHostPolicy,
+) -> RemoteResolution {
+    let Ok(output) = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["remote", "get-url", "origin"])
+        .output()
+    else {
+        return RemoteResolution::Unresolved;
+    };
+    if !output.status.success() {
+        return RemoteResolution::Unresolved;
+    }
+    resolve_remote_from_git_output(&output.stdout, policy)
+}
+
+/// The parse half of [`resolve_remote_github_repo`], keeping the reason.
+pub(crate) fn resolve_remote_from_git_output(
+    stdout: &[u8],
+    policy: &crate::gh::GithubHostPolicy,
+) -> RemoteResolution {
+    let Ok(text) = std::str::from_utf8(stdout) else {
+        return RemoteResolution::Unresolved;
+    };
+    classify_github_remote(strip_git_record_terminator(text), policy)
+}
+
+/// Classify the address grammar first, then apply the host access policy.
+pub(crate) fn classify_github_remote(
+    url: &str,
+    policy: &crate::gh::GithubHostPolicy,
+) -> RemoteResolution {
+    match parse_remote_address(url) {
+        None => RemoteResolution::Unresolved,
+        Some(remote) if policy.allows(&remote.host) => RemoteResolution::Allowed(remote),
+        Some(_) => RemoteResolution::Denied,
+    }
+}
+
+/// The parse half of [`remote_github_repo`]: git's raw stdout for
+/// `git remote get-url` in, a GitHub remote out.
+///
+/// This is the ONLY place a byte is allowed off the end of a remote, and the
+/// only byte it takes off is the one git put there: a single output record
+/// terminator. Everything else git printed is part of the remote and reaches
+/// the parser intact, because a remote really can hold edge whitespace and a
+/// remote with a space in its host is not a GitHub remote.
+///
+/// Invalid UTF-8 is refused rather than lossily substituted. `U+FFFD` is
+/// neither a control character nor whitespace, so a replacement character used
+/// to survive every later check and travel into a `gh --repo` argument as part
+/// of a name nobody wrote.
+#[cfg(test)]
+pub(crate) fn github_remote_from_git_output_with(
+    stdout: &[u8],
+    policy: &crate::gh::GithubHostPolicy,
+) -> Option<GitHubRemote> {
+    resolve_remote_from_git_output(stdout, policy).allowed()
+}
+
+/// [`github_remote_from_git_output_with`] under the legacy name rule, for the
+/// tests that are about GIT OUTPUT HANDLING rather than about which hosts
+/// qualify. See the shim on [`parse_github_remote`].
+#[cfg(test)]
+pub(crate) fn github_remote_from_git_output(stdout: &[u8]) -> Option<GitHubRemote> {
+    github_remote_from_git_output_with(stdout, &crate::gh::GithubHostPolicy::LegacyNameRule)
+}
+
+/// Removes exactly one trailing `\n`. Nothing else, and in particular not a
+/// carriage return in front of it.
+///
+/// This project targets macOS and Linux only and assumes Unix throughout, so
+/// git never terminates an output record with CRLF here and there is no CRLF
+/// case to preserve. What a trailing `\r\n` really means on these platforms is
+/// a remote whose own value ends in a carriage return, with git having appended
+/// only the `\n`: an `url.*.insteadOf` replacement ending in one produces
+/// exactly that, and the bytes were measured rather than assumed. Taking the
+/// `\r` off as well would DELETE a byte of the remote and answer confidently
+/// for an address nobody wrote. Left in place it is simply another control
+/// character, which the parser already refuses.
+fn strip_git_record_terminator(text: &str) -> &str {
+    text.strip_suffix('\n').unwrap_or(text)
+}
+
+/// Extracts `"owner/repo"` from a GitHub remote URL.
+///
+/// Handles the two spellings that can name a GitHub repository git could reach:
+/// the scp-like SSH shorthand (`[user@]github.com:owner/repo.git`, whose colon
+/// must precede any slash) and scheme-qualified URLs (`ssh://`, `git://`,
+/// `git+ssh://`, `ssh+git://`, `http://`, `https://`, with optional credentials
+/// and port). A value with neither is a relative local path to git, not an
+/// address, so `github.com/owner/repo` is refused.
+///
+/// Those are the two spellings dux handles, not the whole of git's grammar. Git
+/// also reads the deprecated `ftp`/`ftps` schemes, `<helper>::<address>` for an
+/// explicit remote helper, and the tilde-expanded ssh path forms. None of them
+/// is a way dux can read reliably, so each is refused deliberately rather than
+/// overlooked.
+#[cfg(test)]
+fn parse_github_owner_repo(url: &str) -> Option<String> {
+    parse_github_remote(url).map(|remote| remote.owner_repo)
+}
+
+/// The transport schemes a git remote URL may use, spelled exactly as git
+/// spells them. Anything else is refused, and the comparison is CASE SENSITIVE
+/// because git's is: see the check site in `parse_github_remote`.
+///
+/// This is the set dux handles, not the full set git understands: the
+/// deprecated `ftp`/`ftps` and any `<helper>::` remote helper are refused on
+/// purpose, since neither names GitHub. Beyond that, the table is the second
+/// line of defence against a scp-like remote: `github.com:owner/repo.git` parses "successfully" as a URL
+/// whose *scheme* is `github.com`, and it would be rejected here even if the
+/// scp-like branch below were ever bypassed.
+///
+/// `git+ssh` and `ssh+git` are spellings of `ssh` and invoke the same transport;
+/// they are accepted and handled identically. `ftp`/`ftps` stay refused.
+const GIT_URL_SCHEMES: [&str; 6] = ["ssh", "git", "git+ssh", "ssh+git", "http", "https"];
+
+/// The schemes for which git decodes the whole address BEFORE it separates host
+/// from path, which is what lets a percent escape in the authority move that
+/// boundary. Everything git runs over ssh, plus its native protocol; `http` and
+/// `https` are deliberately absent, because curl splits first and decodes
+/// afterwards. See the decision site in `parse_github_remote` for the
+/// measurements behind the split.
+const PERCENT_MOVES_THE_BOUNDARY: [&str; 4] = ["ssh", "git+ssh", "ssh+git", "git"];
+
+/// The scheme spellings git actually runs over ssh, matched case sensitively
+/// like the table above. Git's native protocol is deliberately absent: it is a
+/// different transport on a different port, not an ssh spelling.
+///
+/// This exists for one host. GitHub documents `ssh.github.com` for SSH and only
+/// for SSH, so the acceptance of that name is scoped to these three schemes;
+/// see `github_host`.
+const SSH_TRANSPORT_SCHEMES: [&str; 3] = ["ssh", "git+ssh", "ssh+git"];
+
+/// [`parse_github_remote_with`] under the rule this function used to hardcode
+/// (`github.com` or `github.*`).
+///
+/// It exists for the grammar tests below. WHICH SPELLINGS PARSE and WHICH HOSTS
+/// QUALIFY are two separate questions, and only the second one moved: pinning
+/// the tests to the legacy policy keeps every one of them meaning exactly what
+/// it meant when it was written, so this change cannot quietly widen or narrow
+/// the address grammar under them.
+#[cfg(test)]
+fn parse_github_remote(url: &str) -> Option<GitHubRemote> {
+    parse_github_remote_with(url, &crate::gh::GithubHostPolicy::LegacyNameRule)
+}
+
+/// [`parse_remote_address`] with the policy applied, discarding the reason.
+#[cfg(test)]
+fn parse_github_remote_with(
+    url: &str,
+    policy: &crate::gh::GithubHostPolicy,
+) -> Option<GitHubRemote> {
+    classify_github_remote(url, policy).allowed()
+}
+
+/// Parse a git remote address into the host and `owner/repo` it names.
+///
+/// This is the GRAMMAR and only the grammar: what is an address at all, and
+/// what repository it names. Whether dux may hand the host to `gh` is a
+/// separate question, asked once by [`classify_github_remote`], because a
+/// caller has to be able to tell "this is not an address" from "this is an
+/// address on a host that is not allowed". Folding the policy in here made the
+/// two indistinguishable.
+fn parse_remote_address(url: &str) -> Option<GitHubRemote> {
+    // The input is consumed EXACTLY, with no trimming of any kind. Trimming
+    // used to happen here and then again inside the literal check, which
+    // MANUFACTURED matches out of values that are not GitHub remotes:
+    // `" ssh://github.com/o/r "` and a value with a trailing tab both became
+    // `github.com` `o/r`. A git remote can hold edge whitespace, and what git
+    // would then contact is a host with a space in it. Git's own record
+    // terminator is removed at the process boundary, in
+    // `github_remote_from_git_output`, and nowhere else.
+
+    // 0. Refuse anything the URL parser would silently rewrite rather than
+    //    read. This has to come first, because the rewriting happens inside
+    //    `Url::parse` and is invisible afterwards.
+    if !remote_input_is_literal(url) {
+        return None;
+    }
+
+    // 1. The scp-like SSH shorthand, `[user@]host:path`. Git's documented rule
+    //    is that this is SSH whenever the colon appears before any slash, and
+    //    the user part is optional. It is not a URL, so it is parsed by hand,
+    //    and it is tried FIRST because `github.com:owner/repo` would otherwise
+    //    be read as a URL whose scheme is the hostname.
+    if let Some((authority, path)) = split_scp_like(url) {
+        // The scp-like spelling is ssh by definition, so GitHub's documented
+        // port-443 ssh host is legitimate here.
+        let written_host = strip_remote_userinfo(authority).to_ascii_lowercase();
+        let host = remote_api_host(&written_host, true);
+        // Git hands an scp-like path to ssh verbatim, so it is NOT
+        // percent-decoded.
+        return owner_repo_from_path(strip_boundary_slashes(path))
+            .map(|owner_repo| GitHubRemote { host, owner_repo });
+    }
+
+    // 2. Everything with a real scheme goes through the URL parser, which
+    //    already separates credentials, ports and IPv6 literals correctly and
+    //    rejects a malformed authority (an out-of-range or non-numeric port is
+    //    a parse error) instead of guessing at one.
+    if let Ok(parsed) = Url::parse(url) {
+        // The scheme is matched AS WRITTEN, case sensitively, because that is
+        // how git matches it: it compares the literal text before the `://`
+        // against its own lowercase table, and anything else it takes as the
+        // name of a remote helper to run. MEASURED, git 2.55.0, with a stub
+        // `GIT_SSH_COMMAND` printing its argv and a `.invalid` host:
+        // `ssh://git@nonexistent-host.invalid/o/r` reaches ssh as
+        // `git@nonexistent-host.invalid git-upload-pack '/o/r'`, while
+        // `SSH://git@nonexistent-host.invalid/o/r` fails with "git:
+        // 'remote-SSH' is not a git command" and "remote helper 'SSH' aborted
+        // session". `Ssh://`, `HTTPS://`, `GIT://` and `Git+SSH://` fail the
+        // same way, each naming its own missing helper.
+        //
+        // `parsed.scheme()` cannot be used for this: the `url` crate lowercases
+        // the scheme, so it says `ssh` for `SSH://` too, and checking it there
+        // is what made dux answer host `github.com`, repository `o/r` for an
+        // address git cannot connect with. The HOST is a different matter and
+        // stays case insensitive below, because git really does ignore host
+        // case (`ssh://NONEXISTENT-HOST.INVALID/o/r` reaches ssh unchanged).
+        //
+        // Reading the raw scheme also keeps the scp-like second line of
+        // defence: `github.com:owner/repo.git` parses as a URL whose scheme is
+        // the hostname, and it has no `://` at all, so it stops here.
+        let raw_scheme = url.split_once("://")?.0;
+        if !GIT_URL_SCHEMES.contains(&raw_scheme) {
+            return None;
+        }
+        // The authority is read RAW as well, because two things about it can
+        // only be seen before the parser has split it up.
+        let raw_authority = raw_url_authority(url)?;
+        // A percent in the authority can move the boundary git splits on, but
+        // only for some of the transports, and the split the parser has
+        // already performed cannot show it. The asymmetry below is MEASURED,
+        // and it is not an oversight.
+        //
+        // For the ssh-style transports and the native protocol, git decodes a
+        // scheme-qualified address and separates host from path AFTERWARDS, in
+        // that order, so the encoding is gone by the time the cut is made.
+        // `ssh://user%2Fx@host/o/r` reaches ssh as host `user` with the path
+        // `/x@host/o/r` (measured with a stub GIT_SSH_COMMAND that prints what
+        // git hands ssh), and `git://us%2Fer@host/o/r` makes git look up the
+        // host `us` on port 9418 (measured with GIT_TRACE). The crate applies
+        // the generic URL grammar, which splits first, and so reports the
+        // written host for both. Reproducing git's ordering from output that
+        // has already been split would mean reimplementing git's parser, and
+        // no legitimate GitHub remote percent-encodes its authority, so these
+        // are refused rather than guessed at.
+        //
+        // For http and https the same shape does NOT move the boundary. Git
+        // hands those to curl, which separates the authority from the path
+        // first and decodes each piece afterwards, the opposite order:
+        // `https://user%2Fx@host/o/r` and `https://u:p%40ss@host/o/r` both
+        // reach `https://host/o/r/`, the host and path the address names,
+        // which is what the crate reports too. The userinfo there is
+        // credentials and is already dropped as credentials. So a percent is
+        // allowed under the web schemes, and refusing it would refuse an
+        // ordinary remote whose password contains an escaped character.
+        if PERCENT_MOVES_THE_BOUNDARY.contains(&parsed.scheme()) && raw_authority.contains('%') {
+            return None;
+        }
+        // Git's native protocol has no user component, unlike its ssh URL
+        // syntax, so a `user@` here is part of the HOST:
+        // `git://user@github.com/o/r.git` sends git looking up
+        // `user@github.com` on port 9418 (measured with GIT_TRACE), not
+        // github.com. The crate applies the generic URL grammar and discards
+        // the user, which would answer for a repository on a host the remote
+        // never names. `ssh`, `git+ssh` and `ssh+git` are ssh, where a user is
+        // legitimate; under http(s) userinfo is legitimate credentials and is
+        // correctly dropped as such. Only the native protocol lacks it.
+        if parsed.scheme() == "git" && raw_authority.contains('@') {
+            return None;
+        }
+        // The ssh port belongs to the ssh service rather than to the host's
+        // API, and credentials must never reach a log line or a `gh` argument;
+        // taking only the host drops both. For a non-special scheme the parser
+        // leaves the host's case alone, so lowercase it explicitly: hostnames
+        // are case-insensitive and this value is handed to `gh`.
+        let written_host = parsed.host_str()?.to_ascii_lowercase();
+        let host = remote_api_host(&written_host, SSH_TRANSPORT_SCHEMES.contains(&raw_scheme));
+        // An ssh or git port is the transport service's port and has nothing to
+        // do with the host's API, so dropping it is right. An http(s) port is part
+        // of the server endpoint, and `gh` cannot express one: it refuses a
+        // colon in a hostname and builds fixed API URLs. Keeping the host and
+        // discarding the port would send the query to a different server than
+        // the remote names, so it is refused instead. A port written out that is
+        // the scheme's own default names no other server; the `url` crate has
+        // already normalised those away, so `port()` is `None` for them.
+        if matches!(parsed.scheme(), "http" | "https") && parsed.port().is_some() {
+            return None;
+        }
+        // The path is taken from the RAW input, not from `Url::path()`. The
+        // parser canonicalises `.` and `..` segments away, which git does not
+        // do, so `Url::path()` can name a repository the remote never mentioned
+        // (`/o/../r/z` becomes `/r/z`). The parser is used for the authority,
+        // which it gets right, and for nothing else.
+        let raw_path = raw_url_path(url)?;
+        // The SYNTACTIC slashes at the boundaries come off BEFORE decoding:
+        // exactly the one leading slash the URL grammar puts there, and one
+        // trailing slash if it is written. Trimming slash characters after
+        // decoding instead erased DECODED separators at those boundaries, so
+        // `/%2Fo/r` (three components, the first empty) answered `o/r`.
+        let raw_path = strip_boundary_slashes(raw_path);
+        // Git percent-decodes the path of a URL, so `%2E` really is a dot. A
+        // decoded SLASH is refused outright rather than counted as a separator.
+        let path = decode_remote_path(raw_path)?;
+        return owner_repo_from_path(&path).map(|owner_repo| GitHubRemote { host, owner_repo });
+    }
+
+    // 3. There is no third form. Git's grammar for a remote that leaves the
+    //    machine is a scheme-qualified URL or the scp-like `[user@]host:path`,
+    //    and the scp-like one REQUIRES its colon before any slash. A value with
+    //    neither a scheme nor such a colon is a RELATIVE LOCAL PATH.
+    //
+    //    There used to be a branch here accepting the bare `github.com/owner/
+    //    repo` spelling, and it was the oldest line in this function. It was
+    //    wrong: git reads that as a directory. MEASURED, git 2.55.0, isolated
+    //    `HOME`, `GIT_CONFIG_NOSYSTEM=1`, a stub `GIT_SSH_COMMAND` printing its
+    //    argv, and a `.invalid` host so nothing could leave the machine. With
+    //    the remote set to `nonexistent-host.invalid/o/r`, `GIT_TRACE=1 git
+    //    ls-remote` runs `git-upload-pack 'nonexistent-host.invalid/o/r'`
+    //    LOCALLY and fails with "does not appear to be a git repository"; the
+    //    stub ssh is never called and no name is ever resolved. Create the
+    //    directory `nonexistent-host.invalid/o/r` as a bare repo and the same
+    //    command succeeds against it. The scp-like spelling of the same words,
+    //    `nonexistent-host.invalid:o/r`, instead reaches ssh as
+    //    `nonexistent-host.invalid git-upload-pack 'o/r'`.
+    //
+    //    So accepting the bare form meant reporting a folder on disk as a
+    //    GitHub repository and then asking GitHub about it. Removing the branch
+    //    also removes the last asymmetry in this function: it was the one place
+    //    that applied the web family's rules to something git does not run over
+    //    a web transport.
+    None
+}
+
+/// Whether a remote URL can be read literally, which is the only way it can be
+/// read truthfully.
+///
+/// The `url` crate implements the WHATWG URL spec, which DELETES every embedded
+/// tab, newline and carriage return before it parses anything, and strips
+/// leading and trailing C0 controls. Git does neither: to git those bytes are
+/// part of the host or of the path. So `ssh://git<LF>hub.com/o/r` parses to the
+/// host `github.com`, which would MANUFACTURE a GitHub match out of a remote
+/// that is not GitHub at all and send `gh` after somebody else's repository.
+/// There is no way to detect that after the fact, so any input carrying an
+/// ASCII control character (C0 or DEL) is refused up front.
+///
+/// `?` and `#` are refused for the same class of reason: `Url::path()` excludes
+/// the query and the fragment, but to git they are ordinary characters in the
+/// repository path, so keeping the parser's answer would name a different
+/// repository. Neither character can appear in a GitHub owner or repository
+/// name, so nothing legitimate is lost by declining to guess.
+///
+/// A raw backslash is refused for the third variation of the same theme. Under
+/// http and https the `url` crate treats `\` as a path separator, so for
+/// `https://github.com\ignored/o/r` the crate reported the host `github.com`
+/// while the raw-path scan below skipped `\ignored` and answered `o/r`: two
+/// parsers disagreeing about where a component begins, which is exactly the
+/// hazard this parser exists to remove. No GitHub owner or repository name can
+/// contain one, so it is refused wherever it appears rather than reconciled.
+///
+/// Edge whitespace is refused too. The value used to be trimmed before it got
+/// here, so `" ssh://github.com/o/r "` became a GitHub remote. It is not one:
+/// git would look up a host with a space in it.
+fn remote_input_is_literal(url: &str) -> bool {
+    if url.is_empty() {
+        return false;
+    }
+    if url.starts_with(char::is_whitespace) || url.ends_with(char::is_whitespace) {
+        return false;
+    }
+    !url.bytes()
+        .any(|b| b < 0x20 || b == 0x7f || b == b'?' || b == b'#' || b == b'\\')
+}
+
+/// The authority of a scheme-qualified remote, sliced out of the ORIGINAL input:
+/// everything between the `://` and the `/` that ends it, or the whole remainder
+/// when no slash follows. Read raw because the `url` crate has already decoded
+/// and split it, and both of those steps can hide where git would have cut.
+fn raw_url_authority(url: &str) -> Option<&str> {
+    let after_scheme = url.split_once("://")?.1;
+    Some(match after_scheme.find('/') {
+        Some(slash) => &after_scheme[..slash],
+        None => after_scheme,
+    })
+}
+
+/// The path of a scheme-qualified remote, sliced out of the ORIGINAL input so
+/// no normalisation can reach it. Userinfo and an IPv6 literal cannot contain an
+/// unescaped `/`, so the first `/` after the `://` starts the path. `None` when
+/// there is no path, which is not a repository either way.
+fn raw_url_path(url: &str) -> Option<&str> {
+    let after_scheme = url.split_once("://")?.1;
+    let slash = after_scheme.find('/')?;
+    Some(&after_scheme[slash..])
+}
+
+/// Whether a decoded owner or repository name can be handed to `gh` as part of
+/// a `--repo` argument.
+///
+/// Deliberately a rejection list rather than an allow-list. GitHub names use
+/// letters, digits, `-`, `_` and `.`, and an enterprise host is free to differ,
+/// so a strict identifier allow-list would refuse names that really exist. What
+/// is refused is what cannot be a name and can do harm: an empty component,
+/// `.` and `..` (path navigation, not a repository), and any control character
+/// (C0, DEL and the C1 block, all of Unicode's `Cc`) or whitespace, since these
+/// survive percent-decoding and travel straight into a command argument and
+/// into log lines.
+fn remote_component_is_usable(component: &str) -> bool {
+    !component.is_empty()
+        && component != "."
+        && component != ".."
+        && !component
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace())
+}
+
+/// Splits `[user@]host:path` into its authority and path when the string is
+/// git's scp-like SSH shorthand: a colon that appears before any slash, and is
+/// neither the `://` of a scheme nor the `::` of an explicit remote helper.
+fn split_scp_like(url: &str) -> Option<(&str, &str)> {
+    let colon = url.find(':')?;
+    let (authority, rest) = url.split_at(colon);
+    let rest = &rest[1..];
+    if authority.is_empty() || authority.contains('/') || rest.starts_with("//") {
+        return None;
+    }
+    // A SECOND colon right after the first is git's explicit remote-helper
+    // syntax, `<transport>::<address>`, which takes precedence over everything
+    // else and is not the scp-like shorthand at all. MEASURED, git 2.55.0, same
+    // stub ssh and `.invalid` host: `nonexistent-host.invalid::o/r` and
+    // `nonexistent-host.invalid::` both fail with "git:
+    // 'remote-nonexistent-host.invalid' is not a git command" and "remote helper
+    // 'nonexistent-host.invalid' aborted session", never touching ssh, while the
+    // single-colon `nonexistent-host.invalid:o/r` reaches ssh as
+    // `nonexistent-host.invalid git-upload-pack 'o/r'`. dux used to read the
+    // first of those as an scp-like remote and answer host `github.com`,
+    // repository `:o/r`: a host git never contacts, and an owner carrying a
+    // stray colon.
+    //
+    // The `user@` spelling is refused here too, for a measurably different
+    // reason worth writing down: git requires a helper name to be made of
+    // URL-scheme characters and `@` is not one, so
+    // `git@nonexistent-host.invalid::o/r` is NOT a helper invocation, it reaches
+    // ssh as `git@nonexistent-host.invalid git-upload-pack ':o/r'`. That path is
+    // still not `o/r` and `:o` is not an owner, so it is wrong either way.
+    //
+    // The test is on the byte after the FIRST colon, deliberately, rather than a
+    // blunt "the input contains `::`": a scheme-qualified IPv6 literal such as
+    // `ssh://[::1]/o/r` contains `::` and is an ordinary ssh remote (measured:
+    // it reaches ssh as `::1 git-upload-pack '/o/r'`). Such an address is
+    // already ended by the `//` check above and must stay refused only by the
+    // host check, which is the one reason that applies to it.
+    if rest.starts_with(':') {
+        return None;
+    }
+    Some((authority, rest))
+}
+
+/// Drops any `user[:password]@` prefix from a remote's authority. Credentials
+/// embedded in a remote URL must never reach the parsed host, which is logged
+/// and handed to `gh` as a command argument.
+fn strip_remote_userinfo(authority: &str) -> &str {
+    match authority.rsplit_once('@') {
+        Some((_, host)) => host,
+        None => authority,
+    }
+}
+
+/// Removes the SYNTACTIC slashes at the two ends of a remote's path: at most
+/// one at each end, never more.
+///
+/// It has to be at most one, and it has to run before any percent-decoding.
+/// Trimming every slash character erased a DECODED separator sitting at a
+/// boundary along with the syntactic one, so `/%2Fo/r` lost the empty first
+/// component the decode had just produced and answered `o/r`, and a trailing
+/// `%2F` was erased the same way. The leading slash is the URL grammar's; the
+/// trailing one is a spelling git tolerates and so does dux.
+fn strip_boundary_slashes(path: &str) -> &str {
+    let path = path.strip_prefix('/').unwrap_or(path);
+    path.strip_suffix('/').unwrap_or(path)
+}
+
+/// Percent-decodes a remote's path one raw segment at a time, refusing the
+/// whole path if any segment decodes to something containing a slash.
+///
+/// Git percent-decodes a URL's path, so the decoding has to happen; what must
+/// not happen is a decoded slash being read as a separator. A GitHub owner name
+/// and a repository name can never contain one, so a decoded slash always means
+/// the address names something other than what it appears to name.
+/// `https://github.com/octocat%2FHello-World.git` is a single path segment, and
+/// the real service was asked: `git ls-remote` for that address answers "Not
+/// Found", while `octocat/Hello-World` exists. Answering `octocat/Hello-World`
+/// for it sent `gh` after a repository the remote does not address. The
+/// position of the encoded slash makes no difference and neither does the
+/// scheme, so it is refused everywhere.
+///
+/// A slash is the only decoded character that can restructure the path this
+/// way. A decoded dot is legitimate inside a repository name and stays working
+/// (`%2Egit` is still a `.git` suffix); `.` and `..` as whole components are
+/// refused by [`remote_component_is_usable`], as are decoded control characters
+/// and whitespace. A raw backslash is refused by [`remote_input_is_literal`],
+/// but for a reason a percent-encoded one does not share: the `url` crate reads
+/// a RAW backslash as a path separator under http(s) and so disagrees with the
+/// raw-path scan about where a component begins. An encoded one is invisible to
+/// that crate and is not a separator to git either, so it changes no structure
+/// and is left to the component checks.
+fn decode_remote_path(raw_path: &str) -> Option<String> {
+    let mut decoded: Vec<String> = Vec::new();
+    for segment in raw_path.split('/') {
+        let segment = percent_decode_str(segment).decode_utf8().ok()?;
+        if segment.contains('/') {
+            return None;
+        }
+        decoded.push(segment.into_owned());
+    }
+    Some(decoded.join("/"))
+}
+
+/// Takes `owner/repo` from a remote's path, which its caller has already
+/// stripped of its boundary slashes, tolerating a `.git` suffix on the
+/// repository name.
+///
+/// EXACTLY two components, for every family of remote. To git the whole path is
+/// the repository path, so a third segment means git addresses a repository
+/// that is not `owner/repo`, and answering `owner/repo` would send `gh`
+/// somewhere git never goes. The http(s) and bare forms used to tolerate extra
+/// segments because they double as the URL a user copies out of a browser,
+/// where `/tree/main` is a web route layered on the repository path. That
+/// leniency is gone: this function's input comes only from
+/// `git remote get-url`, never from an address bar, so tolerating a browser
+/// route bought nothing and produced wrong answers.
+fn owner_repo_from_path(path: &str) -> Option<String> {
+    let mut segments = path.split('/');
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    if segments.next().is_some() {
+        return None;
+    }
+    // GitHub does not allow a repository literally named `.git`, so a bare
+    // `.git` segment is the suffix and leaves no repository name behind.
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    if !remote_component_is_usable(owner) || !remote_component_is_usable(repo) {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
+/// GitHub's documented second SSH endpoint, offered for networks that block
+/// port 22 and normally written with an explicit `:443`. It is the same GitHub,
+/// reached over a different port.
+const GITHUB_SSH_ALT_HOST: &str = "ssh.github.com";
+
+/// The host to ASK ABOUT for a remote, which is not always the host written in
+/// the remote.
+///
+/// `ssh_transport` says whether git would run this address over ssh, which
+/// matters for exactly one hostname and is passed rather than inferred so the
+/// two call sites have to state it.
+///
+/// `ssh.github.com` is normalised to `github.com`, because this value is handed
+/// to the `gh` command line as the host to query and `gh` knows `github.com` as
+/// an API host; it has no idea what `ssh.github.com` is. Returning the name as
+/// written would turn one silent refusal into a failing lookup, which is not an
+/// improvement.
+///
+/// This function answers "which host is this really" and nothing else. Whether
+/// dux may hand that host to `gh` is the policy's answer, asked once, by
+/// [`classify_github_remote`]; it used to be asked here too, which is what made
+/// a denied host indistinguishable from an unparseable address.
+///
+/// That normalisation is deliberately the ONLY widening here. It is not a
+/// general "any `ssh.` prefix" rule: it is one hostname GitHub documents, and
+/// it is matched exactly, so `sshgithub.com`, `x.ssh.github.com` and
+/// `ssh.github.com.attacker.example` are all refused. There is no enterprise
+/// counterpart either, because GitHub Enterprise Server publishes no equivalent
+/// endpoint and inventing one would be guessing at an address on somebody
+/// else's network. And it applies only over ssh, the transport it is documented
+/// for: `https://ssh.github.com/...` is not an endpoint GitHub offers.
+fn remote_api_host(host: &str, ssh_transport: bool) -> String {
+    // `gh` has never heard of `ssh.github.com`, so the name that has to be
+    // checked against the policy, and handed onwards, is `github.com`.
+    if ssh_transport && host == GITHUB_SSH_ALT_HOST {
+        "github.com".to_string()
+    } else {
+        host.to_string()
+    }
+}
+
+fn sync_entry(source: &Path, destination: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        sync_symlink(source, destination)?;
+        return Ok(());
+    }
+
+    let source_mode = metadata.permissions().mode();
+
+    if file_type.is_dir() {
+        // The status-driven copy expands directories into per-file records
+        // before syncing, so a directory reaching this point is a caller bug.
+        return Err(anyhow!(
+            "sync_entry called on a directory: {}",
+            source.display()
+        ));
+    }
+
+    // Regular file: copy contents through an explicitly-moded handle so the
+    // destination never exists with default umask permissions, and so a
+    // symlink swapped in between checks can't redirect the write.
+    if let Ok(destination_meta) = fs::symlink_metadata(destination) {
+        let dest_type = destination_meta.file_type();
+        if dest_type.is_dir() || dest_type.is_symlink() {
+            remove_path(destination)?;
+        }
+    }
+
+    let mut input = fs::File::open(source)?;
+    let mut output = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(source_mode)
+        .open(destination)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            // Destination is a regular file that survived the cleanup pass
+            // above. Truncate it in place and realign permissions.
+            let file = OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(destination)?;
+            fs::set_permissions(destination, metadata.permissions())?;
+            file
+        }
+        Err(err) => return Err(err.into()),
+    };
+    io::copy(&mut input, &mut output)?;
+    Ok(())
+}
+
+fn sync_symlink(source: &Path, destination: &Path) -> Result<()> {
+    let target = fs::read_link(source)?;
+    if let Ok(existing_target) = fs::read_link(destination)
+        && existing_target == target
+    {
+        return Ok(());
+    }
+    if destination.exists() || fs::symlink_metadata(destination).is_ok() {
+        remove_path(destination)?;
+    }
+    symlink(&target, destination)?;
+    Ok(())
+}
+
+fn remove_path(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ellipsizes_in_the_middle() {
+        assert_eq!(
+            ellipsize_middle("src/components/app.rs", 12),
+            "src/...pp.rs"
+        );
+    }
+
+    #[test]
+    fn ellipsize_start_keeps_the_tail() {
+        // Fits: unchanged.
+        assert_eq!(ellipsize_start("proj/app", 12), "proj/app");
+        // Too long: keep the tail, prefix a single ellipsis (result width == max).
+        let out = ellipsize_start("/home/patrick/code/proj", 10);
+        assert_eq!(out.chars().count(), 10);
+        assert!(out.starts_with('…'));
+        assert!(out.ends_with("proj"));
+        // Degenerate widths.
+        assert_eq!(ellipsize_start("abc", 0), "");
+        assert_eq!(ellipsize_start("abc", 1), "…");
+    }
+
+    #[test]
+    fn display_path_relative_strips_the_base_dir() {
+        let base = Some("/home/patrick");
+        assert_eq!(
+            display_path_relative_to("/home/patrick/proj/a", base),
+            "proj/a"
+        );
+        // A trailing slash on the base is tolerated.
+        assert_eq!(
+            display_path_relative_to("/home/patrick/proj", Some("/home/patrick/")),
+            "proj"
+        );
+        // Boundary-safe: a shared prefix that is not a path boundary is not stripped.
+        assert_eq!(
+            display_path_relative_to("/home/patrickson/x", base),
+            "/home/patrickson/x"
+        );
+        // Not under base, exactly the base, or no base: unchanged.
+        assert_eq!(display_path_relative_to("/etc/hosts", base), "/etc/hosts");
+        assert_eq!(
+            display_path_relative_to("/home/patrick", base),
+            "/home/patrick"
+        );
+        assert_eq!(display_path_relative_to("/a/b", None), "/a/b");
+    }
+
+    #[test]
+    fn is_under_checks_real_paths() {
+        let tmp = std::env::temp_dir();
+        let child = tmp.join("is_under_test_child");
+        std::fs::create_dir_all(&child).unwrap();
+        assert!(is_under(&tmp, &child));
+        std::fs::remove_dir(&child).unwrap();
+    }
+
+    #[test]
+    fn is_under_rejects_nonexistent_candidate() {
+        let tmp = std::env::temp_dir();
+        assert!(!is_under(&tmp, Path::new("/nonexistent/path/xyz")));
+    }
+
+    // --- resolve_worktree_path: CurDir (`.`) rejection ---
+    //
+    // A literal `.` component is never legitimate in a UI-supplied path: it has
+    // no meaning a client should be sending, and (as
+    // `worktree_file::tests::delete_refuses_curdir_component` pins) it
+    // can make `symlink_metadata` dereference a preceding symlink and make
+    // `Path::parent()` strip the symlink component from containment checks.
+    // Reject it lexically at this shared boundary, same as ParentDir.
+
+    #[test]
+    fn resolve_worktree_path_rejects_bare_dot() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resolve_worktree_path(dir.path(), ".").is_err());
+    }
+
+    #[test]
+    fn resolve_worktree_path_rejects_dot_as_middle_component() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        assert!(resolve_worktree_path(dir.path(), "a/./b").is_err());
+    }
+
+    #[test]
+    fn resolve_worktree_path_rejects_trailing_dot_component() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        assert!(resolve_worktree_path(dir.path(), "a/.").is_err());
+    }
+
+    #[test]
+    fn resolve_worktree_path_still_accepts_a_plain_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        assert!(resolve_worktree_path(dir.path(), "a/b").is_ok());
+    }
+
+    #[test]
+    fn docker_name_uses_dash() {
+        assert!(docker_style_name().contains('-'));
+    }
+
+    #[test]
+    fn fallback_agent_name_is_a_valid_unique_branch_name() {
+        let a = fallback_agent_name();
+        let b = fallback_agent_name();
+        assert!(a.starts_with("agent-") && a.len() == "agent-".len() + 32);
+        assert_ne!(a, b);
+        assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    }
+
+    // ── Project worktree explorer link (fork 1d69de16, 18a13536, e80151ad) ──
+
+    #[test]
+    fn ensure_project_worktrees_link_creates_ignored_symlink() {
+        let repo = init_test_repo();
+        let worktrees_root = repo.path().join("dux-state").join("worktrees");
+
+        let link =
+            ensure_project_worktrees_link(repo.path(), &worktrees_root, "Demo-Project").unwrap();
+
+        let target = worktrees_root.join("Demo-Project").canonicalize().unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+        assert!(target.is_dir());
+
+        let status = test_support::git_command()
+            .arg("-C")
+            .arg(repo.path())
+            .args(["status", "--porcelain=v1", "--untracked-files=all"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        let porcelain = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            !porcelain.contains(PROJECT_WORKTREES_LINK_NAME),
+            "the link must be ignored by git status: {porcelain}"
+        );
+        let exclude =
+            fs::read_to_string(repo.path().join(".git").join("info").join("exclude")).unwrap();
+        assert!(exclude.contains(PROJECT_WORKTREES_EXCLUDE_PATTERN));
+
+        // Idempotent: a second call neither duplicates the exclude line nor
+        // replaces the link.
+        ensure_project_worktrees_link(repo.path(), &worktrees_root, "Demo-Project").unwrap();
+        let again =
+            fs::read_to_string(repo.path().join(".git").join("info").join("exclude")).unwrap();
+        assert_eq!(again, exclude);
+    }
+
+    #[test]
+    fn ensure_project_worktrees_link_refuses_real_path() {
+        let repo = init_test_repo();
+        let worktrees_root = repo.path().join("dux-state").join("worktrees");
+        let real = repo.path().join(PROJECT_WORKTREES_LINK_NAME);
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("mine.txt"), "user data").unwrap();
+
+        let result = ensure_project_worktrees_link(repo.path(), &worktrees_root, "Demo-Project");
+
+        assert!(result.is_err());
+        let metadata = fs::symlink_metadata(&real).unwrap();
+        assert!(metadata.file_type().is_dir());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(
+            fs::read_to_string(real.join("mine.txt")).unwrap(),
+            "user data"
+        );
+    }
+
+    #[test]
+    fn ensure_project_worktrees_link_preserves_non_utf8_exclude_bytes() {
+        let repo = init_test_repo();
+        let worktrees_root = repo.path().join("dux-state").join("worktrees");
+        let exclude = repo.path().join(".git").join("info").join("exclude");
+        let original = b"# user bytes\n\xff\xfe\n";
+        fs::write(&exclude, original).unwrap();
+        fs::set_permissions(&exclude, fs::Permissions::from_mode(0o640)).unwrap();
+
+        ensure_project_worktrees_link(repo.path(), &worktrees_root, "Demo-Project").unwrap();
+
+        let updated = fs::read(&exclude).unwrap();
+        assert!(updated.starts_with(original));
+        assert!(updated.ends_with(b"# dux local agent worktree explorer link\n/dux-worktrees\n"));
+        assert_eq!(
+            fs::metadata(&exclude).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "the exclude file keeps its mode"
+        );
+    }
+
+    /// Fail closed: an exclude that cannot be read is left exactly as it was
+    /// and no link appears.
+    #[test]
+    fn ensure_project_worktrees_link_leaves_an_unreadable_exclude_untouched() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads through a 0o000 mode
+        }
+        let repo = init_test_repo();
+        let worktrees_root = repo.path().join("dux-state").join("worktrees");
+        let exclude = repo.path().join(".git").join("info").join("exclude");
+        fs::write(&exclude, b"keep me\n").unwrap();
+        fs::set_permissions(&exclude, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = ensure_project_worktrees_link(repo.path(), &worktrees_root, "Demo-Project");
+
+        fs::set_permissions(&exclude, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(result.is_err());
+        assert_eq!(fs::read(&exclude).unwrap(), b"keep me\n");
+        assert!(
+            fs::symlink_metadata(repo.path().join(PROJECT_WORKTREES_LINK_NAME)).is_err(),
+            "no link without its ignore line"
+        );
+    }
+
+    // ── Helpers for git-backed tests ─────────────────────────────
+
+    /// Create a temporary bare-ish git repo with an initial commit so
+    /// worktrees and branches can be created from it.
+    fn init_test_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let run = |args: &[&str]| {
+            let out = test_support::git_command()
+                .args(args)
+                .current_dir(p)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.name", "test"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["commit", "--allow-empty", "-m", "init"]);
+        dir
+    }
+
+    /// Run one git command inside a test worktree, asserting it succeeded.
+    fn worktree_git(wt: &Path) -> impl Fn(&[&str]) + '_ {
+        move |args: &[&str]| {
+            let out = test_support::git_command()
+                .args(["-C", wt.to_string_lossy().as_ref()])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// Create a worktree + branch from the test repo. Returns the worktree path.
+    fn add_worktree(repo: &Path, branch: &str) -> PathBuf {
+        let wt = repo.join(format!("wt-{branch}"));
+        let out = test_support::git_command()
+            .arg("-C")
+            .arg(repo)
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                wt.to_string_lossy().as_ref(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        wt
+    }
+
+    #[test]
+    fn worktree_files_lists_tracked_untracked_and_loose_ignored_but_collapses_ignored_dirs() {
+        let repo = init_test_repo();
+        let p = repo.path();
+        let g = |args: &[&str]| {
+            test_support::git_command()
+                .args(args)
+                .current_dir(p)
+                .output()
+                .unwrap();
+        };
+        std::fs::write(p.join("tracked.txt"), "a").unwrap();
+        std::fs::create_dir(p.join("src")).unwrap();
+        std::fs::write(p.join("src/main.rs"), "fn main() {}").unwrap();
+        g(&["add", "tracked.txt", "src/main.rs"]);
+        g(&["commit", "-m", "add tracked"]);
+        std::fs::write(p.join("untracked.txt"), "b").unwrap();
+        // Ignore a loose file, an entire directory, AND a glob that matches a file
+        // sitting in an otherwise-tracked directory (src/).
+        std::fs::write(p.join(".gitignore"), "ignored.txt\nnode_modules/\n*.log\n").unwrap();
+        std::fs::write(p.join("ignored.txt"), "c").unwrap();
+        std::fs::create_dir(p.join("node_modules")).unwrap();
+        std::fs::write(p.join("node_modules/dep.js"), "d").unwrap();
+        std::fs::write(p.join("src/debug.log"), "e").unwrap();
+
+        let result = worktree_files(p, crate::config::DEFAULT_SEARCH_INDEX_MAX_FILES).unwrap();
+        let files = result.files;
+        assert!(files.contains(&"tracked.txt".to_string()));
+        assert!(files.contains(&"untracked.txt".to_string()));
+        assert!(files.contains(&".gitignore".to_string()));
+        // A loose gitignored FILE is surfaced so the editor can open it.
+        assert!(
+            files.contains(&"ignored.txt".to_string()),
+            "loose ignored file should be listed: {files:?}"
+        );
+        // An ignored file inside a directory that ALSO has tracked content is
+        // listed too (the walk is filesystem-based, not git-based).
+        assert!(
+            files.contains(&"src/debug.log".to_string()),
+            "ignored file in a partially-tracked dir should be listed: {files:?}"
+        );
+        // With the walkdir-based implementation, fully-ignored dir contents ARE
+        // listed (node_modules/dep.js appears). That is intentional: the new
+        // walk surfaces everything. The old ls-files collapse is gone.
+        assert!(
+            files.iter().any(|f| f.starts_with("node_modules")),
+            "walkdir lists ignored directory contents: {files:?}"
+        );
+        // .git/ contents are listed (except objects/ and logs/).
+        assert!(
+            files.iter().any(|f| f.starts_with(".git/")),
+            "walkdir lists git internals: {files:?}"
+        );
+    }
+
+    #[test]
+    fn worktree_files_walk_lists_git_internals_and_ignored_dir_contents() {
+        let repo = init_test_repo();
+        let p = repo.path();
+        let g = |args: &[&str]| {
+            test_support::git_command()
+                .args(args)
+                .current_dir(p)
+                .output()
+                .unwrap();
+        };
+        // A tracked file and a fully-ignored directory with content.
+        std::fs::write(p.join("src.rs"), "fn main() {}").unwrap();
+        g(&["add", "src.rs"]);
+        g(&["commit", "-m", "add file"]);
+        std::fs::write(p.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::create_dir(p.join("node_modules")).unwrap();
+        std::fs::write(p.join("node_modules/dep.js"), "x").unwrap();
+        // .git/config always exists in an initialized repo.
+
+        let result = worktree_files(p, crate::config::DEFAULT_SEARCH_INDEX_MAX_FILES).unwrap();
+
+        // Tracked file is included.
+        assert!(
+            result.files.contains(&"src.rs".to_string()),
+            "files: {:?}",
+            result.files
+        );
+        // node_modules contents are included (full walk, not ls-files).
+        assert!(
+            result.files.contains(&"node_modules/dep.js".to_string()),
+            "ignored dir contents must appear: {:?}",
+            result.files
+        );
+        // .git/config is readable in the listing.
+        assert!(
+            result.files.iter().any(|f| f.starts_with(".git/config")),
+            ".git/config must be listed: {:?}",
+            result.files
+        );
+        // .git/objects and .git/logs are excluded for performance.
+        assert!(
+            !result.files.iter().any(|f| f.starts_with(".git/objects")),
+            ".git/objects must be excluded: {:?}",
+            result.files
+        );
+        assert!(
+            !result.files.iter().any(|f| f.starts_with(".git/logs")),
+            ".git/logs must be excluded: {:?}",
+            result.files
+        );
+        assert!(!result.truncated, "small repo must not be truncated");
+    }
+
+    #[test]
+    fn list_dir_root_lists_every_child_including_dotfiles_and_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path();
+        std::fs::write(wt.join("Cargo.toml"), "x").unwrap();
+        std::fs::write(wt.join("CLAUDE.md"), "x").unwrap();
+        std::fs::create_dir(wt.join(".git")).unwrap();
+        std::fs::write(wt.join(".git/config"), "[core]\n").unwrap();
+        std::fs::create_dir(wt.join(".superpowers")).unwrap();
+        std::fs::create_dir(wt.join("crates")).unwrap();
+
+        let names: Vec<String> = list_dir(wt, "")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        for expected in ["Cargo.toml", "CLAUDE.md", ".git", ".superpowers", "crates"] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "missing {expected} in {names:?}"
+            );
+        }
+    }
+
+    /// list_dir is structurally immune to a huge sibling subtree: it does a
+    /// single `read_dir` on exactly the requested directory, never recurses,
+    /// and never caps. A 1000-file sibling can't discriminate that property
+    /// on its own (any number would pass); it just exercises the shape.
+    #[test]
+    fn list_dir_root_is_unaffected_by_a_huge_sibling_subtree() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path();
+        std::fs::write(wt.join("Cargo.toml"), "x").unwrap();
+        let big = wt.join("target");
+        std::fs::create_dir(&big).unwrap();
+        for i in 0..1000 {
+            std::fs::write(big.join(format!("f{i}")), "x").unwrap();
+        }
+        // list_dir("") reads ONLY the root dir, so `target`'s size is
+        // irrelevant and Cargo.toml is always present, whatever readdir order.
+        let names: Vec<String> = list_dir(wt, "")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"Cargo.toml".to_string()));
+        assert!(names.contains(&"target".to_string()));
+        assert_eq!(
+            names.len(),
+            2,
+            "root listing must not include descendants: {names:?}"
+        );
+    }
+
+    #[test]
+    fn list_dir_sorts_dirs_first_then_files_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path();
+        std::fs::write(wt.join("Zoo.txt"), "x").unwrap();
+        std::fs::write(wt.join("apple.txt"), "x").unwrap();
+        std::fs::create_dir(wt.join("Beta")).unwrap();
+        std::fs::create_dir(wt.join("alpha")).unwrap();
+        let names: Vec<String> = list_dir(wt, "")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, vec!["alpha", "Beta", "apple.txt", "Zoo.txt"]);
+    }
+
+    #[test]
+    fn list_dir_reports_child_paths_relative_to_the_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path();
+        std::fs::create_dir_all(wt.join("a/b")).unwrap();
+        std::fs::write(wt.join("a/b/c.rs"), "x").unwrap();
+        let entries = list_dir(wt, "a/b").unwrap();
+        let c = entries.iter().find(|e| e.name == "c.rs").unwrap();
+        assert_eq!(c.path, "a/b/c.rs");
+        assert!(!c.is_dir && !c.expandable);
+    }
+
+    #[test]
+    fn list_dir_lists_under_dot_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path();
+        std::fs::create_dir_all(wt.join(".git/objects")).unwrap();
+        std::fs::write(wt.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let names: Vec<String> = list_dir(wt, ".git")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"HEAD".to_string()));
+        assert!(names.contains(&"objects".to_string()));
+    }
+
+    #[test]
+    fn list_dir_rejects_traversal_and_absolute_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(list_dir(dir.path(), "..").is_err());
+        assert!(list_dir(dir.path(), "../etc").is_err());
+        assert!(list_dir(dir.path(), "/etc").is_err());
+    }
+
+    #[test]
+    fn list_dir_dedupes_names_that_collide_after_lossy_utf8_conversion() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Two distinct single-byte names, both invalid UTF-8 on their own, that
+        // `to_string_lossy()` both collapse to the same single replacement
+        // character (U+FFFD), a real filesystem collision the tree UI (which
+        // keys rows by path) must never see duplicated.
+        let name_a = OsString::from_vec(vec![0xFF]);
+        let name_b = OsString::from_vec(vec![0xFE]);
+        // A filesystem that enforces UTF-8 names (APFS, HFS+) cannot hold
+        // either name, so the collision this test is about cannot be staged
+        // there at all. See `create_dir_with_non_utf8_name`.
+        match std::fs::write(dir.path().join(&name_a), "a") {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => {
+                eprintln!("skipping: filesystem cannot hold a non-UTF8 filename ({e})");
+                return;
+            }
+            Err(e) => panic!("writing a non-UTF8 filename failed unexpectedly: {e}"),
+        }
+        std::fs::write(dir.path().join(&name_b), "b").unwrap();
+
+        let entries = list_dir(dir.path(), "").unwrap();
+        let mut paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        paths.sort_unstable();
+        let unique_count = {
+            let mut deduped = paths.clone();
+            deduped.dedup();
+            deduped.len()
+        };
+        assert_eq!(
+            entries.len(),
+            unique_count,
+            "list_dir must never return two entries with the same path: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn list_dir_symlinked_dir_escaping_worktree_is_not_expandable() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("secret")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), dir.path().join("escape"))
+            .unwrap();
+        let e = list_dir(dir.path(), "")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "escape")
+            .unwrap();
+        assert!(e.is_symlink);
+        assert!(
+            !e.expandable,
+            "an escaping symlinked dir must not be expandable"
+        );
+        // And listing THROUGH it must be refused.
+        assert!(list_dir(dir.path(), "escape").is_err());
+    }
+
+    #[test]
+    fn list_dir_in_worktree_symlinked_dir_is_expandable() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::fs::write(dir.path().join("real/x.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
+        let e = list_dir(dir.path(), "")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "link")
+            .unwrap();
+        assert!(e.is_symlink && e.is_dir && e.expandable);
+        // Listing through the in-tree symlink works.
+        let names: Vec<String> = list_dir(dir.path(), "link")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"x.txt".to_string()));
+    }
+
+    #[test]
+    fn rooted_files_prunes_dot_directories_but_keeps_plain_dotfiles() {
+        // A terminal-rooted editor can be pointed at a home directory, where the
+        // dot directories are caches and state nobody searches for source in. The
+        // files themselves stay: a `.bashrc` is exactly what someone opens.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::write(p.join(".bashrc"), "x").unwrap();
+        std::fs::write(p.join("notes.md"), "x").unwrap();
+        std::fs::create_dir(p.join(".cache")).unwrap();
+        std::fs::write(p.join(".cache/blob"), "x").unwrap();
+        std::fs::create_dir_all(p.join("code/.git")).unwrap();
+        std::fs::write(p.join("code/.git/HEAD"), "x").unwrap();
+        std::fs::write(p.join("code/main.rs"), "x").unwrap();
+
+        let result = rooted_files(p, crate::config::DEFAULT_SEARCH_INDEX_MAX_FILES).unwrap();
+
+        assert!(result.files.contains(&".bashrc".to_string()));
+        assert!(result.files.contains(&"notes.md".to_string()));
+        assert!(result.files.contains(&"code/main.rs".to_string()));
+        assert!(
+            !result.files.iter().any(|f| f.starts_with(".cache/")),
+            "a dot directory at the root must be pruned: {:?}",
+            result.files
+        );
+        assert!(
+            !result.files.iter().any(|f| f.contains("/.git/")),
+            "a nested dot directory must be pruned too: {:?}",
+            result.files
+        );
+    }
+
+    #[test]
+    fn rooted_files_keeps_the_cap_and_the_truncated_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::create_dir(p.join("bulk")).unwrap();
+        for i in 0..25 {
+            std::fs::write(p.join(format!("bulk/f{i}.txt")), "x").unwrap();
+        }
+        let result = rooted_files(p, 20).unwrap();
+        assert!(result.truncated);
+        assert_eq!(result.files.len(), 20);
+    }
+
+    #[test]
+    fn worktree_files_still_walks_into_dot_directories() {
+        // The worktree walk is unchanged: the editor opens `.git/config` and a
+        // project's own dot directories through the search box today.
+        let repo = init_test_repo();
+        let p = repo.path();
+        std::fs::create_dir(p.join(".config")).unwrap();
+        std::fs::write(p.join(".config/tool.toml"), "x").unwrap();
+        let result = worktree_files(p, crate::config::DEFAULT_SEARCH_INDEX_MAX_FILES).unwrap();
+        assert!(result.files.contains(&".config/tool.toml".to_string()));
+    }
+
+    #[test]
+    fn worktree_files_walk_sets_truncated_when_cap_exceeded() {
+        let repo = init_test_repo();
+        let p = repo.path();
+        // Create enough files to exceed a small explicit cap.
+        std::fs::create_dir(p.join("bulk")).unwrap();
+        for i in 0..25 {
+            std::fs::write(p.join(format!("bulk/f{i}.txt")), "x").unwrap();
+        }
+        let result = worktree_files(p, 20).unwrap();
+        assert!(result.truncated, "must set truncated when walk exceeds cap");
+        assert_eq!(result.files.len(), 20, "must return exactly cap entries");
+    }
+
+    #[test]
+    fn worktree_files_zero_cap_never_truncates() {
+        let repo = init_test_repo();
+        let p = repo.path();
+        std::fs::create_dir(p.join("bulk")).unwrap();
+        for i in 0..50 {
+            std::fs::write(p.join(format!("bulk/f{i}.txt")), "x").unwrap();
+        }
+        let result = worktree_files(p, 0).unwrap();
+        assert!(!result.truncated, "max_files == 0 must disable the cap");
+        assert!(
+            result
+                .files
+                .iter()
+                .filter(|f| f.starts_with("bulk/"))
+                .count()
+                == 50,
+            "all bulk files must be listed: {}",
+            result.files.len()
+        );
+    }
+
+    #[test]
+    fn parse_worktree_list_porcelain_z_handles_branches_detached_and_spaces() {
+        let input = b"worktree /repo/main checkout\0HEAD 1111111111111111111111111111111111111111\0branch refs/heads/main\0\0worktree /repo/feature\0HEAD 2222222222222222222222222222222222222222\0branch refs/heads/feature/x\0\0worktree /repo/detached\0HEAD abcdef1234567890\0detached\0\0";
+
+        let entries = parse_worktree_list_porcelain_z(input).unwrap();
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].path, PathBuf::from("/repo/main checkout"));
+        assert_eq!(entries[0].branch_name.as_deref(), Some("main"));
+        assert_eq!(entries[0].label(), "main");
+        assert_eq!(entries[1].branch_name.as_deref(), Some("feature/x"));
+        assert_eq!(entries[2].branch_name, None);
+        assert!(entries[2].detached);
+        assert_eq!(entries[2].label(), "detached abcdef1");
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let out = test_support::git_command()
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed in {}: {}",
+            args,
+            cwd.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn commit_all(cwd: &Path, message: &str) {
+        run_git(cwd, &["add", "-A"]);
+        run_git(cwd, &["commit", "-m", message]);
+    }
+
+    /// MEASURED on git 2.55: `git commit` with nothing staged writes its whole
+    /// explanation to STDOUT and leaves stderr EMPTY, exiting 1. An
+    /// stderr-only capture therefore produced the error "git commit failed: "
+    /// with no reason in it whatsoever.
+    #[test]
+    fn commit_failure_carries_a_reason_git_wrote_only_to_stdout() {
+        let repo = init_test_repo();
+        // Call `commit` directly: the web route's preflight would normally
+        // catch this case, but the capture must not depend on that.
+        let err = commit(repo.path(), "a message").expect_err("nothing is staged");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("nothing to commit"),
+            "git wrote the reason to stdout and it must survive, got: {text}"
+        );
+    }
+
+    /// A rejecting hook's report must reach the user. It arrives on stderr,
+    /// because git redirects a hook's stdout onto its own stderr (measured on
+    /// git 2.55), so this pins the hook path independently of which stream it
+    /// happens to travel on.
+    #[test]
+    fn commit_failure_carries_a_rejecting_hooks_report() {
+        let repo = init_test_repo();
+        let hooks = repo.path().join(".git").join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("pre-commit");
+        fs::write(
+            &hook,
+            "#!/bin/sh\necho 'trailing-whitespace....Failed'\nexit 1\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::write(repo.path().join("f.txt"), "x\n").unwrap();
+        run_git(repo.path(), &["add", "f.txt"]);
+
+        let err = commit(repo.path(), "a message").expect_err("the hook must reject the commit");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("trailing-whitespace....Failed"),
+            "the hook's report must reach the user, got: {text}"
+        );
+    }
+
+    /// The worktree path is stripped from user-facing git text: on the web the
+    /// reader may be on a different machine, where the server's layout is
+    /// noise. The REASON must survive the stripping.
+    #[test]
+    fn redact_worktree_path_removes_the_prefix_and_keeps_the_reason() {
+        let wt = Path::new("/home/someone/.config/dux/worktrees/proj/agent");
+        let text = "error: '/home/someone/.config/dux/worktrees/proj/agent/src/a.rs' is unmerged";
+        let out = redact_worktree_path(text, wt);
+        assert_eq!(out, "error: './src/a.rs' is unmerged");
+        assert!(!out.contains("/home/someone"));
+    }
+
+    /// A SIBLING worktree's path must not be half-eaten. Agent worktrees are
+    /// literally siblings under one project root, so `.../proj/agent` and
+    /// `.../proj/agent-2` coexist by construction, and a plain substring
+    /// replacement rendered a mention of the second one as `./-2/f.rs`: not a
+    /// hidden path but a WRONG path, which is worse, because the reader has no
+    /// way to tell it apart from a real one.
+    #[test]
+    fn redact_worktree_path_leaves_a_sibling_worktree_whole() {
+        let wt = Path::new("/home/someone/.config/dux/worktrees/proj/agent");
+        let text = "error: '/home/someone/.config/dux/worktrees/proj/agent-2/f.rs' is unmerged";
+        let out = redact_worktree_path(text, wt);
+        assert!(
+            !out.contains("./-2/"),
+            "a sibling worktree must not be mangled into a path that does not exist: {out}"
+        );
+        assert_eq!(out, text, "a different worktree is not this one's to strip");
+    }
+
+    /// The same defect with a SPACE in the sibling's name, which is why the
+    /// boundary cannot be widened to "whatever usually ends a path in prose".
+    /// A space is a legal filename character, so treating it as a boundary
+    /// would render this as `./2/f.rs`.
+    #[test]
+    fn redact_worktree_path_leaves_a_sibling_worktree_with_a_space_whole() {
+        let wt = Path::new("/wt/proj/agent");
+        let text = "error: '/wt/proj/agent 2/f.rs' is unmerged";
+        assert_eq!(redact_worktree_path(text, wt), text);
+    }
+
+    /// The boundary is a path SEPARATOR or the end of the path, so the worktree
+    /// mentioned bare (the common `cd`-into-it or hook-cwd shape) still
+    /// collapses to `.`.
+    #[test]
+    fn redact_worktree_path_strips_the_worktree_mentioned_on_its_own() {
+        let wt = Path::new("/home/someone/.config/dux/worktrees/proj/agent");
+        let out = redact_worktree_path(
+            "fatal: cannot run in /home/someone/.config/dux/worktrees/proj/agent",
+            wt,
+        );
+        assert_eq!(out, "fatal: cannot run in .");
+    }
+
+    /// git's own shape for a worktree that has gone missing names the server's
+    /// path QUOTED and followed by nothing path-like, so the closing quote has
+    /// to count as a boundary or the whole message is a server path. Found by
+    /// `discard_strips_the_server_path_from_a_classify_refusal` in `dux-web`,
+    /// not by reasoning.
+    #[test]
+    fn redact_worktree_path_strips_a_quoted_worktree() {
+        let wt = Path::new("/home/someone/.config/dux/worktrees/proj/agent");
+        let out = redact_worktree_path(
+            "git status failed: fatal: cannot change to \
+             '/home/someone/.config/dux/worktrees/proj/agent': No such file or directory",
+            wt,
+        );
+        assert_eq!(
+            out,
+            "git status failed: fatal: cannot change to '.': No such file or directory"
+        );
+        assert!(!out.contains("/home/someone"));
+    }
+
+    /// The quote closes the path only for the quote that OPENED it, so a
+    /// double-quoted mention works the same way and a stray apostrophe after an
+    /// unquoted path is not mistaken for a terminator.
+    #[test]
+    fn redact_worktree_path_honours_the_quote_that_opened_the_path() {
+        let wt = Path::new("/wt/agent");
+        assert_eq!(
+            redact_worktree_path("cannot change to \"/wt/agent\": gone", wt),
+            "cannot change to \".\": gone"
+        );
+        assert_eq!(
+            redact_worktree_path("cannot change to /wt/agent's parent", wt),
+            "cannot change to /wt/agent's parent"
+        );
+    }
+
+    /// A trailing separator on the worktree path must not change the answer,
+    /// and must not leave a doubled slash behind.
+    #[test]
+    fn redact_worktree_path_ignores_a_trailing_separator_on_the_worktree() {
+        let text = "error: '/wt/proj/agent/src/a.rs' is unmerged";
+        assert_eq!(
+            redact_worktree_path(text, Path::new("/wt/proj/agent/")),
+            "error: './src/a.rs' is unmerged"
+        );
+    }
+
+    /// Every occurrence, not just the first: git names two paths in a rename
+    /// diagnostic routinely.
+    #[test]
+    fn redact_worktree_path_replaces_every_occurrence() {
+        let wt = Path::new("/wt/agent");
+        let out = redact_worktree_path("from /wt/agent/a.rs to /wt/agent/b.rs", wt);
+        assert_eq!(out, "from ./a.rs to ./b.rs");
+    }
+
+    /// A degenerate worktree path must not turn the message into punctuation
+    /// soup by replacing every slash in it.
+    #[test]
+    fn redact_worktree_path_leaves_text_alone_for_a_root_or_empty_worktree() {
+        let text = "error: /a/b/c is unmerged";
+        assert_eq!(redact_worktree_path(text, Path::new("/")), text);
+        assert_eq!(redact_worktree_path(text, Path::new("")), text);
+    }
+
+    #[test]
+    fn commit_preflight_matrix_empty_message_then_nothing_staged_then_ready() {
+        let repo = init_test_repo();
+        let wt = repo.path();
+
+        // Empty (or whitespace-only) message is refused first, before any git IO
+        // decision about staging.
+        assert_eq!(
+            commit_preflight(wt, "   "),
+            CommitPreflight::EmptyMessage,
+            "a whitespace-only message must be refused as empty",
+        );
+
+        // A valid message but nothing staged: live git status has no staged entry.
+        assert_eq!(
+            commit_preflight(wt, "real message"),
+            CommitPreflight::NothingStaged,
+            "a clean worktree has nothing to commit",
+        );
+
+        // Stage a change and the preflight clears.
+        fs::write(wt.join("a.txt"), "hello\n").unwrap();
+        run_git(wt, &["add", "a.txt"]);
+        assert_eq!(
+            commit_preflight(wt, "real message"),
+            CommitPreflight::Ready,
+            "a staged change with a real message is ready to commit",
+        );
+    }
+
+    #[test]
+    fn discard_classify_reflects_live_status_as_the_worktree_changes() {
+        // The classification must track the CURRENT git status, transitioning as
+        // the same path moves between untracked, staged, tracked-and-modified, and
+        // clean. This is the property the discard confirm relies on: it re-reads
+        // this at action time rather than trusting an earlier snapshot.
+        let repo = init_test_repo();
+        let wt = repo.path();
+
+        // Untracked file: classified as untracked (the delete branch).
+        fs::write(wt.join("ghost.txt"), "ghost\n").unwrap();
+        assert!(
+            discard_classify(wt, "ghost.txt").unwrap(),
+            "a brand-new untracked file must classify as untracked",
+        );
+
+        // Once staged, discard is refused (unstage first) rather than classified.
+        run_git(wt, &["add", "ghost.txt"]);
+        let staged_err = discard_classify(wt, "ghost.txt").unwrap_err().to_string();
+        assert!(
+            staged_err.contains("Unstage the file first"),
+            "a staged file must be refused, got: {staged_err}",
+        );
+
+        // A tracked file with an unstaged modification classifies as tracked (the
+        // restore-from-HEAD branch), NOT untracked.
+        fs::write(wt.join("tracked.txt"), "one\n").unwrap();
+        commit_all(wt, "add tracked");
+        fs::write(wt.join("tracked.txt"), "two\n").unwrap();
+        assert!(
+            !discard_classify(wt, "tracked.txt").unwrap(),
+            "a modified tracked file must classify as tracked, not untracked",
+        );
+
+        // A clean/committed path has nothing to discard.
+        commit_all(wt, "commit tracked change");
+        let clean_err = discard_classify(wt, "tracked.txt").unwrap_err().to_string();
+        assert!(
+            clean_err.contains("No unstaged changes to discard"),
+            "a clean tracked file must report nothing to discard, got: {clean_err}",
+        );
+    }
+
+    /// Every name here is ordinary to a filesystem and a pathspec to git.
+    /// MEASURED on git 2.55: with `--` alone, `git add -- ':!magic.txt'` stages
+    /// every OTHER changed file and `git add -- 'a*b.txt'` also stages
+    /// `ab.txt`, both exiting 0. `--literal-pathspecs` is what makes a name a
+    /// name.
+    fn write_option_looking_files(wt: &Path) -> Vec<&'static str> {
+        let odd = vec!["-lead.txt", ":!magic.txt", "a*b.txt"];
+        for name in odd.iter().chain(["ab.txt", "bystander.txt"].iter()) {
+            fs::write(wt.join(name), "one\n").unwrap();
+        }
+        commit_all(wt, "add option-looking names");
+        for name in odd.iter().chain(["ab.txt", "bystander.txt"].iter()) {
+            fs::write(wt.join(name), "two\n").unwrap();
+        }
+        odd
+    }
+
+    fn staged_paths(wt: &Path) -> Vec<String> {
+        let (staged, _) = changed_files(wt).unwrap();
+        let mut paths: Vec<String> = staged.into_iter().map(|f| f.path).collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn stage_files_and_unstage_files_read_option_looking_names_literally() {
+        let repo = init_test_repo();
+        let wt = repo.path();
+        let odd = write_option_looking_files(wt);
+        let paths: Vec<String> = odd.iter().map(|s| s.to_string()).collect();
+
+        stage_files(wt, &paths).unwrap();
+        let mut want = paths.clone();
+        want.sort();
+        assert_eq!(
+            staged_paths(wt),
+            want,
+            "only the named files may be staged: a glob or exclude pathspec would \
+             sweep in ab.txt or bystander.txt",
+        );
+
+        unstage_files(wt, &paths).unwrap();
+        assert!(
+            staged_paths(wt).is_empty(),
+            "the same names must unstage, and nothing else may be left staged",
+        );
+    }
+
+    #[test]
+    fn stage_file_and_unstage_file_read_an_option_looking_name_literally() {
+        let repo = init_test_repo();
+        let wt = repo.path();
+        write_option_looking_files(wt);
+
+        stage_file(wt, "a*b.txt").unwrap();
+        assert_eq!(
+            staged_paths(wt),
+            vec!["a*b.txt".to_string()],
+            "a single glob-looking name must stage itself alone, not ab.txt too",
+        );
+
+        stage_file(wt, "ab.txt").unwrap();
+        unstage_file(wt, "a*b.txt").unwrap();
+        assert_eq!(
+            staged_paths(wt),
+            vec!["ab.txt".to_string()],
+            "unstaging a glob-looking name must leave its lookalike staged",
+        );
+    }
+
+    #[test]
+    fn discard_file_reads_an_option_looking_name_literally() {
+        let repo = init_test_repo();
+        let wt = repo.path();
+        write_option_looking_files(wt);
+
+        discard_file(wt, "a*b.txt", false).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(wt.join("a*b.txt")).unwrap(),
+            "one\n",
+            "the named file must be restored from HEAD",
+        );
+        assert_eq!(
+            fs::read_to_string(wt.join("ab.txt")).unwrap(),
+            "two\n",
+            "a destructive restore must not reach a file the glob would match",
+        );
+    }
+
+    /// MEASURED on git 2.55: `git reset HEAD` with an empty pathspec list
+    /// unstages the WHOLE index and exits 0, so an empty slice cannot be passed
+    /// through to git.
+    #[test]
+    fn stage_files_and_unstage_files_refuse_an_empty_slice() {
+        let repo = init_test_repo();
+        let wt = repo.path();
+        fs::write(wt.join("a.txt"), "one\n").unwrap();
+        run_git(wt, &["add", "a.txt"]);
+
+        assert!(
+            stage_files(wt, &[]).is_err(),
+            "an empty stage batch must be refused",
+        );
+        assert!(
+            unstage_files(wt, &[]).is_err(),
+            "an empty unstage batch must be refused",
+        );
+        assert_eq!(
+            staged_paths(wt),
+            vec!["a.txt".to_string()],
+            "a refused empty batch must leave the index exactly as it was",
+        );
+    }
+
+    #[test]
+    fn create_worktree_from_start_point_uses_explicit_head_commit() {
+        let repo = init_test_repo();
+        let source = add_worktree(repo.path(), "source-head");
+        fs::write(source.join("fork.txt"), "from source branch\n").unwrap();
+        commit_all(&source, "source commit");
+        let source_head = head_commit(&source).unwrap();
+
+        let worktrees_root = repo.path().join("forks");
+        let (_branch_name, forked) = create_worktree_from_start_point(
+            repo.path(),
+            &worktrees_root,
+            "demo",
+            Some(&source_head),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(head_commit(&forked).unwrap(), source_head);
+        assert_eq!(
+            fs::read_to_string(forked.join("fork.txt")).unwrap(),
+            "from source branch\n"
+        );
+    }
+
+    // ── copy_uncommitted_changes tests ───────────────────────────
+    //
+    // The copy is driven by `git status --porcelain=v1 -z --untracked-files=all`
+    // in the source; each test names the bug it catches.
+
+    /// Two sibling worktrees of the same test repo, at the same HEAD commit.
+    fn copy_test_worktrees(repo: &Path) -> (PathBuf, PathBuf) {
+        let source = add_worktree(repo, "copy-source");
+        let destination = add_worktree(repo, "copy-destination");
+        (source, destination)
+    }
+
+    /// The core rule: files matched by .gitignore never travel.
+    #[test]
+    fn copy_excludes_gitignored_files() {
+        let repo = init_test_repo();
+        fs::write(repo.path().join(".gitignore"), "*.log\n").unwrap();
+        fs::write(repo.path().join("tracked.txt"), "original\n").unwrap();
+        commit_all(repo.path(), "base");
+        let (source, destination) = copy_test_worktrees(repo.path());
+
+        fs::write(source.join("tracked.txt"), "modified\n").unwrap();
+        fs::write(source.join("note.txt"), "untracked\n").unwrap();
+        fs::write(source.join("junk.log"), "ignored\n").unwrap();
+
+        let summary = copy_uncommitted_changes(&source, &destination).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.join("tracked.txt")).unwrap(),
+            "modified\n"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("note.txt")).unwrap(),
+            "untracked\n"
+        );
+        assert!(!destination.join("junk.log").exists());
+        assert_eq!(summary.copied, 2);
+        assert!(summary.skipped_paths.is_empty());
+    }
+
+    /// Catches routing `?? dir/` through a bulk directory copy (which would
+    /// drag ignored files along) and the missing-destination-parent case.
+    #[test]
+    fn copy_expands_untracked_dirs_and_still_excludes_ignored_files_inside_them() {
+        let repo = init_test_repo();
+        fs::write(repo.path().join(".gitignore"), "*.log\n").unwrap();
+        commit_all(repo.path(), "base");
+        let (source, destination) = copy_test_worktrees(repo.path());
+
+        fs::create_dir_all(source.join("newdir").join("nested")).unwrap();
+        fs::write(source.join("newdir").join("keep.txt"), "keep\n").unwrap();
+        fs::write(
+            source.join("newdir").join("nested").join("deep.txt"),
+            "deep\n",
+        )
+        .unwrap();
+        fs::write(source.join("newdir").join("junk.log"), "ignored\n").unwrap();
+
+        copy_uncommitted_changes(&source, &destination).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.join("newdir").join("keep.txt")).unwrap(),
+            "keep\n"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("newdir").join("nested").join("deep.txt")).unwrap(),
+            "deep\n"
+        );
+        assert!(!destination.join("newdir").join("junk.log").exists());
+    }
+
+    /// Catches the proven defect: ` D foo` + `?? foo/bar.txt` must delete the
+    /// stale destination file before copying into the new directory, or the
+    /// copy fails with `File exists` / leaves a stale file behind.
+    #[test]
+    fn copy_handles_tracked_file_replaced_by_directory() {
+        let repo = init_test_repo();
+        fs::write(repo.path().join("foo"), "a file\n").unwrap();
+        commit_all(repo.path(), "base");
+        let (source, destination) = copy_test_worktrees(repo.path());
+
+        fs::remove_file(source.join("foo")).unwrap();
+        fs::create_dir(source.join("foo")).unwrap();
+        fs::write(source.join("foo").join("bar.txt"), "inner\n").unwrap();
+
+        copy_uncommitted_changes(&source, &destination).unwrap();
+
+        assert!(destination.join("foo").is_dir());
+        assert_eq!(
+            fs::read_to_string(destination.join("foo").join("bar.txt")).unwrap(),
+            "inner\n"
+        );
+    }
+
+    /// `D  f` + `?? f` is one path reported twice; delete-then-copy phase
+    /// ordering must land the recreated contents, not the deletion.
+    #[test]
+    fn copy_handles_staged_delete_with_untracked_recreate() {
+        let repo = init_test_repo();
+        fs::write(repo.path().join("f"), "old\n").unwrap();
+        commit_all(repo.path(), "base");
+        let (source, destination) = copy_test_worktrees(repo.path());
+
+        run_git(&source, &["rm", "f"]);
+        fs::write(source.join("f"), "new\n").unwrap();
+
+        copy_uncommitted_changes(&source, &destination).unwrap();
+
+        assert_eq!(fs::read_to_string(destination.join("f")).unwrap(), "new\n");
+    }
+
+    /// `MD`: the worktree delete (Y) wins over the staged modify (X).
+    #[test]
+    fn copy_applies_worktree_delete_over_staged_modify() {
+        let repo = init_test_repo();
+        fs::write(repo.path().join("a.txt"), "base\n").unwrap();
+        commit_all(repo.path(), "base");
+        let (source, destination) = copy_test_worktrees(repo.path());
+
+        fs::write(source.join("a.txt"), "staged edit\n").unwrap();
+        run_git(&source, &["add", "a.txt"]);
+        fs::remove_file(source.join("a.txt")).unwrap();
+
+        let summary = copy_uncommitted_changes(&source, &destination).unwrap();
+
+        assert!(!destination.join("a.txt").exists());
+        assert_eq!(summary.deleted, 1);
+    }
+
+    /// Build a repo stuck mid-merge with `UD`, `DU`, and `UU` records plus a
+    /// rename/rename conflict yielding a `DD` record. Returns (repo, contents
+    /// currently on disk for ud.txt/du.txt/c.txt).
+    fn conflicted_repo() -> (tempfile::TempDir, String, String, String) {
+        let repo = init_test_repo();
+        let p = repo.path();
+        fs::write(p.join("ud.txt"), "base ud\n").unwrap();
+        fs::write(p.join("du.txt"), "base du\n").unwrap();
+        fs::write(p.join("c.txt"), "base c\n").unwrap();
+        fs::write(p.join("orig.txt"), "base orig\n").unwrap();
+        commit_all(p, "base");
+
+        run_git(p, &["switch", "-c", "theirs"]);
+        run_git(p, &["rm", "ud.txt"]);
+        fs::write(p.join("du.txt"), "theirs du\n").unwrap();
+        fs::write(p.join("c.txt"), "theirs c\n").unwrap();
+        run_git(p, &["mv", "orig.txt", "theirs.txt"]);
+        commit_all(p, "theirs side");
+
+        run_git(p, &["switch", "main"]);
+        fs::write(p.join("ud.txt"), "my local edit\n").unwrap();
+        run_git(p, &["rm", "du.txt"]);
+        fs::write(p.join("c.txt"), "ours c\n").unwrap();
+        run_git(p, &["mv", "orig.txt", "ours.txt"]);
+        commit_all(p, "ours side");
+
+        let merge = test_support::git_command()
+            .args(["merge", "theirs"])
+            .current_dir(p)
+            .output()
+            .unwrap();
+        assert!(!merge.status.success(), "the merge must conflict");
+
+        let ud = fs::read_to_string(p.join("ud.txt")).unwrap();
+        let du = fs::read_to_string(p.join("du.txt")).unwrap();
+        let c = fs::read_to_string(p.join("c.txt")).unwrap();
+        (repo, ud, du, c)
+    }
+
+    /// Catches any code-based classification of unmerged records: both `UD`
+    /// and `DU` leave a file on disk (with different contents), so the copy
+    /// must be decided by source disk state, never by the status code.
+    #[test]
+    fn copy_keeps_on_disk_files_from_modify_delete_conflicts() {
+        let (repo, ud, du, c) = conflicted_repo();
+        assert_eq!(ud, "my local edit\n");
+        assert_eq!(du, "theirs du\n");
+
+        let destination = tempfile::tempdir().unwrap();
+        fs::write(destination.path().join("ud.txt"), "stale\n").unwrap();
+        fs::write(destination.path().join("du.txt"), "stale\n").unwrap();
+        fs::write(destination.path().join("c.txt"), "stale\n").unwrap();
+
+        copy_uncommitted_changes(repo.path(), destination.path()).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.path().join("ud.txt")).unwrap(),
+            ud
+        );
+        assert_eq!(
+            fs::read_to_string(destination.path().join("du.txt")).unwrap(),
+            du
+        );
+        assert_eq!(
+            fs::read_to_string(destination.path().join("c.txt")).unwrap(),
+            c
+        );
+    }
+
+    /// The disk-state rule's delete branch: a `DD` record (rename/rename
+    /// conflict on the original path) is absent on disk, so it is deleted
+    /// at the destination.
+    #[test]
+    fn copy_deletes_both_deleted_conflict_paths() {
+        let (repo, _, _, _) = conflicted_repo();
+        assert!(!repo.path().join("orig.txt").exists());
+
+        let destination = tempfile::tempdir().unwrap();
+        fs::write(destination.path().join("orig.txt"), "stale\n").unwrap();
+
+        copy_uncommitted_changes(repo.path(), destination.path()).unwrap();
+
+        assert!(!destination.path().join("orig.txt").exists());
+        // The rename/rename sides are on disk and travel.
+        assert_eq!(
+            fs::read_to_string(destination.path().join("ours.txt")).unwrap(),
+            "base orig\n"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.path().join("theirs.txt")).unwrap(),
+            "base orig\n"
+        );
+    }
+
+    /// Kills two-path `R`/`C` parse corruption: hostile rename/copy detection
+    /// config in the source repo must not corrupt the record stream.
+    #[test]
+    fn copy_is_immune_to_rename_and_copy_detection_config() {
+        let repo = init_test_repo();
+        fs::write(repo.path().join("a.txt"), "contents a\n").unwrap();
+        fs::write(repo.path().join("b.txt"), "contents b\n").unwrap();
+        commit_all(repo.path(), "base");
+        let (source, destination) = copy_test_worktrees(repo.path());
+
+        run_git(&source, &["config", "status.renames", "copies"]);
+        run_git(&source, &["mv", "a.txt", "renamed.txt"]);
+        // A staged copy: identical contents under a new name.
+        fs::write(source.join("copied.txt"), "contents b\n").unwrap();
+        run_git(&source, &["add", "copied.txt"]);
+
+        copy_uncommitted_changes(&source, &destination).unwrap();
+
+        assert!(!destination.join("a.txt").exists());
+        assert_eq!(
+            fs::read_to_string(destination.join("renamed.txt")).unwrap(),
+            "contents a\n"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("copied.txt")).unwrap(),
+            "contents b\n"
+        );
+    }
+
+    #[test]
+    fn copy_deletes_removed_tracked_files_and_prunes_empty_dirs() {
+        let repo = init_test_repo();
+        fs::create_dir_all(repo.path().join("dir").join("sub")).unwrap();
+        fs::write(repo.path().join("dir").join("sub").join("file.txt"), "x\n").unwrap();
+        fs::write(repo.path().join("dir").join("keeper.txt"), "keep\n").unwrap();
+        commit_all(repo.path(), "base");
+        let (source, destination) = copy_test_worktrees(repo.path());
+
+        fs::remove_file(source.join("dir").join("sub").join("file.txt")).unwrap();
+
+        let summary = copy_uncommitted_changes(&source, &destination).unwrap();
+
+        assert!(
+            !destination
+                .join("dir")
+                .join("sub")
+                .join("file.txt")
+                .exists()
+        );
+        // `sub` became empty and is pruned; `dir` still holds keeper.txt.
+        assert!(!destination.join("dir").join("sub").exists());
+        assert_eq!(
+            fs::read_to_string(destination.join("dir").join("keeper.txt")).unwrap(),
+            "keep\n"
+        );
+        assert_eq!(summary.deleted, 1);
+    }
+
+    /// Replaces the mode/symlink coverage the mirror tests used to provide.
+    #[test]
+    fn copy_preserves_file_modes_and_symlinks() {
+        let repo = init_test_repo();
+        let (source, destination) = copy_test_worktrees(repo.path());
+
+        let secret = source.join("secret.txt");
+        fs::write(&secret, "shh\n").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(Path::new("secret.txt"), source.join("link")).unwrap();
+
+        copy_uncommitted_changes(&source, &destination).unwrap();
+
+        let dest_secret = fs::metadata(destination.join("secret.txt")).unwrap();
+        assert_eq!(dest_secret.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::read_link(destination.join("link")).unwrap(),
+            PathBuf::from("secret.txt")
+        );
+    }
+
+    /// A dirty submodule surfaces as ` M smdir` (a directory on disk); the
+    /// copy must skip it with a note rather than fail or bulk-copy it.
+    #[test]
+    fn copy_skips_dirty_submodule_without_failing() {
+        let sub_origin = init_test_repo();
+        fs::write(sub_origin.path().join("subfile.txt"), "sub\n").unwrap();
+        commit_all(sub_origin.path(), "sub base");
+
+        let repo = init_test_repo();
+        let out = test_support::git_command()
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                sub_origin.path().to_str().unwrap(),
+                "smdir",
+            ])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "submodule add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        commit_all(repo.path(), "add submodule");
+        // Dirty the submodule with an untracked file.
+        fs::write(repo.path().join("smdir").join("dirt.txt"), "dirt\n").unwrap();
+
+        let destination = tempfile::tempdir().unwrap();
+        let summary = copy_uncommitted_changes(repo.path(), destination.path()).unwrap();
+
+        assert!(summary.skipped_paths.iter().any(|p| p.contains("smdir")));
+        assert!(!destination.path().join("smdir").exists());
+    }
+
+    /// An untracked embedded git repo collapses to `?? embedded/` even under
+    /// `--untracked-files=all`; it is skipped with a note. This test also
+    /// guards the `--untracked-files=all` flag itself: without it ordinary
+    /// untracked dirs collapse the same way and the expansion tests fail.
+    #[test]
+    fn copy_skips_untracked_embedded_repo_dir() {
+        let repo = init_test_repo();
+        let (source, destination) = copy_test_worktrees(repo.path());
+
+        let embedded = source.join("embedded");
+        fs::create_dir(&embedded).unwrap();
+        run_git(&embedded, &["init"]);
+        fs::write(embedded.join("inner.txt"), "inner\n").unwrap();
+
+        let summary = copy_uncommitted_changes(&source, &destination).unwrap();
+
+        assert!(summary.skipped_paths.iter().any(|p| p.contains("embedded")));
+        assert!(!destination.join("embedded").exists());
+    }
+
+    /// A tracked file replaced by a FIFO is reported as an ordinary ` M`
+    /// copy record, but opening a FIFO with no writer blocks forever. The
+    /// copy must skip it with a note and still complete.
+    #[test]
+    fn copy_skips_tracked_file_replaced_by_fifo_without_hanging() {
+        let repo = init_test_repo();
+        fs::write(repo.path().join("f"), "regular\n").unwrap();
+        commit_all(repo.path(), "base");
+        let (source, destination) = copy_test_worktrees(repo.path());
+
+        fs::remove_file(source.join("f")).unwrap();
+        let out = Command::new("mkfifo")
+            .arg(source.join("f"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "mkfifo failed");
+
+        let summary = copy_uncommitted_changes(&source, &destination).unwrap();
+
+        assert!(summary.skipped_paths.iter().any(|p| p == "f"));
+        // The destination is untouched: it keeps the tracked contents.
+        assert_eq!(
+            fs::read_to_string(destination.join("f")).unwrap(),
+            "regular\n"
+        );
+    }
+
+    /// Recursively snapshot every path under `root` (skipping `.git`) to its
+    /// on-disk representation: file bytes, symlink target, or directory marker.
+    fn snapshot_tree(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut snapshot = std::collections::BTreeMap::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_name() == ".git" {
+                    continue;
+                }
+                let path = entry.path();
+                let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                let meta = fs::symlink_metadata(&path).unwrap();
+                if meta.file_type().is_symlink() {
+                    snapshot.insert(
+                        rel,
+                        fs::read_link(&path)
+                            .unwrap()
+                            .into_os_string()
+                            .into_encoded_bytes(),
+                    );
+                } else if meta.is_dir() {
+                    snapshot.insert(rel, b"<dir>".to_vec());
+                    stack.push(path);
+                } else {
+                    snapshot.insert(rel, fs::read(&path).unwrap());
+                }
+            }
+        }
+        snapshot
+    }
+
+    /// Data-loss tripwire: the copy must NEVER mutate the source checkout,
+    /// which holds the user's uncommitted work. Uses the richest fixture (a
+    /// mid-merge tree with UD/DU/UU/DD records) and asserts the source is
+    /// byte-identical afterwards.
+    #[test]
+    fn copy_never_mutates_the_source_checkout() {
+        let (repo, _, _, _) = conflicted_repo();
+        let before = snapshot_tree(repo.path());
+        assert!(!before.is_empty());
+
+        let destination = tempfile::tempdir().unwrap();
+        copy_uncommitted_changes(repo.path(), destination.path()).unwrap();
+
+        let after = snapshot_tree(repo.path());
+        assert_eq!(before, after, "the source checkout must be untouched");
+    }
+
+    /// Kills line-based or quote-unaware status parsing.
+    #[test]
+    fn copy_handles_paths_with_spaces_quotes_and_unicode() {
+        let repo = init_test_repo();
+        let (source, destination) = copy_test_worktrees(repo.path());
+
+        fs::write(source.join("my file \"quoted\".txt"), "spaces\n").unwrap();
+        fs::write(source.join("日本語 ファイル.txt"), "unicode\n").unwrap();
+        fs::create_dir(source.join("dir with space")).unwrap();
+        fs::write(
+            source.join("dir with space").join("inner file.txt"),
+            "nested\n",
+        )
+        .unwrap();
+
+        copy_uncommitted_changes(&source, &destination).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.join("my file \"quoted\".txt")).unwrap(),
+            "spaces\n"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("日本語 ファイル.txt")).unwrap(),
+            "unicode\n"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("dir with space").join("inner file.txt")).unwrap(),
+            "nested\n"
+        );
+    }
+
+    #[test]
+    fn copy_rejects_same_source_and_destination() {
+        let repo = init_test_repo();
+        assert!(copy_uncommitted_changes(repo.path(), repo.path()).is_err());
+    }
+
+    #[test]
+    fn has_origin_remote_true_with_bare_remote_false_without() {
+        let repo = init_test_repo();
+        assert!(!has_origin_remote(repo.path()).unwrap());
+
+        let bare = tempfile::tempdir().unwrap();
+        run_git(bare.path(), &["init", "--bare", "-b", "main"]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        );
+        assert!(has_origin_remote(repo.path()).unwrap());
+    }
+
+    // ── rename_branch tests ──────────────────────────────────────
+
+    #[test]
+    fn rename_branch_succeeds() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "old-name");
+
+        rename_branch(&wt, "old-name", "new-name").unwrap();
+
+        let branch = current_branch(&wt).unwrap();
+        assert_eq!(branch, "new-name");
+    }
+
+    #[test]
+    fn rename_branch_fails_on_conflict() {
+        let repo = init_test_repo();
+        // Create two worktrees with different branches.
+        let wt1 = add_worktree(repo.path(), "branch-a");
+        let _wt2 = add_worktree(repo.path(), "branch-b");
+
+        // Trying to rename branch-a to branch-b should fail because
+        // branch-b already exists.
+        let result = rename_branch(&wt1, "branch-a", "branch-b");
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("rename failed"),
+            "error should mention rename failure"
+        );
+
+        // The original branch should be unchanged.
+        let branch = current_branch(&wt1).unwrap();
+        assert_eq!(branch, "branch-a");
+    }
+
+    #[test]
+    fn rename_branch_fails_on_invalid_name() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "valid-name");
+
+        // Git rejects branch names with spaces and other invalid characters.
+        let result = rename_branch(&wt, "valid-name", "has spaces");
+        assert!(result.is_err());
+
+        // Original branch should still be intact.
+        let branch = current_branch(&wt).unwrap();
+        assert_eq!(branch, "valid-name");
+    }
+
+    #[test]
+    fn rename_branch_fails_when_old_name_wrong() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "real-branch");
+
+        // Renaming a nonexistent branch should fail.
+        let result = rename_branch(&wt, "nonexistent", "new-name");
+        assert!(result.is_err());
+
+        // The real branch should be unaffected.
+        let branch = current_branch(&wt).unwrap();
+        assert_eq!(branch, "real-branch");
+    }
+
+    #[test]
+    fn rename_branch_noop_same_name() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "same-name");
+
+        // Renaming to the same name should succeed (git allows this).
+        rename_branch(&wt, "same-name", "same-name").unwrap();
+
+        let branch = current_branch(&wt).unwrap();
+        assert_eq!(branch, "same-name");
+    }
+
+    #[test]
+    fn wait_child_or_kill_times_out_and_kills_a_wedged_child() {
+        // A hung child must be killed once the deadline passes, and the error
+        // must say so: this is what keeps a wedged `git branch -m` from
+        // stranding the rename worker forever.
+        use std::time::{Duration, Instant};
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let start = Instant::now();
+        let err = wait_child_or_kill(&mut child, Duration::from_millis(100), "sleep").unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must return promptly after the timeout, not wait for the child"
+        );
+        assert!(
+            err.to_string().contains("timed out"),
+            "error should report the timeout, got: {err}"
+        );
+        // The child was killed and reaped: a follow-up try_wait sees it gone.
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "the timed-out child must have been reaped, not left a zombie"
+        );
+    }
+
+    #[test]
+    fn wait_child_or_kill_returns_status_for_a_fast_child() {
+        use std::time::Duration;
+        let mut child = Command::new("true").spawn().unwrap();
+        let status = wait_child_or_kill(&mut child, Duration::from_secs(5), "true").unwrap();
+        assert!(status.success());
+    }
+
+    // ── branch_exists tests ────────────────────────────────────
+
+    #[test]
+    fn branch_exists_returns_none_for_nonexistent() {
+        let repo = init_test_repo();
+        assert_eq!(branch_exists(repo.path(), "no-such-branch"), None);
+    }
+
+    #[test]
+    fn branch_exists_returns_local_for_existing_branch() {
+        let repo = init_test_repo();
+        let _wt = add_worktree(repo.path(), "feature-x");
+        // "feature-x" now exists as a local branch.
+        assert_eq!(
+            branch_exists(repo.path(), "feature-x"),
+            Some(BranchLocation::Local)
+        );
+    }
+
+    /// The create-agent branch preflight (the single-source decision both
+    /// surfaces consume): a name matching no existing branch is Fresh, and a
+    /// name matching a local branch is ExistingBranch (so the surface can ask
+    /// for consent before attaching to that branch's history).
+    #[test]
+    fn create_agent_branch_preflight_reports_fresh_for_a_new_name() {
+        let repo = init_test_repo();
+        assert_eq!(
+            create_agent_branch_preflight(repo.path(), "brand-new"),
+            CreateAgentBranchPlan::Fresh
+        );
+    }
+
+    #[test]
+    fn create_agent_branch_preflight_reports_existing_branch_with_location() {
+        let repo = init_test_repo();
+        let _wt = add_worktree(repo.path(), "feature-x");
+        assert_eq!(
+            create_agent_branch_preflight(repo.path(), "feature-x"),
+            CreateAgentBranchPlan::ExistingBranch {
+                location: BranchLocation::Local
+            }
+        );
+    }
+
+    // ── create_worktree_existing_branch tests ────────────────
+
+    #[test]
+    fn create_worktree_existing_branch_succeeds_for_local_branch() {
+        let repo = init_test_repo();
+        // Create a branch without a worktree that points to it.
+        run_git(repo.path(), &["branch", "reuse-me"]);
+        let worktrees_root = repo.path().join("wt-root");
+        let (name, path) =
+            create_worktree_existing_branch(repo.path(), &worktrees_root, "proj", "reuse-me")
+                .unwrap();
+        assert_eq!(name, "reuse-me");
+        assert!(path.exists());
+        assert_eq!(current_branch(&path).unwrap(), "reuse-me");
+    }
+
+    // ── refnames are positionals, not options ────────────────
+    //
+    // Every git subcommand below takes a refname in a positional slot. Without a
+    // `--` separator git reads a leading-dash argument as an option, so a
+    // refname that looks like one is silently obeyed as a flag instead of being
+    // rejected as the ref it is. Git's own `check-ref-format` blocks a
+    // dash-LEADING branch through `git branch`, but plumbing (`update-ref`)
+    // creates such a ref outright, and a non-leading component may begin with a
+    // dash (`foo/-bar`) through the porcelain, so these names do reach dux.
+    // Each test below pins the corrected reading: the argument is a REF.
+
+    /// Unlike the three below, this one passed before the `--` was added, and
+    /// the reason is worth writing down rather than leaving for someone to
+    /// rediscover. In isolation `git worktree add <path> --force` really does
+    /// obey the flag and check out HEAD. At THIS call shape it cannot, because
+    /// the worktree path is derived from the same string, so the branch git
+    /// then infers from the path's last component is itself `--force`, which
+    /// `check-ref-format` refuses. Every option-looking name was measured
+    /// against this shape and all of them fail one way or another. The `--` is
+    /// therefore defence in depth here, and this test pins the reading so a
+    /// later change that decouples the path from the branch cannot quietly
+    /// re-open the door.
+    #[test]
+    fn create_worktree_existing_branch_reads_an_option_looking_branch_as_a_ref() {
+        let repo = init_test_repo();
+        let worktrees_root = repo.path().join("wt-root");
+        let result =
+            create_worktree_existing_branch(repo.path(), &worktrees_root, "proj", "--force");
+        assert!(
+            result.is_err(),
+            "an option-looking branch must be refused, not obeyed as a flag: {result:?}"
+        );
+        assert!(
+            !worktrees_root.join("proj").join("--force").exists(),
+            "no worktree should have been created"
+        );
+    }
+
+    /// The `--` makes git read the name as a ref, but it does not make git
+    /// ATTACH it. Measured on git 2.55 against a `update-ref`-created
+    /// `refs/heads/--force`: `git worktree add <path> -- --force` prints
+    /// "Preparing worktree (detached HEAD ...)" and exits 0. The recreate path
+    /// decouples the worktree path from the branch name, so this shape is
+    /// reachable and the previous test's path-derived refusal does not cover it.
+    #[test]
+    fn add_worktree_existing_branch_at_attaches_an_option_looking_branch() {
+        let repo = init_test_repo();
+        let head = head_commit(repo.path()).unwrap();
+        // Plumbing, because `git branch` refuses a dash-leading name.
+        run_git(repo.path(), &["update-ref", "refs/heads/--force", &head]);
+        let worktree = repo.path().join("recreated");
+        add_worktree_existing_branch_at(repo.path(), &worktree, "--force").unwrap();
+        assert_eq!(
+            current_branch_opt(&worktree).unwrap().as_deref(),
+            Some("--force"),
+            "the worktree must be ON the branch, not on a detached HEAD"
+        );
+    }
+
+    /// The `-b` slot is positional too, so a dash-leading NEW branch name
+    /// reaches `worktree add`'s internal `git branch` as a flag. Measured on
+    /// git 2.55: exit 255, "unknown switch `x'", and nothing left on disk. Loud
+    /// rather than silent, so there is nothing to fix; pinned so a later git
+    /// that starts obeying the flag is a failing test rather than a surprise.
+    #[test]
+    fn add_worktree_new_branch_at_refuses_an_option_looking_new_branch() {
+        let repo = init_test_repo();
+        let worktree = repo.path().join("minted");
+        let result = add_worktree_new_branch_at(repo.path(), &worktree, "-x", Some("HEAD"));
+        assert!(result.is_err(), "expected a refused add: {result:?}");
+        assert!(!worktree.exists(), "no worktree should have been created");
+    }
+
+    #[test]
+    fn switch_branch_reads_an_option_looking_branch_as_a_ref() {
+        let repo = init_test_repo();
+        // Without `--`, `git switch --detach` detaches HEAD instead of failing.
+        let result = switch_branch(repo.path(), "--detach");
+        assert!(result.is_err(), "expected a refused switch: {result:?}");
+        assert_eq!(
+            current_branch(repo.path()).unwrap(),
+            "main",
+            "HEAD must not have been detached"
+        );
+    }
+
+    /// The web worktree manager offers "Delete worktree", and the user asked to
+    /// remove a WORKTREE and nothing else. `remove_worktree` additionally runs
+    /// `git branch -D`, which force-deletes the branch even when it holds
+    /// unmerged commits, so the manager needs a variant that stops at the
+    /// worktree. Pin both halves of that: the directory is gone and the branch
+    /// is still listed.
+    #[test]
+    fn remove_worktree_keep_branch_removes_the_directory_and_leaves_the_branch() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "keepme");
+        assert!(wt.exists());
+
+        remove_worktree_keep_branch(repo.path(), &wt, &[]).unwrap();
+
+        assert!(!wt.exists(), "the worktree directory must be gone");
+        let listed = std::process::Command::new("git")
+            .args(["-C", repo.path().to_string_lossy().as_ref(), "branch"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&listed.stdout).contains("keepme"),
+            "the branch must survive a worktree-only removal"
+        );
+    }
+
+    /// Fork f4f2257a: the guard refuses a target that is a registered project's
+    /// ancestor, one inside it (even one not on disk yet), and a symlink alias
+    /// of it, and lets an unrelated sibling through.
+    #[test]
+    fn whole_workspace_guard_rejects_project_ancestors_descendants_and_symlink_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let managed = temp.path().join("managed");
+        let project = managed.join("nested/project");
+        fs::create_dir_all(&project).unwrap();
+        let projects = vec![project.clone()];
+
+        assert!(guard_whole_workspace_removal(&managed, &projects).is_err());
+        assert!(guard_whole_workspace_removal(&project.join("corrupt-child"), &projects).is_err());
+
+        let alias = temp.path().join("project-alias");
+        symlink(&project, &alias).unwrap();
+        assert!(guard_whole_workspace_removal(&alias, &projects).is_err());
+        assert!(
+            guard_whole_workspace_removal(&temp.path().join("safe-sibling"), &projects).is_ok()
+        );
+    }
+
+    /// A relative target or one with `..` cannot be resolved safely, so the
+    /// guard refuses it instead of guessing.
+    #[test]
+    fn whole_workspace_guard_rejects_relative_and_parent_traversal_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(guard_whole_workspace_removal(Path::new("relative/wt"), &[]).is_err());
+        assert!(
+            guard_whole_workspace_removal(&temp.path().join("a/../b"), &[]).is_err(),
+            "a `..` component must be refused even with no projects registered"
+        );
+    }
+
+    /// Both removal entry points run the guard before git: the worktree and
+    /// its branch survive when the worktree contains, or is inside, a
+    /// registered project.
+    #[test]
+    fn remove_worktree_entry_point_applies_registered_project_guard() {
+        let repo = init_test_repo();
+        for project_is_descendant in [true, false] {
+            let branch = format!("protected-delete-{project_is_descendant}");
+            let worktree = add_worktree(repo.path(), &branch);
+            let project = if project_is_descendant {
+                let nested = worktree.join("nested-project");
+                fs::create_dir_all(&nested).unwrap();
+                nested
+            } else {
+                repo.path().to_path_buf()
+            };
+
+            let result = remove_worktree(
+                repo.path(),
+                &worktree,
+                &branch,
+                None,
+                std::slice::from_ref(&project),
+            );
+            assert!(result.is_err());
+            assert!(worktree.exists());
+            assert!(local_branch_exists(repo.path(), &branch));
+
+            let result = remove_worktree_keep_branch(repo.path(), &worktree, &[project]);
+            assert!(result.is_err());
+            assert!(worktree.exists());
+        }
+    }
+
+    /// The guard is for whole-worktree removals only: discarding an untracked
+    /// directory inside a registered checkout stays possible.
+    #[test]
+    fn untracked_directory_discard_inside_registered_project_remains_allowed() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let untracked = project.join("scratch/nested");
+        fs::create_dir_all(&untracked).unwrap();
+        fs::write(untracked.join("notes.txt"), "temporary").unwrap();
+
+        discard_file(&project, "scratch", true).unwrap();
+
+        assert!(!project.join("scratch").exists());
+        assert!(project.exists());
+    }
+
+    /// An unexpandable or relative project path fails the whole inventory, so
+    /// no caller can run the guard against a partial list.
+    #[test]
+    fn registered_project_paths_fails_closed_on_a_relative_project() {
+        assert!(registered_project_paths(["/abs/project", "relative/project"]).is_err());
+        assert_eq!(
+            registered_project_paths(["/abs/project"]).unwrap(),
+            vec![PathBuf::from("/abs/project")]
+        );
+    }
+
+    /// A worktree with uncommitted work is force-removed by git, so the manager
+    /// warns first. That warning is only as good as this predicate.
+    #[test]
+    fn worktree_is_dirty_distinguishes_a_clean_worktree_from_a_dirty_one() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "dirtycheck");
+        assert!(
+            !worktree_is_dirty(&wt).unwrap(),
+            "a freshly created worktree is clean"
+        );
+        // An UNTRACKED file counts: `git worktree remove --force` deletes it
+        // with the directory and it exists in no commit anywhere, so it is the
+        // most unrecoverable thing in there.
+        std::fs::write(wt.join("scratch.txt"), "work in progress").unwrap();
+        assert!(
+            worktree_is_dirty(&wt).unwrap(),
+            "an untracked file must read as dirty"
+        );
+    }
+
+    /// Deleting an agent whose branch dux created removes the LOCAL branch and
+    /// nothing else. A PR agent's branch tracks a branch on origin, and the
+    /// pull request itself lives there, so the remote-tracking ref (and the
+    /// remote it stands for) must come through untouched.
+    #[test]
+    fn remove_worktree_deletes_the_local_branch_and_leaves_the_remote_alone() {
+        let origin = init_test_repo();
+        let repo = init_test_repo();
+        run_git(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin.path().to_string_lossy().as_ref(),
+            ],
+        );
+        run_git(repo.path(), &["fetch", "origin"]);
+        let head = String::from_utf8_lossy(
+            &test_support::git_command()
+                .args([
+                    "-C",
+                    origin.path().to_string_lossy().as_ref(),
+                    "rev-parse",
+                    "HEAD",
+                ])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        run_git(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/pr-head", &head],
+        );
+        let wt = add_worktree(repo.path(), "pr-head");
+
+        remove_worktree(repo.path(), &wt, "pr-head", Some("pr-head"), &[]).unwrap();
+
+        assert!(
+            !local_branch_exists(repo.path(), "pr-head"),
+            "the local branch dux made is dux's to delete"
+        );
+        assert!(
+            ref_exists(repo.path(), "refs/remotes/origin/pr-head"),
+            "nothing dux does on delete may reach the remote's branch"
+        );
+    }
+
+    #[test]
+    fn remove_worktree_deletes_a_branch_whose_name_looks_like_an_option() {
+        let repo = init_test_repo();
+        // `git branch` refuses to create a dash-leading name, but plumbing does
+        // not, and such a ref is what dux would then be asked to clean up.
+        run_git(repo.path(), &["update-ref", "refs/heads/--delete", "HEAD"]);
+        let result = remove_worktree(
+            repo.path(),
+            &repo.path().join("gone"),
+            "--delete",
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            result.branch,
+            BranchDeletion::Deleted,
+            "the branch should have been deleted, not read as the --delete flag"
+        );
+        let listed = std::process::Command::new("git")
+            .args(["-C", repo.path().to_string_lossy().as_ref(), "branch"])
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&listed.stdout).contains("--delete"),
+            "the ref should be gone"
+        );
+    }
+
+    // ── unpushed_commit_count ────────────────────────────────
+
+    /// Commit an empty change on `branch` (creating it from HEAD the first
+    /// time), so a test can put a known number of commits on it.
+    fn commit_on_branch(repo: &Path, branch: &str, message: &str) {
+        run_git(repo, &["commit", "--allow-empty", "-m", message]);
+        // The commit landed on HEAD's branch; point `branch` at it. Done with
+        // plumbing so an option-looking branch name can be created at all,
+        // which `git branch` refuses.
+        run_git(
+            repo,
+            &["update-ref", &format!("refs/heads/{branch}"), "HEAD"],
+        );
+    }
+
+    #[test]
+    fn unpushed_commit_count_counts_everything_when_there_is_no_remote() {
+        let repo = init_test_repo();
+        commit_on_branch(repo.path(), "feature", "one");
+        // One `init` commit plus the one above, and no remote-tracking ref
+        // anywhere, so none of it has been pushed.
+        assert_eq!(
+            unpushed_commit_count(repo.path(), &["feature"])
+                .unwrap()
+                .count,
+            2
+        );
+    }
+
+    #[test]
+    fn unpushed_commit_count_is_zero_for_a_fully_pushed_branch() {
+        let repo = init_test_repo();
+        commit_on_branch(repo.path(), "feature", "one");
+        run_git(
+            repo.path(),
+            &[
+                "update-ref",
+                "refs/remotes/origin/feature",
+                "refs/heads/feature",
+            ],
+        );
+        assert_eq!(
+            unpushed_commit_count(repo.path(), &["feature"])
+                .unwrap()
+                .count,
+            0
+        );
+    }
+
+    #[test]
+    fn unpushed_commit_count_counts_only_what_no_remote_ref_reaches() {
+        let repo = init_test_repo();
+        commit_on_branch(repo.path(), "feature", "one");
+        run_git(
+            repo.path(),
+            &[
+                "update-ref",
+                "refs/remotes/origin/feature",
+                "refs/heads/feature",
+            ],
+        );
+        commit_on_branch(repo.path(), "feature", "two");
+        commit_on_branch(repo.path(), "feature", "three");
+        assert_eq!(
+            unpushed_commit_count(repo.path(), &["feature"])
+                .unwrap()
+                .count,
+            2
+        );
+    }
+
+    /// A remote-tracking ref of ANY remote counts as pushed, not just the one
+    /// the branch happens to track: `--not --remotes` spans `refs/remotes/`.
+    #[test]
+    fn unpushed_commit_count_accepts_a_ref_from_any_remote() {
+        let repo = init_test_repo();
+        commit_on_branch(repo.path(), "feature", "one");
+        run_git(
+            repo.path(),
+            &[
+                "update-ref",
+                "refs/remotes/fork/whatever",
+                "refs/heads/feature",
+            ],
+        );
+        assert_eq!(
+            unpushed_commit_count(repo.path(), &["feature"])
+                .unwrap()
+                .count,
+            0
+        );
+    }
+
+    /// Without the fully-qualified `refs/heads/` form, `git rev-list --count
+    /// --all` would be read as a flag and print the count for every ref in the
+    /// repository instead of failing. The count here must be the branch's own.
+    #[test]
+    fn unpushed_commit_count_reads_an_option_looking_branch_as_a_ref() {
+        let repo = init_test_repo();
+        // `git branch` refuses a dash-leading name but plumbing does not, and
+        // such a ref is exactly what dux would then be asked about.
+        commit_on_branch(repo.path(), "--all", "one");
+        assert_eq!(
+            unpushed_commit_count(repo.path(), &["--all"])
+                .unwrap()
+                .count,
+            2
+        );
+    }
+
+    /// A drifted agent's delete removes two branches, so the dialog's number
+    /// has to cover both: what is only on the birth branch AND what is only on
+    /// the branch the worktree moved onto, with the history they share counted
+    /// once.
+    #[test]
+    fn unpushed_commit_count_unions_several_branches() {
+        let repo = init_test_repo();
+        commit_on_branch(repo.path(), "born-here", "one");
+        run_git(
+            repo.path(),
+            &[
+                "update-ref",
+                "refs/remotes/origin/born-here",
+                "refs/heads/born-here",
+            ],
+        );
+        commit_on_branch(repo.path(), "born-here", "two");
+        commit_on_branch(repo.path(), "drifted", "three");
+        assert_eq!(
+            unpushed_commit_count(repo.path(), &["born-here"])
+                .unwrap()
+                .count,
+            1
+        );
+        assert_eq!(
+            unpushed_commit_count(repo.path(), &["drifted"])
+                .unwrap()
+                .count,
+            2,
+            "`drifted` sits on top of `born-here`, so it reaches both commits"
+        );
+        assert_eq!(
+            unpushed_commit_count(repo.path(), &["born-here", "drifted"])
+                .unwrap()
+                .count,
+            2,
+            "the union counts the commit both branches reach once"
+        );
+    }
+
+    /// The count alone cannot tell "12 commits you forgot to push" from "your
+    /// whole history, because there is nowhere to push it", so the answer says
+    /// which repository it came from and the surfaces word themselves on it.
+    #[test]
+    fn unpushed_commit_count_says_whether_there_are_remote_refs_at_all() {
+        let repo = init_test_repo();
+        commit_on_branch(repo.path(), "feature", "one");
+        assert!(
+            !unpushed_commit_count(repo.path(), &["feature"])
+                .unwrap()
+                .has_remote_refs,
+            "a repository with no remote-tracking refs excludes nothing"
+        );
+        run_git(
+            repo.path(),
+            &[
+                "update-ref",
+                "refs/remotes/origin/main",
+                "refs/heads/feature",
+            ],
+        );
+        assert!(
+            unpushed_commit_count(repo.path(), &["feature"])
+                .unwrap()
+                .has_remote_refs,
+            "one remote-tracking ref anywhere is enough for the count to mean \
+             what it says"
+        );
+    }
+
+    /// Nothing would be deleted, so nothing is at risk, and the caller gets a
+    /// number rather than git's complaint about an empty revision list.
+    #[test]
+    fn unpushed_commit_count_of_no_branches_is_zero() {
+        let repo = init_test_repo();
+        assert_eq!(unpushed_commit_count(repo.path(), &[]).unwrap().count, 0);
+    }
+
+    #[test]
+    fn unpushed_commit_count_fails_for_a_branch_that_does_not_exist() {
+        let repo = init_test_repo();
+        let result = unpushed_commit_count(repo.path(), &["nope"]);
+        assert!(result.is_err(), "expected an error: {result:?}");
+    }
+
+    /// Every local branch of the repo, one per line, for the drift tests below.
+    fn branch_list(repo_path: &Path) -> String {
+        let listed = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(["for-each-ref", "--format=%(refname:short)", "refs/heads/"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&listed.stdout).to_string()
+    }
+
+    /// The reported bug: create an agent, let its branch drift, delete it, and
+    /// the BIRTH branch survives, so recreating the agent under its old name
+    /// fails with "branch already exists". Both branches must go.
+    #[test]
+    fn remove_worktree_also_deletes_a_drifted_initial_branch() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "born-here");
+        // Drift exactly as a user does: switch the worktree onto a new branch.
+        // `born-here` stays behind, and the poller rewrites `branch_name`.
+        run_git(&wt, &["switch", "-c", "drifted"]);
+
+        let result = remove_worktree(repo.path(), &wt, "drifted", Some("born-here"), &[]).unwrap();
+
+        assert_eq!(result.branch, BranchDeletion::Deleted);
+        assert_eq!(
+            result.initial_branch,
+            Some(BranchDeletion::Deleted),
+            "the birth branch was deleted here, so the message can say so"
+        );
+        let branches = branch_list(repo.path());
+        assert!(
+            !branches.contains("drifted"),
+            "the current branch must be gone: {branches}"
+        );
+        assert!(
+            !branches.contains("born-here"),
+            "the birth branch must be gone too: {branches}"
+        );
+    }
+
+    /// An agent that never drifted has ONE branch, and the result must say so
+    /// rather than claiming a second deletion the message would then narrate.
+    #[test]
+    fn remove_worktree_reports_no_initial_branch_when_it_matches_the_current_one() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "steady");
+
+        let result = remove_worktree(repo.path(), &wt, "steady", Some("steady"), &[]).unwrap();
+
+        assert_eq!(result.branch, BranchDeletion::Deleted);
+        assert_eq!(result.initial_branch, None);
+        assert!(result.initial_branch_note("steady").is_none());
+    }
+
+    /// A birth branch someone already deleted by hand is not a failure, and the
+    /// message must not claim dux deleted it.
+    #[test]
+    fn remove_worktree_reports_an_initial_branch_that_was_already_gone() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "born-here");
+        run_git(&wt, &["switch", "-c", "drifted"]);
+        run_git(repo.path(), &["branch", "-D", "--", "born-here"]);
+
+        let result = remove_worktree(repo.path(), &wt, "drifted", Some("born-here"), &[]).unwrap();
+
+        assert_eq!(result.initial_branch, Some(BranchDeletion::AlreadyGone));
+        assert_eq!(
+            result.initial_branch_note("born-here").as_deref(),
+            Some("Its original branch \"born-here\" was already gone.")
+        );
+    }
+
+    /// The verified bug: `git branch -D` also fails when the branch is CHECKED
+    /// OUT in another worktree, and dux used to call every failure "already
+    /// gone". The branch is still there, so the message said the opposite of
+    /// the truth and the name collision it exists to warn about survived
+    /// silently.
+    #[test]
+    fn remove_worktree_reports_a_branch_git_refused_to_delete() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "drifted");
+        // A SECOND worktree holds `born-here`, which is exactly what makes git
+        // refuse: the branch is checked out somewhere else.
+        let holder = add_worktree(repo.path(), "born-here");
+        assert!(holder.exists());
+
+        let result = remove_worktree(repo.path(), &wt, "drifted", Some("born-here"), &[]).unwrap();
+
+        let Some(BranchDeletion::Refused { reason }) = result.initial_branch.clone() else {
+            panic!("expected a refusal, got {:?}", result.initial_branch);
+        };
+        assert!(
+            reason.contains("born-here"),
+            "git's own reason must be carried through: {reason}"
+        );
+        let branches = branch_list(repo.path());
+        assert!(
+            branches.contains("born-here"),
+            "the refused branch really is still there: {branches}"
+        );
+        let note = result
+            .initial_branch_note("born-here")
+            .expect("a refusal is worth a sentence");
+        assert!(
+            note.contains("still there") && note.contains("git branch -D \"born-here\""),
+            "the note must be honest and actionable: {note}"
+        );
+        assert!(
+            result.refused_a_branch(),
+            "a refusal on the BIRTH branch alone still leaves something on disk"
+        );
+    }
+
+    /// The one predicate every surface asks before choosing a warning over an
+    /// info, pinned on each branch slot so a rewrite cannot quietly drop one.
+    #[test]
+    fn refused_a_branch_answers_for_either_branch_slot() {
+        let refused = BranchDeletion::Refused {
+            reason: "error: cannot delete branch".to_string(),
+        };
+        assert!(!RemoveResult::default().refused_a_branch());
+        assert!(
+            !RemoveResult {
+                branch: BranchDeletion::AlreadyGone,
+                initial_branch: Some(BranchDeletion::Deleted),
+            }
+            .refused_a_branch(),
+            "nothing was left behind, so nothing is refused"
+        );
+        assert!(
+            RemoveResult {
+                branch: refused.clone(),
+                initial_branch: None,
+            }
+            .refused_a_branch()
+        );
+        assert!(
+            RemoveResult {
+                branch: BranchDeletion::Deleted,
+                initial_branch: Some(refused),
+            }
+            .refused_a_branch()
+        );
+    }
+
+    /// The same refusal on the branch the worktree itself was on, which is the
+    /// half the delete message narrates first.
+    #[test]
+    fn remove_worktree_reports_a_refused_current_branch() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "shared");
+        // Point the removed worktree's record at a branch a DIFFERENT worktree
+        // is holding, the shape a stale session record produces.
+        let holder = add_worktree(repo.path(), "held-elsewhere");
+        assert!(holder.exists());
+
+        let result = remove_worktree(repo.path(), &wt, "held-elsewhere", None, &[]).unwrap();
+
+        assert!(
+            matches!(result.branch, BranchDeletion::Refused { .. }),
+            "expected a refusal, got {:?}",
+            result.branch
+        );
+        assert!(
+            branch_list(repo.path()).contains("held-elsewhere"),
+            "the branch survives the refusal"
+        );
+    }
+
+    /// A branch nobody ever created is still "already gone", not a refusal: the
+    /// disambiguation is a plumbing question about the ref, not a reading of
+    /// git's prose.
+    #[test]
+    fn remove_worktree_reports_a_never_existing_branch_as_already_gone() {
+        let repo = init_test_repo();
+
+        let result = remove_worktree(
+            repo.path(),
+            &repo.path().join("gone"),
+            "no-such-branch",
+            None,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(result.branch, BranchDeletion::AlreadyGone);
+    }
+
+    #[test]
+    fn a_refusal_note_names_the_branch_the_reason_and_the_way_out() {
+        let note = branch_refusal_note(
+            "feat",
+            "error: cannot delete branch 'feat' used by worktree at '/tmp/w'",
+        );
+        assert_eq!(
+            note,
+            "Git refused to delete branch \"feat\": cannot delete branch 'feat' used by \
+             worktree at '/tmp/w'. Delete it yourself with git branch -D \"feat\", or give \
+             the next agent a different name."
+        );
+    }
+
+    #[test]
+    fn a_git_reason_is_tidied_without_being_rewritten() {
+        assert_eq!(clean_git_reason("error: boom"), "boom.");
+        assert_eq!(clean_git_reason("fatal: boom."), "boom.");
+        assert_eq!(clean_git_reason("  "), "git gave no reason.");
+    }
+
+    /// The refname tenet, applied to the SECOND deletion path: without `--` git
+    /// reads the birth branch's name as a flag and leaves the ref behind while
+    /// still exiting 0, so dux would report a clean delete of something it never
+    /// touched.
+    #[test]
+    fn remove_worktree_deletes_an_initial_branch_whose_name_looks_like_an_option() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "drifted");
+        // `git branch` refuses to create a dash-leading name; plumbing does not,
+        // and such a ref really can reach dux.
+        run_git(repo.path(), &["update-ref", "refs/heads/--delete", "HEAD"]);
+
+        let result = remove_worktree(repo.path(), &wt, "drifted", Some("--delete"), &[]).unwrap();
+
+        assert_eq!(
+            result.initial_branch,
+            Some(BranchDeletion::Deleted),
+            "the ref should have been deleted, not read as the --delete flag"
+        );
+        let branches = branch_list(repo.path());
+        assert!(
+            !branches.contains("--delete"),
+            "the ref should be gone: {branches}"
+        );
+    }
+
+    /// An empty birth branch (a session record that never recorded one) is not
+    /// a branch to delete, and must not turn into a `git branch -D ""`.
+    #[test]
+    fn remove_worktree_ignores_an_empty_initial_branch() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "steady");
+
+        let result = remove_worktree(repo.path(), &wt, "steady", Some(""), &[]).unwrap();
+
+        assert_eq!(result.initial_branch, None);
+    }
+
+    /// The defect this pins is the worst shape in the family: git obeys the
+    /// start point as a FLAG, builds the worktree off HEAD, and exits 0, so dux
+    /// reports a successful agent creation on a worktree branched from the
+    /// wrong commit. Unlike `create_worktree_existing_branch`, the call shape
+    /// offers no accidental protection, because the worktree path here comes
+    /// from `branch_name` and never from `start_point`.
+    ///
+    /// Note which names are covered. A `--` separator alone is NOT enough at
+    /// this call shape, which was MEASURED: `git worktree add` consumes the
+    /// separator itself and then forwards the start point to an internal
+    /// `git branch <name> <start-point>` with no separator of its own, so
+    /// `--force` and `--quiet` (names `git branch` accepts) still branch from
+    /// HEAD and still exit 0 even with `--` or `--end-of-options` in place.
+    /// Resolving the start point to an object id first is what actually closes
+    /// it, and that is what the function now does.
+    #[test]
+    fn create_worktree_from_start_point_reads_an_option_looking_start_point_as_a_ref() {
+        for name in ["--force", "--quiet", "--no-checkout", "--lock"] {
+            let repo = init_test_repo();
+            // `git branch` refuses a dash-leading name but plumbing does not,
+            // and a ref like this is what dux would then be handed as a
+            // project's leading branch.
+            run_git(
+                repo.path(),
+                &["update-ref", &format!("refs/heads/{name}"), "HEAD"],
+            );
+            // Move HEAD on past it so branching from HEAD is distinguishable
+            // from branching from the requested start point.
+            fs::write(repo.path().join("moved.txt"), "after\n").unwrap();
+            commit_all(repo.path(), "move main ahead");
+
+            let start_oid = run_git_capture(
+                repo.path(),
+                &["rev-parse", &format!("refs/heads/{name}")],
+                "resolve start point",
+            )
+            .unwrap();
+            let head_oid = head_commit(repo.path()).unwrap();
+            assert_ne!(start_oid, head_oid, "test setup must separate the two");
+
+            let worktrees_root = repo.path().join("wt-root");
+            let result = create_worktree_from_start_point(
+                repo.path(),
+                &worktrees_root,
+                "proj",
+                Some(name),
+                Some("agent-branch"),
+            );
+
+            match result {
+                Ok((_, path)) => {
+                    // Succeeding is only acceptable if it really did use the
+                    // requested start point. Branching from HEAD and reporting
+                    // success is the defect.
+                    let built = head_commit(&path).unwrap();
+                    assert_eq!(
+                        built, start_oid,
+                        "start point '{name}' was obeyed as a flag: the worktree \
+                         was branched from HEAD and dux reported success",
+                    );
+                }
+                Err(_) => {
+                    // Refusing outright is also correct: nothing was built.
+                    assert!(
+                        !worktrees_root.join("proj").join("agent-branch").exists(),
+                        "a refused start point '{name}' must leave no worktree",
+                    );
+                }
+            }
+        }
+    }
+
+    /// The ordinary path must keep working: a plain branch name as a start
+    /// point still produces a worktree at that branch's commit.
+    #[test]
+    fn create_worktree_from_start_point_still_honours_an_ordinary_branch_name() {
+        let repo = init_test_repo();
+        run_git(repo.path(), &["branch", "start-here"]);
+        fs::write(repo.path().join("moved.txt"), "after\n").unwrap();
+        commit_all(repo.path(), "move main ahead");
+        let want = run_git_capture(
+            repo.path(),
+            &["rev-parse", "refs/heads/start-here"],
+            "resolve start point",
+        )
+        .unwrap();
+
+        let worktrees_root = repo.path().join("wt-root");
+        let (_, path) = create_worktree_from_start_point(
+            repo.path(),
+            &worktrees_root,
+            "proj",
+            Some("start-here"),
+            Some("agent-branch"),
+        )
+        .unwrap();
+        assert_eq!(head_commit(&path).unwrap(), want);
+    }
+
+    /// A start point naming nothing must fail loudly rather than quietly
+    /// producing a worktree off HEAD.
+    #[test]
+    fn create_worktree_from_start_point_refuses_a_start_point_that_names_nothing() {
+        let repo = init_test_repo();
+        let worktrees_root = repo.path().join("wt-root");
+        let result = create_worktree_from_start_point(
+            repo.path(),
+            &worktrees_root,
+            "proj",
+            Some("no-such-branch"),
+            Some("agent-branch"),
+        );
+        assert!(result.is_err(), "expected a refusal, got: {result:?}");
+        assert!(
+            !worktrees_root.join("proj").join("agent-branch").exists(),
+            "no worktree should have been created"
+        );
+    }
+
+    /// `git branch -m <old> <new>` reads a dash-leading old name as an option.
+    /// MEASURED without the separator: `git branch -m --force renamed` renames
+    /// the CURRENT branch (forcibly) and leaves the requested one untouched, so
+    /// dux renames the wrong branch and reports success.
+    #[test]
+    fn rename_branch_reads_an_option_looking_old_name_as_a_ref() {
+        let repo = init_test_repo();
+        run_git(repo.path(), &["update-ref", "refs/heads/--force", "HEAD"]);
+        let before = current_branch(repo.path()).unwrap();
+
+        let _ = rename_branch(repo.path(), "--force", "renamed");
+
+        assert_eq!(
+            current_branch(repo.path()).unwrap(),
+            before,
+            "the CURRENT branch must not have been renamed",
+        );
+        let refs = run_git_capture(
+            repo.path(),
+            &["for-each-ref", "--format=%(refname)", "refs/heads"],
+            "list refs",
+        )
+        .unwrap();
+        assert!(
+            !refs.contains("refs/heads/--force"),
+            "the requested branch should have been renamed away, got: {refs}",
+        );
+    }
+
+    /// `git pull` is the one shape in this family where a `--` separator buys
+    /// NOTHING. MEASURED on git 2.55 with `GIT_TRACE=1`:
+    ///
+    /// ```text
+    /// $ git pull --ff-only origin -- --force
+    /// trace: run_command: git fetch --update-head-ok origin --force
+    /// ```
+    ///
+    /// The separator is consumed by `pull` and the refspec is forwarded to an
+    /// internal `fetch` carrying none of its own, exactly the mechanism this
+    /// file already documents for `git worktree add`. So a branch named
+    /// `--force` is fetched as a FLAG: nothing is fetched, nothing is merged,
+    /// git exits 0 and dux reports a successful refresh of a branch it never
+    /// touched. `--depth=1` is worse: it writes `.git/shallow` into the user's
+    /// source checkout and converts it to a shallow clone.
+    ///
+    /// Both names reach here from real state (`pull_branch` takes the project's
+    /// branch, `pull_current_branch` takes `current_branch_opt`), so this pins
+    /// the fully-qualified refspec that actually closes it.
+    #[test]
+    fn pull_reads_an_option_looking_branch_as_a_ref() {
+        for name in ["--force", "--depth=1"] {
+            let repo = init_test_repo();
+            let first = head_commit(repo.path()).unwrap();
+            // `git branch` refuses a dash-leading name but plumbing does not,
+            // and a ref like this is what dux is then handed to pull.
+            run_git(
+                repo.path(),
+                &["update-ref", &format!("refs/heads/{name}"), &first],
+            );
+            // A second empty commit: same tree, so switching HEAD onto the
+            // older commit below still leaves a clean worktree.
+            run_git(repo.path(), &["commit", "--allow-empty", "-m", "ahead"]);
+            let ahead = head_commit(repo.path()).unwrap();
+            assert_ne!(first, ahead, "test setup must separate the two commits");
+
+            let remote = repo.path().join("remote.git");
+            run_git(
+                repo.path(),
+                &["init", "--bare", remote.to_string_lossy().as_ref()],
+            );
+            run_git(
+                repo.path(),
+                &["remote", "add", "origin", remote.to_string_lossy().as_ref()],
+            );
+            run_git(
+                repo.path(),
+                &[
+                    "push",
+                    "origin",
+                    &format!("refs/heads/main:refs/heads/{name}"),
+                ],
+            );
+            // Park HEAD on the option-looking branch, one commit behind origin.
+            run_git(
+                repo.path(),
+                &["symbolic-ref", "HEAD", &format!("refs/heads/{name}")],
+            );
+            run_git(repo.path(), &["reset", "--mixed", "--quiet"]);
+            assert_eq!(head_commit(repo.path()).unwrap(), first);
+
+            let result = pull_origin_branch(repo.path(), name);
+
+            assert!(
+                !repo.path().join(".git").join("shallow").exists(),
+                "pulling branch '{name}' must not have shallowed the user's checkout",
+            );
+            assert_eq!(
+                head_commit(repo.path()).unwrap(),
+                ahead,
+                "branch '{name}' was obeyed as a flag: it was never fetched \
+                 and never merged ({result:?})",
+            );
+        }
+    }
+
+    #[test]
+    fn pull_still_fast_forwards_an_ordinary_branch_name() {
+        let repo = init_test_repo();
+        let first = head_commit(repo.path()).unwrap();
+        run_git(repo.path(), &["commit", "--allow-empty", "-m", "ahead"]);
+        let ahead = head_commit(repo.path()).unwrap();
+
+        let remote = repo.path().join("remote.git");
+        run_git(
+            repo.path(),
+            &["init", "--bare", remote.to_string_lossy().as_ref()],
+        );
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", remote.to_string_lossy().as_ref()],
+        );
+        run_git(
+            repo.path(),
+            &["push", "origin", "refs/heads/main:refs/heads/main"],
+        );
+        run_git(repo.path(), &["reset", "--hard", "--quiet", &first]);
+
+        pull_origin_branch(repo.path(), "main").unwrap();
+        assert_eq!(head_commit(repo.path()).unwrap(), ahead);
+    }
+
+    #[test]
+    fn push_reads_an_option_looking_branch_as_a_ref_and_pushes_nothing_else() {
+        let repo = init_test_repo();
+        let remote = repo.path().join("remote.git");
+        run_git(
+            repo.path(),
+            &["init", "--bare", remote.to_string_lossy().as_ref()],
+        );
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", remote.to_string_lossy().as_ref()],
+        );
+        run_git(repo.path(), &["branch", "unrelated"]);
+        // A branch named `--all` reaches `push` through current_branch_opt, and
+        // without `--` git reads it as the flag that pushes EVERY branch.
+        run_git(repo.path(), &["update-ref", "refs/heads/--all", "HEAD"]);
+        run_git(repo.path(), &["symbolic-ref", "HEAD", "refs/heads/--all"]);
+
+        let _ = push(repo.path());
+
+        let heads = std::process::Command::new("git")
+            .arg("-C")
+            .arg(remote)
+            .args(["for-each-ref", "--format=%(refname)", "refs/heads"])
+            .output()
+            .unwrap();
+        let heads = String::from_utf8_lossy(&heads.stdout);
+        assert!(
+            !heads.contains("unrelated"),
+            "push must not have fanned out to every branch: {heads}"
+        );
+    }
+
+    #[test]
+    fn create_worktree_existing_branch_fails_when_already_checked_out() {
+        let repo = init_test_repo();
+        let _wt = add_worktree(repo.path(), "occupied");
+        // "occupied" is checked out in _wt: git forbids a second worktree.
+        let worktrees_root = repo.path().join("wt-root");
+        let result =
+            create_worktree_existing_branch(repo.path(), &worktrees_root, "proj", "occupied");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn changed_files_expands_untracked_directories_into_files() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "changes-pane-folder");
+
+        let nested = wt.join("new-folder").join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            wt.join("new-folder").join("one.txt"),
+            "first line\nsecond line\n",
+        )
+        .unwrap();
+        fs::write(nested.join("two.txt"), "nested line\n").unwrap();
+
+        let (_staged, unstaged) = changed_files(&wt).unwrap();
+        let mut actual: Vec<_> = unstaged
+            .into_iter()
+            .map(|file| {
+                (
+                    file.path,
+                    file.status,
+                    file.additions,
+                    file.deletions,
+                    file.binary,
+                )
+            })
+            .collect();
+        actual.sort();
+
+        assert_eq!(
+            actual,
+            vec![
+                (
+                    "new-folder/nested/two.txt".to_string(),
+                    "?".to_string(),
+                    1,
+                    0,
+                    false,
+                ),
+                (
+                    "new-folder/one.txt".to_string(),
+                    "?".to_string(),
+                    2,
+                    0,
+                    false
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn staged_diff_text_returns_diff_for_staged_changes() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "staged-diff");
+        fs::write(wt.join("hello.txt"), "hello world\n").unwrap();
+        let run = |args: &[&str]| {
+            let out = test_support::git_command()
+                .args(args)
+                .current_dir(&wt)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["add", "hello.txt"]);
+        let diff = staged_diff_text(&wt).unwrap();
+        assert!(diff.contains("hello.txt"), "diff should mention the file");
+        assert!(
+            diff.contains("+hello world"),
+            "diff should contain the added line"
+        );
+    }
+
+    #[test]
+    fn staged_diff_text_empty_when_nothing_staged() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "no-staged");
+        let diff = staged_diff_text(&wt).unwrap();
+        assert!(
+            diff.is_empty(),
+            "diff should be empty when nothing is staged"
+        );
+    }
+
+    /// The in-process untracked counting has to answer exactly what the
+    /// per-file `git diff --no-index` subprocess answered, because that is what
+    /// the changes panel has been showing. git itself is the oracle here: the
+    /// fixture covers the shapes that pull the two apart if the rules drift
+    /// (a missing trailing newline, an empty file, a NUL, a BOM, an encoding
+    /// that is not UTF-8, and a NUL that arrives after the sniff window).
+    #[test]
+    fn untracked_line_counts_match_what_git_reports() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "untracked-parity");
+
+        let mut late_nul = vec![b'x'; BINARY_SNIFF_BYTES + 10];
+        late_nul.push(0);
+        let mut early_nul = vec![b'a', b'\n', 0, b'b'];
+        early_nul.extend_from_slice(b"\n");
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("trailing-newline.txt", b"one\ntwo\n".to_vec()),
+            ("no-trailing-newline.txt", b"one\ntwo".to_vec()),
+            ("single-line-no-newline.txt", b"only".to_vec()),
+            ("empty.txt", Vec::new()),
+            ("just-newlines.txt", b"\n\n\n".to_vec()),
+            ("early-nul.bin", early_nul),
+            ("late-nul.bin", late_nul),
+            ("bom.txt", b"\xef\xbb\xbfhello\nworld\n".to_vec()),
+            ("latin1.txt", b"caf\xe9\nna\xefve\n".to_vec()),
+            ("crlf.txt", b"one\r\ntwo\r\n".to_vec()),
+        ];
+        for (name, bytes) in &cases {
+            fs::write(wt.join(name), bytes).unwrap();
+        }
+
+        for (name, _) in &cases {
+            let oracle = untracked_file_diff_stat(&wt, name);
+            let ours = untracked_file_stat(&wt.join(name));
+            match oracle {
+                Some(expected) => assert_eq!(
+                    ours, expected,
+                    "{name}: in-process counting disagrees with git"
+                ),
+                // git reports no record at all for a file with nothing in it.
+                None => assert_eq!(
+                    ours,
+                    DiffStat::Text(0, 0),
+                    "{name}: git had nothing to say, so neither should dux"
+                ),
+            }
+        }
+    }
+
+    /// Past the ceiling the untracked rows are still listed in full; only their
+    /// line counts are dropped, which is what an empty file already renders as.
+    #[test]
+    fn untracked_files_past_the_ceiling_are_listed_without_line_counts() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "untracked-ceiling");
+        // One more file than the sweep will count lines for. Names are padded
+        // so the porcelain's path order is the obvious one.
+        let total = UNTRACKED_STATS_MAX_FILES + 1;
+        for index in 0..total {
+            fs::write(wt.join(format!("f{index:06}.txt")), "one line\n").unwrap();
+        }
+
+        let (_staged, unstaged) = changed_files(&wt).unwrap();
+
+        assert_eq!(unstaged.len(), total, "every change is listed");
+        let counted = unstaged.iter().filter(|f| f.additions > 0).count();
+        assert_eq!(
+            counted, UNTRACKED_STATS_MAX_FILES,
+            "the ceiling bounds the reads, not the rows"
+        );
+        let last = unstaged.last().expect("a last row");
+        assert_eq!(last.status, "?");
+        assert_eq!((last.additions, last.deletions, last.binary), (0, 0, false));
+    }
+
+    #[test]
+    fn changed_files_marks_untracked_binary_files() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "changes-pane-binary");
+
+        fs::write(wt.join("image.bin"), [0_u8, 159, 146, 150]).unwrap();
+
+        let (_staged, unstaged) = changed_files(&wt).unwrap();
+        assert_eq!(unstaged.len(), 1);
+        let file = &unstaged[0];
+        assert_eq!(file.path, "image.bin");
+        assert_eq!(file.status, "?");
+        assert_eq!(file.additions, 0);
+        assert_eq!(file.deletions, 0);
+        assert!(file.binary);
+    }
+
+    #[test]
+    fn parse_status_porcelain_z_handles_untracked_and_spaces() {
+        let raw = b"?? spaced name.txt\0";
+        let entries = parse_status_porcelain_z(raw);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].index_status, '?');
+        assert_eq!(entries[0].worktree_status, '?');
+        assert_eq!(entries[0].path, "spaced name.txt");
+    }
+
+    #[test]
+    fn parse_status_porcelain_z_uses_destination_path_for_renames() {
+        let raw = b"R  new name.txt\0old name.txt\0";
+        let entries = parse_status_porcelain_z(raw);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].index_status, 'R');
+        assert_eq!(entries[0].worktree_status, ' ');
+        assert_eq!(entries[0].path, "new name.txt");
+        assert_eq!(entries[0].renamed_from.as_deref(), Some("old name.txt"));
+    }
+
+    #[test]
+    fn parse_status_porcelain_z_reports_no_source_for_an_ordinary_change() {
+        let entries = parse_status_porcelain_z(b"M  file.txt\0");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].renamed_from, None);
+    }
+
+    #[test]
+    fn changed_files_reports_the_path_a_rename_came_from() {
+        let repo = init_test_repo();
+        fs::create_dir_all(repo.path().join("src")).unwrap();
+        fs::write(repo.path().join("src/old.txt"), "hello\n").unwrap();
+        commit_all(repo.path(), "seed");
+        fs::create_dir_all(repo.path().join("docs")).unwrap();
+        run_git(repo.path(), &["mv", "src/old.txt", "docs/new.txt"]);
+
+        let (staged, _unstaged) = changed_files(repo.path()).unwrap();
+        let moved = staged
+            .iter()
+            .find(|f| f.path == "docs/new.txt")
+            .expect("the rename destination is staged");
+        assert_eq!(moved.renamed_from.as_deref(), Some("src/old.txt"));
+    }
+
+    #[test]
+    fn parse_status_porcelain_z_skips_empty_records() {
+        let raw = b"\0M  file.txt\0\0";
+        let entries = parse_status_porcelain_z(raw);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "file.txt");
+    }
+
+    #[test]
+    fn parse_numstat_handles_regular_path_with_spaces() {
+        let stats = parse_numstat(b"1\t2\tsp ace.txt\0");
+        let stat = stats.get("sp ace.txt").expect("stat present");
+        match stat {
+            DiffStat::Text(additions, deletions) => {
+                assert_eq!((*additions, *deletions), (1, 2));
+            }
+            DiffStat::Binary => panic!("expected text stat"),
+        }
+    }
+
+    #[test]
+    fn parse_numstat_handles_rename_records() {
+        let stats = parse_numstat(b"0\t0\t\0old name.txt\0new name.txt\0");
+        let stat = stats.get("new name.txt").expect("stat present");
+        match stat {
+            DiffStat::Text(additions, deletions) => {
+                assert_eq!((*additions, *deletions), (0, 0));
+            }
+            DiffStat::Binary => panic!("expected text stat"),
+        }
+    }
+
+    #[test]
+    fn parse_numstat_handles_binary_records() {
+        let stats = parse_numstat(b"-\t-\tbinary.bin\0");
+        assert!(matches!(stats.get("binary.bin"), Some(DiffStat::Binary)));
+    }
+
+    /// A repository can mark a path `-diff` in a `.gitattributes`, and
+    /// `--numstat` then prints `-\t-` for it exactly as it does for a real
+    /// binary (`--text` does not override that; measured on git 2.55). The two
+    /// must not end up wearing the same label: the excluded file is text the
+    /// diff viewer opens perfectly well.
+    #[test]
+    fn changed_files_tells_a_diff_excluded_file_apart_from_a_binary() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "diff-excluded");
+
+        fs::write(wt.join(".gitattributes"), "notes.txt -diff\n").unwrap();
+        fs::write(wt.join("notes.txt"), "one\ntwo\n").unwrap();
+        fs::write(wt.join("image.bin"), [0_u8, 159, 146, 150]).unwrap();
+        let out = test_support::git_command()
+            .args(["-C", wt.to_string_lossy().as_ref(), "add", "-A"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let out = test_support::git_command()
+            .args(["-C", wt.to_string_lossy().as_ref(), "commit", "-m", "seed"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        fs::write(wt.join("notes.txt"), "one\ntwo\nthree\n").unwrap();
+        fs::write(wt.join("image.bin"), [0_u8, 1, 2, 3, 4]).unwrap();
+
+        let (_staged, unstaged) = changed_files(&wt).unwrap();
+        let notes = unstaged
+            .iter()
+            .find(|f| f.path == "notes.txt")
+            .expect("the excluded file is still a row");
+        assert!(
+            notes.diff_excluded,
+            "a path the repository marks -diff is excluded from diffs"
+        );
+        assert!(!notes.binary, "it is text, not a binary");
+        assert_eq!((notes.additions, notes.deletions), (0, 0));
+
+        let image = unstaged
+            .iter()
+            .find(|f| f.path == "image.bin")
+            .expect("the binary is still a row");
+        assert!(image.binary, "a real binary is still binary");
+        assert!(!image.diff_excluded);
+    }
+
+    /// The same split on the STAGED side, which reads its own numstat.
+    #[test]
+    fn staged_rows_tell_a_diff_excluded_file_apart_from_a_binary() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "diff-excluded-staged");
+        let git = worktree_git(&wt);
+
+        fs::write(wt.join(".gitattributes"), "notes.txt -diff\n").unwrap();
+        fs::write(wt.join("notes.txt"), "one\n").unwrap();
+        fs::write(wt.join("image.bin"), [0_u8, 159, 146, 150]).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "seed"]);
+
+        fs::write(wt.join("notes.txt"), "one\ntwo\n").unwrap();
+        fs::write(wt.join("image.bin"), [0_u8, 7, 7]).unwrap();
+        git(&["add", "-A"]);
+
+        let (staged, _unstaged) = changed_files(&wt).unwrap();
+        let notes = staged
+            .iter()
+            .find(|f| f.path == "notes.txt")
+            .expect("the excluded file is staged");
+        assert!(notes.diff_excluded);
+        assert!(!notes.binary);
+        let image = staged
+            .iter()
+            .find(|f| f.path == "image.bin")
+            .expect("the binary is staged");
+        assert!(image.binary);
+        assert!(!image.diff_excluded);
+    }
+
+    /// An unset `diff` attribute is not enough on its own. The `binary` macro
+    /// (`*.png binary`) expands to `-diff -merge -text`, so the ordinary way a
+    /// repository declares its binaries also answers `unset` (measured on git
+    /// 2.55), and calling those files "excluded" would promise a text diff for
+    /// a PNG. The content has the last word, on both sides.
+    #[test]
+    fn the_binary_attribute_macro_leaves_a_real_binary_binary() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "binary-macro");
+        let git = worktree_git(&wt);
+
+        fs::write(wt.join(".gitattributes"), "*.png binary\n").unwrap();
+        fs::write(wt.join("pic.png"), [b'P', b'N', b'G', 0, 1, b'a']).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "seed"]);
+        fs::write(wt.join("pic.png"), [b'P', b'N', b'G', 0, 1, b'b', b'c']).unwrap();
+
+        let (_staged, unstaged) = changed_files(&wt).unwrap();
+        let row = unstaged
+            .iter()
+            .find(|f| f.path == "pic.png")
+            .expect("the png is a row");
+        assert!(row.binary, "the binary macro does not make a PNG text");
+        assert!(!row.diff_excluded);
+
+        git(&["add", "-A"]);
+        let (staged, _unstaged) = changed_files(&wt).unwrap();
+        let row = staged
+            .iter()
+            .find(|f| f.path == "pic.png")
+            .expect("the png is staged");
+        assert!(row.binary, "the staged side reads the index blob");
+        assert!(!row.diff_excluded);
+    }
+
+    /// The other half of the same rule: a path the repository marks `-diff`
+    /// outright, whose content holds NUL bytes, is a binary git was told not to
+    /// diff. It keeps the binary verdict, because the diff viewer cannot show
+    /// it as text either.
+    #[test]
+    fn a_diff_excluded_path_holding_nul_bytes_stays_binary() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "excluded-but-binary");
+        let git = worktree_git(&wt);
+
+        fs::write(wt.join(".gitattributes"), "blob.dat -diff\n").unwrap();
+        fs::write(wt.join("blob.dat"), [b'a', 0, b'b']).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "seed"]);
+        fs::write(wt.join("blob.dat"), [b'a', 0, b'b', b'c']).unwrap();
+
+        let (_staged, unstaged) = changed_files(&wt).unwrap();
+        let row = unstaged
+            .iter()
+            .find(|f| f.path == "blob.dat")
+            .expect("the blob is a row");
+        assert!(row.binary);
+        assert!(!row.diff_excluded, "NUL bytes are NUL bytes");
+
+        git(&["add", "-A"]);
+        let (staged, _unstaged) = changed_files(&wt).unwrap();
+        let row = staged
+            .iter()
+            .find(|f| f.path == "blob.dat")
+            .expect("the blob is staged");
+        assert!(row.binary);
+        assert!(!row.diff_excluded);
+    }
+
+    /// The sniff reads the side it is asked about: the index blob for a staged
+    /// change, the working copy for an unstaged one. A file that is text in the
+    /// index and binary on disk is therefore excluded on one side and binary on
+    /// the other, in the same sweep.
+    #[test]
+    fn each_side_sniffs_its_own_content() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "per-side-sniff");
+        let git = worktree_git(&wt);
+
+        fs::write(wt.join(".gitattributes"), "notes.txt -diff\n").unwrap();
+        fs::write(wt.join("notes.txt"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "seed"]);
+
+        // Text in the index...
+        fs::write(wt.join("notes.txt"), "one\ntwo\n").unwrap();
+        git(&["add", "notes.txt"]);
+        // ...and NUL-bearing on disk.
+        fs::write(wt.join("notes.txt"), [b'o', 0, b'n', b'e']).unwrap();
+
+        let (staged, unstaged) = changed_files(&wt).unwrap();
+        let staged_row = staged
+            .iter()
+            .find(|f| f.path == "notes.txt")
+            .expect("staged row");
+        assert!(staged_row.diff_excluded, "the index blob is text");
+        assert!(!staged_row.binary);
+        let unstaged_row = unstaged
+            .iter()
+            .find(|f| f.path == "notes.txt")
+            .expect("unstaged row");
+        assert!(unstaged_row.binary, "the working copy holds a NUL");
+        assert!(!unstaged_row.diff_excluded);
+    }
+
+    /// A deleted row has no working copy left to sniff, and a file git diffed
+    /// always has a blob behind it, so the index answers for it rather than the
+    /// row falling back to "binary" for want of a file to open.
+    #[test]
+    fn a_deleted_excluded_file_is_sniffed_from_the_index() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "excluded-deleted");
+        let git = worktree_git(&wt);
+
+        fs::write(wt.join(".gitattributes"), "notes.txt -diff\n").unwrap();
+        fs::write(wt.join("notes.txt"), "one\ntwo\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "seed"]);
+        fs::remove_file(wt.join("notes.txt")).unwrap();
+
+        let (_staged, unstaged) = changed_files(&wt).unwrap();
+        let row = unstaged
+            .iter()
+            .find(|f| f.path == "notes.txt")
+            .expect("the deleted file is a row");
+        assert_eq!(row.status, "D");
+        assert!(row.diff_excluded, "rows: {unstaged:?}");
+        assert!(!row.binary);
+    }
+
+    /// The question is asked only about the rows that have no counts, and only
+    /// when there is at least one of them: an ordinary sweep spawns no
+    /// check-attr at all.
+    #[test]
+    fn nothing_is_asked_about_paths_that_came_back_with_counts() {
+        let stats = HashMap::from([
+            ("counted.txt".to_string(), DiffStat::Text(3, 1)),
+            ("countless.bin".to_string(), DiffStat::Binary),
+        ]);
+
+        assert_eq!(
+            countless_paths(&[&stats]),
+            vec!["countless.bin".to_string()]
+        );
+        assert!(
+            countless_paths(&[&HashMap::from([(
+                "counted.txt".to_string(),
+                DiffStat::Text(3, 1),
+            )])])
+            .is_empty()
+        );
+    }
+
+    /// The staged and unstaged maps can name the same countless path, and the
+    /// batch asks about it once.
+    #[test]
+    fn countless_paths_are_deduplicated_across_the_two_numstat_maps() {
+        let unstaged = HashMap::from([("both.txt".to_string(), DiffStat::Binary)]);
+        let staged = HashMap::from([
+            ("both.txt".to_string(), DiffStat::Binary),
+            ("other.txt".to_string(), DiffStat::Binary),
+        ]);
+
+        assert_eq!(
+            countless_paths(&[&unstaged, &staged]),
+            vec!["both.txt".to_string(), "other.txt".to_string()]
+        );
+    }
+
+    /// check-attr answers three NUL-delimited fields per path, and a path can
+    /// hold a space, a quote and non-ASCII. Only `unset` means excluded:
+    /// `unspecified`, `set` and a named diff driver all leave a countless row
+    /// saying binary.
+    #[test]
+    fn parse_check_attr_z_collects_only_the_unset_paths() {
+        let raw: &[u8] = b"a b\"c\xc3\xa9.txt\0diff\0unset\0plain.bin\0diff\0unspecified\0set.txt\0diff\0set\0driver.txt\0diff\0odf\0";
+
+        let excluded = parse_check_attr_z(raw);
+
+        assert_eq!(
+            excluded,
+            HashSet::from(["a b\"c\u{e9}.txt".to_string()]),
+            "only an unset diff attribute excludes a path"
+        );
+    }
+
+    /// A truncated answer (a killed check-attr) is read as far as it goes and
+    /// never panics or misaligns the fields it did get.
+    #[test]
+    fn parse_check_attr_z_ignores_a_truncated_trailing_record() {
+        let raw: &[u8] = b"done.txt\0diff\0unset\0half.txt\0diff\0";
+
+        assert_eq!(
+            parse_check_attr_z(raw),
+            HashSet::from(["done.txt".to_string()])
+        );
+    }
+
+    /// End to end over a real repository, for the path shape the parser test
+    /// asserts on: a space, a quote and a non-ASCII character in one name.
+    #[test]
+    fn a_diff_excluded_path_with_awkward_bytes_is_classified() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "diff-excluded-awkward");
+        let name = "a b\"c\u{e9}.txt";
+        let git = worktree_git(&wt);
+
+        // The pattern is C-quoted, which is how a .gitattributes carries a name
+        // with a space or a quote in it.
+        fs::write(
+            wt.join(".gitattributes"),
+            "\"a b\\\"c\\303\\251.txt\" -diff\n",
+        )
+        .unwrap();
+        fs::write(wt.join(name), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "seed"]);
+        fs::write(wt.join(name), "one\ntwo\n").unwrap();
+
+        let (_staged, unstaged) = changed_files(&wt).unwrap();
+        let row = unstaged
+            .iter()
+            .find(|f| f.path == name)
+            .expect("the awkward path is a row");
+        assert!(row.diff_excluded, "rows: {unstaged:?}");
+        assert!(!row.binary);
+    }
+
+    #[test]
+    fn parse_status_porcelain_z_skips_non_utf8_paths() {
+        // 0xFF is invalid as a UTF-8 start byte. Lossy conversion would
+        // produce a U+FFFD-substituted string that no longer matches the
+        // real on-disk file when used as a stage/discard identifier.
+        let raw: &[u8] = b"M  good.txt\0?? \xFFbad.txt\0M  also-good.txt\0";
+        let entries = parse_status_porcelain_z(raw);
+
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["good.txt", "also-good.txt"]);
+    }
+
+    #[test]
+    fn parse_status_porcelain_z_keeps_iterator_aligned_after_invalid_rename() {
+        // A rename whose destination path is not UTF-8 must still consume
+        // its trailing source-path record so the next status entry parses
+        // at the correct position.
+        let raw: &[u8] = b"R  \xFFnew.txt\0old.txt\0M  next.txt\0";
+        let entries = parse_status_porcelain_z(raw);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "next.txt");
+        assert_eq!(entries[0].index_status, 'M');
+    }
+
+    #[test]
+    fn parse_numstat_skips_non_utf8_paths() {
+        // Path bytes after the second tab include 0xFF which is invalid UTF-8.
+        // Without strict parsing, the lookup key would be a corrupted string
+        // that would never match downstream `file.path` comparisons.
+        let stats = parse_numstat(b"1\t2\t\xFFbad.txt\0");
+        assert!(stats.is_empty());
+    }
+
+    /// An empty map is exactly what `unstaged_numstat` returns when the tracked
+    /// `git diff --numstat` could not be run or exited non-zero. The untracked
+    /// counts are read in this process, so they must survive that failure.
+    ///
+    /// The failure is reproduced by handing the pure applier the map the failure
+    /// produces rather than by breaking git: every deterministic way to make
+    /// `git diff` fail in a worktree also fails the `git status` call that runs
+    /// before it, which returns early and never reaches this code at all.
+    #[test]
+    fn untracked_line_counts_survive_a_failed_tracked_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("new.txt"), "one\ntwo\nthree\n").unwrap();
+
+        let mut unstaged = vec![
+            ChangedFile {
+                status: "?".to_string(),
+                path: "new.txt".to_string(),
+                additions: 0,
+                deletions: 0,
+                binary: false,
+                diff_excluded: false,
+                renamed_from: None,
+            },
+            ChangedFile {
+                status: "M".to_string(),
+                path: "tracked.txt".to_string(),
+                additions: 0,
+                deletions: 0,
+                binary: false,
+                diff_excluded: false,
+                renamed_from: None,
+            },
+        ];
+
+        apply_unstaged_stats(dir.path(), &mut unstaged, &HashMap::new(), &HashSet::new());
+
+        assert_eq!(
+            (unstaged[0].additions, unstaged[0].deletions),
+            (3, 0),
+            "the untracked file is counted in process and owes git nothing"
+        );
+        assert_eq!(
+            (unstaged[1].additions, unstaged[1].deletions),
+            (0, 0),
+            "the tracked row is the only thing a tracked-diff failure costs"
+        );
+    }
+
+    /// The other half of the same split: a tracked diff that DID answer fills
+    /// its own rows and leaves the untracked arm to the in-process read.
+    #[test]
+    fn a_tracked_diff_that_answers_fills_only_its_own_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("new.txt"), "one\ntwo\n").unwrap();
+
+        let mut unstaged = vec![
+            ChangedFile {
+                status: "?".to_string(),
+                path: "new.txt".to_string(),
+                additions: 0,
+                deletions: 0,
+                binary: false,
+                diff_excluded: false,
+                renamed_from: None,
+            },
+            ChangedFile {
+                status: "M".to_string(),
+                path: "tracked.txt".to_string(),
+                additions: 0,
+                deletions: 0,
+                binary: false,
+                diff_excluded: false,
+                renamed_from: None,
+            },
+        ];
+        let tracked = HashMap::from([("tracked.txt".to_string(), DiffStat::Text(7, 4))]);
+
+        apply_unstaged_stats(dir.path(), &mut unstaged, &tracked, &HashSet::new());
+
+        assert_eq!((unstaged[0].additions, unstaged[0].deletions), (2, 0));
+        assert_eq!((unstaged[1].additions, unstaged[1].deletions), (7, 4));
+    }
+
+    #[test]
+    fn changed_files_uses_destination_path_for_staged_rename() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "rename-status");
+
+        fs::write(wt.join("old name.txt"), "hello\n").unwrap();
+        run_git(&wt, &["add", "old name.txt"]);
+        run_git(&wt, &["commit", "-m", "add file"]);
+        run_git(&wt, &["mv", "old name.txt", "new name.txt"]);
+
+        let (staged, unstaged) = changed_files(&wt).unwrap();
+
+        assert!(unstaged.is_empty());
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].path, "new name.txt");
+        assert_eq!(staged[0].status, "R");
+    }
+
+    #[test]
+    fn valid_agent_names() {
+        assert!(is_valid_agent_name("foo"));
+        assert!(is_valid_agent_name("foo-bar"));
+        assert!(is_valid_agent_name("foo_bar"));
+        assert!(is_valid_agent_name("foo/bar"));
+        assert!(is_valid_agent_name("ABC123"));
+        assert!(is_valid_agent_name("feature/my-branch_v2"));
+    }
+
+    #[test]
+    fn invalid_agent_names() {
+        assert!(!is_valid_agent_name(""));
+        assert!(!is_valid_agent_name("foo bar"));
+        assert!(!is_valid_agent_name("foo@bar"));
+        assert!(!is_valid_agent_name("-foo"));
+        assert!(!is_valid_agent_name("foo/"));
+        assert!(!is_valid_agent_name("/foo"));
+        assert!(!is_valid_agent_name("foo//bar"));
+        assert!(!is_valid_agent_name("foo.bar"));
+        assert!(!is_valid_agent_name("foo..bar"));
+        assert!(!is_valid_agent_name("hello world!"));
+    }
+
+    #[test]
+    fn create_worktree_uses_custom_name() {
+        let repo = init_test_repo();
+        let worktrees_root = repo.path().join("agents");
+        let (branch, path) = create_worktree_from_start_point(
+            repo.path(),
+            &worktrees_root,
+            "proj",
+            None,
+            Some("my-agent"),
+        )
+        .unwrap();
+        assert_eq!(branch, "my-agent");
+        assert!(path.ends_with("proj/my-agent"));
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn create_worktree_generates_name_when_none() {
+        let repo = init_test_repo();
+        let worktrees_root = repo.path().join("agents");
+        let (branch, path) =
+            create_worktree_from_start_point(repo.path(), &worktrees_root, "proj", None, None)
+                .unwrap();
+        // Auto-generated names contain a dash (docker-style petname).
+        assert!(branch.contains('-'), "expected dash in '{branch}'");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn create_worktree_from_start_point_uses_custom_name() {
+        let repo = init_test_repo();
+        let source = add_worktree(repo.path(), "src-branch");
+        fs::write(source.join("marker.txt"), "data\n").unwrap();
+        commit_all(&source, "add marker");
+        let source_head = head_commit(&source).unwrap();
+
+        let worktrees_root = repo.path().join("forks");
+        let (branch, forked) = create_worktree_from_start_point(
+            repo.path(),
+            &worktrees_root,
+            "proj",
+            Some(&source_head),
+            Some("my-fork"),
+        )
+        .unwrap();
+
+        assert_eq!(branch, "my-fork");
+        assert!(forked.ends_with("proj/my-fork"));
+        assert_eq!(head_commit(&forked).unwrap(), source_head);
+    }
+
+    #[test]
+    fn create_worktree_from_start_point_uses_named_base_branch() {
+        let repo = init_test_repo();
+        let feature = add_worktree(repo.path(), "feature");
+        fs::write(feature.join("feature.txt"), "feature\n").unwrap();
+        commit_all(&feature, "add feature marker");
+
+        let main_head = head_commit(repo.path()).unwrap();
+        let worktrees_root = repo.path().join("agents");
+        let (_branch, agent) = create_worktree_from_start_point(
+            repo.path(),
+            &worktrees_root,
+            "proj",
+            Some("main"),
+            Some("agent-from-main"),
+        )
+        .unwrap();
+
+        assert_eq!(head_commit(&agent).unwrap(), main_head);
+        assert!(!agent.join("feature.txt").exists());
+    }
+
+    // ── agent_name_char_map tests ───────────────────────────────
+
+    #[test]
+    fn agent_map_allows_valid_chars() {
+        assert_eq!(agent_name_char_map("a", 1, 'b'), Some('b'));
+        assert_eq!(agent_name_char_map("a", 1, '0'), Some('0'));
+        assert_eq!(agent_name_char_map("a", 1, '-'), Some('-'));
+        assert_eq!(agent_name_char_map("a", 1, '_'), Some('_'));
+        assert_eq!(agent_name_char_map("a", 1, '/'), Some('/'));
+    }
+
+    #[test]
+    fn agent_map_rejects_invalid_chars() {
+        assert_eq!(agent_name_char_map("a", 1, '@'), None);
+        assert_eq!(agent_name_char_map("a", 1, '.'), None);
+        assert_eq!(agent_name_char_map("a", 1, '!'), None);
+        assert_eq!(agent_name_char_map("a", 1, '#'), None);
+    }
+
+    #[test]
+    fn agent_map_converts_space_to_dash() {
+        assert_eq!(agent_name_char_map("a", 1, ' '), Some('-'));
+    }
+
+    #[test]
+    fn agent_map_rejects_space_at_position_zero() {
+        // Space maps to dash, but dash is rejected at position 0.
+        assert_eq!(agent_name_char_map("", 0, ' '), None);
+    }
+
+    #[test]
+    fn agent_map_first_char_must_be_alphanumeric() {
+        // Rejected at position 0
+        assert_eq!(agent_name_char_map("", 0, '-'), None);
+        assert_eq!(agent_name_char_map("", 0, '_'), None);
+        assert_eq!(agent_name_char_map("", 0, '/'), None);
+        // Accepted at position 0
+        assert_eq!(agent_name_char_map("", 0, 'a'), Some('a'));
+        assert_eq!(agent_name_char_map("", 0, '1'), Some('1'));
+        // Also rejected when inserting at position 0 in non-empty text
+        assert_eq!(agent_name_char_map("abc", 0, '-'), None);
+    }
+
+    #[test]
+    fn agent_map_prevents_double_slash() {
+        // Inserting '/' right after an existing '/'
+        assert_eq!(agent_name_char_map("a/", 2, '/'), None);
+        // Inserting '/' right before an existing '/'
+        assert_eq!(agent_name_char_map("a/b", 1, '/'), None);
+        // Inserting '/' where no adjacent slash exists
+        assert_eq!(agent_name_char_map("ab", 1, '/'), Some('/'));
+    }
+
+    #[test]
+    fn parse_github_ssh_url() {
+        assert_eq!(
+            parse_github_owner_repo("git@github.com:octocat/Hello-World.git"),
+            Some("octocat/Hello-World".to_string()),
+        );
+    }
+
+    #[test]
+    fn parse_github_ssh_url_no_git_suffix() {
+        assert_eq!(
+            parse_github_owner_repo("git@github.com:octocat/Hello-World"),
+            Some("octocat/Hello-World".to_string()),
+        );
+    }
+
+    #[test]
+    fn parse_github_https_url() {
+        assert_eq!(
+            parse_github_owner_repo("https://github.com/octocat/Hello-World.git"),
+            Some("octocat/Hello-World".to_string()),
+        );
+    }
+
+    #[test]
+    fn parse_github_https_url_no_git_suffix() {
+        assert_eq!(
+            parse_github_owner_repo("https://github.com/octocat/Hello-World"),
+            Some("octocat/Hello-World".to_string()),
+        );
+    }
+
+    #[test]
+    fn parse_github_url_non_github() {
+        assert_eq!(
+            parse_github_owner_repo("git@gitlab.com:owner/repo.git"),
+            None,
+        );
+    }
+
+    /// This test used to assert the opposite: that `/tree/main` was stripped and
+    /// the remote answered `octocat/Hello-World`. It was changed deliberately.
+    /// The input to this parser comes only from `git remote get-url`, never from
+    /// a browser address bar, and to git the whole path is the repository path,
+    /// so `/octocat/Hello-World/tree/main` addresses a repository that is not
+    /// `octocat/Hello-World`. A remote is not a browser URL, and a wrong
+    /// repository name (handed to `gh` as `--repo`) is worse than no repository
+    /// name.
+    #[test]
+    fn parse_github_url_rejects_extra_path_segments_on_every_family() {
+        for url in [
+            "https://github.com/octocat/Hello-World/tree/main",
+            "http://github.com/octocat/Hello-World/tree/main",
+            "github.com:octocat/Hello-World/tree/main",
+            "ssh://github.com/octocat/Hello-World/tree/main",
+            "git@github.com:octocat/Hello-World/tree/main",
+        ] {
+            assert_eq!(parse_github_owner_repo(url), None, "{url}");
+        }
+    }
+
+    /// The `url` crate follows the WHATWG URL spec, which DELETES every
+    /// embedded tab, newline and carriage return before parsing. Git does no
+    /// such thing, so `ssh://git<LF>hub.com/o/r` is a host git would never call
+    /// GitHub, and normalising it into `github.com` would MANUFACTURE a match
+    /// and query GitHub about a repository from a remote that is not GitHub.
+    #[test]
+    fn parse_github_remote_rejects_embedded_control_characters() {
+        for url in [
+            "ssh://git\nhub.com/octocat/Hello-World",
+            "ssh://git\thub.com/octocat/Hello-World",
+            "ssh://git\rhub.com/octocat/Hello-World",
+            "https://git\nhub.com/octocat/Hello-World",
+            "git@git\nhub.com:octocat/Hello-World",
+            "git\nhub.com:octocat/Hello-World",
+            "ssh://github.com/octocat/Hello\u{7f}World",
+        ] {
+            assert_eq!(parse_github_remote(url), None, "{url:?}");
+        }
+    }
+
+    /// The parser consumes its input EXACTLY. It used to trim leading and
+    /// trailing whitespace first, which MANUFACTURED a match: a remote really
+    /// can hold edge whitespace, and `" ssh://github.com/o/r "` is not a GitHub
+    /// remote, it is a remote whose host git would look up with a space in it.
+    #[test]
+    fn parse_github_remote_consumes_its_input_exactly() {
+        for url in [
+            " ssh://github.com/octocat/Hello-World",
+            "ssh://github.com/octocat/Hello-World ",
+            " ssh://github.com/octocat/Hello-World ",
+            "\tssh://github.com/octocat/Hello-World",
+            "ssh://github.com/octocat/Hello-World\t",
+            " git@github.com:octocat/Hello-World.git",
+            "github.com:octocat/Hello-World ",
+            "",
+            " ",
+        ] {
+            assert_eq!(parse_github_remote(url), None, "{url:?}");
+        }
+    }
+
+    /// The one place trimming is legitimate is the process boundary, and only
+    /// for what git actually appends: a single output record terminator, which
+    /// on this project's platforms (macOS and Linux, Unix throughout) is
+    /// exactly one `\n` and nothing else. Anything else in git's output is part
+    /// of the remote and must reach the parser intact.
+    #[test]
+    fn github_remote_from_git_output_removes_only_the_record_terminator() {
+        let expected = Some(GitHubRemote {
+            host: "github.com".to_string(),
+            owner_repo: "octocat/Hello-World".to_string(),
+        });
+        for stdout in [
+            "ssh://github.com/octocat/Hello-World.git\n",
+            // git's output is read the same way when the terminator is absent.
+            "ssh://github.com/octocat/Hello-World.git",
+        ] {
+            assert_eq!(
+                github_remote_from_git_output(stdout.as_bytes()),
+                expected,
+                "{stdout:?}",
+            );
+        }
+        for stdout in [
+            // A space before the terminator is part of the remote.
+            "ssh://github.com/octocat/Hello-World.git \n",
+            "ssh://github.com/octocat/Hello-World.git\t\n",
+            " ssh://github.com/octocat/Hello-World.git\n",
+            // Only ONE terminator comes off; the rest is a control character.
+            "ssh://github.com/octocat/Hello-World.git\n\n",
+            "ssh://github.com/octocat/Hello-World.git\r\r\n",
+            // A carriage return before the terminator is DATA, not part of the
+            // terminator. This used to be pinned the other way round, as a
+            // remote resolving to `octocat/Hello-World`, and it passed for an
+            // ambiguous reason: it read the `\r\n` as a CRLF line ending, which
+            // git does not write on macOS or Linux and which this project has
+            // no platform to receive. What really produces this output is a
+            // remote whose own path ends in a carriage return (an
+            // `url.*.insteadOf` replacement ending in one is enough), where git
+            // appended only the `\n`. Stripping the `\r` too would delete a
+            // byte of the remote and answer for an address nobody wrote, so
+            // exactly one `\n` comes off and the surviving control character is
+            // refused like any other.
+            "ssh://github.com/octocat/Hello-World.git\r\n",
+        ] {
+            assert_eq!(
+                github_remote_from_git_output(stdout.as_bytes()),
+                None,
+                "{stdout:?}"
+            );
+        }
+        // Bytes that are not UTF-8 are not lossily substituted into a name: a
+        // replacement character is neither a control nor whitespace, so it used
+        // to survive into a `--repo` argument.
+        assert_eq!(
+            github_remote_from_git_output(b"ssh://github.com/octocat/Hello\xffWorld\n"),
+            None,
+        );
+    }
+
+    /// The `url` crate treats a backslash as a path separator under http(s), so
+    /// the crate and the hand-written raw-path scan disagreed about where the
+    /// path starts: for `https://github.com\ignored/o/r` the crate reported the
+    /// host `github.com` while the raw scan skipped `\ignored` and answered
+    /// `o/r`. Two parsers disagreeing about component boundaries is the whole
+    /// hazard, and neither a GitHub owner nor a repository name can hold a
+    /// backslash, so one is refused outright wherever it appears.
+    #[test]
+    fn parse_github_remote_rejects_a_raw_backslash() {
+        for url in [
+            r"https://github.com\ignored/octocat/Hello-World",
+            r"http://github.com\ignored/octocat/Hello-World",
+            r"ssh://github.com\ignored/octocat/Hello-World",
+            r"ssh://github.com/octocat\Hello-World",
+            r"git@github.com:octocat\Hello-World.git",
+            r"github.com:octocat\Hello-World",
+            r"C:\repo",
+        ] {
+            assert_eq!(parse_github_remote(url), None, "{url}");
+        }
+    }
+
+    /// A decoded slash is refused wherever it appears, and the boundaries are
+    /// the place that took two goes to get right: the ONE syntactic leading
+    /// slash used to be removed by trimming EVERY slash, which erased a decoded
+    /// one sitting next to it, so `/%2Fo/r` answered `o/r`. The syntactic
+    /// slashes now come off BEFORE decoding, exactly one at each end, and each
+    /// remaining raw segment is decoded on its own, so a decoded slash cannot
+    /// be trimmed away and cannot pass as a separator either.
+    #[test]
+    fn parse_github_remote_refuses_decoded_separators_at_the_path_boundaries() {
+        for url in [
+            // A decoded leading separator is not the syntactic one.
+            "ssh://github.com/%2Foctocat/Hello-World",
+            "https://github.com/%2Foctocat/Hello-World",
+            // A decoded trailing separator is not the trailing raw slash the
+            // parser tolerates.
+            "ssh://github.com/octocat/Hello-World%2F",
+            "https://github.com/octocat/Hello-World.git%2F",
+            // And one in the middle, which used to be read as a separator.
+            "ssh://github.com/octocat/Hello-World%2Fextra",
+            // An empty component is an empty component however it arrives.
+            "ssh://github.com/octocat/Hello-World//",
+        ] {
+            assert_eq!(parse_github_remote(url), None, "{url}");
+        }
+        // One trailing RAW slash is still tolerated, and still comes off before
+        // the `.git` suffix is matched.
+        for url in [
+            "ssh://github.com/octocat/Hello-World.git/",
+            "https://github.com/octocat/Hello-World.git/",
+            "github.com:octocat/Hello-World.git/",
+        ] {
+            assert_eq!(
+                parse_github_remote(url),
+                Some(GitHubRemote {
+                    host: "github.com".to_string(),
+                    owner_repo: "octocat/Hello-World".to_string(),
+                }),
+                "{url}",
+            );
+        }
+    }
+
+    /// An ssh or git port is the ssh service's port, not the API's, so dropping
+    /// it is right. An http(s) port is part of the server endpoint, and `gh`
+    /// cannot express one at all: it refuses a colon in a hostname and builds
+    /// fixed API URLs. Keeping the host and discarding the port would send the
+    /// query to a DIFFERENT server than the remote names, so it is refused. A
+    /// port written out that is the scheme's own default names no other server
+    /// and is accepted.
+    #[test]
+    fn parse_github_remote_rejects_a_non_default_http_port() {
+        let github = Some(GitHubRemote {
+            host: "github.com".to_string(),
+            owner_repo: "octocat/Hello-World".to_string(),
+        });
+        for url in [
+            "https://github.com:443/octocat/Hello-World.git",
+            "http://github.com:80/octocat/Hello-World.git",
+            // ssh and git transports keep dropping their port.
+            "ssh://git@github.com:2222/octocat/Hello-World.git",
+            "git://github.com:9418/octocat/Hello-World.git",
+            "git+ssh://github.com:2222/octocat/Hello-World.git",
+        ] {
+            assert_eq!(parse_github_remote(url), github, "{url}");
+        }
+        for url in [
+            "https://github.com:8443/octocat/Hello-World.git",
+            "http://github.com:8080/octocat/Hello-World.git",
+            "https://github.com:80/octocat/Hello-World.git",
+            "http://github.com:443/octocat/Hello-World.git",
+        ] {
+            assert_eq!(parse_github_remote(url), None, "{url}");
+        }
+    }
+
+    /// `Url::path()` drops `?query` and `#fragment`, and canonicalises `.` and
+    /// `..` segments. For a git remote none of that is true: those characters
+    /// and segments are ordinary parts of the repository path, so the answer
+    /// would silently name a DIFFERENT repository. dux reads the raw path out of
+    /// the input instead of the parser's normalised one.
+    #[test]
+    fn parse_github_remote_does_not_let_the_url_parser_retarget_the_repository() {
+        for url in [
+            // `?`/`#` are part of the path to git, so these are not `o/r`.
+            "ssh://github.com/octocat/Hello-World?x",
+            "ssh://github.com/octocat/Hello-World#x",
+            "https://github.com/octocat/Hello-World?x",
+            // Dot segments are ordinary path components to git; the parser
+            // would collapse these onto a repository the remote never named.
+            "ssh://github.com/octocat/../Hello-World/x",
+            "ssh://github.com/octocat/Hello-World/../../a/b",
+            "ssh://github.com/./octocat/Hello-World/x",
+            "ssh://github.com/octocat/%2E%2E/Hello-World/x",
+            "https://github.com/octocat/../Hello-World/x",
+        ] {
+            assert_eq!(parse_github_remote(url), None, "{url}");
+        }
+    }
+
+    /// A `.` or `..` component is not a repository, in any family, however it is
+    /// spelled.
+    #[test]
+    fn parse_github_remote_rejects_dot_path_components() {
+        for url in [
+            "ssh://github.com/octocat/..",
+            "ssh://github.com/../Hello-World",
+            "ssh://github.com/octocat/%2E%2E",
+            "ssh://github.com/octocat/.",
+            "github.com:octocat/..",
+            "github.com:../Hello-World",
+            "ssh://github.com/octocat/...git",
+        ] {
+            assert_eq!(parse_github_remote(url), None, "{url}");
+        }
+    }
+
+    /// Percent-decoding happens after parsing, so a decoded control character
+    /// lands inside the owner or repository name and is handed straight to `gh`
+    /// as a `--repo` argument. Emptiness was the only thing checked.
+    #[test]
+    fn parse_github_remote_rejects_decoded_control_characters_and_whitespace() {
+        for url in [
+            "ssh://github.com/octocat/Hello%00World",
+            "ssh://github.com/octocat/Hello%0AWorld",
+            "ssh://github.com/octo%09cat/Hello-World",
+            "https://github.com/octocat/Hello%0DWorld",
+            // C1 controls, which arrive as two percent-encoded UTF-8 bytes.
+            "ssh://github.com/octocat/Hello%C2%85World",
+            // Whitespace is not a GitHub name character either, and a space in
+            // a command argument is its own hazard.
+            "ssh://github.com/octocat/Hello%20World",
+        ] {
+            assert_eq!(parse_github_remote(url), None, "{url}");
+        }
+    }
+
+    /// `git+ssh://` and `ssh+git://` are valid git URL schemes that invoke SSH
+    /// exactly as `ssh://` does, so they parse the same way.
+    #[test]
+    fn parse_github_remote_accepts_the_ssh_scheme_aliases() {
+        for url in [
+            "git+ssh://github.com/octocat/Hello-World.git",
+            "ssh+git://git@github.com/octocat/Hello-World.git",
+        ] {
+            assert_eq!(
+                parse_github_remote(url),
+                Some(GitHubRemote {
+                    host: "github.com".to_string(),
+                    owner_repo: "octocat/Hello-World".to_string(),
+                }),
+                "{url}",
+            );
+        }
+        // The ssh aliases are the whole of the addition: ftp/ftps stay refused.
+        assert_eq!(
+            parse_github_remote("ftps://github.com/octocat/Hello-World"),
+            None,
+        );
+    }
+
+    /// A percent-encoded authority moves the boundary git splits the address
+    /// on for the ssh-style transports, and the parsed answer cannot show it.
+    ///
+    /// Measured with a stub `GIT_SSH_COMMAND` that prints the arguments git
+    /// hands ssh. For `ssh://user%2F@github.com/octocat/Hello-World.git` git
+    /// runs `ssh user git-upload-pack '/@github.com/octocat/Hello-World.git'`:
+    /// it decodes first and splits afterwards, so the host is `user` and the
+    /// repository path is the rest. `ssh://git%2Fhub.com/o/r` becomes host
+    /// `git`, path `/hub.com/o/r` the same way. The native protocol behaves
+    /// identically: `GIT_TRACE=1 git ls-remote git://us%2Fer@host.invalid/o/r`
+    /// reports `unable to look up us (port 9418)`. The `url` crate reports
+    /// `github.com` for all of them, and the decoded-slash check only ever sees
+    /// the path, so dux answered with a repository on a host the remote does
+    /// not address.
+    ///
+    /// This covers the ssh-style transports ONLY. See the companion test for
+    /// http(s), where the same shape is harmless and is accepted.
+    #[test]
+    fn parse_github_remote_refuses_a_percent_encoded_authority_on_ssh_style_transports() {
+        for url in [
+            // The encoded slash sits in the user part.
+            "ssh://user%2F@github.com/octocat/Hello-World.git",
+            "ssh://user%2F@github.com/o/r.git",
+            "git+ssh://user%2F@github.com/o/r",
+            "ssh+git://user%2F@github.com/o/r",
+            "git://user%2F@github.com/o/r",
+            "git://user%2F@github.com/o/r.git",
+            // And in the host itself.
+            "ssh://git%2Fhub.com/o/r",
+            "ssh://git@git%2Fhub.com/o/r",
+            // An encoding that decodes to nothing structural is refused too:
+            // dux cannot reproduce git's decode-then-split order from the
+            // crate's already-split output, so it declines to guess at all.
+            "ssh://git%40github.com/o/r",
+        ] {
+            assert_eq!(parse_github_remote(url), None, "{url}");
+        }
+        // The ordinary spelling is untouched.
+        assert_eq!(
+            parse_github_remote("ssh://git@github.com/o/r.git"),
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: "o/r".to_string(),
+            }),
+        );
+    }
+
+    /// Under http and https a percent in the authority is harmless, so it is
+    /// accepted. This is the asymmetry, and it is measured rather than assumed.
+    ///
+    /// Git hands an http(s) remote to curl, which separates the authority from
+    /// the path FIRST and decodes each piece afterwards, the opposite order
+    /// from the ssh-style transports. So the escape never moves the boundary:
+    ///
+    /// ```text
+    /// git ls-remote 'https://user%2Fx@nonexistent-host.invalid/o/r'
+    ///   -> unable to access 'https://nonexistent-host.invalid/o/r/'
+    /// git ls-remote 'https://u:p%40ss@nonexistent-host.invalid/o/r'
+    ///   -> unable to access 'https://nonexistent-host.invalid/o/r/'
+    /// ```
+    ///
+    /// Both reach the host the address names, with the path the address names,
+    /// which is exactly what the `url` crate reports. Refusing these was the
+    /// cost of the ssh rule being applied to every scheme, and it refused an
+    /// ordinary web remote carrying credentials with an escaped character in
+    /// the password, which is a real thing users have.
+    #[test]
+    fn parse_github_remote_accepts_a_percent_encoded_authority_on_web_transports() {
+        let github = || {
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: "o/r".to_string(),
+            })
+        };
+        for url in [
+            // The regressed case: an escape inside the password.
+            "https://user:p%40ss@github.com/o/r.git",
+            "http://u:p%40ss@github.com/o/r",
+            // An escaped slash in the user part does NOT move the boundary
+            // here, per the measurement above, so it is not a hole.
+            "https://user%2Fx@github.com/o/r.git",
+            "http://user%2F@github.com/o/r.git",
+        ] {
+            assert_eq!(parse_github_remote(url), github(), "{url}");
+        }
+        // An escape in the HOST is still handled identically by both, so
+        // nothing has to be refused on dux's side to keep them agreeing. curl
+        // decodes the host and rejects a decoded `/` outright ("URL rejected:
+        // Bad hostname" for `https://git%2Fhub.com/o/r`), which is what the
+        // `url` crate does too, so this stays refused for its own reason.
+        assert_eq!(parse_github_remote("https://git%2Fhub.com/o/r"), None);
+        // And a decoded escape that IS a legal host character resolves the
+        // same way in both: `git ls-remote https://nonexistent-host%2Einvalid/o/r`
+        // reports `Could not resolve host: nonexistent-host.invalid`.
+        assert_eq!(parse_github_remote("https://github%2Ecom/o/r"), github());
+    }
+
+    /// Git's native protocol has no user component, so a `user@` in a `git://`
+    /// authority is part of the HOST.
+    ///
+    /// Measured: `GIT_TRACE=1 git ls-remote git://user@github.com/octocat/Hello-World.git`
+    /// reports `unable to look up user@github.com (port 9418)`. The `url`
+    /// crate reads the same string by the generic URL grammar, reports the host
+    /// `github.com` and throws `user@` away as userinfo, so dux answered with a
+    /// GitHub repository for a remote that never names github.com.
+    ///
+    /// This is scheme-specific on purpose. Git's ssh URL syntax DOES have a
+    /// user component (`ssh://user@host/path` is the documented spelling), and
+    /// `git+ssh`/`ssh+git` are the same transport, so a user is legitimate
+    /// there. Under http(s) userinfo is legitimate credentials, already dropped
+    /// as such. Only the native protocol lacks the component.
+    #[test]
+    fn parse_github_remote_refuses_a_user_in_a_native_git_url() {
+        assert_eq!(
+            parse_github_remote("git://user@github.com/octocat/Hello-World.git"),
+            None,
+        );
+        let github = |owner_repo: &str| {
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: owner_repo.to_string(),
+            })
+        };
+        // The native protocol without a user, and every scheme whose syntax
+        // really does carry one, keep working.
+        for url in [
+            "git://github.com/o/r.git",
+            "ssh://user@github.com/o/r.git",
+            "git+ssh://user@github.com/o/r.git",
+            "ssh+git://user@github.com/o/r.git",
+            "https://user:token@github.com/o/r.git",
+        ] {
+            assert_eq!(parse_github_remote(url), github("o/r"), "{url}");
+        }
+    }
+
+    /// Git matches a URL scheme CASE SENSITIVELY. It compares the literal text
+    /// before the `://` against its own lowercase table, and anything else is
+    /// taken as the name of a remote helper, so an uppercase spelling does not
+    /// select the transport it looks like.
+    ///
+    /// MEASURED, git 2.55.0, with a stub `GIT_SSH_COMMAND` that prints its argv
+    /// and a `.invalid` host so nothing leaves the machine:
+    ///
+    /// ```text
+    /// $ git ls-remote ssh://git@nonexistent-host.invalid/o/r
+    /// SSH-INVOKED argv: git@nonexistent-host.invalid git-upload-pack '/o/r'
+    /// $ git ls-remote SSH://git@nonexistent-host.invalid/o/r
+    /// git: 'remote-SSH' is not a git command. See 'git --help'.
+    /// fatal: remote helper 'SSH' aborted session
+    /// ```
+    ///
+    /// `Ssh://`, `HTTPS://`, `GIT://` and `Git+SSH://` all fail the same way,
+    /// each naming its own missing `git-remote-<as-written>` helper. So dux used
+    /// to answer host `github.com`, repository `o/r` for an address git cannot
+    /// connect with at all.
+    ///
+    /// The HOST stays case insensitive, because git really does ignore host
+    /// case: `ssh://NONEXISTENT-HOST.INVALID/o/r` reaches ssh as
+    /// `NONEXISTENT-HOST.INVALID git-upload-pack '/o/r'`, and
+    /// `git@NonExistent-Host.Invalid:o/r.git` reaches it too. Only the scheme is
+    /// case sensitive; making both insensitive was the regression this pins.
+    #[test]
+    fn parse_github_remote_refuses_a_scheme_spelled_in_the_wrong_case() {
+        for url in [
+            "SSH://git@github.com/o/r",
+            "Ssh://git@github.com/o/r",
+            "HTTPS://github.com/o/r",
+            "Https://github.com/o/r",
+            "GIT://github.com/o/r",
+            "Git+SSH://github.com/o/r",
+            "SSH+GIT://github.com/o/r",
+            "HTTP://github.com/o/r",
+        ] {
+            assert_eq!(parse_github_remote(url), None, "{url}");
+        }
+        // The host really is case insensitive, in every family, and stays so.
+        let github = |owner_repo: &str| {
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: owner_repo.to_string(),
+            })
+        };
+        for url in [
+            "ssh://GITHUB.COM/o/r",
+            "ssh://git@GitHub.com/o/r",
+            "git@GitHub.com:o/r.git",
+            "https://GitHub.COM/o/r.git",
+        ] {
+            assert_eq!(parse_github_remote(url), github("o/r"), "{url}");
+        }
+        // `GitHub.com/o/r` used to be the fifth row of that accept list, as the
+        // bare family's host-case coverage. Host case is not what is wrong with
+        // it: git reads a value with no scheme and no colon as a relative LOCAL
+        // PATH, so accepting it in any case meant asking GitHub about a
+        // directory. See `parse_github_remote_refuses_a_bare_host_and_path` for
+        // the measurement.
+        assert_eq!(parse_github_remote("GitHub.com/o/r"), None);
+    }
+
+    /// `<transport>::<address>` is git's EXPLICIT remote-helper syntax, which
+    /// takes precedence over everything else. It is not the scp-like shorthand,
+    /// and there is no host and no `owner/repo` in it for dux to report.
+    ///
+    /// MEASURED, git 2.55.0, same stub ssh and `.invalid` host:
+    ///
+    /// ```text
+    /// $ git ls-remote nonexistent-host.invalid::o/r
+    /// git: 'remote-nonexistent-host.invalid' is not a git command.
+    /// fatal: remote helper 'nonexistent-host.invalid' aborted session
+    /// $ git ls-remote nonexistent-host.invalid::
+    /// git: 'remote-nonexistent-host.invalid' is not a git command.
+    /// fatal: remote helper 'nonexistent-host.invalid' aborted session
+    /// $ git ls-remote nonexistent-host.invalid:o/r
+    /// SSH-INVOKED argv: nonexistent-host.invalid git-upload-pack 'o/r'
+    /// ```
+    ///
+    /// dux used to answer host `github.com`, repository `:o/r` for the first of
+    /// those: a host git never contacts, and an owner with a stray colon on it.
+    ///
+    /// The `user@` spelling is refused too, but for a measurably DIFFERENT
+    /// reason, and the difference is worth stating so nobody rediscovers it as a
+    /// contradiction. Git requires a helper name to be made of URL-scheme
+    /// characters, and `@` is not one, so `git@nonexistent-host.invalid::o/r` is
+    /// NOT a helper invocation: it reaches ssh as
+    /// `git@nonexistent-host.invalid git-upload-pack ':o/r'`. That path is still
+    /// not `o/r`, and `:o` is not an owner any host can have, so answering
+    /// `o/r`, or `:o/r`, for it would be wrong either way.
+    #[test]
+    fn parse_github_remote_refuses_gits_explicit_remote_helper_syntax() {
+        for url in [
+            "github.com::o/r",
+            "git@github.com::o/r",
+            "github.com::",
+            "github.com::o/r.git",
+        ] {
+            assert_eq!(parse_github_remote(url), None, "{url}");
+        }
+        // The ordinary scp-like forms are untouched, including the verbatim
+        // encoded one: git hands an scp-like path to ssh without decoding it.
+        let github = |owner_repo: &str| {
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: owner_repo.to_string(),
+            })
+        };
+        assert_eq!(parse_github_remote("github.com:o/r"), github("o/r"));
+        assert_eq!(parse_github_remote("git@github.com:o/r.git"), github("o/r"));
+        assert_eq!(parse_github_remote("github.com:o%2Fr/x"), github("o%2Fr/x"),);
+    }
+
+    /// The remote-helper rule tests the byte after the FIRST colon, and not a
+    /// blunt "contains `::`", because a scheme-qualified IPv6 literal contains
+    /// `::` and is not a helper invocation. Such an address never reaches the
+    /// scp-like branch at all (the `//` after the scheme ends it first), and
+    /// this pins that it still does not.
+    ///
+    /// MEASURED: `git ls-remote ssh://[::1]/o/r` reaches ssh as
+    /// `::1 git-upload-pack '/o/r'`, an ordinary ssh remote. dux refuses it
+    /// because `::1` is not a GitHub host, which is the only reason it should.
+    #[test]
+    fn parse_github_remote_leaves_a_scheme_qualified_ipv6_address_to_the_host_check() {
+        assert_eq!(split_scp_like("ssh://[::1]/o/r"), None);
+        assert_eq!(split_scp_like("ssh://[::1]:2222/o/r"), None);
+        assert_eq!(parse_github_remote("ssh://[::1]/o/r"), None);
+        assert_eq!(parse_github_remote("ssh://[::1]:2222/o/r"), None);
+    }
+
+    /// The full behaviour table, pinned as one test so no future rewrite of the
+    /// parser can quietly move any single row of it.
+    #[test]
+    fn parse_github_remote_behaviour_table() {
+        let github = |owner_repo: &str| {
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: owner_repo.to_string(),
+            })
+        };
+        let cases: [(&str, Option<GitHubRemote>); 46] = [
+            // Whitespace INSIDE the address. The literal check refuses only
+            // whitespace at the edges, because a git remote really can hold it
+            // there and refusing it is the point; an interior space is a
+            // different thing, and it is part of the host or of the path. What
+            // git would contact for the first of these is a host whose name
+            // begins with a space, so none of them names a repository on
+            // github.com, and the policy must not launder the space away.
+            ("git@ github.com:o/r.git", None),
+            ("ssh://git@ github.com/o/r", None),
+            ("github.com :o/r", None),
+            ("git@github.com: o/r", None),
+            // GitHub's documented port-443 SSH endpoint is github.com reached
+            // another way, so it parses, and it comes back NORMALISED because
+            // the host is handed to `gh` as an API host.
+            ("ssh://git@ssh.github.com:443/o/r.git", github("o/r")),
+            ("ssh://git@ssh.github.com/o/r.git", github("o/r")),
+            ("git@ssh.github.com:o/r.git", github("o/r")),
+            // It is documented for ssh and nothing else, it has no enterprise
+            // equivalent, and the match is the exact hostname.
+            ("https://ssh.github.com/o/r", None),
+            ("ssh://git@ssh.github.example.com/o/r", None),
+            ("ssh://git@sshgithub.com/o/r", None),
+            ("ssh://git@evil-ssh.github.com.attacker.example/o/r", None),
+            // The colon precedes the first slash, so git reads this as the
+            // scp-like form and contacts the host `user`.
+            ("user:token@github.com/o/r", None),
+            // Git matches a scheme case sensitively and reads
+            // `<transport>::<address>` as an explicit remote helper, so neither
+            // of these names a GitHub repository git could reach.
+            ("SSH://git@GitHub.com/o/r", None),
+            ("HTTPS://github.com/o/r", None),
+            ("github.com::o/r", None),
+            ("git@github.com::o/r", None),
+            // The authority decides where git cuts for the ssh-style
+            // transports, so both of these name something other than a
+            // repository on github.com.
+            ("ssh://user%2F@github.com/o/r.git", None),
+            ("git://user%2F@github.com/o/r", None),
+            ("git://user@github.com/o/r.git", None),
+            // The web transports split before they decode, so the same escape
+            // moves nothing and these are ordinary GitHub remotes. Measured:
+            // both reach `https://nonexistent-host.invalid/o/r/` when the
+            // authority is spelled against a host that does not resolve.
+            ("https://user:p%40ss@github.com/o/r.git", github("o/r")),
+            ("https://user%2Fx@github.com/o/r.git", github("o/r")),
+            // No scheme and no colon before the first slash is not an address:
+            // git reads it as a relative local path, so none of these name a
+            // repository on github.com. This row used to read
+            // `("github.com/o/r", github("o/r"))`.
+            ("github.com/o/r", None),
+            ("github.com/o/r/x", None),
+            ("GitHub.com/o/r", None),
+            (r"C:\repo", None),
+            ("ssh://github.com/o/r/extra", None),
+            ("github.com:o/r/extra", None),
+            ("git@github.com:o/r/extra", None),
+            ("ssh://github.com/o/r.git/", github("o/r")),
+            ("ssh://github.com/o/r%2Egit", github("o/r")),
+            ("user@github.com/o/r", None),
+            ("user:tok@github.com/o/r", None),
+            ("github.com:o/r", github("o/r")),
+            ("git@GitHub.com:o/r.git", github("o/r")),
+            ("ssh://GITHUB.COM/o/r", github("o/r")),
+            ("ssh://github.com:99999/o/r", None),
+            ("ssh://github.com:abc/o/r", None),
+            ("git@github.com:o/r.git", github("o/r")),
+            ("https://github.com/o/r.git", github("o/r")),
+            ("ssh://git@github.com/o/r.git", github("o/r")),
+            ("git@gitlab.com:o/r.git", None),
+            ("ssh://git@gitlab.com/o/r.git", None),
+            ("https://gitlab.com/o/r.git", None),
+            ("/some/path/repo.git", None),
+            ("file:///some/path/repo.git", None),
+            // A remote is not a browser URL: the whole path is the repository
+            // path, so this is not `o/r`.
+            ("https://github.com/o/r/tree/main", None),
+        ];
+        for (url, expected) in cases {
+            assert_eq!(parse_github_remote(url), expected, "{url}");
+        }
+    }
+
+    #[test]
+    fn parse_github_enterprise_https_url_preserves_host() {
+        assert_eq!(
+            parse_github_remote("https://github.example.com/octocat/Hello-World.git"),
+            Some(GitHubRemote {
+                host: "github.example.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_github_enterprise_ssh_url_preserves_host() {
+        assert_eq!(
+            parse_github_remote("git@github.example.com:octocat/Hello-World.git"),
+            Some(GitHubRemote {
+                host: "github.example.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_github_ssh_scheme_url_with_user_and_git_suffix() {
+        assert_eq!(
+            parse_github_remote("ssh://git@github.com/octocat/Hello-World.git"),
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_github_ssh_scheme_url_without_git_suffix() {
+        assert_eq!(
+            parse_github_remote("ssh://git@github.com/octocat/Hello-World"),
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_github_ssh_scheme_url_without_user() {
+        assert_eq!(
+            parse_github_remote("ssh://github.com/octocat/Hello-World.git"),
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_github_ssh_scheme_url_drops_the_ssh_port() {
+        // The port belongs to the ssh service, not to the host's API, and the
+        // parsed host is handed to `gh`, so it must come back bare.
+        assert_eq!(
+            parse_github_remote("ssh://git@github.com:2222/octocat/Hello-World.git"),
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_github_ssh_scheme_enterprise_host_is_preserved() {
+        assert_eq!(
+            parse_github_remote("ssh://git@github.example.com/octocat/Hello-World.git"),
+            Some(GitHubRemote {
+                host: "github.example.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+    }
+
+    /// GitHub documents a second SSH endpoint, `ssh.github.com` on port 443,
+    /// for people on networks that block port 22. A remote pointed at it is an
+    /// ordinary GitHub remote and must produce a pull-request banner like any
+    /// other, so both spellings of it parse.
+    ///
+    /// The host comes back as `github.com` rather than as written. MEASURED,
+    /// git 2.55.0, isolated `HOME`, `GIT_CONFIG_NOSYSTEM=1` and a stub
+    /// `GIT_SSH_COMMAND` printing its argv, so nothing left the machine:
+    ///
+    /// ```text
+    /// ssh://git@ssh.github.com:443/o/r.git
+    ///   -> -o SendEnv=GIT_PROTOCOL -p 443 git@ssh.github.com git-upload-pack '/o/r.git'
+    /// ssh://git@ssh.github.com/o/r.git
+    ///   -> git@ssh.github.com git-upload-pack '/o/r.git'
+    /// git@ssh.github.com:o/r.git
+    ///   -> git@ssh.github.com git-upload-pack 'o/r.git'
+    /// ```
+    ///
+    /// The port is dropped as it is for every ssh remote: it is the ssh
+    /// service's port and says nothing about the host's API.
+    #[test]
+    fn parse_github_documented_ssh_alt_host_normalises_to_github_com() {
+        for url in [
+            "ssh://git@ssh.github.com:443/o/r.git",
+            "ssh://git@ssh.github.com/o/r.git",
+            "ssh://ssh.github.com/o/r.git",
+            "git@ssh.github.com:o/r.git",
+            "ssh.github.com:o/r",
+            "git+ssh://git@ssh.github.com/o/r.git",
+            "ssh+git://git@ssh.github.com/o/r.git",
+            "ssh://git@SSH.GitHub.com/o/r.git",
+        ] {
+            assert_eq!(
+                parse_github_remote(url),
+                Some(GitHubRemote {
+                    host: "github.com".to_string(),
+                    owner_repo: "o/r".to_string(),
+                }),
+                "{url}",
+            );
+        }
+    }
+
+    /// The alt host is accepted for the transport GitHub documents it for and
+    /// for nothing else, and it is an EXACT hostname match rather than a prefix,
+    /// suffix or substring test.
+    ///
+    /// `https://ssh.github.com/...` is not a documented endpoint, so dux does
+    /// not invent one. Neither is an enterprise `ssh.` variant: GitHub
+    /// Enterprise Server publishes no equivalent, so guessing at one would be
+    /// making up an address on a customer's own network. And the native git
+    /// protocol on that name is not documented either.
+    #[test]
+    fn parse_github_refuses_undocumented_ssh_alt_host_spellings() {
+        for url in [
+            // Not a documented endpoint for the web transports.
+            "https://ssh.github.com/o/r",
+            "https://ssh.github.com/o/r.git",
+            "http://ssh.github.com/o/r",
+            "git://ssh.github.com/o/r",
+            // No documented GitHub Enterprise Server equivalent exists.
+            "ssh://git@ssh.github.example.com/o/r",
+            "git@ssh.github.example.com:o/r.git",
+            // Exact match, not a substring or suffix test.
+            "ssh://git@sshgithub.com/o/r",
+            "ssh://git@evil-ssh.github.com.attacker.example/o/r",
+            "ssh://git@ssh.github.com.attacker.example/o/r",
+            "ssh://git@x.ssh.github.com/o/r",
+            "git@sshgithub.com:o/r.git",
+        ] {
+            assert_eq!(parse_github_remote(url), None, "{url}");
+        }
+    }
+
+    /// `user:token@host/o/r` is not the bare `host/path` form: the colon
+    /// precedes the first slash, so git reads the WHOLE value as the scp-like
+    /// spelling and the host it contacts is `user`. MEASURED, git 2.55.0, same
+    /// isolated setup and stub ssh as above:
+    ///
+    /// ```text
+    /// $ git remote add origin user:token@nonexistent-host.invalid/o/r
+    /// $ git ls-remote origin
+    /// STUB-SSH-ARGV: user git-upload-pack 'token@nonexistent-host.invalid/o/r'
+    /// ```
+    ///
+    /// (Drop the colon and it really is a local path: `user@nonexistent-host
+    /// .invalid/o/r` fails with "does not appear to be a git repository" and the
+    /// stub ssh is never called.)
+    ///
+    /// It lives here rather than in the bare-form test because it is refused for
+    /// a different reason: not "git reads this as a folder", but "the host git
+    /// would contact is `user`, which is not GitHub".
+    #[test]
+    fn parse_github_remote_refuses_credentials_before_a_scp_like_colon() {
+        assert_eq!(
+            parse_github_remote("user:token@github.com/octocat/Hello-World"),
+            None,
+        );
+        assert_eq!(parse_github_remote("user:token@github.com/o/r"), None);
+    }
+
+    #[test]
+    fn parse_github_ssh_scheme_rejects_non_github_host() {
+        // The parsed host is queried with `gh`, so a non-GitHub host must not
+        // be accepted through the ssh:// spelling either.
+        assert_eq!(
+            parse_github_remote("ssh://git@gitlab.com/owner/repo.git"),
+            None,
+        );
+        assert_eq!(
+            parse_github_remote("ssh://git@gitlab.com:2222/owner/repo.git"),
+            None,
+        );
+    }
+
+    #[test]
+    fn parse_github_https_url_does_not_leak_embedded_credentials() {
+        assert_eq!(
+            parse_github_remote("https://user:token@github.com/octocat/Hello-World.git"),
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_github_ssh_scheme_url_does_not_leak_embedded_credentials() {
+        assert_eq!(
+            parse_github_remote("ssh://user:token@github.com/octocat/Hello-World.git"),
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_github_url_rejects_file_and_local_paths() {
+        assert_eq!(parse_github_remote("file:///some/path/repo.git"), None);
+        assert_eq!(parse_github_remote("/some/path/repo.git"), None);
+        assert_eq!(parse_github_remote("../sibling/repo"), None);
+    }
+
+    /// `github.com/owner/repo`, with no scheme and no colon, is not a network
+    /// address at all. Git's grammar offers exactly two remote spellings that
+    /// leave the machine: a scheme-qualified URL, and the scp-like
+    /// `[user@]host:path`, which REQUIRES the colon to come before any slash.
+    /// A value with neither is a RELATIVE LOCAL PATH, and git reads it as one.
+    ///
+    /// MEASURED, git 2.55.0, isolated `HOME`, `GIT_CONFIG_NOSYSTEM=1`, a stub
+    /// `GIT_SSH_COMMAND` that prints its argv, and a `.invalid` host so nothing
+    /// can leave the machine:
+    ///
+    /// ```text
+    /// $ git remote add bare nonexistent-host.invalid/o/r
+    /// $ GIT_TRACE=1 git ls-remote bare
+    /// trace: run_command: git-upload-pack 'nonexistent-host.invalid/o/r'
+    /// trace: built-in: git upload-pack nonexistent-host.invalid/o/r
+    /// fatal: 'nonexistent-host.invalid/o/r' does not appear to be a git repository
+    /// $ mkdir -p nonexistent-host.invalid/o && git init --bare nonexistent-host.invalid/o/r
+    /// $ git ls-remote bare; echo $?
+    /// 0
+    /// ```
+    ///
+    /// The stub ssh is never called, no name is ever resolved, and once the
+    /// DIRECTORY exists git reads it happily as a local repository. Contrast
+    /// the scp-like spelling of the same words, which does go over the network:
+    ///
+    /// ```text
+    /// $ git remote add scp nonexistent-host.invalid:o/r
+    /// $ git ls-remote scp
+    /// STUB_SSH_ARGV: nonexistent-host.invalid git-upload-pack 'o/r'
+    /// ```
+    ///
+    /// So a remote written the bare way points at a folder on disk. dux used to
+    /// answer host `github.com`, repository `o/r` for it and go and ask GitHub
+    /// about a directory. It is refused instead, whatever the case of the host
+    /// and with or without a `user@` in front (which is not git syntax in any
+    /// spelling either: with no scheme there is no authority for credentials to
+    /// belong to).
+    #[test]
+    fn parse_github_remote_refuses_a_bare_host_and_path() {
+        for url in [
+            "github.com/octocat/Hello-World",
+            "github.com/octocat/Hello-World.git",
+            "GitHub.com/octocat/Hello-World",
+            "github.com/o/r",
+            "github.com/o/r/x",
+            "user@github.com/octocat/Hello-World",
+            "gitlab.com/o/r",
+        ] {
+            assert_eq!(parse_github_remote(url), None, "{url}");
+        }
+    }
+
+    /// The scp-like spelling's user part is optional: git treats `host:path` as
+    /// ssh whenever the colon precedes any slash, with or without `user@`.
+    #[test]
+    fn parse_github_scp_like_without_user() {
+        assert_eq!(
+            parse_github_remote("github.com:octocat/Hello-World.git"),
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+    }
+
+    /// The path of an ssh remote IS the repository, so a third segment names a
+    /// different repository than `owner/repo`. Answering `owner/repo` sent `gh`
+    /// somewhere git never goes.
+    #[test]
+    fn parse_github_ssh_forms_reject_extra_path_segments() {
+        assert_eq!(
+            parse_github_remote("ssh://github.com/octocat/Hello-World/extra"),
+            None
+        );
+        assert_eq!(
+            parse_github_remote("github.com:octocat/Hello-World/extra"),
+            None
+        );
+        assert_eq!(
+            parse_github_remote("git@github.com:octocat/Hello-World/extra"),
+            None,
+        );
+    }
+
+    /// A trailing slash is not part of the repository name, and it has to come
+    /// off before the `.git` suffix or the suffix no longer matches. Exactly ONE
+    /// comes off, though: `Hello-World//` used to be pinned here as `o/r` and is
+    /// now refused, because the second slash leaves an empty component and an
+    /// empty component is not a repository. That is the same rule that stops a
+    /// decoded `%2F` at the boundary from impersonating the syntactic slash; see
+    /// `parse_github_remote_refuses_decoded_separators_at_the_path_boundaries`.
+    #[test]
+    fn parse_github_remote_trims_one_trailing_slash() {
+        for url in [
+            "ssh://github.com/octocat/Hello-World.git/",
+            "https://github.com/octocat/Hello-World.git/",
+            "github.com:octocat/Hello-World.git/",
+        ] {
+            assert_eq!(
+                parse_github_remote(url),
+                Some(GitHubRemote {
+                    host: "github.com".to_string(),
+                    owner_repo: "octocat/Hello-World".to_string(),
+                }),
+                "{url}",
+            );
+        }
+    }
+
+    /// git percent-decodes the path of a real URL, so dux must too: the remote
+    /// below addresses `/octocat/Hello-World.git`. A decoded DOT is legitimate
+    /// inside a repository name and keeps working; a decoded SLASH never is,
+    /// and is refused wherever it appears.
+    #[test]
+    fn parse_github_url_decodes_percent_escapes() {
+        assert_eq!(
+            parse_github_remote("ssh://github.com/octocat/Hello-World%2Egit"),
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+        // A decoded separator is refused rather than counted. This one was
+        // already refused, by the segment count.
+        assert_eq!(
+            parse_github_remote("ssh://github.com/octocat/Hello-World%2Fextra"),
+            None,
+        );
+        // And this one was pinned the other way round, as `octocat/Hello-World`,
+        // which encoded the wrong assumption: that a decoded slash in the
+        // MIDDLE of a path is a separator dux may act on. It is not. The real
+        // service was asked, and `git ls-remote` for this address answers "Not
+        // Found" while `octocat/Hello-World` exists, so the accepted answer
+        // named a repository this remote does not address. Neither a GitHub
+        // owner nor a repository name can contain a slash, so a decoded one
+        // always means the address names something other than what it appears
+        // to name, in every scheme and at every position.
+        assert_eq!(
+            parse_github_remote("https://github.com/octocat%2FHello-World"),
+            None,
+        );
+        assert_eq!(
+            parse_github_remote("https://github.com/octocat%2FHello-World.git"),
+            None,
+        );
+        assert_eq!(
+            parse_github_remote("ssh://github.com/octocat%2FHello-World.git"),
+            None,
+        );
+    }
+
+    /// Hostnames are case-insensitive, and the parsed host is handed to `gh`,
+    /// so it is compared and stored lowercased. A capitalised host used to fall
+    /// into the same silent no-pull-request-anywhere failure as the ssh one.
+    ///
+    /// This list used to carry `SSH://git@GitHub.com/octocat/Hello-World.git`
+    /// as an accepted row, and it passed for the wrong reason: the round that
+    /// made the HOST case insensitive checked the scheme after the `url` crate
+    /// had lowercased it, which made the SCHEME case insensitive too. Git's is
+    /// not (measured in
+    /// `parse_github_remote_refuses_a_scheme_spelled_in_the_wrong_case`), so
+    /// that row asserted dux answering for a remote git cannot connect with. It
+    /// has moved to that test, as a refusal.
+    #[test]
+    fn parse_github_host_is_matched_and_stored_case_insensitively() {
+        for url in [
+            "git@GitHub.com:octocat/Hello-World.git",
+            "GitHub.com:octocat/Hello-World.git",
+            "ssh://GITHUB.COM/octocat/Hello-World.git",
+            "ssh://git@GitHub.com/octocat/Hello-World.git",
+            "https://GitHub.COM/octocat/Hello-World.git",
+        ] {
+            assert_eq!(
+                parse_github_remote(url),
+                Some(GitHubRemote {
+                    host: "github.com".to_string(),
+                    owner_repo: "octocat/Hello-World".to_string(),
+                }),
+                "{url}",
+            );
+        }
+        // The bare `GitHub.com/octocat/Hello-World` spelling was the sixth row
+        // here and is now a refusal, for a reason that has nothing to do with
+        // case: git reads a value with no scheme and no colon before the first
+        // slash as a relative LOCAL PATH, so accepting it meant asking GitHub
+        // about a directory on disk. See
+        // `parse_github_remote_refuses_a_bare_host_and_path`.
+        assert_eq!(parse_github_remote("GitHub.com/octocat/Hello-World"), None);
+    }
+
+    /// `github.com:octocat/…` parses "successfully" as a URL whose scheme is
+    /// `github.com`, so the scp-like branch has to be tried first, and the
+    /// scheme allow-list has to be closed as well.
+    #[test]
+    fn parse_github_url_accepts_only_git_transport_schemes() {
+        assert_eq!(
+            parse_github_remote("git://github.com/octocat/Hello-World.git"),
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+        assert_eq!(
+            parse_github_remote("ftp://github.com/octocat/Hello-World"),
+            None
+        );
+        // `git+ssh://` used to be pinned as rejected here. It is a valid git
+        // scheme that invokes SSH, so it is now accepted; see
+        // `parse_github_remote_accepts_the_ssh_scheme_aliases`.
+        assert_eq!(
+            parse_github_remote("git+ssh://github.com/octocat/Hello-World"),
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+    }
+
+    /// Pins what the URL parser actually does with the shapes at the edges,
+    /// rather than assuming. An out-of-range or non-numeric port is a parse
+    /// error, not a host we could mistakenly keep; a scheme with no host has no
+    /// host to qualify.
+    #[test]
+    fn parse_github_url_rejects_malformed_authorities() {
+        assert_eq!(
+            parse_github_remote("ssh://github.com:99999/octocat/Hello-World"),
+            None
+        );
+        assert_eq!(
+            parse_github_remote("ssh://github.com:abc/octocat/Hello-World"),
+            None
+        );
+        assert_eq!(parse_github_remote("ssh:///octocat/Hello-World"), None);
+        // An internationalised host is normalised by the `url` crate (punycode
+        // under http(s), percent-encoding under ssh) and neither result is a
+        // GitHub host, so both are rejected. dux adds no normalisation of its
+        // own.
+        assert_eq!(
+            parse_github_remote("https://gïthub.com/octocat/Hello-World"),
+            None
+        );
+        assert_eq!(
+            parse_github_remote("ssh://gïthub.com/octocat/Hello-World"),
+            None
+        );
+    }
+
+    /// GitHub does not allow a repository named `.git`, and a bare `.git`
+    /// segment is the suffix rather than a name, so there is no repository left
+    /// to ask about.
+    #[test]
+    fn parse_github_url_rejects_a_repository_named_dot_git() {
+        assert_eq!(parse_github_remote("ssh://github.com/octocat/.git"), None);
+        assert_eq!(parse_github_remote("https://github.com/octocat/.git"), None);
+    }
+
+    // ── unborn-HEAD / initial-commit tests ───────────────────────
+
+    /// Create a temporary repo with `git init` but NO commit (unborn HEAD),
+    /// with a local identity configured so a commit can be made if asked.
+    fn init_test_repo_no_commit() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let run = |args: &[&str]| {
+            let out = test_support::git_command()
+                .args(args)
+                .current_dir(p)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.name", "test"]);
+        run(&["config", "user.email", "t@t"]);
+        dir
+    }
+
+    #[test]
+    fn repo_has_commits_is_false_on_unborn_head() {
+        let repo = init_test_repo_no_commit();
+        assert!(
+            !repo_has_commits(repo.path()),
+            "a fresh `git init` with no commits must report no commits"
+        );
+    }
+
+    #[test]
+    fn repo_has_commits_is_true_after_a_commit() {
+        let repo = init_test_repo(); // makes one empty commit
+        assert!(
+            repo_has_commits(repo.path()),
+            "a repo with a commit must report having commits"
+        );
+    }
+
+    #[test]
+    fn repo_has_commits_is_false_for_non_repo() {
+        // A plain directory that is not a git repo must not report commits
+        // (and must not panic).
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!repo_has_commits(tmp.path()));
+    }
+
+    #[test]
+    fn create_initial_commit_makes_head_resolvable() {
+        let repo = init_test_repo_no_commit();
+        assert!(!repo_has_commits(repo.path()));
+        create_initial_commit(repo.path()).expect("initial commit should succeed");
+        assert!(
+            repo_has_commits(repo.path()),
+            "after create_initial_commit, HEAD must resolve to a commit"
+        );
+    }
+
+    #[test]
+    fn create_initial_commit_does_not_stage_existing_files() {
+        // A folder can contain files before `git init`. The empty initial
+        // commit must NOT commit them: they stay untracked afterwards.
+        let repo = init_test_repo_no_commit();
+        std::fs::write(repo.path().join("wip.txt"), "work in progress").unwrap();
+        create_initial_commit(repo.path()).expect("initial commit should succeed");
+
+        let out = test_support::git_command()
+            .args([
+                "-C",
+                repo.path().to_string_lossy().as_ref(),
+                "status",
+                "--porcelain",
+            ])
+            .output()
+            .unwrap();
+        let status = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            status.contains("?? wip.txt"),
+            "existing file must remain untracked after the empty initial commit, got: {status:?}"
+        );
+    }
+
+    #[test]
+    fn create_initial_commit_is_idempotent_when_already_born() {
+        // Called on a repo that already has a commit (e.g. one raced in), it must
+        // NOT add a second commit; it returns Ok with the current branch so the
+        // caller can still register the project.
+        let repo = init_test_repo(); // one empty commit on "main"
+        assert!(repo_has_commits(repo.path()));
+        let count_before = test_support::git_command()
+            .args([
+                "-C",
+                repo.path().to_string_lossy().as_ref(),
+                "rev-list",
+                "--count",
+                "HEAD",
+            ])
+            .output()
+            .unwrap();
+        let before = String::from_utf8_lossy(&count_before.stdout)
+            .trim()
+            .to_string();
+
+        let branch =
+            create_initial_commit(repo.path()).expect("already-born repo is idempotent success");
+        assert_eq!(branch, "main", "returns the current branch");
+
+        let count_after = test_support::git_command()
+            .args([
+                "-C",
+                repo.path().to_string_lossy().as_ref(),
+                "rev-list",
+                "--count",
+                "HEAD",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&count_after.stdout).trim(),
+            before,
+            "must not add a second commit to a born repo"
+        );
+    }
+
+    #[test]
+    fn create_initial_commit_produces_a_truly_empty_commit() {
+        // The commit must contain no files, regardless of an untracked working
+        // tree: its tree must equal the empty tree.
+        let repo = init_test_repo_no_commit();
+        std::fs::write(repo.path().join("untracked.txt"), "x").unwrap();
+        create_initial_commit(repo.path()).expect("initial commit should succeed");
+
+        // `git show --stat` on a truly empty commit lists no files.
+        let out = test_support::git_command()
+            .args([
+                "-C",
+                repo.path().to_string_lossy().as_ref(),
+                "show",
+                "--stat",
+                "--format=",
+                "HEAD",
+            ])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stat.trim().is_empty(),
+            "the initial commit must have an empty tree (no files), got: {stat:?}"
+        );
+    }
+
+    #[test]
+    fn create_initial_commit_refuses_when_files_are_staged() {
+        // If the user staged files before adding the repo, we must NOT silently
+        // bake them into the "empty" initial commit. Refuse instead.
+        let repo = init_test_repo_no_commit();
+        std::fs::write(repo.path().join("secret.env"), "TOKEN=abc").unwrap();
+        let add = test_support::git_command()
+            .args([
+                "-C",
+                repo.path().to_string_lossy().as_ref(),
+                "add",
+                "secret.env",
+            ])
+            .output()
+            .unwrap();
+        assert!(add.status.success());
+
+        let result = create_initial_commit(repo.path());
+        assert!(
+            result.is_err(),
+            "create_initial_commit must refuse when the index has staged content"
+        );
+        assert!(
+            !repo_has_commits(repo.path()),
+            "refusing must leave the repo commit-less (nothing was committed)"
+        );
+    }
+
+    #[test]
+    fn create_initial_commit_surfaces_the_git_error_when_it_fails() {
+        // Exercise the failure path deterministically: a read-only object store
+        // lets the read-only pre-checks pass (unborn HEAD, clean index) but makes
+        // writing the commit objects fail. The error must be surfaced (carrying
+        // git's stderr) and the repo must stay commit-less.
+        if is_root() {
+            // root bypasses DAC write bits, so the read-only trick can't fail git.
+            return;
+        }
+        let repo = init_test_repo_no_commit();
+        let objects = repo.path().join(".git/objects");
+        let mut perms = std::fs::metadata(&objects).unwrap().permissions();
+        let original = perms.clone();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&objects, perms).unwrap();
+
+        let result = create_initial_commit(repo.path());
+
+        // Restore write permission so the TempDir can be cleaned up.
+        std::fs::set_permissions(&objects, original).unwrap();
+
+        let err = result.expect_err("commit into a read-only object store must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&repo.path().display().to_string()),
+            "error must name the repo path, got: {msg}"
+        );
+        assert!(
+            !repo_has_commits(repo.path()),
+            "a failed commit must leave the repo commit-less"
+        );
+    }
+
+    /// True when the test process runs as uid 0 (root ignores DAC write bits, so
+    /// permission-based failure injection is a no-op).
+    fn is_root() -> bool {
+        Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn create_initial_commit_runs_no_hooks() {
+        // The bootstrap commit is built with plumbing, so NO hook runs, not
+        // pre-commit/commit-msg (which `--no-verify` would skip) and crucially not
+        // post-commit/reference-transaction (which `--no-verify` does NOT skip).
+        let repo = init_test_repo_no_commit();
+        let hooks = repo.path().join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        for name in ["pre-commit", "post-commit", "reference-transaction"] {
+            let hook = hooks.join(name);
+            std::fs::write(&hook, format!("#!/bin/sh\ntouch RAN_{name}\n")).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+
+        create_initial_commit(repo.path()).expect("commit should succeed with hooks present");
+        assert!(repo_has_commits(repo.path()));
+        for name in ["pre-commit", "post-commit", "reference-transaction"] {
+            assert!(
+                !repo.path().join(format!("RAN_{name}")).exists(),
+                "the {name} hook must not have executed"
+            );
+        }
+    }
+
+    #[test]
+    fn create_initial_commit_works_on_a_bare_repo() {
+        // A fresh `git init --bare` repo has no work tree, so `git commit` can't
+        // be used: the plumbing path must still bootstrap it.
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = test_support::git_command()
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        run(&["init", "--bare", "-b", "main"]);
+        run(&["config", "user.name", "test"]);
+        run(&["config", "user.email", "t@t"]);
+        assert_eq!(repo_commit_state(dir.path()), CommitState::Unborn);
+
+        create_initial_commit(dir.path()).expect("bare repo bootstrap should succeed");
+        assert!(
+            repo_has_commits(dir.path()),
+            "the bare repo must have a commit after bootstrap"
+        );
+    }
+
+    #[test]
+    fn create_initial_commit_is_idempotent_on_a_born_detached_head() {
+        // Born + detached HEAD (no symbolic ref): still idempotent success (no
+        // second commit, no error), per the documented contract.
+        let repo = init_test_repo(); // one commit on "main"
+        let run = |args: &[&str]| {
+            assert!(
+                test_support::git_command()
+                    .args(args)
+                    .current_dir(repo.path())
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        };
+        run(&["checkout", "--detach"]);
+        assert_eq!(repo_commit_state(repo.path()), CommitState::Born);
+
+        let branch = create_initial_commit(repo.path())
+            .expect("a born detached-HEAD repo must be idempotent success, not an error");
+        // Detached HEAD has no symbolic branch name: the returned branch is
+        // empty (the worker degrades this to the "main" fallback, tested in
+        // project_browser).
+        assert!(
+            branch.is_empty(),
+            "a detached HEAD has no branch name, got {branch:?}"
+        );
+        let out = test_support::git_command()
+            .args([
+                "-C",
+                repo.path().to_string_lossy().as_ref(),
+                "rev-list",
+                "--count",
+                "HEAD",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "1",
+            "must not add a second commit"
+        );
+    }
+
+    #[test]
+    fn create_initial_commit_is_race_safe_across_threads() {
+        // Two threads bootstrap the SAME unborn repo concurrently (simulating two
+        // dux instances). The update-ref CAS must let exactly one commit land
+        // (never two), and the loser must NOT hard-error: it sees the repo is now
+        // Born and returns Ok too. End state: exactly one commit.
+        let repo = init_test_repo_no_commit();
+        let path = repo.path().to_path_buf();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let p = path.clone();
+                let b = barrier.clone();
+                std::thread::spawn(move || {
+                    b.wait();
+                    create_initial_commit(&p)
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        assert!(
+            results.iter().all(|r| r.is_ok()),
+            "neither racer should hard-error, got: {results:?}"
+        );
+        // Exactly one commit exists (the CAS prevented a second).
+        let out = test_support::git_command()
+            .arg("-C")
+            .arg(path)
+            .args(["rev-list", "--count", "HEAD"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "1",
+            "the race must leave exactly one commit"
+        );
+    }
+
+    /// Body of the identity-starved bootstrap, run by the parent tests below in a
+    /// CHILD process because per-command isolation cannot reach the git
+    /// commands production spawns; only the process environment can.
+    #[test]
+    #[ignore = "helper process for the create_initial_commit identity tests"]
+    fn create_initial_commit_identity_free_child() {
+        let Ok(path) = std::env::var("DUX_TEST_UNBORN_REPO") else {
+            return;
+        };
+        create_initial_commit(Path::new(&path))
+            .expect("the bootstrap commit must not need a resolvable git identity");
+    }
+
+    /// An unborn repo git cannot work out an identity for, on ANY host: the
+    /// environment carries none, the config files are unreachable, and
+    /// `user.useConfigOnly` stops git synthesizing one from the hostname (which a
+    /// dotted host with a GECOS name would otherwise let it do, leaving the test
+    /// asserting nothing).
+    fn identity_starved_repo(config: &[(&str, &str)]) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = test_support::git_command()
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.useConfigOnly", "true"]);
+        for (key, value) in config {
+            run(&["config", key, value]);
+        }
+        repo
+    }
+
+    /// Bootstrap `repo` in a child process whose environment can tell git
+    /// nothing, and hand back the author line the commit landed with.
+    fn bootstrap_without_identity(repo: &Path) -> String {
+        let home = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "git::tests::create_initial_commit_identity_free_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("DUX_TEST_UNBORN_REPO", repo)
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env_remove("GIT_AUTHOR_NAME")
+            .env_remove("GIT_AUTHOR_EMAIL")
+            .env_remove("GIT_COMMITTER_NAME")
+            .env_remove("GIT_COMMITTER_EMAIL")
+            .env_remove("EMAIL")
+            .env_remove("EMAIL_ADDRESS");
+        test_support::isolate_git_config(&mut child);
+        let out = child.output().expect("re-run the test binary");
+        assert!(
+            out.status.success(),
+            "the identity-starved child must bootstrap the repo:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let author = test_support::git_command()
+            .arg("-C")
+            .arg(repo)
+            .args(["log", "-1", "--format=%an <%ae>"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&author.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn create_initial_commit_succeeds_with_no_git_identity() {
+        // A clean CI runner: nothing configured anywhere. dux's own empty commit
+        // signs itself rather than failing the whole project add.
+        let repo = identity_starved_repo(&[]);
+        assert_eq!(
+            bootstrap_without_identity(repo.path()),
+            "dux <dux@localhost>",
+            "the fallback identity is what signed the bootstrap commit"
+        );
+    }
+
+    #[test]
+    fn create_initial_commit_keeps_a_configured_name_when_only_the_email_is_missing() {
+        // Only what git is missing is supplied: a repo that knows a name keeps
+        // it, and the fallback fills in the address alone.
+        let repo = identity_starved_repo(&[("user.name", "Real Person")]);
+        assert_eq!(
+            bootstrap_without_identity(repo.path()),
+            "Real Person <dux@localhost>",
+            "a configured name must survive the fallback"
+        );
+    }
+
+    #[test]
+    fn create_initial_commit_keeps_a_configured_identity() {
+        // The fallback is a last resort: wherever git can resolve a real
+        // identity, that identity is the one on dux's bootstrap commit.
+        let repo = init_test_repo_no_commit();
+        let run = |args: &[&str]| {
+            test_support::git_command()
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap()
+        };
+        assert!(
+            run(&["config", "user.name", "Real Person"])
+                .status
+                .success(),
+            "set user.name"
+        );
+        assert!(
+            run(&["config", "user.email", "real@example.com"])
+                .status
+                .success(),
+            "set user.email"
+        );
+
+        create_initial_commit(repo.path()).expect("initial commit should succeed");
+
+        let author = run(&["log", "-1", "--format=%an <%ae>"]);
+        assert_eq!(
+            String::from_utf8_lossy(&author.stdout).trim(),
+            "Real Person <real@example.com>",
+            "a configured identity must win over the fallback"
+        );
+    }
+
+    #[test]
+    fn repo_commit_state_distinguishes_born_unborn_and_non_repo() {
+        assert_eq!(
+            repo_commit_state(init_test_repo_no_commit().path()),
+            CommitState::Unborn
+        );
+        assert_eq!(
+            repo_commit_state(init_test_repo().path()),
+            CommitState::Born
+        );
+        // A non-repo path can't be classified: Indeterminate, never Unborn.
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(repo_commit_state(tmp.path()), CommitState::Indeterminate);
+    }
+
+    /// The plan's worst hazard: git answers questions by walking UP parent
+    /// directories, so a folder inside somebody else's repository would happily
+    /// report, stage and commit to the parent. Only the repository's own top
+    /// level counts as a working repository.
+    #[test]
+    fn a_folder_is_a_working_repo_only_when_it_is_the_repositorys_top_level() {
+        let repo = init_test_repo();
+        assert_eq!(
+            folder_repo_status(repo.path()),
+            FolderRepoStatus::WorkingRepo
+        );
+
+        let sub = repo.path().join("src");
+        std::fs::create_dir(&sub).unwrap();
+        assert_eq!(
+            folder_repo_status(&sub),
+            FolderRepoStatus::InsideRepoRootedElsewhere,
+            "a folder inside a repository must never drive the parent's changes panel"
+        );
+
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(folder_repo_status(plain.path()), FolderRepoStatus::NoRepo);
+
+        let bare = tempfile::tempdir().unwrap();
+        let out = test_support::git_command()
+            .args(["init", "--bare"])
+            .current_dir(bare.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            folder_repo_status(bare.path()),
+            FolderRepoStatus::NoRepo,
+            "a bare repository has no work tree, so there is nothing for a changes panel to show"
+        );
+
+        let git_dir = repo.path().join(".git");
+        assert_eq!(
+            folder_repo_status(&git_dir),
+            FolderRepoStatus::NoRepo,
+            "git's own internals are the quiet case, not a working repository"
+        );
+    }
+
+    /// The NUL form is what keeps a path from forging a record boundary, which
+    /// is the whole reason the targeted removal can trust the list it reads.
+    #[test]
+    fn worktree_registrations_survive_a_newline_in_a_path() {
+        let raw = b"worktree /repo\0HEAD abc\0branch refs/heads/main\0\0\
+                    worktree /wt/wei rd\nname\0HEAD abc\0branch refs/heads/W\0prunable gitdir file points to non-existent location\0\0";
+        let parsed = parse_worktree_registrations(raw);
+        assert_eq!(parsed.len(), 2, "{parsed:?}");
+        assert_eq!(parsed[0].path, Path::new("/repo"));
+        assert!(!parsed[0].prunable);
+        assert_eq!(parsed[1].path, Path::new("/wt/wei rd\nname"));
+        assert!(parsed[1].prunable);
+    }
+
+    /// A registration whose directory is still there is somebody's working copy:
+    /// `git worktree remove --force` would DELETE it, measured, so the prunable
+    /// verdict gates the call rather than merely informing it.
+    #[test]
+    fn a_live_registration_is_refused_rather_than_removed() {
+        let repo = init_test_repo();
+        let live = repo.path().join("wt-live");
+        add_worktree_new_branch_at(repo.path(), &live, "live", Some("HEAD")).unwrap();
+
+        let err = forget_missing_worktree_registration(repo.path(), &live)
+            .expect_err("a live registration is refused");
+        assert!(
+            format!("{err:#}").contains("still has a working copy"),
+            "{err:#}"
+        );
+        assert!(live.exists(), "and the directory is untouched");
+    }
+
+    /// Nothing registered at the path is not an error: the add that follows is
+    /// free to run.
+    #[test]
+    fn forgetting_an_unregistered_path_is_a_no_op() {
+        let repo = init_test_repo();
+        forget_missing_worktree_registration(repo.path(), &repo.path().join("never-existed"))
+            .expect("nothing to forget");
+    }
+
+    /// A deleted directory is gone; a directory dux cannot stat is a question
+    /// it could not answer. `Path::exists()` cannot tell the two apart, and
+    /// calling an unreachable mount "deleted" offers to recreate a working copy
+    /// that is sitting safely where it always was.
+    #[test]
+    fn only_a_stat_that_says_nothing_is_there_reads_as_missing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let holder = tempfile::tempdir().unwrap();
+        let gone = holder.path().join("gone");
+        assert_eq!(directory_presence(&gone), DirectoryPresence::Missing);
+        assert_eq!(folder_repo_status(&gone), FolderRepoStatus::Missing);
+        assert_eq!(managed_worktree_status(&gone), FolderRepoStatus::Missing);
+
+        // A parent that is a regular file: the path cannot exist, so it is gone.
+        let file = holder.path().join("afile");
+        std::fs::write(&file, "x").unwrap();
+        let under_file = file.join("child");
+        assert_eq!(directory_presence(&under_file), DirectoryPresence::Missing);
+        assert_eq!(
+            managed_worktree_status(&under_file),
+            FolderRepoStatus::Missing
+        );
+
+        // A dangling symlink is gone too: `symlink_metadata` would answer Ok
+        // here, which is why the classifier follows links.
+        let dangling = holder.path().join("dangling");
+        std::os::unix::fs::symlink(holder.path().join("nowhere"), &dangling).unwrap();
+        assert_eq!(directory_presence(&dangling), DirectoryPresence::Missing);
+
+        let locked = holder.path().join("locked");
+        std::fs::create_dir_all(locked.join("inner")).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = locked.join("inner");
+        let presence = directory_presence(&unreadable);
+        let folder = folder_repo_status(&unreadable);
+        let managed = managed_worktree_status(&unreadable);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(presence, DirectoryPresence::Indeterminate);
+        assert_eq!(
+            folder,
+            FolderRepoStatus::Indeterminate,
+            "a folder dux cannot stat is the hedged verdict, never the deleted one"
+        );
+        assert_eq!(managed, FolderRepoStatus::Indeterminate);
+        assert!(
+            managed.quiet_reason().contains("readable"),
+            "{}",
+            managed.quiet_reason()
+        );
+    }
+
+    /// Symlinks must not be able to fake a top level: the comparison is on
+    /// canonical paths, which is what `repo_path_kind` already does.
+    #[test]
+    fn a_symlink_to_a_repository_root_still_reads_as_that_root() {
+        let repo = init_test_repo();
+        let holder = tempfile::tempdir().unwrap();
+        let link = holder.path().join("link-to-repo");
+        std::os::unix::fs::symlink(repo.path(), &link).unwrap();
+        assert_eq!(folder_repo_status(&link), FolderRepoStatus::WorkingRepo);
+    }
+
+    // ── SHARED VECTORS with paths.test.ts `standaloneAgentDefaultName` ────────
+    //
+    // The web's create dialog PROMISES this name in its placeholder ("defaults
+    // to ..."), so the browser has to derive the same string the server will
+    // actually store. These are the cases a plain trailing-segment read gets
+    // wrong.
+    #[test]
+    fn the_default_standalone_name_collapses_whitespace_and_never_ends_up_empty() {
+        for (folder, expected) in [
+            ("/home/ada/notes", "notes"),
+            ("/home/ada/notes/", "notes"),
+            // Runs of whitespace collapse and the ends are trimmed, so a name
+            // copied out of a file manager does not render with a ragged gap.
+            ("/home/ada/My   Notes ", "My Notes"),
+            // Nothing usable left: the root, a name of only whitespace, nothing
+            // at all.
+            ("/", "Standalone agent"),
+            ("/home/ada/   ", "Standalone agent"),
+            ("", "Standalone agent"),
+        ] {
+            assert_eq!(
+                standalone_agent_title("", Path::new(folder)),
+                expected,
+                "for {folder:?}"
+            );
+        }
+        // A typed name wins, trimmed and otherwise verbatim.
+        assert_eq!(
+            standalone_agent_title("  Sort the downloads!  ", Path::new("/home/ada/notes")),
+            "Sort the downloads!"
+        );
+    }
+
+    #[test]
+    fn only_a_working_repo_lets_the_changes_panel_mutate_anything() {
+        assert!(FolderRepoStatus::WorkingRepo.changes_panel_works());
+        assert!(FolderRepoStatus::WorkingRepo.mutations_allowed());
+        for quiet in [
+            FolderRepoStatus::InsideRepoRootedElsewhere,
+            FolderRepoStatus::NoRepo,
+            FolderRepoStatus::Indeterminate,
+        ] {
+            assert!(!quiet.changes_panel_works(), "{quiet:?}");
+            assert!(!quiet.mutations_allowed(), "{quiet:?}");
+        }
+    }
+
+    /// The upload seed follows "can git see this path", which is a DIFFERENT
+    /// question from "does the changes panel work here": a folder inside
+    /// somebody's repository is exactly where an unignored upload directory
+    /// would pollute their status.
+    #[test]
+    fn the_upload_seed_follows_git_visibility_and_fails_closed_when_unsure() {
+        assert!(FolderRepoStatus::WorkingRepo.git_can_see_path());
+        assert!(FolderRepoStatus::InsideRepoRootedElsewhere.git_can_see_path());
+        assert!(!FolderRepoStatus::NoRepo.git_can_see_path());
+        assert!(
+            !FolderRepoStatus::Indeterminate.git_can_see_path(),
+            "when git cannot be consulted, dux writes nothing into the user's folder"
+        );
+    }
+
+    /// Each quiet case says why it is quiet, and never says "git is busy",
+    /// which is what today's non-repo error path would misreport.
+    #[test]
+    fn every_quiet_folder_says_why_in_its_own_words() {
+        let inside = FolderRepoStatus::InsideRepoRootedElsewhere.quiet_reason();
+        assert!(inside.contains("rooted elsewhere"), "got {inside:?}");
+        let none = FolderRepoStatus::NoRepo.quiet_reason();
+        assert!(none.contains("no git repository"), "got {none:?}");
+        let unsure = FolderRepoStatus::Indeterminate.quiet_reason();
+        assert!(unsure.contains("could not consult git"), "got {unsure:?}");
+        for status in [
+            FolderRepoStatus::InsideRepoRootedElsewhere,
+            FolderRepoStatus::NoRepo,
+            FolderRepoStatus::Indeterminate,
+        ] {
+            assert!(
+                !status.quiet_reason().to_lowercase().contains("busy"),
+                "a quiet folder is never a busy repository: {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_path_kind_classifies_root_subdir_plain_and_bare() {
+        // Catches the crux misclassifications, including offering `git init`
+        // on a bare repository.
+        let repo = init_test_repo();
+        assert_eq!(repo_path_kind(repo.path()), RepoPathKind::WorkTreeRoot);
+
+        let sub = repo.path().join("src");
+        std::fs::create_dir(&sub).unwrap();
+        match repo_path_kind(&sub) {
+            RepoPathKind::InsideWorkTree { root } => {
+                assert_eq!(
+                    root.canonicalize().unwrap(),
+                    repo.path().canonicalize().unwrap()
+                );
+            }
+            other => panic!("subdir must classify as InsideWorkTree, got {other:?}"),
+        }
+
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(repo_path_kind(plain.path()), RepoPathKind::NotARepo);
+
+        let bare = tempfile::tempdir().unwrap();
+        let out = test_support::git_command()
+            .args(["init", "--bare"])
+            .current_dir(bare.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(repo_path_kind(bare.path()), RepoPathKind::BareRoot);
+    }
+
+    #[test]
+    fn repo_path_kind_flags_git_internal_directories() {
+        // Catches the measured ladder hole: inside `<repo>/.git`, `--git-dir`
+        // succeeds, `--is-bare-repository` is false, and `--show-toplevel`
+        // exits 128; without the `--is-inside-git-dir` rung this fell to
+        // Indeterminate and the fail-open add gate accepted `~/repo/.git`.
+        let repo = init_test_repo();
+        let git_dir = repo.path().join(".git");
+        assert!(
+            matches!(repo_path_kind(&git_dir), RepoPathKind::InsideGitDir { .. }),
+            "<repo>/.git must classify as InsideGitDir"
+        );
+        assert!(
+            matches!(
+                repo_path_kind(&git_dir.join("objects")),
+                RepoPathKind::InsideGitDir { .. }
+            ),
+            "<repo>/.git/objects must classify as InsideGitDir"
+        );
+    }
+
+    #[test]
+    fn repo_path_kind_flags_bare_repo_internals() {
+        // Catches registering a bare repository's internals as a project.
+        let bare = tempfile::tempdir().unwrap();
+        let out = test_support::git_command()
+            .args(["init", "--bare"])
+            .current_dir(bare.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(
+            matches!(
+                repo_path_kind(&bare.path().join("objects")),
+                RepoPathKind::InsideGitDir { .. }
+            ),
+            "a bare repo's objects/ must classify as InsideGitDir"
+        );
+    }
+
+    /// Create a directory whose name is not valid UTF-8, or return `None` when
+    /// the filesystem refuses to hold one.
+    ///
+    /// A non-UTF8 filename is legal on Linux, where these tests do their work:
+    /// a byte sequence is just bytes, and dux must decode `--show-toplevel`
+    /// from the raw bytes rather than lossily. It is NOT universally legal.
+    /// macOS's APFS and HFS+ enforce valid UTF-8 in filenames at the syscall
+    /// boundary and reject the name with `EILSEQ` ("illegal byte sequence"),
+    /// so the fixture cannot be BUILT there and the test used to die in setup,
+    /// before a line of product code ran.
+    ///
+    /// Skipping where the filesystem cannot express the premise is the honest
+    /// reading, and it is narrow on purpose: the check is what the filesystem
+    /// just DID with the name, not which operating system is running. A macOS
+    /// filesystem that does accept the bytes still runs the test, and a Linux
+    /// filesystem that refuses them (some network and FUSE mounts do) stops
+    /// reporting a failure that is not dux's.
+    fn create_dir_with_non_utf8_name(parent: &Path, name: &[u8]) -> Option<std::path::PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = parent.join(std::ffi::OsStr::from_bytes(name));
+        match std::fs::create_dir(&path) {
+            Ok(()) => Some(path),
+            // EILSEQ: the filesystem enforces UTF-8 names and will not hold
+            // this one. Nothing about dux can be observed here.
+            Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => {
+                eprintln!(
+                    "skipping: {} cannot hold a non-UTF8 filename ({e})",
+                    parent.display()
+                );
+                None
+            }
+            Err(e) => panic!("creating a non-UTF8 directory failed unexpectedly: {e}"),
+        }
+    }
+
+    #[test]
+    fn repo_path_kind_classifies_repos_under_non_utf8_paths() {
+        // Catches the fail-open gate bypass: `--show-toplevel` output for a
+        // repo under a non-UTF8 path (legal on Linux) must be decoded from the
+        // raw bytes; a lossy decode rewrites the byte to U+FFFD, fails
+        // canonicalization, and falls to Indeterminate, which the add gate
+        // accepts.
+        let base = tempfile::tempdir().unwrap();
+        let Some(repo) = create_dir_with_non_utf8_name(base.path(), b"rep\xFFo") else {
+            return;
+        };
+        let out = test_support::git_command()
+            .arg("-C")
+            .arg(&repo)
+            .arg("init")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git init under a non-UTF8 path failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(repo_path_kind(&repo), RepoPathKind::WorkTreeRoot);
+
+        let sub = repo.join("src");
+        std::fs::create_dir(&sub).unwrap();
+        match repo_path_kind(&sub) {
+            RepoPathKind::InsideWorkTree { root } => {
+                assert_eq!(root.canonicalize().unwrap(), repo.canonicalize().unwrap());
+            }
+            other => panic!(
+                "a subdir of a non-UTF8-path repo must classify as InsideWorkTree, got {other:?}"
+            ),
+        }
+        assert!(
+            matches!(
+                repo_path_kind(&repo.join(".git")),
+                RepoPathKind::InsideGitDir { .. }
+            ),
+            "a non-UTF8-path repo's .git must classify as InsideGitDir"
+        );
+    }
+
+    #[test]
+    fn init_repo_creates_a_repository_and_errors_on_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).expect("git init in an empty folder must succeed");
+        assert!(is_git_repo(dir.path()));
+        assert_eq!(repo_commit_state(dir.path()), CommitState::Unborn);
+
+        let missing = dir.path().join("does-not-exist");
+        assert!(
+            init_repo(&missing).is_err(),
+            "git init in a missing folder must surface an error"
+        );
+    }
+
+    // ── remote_default_branch tests ──────────────────────────────
+
+    #[test]
+    fn remote_default_branch_returns_none_for_local_only_repo() {
+        let repo = init_test_repo();
+        // A repo created with `git init` has no remotes, so origin/HEAD
+        // doesn't exist and the function should return None.
+        assert_eq!(remote_default_branch(repo.path()), None);
+    }
+
+    #[test]
+    fn remote_default_branch_returns_branch_from_cloned_repo() {
+        // Set up a "remote" bare repo and clone it, which auto-sets origin/HEAD.
+        let bare_dir = tempfile::tempdir().unwrap();
+        let bare = bare_dir.path();
+        let run = |cwd: &Path, args: &[&str]| {
+            let out = test_support::git_command()
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(bare, &["init", "--bare", "-b", "main"]);
+
+        // Create a temporary non-bare repo, add a commit, push to the bare.
+        let staging_dir = tempfile::tempdir().unwrap();
+        let staging = staging_dir.path();
+        run(staging, &["clone", bare.to_str().unwrap(), "."]);
+        run(staging, &["config", "user.name", "test"]);
+        run(staging, &["config", "user.email", "t@t"]);
+        run(staging, &["commit", "--allow-empty", "-m", "init"]);
+        run(staging, &["push", "origin", "main"]);
+
+        // Now clone the bare repo: this sets origin/HEAD automatically.
+        let clone_dir = tempfile::tempdir().unwrap();
+        let clone = clone_dir.path();
+        run(clone, &["clone", bare.to_str().unwrap(), "."]);
+
+        assert_eq!(remote_default_branch(clone), Some("main".to_string()),);
+    }
+
+    // ── switch_branch tests ──────────────────────────────────────
+
+    #[test]
+    fn switch_branch_switches_on_clean_tree() {
+        let repo = init_test_repo();
+        run_git(repo.path(), &["branch", "feat"]);
+        assert_eq!(current_branch(repo.path()).unwrap(), "main");
+
+        switch_branch(repo.path(), "feat").unwrap();
+
+        assert_eq!(current_branch(repo.path()).unwrap(), "feat");
+    }
+
+    #[test]
+    fn switch_branch_errors_when_target_missing() {
+        let repo = init_test_repo();
+        let err = switch_branch(repo.path(), "does-not-exist").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("git switch does-not-exist failed"),
+            "expected failure message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn switch_branch_preserves_unrelated_untracked_files() {
+        let repo = init_test_repo();
+        run_git(repo.path(), &["branch", "feat"]);
+        fs::write(repo.path().join("scratch.txt"), "unrelated\n").unwrap();
+
+        switch_branch(repo.path(), "feat").unwrap();
+
+        assert_eq!(current_branch(repo.path()).unwrap(), "feat");
+        assert_eq!(
+            fs::read_to_string(repo.path().join("scratch.txt")).unwrap(),
+            "unrelated\n"
+        );
+    }
+
+    #[test]
+    fn switch_branch_errors_when_unstaged_changes_would_be_overwritten() {
+        let repo = init_test_repo();
+        // Create a tracked file on main.
+        fs::write(repo.path().join("a.txt"), "main-v1\n").unwrap();
+        commit_all(repo.path(), "add a.txt on main");
+
+        // Fork feat branch with a different version of a.txt. Uses `switch
+        // -c` to both create and switch to the branch; switch_branch is not
+        // exercised here: that's the subject under test below.
+        run_git(repo.path(), &["switch", "-c", "feat"]);
+        fs::write(repo.path().join("a.txt"), "feat-v1\n").unwrap();
+        commit_all(repo.path(), "modify a.txt on feat");
+
+        // Back on main, introduce unstaged changes to a.txt.
+        run_git(repo.path(), &["switch", "main"]);
+        fs::write(repo.path().join("a.txt"), "dirty\n").unwrap();
+
+        // Switching to feat should refuse because it would overwrite.
+        let err = switch_branch(repo.path(), "feat").unwrap_err();
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(
+            msg.contains("overwritten") || msg.contains("would be"),
+            "expected conflict error, got: {msg}"
+        );
+    }
+
+    // ── current_branch_opt tests ─────────────────────────────────
+
+    #[test]
+    fn current_branch_opt_returns_branch_on_normal_head() {
+        let tmp = init_test_repo();
+        assert_eq!(
+            current_branch_opt(tmp.path()).unwrap(),
+            Some("main".to_string())
+        );
+    }
+
+    #[test]
+    fn current_branch_opt_returns_none_on_detached_head() {
+        let tmp = init_test_repo();
+        let p = tmp.path();
+        // Create a second commit so there is a parent to detach onto.
+        std::fs::write(p.join("f"), b"x").unwrap();
+        run_git(p, &["add", "."]);
+        run_git(p, &["commit", "-m", "second"]);
+        run_git(p, &["checkout", "--detach", "HEAD~1"]);
+        assert_eq!(current_branch_opt(p).unwrap(), None);
+    }
+
+    /// Fork name. Upstream has no `head_branch`; `current_branch_opt` is the
+    /// same contract (attached = Some, detached = None) and `current_branch`
+    /// is the strict variant that refuses a detached HEAD.
+    #[test]
+    fn head_branch_distinguishes_attached_and_detached_head() {
+        let repo = init_test_repo();
+        assert_eq!(
+            current_branch_opt(repo.path()).unwrap().as_deref(),
+            Some("main")
+        );
+        let head = head_commit(repo.path()).unwrap();
+        run_git(repo.path(), &["checkout", "--detach", &head]);
+
+        assert_eq!(current_branch_opt(repo.path()).unwrap(), None);
+        assert!(current_branch(repo.path()).is_err());
+    }
+
+    /// Fork name (24deeeee, audit03 P1-22): present, deleted-in-worktree, new,
+    /// and git-failure answers are four different things.
+    #[test]
+    fn file_bytes_at_head_distinguishes_new_deleted_binary_and_git_errors() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "head-bytes-cases");
+        fs::write(wt.join("tracked.bin"), [0_u8, 1, 2, 255]).unwrap();
+        run_git(&wt, &["add", "tracked.bin"]);
+        run_git(&wt, &["commit", "-m", "binary"]);
+
+        assert_eq!(
+            file_bytes_at_head(&wt, "tracked.bin").unwrap(),
+            Some(vec![0, 1, 2, 255])
+        );
+        fs::remove_file(wt.join("tracked.bin")).unwrap();
+        assert_eq!(
+            file_bytes_at_head(&wt, "tracked.bin").unwrap(),
+            Some(vec![0, 1, 2, 255]),
+            "deleted working-tree files still have HEAD bytes"
+        );
+        fs::write(wt.join("new.txt"), "new").unwrap();
+        assert_eq!(file_bytes_at_head(&wt, "new.txt").unwrap(), None);
+
+        let non_repo = tempfile::tempdir().unwrap();
+        assert!(
+            file_bytes_at_head(non_repo.path(), "anything").is_err(),
+            "a git failure must not read as a new file"
+        );
+
+        // A repository with no commits yet: every file is new, not an error.
+        let unborn = init_test_repo_no_commit();
+        fs::write(unborn.path().join("first.txt"), "x").unwrap();
+        assert_eq!(
+            file_bytes_at_head(unborn.path(), "first.txt").unwrap(),
+            None
+        );
+    }
+
+    /// Fork name (P1-24). The Changes panel is polled, so the number of git
+    /// processes one `changed_files` sweep starts must not grow with the
+    /// number of untracked files.
+    #[test]
+    fn changed_files_git_process_count_is_bounded_with_untracked_growth() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "bounded-untracked-processes");
+
+        fs::write(wt.join("one.txt"), "one\n").unwrap();
+        CHANGED_FILES_GIT_COMMANDS.with(|count| count.set(0));
+        changed_files(&wt).unwrap();
+        let one_file_count = CHANGED_FILES_GIT_COMMANDS.with(std::cell::Cell::get);
+
+        for index in 0..100 {
+            fs::write(wt.join(format!("many-{index:03}.txt")), "line\n").unwrap();
+        }
+        CHANGED_FILES_GIT_COMMANDS.with(|count| count.set(0));
+        let (_, files) = changed_files(&wt).unwrap();
+        let many_file_count = CHANGED_FILES_GIT_COMMANDS.with(std::cell::Cell::get);
+
+        assert_eq!(files.len(), 101);
+        // status + unstaged numstat + staged numstat.
+        assert_eq!(one_file_count, 3);
+        assert_eq!(many_file_count, one_file_count);
+    }
+
+    #[test]
+    fn current_branch_opt_errors_on_non_repo() {
+        let tmp = tempfile::tempdir().unwrap(); // not a git repo
+        assert!(current_branch_opt(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn switch_branch_if_needed_switches_from_detached_head() {
+        let tmp = init_test_repo();
+        let p = tmp.path().to_path_buf();
+        run_git(&p, &["checkout", "--detach", "HEAD"]);
+        // Must not error on detached HEAD; must end up on main.
+        switch_branch_if_needed(&p, "main").unwrap();
+        assert_eq!(current_branch_opt(&p).unwrap(), Some("main".to_string()));
+    }
+
+    #[test]
+    fn pull_branch_switches_to_requested_branch_before_pull() {
+        let bare_dir = tempfile::tempdir().unwrap();
+        let bare = bare_dir.path();
+        run_git(bare, &["init", "--bare", "-b", "main"]);
+
+        let staging_dir = tempfile::tempdir().unwrap();
+        let staging = staging_dir.path();
+        run_git(staging, &["clone", bare.to_str().unwrap(), "."]);
+        run_git(staging, &["config", "user.name", "test"]);
+        run_git(staging, &["config", "user.email", "t@t"]);
+        run_git(staging, &["commit", "--allow-empty", "-m", "init"]);
+        run_git(staging, &["push", "origin", "main"]);
+        run_git(staging, &["switch", "-c", "feature"]);
+        run_git(staging, &["commit", "--allow-empty", "-m", "feature"]);
+        run_git(staging, &["push", "origin", "feature"]);
+
+        let clone_dir = tempfile::tempdir().unwrap();
+        let clone = clone_dir.path();
+        run_git(clone, &["clone", bare.to_str().unwrap(), "."]);
+        run_git(clone, &["switch", "feature"]);
+        assert_eq!(current_branch(clone).unwrap(), "feature");
+
+        pull_branch(clone, "main").unwrap();
+
+        assert_eq!(current_branch(clone).unwrap(), "main");
+    }
+
+    #[test]
+    fn pull_current_branch_on_detached_head_returns_clear_error() {
+        let repo = init_test_repo();
+        // A second commit is required so HEAD~1 exists for the detach.
+        fs::write(repo.path().join("detach.txt"), "x\n").unwrap();
+        run_git(repo.path(), &["add", "detach.txt"]);
+        run_git(repo.path(), &["commit", "-m", "second commit"]);
+        run_git(repo.path(), &["checkout", "--detach", "HEAD~1"]);
+
+        let err = pull_current_branch(repo.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("detached"),
+            "expected 'detached' in error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("symbolic-ref"),
+            "expected no 'symbolic-ref' in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn push_on_detached_head_returns_clear_error() {
+        let repo = init_test_repo();
+        // A second commit is required so HEAD~1 exists for the detach.
+        fs::write(repo.path().join("detach.txt"), "x\n").unwrap();
+        run_git(repo.path(), &["add", "detach.txt"]);
+        run_git(repo.path(), &["commit", "-m", "second commit"]);
+        run_git(repo.path(), &["checkout", "--detach", "HEAD~1"]);
+
+        let err = push(repo.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("detached"),
+            "expected 'detached' in error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("symbolic-ref"),
+            "expected no 'symbolic-ref' in error, got: {msg}"
+        );
+    }
+
+    /// The two rules must not have leaked into each other. Everything below is
+    /// something a PERSON may type into the pull request field, and every one of
+    /// them must be refused as a project's CONFIGURED address, which git alone
+    /// decides. This is the safety property that keeps the leniency from naming
+    /// a different repository than the one on disk.
+    #[test]
+    fn independent_check_lenient_typed_forms_are_not_configured_addresses() {
+        // Only the forms git itself does NOT accept as an address. A plain
+        // `https://host/owner/repo` is a real address and legitimately parses as
+        // both, which is not a leak.
+        let lenient = [
+            "example/application",
+            "github.com/example/application",
+            "https://github.com/example/application/issues",
+            "https://github.com/example/application/security/dependabot",
+            "https://github.com/example/application/this/is/a/made/up/path",
+        ];
+        for raw in lenient {
+            assert!(
+                crate::pr_reference::parse_typed_reference(raw).is_ok(),
+                "a person may type this: {raw}"
+            );
+            assert_eq!(
+                parse_github_remote(raw),
+                None,
+                "but it must NEVER be read as a configured address: {raw}"
+            );
+        }
+        for both in [
+            "git@github.com:example/application.git",
+            "https://github.com/example/application",
+        ] {
+            assert!(
+                parse_github_remote(both).is_some(),
+                "a real address must still parse: {both}"
+            );
+            assert!(
+                crate::pr_reference::parse_typed_reference(both).is_ok(),
+                "and a person may equally type it: {both}"
+            );
+        }
+    }
+
+    /// `file_status`: the per-path porcelain lookup behind the web editor's
+    /// file-info panel.
+    mod file_status_tests {
+        use super::*;
+
+        /// A repository with one committed file, so a status lookup has both a
+        /// clean and a dirty case to report on.
+        fn repo_with_commit() -> tempfile::TempDir {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().to_path_buf();
+            let run = |args: &[&str]| {
+                let out = test_support::git_command()
+                    .args(args)
+                    .current_dir(&p)
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "git {:?} failed: {}",
+                    args,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            };
+            run(&["init", "-b", "main"]);
+            run(&["config", "user.name", "test"]);
+            run(&["config", "user.email", "t@t"]);
+            std::fs::write(dir.path().join("tracked.txt"), "one\n").unwrap();
+            run(&["add", "tracked.txt"]);
+            run(&["commit", "-m", "init"]);
+            dir
+        }
+
+        #[test]
+        fn a_directory_that_is_not_a_repository_reports_none() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+            assert_eq!(file_status(dir.path(), "a.txt").unwrap(), None);
+        }
+
+        #[test]
+        fn an_unmodified_tracked_file_reports_no_codes() {
+            let dir = repo_with_commit();
+            let st = file_status(dir.path(), "tracked.txt").unwrap().unwrap();
+            assert_eq!(st.staged, None);
+            assert_eq!(st.unstaged, None);
+        }
+
+        #[test]
+        fn a_modified_file_reports_an_unstaged_code() {
+            let dir = repo_with_commit();
+            std::fs::write(dir.path().join("tracked.txt"), "two\n").unwrap();
+            let st = file_status(dir.path(), "tracked.txt").unwrap().unwrap();
+            assert_eq!(st.staged, None);
+            assert_eq!(st.unstaged.as_deref(), Some("M"));
+        }
+
+        #[test]
+        fn an_untracked_file_reports_the_question_mark_code() {
+            let dir = repo_with_commit();
+            std::fs::write(dir.path().join("fresh.txt"), "new\n").unwrap();
+            let st = file_status(dir.path(), "fresh.txt").unwrap().unwrap();
+            assert_eq!(st.unstaged.as_deref(), Some("?"));
+        }
+
+        /// The lookup is scoped to the ONE path asked about: a sibling being
+        /// dirty must never colour this file's answer.
+        #[test]
+        fn the_lookup_is_scoped_to_the_requested_path() {
+            let dir = repo_with_commit();
+            std::fs::write(dir.path().join("noisy.txt"), "unrelated\n").unwrap();
+            let st = file_status(dir.path(), "tracked.txt").unwrap().unwrap();
+            assert_eq!(st.unstaged, None, "a dirty sibling must not leak in");
+        }
+
+        /// The pathspec is passed with the `:(literal)` magic prefix, so a name
+        /// containing a glob metacharacter matches ITSELF and not whatever the
+        /// glob would have matched. Without it, asking about `star[1].txt`
+        /// silently answers about `star1.txt`.
+        #[test]
+        fn a_glob_metacharacter_in_the_name_matches_only_that_file() {
+            let dir = repo_with_commit();
+            std::fs::write(dir.path().join("star1.txt"), "decoy\n").unwrap();
+            let st = file_status(dir.path(), "star[1].txt").unwrap().unwrap();
+            assert_eq!(
+                st.unstaged, None,
+                "a literal pathspec must not match the decoy the glob would"
+            );
+            std::fs::write(dir.path().join("star[1].txt"), "real\n").unwrap();
+            let st = file_status(dir.path(), "star[1].txt").unwrap().unwrap();
+            assert_eq!(st.unstaged.as_deref(), Some("?"));
+        }
+
+        /// A leading dash must be read as a PATH, not as an option. The `--`
+        /// separator is what guarantees it (CLAUDE.md's refname/positional
+        /// rule); without it git would try to parse `--force` as a flag.
+        #[test]
+        fn a_name_that_looks_like_an_option_is_read_as_a_path() {
+            let dir = repo_with_commit();
+            std::fs::write(dir.path().join("--force"), "dashy\n").unwrap();
+            let st = file_status(dir.path(), "--force").unwrap().unwrap();
+            assert_eq!(st.unstaged.as_deref(), Some("?"));
+        }
+
+        #[test]
+        fn a_non_latin_name_is_reported_unchanged() {
+            let dir = repo_with_commit();
+            std::fs::write(dir.path().join("файл.txt"), "текст\n").unwrap();
+            let st = file_status(dir.path(), "файл.txt").unwrap().unwrap();
+            assert_eq!(st.unstaged.as_deref(), Some("?"));
+        }
+
+        /// An IGNORED file is listed by no `git status` at all, so a status
+        /// lookup alone cannot tell it apart from a clean tracked file. This
+        /// is the measurement the separate ignore probe exists for.
+        #[test]
+        fn an_ignored_file_is_invisible_to_the_status_lookup() {
+            let dir = repo_with_commit();
+            std::fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
+            std::fs::create_dir(dir.path().join("node_modules")).unwrap();
+            std::fs::write(dir.path().join("node_modules/a.js"), "x\n").unwrap();
+            let st = file_status(dir.path(), "node_modules/a.js")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (st.staged, st.unstaged),
+                (None, None),
+                "status says nothing about an ignored file, which is why it needs its own probe"
+            );
+        }
+
+        #[test]
+        fn path_is_ignored_answers_yes_for_an_ignored_file_and_no_for_a_tracked_one() {
+            let dir = repo_with_commit();
+            std::fs::write(dir.path().join(".gitignore"), "node_modules/\n*.log\n").unwrap();
+            std::fs::create_dir(dir.path().join("node_modules")).unwrap();
+            std::fs::write(dir.path().join("node_modules/a.js"), "x\n").unwrap();
+            std::fs::write(dir.path().join("debug.log"), "x\n").unwrap();
+            assert!(path_is_ignored(dir.path(), "node_modules/a.js").unwrap());
+            assert!(path_is_ignored(dir.path(), "debug.log").unwrap());
+            assert!(!path_is_ignored(dir.path(), "tracked.txt").unwrap());
+            assert!(!path_is_ignored(dir.path(), ".gitignore").unwrap());
+        }
+
+        /// A TRACKED file that also matches an ignore rule is not ignored, and
+        /// `check-ignore` says so because it consults the index by default.
+        #[test]
+        fn a_tracked_file_matching_an_ignore_rule_is_not_ignored() {
+            let dir = repo_with_commit();
+            std::fs::write(dir.path().join(".gitignore"), "tracked.txt\n").unwrap();
+            assert!(!path_is_ignored(dir.path(), "tracked.txt").unwrap());
+        }
+
+        /// A leading dash must be read as a PATH here too: `--` is what
+        /// guarantees it, and `check-ignore` cannot take the `:(literal)`
+        /// magic `file_status` uses (MEASURED: git 2.55 answers "pathspec
+        /// magic not supported by this command" and exits 128).
+        #[test]
+        fn path_is_ignored_reads_a_dash_leading_name_as_a_path() {
+            let dir = repo_with_commit();
+            std::fs::write(dir.path().join(".gitignore"), "--force\n").unwrap();
+            std::fs::write(dir.path().join("--force"), "x\n").unwrap();
+            assert!(path_is_ignored(dir.path(), "--force").unwrap());
+        }
+
+        #[test]
+        fn repository_root_names_the_repository_that_owns_a_directory() {
+            let dir = repo_with_commit();
+            let root = repository_root(dir.path()).unwrap().unwrap();
+            assert_eq!(
+                root.canonicalize().unwrap(),
+                dir.path().canonicalize().unwrap()
+            );
+        }
+
+        #[test]
+        fn repository_root_is_none_outside_any_repository() {
+            let dir = tempfile::tempdir().unwrap();
+            assert_eq!(repository_root(dir.path()).unwrap(), None);
+        }
+
+        /// A NESTED repository is what makes this question load-bearing: the
+        /// outer repository lists nothing for anything inside it, so without
+        /// asking who owns the path a vendored clone reads as unmodified.
+        #[test]
+        fn a_nested_repository_reports_its_own_root_not_the_outer_one() {
+            let outer = repo_with_commit();
+            let inner = outer.path().join("vendor");
+            std::fs::create_dir(&inner).unwrap();
+            let out = test_support::git_command()
+                .args(["init", "-b", "main"])
+                .current_dir(&inner)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            std::fs::write(inner.join("inner.txt"), "x\n").unwrap();
+
+            let st = file_status(outer.path(), "vendor/inner.txt")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (st.staged, st.unstaged),
+                (None, None),
+                "the outer repository sees nothing inside a nested one"
+            );
+            let root = repository_root(&inner).unwrap().unwrap();
+            assert_eq!(root.canonicalize().unwrap(), inner.canonicalize().unwrap());
+            assert_ne!(
+                root.canonicalize().unwrap(),
+                outer.path().canonicalize().unwrap()
+            );
+        }
+    }
+
+    /// The dangling-symlink branch of [`resolve_worktree_path`]: `exists()`
+    /// follows the link, so a link whose target has been removed skipped every
+    /// containment check.
+    mod dangling_symlink_tests {
+        use super::*;
+
+        #[test]
+        fn a_dangling_symlink_pointing_out_of_the_worktree_is_refused() {
+            let wt = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink("/root/.ssh/id_ed25519", wt.path().join("secret")).unwrap();
+            let err = resolve_worktree_path(wt.path(), "secret").unwrap_err();
+            assert!(
+                err.to_string().contains("escapes worktree"),
+                "unexpected error: {err}"
+            );
+        }
+
+        /// A relative target is resolved against the LINK's directory, not the
+        /// worktree root, or `../../etc/shadow` from a subdirectory would look
+        /// contained.
+        #[test]
+        fn a_dangling_relative_symlink_climbing_out_is_refused() {
+            let wt = tempfile::tempdir().unwrap();
+            std::fs::create_dir(wt.path().join("sub")).unwrap();
+            std::os::unix::fs::symlink("../../elsewhere/gone.txt", wt.path().join("sub/link"))
+                .unwrap();
+            let err = resolve_worktree_path(wt.path(), "sub/link").unwrap_err();
+            assert!(
+                err.to_string().contains("escapes worktree"),
+                "unexpected error: {err}"
+            );
+        }
+
+        /// A dangling link that stays INSIDE the worktree is legitimate (the
+        /// file it names may be about to be created) and must still resolve.
+        #[test]
+        fn a_dangling_symlink_staying_inside_the_worktree_still_resolves() {
+            let wt = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink("not-yet.txt", wt.path().join("link")).unwrap();
+            assert!(resolve_worktree_path(wt.path(), "link").is_ok());
+        }
+
+        #[test]
+        fn a_dangling_symlink_into_the_git_directory_is_refused() {
+            let wt = tempfile::tempdir().unwrap();
+            std::fs::create_dir(wt.path().join(".git")).unwrap();
+            std::os::unix::fs::symlink(".git/gone", wt.path().join("link")).unwrap();
+            let err = resolve_worktree_path(wt.path(), "link").unwrap_err();
+            assert!(
+                err.to_string().contains("git directory"),
+                "unexpected error: {err}"
+            );
+        }
+
+        /// A path that simply does not exist is not a symlink and keeps taking
+        /// the permissive branch: creating a new file depends on it.
+        #[test]
+        fn a_plain_missing_path_is_still_allowed_through() {
+            let wt = tempfile::tempdir().unwrap();
+            assert!(resolve_worktree_path(wt.path(), "brand-new.txt").is_ok());
+        }
+    }
+}

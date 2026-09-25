@@ -1,0 +1,566 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+
+import { BUSY_TOAST_MAX_MS } from "./notify"
+
+// Mock sonner before importing the store so the store's top-level
+// `import { toast } from "sonner"` picks up our spies.
+vi.mock("sonner", () => {
+  const toast = Object.assign(vi.fn(), {
+    success: vi.fn(),
+    error: vi.fn(),
+    warning: vi.fn(),
+    loading: vi.fn(),
+    dismiss: vi.fn(),
+  })
+  return { toast }
+})
+
+// Mirror the store test harness: the module reads location/localStorage,
+// registers listeners, and boots at import. Stub the minimum so the store
+// settles before each test.
+
+// The info-toast auto-clear window is config-driven (`status_clear_seconds` in
+// the bootstrap document). Tests flip this before loading the store with a
+// bootstrap to assert the computed duration.
+let statusClearSeconds = 6
+
+const fetchMock = vi.fn(async (url: string) => {
+  const u = String(url)
+  if (u.includes("/api/v1/bootstrap")) {
+    return {
+      status: 200,
+      ok: true,
+      json: async () => ({
+        available_providers: [],
+        macros: [],
+        welcome_tips: [],
+        dux_version: "development",
+        randomize_agent_names_by_default: false,
+        gh_available: false,
+        pr_banner_position: "top",
+        agent_scrollback_lines: 10000,
+        show_changes_pane: true,
+        always_show_tab_strip: false,
+        global_env: {},
+        status_clear_seconds: statusClearSeconds,
+      }),
+      text: async () => "",
+      headers: { get: () => null },
+    } as unknown as Response
+  }
+  return {
+    status: 200,
+    ok: true,
+    json: async () => ({}),
+    text: async () => "{}",
+    headers: { get: () => null },
+  } as unknown as Response
+})
+
+class FakeWebSocket {
+  onopen: (() => void) | null = null
+  onclose: (() => void) | null = null
+  onerror: (() => void) | null = null
+  onmessage: (() => void) | null = null
+  binaryType = ""
+  readyState = 1
+  close() {}
+  send() {}
+}
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  statusClearSeconds = 6
+  vi.stubGlobal("location", { host: "localhost:0" })
+  vi.stubGlobal("localStorage", {
+    getItem: () => null,
+    setItem: () => {},
+    removeItem: () => {},
+  })
+  vi.stubGlobal("window", { addEventListener: () => {} })
+  vi.stubGlobal("history", { go: () => {} })
+  vi.stubGlobal("WebSocket", FakeWebSocket)
+  vi.stubGlobal("fetch", fetchMock)
+  vi.resetModules()
+})
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
+
+async function loadStore() {
+  const mod = await import("./store")
+  await vi.waitFor(() => {
+    expect(mod.getSnapshot().booted).toBe(true)
+  })
+  return mod
+}
+
+// Load and wait for the bootstrap document to land too, so `status_clear_seconds`
+// is available to the duration computation.
+async function loadStoreWithBootstrap() {
+  const mod = await import("./store")
+  await vi.waitFor(() => {
+    expect(mod.getSnapshot().booted).toBe(true)
+    expect(mod.getSnapshot().bootstrap).not.toBeNull()
+  })
+  return mod
+}
+
+// Drive a `status` / `status_cleared` frame through the events socket exactly as
+// the server pushes it on `/ws/events`. `key` is omitted from the frame when
+// null/undefined (the anonymous
+// slot), mirroring the server's `skip_serializing_if = None`.
+type StoreModule = typeof import("./store")
+function status(
+  mod: StoreModule,
+  key: string | null | undefined,
+  tone: string,
+  message: string,
+  sticky?: boolean,
+) {
+  // `sticky` is omitted from the frame unless a test asks for it, which is the
+  // COMPATIBILITY shape rather than the current server's: `WireStatus.sticky`
+  // carries `#[serde(default)]`, so a current server sends the field on every
+  // frame. A frame without one comes from a server that predates it, and the
+  // third test below is what pins that reading.
+  const extra = sticky === undefined ? {} : { sticky }
+  mod.eventsSocket.onEvent(
+    key == null
+      ? { event: "status", tone, message, ...extra }
+      : { event: "status", key, tone, message, ...extra },
+  )
+}
+function statusCleared(mod: StoreModule, key: string | null | undefined) {
+  mod.eventsSocket.onEvent(
+    key == null ? { event: "status_cleared" } : { event: "status_cleared", key },
+  )
+}
+
+describe("engine status → sonner toast routing", () => {
+  it("busy then success reuses the same toast id and dismisses on clear", async () => {
+    const mod = await loadStore()
+    const { toast } = await import("sonner")
+
+    // Busy arrives first, and should fire toast.loading capped by the leak guard,
+    // never at Infinity (a dropped socket would otherwise strand the spinner).
+    status(mod, "pull", "busy", "Pulling…")
+    expect(toast.loading).toHaveBeenCalledWith("Pulling…", {
+      id: "pull",
+      duration: BUSY_TOAST_MAX_MS,
+    })
+
+    // Success replaces it on the same id, should fire toast.success with 6s.
+    status(mod, "pull", "info", "Pulled.")
+    expect(toast.success).toHaveBeenCalledWith("Pulled.", {
+      id: "pull",
+      duration: 6000,
+    })
+
+    // Clear dismisses the toast by key.
+    statusCleared(mod, "pull")
+    expect(toast.dismiss).toHaveBeenCalledWith("pull")
+  })
+
+  it("error status auto-dismisses, on the longest final window", async () => {
+    const mod = await loadStore()
+    const { toast } = await import("sonner")
+
+    status(mod, "push", "error", "Push failed.")
+    expect(toast.error).toHaveBeenCalledWith("Push failed.", {
+      id: "push",
+      duration: 24000,
+    })
+  })
+
+  it("warning status auto-dismisses, between the info and error windows", async () => {
+    const mod = await loadStore()
+    const { toast } = await import("sonner")
+
+    status(mod, "warn-key", "warning", "Careful!")
+    expect(toast.warning).toHaveBeenCalledWith("Careful!", {
+      id: "warn-key",
+      duration: 18000,
+    })
+  })
+
+  it("unkeyed (anonymous) status uses the stable anonymous-slot id", async () => {
+    const mod = await loadStore()
+    const { toast } = await import("sonner")
+
+    status(mod, null, "info", "All good.")
+    expect(toast.success).toHaveBeenCalledWith("All good.", {
+      id: "dux-anon-status",
+      duration: 6000,
+    })
+  })
+
+  it("anonymous clear dismisses the anonymous slot toast", async () => {
+    const mod = await loadStore()
+    const { toast } = await import("sonner")
+
+    // Set an anonymous busy first.
+    status(mod, null, "busy", "Uploading…")
+    expect(toast.loading).toHaveBeenCalledWith("Uploading…", {
+      id: "dux-anon-status",
+      duration: BUSY_TOAST_MAX_MS,
+    })
+
+    // Clear dismisses the anonymous slot.
+    statusCleared(mod, null)
+    expect(toast.dismiss).toHaveBeenCalledWith("dux-anon-status")
+  })
+
+  it("empty message is dropped, no toast fired", async () => {
+    const mod = await loadStore()
+    const { toast } = await import("sonner")
+
+    status(mod, "k", "info", "")
+    expect(toast.success).not.toHaveBeenCalled()
+    expect(toast.loading).not.toHaveBeenCalled()
+  })
+
+  it("status does NOT update a statusLine field, toasts are the sole web surface", async () => {
+    const mod = await loadStore()
+
+    status(mod, "sl-key", "info", "Status bar message.")
+    // The store carries no statusLine field; toasts are the sole web status
+    // surface.
+    expect(mod.getSnapshot()).not.toHaveProperty("statusLine")
+  })
+
+  it("an anonymous (no-key) status uses the stable anonymous-slot id", async () => {
+    // The engine's CommitChanges emits an anonymous Info status (no key); it now
+    // arrives as a `status` event over `/ws/events` and lands on the stable
+    // anonymous-slot id.
+    const mod = await loadStore()
+    const { toast } = await import("sonner")
+
+    status(mod, undefined, "info", "Changes committed successfully.")
+    expect(toast.success).toHaveBeenCalledWith("Changes committed successfully.", {
+      id: "dux-anon-status",
+      duration: 6000,
+    })
+  })
+
+  it("info-toast duration honors a custom status_clear_seconds", async () => {
+    statusClearSeconds = 10
+    const mod = await loadStoreWithBootstrap()
+    const { toast } = await import("sonner")
+
+    status(mod, "k", "info", "Done.")
+    expect(toast.success).toHaveBeenCalledWith("Done.", {
+      id: "k",
+      duration: 10000,
+    })
+  })
+
+  it("status_clear_seconds of 0 makes every final toast sticky (Infinity)", async () => {
+    statusClearSeconds = 0
+    const mod = await loadStoreWithBootstrap()
+    const { toast } = await import("sonner")
+
+    status(mod, "k", "info", "Sticky info.")
+    expect(toast.success).toHaveBeenCalledWith("Sticky info.", {
+      id: "k",
+      duration: Infinity,
+    })
+    status(mod, "k2", "error", "Sticky error.")
+    expect(toast.error).toHaveBeenCalledWith("Sticky error.", {
+      id: "k2",
+      duration: Infinity,
+    })
+  })
+
+  it("status_clear_seconds of 0 still caps a busy toast at the leak guard", async () => {
+    // The opt-out covers final states only. A busy is not a final: leaving it
+    // immortal is the stranded-spinner bug, so the guard always applies.
+    statusClearSeconds = 0
+    const mod = await loadStoreWithBootstrap()
+    const { toast } = await import("sonner")
+
+    status(mod, "k", "busy", "Working…")
+    expect(toast.loading).toHaveBeenCalledWith("Working…", {
+      id: "k",
+      duration: BUSY_TOAST_MAX_MS,
+    })
+  })
+
+  it("scales the warning and error windows off a custom status_clear_seconds", async () => {
+    statusClearSeconds = 10
+    const mod = await loadStoreWithBootstrap()
+    const { toast } = await import("sonner")
+
+    status(mod, "w", "warning", "Careful.")
+    expect(toast.warning).toHaveBeenCalledWith("Careful.", {
+      id: "w",
+      duration: 30000,
+    })
+    status(mod, "e", "error", "Broken.")
+    expect(toast.error).toHaveBeenCalledWith("Broken.", {
+      id: "e",
+      duration: 40000,
+    })
+  })
+
+  it("no status tone ever produces a toast that lives forever by default", async () => {
+    // The user-visible contract: with the default window every tone, including
+    // busy, error and an unknown tone the server might add later, dismisses.
+    const mod = await loadStore()
+    const { toast } = await import("sonner")
+    const fired = [toast.success, toast.error, toast.warning, toast.loading]
+
+    for (const tone of ["info", "success", "warning", "error", "busy", "mystery"]) {
+      status(mod, `t-${tone}`, tone, `message for ${tone}`)
+    }
+    const durations = fired.flatMap((fn) =>
+      vi.mocked(fn).mock.calls.map((call) => (call[1] as { duration: number }).duration),
+    )
+    expect(durations.length).toBeGreaterThan(0)
+    for (const d of durations) expect(d).toBeLessThan(Infinity)
+  })
+
+  // sonner never auto-closes a `loading` toast: its close timer bails on
+  // `toast.type === 'loading'`, so the duration handed to `toast.loading` is
+  // inert (pinned in components/ui/sonner.test.tsx). The store therefore owns
+  // the busy dismissal itself, and these are the tests for that timer.
+  describe("busy toast leak guard", () => {
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it("dismisses a busy toast whose final never arrives", async () => {
+      const mod = await loadStore()
+      const { toast } = await import("sonner")
+      vi.useFakeTimers()
+
+      status(mod, "pull", "busy", "Pulling…")
+      vi.advanceTimersByTime(BUSY_TOAST_MAX_MS - 1)
+      expect(toast.warning).not.toHaveBeenCalled()
+      vi.advanceTimersByTime(1)
+      // Replaced by a warning on the same key, never dismissed: a spinner that
+      // simply leaves the screen reads as "the operation finished", which is
+      // the one thing the guard does not know.
+      expect(toast.dismiss).not.toHaveBeenCalled()
+      expect(toast.warning).toHaveBeenCalledWith(
+        expect.stringContaining("Pulling…"),
+        expect.objectContaining({ id: "pull" }),
+      )
+    })
+
+    it("cancels the guard once the keyed final replaces the spinner", async () => {
+      // The final already owns the toast and carries its own window; letting a
+      // stale guard fire would yank a success or error off the screen early.
+      const mod = await loadStore()
+      const { toast } = await import("sonner")
+      vi.useFakeTimers()
+
+      status(mod, "pull", "busy", "Pulling…")
+      status(mod, "pull", "error", "Pull failed.")
+      vi.advanceTimersByTime(BUSY_TOAST_MAX_MS * 2)
+      expect(toast.dismiss).not.toHaveBeenCalled()
+    })
+
+    it("cancels the guard when an explicit clear dismisses the toast", async () => {
+      const mod = await loadStore()
+      const { toast } = await import("sonner")
+      vi.useFakeTimers()
+
+      status(mod, "pull", "busy", "Pulling…")
+      statusCleared(mod, "pull")
+      expect(toast.dismiss).toHaveBeenCalledTimes(1)
+      vi.advanceTimersByTime(BUSY_TOAST_MAX_MS * 2)
+      // Still just the explicit clear: the guard did not fire a second dismiss.
+      expect(toast.dismiss).toHaveBeenCalledTimes(1)
+    })
+
+    it("restarts the guard for a fresh busy on the same key", async () => {
+      // A retry re-uses the key. The first busy's guard must not survive to
+      // kill the second spinner mid-operation.
+      const mod = await loadStore()
+      const { toast } = await import("sonner")
+      vi.useFakeTimers()
+
+      status(mod, "pull", "busy", "Pulling…")
+      vi.advanceTimersByTime(BUSY_TOAST_MAX_MS - 1000)
+      status(mod, "pull", "busy", "Pulling, still…")
+      vi.advanceTimersByTime(1000)
+      expect(toast.warning).not.toHaveBeenCalled()
+      vi.advanceTimersByTime(BUSY_TOAST_MAX_MS - 1000)
+      expect(toast.warning).toHaveBeenCalledWith(
+        expect.stringContaining("Pulling, still…"),
+        expect.objectContaining({ id: "pull" }),
+      )
+    })
+
+    it("guards the anonymous busy slot too", async () => {
+      const mod = await loadStore()
+      const { toast } = await import("sonner")
+      vi.useFakeTimers()
+
+      status(mod, null, "busy", "Uploading…")
+      vi.advanceTimersByTime(BUSY_TOAST_MAX_MS)
+      expect(toast.warning).toHaveBeenCalledWith(
+        expect.stringContaining("Uploading…"),
+        expect.objectContaining({ id: "dux-anon-status" }),
+      )
+    })
+
+    it("arms no guard for a final tone, which sonner already retires on its own", async () => {
+      const mod = await loadStore()
+      const { toast } = await import("sonner")
+      vi.useFakeTimers()
+
+      status(mod, "k", "info", "Done.")
+      status(mod, "k2", "warning", "Careful.")
+      vi.advanceTimersByTime(BUSY_TOAST_MAX_MS * 2)
+      expect(toast.dismiss).not.toHaveBeenCalled()
+    })
+  })
+
+  it("uses the 6s default window for info toasts when status_clear_seconds is the default", async () => {
+    // The `?? 6` fallback covers both the pre-load (null bootstrap) window and a
+    // config whose status_clear_seconds is the default 6, either way, 6000ms.
+    const mod = await loadStore()
+    const { toast } = await import("sonner")
+
+    status(mod, "k", "info", "Default window.")
+    expect(toast.success).toHaveBeenCalledWith("Default window.", {
+      id: "k",
+      duration: 6000,
+    })
+  })
+
+  it("a keyed busy is dismissed by its matching-key async final", async () => {
+    // The async worktree-removal delete emits a `delete:{id}` busy whose final
+    // arrives later keyed identically. Both ride `status` events; the busy adopts
+    // the key as its sonner id so the final replaces it in place (otherwise the
+    // spinner strands on the anonymous slot, the reported worktree-delete bug).
+    const mod = await loadStore()
+    const { toast } = await import("sonner")
+
+    status(mod, "delete:s1", "busy", 'Removing worktree for agent "x"…')
+    expect(toast.loading).toHaveBeenCalledWith('Removing worktree for agent "x"…', {
+      id: "delete:s1",
+      duration: BUSY_TOAST_MAX_MS,
+    })
+
+    // The async success final reuses the same id, swapping spinner → check.
+    status(mod, "delete:s1", "info", "Agent and worktree removed.")
+    expect(toast.success).toHaveBeenCalledWith("Agent and worktree removed.", {
+      id: "delete:s1",
+      duration: 6000,
+    })
+  })
+})
+
+// The standalone editor tab (`#/editor/agent/<id>`) is deliberately quiet: it
+// renders only statuses addressed to its own connection, never the workspace
+// broadcasts. Boot the store on a standalone hash so `state.standaloneEditor` is
+// true from the first frame, then push scoped frames through the same arm.
+describe("the standalone editor tab", () => {
+  function bootStandalone() {
+    vi.stubGlobal("location", {
+      host: "localhost:0",
+      hash: "#/editor/agent/s1",
+    })
+  }
+
+  function scopedStatus(
+    mod: StoreModule,
+    key: string,
+    tone: string,
+    message: string,
+    scope: unknown,
+  ) {
+    mod.eventsSocket.onEvent({
+      event: "status",
+      key,
+      tone,
+      message,
+      scope,
+    } as Parameters<typeof mod.eventsSocket.onEvent>[0])
+  }
+
+  it("drops a workspace broadcast", async () => {
+    bootStandalone()
+    const mod = await loadStore()
+    const { toast } = await import("sonner")
+    expect(mod.getSnapshot().standaloneEditor).toBe(true)
+
+    scopedStatus(mod, "pull", "warning", "Agent exited.", "all")
+    expect(toast.warning).not.toHaveBeenCalled()
+  })
+
+  it("renders a status addressed to this connection", async () => {
+    bootStandalone()
+    const mod = await loadStore()
+    const { toast } = await import("sonner")
+
+    scopedStatus(mod, "save", "info", "Saved.", { connection: "c1" })
+    expect(toast.success).toHaveBeenCalledWith("Saved.", {
+      id: "save",
+      duration: 6000,
+    })
+  })
+
+  it("still dismisses on status_cleared, which is unconditional", async () => {
+    bootStandalone()
+    const mod = await loadStore()
+    const { toast } = await import("sonner")
+
+    statusCleared(mod, "pull")
+    expect(toast.dismiss).toHaveBeenCalledWith("pull")
+  })
+
+  it("leaves the workspace tab showing broadcasts", async () => {
+    // Same frame, ordinary surface: the gate is surface-scoped, not global.
+    const mod = await loadStore()
+    const { toast } = await import("sonner")
+    expect(mod.getSnapshot().standaloneEditor).toBe(false)
+
+    scopedStatus(mod, "pull", "warning", "Agent exited.", "all")
+    expect(toast.warning).toHaveBeenCalledWith("Agent exited.", {
+      id: "pull",
+      duration: 18000,
+    })
+  })
+})
+
+describe("an engine status that says it waits for the user", () => {
+  it("is pinned when the frame carries sticky", async () => {
+    const mod = await loadStoreWithBootstrap()
+    const { toast } = await import("sonner")
+
+    status(mod, "half-done", "warning", "Half of it landed.", true)
+    expect(toast.warning).toHaveBeenCalledWith("Half of it landed.", {
+      id: "half-done",
+      duration: Infinity,
+    })
+  })
+
+  it("is NOT pinned when the frame says so explicitly", async () => {
+    const mod = await loadStoreWithBootstrap()
+    const { toast } = await import("sonner")
+
+    status(mod, "ordinary", "warning", "Careful.", false)
+    expect(toast.warning).toHaveBeenCalledWith("Careful.", {
+      id: "ordinary",
+      duration: 18000,
+    })
+  })
+
+  it("is NOT pinned when the field is absent, which is what an older server sends", async () => {
+    // The field is new. Every status from a server that predates it arrives
+    // without one, and an absent flag must read as false rather than as
+    // "unknown, better keep it on screen".
+    const mod = await loadStoreWithBootstrap()
+    const { toast } = await import("sonner")
+
+    status(mod, "ordinary", "error", "Broken.")
+    expect(toast.error).toHaveBeenCalledWith("Broken.", {
+      id: "ordinary",
+      duration: 24000,
+    })
+  })
+})

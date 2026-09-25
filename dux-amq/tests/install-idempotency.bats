@@ -79,20 +79,19 @@ SH
   local config_target="$STATE_ROOT/dux/user-config.toml"
   cat >"$config_target" <<'TOML'
 # user-owned header comment
-prompt_for_name = true
+[defaults]
+enable_randomized_pet_name_by_default = false
 
 [providers.claude]
 command = "claude-amq"
 args = ["--custom-claude-arg"]
 resume_args = ["--continue", "--fork-session"]
 forward_scroll = true
-forward_mouse = false
 
 [providers.codex]
 command = "codex-amq"
 args = ["--no-alt-screen", "--model", "audit03-custom"]
 forward_scroll = false
-forward_mouse = false
 
 [providers.gemini]
 command = "gemini-amq"
@@ -133,7 +132,7 @@ TOML
 
   [ -L "$STATE_ROOT/dux/config.toml" ]
   cmp "$STATE_ROOT/dux/config.toml.expected" "$config_target"
-  ! grep -Fq -- "/data/state" "$HOME/.bashrc"
+  ! grep -Fq -- "/data/state" "$HOME/.bashrc" || false
   run env -u STATE_ROOT -u DUX_HOME -u AMQ_GLOBAL_ROOT \
     HOME="$HOME" bash -c 'source "$HOME/.bashrc"; printf "%s|%s|%s\n" "$STATE_ROOT" "$DUX_HOME" "$AMQ_GLOBAL_ROOT"'
   [ "$status" -eq 0 ]

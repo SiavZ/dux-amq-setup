@@ -1,0 +1,251 @@
+---
+import "../styles/global.css";
+import DocsSearch from "../components/DocsSearch.astro";
+import { SITE_TITLE, SITE_DESCRIPTION } from "../lib/site";
+
+interface Props {
+  title?: string;
+  description?: string;
+  ogImage?: string;
+  noIndex?: boolean;
+  /** When true, emit JSON-LD for SoftwareApplication + WebSite (only on the homepage). */
+  emitStructuredData?: boolean;
+}
+
+const {
+  title = SITE_TITLE,
+  description = SITE_DESCRIPTION,
+  ogImage = "/og.png",
+  noIndex = false,
+  emitStructuredData = true,
+} = Astro.props;
+
+// Analytics is opt-in via an env flag set only by the deploy workflow, so it
+// never loads during local dev or local/PR builds, only on the published site.
+const enableAnalytics = process.env.ENABLE_ANALYTICS === "true";
+
+const site = Astro.site ?? new URL("https://getdux.app");
+const canonical = new URL(Astro.url.pathname, site).toString();
+const ogImageURL = new URL(ogImage, site).toString();
+
+// Alt text for the social card: it describes what the card SHOWS rather than
+// defining the product, so only a redraw of public/og.png needs it reworded.
+const ogImageAlt =
+  "dux: your AI agents deserve a proper office. A dux session running several AI coding agents in parallel, one git worktree each.";
+
+const keywords = [
+  "dux",
+  "getdux",
+  "AI coding agents",
+  "Claude Code",
+  "Codex CLI",
+  "GitHub Copilot CLI",
+  "OpenCode",
+  "parallel AI agents",
+  "git worktrees",
+  "terminal UI",
+  "TUI",
+  "Rust TUI",
+  // dux has a web UI as well as the TUI, and people search for both. Neither
+  // set is a claim that dux is only one of them; see lib/site.ts for the
+  // positioning the copy has to carry.
+  "web UI",
+  "dux server",
+  "AI agents in the browser",
+  "self-hosted AI coding",
+  "AI coding agents on your phone",
+  "AI agent orchestration",
+  "PTY",
+  "AI pair programming",
+  "multi-agent coding",
+];
+
+const sd = {
+  software: {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    name: "dux",
+    alternateName: ["getdux", "dux TUI", "dux server"],
+    operatingSystem: ["macOS", "Linux", "Windows (WSL2)"],
+    applicationCategory: "DeveloperApplication",
+    // Two front ends over one workspace, so the subcategory is not a single value.
+    applicationSubCategory: ["Terminal UI", "Web UI"],
+    description,
+    url: site.toString(),
+    downloadUrl: "https://github.com/patrickdappollonio/dux/releases",
+    softwareHelp: "https://github.com/patrickdappollonio/dux#readme",
+    offers: {
+      "@type": "Offer",
+      price: "0",
+      priceCurrency: "USD",
+    },
+    license: "https://github.com/patrickdappollonio/dux/blob/main/LICENSE",
+    author: {
+      "@type": "Person",
+      name: "Patrick D'appollonio",
+      url: "https://www.patrickdap.com",
+    },
+    keywords: keywords.join(", "),
+    featureList: [
+      "Run multiple AI coding agents in parallel",
+      "One git worktree per agent",
+      "PTY-based, runs real CLIs (Claude, Codex, Copilot, OpenCode, any)",
+      "Terminal UI and web UI over the same workspace",
+      "Web UI served by `dux server`, reachable from a phone",
+      "Edit files in the browser with a real editor",
+      "Built-in git staging, diffs, commit, push, and pull",
+      "Macros for reusable prompts",
+      "Command palette matching words in any order, partial words too, with looser hits after the exact ones",
+      "Fork agent sessions",
+      "Companion terminals per agent",
+      "Theming via Opaline TOML format",
+      "Per-project startup commands",
+    ],
+  },
+  website: {
+    "@context": "https://schema.org",
+    "@type": "WebSite",
+    name: "dux",
+    url: site.toString(),
+    description,
+    publisher: {
+      "@type": "Person",
+      name: "Patrick D'appollonio",
+      url: "https://www.patrickdap.com",
+    },
+  },
+};
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="generator" content={Astro.generator} />
+
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <meta name="keywords" content={keywords.join(", ")} />
+    <meta name="author" content="Patrick D'appollonio" />
+    <meta name="theme-color" content="#0b0b14" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="application-name" content="dux" />
+    <meta name="apple-mobile-web-app-title" content="dux" />
+    {noIndex && <meta name="robots" content="noindex, nofollow" />}
+    {!noIndex && <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1" />}
+
+    <link rel="canonical" href={canonical} />
+    <link rel="icon" type="image/png" href="/favicon-96x96.png" sizes="96x96" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="shortcut icon" href="/favicon.ico" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <link rel="sitemap" type="application/xml" href="/sitemap-index.xml" />
+    <link rel="alternate" type="application/rss+xml" title="dux blog" href="/rss.xml" />
+
+    {/* Open Graph */}
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:site_name" content="dux" />
+    <meta property="og:locale" content="en_US" />
+    <meta property="og:image" content={ogImageURL} />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content={ogImageAlt} />
+
+    {/* Twitter / X */}
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={ogImageURL} />
+    <meta name="twitter:image:alt" content={ogImageAlt} />
+    <meta name="twitter:creator" content="@patrickdap" />
+
+    {/* Preload / preconnect */}
+    <link rel="preconnect" href="https://rsms.me" crossorigin />
+    <link rel="preconnect" href="https://fonts.googleapis.com" crossorigin />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="preconnect" href="https://asciinema.org" crossorigin />
+
+    <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap"
+    />
+
+    {
+      emitStructuredData && (
+        <>
+          <script type="application/ld+json" set:html={JSON.stringify(sd.software)} />
+          <script type="application/ld+json" set:html={JSON.stringify(sd.website)} />
+        </>
+      )
+    }
+
+    {/* Privacy-friendly analytics (Umami). Only on the published site. */}
+    {
+      enableAnalytics && (
+        <script
+          is:inline
+          defer
+          src="https://m.blogmetrics.fyi/script.js"
+          data-website-id="43bdb37d-104a-473d-b37d-143f390ccd4d"
+        />
+      )
+    }
+  </head>
+  <body class="text-[color:var(--color-text)]">
+    <slot />
+
+    {/* Global search modal (docs + blog). Opened from the header button or
+        Cmd/Ctrl-K; the Pagefind engine is lazy-loaded only when first opened. */}
+    <DocsSearch />
+
+    {/* Mark every off-site link: open in a new tab, harden rel, and (for
+        inline links) append an external-link glyph. Runs once on load and
+        covers both hand-authored components and rendered Markdown. */}
+    <script is:inline>
+      (() => {
+        const ICON =
+          '<svg class="ext-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17 17 7"/><path d="M7 7h10v10"/></svg>';
+        const isExternal = (a) => {
+          try {
+            const u = new URL(a.href, location.href);
+            return (
+              (u.protocol === "http:" || u.protocol === "https:") &&
+              u.host !== location.host
+            );
+          } catch {
+            return false;
+          }
+        };
+        document.querySelectorAll("a[href]").forEach((a) => {
+          if (!isExternal(a) || a.dataset.external === "done") return;
+          a.target = "_blank";
+          const rel = new Set(
+            (a.getAttribute("rel") || "").split(/\s+/).filter(Boolean),
+          );
+          rel.add("noopener");
+          rel.add("noreferrer");
+          rel.add("nofollow");
+          a.setAttribute("rel", [...rel].join(" "));
+          const cardLike =
+            a.matches(".card, .btn-primary, .btn-ghost") ||
+            a.querySelector("div, p, h1, h2, h3, h4, h5, h6, img");
+          if (
+            !cardLike &&
+            a.dataset.noExtIcon === undefined &&
+            !a.querySelector(".ext-icon")
+          ) {
+            a.insertAdjacentHTML("beforeend", ICON);
+          }
+          a.dataset.external = "done";
+        });
+      })();
+    </script>
+  </body>
+</html>

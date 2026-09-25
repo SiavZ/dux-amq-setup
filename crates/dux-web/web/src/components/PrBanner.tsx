@@ -1,0 +1,51 @@
+import { GitPullRequest } from "lucide-react"
+
+import { SimpleTooltip } from "@/components/SimpleTooltip"
+import { prBannerClass, prStateLabel } from "@/lib/pr"
+import { cn } from "@/lib/utils"
+import type { PrView } from "@/lib/types"
+
+// A slim, one-line PR info strip mirroring the TUI's PR banner lane
+// (`render_pr_banner`): a state-colored surface carrying the PR icon, `#N`, the
+// state word, and the (truncated) title. The whole strip is one anchor through
+// to the PR, keyboard-focusable like any link.
+//
+// `position` is where the strip sits relative to the terminal (top = above,
+// bottom = below). It draws a border only on the edge FACING the terminal: the
+// opposite edge already abuts a bordered element (the header above / the status
+// bar below), so a two-sided border would read as a doubled line.
+export function PrBanner({
+  pr,
+  position = "top",
+}: {
+  pr: PrView
+  position?: "top" | "bottom"
+}) {
+  const state = prStateLabel(pr.state)
+  return (
+    <a
+      href={pr.url}
+      target="_blank"
+      rel="noopener noreferrer"
+      className={cn(
+        "flex h-9 shrink-0 items-center gap-2 px-3 text-sm transition-colors",
+        position === "top" ? "border-b" : "border-t",
+        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        prBannerClass(pr.state)
+      )}
+    >
+      <GitPullRequest className="size-4 shrink-0" />
+      {/* Single font (sans) across the strip: a mono `#N` next to the sans
+          state/title misaligned vertically under items-center. */}
+      <span className="shrink-0 font-semibold">#{pr.number}</span>
+      <span className="shrink-0 capitalize opacity-80">{state}</span>
+      {/* Only the title carries a tooltip: the #number is already fully visible
+          so repeating it would be the old redundant tooltip. The title itself
+          is `truncate` and can clip at narrow widths, so it always gets the
+          full text on hover (skipping truncation detection keeps this simple). */}
+      <SimpleTooltip content={pr.title}>
+        <span className="truncate text-foreground/80">{pr.title}</span>
+      </SimpleTooltip>
+    </a>
+  )
+}

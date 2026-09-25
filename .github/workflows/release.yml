@@ -4,122 +4,61 @@ on:
   release:
     types: [created]
 
-# audit02 P2 — never cancel an in-flight release upload; one release per tag.
-concurrency:
-  group: release-${{ github.event.release.tag_name }}
-  cancel-in-progress: false
-
-# audit02 P1-O — workflow-level `permissions:` removed; each job declares
-# its own minimum scope below.
+permissions:
+  contents: write
 
 jobs:
-  build:
-    name: Build ${{ matrix.archive }}
-    runs-on: ${{ matrix.runner }}
-    # audit02 P0-I — `actions/attest-build-provenance` requires:
-    #   id-token: write     mint the OIDC token used to sign the attestation
-    #   attestations: write store the attestation against the repository
-    #   contents: write     upload tarball + SBOM + SHA256SUMS to the release
-    # All three must live on the SAME job (per GitHub's documentation).
-    permissions:
-      id-token: write
-      attestations: write
-      contents: write
-    # audit02 Phase 21 (P1-S, P2-5) — runners pinned to specific OS
-    # versions instead of `ubuntu-latest`/`macos-latest`. The `*-latest`
-    # alias migrates without warning when GitHub bumps its default,
-    # which has historically broken release builds (e.g. macos-latest
-    # going from 13→14 changed the default arch from x86_64 to arm64).
-    # Pinning gives deterministic toolchains and explicit upgrades.
-    #
-    # macOS runner choices:
-    #   • macos-13 is Intel (x86_64); used for the x86_64-apple-darwin
-    #     target so the build is native and cross-compile pitfalls
-    #     (linker, framework search paths) are avoided.
-    #   • macos-14 is Apple Silicon (arm64); used for the
-    #     aarch64-apple-darwin target for the same reason.
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-24.04
-            archive: dux-linux-amd64.tar.gz
-          - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
-            archive: dux-linux-arm64.tar.gz
-          # macos-13 was retired in December 2025 (announced 2025-09-19); the
-          # label still validates but no runner is ever assigned, so this job
-          # queued indefinitely on the first real release rather than failing.
-          # macos-15-intel is GitHub's documented replacement for native x86_64
-          # and is the LAST Intel image — available until August 2027, after
-          # which x86_64 must be cross-compiled from an arm64 runner.
-          - target: x86_64-apple-darwin
-            runner: macos-15-intel
-            archive: dux-darwin-amd64.tar.gz
-          - target: aarch64-apple-darwin
-            runner: macos-14
-            archive: dux-darwin-arm64.tar.gz
-
+  # A release binary with no web UI is the failure this guard exists to prevent.
+  # DUX_DISABLE_UI_BUILD makes crates/dux-web/build.rs skip the React build, which
+  # would produce four platform archives serving a "web UI not built" notice page.
+  # Every build job needs this one, so the hatch cannot ship.
+  #
+  # DUX_UI_BUILD_STATE is checked alongside it, belt and braces. build.rs stamps
+  # that name on every path it takes and a cargo:rustc-env beats an ambient value,
+  # so a set one can no longer talk the test suite into skipping; the two retired
+  # names could, and are listed here so a branch still carrying one is caught
+  # rather than quietly ignored.
+  no-ui-build-hatch:
+    name: Reject DUX_DISABLE_UI_BUILD
+    runs-on: ubuntu-latest
     steps:
-      # audit02 P0-H — third-party actions pinned by commit SHA. The
-      # `# vX.Y.Z` comment stays so future updates remain readable, and
-      # dependabot (Phase 24) keeps the SHAs fresh.
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-      - name: Install musl tools
-        if: contains(matrix.target, 'musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
-      # macOS runners ship with BSD tar; reproducible-tar flags need GNU
-      # tar (audit02 P0-I §7.7 footnote). Install gnu-tar and prefer
-      # `gtar` for the package step.
-      - name: Install GNU tar (macOS)
-        if: contains(matrix.runner, 'macos')
-        run: brew install gnu-tar
-
-      # Toolchain channel comes from rust-toolchain.toml at repo root
-      # (audit02 6.2 — deterministic version, no `stable` drift).
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: "1.88.0"
-          targets: ${{ matrix.target }}
-
-      # audit02 P1-N — release builds run on push events to release tags
-      # only, so populating the cache here is safe.
-      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab # v2.7.5
-        with:
-          key: ${{ matrix.target }}
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          cache-on-failure: false
-
-      # audit02 P0-I — cargo-auditable embeds the dependency tree in the
-      # binary so post-publication scans (`cargo audit bin`, trivy, grype)
-      # can re-check release artefacts. ~4 KB overhead.
-      - name: Install cargo-auditable
-        run: cargo install --locked cargo-auditable --version 0.7.5
-
-      # audit02 P0-I — cargo-cyclonedx generates a CycloneDX SBOM per
-      # build target. Limitation: bundled C/C++ deps (rusqlite's vendored
-      # SQLite) are not enumerated; downstream consumers should treat the
-      # SBOM as Rust-deps-only.
-      - name: Install cargo-cyclonedx
-        run: cargo install --locked cargo-cyclonedx --version 0.5.9
-
-      # Fork tags are namespaced `dux-amq-vX.Y.Z` so they never collide with
-      # upstream's `vX.Y.Z` sequence (upstream owns v0.1.0…v0.6.0 and counting).
-      # Strip both prefixes to get the bare semver the manifest needs.
-      #
-      # This used to run `cargo set-version` from cargo-edit, which cannot be
-      # installed on the pinned toolchain: cargo-edit 0.13.8 pulls
-      # smol_str 0.3.4, which requires rustc >= 1.89 while rust-toolchain.toml
-      # pins 1.88.0. That broke every build job on this workflow's first-ever
-      # run. `Cargo.toml` is a single package with exactly one top-level
-      # `version =` line (asserted below), so an in-place edit is equivalent
-      # and drops a build-time dependency entirely. Cargo.lock's own `dux`
-      # entry is refreshed by the build step, which does not pass `--locked`.
-      - name: Set version from tag
+      - name: Fail if the frontend-build escape hatch is set
         run: |
+          set -euo pipefail
+          failed=""
+          for name in DUX_DISABLE_UI_BUILD DUX_UI_BUILD_STATE DUX_UI_BUILD_SKIPPED DUX_UI_BUILD_STALE; do
+            value="$(printenv "$name" || true)"
+            if [ -n "$value" ]; then
+              echo "$name is set to '$value' in this workflow's environment. It skips the" >&2
+              echo "React build or misreports whether one happened, so a release archive" >&2
+              echo "could ship a placeholder page instead of the web UI, or ship untested." >&2
+              echo "Refusing to build a release." >&2
+              failed="yes"
+            fi
+          done
+          [ -z "$failed" ] || exit 1
+          echo "OK: no frontend-build escape hatch or state marker is set; the web UI will be built in."
+
+  prepare-release:
+    name: Prepare release metadata
+    runs-on: ubuntu-latest
+    # Carries the guard edge even though it only reads the tag, so that "the
+    # release workflow refuses to run with DUX_DISABLE_UI_BUILD set" is true of
+    # the whole workflow rather than of most of it.
+    needs: no-ui-build-hatch
+    outputs:
+      version: ${{ steps.release_version.outputs.value }}
+      npm_tag: ${{ steps.npm_dist_tag.outputs.value }}
+    steps:
+      - name: Determine release version
+        id: release_version
+        run: |
+          # This fork's tags are namespaced `dux-amq-vX.Y.Z` so they never collide
+          # with upstream's `vX.Y.Z` sequence (upstream owns v0.1.0 onwards, and
+          # every one of those tags is upstream code). Strip both prefixes to get
+          # the bare semver the manifest needs, and refuse anything that does not
+          # yield one: `dux-amq-v0.1.0-rc1` once reached `cargo set-version`
+          # unstripped and could never have built (244b33c6).
           VERSION="${{ github.event.release.tag_name }}"
           VERSION="${VERSION#dux-amq-}"
           VERSION="${VERSION#v}"
@@ -129,62 +68,128 @@ jobs:
             echo "Tag releases as 'dux-amq-vX.Y.Z'." >&2
             exit 1
           fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
 
-          # Refuse to guess if the manifest ever gains a workspace or a second
-          # top-level version key — better a failed release than a wrong one.
-          n=$(grep -c '^version = ' Cargo.toml)
-          if [ "$n" != "1" ]; then
-            echo "Expected exactly one top-level 'version =' in Cargo.toml, found $n." >&2
-            echo "The manifest shape changed; update this step deliberately." >&2
-            exit 1
+      - name: Determine npm dist tag
+        id: npm_dist_tag
+        env:
+          VERSION: ${{ steps.release_version.outputs.value }}
+        run: |
+          if [[ "$VERSION" == *-* ]]; then
+            echo "value=next" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=" >> "$GITHUB_OUTPUT"
           fi
 
-          # -i.bak keeps this portable across GNU sed (Linux) and BSD sed (macOS).
-          sed -i.bak -E "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
-          rm -f Cargo.toml.bak
+  build:
+    name: Build ${{ matrix.archive }}
+    needs: [prepare-release, no-ui-build-hatch]
+    runs-on: ${{ matrix.runner }}
+    # actions/attest-build-provenance needs id-token (to mint the OIDC token that
+    # signs the attestation) and attestations (to store it) on the SAME job that
+    # produces the subject. The job itself never touches the release, so it only
+    # reads contents.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      # Deliberately NOT fail-fast. Nothing this job produces is publicly
+      # reachable (it uploads artifacts, not release assets), so letting the
+      # other platforms finish costs nothing and reports every broken target in
+      # one run instead of one per re-run. The gate is publish-archives below,
+      # which needs ALL of them.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            archive: dux-linux-amd64.tar.gz
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            archive: dux-linux-arm64.tar.gz
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            archive: dux-darwin-amd64.tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            archive: dux-darwin-arm64.tar.gz
 
-          actual=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "(.*)"/\1/')
-          if [ "$actual" != "$VERSION" ]; then
-            echo "Version rewrite failed: wanted '$VERSION', manifest reads '$actual'." >&2
-            exit 1
-          fi
-          echo "Cargo.toml version set to $actual"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # audit02 P0-I §7.3 — replaces plain `cargo build --release`. The
-      # produced binary is byte-compatible (same compiler flags) but
-      # carries an embedded `.dep-v0` section.
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+
+      # macOS runners ship BSD tar, and the reproducible package step below needs
+      # GNU tar's --sort/--owner/--mtime flags.
+      - name: Install GNU tar (macOS)
+        if: contains(matrix.runner, 'macos')
+        run: brew install gnu-tar
+
+      # cargo-auditable embeds the dependency tree in the binary so published
+      # artifacts can be re-scanned later (`cargo audit bin`, trivy, grype).
+      # cargo-cyclonedx writes a CycloneDX SBOM per target. Both pinned to a
+      # reviewed version (audit03 P1-10): an unpinned install resolves
+      # whatever was published that morning.
+      - name: Install cargo-auditable and cargo-cyclonedx
+        run: |
+          cargo install --locked cargo-auditable --version 0.7.5
+          cargo install --locked cargo-cyclonedx --version 0.5.9
+
+      # Replaces `cargo set-version` from cargo-edit (a8ea7e79): cargo-edit is a
+      # whole extra toolchain dependency for a one-line edit, and a release of it
+      # once raised its MSRV past the toolchain and broke every build job. The
+      # workspace keeps a single version in [workspace.package] that every crate
+      # inherits, so this rewrites exactly that line, refuses to guess if the
+      # manifest shape changes, and reads the value back.
+      - name: Set version from tag
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: .github/scripts/set_workspace_version.sh "$VERSION"
+
       - name: Build (auditable)
+        env:
+          DUX_RELEASE_BUILD: "1"
         run: cargo auditable build --release --target ${{ matrix.target }}
 
-      - name: Strip binary
-        run: strip target/${{ matrix.target }}/release/dux
+      # Symbol stripping happens in Cargo ([profile.release] strip = "symbols"),
+      # so local release builds and CI produce the same binary and there is
+      # exactly one stripping mechanism.
 
-      - name: Pin source timestamp
-        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
-
-      # audit02 P0-I §7.4 — SBOM filename includes the matrix target so
-      # all four end up in the release alongside the tarballs. The
-      # `--override-filename` flag tells cargo-cyclonedx to write
-      # `sbom-<target>.cdx.json` next to Cargo.toml.
+      # The SBOM covers the binary crate's dependency graph, which is everything
+      # linked into the shipped executable (the dux crate pulls in dux-core,
+      # dux-tui and dux-web). cargo-cyclonedx also writes one file per workspace
+      # member; only the binary's is kept. Limitation: bundled C code
+      # (rusqlite's vendored SQLite) is not enumerated, so treat it as
+      # Rust-deps-only.
       - name: Generate SBOM
         run: |
-          cargo cyclonedx --format json --override-filename "sbom-${{ matrix.target }}.cdx"
-          ls -la sbom-*.cdx.json
+          set -euo pipefail
+          cargo cyclonedx --manifest-path crates/dux/Cargo.toml --format json \
+            --target ${{ matrix.target }} --override-filename "sbom-${{ matrix.target }}.cdx"
+          mv "crates/dux/sbom-${{ matrix.target }}.cdx.json" .
+          rm -f crates/*/sbom-*.cdx.json
+          ls -la "sbom-${{ matrix.target }}.cdx.json"
 
-      # audit02 P0-I §7.7 — pin metadata to source identity, then package
-      # twice and compare before upload so the reproducibility claim is
-      # exercised on every release runner. GNU tar is `gtar` on macOS.
+      # Reproducible packaging (audit02 P0-I, 4f572aac, audit03 P1-09): member
+      # metadata pinned to the source commit's numeric epoch, and `gzip -n` so the
+      # gzip header carries no wall-clock time. Packaged twice across a second
+      # boundary and compared, so the check cannot pass by timing luck again.
       - name: Package (reproducible)
         run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
           if command -v gtar >/dev/null 2>&1; then TAR=gtar; else TAR=tar; fi
-          # `--mtime` normalises the tar MEMBER timestamps, but `-z` pipes the
-          # stream through gzip on stdin, and gzip then stamps WALL-CLOCK time
-          # into bytes 5-8 of its own header. The two archives below were
-          # therefore only ever byte-identical when both packagings happened to
-          # land inside the same second -- which is exactly how this check
-          # passed on three runners and failed on the slower Intel one with
-          # "differ: char 5". `gzip -n` zeroes that header timestamp, making the
-          # archive genuinely reproducible across time rather than by luck.
           package() {
             "$TAR" --sort=name --owner=0 --group=0 --numeric-owner \
               --mtime="@${SOURCE_DATE_EPOCH}" \
@@ -192,25 +197,61 @@ jobs:
               -cf "$1" -C "target/${{ matrix.target }}/release" dux
           }
           package "${{ matrix.archive }}.first"
-          # Deliberately straddle a second boundary. Without this the two
-          # packagings usually complete within the same second and `cmp`
-          # passes whether or not the output is actually time-independent,
-          # which is what let the gzip-header bug above go unnoticed.
           sleep 2
           package "${{ matrix.archive }}"
           if ! cmp "${{ matrix.archive }}.first" "${{ matrix.archive }}"; then
             echo "Reproducibility check FAILED: two identical packagings differ." >&2
-            echo "First 16 bytes of each (gzip header is bytes 1-10):" >&2
             od -An -tx1 -N16 "${{ matrix.archive }}.first" >&2
             od -An -tx1 -N16 "${{ matrix.archive }}" >&2
             exit 1
           fi
           rm "${{ matrix.archive }}.first"
 
-      # audit02 P0-I §7.5 — OIDC-keyless build provenance attestation.
-      # Verifiable downstream via:
-      #   gh attestation verify dux-linux-amd64.tar.gz --owner <owner>
-      # Subject covers both the tarball and the per-target SBOM.
+      # One "<archive>.sha256" beside each archive, in sha256sum's own format
+      # (hex digest, two spaces, file name) so `sha256sum -c` and `shasum -a 256
+      # -c` both accept it unchanged.
+      #
+      # Be honest about what this is for: it lets install.sh detect a corrupt or
+      # truncated download, and it gives a value anyone can check by hand. It is
+      # not tamper protection. Whoever could replace an archive on the release
+      # page could replace this file next to it just as easily. Signing is what
+      # would defend against that and is not in place.
+      #
+      # Linux runners have sha256sum, macOS runners have shasum, so pick
+      # whichever exists rather than assuming one.
+      - name: Checksum the archive
+        run: |
+          set -euo pipefail
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+          elif command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+          else
+            echo "Neither sha256sum nor shasum is available on this runner." >&2
+            exit 1
+          fi
+          cat "${{ matrix.archive }}.sha256"
+
+      # Start the archive that is about to be uploaded and confirm it really serves
+      # the web UI: a page referencing a content-hashed bundle, that bundle
+      # downloading, and a WebSocket upgrade completing. Placed BEFORE the upload so
+      # a failure means nothing ships. See the script header for why this is the last
+      # line of defence rather than the primary gate (the tag already exists by now)
+      # and for the one matrix entry it can only skip.
+      - name: Smoke-test the packaged archive
+        run: .github/scripts/smoke_archive.sh ${{ matrix.archive }} ${{ matrix.target }}
+
+      # Every upstream `v*` tag is upstream code, and until 244b33c6 this
+      # workflow had only ever shipped upstream binaries under this fork's name:
+      # no AMQ, peer or watch features, none of the Rust-side threat-model
+      # mitigations. Refuse to publish an archive that is not fork lineage. Runs
+      # BEFORE the artifact upload, so a wrong-lineage build never reaches the
+      # publish gate.
+      - name: Verify the archive is fork lineage
+        run: .github/scripts/verify_fork_lineage.sh ${{ matrix.archive }} ${{ matrix.target }}
+
+      # OIDC-keyless build provenance. Verify with
+      #   gh attestation verify dux-linux-amd64.tar.gz --owner SiavZ
       - name: Attest build provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
@@ -218,145 +259,209 @@ jobs:
             ${{ matrix.archive }}
             sbom-${{ matrix.target }}.cdx.json
 
-      - name: Upload tarball + SBOM to release
+      # NOTE: this job deliberately does NOT touch the release. It hands the
+      # archive to publish-archives as a workflow artifact instead, so a platform
+      # that fails cannot leave the other three downloadable against a tag that
+      # already exists. See publish-archives for the reasoning.
+      #
+      # The .sha256 rides along so the combined-checksums step can concatenate the
+      # four of them without recomputing anything.
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}
+            ${{ matrix.archive }}.sha256
+            sbom-${{ matrix.target }}.cdx.json
+          retention-days: 1
+          if-no-files-found: error
+
+  # THE PUBLISH GATE. Every release asset becomes publicly reachable here and
+  # nowhere else.
+  #
+  # The build matrix used to upload its own archive, which meant a platform whose
+  # smoke test failed left the other three downloadable against a tag that already
+  # existed. The tag is created before this workflow starts, so there is no
+  # "abort the release" to fall back on: the only lever is to publish nothing
+  # until every platform has passed. `needs: [build]` gives exactly that, because
+  # a needs edge requires ALL matrix legs to succeed. The smoke test still gates
+  # its own archive inside the build job; this gates the release.
+  #
+  # It also publishes a single dux-checksums.txt holding all four lines, for a
+  # human verifying a download by hand: `sha256sum -c dux-checksums.txt` in a
+  # directory holding the archives. The installer deliberately does NOT use that
+  # file, it fetches the per-archive .sha256 instead, so a single-platform user
+  # never needs the other three archives present.
+  #
+  # Same honesty as above: this is corruption detection and a value to check out
+  # of band, not tamper protection. It is unsigned and served from the same place
+  # as the archives.
+  publish-archives:
+    name: Publish archives and checksums
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release archive artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: dist/artifacts
+          merge-multiple: true
+
+      - name: Combine per-archive checksums
+        run: |
+          set -euo pipefail
+          # Exported before the glob below, since it is the SHELL's locale that
+          # decides the expansion order, not cat's.
+          export LC_ALL=C
+          cd dist/artifacts
+          # The glob sorts, so the file is byte-stable regardless of the order
+          # the matrix jobs happened to finish in.
+          cat *.sha256 > dux-checksums.txt
+          echo "Combined checksums:"
+          cat dux-checksums.txt
+          # Four archives in the matrix, so four lines. A short file means a
+          # matrix job silently produced nothing.
+          lines="$(wc -l < dux-checksums.txt)"
+          if [ "$lines" -ne 4 ]; then
+            echo "Expected 4 checksum lines, got ${lines}." >&2
+            exit 1
+          fi
+          sha256sum -c dux-checksums.txt
+
+      # One upload call for everything, so the release page goes from "no assets"
+      # to "all assets" rather than filling in over several minutes.
+      #
+      # --clobber REPLACES an asset that is already there. Without it, re-running
+      # this job after a partial failure dies on the first name that already
+      # exists, which is precisely the state a re-run exists to repair.
+      #
+      # No checkout in this job, so gh cannot infer the repo from a git remote.
+      # GH_REPO tells it explicitly.
+      - name: Upload archives and checksums to release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          gh release upload "${{ github.event.release.tag_name }}" \
-            "${{ matrix.archive }}" \
-            "sbom-${{ matrix.target }}.cdx.json" \
-            --clobber
+          set -euo pipefail
+          cd dist/artifacts
+          gh release upload "${{ github.event.release.tag_name }}" --clobber \
+            *.tar.gz *.tar.gz.sha256 dux-checksums.txt sbom-*.cdx.json
+          echo "Published:"
+          ls -1
 
+  # The npm package is upstream's `@patrickdappollonio/dux`. This fork publishes
+  # no npm package and holds no token for that scope, so both npm jobs run only
+  # in upstream's repository. The condition keeps the job definitions identical
+  # to upstream's, which keeps future upstream merges of this file mechanical.
+  build-npm-package:
+    name: Build npm package
+    needs: [prepare-release, build]
+    if: ${{ github.repository == 'patrickdappollonio/dux' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+
+      - name: Download release archive artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: dist/artifacts
+          merge-multiple: true
+
+      - name: Build npm package
+        env:
+          RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
+          ARTIFACTS_DIR: dist/artifacts
+        run: node npm/scripts/build_npm_package.mjs
+
+      - name: Upload npm package artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: npm-package
+          path: dist/npm/dux-npm-*.tgz
+          retention-days: 1
+          if-no-files-found: error
+
+  publish-npm:
+    name: Publish npm package
+    needs: [prepare-release, build-npm-package]
+    if: ${{ github.repository == 'patrickdappollonio/dux' && needs.build-npm-package.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          scope: "@patrickdappollonio"
+
+      - name: Update npm
+        run: npm install -g npm@latest
+
+      - name: Download npm package artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: npm-package
+          path: dist/npm
+
+      - name: Publish to npm
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          NPM_TAG: ${{ needs.prepare-release.outputs.npm_tag }}
+        run: |
+          set -euo pipefail
+          tarball="dist/npm/dux-npm-${VERSION}.tgz"
+          if [[ ! -f "$tarball" ]]; then
+            echo "npm tarball $tarball not found"
+            exit 1
+          fi
+
+          publish_cmd=(npm publish "$tarball" --access public)
+          if [[ -n "$NPM_TAG" ]]; then
+            publish_cmd+=(--tag "$NPM_TAG")
+          fi
+
+          echo "+ ${publish_cmd[*]}"
+          "${publish_cmd[@]}"
+
+  # Gated on the archives BEING PUBLISHED, not merely on the build matrix passing.
+  # The install script is not an archive, but publishing it against a tag whose
+  # archives never landed gives a user a one-line installer that 404s, and
+  # `latest/download/install.sh` resolves to whichever release most recently had
+  # one attached. Nothing becomes reachable until every archive is actually up.
+  #
+  # `needs: [build]` was the wrong edge for precisely the hazard described above:
+  # it runs this job in PARALLEL with publish-archives rather than after it, so a
+  # failed upload still left the installer attached to the tag.
+  #
+  # --clobber so re-running after a partial failure replaces the asset instead of
+  # dying on the name already being there.
   upload-install-script:
     name: Upload install script
-    # audit02 Phase 21 (P2-5) — pinned OS version (no `*-latest` drift).
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write    # upload install.sh asset
+    runs-on: ubuntu-latest
+    needs: [publish-archives]
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Upload install script
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload ${{ github.event.release.tag_name }} install.sh
-
-  # audit02 P0-I §7.6 — generate SHA256SUMS over the now-uploaded tarballs
-  # so users (and `dux-amq/install.sh`'s pinned hash) can verify integrity
-  # with `curl -fsSL .../SHA256SUMS | sha256sum -c -`.
-  # Runs after `build` has uploaded every per-target tarball.
-  sha256sums:
-    name: SHA256SUMS
-    runs-on: ubuntu-24.04
-    needs: [build]
-    permissions:
-      contents: write    # upload SHA256SUMS asset
-    steps:
-      - name: Download tarballs from release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p dist
-          # The `--pattern '*.tar.gz'` filter restricts download to the
-          # binary archives — SBOMs are JSON and excluded.
-          gh release download "${{ github.event.release.tag_name }}" \
-            --repo "${{ github.repository }}" \
-            --pattern '*.tar.gz' \
-            --dir dist
-
-      - name: Generate SHA256SUMS
-        run: |
-          cd dist
-          # `sha256sum` already produces `<hash>  <filename>` (two spaces),
-          # the format expected by `sha256sum -c -`. Sort for determinism.
-          sha256sum *.tar.gz | LC_ALL=C sort > SHA256SUMS
-          cat SHA256SUMS
-
-      # This job never checks out the repository, so `gh` cannot infer the
-      # target from a git remote — without `--repo` it fails with
-      # "failed to run git: fatal: not a git repository". The download step
-      # above already passes it; the upload step did not.
-      - name: Upload SHA256SUMS
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release upload "${{ github.event.release.tag_name }}" \
-            --repo "${{ github.repository }}" \
-            dist/SHA256SUMS --clobber
-
-  # rustport Phase 03 — the check whose absence produced finding F1.
-  #
-  # Every `v*` tag in this repository is an ancestor of upstream/main, so
-  # `release.yml` had only ever built UPSTREAM code: no `peer.rs`, no
-  # `amq_inject.rs`, no `purge.rs`, no `watch/`. Released artifacts therefore
-  # contained none of the AMQ/peer/watch features the README advertises, and
-  # none of the Rust-side threat-model mitigations.
-  #
-  # `dux --help` enumerates the top-level subcommands (src/main.rs::print_help).
-  # `peer` and `session purge` exist only in this fork, so asserting they are
-  # present proves the artifact was built from fork lineage. An upstream-lineage
-  # tag fails this job instead of shipping silently.
-  verify-release:
-    name: Verify artifact is fork lineage
-    runs-on: ubuntu-24.04
-    needs: [build, sha256sums]
-    permissions:
-      contents: read
-    steps:
-      - name: Download linux-amd64 tarball and SHA256SUMS
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release download "${{ github.event.release.tag_name }}" \
-            --repo "${{ github.repository }}" \
-            --pattern 'dux-linux-amd64.tar.gz' \
-            --pattern 'SHA256SUMS' \
-            --dir dist
-
-      - name: Verify checksum
-        run: |
-          cd dist
-          grep ' dux-linux-amd64.tar.gz$' SHA256SUMS | sha256sum -c -
-
-      - name: Extract and smoke-test
-        run: |
-          cd dist
-          tar -xzf dux-linux-amd64.tar.gz
-          chmod +x dux
-          ./dux --help > help.txt
-          cat help.txt
-
-          fail=0
-          for sub in "dux peer" "dux session" "dux doctor" "dux config"; do
-            if ! grep -q -- "$sub" help.txt; then
-              echo "MISSING subcommand in --help: $sub" >&2
-              fail=1
-            fi
-          done
-
-          # `peer` and `session purge` are fork-only. Their absence means this
-          # release was cut from an upstream-lineage ref.
-          if ! grep -q 'Route messages between Dux agent sessions' help.txt; then
-            echo "FATAL: 'dux peer' description absent — artifact is not fork lineage." >&2
-            fail=1
-          fi
-          if ! grep -q 'session purge' help.txt; then
-            echo "FATAL: 'dux session purge' absent — artifact is not fork lineage." >&2
-            fail=1
-          fi
-
-          exit $fail
+        run: gh release upload "${{ github.event.release.tag_name }}" --clobber install.sh
 
   update-release-notes:
     name: Append install instructions
-    # audit02 Phase 21 (P2-5) — pinned OS version (no `*-latest` drift).
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write    # edit release body
-    # Wait for SHA256SUMS so the rendered release body never references
-    # an asset that hasn't landed yet.
-    needs: [build, upload-install-script, sha256sums]
+    runs-on: ubuntu-latest
+    needs: [build, publish-archives, upload-install-script]
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Append install section to release notes
         env:

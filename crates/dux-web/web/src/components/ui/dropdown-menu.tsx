@@ -1,0 +1,382 @@
+"use client"
+
+import * as React from "react"
+import { Menu as MenuPrimitive } from "@base-ui/react/menu"
+
+import { cn } from "@/lib/utils"
+import { useIsMobile } from "@/hooks/use-mobile"
+import {
+  SHEET_BACKDROP_CLASS,
+  SHEET_POPUP_CLASS,
+  SHEET_POSITIONER_STYLE,
+} from "@/components/ui/popupSheet"
+import { ChevronRightIcon, ChevronLeftIcon, CheckIcon } from "lucide-react"
+
+// On phones every dropdown renders as a full-width bottom sheet instead of an
+// anchored popup. The sheet geometry, backdrop and popup classes live in
+// ui/popupSheet.ts, shared with ui/popover.tsx so every popup primitive presents
+// identically. The split is JS-driven so the desktop tree stays byte-identical,
+// and only the presentation swaps: the base-ui Root, Trigger, Popup and Item
+// machinery is the same in both.
+
+function DropdownMenu({ ...props }: MenuPrimitive.Root.Props) {
+  return <MenuPrimitive.Root data-slot="dropdown-menu" {...props} />
+}
+
+function DropdownMenuPortal({ ...props }: MenuPrimitive.Portal.Props) {
+  return <MenuPrimitive.Portal data-slot="dropdown-menu-portal" {...props} />
+}
+
+function DropdownMenuTrigger({ ...props }: MenuPrimitive.Trigger.Props) {
+  return <MenuPrimitive.Trigger data-slot="dropdown-menu-trigger" {...props} />
+}
+
+function DropdownMenuContent({
+  align = "start",
+  alignOffset = 0,
+  side = "bottom",
+  sideOffset = 4,
+  className,
+  ...props
+}: MenuPrimitive.Popup.Props &
+  Pick<
+    MenuPrimitive.Positioner.Props,
+    "align" | "alignOffset" | "side" | "sideOffset"
+  >) {
+  const isMobile = useIsMobile()
+  if (isMobile) {
+    // The same Portal, Positioner and Popup parts as the desktop branch, so
+    // every menu-content convention rides through unchanged and only geometry
+    // and animation differ. The anchored align and side props are accepted and
+    // ignored: `SHEET_POSITIONER_STYLE` overrides the computed placement.
+    return (
+      <MenuPrimitive.Portal>
+        <MenuPrimitive.Backdrop
+          data-slot="dropdown-menu-backdrop"
+          className={SHEET_BACKDROP_CLASS}
+        />
+        <MenuPrimitive.Positioner
+          className="isolate z-50 outline-none"
+          style={SHEET_POSITIONER_STYLE}
+          align={align}
+          alignOffset={alignOffset}
+          side={side}
+          sideOffset={sideOffset}
+        >
+          <MenuPrimitive.Popup
+            data-slot="dropdown-menu-content"
+            className={cn(SHEET_POPUP_CLASS, className)}
+            {...props}
+          />
+        </MenuPrimitive.Positioner>
+      </MenuPrimitive.Portal>
+    )
+  }
+  return (
+    <MenuPrimitive.Portal>
+      <MenuPrimitive.Positioner
+        className="isolate z-50 outline-none"
+        align={align}
+        alignOffset={alignOffset}
+        side={side}
+        sideOffset={sideOffset}
+      >
+        <MenuPrimitive.Popup
+          data-slot="dropdown-menu-content"
+          // Deliberately not the template's `w-(--anchor-width)`, which pins a
+          // menu to its trigger and collapses an icon-button trigger's menu to
+          // the min-width floor. Menus size to their widest item instead, with a
+          // wider floor and a screen-edge cap.
+          className={cn("z-50 max-h-(--available-height) w-max min-w-40 max-w-(--available-width) origin-(--transform-origin) overflow-x-hidden overflow-y-auto overscroll-contain rounded-lg bg-popover p-1 text-popover-foreground shadow-md ring-1 ring-foreground/10 duration-100 outline-none data-[side=bottom]:slide-in-from-top-2 data-[side=inline-end]:slide-in-from-left-2 data-[side=inline-start]:slide-in-from-right-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:overflow-hidden data-closed:fade-out-0 data-closed:zoom-out-95", className )}
+          {...props}
+        />
+      </MenuPrimitive.Positioner>
+    </MenuPrimitive.Portal>
+  )
+}
+
+function DropdownMenuGroup({ ...props }: MenuPrimitive.Group.Props) {
+  return <MenuPrimitive.Group data-slot="dropdown-menu-group" {...props} />
+}
+
+function DropdownMenuLabel({
+  className,
+  inset,
+  ...props
+}: MenuPrimitive.GroupLabel.Props & {
+  inset?: boolean
+}) {
+  return (
+    <MenuPrimitive.GroupLabel
+      data-slot="dropdown-menu-label"
+      data-inset={inset}
+      className={cn(
+        "px-1.5 py-1 text-xs font-medium text-muted-foreground data-inset:pl-7",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+function DropdownMenuItem({
+  className,
+  inset,
+  variant = "default",
+  ...props
+}: MenuPrimitive.Item.Props & {
+  inset?: boolean
+  variant?: "default" | "destructive"
+}) {
+  return (
+    <MenuPrimitive.Item
+      data-slot="dropdown-menu-item"
+      data-inset={inset}
+      data-variant={variant}
+      // Divergence from the generated template: max-md:min-h-11 gives each menu
+      // item a ≥44px touch target on phones: these menus carry the mobile hub's
+      // primary session/project actions. Desktop density is unchanged via md:.
+      className={cn(
+        "group/dropdown-menu-item relative flex min-h-11 cursor-default items-center gap-1.5 rounded-md px-1.5 py-1 text-sm outline-hidden select-none focus:bg-accent focus:text-accent-foreground not-data-[variant=destructive]:focus:**:text-accent-foreground data-inset:pl-7 data-[variant=destructive]:text-destructive data-[variant=destructive]:focus:bg-destructive/10 data-[variant=destructive]:focus:text-destructive dark:data-[variant=destructive]:focus:bg-destructive/20 data-disabled:pointer-events-none data-disabled:opacity-50 md:min-h-0 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4 data-[variant=destructive]:*:[svg]:text-destructive",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+// Lets the mobile sub-sheet's Back row close its own submenu and only it:
+// `actionsRef.close()` closes the nearest SubmenuRoot with the imperative-action
+// reason, returning focus to its trigger in the parent sheet.
+const SubmenuCloseContext = React.createContext<(() => void) | null>(null)
+
+function DropdownMenuSub({
+  actionsRef: actionsRefProp,
+  ...props
+}: MenuPrimitive.SubmenuRoot.Props) {
+  const localActionsRef = React.useRef<MenuPrimitive.Root.Actions | null>(null)
+  // A caller-supplied actionsRef wins; ours is a fallback. Passing one is inert,
+  // registering the handle only: the "must unmount manually" note in base-ui's
+  // docs describes the unmount() action, not the ref.
+  const actionsRef = actionsRefProp ?? localActionsRef
+  // No manual useCallback: the React Compiler memoizes this (and flags a
+  // hand-written dependency list over ref.current access as unpreservable).
+  const close = () => {
+    actionsRef.current?.close()
+  }
+  return (
+    <SubmenuCloseContext.Provider value={close}>
+      <MenuPrimitive.SubmenuRoot
+        data-slot="dropdown-menu-sub"
+        actionsRef={actionsRef}
+        {...props}
+      />
+    </SubmenuCloseContext.Provider>
+  )
+}
+
+function DropdownMenuSubTrigger({
+  className,
+  inset,
+  children,
+  ...props
+}: MenuPrimitive.SubmenuTrigger.Props & {
+  inset?: boolean
+}) {
+  return (
+    <MenuPrimitive.SubmenuTrigger
+      data-slot="dropdown-menu-sub-trigger"
+      data-inset={inset}
+      // These must stay identical to `DropdownMenuItem`'s pair: a submenu
+      // trigger is a row in the same open menu, and without the shared phone
+      // floor it renders visibly shorter than every sibling item.
+      className={cn(
+        "flex min-h-11 cursor-default items-center gap-1.5 rounded-md px-1.5 py-1 text-sm outline-hidden select-none md:min-h-0 focus:bg-accent focus:text-accent-foreground not-data-[variant=destructive]:focus:**:text-accent-foreground data-inset:pl-7 data-popup-open:bg-accent data-popup-open:text-accent-foreground data-open:bg-accent data-open:text-accent-foreground [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+        className
+      )}
+      {...props}
+    >
+      {children}
+      <ChevronRightIcon className="ml-auto" />
+    </MenuPrimitive.SubmenuTrigger>
+  )
+}
+
+function DropdownMenuSubContent({
+  align = "start",
+  alignOffset = -3,
+  side = "right",
+  sideOffset = 0,
+  className,
+  children,
+  ...props
+}: React.ComponentProps<typeof DropdownMenuContent>) {
+  const isMobile = useIsMobile()
+  const closeSub = React.useContext(SubmenuCloseContext)
+  if (isMobile) {
+    // A submenu drills down, matching AppMenuSheet: the same full-width sheet
+    // stacked over the parent with a Back row on top, because nested anchored
+    // popovers cannot work on a phone. The Back row is a real menu item, and
+    // `closeOnClick={false}` keeps the tree-wide close-on-select off it. The
+    // desktop submenu className is deliberately not merged: its anchored-popup
+    // geometry would undo the sheet.
+    return (
+      <DropdownMenuContent
+        data-slot="dropdown-menu-sub-content"
+        className={className}
+        align={align}
+        alignOffset={alignOffset}
+        side={side}
+        sideOffset={sideOffset}
+        {...props}
+      >
+        <DropdownMenuItem
+          data-slot="dropdown-menu-back"
+          closeOnClick={false}
+          onClick={() => closeSub?.()}
+          className="font-medium"
+        >
+          <ChevronLeftIcon />
+          Back
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        {children}
+      </DropdownMenuContent>
+    )
+  }
+  return (
+    <DropdownMenuContent
+      data-slot="dropdown-menu-sub-content"
+      className={cn("w-auto min-w-[96px] rounded-lg bg-popover p-1 text-popover-foreground shadow-lg ring-1 ring-foreground/10 duration-100 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95", className )}
+      align={align}
+      alignOffset={alignOffset}
+      side={side}
+      sideOffset={sideOffset}
+      {...props}
+    >
+      {children}
+    </DropdownMenuContent>
+  )
+}
+
+function DropdownMenuCheckboxItem({
+  className,
+  children,
+  checked,
+  inset,
+  ...props
+}: MenuPrimitive.CheckboxItem.Props & {
+  inset?: boolean
+}) {
+  return (
+    <MenuPrimitive.CheckboxItem
+      data-slot="dropdown-menu-checkbox-item"
+      data-inset={inset}
+      className={cn(
+        "relative flex cursor-default items-center gap-1.5 rounded-md py-1 pr-8 pl-1.5 text-sm outline-hidden select-none focus:bg-accent focus:text-accent-foreground focus:**:text-accent-foreground data-inset:pl-7 data-disabled:pointer-events-none data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+        className
+      )}
+      checked={checked}
+      {...props}
+    >
+      <span
+        className="pointer-events-none absolute right-2 flex items-center justify-center"
+        data-slot="dropdown-menu-checkbox-item-indicator"
+      >
+        <MenuPrimitive.CheckboxItemIndicator>
+          <CheckIcon
+          />
+        </MenuPrimitive.CheckboxItemIndicator>
+      </span>
+      {children}
+    </MenuPrimitive.CheckboxItem>
+  )
+}
+
+function DropdownMenuRadioGroup({ ...props }: MenuPrimitive.RadioGroup.Props) {
+  return (
+    <MenuPrimitive.RadioGroup
+      data-slot="dropdown-menu-radio-group"
+      {...props}
+    />
+  )
+}
+
+function DropdownMenuRadioItem({
+  className,
+  children,
+  inset,
+  ...props
+}: MenuPrimitive.RadioItem.Props & {
+  inset?: boolean
+}) {
+  return (
+    <MenuPrimitive.RadioItem
+      data-slot="dropdown-menu-radio-item"
+      data-inset={inset}
+      className={cn(
+        "relative flex cursor-default items-center gap-1.5 rounded-md py-1 pr-8 pl-1.5 text-sm outline-hidden select-none focus:bg-accent focus:text-accent-foreground focus:**:text-accent-foreground data-inset:pl-7 data-disabled:pointer-events-none data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+        className
+      )}
+      {...props}
+    >
+      <span
+        className="pointer-events-none absolute right-2 flex items-center justify-center"
+        data-slot="dropdown-menu-radio-item-indicator"
+      >
+        <MenuPrimitive.RadioItemIndicator>
+          <CheckIcon
+          />
+        </MenuPrimitive.RadioItemIndicator>
+      </span>
+      {children}
+    </MenuPrimitive.RadioItem>
+  )
+}
+
+function DropdownMenuSeparator({
+  className,
+  ...props
+}: MenuPrimitive.Separator.Props) {
+  return (
+    <MenuPrimitive.Separator
+      data-slot="dropdown-menu-separator"
+      className={cn("-mx-1 my-1 h-px bg-border", className)}
+      {...props}
+    />
+  )
+}
+
+function DropdownMenuShortcut({
+  className,
+  ...props
+}: React.ComponentProps<"span">) {
+  return (
+    <span
+      data-slot="dropdown-menu-shortcut"
+      className={cn(
+        "ml-auto text-xs tracking-widest text-muted-foreground group-focus/dropdown-menu-item:text-accent-foreground",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+export {
+  DropdownMenu,
+  DropdownMenuPortal,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuLabel,
+  DropdownMenuItem,
+  DropdownMenuCheckboxItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuShortcut,
+  DropdownMenuSub,
+  DropdownMenuSubTrigger,
+  DropdownMenuSubContent,
+}

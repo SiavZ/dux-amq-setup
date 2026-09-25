@@ -1,0 +1,65 @@
+[package]
+name = "dux-core"
+version.workspace = true
+rust-version.workspace = true
+edition = "2024"
+# Ships only inside the dux binary, never on crates.io. cargo-deny keys its
+# private-crate exemptions (license, path wildcards) on this.
+publish = false
+
+[features]
+# Exposes the stand-in `gh` builders (`gh::probe_test_support`) to other crates'
+# test targets. `dux-tui` and `dux-web` enable it as a DEV-dependency only, so it
+# is off in a normal build and none of it ships in a release binary.
+test-support = []
+
+[dependencies]
+notify.workspace = true
+# Gzips a rotated log copy in the background; dux-web already depends on it.
+flate2.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+compact_str = "0.9"
+content_inspector.workspace = true
+home.workspace = true
+indexmap.workspace = true
+petname = { version = "3.0.0", default-features = false, features = ["default-rng", "default-words"] }
+portable-pty = "0.9"
+rusqlite = { version = "0.39.0", features = ["bundled", "chrono", "backup"] }
+libc.workspace = true
+rustix.workspace = true
+serde.workspace = true
+# `preserve_order` is load-bearing: `[macros]` and `[providers]` are
+# order-meaningful flattened IndexMaps, and without it `toml::from_str` hands
+# serde the keys alphabetically, so a config reload (or a `-p dux-core` test)
+# silently re-sorts them. dux-tui already enabled it; declaring it here too
+# keeps dux-core's own semantics independent of feature unification.
+toml = { version = "1.1.2", features = ["preserve_order"] }
+toml_edit = "0.25"
+serde_json.workspace = true
+sysinfo.workspace = true
+tempfile.workspace = true
+url.workspace = true
+percent-encoding.workspace = true
+uuid.workspace = true
+walkdir = "2"
+alacritty_terminal = "0.26.0"
+ureq = "3.3.0"
+# Watch rules (`crate::watch`): linear-time regex with a size cap, plus a
+# small seeded RNG for backoff jitter.
+regex = "1"
+rand = { version = "0.8", features = ["small_rng"] }
+
+[dev-dependencies]
+# AMQ queue expiry tests backdate file mtimes.
+filetime = "0.2"
+
+# The reload end-to-end test execs itself to play the second generation of a
+# reload, so it needs its own `main` instead of libtest's (which would just run
+# the suite again after the exec). Being a test target, it is never built by
+# `cargo build` or `cargo install`, unlike the `[[bin]]` it replaced.
+[[test]]
+name = "reload_handoff_e2e"
+harness = false

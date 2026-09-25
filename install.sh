@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# This fork's releases, not upstream's: upstream's builds carry none of the
+# AMQ/peer/watch features this repository ships (244b33c6, audit03 P1-07).
+# DUX_REPO exists for mirrors and tests.
 REPO="${DUX_REPO:-SiavZ/dux-amq-setup}"
 BINARY="dux"
 
 # Allow overriding the version and install directory via environment variables.
 VERSION="${DUX_VERSION:-}"
 INSTALL_DIR="${DUX_INSTALL_DIR:-}"
+DUX_TMPDIR=""
 
-log() { printf '%s\n' "$@"; }
-err() { log "$@" >&2; exit 1; }
-
-# Progress output from a function whose stdout is captured by command
-# substitution MUST go to stderr, or it lands in the captured value.
-# `resolve_version` is called as `version="$(resolve_version)"`.
-note() { log "$@" >&2; }
+log() { printf '%s\n' "$@" >&2; }
+err() { log "$@"; exit 1; }
+cleanup() {
+    [ -n "$DUX_TMPDIR" ] && rm -rf "$DUX_TMPDIR"
+}
 
 detect_os() {
     local os
@@ -60,25 +62,183 @@ http_download() {
     fi
 }
 
-sha256_file() {
-    if has_cmd sha256sum; then
-        sha256sum "$1" | awk '{print $1}'
-    elif has_cmd shasum; then
-        shasum -a 256 "$1" | awk '{print $1}'
+# Detail about the last http_fetch_optional call, for the caller's message.
+HTTP_FETCH_DETAIL=""
+
+# Fetch a file that is allowed to be absent, telling "the server says it is not
+# there" apart from "the fetch never happened".
+#
+# http_download cannot make that distinction: it collapses a 404, a DNS failure,
+# a refused connection, a TLS error and a proxy error into one non-zero exit. The
+# caller then has to guess, and guessing produced a message that asserted a
+# specific cause ("this release predates checksums") on the strength of a local
+# network error. Three outcomes instead, so the caller can say something true:
+#
+#   0 -> downloaded into $dest
+#   1 -> the server answered, and answered that the file is not there (404/410)
+#   2 -> the fetch itself failed, so nothing is known about whether it exists
+#
+# $dest is removed unless the outcome is 0, so a caller can still treat a
+# zero-byte leftover as "absent" without depending on this.
+http_fetch_optional() {
+    local url="$1" dest="$2"
+    local errfile="${dest}.fetch-error"
+    HTTP_FETCH_DETAIL=""
+    rm -f "$dest" "$errfile"
+
+    if has_cmd curl; then
+        # No -f here: --fail makes curl exit 22 for every HTTP error, which is the
+        # very conflation being removed. Ask for the status code instead.
+        local code status=0
+        code="$(curl -sSL --max-time 60 -o "$dest" -w '%{http_code}' "$url" 2>"$errfile")" \
+            || status=$?
+        if [ "$status" -ne 0 ]; then
+            HTTP_FETCH_DETAIL="curl exit ${status}: $(tr '\n' ' ' <"$errfile" 2>/dev/null)"
+            rm -f "$dest" "$errfile"
+            return 2
+        fi
+        rm -f "$errfile"
+        case "$code" in
+            2??)     return 0 ;;
+            404|410) rm -f "$dest"; HTTP_FETCH_DETAIL="the server answered HTTP ${code}"; return 1 ;;
+            *)       rm -f "$dest"; HTTP_FETCH_DETAIL="the server answered HTTP ${code}"; return 2 ;;
+        esac
+    elif has_cmd wget; then
+        # -nv rather than -q: quiet still suppresses the ERROR text, which is the
+        # only thing that explains a transport failure (a refused connection
+        # produces no server response for -S to report). -nv keeps the message and
+        # drops the progress bar.
+        local status=0
+        wget -nv -S -O "$dest" "$url" 2>"$errfile" || status=$?
+        if [ "$status" -eq 0 ]; then
+            rm -f "$errfile"
+            return 0
+        fi
+        # wget exits 8 for any error RESPONSE, so the status alone cannot separate
+        # a 404 from a 500. -S puts the response lines on stderr; read the last.
+        local code
+        code="$(grep -oE 'HTTP/[0-9.]+ [0-9]{3}' "$errfile" 2>/dev/null | tail -1 | sed 's/.* //')"
+        if [ -n "$code" ]; then
+            HTTP_FETCH_DETAIL="the server answered HTTP ${code}"
+        else
+            HTTP_FETCH_DETAIL="wget exit ${status}: $(tr '\n' ' ' <"$errfile" 2>/dev/null)"
+        fi
+        rm -f "$dest" "$errfile"
+        case "$code" in
+            404|410) return 1 ;;
+            *)       return 2 ;;
+        esac
     else
-        err "Either sha256sum or shasum is required to verify the release archive."
+        HTTP_FETCH_DETAIL="neither curl nor wget is installed"
+        return 2
     fi
 }
 
-verify_archive() {
-    local archive_path="$1" sums_path="$2" archive_name="$3"
-    local expected actual
-    expected="$(awk -v name="$archive_name" '$2 == name || $2 == "*" name { print $1; exit }' "$sums_path")"
-    [ -n "$expected" ] || err "SHA256SUMS has no entry for ${archive_name}."
-    actual="$(sha256_file "$archive_path")"
-    [ "$actual" = "$expected" ] || \
-        err "Checksum mismatch for ${archive_name}: got ${actual}, expected ${expected}."
-    log "Verified ${archive_name} (${actual})"
+# Print the SHA-256 of a file as lowercase hex, or return 1 when this machine
+# has no way to compute one. Linux ships sha256sum (coreutils); macOS ships
+# shasum instead; a minimal container may well have neither, which is why the
+# failure is a return value rather than a fatal error.
+sha256_of() {
+    local file="$1"
+    if has_cmd sha256sum; then
+        sha256sum "$file" | cut -d' ' -f1
+    elif has_cmd shasum; then
+        shasum -a 256 "$file" | cut -d' ' -f1
+    else
+        return 1
+    fi
+}
+
+# Check a downloaded archive against its published checksum.
+#
+# What this genuinely buys, stated plainly: it detects a CORRUPTED or TRUNCATED
+# download, and it publishes a value you can verify by hand out of band. It is
+# NOT protection against a tampered release. Anyone able to replace an archive on
+# the release page can replace the checksum file sitting beside it just as
+# easily, because both come from the same place over the same channel. Only
+# signed artifacts would defend against that, and dux does not sign releases yet.
+#
+# Outcomes:
+#   * checksum present and matching  -> return 0, install proceeds
+#   * checksum present and different -> exit 1, nothing is installed
+#   * checksum could not be FETCHED  -> warn that the fetch failed, return 1,
+#     and the caller proceeds anyway
+#   * checksum genuinely absent, or no hashing tool on this machine -> warn
+#     loudly and return 1, and the caller proceeds anyway
+#
+# The fourth argument is the fetch outcome from http_fetch_optional (0 fetched,
+# 1 absent, 2 fetch failed); it defaults to 0 so a caller holding a local file
+# can pass three arguments. Keeping "the fetch failed" separate from "there is no
+# checksum" matters twice over: a message that blames the release for a local DNS
+# failure sends the user to the wrong place, and mandatory checksums are
+# impossible while the two look identical.
+#
+# The permissive branches are deliberate and TEMPORARY. Releases published before
+# checksums existed carry no .sha256 file, and the install-script CI installs the
+# real latest release, so treating a missing checksum as fatal today would break
+# both installing older versions and that CI run. Once every supported release
+# carries a checksum, make it mandatory by replacing the `return 1` in the "no
+# published checksum" branch with a call to `err`. The fetch-failure branch
+# should become an `err` at the same time (an unverifiable download is
+# unverifiable whatever the reason) but it is a SEPARATE decision with a separate
+# message, which is the point of splitting them. The "no hashing tool" branch
+# should probably stay a warning even then, since that is a property of the
+# user's machine and not of the release.
+verify_checksum() {
+    local archive="$1" checksum_file="$2" label="$3" fetch_status="${4:-0}"
+
+    if [ "$fetch_status" -eq 2 ]; then
+        log ""
+        log "WARNING: the checksum for ${label} could not be fetched."
+        log "         ${HTTP_FETCH_DETAIL:-the request failed}"
+        log "         This is a problem reaching the server (DNS, connectivity, TLS or"
+        log "         a proxy), NOT a release that was published without a checksum."
+        log "         The download was NOT verified. Re-run the install once the"
+        log "         connection works, or check the archive by hand against the"
+        log "         checksum on the release page."
+        log ""
+        return 1
+    fi
+
+    if [ ! -s "$checksum_file" ]; then
+        log ""
+        log "WARNING: no published checksum for ${label}."
+        log "         The download was NOT verified. Releases published before dux"
+        log "         started emitting checksums do not have one."
+        log ""
+        return 1
+    fi
+
+    # The published file is one line in sha256sum's own format: the hex digest,
+    # two spaces, the archive name. Take the first field only.
+    local expected
+    expected="$(head -1 "$checksum_file" | cut -d' ' -f1 | tr '[:upper:]' '[:lower:]')"
+
+    if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+        err "Checksum file for ${label} is malformed (expected 64 hex characters, got '${expected}')." \
+            "Refusing to install an archive that cannot be verified against it."
+    fi
+
+    local actual
+    if ! actual="$(sha256_of "$archive")"; then
+        log ""
+        log "WARNING: neither sha256sum nor shasum is available on this machine."
+        log "         A checksum was published for ${label} but could not be checked."
+        log "         Install coreutils (sha256sum) or perl (shasum) to enable verification."
+        log ""
+        return 1
+    fi
+
+    if [ "$actual" != "$expected" ]; then
+        err "Checksum mismatch for ${label}." \
+            "  expected: ${expected}" \
+            "  actual:   ${actual}" \
+            "The download is corrupt or does not match what the release publishes." \
+            "Nothing has been installed. Try again, and if it keeps failing, report it."
+    fi
+
+    log "Checksum verified for ${label} (sha256 ${actual})."
+    return 0
 }
 
 # Parse the first tag_name out of a GitHub API response without requiring jq.
@@ -91,10 +251,19 @@ parse_tag() {
         | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/'
 }
 
+# Print the line for `name` from a combined SHA256SUMS file (sha256sum format,
+# `<hex>  <name>` or `<hex> *<name>`), or nothing when it has no such entry.
+# verify_checksum then sees either a one-line checksum file or an empty one,
+# and an empty one already reads as "no published checksum".
+checksum_line_from_sums() {
+    local sums="$1" name="$2"
+    awk -v name="$name" '$2 == name || $2 == "*" name { print; exit }' "$sums"
+}
+
 resolve_version() {
     if [ -n "$VERSION" ]; then
-        # Fork releases are tagged `dux-amq-vX.Y.Z`; a bare `X.Y.Z` is also
-        # accepted and gets the `v` prefix for backward compatibility.
+        # Fork releases are tagged `dux-amq-vX.Y.Z`, so they never collide with
+        # upstream's `vX.Y.Z`. A bare `X.Y.Z` still gets the `v` prefix.
         case "$VERSION" in
             dux-amq-*|v*) echo "$VERSION" ;;
             *)            echo "v$VERSION" ;;
@@ -102,19 +271,19 @@ resolve_version() {
         return
     fi
 
-    note "Fetching latest release version..."
+    log "Fetching latest release version..."
     local response tag
 
-    # `/releases/latest` excludes prereleases and returns 404 when a repository
-    # has only prereleases — which is exactly the state this repo was in before
-    # its first stable release. Fall back to the full list (newest first) so a
-    # prerelease-only repo still installs rather than dying with a bare error.
+    # `/releases/latest` excludes prereleases and answers 404 when a repository
+    # has only prereleases, which is the state this fork was in before its first
+    # stable release. Fall back to the full list (newest first) so such a repo
+    # still installs rather than dying with a bare error.
     if response="$(http_get "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null)"; then
         tag="$(parse_tag "$response")"
     fi
 
     if [ -z "${tag:-}" ]; then
-        note "No stable release found; falling back to the most recent release..."
+        log "No stable release found; falling back to the most recent release..."
         response="$(http_get "https://api.github.com/repos/${REPO}/releases?per_page=1" 2>/dev/null)" || true
         tag="$(parse_tag "${response:-}")"
     fi
@@ -126,8 +295,8 @@ resolve_version() {
             "unreachable from this host (rate limit, proxy, or no network)." \
             "" \
             "Install a specific version instead:" \
-            "  curl -sSfL https://raw.githubusercontent.com/${REPO}/main/install.sh \\" \
-            "    | DUX_VERSION=dux-amq-v0.1.0 bash" \
+            "  curl -sSfL https://github.com/${REPO}/releases/latest/download/install.sh \\" \
+            "    | DUX_VERSION=dux-amq-v0.1.1 bash" \
             "" \
             "Available releases: https://github.com/${REPO}/releases"
     fi
@@ -154,37 +323,58 @@ resolve_install_dir() {
 }
 
 main() {
-    local os arch version install_dir archive url sums_url tmpdir cleanup_cmd
+    local os arch version install_dir archive base_url url checksum_file checksum_status
 
     os="$(detect_os)"
     arch="$(detect_arch)"
     version="$(resolve_version)"
     install_dir="$(resolve_install_dir)"
     archive="${BINARY}-${os}-${arch}.tar.gz"
-    url="https://github.com/${REPO}/releases/download/${version}/${archive}"
-    sums_url="https://github.com/${REPO}/releases/download/${version}/SHA256SUMS"
+    base_url="https://github.com/${REPO}/releases/download/${version}"
+    url="${base_url}/${archive}"
 
     log "Installing ${BINARY} ${version} (${os}/${arch}) to ${install_dir}"
 
-    tmpdir="$(mktemp -d)"
-    printf -v cleanup_cmd 'rm -rf -- %q' "$tmpdir"
-    # Expand now: `tmpdir` is local to main and is out of scope at EXIT.
-    # shellcheck disable=SC2064
-    trap "$cleanup_cmd" EXIT
+    DUX_TMPDIR="$(mktemp -d)"
+    trap cleanup EXIT
 
     log "Downloading ${url}..."
-    http_download "$url" "${tmpdir}/${archive}"
-    http_download "$sums_url" "${tmpdir}/SHA256SUMS"
-    verify_archive "${tmpdir}/${archive}" "${tmpdir}/SHA256SUMS" "$archive"
+    http_download "$url" "${DUX_TMPDIR}/${archive}"
 
-    tar xzf "${tmpdir}/${archive}" -C "$tmpdir"
+    # Fetching the checksum is best effort: releases from before dux published
+    # them answer this URL with a 404, and that must not abort the install. It
+    # goes through http_fetch_optional rather than http_download so that a 404
+    # and a failed request stay distinguishable, and the warning can name the
+    # cause it actually observed.
+    checksum_file="${DUX_TMPDIR}/${archive}.sha256"
+    checksum_status=0
+    http_fetch_optional "${url}.sha256" "$checksum_file" || checksum_status=$?
 
-    # Install the binary — use sudo only if the target directory is not writable.
+    # This fork's releases before the per-archive .sha256 files existed
+    # (dux-amq-v0.1.0, dux-amq-v0.1.1) publish one combined SHA256SUMS instead.
+    # When the server says the .sha256 is not there, read the archive's line out
+    # of SHA256SUMS so those releases stay verified rather than warned through.
+    if [ "$checksum_status" -eq 1 ]; then
+        checksum_status=0
+        http_fetch_optional "${base_url}/SHA256SUMS" "${DUX_TMPDIR}/SHA256SUMS" || checksum_status=$?
+        if [ "$checksum_status" -eq 0 ]; then
+            checksum_line_from_sums "${DUX_TMPDIR}/SHA256SUMS" "$archive" > "$checksum_file"
+        fi
+    fi
+
+    # A mismatch exits from inside here without installing anything. A missing or
+    # unfetchable checksum warns and returns non-zero, which is not a failure of
+    # the install.
+    verify_checksum "${DUX_TMPDIR}/${archive}" "$checksum_file" "$archive" "$checksum_status" || true
+
+    tar xzf "${DUX_TMPDIR}/${archive}" -C "$DUX_TMPDIR"
+
+    # Install the binary: use sudo only if the target directory is not writable.
     if [ -w "$install_dir" ]; then
-        install -m 755 "${tmpdir}/${BINARY}" "${install_dir}/${BINARY}"
+        install -m 755 "${DUX_TMPDIR}/${BINARY}" "${install_dir}/${BINARY}"
     else
         log "Installation directory ${install_dir} is not writable, using sudo..."
-        sudo install -m 755 "${tmpdir}/${BINARY}" "${install_dir}/${BINARY}"
+        sudo install -m 755 "${DUX_TMPDIR}/${BINARY}" "${install_dir}/${BINARY}"
     fi
 
     log ""
@@ -198,4 +388,10 @@ main() {
     fi
 }
 
-main
+# Setting DUX_INSTALL_SH_LIB=1 defines the functions above without installing
+# anything, so the checksum logic can be driven directly by
+# .github/scripts/test_install_checksum.sh with no network and no release.
+# Nothing outside that test should set it.
+if [ "${DUX_INSTALL_SH_LIB:-}" != "1" ]; then
+    main
+fi

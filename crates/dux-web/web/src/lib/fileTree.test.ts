@@ -1,0 +1,208 @@
+import { describe, expect, it } from "vitest"
+import {
+  ancestorDirs,
+  descendantDirPaths,
+  dirsToLoadFor,
+  flattenLazy,
+} from "./fileTree"
+import type { DirEntry, DirState } from "./fileTree"
+
+function file(path: string): DirEntry {
+  const name = path.split("/").pop() ?? path
+  return { name, path, is_dir: false, is_symlink: false, expandable: false }
+}
+
+function dir(path: string): DirEntry {
+  const name = path.split("/").pop() ?? path
+  return { name, path, is_dir: true, is_symlink: false, expandable: true }
+}
+
+describe("ancestorDirs", () => {
+  it("returns each parent directory path", () => {
+    expect(ancestorDirs("a/b/c.ts")).toEqual(["a", "a/b"])
+  })
+
+  it("returns nothing for a root-level file", () => {
+    expect(ancestorDirs("c.ts")).toEqual([])
+  })
+})
+
+describe("dirsToLoadFor", () => {
+  it("returns root + each uncached ancestor top-down", () => {
+    expect(dirsToLoadFor("a/b/c.ts", new Set())).toEqual(["", "a", "a/b"])
+    expect(dirsToLoadFor("a/b/c.ts", new Set(["", "a"]))).toEqual(["a/b"])
+    expect(dirsToLoadFor("root.txt", new Set([""]))).toEqual([])
+  })
+})
+
+describe("flattenLazy", () => {
+  it("returns no rows when the root is not loaded", () => {
+    expect(flattenLazy(new Map(), new Set())).toEqual([])
+  })
+
+  it("lists only loaded, expanded levels and shows a loading placeholder", () => {
+    const dirs = new Map<string, DirState>([
+      ["", { status: "loaded", entries: [dir("src"), file("README.md")] }],
+      // "src" is expanded but not yet loaded → placeholder row.
+    ])
+    const rows = flattenLazy(dirs, new Set(["src"]))
+    expect(rows.map((r) => [r.path, r.depth, r.state])).toEqual([
+      ["src", 0, "loading"],
+      ["src/__loading__", 1, "loading"],
+      ["README.md", 0, "idle"],
+    ])
+  })
+
+  it("descends into a loaded expanded dir", () => {
+    const dirs = new Map<string, DirState>([
+      ["", { status: "loaded", entries: [dir("src"), file("README.md")] }],
+      ["src", { status: "loaded", entries: [dir("src/app"), file("src/lib.rs")] }],
+    ])
+    const rows = flattenLazy(dirs, new Set(["src"]))
+    expect(rows.map((r) => [r.path, r.depth, r.state])).toEqual([
+      ["src", 0, "idle"],
+      ["src/app", 1, "idle"],
+      ["src/lib.rs", 1, "idle"],
+      ["README.md", 0, "idle"],
+    ])
+  })
+
+  it("does not descend into a collapsed dir even when loaded", () => {
+    const dirs = new Map<string, DirState>([
+      ["", { status: "loaded", entries: [dir("src")] }],
+      ["src", { status: "loaded", entries: [file("src/lib.rs")] }],
+    ])
+    const rows = flattenLazy(dirs, new Set())
+    expect(rows.map((r) => r.path)).toEqual(["src"])
+    expect(rows[0].state).toBe("idle")
+  })
+
+  it("marks an errored expanded dir with an error row", () => {
+    const dirs = new Map<string, DirState>([
+      ["", { status: "loaded", entries: [dir("src")] }],
+      ["src", { status: "error", message: "boom" }],
+    ])
+    const rows = flattenLazy(dirs, new Set(["src"]))
+    expect(rows.map((r) => [r.path, r.depth, r.state])).toEqual([
+      ["src", 0, "error"],
+      ["src/__error__", 1, "error"],
+    ])
+  })
+
+  it("keeps a nested error placeholder beside later siblings at its own depth", () => {
+    const dirs = new Map<string, DirState>([
+      ["", { status: "loaded", entries: [dir("src"), file("README.md")] }],
+      ["src", { status: "loaded", entries: [dir("src/app"), file("src/lib.rs")] }],
+      ["src/app", { status: "error", message: "denied" }],
+    ])
+    const rows = flattenLazy(dirs, new Set(["src", "src/app"]))
+
+    expect(rows.map((row) => [row.path, row.depth, row.kind])).toEqual([
+      ["src", 0, "entry"],
+      ["src/app", 1, "entry"],
+      ["src/app/__error__", 2, "error"],
+      ["src/lib.rs", 1, "entry"],
+      ["README.md", 0, "entry"],
+    ])
+  })
+
+  it("keeps non-expandable entries as plain rows", () => {
+    const escape: DirEntry = {
+      name: "escape",
+      path: "escape",
+      is_dir: false,
+      is_symlink: true,
+      expandable: false,
+    }
+    const dirs = new Map<string, DirState>([
+      ["", { status: "loaded", entries: [escape] }],
+    ])
+    const rows = flattenLazy(dirs, new Set())
+    expect(rows).toHaveLength(1)
+    expect(rows[0].isSymlink).toBe(true)
+    expect(rows[0].expandable).toBe(false)
+  })
+
+  it("marks a real file named __error__ as a normal entry row, not a placeholder", () => {
+    const real = file("src/__error__")
+    const dirs = new Map<string, DirState>([
+      ["", { status: "loaded", entries: [dir("src")] }],
+      ["src", { status: "loaded", entries: [real] }],
+    ])
+    const rows = flattenLazy(dirs, new Set(["src"]))
+    const row = rows.find((r) => r.path === "src/__error__")
+    expect(row).toBeDefined()
+    expect(row?.kind).toBe("entry")
+    expect(row?.isDir).toBe(false)
+  })
+
+  it("marks a real file named __loading__ as a normal entry row, not a placeholder", () => {
+    const real = file("src/__loading__")
+    const dirs = new Map<string, DirState>([
+      ["", { status: "loaded", entries: [dir("src")] }],
+      ["src", { status: "loaded", entries: [real] }],
+    ])
+    const rows = flattenLazy(dirs, new Set(["src"]))
+    const row = rows.find((r) => r.path === "src/__loading__")
+    expect(row).toBeDefined()
+    expect(row?.kind).toBe("entry")
+  })
+
+  it("tags synthetic loading/error placeholder rows with the matching kind", () => {
+    const loadingDirs = new Map<string, DirState>([
+      ["", { status: "loaded", entries: [dir("src")] }],
+    ])
+    const loadingRows = flattenLazy(loadingDirs, new Set(["src"]))
+    expect(loadingRows.find((r) => r.path === "src/__loading__")?.kind).toBe(
+      "loading",
+    )
+
+    const errorDirs = new Map<string, DirState>([
+      ["", { status: "loaded", entries: [dir("src")] }],
+      ["src", { status: "error", message: "boom" }],
+    ])
+    const errorRows = flattenLazy(errorDirs, new Set(["src"]))
+    expect(errorRows.find((r) => r.path === "src/__error__")?.kind).toBe(
+      "error",
+    )
+  })
+
+  it("marks a dir row empty when it is loaded with zero children, regardless of expansion", () => {
+    const dirs = new Map<string, DirState>([
+      ["", { status: "loaded", entries: [dir("src"), dir("empty-dir")] }],
+      ["src", { status: "loaded", entries: [file("src/lib.rs")] }],
+      ["empty-dir", { status: "loaded", entries: [] }],
+    ])
+    // Neither dir is expanded, `empty` must still reflect the loaded cache.
+    const collapsed = flattenLazy(dirs, new Set())
+    expect(collapsed.find((r) => r.path === "src")?.empty).toBe(false)
+    expect(collapsed.find((r) => r.path === "empty-dir")?.empty).toBe(true)
+  })
+
+  it("a dir not yet loaded (never fetched) is not marked empty", () => {
+    const dirs = new Map<string, DirState>([
+      ["", { status: "loaded", entries: [dir("unloaded")] }],
+    ])
+    const rows = flattenLazy(dirs, new Set())
+    expect(rows.find((r) => r.path === "unloaded")?.empty).toBe(false)
+  })
+})
+
+describe("descendantDirPaths", () => {
+  it("returns dirs nested under the given path, excluding the path itself and siblings", () => {
+    const dirs = new Map<string, DirState>([
+      ["a", { status: "loaded", entries: [] }],
+      ["a/b", { status: "loaded", entries: [] }],
+      ["a/b/c", { status: "loading" }],
+      ["ax", { status: "loaded", entries: [] }],
+    ])
+    expect(descendantDirPaths(dirs, "a").sort()).toEqual(["a/b", "a/b/c"])
+  })
+
+  it("returns an empty list when nothing is nested under the path", () => {
+    const dirs = new Map<string, DirState>([
+      ["a", { status: "loaded", entries: [] }],
+    ])
+    expect(descendantDirPaths(dirs, "a")).toEqual([])
+  })
+})

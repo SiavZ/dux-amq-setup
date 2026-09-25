@@ -1,0 +1,1276 @@
+//! Companion-terminal lifecycle on the headless `Engine`. Companion terminals
+//! are plain PTYs distinct from agent providers: no launch or resume flow and no
+//! provider semantics, just the configured terminal command. A terminal is owned
+//! by an agent session, spawned in that agent's worktree; by a project, spawned
+//! at its repo root with no agent attached; or by nothing at all, spawned in the
+//! user's home directory.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+
+use crate::model::{CompanionTerminal, TerminalOwner};
+use crate::pty::PtyClient;
+
+use super::Engine;
+
+impl Engine {
+    /// Spawn a new companion terminal in the given session's worktree and register
+    /// it in `companion_terminals`. Returns the generated `(terminal_id, label)`.
+    ///
+    /// The terminal runs `config.terminal.command` and `args` with the session's
+    /// resolved environment, the global env merged with the owning project's.
+    pub fn create_companion_terminal(
+        &mut self,
+        session_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<(String, String)> {
+        let session = self
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .cloned()
+            .context("unknown session")?;
+        // A shell cannot start in a directory that is gone, and the error the
+        // spawn would give says nothing about which directory or what to do.
+        if let Some(reason) = self.missing_directory_reason(session_id) {
+            anyhow::bail!("{reason}");
+        }
+
+        // A standalone agent belongs to no project, so a terminal opened on it
+        // gets the global environment with no project overlay. Falling through
+        // to `unwrap_or_default` on a missing project id would hand it an empty
+        // environment instead, which is a different and much worse thing.
+        let user_env = match session.project_id() {
+            Some(project_id) => self
+                .projects
+                .iter()
+                .find(|project| project.id == project_id)
+                .and_then(|project| {
+                    crate::config::resolve_agent_env(&self.config.env, &project.env).ok()
+                })
+                .unwrap_or_default(),
+            None => crate::config::resolve_agent_env(
+                &self.config.env,
+                &std::collections::BTreeMap::new(),
+            )
+            .unwrap_or_default(),
+        };
+        // The agent's identity comes first so the user's `[env]` still wins, as
+        // for the provider itself (fork
+        // `companion_terminal_receives_session_identity_env`). A shell opened on
+        // an agent is where the user runs `dux peer send` or the AMQ CLI by
+        // hand, and those read DUX_SESSION_ID / DUX_STORE_ID / DUX_AMQ_HANDLE
+        // to know who is speaking. It uses the persisted handle and reserves
+        // nothing: the terminal is not a second reader on the agent's inbox.
+        let mut env = {
+            let mut identity = Vec::new();
+            match crate::peer::load_or_create_store_id(&self.paths.root) {
+                Ok(store_id) => crate::peer::append_session_env(
+                    &mut identity,
+                    &crate::peer::session_store::peer_session(
+                        &session,
+                        session.agent_handle().to_string(),
+                        false,
+                    ),
+                    &store_id,
+                ),
+                Err(err) => crate::logger::warn(&format!(
+                    "companion terminal for {} opens without DUX_* identity: {err:#}",
+                    crate::sanitize::for_terminal(&session.id)
+                )),
+            }
+            identity
+        };
+        env.extend(user_env);
+        self.spawn_terminal(
+            TerminalOwner::Session(session_id.to_string()),
+            Path::new(session.directory()),
+            &env,
+            rows,
+            cols,
+        )
+    }
+
+    /// Spawn a new project terminal at the given project's repo root and register
+    /// it in `companion_terminals`. Returns the generated `(terminal_id, label)`.
+    ///
+    /// A project terminal is a plain shell with no agent attached: the same
+    /// terminal command and the global env merged with the project's, owned by
+    /// the project instead of a session. It does not run the project's
+    /// `startup_command`, which is worktree provisioning, not a shell rc.
+    pub fn create_project_terminal(
+        &mut self,
+        project_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<(String, String)> {
+        let project = self
+            .projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .cloned()
+            .context("unknown project")?;
+
+        if !Path::new(&project.path).is_dir() {
+            bail!(
+                "the project's path \"{}\" does not exist on disk, so a project terminal cannot be opened there",
+                project.path
+            );
+        }
+
+        let env =
+            crate::config::resolve_agent_env(&self.config.env, &project.env).unwrap_or_default();
+
+        self.spawn_terminal(
+            TerminalOwner::Project(project_id.to_string()),
+            Path::new(&project.path),
+            &env,
+            rows,
+            cols,
+        )
+    }
+
+    /// Spawn a new standalone terminal in the user's home directory and register
+    /// it in `companion_terminals`. Returns the generated `(terminal_id, label)`.
+    ///
+    /// A standalone terminal belongs to no agent and no project, so it takes its
+    /// directory from [`crate::home_path::standalone_terminal_dir`] rather than
+    /// an owner's path and gets the global environment with no project overlay,
+    /// where the owned kinds merge `config.env` with their project's `env`.
+    ///
+    /// Like a project terminal it does not run any `startup_command`: that is
+    /// worktree provisioning for new agents, not a shell rc.
+    pub fn create_standalone_terminal(&mut self, rows: u16, cols: u16) -> Result<(String, String)> {
+        let dir = crate::home_path::standalone_terminal_dir();
+        // The global half only. `resolve_agent_env` merges a project's env over
+        // the global one; passing an empty map is exactly "there is no project".
+        let env =
+            crate::config::resolve_agent_env(&self.config.env, &std::collections::BTreeMap::new())
+                .unwrap_or_default();
+
+        self.spawn_terminal(TerminalOwner::Standalone, &dir, &env, rows, cols)
+    }
+
+    /// Shared spawn for every owner: run the configured terminal command at
+    /// `cwd` with `env` and register the PTY under a fresh `term-N` id.
+    fn spawn_terminal(
+        &mut self,
+        owner: TerminalOwner,
+        cwd: &Path,
+        env: &[(String, String)],
+        rows: u16,
+        cols: u16,
+    ) -> Result<(String, String)> {
+        // `[limits].max_companion_terminals` (port-misc): one gate for every
+        // owner, since every terminal spawn funnels through here.
+        if let Some(reason) = self.refuse_companion_terminal_for_limits() {
+            anyhow::bail!("{reason}");
+        }
+        // A companion terminal is a plain shell, so it opts out of agent-signal
+        // tracking: its bytes are never scanned for OSC or bell attention
+        // signals and it can never raise a spurious attention flag.
+        //
+        // `rows` and `cols` come from the caller so a spawn beside a visible
+        // pane matches it on the first frame, with no initial reflow of the
+        // shell; a headless caller passes a default and relies on the client's
+        // first resize.
+        let client = PtyClient::spawn_with_env_opts(
+            &self.config.terminal.command,
+            &self.config.terminal.args,
+            cwd,
+            rows,
+            cols,
+            self.config.ui.agent_scrollback_lines,
+            crate::pty::PtySpawnOptions {
+                env,
+                track_agent_signals: false,
+                // A companion shell still gets the terminal identity so it sees the
+                // same terminal an agent would.
+                identity: &self.resolved_identity(),
+            },
+        )?;
+
+        self.terminal_counter += 1;
+        let terminal_id = format!("term-{}", self.terminal_counter);
+        let label = format!("Terminal {}", self.terminal_counter);
+
+        self.companion_terminals.insert(
+            terminal_id.clone(),
+            CompanionTerminal {
+                owner,
+                label: label.clone(),
+                foreground_cmd: None,
+                client,
+                // Reuse the monotonic terminal counter so the default drag order
+                // equals creation order; reorders rewrite this later.
+                sort_order: self.terminal_counter as u64,
+                created_at: chrono::Utc::now(),
+            },
+        );
+
+        Ok((terminal_id, label))
+    }
+
+    /// Where a file dropped onto the pane currently showing `pty_id` should be
+    /// saved.
+    ///
+    /// `pty_id` is whatever the browser pane is attached to, the only
+    /// identifier it reliably has: a terminal id, an agent's session id (the
+    /// session-slot tab), or an extra tab's id. Resolving all three here keeps
+    /// the upload route from having to know how tabs relate to sessions.
+    ///
+    /// The two answers differ in kind because the intents differ. An agent
+    /// means "look at this for me", so the file goes to that agent's upload
+    /// directory, inside the worktree and ignored by git, where it never touches
+    /// the user's git status and dies with the agent; every tab of one agent
+    /// shares one worktree, so which tab is on screen changes nothing.
+    ///
+    /// A terminal gets a plan rather than a path: the real answer is the live
+    /// working directory of a shell that may have been `cd`'d anywhere, and that
+    /// must not be computed on this thread. A terminal is where the user is
+    /// working, so a drop lands there whoever owns it, and a standalone terminal
+    /// is matched here first, as a terminal, so it never reaches the upload
+    /// branch it has no worktree for.
+    pub fn file_drop_destination(
+        &self,
+        pty_id: &str,
+    ) -> Option<crate::file_drop::FileDropDestination> {
+        if let Some(terminal) = self.companion_terminals.get(pty_id) {
+            return Some(crate::file_drop::FileDropDestination::Terminal(
+                terminal.client.working_directory(),
+            ));
+        }
+        let session = self.session_behind_pty(pty_id)?;
+        // No destination at all when the agent's directory is gone: the upload
+        // directory lives inside it, so creating one would put a hidden folder
+        // back where the working copy used to be and the paste would name a
+        // path that leads nowhere.
+        if self.missing_directory_reason(&session.id).is_some() {
+            return None;
+        }
+        Some(crate::file_drop::FileDropDestination::AgentUploads {
+            worktree: session.directory().into(),
+            // Normalized on every read rather than trusted, so a config that
+            // never went through `load_config` still resolves a usable
+            // directory.
+            relative: crate::config::normalized_upload_directory(&self.config.ui.upload_directory),
+            write_gitignore: self.upload_seed_allowed(session),
+        })
+    }
+
+    /// Whether the hidden upload directory dux creates inside an agent's
+    /// working directory should be seeded with a self-gitignoring `.gitignore`.
+    ///
+    /// For a managed worktree the configured preference decides, and the
+    /// directory is inside a repository anyway.
+    ///
+    /// A standalone agent's folder is the user's, so the preference is ANDed
+    /// with whether git can see the path at all. The rule is git visibility
+    /// rather than "is this a working repository", because a folder sitting
+    /// inside somebody else's repository is exactly where untracked uploads
+    /// would pollute their `git status`. A plain folder and a folder dux could
+    /// not classify both get nothing written: dux never cleans the folder up,
+    /// so writing there on a guess cannot be undone.
+    ///
+    /// A drop landing before the folder is classified still creates the upload
+    /// directory, unconditionally, just without the `.gitignore`. The next drop
+    /// into the same agent heals it: `DropDir::open_uploads` runs again with the
+    /// verdict in hand and its `.gitignore` create is `O_CREAT | O_EXCL`, so it
+    /// seeds the directory already there.
+    fn upload_seed_allowed(&self, session: &crate::model::AgentSession) -> bool {
+        if !self.config.ui.upload_write_gitignore {
+            return false;
+        }
+        match &session.workspace {
+            crate::model::AgentWorkspace::Managed(_) => true,
+            crate::model::AgentWorkspace::Folder(_) => {
+                self.folder_repo_status(&session.id).git_can_see_path()
+            }
+        }
+    }
+
+    /// Where a file dropped onto the editor's file tree should be saved: the
+    /// tree directory the user dropped on, inside that agent's worktree. The
+    /// other intent from [`Self::file_drop_destination`], which answers "look at
+    /// this for me" with the invisible upload directory; this answers "add this
+    /// file to my project" with an ordinary file git can see.
+    ///
+    /// A terminal id answers with the directory the terminal was spawned in,
+    /// never its live working directory, which is where this parts company with
+    /// [`Self::file_drop_destination`]. A drop on the terminal itself follows
+    /// the shell, because it means "put this where I am typing"; the tree was
+    /// drawn from the pinned root, so following the shell here would land the
+    /// same click somewhere else after a `cd`.
+    ///
+    /// `relative` is carried through unvalidated: the guards belong next to the
+    /// walk that opens the directory, `DropDir::open_tree_dir`, on the blocking
+    /// pool rather than the engine thread.
+    pub fn file_drop_tree_destination(
+        &self,
+        pty_id: &str,
+        relative: &str,
+    ) -> Option<crate::file_drop::FileDropDestination> {
+        if let Some(terminal) = self.companion_terminals.get(pty_id) {
+            return Some(crate::file_drop::FileDropDestination::WorktreeDirectory {
+                worktree: terminal.client.spawn_dir().to_path_buf(),
+                relative: relative.to_string(),
+            });
+        }
+        let session = self.session_behind_pty(pty_id)?;
+        Some(crate::file_drop::FileDropDestination::WorktreeDirectory {
+            worktree: session.directory().into(),
+            relative: relative.to_string(),
+        })
+    }
+
+    /// The agent pane whose changed files a drop on `pty_id` could affect: its
+    /// session id and its worktree, or `None` when there is no agent behind the
+    /// pane at all.
+    ///
+    /// This answers ownership only, never whether the file landed in that
+    /// worktree: a terminal's directory is discovered from a live process whose
+    /// shell may have been `cd`'d anywhere, so the caller checks containment
+    /// against the final path once the file exists.
+    ///
+    /// A terminal owned by a project or by nothing answers `None`, having no
+    /// agent pane listing changed files. The match is exhaustive so a fourth
+    /// kind of owner has to be answered for here.
+    pub fn file_drop_refresh_target(&self, pty_id: &str) -> Option<(String, PathBuf)> {
+        // The two branches resolve different keyspaces and must not share a
+        // lookup: a companion terminal names its owner by session id, while a
+        // bare pane id is a tab id, and no tab id is ever a session id.
+        let session = match self.companion_terminals.get(pty_id) {
+            Some(terminal) => match terminal.owner.as_ref() {
+                crate::model::TerminalOwnerRef::Session(id) => self.session_by_id(id)?,
+                crate::model::TerminalOwnerRef::Project(_)
+                | crate::model::TerminalOwnerRef::Standalone => return None,
+            },
+            None => self.session_behind_pty(pty_id)?,
+        };
+        Some((session.id.clone(), PathBuf::from(session.directory())))
+    }
+
+    /// The runtime PTY key a PANE's addressed id names, or `None` when nothing
+    /// on this workspace answers to it.
+    ///
+    /// A pane addresses its PTY with whichever id its surface holds, and for an
+    /// agent's slot tab that is not always the tab's own id: the browser's URL
+    /// grammar spells "whichever tab is in the slot" as the session id, because
+    /// a hash is parsed before any spine has named the real one, and the pane
+    /// carries that placeholder into every id it sends afterwards. The agent PTY
+    /// socket route resolves the same spelling, streaming `slot_tab_id` rather
+    /// than the path's session id.
+    ///
+    /// The answer is a key into the runtime maps, a companion terminal id or a
+    /// tab id, and never a session id.
+    pub fn pty_key_for_pane_id(&self, pane_id: &str) -> Option<String> {
+        if self.companion_terminals.contains_key(pane_id) {
+            return Some(pane_id.to_string());
+        }
+        if self.owning_session_for_tab(pane_id).is_some() {
+            return Some(pane_id.to_string());
+        }
+        self.session_by_id(pane_id)
+            .map(|session| session.slot_tab_id().to_string())
+    }
+
+    /// The agent session a pane's pty id belongs to: the agent whose
+    /// session-slot tab it is, or the session owning that extra tab. The id is
+    /// canonicalized first, so the bare per-agent spelling a browser sends for a
+    /// slot tab resolves here as it does on the PTY socket, then routed through
+    /// `owning_session_for_tab` so a tab id resolves one way everywhere.
+    ///
+    /// A companion terminal id canonicalizes to itself and owns no session, so
+    /// it answers `None`; every caller matches terminals first anyway.
+    fn session_behind_pty(&self, pty_id: &str) -> Option<&crate::model::AgentSession> {
+        let tab_id = self.pty_key_for_pane_id(pty_id)?;
+        let session_id = self.owning_session_for_tab(&tab_id)?;
+        self.session_by_id(&session_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::engine::test_support::{sample_project, sample_session, test_engine};
+    use crate::ids::TabId;
+    use crate::model::TerminalOwner;
+
+    #[test]
+    fn a_drop_on_any_tab_of_an_agent_lands_in_that_agent_s_upload_directory() {
+        // Every tab of one agent shares one worktree, so which tab is on screen
+        // must not change where the file lands. Both a slot tab id and an extra
+        // tab id resolve back to the owning agent through
+        // `owning_session_for_tab`, which is the half a route would otherwise
+        // have to know about.
+        let (mut engine, _tmp) = test_engine();
+        let worktree = tempfile::tempdir().expect("worktree dir");
+        engine.projects.push(sample_project(
+            "p1",
+            worktree.path().to_string_lossy().as_ref(),
+        ));
+        let mut session = sample_session("s1", "p1", "feature");
+        session
+            .workspace
+            .as_managed_mut()
+            .expect("managed test session")
+            .worktree_path = worktree.path().to_string_lossy().to_string();
+        engine.sessions.push(session);
+        engine.agent_tabs.insert(
+            TabId::new("tab-9"),
+            crate::model::AgentTab {
+                id: "tab-9".to_string(),
+                session_id: "s1".to_string(),
+                provider: crate::model::ProviderKind::new("claude"),
+                sort_order: 1,
+                created_at: chrono::Utc::now(),
+            },
+        );
+
+        for pty_id in ["s1-slot", "tab-9"] {
+            let dest = engine
+                .file_drop_destination(pty_id)
+                .unwrap_or_else(|| panic!("{pty_id} should resolve to a destination"));
+            match dest {
+                crate::file_drop::FileDropDestination::AgentUploads {
+                    worktree: root,
+                    relative,
+                    write_gitignore,
+                } => {
+                    assert_eq!(root, worktree.path(), "for {pty_id}");
+                    assert_eq!(
+                        relative,
+                        crate::config::DEFAULT_UPLOAD_DIRECTORY,
+                        "for {pty_id}"
+                    );
+                    assert!(write_gitignore, "for {pty_id}");
+                }
+                other => panic!("{pty_id} resolved to {other:?}, not the upload directory"),
+            }
+        }
+
+        assert!(
+            engine.file_drop_destination("nobody").is_none(),
+            "an unknown pty id must not resolve to a directory"
+        );
+    }
+
+    #[test]
+    fn a_pane_addressed_by_the_bare_agent_id_resolves_to_the_slot_tab() {
+        // The client's URL grammar spells "whichever tab is in the slot" as the
+        // SESSION id, because the slot tab's own id is generated and a hash can
+        // be parsed before any spine names it. The agent PTY socket resolves
+        // that spelling server-side, so every other id-taking seam must resolve
+        // it the same way or the first tab is the one pane nothing works on.
+        let (mut engine, _tmp) = test_engine();
+        let worktree = tempfile::tempdir().expect("worktree dir");
+        engine.projects.push(sample_project(
+            "p1",
+            worktree.path().to_string_lossy().as_ref(),
+        ));
+        let mut session = sample_session("s1", "p1", "feature");
+        session
+            .workspace
+            .as_managed_mut()
+            .expect("managed test session")
+            .worktree_path = worktree.path().to_string_lossy().to_string();
+        engine.sessions.push(session);
+        engine.agent_tabs.insert(
+            TabId::new("tab-9"),
+            crate::model::AgentTab {
+                id: "tab-9".to_string(),
+                session_id: "s1".to_string(),
+                provider: crate::model::ProviderKind::new("claude"),
+                sort_order: 1,
+                created_at: chrono::Utc::now(),
+            },
+        );
+        engine.config.terminal.command = "cat".to_string();
+        engine.config.terminal.args = vec![];
+        let (terminal, _) = engine
+            .create_companion_terminal("s1", 24, 80)
+            .expect("companion terminal");
+
+        assert_eq!(
+            engine.pty_key_for_pane_id("s1").as_deref(),
+            Some("s1-slot"),
+            "the bare agent id is the slot tab's alias"
+        );
+        for already_canonical in ["s1-slot", "tab-9", terminal.as_str()] {
+            assert_eq!(
+                engine.pty_key_for_pane_id(already_canonical).as_deref(),
+                Some(already_canonical),
+                "a real pty key answers itself"
+            );
+        }
+        assert!(engine.pty_key_for_pane_id("nobody").is_none());
+
+        // And the alias reaches the destinations, since that is what the upload
+        // route asks with.
+        match engine.file_drop_destination("s1") {
+            Some(crate::file_drop::FileDropDestination::AgentUploads {
+                worktree: root, ..
+            }) => {
+                assert_eq!(root, worktree.path());
+            }
+            other => panic!("the bare agent id resolved to {other:?}"),
+        }
+        match engine.file_drop_tree_destination("s1", "assets") {
+            Some(crate::file_drop::FileDropDestination::WorktreeDirectory {
+                worktree: root,
+                relative,
+            }) => {
+                assert_eq!(root, worktree.path());
+                assert_eq!(relative, "assets");
+            }
+            other => panic!("the bare agent id resolved to {other:?}"),
+        }
+        assert_eq!(
+            engine
+                .file_drop_refresh_target("s1")
+                .map(|(id, _)| id)
+                .as_deref(),
+            Some("s1")
+        );
+    }
+
+    #[test]
+    fn an_agent_destination_carries_the_configured_upload_directory_and_gitignore_choice() {
+        // The two settings have to reach the destination, or configuring them
+        // does nothing at all. A configured value that is unusable degrades
+        // through the pure normalizer here, since an in-memory Config never
+        // went through `load_config`'s warn-and-correct.
+        let (mut engine, _tmp) = test_engine();
+        let worktree = tempfile::tempdir().expect("worktree dir");
+        engine.projects.push(sample_project(
+            "p1",
+            worktree.path().to_string_lossy().as_ref(),
+        ));
+        let mut session = sample_session("s1", "p1", "feature");
+        session
+            .workspace
+            .as_managed_mut()
+            .expect("managed test session")
+            .worktree_path = worktree.path().to_string_lossy().to_string();
+        engine.sessions.push(session);
+
+        engine.config.ui.upload_directory = "tmp/dropped".to_string();
+        engine.config.ui.upload_write_gitignore = false;
+        match engine.file_drop_destination("s1-slot") {
+            Some(crate::file_drop::FileDropDestination::AgentUploads {
+                relative,
+                write_gitignore,
+                ..
+            }) => {
+                assert_eq!(relative, "tmp/dropped");
+                assert!(!write_gitignore);
+            }
+            other => panic!("resolved to {other:?}"),
+        }
+
+        engine.config.ui.upload_directory = "/etc".to_string();
+        match engine.file_drop_destination("s1-slot") {
+            Some(crate::file_drop::FileDropDestination::AgentUploads { relative, .. }) => {
+                assert_eq!(
+                    relative,
+                    crate::config::DEFAULT_UPLOAD_DIRECTORY,
+                    "an absolute upload directory must degrade to the default"
+                );
+            }
+            other => panic!("resolved to {other:?}"),
+        }
+    }
+
+    /// The upload seed for a STANDALONE agent follows "can git see this path",
+    /// which is a different question from "does the changes panel work here".
+    ///
+    /// A folder INSIDE somebody else's repository is exactly where untracked
+    /// uploads would pollute their `git status`, so it gets the seed even
+    /// though its own panel stays quiet. A plain folder gets no junk written
+    /// into it, and a folder dux could not classify gets nothing either:
+    /// writing into the user's directory on a guess is the one direction dux
+    /// cannot undo, because it never cleans the folder up.
+    #[test]
+    fn the_upload_seed_for_a_standalone_agent_follows_git_visibility() {
+        let (mut engine, _tmp) = test_engine();
+        let folder = tempfile::tempdir().expect("folder");
+        engine
+            .sessions
+            .push(crate::engine::test_support::sample_standalone_session(
+                "sa1",
+                folder.path().to_string_lossy().as_ref(),
+            ));
+        engine.config.ui.upload_write_gitignore = true;
+
+        let seeded = |engine: &super::Engine| match engine.file_drop_destination("sa1-slot") {
+            Some(crate::file_drop::FileDropDestination::AgentUploads {
+                write_gitignore, ..
+            }) => write_gitignore,
+            other => panic!("resolved to {other:?}"),
+        };
+
+        // Unprobed, so unknown: fail closed.
+        assert!(!seeded(&engine));
+
+        for (status, expected) in [
+            (crate::git::FolderRepoStatus::WorkingRepo, true),
+            (
+                crate::git::FolderRepoStatus::InsideRepoRootedElsewhere,
+                true,
+            ),
+            (crate::git::FolderRepoStatus::NoRepo, false),
+            (crate::git::FolderRepoStatus::Indeterminate, false),
+        ] {
+            engine
+                .folder_repo_statuses
+                .insert("sa1".to_string(), status);
+            assert_eq!(seeded(&engine), expected, "{status:?}");
+        }
+
+        // And the preference still wins outright: switching it off writes
+        // nothing anywhere, repository or not.
+        engine.config.ui.upload_write_gitignore = false;
+        engine
+            .folder_repo_statuses
+            .insert("sa1".to_string(), crate::git::FolderRepoStatus::WorkingRepo);
+        assert!(!seeded(&engine));
+    }
+
+    #[test]
+    fn a_terminal_of_every_owner_keeps_the_live_working_directory() {
+        // The narrowing has to stop at agents. A terminal is where the user is
+        // working, whoever owns it, so none of the three kinds may resolve to an
+        // upload directory. The standalone one is the case that has no worktree
+        // at all, so an upload destination could not even be built for it.
+        let (mut engine, _tmp) = test_engine();
+        let worktree = tempfile::tempdir().expect("worktree dir");
+        engine.projects.push(sample_project(
+            "p1",
+            worktree.path().to_string_lossy().as_ref(),
+        ));
+        let mut session = sample_session("s1", "p1", "feature");
+        session
+            .workspace
+            .as_managed_mut()
+            .expect("managed test session")
+            .worktree_path = worktree.path().to_string_lossy().to_string();
+        engine.sessions.push(session);
+        engine.config.terminal.command = "cat".to_string();
+        engine.config.terminal.args = vec![];
+
+        let (session_terminal, _) = engine
+            .create_companion_terminal("s1", 24, 80)
+            .expect("session terminal");
+        let (project_terminal, _) = engine
+            .create_project_terminal("p1", 24, 80)
+            .expect("project terminal");
+        let (standalone_terminal, _) = engine
+            .create_standalone_terminal(24, 80)
+            .expect("standalone terminal");
+
+        for pty_id in [&session_terminal, &project_terminal, &standalone_terminal] {
+            match engine.file_drop_destination(pty_id) {
+                Some(crate::file_drop::FileDropDestination::Terminal(_)) => {}
+                other => panic!("{pty_id} resolved to {other:?}, not a live lookup"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_drop_on_a_terminal_resolves_to_a_live_lookup_not_a_stored_path() {
+        // The distinction that matters: a terminal must NOT hand back a fixed
+        // path, because a shell's directory changes the moment someone types
+        // `cd`. It hands back a plan that asks the live process.
+        let (mut engine, _tmp) = test_engine();
+        let worktree = tempfile::tempdir().expect("worktree dir");
+        engine.projects.push(sample_project(
+            "p1",
+            worktree.path().to_string_lossy().as_ref(),
+        ));
+        let mut session = sample_session("s1", "p1", "feature");
+        session
+            .workspace
+            .as_managed_mut()
+            .expect("managed test session")
+            .worktree_path = worktree.path().to_string_lossy().to_string();
+        engine.sessions.push(session);
+        engine.config.terminal.command = "cat".to_string();
+        engine.config.terminal.args = vec![];
+
+        let (terminal_id, _) = engine
+            .create_companion_terminal("s1", 24, 80)
+            .expect("create companion terminal");
+
+        match engine.file_drop_destination(&terminal_id) {
+            Some(crate::file_drop::FileDropDestination::Terminal(plan)) => {
+                assert_eq!(plan.spawn_dir, worktree.path());
+                assert!(
+                    plan.shell_pid.is_some(),
+                    "the plan must carry a live process to ask, or it can only \
+                     ever report the spawn directory"
+                );
+            }
+            other => panic!("a terminal resolved to {other:?}, not a live lookup"),
+        }
+    }
+
+    #[test]
+    fn a_tree_drop_on_a_terminal_lands_under_the_terminal_s_pinned_spawn_directory() {
+        // A terminal now HAS a file tree: its editor is rooted at the directory
+        // it started in. So a tree drop naming a terminal means what it says,
+        // and it means the same thing an agent's tree drop means, add this file
+        // where I pointed. The root is the SPAWN directory, never the live one,
+        // for the same reason the editor is pinned there.
+        let (mut engine, _tmp) = test_engine();
+        let repo = tempfile::tempdir().expect("repo dir");
+        engine
+            .projects
+            .push(sample_project("p1", repo.path().to_string_lossy().as_ref()));
+        engine.config.terminal.command = "cat".to_string();
+        engine.config.terminal.args = vec![];
+
+        let (terminal_id, _) = engine
+            .create_project_terminal("p1", 24, 80)
+            .expect("project terminal");
+
+        match engine.file_drop_tree_destination(&terminal_id, "docs") {
+            Some(crate::file_drop::FileDropDestination::WorktreeDirectory {
+                worktree: root,
+                relative,
+            }) => {
+                assert_eq!(root, repo.path());
+                assert_eq!(relative, "docs");
+            }
+            other => panic!("a terminal tree drop resolved to {other:?}"),
+        }
+
+        assert!(
+            engine
+                .file_drop_tree_destination("nobody", "docs")
+                .is_none(),
+            "an unknown pty id still has no tree to drop on"
+        );
+    }
+
+    #[test]
+    fn only_a_pane_with_an_agent_behind_it_has_changed_files_to_refresh() {
+        // A dropped file is invisible in the Changes pane until something asks
+        // for a recompute, and only an agent HAS a changes pane. A terminal
+        // owned by a project, or by nothing at all, has no agent behind it, so
+        // there is nothing to refresh however useful the file may be.
+        let (mut engine, _tmp) = test_engine();
+        let worktree = tempfile::tempdir().expect("worktree dir");
+        engine.projects.push(sample_project(
+            "p1",
+            worktree.path().to_string_lossy().as_ref(),
+        ));
+        let mut session = sample_session("s1", "p1", "feature");
+        session
+            .workspace
+            .as_managed_mut()
+            .expect("managed test session")
+            .worktree_path = worktree.path().to_string_lossy().to_string();
+        engine.sessions.push(session);
+        engine.agent_tabs.insert(
+            TabId::new("tab-9"),
+            crate::model::AgentTab {
+                id: "tab-9".to_string(),
+                session_id: "s1".to_string(),
+                provider: crate::model::ProviderKind::new("claude"),
+                sort_order: 1,
+                created_at: chrono::Utc::now(),
+            },
+        );
+        engine.config.terminal.command = "cat".to_string();
+        engine.config.terminal.args = vec![];
+
+        let (session_terminal, _) = engine
+            .create_companion_terminal("s1", 24, 80)
+            .expect("session terminal");
+        let (project_terminal, _) = engine
+            .create_project_terminal("p1", 24, 80)
+            .expect("project terminal");
+        let (standalone_terminal, _) = engine
+            .create_standalone_terminal(24, 80)
+            .expect("standalone terminal");
+
+        for pty_id in ["s1-slot", "tab-9", session_terminal.as_str()] {
+            assert_eq!(
+                engine.file_drop_refresh_target(pty_id),
+                Some(("s1".to_string(), std::path::PathBuf::from(worktree.path()))),
+                "{pty_id} belongs to agent s1"
+            );
+        }
+        for pty_id in [
+            project_terminal.as_str(),
+            standalone_terminal.as_str(),
+            "nobody",
+        ] {
+            assert_eq!(
+                engine.file_drop_refresh_target(pty_id),
+                None,
+                "{pty_id} has no agent pane behind it"
+            );
+        }
+    }
+
+    /// Every door onto an agent's directory says the same thing when it is
+    /// gone, rather than each one answering with whatever the filesystem said.
+    #[test]
+    fn a_missing_directory_closes_the_terminal_and_the_upload_doors() {
+        let (mut engine, _tmp) = test_engine();
+        engine.projects.push(sample_project("p1", "/tmp/p1"));
+        engine.sessions.push(sample_session("s1", "p1", "feat"));
+        engine
+            .folder_repo_statuses
+            .insert("s1".to_string(), crate::git::FolderRepoStatus::Missing);
+
+        let reason = engine
+            .missing_directory_reason("s1")
+            .expect("the one sentence");
+        assert!(reason.contains("/tmp/s1-worktree"), "{reason}");
+        assert!(reason.contains("recreated"), "{reason}");
+
+        let err = engine
+            .create_companion_terminal("s1", 24, 80)
+            .expect_err("a shell cannot start in a directory that is gone");
+        assert_eq!(format!("{err:#}"), reason);
+
+        // And a drop has nowhere to land, so no hidden upload directory is
+        // created where the working copy used to be.
+        let tab = engine.slot_tab_id_of(crate::ids::SessionIdRef::new("s1"));
+        assert!(engine.file_drop_destination(tab.as_str()).is_none());
+    }
+
+    #[test]
+    fn create_companion_terminal_spawns_and_registers() {
+        let (mut engine, _tmp) = test_engine();
+
+        // A real worktree directory the PTY can `cwd` into.
+        let worktree = tempfile::tempdir().expect("worktree dir");
+        engine.projects.push(sample_project(
+            "p1",
+            worktree.path().to_string_lossy().as_ref(),
+        ));
+        let mut session = sample_session("s1", "p1", "feature");
+        session
+            .workspace
+            .as_managed_mut()
+            .expect("managed test session")
+            .worktree_path = worktree.path().to_string_lossy().to_string();
+        engine.sessions.push(session);
+
+        // `cat` is always on PATH and simply echoes: a safe stand-in terminal.
+        engine.config.terminal.command = "cat".to_string();
+        engine.config.terminal.args = vec![];
+
+        let (terminal_id, label) = engine
+            .create_companion_terminal("s1", 24, 80)
+            .expect("create companion terminal");
+
+        assert_eq!(terminal_id, "term-1");
+        assert_eq!(label, "Terminal 1");
+        assert_eq!(engine.terminal_counter, 1);
+
+        let terminal = engine
+            .companion_terminals
+            .get(&terminal_id)
+            .expect("terminal registered");
+        assert_eq!(terminal.owner, TerminalOwner::Session("s1".to_string()));
+        assert_eq!(terminal.label, "Terminal 1");
+        assert!(terminal.foreground_cmd.is_none());
+    }
+
+    #[test]
+    fn companion_terminals_spawn_with_monotonic_sort_order_and_created_at() {
+        let (mut engine, _tmp) = test_engine();
+
+        let worktree = tempfile::tempdir().expect("worktree dir");
+        engine.projects.push(sample_project(
+            "p1",
+            worktree.path().to_string_lossy().as_ref(),
+        ));
+        let mut session = sample_session("s1", "p1", "feature");
+        session
+            .workspace
+            .as_managed_mut()
+            .expect("managed test session")
+            .worktree_path = worktree.path().to_string_lossy().to_string();
+        engine.sessions.push(session);
+
+        engine.config.terminal.command = "cat".to_string();
+        engine.config.terminal.args = vec![];
+
+        let before = chrono::Utc::now();
+        let (first, _) = engine
+            .create_companion_terminal("s1", 24, 80)
+            .expect("first terminal");
+        let (second, _) = engine
+            .create_companion_terminal("s1", 24, 80)
+            .expect("second terminal");
+        let after = chrono::Utc::now();
+
+        let t1 = &engine.companion_terminals[&first];
+        let t2 = &engine.companion_terminals[&second];
+
+        // Default order equals creation order: the counter-derived sort_order is
+        // strictly increasing across spawns.
+        assert_eq!(t1.sort_order, 1);
+        assert_eq!(t2.sort_order, 2);
+        assert!(t1.sort_order < t2.sort_order);
+
+        // created_at is stamped at spawn, within the observed window.
+        assert!(t1.created_at >= before && t1.created_at <= after);
+        assert!(t2.created_at >= t1.created_at && t2.created_at <= after);
+    }
+
+    #[test]
+    fn terminal_is_working_tracks_a_running_foreground_app() {
+        let (mut engine, _tmp) = test_engine();
+
+        let worktree = tempfile::tempdir().expect("worktree dir");
+        engine.projects.push(sample_project(
+            "p1",
+            worktree.path().to_string_lossy().as_ref(),
+        ));
+        let mut session = sample_session("s1", "p1", "feature");
+        session
+            .workspace
+            .as_managed_mut()
+            .expect("managed test session")
+            .worktree_path = worktree.path().to_string_lossy().to_string();
+        engine.sessions.push(session);
+        engine.config.terminal.command = "cat".to_string();
+        engine.config.terminal.args = vec![];
+
+        let (id, _) = engine
+            .create_companion_terminal("s1", 24, 80)
+            .expect("terminal");
+
+        // Idle shell prompt: no foreground app, no streaming, no typing -> idle.
+        engine
+            .companion_terminals
+            .get_mut(&id)
+            .unwrap()
+            .foreground_cmd = None;
+        assert!(
+            !engine.terminal_is_working(&id),
+            "an idle terminal at the shell prompt is not working"
+        );
+
+        // A foreground app is running (the name changed): busy even with no output.
+        engine
+            .companion_terminals
+            .get_mut(&id)
+            .unwrap()
+            .foreground_cmd = Some("vim".to_string());
+        assert!(
+            engine.terminal_is_working(&id),
+            "a running foreground app reads as working even while quiet"
+        );
+
+        // Typing into the terminal takes precedence over the running app.
+        engine.note_pty_input(&id);
+        assert!(
+            !engine.terminal_is_working(&id),
+            "typing suppresses the working cue"
+        );
+        engine.pty_input.remove(&id);
+
+        // An empty foreground_cmd is treated as no app.
+        engine
+            .companion_terminals
+            .get_mut(&id)
+            .unwrap()
+            .foreground_cmd = Some(String::new());
+        assert!(
+            !engine.terminal_is_working(&id),
+            "an empty foreground_cmd is not a running app"
+        );
+
+        // An unknown terminal id is never working.
+        assert!(!engine.terminal_is_working("term-nope"));
+    }
+
+    /// Scrolling a terminal must behave the way scrolling an agent does for the
+    /// half that is an INFERENCE (output text), and must not touch the half that
+    /// is a FACT (a foreground app is running). A `vim` that repaints because the
+    /// user scrolled it is still `vim` running, so the row keeps saying Running;
+    /// the point of the pointer window is only to stop reading the repaint itself
+    /// as evidence.
+    #[test]
+    fn scrolling_a_terminal_suppresses_the_repaint_but_not_a_running_app() {
+        let (mut engine, _tmp) = test_engine();
+
+        let worktree = tempfile::tempdir().expect("worktree dir");
+        engine.projects.push(sample_project(
+            "p1",
+            worktree.path().to_string_lossy().as_ref(),
+        ));
+        let mut session = sample_session("s1", "p1", "feature");
+        session
+            .workspace
+            .as_managed_mut()
+            .expect("managed test session")
+            .worktree_path = worktree.path().to_string_lossy().to_string();
+        engine.sessions.push(session);
+        engine.config.terminal.command = "cat".to_string();
+        engine.config.terminal.args = vec![];
+
+        let (id, _) = engine
+            .create_companion_terminal("s1", 24, 80)
+            .expect("terminal");
+
+        // An idle shell that repaints because the user scrolled it: no app, no
+        // progress report, so the repaint is not evidence of anything.
+        engine
+            .companion_terminals
+            .get_mut(&id)
+            .unwrap()
+            .foreground_cmd = None;
+        engine.note_pty_write(&id, b"\x1b[<64;10;5M");
+        // Stamp the activity at the pointer stamp's OWN instant rather than
+        // reading the clock again. The activity window outlives the pointer one,
+        // so two adjacent `Instant::now()` calls would make the assertion depend
+        // on how long the gap between these lines happened to be.
+        let scrolled_at = engine.pty_pointer[&id].at;
+        engine.pty_activity.insert(id.clone(), scrolled_at);
+        assert!(
+            !engine.terminal_is_working(&id),
+            "a repaint caused by the user's own scroll must not read as Running"
+        );
+        assert!(
+            !engine.is_typing(&id),
+            "and scrolling must never read as Typing"
+        );
+
+        // Now a real app is running in it. Scrolling changes nothing about that.
+        engine
+            .companion_terminals
+            .get_mut(&id)
+            .unwrap()
+            .foreground_cmd = Some("vim".to_string());
+        assert!(
+            engine.terminal_is_working(&id),
+            "a running foreground app is a fact, not an inference from output, \
+             so scrolling must not hide it"
+        );
+    }
+
+    #[test]
+    fn create_companion_terminal_unknown_session_errors() {
+        let (mut engine, _tmp) = test_engine();
+        engine.config.terminal.command = "cat".to_string();
+        engine.config.terminal.args = vec![];
+
+        let err = engine
+            .create_companion_terminal("missing", 24, 80)
+            .expect_err("missing session should error");
+        assert!(
+            err.to_string().contains("unknown session"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn create_project_terminal_spawns_at_project_root_with_project_owner() {
+        let (mut engine, _tmp) = test_engine();
+
+        // A real project directory the PTY can `cwd` into.
+        let repo = tempfile::tempdir().expect("project dir");
+        engine
+            .projects
+            .push(sample_project("p1", repo.path().to_string_lossy().as_ref()));
+
+        engine.config.terminal.command = "cat".to_string();
+        engine.config.terminal.args = vec![];
+
+        let (terminal_id, label) = engine
+            .create_project_terminal("p1", 24, 80)
+            .expect("create project terminal");
+
+        assert_eq!(terminal_id, "term-1");
+        assert_eq!(label, "Terminal 1");
+
+        let terminal = engine
+            .companion_terminals
+            .get(&terminal_id)
+            .expect("terminal registered");
+        assert_eq!(terminal.owner, TerminalOwner::Project("p1".to_string()));
+        assert_eq!(terminal.label, "Terminal 1");
+        assert!(terminal.foreground_cmd.is_none());
+    }
+
+    #[test]
+    fn create_standalone_terminal_opens_in_the_home_directory_owning_nothing() {
+        // The journey: the user asks for a terminal that belongs to nothing. It
+        // opens in their home directory, carries the standalone owner, and needs
+        // no project and no agent to exist first.
+        let (mut engine, _tmp) = test_engine();
+        engine.config.terminal.command = "cat".to_string();
+        engine.config.terminal.args = vec![];
+
+        let (terminal_id, label) = engine
+            .create_standalone_terminal(24, 80)
+            .expect("create standalone terminal");
+
+        assert_eq!(terminal_id, "term-1");
+        assert_eq!(label, "Terminal 1");
+
+        let terminal = engine
+            .companion_terminals
+            .get(&terminal_id)
+            .expect("terminal registered");
+        assert_eq!(terminal.owner, crate::model::TerminalOwner::Standalone);
+        assert_eq!(
+            terminal.client.spawn_dir(),
+            crate::home_path::standalone_terminal_dir(),
+            "a standalone terminal opens where the home-directory rule says"
+        );
+    }
+
+    #[test]
+    fn a_standalone_terminal_gets_the_global_env_and_no_project_overlay() {
+        // Two projects exist, each with its own env. A standalone terminal
+        // belongs to neither, so it must see the global env and nothing else.
+        let (mut engine, _tmp) = test_engine();
+        engine.config.terminal.command = "cat".to_string();
+        engine.config.terminal.args = vec![];
+        engine
+            .config
+            .env
+            .insert("DUX_GLOBAL".to_string(), "global".to_string());
+        let mut p = sample_project("p1", "/tmp/p1");
+        p.env
+            .insert("DUX_PROJECT".to_string(), "project".to_string());
+        engine.projects.push(p);
+
+        // Measured rather than reasoned about: the shell itself reports what it
+        // was handed, so this asserts the environment the CHILD really got and
+        // not the argument the call site assembled.
+        engine.config.terminal.command = "sh".to_string();
+        engine.config.terminal.args = vec![
+            "-c".to_string(),
+            "echo \"global=[$DUX_GLOBAL] project=[$DUX_PROJECT]\"".to_string(),
+        ];
+
+        let (id, _) = engine
+            .create_standalone_terminal(24, 80)
+            .expect("create standalone terminal");
+
+        let output = read_until(&engine.companion_terminals[&id].client, "global=");
+        assert!(
+            output.contains("global=[global]"),
+            "the global env reaches a standalone terminal; saw: {output}"
+        );
+        assert!(
+            output.contains("project=[]"),
+            "no project's env overlays a terminal that belongs to no project; saw: {output}"
+        );
+    }
+
+    /// Poll a PTY's visible text until `needle` appears, bounded. Terminal output
+    /// arrives on the reader thread, so the alternative to polling is asserting
+    /// against a buffer that may simply not have been filled yet.
+    fn read_until(client: &crate::pty::PtyClient, needle: &str) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let text = client.visible_text_excerpt(usize::MAX);
+            if text.contains(needle) || std::time::Instant::now() >= deadline {
+                return text;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn create_project_terminal_unknown_project_errors() {
+        let (mut engine, _tmp) = test_engine();
+        engine.config.terminal.command = "cat".to_string();
+        engine.config.terminal.args = vec![];
+
+        let err = engine
+            .create_project_terminal("missing", 24, 80)
+            .expect_err("missing project should error");
+        assert!(
+            err.to_string().contains("unknown project"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn create_project_terminal_path_missing_errors() {
+        let (mut engine, _tmp) = test_engine();
+        engine
+            .projects
+            .push(sample_project("p1", "/definitely/not/a/real/path"));
+        engine.config.terminal.command = "cat".to_string();
+        engine.config.terminal.args = vec![];
+
+        let err = engine
+            .create_project_terminal("p1", 24, 80)
+            .expect_err("path-missing project should error");
+        assert!(
+            err.to_string().contains("does not exist on disk"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            engine.companion_terminals.is_empty(),
+            "no terminal should have been registered"
+        );
+    }
+
+    /// Fork `companion_terminal_receives_session_identity_env`: a terminal
+    /// opened on an agent is where the user runs `dux peer send` or the AMQ
+    /// CLI by hand, so it carries the agent's Dux identity, with the
+    /// PERSISTED handle (not one re-derived from the directory).
+    #[test]
+    fn companion_terminal_receives_session_identity_env() {
+        let (mut engine, _tmp) = test_engine();
+        let worktree = tempfile::tempdir().expect("worktree dir");
+        engine.projects.push(sample_project(
+            "p1",
+            worktree.path().to_string_lossy().as_ref(),
+        ));
+        let mut session = sample_session("session-a", "p1", "feature");
+        session.agent_handle = "stable-handle".to_string();
+        session
+            .workspace
+            .as_managed_mut()
+            .expect("managed test session")
+            .worktree_path = worktree.path().to_string_lossy().to_string();
+        engine.sessions.push(session);
+        engine.config.terminal.command = "/bin/sh".to_string();
+        engine.config.terminal.args = vec![
+            "-c".to_string(),
+            "printf '%s|%s|%s\\n' \"$DUX_SESSION_ID\" \"$DUX_STORE_ID\" \"$DUX_AMQ_HANDLE\"; sleep 5"
+                .to_string(),
+        ];
+
+        let (terminal, _) = engine
+            .create_companion_terminal("session-a", 24, 80)
+            .expect("spawn companion terminal");
+        let store_id = crate::peer::load_or_create_store_id(&engine.paths.root).unwrap();
+        let expected = format!("session-a|{store_id}|stable-handle");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let rendered: String = engine.companion_terminals[&terminal]
+                .client
+                .snapshot()
+                .cells
+                .iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect();
+            if rendered.contains(&expected) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "companion terminal did not receive identity env; got: {rendered:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        engine.shutdown_ptys(std::time::Duration::ZERO);
+    }
+}

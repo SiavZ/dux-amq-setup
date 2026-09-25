@@ -1,0 +1,1804 @@
+//! The upload half of dropping a file onto a terminal or agent pane.
+//!
+//! This route saves bytes and never writes to a terminal. Writing is gated on
+//! being the connection that holds input, and that gate lives on the websocket in
+//! `PtySizeOwners::may_write`; a handler that pasted the path itself would be a
+//! plain HTTP request walking past it. So the route saves the file, returns where
+//! it landed, and the browser pastes that path over its own gated socket.
+//!
+//! The ownership check here is a courtesy that turns "saved and then silently not
+//! pasted" into a clear refusal. It is not the protection and must never be
+//! described as one. It needs its own identifier: `X-Connection-Id` names the
+//! EVENTS socket, and input ownership is tracked against the number minted when
+//! the terminal socket connects, which the upload carries in `conn`.
+//!
+//! Three destinations, for two intents:
+//!
+//! - An AGENT pane: the agent's upload directory (`ui.upload_directory`), created
+//!   on first use with a self-ignoring `.gitignore`. A file handed to an agent
+//!   must never touch git status and should die with the agent, and it sits inside
+//!   the worktree because some CLIs refuse to read outside their workspace.
+//! - A TERMINAL pane: wherever the terminal actually is, discovered live, because
+//!   a shell's directory moves the moment someone types `cd`. True of all three
+//!   kinds, a standalone terminal included, which has no worktree at all.
+//! - The EDITOR'S FILE TREE: the directory dropped on, as an ordinary visible
+//!   file. Nothing here goes near the upload directory and nothing writes a
+//!   `.gitignore`; hiding the file would defeat the intent. Marked by the `dir`
+//!   query parameter, which is present (possibly empty) for exactly this case.
+//!
+//! A tree drop naming a terminal is the one place a terminal answers with a fixed
+//! path: a terminal-rooted editor is pinned to the spawn directory the tree was
+//! drawn from, so following the live shell would land the same click elsewhere
+//! after a `cd`.
+//!
+//! The pane cases resolve through `Engine::file_drop_destination` and the tree
+//! case through `Engine::file_drop_tree_destination`; creation, probing and
+//! writing all run on a blocking pool.
+//!
+//! A tree drop reuses this route rather than getting one of its own, because
+//! everything except the destination is the part that is easy to get wrong: the
+//! size cap, the concurrency permit taken before the body is buffered, the name
+//! validated and never rewritten, the create relative to a pinned directory
+//! handle, the refusal of a symlink at any candidate, and the collision suffix.
+//!
+//! On an occupied name a drop suffixes where the editor's MOVE refuses. Both
+//! promise that nothing on disk is overwritten, and they differ because a move
+//! names one exact destination while a drop names only a folder, so the next free
+//! name is the honest answer; the response reports it as `renamed`, with
+//! `requested_name` beside `saved_name`.
+//!
+//! There is one size limit, `[server] file_drop_max_bytes`, applied by the
+//! `DefaultBodyLimit` layer below. Uploads to an agent go through the same limit;
+//! do not add a second one for them.
+//!
+//! dux has no file watcher, so a successful drop ends with the same
+//! [`crate::git_routes::refresh_changed_files_now`] every mutating git route
+//! calls, on one condition: the file landed inside the owning agent's worktree,
+//! which is the only tree git is watching. That is a real check made on the FINAL
+//! path with both sides resolved and compared component-wise, because a terminal's
+//! shell may have been `cd`'d to a sibling directory whose path merely starts with
+//! the worktree's. A terminal owned by a project or by nothing refreshes nothing,
+//! and neither does a refusal or a failed write.
+
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::rejection::BytesRejection;
+use axum::extract::{DefaultBodyLimit, Query, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use serde::{Deserialize, Serialize};
+
+use crate::rest_common::id_within_bound;
+use crate::server::AppState;
+
+/// Query parameters of a file-drop upload. The bytes are the raw request body:
+/// one file per request, which is what the paste rule wants anyway (a pasted
+/// path is only treated as an attachment when it parses as exactly one token, so
+/// several files means several pastes in sequence). Multipart would be a new
+/// dependency for no gain.
+#[derive(Deserialize)]
+struct DropQuery {
+    /// The PTY the pane is attached to, as the PANE addresses it: a terminal
+    /// id, a tab id, or the bare agent id a client uses for whichever tab holds
+    /// the session slot. The engine resolves all of them, and the handler
+    /// resolves this one before it asks anything else about it.
+    pty: String,
+    /// The dropped filename, as the browser reported it. Validated, never
+    /// rewritten.
+    filename: String,
+    /// The TERMINAL SOCKET's connection id (not the events-socket id in
+    /// `X-Connection-Id`). Optional: a browser that has not yet received its
+    /// first frame simply skips the courtesy check.
+    conn: Option<u64>,
+    /// Present means the drop came from the editor's file tree, and the value is the
+    /// root-relative directory dropped on (`""` for the root). Absent means a drop
+    /// on the agent or terminal pane. This one parameter carries both intents rather
+    /// than a second route, because only the destination differs between them.
+    dir: Option<String>,
+}
+
+/// Where a dropped file ended up.
+#[derive(Serialize)]
+struct SavedDropBody {
+    /// The absolute path, which is what the browser pastes.
+    path: String,
+    /// The name it was saved under. Differs from `requested_name` on a
+    /// collision.
+    saved_name: String,
+    /// The name as dropped, so the browser can report the pair rather than a
+    /// count when they differ.
+    requested_name: String,
+    /// The absolute directory it landed in.
+    folder: String,
+    /// The directory shortened with `~`, for the toast. Shortened here because
+    /// the SERVER is the machine whose home directory it is; the browser has no
+    /// way to know.
+    folder_label: String,
+    /// True when a collision forced a different name.
+    renamed: bool,
+}
+
+/// The file-drop route, with both of its limits attached.
+///
+/// Takes `state` rather than being state-generic like the other route modules,
+/// because both layers need configured values: the body limit needs the
+/// configured size cap, and the permit layer needs the shared semaphore.
+pub fn routes(state: &AppState) -> Router<AppState> {
+    let max_bytes = state.file_drop_max_bytes;
+    Router::new().route(
+        "/api/v1/file-drop",
+        post(upload_dropped_file)
+            // Set EXPLICITLY, because the framework's own default is 2 MB and
+            // would reject an ordinary screenshot from a high-resolution
+            // display. A `0` cap is handled inside the handler as "file drop is
+            // off" rather than as a zero-byte limit, so the refusal can say so.
+            .layer(DefaultBodyLimit::max(max_bytes.max(1)))
+            // Outermost is the point: the body is buffered in full before the
+            // handler's first line, so a permit taken inside it would be taken after
+            // the memory was already spent. A request beyond the limit waits up to
+            // `PERMIT_WAIT` and is then refused.
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                hold_a_file_drop_permit,
+            )),
+    )
+}
+
+/// How long a drop waits for a free upload slot before it is refused.
+///
+/// The wait exists because slots turn over, so a drop arriving a moment too early
+/// still works. It must not be unbounded: the permit is held across the whole body
+/// read and a client may trickle its body, so two slow requests would otherwise
+/// hold both default slots indefinitely with every later drop queued behind them.
+///
+/// The window covers somebody ELSE'S transfer, not the waiter's own. Nothing here
+/// times a transfer: `DefaultBodyLimit` bounds a body's size and the server puts
+/// no deadline on reading it, so this bounds only how long a waiter sits before
+/// being told no. A drop behind a genuinely slow large upload can be refused while
+/// nothing is stalled.
+///
+/// The value is a tradeoff, not a measurement: shorter refuses drops that would
+/// have gone through, and longer just extends the silence, since a refusal at
+/// least names the problem. It is tolerable only because the browser raises a
+/// spinner naming the file for the whole in-flight window and turns the 503 into
+/// "try again in a moment". If that indication is ever removed, this is too long.
+const PERMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Hold one file-drop permit for the whole request, body included. The binding must
+/// be named, never `_`, or the permit drops immediately and the layer bounds
+/// nothing. An expired wait answers 503; the websocket caps refuse immediately
+/// instead, because a socket is long-lived where an upload is not.
+async fn hold_a_file_drop_permit(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let permit = tokio::time::timeout(
+        PERMIT_WAIT,
+        state.file_drop_semaphore.clone().acquire_owned(),
+    )
+    .await;
+    let _permit = match permit {
+        Ok(permit) => permit,
+        Err(_) => {
+            dux_core::logger::warn(
+                "[server] /api/v1/file-drop refused: no upload slot came free within \
+                 the wait (file_drop_max_concurrency)",
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The server is already handling as many dropped files as it \
+                 allows at once. Try the drop again shortly.",
+            )
+                .into_response();
+        }
+    };
+    next.run(req).await
+}
+
+/// The refusal for a pane id nothing answers to. It names the id, so a refusal
+/// about a pane the user is looking at is distinguishable from one about a missing
+/// agent. The id is echoed back char-truncated, never byte-sliced, which would
+/// panic inside a multi-byte character; the over-length case is one of the callers,
+/// so this cannot lean on the caller's length bound.
+fn unknown_pane(pane_id: &str) -> String {
+    const SHOWN: usize = 64;
+    let mut shown: String = pane_id.chars().take(SHOWN).collect();
+    if pane_id.chars().nth(SHOWN).is_some() {
+        shown.push('…');
+    }
+    // Lower-case and clause-shaped, because the browser reads it as the reason
+    // half of "Could not save <file>: <reason>".
+    format!(
+        "nothing on this server answers to the id \"{shown}\", so there was \
+         nowhere to put it. The pane may have been closed or detached since the \
+         page loaded; reload and try the file again."
+    )
+}
+
+async fn upload_dropped_file(
+    State(state): State<AppState>,
+    Query(query): Query<DropQuery>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    if state.file_drop_max_bytes == 0 {
+        return (
+            StatusCode::FORBIDDEN,
+            "File drop is switched off on this server. Set [server] \
+             file_drop_max_bytes in config.toml to a size in bytes and restart \
+             to turn it back on."
+                .to_string(),
+        )
+            .into_response();
+    }
+    if !id_within_bound(&query.pty) {
+        return (StatusCode::NOT_FOUND, unknown_pane(&query.pty)).into_response();
+    }
+
+    // Canonicalized once, before anything is asked about it. A pane addresses its
+    // PTY with whichever id its surface holds, and for an agent's slot tab that is
+    // the session id, which the PTY socket route resolves the same way. Resolving
+    // here rather than inside each lookup keeps the courtesy check honest: input
+    // ownership is recorded against the real pty key, so a check asked with the
+    // placeholder would find nothing and pass a drop it should have refused.
+    let Some(pty) = state.engine.pty_key_for_pane_id(query.pty.clone()).await else {
+        return (StatusCode::NOT_FOUND, unknown_pane(&query.pty)).into_response();
+    };
+
+    // The courtesy check: the websocket's own write check enforces input authority,
+    // and this only tells a viewer who cannot paste before the file is written. An
+    // editor tree drop pastes nothing, so it is skipped explicitly, or a browser
+    // carrying a `conn` from the pane it came from could have a durable save
+    // refused by a check that does not apply to it.
+    if query.dir.is_none()
+        && let Some(conn) = query.conn
+        && state.input_held_by_someone_else(&pty, conn)
+    {
+        return (
+            StatusCode::CONFLICT,
+            "Another device is driving this terminal, so the path could not be \
+             pasted. Take over input and drop the file again."
+                .to_string(),
+        )
+            .into_response();
+    }
+
+    let bytes = match body {
+        Ok(b) => b,
+        Err(_) => {
+            // The limit is enforced by the body-limit layer, which rejects with
+            // its own terse message; replace it with one that names the setting.
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "That file is over the {} byte limit for a dropped file. \
+                     Nothing was written. Raise [server] file_drop_max_bytes in \
+                     config.toml and restart to allow bigger files.",
+                    state.file_drop_max_bytes
+                ),
+            )
+                .into_response();
+        }
+    };
+
+    let destination = match query.dir.clone() {
+        Some(dir) => {
+            state
+                .engine
+                .file_drop_tree_destination(pty.clone(), dir)
+                .await
+        }
+        None => state.engine.file_drop_destination(pty.clone()).await,
+    };
+    let Some(destination) = destination else {
+        return (StatusCode::NOT_FOUND, unknown_pane(&query.pty)).into_response();
+    };
+
+    // Which agent, if any, would want to hear that its files changed. Asked
+    // BEFORE the write so the containment check can run inside the same blocking
+    // task as the write itself, rather than costing the response a second hop.
+    let refresh_target = state.engine.file_drop_refresh_target(pty.clone()).await;
+    let worktree = refresh_target.as_ref().map(|(_, w)| w.clone());
+
+    let filename = query.filename.clone();
+    // Everything from here is filesystem work: pinning the directory (a /proc
+    // read, or an `lsof` process on macOS) and writing the file. Off the async
+    // reactor, exactly like the editor's file routes.
+    let saved = tokio::task::spawn_blocking(move || {
+        // A destination that cannot be used is a refusal in its OWN words: a
+        // path that could not be sent to the terminal, or a process dux is not
+        // allowed to read. Flattening those into "could not write the file"
+        // would describe the wrong problem.
+        let dir = destination
+            .open()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+        let saved = dux_core::file_drop::save_drop(&dir, &filename, &bytes, &stamp)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        // On the final path, once it exists, and resolved on both sides: a
+        // terminal's shell may have been `cd`'d to a sibling directory whose path
+        // merely starts with the worktree's.
+        let inside = worktree
+            .as_deref()
+            .is_some_and(|w| dux_core::file_drop::saved_file_is_within(w, &saved.path));
+        Ok::<_, std::io::Error>((saved, dir.path().to_path_buf(), inside))
+    })
+    .await;
+
+    match saved {
+        Ok(Ok((saved, folder, inside_worktree))) => {
+            // dux has no file watcher, so a file written outside the git routes
+            // is invisible in the Changes pane until the next poll (up to ten
+            // seconds). Tell the pane now. A drop that landed outside the
+            // worktree changes nothing git is watching, so it says nothing.
+            if inside_worktree && let Some((session_id, worktree)) = refresh_target {
+                crate::git_routes::refresh_changed_files_now(&state, session_id, &worktree);
+            }
+            let body = SavedDropBody {
+                path: saved.path.to_string_lossy().into_owned(),
+                saved_name: saved.saved_name,
+                requested_name: query.filename,
+                folder: folder.to_string_lossy().into_owned(),
+                folder_label: dux_core::home_path::shorten_home(&folder),
+                renamed: saved.renamed,
+            };
+            axum::Json(body).into_response()
+        }
+        // A refusal (an unusable name, a symlink in the way, a destination that
+        // cannot be written) is a client condition and names its reason, so the
+        // browser can put that reason in the toast rather than a generic one.
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("file drop task failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::{Request, StatusCode};
+    use dux_core::config::{DuxPaths, ProjectConfig};
+    use dux_core::storage::SessionStore;
+    use tower::ServiceExt;
+
+    fn sample_session(id: &str, worktree: &str) -> dux_core::model::AgentSession {
+        let n = chrono::Utc::now();
+        dux_core::model::AgentSession {
+            id: id.to_string(),
+            agent_handle: dux_core::model::normalize_agent_handle(id),
+            shared_workspace: false,
+            deleted_at: None,
+            slot_tab_id: format!("{id}-slot"),
+            provider: dux_core::model::ProviderKind::new("claude"),
+            title: None,
+            started_providers: Vec::new(),
+            desired_running: true,
+            auto_reopen_enabled: false,
+            status: dux_core::model::SessionStatus::Detached,
+            created_at: n,
+            updated_at: n,
+            last_focused_tab: None,
+            workspace: dux_core::model::AgentWorkspace::Managed(
+                dux_core::model::ManagedWorkspace {
+                    project_id: "p1".to_string(),
+                    project_path: None,
+                    source_branch: "main".to_string(),
+                    branch_name: "feat".to_string(),
+                    initial_branch: "feat".to_string(),
+                    branch_provenance: dux_core::model::BranchProvenance::CreatedByDux,
+                    worktree_path: worktree.to_string(),
+                },
+            ),
+        }
+    }
+
+    /// A real router with agent "s1" pointed at a fresh worktree, and file drop
+    /// configured with the given limits.
+    async fn router_with_limits(
+        max_bytes: usize,
+        max_concurrency: u32,
+    ) -> (tempfile::TempDir, std::path::PathBuf, axum::Router) {
+        router_with(max_bytes, max_concurrency, None).await
+    }
+
+    /// The same router with `ui.upload_directory` written into the config the
+    /// engine boots from, so a test can prove the setting reaches the drop.
+    async fn router_with_upload_directory(
+        directory: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf, axum::Router) {
+        router_with(1024 * 1024, 4, Some(directory)).await
+    }
+
+    async fn router_with(
+        max_bytes: usize,
+        max_concurrency: u32,
+        upload_directory: Option<&str>,
+    ) -> (tempfile::TempDir, std::path::PathBuf, axum::Router) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let wt = root.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        if let Some(directory) = upload_directory {
+            std::fs::write(
+                root.join("config.toml"),
+                format!("[ui]\nupload_directory = \"{directory}\"\n"),
+            )
+            .unwrap();
+        }
+
+        let paths = DuxPaths {
+            root: root.clone(),
+            config_path: root.join("config.toml"),
+            sessions_db_path: root.join("sessions.sqlite3"),
+            worktrees_root: root.join("worktrees"),
+            lock_path: root.join("dux.lock"),
+        };
+        std::fs::create_dir_all(&paths.worktrees_root).unwrap();
+        {
+            let store = SessionStore::open(&paths.sessions_db_path).unwrap();
+            store
+                .upsert_project(&ProjectConfig {
+                    id: "p1".to_string(),
+                    path: root.to_string_lossy().into_owned(),
+                    name: Some("p1".to_string()),
+                    default_provider: None,
+                    leading_branch: None,
+                    auto_reopen_agents: None,
+                    startup_command: None,
+                    env: Default::default(),
+                    workspace_mode: None,
+                })
+                .unwrap();
+            store
+                .create_session(&sample_session("s1", wt.to_string_lossy().as_ref()))
+                .unwrap();
+        }
+        let engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        let (handle, _join) = crate::engine_actor::spawn_engine_thread(engine);
+        let app = crate::server::build_app(
+            handle,
+            Router::<AppState>::new(),
+            crate::server::RouterParams::plain_http()
+                .with_file_drop_limits(max_bytes, max_concurrency),
+        );
+        (tmp, wt, app)
+    }
+
+    async fn router() -> (tempfile::TempDir, std::path::PathBuf, axum::Router) {
+        router_with_limits(1024 * 1024, 4).await
+    }
+
+    fn drop_req(query: &str, body: Vec<u8>) -> Request<axum::body::Body> {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/file-drop?{query}"))
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    async fn body_text(resp: axum::response::Response) -> String {
+        String::from_utf8_lossy(&to_bytes(resp.into_body(), 1 << 20).await.unwrap()).into_owned()
+    }
+
+    /// A workspace with agent `s1` at `<root>/wt`, project `p1` at `<root>`, and
+    /// a live engine, plus the `AppState` the router is actually serving so a
+    /// test can read the two refresh observers (the changed-files cache's
+    /// invalidation generation and the engine handle's refresh tally).
+    struct DropWorld {
+        _tmp: tempfile::TempDir,
+        _join: std::thread::JoinHandle<()>,
+        root: std::path::PathBuf,
+        wt: std::path::PathBuf,
+        handle: crate::engine_actor::EngineHandle,
+        app: axum::Router,
+        state: AppState,
+    }
+
+    impl DropWorld {
+        /// Both halves of "the changed files were refreshed": the cache
+        /// generation, and the worktrees the engine was asked to recompute.
+        fn refreshes(&self) -> (u64, Vec<String>) {
+            (
+                self.state.changes.invalidation_generation(),
+                self.state.engine.refresh_requests(),
+            )
+        }
+
+        async fn create_terminal(&self, path: &str) -> String {
+            let created = self
+                .app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(created.status(), StatusCode::CREATED, "creating {path}");
+            let created: serde_json::Value =
+                serde_json::from_str(&body_text(created).await).unwrap();
+            created["terminal_id"].as_str().unwrap().to_string()
+        }
+
+        /// Type a `cd` into the terminal and wait until the shell has actually
+        /// arrived, by watching the directory dux would drop into. Watching the
+        /// state under test is deterministic in a way a fixed sleep is not.
+        async fn cd(&self, terminal_id: &str, dir: &std::path::Path) {
+            self.handle.write_pty(
+                terminal_id.to_string(),
+                format!("cd '{}'\n", dir.display()).into_bytes(),
+            );
+            let want = std::fs::canonicalize(dir).unwrap();
+            for _ in 0..300 {
+                if let Some(dest) = self
+                    .handle
+                    .file_drop_destination(terminal_id.to_string())
+                    .await
+                    && let Ok(pinned) = dest.open()
+                    && std::fs::canonicalize(pinned.path()).ok() == Some(want.clone())
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("the shell never reported {}", dir.display());
+        }
+
+        async fn drop_on(&self, pty: &str, filename: &str) -> axum::response::Response {
+            self.app
+                .clone()
+                .oneshot(drop_req(
+                    &format!("pty={pty}&filename={filename}"),
+                    b"png".to_vec(),
+                ))
+                .await
+                .unwrap()
+        }
+    }
+
+    async fn drop_world() -> DropWorld {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let wt = root.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        let paths = DuxPaths {
+            root: root.clone(),
+            config_path: root.join("config.toml"),
+            sessions_db_path: root.join("sessions.sqlite3"),
+            worktrees_root: root.join("worktrees"),
+            lock_path: root.join("dux.lock"),
+        };
+        std::fs::create_dir_all(&paths.worktrees_root).unwrap();
+        {
+            let store = SessionStore::open(&paths.sessions_db_path).unwrap();
+            store
+                .upsert_project(&ProjectConfig {
+                    id: "p1".to_string(),
+                    path: root.to_string_lossy().into_owned(),
+                    name: Some("p1".to_string()),
+                    default_provider: None,
+                    leading_branch: None,
+                    auto_reopen_agents: None,
+                    startup_command: None,
+                    env: Default::default(),
+                    workspace_mode: None,
+                })
+                .unwrap();
+            store
+                .create_session(&sample_session("s1", wt.to_string_lossy().as_ref()))
+                .unwrap();
+        }
+        let mut engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        // A plain, always-present shell, so the test does not depend on whatever
+        // the machine's own terminal setting happens to be.
+        engine.config.terminal.command = "/bin/sh".to_string();
+        engine.config.terminal.args = vec![];
+        let (handle, join) = crate::engine_actor::spawn_engine_thread(engine);
+
+        // The router owns its state, so a probe route hands a clone back out.
+        let slot: std::sync::Arc<std::sync::Mutex<Option<AppState>>> = Default::default();
+        let captured = std::sync::Arc::clone(&slot);
+        let probe = Router::new().route(
+            "/test/state",
+            axum::routing::get(move |State(state): State<AppState>| {
+                let captured = std::sync::Arc::clone(&captured);
+                async move {
+                    *captured.lock().unwrap() = Some(state);
+                    "ok"
+                }
+            }),
+        );
+        let app = crate::server::build_app(
+            handle.clone(),
+            probe,
+            crate::server::RouterParams::plain_http(),
+        );
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/test/state")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let state = slot.lock().unwrap().take().unwrap();
+
+        DropWorld {
+            _tmp: tmp,
+            _join: join,
+            root,
+            wt,
+            handle,
+            app,
+            state,
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_on_an_agent_refreshes_that_agent_s_changed_files() {
+        // The gap this closes: without it a dropped screenshot is invisible in
+        // the Changes pane until the next poll, up to ten seconds later.
+        let world = drop_world().await;
+        let (generation, refreshes) = world.refreshes();
+        assert!(refreshes.is_empty(), "nothing has refreshed yet");
+
+        let resp = world.drop_on("s1-slot", "shot.png").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let (generation_after, refreshes) = world.refreshes();
+        assert!(
+            generation_after > generation,
+            "the REST changed-files cache must be invalidated, or the next GET \
+             serves the pre-drop answer"
+        );
+        assert_eq!(
+            refreshes.len(),
+            1,
+            "the engine must be asked to recompute exactly once, got {refreshes:?}"
+        );
+        assert_eq!(
+            std::fs::canonicalize(&refreshes[0]).unwrap(),
+            std::fs::canonicalize(&world.wt).unwrap(),
+            "the refresh must name the agent's own worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_on_the_agent_s_own_terminal_inside_the_worktree_refreshes_the_agent() {
+        // A companion terminal of an agent, sitting in that agent's worktree: the
+        // file lands where git can see it, so the pane has to hear about it.
+        let world = drop_world().await;
+        let terminal = world.create_terminal("/api/v1/sessions/s1/terminals").await;
+        let deep = world.wt.join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        world.cd(&terminal, &deep).await;
+        let (generation, _) = world.refreshes();
+
+        let resp = world.drop_on(&terminal, "shot.png").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let (generation_after, refreshes) = world.refreshes();
+        assert!(
+            generation_after > generation,
+            "the cache must be invalidated"
+        );
+        assert_eq!(refreshes.len(), 1, "got {refreshes:?}");
+        assert_eq!(
+            std::fs::canonicalize(&refreshes[0]).unwrap(),
+            std::fs::canonicalize(&world.wt).unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_on_the_agent_s_terminal_outside_the_worktree_refreshes_nothing() {
+        // The shell was `cd`'d out of the worktree, so the file landed somewhere
+        // git is not looking. Refreshing would be a lie about what changed.
+        let world = drop_world().await;
+        let terminal = world.create_terminal("/api/v1/sessions/s1/terminals").await;
+        let outside = world.root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        world.cd(&terminal, &outside).await;
+        let (generation, _) = world.refreshes();
+
+        let resp = world.drop_on(&terminal, "shot.png").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let (generation_after, refreshes) = world.refreshes();
+        assert_eq!(generation_after, generation, "nothing to invalidate");
+        assert!(refreshes.is_empty(), "got {refreshes:?}");
+    }
+
+    #[tokio::test]
+    async fn a_sibling_whose_path_starts_with_the_worktree_s_is_not_inside_the_worktree() {
+        // `/w/wt-extra` starts with `/w/wt` as TEXT and is not inside it. A string
+        // prefix check passes this and refreshes an agent whose worktree never
+        // changed.
+        let world = drop_world().await;
+        let terminal = world.create_terminal("/api/v1/sessions/s1/terminals").await;
+        let sibling = world.root.join("wt-extra");
+        std::fs::create_dir_all(&sibling).unwrap();
+        assert!(
+            sibling
+                .to_string_lossy()
+                .starts_with(world.wt.to_string_lossy().as_ref()),
+            "the fixture must actually set the trap"
+        );
+        world.cd(&terminal, &sibling).await;
+        let (generation, _) = world.refreshes();
+
+        let resp = world.drop_on(&terminal, "shot.png").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let (generation_after, refreshes) = world.refreshes();
+        assert_eq!(generation_after, generation);
+        assert!(
+            refreshes.is_empty(),
+            "a sibling directory is not containment, got {refreshes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_on_a_project_terminal_refreshes_nothing_even_inside_a_worktree() {
+        // A project terminal has no agent pane behind it, so there is nothing to
+        // refresh, and that stays true when the shell happens to sit inside an
+        // agent's worktree.
+        let world = drop_world().await;
+        let terminal = world.create_terminal("/api/v1/projects/p1/terminals").await;
+        world.cd(&terminal, &world.wt).await;
+        let (generation, _) = world.refreshes();
+
+        let resp = world.drop_on(&terminal, "shot.png").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let (generation_after, refreshes) = world.refreshes();
+        assert_eq!(generation_after, generation);
+        assert!(refreshes.is_empty(), "got {refreshes:?}");
+    }
+
+    #[tokio::test]
+    async fn dropping_on_a_standalone_terminal_refreshes_nothing_even_inside_a_worktree() {
+        // A standalone terminal is owned by nothing at all. Same answer, and the
+        // `cd` into the worktree is what makes the test about OWNERSHIP rather
+        // than about the directory it happened to open in.
+        let world = drop_world().await;
+        let terminal = world.create_terminal("/api/v1/terminals").await;
+        world.cd(&terminal, &world.wt).await;
+        let (generation, _) = world.refreshes();
+
+        let resp = world.drop_on(&terminal, "shot.png").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let (generation_after, refreshes) = world.refreshes();
+        assert_eq!(generation_after, generation);
+        assert!(refreshes.is_empty(), "got {refreshes:?}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_drop_refreshes_nothing() {
+        // Nothing was written, so there is nothing to tell the Changes pane
+        // about.
+        let world = drop_world().await;
+        let (generation, _) = world.refreshes();
+
+        let resp = world.drop_on("s1-slot", "..%2F..%2Fescaped.png").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let (generation_after, refreshes) = world.refreshes();
+        assert_eq!(generation_after, generation);
+        assert!(refreshes.is_empty(), "got {refreshes:?}");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_screenshot_on_an_agent_saves_it_in_the_upload_directory() {
+        // The journey: someone drags a screenshot onto their agent's pane. The
+        // file goes to the agent's upload directory, out of the way of git, and
+        // the route hands back the path, because the path is what the browser
+        // pastes.
+        let (_tmp, wt, app) = router().await;
+        let resp = app
+            .oneshot(drop_req(
+                "pty=s1-slot&filename=Screen%20Shot.png",
+                b"\x89PNG-ish".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+
+        assert_eq!(body["saved_name"], "Screen Shot.png");
+        assert_eq!(body["requested_name"], "Screen Shot.png");
+        assert_eq!(body["renamed"], false);
+        let path = std::path::PathBuf::from(body["path"].as_str().unwrap());
+        let uploads = wt.join(".dux").join("uploads");
+        assert_eq!(
+            std::fs::canonicalize(path.parent().unwrap()).unwrap(),
+            std::fs::canonicalize(&uploads).unwrap(),
+            "must land in the agent's upload directory"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"\x89PNG-ish",
+            "the file must be readable at the path the route reported"
+        );
+        // Created with the directory, so git reports nothing at all: not the
+        // screenshot, not the ignore file, not the directory.
+        assert_eq!(
+            std::fs::read_to_string(uploads.join(".gitignore")).unwrap(),
+            "*\n"
+        );
+    }
+
+    /// The way a BROWSER actually addresses an agent's first tab.
+    ///
+    /// The slot tab's id is generated and the session merely points at it, so
+    /// the client's URL grammar spells "whichever tab is in the slot" as the
+    /// SESSION id, and the pane carries that placeholder into every id it
+    /// sends, this upload included. The agent PTY socket accepts the same
+    /// spelling and resolves it server-side, so the upload route has to resolve
+    /// it too, or the one pane every agent has cannot attach a file at all.
+    ///
+    /// Every other test in this file names the slot tab by its real id, which
+    /// is a spelling the browser has no way to produce for this pane.
+    mod addressed_by_the_bare_agent_id {
+        use super::*;
+
+        #[tokio::test]
+        async fn a_pane_drop_lands_in_the_upload_directory() {
+            let (_tmp, wt, app) = router().await;
+            let resp = app
+                .oneshot(drop_req("pty=s1&filename=shot.png", b"png".to_vec()))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "a live agent's own pane must not be refused as unknown: {}",
+                body_text(resp).await
+            );
+            assert_eq!(
+                std::fs::read(wt.join(".dux/uploads/shot.png")).unwrap(),
+                b"png"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_tree_drop_lands_in_the_folder_that_was_dropped_on() {
+            // The editor's file tree addresses an agent root by its session id
+            // too (`rootPtyId`), so it regressed with the pane.
+            let (_tmp, wt, app) = router().await;
+            std::fs::create_dir_all(wt.join("assets")).unwrap();
+            let resp = app
+                .oneshot(drop_req(
+                    "pty=s1&filename=logo.png&dir=assets",
+                    b"bytes".to_vec(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{}", body_text(resp).await);
+            assert_eq!(std::fs::read(wt.join("assets/logo.png")).unwrap(), b"bytes");
+        }
+
+        #[tokio::test]
+        async fn a_pane_drop_is_refused_while_another_device_holds_the_terminal() {
+            // The courtesy check reads the same ownership map the terminal
+            // socket writes, and the socket records the SLOT TAB's id. Asked
+            // with the placeholder spelling it must still find that record, or
+            // the check silently never fires for the one pane every agent has.
+            let world = drop_world().await;
+            let slot = world
+                .handle
+                .slot_tab_id("s1".to_string())
+                .await
+                .expect("the fixture agent has a slot tab");
+            world.state.give_input_to(&slot, 7);
+
+            let resp = world
+                .app
+                .clone()
+                .oneshot(drop_req(
+                    "pty=s1&filename=shot.png&conn=99",
+                    b"png".to_vec(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            assert!(
+                !world.wt.join(".dux").exists(),
+                "a refused drop must write nothing"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_drop_refreshes_that_agent_s_changed_files() {
+            let world = drop_world().await;
+            let (generation, _) = world.refreshes();
+
+            let resp = world.drop_on("s1", "shot.png").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            let (generation_after, refreshes) = world.refreshes();
+            assert!(
+                generation_after > generation,
+                "the cache must be invalidated"
+            );
+            assert_eq!(refreshes.len(), 1, "got {refreshes:?}");
+            assert_eq!(
+                std::fs::canonicalize(&refreshes[0]).unwrap(),
+                std::fs::canonicalize(&world.wt).unwrap(),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_over_long_id_is_refused_without_echoing_all_of_it() {
+        // The length bound is checked before anything else, so its refusal
+        // is the one place the echoed id has not already been bounded.
+        // Truncation is by CHARACTER: byte slicing panics inside a
+        // multi-byte one, and a name full of them is exactly what a client
+        // can send.
+        let world = drop_world().await;
+        let long: String = std::iter::repeat_n('é', 4096).collect();
+        let resp = world.drop_on(&long, "notes.md").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let msg = body_text(resp).await;
+        assert!(msg.contains('…'), "got: {msg}");
+        assert!(msg.chars().count() < 300, "the whole id was echoed back");
+    }
+
+    #[tokio::test]
+    async fn the_upload_route_stores_a_posted_text_file_byte_for_byte() {
+        // A ROUTE-CONTRACT test, and nothing more. Be honest about its reach:
+        // it posts a `.txt` through the ordinary upload route and would pass
+        // with the entire long-paste client feature reverted, because the
+        // DECISION to turn a paste into a file is client-side
+        // (`lib/clipboardPaste.ts`) and never touches this crate.
+        //
+        // It earns its place anyway: the client feature rests on the promise
+        // that whatever it posts comes back off disk unchanged, since the whole
+        // point is that the agent opens the file and reads what was on the
+        // clipboard. This is where that promise is pinned.
+        //
+        // The content is deliberately awkward: non-Latin text, an emoji outside
+        // the BMP, a CRLF and a lone LF. Any re-encoding, newline normalization
+        // or BOM on the way through would show up here as different bytes.
+        let (_tmp, wt, app) = router().await;
+        let text = "エラーログ\r\nline two\n🙂 done";
+        let resp = app
+            .oneshot(drop_req(
+                "pty=s1-slot&filename=pasted-2026-08-09-141530.txt",
+                text.as_bytes().to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+
+        assert_eq!(body["saved_name"], "pasted-2026-08-09-141530.txt");
+        let path = std::path::PathBuf::from(body["path"].as_str().unwrap());
+        assert_eq!(
+            std::fs::canonicalize(path.parent().unwrap()).unwrap(),
+            std::fs::canonicalize(wt.join(".dux").join("uploads")).unwrap(),
+            "a pasted document goes to the same upload directory a dropped file does"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            text.as_bytes(),
+            "the saved file must be the pasted text byte for byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_configured_upload_directory_is_where_an_agent_drop_actually_lands() {
+        // Every other test in this file exercises the DEFAULT `.dux/uploads`,
+        // so nothing proved the configured value reaches the drop at all: the
+        // whole chain from `config.toml` through the engine's destination to
+        // the walk that creates the directory could have been ignoring it and
+        // every one of them would still pass. A nested, multi-component,
+        // non-hidden path so the parent-creating walk is exercised too.
+        let (_tmp, wt, app) = router_with_upload_directory("tmp/dux/drops").await;
+        let resp = app
+            .oneshot(drop_req("pty=s1-slot&filename=shot.png", b"png".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+
+        let path = std::path::PathBuf::from(body["path"].as_str().unwrap());
+        let uploads = wt.join("tmp").join("dux").join("drops");
+        assert_eq!(
+            std::fs::canonicalize(path.parent().unwrap()).unwrap(),
+            std::fs::canonicalize(&uploads).unwrap(),
+            "the configured directory is the one that must be used"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"png");
+        assert_eq!(
+            std::fs::read_to_string(uploads.join(".gitignore")).unwrap(),
+            "*\n"
+        );
+        assert!(
+            !wt.join(".dux").exists(),
+            "the default must not be created alongside the configured one"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_on_a_terminal_still_lands_in_its_own_working_directory() {
+        // The narrowing stops at agents. This is the same worktree the agent
+        // above uploads into, so the assertion that matters is that the file
+        // did NOT go to `.dux/uploads`: a terminal is where the user is
+        // working, and that is where a dropped file belongs.
+        let world = drop_world().await;
+        let terminal = world.create_terminal("/api/v1/sessions/s1/terminals").await;
+        world.cd(&terminal, &world.wt).await;
+
+        let resp = world.drop_on(&terminal, "shot.png").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        let path = std::path::PathBuf::from(body["path"].as_str().unwrap());
+        assert_eq!(
+            std::fs::canonicalize(path.parent().unwrap()).unwrap(),
+            std::fs::canonicalize(&world.wt).unwrap(),
+        );
+        assert!(
+            !world.wt.join(".dux").exists(),
+            "a terminal drop must not create an upload directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_same_name_twice_is_reported_with_the_new_name() {
+        let (_tmp, _wt, app) = router().await;
+        let first = app
+            .clone()
+            .oneshot(drop_req("pty=s1-slot&filename=shot.png", b"one".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = app
+            .oneshot(drop_req("pty=s1-slot&filename=shot.png", b"two".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_text(second).await).unwrap();
+        assert_eq!(body["renamed"], true);
+        assert_eq!(body["requested_name"], "shot.png");
+        assert_ne!(body["saved_name"], "shot.png");
+        // The browser reports the PAIR, so both halves have to come back.
+        assert_eq!(
+            std::fs::read(body["path"].as_str().unwrap()).unwrap(),
+            b"two"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_traversing_filename_is_refused_and_writes_nothing() {
+        let (tmp, _wt, app) = router().await;
+        let resp = app
+            .oneshot(drop_req(
+                "pty=s1-slot&filename=..%2F..%2Fescaped.png",
+                b"x".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let msg = body_text(resp).await;
+        assert!(
+            msg.contains("path separator"),
+            "the refusal must name its reason, got: {msg}"
+        );
+        assert!(!tmp.path().join("escaped.png").exists());
+    }
+
+    #[tokio::test]
+    async fn an_over_size_file_is_refused_with_a_message_naming_the_setting() {
+        // A terse framework rejection ("length limit exceeded") tells the user
+        // nothing they can act on, so the route replaces it with one that names
+        // the limit and the setting that moves it.
+        let (_tmp, wt, app) = router_with_limits(16, 4).await;
+        let resp = app
+            .oneshot(drop_req("pty=s1-slot&filename=big.png", vec![0u8; 4096]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let msg = body_text(resp).await;
+        assert!(msg.contains("16 byte limit"), "got: {msg}");
+        assert!(msg.contains("file_drop_max_bytes"), "got: {msg}");
+        assert!(msg.contains("Nothing was written"), "got: {msg}");
+        assert!(
+            std::fs::read_dir(&wt).unwrap().next().is_none(),
+            "a refused upload must leave the destination untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_size_cap_switches_file_drop_off() {
+        let (_tmp, wt, app) = router_with_limits(0, 4).await;
+        let resp = app
+            .oneshot(drop_req("pty=s1-slot&filename=shot.png", b"x".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let msg = body_text(resp).await;
+        assert!(msg.contains("switched off"), "got: {msg}");
+        assert!(std::fs::read_dir(&wt).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_pty_is_not_found() {
+        let (_tmp, _wt, app) = router().await;
+        let resp = app
+            .oneshot(drop_req("pty=nobody&filename=shot.png", b"x".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dropping_on_a_terminal_lands_where_the_shell_actually_is_after_a_cd() {
+        // The journey the spawn directory would get wrong: open a terminal, type
+        // `cd` somewhere else, then drop a file on it. The file has to land where
+        // the user actually IS. Asserting only that it lands in the worktree
+        // would pass with the stored spawn directory, which is the bug.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let wt = root.join("wt");
+        let elsewhere = wt.join("deep").join("nested");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+
+        let paths = DuxPaths {
+            root: root.clone(),
+            config_path: root.join("config.toml"),
+            sessions_db_path: root.join("sessions.sqlite3"),
+            worktrees_root: root.join("worktrees"),
+            lock_path: root.join("dux.lock"),
+        };
+        std::fs::create_dir_all(&paths.worktrees_root).unwrap();
+        {
+            let store = SessionStore::open(&paths.sessions_db_path).unwrap();
+            store
+                .upsert_project(&ProjectConfig {
+                    id: "p1".to_string(),
+                    path: root.to_string_lossy().into_owned(),
+                    name: Some("p1".to_string()),
+                    default_provider: None,
+                    leading_branch: None,
+                    auto_reopen_agents: None,
+                    startup_command: None,
+                    env: Default::default(),
+                    workspace_mode: None,
+                })
+                .unwrap();
+            store
+                .create_session(&sample_session("s1", wt.to_string_lossy().as_ref()))
+                .unwrap();
+        }
+        let mut engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        // A plain, always-present shell, so the test does not depend on whatever
+        // the machine's own terminal setting happens to be.
+        engine.config.terminal.command = "/bin/sh".to_string();
+        engine.config.terminal.args = vec![];
+        let (handle, _join) = crate::engine_actor::spawn_engine_thread(engine);
+        let app = crate::server::build_app(
+            handle.clone(),
+            Router::<AppState>::new(),
+            crate::server::RouterParams::plain_http(),
+        );
+
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions/s1/terminals")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created: serde_json::Value = serde_json::from_str(&body_text(created).await).unwrap();
+        let terminal_id = created["terminal_id"].as_str().unwrap().to_string();
+
+        // Type the `cd`, then wait for the shell to have actually done it by
+        // watching its own working directory change. Watching the state we care
+        // about is deterministic in a way a fixed sleep is not.
+        handle.write_pty(terminal_id.clone(), b"cd deep/nested\n".to_vec());
+        let want = std::fs::canonicalize(&elsewhere).unwrap();
+        let mut arrived = false;
+        for _ in 0..200 {
+            if let Some(dest) = handle.file_drop_destination(terminal_id.clone()).await
+                && let Ok(dir) = dest.open()
+                && std::fs::canonicalize(dir.path()).ok() == Some(want.clone())
+            {
+                arrived = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(arrived, "the shell never reported the new directory");
+
+        let resp = app
+            .oneshot(drop_req(
+                &format!("pty={terminal_id}&filename=shot.png"),
+                b"png".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        let path = std::path::PathBuf::from(body["path"].as_str().unwrap());
+        assert_eq!(
+            std::fs::canonicalize(path.parent().unwrap()).unwrap(),
+            want,
+            "the file landed where the terminal was opened, not where it is now"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"png");
+    }
+
+    /// The DURABLE intent: a file dropped onto the editor's file tree is "add
+    /// this to my project", so it lands in the tree directory the user dropped
+    /// on, as an ordinary visible file, and never in the invisible upload
+    /// directory an agent-pane drop uses.
+    mod editor_tree_drop {
+        use super::*;
+
+        /// A drop naming a tree directory. `dir` is what separates the two
+        /// intents on the wire; everything else is the same upload route.
+        fn tree_drop(pty: &str, filename: &str, dir: &str) -> Request<axum::body::Body> {
+            drop_req(
+                &format!("pty={pty}&filename={filename}&dir={dir}"),
+                b"bytes".to_vec(),
+            )
+        }
+
+        #[tokio::test]
+        async fn dropping_on_a_folder_row_saves_a_visible_file_in_that_folder() {
+            let (_tmp, wt, app) = router().await;
+            std::fs::create_dir_all(wt.join("assets")).unwrap();
+
+            let resp = app
+                .oneshot(tree_drop("s1-slot", "logo.png", "assets"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{}", "folder drop");
+            let body: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+
+            assert_eq!(body["saved_name"], "logo.png");
+            assert_eq!(body["renamed"], false);
+            assert_eq!(
+                std::fs::read(wt.join("assets/logo.png")).unwrap(),
+                b"bytes",
+                "the file must be where the user dropped it"
+            );
+            assert!(
+                !wt.join("assets/.gitignore").exists(),
+                "a durable drop must not hide itself from git"
+            );
+            assert!(
+                !wt.join(".dux").exists(),
+                "the uploads directory must not be created, let alone used"
+            );
+        }
+
+        #[tokio::test]
+        async fn dropping_on_empty_tree_space_saves_at_the_worktree_root() {
+            // Empty space is the ROOT, and the root travels as the empty
+            // string, so this also pins that encoding.
+            let (_tmp, wt, app) = router().await;
+            let resp = app
+                .oneshot(tree_drop("s1-slot", "notes.md", ""))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+            assert_eq!(
+                std::path::PathBuf::from(body["path"].as_str().unwrap()),
+                wt.join("notes.md")
+            );
+            assert!(!wt.join(".dux").exists());
+        }
+
+        #[tokio::test]
+        async fn a_drop_of_several_files_saves_every_one_of_them() {
+            // One request per file, which is what the browser sends, and the
+            // point is that the second does not disturb the first.
+            let (_tmp, wt, app) = router().await;
+            std::fs::create_dir_all(wt.join("docs")).unwrap();
+            for name in ["one.md", "two.md", "three.md"] {
+                let resp = app
+                    .clone()
+                    .oneshot(tree_drop("s1-slot", name, "docs"))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "saving {name}");
+            }
+            for name in ["one.md", "two.md", "three.md"] {
+                assert!(wt.join("docs").join(name).exists(), "{name} is missing");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_collision_keeps_the_existing_file_and_reports_the_new_name() {
+            // The editor's MOVE refuses an occupied destination outright,
+            // because the user named that exact destination. A DROP names no
+            // destination name at all, so the upload route's suffix applies
+            // instead. Both promises are the same where it counts: the file
+            // already there is never overwritten, and the browser is told
+            // which name was actually used.
+            let (_tmp, wt, app) = router().await;
+            std::fs::write(wt.join("notes.md"), "mine\n").unwrap();
+
+            let resp = app
+                .oneshot(tree_drop("s1-slot", "notes.md", ""))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+
+            assert_eq!(body["renamed"], true);
+            assert_eq!(body["requested_name"], "notes.md");
+            assert_ne!(body["saved_name"], "notes.md");
+            assert_eq!(
+                std::fs::read_to_string(wt.join("notes.md")).unwrap(),
+                "mine\n",
+                "not one byte of the existing file may change"
+            );
+            assert_eq!(
+                std::fs::read(body["path"].as_str().unwrap()).unwrap(),
+                b"bytes"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_non_latin_name_survives_a_tree_drop_exactly_as_dropped() {
+            let (_tmp, wt, app) = router().await;
+            let resp = app
+                .oneshot(tree_drop(
+                    "s1-slot",
+                    "%E8%A8%AD%E8%A8%88%E3%83%A1%E3%83%A2.md",
+                    "",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+            assert_eq!(body["saved_name"], "設計メモ.md");
+            assert!(wt.join("設計メモ.md").exists());
+        }
+
+        #[tokio::test]
+        async fn a_directory_escaping_the_worktree_is_refused_and_writes_nothing() {
+            let (tmp, wt, app) = router().await;
+            let resp = app
+                .oneshot(tree_drop("s1-slot", "escaped.png", "..%2F.."))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let msg = body_text(resp).await;
+            assert!(msg.contains("not inside the worktree"), "got: {msg}");
+            assert!(!tmp.path().join("escaped.png").exists());
+            assert!(!wt.join("escaped.png").exists());
+        }
+
+        #[tokio::test]
+        async fn the_git_directory_is_refused() {
+            let (_tmp, wt, app) = router().await;
+            std::fs::create_dir_all(wt.join(".git/hooks")).unwrap();
+            let resp = app
+                .oneshot(tree_drop("s1-slot", "pre-commit", ".git%2Fhooks"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let msg = body_text(resp).await;
+            assert!(msg.contains("git directory"), "got: {msg}");
+            assert!(!wt.join(".git/hooks/pre-commit").exists());
+        }
+
+        #[tokio::test]
+        async fn a_directory_that_is_really_a_file_is_refused() {
+            // The browser resolves a drop on a FILE row to that file's parent,
+            // so a file arriving here means a stale tree or a made-up request.
+            // Writing into it is impossible, so say so rather than failing
+            // opaquely.
+            let (_tmp, wt, app) = router().await;
+            std::fs::write(wt.join("README.md"), "x").unwrap();
+            let resp = app
+                .oneshot(tree_drop("s1-slot", "logo.png", "README.md"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let msg = body_text(resp).await;
+            assert!(msg.contains("README.md"), "the refusal must name it: {msg}");
+        }
+
+        #[tokio::test]
+        async fn a_missing_directory_is_refused_rather_than_created() {
+            // The wording is asserted, not only the status. The browser's tree
+            // is a lazy cache, so this is the ordinary stale-tree journey: a raw
+            // `No such file or directory (os error 2)` would pass a status-only
+            // assertion, while every other refusal on this path is a sentence.
+            let (_tmp, wt, app) = router().await;
+            let resp = app
+                .oneshot(tree_drop("s1-slot", "logo.png", "nope"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let msg = body_text(resp).await;
+            assert!(msg.contains("nope"), "the refusal must name it: {msg}");
+            assert!(
+                msg.contains("not there any more") && msg.contains("nothing was saved"),
+                "the refusal must be in the user's words: {msg}"
+            );
+            assert!(
+                !msg.contains("os error"),
+                "an errno is not a sentence: {msg}"
+            );
+            assert!(!wt.join("nope").exists());
+        }
+
+        /// The courtesy input-ownership check is SKIPPED for a tree drop, and
+        /// this is the test that pins the skip.
+        ///
+        /// It matters because the skip is otherwise invisible: deleting
+        /// `query.dir.is_none() &&` from the condition left every other test in
+        /// this file green, since none of them sets `conn` at all. A browser
+        /// really does carry a terminal-socket id (it holds one per pane it has
+        /// attached to), so without the skip a durable save into the user's own
+        /// project could be refused by a check about pasting into a terminal
+        /// that this drop never goes near.
+        #[tokio::test]
+        async fn a_tree_drop_is_saved_even_while_another_device_holds_the_terminal() {
+            let world = drop_world().await;
+            // Somebody ELSE owns input on this agent's PTY.
+            world.state.give_input_to("s1-slot", 7);
+            assert!(
+                world.state.input_held_by_someone_else("s1-slot", 99),
+                "the fixture must actually put input in another connection's hands"
+            );
+
+            let resp = world
+                .app
+                .clone()
+                .oneshot(drop_req(
+                    "pty=s1-slot&filename=notes.md&dir=&conn=99",
+                    b"bytes".to_vec(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "a tree drop pastes nothing into any terminal, so who holds \
+                 input has nothing to do with it: {}",
+                body_text(resp).await
+            );
+            assert_eq!(std::fs::read(world.wt.join("notes.md")).unwrap(), b"bytes");
+        }
+
+        /// The other direction, so the pair proves the check exists rather than
+        /// merely that it does not fire. A PANE drop ends in a paste over the
+        /// terminal socket, and a viewer who cannot write is better told before
+        /// a file is written than after.
+        #[tokio::test]
+        async fn a_pane_drop_is_refused_while_another_device_holds_the_terminal() {
+            let world = drop_world().await;
+            world.state.give_input_to("s1-slot", 7);
+
+            let resp = world
+                .app
+                .clone()
+                .oneshot(drop_req(
+                    "pty=s1-slot&filename=shot.png&conn=99",
+                    b"png".to_vec(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            let msg = body_text(resp).await;
+            assert!(msg.contains("Take over input"), "got: {msg}");
+            assert!(
+                !world.wt.join(".dux").exists(),
+                "a refused pane drop must write nothing"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_tree_drop_refreshes_the_agent_s_changed_files() {
+            // The file is visible to git by design, so the Changes pane must
+            // hear about it now rather than up to ten seconds later.
+            let world = drop_world().await;
+            let (generation, refreshes) = world.refreshes();
+            assert!(refreshes.is_empty());
+
+            let resp = world
+                .app
+                .clone()
+                .oneshot(tree_drop("s1-slot", "notes.md", ""))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            let (generation_after, refreshes) = world.refreshes();
+            assert!(generation_after > generation);
+            assert_eq!(refreshes.len(), 1, "got {refreshes:?}");
+            assert_eq!(
+                std::fs::canonicalize(&refreshes[0]).unwrap(),
+                std::fs::canonicalize(&world.wt).unwrap()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_tree_drop_on_a_terminal_lands_at_its_pinned_root_not_where_the_shell_went() {
+            // A terminal HAS a file tree now, and the tree was drawn from the
+            // directory the terminal was spawned in. So the drop follows that
+            // root and not the live shell, which is the exact opposite of what a
+            // drop on the terminal's own pane does. The shell is walked
+            // somewhere else first, so the two answers are visibly different.
+            let world = drop_world().await;
+            let terminal = world.create_terminal("/api/v1/projects/p1/terminals").await;
+            world.cd(&terminal, &world.wt).await;
+
+            let resp = world
+                .app
+                .clone()
+                .oneshot(tree_drop(&terminal, "notes.md", ""))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{}", body_text(resp).await);
+
+            assert_eq!(
+                std::fs::read(world.root.join("notes.md")).unwrap(),
+                b"bytes"
+            );
+            assert!(
+                !world.wt.join("notes.md").exists(),
+                "the drop followed the shell rather than the pinned root"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_tree_drop_on_a_terminal_refreshes_nothing() {
+            // A terminal root has no agent behind it, so there is no changes
+            // pane to tell and nothing is broadcast. Silence is the answer, not
+            // an omission.
+            let world = drop_world().await;
+            let terminal = world.create_terminal("/api/v1/projects/p1/terminals").await;
+            let (generation, _) = world.refreshes();
+
+            let resp = world
+                .app
+                .clone()
+                .oneshot(tree_drop(&terminal, "notes.md", ""))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            let (generation_after, refreshes) = world.refreshes();
+            assert_eq!(generation_after, generation);
+            assert!(refreshes.is_empty(), "got {refreshes:?}");
+        }
+
+        #[tokio::test]
+        async fn a_tree_drop_naming_nothing_at_all_is_still_not_found() {
+            // The refusal did not go away, it narrowed: an id that names neither
+            // an agent nor a terminal still has no tree to drop on.
+            let world = drop_world().await;
+            let resp = world
+                .app
+                .clone()
+                .oneshot(tree_drop("nobody", "notes.md", ""))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            let msg = body_text(resp).await;
+            assert!(
+                msg.contains("\"nobody\""),
+                "the refusal has to name the id it was asked about, or a \
+                 resolver bug about a LIVE pane reads as the truth about a \
+                 missing one: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_permit_is_taken_before_the_body_is_read() {
+        // The bug this guards is subtle: a permit taken INSIDE the handler still
+        // serializes the work and still looks correct, but by then the body has
+        // already been buffered in full, so the memory the cap exists to bound
+        // was already spent. Asserting that two requests merely serialise would
+        // pass with the permit in the wrong place.
+        //
+        // So the proof is about the BODY: one upload holds the only permit with
+        // a body that never finishes, and a second request's body must not be
+        // consumed at all while it waits.
+        //
+        // The second request must not START until the first genuinely holds the
+        // permit, or the test is a scheduling race that would also pass if the
+        // second simply had not been reached yet. The first request SAYS when it
+        // is holding: its body reports the moment anything polls it, and the only
+        // thing that polls it is the buffering step INSIDE the handler, which is
+        // downstream of the permit layer. So a poll of the first body is proof
+        // the permit was acquired, and the second request is only built after it.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (_tmp, _wt, app) = router_with_limits(1024 * 1024, 1).await;
+
+        // The first upload's body yields one chunk and then never completes, so
+        // its handler stays parked inside the buffering step, holding the permit.
+        let (holding_tx, holding_rx) = tokio::sync::oneshot::channel::<()>();
+        let (blocker_tx, blocker_rx) = tokio::sync::oneshot::channel::<()>();
+        let first_body = axum::body::Body::from_stream(futures_util::stream::once(async move {
+            let _ = holding_tx.send(());
+            let _ = blocker_rx.await;
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"never finishes"))
+        }));
+        let first = tokio::spawn(
+            app.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/file-drop?pty=s1-slot&filename=slow.png")
+                    .body(first_body)
+                    .unwrap(),
+            ),
+        );
+        holding_rx
+            .await
+            .expect("the first upload must reach its body, which means it holds the permit");
+
+        // The second upload's body flags the instant anything polls it.
+        let polled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&polled);
+        let second_body = axum::body::Body::from_stream(futures_util::stream::once(async move {
+            flag.store(true, Ordering::SeqCst);
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"second"))
+        }));
+        let second = tokio::spawn(
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/file-drop?pty=s1-slot&filename=second.png")
+                    .body(second_body)
+                    .unwrap(),
+            ),
+        );
+
+        // Give both tasks every chance to run. Yielding rather than sleeping
+        // keeps this deterministic and instant.
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !polled.load(Ordering::SeqCst),
+            "the second upload's body was consumed while another upload held the \
+             only permit, so the permit is being taken after the body is buffered \
+             and bounds no memory at all"
+        );
+
+        // Release the first, and the second must then go through: the permit
+        // gates, it does not reject.
+        let _ = blocker_tx.send(());
+        let first = first.await.unwrap().unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = second.await.unwrap().unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert!(
+            polled.load(Ordering::SeqCst),
+            "the second upload should have run once the permit freed"
+        );
+    }
+
+    /// A drop that never gets a slot is REFUSED, not queued forever, and it is
+    /// refused after a wait a person would actually sit through.
+    ///
+    /// Same hold as the test above: the first upload's body yields a chunk and
+    /// then parks, so its handler sits in the buffering step with the only
+    /// permit. Here the blocker is simply never released. The clock is paused,
+    /// so the runtime fast-forwards past the permit wait the moment every task
+    /// is idle, which is what makes this instant rather than a 30-second test.
+    ///
+    /// Both halves of the bound are measured: asking only "did the call return"
+    /// passes with `PERMIT_WAIT` set to 30 DAYS, in under two seconds, because a paused
+    /// clock skips any finite duration just as cheaply. And deleting the timeout
+    /// altogether makes the test HANG rather than fail, which in CI is a job
+    /// timeout nobody reads rather than a red test.
+    ///
+    /// So the wait is measured on the virtual clock and bounded from both sides.
+    /// The lower bound says the refusal came from `PERMIT_WAIT` and not from
+    /// something else answering early; the upper bounds say the constant is
+    /// still a number a human tolerates. `TOLERABLE_WAIT` doubles as the outer
+    /// deadline, so an unbounded wait fails on an assertion instead of hanging.
+    #[tokio::test(start_paused = true)]
+    async fn an_upload_that_never_gets_a_slot_is_refused_rather_than_queued() {
+        /// The longest a dropped file may sit with no answer before this is a
+        /// defect regardless of what the code intended. A person who drops a
+        /// file and sees nothing has given up well before a minute.
+        const TOLERABLE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+        assert!(
+            PERMIT_WAIT <= TOLERABLE_WAIT,
+            "PERMIT_WAIT is {PERMIT_WAIT:?}, longer than the {TOLERABLE_WAIT:?} a \
+             user will wait for a dropped file. A paused clock will skip any \
+             duration you write here, so this bound is the only thing standing \
+             between the constant and a wait nobody would sit through."
+        );
+
+        let (_tmp, _wt, app) = router_with_limits(1024 * 1024, 1).await;
+
+        let (holding_tx, holding_rx) = tokio::sync::oneshot::channel::<()>();
+        let (_blocker_tx, blocker_rx) = tokio::sync::oneshot::channel::<()>();
+        let first_body = axum::body::Body::from_stream(futures_util::stream::once(async move {
+            let _ = holding_tx.send(());
+            let _ = blocker_rx.await;
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"never finishes"))
+        }));
+        let _first = tokio::spawn(
+            app.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/file-drop?pty=s1-slot&filename=slow.png")
+                    .body(first_body)
+                    .unwrap(),
+            ),
+        );
+        holding_rx
+            .await
+            .expect("the first upload must reach its body, which means it holds the permit");
+
+        // The outer deadline is what turns "waits forever" into a failed
+        // assertion. Without it, removing the timeout from the permit layer
+        // parks this test until the harness or CI kills the job.
+        let started = tokio::time::Instant::now();
+        let second = tokio::time::timeout(
+            TOLERABLE_WAIT,
+            app.oneshot(drop_req(
+                "pty=s1-slot&filename=second.png",
+                b"second".to_vec(),
+            )),
+        )
+        .await
+        .expect(
+            "the drop never answered within the tolerable wait: the permit wait is \
+             either unbounded or far longer than a user will sit through",
+        )
+        .unwrap();
+        let waited = started.elapsed();
+
+        assert_eq!(
+            second.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a drop with no slot available must be refused once the wait expires, \
+             not held open indefinitely"
+        );
+        // Pin the refusal to PERMIT_WAIT itself. Virtual time, so this costs
+        // nothing, but it still fails if the constant drifts or if the answer
+        // came from somewhere other than the permit timeout.
+        assert!(
+            waited >= PERMIT_WAIT,
+            "the drop was refused after {waited:?}, before PERMIT_WAIT ({PERMIT_WAIT:?}) \
+             could have expired, so the refusal came from somewhere else"
+        );
+        assert!(
+            waited < PERMIT_WAIT + std::time::Duration::from_secs(1),
+            "the drop took {waited:?}, well past PERMIT_WAIT ({PERMIT_WAIT:?}): \
+             something is waiting longer than the permit layer intends"
+        );
+        let body = body_text(second).await;
+        assert!(
+            body.contains("Try the drop again"),
+            "the refusal must tell the user what to do: {body}"
+        );
+    }
+}

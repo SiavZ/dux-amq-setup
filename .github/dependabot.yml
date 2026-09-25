@@ -28,3 +28,15 @@ updates:
       interval: "weekly"
       day: "monday"
     open-pull-requests-limit: 5
+
+  # The React web UI compiled into the binary (crates/dux-web/web). Added with
+  # the workspace: its npm lockfile ships in every release.
+  - package-ecosystem: "npm"
+    directory: "/crates/dux-web/web"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      patches:
+        update-types: ["patch"]

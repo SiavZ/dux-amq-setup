@@ -145,7 +145,8 @@ the output for support.
 ## Update cadence
 
 This file is **a living document**. Every audit
-(`docs/audits/audit01.md`, `audit02.md`, …) must extend the STRIDE
+(`docs/audits/audit01/audit01.md`, `docs/audits/audit02/audit02.md`,
+`docs/audits/audit03/`, …) must extend the STRIDE
 table with new threats discovered, and stale rows must be either
 re-validated or removed in the same PR that supersedes them.
 
@@ -156,7 +157,7 @@ introduces the surface. PRs that add attack surface without
 updating this file are blocked at review.
 
 A future CI check (`scripts/validate-threat-model.sh`) is planned
-to compare the phase references in this table against the phase
-files under `docs/plans/audits/` and warn when a phase claims to
+to compare the phase references in this table against the audit
+reports under `docs/audits/` and warn when a phase claims to
 mitigate a threat that is not listed here. Tracked as a
 post-audit02 follow-up.

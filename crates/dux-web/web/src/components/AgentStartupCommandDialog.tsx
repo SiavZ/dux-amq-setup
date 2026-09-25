@@ -1,0 +1,108 @@
+import { useState } from "react"
+
+import { Button } from "@/components/ui/button"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import { Textarea } from "@/components/ui/textarea"
+import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
+import {
+  closeAgentStartupCommand,
+  updateProjectSettings,
+  useDux,
+} from "@/lib/store"
+import type { ProjectView, SessionView } from "@/lib/types"
+import { sessionLabel, workspaceProjectId } from "@/lib/agentWorkspace"
+
+// Edit the startup command from an agent's menu. It is project-scoped, so this
+// edits the agent's PROJECT and the copy says so. The form is mounted only while
+// open and a project resolves; its state seeds lazily from the project.
+function AgentStartupCommandForm({
+  session,
+  project,
+}: {
+  session: SessionView
+  project: ProjectView
+}) {
+  const [startup, setStartup] = useState(() => project.startup_command ?? "")
+  const agentName = sessionLabel(session)
+
+  async function handleSave() {
+    const next = startup.trim() === "" ? null : startup
+    // No-op when unchanged; `updateProjectSettings` skips the request on an empty
+    // patch, so saving without a change just closes.
+    const patch =
+      next === (project.startup_command ?? null) ? {} : { startup_command: next }
+    if (await updateProjectSettings(project.id, patch)) closeAgentStartupCommand()
+  }
+
+  return (
+    <DialogContent showCloseButton={false}>
+      <DialogHeader>
+        <DialogTitle>Startup command: {agentName}</DialogTitle>
+        <DialogDescription>
+          Runs after each agent or terminal launches in project{" "}
+          <span className="font-medium">{project.name}</span>. This applies to
+          every agent in the project, not just this one. Leave empty to clear it.
+        </DialogDescription>
+      </DialogHeader>
+      <Textarea
+        value={startup}
+        onChange={(e) => setStartup(e.target.value)}
+        onKeyDown={(e) => {
+          // Plain Enter inserts a newline (a startup command can be multi-line);
+          // Cmd/Ctrl-Enter saves, matching the common textarea submit convention.
+          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+            e.preventDefault()
+            void handleSave()
+          }
+        }}
+        placeholder="npm run dev"
+        className="min-h-16 font-mono"
+        autoFocus
+      />
+      <DialogFooter>
+        <Button variant="outline" onClick={closeAgentStartupCommand}>
+          Cancel
+        </Button>
+        <Button onClick={() => void handleSave()}>Save</Button>
+      </DialogFooter>
+    </DialogContent>
+  )
+}
+
+export function AgentStartupCommandDialog() {
+  const { spine, agentStartupCommandTarget } = useDux()
+  const session = spine?.sessions.find((s) => s.id === agentStartupCommandTarget)
+  // A standalone agent belongs to no project, so the lookup must not happen at
+  // all for one rather than miss.
+  const project = spine?.projects.find(
+    (p) =>
+      session !== undefined && p.id === workspaceProjectId(session.workspace),
+  )
+  // Closes the dialog when the agent or its project vanishes from the
+  // ViewModel; see the hook.
+  const open = useVanishedTargetGuard(
+    agentStartupCommandTarget !== null,
+    session !== undefined && project !== undefined,
+    closeAgentStartupCommand,
+  )
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(o) => {
+        if (!o) closeAgentStartupCommand()
+      }}
+    >
+      {open && session && project && (
+        <AgentStartupCommandForm session={session} project={project} />
+      )}
+    </Dialog>
+  )
+}

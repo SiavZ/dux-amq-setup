@@ -1,0 +1,543 @@
+mod companion;
+
+use anyhow::Result;
+
+const SERVER_USAGE: &str = "\
+Usage: dux server [OPTIONS]
+
+Run the dux web UI over the headless engine. dux is a trusted-local tool with no
+login gate; only run a non-loopback bind on a network you trust.
+
+Options:
+      --bind <ADDR:PORT>  Bind this exact address, overriding [server] host+port.
+                          An IP:port socket address (hostnames are NOT resolved),
+                          e.g. 0.0.0.0:3890. May be given only once.
+      --port <PORT>       Override [server] port only (ignored when --bind is set).
+                          dux binds host:port (and the machine's Tailscale address
+                          unless disabled). Default port 3890.
+      --no-tailscale      Skip Tailscale detection this run (serve the configured
+                          host only).
+  -h, --help              Print this help and exit.";
+
+fn main() -> Result<()> {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("server") => run_server(args),
+        // Before anything touches config or the lock: a version query must work
+        // on a machine with no dux home and while another dux is running.
+        Some("--version" | "-V") => {
+            println!("dux {}", dux_core::version::long());
+            Ok(())
+        }
+        Some("peer") => run_peer(args),
+        _ => run_tui_with_flip(),
+    }
+}
+
+/// `dux peer ...`: route a message between agent sessions. Dispatched before
+/// the TUI's argument handling, which treats `--help` anywhere on the line as
+/// a request for the top-level help; a peer message may legitimately contain
+/// that word. Takes no single-instance lock: it runs from inside agents while
+/// the TUI or server holds it, and the AMQ registry has its own lock.
+fn run_peer(args: impl Iterator<Item = String>) -> Result<()> {
+    let args = args.collect::<Vec<_>>();
+    let paths = dux_core::config::DuxPaths::discover()?;
+    dux_core::peer::run_peer(&args, &paths)
+}
+
+/// Write the handoff and replace this process with the newer dux binary.
+///
+/// Never returns on success: `exec` replaces the running image in place, which
+/// is precisely what keeps the process, its agent children, and their inherited
+/// descriptors alive across the swap.
+///
+/// `engine` stays alive, owned by this frame, right up to the exec. Dropping an
+/// `Engine` drops every `PtyClient`, which closes the PTY masters the
+/// replacement image is about to inherit and SIGKILLs the agents this feature
+/// exists to keep running. `exec` itself runs no destructors, so simply not
+/// dropping it is enough: no leak and no `unsafe` needed.
+///
+/// On failure the engine is handed BACK, still intact, with close-on-exec
+/// restored on every master, so the caller can put the user straight back in
+/// the TUI. Failing a reload must cost a status line, not the agents.
+fn exec_reload(
+    engine: Box<dux_core::engine::Engine>,
+    handoff: dux_core::reload_handoff::Handoff,
+) -> std::result::Result<std::convert::Infallible, (Box<dux_core::engine::Engine>, String)> {
+    let handoff_path =
+        dux_core::reload_handoff::Handoff::path_for(&engine.paths.root, std::process::id());
+    let give_back = |engine, reason: String| {
+        handoff.abandon();
+        Err((engine, reason))
+    };
+
+    if let Err(err) = handoff.write(&handoff_path) {
+        return give_back(
+            engine,
+            format!("Reload failed: could not write the handoff ({err:#}). Nothing was changed."),
+        );
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        let _ = std::fs::remove_file(&handoff_path);
+        return give_back(
+            engine,
+            "Reload failed: dux could not find its own binary. Nothing was changed.".to_string(),
+        );
+    };
+
+    // The last step before the exec, once nothing can refuse the reload any
+    // more: wind down this image's background workers (AMQ watcher and poll
+    // thread, settling every inbox claim) so the successor starts its own.
+    // If the exec then fails, `resume_after_failed_reload` runs the TUI's
+    // `start_run_services` again, which restarts them.
+    let mut engine = engine;
+    engine.quiesce_for_exec();
+    let err = match dux_core::reload_policy::exec_into_reload(&exe, &handoff_path) {
+        Ok(never) => match never {},
+        Err(err) => err,
+    };
+    // Still this image, still owning everything. Nobody will read the handoff.
+    let _ = std::fs::remove_file(&handoff_path);
+    give_back(
+        engine,
+        format!(
+            "Reload failed: could not start {} ({err}). Your agents are untouched.",
+            exe.display()
+        ),
+    )
+}
+
+/// Default arm: run the TUI, and when it flips to the web server, serve the same
+/// engine in this process until the server stops, then resume the TUI, repeating
+/// until the user quits from either surface. While serving, the terminal shows
+/// [`dux_tui::ServerStatusScreen`], whose keys drive the flip alongside the
+/// SIGINT/SIGTERM handling inside `serve_with_engine`.
+fn run_tui_with_flip() -> Result<()> {
+    let mut next = dux_tui::run(Box::new(companion::WebCompanion::new()))?;
+    loop {
+        match next {
+            dux_tui::TuiExit::Done => break,
+            dux_tui::TuiExit::Reload { engine, handoff } => {
+                let Err((engine, reason)) = exec_reload(engine, handoff);
+                next = dux_tui::resume_after_failed_reload(
+                    engine,
+                    Box::new(companion::WebCompanion::new()),
+                    reason,
+                )?;
+            }
+            dux_tui::TuiExit::FlipToServer {
+                engine,
+                listeners,
+                urls,
+            } => {
+                // Read before the engine and listeners move into
+                // `serve_with_engine`. The flip is LOCAL MODE, so the primary
+                // address is always loopback and a non-loopback URL means only that
+                // the Tailscale leg bound, which is what the safety note reads.
+                let theme_name = engine.config.ui.theme.clone();
+                let paths = engine.paths.clone();
+                let tailscale = engine.config.server.tailscale_mode();
+                let tailnet_bound = urls.iter().any(|u| {
+                    u.strip_prefix("http://")
+                        .and_then(|rest| rest.rsplit_once(':'))
+                        .map(|(host, _)| {
+                            let ip = host.trim_start_matches('[').trim_end_matches(']');
+                            ip != "127.0.0.1" && ip != "::1"
+                        })
+                        .unwrap_or(false)
+                });
+                // On the `auto` mode the Tailscale leg comes and goes while the
+                // status screen stays up, so the note has to cover the whole
+                // session rather than this instant. On `yes` and `no` what bound
+                // at the flip is what there will be.
+                let safety_note = if tailscale.watches_interface() {
+                    Some(dux_web::SAFETY_NOTE_TAILNET_WATCHED.to_string())
+                } else if tailnet_bound {
+                    Some(dux_web::SAFETY_NOTE_TAILNET.to_string())
+                } else {
+                    None
+                };
+
+                // The activity buffer is shared between the web console (the
+                // producer, wired in serve_with_engine) and the status screen
+                // (the consumer). Created here so both get the same handle.
+                let activity = dux_core::activity::ActivityRing::new();
+
+                // A failure here (no TTY, a raw-mode error) falls back to a plain
+                // line, because the server must still run. `screen` lives outside
+                // the tick closure so it can be dropped, restoring the terminal,
+                // after serving returns. The `RefCell` is what lets
+                // `serve_with_engine`'s two FnMut callbacks borrow it in turn: they
+                // run one at a time on this thread, but a plain `&mut` capture would
+                // be two simultaneous exclusive borrows.
+                let screen = std::cell::RefCell::new(
+                    match dux_tui::ServerStatusScreen::new(
+                        &urls,
+                        safety_note,
+                        &theme_name,
+                        &paths,
+                        activity.clone(),
+                    ) {
+                        Ok(screen) => Some(screen),
+                        Err(err) => {
+                            eprintln!(
+                                "dux server running at {} (status screen unavailable: {err}). \
+                                 Press Ctrl-C to stop",
+                                urls.join(", ")
+                            );
+                            None
+                        }
+                    },
+                );
+
+                let (engine, exit) = dux_web::serve_with_engine(
+                    *engine,
+                    listeners,
+                    activity,
+                    || {
+                        // With the screen up, its keys drive the exit; without it,
+                        // only SIGINT/SIGTERM (handled inside serve) can stop us.
+                        match screen.borrow_mut().as_mut() {
+                            Some(screen) => match screen.tick() {
+                                dux_tui::ServerScreenTick::Continue => {
+                                    dux_web::ServerTick::Continue
+                                }
+                                dux_tui::ServerScreenTick::ReturnToTui => {
+                                    dux_web::ServerTick::ReturnToTui
+                                }
+                                dux_tui::ServerScreenTick::QuitProcess => {
+                                    dux_web::ServerTick::QuitProcess
+                                }
+                            },
+                            None => dux_web::ServerTick::Continue,
+                        }
+                    },
+                    |message| {
+                        // Through the status screen so it renders on its own themed
+                        // line rather than as raw text wherever the cursor sits.
+                        match screen.borrow_mut().as_mut() {
+                            Some(screen) => screen.show_shutdown_message(message),
+                            None => eprintln!("{message}"),
+                        }
+                    },
+                )?;
+
+                // Serving has stopped. Drop the status screen explicitly to
+                // restore the terminal (leave raw mode + alt screen, show the
+                // cursor) BEFORE resuming the TUI (which re-inits ratatui) or
+                // before any final messages on quit.
+                drop(screen.into_inner());
+
+                match exit {
+                    dux_web::ServerExit::QuitProcess => break,
+                    dux_web::ServerExit::ReturnToTui => {
+                        next = dux_tui::resume_after_server(
+                            Box::new(engine),
+                            // A fresh companion per resumed TUI: the previous
+                            // serve's runtime is gone, and so is anything that
+                            // was holding it.
+                            Box::new(companion::WebCompanion::new()),
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_server(args: impl Iterator<Item = String>) -> Result<()> {
+    let parsed = match parse_server_args(args) {
+        ParsedServerArgs::HelpRequested => {
+            println!("{SERVER_USAGE}");
+            return Ok(());
+        }
+        ParsedServerArgs::Error(msg) => {
+            eprintln!("error: {msg}");
+            eprintln!("{SERVER_USAGE}");
+            std::process::exit(2);
+        }
+        ParsedServerArgs::Ok(parsed) => parsed,
+    };
+
+    let overrides = parsed.into_overrides();
+
+    let paths = dux_core::config::DuxPaths::discover()?;
+    std::fs::create_dir_all(&paths.root)?;
+    // `dux server` never calls `ensure_config`, so without this the bootstrap's
+    // project-sync would create a comment-free config.toml on a first run that
+    // starts in server mode. Registering the TUI's canonical renderer keeps
+    // "the config file is the documentation" true on both entry points.
+    dux_tui::install_canonical_renderer();
+    let config = dux_core::config::load_config(&paths);
+
+    // Initialize the logger early so every subsequent logger::* call in the server
+    // path (bootstrap, bind) actually reaches dux.log.
+    // OnceLock::set is idempotent, so it is safe if the TUI already initialized it (flip).
+    dux_core::logger::init(&config.logging, &paths);
+    dux_core::logger::info("bootstrapping dux server");
+
+    // Detected up front to feed the Tailscale leg of the bind plan; blocking is fine
+    // at CLI startup and the call is bounded. A failed detection warns and proceeds
+    // on the configured host only, never blocks, and under `auto` the serve path
+    // keeps watching, so the warning says so rather than sounding final.
+    let tailscale_mode = dux_core::config::effective_tailscale_mode(
+        config.server.tailscale_mode(),
+        overrides.no_tailscale,
+    );
+    let tailscale_ip = if tailscale_mode.wants_tailscale() {
+        match dux_core::tailscale::detect_ip() {
+            Ok(ip) => Some(ip),
+            Err(reason) => {
+                eprintln!(
+                    "WARNING: {}",
+                    dux_core::tailscale::undetected_warning(
+                        tailscale_mode,
+                        reason,
+                        "the configured host"
+                    )
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let plan = match dux_core::config::resolve_server_plan(&config.server, &overrides, tailscale_ip)
+    {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Loud warning when binding a non-loopback address: dux has no login gate, so
+    // anyone who can reach the address can control your agents and worktrees.
+    // Fires pre-bind (stderr) so it is visible even if a bind then fails.
+    let is_local = |a: &std::net::SocketAddr| a.ip().is_loopback() || Some(a.ip()) == tailscale_ip;
+    for plan_addr in plan.addrs.iter().filter(|p| !is_local(&p.addr())) {
+        eprintln!(
+            "WARNING: dux is binding {}, a non-loopback address, with NO login gate. Anyone \
+             who can reach this address can control your agents and worktrees. Only do this on \
+             a network you trust, or front dux with an upstream auth proxy.",
+            plan_addr.addr()
+        );
+    }
+
+    dux_web::run_server(
+        paths,
+        plan,
+        // Same display version as the TUI footer and the web sidebar
+        // ("vX.Y.Z" for release builds, "development" otherwise) so all three
+        // surfaces always show the same thing.
+        dux_core::display_version().to_string(),
+    )
+}
+
+/// Outcome of parsing `dux server` arguments. Separated from `run_server` so the
+/// argument parser is unit-testable without touching config/discovery.
+enum ParsedServerArgs {
+    Ok(ServerArgs),
+    HelpRequested,
+    Error(String),
+}
+
+/// Raw parsed `dux server` flags before config is loaded.
+#[derive(Default)]
+struct ServerArgs {
+    /// `--bind <ADDR:PORT>`: an exact bind address, overriding config host+port.
+    /// May be given only once.
+    bind: Option<String>,
+    port: Option<u16>,
+    no_tailscale: bool,
+}
+
+impl ServerArgs {
+    fn into_overrides(self) -> dux_core::config::ServerCliOverrides {
+        dux_core::config::ServerCliOverrides {
+            bind: self.bind,
+            port: self.port,
+            no_tailscale: self.no_tailscale,
+        }
+    }
+}
+
+fn parse_server_args(mut args: impl Iterator<Item = String>) -> ParsedServerArgs {
+    let mut out = ServerArgs::default();
+
+    // Pull the value for a `--flag VALUE` or `--flag=VALUE` form. `inline` is
+    // Some when the `=` form was used.
+    fn take_value(
+        name: &str,
+        inline: Option<String>,
+        args: &mut impl Iterator<Item = String>,
+    ) -> Result<String, String> {
+        match inline {
+            Some(v) => Ok(v),
+            None => args
+                .next()
+                .ok_or_else(|| format!("{name} requires a value")),
+        }
+    }
+
+    fn parse_port(name: &str, raw: &str) -> Result<u16, String> {
+        raw.parse::<u16>()
+            .map_err(|_| format!("{name} expects a port number 0-65535, got \"{raw}\""))
+    }
+
+    // Pull a port-valued flag's value and parse it in one step, so the three
+    // port arms (`--port`/`--http-port`/`--https-port`) collapse to a single line
+    // each that only differs in the field they assign.
+    fn take_port(
+        name: &str,
+        inline: Option<String>,
+        args: &mut impl Iterator<Item = String>,
+    ) -> Result<u16, String> {
+        let raw = take_value(name, inline, args)?;
+        parse_port(name, &raw)
+    }
+
+    while let Some(arg) = args.next() {
+        // Split `--flag=value` once; bare flags have no `=`.
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) => (f.to_string(), Some(v.to_string())),
+            None => (arg.clone(), None),
+        };
+
+        match flag.as_str() {
+            "--help" | "-h" => return ParsedServerArgs::HelpRequested,
+            "--no-tailscale" => out.no_tailscale = true,
+            "--port" => match take_port("--port", inline, &mut args) {
+                Ok(p) => out.port = Some(p),
+                Err(e) => return ParsedServerArgs::Error(e),
+            },
+            "--bind" => match take_value("--bind", inline, &mut args) {
+                Ok(v) => {
+                    if out.bind.is_some() {
+                        return ParsedServerArgs::Error(
+                            "--bind may be given only once".to_string(),
+                        );
+                    }
+                    out.bind = Some(v);
+                }
+                Err(e) => return ParsedServerArgs::Error(e),
+            },
+            other => {
+                return ParsedServerArgs::Error(format!("unknown argument \"{other}\""));
+            }
+        }
+    }
+
+    ParsedServerArgs::Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> ParsedServerArgs {
+        parse_server_args(args.iter().map(|s| s.to_string()))
+    }
+
+    fn ok(args: &[&str]) -> ServerArgs {
+        match parse(args) {
+            ParsedServerArgs::Ok(a) => a,
+            ParsedServerArgs::HelpRequested => panic!("unexpected help"),
+            ParsedServerArgs::Error(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    fn err(args: &[&str]) -> String {
+        match parse(args) {
+            ParsedServerArgs::Error(e) => e,
+            other => panic!("expected error, got {}", matches_label(&other)),
+        }
+    }
+
+    fn matches_label(p: &ParsedServerArgs) -> &'static str {
+        match p {
+            ParsedServerArgs::Ok(_) => "Ok",
+            ParsedServerArgs::HelpRequested => "HelpRequested",
+            ParsedServerArgs::Error(_) => "Error",
+        }
+    }
+
+    #[test]
+    fn empty_args_parse_to_defaults() {
+        let a = ok(&[]);
+        assert!(a.bind.is_none());
+        assert!(a.port.is_none());
+        assert!(!a.no_tailscale);
+    }
+
+    #[test]
+    fn port_parses_as_number() {
+        let a = ok(&["--port", "9090"]);
+        assert_eq!(a.port, Some(9090));
+        let a = ok(&["--port=7000"]);
+        assert_eq!(a.port, Some(7000));
+    }
+
+    #[test]
+    fn bind_parses_once() {
+        assert_eq!(
+            ok(&["--bind", "0.0.0.0:8888"]).bind.as_deref(),
+            Some("0.0.0.0:8888")
+        );
+    }
+
+    #[test]
+    fn second_bind_is_rejected() {
+        assert!(err(&["--bind", "a:1", "--bind", "b:2"]).contains("once"));
+    }
+
+    #[test]
+    fn removed_flags_unknown() {
+        for f in [
+            "--listen",
+            "--disable-auth",
+            "--insecure-allow-remote",
+            "--acme-domain",
+            "--no-acme",
+            "--dangerously-listen-http",
+        ] {
+            assert!(
+                err(&[f]).contains("unknown argument")
+                    || err(&[f, "x"]).contains("unknown argument")
+            );
+        }
+    }
+
+    #[test]
+    fn no_tailscale_sets_its_field() {
+        let a = ok(&["--no-tailscale"]);
+        assert!(a.no_tailscale);
+    }
+
+    #[test]
+    fn help_flags_request_help() {
+        assert!(matches!(
+            parse(&["--help"]),
+            ParsedServerArgs::HelpRequested
+        ));
+        assert!(matches!(parse(&["-h"]), ParsedServerArgs::HelpRequested));
+    }
+
+    #[test]
+    fn unknown_flag_errors() {
+        let msg = err(&["--what-is-this"]);
+        assert!(
+            msg.contains("--what-is-this"),
+            "should name the unknown flag: {msg}"
+        );
+    }
+
+    #[test]
+    fn value_flag_without_value_errors() {
+        let msg = err(&["--bind"]);
+        assert!(msg.contains("--bind"), "should name the flag: {msg}");
+        assert!(msg.contains("requires a value"), "should explain: {msg}");
+    }
+}
