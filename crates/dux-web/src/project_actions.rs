@@ -574,9 +574,16 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let id = json["id"].as_str().expect("created id").to_string();
         assert_eq!(location, format!("/api/v1/projects/{id}"));
+        // The engine registers projects by their canonical path (the add gate
+        // canonicalizes before storing, so two spellings of one checkout cannot
+        // become two projects), and on macOS the temp dir the test created is
+        // reached through a `/var` -> `/private/var` symlink. The view therefore
+        // reports the canonical spelling, which is the contract the client relies
+        // on: the paths it gets back all name the same directory the same way.
+        let canonical = std::fs::canonicalize(repo.path()).expect("canonical repo path");
         assert_eq!(
             json["path"].as_str(),
-            Some(path.as_str()),
+            Some(canonical.to_string_lossy().as_ref()),
             "the full project view is returned, not the bare id"
         );
 
