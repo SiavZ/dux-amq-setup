@@ -152,7 +152,13 @@ async fn boot() -> (SocketAddr, tempfile::TempDir) {
             ))
             .unwrap();
     }
-    let engine = bootstrap_engine(&paths).unwrap();
+    let mut engine = bootstrap_engine(&paths).unwrap();
+    // The host's real disk fullness must not decide these tests: the disk
+    // watchdog samples at boot and posts its own warning, which the
+    // held-failure and status-order assertions here would count. The guard
+    // is covered by dux_core::engine::limits with synthetic samples.
+    engine.config.limits.disk_high_water_pct = 0;
+    engine.config.limits.disk_warn_pct = 0;
     let (handle, _join) = spawn_engine_thread(engine);
 
     let probe: Router<AppState> = Router::new()

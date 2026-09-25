@@ -898,7 +898,12 @@ mod tests {
                 .create_session(&sample_session("s_err", wt_err.to_string_lossy().as_ref()))
                 .unwrap();
         }
-        let engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        let mut engine = crate::bootstrap::bootstrap_engine(&paths).unwrap();
+        // The disk watchdog samples the host's real disk at boot and posts
+        // its own warning, which the status-order assertions here would pick
+        // up first. The guard is covered by dux_core::engine::limits.
+        engine.config.limits.disk_high_water_pct = 0;
+        engine.config.limits.disk_warn_pct = 0;
         let (handle, _join) = crate::engine_actor::spawn_engine_thread(engine);
         (handle, Arc::new(EventBus::new()), tmp, wt)
     }
