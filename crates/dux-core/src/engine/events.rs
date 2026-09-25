@@ -3084,11 +3084,9 @@ impl Engine {
                         &project,
                         current_branch,
                         status_op_id,
-                        |current_branch, base_moved| {
-                            crate::engine::WebCheckoutOutcome::AlreadyLeading {
-                                current_branch,
-                                base_moved,
-                            }
+                        |current_branch, base| crate::engine::WebCheckoutOutcome::AlreadyLeading {
+                            current_branch,
+                            base,
                         },
                         crate::engine::already_on_default_branch_message,
                     )
@@ -3151,9 +3149,9 @@ impl Engine {
                         &project,
                         target_branch,
                         status_op_id,
-                        |target_branch, base_moved| crate::engine::WebCheckoutOutcome::Ok {
+                        |target_branch, base| crate::engine::WebCheckoutOutcome::Ok {
                             target_branch,
-                            base_moved,
+                            base,
                         },
                         crate::engine::checkout_default_branch_message,
                     )
@@ -3223,61 +3221,65 @@ impl Engine {
     /// The end of a "check out the default branch" that left the folder on
     /// `branch` (checked out just now, or already there): make it the project's
     /// base, then answer with the web op's final when a browser asked, or with
-    /// the local confirmation otherwise, and a save failure after either.
+    /// the local status otherwise. A failed save answers with its sticky error
+    /// instead of the confirmation, so nothing claims the base moved.
     fn finish_default_branch_checkout(
         &mut self,
         project: &Project,
         branch: String,
         status_op_id: Option<String>,
-        web_outcome: impl FnOnce(String, bool) -> crate::engine::WebCheckoutOutcome,
+        web_outcome: impl FnOnce(
+            String,
+            crate::engine::ProjectBaseAdoption,
+        ) -> crate::engine::WebCheckoutOutcome,
         message: fn(&str, &str, bool) -> crate::status_text::StatusText,
     ) -> EventReaction {
         let base = self.adopt_project_base(project, &branch);
-        let final_reaction = if let Some(id) = status_op_id
+        if let Some(id) = status_op_id
             && let Some(op) = self.pending_web_checkout_ops.remove(&id)
         {
-            op.resolve(&web_outcome(branch, base.moved()))
-                .into_reaction()
-        } else {
-            EventReaction::Status(StatusUpdate::info(message(
-                &project.name,
-                &branch,
-                base.moved(),
-            )))
+            return op.resolve(&web_outcome(branch, base)).into_reaction();
+        }
+        // STICKY on a failed save: the fix is outside the status line (a full
+        // disk, a locked database), and then the checkout has to run again.
+        let update = match base.save_failure_message(&project.name, &branch) {
+            Some(error) => StatusUpdate::error(error).sticky(),
+            None => StatusUpdate::info(message(&project.name, &branch, base.moved())),
         };
-        base.with_unsaved_warning(final_reaction)
+        EventReaction::Status(update)
     }
 
-    /// Make `branch` the base new worktrees of `project` branch from, in memory
-    /// and in SQLite (never config: the base is derived state).
-    fn adopt_project_base(&mut self, project: &Project, branch: &str) -> BaseMove {
+    /// Make `branch` the base new worktrees of `project` branch from: saved to
+    /// SQLite first (never config: the base is derived state), and moved in
+    /// memory only once saved, so the two never disagree.
+    fn adopt_project_base(
+        &mut self,
+        project: &Project,
+        branch: &str,
+    ) -> crate::engine::ProjectBaseAdoption {
         let Some(existing) = self.projects.iter_mut().find(|item| item.id == project.id) else {
-            return BaseMove::Unchanged;
+            return crate::engine::ProjectBaseAdoption::Unchanged;
         };
         if existing.leading_branch.as_deref() == Some(branch) {
-            return BaseMove::Unchanged;
+            return crate::engine::ProjectBaseAdoption::Unchanged;
         }
-        existing.leading_branch = Some(branch.to_string());
         match self
             .session_store
             .update_project_leading_branch(&project.id, branch)
         {
-            Ok(()) => BaseMove::Moved,
+            Ok(()) => {
+                existing.leading_branch = Some(branch.to_string());
+                crate::engine::ProjectBaseAdoption::Moved
+            }
             Err(err) => {
                 logger::error(&format!(
                     "failed to save \"{branch}\" as the base branch of project {}: {err:#}",
                     project.id
                 ));
-                BaseMove::MovedUnsaved(crate::status_text![
-                    "Couldn't save ",
-                    q(branch),
-                    " as the base branch of project ",
-                    q(project.name),
-                    format!(
-                        ": {:#}. New worktrees branch from it until dux restarts or reloads its config, then from the branch saved before.",
-                        err
-                    )
-                ])
+                crate::engine::ProjectBaseAdoption::SaveFailed {
+                    previous: existing.leading_branch.clone(),
+                    reason: format!("{err:#}"),
+                }
             }
         }
     }
@@ -3698,39 +3700,6 @@ impl Engine {
             WorkerEvent::TailscaleModeApplied { mode, outcome } => {
                 EventReaction::TailscaleModeApplied { mode, outcome }
             }
-        }
-    }
-}
-
-/// What [`Engine::adopt_project_base`] did to a project's base.
-enum BaseMove {
-    /// It already was that branch.
-    Unchanged,
-    /// It moved, in memory and in SQLite.
-    Moved,
-    /// It moved in memory, but SQLite refused; carries the warning to show.
-    MovedUnsaved(StatusText),
-}
-
-impl BaseMove {
-    fn moved(&self) -> bool {
-        match self {
-            Self::Unchanged => false,
-            Self::Moved | Self::MovedUnsaved(_) => true,
-        }
-    }
-
-    /// The final, plus the save failure after it when there was one: a base
-    /// that only lives until the next restart must not pass silently.
-    fn with_unsaved_warning(self, final_reaction: EventReaction) -> EventReaction {
-        match self {
-            Self::Unchanged | Self::Moved => final_reaction,
-            // STICKY: the base is lost at the next restart or reload unless the
-            // user acts, so this must not time out unread.
-            Self::MovedUnsaved(warning) => EventReaction::Multi(vec![
-                final_reaction,
-                EventReaction::Status(StatusUpdate::warning(warning).sticky()),
-            ]),
         }
     }
 }
@@ -5897,10 +5866,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_base_sqlite_refuses_to_save_is_still_used_and_said_out_loud() {
-        let (mut engine, _tmp) = test_engine();
-        let project = project_based_on_feature(&mut engine);
+    /// Make SQLite refuse every update to the projects table, the way a full
+    /// disk or a locked database would, while reads keep working.
+    fn refuse_project_updates(engine: &Engine) {
         rusqlite::Connection::open(&engine.paths.sessions_db_path)
             .expect("second connection")
             .execute_batch(
@@ -5908,6 +5876,33 @@ mod tests {
                  begin select raise(abort, 'the disk said no'); end;",
             )
             .expect("install the refusing trigger");
+    }
+
+    /// The one status a failed save ends in: a sticky error, built from parts,
+    /// that never claims the base moved.
+    fn unsaved_base_error(reaction: &EventReaction) -> &StatusUpdate {
+        let EventReaction::Status(update) = reaction else {
+            panic!("expected the save failure as the only status");
+        };
+        assert_eq!(update.tone, StatusTone::Error);
+        assert!(
+            update.sticky,
+            "the user must fix something outside the toast and run the checkout again"
+        );
+        assert!(update.segments.is_some(), "the names must travel as parts");
+        assert!(
+            !update.message.contains("branch from \"main\" now"),
+            "{}",
+            update.message
+        );
+        update
+    }
+
+    #[test]
+    fn a_base_sqlite_refuses_to_save_is_not_adopted_and_the_old_one_is_named() {
+        let (mut engine, _tmp) = test_engine();
+        let project = project_based_on_feature(&mut engine);
+        refuse_project_updates(&engine);
 
         let reaction =
             engine.process_worker_event(WorkerEvent::NonDefaultBranchCheckoutCompleted {
@@ -5917,30 +5912,116 @@ mod tests {
                 status_op_id: None,
             });
 
-        assert_eq!(engine.projects[0].leading_branch.as_deref(), Some("main"));
-        assert_eq!(stored_base(&engine).as_deref(), Some("feature"));
-        let EventReaction::Multi(parts) = reaction else {
-            panic!("expected the final followed by the save warning");
-        };
         assert_eq!(
-            status_message(&parts[0]),
-            "Checked out \"main\" for project \"p1-name\". New worktrees branch from \"main\" now."
+            engine.projects[0].leading_branch.as_deref(),
+            Some("feature"),
+            "memory and disk must agree on the base"
         );
-        let EventReaction::Status(warning) = &parts[1] else {
-            panic!("expected a warning status");
-        };
-        assert_eq!(warning.tone, StatusTone::Warning);
-        assert!(warning.sticky, "a base that may be lost must not time out");
+        assert_eq!(stored_base(&engine).as_deref(), Some("feature"));
+        assert_eq!(
+            engine.projects[0].current_branch, "main",
+            "the folder stays on the branch that was checked out"
+        );
+        let error = unsaved_base_error(&reaction);
         assert!(
-            warning
-                .message
-                .starts_with("Couldn't save \"main\" as the base branch of project \"p1-name\": ")
-                && warning.message.contains("the disk said no")
-                && warning.message.ends_with(
-                    "until dux restarts or reloads its config, then from the branch saved before."
-                ),
+            error.message.starts_with(
+                "The folder of project \"p1-name\" is on \"main\", but new worktrees still \
+                 branch from \"feature\" because dux could not save the new base ("
+            ) && error.message.contains("the disk said no")
+                && error
+                    .message
+                    .ends_with("). Check out the default branch again once the problem is fixed."),
             "{}",
-            warning.message
+            error.message
+        );
+    }
+
+    #[test]
+    fn a_folder_already_on_the_default_branch_whose_base_cannot_be_saved_keeps_the_old_base() {
+        let (mut engine, _tmp) = test_engine();
+        let project = project_based_on_feature(&mut engine);
+        refuse_project_updates(&engine);
+
+        let reaction =
+            engine.process_worker_event(WorkerEvent::CheckoutProjectDefaultBranchInspected {
+                project,
+                result: Ok(("main".into(), None)),
+                status_op_id: None,
+            });
+
+        assert_eq!(
+            engine.projects[0].leading_branch.as_deref(),
+            Some("feature")
+        );
+        assert_eq!(stored_base(&engine).as_deref(), Some("feature"));
+        let error = unsaved_base_error(&reaction);
+        assert!(
+            error
+                .message
+                .contains("new worktrees still branch from \"feature\""),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn a_base_whose_project_row_is_missing_is_not_reported_as_saved() {
+        let (mut engine, _tmp) = test_engine();
+        // In memory only: SQLite has no row for this project to update.
+        let mut project = sample_project("p1", "/tmp/p1");
+        project.leading_branch = Some("feature".to_string());
+        engine.projects.push(project.clone());
+
+        let reaction =
+            engine.process_worker_event(WorkerEvent::NonDefaultBranchCheckoutCompleted {
+                action: NonDefaultBranchAction::CheckoutProjectDefault { project },
+                target_branch: "main".into(),
+                result: Ok(()),
+                status_op_id: None,
+            });
+
+        assert_eq!(
+            engine.projects[0].leading_branch.as_deref(),
+            Some("feature")
+        );
+        let error = unsaved_base_error(&reaction);
+        assert!(
+            error.message.contains("no project with id")
+                && error
+                    .message
+                    .contains("new worktrees still branch from \"feature\""),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn an_unsaved_base_with_none_recorded_before_says_none_is_recorded() {
+        let (mut engine, _tmp) = test_engine();
+        let mut project = sample_project("p1", "/tmp/p1");
+        project.leading_branch = None;
+        engine.projects.push(project.clone());
+
+        let reaction =
+            engine.process_worker_event(WorkerEvent::NonDefaultBranchCheckoutCompleted {
+                action: NonDefaultBranchAction::CheckoutProjectDefault { project },
+                target_branch: "main".into(),
+                result: Ok(()),
+                status_op_id: None,
+            });
+
+        assert_eq!(engine.projects[0].leading_branch, None);
+        let error = unsaved_base_error(&reaction);
+        assert!(
+            error.message.starts_with(
+                "The folder of project \"p1-name\" is on \"main\", but dux could not save it \
+                 as the base new worktrees branch from ("
+            ) && error.message.ends_with(
+                "), so the project still has no base branch recorded. Check out the default \
+                 branch again once the problem is fixed."
+            ),
+            "{}",
+            error.message
         );
     }
 
@@ -6004,36 +6085,6 @@ mod tests {
             crate::git::current_branch(repo.path()).unwrap(),
             "other",
             "nothing was checked out"
-        );
-    }
-
-    #[test]
-    fn a_base_whose_project_row_is_missing_is_not_reported_as_saved() {
-        let (mut engine, _tmp) = test_engine();
-        // In memory only: SQLite has no row for this project to update.
-        let mut project = sample_project("p1", "/tmp/p1");
-        project.leading_branch = Some("feature".to_string());
-        engine.projects.push(project.clone());
-
-        let reaction =
-            engine.process_worker_event(WorkerEvent::NonDefaultBranchCheckoutCompleted {
-                action: NonDefaultBranchAction::CheckoutProjectDefault { project },
-                target_branch: "main".into(),
-                result: Ok(()),
-                status_op_id: None,
-            });
-
-        let EventReaction::Multi(parts) = reaction else {
-            panic!("expected the final followed by the save warning");
-        };
-        let EventReaction::Status(warning) = &parts[1] else {
-            panic!("expected a warning status");
-        };
-        assert_eq!(warning.tone, StatusTone::Warning);
-        assert!(
-            warning.message.contains("no project with id"),
-            "{}",
-            warning.message
         );
     }
 

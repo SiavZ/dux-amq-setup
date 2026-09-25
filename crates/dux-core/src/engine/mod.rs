@@ -879,11 +879,11 @@ pub enum WebDeleteOutcome {
 /// inspect-failed before any switch runs, and the switch (worker 2) finishes
 /// with success / failure.
 pub enum WebCheckoutOutcome {
-    /// The `git switch` (worker 2) succeeded onto `target_branch`, which is now
-    /// the project's base; `base_moved` says whether it was not already.
+    /// The `git switch` (worker 2) succeeded onto `target_branch`; `base` says
+    /// whether it became the project's base.
     Ok {
         target_branch: String,
-        base_moved: bool,
+        base: ProjectBaseAdoption,
     },
     /// The `git switch` (worker 2) failed; `repo_path` is the source checkout path.
     Failed {
@@ -891,15 +891,74 @@ pub enum WebCheckoutOutcome {
         repo_path: String,
     },
     /// Worker 1 found the project already on its leading branch; no switch ran.
-    /// That branch is now the project's base; `base_moved` as for `Ok`.
+    /// `base` as for `Ok`.
     AlreadyLeading {
         current_branch: String,
-        base_moved: bool,
+        base: ProjectBaseAdoption,
     },
     /// Worker 1 could only heuristically guess the default branch, so it refused.
     Heuristic { current_branch: String },
     /// Worker 1's inspection itself failed.
     InspectFailed { error: String },
+}
+
+/// What a finished "check out the default branch" did to the project's base,
+/// the branch new worktrees start from. The base moves only once SQLite has
+/// saved it, so memory and disk always agree on it.
+pub enum ProjectBaseAdoption {
+    /// It already was the checked-out branch.
+    Unchanged,
+    /// It is the checked-out branch now, saved.
+    Moved,
+    /// SQLite refused the new base, so the base stayed `previous` (`None` when
+    /// the project had none recorded); `reason` is the refusal.
+    SaveFailed {
+        previous: Option<String>,
+        reason: String,
+    },
+}
+
+impl ProjectBaseAdoption {
+    /// Whether the base is a different branch than before.
+    pub fn moved(&self) -> bool {
+        match self {
+            Self::Moved => true,
+            Self::Unchanged | Self::SaveFailed { .. } => false,
+        }
+    }
+
+    /// The sticky error a failed save ends the checkout with, in place of the
+    /// confirmation; `None` when the save did not fail. Both surfaces print this.
+    pub fn save_failure_message(&self, project_name: &str, branch: &str) -> Option<StatusText> {
+        let Self::SaveFailed { previous, reason } = self else {
+            return None;
+        };
+        let lead = status_text![
+            "The folder of project ",
+            q(project_name),
+            " is on ",
+            q(branch)
+        ];
+        let middle = match previous {
+            Some(previous) => status_text![
+                lead,
+                ", but new worktrees still branch from ",
+                q(previous),
+                format!(" because dux could not save the new base ({reason})."),
+            ],
+            None => status_text![
+                lead,
+                format!(
+                    ", but dux could not save it as the base new worktrees branch from \
+                     ({reason}), so the project still has no base branch recorded."
+                ),
+            ],
+        };
+        Some(status_text![
+            middle,
+            " Check out the default branch again once the problem is fixed."
+        ])
+    }
 }
 
 /// The confirmation for a finished "check out the default branch" on an

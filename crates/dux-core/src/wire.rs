@@ -2946,14 +2946,20 @@ impl Engine {
             move |o: &crate::engine::WebCheckoutOutcome| {
                 use crate::engine::{Final, WebCheckoutOutcome};
                 match o {
+                    // STICKY on a failed save: the base did not move, and
+                    // the fix (a full disk, a locked database) is outside the
+                    // toast, followed by running the checkout again.
                     WebCheckoutOutcome::Ok {
                         target_branch,
-                        base_moved,
-                    } => Final::info(crate::engine::checkout_default_branch_message(
-                        &project_name,
-                        target_branch,
-                        *base_moved,
-                    )),
+                        base,
+                    } => match base.save_failure_message(&project_name, target_branch) {
+                        Some(message) => Final::error(message).sticky(),
+                        None => Final::info(crate::engine::checkout_default_branch_message(
+                            &project_name,
+                            target_branch,
+                            base.moved(),
+                        )),
+                    },
                     // STICKY: the checkout stopped part-way and the repository
                     // is left on whatever branch it landed on. The message says
                     // outright that the fix is in the user's terminal, which is
@@ -2969,14 +2975,20 @@ impl Engine {
                         ". Resolve in your terminal and retry."
                     ])
                     .sticky(),
+                    // STICKY on a failed save: the base did not move, and
+                    // the fix (a full disk, a locked database) is outside the
+                    // toast, followed by running the checkout again.
                     WebCheckoutOutcome::AlreadyLeading {
                         current_branch,
-                        base_moved,
-                    } => Final::info(crate::engine::already_on_default_branch_message(
-                        &project_name,
-                        current_branch,
-                        *base_moved,
-                    )),
+                        base,
+                    } => match base.save_failure_message(&project_name, current_branch) {
+                        Some(message) => Final::error(message).sticky(),
+                        None => Final::info(crate::engine::already_on_default_branch_message(
+                            &project_name,
+                            current_branch,
+                            base.moved(),
+                        )),
+                    },
                     // STICKY: same shape, same instruction. dux cannot proceed
                     // and is asking the user to go and settle the repository's
                     // default branch by hand before retrying.
@@ -7731,6 +7743,75 @@ mod tests {
             "busy",
             "the second request starts a chain of its own"
         );
+    }
+
+    /// A browser's checkout whose new base SQLite will not save resolves its op
+    /// with the sticky save error, keyed to the op's busy, and the base stays
+    /// what it was: the same ending the terminal UI gets.
+    #[test]
+    fn a_web_checkout_whose_base_cannot_be_saved_resolves_with_the_sticky_error() {
+        let repo = init_repo_on_feature_branch("trunk");
+        let (mut engine, _tmp) = test_engine();
+        // No SQLite row, so the save matches nothing and fails.
+        let mut project = sample_project("p1", repo.path().to_string_lossy().as_ref());
+        project.leading_branch = Some("feature".to_string());
+        project.current_branch = "feature".to_string();
+        project.branch_status = ProjectBranchStatus::NotLeading;
+        engine.projects.push(project.clone());
+
+        let busy = engine
+            .apply_wire(WireCommand::CheckoutProjectDefaultBranch {
+                project_id: "p1".to_string(),
+            })
+            .expect("checkout")
+            .status
+            .expect("busy");
+        let op_id = engine
+            .pending_web_checkout_ops
+            .keys()
+            .next()
+            .cloned()
+            .expect("the web op");
+
+        let reaction =
+            engine.process_worker_event(WorkerEvent::NonDefaultBranchCheckoutCompleted {
+                action: NonDefaultBranchAction::CheckoutProjectDefault { project },
+                target_branch: "trunk".to_string(),
+                result: Ok(()),
+                status_op_id: Some(op_id),
+            });
+
+        let statuses = wire_statuses_from_reaction(&reaction);
+        assert_eq!(statuses.len(), 1, "one final, and it is the error");
+        let status = &statuses[0];
+        assert_eq!(status.tone, "error");
+        assert!(status.sticky);
+        assert_eq!(status.key, busy.key, "the final replaces the busy");
+        assert!(
+            status.message.starts_with(
+                "The folder of project \"p1-name\" is on \"trunk\", but new worktrees still \
+                 branch from \"feature\" because dux could not save the new base ("
+            ),
+            "{}",
+            status.message
+        );
+        let segments =
+            serde_json::to_value(status.segments.as_ref().expect("built from parts")).unwrap();
+        for name in ["p1-name", "trunk", "feature"] {
+            assert!(
+                segments
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!({"name": name, "quoted": true})),
+                "{name} must be a part: {segments}"
+            );
+        }
+        assert_eq!(
+            engine.projects[0].leading_branch.as_deref(),
+            Some("feature")
+        );
+        assert!(engine.pending_web_checkout_ops.is_empty());
+        assert_checkout_accepted_again(&engine, "p1");
     }
 
     /// A failed inspection ends the chain with a toast that times out, so the
