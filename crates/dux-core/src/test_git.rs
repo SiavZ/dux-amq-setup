@@ -41,7 +41,36 @@ pub fn fixture_git() -> Command {
 /// Applies the fixture template to an already-built `git` command, for helpers
 /// that build their command some other way (see `git::test_support`).
 pub fn keep_fixture_unsigned(command: &mut Command) -> &mut Command {
+    ensure_fixture_template_info_files();
     command.env("GIT_TEMPLATE_DIR", FIXTURE_TEMPLATE_DIR)
+}
+
+/// The files the default git template installs that the fixtures' template
+/// does not carry, so a fixture is the same repository `git init` alone would
+/// make. The signing template is a directory with only a `config`, so without
+/// this a fixture repository has no `.git/info/exclude` (and no `info`
+/// directory at all), while a real one always does; tests that exercise the
+/// exclude (`ensure_project_worktrees_link_*`) write to a path that does not
+/// exist.
+fn ensure_fixture_template_info_files() {
+    let info = std::path::Path::new(crate::test_git::FIXTURE_TEMPLATE_DIR).join("info");
+    std::fs::create_dir_all(&info).expect("create the fixture template's info dir");
+    let exclude = info.join("exclude");
+    if !exclude.exists() {
+        std::fs::write(
+            &exclude,
+            // The default template's own sample exclude, byte for byte, so a
+            // fixture starts with the comments and patterns git itself ships.
+            "# git ls-files --others --exclude-from=.git/info/exclude
+# Lines that start with '#' are comments.
+# For a project mostly in C, the following would be a good set of
+# exclude patterns (uncomment them if you want to try them):
+# *.[oa]
+# *~
+",
+        )
+        .expect("write the fixture template's exclude sample");
+    }
 }
 
 #[cfg(test)]

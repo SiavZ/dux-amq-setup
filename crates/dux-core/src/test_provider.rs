@@ -340,10 +340,12 @@ mod tests {
         for (name, _) in default_provider_commands() {
             let resolved = provider_config(&config, &ProviderKind::from_str(name));
             assert_eq!(resolved.command, HARMLESS_PROVIDER_COMMAND, "{name}");
-            // The stock name keeps its resume support, so resume paths still run.
+            // The stock name keeps its resume support, so resume paths still
+            // run. The fork's provider set adds cline, ntl and jcode, which
+            // have no cwd-scoped resume-latest, so they sit beside copilot.
             assert_eq!(
                 resolved.supports_session_resume(),
-                name != "copilot",
+                !matches!(name, "copilot" | "cline" | "ntl" | "jcode"),
                 "{name}"
             );
         }
