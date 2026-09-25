@@ -2,6 +2,8 @@
 // git may refuse to delete a branch still checked out elsewhere.
 
 import type { FinalTone } from "@/lib/notify"
+import { chip, type Prose, prose, quotedChip } from "@/lib/prose"
+import { singleQuoted } from "@/lib/shellQuote"
 
 /// What the server says happened to the branch. Mirrors
 /// `project_reads.rs`'s `BranchOutcomeReply`; `null`/absent means no branch
@@ -18,7 +20,8 @@ export interface DeleteWorktreeReply {
 
 export interface WorktreeDeleteReport {
   tone: FinalTone
-  message: string
+  /// Every name (the path, the branch, the command to run) is a chip.
+  message: Prose
   /// See the toast tenet: sticky only when the user must act OUTSIDE the toast
   /// to recover, or something was left half-done. A refused branch is both, so
   /// it is the one rung here that pins.
@@ -34,21 +37,21 @@ export function worktreeDeleteReport(
   if (branch === null) {
     return {
       tone: "success",
-      message: `Removed the worktree at ${worktreePath}. Its branch is still there.`,
+      message: prose`Removed the worktree at ${chip(worktreePath)}. Its branch is still there.`,
       sticky: false,
     }
   }
   if (branch.outcome === "deleted") {
     return {
       tone: "success",
-      message: `Removed the worktree at ${worktreePath} and deleted its branch "${branch.name}".`,
+      message: prose`Removed the worktree at ${chip(worktreePath)} and deleted its branch ${quotedChip(branch.name)}.`,
       sticky: false,
     }
   }
   if (branch.outcome === "already_gone") {
     return {
       tone: "success",
-      message: `Removed the worktree at ${worktreePath}. Its branch "${branch.name}" was already gone.`,
+      message: prose`Removed the worktree at ${chip(worktreePath)}. Its branch ${quotedChip(branch.name)} was already gone.`,
       sticky: false,
     }
   }
@@ -58,10 +61,7 @@ export function worktreeDeleteReport(
   const reason = cleanReason(branch.reason)
   return {
     tone: "warning",
-    message:
-      `Removed the worktree at ${worktreePath}, but git refused to delete its branch ` +
-      `"${branch.name}": ${reason} Delete it yourself with git branch -D "${branch.name}", ` +
-      `or leave it and give the next agent a different name.`,
+    message: prose`Removed the worktree at ${chip(worktreePath)}, but git refused to delete its branch ${quotedChip(branch.name)}: ${reason} Delete it yourself with ${chip(`git branch -D ${singleQuoted(branch.name)}`)}, or leave it and give the next agent a different name.`,
     sticky: true,
   }
 }

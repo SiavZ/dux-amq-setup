@@ -109,8 +109,8 @@ macro_rules! require_real_ui_build {
     };
 }
 
-fn temp_paths() -> (tempfile::TempDir, DuxPaths) {
-    let tmp = tempfile::tempdir().unwrap();
+fn temp_paths() -> (dux_core::test_scratch::ScratchDir, DuxPaths) {
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
     let paths = DuxPaths {
         root: root.clone(),
@@ -175,7 +175,8 @@ fn assert_is_spa_shell(html: &str, what: &str) {
 #[tokio::test]
 async fn serves_embedded_index_at_root() {
     let (_tmp, paths) = temp_paths();
-    let engine = bootstrap_engine(&paths).unwrap();
+    let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     let (handle, _join) = spawn_engine_thread(engine);
     let app = router(handle);
     let resp = app
@@ -192,7 +193,8 @@ async fn serves_embedded_index_at_root() {
 #[tokio::test]
 async fn unknown_path_falls_back_to_index() {
     let (_tmp, paths) = temp_paths();
-    let engine = bootstrap_engine(&paths).unwrap();
+    let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     let (handle, _join) = spawn_engine_thread(engine);
     let app = router(handle);
     let resp = app
@@ -208,9 +210,10 @@ async fn unknown_path_falls_back_to_index() {
 }
 
 /// Build a router backed by a throwaway engine for static-asset assertions.
-fn test_router() -> (tempfile::TempDir, axum::Router) {
+fn test_router() -> (dux_core::test_scratch::ScratchDir, axum::Router) {
     let (tmp, paths) = temp_paths();
-    let engine = bootstrap_engine(&paths).unwrap();
+    let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     let (handle, _join) = spawn_engine_thread(engine);
     (tmp, router(handle))
 }
@@ -921,7 +924,8 @@ async fn live_server_serves_the_built_page_and_accepts_a_websocket() {
     require_real_ui_build!("live_server_serves_the_built_page_and_accepts_a_websocket");
 
     let (_tmp, paths) = temp_paths();
-    let engine = bootstrap_engine(&paths).unwrap();
+    let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     let (handle, _join) = spawn_engine_thread(engine);
     let app = router(handle);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

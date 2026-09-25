@@ -27,6 +27,7 @@ import {
 } from "@/lib/fileDrop"
 import { FileDropApiError, uploadDroppedFile } from "@/lib/fileDropApi"
 import { notify, notifyBusy, notifyError } from "@/lib/notify"
+import { chip, prose } from "@/lib/prose"
 import { registerAttachCapability } from "@/lib/attachRegistry"
 import type { PtySocket } from "@/lib/ptySocket"
 
@@ -199,8 +200,8 @@ export function useUploadPipeline(deps: UploadPipelineDeps): UploadPipeline {
       // replaces the spinner rather than stacking a second toast.
       notifyBusy(
         files.length === 1
-          ? `Uploading ${file.name}...`
-          : `Uploading ${file.name} (${i + 1} of ${files.length})...`,
+          ? prose`Uploading ${chip(file.name)}...`
+          : prose`Uploading ${chip(file.name)} (${i + 1} of ${files.length})...`,
         // A fetch this tab is awaiting itself, not an engine status: if the
         // guard fires, the request is still in flight in this browser.
         { id: toastId, origin: "local" },
@@ -300,7 +301,7 @@ export function useUploadPipeline(deps: UploadPipelineDeps): UploadPipeline {
     // Sticky when a file was saved but never delivered: the report then carries
     // the only copy on screen of a saved file's path, and the user must act
     // outside the toast to finish what they started.
-    notify(report.tone, report.message, { id: toastId, sticky: report.sticky })
+    notify(report.tone, report.prose, { id: toastId, sticky: report.sticky })
   }
 
   /// Raise the batch's spinner and make sure something final always replaces it.

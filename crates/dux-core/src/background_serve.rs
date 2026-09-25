@@ -49,6 +49,81 @@ pub struct TuiOwnership {
     pub conn_id: u64,
 }
 
+impl TuiOwnership {
+    /// Claim `pty_id` for the terminal UI if nobody is driving it, and hand back
+    /// the handover to announce, or `None` when nothing changed hands.
+    ///
+    /// It never steals: a pty another connection holds is left with that
+    /// connection. A pty this seat already holds is not a new claim either, so
+    /// there is nothing to announce for it.
+    pub fn claim_if_free(&self, pty_id: &str) -> Option<PtyOwnershipEvent> {
+        let claim = self
+            .owners
+            .may_write(pty_id, self.conn_id, Some(TUI_DEVICE_LABEL), || {});
+        if !claim.claimed_new {
+            return None;
+        }
+        claim.epoch.map(|epoch| PtyOwnershipEvent::Claimed {
+            pty_id: pty_id.to_string(),
+            conn_id: self.conn_id,
+            epoch,
+            device: TUI_DEVICE_LABEL.to_string(),
+        })
+    }
+
+    /// Claim every pty that is running in `engine` and that nobody drives, and
+    /// hand back one handover per pty that changed hands, in the engine's
+    /// stable order.
+    ///
+    /// What "running" means is [`Engine::running_pty_ids`]: a dormant tab has
+    /// no process and so no pty, and is never claimed.
+    ///
+    /// Leaves ONE info line in the log: how many it took, and each pty it left
+    /// alone with the connection holding it.
+    pub fn claim_every_running_pty(&self, engine: &Engine) -> Vec<PtyOwnershipEvent> {
+        let running = engine.running_pty_ids();
+        let mut claimed = Vec::new();
+        let mut skipped = Vec::new();
+        for pty_id in &running {
+            match self.claim_if_free(pty_id) {
+                Some(event) => claimed.push(event),
+                None => {
+                    let (holder, _, _) = self.owners.current_owner(pty_id);
+                    skipped.push((pty_id.clone(), holder));
+                }
+            }
+        }
+        crate::logger::info(&bulk_claim_log_line(claimed.len(), running.len(), &skipped));
+        claimed
+    }
+}
+
+/// The one log line [`TuiOwnership::claim_every_running_pty`] leaves: `claimed`
+/// of `running` ptys taken, and each pty left alone with the connection that
+/// holds it (`None` when the registry records no owner for it).
+fn bulk_claim_log_line(
+    claimed: usize,
+    running: usize,
+    skipped: &[(String, Option<u64>)],
+) -> String {
+    let mut line = format!(
+        "[server] switching serving on claimed {claimed} of {running} running ptys for the \
+         terminal UI"
+    );
+    if !skipped.is_empty() {
+        let left: Vec<String> = skipped
+            .iter()
+            .map(|(pty_id, holder)| match holder {
+                Some(conn_id) => format!("{pty_id} (held by connection {conn_id})"),
+                None => format!("{pty_id} (no owner recorded)"),
+            })
+            .collect();
+        line.push_str("; left alone: ");
+        line.push_str(&left.join(", "));
+    }
+    line
+}
+
 /// An ownership fact the terminal UI produced, on its way to the browsers.
 ///
 /// The terminal UI can decide these (it holds a seat in the registry) but cannot
@@ -193,11 +268,21 @@ pub trait BackgroundServeCompanion {
     /// Bound by the CALLER so a bind failure is reported without anything having
     /// been torn down: the terminal UI stays exactly where it was. Returns the
     /// URLs on success, or a message fit for the status line.
+    ///
+    /// `claim_before_serving` asks for every pty running in `engine` that nobody
+    /// drives to be claimed for the terminal UI BEFORE any listener accepts a
+    /// connection (see [`TuiOwnership::claim_every_running_pty`]), and the claims
+    /// announced once the serve is up. The terminal UI passes it for a start
+    /// somebody at its keyboard asked for, and never for the startup autostart.
+    /// Seeding the registry first is the whole point: a browser tab already
+    /// reconnecting cannot win a plain-attach claim in between, and its handshake
+    /// reads the owner from the seeded registry.
     fn start(
         &mut self,
         engine: &mut Engine,
         listeners: Vec<std::net::TcpListener>,
         urls: Vec<String>,
+        claim_before_serving: bool,
     ) -> Result<Vec<String>, String>;
 
     /// Change `[server] tailscale` on the running listener.
@@ -229,4 +314,134 @@ pub trait BackgroundServeCompanion {
     /// layer can do. A no-op when nothing is serving, and cheap to call with an
     /// empty slice.
     fn publish_ownership_events(&mut self, events: &[PtyOwnershipEvent]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seat() -> TuiOwnership {
+        let owners = Arc::new(PtySizeOwners::default());
+        TuiOwnership {
+            conn_id: owners.next_conn_id(),
+            owners,
+        }
+    }
+
+    /// A pty nobody drives is claimed for the terminal UI, under its device
+    /// label, and the claim comes back as the one fact to announce. A second
+    /// ask is a claim this surface already holds, so there is nothing to say.
+    #[test]
+    fn claiming_a_free_pty_records_the_tui_and_returns_one_claimed_fact() {
+        let seat = seat();
+
+        let claimed = seat.claim_if_free("s1-slot");
+
+        let (owner, epoch, device) = seat.owners.current_owner("s1-slot");
+        assert_eq!(owner, Some(seat.conn_id));
+        assert_eq!(device.as_deref(), Some(TUI_DEVICE_LABEL));
+        assert_eq!(
+            claimed,
+            Some(PtyOwnershipEvent::Claimed {
+                pty_id: "s1-slot".to_string(),
+                conn_id: seat.conn_id,
+                epoch,
+                device: TUI_DEVICE_LABEL.to_string(),
+            })
+        );
+        assert_eq!(seat.claim_if_free("s1-slot"), None);
+    }
+
+    /// The bulk claim leaves one line in the log saying how many of the running
+    /// ptys it took, and which it left alone and who was holding each, so a
+    /// report that a browser "could not type" can be traced to the moment
+    /// serving came on.
+    #[test]
+    fn the_bulk_claim_log_line_counts_and_names_every_pty_left_alone() {
+        let line = bulk_claim_log_line(
+            3,
+            5,
+            &[
+                ("term-2".to_string(), Some(7)),
+                ("s1-slot".to_string(), None),
+            ],
+        );
+        assert_eq!(
+            line,
+            "[server] switching serving on claimed 3 of 5 running ptys for the terminal UI; \
+             left alone: term-2 (held by connection 7), s1-slot (no owner recorded)"
+        );
+        assert_eq!(
+            bulk_claim_log_line(2, 2, &[]),
+            "[server] switching serving on claimed 2 of 2 running ptys for the terminal UI"
+        );
+    }
+
+    /// Never a steal: a pty another connection holds stays that connection's,
+    /// and nothing is announced.
+    #[test]
+    fn claiming_leaves_a_pty_another_connection_drives_alone() {
+        let seat = seat();
+        let browser = seat.owners.next_conn_id();
+        seat.owners.claim("term-1", browser).expect("claimed");
+
+        assert_eq!(seat.claim_if_free("term-1"), None);
+        assert!(seat.owners.is_owner("term-1", browser));
+    }
+
+    /// Everything running is claimed in one pass, one fact per newly claimed
+    /// pty, in the engine's stable order; a pty somebody else holds and a
+    /// dormant tab are skipped.
+    #[test]
+    fn claiming_every_running_pty_takes_the_free_ones_and_skips_the_rest() {
+        let (mut engine, _tmp) = crate::engine::test_support::test_engine();
+        let spawn = || {
+            crate::pty::PtyClient::spawn(
+                "sleep",
+                &["5".to_string()],
+                std::path::Path::new("."),
+                10,
+                10,
+                100,
+            )
+            .expect("spawn pty")
+        };
+        engine
+            .providers
+            .insert(crate::ids::TabId::new("a-slot"), spawn());
+        engine
+            .providers
+            .insert(crate::ids::TabId::new("b-slot"), spawn());
+        // A tab row with no process behind it.
+        engine.agent_tabs.insert(
+            crate::ids::TabId::new("a-tab-2"),
+            crate::engine::test_support::sample_tab("a-tab-2", "a", "claude", 1),
+        );
+        engine.config.terminal.command = "cat".to_string();
+        engine.config.terminal.args = vec![];
+        let (terminal, _) = engine
+            .create_standalone_terminal(10, 10)
+            .expect("standalone terminal");
+        let seat = seat();
+        let browser = seat.owners.next_conn_id();
+        seat.owners.claim("b-slot", browser).expect("claimed");
+
+        let claimed = seat.claim_every_running_pty(&engine);
+
+        let ids: Vec<&str> = claimed
+            .iter()
+            .map(|event| match event {
+                PtyOwnershipEvent::Claimed { pty_id, device, .. } => {
+                    assert_eq!(device, TUI_DEVICE_LABEL);
+                    pty_id.as_str()
+                }
+                other => panic!("only claims are announced: {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, vec!["a-slot", terminal.as_str()]);
+        assert!(seat.owners.is_owner("a-slot", seat.conn_id));
+        assert!(seat.owners.is_owner(&terminal, seat.conn_id));
+        assert!(seat.owners.is_owner("b-slot", browser));
+        assert_eq!(seat.owners.current_owner("a-tab-2").0, None);
+    }
 }

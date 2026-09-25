@@ -9,6 +9,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import { Input } from "@/components/ui/input"
 import { standaloneAgentDefaultName } from "@/lib/paths"
 import {
@@ -80,8 +81,8 @@ function StandaloneAgentBrowser() {
             // twin of the server's sanitizer, so it cannot promise another name.
             placeholder={`Agent name (optional, defaults to "${standaloneAgentDefaultName(selected)}")`}
           />
-          <span className="font-mono text-xs break-all text-muted-foreground">
-            {selected}
+          <span className="text-xs text-muted-foreground">
+            <InlineCode>{selected}</InlineCode>
           </span>
         </div>
       ) : null}

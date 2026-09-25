@@ -4,10 +4,14 @@ import type { AgentWorkspaceWire } from "./agentWorkspace"
 import type { SessionView } from "./types"
 import {
   canRecreateWorkingCopy,
-  recreateConfirmBody,
+  recreateConfirmProse,
   recreateRunningProviders,
   recreateRunningTabClause,
 } from "./recreateWorkingCopy"
+import { chip, proseText, quotedChip } from "./prose"
+
+const recreateText = (...args: Parameters<typeof recreateConfirmProse>) =>
+  proseText(recreateConfirmProse(...args))
 
 const managed: AgentWorkspaceWire = {
   kind: "managed",
@@ -40,12 +44,38 @@ describe("canRecreateWorkingCopy", () => {
   })
 })
 
-describe("recreateConfirmBody", () => {
-  // Mirrors `dux_core::working_copy::recreate_confirm_body`. The Rust side has
-  // the twin assertions, so a wording change fails on whichever side changed.
+// The web draws the path and every branch as a chip.
+describe("the recreate body as names in prose", () => {
+  it("marks the path and each branch", () => {
+    const prose = recreateConfirmProse("~/wt", "feat", "main", true, ["codex"])
+    for (const name of [
+      chip("~/wt"),
+      quotedChip("feat"),
+      quotedChip("origin/feat"),
+      quotedChip("main"),
+    ]) {
+      expect(prose).toContainEqual(name)
+    }
+  })
+
+  it("marks every provider named in the running-tab sentence", () => {
+    const cautious = recreateConfirmProse("~/wt", "feat", "main", true, [
+      "codex",
+      "opencode",
+    ])
+    expect(cautious).toContainEqual(chip("Codex"))
+    expect(cautious).toContainEqual(chip("Opencode"))
+    const calm = recreateConfirmProse("~/wt", "feat", "main", true, ["claude"])
+    expect(calm).toContainEqual(chip("Claude"))
+  })
+})
+
+describe("the recreate body's words", () => {
+  // Pinned to literal text here; the segments are pinned against the terminal
+  // UI's by the shared fixture in prose.test.tsx.
   it("reads the same as the terminal UI's", () => {
     expect(
-      recreateConfirmBody("~/worktrees/repo/feat", "feat", "main", true, [
+      recreateText("~/worktrees/repo/feat", "feat", "main", true, [
         "claude",
       ]),
     ).toBe(
@@ -69,7 +99,7 @@ describe("recreateConfirmBody", () => {
   // A provider with no directory-scoped resume (copilot ships with none) is
   // told so rather than promised a resume the same path cannot buy it.
   it("says the conversation will not resume when the provider cannot", () => {
-    const body = recreateConfirmBody("~/wt", "feat", "main", false, ["copilot"])
+    const body = recreateText("~/wt", "feat", "main", false, ["copilot"])
     expect(body).toContain("will not resume")
     expect(body).not.toContain("may resume")
     expect(body).toContain("are gone either way")
@@ -80,10 +110,10 @@ describe("recreateConfirmBody", () => {
   // answer.
   it("says what a running tab does, per provider", () => {
     expect(
-      recreateConfirmBody("~/wt", "feat", "main", true, ["claude"]),
+      recreateText("~/wt", "feat", "main", true, ["claude"]),
     ).toContain("A running Claude tab keeps working in the recreated copy by itself.")
     for (const provider of ["codex", "opencode", "copilot"]) {
-      const body = recreateConfirmBody("~/wt", "feat", "main", true, [provider])
+      const body = recreateText("~/wt", "feat", "main", true, [provider])
       expect(body).toContain(
         "cannot follow the folder: stop it and start the agent again",
       )

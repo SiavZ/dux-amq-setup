@@ -78,6 +78,45 @@ pub fn amq_handle(name: &str) -> String {
     out
 }
 
+/// Sanitise a status's structured parts beside its sanitized plain message.
+///
+/// Upstream (statusline + status_text) carries a status as a plain message
+/// plus the [`crate::prose`] segments the web draws chips from. The fork
+/// sanitizes the message at the one chokepoint (`StatusLine::set_scoped`),
+/// and the parts must agree with it: they spell the same sentence, and the
+/// web would otherwise render the raw escape a sanitized message no longer
+/// shows. Names and text segments are filtered with [`for_terminal`], and a
+/// part whose sanitized spelling no longer matches the sentence built from
+/// the sanitized message drops the parts rather than disagreeing with them.
+pub fn prose_segments(
+    segments: Vec<crate::prose::ProseSegment>,
+    sanitized_message: &str,
+) -> Vec<crate::prose::ProseSegment> {
+    use crate::prose::ProseSegment;
+    let cleaned: Vec<ProseSegment> = segments
+        .into_iter()
+        .map(|segment| match segment {
+            ProseSegment::Text(text) => ProseSegment::Text(for_terminal(&text)),
+            ProseSegment::Name { name, quoted } => ProseSegment::Name {
+                name: for_terminal(&name),
+                quoted,
+            },
+        })
+        .collect();
+    // Rebuild the plain sentence the parts now spell and keep them only when
+    // they agree with the sanitized message, mirroring
+    // `StatusText::from_parts`, which keeps parts only when they spell the
+    // message. A disagreement means an escape changed the length of a segment
+    // in a way the parts cannot express, so the surfaces fall back to the
+    // sanitized plain text, which is always safe.
+    let spelled = crate::prose::Prose::from_segments(cleaned.clone()).plain();
+    if spelled == sanitized_message {
+        cleaned
+    } else {
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -12,10 +12,10 @@ import {
   MAX_NAMED_FILES,
   dragCarriesFiles,
   dropRefusalReason,
-  endSentence,
 } from "./fileDrop"
 import type { DropToast } from "./fileDrop"
 import { FileDropApiError } from "./fileDropApi"
+import { chip, endProse, joinProse, type Prose, prose, proseText } from "./prose"
 
 /// What became of one file dropped on the tree. Two endings, not three: there
 /// is nothing to deliver, so "saved but not delivered" cannot happen.
@@ -32,33 +32,49 @@ export function editorDropDirLabel(dir: string): string {
   return dir === "" ? "the worktree root" : dir
 }
 
+/// The destination as a sentence part: a folder is a name, the root is words.
+function dirProse(dir: string): Prose {
+  return dir === "" ? [editorDropDirLabel(dir)] : [chip(dir)]
+}
+
+/// A rung's report: the sentence, and its plain spelling beside it.
+function toast(tone: DropToast["tone"], sentence: Prose): DropToast {
+  return { tone, sticky: false, prose: sentence, message: proseText(sentence) }
+}
+
 /// `name (reason)` for up to [`MAX_NAMED_FILES`] files, then a count: a drop of
 /// many files failing the same way produces a toast nobody reads.
 function reasonList(
   refused: { requestedName: string; reason: string }[],
-): string {
-  const named = refused
-    .slice(0, MAX_NAMED_FILES)
-    .map((r) => `${r.requestedName} (${r.reason})`)
-    .join(", ")
+): Prose {
+  const named = joinProse(
+    refused
+      .slice(0, MAX_NAMED_FILES)
+      .map((r) => prose`${chip(r.requestedName)} (${r.reason})`),
+    ", ",
+  )
   const rest = refused.length - MAX_NAMED_FILES
-  return rest > 0 ? `${named} and ${rest} more` : named
+  return rest > 0 ? prose`${named} and ${rest} more` : named
 }
 
 /// What every renamed file is now called, appended to any rung that saved one.
 /// The server suffixes a colliding name instead of overwriting, so without this
 /// the user goes looking for a file that is not on disk under the name they
 /// dropped.
-function renameNote(saved: { requestedName: string; savedName: string }[]) {
+function renameNote(
+  saved: { requestedName: string; savedName: string }[],
+): Prose {
   const renamed = saved.filter((s) => s.requestedName !== s.savedName)
-  if (renamed.length === 0) return ""
-  const pairs = renamed
-    .slice(0, MAX_NAMED_FILES)
-    .map((r) => `${r.requestedName} was saved as ${r.savedName}`)
-    .join(", ")
+  if (renamed.length === 0) return []
+  const pairs = joinProse(
+    renamed
+      .slice(0, MAX_NAMED_FILES)
+      .map((r) => prose`${chip(r.requestedName)} was saved as ${chip(r.savedName)}`),
+    ", ",
+  )
   const rest = renamed.length - MAX_NAMED_FILES
   const tail = rest > 0 ? ` and ${rest} more` : ""
-  return ` ${pairs}${tail}, so nothing was overwritten.`
+  return prose` ${pairs}${tail}, so nothing was overwritten.`
 }
 
 /// The one toast for a whole tree drop, chosen from the per-file outcomes. The
@@ -73,58 +89,49 @@ export function editorDropToast(
 ): DropToast {
   const saved = outcomes.filter((o) => o.kind === "saved")
   const refused = outcomes.filter((o) => o.kind === "refused")
-  const where = editorDropDirLabel(dir)
+  const where = dirProse(dir)
 
   // 1. Nothing landed.
   if (saved.length === 0) {
     if (refused.length === 1) {
-      return {
-        tone: "error",
-        sticky: false,
-        message: endSentence(
-          `Could not save ${refused[0].requestedName}: ${refused[0].reason}`,
+      return toast(
+        "error",
+        endProse(
+          prose`Could not save ${chip(refused[0].requestedName)}: ${refused[0].reason}`,
         ),
-      }
+      )
     }
-    return {
-      tone: "error",
-      sticky: false,
-      message: endSentence(
-        `Could not save any of the ${refused.length} dropped files. ${reasonList(refused)}`,
+    return toast(
+      "error",
+      endProse(
+        prose`Could not save any of the ${refused.length} dropped files. ${reasonList(refused)}`,
       ),
-    }
+    )
   }
 
   // 2. Something landed and something did not. A warning, never a success:
   // the count is the only honest headline.
   if (refused.length > 0) {
-    return {
-      tone: "warning",
-      sticky: false,
-      message:
-        `Saved ${saved.length} of ${outcomes.length} files to ${where}. ` +
-        endSentence(`Refused: ${reasonList(refused)}`) +
-        renameNote(saved),
-    }
+    return toast(
+      "warning",
+      prose`Saved ${saved.length} of ${outcomes.length} files to ${where}. ${endProse(prose`Refused: ${reasonList(refused)}`)}${renameNote(saved)}`,
+    )
   }
 
   // 3. Everything landed.
   if (saved.length === 1) {
     const one = saved[0]
-    return {
-      tone: "success",
-      sticky: false,
-      message:
-        one.requestedName === one.savedName
-          ? `Saved ${one.savedName} to ${where}.`
-          : `Saved ${one.requestedName} to ${where} as ${one.savedName}, so nothing was overwritten.`,
-    }
+    return toast(
+      "success",
+      one.requestedName === one.savedName
+        ? prose`Saved ${chip(one.savedName)} to ${where}.`
+        : prose`Saved ${chip(one.requestedName)} to ${where} as ${chip(one.savedName)}, so nothing was overwritten.`,
+    )
   }
-  return {
-    tone: "success",
-    sticky: false,
-    message: `Saved ${saved.length} files to ${where}.` + renameNote(saved),
-  }
+  return toast(
+    "success",
+    prose`Saved ${saved.length} files to ${where}.${renameNote(saved)}`,
+  )
 }
 
 /// What a browser handed over when the user let go, sorted into files and
@@ -201,7 +208,7 @@ export interface TreeDropDeps {
   revalidateDirs: (dirs: string[]) => void
   /// Re-index the worktree for the "Search files…" box.
   refreshSearchIndex: () => Promise<void>
-  reportBusy: (message: string) => void
+  reportBusy: (message: Prose) => void
   reportFinal: (toast: DropToast) => void
 }
 
@@ -220,19 +227,19 @@ export async function performTreeDrop(
   deps: TreeDropDeps,
 ): Promise<void> {
   const { files, folders } = dropped
-  const where = editorDropDirLabel(dir)
+  const where = dirProse(dir)
 
   // Nothing identifiable arrived (see `DroppedItems`), the case where silence
   // is worst: the user let go and the interface carried on regardless.
   if (files.length === 0 && folders.length === 0) {
-    deps.reportFinal({
-      tone: "error",
-      // Not sticky: nothing was taken and nothing saved, so nothing to recover.
-      sticky: false,
-      message:
+    // Not sticky (see `toast`): nothing was taken and nothing saved, so nothing
+    // to recover.
+    deps.reportFinal(
+      toast("error", [
         "Nothing came through in that drop. If you dropped a folder, drop the " +
-        "files inside it instead.",
-    })
+          "files inside it instead.",
+      ]),
+    )
     return
   }
 
@@ -252,8 +259,8 @@ export async function performTreeDrop(
   for (const [i, file] of files.entries()) {
     deps.reportBusy(
       total === 1
-        ? `Saving ${file.name} to ${where}…`
-        : `Saving ${file.name} to ${where} (${i + 1} of ${total})…`,
+        ? prose`Saving ${chip(file.name)} to ${where}…`
+        : prose`Saving ${chip(file.name)} to ${where} (${i + 1} of ${total})…`,
     )
     try {
       const saved = await deps.upload(file, dir)

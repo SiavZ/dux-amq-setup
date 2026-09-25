@@ -9,6 +9,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import {
   Select,
   SelectContent,
@@ -84,7 +85,9 @@ function ProjectSettingsForm({
   return (
     <DialogContent showCloseButton={false} className="sm:max-w-lg">
       <DialogHeader>
-        <DialogTitle>Project settings: {project.name}</DialogTitle>
+        <DialogTitle>
+          Project settings: <InlineCode>{project.name}</InlineCode>
+        </DialogTitle>
         <DialogDescription>
           Per-project overrides. Leave a field on the inherited default to fall
           back to the global configuration.

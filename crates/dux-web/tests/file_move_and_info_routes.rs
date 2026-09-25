@@ -54,7 +54,7 @@ fn sample_session(id: &str, worktree: &str) -> dux_core::model::AgentSession {
 }
 
 fn git(repo: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
+    let out = dux_core::test_git::fixture_git()
         .args(args)
         .current_dir(repo)
         .output()
@@ -70,8 +70,12 @@ fn git(repo: &Path, args: &[&str]) {
 /// Boot a server with one session (`s1`) whose worktree is a real git
 /// repository holding a committed file, a subdirectory to move into, and a
 /// file with a non-Latin name.
-async fn boot() -> (SocketAddr, tempfile::TempDir, std::path::PathBuf) {
-    let tmp = tempfile::tempdir().unwrap();
+async fn boot() -> (
+    SocketAddr,
+    dux_core::test_scratch::ScratchDir,
+    std::path::PathBuf,
+) {
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
     let wt = root.join("wt1");
     std::fs::create_dir_all(&wt).unwrap();
@@ -112,7 +116,8 @@ async fn boot() -> (SocketAddr, tempfile::TempDir, std::path::PathBuf) {
             .create_session(&sample_session("s1", wt.to_string_lossy().as_ref()))
             .unwrap();
     }
-    let engine = bootstrap_engine(&paths).unwrap();
+    let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     let (handle, _join) = spawn_engine_thread(engine);
     let app = build_app(
         handle,

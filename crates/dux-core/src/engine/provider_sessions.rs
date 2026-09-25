@@ -540,7 +540,7 @@ mod tests {
         assert_eq!(engine.startup_launch_candidates().len(), 1);
     }
 
-    fn startup_fixture() -> (Engine, tempfile::TempDir) {
+    fn startup_fixture() -> (Engine, crate::test_scratch::ScratchDir) {
         let (mut engine, tmp) = test_engine();
         let dir = tmp.path().join("checkout");
         std::fs::create_dir_all(&dir).unwrap();
@@ -632,7 +632,7 @@ mod tests {
             true,
             (24, 80),
             AgentLaunchKind::Reconnect {
-                status_message: String::new(),
+                status_message: Default::default(),
             },
         );
         assert_eq!(
@@ -670,7 +670,7 @@ mod tests {
             false,
             (24, 80),
             AgentLaunchKind::ResumeFallback {
-                status_message: String::new(),
+                status_message: Default::default(),
             },
         );
         assert!(!fallback.resumes_a_conversation());
@@ -751,7 +751,7 @@ mod tests {
             false,
             (24, 80),
             AgentLaunchKind::Reconnect {
-                status_message: String::new(),
+                status_message: Default::default(),
             },
         );
         let (tx, rx) = std::sync::mpsc::channel();

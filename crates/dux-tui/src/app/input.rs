@@ -235,6 +235,12 @@ enum PromptMouseTarget {
     ConfirmDetachAgentConfirm,
     ConfirmRecreateWorkingCopyCancel,
     ConfirmRecreateWorkingCopyConfirm,
+    ConfirmCheckoutDefaultBranchCancel,
+    ConfirmCheckoutDefaultBranchConfirm,
+    ConfirmDeleteProjectCancel,
+    ConfirmDeleteProjectConfirm,
+    ConfirmRemoveProjectCancel,
+    ConfirmRemoveProjectConfirm,
     ConfirmDeleteMacroCancel,
     ConfirmDeleteMacroConfirm,
     ConfirmQuitCancel,
@@ -337,6 +343,24 @@ impl ButtonPressedTarget {
             }
             PromptMouseTarget::ConfirmRecreateWorkingCopyConfirm => {
                 Some(ButtonPressedTarget::ConfirmRecreateWorkingCopyConfirm)
+            }
+            PromptMouseTarget::ConfirmCheckoutDefaultBranchCancel => {
+                Some(ButtonPressedTarget::ConfirmCheckoutDefaultBranchCancel)
+            }
+            PromptMouseTarget::ConfirmCheckoutDefaultBranchConfirm => {
+                Some(ButtonPressedTarget::ConfirmCheckoutDefaultBranchConfirm)
+            }
+            PromptMouseTarget::ConfirmDeleteProjectCancel => {
+                Some(ButtonPressedTarget::ConfirmDeleteProjectCancel)
+            }
+            PromptMouseTarget::ConfirmDeleteProjectConfirm => {
+                Some(ButtonPressedTarget::ConfirmDeleteProjectConfirm)
+            }
+            PromptMouseTarget::ConfirmRemoveProjectCancel => {
+                Some(ButtonPressedTarget::ConfirmRemoveProjectCancel)
+            }
+            PromptMouseTarget::ConfirmRemoveProjectConfirm => {
+                Some(ButtonPressedTarget::ConfirmRemoveProjectConfirm)
             }
             PromptMouseTarget::ConfirmDeleteMacroCancel => {
                 Some(ButtonPressedTarget::ConfirmDeleteMacroCancel)
@@ -1904,6 +1928,9 @@ impl App {
             | PromptState::ConfirmCloseTab { .. }
             | PromptState::ConfirmDetachAgent { .. }
             | PromptState::ConfirmRecreateWorkingCopy { .. }
+            | PromptState::ConfirmCheckoutDefaultBranch { .. }
+            | PromptState::ConfirmDeleteProject { .. }
+            | PromptState::ConfirmRemoveProject { .. }
             | PromptState::ConfirmQuit { .. }
             | PromptState::ConfirmDiscardFile { .. }
             | PromptState::ConfirmInitRepo { .. }
@@ -2839,10 +2866,13 @@ impl App {
         let reaction = self.engine.apply(Command::Pull {
             repo_path: PathBuf::from(managed.worktree_path.clone()),
             target: PullTarget::Session,
-            busy_message: "Pulling latest changes from remote\u{2026}".to_string(),
+            busy_message: "Pulling latest changes from remote\u{2026}"
+                .to_string()
+                .into(),
             already_running_message:
                 "Pull already in progress for this worktree. Wait for the current pull to finish."
-                    .to_string(),
+                    .to_string()
+                    .into(),
         })?;
         self.apply_reaction(reaction);
         Ok(())
@@ -4864,6 +4894,62 @@ impl App {
         Some(false)
     }
 
+    fn handle_confirm_checkout_default_branch_prompt_key(&mut self, key: KeyEvent) -> Option<bool> {
+        let PromptState::ConfirmCheckoutDefaultBranch { focus, .. } = &mut self.prompt else {
+            return None;
+        };
+        let confirm = focus.is_confirm();
+        let action = self.bindings.lookup(&key, BindingScope::Dialog);
+        match modal_key_step(action, key, false) {
+            // Escape is a cancel, and a cancel says so.
+            ModalKeyStep::Close => {
+                return Some(self.resolve_confirm_checkout_default_branch(false));
+            }
+            ModalKeyStep::MoveFocus(_) => *focus = focus.toggled(),
+            ModalKeyStep::Confirm | ModalKeyStep::ActivateFocus => {
+                return Some(self.resolve_confirm_checkout_default_branch(confirm));
+            }
+            ModalKeyStep::FallThroughToField => {}
+        }
+        Some(false)
+    }
+
+    fn handle_confirm_delete_project_prompt_key(&mut self, key: KeyEvent) -> Option<bool> {
+        let PromptState::ConfirmDeleteProject { focus, .. } = &mut self.prompt else {
+            return None;
+        };
+        let confirm = focus.is_confirm();
+        let action = self.bindings.lookup(&key, BindingScope::Dialog);
+        match modal_key_step(action, key, false) {
+            // Escape is a cancel, and a cancel says so.
+            ModalKeyStep::Close => return Some(self.resolve_confirm_delete_project(false)),
+            ModalKeyStep::MoveFocus(_) => *focus = focus.toggled(),
+            ModalKeyStep::Confirm | ModalKeyStep::ActivateFocus => {
+                return Some(self.resolve_confirm_delete_project(confirm));
+            }
+            ModalKeyStep::FallThroughToField => {}
+        }
+        Some(false)
+    }
+
+    fn handle_confirm_remove_project_prompt_key(&mut self, key: KeyEvent) -> Option<bool> {
+        let PromptState::ConfirmRemoveProject { focus, .. } = &mut self.prompt else {
+            return None;
+        };
+        let confirm = focus.is_confirm();
+        let action = self.bindings.lookup(&key, BindingScope::Dialog);
+        match modal_key_step(action, key, false) {
+            // Escape is a cancel, and a cancel says so.
+            ModalKeyStep::Close => return Some(self.resolve_confirm_remove_project(false)),
+            ModalKeyStep::MoveFocus(_) => *focus = focus.toggled(),
+            ModalKeyStep::Confirm | ModalKeyStep::ActivateFocus => {
+                return Some(self.resolve_confirm_remove_project(confirm));
+            }
+            ModalKeyStep::FallThroughToField => {}
+        }
+        Some(false)
+    }
+
     fn handle_confirm_quit_prompt_key(&mut self, key: KeyEvent) -> Option<bool> {
         let PromptState::ConfirmQuit { focus, .. } = &mut self.prompt else {
             return None;
@@ -4963,7 +5049,6 @@ impl App {
 
     fn handle_confirm_non_default_branch_prompt_key(&mut self, key: KeyEvent) -> Option<bool> {
         let PromptState::ConfirmNonDefaultBranch {
-            action,
             focus,
             kind,
             checkout_default,
@@ -4972,8 +5057,7 @@ impl App {
         else {
             return None;
         };
-        let has_checkbox =
-            matches!(kind, BranchWarningKind::Known { .. }) && action.allows_add_anyway();
+        let has_checkbox = matches!(kind, BranchWarningKind::Known { .. });
         let action = self.bindings.lookup(&key, BindingScope::Dialog);
         match modal_key_step(action, key, false) {
             ModalKeyStep::Close => self.prompt = PromptState::None,
@@ -5065,6 +5149,15 @@ impl App {
             return Some(exit);
         }
         if let Some(exit) = self.handle_confirm_recreate_working_copy_prompt_key(key) {
+            return Some(exit);
+        }
+        if let Some(exit) = self.handle_confirm_checkout_default_branch_prompt_key(key) {
+            return Some(exit);
+        }
+        if let Some(exit) = self.handle_confirm_delete_project_prompt_key(key) {
+            return Some(exit);
+        }
+        if let Some(exit) = self.handle_confirm_remove_project_prompt_key(key) {
             return Some(exit);
         }
         if let Some(exit) = self.handle_confirm_quit_prompt_key(key) {
@@ -6626,6 +6719,51 @@ impl App {
                 column,
                 row,
             ),
+            OverlayMouseLayout::ConfirmCheckoutDefaultBranch {
+                cancel_button,
+                confirm_button,
+            } => click_target(
+                &[
+                    (
+                        cancel_button,
+                        PromptMouseTarget::ConfirmCheckoutDefaultBranchCancel,
+                    ),
+                    (
+                        confirm_button,
+                        PromptMouseTarget::ConfirmCheckoutDefaultBranchConfirm,
+                    ),
+                ],
+                column,
+                row,
+            ),
+            OverlayMouseLayout::ConfirmDeleteProject {
+                cancel_button,
+                confirm_button,
+            } => click_target(
+                &[
+                    (cancel_button, PromptMouseTarget::ConfirmDeleteProjectCancel),
+                    (
+                        confirm_button,
+                        PromptMouseTarget::ConfirmDeleteProjectConfirm,
+                    ),
+                ],
+                column,
+                row,
+            ),
+            OverlayMouseLayout::ConfirmRemoveProject {
+                cancel_button,
+                confirm_button,
+            } => click_target(
+                &[
+                    (cancel_button, PromptMouseTarget::ConfirmRemoveProjectCancel),
+                    (
+                        confirm_button,
+                        PromptMouseTarget::ConfirmRemoveProjectConfirm,
+                    ),
+                ],
+                column,
+                row,
+            ),
             OverlayMouseLayout::ConfirmDetachAgent {
                 cancel_button,
                 confirm_button,
@@ -7792,6 +7930,205 @@ impl App {
         false
     }
 
+    /// Answer the "check out the default branch?" confirmation. Confirming
+    /// starts the checkout against the project as it is NOW (it may have been
+    /// removed while the dialog was up); cancelling runs nothing and says so,
+    /// because a silent close is indistinguishable from a checkout that quietly
+    /// did nothing.
+    pub(super) fn resolve_confirm_checkout_default_branch(&mut self, confirm: bool) -> bool {
+        let (project_id, project_name) = match &self.prompt {
+            PromptState::ConfirmCheckoutDefaultBranch {
+                project_id,
+                project_name,
+                ..
+            } => (project_id.clone(), project_name.clone()),
+            _ => return false,
+        };
+        self.prompt = PromptState::None;
+        // Both answers ask the project as it is now: the base the dialog was
+        // opened with may have moved, or the project may be gone.
+        let project = self
+            .engine
+            .projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .cloned();
+        if !confirm {
+            match &project {
+                Some(project) => {
+                    self.set_info(dux_core::engine::checkout_default_branch_cancelled_message(
+                        &project.name,
+                        project.leading_branch.as_deref(),
+                    ));
+                }
+                None => self.set_info(
+                    dux_core::engine::checkout_default_branch_cancelled_project_gone_message(
+                        &project_name,
+                    ),
+                ),
+            }
+            return false;
+        }
+        let Some(project) = project else {
+            self.set_warning(
+                dux_core::engine::checkout_default_branch_project_gone_message(&project_name),
+            );
+            return false;
+        };
+        self.dispatch_checkout_project_default_branch(project);
+        false
+    }
+
+    /// Answer the "delete project?" confirmation. Confirming runs the core
+    /// cascade against the project as it is NOW (it may have been removed
+    /// while the dialog was up, which is said out loud); cancelling deletes
+    /// nothing and says so, because a silent close is indistinguishable from a
+    /// delete that quietly did nothing.
+    pub(crate) fn resolve_confirm_delete_project(&mut self, confirm: bool) -> bool {
+        let (project_id, project_name, painted) = match &self.prompt {
+            PromptState::ConfirmDeleteProject {
+                project_id,
+                project_name,
+                agent_count,
+                ..
+            } => (project_id.clone(), project_name.clone(), *agent_count),
+            _ => return false,
+        };
+        if confirm
+            && self.ask_again_if_project_grew(
+                &project_id,
+                &project_name,
+                painted,
+                dux_core::project_prose::ProjectGoneVerb::Delete,
+            )
+        {
+            return false;
+        }
+        self.prompt = PromptState::None;
+        if !confirm {
+            self.set_info(dux_core::project_prose::delete_project_cancelled_message(
+                &project_name,
+                self.project_agent_count(&project_id),
+            ));
+            return false;
+        }
+        let Some(project) = self
+            .engine
+            .projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .cloned()
+        else {
+            self.set_warning(dux_core::project_prose::project_gone_message(
+                &project_name,
+                dux_core::project_prose::ProjectGoneVerb::Delete,
+            ));
+            return false;
+        };
+        if let Err(err) = self.run_delete_project(project) {
+            self.set_error(format!("{err:#}"));
+        }
+        false
+    }
+
+    /// The project-confirm guard: when the project now holds more agents than
+    /// the dialog last painted, the confirm was consent to a smaller cascade.
+    /// Keep the dialog open (the next paint shows the true count), hand focus
+    /// back to Cancel, and say why on the status line. Returns whether it asked
+    /// again, in which case nothing may run.
+    fn ask_again_if_project_grew(
+        &mut self,
+        project_id: &str,
+        project_name: &str,
+        painted: usize,
+        verb: dux_core::project_prose::ProjectGoneVerb,
+    ) -> bool {
+        let live = self.project_agent_count(project_id);
+        if live <= painted {
+            return false;
+        }
+        match &mut self.prompt {
+            PromptState::ConfirmDeleteProject { focus, .. }
+            | PromptState::ConfirmRemoveProject { focus, .. } => *focus = ConfirmFocus::Cancel,
+            _ => {}
+        }
+        self.set_warning(dux_core::project_prose::project_gained_agents_message(
+            project_name,
+            live,
+            verb,
+        ));
+        true
+    }
+
+    /// Answer the "remove project?" confirmation. Confirming re-reads the
+    /// target: a real project must still exist and still hold no agents, and
+    /// an orphaned group must still have agents to clear. Cancelling removes
+    /// nothing and says so.
+    pub(crate) fn resolve_confirm_remove_project(&mut self, confirm: bool) -> bool {
+        let (project_id, project_name, orphaned, painted) = match &self.prompt {
+            PromptState::ConfirmRemoveProject {
+                project_id,
+                project_name,
+                orphaned,
+                agent_count,
+                ..
+            } => (
+                project_id.clone(),
+                project_name.clone(),
+                *orphaned,
+                *agent_count,
+            ),
+            _ => return false,
+        };
+        // A real project's removal needs no re-ask: `run_remove_project` refuses
+        // one that has gained any agent at all.
+        if confirm
+            && orphaned
+            && self.ask_again_if_project_grew(
+                &project_id,
+                &project_name,
+                painted,
+                dux_core::project_prose::ProjectGoneVerb::Remove,
+            )
+        {
+            return false;
+        }
+        self.prompt = PromptState::None;
+        if !confirm {
+            self.set_info(dux_core::project_prose::remove_project_cancelled_message(
+                &project_name,
+            ));
+            return false;
+        }
+        let gone = dux_core::project_prose::project_gone_message(
+            &project_name,
+            dux_core::project_prose::ProjectGoneVerb::Remove,
+        );
+        let outcome = if orphaned {
+            if self.project_agent_count(&project_id) == 0 {
+                self.set_warning(gone);
+                return false;
+            }
+            self.run_remove_orphaned_project(project_id, project_name)
+        } else {
+            let Some(project) = self
+                .engine
+                .projects
+                .iter()
+                .find(|p| p.id == project_id)
+                .cloned()
+            else {
+                self.set_warning(gone);
+                return false;
+            };
+            self.run_remove_project(project)
+        };
+        if let Err(err) = outcome {
+            self.set_error(format!("{err:#}"));
+        }
+        false
+    }
+
     pub(super) fn resolve_confirm_close_tab(&mut self, confirm: bool) -> bool {
         let (session_id, tab_id) = match &self.prompt {
             PromptState::ConfirmCloseTab {
@@ -7990,9 +8327,9 @@ impl App {
     }
 
     fn resolve_confirm_non_default_branch(&mut self) -> bool {
-        let (action, branch, checkout_default, default_branch) = match &self.prompt {
+        let (add, branch, checkout_default, default_branch) = match &self.prompt {
             PromptState::ConfirmNonDefaultBranch {
-                action,
+                add,
                 current_branch,
                 kind,
                 checkout_default,
@@ -8003,7 +8340,7 @@ impl App {
                     BranchWarningKind::Heuristic => None,
                 };
                 (
-                    action.clone(),
+                    add.clone(),
                     current_branch.clone(),
                     *checkout_default && default_branch.is_some(),
                     default_branch,
@@ -8011,30 +8348,31 @@ impl App {
             }
             _ => return false,
         };
+        // The box decides the base: ticked, new worktrees branch from the
+        // default it checks out; unticked, from the branch the folder is on.
+        let leading_branch = dux_core::add_project_plan::project_base_at_add(
+            Some(branch.as_str()),
+            default_branch.as_deref(),
+            checkout_default,
+        )
+        .into_branch();
         self.prompt = PromptState::None;
         if checkout_default {
             // Safe: `checkout_default` is only true when `default_branch` is `Some`.
             let target = default_branch.expect("checkout_default implies known default branch");
-            let reason = match action {
-                NonDefaultBranchAction::AddProject { .. } => "before adding the project",
-                NonDefaultBranchAction::CheckoutProjectDefault { .. } => "for the selected project",
+            let action = NonDefaultBranchAction::AddProject {
+                path: add.path,
+                name: add.name,
+                leading_branch,
             };
-            self.dispatch_non_default_branch_checkout(action, target, reason.to_string(), None);
-        } else {
-            match action {
-                NonDefaultBranchAction::AddProject {
-                    path,
-                    name,
-                    leading_branch,
-                } => {
-                    if let Err(e) = self.finish_add_project(path, name, branch, leading_branch) {
-                        self.set_error(format!("{e:#}"));
-                    }
-                }
-                NonDefaultBranchAction::CheckoutProjectDefault { .. } => {
-                    self.set_error("Check out the default branch before retrying.");
-                }
-            }
+            self.dispatch_non_default_branch_checkout(
+                action,
+                target,
+                "before adding the project".to_string(),
+                None,
+            );
+        } else if let Err(e) = self.finish_add_project(add.path, add.name, branch, leading_branch) {
+            self.set_error(format!("{e:#}"));
         }
         false
     }
@@ -8442,14 +8780,12 @@ impl App {
             }
             OverlayCheckboxId::NonDefaultBranchCheckoutDefault => {
                 if let PromptState::ConfirmNonDefaultBranch {
-                    action,
                     kind,
                     checkout_default,
                     focus,
                     ..
                 } = &mut self.prompt
                     && matches!(kind, BranchWarningKind::Known { .. })
-                    && action.allows_add_anyway()
                 {
                     *checkout_default = !*checkout_default;
                     *focus = ConfirmNonDefaultBranchFocus::Checkbox;
@@ -8993,6 +9329,12 @@ impl App {
             | PromptMouseTarget::ConfirmDetachAgentConfirm
             | PromptMouseTarget::ConfirmRecreateWorkingCopyCancel
             | PromptMouseTarget::ConfirmRecreateWorkingCopyConfirm
+            | PromptMouseTarget::ConfirmCheckoutDefaultBranchCancel
+            | PromptMouseTarget::ConfirmCheckoutDefaultBranchConfirm
+            | PromptMouseTarget::ConfirmDeleteProjectCancel
+            | PromptMouseTarget::ConfirmDeleteProjectConfirm
+            | PromptMouseTarget::ConfirmRemoveProjectCancel
+            | PromptMouseTarget::ConfirmRemoveProjectConfirm
             | PromptMouseTarget::ConfirmDeleteMacroCancel
             | PromptMouseTarget::ConfirmDeleteMacroConfirm
             | PromptMouseTarget::MacroCancel
@@ -9112,6 +9454,24 @@ impl App {
             }
             ButtonPressedTarget::ConfirmRecreateWorkingCopyConfirm => {
                 self.resolve_confirm_recreate_working_copy(true)
+            }
+            ButtonPressedTarget::ConfirmCheckoutDefaultBranchCancel => {
+                self.resolve_confirm_checkout_default_branch(false)
+            }
+            ButtonPressedTarget::ConfirmCheckoutDefaultBranchConfirm => {
+                self.resolve_confirm_checkout_default_branch(true)
+            }
+            ButtonPressedTarget::ConfirmDeleteProjectCancel => {
+                self.resolve_confirm_delete_project(false)
+            }
+            ButtonPressedTarget::ConfirmDeleteProjectConfirm => {
+                self.resolve_confirm_delete_project(true)
+            }
+            ButtonPressedTarget::ConfirmRemoveProjectCancel => {
+                self.resolve_confirm_remove_project(false)
+            }
+            ButtonPressedTarget::ConfirmRemoveProjectConfirm => {
+                self.resolve_confirm_remove_project(true)
             }
             ButtonPressedTarget::ConfirmDeleteMacroCancel => {
                 self.resolve_confirm_delete_macro(false)
@@ -11317,6 +11677,7 @@ mod tests {
         configure_project_text_input, cursor_from_single_line_position, snapshot_cell_columns,
         startup_command_log_visual_lines,
     };
+    use std::process::Command;
 
     /// The commit success message advertises the push key only where pushing can
     /// succeed. A standalone agent has no branch, so the key it used to name
@@ -11375,7 +11736,6 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
     use ratatui::text::Line;
-    use std::process::Command;
     use tempfile::tempdir;
 
     #[test]
@@ -13004,17 +13364,17 @@ not_a_real_action = ["x"]
         );
         std::fs::create_dir_all(worktree).expect("worktree dir");
 
-        Command::new("git")
+        dux_core::test_git::fixture_git()
             .args(["init"])
             .current_dir(worktree)
             .output()
             .expect("git init");
-        Command::new("git")
+        dux_core::test_git::fixture_git()
             .args(["config", "user.email", "test@example.com"])
             .current_dir(worktree)
             .output()
             .expect("git email");
-        Command::new("git")
+        dux_core::test_git::fixture_git()
             .args(["config", "user.name", "Test User"])
             .current_dir(worktree)
             .output()
@@ -13025,12 +13385,12 @@ not_a_real_action = ["x"]
             std::fs::create_dir_all(parent).expect("file parent");
         }
         std::fs::write(&file_path, original).expect("write original");
-        Command::new("git")
+        dux_core::test_git::fixture_git()
             .args(["add", relative_path])
             .current_dir(worktree)
             .output()
             .expect("git add");
-        Command::new("git")
+        dux_core::test_git::fixture_git()
             .args(["commit", "-m", "initial"])
             .current_dir(worktree)
             .output()
@@ -13226,7 +13586,7 @@ not_a_real_action = ["x"]
     /// something to open.
     fn select_a_modified_file_in_a_repo(app: &mut App, repo: &std::path::Path) {
         let git = |args: &[&str]| {
-            std::process::Command::new("git")
+            dux_core::test_git::fixture_git()
                 .args(args)
                 .current_dir(repo)
                 .output()
@@ -15870,10 +16230,9 @@ not_a_real_action = ["x"]
     fn chooser_new_agent_on_agentless_project_proceeds_to_branch_inspection() {
         let mut app = test_app(default_bindings());
         // Point the second project at a real repo so branch inspection can run.
-        let repo = PathBuf::from(&app.engine.projects[0].path)
-            .parent()
-            .unwrap()
-            .join("second-repo");
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let repo = scratch.path().join("second-repo");
+        app.test_scratch_dirs.push(scratch);
         std::fs::create_dir_all(&repo).unwrap();
         init_test_repo(&repo);
         app.engine.projects.push(Project {
@@ -16402,7 +16761,7 @@ not_a_real_action = ["x"]
             session.clone(),
             true,
             AgentLaunchKind::Create {
-                status_message: "imported".to_string(),
+                status_message: "imported".to_string().into(),
                 repo_path: app.engine.projects[0].path.clone(),
                 owns_worktree: false,
                 startup_result: None,
@@ -23070,6 +23429,51 @@ not_a_real_action = ["x"]
         }
     }
 
+    /// A pull request's head branch is somebody else's text. The name the
+    /// prompt seeds (visible and editable) drops the bidi controls that would
+    /// redraw the dialog around it, while the head branch the create looks up
+    /// keeps its exact bytes.
+    #[test]
+    fn a_pull_request_head_branch_seeds_the_name_without_bidi_controls() {
+        let mut app = test_app(default_bindings());
+        let project = app.engine.projects[0].clone();
+        let crafted = "feat\u{202E}txt.exe";
+
+        app.engine
+            .worker_tx
+            .send(WorkerEvent::PullRequestResolved {
+                result: Ok(ResolvedPullRequest {
+                    project,
+                    host: "github.com".to_string(),
+                    owner_repo: "octocat/Hello-World".to_string(),
+                    number: 42,
+                    title: "Fix issue".to_string(),
+                    state: "OPEN".to_string(),
+                    head_ref_name: crafted.to_string(),
+                    custom_name: None,
+                }),
+                purpose: dux_core::worker::PrLookupPurpose::CreateAgent,
+                status_op_id: None,
+            })
+            .expect("send PR resolution");
+        app.drain_events();
+
+        let PromptState::NameNewAgent { input, request, .. } = &app.prompt else {
+            panic!("expected name-new-agent prompt, got {:?}", app.prompt);
+        };
+        assert_eq!(input.text, "feattxt.exe");
+        let CreateAgentRequest::PullRequest {
+            head_branch,
+            custom_name,
+            ..
+        } = request
+        else {
+            panic!("expected PullRequest request, got {request:?}");
+        };
+        assert_eq!(head_branch, crafted, "the lookup keeps the exact ref");
+        assert_eq!(custom_name.as_deref(), Some("feattxt.exe"));
+    }
+
     /// Mint and register a PR-lookup op exactly as `dispatch_pull_request_lookup`
     /// does (without spawning the real `gh` worker), returning its opaque id and
     /// leaving its keyed busy on the status line.
@@ -23659,7 +24063,7 @@ cyan = "#00ffff"
         let outside = tempdir().expect("outside tempdir");
         let run = |args: &[&str]| {
             assert!(
-                std::process::Command::new("git")
+                dux_core::test_git::fixture_git()
                     .args(args)
                     .current_dir(outside.path())
                     .output()
@@ -26882,7 +27286,7 @@ cyan = "#00ffff"
         .to_path_buf();
         std::fs::create_dir_all(&worktree).expect("worktree dir");
         let git = |args: &[&str]| {
-            Command::new("git")
+            dux_core::test_git::fixture_git()
                 .args(args)
                 .current_dir(&worktree)
                 .output()
@@ -27028,7 +27432,7 @@ cyan = "#00ffff"
         .to_path_buf();
         std::fs::create_dir_all(&worktree).expect("worktree dir");
         let git = |args: &[&str]| {
-            Command::new("git")
+            dux_core::test_git::fixture_git()
                 .args(args)
                 .current_dir(&worktree)
                 .output()
@@ -27433,10 +27837,9 @@ cyan = "#00ffff"
     fn tab_with_shift_moves_non_default_branch_focus_backwards_when_checkbox_present() {
         let mut app = test_app(default_bindings());
         app.prompt = PromptState::ConfirmNonDefaultBranch {
-            action: NonDefaultBranchAction::AddProject {
+            add: crate::app::PendingProjectAdd {
                 path: "/tmp/project".to_string(),
                 name: "project".to_string(),
-                leading_branch: "main".to_string(),
             },
             current_branch: "feature".to_string(),
             kind: BranchWarningKind::Known {
@@ -27479,10 +27882,9 @@ cyan = "#00ffff"
     fn tab_with_shift_moves_non_default_branch_focus_backwards_without_checkbox() {
         let mut app = test_app(default_bindings());
         app.prompt = PromptState::ConfirmNonDefaultBranch {
-            action: NonDefaultBranchAction::AddProject {
+            add: crate::app::PendingProjectAdd {
                 path: "/tmp/project".to_string(),
                 name: "project".to_string(),
-                leading_branch: "feature".to_string(),
             },
             current_branch: "feature".to_string(),
             kind: BranchWarningKind::Heuristic,
@@ -36847,23 +37249,24 @@ cyan = "#00ffff"
     }
 
     /// A git repository with no commits yet, so `add_project` takes the
-    /// initial-commit rung. Leaked rather than returned so the caller keeps one
-    /// return type.
-    fn leaked_unborn_repo() -> String {
+    /// initial-commit rung. The app holds the directory's guard, so it is
+    /// removed when the app drops.
+    fn scratch_unborn_repo(app: &mut App) -> String {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().to_path_buf();
-        std::mem::forget(dir);
+        app.test_scratch_dirs.push(dir);
         run_git(&path, &["init", "-b", "main"]);
         run_git(&path, &["config", "user.name", "test"]);
         run_git(&path, &["config", "user.email", "t@t"]);
         path.to_string_lossy().to_string()
     }
 
-    /// A plain directory that is not a repository at all.
-    fn leaked_plain_dir() -> String {
+    /// A plain directory that is not a repository at all, held by the app the
+    /// same way.
+    fn scratch_plain_dir(app: &mut App) -> String {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().to_path_buf();
-        std::mem::forget(dir);
+        app.test_scratch_dirs.push(dir);
         path.to_string_lossy().to_string()
     }
 
@@ -36929,11 +37332,13 @@ cyan = "#00ffff"
                     .expect("open the discard confirmation");
             }
             "ConfirmCreateInitialCommit" => {
-                app.add_project(leaked_unborn_repo(), "Fresh".to_string())
+                let repo = scratch_unborn_repo(&mut app);
+                app.add_project(repo, "Fresh".to_string())
                     .expect("add an unborn repo");
             }
             "ConfirmInitRepo" => {
-                app.add_project_from_browser_path(leaked_plain_dir());
+                let dir = scratch_plain_dir(&mut app);
+                app.add_project_from_browser_path(dir);
             }
             "ConfirmUseExistingBranch" => {
                 let project = app.engine.projects[0].clone();
@@ -37579,10 +37984,9 @@ cyan = "#00ffff"
         // ── ConfirmNonDefaultBranch: Cancel -> Add -> Checkbox.
         let mut app = test_app(default_bindings());
         app.prompt = PromptState::ConfirmNonDefaultBranch {
-            action: NonDefaultBranchAction::AddProject {
+            add: crate::app::PendingProjectAdd {
                 path: "/tmp/project".to_string(),
                 name: "project".to_string(),
-                leading_branch: "main".to_string(),
             },
             current_branch: "feature".to_string(),
             kind: BranchWarningKind::Known {

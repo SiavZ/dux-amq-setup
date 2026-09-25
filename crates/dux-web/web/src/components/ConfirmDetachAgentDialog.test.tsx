@@ -1,5 +1,11 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { Bootstrap } from "@/lib/bootstrapApi"
@@ -107,7 +113,9 @@ describe("ConfirmDetachAgentDialog", () => {
 
     expect(await screen.findByText("Detach agent?")).toBeTruthy()
     const body = await screen.findByText(/dux will ask/)
-    expect(body.textContent).toContain('"fix-auth"')
+    // The agent's name is a chip, and the chip replaces the quotes.
+    expect(within(body).getByText("fix-auth", { selector: "code" })).toBeTruthy()
+    expect(body.textContent).toContain("dux will ask fix-auth to shut down")
     expect(body.textContent).toContain("wait up to 45 seconds")
     expect(body.textContent).toContain("stays in the list as Detached")
   })

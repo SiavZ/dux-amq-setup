@@ -3,6 +3,7 @@
 // `sessions.changed` events over `/ws/events` tell the client when to re-GET,
 // and a non-2xx throws a `WorkspaceFetchError` carrying the HTTP status.
 import type { AgentWorkspaceWire } from "@/lib/agentWorkspace"
+import { stripBidiControls } from "@/lib/bidi"
 import type {
   AgentTabView,
   ProjectView,
@@ -176,6 +177,9 @@ export function normalizeWorkspace(raw: RawWorkspace): Spine {
       } = rawSession
       return {
         ...s,
+        // Someone else's text, cleaned once here for every screen that draws it
+        // (see `./bidi`).
+        ...(s.pr ? { pr: { ...s.pr, title: stripBidiControls(s.pr.title) } } : {}),
         workspace: normalizeSessionWorkspace(rawSession),
         tabs: (s.tabs ?? []).map(normalizeTab),
         // An older server that predates attention omits the field; treat missing

@@ -9,6 +9,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import {
   Select,
   SelectContent,
@@ -52,7 +53,9 @@ function ChangeProviderForm({
   return (
     <DialogContent showCloseButton={false}>
       <DialogHeader>
-        <DialogTitle>Change provider: {label}</DialogTitle>
+        <DialogTitle>
+          Change provider: <InlineCode>{label}</InlineCode>
+        </DialogTitle>
         <DialogDescription>
           Pick the CLI this agent uses. The change takes effect the next time
           this agent launches; the running session keeps its current provider

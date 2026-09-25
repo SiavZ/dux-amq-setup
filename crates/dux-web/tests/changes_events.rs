@@ -53,7 +53,7 @@ fn sample_session(id: &str, worktree: &str) -> dux_core::model::AgentSession {
 }
 
 fn run_git(cwd: &std::path::Path, args: &[&str]) {
-    let ok = std::process::Command::new("git")
+    let ok = dux_core::test_git::fixture_git()
         .args(args)
         .current_dir(cwd)
         .status()
@@ -81,8 +81,8 @@ fn init_repo_with_unstaged(dir: &std::path::Path) {
 ///
 /// Also injects a test-only gated probe route `/api/_interest` returning the bus's
 /// currently-interested session ids (so a test can assert interest exactness).
-async fn boot() -> (SocketAddr, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().unwrap();
+async fn boot() -> (SocketAddr, dux_core::test_scratch::ScratchDir) {
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
 
     let wt1 = root.join("wt1");
@@ -159,6 +159,7 @@ async fn boot() -> (SocketAddr, tempfile::TempDir) {
     // is covered by dux_core::engine::limits with synthetic samples.
     engine.config.limits.disk_high_water_pct = 0;
     engine.config.limits.disk_warn_pct = 0;
+    dux_core::test_provider::defuse_config(&mut engine.config);
     let (handle, _join) = spawn_engine_thread(engine);
 
     let probe: Router<AppState> = Router::new()

@@ -10,6 +10,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -193,7 +194,7 @@ function PickerBody() {
             </p>
             {filtered.length === 0 ? (
               <p className="px-2 py-4 text-sm text-muted-foreground">
-                No projects match “{query}”.
+                No projects match <InlineCode>{query}</InlineCode>.
               </p>
             ) : (
               filtered.map((project) => {

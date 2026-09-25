@@ -44,9 +44,9 @@ fn sample_session(id: &str, worktree: &str) -> dux_core::model::AgentSession {
 async fn boot() -> (
     SocketAddr,
     std::sync::Arc<LiveServerLimits>,
-    tempfile::TempDir,
+    dux_core::test_scratch::ScratchDir,
 ) {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
     let wt1 = root.join("wt1");
     std::fs::create_dir_all(&wt1).unwrap();
@@ -81,7 +81,8 @@ async fn boot() -> (
             .create_session(&sample_session("s1", wt1.to_string_lossy().as_ref()))
             .unwrap();
     }
-    let engine = bootstrap_engine(&paths).unwrap();
+    let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     let (handle, _join) = spawn_engine_thread(engine);
     let limits = handle.live_limits();
     let app = build_app(

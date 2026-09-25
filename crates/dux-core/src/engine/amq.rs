@@ -1359,7 +1359,7 @@ mod tests {
     /// is the persisted identity AMQ routes by, not derived from the
     /// directory (the worktree basename also reads `alice`, so legacy
     /// directory aliases resolve to the same agent).
-    fn engine_with_agent() -> (Engine, tempfile::TempDir, PathBuf) {
+    fn engine_with_agent() -> (Engine, crate::test_scratch::ScratchDir, PathBuf) {
         let (mut engine, tmp) = test_engine();
         let mut session = sample_session("s1", "p1", "feature/x");
         session.agent_handle = "alice".to_string();
@@ -1879,7 +1879,7 @@ mod tests {
 
     // ─── orchestrator watchdog ──────────────────────────────────────
 
-    fn orchestrator_engine() -> (Engine, tempfile::TempDir) {
+    fn orchestrator_engine() -> (Engine, crate::test_scratch::ScratchDir) {
         let (mut engine, tmp, _queue) = engine_with_agent();
         engine.config.amq.inject.startup_grace_ms = 0;
         engine.config.amq.orchestrator.poll_interval_secs = 1;

@@ -61,6 +61,14 @@ pub enum InFlightKey {
     /// this key, which also makes init-and-commit and commit-only on one path
     /// mutually exclusive.
     InitialCommit(String),
+    /// A "check out the default branch" is running for the project whose
+    /// checkout is at this path, keyed by the project's path like `Pull`, so a
+    /// second request from either surface cannot race the first one's
+    /// `git switch` and report a false failure. Taken by
+    /// [`super::Engine::begin_default_branch_checkout`] and released at every
+    /// ending of the chain: the inspection's heuristic, failure and
+    /// already-on-default answers, and the switch's success or failure.
+    CheckoutDefaultBranch(String),
 }
 
 /// Convenience alias so call sites can spell the storage shape once.

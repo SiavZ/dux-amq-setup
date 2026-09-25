@@ -80,6 +80,19 @@ afterEach(() => {
 })
 
 describe("NewAgentPickerDialog", () => {
+  // What the user typed is a value, so the empty state shows it as the shared
+  // chip rather than in quotes.
+  it("names the search that matched nothing as a chip", () => {
+    seed("new")
+    render(<NewAgentPickerDialog />)
+    fireEvent.change(screen.getByLabelText("Search projects"), {
+      target: { value: "zzz" },
+    })
+    const empty = screen.getByText(/No projects match/)
+    expect(empty.textContent).toBe("No projects match zzz.")
+    expect(screen.getByText("zzz", { selector: "code" })).toBeTruthy()
+  })
+
   it("opens the create-agent name dialog for the clicked project in the new intent", () => {
     seed("new")
     render(<NewAgentPickerDialog />)

@@ -1,0 +1,349 @@
+{
+  "note": "Dialog sentences BOTH surfaces print, as prose segments: a string is constant words, an object is a name each surface draws as a chip (`quoted` says the plain-text spelling wraps it in straight double quotes). Read by `the_two_surfaces_build_every_shared_sentence_from_the_same_segments` in crates/dux-core/src/prose.rs and by prose.test.tsx in crates/dux-web/web. Adjacent strings are merged before comparing, so either side may split its constant words however it likes; the words and the names must be the same. Paths are outside any home directory because the terminal side home-collapses them. A single line break inside a sentence is where the terminal UI breaks the row; the web renders it as the space HTML makes of it.",
+  "cases": [
+    {
+      "what": "detaching an agent with one running tab",
+      "sentence": "detach_confirm",
+      "args": {
+        "label": "feat/login",
+        "grace_seconds": 30,
+        "live_tabs": 1
+      },
+      "segments": [
+        "dux will ask ",
+        {
+          "name": "feat/login",
+          "quoted": true
+        },
+        " to shut down and wait up to 30 seconds for it to exit before forcing it. The agent stays in the list as Detached, and you can resume it later. Anything the agent is doing right now is interrupted."
+      ]
+    },
+    {
+      "what": "detaching an agent with several running tabs",
+      "sentence": "detach_confirm",
+      "args": {
+        "label": "feat/login",
+        "grace_seconds": 45,
+        "live_tabs": 3
+      },
+      "segments": [
+        "dux will ask ",
+        {
+          "name": "feat/login",
+          "quoted": true
+        },
+        " to shut down and wait up to 45 seconds for it to exit before forcing it. The agent stays in the list as Detached, and you can resume it later. Anything the agent is doing right now is interrupted. All 3 running tabs stop together."
+      ]
+    },
+    {
+      "what": "recreating a working copy under a running Claude tab",
+      "sentence": "recreate_confirm",
+      "args": {
+        "worktree_label": "/srv/worktrees/dux/feat-login",
+        "branch_name": "feat/login",
+        "source_branch": "main",
+        "conversation_resumes": true,
+        "providers": [
+          "claude"
+        ]
+      },
+      "segments": [
+        "Recreate the working copy for this agent at ",
+        {
+          "name": "/srv/worktrees/dux/feat-login",
+          "quoted": false
+        },
+        "?\n\nIf branch ",
+        {
+          "name": "feat/login",
+          "quoted": true
+        },
+        " still exists locally, dux checks it out there again. If it is gone locally but still on the remote, dux creates it again from ",
+        {
+          "name": "origin/feat/login",
+          "quoted": true
+        },
+        ", holding everything that had been pushed. If it is gone everywhere, dux creates it again from ",
+        {
+          "name": "main",
+          "quoted": true
+        },
+        ", and the commits that branch held are not coming back.\n\nAny code changes that were in the old directory are gone either way: this puts the directory back, not its contents. The conversation may resume, because the agent's CLI keys its history by directory path and dux recreates the working copy at the same path.\n\nA running ",
+        {
+          "name": "Claude",
+          "quoted": false
+        },
+        " tab keeps working in the recreated copy by itself. A terminal still open in the old directory keeps working in a directory that is gone; close it and open one in the recreated copy."
+      ]
+    },
+    {
+      "what": "recreating a working copy under several CLIs that cannot follow the folder",
+      "sentence": "recreate_confirm",
+      "args": {
+        "worktree_label": "/srv/worktrees/dux/fix",
+        "branch_name": "fix",
+        "source_branch": "develop",
+        "conversation_resumes": false,
+        "providers": [
+          "codex",
+          "opencode",
+          "claude",
+          "copilot"
+        ]
+      },
+      "segments": [
+        "Recreate the working copy for this agent at ",
+        {
+          "name": "/srv/worktrees/dux/fix",
+          "quoted": false
+        },
+        "?\n\nIf branch ",
+        {
+          "name": "fix",
+          "quoted": true
+        },
+        " still exists locally, dux checks it out there again. If it is gone locally but still on the remote, dux creates it again from ",
+        {
+          "name": "origin/fix",
+          "quoted": true
+        },
+        ", holding everything that had been pushed. If it is gone everywhere, dux creates it again from ",
+        {
+          "name": "develop",
+          "quoted": true
+        },
+        ", and the commits that branch held are not coming back.\n\nAny code changes that were in the old directory are gone either way: this puts the directory back, not its contents. The conversation will not resume: this agent's CLI has no way to pick a conversation back up, so it starts fresh wherever it runs.\n\nA running ",
+        {
+          "name": "Codex",
+          "quoted": false
+        },
+        ", ",
+        {
+          "name": "Opencode",
+          "quoted": false
+        },
+        " or ",
+        {
+          "name": "Copilot",
+          "quoted": false
+        },
+        " tab cannot follow the folder: stop it and start the agent again to continue in the recreated copy. A terminal still open in the old directory keeps working in a directory that is gone; close it and open one in the recreated copy."
+      ]
+    },
+    {
+      "what": "checking out the default branch of a project with a recorded base",
+      "sentence": "checkout_default_branch_confirm",
+      "args": {
+        "project_name": "dux",
+        "stored_base": "develop"
+      },
+      "segments": [
+        "This switches the source checkout for ",
+        {
+          "name": "dux",
+          "quoted": true
+        },
+        " back to its default branch, moving HEAD in the shared repository. New worktrees branch from ",
+        {
+          "name": "develop",
+          "quoted": true
+        },
+        " now. After the checkout, they branch from the default branch."
+      ]
+    },
+    {
+      "what": "checking out the default branch of a project with no recorded base",
+      "sentence": "checkout_default_branch_confirm",
+      "args": {
+        "project_name": "dux",
+        "stored_base": null
+      },
+      "segments": [
+        "This switches the source checkout for ",
+        {
+          "name": "dux",
+          "quoted": true
+        },
+        " back to its default branch, moving HEAD in the shared repository. After the checkout, new worktrees branch from the default branch."
+      ]
+    },
+    {
+      "what": "adding a project on a branch other than the remote's default",
+      "sentence": "add_project_branch_warning",
+      "args": {
+        "current_branch": "feature/x",
+        "default_branch": "main"
+      },
+      "segments": [
+        "This repository is on branch ",
+        {
+          "name": "feature/x",
+          "quoted": false
+        },
+        ", but the\nremote default branch is ",
+        {
+          "name": "main",
+          "quoted": false
+        },
+        "."
+      ]
+    },
+    {
+      "what": "adding a project whose default branch dux cannot identify",
+      "sentence": "add_project_branch_warning",
+      "args": {
+        "current_branch": "dev",
+        "default_branch": null
+      },
+      "segments": [
+        "This repository is on branch ",
+        {
+          "name": "dev",
+          "quoted": false
+        },
+        ",\nwhich doesn't appear to be the main branch."
+      ]
+    },
+    {
+      "what": "the branch new worktrees start from when a project is added",
+      "sentence": "add_project_worktree_base",
+      "args": {
+        "branch": "main"
+      },
+      "segments": [
+        "New worktrees will branch from ",
+        {
+          "name": "main",
+          "quoted": true
+        },
+        "."
+      ]
+    },
+    {
+      "what": "the note under a warning dux could not be sure of",
+      "sentence": "add_project_heuristic_note",
+      "args": {},
+      "segments": [
+        "Dux can't confidently identify this repo's default\nbranch, so it won't change branches for you."
+      ]
+    },
+    {
+      "what": "deleting a project with no agents",
+      "sentence": "delete_project_confirm",
+      "args": {
+        "project_name": "dux",
+        "agent_count": 0
+      },
+      "segments": [
+        "This deletes ",
+        {
+          "name": "dux",
+          "quoted": true
+        },
+        " from dux. This is irreversible. The source checkout is kept."
+      ]
+    },
+    {
+      "what": "deleting a project with one agent",
+      "sentence": "delete_project_confirm",
+      "args": {
+        "project_name": "dux",
+        "agent_count": 1
+      },
+      "segments": [
+        "This deletes ",
+        {
+          "name": "dux",
+          "quoted": true
+        },
+        ", its 1 agent, and its worktree on disk from dux. This is irreversible. The source checkout is kept."
+      ]
+    },
+    {
+      "what": "deleting a project with several agents",
+      "sentence": "delete_project_confirm",
+      "args": {
+        "project_name": "dux",
+        "agent_count": 3
+      },
+      "segments": [
+        "This deletes ",
+        {
+          "name": "dux",
+          "quoted": true
+        },
+        ", its 3 agents, and their worktrees on disk from dux. This is irreversible. The source checkout is kept."
+      ]
+    },
+    {
+      "what": "deleting a project whose name is not known",
+      "sentence": "delete_project_confirm",
+      "args": {
+        "project_name": null,
+        "agent_count": 2
+      },
+      "segments": [
+        "This deletes this project, its 2 agents, and their worktrees on disk from dux. This is irreversible. The source checkout is kept."
+      ]
+    },
+    {
+      "what": "removing a project with no agents",
+      "sentence": "remove_project_confirm",
+      "args": {
+        "project_name": "dux",
+        "agent_count": 0
+      },
+      "segments": [
+        "This removes ",
+        {
+          "name": "dux",
+          "quoted": true
+        },
+        " from dux. Worktrees on disk are kept."
+      ]
+    },
+    {
+      "what": "removing a project with one agent",
+      "sentence": "remove_project_confirm",
+      "args": {
+        "project_name": "dux",
+        "agent_count": 1
+      },
+      "segments": [
+        "This removes ",
+        {
+          "name": "dux",
+          "quoted": true
+        },
+        " and deletes its 1 agent from dux. Worktrees on disk are kept."
+      ]
+    },
+    {
+      "what": "removing an orphaned project group with several agents",
+      "sentence": "remove_project_confirm",
+      "args": {
+        "project_name": "3f2a9c1b",
+        "agent_count": 2
+      },
+      "segments": [
+        "This removes ",
+        {
+          "name": "3f2a9c1b",
+          "quoted": true
+        },
+        " and deletes its 2 agents from dux. Worktrees on disk are kept."
+      ]
+    },
+    {
+      "what": "removing a project whose name is not known",
+      "sentence": "remove_project_confirm",
+      "args": {
+        "project_name": null,
+        "agent_count": 0
+      },
+      "segments": [
+        "This removes this project from dux. Worktrees on disk are kept."
+      ]
+    }
+  ]
+}

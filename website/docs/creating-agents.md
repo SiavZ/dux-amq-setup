@@ -80,8 +80,13 @@ lives, and its footer carries the way out to a standalone agent:
 ![The terminal UI project chooser for a new agent, listing two projects with their agent counts and paths, and a footer key for creating a standalone agent instead.](/screens/tui-new-agent-chooser.png)
 
 On confirmation dux creates a worktree on a new branch, branched from the project's
-leading branch. If the name matches an existing local branch, dux asks whether to attach
-to that branch instead, which is what you want when continuing work that already started.
+leading branch. That is settled when you add the project: if the repository was on some
+other branch than its default, the add dialog asks whether to check the default out first.
+Say yes and the default branch leads; say no and the branch it was on leads instead.
+Checking out the project's default branch later makes the default lead from then on.
+
+If the name matches an existing local branch, dux asks whether to attach to that branch
+instead, which is what you want when continuing work that already started.
 
 > [!IMPORTANT]
 > Attaching matters at the other end of the agent's life. dux remembers that the branch

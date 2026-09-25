@@ -42,7 +42,7 @@ impl App {
     /// web so the two surfaces cannot answer differently.
     pub(crate) fn planned_standalone_agent_create(
         &self,
-    ) -> Option<Result<(CreateAgentRequest, String)>> {
+    ) -> Option<Result<(CreateAgentRequest, dux_core::status_text::StatusText)>> {
         let PromptState::NameStandaloneAgent { folder, input } = &self.prompt else {
             return None;
         };
@@ -65,7 +65,7 @@ impl App {
         self.prompt = PromptState::None;
         match planned {
             Ok((request, busy_message)) => {
-                if let Err(err) = self.dispatch_create_agent_request(request, busy_message) {
+                if let Err(err) = self.dispatch_create_agent_request(request, busy_message.into()) {
                     self.set_error(format!("Could not create the standalone agent: {err:#}"));
                 }
             }
@@ -145,9 +145,6 @@ impl App {
             return Ok(());
         }
 
-        let leading_branch =
-            leading_branch_for_project(&path, (!branch.is_empty()).then_some(branch.as_str()));
-
         // A non-default-branch warning maps back to the TUI's existing
         // `BranchWarningKind` for the ConfirmNonDefaultBranch dialog. `None`
         // (default branch or detached HEAD) falls through to the direct add.
@@ -173,10 +170,9 @@ impl App {
         };
         if let Some(kind) = warning_kind {
             self.prompt = PromptState::ConfirmNonDefaultBranch {
-                action: NonDefaultBranchAction::AddProject {
+                add: crate::app::PendingProjectAdd {
                     path: path.to_string_lossy().to_string(),
                     name,
-                    leading_branch,
                 },
                 current_branch: branch,
                 kind,
@@ -189,6 +185,14 @@ impl App {
             return Ok(());
         }
 
+        // No dialog, no checkout: new worktrees branch from where the folder is
+        // (the default, or the fallback on a detached HEAD).
+        let leading_branch = dux_core::project_browser::project_base_for_add(
+            &path,
+            (!branch.is_empty()).then_some(branch.as_str()),
+            false,
+        )
+        .into_branch();
         let path_str = path.to_string_lossy().to_string();
         self.finish_add_project(path_str, name, branch, leading_branch)
     }
@@ -256,7 +260,7 @@ impl App {
         let reaction = self.engine.apply(Command::PersistProject {
             action: Box::new(ProjectPersistenceAction::Add {
                 project,
-                status_message,
+                status_message: status_message.into(),
             }),
             // Add is inline (returns its final immediately); no handler-resolved op.
             status_op_id: None,
@@ -955,32 +959,13 @@ impl App {
         };
         let worker_tx = self.engine.worker_tx.clone();
         thread::spawn(move || {
-            use std::panic::AssertUnwindSafe;
-            // Pre-clone the values needed for the panic-path event before
-            // they are moved into the job closure.
-            let tx_panic = worker_tx.clone();
-            let action_panic = action.clone();
-            let branch_panic = target_branch.clone();
-            let op_id_panic = status_op_id.clone();
-            if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                dux_core::project_browser::run_add_project_checkout_job(
-                    action,
-                    target_branch,
-                    worker_tx,
-                    Some(status_op_id),
-                );
-            })) {
-                let reason = dux_core::engine::format_panic_payload(payload);
-                dux_core::logger::error(&format!(
-                    "non-default-branch-checkout worker panicked: {reason}"
-                ));
-                let _ = tx_panic.send(WorkerEvent::NonDefaultBranchCheckoutCompleted {
-                    action: action_panic,
-                    target_branch: branch_panic,
-                    result: Err(format!("Worker panicked: {reason}")),
-                    status_op_id: Some(op_id_panic),
-                });
-            }
+            dux_core::project_browser::run_checkout_job_reporting_panics(
+                action,
+                target_branch,
+                worker_tx,
+                Some(status_op_id),
+                dux_core::project_browser::run_add_project_checkout_job,
+            );
         });
     }
 
@@ -1200,6 +1185,26 @@ impl App {
             return Ok(());
         }
 
+        // Ask first, the same question the browser asks: the checkout moves
+        // HEAD in the user's folder and moves the project's base with it.
+        self.prompt = PromptState::ConfirmCheckoutDefaultBranch {
+            project_id: project.id.clone(),
+            project_name: project.name.clone(),
+            stored_base: project.leading_branch.clone(),
+            focus: ConfirmFocus::Cancel, // Cancel is the safe default
+        };
+        Ok(())
+    }
+
+    /// Run the confirmed "check out the default branch": inspect, then check
+    /// out (or find the folder already there) and move the project's base.
+    pub(crate) fn dispatch_checkout_project_default_branch(&mut self, project: Project) {
+        // One at a time per repository, whichever surface asked first; the
+        // engine releases it at every ending of the chain.
+        if let Err(refusal) = self.engine.begin_default_branch_checkout(&project) {
+            self.apply_reaction(dux_core::engine::EventReaction::Status(refusal));
+            return;
+        }
         // One op spans the whole chain: the short-circuit terminals resolve it to
         // a clear in `drain_events`, while the Known case forwards this id into
         // the switch worker and re-emits the busy text through `progress`, so the
@@ -1242,7 +1247,6 @@ impl App {
                 });
             }
         });
-        Ok(())
     }
 
     pub(crate) fn dispatch_create_agent_request(
@@ -1313,7 +1317,7 @@ impl App {
             .is_in_flight(&dux_core::engine::InFlightKey::CreateAgent);
         let reaction = self.engine.apply(Command::DispatchCreateAgentRequest {
             request: Box::new(request),
-            busy_message,
+            busy_message: busy_message.into(),
             term_size,
         })?;
         if !was_in_flight
@@ -1866,11 +1870,11 @@ impl App {
                 project_name: project.name.clone(),
                 leading_branch: project.leading_branch.clone(),
             },
-            busy_message: format!("Refreshing project \"{}\" from remote\u{2026}", project.name),
+            busy_message: format!("Refreshing project \"{}\" from remote\u{2026}", project.name).into(),
             already_running_message: format!(
                 "Project refresh already in progress for \"{}\". Wait for the current pull to finish.",
                 project.name,
-            ),
+            ).into(),
         })?;
         self.apply_reaction(reaction);
         Ok(())
@@ -3412,78 +3416,135 @@ impl App {
         Ok(())
     }
 
+    /// `remove-project`: ask first, the same question the browser's Remove
+    /// project dialog asks. A real project that still holds agents is refused
+    /// before anything is asked (removing it would orphan them; `delete-project`
+    /// takes the agents too). With no real project selected, an orphaned
+    /// agent's group (its project record is gone) is the target instead.
     pub(crate) fn remove_selected_project(&mut self) -> Result<()> {
         if let Some(project) = self.take_selected_project() {
-            // Real project: keep the guard. Removing one that still has agents
-            // here would orphan them. Use "delete project" to remove agents too.
-            let has_sessions = self
-                .engine
-                .sessions
-                .iter()
-                .any(|s| s.project_id() == Some(project.id.as_str()));
-            if has_sessions {
+            if self.project_agent_count(&project.id) > 0 {
                 self.set_error("Delete all agents in this project first.");
                 return Ok(());
             }
-            let project_name = project.name.clone();
-            let success_name = project_name.clone();
-            let db_fail_name = project_name.clone();
-            let op = dux_core::engine::status_op(format!(
-                "Removing project \"{project_name}\" from workspace..."
-            ))
-            .resolve_in_handler(move |o: &PersistFinalOutcome| match o {
-                PersistFinalOutcome::Saved => dux_core::engine::Final::info(format!(
-                    "Removed project \"{success_name}\" from app"
-                )),
-                PersistFinalOutcome::DbFailed(error) => dux_core::engine::Final::error(format!(
-                    "Could not remove project \"{db_fail_name}\" from the database: {error}"
-                )),
-                PersistFinalOutcome::ConfigWriteFailed(err) => dux_core::engine::Final::error(format!(
-                    "Project was removed from the database, but config.toml could not be updated: {err}"
-                )),
-            });
-            let pending = self.engine.begin_status_op(&op);
-            let op_id = op.id().to_string();
-            self.pending_persist_ops.insert(op_id.clone(), op);
-            let reaction = self.engine.apply(Command::PersistProject {
-                action: Box::new(ProjectPersistenceAction::Remove {
-                    project_id: project.id.clone(),
-                    project_name: project.name.clone(),
-                }),
-                status_op_id: Some(op_id),
-            })?;
-            self.apply_reaction(reaction);
-            self.apply_reaction(dux_core::engine::EventReaction::Status(pending));
+            self.prompt = PromptState::ConfirmRemoveProject {
+                project_id: project.id.clone(),
+                project_name: project.name.clone(),
+                agent_count: 0,
+                orphaned: false,
+                focus: ConfirmFocus::Cancel, // Cancel is the safe default
+            };
             return Ok(());
         }
-        // No real project is selected. An orphaned session, whose project record
-        // is gone, clears the whole ghost group: `Command::RemoveProject` cascades
-        // the orphaned session records and keeps their worktrees on disk. A
-        // standalone agent is not an orphan and has no ghost group to clear.
+        // A standalone agent is not an orphan and has no ghost group to clear.
         if let Some(session) = self.selected_session().cloned()
             && let Some(project_id) = session.project_id().map(str::to_string)
         {
-            let project_name = dux_core::sidebar::short_project_id(&project_id);
-            let reaction = self.engine.apply(Command::RemoveProject {
+            self.prompt = PromptState::ConfirmRemoveProject {
+                project_name: dux_core::sidebar::short_project_id(&project_id),
+                agent_count: self.project_agent_count(&project_id),
                 project_id,
-                project_name,
-            })?;
-            self.apply_reaction(reaction);
-            // The cascade mutates engine.sessions synchronously; refresh the cache
-            // (and fix the selection) so render never indexes a stale row.
-            self.rebuild_left_items();
+                orphaned: true,
+                focus: ConfirmFocus::Cancel, // Cancel is the safe default
+            };
             return Ok(());
         }
         self.set_error("Select a project first.");
         Ok(())
     }
 
+    /// `delete-project`: ask first, the same question the browser's Delete
+    /// project dialog asks, because the cascade deletes every agent in the
+    /// project and removes their worktrees from disk. Nothing runs until the
+    /// dialog is confirmed (`resolve_confirm_delete_project`).
     pub(crate) fn delete_selected_project(&mut self) -> Result<()> {
         let Some(project) = self.take_selected_project() else {
             self.set_error("Select a project first.");
             return Ok(());
         };
+        self.prompt = PromptState::ConfirmDeleteProject {
+            agent_count: self.project_agent_count(&project.id),
+            project_id: project.id,
+            project_name: project.name,
+            focus: ConfirmFocus::Cancel, // Cancel is the safe default
+        };
+        Ok(())
+    }
 
+    /// How many agents belong to `project_id`, a real project's or an
+    /// orphaned group's.
+    pub(crate) fn project_agent_count(&self, project_id: &str) -> usize {
+        self.engine
+            .sessions
+            .iter()
+            .filter(|s| s.project_id() == Some(project_id))
+            .count()
+    }
+
+    /// Remove a real, agent-less project from dux, keeping its files. Runs only
+    /// once the removal is confirmed, and refuses a project that has gained an
+    /// agent behind the open dialog.
+    pub(crate) fn run_remove_project(&mut self, project: Project) -> Result<()> {
+        // Removing one that still has agents here would orphan them. Use
+        // "delete project" to remove agents too.
+        if self.project_agent_count(&project.id) > 0 {
+            self.set_error("Delete all agents in this project first.");
+            return Ok(());
+        }
+        let project_name = project.name.clone();
+        let success_name = project_name.clone();
+        let db_fail_name = project_name.clone();
+        let op = dux_core::engine::status_op(format!(
+            "Removing project \"{project_name}\" from workspace..."
+        ))
+        .resolve_in_handler(move |o: &PersistFinalOutcome| match o {
+            PersistFinalOutcome::Saved => dux_core::engine::Final::info(format!(
+                "Removed project \"{success_name}\" from app"
+            )),
+            PersistFinalOutcome::DbFailed(error) => dux_core::engine::Final::error(format!(
+                "Could not remove project \"{db_fail_name}\" from the database: {error}"
+            )),
+            PersistFinalOutcome::ConfigWriteFailed(err) => dux_core::engine::Final::error(format!(
+                "Project was removed from the database, but config.toml could not be updated: {err}"
+            )),
+        });
+        let pending = self.engine.begin_status_op(&op);
+        let op_id = op.id().to_string();
+        self.pending_persist_ops.insert(op_id.clone(), op);
+        let reaction = self.engine.apply(Command::PersistProject {
+            action: Box::new(ProjectPersistenceAction::Remove {
+                project_id: project.id.clone(),
+                project_name: project.name.clone(),
+            }),
+            status_op_id: Some(op_id),
+        })?;
+        self.apply_reaction(reaction);
+        self.apply_reaction(dux_core::engine::EventReaction::Status(pending));
+        Ok(())
+    }
+
+    /// Clear an orphaned group (agents whose project record is gone):
+    /// `Command::RemoveProject` cascades the orphaned session records and keeps
+    /// their worktrees on disk. Runs only once the removal is confirmed.
+    pub(crate) fn run_remove_orphaned_project(
+        &mut self,
+        project_id: String,
+        project_name: String,
+    ) -> Result<()> {
+        let reaction = self.engine.apply(Command::RemoveProject {
+            project_id,
+            project_name,
+        })?;
+        self.apply_reaction(reaction);
+        // The cascade mutates engine.sessions synchronously; refresh the cache
+        // (and fix the selection) so render never indexes a stale row.
+        self.rebuild_left_items();
+        Ok(())
+    }
+
+    /// Delete a project, every agent in it and their worktrees. Runs only once
+    /// the deletion is confirmed.
+    pub(crate) fn run_delete_project(&mut self, project: Project) -> Result<()> {
         // The whole delete (guards, the per-session cascade with worktree
         // removal, and the project record and config removal) is owned by the
         // core `Command::DeleteProject`, so the two surfaces cannot disagree on
@@ -3591,7 +3652,7 @@ impl App {
                     // Route the busy through a keyed reconnect op so its final
                     // (resolved in the shared launch-ready/failed view handlers)
                     // replaces exactly this spinner instead of most-recent-wins.
-                    let op = self.build_reconnect_status_op(busy_message);
+                    let op = self.build_reconnect_status_op(busy_message.to_string());
                     let pending = self.engine.begin_status_op(&op);
                     self.apply_reaction(dux_core::engine::EventReaction::Status(pending));
                     self.pending_reconnect_ops
@@ -4477,7 +4538,6 @@ mod tests {
     fn test_app_with_sessions(sessions: Vec<AgentSession>, projects: Vec<Project>) -> App {
         let tmp = tempdir().expect("tempdir");
         let root = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
 
         let paths = DuxPaths {
             config_path: root.join("config.toml"),
@@ -4495,7 +4555,7 @@ mod tests {
         let config_writer =
             dux_core::config_queue::ConfigWriteQueue::new(paths.config_path.clone());
         let engine = dux_core::engine::Engine {
-            config: Config::default(),
+            config: dux_core::test_provider::harmless_config(),
             paths,
             session_store,
             projects,
@@ -4713,7 +4773,7 @@ mod tests {
             background_server_preflight_pending: false,
             background_server_wanted: false,
             companion_followup_ran: false,
-            pending_background_server_op: None,
+            pending_background_server_start: None,
             pending_tailscale_mode_op: None,
             server_flip_preflight_pending: false,
             pending_persist_ops: std::collections::HashMap::new(),
@@ -4730,6 +4790,7 @@ mod tests {
             pending_config_reload_op: None,
             project_chooser_context: None,
             agent_filter: None,
+            test_scratch_dirs: tmp.into(),
         };
         app.interactive_patterns = app.bindings.interactive_byte_patterns();
         app.rebuild_left_items();
@@ -4795,13 +4856,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scratch_roots_are_removed_when_their_holders_drop() {
+        let app = test_app_with_sessions(Vec::new(), Vec::new());
+        let app_root = app.engine.paths.root.clone();
+        assert!(app_root.join("sessions.sqlite3").exists());
+        drop(app);
+        assert!(
+            !app_root.exists(),
+            "{} outlived the app",
+            app_root.display()
+        );
+
+        let (engine, scratch) = test_engine_with_sessions(Vec::new(), Vec::new());
+        let engine_root = engine.paths.root.clone();
+        drop(engine);
+        drop(scratch);
+        assert!(
+            !engine_root.exists(),
+            "{} outlived its guard",
+            engine_root.display()
+        );
+    }
+
+    /// An engine over a scratch config root, returned with the root's guard:
+    /// the caller holds it for as long as the engine runs, and dropping it
+    /// removes the directory.
     fn test_engine_with_sessions(
         sessions: Vec<AgentSession>,
         projects: Vec<Project>,
-    ) -> dux_core::engine::Engine {
+    ) -> (dux_core::engine::Engine, tempfile::TempDir) {
         let tmp = tempdir().expect("tempdir");
         let root = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
 
         let paths = DuxPaths {
             config_path: root.join("config.toml"),
@@ -4816,11 +4902,11 @@ mod tests {
             .expect("single-instance lock for test engine");
         let (worker_tx, worker_rx) = mpsc::channel();
         // auto_reopen on so bootstrap WOULD relaunch, proving resume's skip.
-        let mut config = Config::default();
+        let mut config = dux_core::test_provider::harmless_config();
         config.ui.auto_reopen_agents = true;
         let config_writer =
             dux_core::config_queue::ConfigWriteQueue::new(paths.config_path.clone());
-        dux_core::engine::Engine {
+        let engine = dux_core::engine::Engine {
             config,
             paths,
             session_store,
@@ -4909,7 +4995,8 @@ mod tests {
             last_created_op_id: None,
             created_session_by_op: std::collections::HashMap::new(),
             startup_launches: Default::default(),
-        }
+        };
+        (engine, tmp)
     }
 
     fn seed_tab(app: &mut App, id: &str, session_id: &str, provider: &str, order: i64) {
@@ -5231,7 +5318,7 @@ mod tests {
     /// path string.
     fn init_unborn_repo() -> (tempfile::TempDir, String) {
         fn run_git(cwd: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
+            let out = dux_core::test_git::fixture_git()
                 .args(args)
                 .current_dir(cwd)
                 .output()
@@ -5361,7 +5448,7 @@ mod tests {
         // precedence over the non-default-branch heuristic warning: the user
         // just created this branch; warning "that's not main" would be noise.
         fn run_git(cwd: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
+            let out = dux_core::test_git::fixture_git()
                 .args(args)
                 .current_dir(cwd)
                 .output()
@@ -5570,7 +5657,7 @@ mod tests {
     #[test]
     fn checkout_inspect_op_known_case_keeps_one_spinner_across_the_chain() {
         fn run_git(cwd: &Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
+            let out = dux_core::test_git::fixture_git()
                 .args(args)
                 .current_dir(cwd)
                 .output()
@@ -6053,7 +6140,7 @@ mod tests {
         session.status = SessionStatus::Active;
         session.desired_running = true;
         let project = make_project("project-1", "codex");
-        let engine = test_engine_with_sessions(vec![session], vec![project]);
+        let (engine, _scratch) = test_engine_with_sessions(vec![session], vec![project]);
 
         let app = App::resume(engine).expect("resume builds an App");
 
@@ -6294,11 +6381,11 @@ mod tests {
         app.apply_project_persistence_outcome(ProjectPersistenceOutcome {
             action: ProjectPersistenceAction::Add {
                 project: make_project("project-2", "claude"),
-                status_message: "Added project".to_string(),
+                status_message: "Added project".to_string().into(),
             },
             view: ProjectPersistenceView::Added {
                 project_id: "project-2".to_string(),
-                status_message: "Added project".to_string(),
+                status_message: "Added project".to_string().into(),
             },
             status_op_id: None,
         });
@@ -7400,7 +7487,9 @@ mod tests {
         app.selected_left = 0;
 
         app.delete_selected_project()
-            .expect("should return Ok (error reported via status line)");
+            .expect("open the confirmation");
+        // The engine's guard answers the confirmed delete.
+        app.resolve_confirm_delete_project(true);
 
         // Session must still be present, because deletion was refused.
         assert!(
@@ -7442,7 +7531,9 @@ mod tests {
         app.selected_left = 0;
 
         app.delete_selected_project()
-            .expect("should return Ok (error reported via status line)");
+            .expect("open the confirmation");
+        // The engine's guard answers the confirmed delete.
+        app.resolve_confirm_delete_project(true);
 
         assert!(
             app.engine.sessions.iter().any(|s| s.id == "s1"),
@@ -7746,8 +7837,8 @@ mod tests {
             "Deleted claude agent \"branch-s1\" from project \"demo\" and removed its \
              worktree. Its branch \"branch-s1\" was created inside this agent's worktree and \
              was kept, and its branch \"develop\" existed before this agent and was kept. \
-             Delete either yourself with git branch -D \"branch-s1\" or git branch -D \
-             \"develop\" if you no longer need them."
+             Delete either yourself with git branch -D 'branch-s1' or git branch -D \
+             'develop' if you no longer need them."
         );
     }
 
@@ -7781,7 +7872,7 @@ mod tests {
             status.message,
             "Deleted claude agent \"branch-s1\" from project \"demo\" and removed its \
              worktree. Its branch \"branch-s1\" came with the worktree this agent adopted and \
-             was kept. Delete it yourself with git branch -D \"branch-s1\" if you no longer \
+             was kept. Delete it yourself with git branch -D 'branch-s1' if you no longer \
              need it."
         );
     }
@@ -8326,6 +8417,856 @@ mod tests {
             app.status.text().contains("to shut down"),
             "status: {}",
             app.status.text()
+        );
+    }
+
+    /// A real project (a clone added through the add-project flow) holding one
+    /// real agent whose worktree exists on disk, targeted by the project-scoped
+    /// palette commands.
+    fn project_with_a_real_agent() -> (tempfile::TempDir, App, PathBuf) {
+        let (root, _repo, mut app) = project_based_on_develop();
+        let worktree = create_agent_worktree(&mut app);
+        assert!(worktree.is_dir(), "the agent's worktree is on disk");
+        app.project_chooser_context = Some(app.engine.projects[0].id.clone());
+        (root, app, worktree)
+    }
+
+    #[test]
+    fn the_delete_project_command_asks_first_and_deletes_nothing() {
+        let (_root, mut app, worktree) = project_with_a_real_agent();
+
+        app.execute_command("delete-project".to_string())
+            .expect("open the confirmation");
+
+        match &app.prompt {
+            PromptState::ConfirmDeleteProject {
+                project_name,
+                agent_count,
+                focus,
+                ..
+            } => {
+                assert_eq!(project_name, "repo");
+                assert_eq!(*agent_count, 1);
+                assert_eq!(*focus, ConfirmFocus::Cancel, "Cancel is the safe default");
+            }
+            other => panic!("expected the delete-project confirmation, got {other:?}"),
+        }
+        assert_eq!(app.engine.projects.len(), 1, "nothing is deleted yet");
+        assert_eq!(app.engine.sessions.len(), 1, "nothing is deleted yet");
+        assert!(worktree.is_dir(), "the worktree is untouched");
+    }
+
+    #[test]
+    fn escape_cancels_the_project_delete_and_keeps_the_worktree() {
+        let (_root, mut app, worktree) = project_with_a_real_agent();
+        app.execute_command("delete-project".to_string())
+            .expect("open the confirmation");
+
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        app.drain_events();
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert_eq!(app.engine.projects.len(), 1);
+        assert_eq!(app.engine.sessions.len(), 1);
+        assert!(worktree.is_dir(), "the worktree is still on disk");
+        assert_eq!(
+            app.status.text(),
+            "Cancelled deleting project \"repo\". Nothing was deleted: its agent and its \
+             worktree are still here."
+        );
+    }
+
+    #[test]
+    fn pressing_cancel_on_the_project_delete_deletes_nothing_either() {
+        let (_root, mut app, worktree) = project_with_a_real_agent();
+        app.execute_command("delete-project".to_string())
+            .expect("open the confirmation");
+
+        // Cancel has focus; activating it is the same answer as Escape.
+        app.handle_key(key(KeyCode::Char(' '), KeyModifiers::NONE))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        app.drain_events();
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert_eq!(app.engine.projects.len(), 1);
+        assert_eq!(app.engine.sessions.len(), 1);
+        assert!(worktree.is_dir(), "the worktree is still on disk");
+        assert!(
+            app.status.text().starts_with("Cancelled deleting project"),
+            "{}",
+            app.status.text()
+        );
+    }
+
+    #[test]
+    fn confirming_the_project_delete_runs_the_cascade_and_removes_the_worktree() {
+        let (_root, mut app, worktree) = project_with_a_real_agent();
+        app.execute_command("delete-project".to_string())
+            .expect("open the confirmation");
+
+        // Move focus from Cancel to Delete, then press it.
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert!(app.engine.projects.is_empty(), "the project is gone");
+        assert!(app.engine.sessions.is_empty(), "its agent is gone");
+        assert!(
+            app.engine.session_store.load_projects().unwrap().is_empty(),
+            "the project record is gone"
+        );
+        assert!(!worktree.exists(), "the worktree was removed from disk");
+    }
+
+    #[test]
+    fn confirming_the_project_delete_after_the_project_is_gone_says_so() {
+        let (_root, mut app, worktree) = project_with_a_real_agent();
+        app.execute_command("delete-project".to_string())
+            .expect("open the confirmation");
+        // The project leaves behind the open dialog (the browser removed it).
+        app.engine.projects.clear();
+
+        app.resolve_confirm_delete_project(true);
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert_eq!(app.engine.sessions.len(), 1, "nothing is cascaded");
+        assert!(worktree.is_dir(), "the worktree is untouched");
+        assert_eq!(
+            app.status.text(),
+            "Project \"repo\" is gone, so there was nothing to delete."
+        );
+    }
+
+    /// Click the middle of `rect` the way a person does: press, then release.
+    fn click(app: &mut App, rect: ratatui::layout::Rect) {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (column, row) = (rect.x + rect.width / 2, rect.y + rect.height / 2);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+    }
+
+    fn render_once(app: &mut App) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("render");
+    }
+
+    #[test]
+    fn clicking_the_project_delete_buttons_cancels_and_confirms() {
+        let (_root, mut app, worktree) = project_with_a_real_agent();
+
+        app.execute_command("delete-project".to_string())
+            .expect("open the confirmation");
+        render_once(&mut app);
+        let OverlayMouseLayout::ConfirmDeleteProject { cancel_button, .. } =
+            app.overlay_layout.active
+        else {
+            panic!("the dialog must publish its buttons for the mouse");
+        };
+        click(&mut app, cancel_button);
+        assert!(matches!(app.prompt, PromptState::None));
+        assert_eq!(app.engine.projects.len(), 1, "Cancel deletes nothing");
+        assert!(worktree.is_dir());
+
+        app.project_chooser_context = Some(app.engine.projects[0].id.clone());
+        app.execute_command("delete-project".to_string())
+            .expect("open the confirmation");
+        render_once(&mut app);
+        let OverlayMouseLayout::ConfirmDeleteProject { confirm_button, .. } =
+            app.overlay_layout.active
+        else {
+            panic!("the dialog must publish its buttons for the mouse");
+        };
+        click(&mut app, confirm_button);
+        assert!(app.engine.projects.is_empty(), "Delete runs the cascade");
+        assert!(!worktree.exists(), "the worktree was removed from disk");
+    }
+
+    /// A second real agent in the first project, created the way the palette
+    /// creates one, while whatever dialog is open stays open.
+    fn add_second_agent(app: &mut App) {
+        let project = app.engine.projects[0].clone();
+        app.dispatch_create_agent_request(
+            CreateAgentRequest::NewProject {
+                project,
+                custom_name: Some("agent-two".to_string()),
+                use_existing_branch: false,
+                pull_before_create: true,
+                copy_uncommitted_changes: false,
+            },
+            "Creating an agent...".to_string(),
+        )
+        .expect("dispatch the create");
+        drain_until(app, "the second agent", |app| {
+            app.engine.sessions.len() == 2
+        });
+    }
+
+    /// Every cell of one frame, row by row, as text.
+    fn rendered_text(app: &mut App) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("render");
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The count is the one number the user agrees to, so it must be the
+    /// project's count at the moment it is painted, not when the dialog opened.
+    #[test]
+    fn the_project_delete_dialog_counts_an_agent_added_while_it_is_open() {
+        let (_root, mut app, _worktree) = project_with_a_real_agent();
+        app.execute_command("delete-project".to_string())
+            .expect("open the confirmation");
+        assert!(rendered_text(&mut app).contains("its 1 agent,"));
+
+        add_second_agent(&mut app);
+
+        let text = rendered_text(&mut app);
+        assert!(
+            text.contains("its 2 agents,"),
+            "the dialog must count the agent that arrived: {text}"
+        );
+        match &app.prompt {
+            PromptState::ConfirmDeleteProject { agent_count, .. } => assert_eq!(*agent_count, 2),
+            other => panic!("expected the delete-project confirmation, got {other:?}"),
+        }
+    }
+
+    /// Consent was given for the agents the dialog showed. An agent that
+    /// arrived after the last paint was never on screen, so the cascade must not
+    /// take it on that consent: the dialog stays, Cancel regains focus, and the
+    /// status line says why.
+    #[test]
+    fn confirming_after_the_project_gained_an_agent_deletes_nothing_and_asks_again() {
+        let (_root, mut app, worktree) = project_with_a_real_agent();
+        app.execute_command("delete-project".to_string())
+            .expect("open the confirmation");
+        rendered_text(&mut app);
+        if let PromptState::ConfirmDeleteProject { focus, .. } = &mut app.prompt {
+            *focus = ConfirmFocus::Confirm;
+        }
+
+        add_second_agent(&mut app);
+        app.resolve_confirm_delete_project(true);
+
+        assert_eq!(app.engine.projects.len(), 1, "the project is kept");
+        assert_eq!(app.engine.sessions.len(), 2, "no agent is deleted");
+        assert!(worktree.is_dir(), "the first worktree is untouched");
+        match &app.prompt {
+            PromptState::ConfirmDeleteProject { focus, .. } => {
+                assert_eq!(*focus, ConfirmFocus::Cancel, "Cancel regains focus");
+            }
+            other => panic!("the dialog must stay open to ask again, got {other:?}"),
+        }
+        assert_eq!(
+            app.status.text(),
+            "Project \"repo\" gained an agent while the dialog was open, so nothing was \
+             deleted. It now has 2 agents; confirm again to delete them."
+        );
+        assert!(rendered_text(&mut app).contains("its 2 agents,"));
+
+        // Asked again with the true count on screen, the answer stands.
+        app.resolve_confirm_delete_project(true);
+        assert!(app.engine.projects.is_empty(), "the second answer deletes");
+    }
+
+    #[test]
+    fn confirming_an_orphan_removal_after_the_group_grew_asks_again() {
+        let (_root, mut app, _worktree) = project_with_a_real_agent();
+        app.engine.projects.clear();
+        app.project_chooser_context = None;
+        app.rebuild_left_items();
+        app.selected_left = app
+            .left_items()
+            .iter()
+            .position(|item| matches!(item, LeftItem::Session(_)))
+            .expect("the orphaned agent's row");
+        app.execute_command("remove-project".to_string())
+            .expect("open the confirmation");
+        rendered_text(&mut app);
+
+        // A second record for the same missing project arrives behind the dialog.
+        let mut extra = app.engine.sessions[0].clone();
+        extra.id = "orphan-two".into();
+        app.engine.sessions.push(extra);
+        app.resolve_confirm_remove_project(true);
+
+        assert_eq!(app.engine.sessions.len(), 2, "no record is cleared");
+        assert!(matches!(
+            app.prompt,
+            PromptState::ConfirmRemoveProject {
+                focus: ConfirmFocus::Cancel,
+                ..
+            }
+        ));
+        assert!(
+            app.status
+                .text()
+                .contains("gained an agent while the dialog was open"),
+            "{}",
+            app.status.text()
+        );
+    }
+
+    /// A real project with no agents, targeted by the project-scoped commands.
+    fn agentless_project() -> (tempfile::TempDir, App) {
+        let (root, _repo, mut app) = project_based_on_develop();
+        app.project_chooser_context = Some(app.engine.projects[0].id.clone());
+        (root, app)
+    }
+
+    #[test]
+    fn the_remove_project_command_asks_first_and_removes_nothing() {
+        let (_root, mut app) = agentless_project();
+
+        app.execute_command("remove-project".to_string())
+            .expect("open the confirmation");
+
+        match &app.prompt {
+            PromptState::ConfirmRemoveProject {
+                project_name,
+                agent_count,
+                focus,
+                ..
+            } => {
+                assert_eq!(project_name, "repo");
+                assert_eq!(*agent_count, 0);
+                assert_eq!(*focus, ConfirmFocus::Cancel, "Cancel is the safe default");
+            }
+            other => panic!("expected the remove-project confirmation, got {other:?}"),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        app.drain_events();
+        assert_eq!(app.engine.projects.len(), 1, "nothing is removed yet");
+        assert_eq!(app.engine.session_store.load_projects().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn escape_cancels_the_project_removal() {
+        let (_root, mut app) = agentless_project();
+        app.execute_command("remove-project".to_string())
+            .expect("open the confirmation");
+
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        app.drain_events();
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert_eq!(app.engine.projects.len(), 1);
+        assert_eq!(app.engine.session_store.load_projects().unwrap().len(), 1);
+        assert_eq!(
+            app.status.text(),
+            "Cancelled removing project \"repo\". Nothing was removed."
+        );
+    }
+
+    #[test]
+    fn confirming_the_project_removal_removes_the_record_and_keeps_the_folder() {
+        let (_root, mut app) = agentless_project();
+        let folder = PathBuf::from(&app.engine.projects[0].path);
+        app.execute_command("remove-project".to_string())
+            .expect("open the confirmation");
+
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        drain_until(&mut app, "the project to be removed", |app| {
+            app.engine.projects.is_empty()
+        });
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert!(app.engine.session_store.load_projects().unwrap().is_empty());
+        assert!(folder.is_dir(), "the source checkout stays on disk");
+    }
+
+    #[test]
+    fn removing_a_project_that_still_has_agents_is_refused_without_asking() {
+        let (_root, mut app, worktree) = project_with_a_real_agent();
+
+        app.execute_command("remove-project".to_string())
+            .expect("refuse");
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert_eq!(
+            app.status.text(),
+            "Delete all agents in this project first."
+        );
+        assert_eq!(app.engine.projects.len(), 1);
+        assert!(worktree.is_dir());
+    }
+
+    #[test]
+    fn removing_an_orphaned_group_asks_first_and_keeps_the_worktrees() {
+        let (_root, mut app, worktree) = project_with_a_real_agent();
+        // The project record goes, leaving its agent as an orphan.
+        app.engine.projects.clear();
+        app.project_chooser_context = None;
+        app.rebuild_left_items();
+        app.selected_left = app
+            .left_items()
+            .iter()
+            .position(|item| matches!(item, LeftItem::Session(_)))
+            .expect("the orphaned agent's row");
+
+        app.execute_command("remove-project".to_string())
+            .expect("open the confirmation");
+        match &app.prompt {
+            PromptState::ConfirmRemoveProject { agent_count, .. } => {
+                assert_eq!(*agent_count, 1);
+            }
+            other => panic!("expected the remove-project confirmation, got {other:?}"),
+        }
+        assert_eq!(app.engine.sessions.len(), 1, "nothing is removed yet");
+
+        app.resolve_confirm_remove_project(true);
+
+        assert!(app.engine.sessions.is_empty(), "the orphan record is gone");
+        assert!(worktree.is_dir(), "its worktree stays on disk");
+    }
+
+    /// A clone of a bare local `origin` whose HEAD names `main`, checked out on
+    /// `feature`, which carries one pushed commit `main` does not have. Returns
+    /// the holder, the clone's path and that commit.
+    fn clone_on_a_feature_branch() -> (tempfile::TempDir, PathBuf, String) {
+        let root = tempdir().expect("tempdir");
+        let seed = root.path().join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        crate::app::test_support::run_git_output(&seed, &["init", "-q", "-b", "main"]);
+        crate::app::test_support::run_git_output(&seed, &["config", "user.email", "t@example.com"]);
+        crate::app::test_support::run_git_output(&seed, &["config", "user.name", "Test"]);
+        std::fs::write(seed.join("README.md"), "base\n").unwrap();
+        crate::app::test_support::run_git_output(&seed, &["add", "README.md"]);
+        crate::app::test_support::run_git_output(&seed, &["commit", "-q", "-m", "base"]);
+        let origin = root.path().join("origin.git");
+        crate::app::test_support::run_git_output(
+            root.path(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                seed.to_string_lossy().as_ref(),
+                origin.to_string_lossy().as_ref(),
+            ],
+        );
+        let repo = root.path().join("repo");
+        crate::app::test_support::run_git_output(
+            root.path(),
+            &[
+                "clone",
+                "-q",
+                origin.to_string_lossy().as_ref(),
+                repo.to_string_lossy().as_ref(),
+            ],
+        );
+        crate::app::test_support::run_git_output(&repo, &["config", "user.email", "t@example.com"]);
+        crate::app::test_support::run_git_output(&repo, &["config", "user.name", "Test"]);
+        crate::app::test_support::run_git_output(&repo, &["switch", "-q", "-c", "feature"]);
+        std::fs::write(repo.join("feature.txt"), "only on feature\n").unwrap();
+        crate::app::test_support::run_git_output(&repo, &["add", "feature.txt"]);
+        crate::app::test_support::run_git_output(&repo, &["commit", "-q", "-m", "feature work"]);
+        crate::app::test_support::run_git_output(&repo, &["push", "-q", "-u", "origin", "feature"]);
+        let commit = crate::app::test_support::run_git_output(&repo, &["rev-parse", "HEAD"]);
+        (root, repo, commit)
+    }
+
+    /// An app whose default provider runs `cat`, the one stand-in: the agent
+    /// CLI is the only part of the journey that cannot run here.
+    fn journey_app() -> App {
+        let mut app = test_app_with_sessions(Vec::new(), Vec::new());
+        let provider = app.engine.config.default_provider();
+        app.engine.config.providers.commands.insert(
+            provider.as_str().to_string(),
+            dux_core::config::ProviderCommandConfig {
+                command: "cat".to_string(),
+                args: vec![],
+                resume_args: None,
+                ..Default::default()
+            },
+        );
+        app
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    /// Answer the non-default-branch dialog the way a person does: move focus
+    /// to the checkbox, set it, then press the confirm button.
+    fn answer_branch_dialog(app: &mut App, check_out_default: bool) {
+        let PromptState::ConfirmNonDefaultBranch {
+            checkout_default, ..
+        } = &app.prompt
+        else {
+            panic!(
+                "expected the non-default-branch dialog, got {:?}",
+                app.prompt
+            );
+        };
+        let starts_checked = *checkout_default;
+        // Cancel -> Add -> Checkbox.
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        if starts_checked != check_out_default {
+            app.handle_key(key(KeyCode::Char(' '), KeyModifiers::NONE))
+                .unwrap();
+        }
+        // Checkbox -> Add.
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::SHIFT))
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(
+            matches!(app.prompt, PromptState::None),
+            "confirming closes the dialog, got {:?}",
+            app.prompt
+        );
+    }
+
+    fn drain_until(app: &mut App, what: &str, mut done: impl FnMut(&App) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !done(app) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}; status: {}",
+                app.status.text()
+            );
+            app.drain_events();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Create an agent in the only project the way the new-agent flow does and
+    /// return its worktree once it exists on disk.
+    fn create_agent_worktree(app: &mut App) -> PathBuf {
+        let project = app.engine.projects[0].clone();
+        app.dispatch_create_agent_request(
+            CreateAgentRequest::NewProject {
+                project,
+                custom_name: Some("agent-one".to_string()),
+                use_existing_branch: false,
+                pull_before_create: true,
+                copy_uncommitted_changes: false,
+            },
+            "Creating an agent...".to_string(),
+        )
+        .expect("dispatch the create");
+        drain_until(app, "the agent's worktree", |app| {
+            app.engine.sessions.iter().any(|s| {
+                s.managed_worktree()
+                    .is_some_and(|p| Path::new(p).join(".git").exists())
+            })
+        });
+        PathBuf::from(
+            app.engine
+                .sessions
+                .iter()
+                .find_map(|s| s.managed_worktree())
+                .unwrap(),
+        )
+    }
+
+    fn worktree_has_commit(worktree: &Path, commit: &str) -> bool {
+        dux_core::test_git::fixture_git()
+            .args(["merge-base", "--is-ancestor", commit, "HEAD"])
+            .current_dir(worktree)
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    fn stored_project_base(app: &App) -> Option<String> {
+        app.engine
+            .session_store
+            .load_projects()
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|p| p.leading_branch)
+    }
+
+    #[test]
+    fn adding_with_the_box_unticked_branches_new_worktrees_from_the_current_branch() {
+        let (_root, repo, feature_commit) = clone_on_a_feature_branch();
+        let mut app = journey_app();
+
+        app.add_project(repo.to_string_lossy().to_string(), "repo".to_string())
+            .expect("add_project");
+        answer_branch_dialog(&mut app, false);
+        drain_until(&mut app, "the project", |app| {
+            !app.engine.projects.is_empty() && stored_project_base(app).is_some()
+        });
+
+        assert_eq!(
+            app.engine.projects[0].leading_branch.as_deref(),
+            Some("feature")
+        );
+        assert_eq!(stored_project_base(&app).as_deref(), Some("feature"));
+        let worktree = create_agent_worktree(&mut app);
+        assert!(
+            worktree_has_commit(&worktree, &feature_commit),
+            "the dialog said new worktrees branch from \"feature\""
+        );
+        assert_eq!(
+            crate::app::test_support::run_git_output(&repo, &["symbolic-ref", "--short", "HEAD"]),
+            "feature",
+            "the user's folder stays where it was"
+        );
+    }
+
+    #[test]
+    fn adding_with_the_box_ticked_branches_new_worktrees_from_the_default_branch() {
+        let (_root, repo, feature_commit) = clone_on_a_feature_branch();
+        let mut app = journey_app();
+
+        app.add_project(repo.to_string_lossy().to_string(), "repo".to_string())
+            .expect("add_project");
+        answer_branch_dialog(&mut app, true);
+        drain_until(&mut app, "the project", |app| {
+            !app.engine.projects.is_empty() && stored_project_base(app).is_some()
+        });
+
+        assert_eq!(
+            crate::app::test_support::run_git_output(&repo, &["symbolic-ref", "--short", "HEAD"]),
+            "main"
+        );
+        assert_eq!(stored_project_base(&app).as_deref(), Some("main"));
+        let worktree = create_agent_worktree(&mut app);
+        assert!(
+            !worktree_has_commit(&worktree, &feature_commit),
+            "new worktrees branch from \"main\", which lacks the feature commit"
+        );
+    }
+
+    /// A real project whose folder is on `develop` and whose recorded base is
+    /// `develop` (added with the checkout box unticked), selected so the
+    /// project-scoped command acts on it. origin's default is `main`.
+    fn project_based_on_develop() -> (tempfile::TempDir, PathBuf, App) {
+        let (root, repo, _) = clone_on_a_feature_branch();
+        crate::app::test_support::run_git_output(&repo, &["switch", "-q", "-c", "develop"]);
+        let mut app = journey_app();
+        app.add_project(repo.to_string_lossy().to_string(), "repo".to_string())
+            .expect("add_project");
+        answer_branch_dialog(&mut app, false);
+        drain_until(&mut app, "the project", |app| {
+            !app.engine.projects.is_empty() && stored_project_base(app).is_some()
+        });
+        assert_eq!(stored_project_base(&app).as_deref(), Some("develop"));
+        app.project_chooser_context = Some(app.engine.projects[0].id.clone());
+        (root, repo, app)
+    }
+
+    fn folder_branch(repo: &Path) -> String {
+        crate::app::test_support::run_git_output(repo, &["symbolic-ref", "--short", "HEAD"])
+    }
+
+    #[test]
+    fn checking_out_the_default_branch_asks_before_anything_runs() {
+        let (_root, repo, mut app) = project_based_on_develop();
+
+        app.checkout_selected_project_default_branch()
+            .expect("open the confirmation");
+
+        match &app.prompt {
+            PromptState::ConfirmCheckoutDefaultBranch {
+                project_name,
+                stored_base,
+                focus,
+                ..
+            } => {
+                assert_eq!(project_name, "repo");
+                assert_eq!(stored_base.as_deref(), Some("develop"));
+                assert_eq!(*focus, ConfirmFocus::Cancel, "Cancel is the safe default");
+            }
+            other => panic!("expected the checkout confirmation, got {other:?}"),
+        }
+        assert!(
+            app.pending_checkout_inspect_ops.is_empty(),
+            "nothing may run until the user confirms"
+        );
+        assert_eq!(folder_branch(&repo), "develop");
+    }
+
+    #[test]
+    fn escape_cancels_the_default_branch_checkout_and_says_nothing_changed() {
+        let (_root, repo, mut app) = project_based_on_develop();
+        app.checkout_selected_project_default_branch()
+            .expect("open the confirmation");
+
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        // Give a stray worker every chance to have run.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        app.drain_events();
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert!(app.pending_checkout_inspect_ops.is_empty());
+        assert_eq!(folder_branch(&repo), "develop", "nothing was checked out");
+        assert_eq!(stored_project_base(&app).as_deref(), Some("develop"));
+        assert_eq!(
+            app.engine.projects[0].leading_branch.as_deref(),
+            Some("develop")
+        );
+        assert_eq!(
+            app.status.text(),
+            "Cancelled checking out the default branch for project \"repo\". Nothing was \
+             checked out, and new worktrees still branch from \"develop\"."
+        );
+    }
+
+    #[test]
+    fn pressing_cancel_runs_nothing_either() {
+        let (_root, repo, mut app) = project_based_on_develop();
+        app.checkout_selected_project_default_branch()
+            .expect("open the confirmation");
+
+        // Cancel has focus; activating it is the same answer as Escape.
+        app.handle_key(key(KeyCode::Char(' '), KeyModifiers::NONE))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        app.drain_events();
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert!(app.pending_checkout_inspect_ops.is_empty());
+        assert_eq!(folder_branch(&repo), "develop");
+        assert_eq!(stored_project_base(&app).as_deref(), Some("develop"));
+    }
+
+    #[test]
+    fn confirming_checks_out_the_default_and_makes_it_the_project_base() {
+        let (_root, repo, mut app) = project_based_on_develop();
+        app.checkout_selected_project_default_branch()
+            .expect("open the confirmation");
+
+        // Move focus from Cancel to the confirm button, then press it.
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(app.prompt, PromptState::None));
+        drain_until(&mut app, "the base to move to main", |app| {
+            stored_project_base(app).as_deref() == Some("main")
+        });
+
+        assert_eq!(folder_branch(&repo), "main");
+        assert_eq!(
+            app.engine.projects[0].leading_branch.as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            app.status.text(),
+            "Checked out \"main\" for project \"repo\". New worktrees branch from \"main\" now."
+        );
+    }
+
+    /// The cancel line names the base new worktrees branch from NOW, not the
+    /// one captured when the dialog opened: the base can move underneath an
+    /// open dialog (the browser checked out the default meanwhile).
+    #[test]
+    fn cancelling_names_the_base_as_it_is_when_the_dialog_closes() {
+        let (_root, _repo, mut app) = project_based_on_develop();
+        app.checkout_selected_project_default_branch()
+            .expect("open the confirmation");
+        app.engine.projects[0].leading_branch = Some("main".to_string());
+
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(
+            app.status.text(),
+            "Cancelled checking out the default branch for project \"repo\". Nothing was \
+             checked out, and new worktrees still branch from \"main\"."
+        );
+    }
+
+    /// A project removed while its dialog was open is said to be gone, rather
+    /// than described by a base it no longer has.
+    #[test]
+    fn cancelling_after_the_project_is_gone_says_so() {
+        let (_root, _repo, mut app) = project_based_on_develop();
+        app.checkout_selected_project_default_branch()
+            .expect("open the confirmation");
+        app.engine.projects.clear();
+
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(
+            app.status.text(),
+            "Cancelled checking out the default branch for project \"repo\". The project has \
+             been removed from dux since the dialog opened, so there is nothing to check out."
+        );
+    }
+
+    /// One checkout per repository at a time, from either surface: a second
+    /// confirmation while one runs is refused with an ordinary warning and
+    /// starts nothing, and every ending hands the repository back.
+    #[test]
+    fn a_second_checkout_while_one_runs_is_refused_and_the_repository_is_released_after() {
+        let (_root, repo, mut app) = project_based_on_develop();
+        let project = app.engine.projects[0].clone();
+        let key = dux_core::engine::InFlightKey::CheckoutDefaultBranch(project.path.clone());
+
+        app.dispatch_checkout_project_default_branch(project.clone());
+        assert_eq!(app.pending_checkout_inspect_ops.len(), 1);
+        app.dispatch_checkout_project_default_branch(project.clone());
+        assert_eq!(
+            app.pending_checkout_inspect_ops.len(),
+            1,
+            "the refusal must not start a second chain"
+        );
+        let (tone, message) = app.status.most_recent_tui().expect("the refusal");
+        assert_eq!(tone, dux_core::statusline::StatusTone::Warning);
+        assert_eq!(
+            message,
+            "dux is already checking out the default branch for project \"repo\". Wait for it \
+             to finish; its result will say where the project's worktrees branch from."
+        );
+
+        // Ending one: the switch succeeded.
+        drain_until(&mut app, "the base to move to main", |app| {
+            stored_project_base(app).as_deref() == Some("main")
+        });
+        drain_until(&mut app, "the chain to finish", |app| {
+            app.pending_checkout_inspect_ops.is_empty()
+        });
+        assert!(!app.engine.is_in_flight(&key), "success releases it");
+        assert_eq!(folder_branch(&repo), "main");
+
+        // Ending two: the folder is already on the default branch.
+        app.dispatch_checkout_project_default_branch(project);
+        assert_eq!(app.pending_checkout_inspect_ops.len(), 1, "accepted again");
+        drain_until(&mut app, "the already-there answer", |app| {
+            app.pending_checkout_inspect_ops.is_empty()
+        });
+        assert!(
+            !app.engine.is_in_flight(&key),
+            "already being there releases it"
         );
     }
 }

@@ -6,6 +6,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
 import { closeDiscard, discardFile, useDux } from "@/lib/store"
 
@@ -44,17 +45,19 @@ export function ConfirmDiscardFileDialog() {
     <Dialog open={isOpen} onOpenChange={handleOpenChange}>
       <DialogContent showCloseButton={false} destructive>
         <DialogHeader>
-          <DialogTitle>Discard changes to {path}?</DialogTitle>
+          <DialogTitle>
+            Discard changes to <InlineCode>{path}</InlineCode>?
+          </DialogTitle>
         </DialogHeader>
         <p className="text-sm text-destructive">
           {untracked ? (
             <>
-              <span className="font-mono break-all">{path}</span> is untracked and will be{" "}
+              <InlineCode>{path}</InlineCode> is untracked and will be{" "}
               permanently DELETED from disk. This action cannot be undone.
             </>
           ) : (
             <>
-              All changes to <span className="font-mono break-all">{path}</span> will be{" "}
+              All changes to <InlineCode>{path}</InlineCode> will be{" "}
               restored to its last committed state. This action cannot be undone.
             </>
           )}

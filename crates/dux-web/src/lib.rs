@@ -2162,7 +2162,7 @@ mod tests {
             lock_path: root.join("dux.lock"),
         };
         std::fs::create_dir_all(&paths.worktrees_root).expect("worktrees dir");
-        let mut engine = crate::bootstrap::bootstrap_engine(&paths).expect("engine");
+        let mut engine = crate::test_support::bootstrap_test_engine(&paths).expect("engine");
         let (handle, ends) = crate::engine_actor::build_actor_channels(&engine);
         let mut svc = crate::engine_actor::EngineService::new(
             &engine,
@@ -2223,7 +2223,7 @@ mod tests {
             lock_path: root.join("dux.lock"),
         };
         std::fs::create_dir_all(&paths.worktrees_root).expect("worktrees dir");
-        let mut engine = crate::bootstrap::bootstrap_engine(&paths).expect("engine");
+        let mut engine = crate::test_support::bootstrap_test_engine(&paths).expect("engine");
         let (handle, ends) = crate::engine_actor::build_actor_channels(&engine);
         let mut svc = crate::engine_actor::EngineService::new(
             &engine,
@@ -2302,7 +2302,7 @@ mod tests {
             lock_path: root.join("dux.lock"),
         };
         std::fs::create_dir_all(&paths.worktrees_root).expect("worktrees dir");
-        let mut engine = crate::bootstrap::bootstrap_engine(&paths).expect("engine");
+        let mut engine = crate::test_support::bootstrap_test_engine(&paths).expect("engine");
         let (handle, ends) = crate::engine_actor::build_actor_channels(&engine);
         let mut svc = crate::engine_actor::EngineService::new(
             &engine,

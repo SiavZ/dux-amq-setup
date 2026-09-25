@@ -10,7 +10,8 @@ import {
 import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
 import { closeDeleteProject, deleteProject, useDux } from "@/lib/store"
 import { workspaceProjectId } from "@/lib/agentWorkspace"
-import { formatRegularCount } from "@/lib/formatRegularCount"
+import { deleteProjectProse } from "@/lib/projectConfirm"
+import { renderProse } from "@/lib/prose"
 
 // The destructive cascade counterpart to `RemoveProjectDialog`: it also deletes
 // every agent's worktree from disk, so the copy spells that out. Offered only for
@@ -25,19 +26,11 @@ export function DeleteProjectDialog() {
     project !== undefined,
     closeDeleteProject,
   )
-  const name = project?.name ?? "this project"
+  const name = project?.name
   const agentCount =
     spine?.sessions.filter(
       (s) => workspaceProjectId(s.workspace) === deleteProjectTarget,
     ).length ?? 0
-  // Name the agents and their worktrees only when there are any; a project with
-  // no agents has no worktrees to mention.
-  const cascadeClause =
-    agentCount > 0
-      ? `, its ${formatRegularCount(agentCount, "agent")}, and ${
-          agentCount === 1 ? "its worktree" : "their worktrees"
-        } on disk`
-      : ""
 
   function handleConfirm() {
     if (!deleteProjectTarget) return
@@ -55,8 +48,7 @@ export function DeleteProjectDialog() {
         <DialogHeader>
           <DialogTitle>Delete project?</DialogTitle>
           <DialogDescription>
-            This deletes &ldquo;{name}&rdquo;{cascadeClause} from dux. This is
-            irreversible. The source checkout is kept.
+            {renderProse(deleteProjectProse(name, agentCount))}
           </DialogDescription>
         </DialogHeader>
         <DialogFooter>

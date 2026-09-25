@@ -501,7 +501,7 @@ mod tests {
     /// resolves and there is no `origin/HEAD` (the heuristic-warning path).
     fn init_repo(dir: &Path) {
         let run = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
+            let ok = dux_core::test_git::fixture_git()
                 .args(args)
                 .current_dir(dir)
                 .output()
@@ -575,7 +575,7 @@ mod tests {
     /// Build a detached-HEAD repo: init on `main`, commit once, then detach.
     fn init_repo_detached(dir: &Path) {
         let run = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
+            let ok = dux_core::test_git::fixture_git()
                 .args(args)
                 .current_dir(dir)
                 .output()
@@ -627,7 +627,7 @@ mod tests {
     /// Init a repo with `git init` but NO commit (unborn HEAD).
     fn init_repo_no_commit(dir: &Path) {
         let run = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
+            let ok = dux_core::test_git::fixture_git()
                 .args(args)
                 .current_dir(dir)
                 .output()
@@ -754,7 +754,7 @@ mod tests {
     async fn inspect_classifies_a_bare_root_with_branch_fields() {
         // Catches the client offering `git init` on a bare repository.
         let bare = tempfile::tempdir().unwrap();
-        let ok = std::process::Command::new("git")
+        let ok = dux_core::test_git::fixture_git()
             .args(["init", "--bare", "-b", "main"])
             .current_dir(bare.path())
             .output()

@@ -687,7 +687,7 @@ pub enum TailscaleModeOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TailscaleModeReport {
     pub warning: bool,
-    pub message: String,
+    pub message: crate::status_text::StatusText,
 }
 
 impl TailscaleModeOutcome {
@@ -699,10 +699,11 @@ impl TailscaleModeOutcome {
         match self {
             Self::Applied { bound: Some(addr) } => TailscaleModeReport {
                 warning: false,
-                message: format!(
-                    "{saved} dux is serving your Tailscale address on http://{addr} as well as \
-                     its other address(es)."
-                ),
+                message: crate::status_text![
+                    format!("{saved} dux is serving your Tailscale address on "),
+                    n(format!("http://{addr}")),
+                    " as well as its other address(es)."
+                ],
             },
             Self::Applied { bound: None } => TailscaleModeReport {
                 warning: false,
@@ -710,18 +711,21 @@ impl TailscaleModeOutcome {
                     TailscaleMode::Auto => format!(
                         "{saved} dux is watching the Tailscale interface and binds your \
                          Tailscale address by itself when it appears."
-                    ),
+                    )
+                    .into(),
                     // On `yes` the detection found an address dux is already
                     // reachable on (a wildcard primary, or the tailnet address
                     // itself), so a second listener would be the same socket.
                     TailscaleMode::Yes => format!(
                         "{saved} There is no separate Tailscale listener to add or remove; \
                          the address dux already serves covers it."
-                    ),
+                    )
+                    .into(),
                     TailscaleMode::No => format!(
                         "{saved} Nothing was serving on your Tailscale address, and nothing \
                          will be; dux is serving on its other address(es) only."
-                    ),
+                    )
+                    .into(),
                 },
             },
             Self::Detached => TailscaleModeReport {
@@ -730,7 +734,8 @@ impl TailscaleModeOutcome {
                     "{saved} dux stopped serving on your Tailscale address and is still \
                      serving on its other address(es); anything connected over the tailnet \
                      loses its connection."
-                ),
+                )
+                .into(),
             },
             Self::NothingDetected => TailscaleModeReport {
                 warning: true,
@@ -738,7 +743,8 @@ impl TailscaleModeOutcome {
                     "{saved} No Tailscale address was found, and \"yes\" does not look again: \
                      dux serves without it until you restart or choose \"auto\", which binds \
                      it whenever the interface appears."
-                ),
+                )
+                .into(),
             },
             Self::BindFailed => TailscaleModeReport {
                 warning: true,
@@ -746,14 +752,16 @@ impl TailscaleModeOutcome {
                     "{saved} Your Tailscale address was found, but its listener would not bind \
                      (see dux.log); dux is serving on its other address(es). Free that port and \
                      choose the mode again, or use \"auto\", which retries by itself."
-                ),
+                )
+                .into(),
             },
             Self::NoPrimary => TailscaleModeReport {
                 warning: true,
                 message: format!(
                     "{saved} dux could not read the address of its main listener, so there is \
                      no port to serve a Tailscale leg on; restart dux to pick the mode up."
-                ),
+                )
+                .into(),
             },
             Self::RefusedForcedNo => TailscaleModeReport {
                 warning: true,
@@ -761,27 +769,31 @@ impl TailscaleModeOutcome {
                     "{saved} This run was started with --no-tailscale, which wins for as long \
                      as it runs, so nothing changed on the listeners; restart dux without that \
                      flag to use the saved mode."
-                ),
+                )
+                .into(),
             },
             Self::NotServing => TailscaleModeReport {
                 warning: false,
                 message: format!(
                     "{saved} Nothing is serving, so it applies when a listener starts."
-                ),
+                )
+                .into(),
             },
             Self::Superseded => TailscaleModeReport {
                 warning: true,
                 message: format!(
                     "{saved} Another Tailscale mode change arrived first, so this one was \
                      dropped; the saved value is what a restart uses."
-                ),
+                )
+                .into(),
             },
             Self::TimedOut => TailscaleModeReport {
                 warning: true,
                 message: format!(
                     "{saved} The server did not report back in time, so dux cannot say what \
                      the Tailscale listener is doing; check dux.log."
-                ),
+                )
+                .into(),
             },
         }
     }
@@ -5332,6 +5344,28 @@ github_integration = false
                 report.message
             );
         }
+    }
+
+    #[test]
+    fn the_bound_leg_address_travels_as_one_name_and_the_words_are_unchanged() {
+        use std::net::SocketAddr;
+        let leg: SocketAddr = "100.64.0.5:8080".parse().unwrap();
+        let applied = TailscaleModeOutcome::Applied { bound: Some(leg) }.report(TailscaleMode::Yes);
+        assert_eq!(
+            applied.message.message(),
+            "[server] tailscale is saved as \"yes\". dux is serving your Tailscale address on \
+             http://100.64.0.5:8080 as well as its other address(es)."
+        );
+        assert!(
+            applied
+                .message
+                .segments()
+                .unwrap()
+                .contains(&crate::prose::ProseSegment::Name {
+                    name: "http://100.64.0.5:8080".into(),
+                    quoted: false,
+                })
+        );
     }
 
     #[test]

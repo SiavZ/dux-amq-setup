@@ -157,7 +157,12 @@ one button, **Take over**, and two ways to press it: click it, or, with the pane
 use the key that focuses an agent (Enter unless you have rebound it). Typing does not
 claim a terminal, so keys pressed under the card go nowhere. An agent you start yourself
 is yours straight away, with no card over it; agents dux reopens for you at startup wear
-the **Running in the background** card until you press it. The card calls the terminal UI `the dux
+the **Running in the background** card until you press it. Switching the background
+server on while dux is already running, with the palette command or by turning
+`serve_while_tui` on in the config file, keeps everything you had running as yours: every
+agent and terminal stays in your hands with no card over it, and a browser that wants one
+presses **Take over**. When dux starts with the setting already on, it keeps nothing, so
+a browser can pick up any of it. The card calls the terminal UI `the dux
 TUI` when that is what has the keyboard. Taking a terminal over also retargets its size
 to the device that took it, and everyone watching adopts that geometry. Take-over works
 in both directions and is sticky either way: losing a terminal does not silently give it

@@ -257,7 +257,7 @@ mod tests {
         }
     }
 
-    fn engine() -> (Engine, tempfile::TempDir) {
+    fn engine() -> (Engine, crate::test_scratch::ScratchDir) {
         test_engine()
     }
 

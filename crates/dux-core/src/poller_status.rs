@@ -104,10 +104,12 @@ pub fn refs_watcher_lost_agent(agent_label: &str) -> StatusUpdate {
     StatusUpdate::keyed(
         key(&format!("{REFS_WATCHER_LABEL}:{agent_label}")),
         StatusTone::Warning,
-        format!(
-            "dux cannot watch agent \"{agent_label}\" for branch changes, so its pull request \
+        crate::status_text![
+            "dux cannot watch agent ",
+            q(agent_label),
+            " for branch changes, so its pull request \
              status stops updating until you restart dux. Every other agent is unaffected."
-        ),
+        ],
     )
 }
 
@@ -120,10 +122,15 @@ pub fn pr_status_not_saved(session_id: &str, agent_label: &str, error: &str) -> 
     StatusUpdate::keyed(
         key(&format!("pr-status-write:{session_id}")),
         StatusTone::Warning,
-        format!(
-            "dux refreshed the pull request status for agent \"{agent_label}\" but could not save \
-             it: {error}. What you see is correct; after a restart dux has to ask GitHub again."
-        ),
+        crate::status_text![
+            "dux refreshed the pull request status for agent ",
+            q(agent_label),
+            format!(
+                " but could not save \
+             it: {}. What you see is correct; after a restart dux has to ask GitHub again.",
+                error
+            )
+        ],
     )
 }
 

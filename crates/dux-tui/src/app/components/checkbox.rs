@@ -4,6 +4,12 @@ use ratatui::prelude::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
+use dux_core::prose::Prose;
+
+use super::name_chip::prose_lines;
+use super::wrap_lines::wrap_styled_lines;
+use crate::theme::Theme;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CheckboxState {
     Normal,
@@ -32,9 +38,17 @@ impl CheckboxLayout {
     }
 }
 
-#[derive(Clone, Debug)]
+/// What a checkbox says: plain words, or a sentence that names something and
+/// draws each name as the shared chip.
+#[derive(Clone, Copy)]
+enum CheckboxLabel<'a> {
+    Plain(&'a str),
+    Prose(&'a Prose, &'a Theme),
+}
+
+#[derive(Clone)]
 pub(crate) struct Checkbox<'a> {
-    label: &'a str,
+    label: CheckboxLabel<'a>,
     checked: bool,
     state: CheckboxState,
 }
@@ -50,7 +64,17 @@ impl<'a> Checkbox<'a> {
 
     pub(crate) fn new(label: &'a str) -> Self {
         Self {
-            label,
+            label: CheckboxLabel::Plain(label),
+            checked: false,
+            state: CheckboxState::Normal,
+        }
+    }
+
+    /// A checkbox whose label names something: every name in `prose` renders
+    /// as the name chip, the words around it in the label style.
+    pub(crate) fn with_prose(prose: &'a Prose, theme: &'a Theme) -> Self {
+        Self {
+            label: CheckboxLabel::Prose(prose, theme),
             checked: false,
             state: CheckboxState::Normal,
         }
@@ -79,24 +103,36 @@ impl<'a> Checkbox<'a> {
         let indent_width = display_width(Self::INDENT);
         let available = usize::from(max_width);
         let label_width = available.saturating_sub(indent_width).max(1);
-        let wrapped = wrap_checkbox_label(self.label, label_width);
+        let rows: Vec<Vec<Span<'static>>> = match self.label {
+            CheckboxLabel::Plain(label) => wrap_checkbox_label(label, label_width)
+                .into_iter()
+                .map(|text| vec![Span::styled(text, label_style)])
+                .collect(),
+            CheckboxLabel::Prose(prose, theme) => {
+                let sentence = prose_lines(prose, "", label_style, theme);
+                let wrapped = wrap_styled_lines(&sentence, label_width, theme);
+                if wrapped.is_empty() {
+                    vec![Vec::new()]
+                } else {
+                    wrapped.into_iter().map(|line| line.spans).collect()
+                }
+            }
+        };
         let marker = if self.checked { "[x]" } else { "[ ]" };
-        let mut lines = Vec::with_capacity(wrapped.len().max(1));
+        let mut lines = Vec::with_capacity(rows.len().max(1));
 
-        for (index, text) in wrapped.into_iter().enumerate() {
-            if index == 0 {
-                lines.push(Line::from(vec![
+        for (index, row) in rows.into_iter().enumerate() {
+            let mut spans = if index == 0 {
+                vec![
                     Span::raw(Self::PREFIX),
                     Span::styled(marker.to_string(), marker_style),
                     Span::raw(Self::GAP),
-                    Span::styled(text, label_style),
-                ]));
+                ]
             } else {
-                lines.push(Line::from(vec![
-                    Span::raw(Self::INDENT),
-                    Span::styled(text, label_style),
-                ]));
-            }
+                vec![Span::raw(Self::INDENT)]
+            };
+            spans.extend(row);
+            lines.push(Line::from(spans));
         }
 
         CheckboxLayout {
@@ -321,6 +357,41 @@ mod tests {
 
         assert_eq!(unchecked_spans[1].content.as_ref(), "[ ]");
         assert_eq!(checked_spans[1].content.as_ref(), "[x]");
+    }
+
+    /// A label that names something keeps the name as a chip on the row it
+    /// lands on, with the label's own style on the words around it, and the
+    /// marker and indent geometry of a plain label.
+    #[test]
+    fn a_prose_label_draws_its_names_as_chips_and_wraps_with_the_same_indent() {
+        let theme = crate::theme::Theme::default_dark();
+        let prose = dux_core::prose::Prose::new()
+            .text("Also delete the branch ")
+            .name("feat/login");
+        let label_style = Style::default().fg(Color::Yellow);
+        let layout = Checkbox::with_prose(&prose, &theme).checked(true).layout(
+            24,
+            Style::default(),
+            label_style,
+        );
+
+        let rows: Vec<String> = layout
+            .lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![" [x] Also delete the", "     branch  feat/login "]
+        );
+        assert_eq!(layout.height, 2);
+        let chip = layout.lines[1]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("feat/login"))
+            .expect("the name is on the second row");
+        assert_eq!(chip.style, theme.name_style());
+        assert_eq!(layout.lines[0].spans[3].style, label_style);
     }
 
     #[test]

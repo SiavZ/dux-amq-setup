@@ -1049,6 +1049,44 @@ pub fn local_branch_exists(repo_path: &Path, name: &str) -> bool {
     ref_exists(repo_path, &format!("refs/heads/{name}"))
 }
 
+/// Whether origin has branch `name` right now, asked of origin itself with
+/// `ls-remote` (plumbing) rather than this clone's tracking refs, which may
+/// never have been fetched. `Ok(false)` only when origin answered and has no
+/// such ref (exit 2); any failure to ask is an `Err`, never a "no".
+///
+/// `ls-remote` patterns match a ref's tail, so the answer is the exact ref in
+/// its output, not the exit status alone. The refspec is fully qualified, so
+/// a dash-leading branch name cannot be read as an option.
+pub fn origin_has_branch(repo_path: &Path, name: &str) -> Result<bool> {
+    let full_ref = format!("refs/heads/{name}");
+    let output = Command::new("git")
+        .args([
+            "-C",
+            repo_path.to_string_lossy().as_ref(),
+            "ls-remote",
+            "--exit-code",
+            "origin",
+            "--",
+            &full_ref,
+        ])
+        // Never stop to ask for credentials: this is a question, not a login.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("failed to run git ls-remote in {}", repo_path.display()))?;
+    match output.status.code() {
+        Some(0) => Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.split('\t').nth(1) == Some(full_ref.as_str()))),
+        Some(2) => Ok(false),
+        _ => anyhow::bail!(
+            "git ls-remote origin failed in {}: {}",
+            repo_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
 /// How much of a branch exists only on this machine, and whether there was
 /// anywhere for it to have been pushed to in the first place.
 ///
@@ -1918,12 +1956,23 @@ impl BranchDeletion {
 /// the web toast say the same thing, which both need because a surviving branch
 /// makes recreating an agent under the same name fail far from the deletion that
 /// caused it.
-pub fn branch_refusal_note(branch: &str, reason: &str) -> String {
+pub fn branch_refusal_note(branch: &str, reason: &str) -> crate::status_text::StatusText {
     let reason = clean_git_reason(reason);
-    format!(
-        "Git refused to delete branch \"{branch}\": {reason} Delete it yourself with \
-         git branch -D \"{branch}\", or give the next agent a different name."
-    )
+    crate::status_text![
+        "Git refused to delete branch ",
+        q(branch),
+        format!(": {reason} Delete it yourself with "),
+        n(branch_delete_command(branch)),
+        ", or give the next agent a different name."
+    ]
+}
+
+/// The command a status tells the user to run to remove a branch by hand, as
+/// one string so it can travel as one name (the web draws it as a single chip).
+/// The branch is single-quoted, because a branch name can come from a pull
+/// request somebody else opened and the user is being invited to paste this.
+pub fn branch_delete_command(branch: &str) -> String {
+    format!("git branch -D {}", crate::shell_quote::single_quote(branch))
 }
 
 /// git's stderr line, tidied for a status message: the "error: " prefix dropped,
@@ -1962,18 +2011,27 @@ impl RemoveResult {
     /// nothing extra rather than mentioning a branch the user never saw.
     ///
     /// Lives here so the TUI status line and the web toast say the same thing.
-    pub fn initial_branch_note(&self, initial_branch: &str) -> Option<String> {
+    pub fn initial_branch_note(
+        &self,
+        initial_branch: &str,
+    ) -> Option<crate::status_text::StatusText> {
         match self.initial_branch.as_ref()? {
-            BranchDeletion::Deleted => Some(format!(
-                "Its original branch \"{initial_branch}\" was deleted too."
-            )),
-            BranchDeletion::AlreadyGone => Some(format!(
-                "Its original branch \"{initial_branch}\" was already gone."
-            )),
-            BranchDeletion::Refused { reason } => Some(format!(
-                "Its original branch \"{initial_branch}\" is still there. {}",
+            BranchDeletion::Deleted => Some(crate::status_text![
+                "Its original branch ",
+                q(initial_branch),
+                " was deleted too."
+            ]),
+            BranchDeletion::AlreadyGone => Some(crate::status_text![
+                "Its original branch ",
+                q(initial_branch),
+                " was already gone."
+            ]),
+            BranchDeletion::Refused { reason } => Some(crate::status_text![
+                "Its original branch ",
+                q(initial_branch),
+                " is still there. ",
                 branch_refusal_note(initial_branch, reason)
-            )),
+            ]),
         }
     }
 }
@@ -4199,8 +4257,13 @@ pub(crate) mod test_support {
     /// purpose. dux WANTS `insteadOf` rewrites applied when it runs for real,
     /// because the rewritten URL is the one git would actually contact; do not
     /// "fix" production by isolating it from the user's configuration.
+    ///
+    /// Hiding the global file from the FIXTURE's commands does not stop the
+    /// production git commands a test runs inside that fixture from reading it,
+    /// so the repositories this helper creates also come from the fixture
+    /// template (see [`crate::test_git`]) and refuse to sign on their own.
     pub(crate) fn git_command() -> std::process::Command {
-        let mut command = std::process::Command::new("git");
+        let mut command = crate::test_git::fixture_git();
         isolate_git_config(&mut command);
         command
     }
@@ -5713,6 +5776,51 @@ mod tests {
             args,
             cwd.display(),
             String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// origin itself answers, not this clone's tracking refs: a branch origin
+    /// has counts even though it was never fetched, a local-only branch does
+    /// not, and an origin that cannot be reached is an error, never a "no".
+    #[test]
+    fn origin_has_branch_asks_origin_itself() {
+        let bare = tempfile::tempdir().unwrap();
+        run_git(bare.path(), &["init", "-q", "--bare", "-b", "main"]);
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-q", "-b", "main"]);
+        run_git(repo.path(), &["config", "user.name", "t"]);
+        run_git(repo.path(), &["config", "user.email", "t@t"]);
+        run_git(
+            repo.path(),
+            &["commit", "-q", "--allow-empty", "-m", "init"],
+        );
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        );
+        run_git(repo.path(), &["push", "-q", "origin", "main"]);
+        run_git(
+            repo.path(),
+            &["update-ref", "-d", "refs/remotes/origin/main"],
+        );
+        run_git(repo.path(), &["branch", "feature"]);
+
+        assert!(
+            origin_has_branch(repo.path(), "main").unwrap(),
+            "exit 0: origin has it, fetched or not"
+        );
+        assert!(
+            !origin_has_branch(repo.path(), "feature").unwrap(),
+            "exit 2: origin answered and has no such branch"
+        );
+
+        run_git(
+            repo.path(),
+            &["remote", "set-url", "origin", "/nonexistent/dux-origin.git"],
+        );
+        assert!(
+            origin_has_branch(repo.path(), "main").is_err(),
+            "an origin that cannot be asked is not a no"
         );
     }
 
@@ -7358,7 +7466,7 @@ mod tests {
             .initial_branch_note("born-here")
             .expect("a refusal is worth a sentence");
         assert!(
-            note.contains("still there") && note.contains("git branch -D \"born-here\""),
+            note.contains("still there") && note.contains("git branch -D 'born-here'"),
             "the note must be honest and actionable: {note}"
         );
         assert!(
@@ -7451,9 +7559,55 @@ mod tests {
         assert_eq!(
             note,
             "Git refused to delete branch \"feat\": cannot delete branch 'feat' used by \
-             worktree at '/tmp/w'. Delete it yourself with git branch -D \"feat\", or give \
+             worktree at '/tmp/w'. Delete it yourself with git branch -D 'feat', or give \
              the next agent a different name."
         );
+    }
+
+    /// Run the suggested command the way a user pasting it would, through a
+    /// POSIX shell, with `git` shadowed by a function that records its argv one
+    /// NUL-terminated argument at a time. Returns the arguments `git` received
+    /// after `branch -D`, and whether anything else ran (a file the crafted
+    /// names would `touch`).
+    fn run_suggested_delete(branch: &str) -> (Vec<String>, bool) {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let command = branch_delete_command(branch);
+        let script = format!("git() {{ shift 2; printf '%s\\0' \"$@\" > argv; }}; {command}");
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .current_dir(dir.path())
+            .status()
+            .expect("run sh");
+        assert!(status.success(), "the command must parse: {command}");
+        let raw = std::fs::read(dir.path().join("argv")).expect("git was called");
+        let args = raw
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8(s.to_vec()).unwrap())
+            .collect();
+        let injected = dir.path().join("INJECTED").exists();
+        (args, injected)
+    }
+
+    /// A branch name is attacker-shaped text (a pull request's head branch
+    /// reaches dux verbatim), and the delete command is one a user copies into
+    /// a shell. Double quotes left `$`, backticks and a closing quote live, so a
+    /// crafted name ran its own command.
+    #[test]
+    fn the_suggested_delete_command_passes_a_crafted_name_as_one_argument() {
+        let crafted = "foo\";touch${IFS}INJECTED;echo\"";
+        let (args, injected) = run_suggested_delete(crafted);
+        assert_eq!(args, vec![crafted.to_string()]);
+        assert!(!injected, "the crafted name ran a command of its own");
+    }
+
+    #[test]
+    fn the_suggested_delete_command_survives_a_single_quote_in_the_name() {
+        let name = "it's';touch INJECTED;'";
+        let (args, injected) = run_suggested_delete(name);
+        assert_eq!(args, vec![name.to_string()]);
+        assert!(!injected, "the name broke out of its quotes");
     }
 
     #[test]

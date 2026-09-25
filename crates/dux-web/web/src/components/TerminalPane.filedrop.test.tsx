@@ -9,6 +9,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 
 import type { DuxState } from "@/lib/store"
 import { notifyPtyOwner, resetPtyOwnerEpochs } from "@/lib/ptyOwnership"
+import { toastChips, toastText } from "@/test/toastText"
 
 /// A stand-in for xterm that does what xterm's `paste()` REALLY does.
 ///
@@ -455,7 +456,7 @@ describe("dropping a file onto an agent", () => {
     render(<TerminalPane kind="agent" id="s1" sessionId="s1" />)
     await drop([file("shot.png")])
 
-    const message = vi.mocked(toast.success).mock.calls[0][0] as string
+    const message = toastText(vi.mocked(toast.success).mock.calls[0][0])
     expect(message).toContain("shot.png")
     expect(message).toContain("shot-S-1.png")
     expect(sentToSocket()).toEqual(["/tmp/p1/shot-S-1.png "])
@@ -638,7 +639,7 @@ describe("the paste form follows the provider running in the pane", () => {
       render(<TerminalPane kind="agent" id="s1" sessionId="s1" />)
       await drop([file("shot.png")])
       expect(sentToSocket(), `codex configured as ${form}`).toEqual([])
-      const message = vi.mocked(toast.warning).mock.calls[0][0] as string
+      const message = toastText(vi.mocked(toast.warning).mock.calls[0][0])
       expect(message).toContain("1000 characters")
     }
   })
@@ -685,7 +686,7 @@ describe("which CLI a pane is actually talking to", () => {
     // attach nothing, and report success.
     expect(longPath.length).toBe(2000)
     expect(await dropLongPathOn("myagent", "codex")).toEqual([])
-    const message = vi.mocked(toast.warning).mock.calls[0][0] as string
+    const message = toastText(vi.mocked(toast.warning).mock.calls[0][0])
     expect(message).toContain("1000 characters")
   })
 
@@ -926,7 +927,7 @@ describe("dropping several files", () => {
       expect(name).toBe(started[i])
     }
 
-    const message = vi.mocked(toast.success).mock.calls[0][0] as string
+    const message = toastText(vi.mocked(toast.success).mock.calls[0][0])
     expect(message).toContain("3 files")
   })
 })
@@ -946,7 +947,7 @@ describe("when a file cannot be pasted", () => {
     expect(TermStub.pastes).toEqual([])
     expect(sentToSocket()).toEqual([])
     expect(vi.mocked(toast.success)).not.toHaveBeenCalled()
-    const message = vi.mocked(toast.warning).mock.calls[0][0] as string
+    const message = toastText(vi.mocked(toast.warning).mock.calls[0][0])
     expect(message).toContain("not sent")
     expect(message).toContain("/tmp/p1/shot.png")
 
@@ -974,7 +975,7 @@ describe("when a file cannot be pasted", () => {
 
     expect(TermStub.pastes).toEqual([])
     expect(sentToSocket()).toEqual([])
-    const message = vi.mocked(toast.warning).mock.calls[0][0] as string
+    const message = toastText(vi.mocked(toast.warning).mock.calls[0][0])
     expect(message).toContain("/tmp/p1/shot.png")
     expect(message).toContain("the connection dropped")
   })
@@ -1006,7 +1007,7 @@ describe("when a file cannot be pasted", () => {
     expect(TermStub.pastes).toEqual([])
     expect(sentToSocket()).toEqual([])
     expect(vi.mocked(toast.success)).not.toHaveBeenCalled()
-    const message = vi.mocked(toast.warning).mock.calls[0][0] as string
+    const message = toastText(vi.mocked(toast.warning).mock.calls[0][0])
     expect(message).toContain("not sent")
     expect(message).toContain("1000 characters")
     expect(message).toContain(longPath)
@@ -1047,7 +1048,7 @@ describe("when a file cannot be pasted", () => {
 
     expect(TermStub.pastes).toEqual([])
     expect(sentToSocket()).toEqual([])
-    const message = vi.mocked(toast.error).mock.calls[0][0] as string
+    const message = toastText(vi.mocked(toast.error).mock.calls[0][0])
     expect(message).toContain("big.png")
     expect(message).toContain("over the 1024 byte limit")
   })
@@ -1065,7 +1066,7 @@ describe("when a file cannot be pasted", () => {
     render(<TerminalPane kind="agent" id="s1" sessionId="s1" />)
     await drop([file("shot.png")])
 
-    const message = vi.mocked(toast.error).mock.calls[0][0] as string
+    const message = toastText(vi.mocked(toast.error).mock.calls[0][0])
     expect(message).toContain("shot.png")
     // The server's own words carry the advice, so dux does not add a second
     // copy of it. The whole sentence is asserted, because the bug this replaces
@@ -1116,7 +1117,8 @@ describe("what the user sees while a drop is uploading", () => {
     // In flight: the spinner is up and nothing final has been said yet.
     expect(vi.mocked(toast.loading)).toHaveBeenCalled()
     const busy = vi.mocked(toast.loading).mock.calls[0]
-    expect(busy[0] as string).toContain("shot.png")
+    expect(toastText(busy[0])).toContain("shot.png")
+    expect(toastChips(busy[0])).toEqual(["shot.png"])
     expect(vi.mocked(toast.success)).not.toHaveBeenCalled()
 
     await act(async () => {
@@ -1154,7 +1156,7 @@ describe("what the user sees while a drop is uploading", () => {
 
     const messages = vi
       .mocked(toast.loading)
-      .mock.calls.map((c) => c[0] as string)
+      .mock.calls.map((c) => toastText(c[0]))
     expect(messages).toHaveLength(3)
     expect(messages[0]).toContain("a.png")
     expect(messages[0]).toContain("1 of 3")
@@ -1175,7 +1177,7 @@ describe("what the user sees while a drop is uploading", () => {
     await drop([file("shot.png")])
 
     expect(vi.mocked(toast.loading)).toHaveBeenCalled()
-    const message = vi.mocked(toast.error).mock.calls[0][0] as string
+    const message = toastText(vi.mocked(toast.error).mock.calls[0][0])
     expect(message).toContain("xterm blew up")
     const finalId = (
       vi.mocked(toast.error).mock.calls[0][1] as { id: string }

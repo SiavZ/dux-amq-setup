@@ -25,7 +25,7 @@ use dux_web::server::{AppState, RouterParams, build_app};
 /// production read is deliberately left alone: a rewrite SHOULD apply there,
 /// because the rewritten address is the one git would really contact.
 fn git_isolated(dir: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
+    let out = dux_core::test_git::fixture_git()
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -44,8 +44,11 @@ fn git_isolated(dir: &Path, args: &[&str]) {
 
 /// Boot a server whose projects are `(id, name, origin address)`, with GitHub
 /// integration on and the given hosts eligible.
-async fn boot(projects: &[(&str, &str, &str)], hosts: &[&str]) -> (SocketAddr, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().unwrap();
+async fn boot(
+    projects: &[(&str, &str, &str)],
+    hosts: &[&str],
+) -> (SocketAddr, dux_core::test_scratch::ScratchDir) {
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
     let paths = DuxPaths {
         root: root.clone(),
@@ -96,6 +99,7 @@ async fn boot(projects: &[(&str, &str, &str)], hosts: &[&str]) -> (SocketAddr, t
     // A worktree-mode install: these fixtures register dux's own root as the
     // project, which shared mode rightly refuses to run agents in.
     engine.config.workspace = None;
+    dux_core::test_provider::defuse_config(&mut engine.config);
     engine.github_integration_enabled = true;
     // Point the probe at a stand-in `gh` that reports exactly `hosts`. Starting
     // the engine thread starts the REAL host probe, so placing an answer here

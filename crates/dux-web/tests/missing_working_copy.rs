@@ -18,7 +18,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 
 fn run_git(cwd: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
+    let out = dux_core::test_git::fixture_git()
         .args(args)
         .current_dir(cwd)
         .output()
@@ -61,7 +61,11 @@ fn sample_session(id: &str, worktree: &str, branch: &str) -> dux_core::model::Ag
 
 /// A server with one managed agent in a REAL worktree of a real project
 /// repository, so the recreate has a repository to check the branch out from.
-async fn boot() -> (SocketAddr, tempfile::TempDir, std::path::PathBuf) {
+async fn boot() -> (
+    SocketAddr,
+    dux_core::test_scratch::ScratchDir,
+    std::path::PathBuf,
+) {
     let (addr, tmp, worktree, _repo) = boot_with_repo().await;
     (addr, tmp, worktree)
 }
@@ -70,11 +74,11 @@ async fn boot() -> (SocketAddr, tempfile::TempDir, std::path::PathBuf) {
 /// tests that need to look at what git holds.
 async fn boot_with_repo() -> (
     SocketAddr,
-    tempfile::TempDir,
+    dux_core::test_scratch::ScratchDir,
     std::path::PathBuf,
     std::path::PathBuf,
 ) {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = dux_core::test_scratch::ScratchDir::new();
     let root = tmp.path().to_path_buf();
 
     let repo = root.join("repo");
@@ -121,7 +125,8 @@ async fn boot_with_repo() -> (
             ))
             .unwrap();
     }
-    let engine = bootstrap_engine(&paths).unwrap();
+    let mut engine = bootstrap_engine(&paths).unwrap();
+    dux_core::test_provider::defuse_config(&mut engine.config);
     let (handle, _join) = spawn_engine_thread(engine);
     let app = build_app(handle, axum::Router::new(), RouterParams::plain_http());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -457,7 +462,7 @@ async fn recreating_one_working_copy_leaves_an_unreachable_sibling_alone() {
     wait_for_missing(addr, false).await;
 
     std::fs::rename(&stashed, &sibling).expect("the sibling's mount comes back");
-    let listed = std::process::Command::new("git")
+    let listed = dux_core::test_git::fixture_git()
         .args(["-C", &repo.to_string_lossy(), "worktree", "list"])
         .output()
         .expect("git runs");
@@ -466,7 +471,7 @@ async fn recreating_one_working_copy_leaves_an_unreachable_sibling_alone() {
         listing.contains("[other]"),
         "the sibling's registration survived: {listing}"
     );
-    let status = std::process::Command::new("git")
+    let status = dux_core::test_git::fixture_git()
         .args(["-C", &sibling.to_string_lossy(), "status", "--porcelain=v1"])
         .output()
         .expect("git runs");

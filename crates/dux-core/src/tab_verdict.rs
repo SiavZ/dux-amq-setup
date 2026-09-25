@@ -152,7 +152,7 @@ pub fn refused_resume_warning(
     agent_label: &str,
     excerpt: &[String],
     remedy: &str,
-) -> Option<String> {
+) -> Option<crate::status_text::StatusText> {
     let start = excerpt.len().saturating_sub(RESUME_REFUSAL_QUOTED_LINES);
     let quote = excerpt[start..]
         .iter()
@@ -184,10 +184,15 @@ pub fn refused_resume_warning(
     } else {
         "\u{2026}"
     };
-    Some(format!(
-        "Agent \"{agent_label}\" could not resume its previous session; the provider said: \
-         {head}{quote}{tail} {remedy}"
-    ))
+    Some(crate::status_text![
+        "Agent ",
+        q(agent_label),
+        format!(
+            " could not resume its previous session; the provider said: \
+         {}{}{} {}",
+            head, quote, tail, remedy
+        )
+    ])
 }
 
 /// "moments ago", "about 2 minutes ago": a coarse, prose-shaped age for a

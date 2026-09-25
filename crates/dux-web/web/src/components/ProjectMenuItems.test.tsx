@@ -79,3 +79,12 @@ describe("ProjectMenuItems startup-command logs entry", () => {
     expect(openProjectStartupLogs).toHaveBeenCalledWith("p1")
   })
 })
+
+// The verb form, matching the confirmation's title and its button.
+describe("ProjectMenuItems default-branch entry", () => {
+  it("reads Check out, never the noun Checkout", async () => {
+    await openMenu()
+    expect(screen.getByText("Check out default branch…")).toBeTruthy()
+    expect(screen.queryByText("Checkout default branch…")).toBeNull()
+  })
+})

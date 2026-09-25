@@ -13,6 +13,8 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::engine::StatusUpdate;
+use crate::prose::ProseSegment;
+use crate::status_text::StatusText;
 use crate::statusline::{QuietSurfaces, StatusScope, StatusTone};
 
 /// Process-global source of opaque status ids. Monotonic only so each op gets a
@@ -34,7 +36,11 @@ pub enum Final {
     /// retiring on a timer; see [`Final::sticky`].
     Message {
         tone: StatusTone,
+        /// The plain sentence the terminal UI prints.
         text: String,
+        /// The parts `text` was built from, for the web's name chips; see
+        /// [`crate::status_text`].
+        segments: Option<Vec<ProseSegment>>,
         sticky: bool,
         /// Which surfaces withhold this outcome. A quieted keyed final still
         /// retires its spinner; only the sentence is withheld.
@@ -46,26 +52,32 @@ pub enum Final {
 }
 
 impl Final {
-    pub fn info(text: impl Into<String>) -> Self {
+    pub fn info(text: impl Into<StatusText>) -> Self {
+        let (text, segments) = text.into().into_parts();
         Final::Message {
             tone: StatusTone::Info,
-            text: text.into(),
+            text,
+            segments,
             sticky: false,
             quiet_on: QuietSurfaces::LOUD,
         }
     }
-    pub fn warning(text: impl Into<String>) -> Self {
+    pub fn warning(text: impl Into<StatusText>) -> Self {
+        let (text, segments) = text.into().into_parts();
         Final::Message {
             tone: StatusTone::Warning,
-            text: text.into(),
+            text,
+            segments,
             sticky: false,
             quiet_on: QuietSurfaces::LOUD,
         }
     }
-    pub fn error(text: impl Into<String>) -> Self {
+    pub fn error(text: impl Into<StatusText>) -> Self {
+        let (text, segments) = text.into().into_parts();
         Final::Message {
             tone: StatusTone::Error,
-            text: text.into(),
+            text,
+            segments,
             sticky: false,
             quiet_on: QuietSurfaces::LOUD,
         }
@@ -83,11 +95,13 @@ impl Final {
             Final::Message {
                 tone,
                 text,
+                segments,
                 quiet_on,
                 ..
             } => Final::Message {
                 tone,
                 text,
+                segments,
                 sticky: true,
                 quiet_on,
             },
@@ -100,10 +114,15 @@ impl Final {
     pub fn quiet_on(self, quiet_on: QuietSurfaces) -> Self {
         match self {
             Final::Message {
-                tone, text, sticky, ..
+                tone,
+                text,
+                segments,
+                sticky,
+                ..
             } => Final::Message {
                 tone,
                 text,
+                segments,
                 sticky,
                 quiet_on,
             },
@@ -138,7 +157,7 @@ impl ResolvedFinal {
 
     /// Panic fallback used by `spawn_status_op` when the work closure unwinds:
     /// the success/failure closures never ran, so synthesise a keyed error.
-    pub fn error(key: impl Into<String>, text: impl Into<String>) -> Self {
+    pub fn error(key: impl Into<String>, text: impl Into<StatusText>) -> Self {
         Self {
             key: key.into(),
             outcome: Final::error(text),
@@ -160,11 +179,13 @@ impl ResolvedFinal {
             Final::Message {
                 tone,
                 text,
+                segments,
                 sticky,
                 quiet_on,
             } => EventReaction::Status(StatusUpdate {
                 tone,
                 message: text,
+                segments,
                 key: Some(self.key),
                 scope: self.scope,
                 sticky,
@@ -179,7 +200,7 @@ impl ResolvedFinal {
 /// correlation id is minted internally, so a caller never authors or sees a key.
 /// A [`StatusOp`] is unobtainable without passing through `on_success` then
 /// `on_failure`, so both outcomes are always declared.
-pub fn status_op(pending: impl Into<String>) -> NeedsSuccess {
+pub fn status_op(pending: impl Into<StatusText>) -> NeedsSuccess {
     NeedsSuccess {
         key: next_status_id(),
         pending: pending.into(),
@@ -188,7 +209,7 @@ pub fn status_op(pending: impl Into<String>) -> NeedsSuccess {
 
 pub struct NeedsSuccess {
     key: String,
-    pending: String,
+    pending: StatusText,
 }
 
 impl NeedsSuccess {
@@ -228,7 +249,7 @@ impl NeedsSuccess {
 /// [`Self::id`]; the handler retrieves it and calls [`Self::resolve`].
 pub struct HandlerStatusOp<O> {
     key: String,
-    pending: String,
+    pending: StatusText,
     resolver: Box<dyn FnOnce(&O) -> Final + Send>,
     /// Delivery audience captured at dispatch time from `Engine::current_origin`
     /// and applied to the pending busy, every `progress` re-emit and the
@@ -268,7 +289,7 @@ impl<O> HandlerStatusOp<O> {
     /// An updated keyed busy on the same id, for operations that report progress
     /// mid-flight. Does not consume the op: the eventual [`Self::resolve`] still
     /// replaces it.
-    pub fn progress(&self, message: impl Into<String>) -> StatusUpdate {
+    pub fn progress(&self, message: impl Into<StatusText>) -> StatusUpdate {
         StatusUpdate::busy(message)
             .with_key(self.key.clone())
             .with_scope(self.scope.clone())
@@ -355,7 +376,7 @@ impl<T, E> PendingStatusOp for StatusOp<T, E> {
 
 pub struct NeedsFailure<T> {
     key: String,
-    pending: String,
+    pending: StatusText,
     on_success: Box<dyn FnOnce(&T) -> Final + Send>,
     _t: PhantomData<fn(&T)>,
 }
@@ -378,7 +399,7 @@ impl<T> NeedsFailure<T> {
 /// two outcome closures. Resolve it where the typed `Result` is in scope.
 pub struct StatusOp<T, E> {
     key: String,
-    pending: String,
+    pending: StatusText,
     on_success: Box<dyn FnOnce(&T) -> Final + Send>,
     on_failure: Box<dyn FnOnce(&E) -> Final + Send>,
 }
@@ -414,6 +435,7 @@ mod tests {
             Final::Message {
                 tone: StatusTone::Info,
                 text: "ok".into(),
+                segments: None,
                 sticky: false,
                 quiet_on: QuietSurfaces::LOUD,
             }
@@ -423,6 +445,7 @@ mod tests {
             Final::Message {
                 tone: StatusTone::Error,
                 text: "bad".into(),
+                segments: None,
                 sticky: false,
                 quiet_on: QuietSurfaces::LOUD,
             }
@@ -432,6 +455,7 @@ mod tests {
             Final::Message {
                 tone: StatusTone::Warning,
                 text: "hmm".into(),
+                segments: None,
                 sticky: false,
                 quiet_on: QuietSurfaces::LOUD,
             }

@@ -9,7 +9,8 @@ import {
 } from "@/components/ui/dialog"
 import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
 import { sessionLabel } from "@/lib/agentWorkspace"
-import { detachConfirmBody, shutdownGraceSeconds } from "@/lib/detachAgent"
+import { detachConfirmProse, shutdownGraceSeconds } from "@/lib/detachAgent"
+import { renderProse } from "@/lib/prose"
 import { closeStopAgent, killSessionPty, useDux } from "@/lib/store"
 
 // The confirmation behind detaching an agent, from the agent's row menu and
@@ -58,7 +59,9 @@ export function ConfirmDetachAgentDialog() {
         <DialogHeader>
           <DialogTitle>Detach agent?</DialogTitle>
           <DialogDescription>
-            {detachConfirmBody(label, shutdownGraceSeconds(bootstrap), liveTabs)}
+            {renderProse(
+              detachConfirmProse(label, shutdownGraceSeconds(bootstrap), liveTabs),
+            )}
           </DialogDescription>
         </DialogHeader>
         {/* Misclick-safe spacing between the body and the buttons. */}

@@ -10,6 +10,7 @@ pub(crate) mod checkbox;
 pub(crate) mod focus_ring;
 pub(crate) mod hint_bar;
 pub(crate) mod modal;
+pub(crate) mod name_chip;
 pub(crate) mod pane_card;
 pub(crate) mod scroll_marker;
 pub(crate) mod wrap_lines;
@@ -23,6 +24,7 @@ pub(crate) use checkbox::{Checkbox, CheckboxState};
 pub(crate) use focus_ring::next_focus;
 pub(crate) use hint_bar::{Hint, modal_hint_line};
 pub(crate) use modal::Modal;
+pub(crate) use name_chip::{labelled_name, name_chip, prose_lines, prose_spans};
 pub(crate) use pane_card::{CardBlockPlan, CardContent, PaneCardBlock, plan_pane_card};
 pub(crate) use scroll_marker::render_scroll_marker;
 /// The marker geometry is re-exported for the tests that assert a marker cannot

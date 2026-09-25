@@ -2895,7 +2895,7 @@ mod tests {
     }
 
     /// A session with an extra tab, both of which the spine will project.
-    fn engine_with_two_tabs() -> (Engine, tempfile::TempDir) {
+    fn engine_with_two_tabs() -> (Engine, crate::test_scratch::ScratchDir) {
         let (mut engine, tmp) = test_engine();
         engine.sessions.push(sample_session("s1", "p1", "feat/x"));
         engine.agent_tabs.insert(

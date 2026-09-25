@@ -8,6 +8,7 @@
 // interpolated into the markup.
 
 import { notifyInfo } from "./notify"
+import { chip, prose } from "./prose"
 
 // The brand-duck cutout path, traced from `public/dux-logo.png` by
 // `scripts/gen-duck-favicon.mjs`. Even-odd fill, so the beak, eyes and bowtie
@@ -131,9 +132,7 @@ export function applyFavicon(raw: string | null | undefined): void {
     if (raw !== lastNoticedLegacy) {
       lastNoticedLegacy = raw ?? null
       notifyInfo(
-        `The configured favicon '${(raw ?? "").trim()}' is no longer supported, ` +
-          `showing the default duck. Pick a color in the Preferences dialog, ` +
-          `opened from the cog menu in the top-right.`,
+        prose`The configured favicon ${chip((raw ?? "").trim())} is no longer supported, showing the default duck. Pick a color in the Preferences dialog, opened from the cog menu in the top-right.`,
       )
     }
   } else {

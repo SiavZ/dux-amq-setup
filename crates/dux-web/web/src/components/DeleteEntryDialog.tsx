@@ -6,6 +6,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 
 export interface DeleteEntryTarget {
   path: string
@@ -47,24 +48,26 @@ export function DeleteEntryDialog({
     >
       <DialogContent showCloseButton={false} destructive>
         <DialogHeader>
-          <DialogTitle>Delete {path}?</DialogTitle>
+          <DialogTitle>
+            Delete <InlineCode>{path}</InlineCode>?
+          </DialogTitle>
         </DialogHeader>
         {blockedBySave ? (
           <p className="text-sm text-destructive">
-            <span className="font-mono break-all">{path}</span> is currently being
+            <InlineCode>{path}</InlineCode> is currently being
             saved. Wait for the save to finish before deleting it.
           </p>
         ) : (
           <p className="text-sm text-destructive">
             {isDir ? (
               <>
-                <span className="font-mono break-all">{path}</span> and everything
+                <InlineCode>{path}</InlineCode> and everything
                 inside it will be permanently deleted from disk (recursive).
                 This cannot be undone.
               </>
             ) : (
               <>
-                <span className="font-mono break-all">{path}</span> will be permanently
+                <InlineCode>{path}</InlineCode> will be permanently
                 deleted from disk. This cannot be undone.
               </>
             )}{" "}

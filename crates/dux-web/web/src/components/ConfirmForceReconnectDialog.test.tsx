@@ -66,8 +66,8 @@ describe("ConfirmForceReconnectDialog", () => {
   it("asks for confirmation before force-recreating, naming the agent", () => {
     seed("s1", [session])
     render(<ConfirmForceReconnectDialog />)
-    // The agent name sits in its own break-all span (long names must wrap
-    // instead of widening the dialog), so match on the whole title element.
+    // The agent name is the shared chip (which wraps a long name instead of
+    // widening the dialog), so match on the whole title element.
     expect(
       screen.getByText(
         (_, el) =>
@@ -75,6 +75,7 @@ describe("ConfirmForceReconnectDialog", () => {
           el.textContent === "Force recreate quacky-mallard?",
       ),
     ).toBeTruthy()
+    expect(screen.getByText("quacky-mallard", { selector: "code" })).toBeTruthy()
     expect(
       screen.getByText(/start a fresh session instead of continuing/),
     ).toBeTruthy()

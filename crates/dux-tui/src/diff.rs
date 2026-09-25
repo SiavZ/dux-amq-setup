@@ -829,7 +829,6 @@ pub fn wrap_diff_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
     use tempfile::tempdir;
 
     #[test]
@@ -837,17 +836,17 @@ mod tests {
         let dir = tempdir().unwrap();
         let repo = dir.path();
 
-        Command::new("git")
+        dux_core::test_git::fixture_git()
             .args(["init"])
             .current_dir(repo)
             .output()
             .unwrap();
-        Command::new("git")
+        dux_core::test_git::fixture_git()
             .args(["config", "user.email", "test@example.com"])
             .current_dir(repo)
             .output()
             .unwrap();
-        Command::new("git")
+        dux_core::test_git::fixture_git()
             .args(["config", "user.name", "Test User"])
             .current_dir(repo)
             .output()
@@ -855,12 +854,12 @@ mod tests {
 
         let file = repo.join("image.bin");
         std::fs::write(&file, [0_u8, 159, 146, 150]).unwrap();
-        Command::new("git")
+        dux_core::test_git::fixture_git()
             .args(["add", "image.bin"])
             .current_dir(repo)
             .output()
             .unwrap();
-        Command::new("git")
+        dux_core::test_git::fixture_git()
             .args(["commit", "-m", "initial"])
             .current_dir(repo)
             .output()
@@ -906,17 +905,17 @@ mod tests {
         let dir = tempdir().unwrap();
         let repo = dir.path();
 
-        Command::new("git")
+        dux_core::test_git::fixture_git()
             .args(["init"])
             .current_dir(repo)
             .output()
             .unwrap();
-        Command::new("git")
+        dux_core::test_git::fixture_git()
             .args(["config", "user.email", "test@example.com"])
             .current_dir(repo)
             .output()
             .unwrap();
-        Command::new("git")
+        dux_core::test_git::fixture_git()
             .args(["config", "user.name", "Test User"])
             .current_dir(repo)
             .output()
@@ -924,12 +923,12 @@ mod tests {
 
         let file = repo.join(filename);
         std::fs::write(&file, initial).unwrap();
-        Command::new("git")
+        dux_core::test_git::fixture_git()
             .args(["add", filename])
             .current_dir(repo)
             .output()
             .unwrap();
-        Command::new("git")
+        dux_core::test_git::fixture_git()
             .args(["commit", "-m", "initial"])
             .current_dir(repo)
             .output()

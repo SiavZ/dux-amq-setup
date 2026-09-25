@@ -46,8 +46,8 @@ pub use lifecycle::{
     GroupWorktreeRemoval, PendingDetach, PrunedPty, PrunedPtyKind, RAPID_EXIT_WINDOW,
     ReapedTerminations, ShutdownReport, TerminatingPty, agent_exit_with_companion_notice,
     clean_exit_closes_tab_row, closed_tab_exit_notice, closed_terminal_notice, detach_busy_message,
-    detach_confirm_body, detach_final, detach_not_running_message, detach_status_key,
-    detached_agent_notice, format_shutdown_result, format_shutdown_start,
+    detach_confirm_body, detach_confirm_prose, detach_final, detach_not_running_message,
+    detach_status_key, detached_agent_notice, format_shutdown_result, format_shutdown_start,
 };
 pub use pr_sync_control::PrSyncControl;
 pub use resume_fallback::ResumeFallbackOutcome;
@@ -78,6 +78,8 @@ use crate::model::{
     ProviderKind, SessionStatus,
 };
 use crate::pty::{ProgressReport, PtyClient};
+use crate::status_text;
+use crate::status_text::StatusText;
 use crate::storage::SessionStore;
 use crate::worker::{
     BranchSyncEntry, PrSyncEntry, ProjectPersistenceAction, ResourceKind, ResourceTarget,
@@ -507,7 +509,7 @@ pub struct Engine {
     /// whether the current status-line content was set by this deletion (and
     /// should be cleared) or by an unrelated operation (and should be left
     /// alone). Cleared per-session when the worker event arrives.
-    pub deletion_busy_messages: HashMap<String, String>,
+    pub deletion_busy_messages: HashMap<String, StatusText>,
     pub watched_worktree: Arc<Mutex<Option<PathBuf>>>,
     /// Coalescing state for [`Engine::spawn_changed_files_refresh`]: at most one
     /// reader thread and at most one queued worktree, newest wins. Shared by
@@ -780,7 +782,7 @@ pub enum CreateLaunchOutcome {
     /// The session was committed and the agent surface is ready. `status_message`
     /// is the create-kind success line.
     Committed {
-        status_message: String,
+        status_message: StatusText,
         /// Which surfaces withhold that line. A create whose pane launches and
         /// streams confirms nothing; one whose sentence carries a fact the
         /// screen does not show still does.
@@ -794,7 +796,7 @@ pub enum CreateLaunchOutcome {
     PersistFailed { error: String },
     /// The launch (or the create worker) failed; `message` is the already-formatted
     /// error line.
-    Failed { message: String },
+    Failed { message: StatusText },
 }
 
 /// Handler-computed outcome for a reconnect / force-restart launch op, shared by
@@ -806,7 +808,7 @@ pub enum CreateLaunchOutcome {
 pub enum LaunchOutcome {
     /// Reconnect / force-reconnect succeeded; `status_message` is the success line.
     Ready {
-        status_message: String,
+        status_message: StatusText,
         /// Which surfaces withhold that line. A resumed pane relaunches and
         /// paints its prior conversation, so it confirms nothing; a pane that
         /// comes up empty still has to say why.
@@ -838,15 +840,19 @@ pub fn launch_outcome_final(o: &LaunchOutcome) -> Final {
         LaunchOutcome::ReconnectFailed {
             branch_name,
             message,
-        } => Final::error(format!(
-            "Reconnect failed for agent \"{branch_name}\": {message}"
-        )),
+        } => Final::error(status_text![
+            "Reconnect failed for agent ",
+            q(branch_name),
+            format!(": {message}")
+        ]),
         LaunchOutcome::ForceReconnectFailed {
             branch_name,
             message,
-        } => Final::error(format!(
-            "Fresh restart failed for agent \"{branch_name}\": {message}"
-        )),
+        } => Final::error(status_text![
+            "Fresh restart failed for agent ",
+            q(branch_name),
+            format!(": {message}")
+        ]),
         LaunchOutcome::Missing => Final::clear(),
     }
 }
@@ -880,13 +886,13 @@ pub enum WebDeleteOutcome {
     /// message came from the snapshot it left behind. `refused` is true when git
     /// would not delete one of the branches, which leaves the user something to
     /// clean up and is the difference between an info and a warning.
-    Succeeded { message: String, refused: bool },
+    Succeeded { message: StatusText, refused: bool },
     /// Git removal succeeded but the session was already gone (e.g. its project
     /// was removed) before the worker reported back.
     SucceededGone,
     /// Git removal failed; `message` is the authored failure sentence, which
     /// names the agent when the dispatch-time snapshot was still there to name it.
-    Failed { message: String },
+    Failed { message: StatusText },
     /// Git removal succeeded but the post-removal `FinishDeleteSession` cascade
     /// failed; `message` is the formatted error.
     CleanupFailed { message: String },
@@ -899,26 +905,156 @@ pub enum WebDeleteOutcome {
 /// inspect-failed before any switch runs, and the switch (worker 2) finishes
 /// with success / failure.
 pub enum WebCheckoutOutcome {
-    /// The `git switch` (worker 2) succeeded onto `target_branch`.
-    Ok { target_branch: String },
+    /// The `git switch` (worker 2) succeeded onto `target_branch`, which is now
+    /// the project's base; `base_moved` says whether it was not already.
+    Ok {
+        target_branch: String,
+        base_moved: bool,
+    },
     /// The `git switch` (worker 2) failed; `repo_path` is the source checkout path.
     Failed {
         target_branch: String,
         repo_path: String,
     },
     /// Worker 1 found the project already on its leading branch; no switch ran.
-    AlreadyLeading { current_branch: String },
+    /// That branch is now the project's base; `base_moved` as for `Ok`.
+    AlreadyLeading {
+        current_branch: String,
+        base_moved: bool,
+    },
     /// Worker 1 could only heuristically guess the default branch, so it refused.
     Heuristic { current_branch: String },
     /// Worker 1's inspection itself failed.
     InspectFailed { error: String },
 }
 
+/// The confirmation for a finished "check out the default branch" on an
+/// existing project. Both surfaces print exactly this. The base only lives in
+/// the project info, so a move is said out loud rather than left to be noticed.
+pub fn checkout_default_branch_message(
+    project_name: &str,
+    target_branch: &str,
+    base_moved: bool,
+) -> StatusText {
+    status_text![
+        "Checked out ",
+        q(target_branch),
+        " for project ",
+        q(project_name),
+        ".",
+        base_moved_suffix(target_branch, base_moved)
+    ]
+}
+
+/// The confirmation when the folder was already on the default branch, so no
+/// checkout ran. Both surfaces print exactly this.
+pub fn already_on_default_branch_message(
+    project_name: &str,
+    current_branch: &str,
+    base_moved: bool,
+) -> StatusText {
+    status_text![
+        "Project ",
+        q(project_name),
+        " is already on the leading branch ",
+        q(current_branch),
+        ".",
+        base_moved_suffix(current_branch, base_moved)
+    ]
+}
+
+/// The body of the "check out the default branch?" confirmation both surfaces
+/// show before anything runs. `stored_base` is the branch new worktrees start
+/// from today; the default itself is only known once dux looks, so it is named
+/// generically. The browser prints the same words (`lib/checkoutDefaultBranch.ts`).
+pub fn checkout_default_branch_confirm_body(
+    project_name: &str,
+    stored_base: Option<&str>,
+) -> String {
+    checkout_default_branch_confirm_prose(project_name, stored_base).plain()
+}
+
+/// [`checkout_default_branch_confirm_body`] as prose, the project and its base
+/// marked so each surface draws them as chips. Pinned against the browser's
+/// `checkoutDefaultBranchProse` by `tests/fixtures/prose_cross_language.json`.
+pub fn checkout_default_branch_confirm_prose(
+    project_name: &str,
+    stored_base: Option<&str>,
+) -> crate::prose::Prose {
+    let lead = crate::prose::Prose::new()
+        .text("This switches the source checkout for ")
+        .quoted(project_name)
+        .text(" back to its default branch, moving HEAD in the shared repository.");
+    match stored_base {
+        Some(base) => lead
+            .text(" New worktrees branch from ")
+            .quoted(base)
+            .text(" now. After the checkout, they branch from the default branch."),
+        None => lead.text(" After the checkout, new worktrees branch from the default branch."),
+    }
+}
+
+/// The refusal when a "check out the default branch" is already running for
+/// the project: an ordinary warning, because waiting is all it asks.
+pub fn default_branch_checkout_running_message(project_name: &str) -> StatusText {
+    status_text![
+        "dux is already checking out the default branch for project ",
+        q(project_name),
+        ". Wait for it to finish; its result will say where the project's worktrees branch from."
+    ]
+}
+
+/// The status line after the confirmation is dismissed: nothing ran, and the
+/// base is where it was.
+pub fn checkout_default_branch_cancelled_message(
+    project_name: &str,
+    stored_base: Option<&str>,
+) -> StatusText {
+    let lead = status_text![
+        "Cancelled checking out the default branch for project ",
+        q(project_name),
+        ". Nothing was checked out"
+    ];
+    match stored_base {
+        Some(base) => status_text![lead, ", and new worktrees still branch from ", q(base), "."],
+        None => status_text![lead, ", and the project's base branch is unchanged."],
+    }
+}
+
+/// The status line after the confirmation is dismissed for a project that was
+/// removed from dux while the dialog was open: there is no base left to name.
+pub fn checkout_default_branch_cancelled_project_gone_message(project_name: &str) -> StatusText {
+    status_text![
+        "Cancelled checking out the default branch for project ",
+        q(project_name),
+        ". The project has been removed from dux since the dialog opened, so there is nothing \
+         to check out."
+    ]
+}
+
+/// The refusal when the confirmation is accepted for a project that was
+/// removed from dux while the dialog was open.
+pub fn checkout_default_branch_project_gone_message(project_name: &str) -> StatusText {
+    status_text![
+        "Project ",
+        q(project_name),
+        " is gone, so there was no default branch to check out."
+    ]
+}
+
+fn base_moved_suffix(branch: &str, base_moved: bool) -> StatusText {
+    if base_moved {
+        status_text![" New worktrees branch from ", q(branch), " now."]
+    } else {
+        StatusText::new()
+    }
+}
+
 /// Handler-computed outcome for the web add-project "Check Out & Add" op.
 pub enum WebAddProjectOutcome {
     /// The switch and the inline project-add both succeeded; `status_message` is
     /// the combined "Checked out X and added project Y" line.
-    Added { status_message: String },
+    Added { status_message: StatusText },
     /// The `git switch` failed before the add ran.
     SwitchFailed {
         target_branch: String,
@@ -926,7 +1062,7 @@ pub enum WebAddProjectOutcome {
     },
     /// The switch succeeded but the inline add was rolled back; `message` is the
     /// already-formatted failure line.
-    AddFailed { message: String },
+    AddFailed { message: StatusText },
 }
 
 /// Handler-computed outcome for the web new-agent-from-PR lookup op.
@@ -943,10 +1079,10 @@ pub enum WebPrLookupOutcome {
 pub enum PrAttachOutcome {
     /// The lookup resolved and the pin was applied; `message` is the
     /// already-formatted confirmation from [`Engine::apply_pr_attach`].
-    Attached { message: String },
+    Attached { message: StatusText },
     /// The lookup failed or applying the pin failed; `message` is the
     /// already-formatted error line.
-    Failed { message: String },
+    Failed { message: StatusText },
     /// The agent the lookup was for is gone by the time the answer landed.
     /// There is nothing to attach it to and nothing on either surface the
     /// sentence could be about, so the operation ends with its spinner retired
@@ -1300,7 +1436,7 @@ const PR_RATE_LIMIT_BACKOFF_SECS: u64 = 300;
 pub struct PrPauseNotice {
     pub pause: Duration,
     pub tone: crate::statusline::StatusTone,
-    pub message: String,
+    pub message: StatusText,
 }
 
 /// Decide whether a host's sync signal pauses its pull-request checks, and how
@@ -1338,33 +1474,39 @@ pub fn pr_pause_notice(
         return Some(PrPauseNotice {
             pause: Duration::from_secs(secs_until),
             tone: StatusTone::Info,
-            message: format!(
-                "GitHub's API rate limit for {} is nearly used up ({} points left). dux \
-                 paused PR status checks; they resume automatically{when}.",
-                sig.host, r.remaining,
-            ),
+            message: crate::status_text![
+                "GitHub's API rate limit for ",
+                n(sig.host),
+                format!(
+                    " is nearly used up ({} points left). dux \
+                 paused PR status checks; they resume automatically{}.",
+                    r.remaining, when
+                )
+            ],
         });
     }
     if sig.rate_limited {
         return Some(PrPauseNotice {
             pause: Duration::from_secs(PR_RATE_LIMIT_BACKOFF_SECS),
             tone: StatusTone::Warning,
-            message: format!(
-                "GitHub is rate-limiting API requests on {}. dux paused PR status checks; \
-                 they resume automatically once the limit clears.",
-                sig.host,
-            ),
+            message: crate::status_text![
+                "GitHub is rate-limiting API requests on ",
+                n(sig.host),
+                ". dux paused PR status checks; \
+                 they resume automatically once the limit clears."
+            ],
         });
     }
     if sig.hard_failed {
         return Some(PrPauseNotice {
             pause: Duration::from_secs(PR_HARD_FAILURE_BACKOFF_SECS),
             tone: StatusTone::Warning,
-            message: format!(
-                "dux could not reach GitHub for PR status on {} (a network or gh error); \
-                 it will retry shortly.",
-                sig.host,
-            ),
+            message: crate::status_text![
+                "dux could not reach GitHub for PR status on ",
+                n(sig.host),
+                " (a network or gh error); \
+                 it will retry shortly."
+            ],
         });
     }
     None
@@ -4306,7 +4448,7 @@ impl Engine {
         title: &str,
         state: &str,
         url: &str,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<StatusText> {
         let Some(session) = self.sessions.iter().find(|s| s.id == session_id) else {
             anyhow::bail!("unknown session: {session_id}");
         };
@@ -4350,10 +4492,16 @@ impl Engine {
         }
         self.pr_overrides.insert(session_id.to_string(), stored);
         self.update_pr_sync_sessions();
-        Ok(format!(
-            "Attached PR #{number} ({owner_repo}) to agent \"{agent_name}\". dux will track \
+        Ok(crate::status_text![
+            "Attached PR ",
+            n(format!("#{}", number)),
+            " (",
+            n(owner_repo),
+            ") to agent ",
+            q(agent_name),
+            ". dux will track \
              this pull request until you detach it; autodetection is paused for this agent."
-        ))
+        ])
     }
 
     /// Detach a session's pull request: this agent has no PR, as of now. The
@@ -4366,7 +4514,7 @@ impl Engine {
     /// The suppression is durable: a restart is not the user changing their
     /// mind. It is lifted by a manual attach or by
     /// [`Self::resume_pr_autodetection`].
-    pub fn clear_pull_request_override(&mut self, session_id: &str) -> anyhow::Result<String> {
+    pub fn clear_pull_request_override(&mut self, session_id: &str) -> anyhow::Result<StatusText> {
         let Some(session) = self.sessions.iter().find(|s| s.id == session_id) else {
             anyhow::bail!("unknown session: {session_id}");
         };
@@ -4406,11 +4554,13 @@ impl Engine {
         // TUI rebuilds its rows off the same call.
         self.pr_statuses.remove(session_id);
         self.update_pr_sync_sessions();
-        Ok(format!(
-            "Detached the pull request from agent \"{agent_name}\". dux will stop looking for \
+        Ok(crate::status_text![
+            "Detached the pull request from agent ",
+            q(agent_name),
+            ". dux will stop looking for \
              one on this agent until you attach a pull request by hand or resume autodetection \
              for it."
-        ))
+        ])
     }
 
     /// Undo a detach: autodetection is switched back on for the session and one
@@ -4420,7 +4570,7 @@ impl Engine {
     /// CLI that could have been uninstalled since. Without a usable `gh` the
     /// check is a no-op and the next cycle after the integration re-arms picks
     /// the session up.
-    pub fn resume_pr_autodetection(&mut self, session_id: &str) -> anyhow::Result<String> {
+    pub fn resume_pr_autodetection(&mut self, session_id: &str) -> anyhow::Result<StatusText> {
         let Some(session) = self.sessions.iter().find(|s| s.id == session_id) else {
             anyhow::bail!("unknown session: {session_id}");
         };
@@ -4455,13 +4605,17 @@ impl Engine {
             "dux will check GitHub once the GitHub integration is enabled and gh is signed in."
         };
         if was_suppressed {
-            Ok(format!(
-                "Resumed pull-request autodetection for agent \"{agent_name}\". {tail}"
-            ))
+            Ok(crate::status_text![
+                "Resumed pull-request autodetection for agent ",
+                q(agent_name),
+                format!(". {}", tail)
+            ])
         } else {
-            Ok(format!(
-                "Pull-request autodetection was already running for agent \"{agent_name}\"; {tail}"
-            ))
+            Ok(crate::status_text![
+                "Pull-request autodetection was already running for agent ",
+                q(agent_name),
+                format!("; {}", tail)
+            ])
         }
     }
 }
@@ -4529,9 +4683,11 @@ impl Engine {
         // dispatch is certain, never before a refusal path).
         self.mark_in_flight(InFlightKey::PrAttach(session_id.to_string()));
 
-        let op = status_op(format!(
-            "Resolving PR to attach to agent \"{agent_name}\"..."
-        ))
+        let op = status_op(crate::status_text![
+            "Resolving PR to attach to agent ",
+            q(agent_name),
+            "..."
+        ])
         .resolve_in_handler(pr_attach_final)
         .with_scope(self.current_origin.clone());
         let op_id = op.id().to_string();
@@ -4624,7 +4780,7 @@ impl Engine {
         folder: &str,
         name: &str,
         provider: Option<&str>,
-    ) -> anyhow::Result<(crate::worker::CreateAgentRequest, String)> {
+    ) -> anyhow::Result<(crate::worker::CreateAgentRequest, StatusText)> {
         let folder = PathBuf::from(folder.trim());
         if !folder.is_absolute() {
             anyhow::bail!(
@@ -4691,10 +4847,11 @@ impl Engine {
             }
             None => self.config.default_provider(),
         };
-        let busy_message = format!(
-            "Creating a standalone agent in \"{}\"\u{2026}",
-            crate::home_path::shorten_home(&folder)
-        );
+        let busy_message = crate::status_text![
+            "Creating a standalone agent in ",
+            q(crate::home_path::shorten_home(&folder)),
+            "\u{2026}"
+        ];
         Ok((
             crate::worker::CreateAgentRequest::Standalone {
                 folder,
@@ -4811,15 +4968,17 @@ impl Engine {
     /// Where an agent lives, as a phrase a status line can drop into a
     /// sentence: `project "web"` for a managed agent, `folder "~/notes"` for a
     /// standalone one. Folder paths are shortened against the server's home.
-    pub fn session_location_phrase(&self, session: &AgentSession) -> String {
+    pub fn session_location_phrase(&self, session: &AgentSession) -> StatusText {
         match &session.workspace {
             crate::model::AgentWorkspace::Managed(_) => {
-                format!("project \"{}\"", self.project_name_for_session(session))
+                crate::status_text!["project ", q(self.project_name_for_session(session))]
             }
-            crate::model::AgentWorkspace::Folder(folder) => format!(
-                "folder \"{}\"",
-                crate::home_path::shorten_home(Path::new(&folder.folder_path))
-            ),
+            crate::model::AgentWorkspace::Folder(folder) => crate::status_text![
+                "folder ",
+                q(crate::home_path::shorten_home(Path::new(
+                    &folder.folder_path
+                )))
+            ],
         }
     }
 
@@ -4829,22 +4988,32 @@ impl Engine {
     /// "attaching…" placeholder back to the user. `resume` is the result of
     /// [`should_resume_session`]. Callers may append extra context (e.g. a
     /// detached-worktree note) to the returned string.
-    pub fn agent_reconnect_status_message(&self, session: &AgentSession, resume: bool) -> String {
+    pub fn agent_reconnect_status_message(
+        &self,
+        session: &AgentSession,
+        resume: bool,
+    ) -> StatusText {
         let location = self.session_location_phrase(session);
         if resume {
-            format!(
-                "Resumed {} agent \"{}\" in {}.",
-                session.provider.as_str(),
-                session.display_label(),
-                location
-            )
+            crate::status_text![
+                "Resumed ",
+                n(session.provider.as_str()),
+                " agent ",
+                q(session.display_label()),
+                " in ",
+                location,
+                "."
+            ]
         } else {
-            format!(
-                "Started fresh {} session for agent \"{}\" in {}. Your provider's own resume command can bring back an earlier conversation.",
-                session.provider.as_str(),
-                session.display_label(),
-                location
-            )
+            crate::status_text![
+                "Started fresh ",
+                n(session.provider.as_str()),
+                " session for agent ",
+                q(session.display_label()),
+                " in ",
+                location,
+                ". Your provider's own resume command can bring back an earlier conversation."
+            ]
         }
     }
 
@@ -4880,10 +5049,11 @@ impl Engine {
         // guard the worktree.
         if !force && self.providers.contains_key(session.slot_tab_id()) {
             return Ok(ReconnectPlan::AlreadyConnected {
-                message: format!(
-                    "Agent \"{}\" is already connected.",
-                    session.display_label()
-                ),
+                message: crate::status_text![
+                    "Agent ",
+                    q(session.display_label()),
+                    " is already connected."
+                ],
             });
         }
         // Both kinds have a directory to reconnect into, and both must
@@ -4893,17 +5063,25 @@ impl Engine {
             == crate::git::DirectoryPresence::Missing
         {
             let message = match &session.workspace {
-                crate::model::AgentWorkspace::Managed(managed) => format!(
-                    "The working copy for agent \"{}\" at {} no longer exists. Recreate the \
-                     working copy to check its branch out there again, or delete this agent.",
-                    session.display_label(),
-                    crate::home_path::shorten_home(Path::new(&managed.worktree_path))
-                ),
-                crate::model::AgentWorkspace::Folder(folder) => format!(
-                    "The folder agent \"{}\" runs in ({}) no longer exists. Restore the folder, or delete this agent and create a new one pointing at the folder you want.",
-                    session.display_label(),
-                    crate::home_path::shorten_home(Path::new(&folder.folder_path))
-                ),
+                crate::model::AgentWorkspace::Managed(managed) => crate::status_text![
+                    "The working copy for agent ",
+                    q(session.display_label()),
+                    " at ",
+                    n(crate::home_path::shorten_home(Path::new(
+                        &managed.worktree_path
+                    ))),
+                    " no longer exists. Recreate the \
+                     working copy to check its branch out there again, or delete this agent."
+                ],
+                crate::model::AgentWorkspace::Folder(folder) => crate::status_text![
+                    "The folder agent ",
+                    q(session.display_label()),
+                    " runs in (",
+                    n(crate::home_path::shorten_home(Path::new(
+                        &folder.folder_path
+                    ))),
+                    ") no longer exists. Restore the folder, or delete this agent and create a new one pointing at the folder you want."
+                ],
             };
             return Ok(ReconnectPlan::WorktreeMissing { message });
         }
@@ -4921,10 +5099,13 @@ impl Engine {
                 crate::config::validate_shared_workspace_path(session.directory(), &self.paths)
         {
             return Ok(ReconnectPlan::WorktreeMissing {
-                message: format!(
-                    "Shared workspace is not eligible for reconnect: {}",
+                // Sanitized at the status chokepoints like every other message
+                // (fork 2d9423ae); this one carries a path the validator
+                // rejected, so the words can hold arbitrary bytes.
+                message: crate::status_text![
+                    "Shared workspace is not eligible for reconnect: ",
                     crate::sanitize::for_terminal(&format!("{err:#}"))
-                ),
+                ],
             });
         }
 
@@ -4948,10 +5129,11 @@ impl Engine {
         };
         let mut msg = self.agent_reconnect_status_message(&session, resume);
         if let Some(detached) = &detached_label {
-            msg.push_str(&format!(
-                " Agent \"{}\" was detached to avoid worktree conflicts.",
-                detached,
-            ));
+            msg.push(crate::status_text![
+                " Agent ",
+                q(detached),
+                " was detached to avoid worktree conflicts."
+            ]);
         }
         // A standalone agent has no project whose default provider it could
         // be diverging from, so the note is simply not written for one.
@@ -4965,11 +5147,13 @@ impl Engine {
             } else {
                 "current global default provider"
             };
-            msg.push_str(&format!(
-                " Note: this agent uses {}. Your {provider_label} is {}.",
-                session.provider.as_str(),
-                project.default_provider.as_str(),
-            ));
+            msg.push(crate::status_text![
+                " Note: this agent uses ",
+                n(session.provider.as_str()),
+                format!(". Your {} is ", provider_label),
+                n(project.default_provider.as_str()),
+                "."
+            ]);
         }
 
         let branch_name = session.display_label();
@@ -4993,9 +5177,9 @@ impl Engine {
                 crate::statusline::QuietSurfaces::LOUD
             });
         let busy_message = if force {
-            format!("Starting fresh agent \"{branch_name}\"...")
+            crate::status_text!["Starting fresh agent ", q(branch_name), "..."]
         } else {
-            format!("Launching agent \"{branch_name}\"...")
+            crate::status_text!["Launching agent ", q(branch_name), "..."]
         };
         Ok(ReconnectPlan::Launch {
             request: Box::new(request),
@@ -5405,7 +5589,7 @@ impl Engine {
             pty_size,
             crate::worker::AgentLaunchKind::Tab {
                 is_fresh: true,
-                status_message,
+                status_message: status_message.into(),
             },
         );
         // The launch itself runs on a worker (ready/failed arrives later), but the
@@ -5788,17 +5972,17 @@ impl Engine {
 pub enum ReconnectPlan {
     /// Normal reconnect refused: a provider is already live. The caller shows
     /// `message` and does nothing else.
-    AlreadyConnected { message: String },
+    AlreadyConnected { message: StatusText },
     /// The session's worktree is gone. The caller surfaces `message` as an error
     /// (the TUI as a status error, the web as a 400).
-    WorktreeMissing { message: String },
+    WorktreeMissing { message: StatusText },
     /// Relaunch: dispatch `request` and surface `busy_message` as the pending
     /// status. `resume` is the collision-aware decision the request carries, so a
     /// surface can announce it truthfully. `detached_label` names any conflicting
     /// same-worktree agent that was detached to make room (already applied).
     Launch {
         request: Box<crate::worker::AgentLaunchRequest>,
-        busy_message: String,
+        busy_message: StatusText,
         resume: bool,
         detached_label: Option<String>,
     },
@@ -5866,9 +6050,27 @@ mod tests {
         sample_project, sample_session, sample_standalone_session, test_engine,
     };
 
+    /// Both surfaces print this confirmation word for word (the browser's copy
+    /// lives in `lib/checkoutDefaultBranch.ts` and is pinned to the same text).
+    #[test]
+    fn the_checkout_default_confirmation_names_the_project_and_its_current_base() {
+        assert_eq!(
+            checkout_default_branch_confirm_body("dux", Some("develop")),
+            "This switches the source checkout for \"dux\" back to its default branch, \
+             moving HEAD in the shared repository. New worktrees branch from \"develop\" now. \
+             After the checkout, they branch from the default branch."
+        );
+        assert_eq!(
+            checkout_default_branch_confirm_body("dux", None),
+            "This switches the source checkout for \"dux\" back to its default branch, \
+             moving HEAD in the shared repository. After the checkout, new worktrees branch \
+             from the default branch."
+        );
+    }
+
     /// An engine with one managed agent that has one extra tab, for the
     /// slot-tab resolvers.
-    fn engine_with_an_extra_tab() -> (Engine, tempfile::TempDir) {
+    fn engine_with_an_extra_tab() -> (Engine, crate::test_scratch::ScratchDir) {
         let (mut engine, tmp) = test_engine();
         engine
             .projects
@@ -6023,7 +6225,8 @@ mod tests {
     /// and skip the second: a plain folder has no branch to watch and no
     /// repository to ask GitHub about, and enrolling it would burn a git or
     /// `gh` call per cycle to produce an error nobody can act on.
-    fn engine_with_a_standalone_agent() -> (Engine, tempfile::TempDir, tempfile::TempDir) {
+    fn engine_with_a_standalone_agent()
+    -> (Engine, crate::test_scratch::ScratchDir, tempfile::TempDir) {
         let (mut engine, tmp) = test_engine();
         let folder = tempfile::tempdir().expect("folder");
         engine
@@ -9562,10 +9765,48 @@ mod tests {
     /// this, the TUI carried a byte-identical copy (`reconnect_final`); this pins
     /// the one core source so the wording cannot drift.
     #[test]
+    fn the_default_branch_checkout_refusals_carry_the_project_as_a_part() {
+        use crate::prose::ProseSegment;
+        let cases = [
+            (
+                default_branch_checkout_running_message("app"),
+                "dux is already checking out the default branch for project \"app\". Wait for \
+                 it to finish; its result will say where the project's worktrees branch from.",
+            ),
+            (
+                checkout_default_branch_cancelled_project_gone_message("app"),
+                "Cancelled checking out the default branch for project \"app\". The project has \
+                 been removed from dux since the dialog opened, so there is nothing to check out.",
+            ),
+            (
+                checkout_default_branch_project_gone_message("app"),
+                "Project \"app\" is gone, so there was no default branch to check out.",
+            ),
+        ];
+        for (status, plain) in cases {
+            assert_eq!(status.message(), plain);
+            let names: Vec<&ProseSegment> = status
+                .segments()
+                .expect("built from parts")
+                .iter()
+                .filter(|segment| matches!(segment, ProseSegment::Name { .. }))
+                .collect();
+            assert_eq!(
+                names,
+                [&ProseSegment::Name {
+                    name: "app".to_string(),
+                    quoted: true
+                }],
+                "exactly the project is a name in {plain}"
+            );
+        }
+    }
+
+    #[test]
     fn launch_outcome_final_maps_each_variant_to_its_message() {
         assert_eq!(
             launch_outcome_final(&LaunchOutcome::Ready {
-                status_message: "Resumed claude agent \"x\".".to_string(),
+                status_message: "Resumed claude agent \"x\".".to_string().into(),
                 quiet_on: crate::statusline::QuietSurfaces::LOUD,
             }),
             Final::info("Resumed claude agent \"x\".".to_string()),
@@ -9575,14 +9816,44 @@ mod tests {
                 branch_name: "feat".to_string(),
                 message: "boom".to_string(),
             }),
-            Final::error("Reconnect failed for agent \"feat\": boom".to_string()),
+            Final::error(crate::status_text![
+                "Reconnect failed for agent ",
+                q("feat"),
+                ": boom"
+            ]),
+        );
+        let Final::Message { text, .. } = launch_outcome_final(&LaunchOutcome::ReconnectFailed {
+            branch_name: "feat".to_string(),
+            message: "boom".to_string(),
+        }) else {
+            panic!("a failed reconnect has a message");
+        };
+        assert_eq!(
+            text, "Reconnect failed for agent \"feat\": boom",
+            "the plain words are unchanged"
         );
         assert_eq!(
             launch_outcome_final(&LaunchOutcome::ForceReconnectFailed {
                 branch_name: "feat".to_string(),
                 message: "boom".to_string(),
             }),
-            Final::error("Fresh restart failed for agent \"feat\": boom".to_string()),
+            Final::error(crate::status_text![
+                "Fresh restart failed for agent ",
+                q("feat"),
+                ": boom"
+            ]),
+        );
+        let Final::Message { text, .. } =
+            launch_outcome_final(&LaunchOutcome::ForceReconnectFailed {
+                branch_name: "feat".to_string(),
+                message: "boom".to_string(),
+            })
+        else {
+            panic!("a failed fresh restart has a message");
+        };
+        assert_eq!(
+            text, "Fresh restart failed for agent \"feat\": boom",
+            "the plain words are unchanged"
         );
         assert_eq!(
             launch_outcome_final(&LaunchOutcome::Missing),
@@ -11556,7 +11827,7 @@ mod tab_ops_tests {
             .insert(TabId::new("t2"), std::time::Instant::now());
         engine.closing_sessions.insert("s1".to_string());
 
-        let outcome = engine.retry_resume_fallback("t2", (24, 80), "retrying".to_string());
+        let outcome = engine.retry_resume_fallback("t2", (24, 80), "retrying".to_string().into());
 
         let ResumeFallbackOutcome::Retried { reaction } = outcome else {
             panic!("expected a Retried outcome");
@@ -11594,7 +11865,7 @@ mod tab_ops_tests {
             .insert(TabId::new("t3"), std::time::Instant::now());
         engine.closing_sessions.insert("s1".to_string());
 
-        let outcome = engine.retry_resume_fallback("t3", (24, 80), "retrying".to_string());
+        let outcome = engine.retry_resume_fallback("t3", (24, 80), "retrying".to_string().into());
 
         assert!(matches!(outcome, ResumeFallbackOutcome::Retried { .. }));
         assert_eq!(

@@ -53,6 +53,7 @@ import {
 import { firstLoadApi } from "./firstLoadApi"
 import {
   dismissNotification,
+  type Notice,
   notify,
   notifyError,
   notifyInfo,
@@ -61,6 +62,7 @@ import {
   notifyWarning,
   setStatusClearSeconds,
 } from "./notify"
+import { chip, type Prose, prose, wireProse } from "./prose"
 import { publishConnectionTiming } from "./connectionTiming"
 import { clearServerValidated, noteServerValidated } from "./serverValidated"
 import { registerPageLifecycle } from "./pageLifecycle"
@@ -1100,7 +1102,7 @@ function handleStatusEvent(event: EventsServerMessage): void {
   showStatusToast(
     event.key,
     event.tone ?? "info",
-    event.message ?? "",
+    wireProse(event.message ?? "", event.segments),
     event.sticky ?? false,
   )
 }
@@ -2027,7 +2029,7 @@ const ANON_TOAST_ID = "dux-anon-status"
 function showStatusToast(
   key: string | null | undefined,
   tone: string,
-  message: string,
+  message: Notice,
   sticky: boolean,
 ): void {
   const id = key ?? ANON_TOAST_ID // no key → stable anonymous-slot id
@@ -4182,9 +4184,9 @@ function providerIsConfigured(provider: string): boolean {
 }
 
 // The same refusal the server gives, so a pre-flight toast and a refused
-// request read alike.
-function providerNotConfigured(provider: string): string {
-  return `Provider "${provider}" is not configured. Pick one of the configured providers.`
+// request read alike; the browser raises this one itself, so it chips the name.
+function providerNotConfigured(provider: string): Prose {
+  return prose`Provider ${chip(provider)} is not configured. Pick one of the configured providers.`
 }
 
 // Ask the server to swap which provider a session uses. The provider is validated
@@ -5284,12 +5286,12 @@ function submitPrReferenceFirst(reference: string, name: string): void {
         // clone, and neither wording may imply it might.
         notifyError(
           resolved.uninspected_summary
-            ? `No project dux could check is a checkout of ${repository}, and dux could not check every project (${resolved.uninspected_summary}). Choose a project that already has it, or add one from a directory on disk.`
-            : `No project in dux is a checkout of ${repository}. Choose a project that already has it, or add one from a directory on disk.`,
+            ? prose`No project dux could check is a checkout of ${chip(repository)}, and dux could not check every project (${resolved.uninspected_summary}). Choose a project that already has it, or add one from a directory on disk.`
+            : prose`No project in dux is a checkout of ${chip(repository)}. Choose a project that already has it, or add one from a directory on disk.`,
         )
       } else {
         notifyInfo(
-          `${resolved.projects.length} projects are checkouts of ${repository}. Choose which one this agent belongs in.`,
+          prose`${resolved.projects.length} projects are checkouts of ${chip(repository)}. Choose which one this agent belongs in.`,
         )
       }
       // Either way the picker is offered, over just the matches when there are

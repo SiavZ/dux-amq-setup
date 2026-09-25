@@ -1,3 +1,5 @@
+use crate::prose::ProseSegment;
+use crate::status_text::StatusText;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
@@ -294,6 +296,10 @@ pub struct KeyedStatus {
     pub key: Option<String>,
     pub tone: StatusTone,
     pub message: String,
+    /// The parts `message` was built from, when it was built from parts; see
+    /// [`crate::status_text`]. The web draws the names in them as chips; the
+    /// terminal UI never reads them.
+    pub segments: Option<Vec<ProseSegment>>,
     /// Delivery audience for this status. Defaults to [`StatusScope::All`]; the
     /// web actor sets it from the originating connection so per-connection
     /// filtering can suppress other clients' operation toasts.
@@ -331,6 +337,9 @@ pub struct KeyedWireStatus {
     pub key: Option<String>,
     pub tone: String, // StatusTone::as_wire()
     pub message: String,
+    /// The parts `message` was built from, carried so a replayed status still
+    /// draws its names as chips. `None` for a plain sentence.
+    pub segments: Option<Vec<ProseSegment>>,
     /// Delivery audience, carried so the on-connect status snapshot can be
     /// filtered per connection (a mid-operation joiner must not receive another
     /// connection's in-progress `Busy`). Defaults to [`StatusScope::All`].
@@ -624,7 +633,14 @@ impl KeyedStatusController {
         tone: StatusTone,
         message: impl Into<String>,
     ) -> Generation {
-        self.set_scoped(now, key, tone, message, StatusScope::All, false)
+        self.set_scoped(
+            now,
+            key,
+            tone,
+            StatusText::plain(message),
+            StatusScope::All,
+            false,
+        )
     }
 
     /// Like [`set`](Self::set) but records the status's delivery [`StatusScope`].
@@ -638,10 +654,11 @@ impl KeyedStatusController {
         now: Instant,
         key: Option<String>,
         tone: StatusTone,
-        message: impl Into<String>,
+        message: impl Into<StatusText>,
         scope: StatusScope,
         sticky: bool,
     ) -> Generation {
+        let (message, segments) = message.into().into_parts();
         let generation = Generation(self.next_gen);
         let seq = self.next_seq;
         self.next_gen += 1;
@@ -654,8 +671,11 @@ impl KeyedStatusController {
             // names and PR titles, any of which can hold terminal escapes
             // that would retitle or paste-inject the operator's terminal on
             // the TUI and land raw in a browser toast. One chokepoint for
-            // every surface; escapes show as `\x1b` text instead.
-            message: crate::sanitize::for_terminal(&message.into()),
+            // every surface; escapes show as `\x1b` text instead. Upstream's
+            // structured halves stay: the plain text and the parts must stay
+            // in agreement, so both are built from the sanitized message.
+            message: crate::sanitize::for_terminal(&message),
+            segments: segments.map(|segments| crate::sanitize::prose_segments(segments, &message)),
             scope,
             sticky,
             // Nobody has said otherwise yet; `mark_unwatched` is called by the
@@ -1255,6 +1275,7 @@ impl KeyedStatusController {
         ));
         anon.tone = StatusTone::Warning;
         anon.message = "timed out, check dux.log".to_string();
+        anon.segments = None;
         anon.since = now;
         anon.heartbeat = now;
         anon.generation = Generation(self.next_gen);
@@ -1265,6 +1286,7 @@ impl KeyedStatusController {
             key: None,
             tone: StatusTone::Warning.as_wire().to_string(),
             message: "timed out, check dux.log".to_string(),
+            segments: None,
             scope: anon.scope.clone(),
             sticky: false,
         });
@@ -1420,6 +1442,7 @@ impl KeyedStatusController {
                 key: entry.key,
                 tone: entry.tone.as_wire().to_string(),
                 message: entry.message,
+                segments: entry.segments,
                 scope: entry.scope,
                 sticky: entry.sticky,
             })
@@ -1485,6 +1508,7 @@ impl KeyedStatusController {
                 key: entry.key.clone(),
                 tone: entry.tone.as_wire().to_string(),
                 message: entry.message.clone(),
+                segments: entry.segments.clone(),
                 scope: entry.scope.clone(),
                 sticky: entry.sticky,
             });
@@ -1513,6 +1537,7 @@ impl KeyedStatusController {
         self.next_seq += 1;
         entry.tone = StatusTone::Warning;
         entry.message = reason.message();
+        entry.segments = None;
         entry.sticky = false;
         entry.generation = generation;
         entry.since = now;
@@ -1522,6 +1547,7 @@ impl KeyedStatusController {
             key: entry.key.clone(),
             tone: StatusTone::Warning.as_wire().to_string(),
             message: entry.message.clone(),
+            segments: None,
             scope: entry.scope.clone(),
             sticky: entry.sticky,
         })
@@ -1536,6 +1562,7 @@ impl KeyedStatusController {
                 key: None,
                 tone: anon.tone.as_wire().to_string(),
                 message: anon.message.clone(),
+                segments: anon.segments.clone(),
                 scope: anon.scope.clone(),
                 sticky: anon.sticky,
             });
@@ -1547,6 +1574,7 @@ impl KeyedStatusController {
                 key: entry.key.clone(),
                 tone: entry.tone.as_wire().to_string(),
                 message: entry.message.clone(),
+                segments: entry.segments.clone(),
                 scope: entry.scope.clone(),
                 sticky: entry.sticky,
             });
@@ -1591,6 +1619,7 @@ impl KeyedStatusController {
             key: winner.key.clone(),
             tone: winner.tone.as_wire().to_string(),
             message: winner.message.clone(),
+            segments: winner.segments.clone(),
             scope: winner.scope.clone(),
             sticky: winner.sticky,
         })
@@ -2404,6 +2433,114 @@ mod tests {
     ) {
         c.set(now, key.map(str::to_string), tone, message);
         c.mark_unwatched(key);
+    }
+
+    fn named() -> crate::status_text::StatusText {
+        crate::status_text!["Checked out ", q("main"), " for project ", q("app"), "."]
+    }
+
+    #[test]
+    fn the_replay_snapshot_carries_a_named_sentence_s_segments() {
+        let t0 = Instant::now();
+        let mut c = KeyedStatusController::emitting_finals();
+        c.set_scoped(
+            t0,
+            Some("checkout".into()),
+            StatusTone::Info,
+            named(),
+            super::StatusScope::All,
+            false,
+        );
+        c.set(t0, None, StatusTone::Warning, "plain words");
+        let snapshot = c.snapshot();
+        let keyed = snapshot
+            .iter()
+            .find(|s| s.key.as_deref() == Some("checkout"))
+            .unwrap();
+        assert_eq!(keyed.message, "Checked out \"main\" for project \"app\".");
+        assert_eq!(keyed.segments.as_deref(), named().segments());
+        let anon = snapshot.iter().find(|s| s.key.is_none()).unwrap();
+        assert_eq!(
+            anon.segments, None,
+            "a plain sentence has no parts to carry"
+        );
+    }
+
+    #[test]
+    fn a_heartbeat_re_sends_the_named_busy_with_its_segments() {
+        let t0 = Instant::now();
+        let live = LiveStatusKeys::default();
+        live.register("pull");
+        let mut c = KeyedStatusController::emitting_finals().with_live_keys(live);
+        let busy = crate::status_text!["Pulling ", q("main"), "\u{2026}"];
+        c.set_scoped(
+            t0,
+            Some("pull".into()),
+            StatusTone::Busy,
+            busy.clone(),
+            super::StatusScope::All,
+            false,
+        );
+        let changes = c.tick(t0 + BUSY_TIMEOUT, BUSY_TIMEOUT);
+        assert_eq!(changes.refreshed.len(), 1);
+        assert_eq!(changes.refreshed[0].segments.as_deref(), busy.segments());
+    }
+
+    #[test]
+    fn a_timed_out_busy_drops_the_parts_of_the_sentence_it_replaced() {
+        let t0 = Instant::now();
+        let mut c = KeyedStatusController::emitting_finals();
+        let busy = crate::status_text!["Pulling ", q("main"), "\u{2026}"];
+        c.set_scoped(
+            t0,
+            Some("pull".into()),
+            StatusTone::Busy,
+            busy,
+            super::StatusScope::All,
+            false,
+        );
+        let changes = c.tick(t0 + BUSY_TIMEOUT, BUSY_TIMEOUT);
+        assert_eq!(changes.upgraded[0].message, "timed out, check dux.log");
+        assert_eq!(changes.upgraded[0].segments, None);
+        assert_eq!(c.snapshot()[0].segments, None);
+    }
+
+    #[test]
+    fn a_held_late_final_keeps_its_segments() {
+        let t0 = Instant::now();
+        let mut c = KeyedStatusController::emitting_finals();
+        c.set_scoped(
+            t0,
+            Some("pr".into()),
+            StatusTone::Error,
+            named(),
+            super::StatusScope::All,
+            false,
+        );
+        c.mark_unwatched(Some("pr"));
+        let _ = c.tick(t0 + FINAL_REPLAY_WINDOW, BUSY_TIMEOUT);
+        let late = c.take_late_finals();
+        assert_eq!(late[0].segments.as_deref(), named().segments());
+    }
+
+    #[test]
+    fn the_terminal_line_prints_a_named_sentence_byte_for_byte_as_before() {
+        // The terminal UI's line is the plain spelling and nothing else: the
+        // quotes the sentence always had, no markup, no chip.
+        let t0 = Instant::now();
+        let mut c = KeyedStatusController::with_clear_after(Duration::from_secs(5));
+        c.set_scoped(
+            t0,
+            Some("checkout".into()),
+            StatusTone::Info,
+            named(),
+            super::StatusScope::All,
+            false,
+        );
+        assert_eq!(
+            c.text().as_bytes(),
+            b"Checked out \"main\" for project \"app\"."
+        );
     }
 
     #[test]

@@ -678,11 +678,10 @@ pub struct App {
     /// here would otherwise rebuild. Folded into the per-iteration mutated answer
     /// and cleared there.
     pub(crate) companion_followup_ran: bool,
-    /// The keyed status op for a background-server start, held from the moment the
-    /// pre-flight is dispatched until its result lands. `Option` rather than a map
-    /// because the pre-flight is in-flight-guarded, so there is only ever one.
-    pub(crate) pending_background_server_op:
-        Option<dux_core::engine::HandlerStatusOp<BackgroundServerOutcome>>,
+    /// The background-server start in flight, held from the moment the pre-flight
+    /// is dispatched until its result lands. `Option` rather than a map because
+    /// the pre-flight is in-flight-guarded, so there is only ever one.
+    pub(crate) pending_background_server_start: Option<PendingBackgroundServerStart>,
     /// The keyed status op for a live `[server] tailscale` change, held from the
     /// moment the background server is asked until its outcome lands on the
     /// worker lane. `Option` rather than a map: the serve loop answers every
@@ -840,6 +839,14 @@ pub struct App {
     /// full, unfiltered list is shown. This is a DISPLAY filter only: it never
     /// mutates `engine.sessions`, never persists, and composes with the sort mode.
     pub(crate) agent_filter: Option<TextInput>,
+    /// Test builds only: the scratch directories this app's paths point into
+    /// (its config root, and any repository a test hands it). Holding the
+    /// guards here removes them when the app drops, so a test run leaves
+    /// nothing behind in the temp directory; each guard retries while a worker
+    /// thread the test never joined is still writing inside it. Declared last
+    /// so it drops after every field that may still hold a file inside it open.
+    #[cfg(test)]
+    pub(crate) test_scratch_dirs: dux_core::test_scratch::ScratchDirs,
 }
 
 /// Handler-resolved outcome for the server-flip op (see
@@ -856,8 +863,21 @@ pub enum TuiServerFlipOutcome {
     Failed(String),
 }
 
+/// A background-server start whose bind pre-flight is still on its worker
+/// thread (see [`App::pending_background_server_start`]).
+///
+/// The trigger travels with the status op rather than beside it, because the
+/// place the pre-flight lands is where it decides what the start does beyond
+/// serving: a start somebody at this keyboard asked for claims every running
+/// pty, and the startup autostart claims none. Held together, the two cannot
+/// disagree about which start they belong to.
+pub(crate) struct PendingBackgroundServerStart {
+    pub(crate) op: dux_core::engine::HandlerStatusOp<BackgroundServerOutcome>,
+    pub(crate) trigger: BackgroundServerStart,
+}
+
 /// Handler-resolved outcome for a background-server start (see
-/// [`App::pending_background_server_op`]).
+/// [`App::pending_background_server_start`]).
 ///
 /// Every arm is terminal, unlike the flip's: the flip's busy rides on until the
 /// process changes surface, while this one has an answer either way and the TUI
@@ -2094,6 +2114,14 @@ pub(crate) enum DeleteAgentFocus {
     BranchCheckbox,
 }
 
+/// The project the non-default-branch dialog will add once answered. Its base
+/// is not stored here: confirming decides it from the checkbox's final state.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingProjectAdd {
+    pub(crate) path: String,
+    pub(crate) name: String,
+}
+
 /// Which selectable element has focus in the Non-Default Branch confirmation
 /// modal. `Checkbox` is only reachable when `BranchWarningKind::Known`: the
 /// heuristic path has no checkbox to focus.
@@ -2389,6 +2417,48 @@ pub(crate) enum PromptState {
         running_providers: Vec<String>,
         focus: ConfirmFocus, // Cancel (default) or Recreate
     },
+    /// Asked before "check out the default branch" runs anything, the same
+    /// question the browser's dialog asks: the checkout moves HEAD in the user's
+    /// folder and makes the default the branch new worktrees start from.
+    ///
+    /// The name and the base are captured when the dialog opens: the sentence
+    /// promises to move a specific base, and a reload behind an open dialog
+    /// must not change what the user is agreeing to.
+    ConfirmCheckoutDefaultBranch {
+        project_id: String,
+        project_name: String,
+        stored_base: Option<String>,
+        focus: ConfirmFocus, // Cancel (default) or Check out
+    },
+    /// Asked before `delete-project` runs anything, the same question the
+    /// browser's Delete project dialog asks: the cascade deletes every agent in
+    /// the project and removes their worktrees from disk.
+    ///
+    /// The name is captured when the dialog opens. The agent count is the
+    /// project's LIVE count, rewritten on every paint, so `agent_count` holds
+    /// the number the user last saw; the confirm compares it with a fresh count
+    /// and asks again rather than deleting agents that were never on screen.
+    /// The confirm also reads the project again, because it may have gone.
+    ConfirmDeleteProject {
+        project_id: String,
+        project_name: String,
+        /// The count the dialog last painted.
+        agent_count: usize,
+        focus: ConfirmFocus, // Cancel (default) or Delete
+    },
+    /// Asked before `remove-project` runs anything, the same question the
+    /// browser's Remove project dialog asks: the project leaves dux and every
+    /// worktree stays on disk.
+    ConfirmRemoveProject {
+        project_id: String,
+        project_name: String,
+        agent_count: usize,
+        /// The target is an orphaned group (agents whose project record is
+        /// gone) rather than a real project: confirming clears those agents'
+        /// records through the core cascade instead of removing a project.
+        orphaned: bool,
+        focus: ConfirmFocus, // Cancel (default) or Remove
+    },
     ConfirmQuit {
         agent_count: usize,
         terminal_count: usize,
@@ -2494,8 +2564,11 @@ pub(crate) enum PromptState {
         editing: Option<MacroEditState>,
         pending_delete: Option<PendingMacroDelete>,
     },
+    /// The add-project pre-flight for a repository on a non-default branch.
+    /// Adding is the only thing it does: checking out an existing project's
+    /// default branch asks through `ConfirmCheckoutDefaultBranch` instead.
     ConfirmNonDefaultBranch {
-        action: NonDefaultBranchAction,
+        add: PendingProjectAdd,
         current_branch: String,
         kind: BranchWarningKind,
         focus: ConfirmNonDefaultBranchFocus,
@@ -3283,6 +3356,18 @@ pub(crate) enum OverlayMouseLayout {
         cancel_button: Rect,
         confirm_button: Rect,
     },
+    ConfirmCheckoutDefaultBranch {
+        cancel_button: Rect,
+        confirm_button: Rect,
+    },
+    ConfirmDeleteProject {
+        cancel_button: Rect,
+        confirm_button: Rect,
+    },
+    ConfirmRemoveProject {
+        cancel_button: Rect,
+        confirm_button: Rect,
+    },
     ConfirmDeleteMacro {
         cancel_button: Rect,
         delete_button: Rect,
@@ -3640,6 +3725,8 @@ mod overlay_dismiss;
 mod pty_ownership;
 mod redraw;
 pub(crate) use redraw::RedrawGate;
+#[cfg(test)]
+mod name_chip_dialogs;
 mod new_agent_settings;
 mod render;
 mod reorder;
@@ -4028,7 +4115,7 @@ impl App {
             background_server_preflight_pending: false,
             background_server_wanted: false,
             companion_followup_ran: false,
-            pending_background_server_op: None,
+            pending_background_server_start: None,
             pending_tailscale_mode_op: None,
             server_flip_preflight_pending: false,
             pending_persist_ops: HashMap::new(),
@@ -4046,6 +4133,8 @@ impl App {
             pending_config_reload_op: None,
             project_chooser_context: None,
             agent_filter: None,
+            #[cfg(test)]
+            test_scratch_dirs: dux_core::test_scratch::ScratchDirs::new(),
         };
         // First boot relaunches prior sessions; a resume must not, because the
         // engine handed back from the web server already owns the live providers, and
@@ -5191,6 +5280,7 @@ impl App {
             "rerun-startup-command-on-agent" => self.rerun_startup_command_on_agent(),
             "read-startup-command-logs" => self.open_startup_command_logs(),
             "pull-project" => self.refresh_selected_project(),
+            "checkout-project-default-branch" => self.checkout_selected_project_default_branch(),
             "delete-project" => self.delete_selected_project(),
             "remove-project" => self.remove_selected_project(),
             "delete-agent" => self.confirm_delete_selected_session(),
@@ -5217,6 +5307,11 @@ impl App {
             }
             "move-agent-bottom" => {
                 self.move_selected_agent(reorder::MoveDir::Bottom);
+                Ok(())
+            }
+            "delete-terminal" => self.delete_terminal_from_palette(),
+            "filter-agents" => {
+                self.filter_agents_from_palette();
                 Ok(())
             }
             "move-terminal-up" => {
@@ -5791,6 +5886,33 @@ impl App {
     /// Enter agent-list filter mode: seed an empty query and rebuild the list.
     /// While active, printable keys type into the query and the arrows navigate
     /// the filtered rows (mirroring the project browser's type-to-filter).
+    /// The palette's way into the agent filter. The key binding only fires
+    /// from the agents pane, where typing already reaches the filter; the
+    /// palette can run from anywhere, so it brings the pane into view and gives
+    /// it focus, or the query would be typed into nothing.
+    pub(crate) fn filter_agents_from_palette(&mut self) {
+        self.left_collapsed = false;
+        self.focus = FocusPane::Left;
+        self.left_section = LeftSection::Projects;
+        self.open_agent_filter();
+    }
+
+    /// The palette's way to delete a terminal. The key binding acts on the
+    /// highlighted terminal row, so the palette does too, and only while a
+    /// terminal row is the selection: the remembered terminal index outlives
+    /// the cursor moving back onto an agent, and deleting a terminal the
+    /// user is not looking at is not what they asked for.
+    pub(crate) fn delete_terminal_from_palette(&mut self) -> Result<()> {
+        if self.left_section != LeftSection::Terminals {
+            self.set_error(
+                "Select a terminal in the agents pane first, then run delete-terminal again to \
+                 close it.",
+            );
+            return Ok(());
+        }
+        self.confirm_delete_selected_terminal()
+    }
+
     pub(crate) fn open_agent_filter(&mut self) {
         self.agent_filter = Some(TextInput::new());
         self.rebuild_left_items();
@@ -7337,6 +7459,112 @@ pub(crate) fn runtime_project_to_config(
 mod tests {
     use super::*;
 
+    /// Every command the palette lists must reach an arm of `execute_command`,
+    /// never the catch-all that reports it as unknown. Each name runs on a
+    /// fresh app, so one command's state cannot hide another's miss.
+    #[test]
+    fn every_palette_command_reaches_a_real_arm() {
+        let mut missing = Vec::new();
+        for command in dux_core::palette::PALETTE_COMMANDS {
+            let mut app = test_support::test_app(test_support::default_bindings());
+            // Both ways to serve refuse early while a flip is starting, so the
+            // sweep never binds a port or detects Tailscale.
+            app.server_flip_preflight_pending = true;
+            // An `Err` is a real arm refusing on this bare fixture; only the
+            // catch-all's status says the name was never matched.
+            let _ = app.execute_command(command.name.to_string());
+            if let Some((_, message)) = app.status.most_recent_tui()
+                && message.contains("Unknown command")
+            {
+                missing.push(command.name);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "palette commands with no execute_command arm: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn the_palette_opens_the_agent_filter_in_view_and_focused() {
+        let mut app = test_support::test_app(test_support::default_bindings());
+        app.focus = FocusPane::Center;
+        app.left_collapsed = true;
+
+        app.execute_command("filter-agents".to_string()).unwrap();
+
+        assert!(app.agent_filter.is_some(), "the filter must be open");
+        assert_eq!(app.focus, FocusPane::Left, "typing must reach the filter");
+        assert!(!app.left_collapsed, "the filter must be on screen");
+    }
+
+    #[test]
+    fn the_palette_asks_before_deleting_the_selected_terminal() {
+        let mut app = test_support::test_app(test_support::default_bindings());
+        app.show_companion_terminal().expect("launch a terminal");
+        app.left_section = LeftSection::Terminals;
+        app.selected_terminal_index = 0;
+
+        app.execute_command("delete-terminal".to_string()).unwrap();
+
+        assert!(
+            matches!(app.prompt, PromptState::ConfirmDeleteTerminal { .. }),
+            "expected the delete-terminal confirmation, got {:?}",
+            app.prompt
+        );
+    }
+
+    #[test]
+    fn the_palette_refuses_to_delete_a_terminal_that_is_not_selected() {
+        let mut app = test_support::test_app(test_support::default_bindings());
+        app.show_companion_terminal().expect("launch a terminal");
+        app.left_section = LeftSection::Projects;
+        app.selected_terminal_index = 0;
+
+        app.execute_command("delete-terminal".to_string()).unwrap();
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert!(
+            app.status
+                .text()
+                .contains("Select a terminal in the agents pane first"),
+            "{}",
+            app.status.text()
+        );
+    }
+
+    #[test]
+    fn the_palette_asks_before_checking_out_the_default_branch() {
+        let mut app = test_support::test_app(test_support::default_bindings());
+
+        app.execute_command("checkout-project-default-branch".to_string())
+            .unwrap();
+
+        assert!(
+            matches!(app.prompt, PromptState::ConfirmCheckoutDefaultBranch { .. }),
+            "expected the checkout confirmation, got {:?}",
+            app.prompt
+        );
+    }
+
+    /// An engine status built from parts, for the web's name chips, reaches the
+    /// terminal UI's status line as exactly the sentence it printed before the
+    /// parts existed: straight quotes where it always had them, nothing else.
+    #[test]
+    fn a_status_built_from_parts_prints_byte_for_byte_as_before() {
+        let mut app =
+            crate::app::test_support::test_app(crate::app::test_support::default_bindings());
+        let update = dux_core::engine::StatusUpdate::info(
+            dux_core::engine::checkout_default_branch_message("app", "main", true),
+        );
+        assert!(update.segments.is_some(), "the sentence carries its parts");
+        app.apply_reaction(dux_core::engine::EventReaction::Status(update));
+        assert_eq!(
+            app.status.text().as_bytes(),
+            b"Checked out \"main\" for project \"app\". New worktrees branch from \"main\" now."
+        );
+    }
+
     /// The answer the delete request carries, in the three states the dialog
     /// can be in. The absent case is the load-bearing one: it is what keeps the
     /// engine's provenance default, and sending `Some(false)` there would
@@ -8496,12 +8724,12 @@ leading_branch = "main"
         paths.ensure_dirs().expect("dirs");
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).expect("repo");
-        std::process::Command::new("git")
+        dux_core::test_git::fixture_git()
             .arg("init")
             .arg(&repo)
             .output()
             .expect("git init");
-        std::process::Command::new("git")
+        dux_core::test_git::fixture_git()
             .arg("checkout")
             .arg("-b")
             .arg("main")

@@ -6,6 +6,7 @@
 // one fails on the side that changed.
 
 import { type AgentWorkspaceWire, matchWorkspace } from "./agentWorkspace"
+import { chip, type Prose, proseText, quotedChip } from "./prose"
 import type { SessionView } from "./types"
 
 /** Whether the recreate action exists for this agent. Its own helper rather
@@ -34,10 +35,13 @@ export function recreateRunningProviders(session: SessionView): string[] {
   return live.length > 0 ? live : [session.provider]
 }
 
-/** Several provider names as one subject: "Codex", "Codex or Opencode". */
-function providersJoined(names: string[]): string {
-  if (names.length <= 1) return names[0] ?? ""
-  return `${names.slice(0, -1).join(", ")} or ${names[names.length - 1]}`
+/** Several provider names as one subject, each marked as a name: "Codex",
+ * "Codex or Opencode". */
+function providersJoined(names: string[]): Prose {
+  return names.flatMap((name, index): Prose => {
+    if (index === 0) return [chip(name)]
+    return [index === names.length - 1 ? " or " : ", ", chip(name)]
+  })
 }
 
 /** What the tabs still running in the deleted directory do once the working
@@ -53,6 +57,11 @@ function providersJoined(names: string[]): string {
  * until it is quit and resumed in the new folder. OpenCode and Copilot have not
  * been measured, so they get the cautious answer rather than a promise. */
 export function recreateRunningTabClause(providers: string[]): string {
+  return proseText(recreateRunningTabProse(providers))
+}
+
+/** The same clause with each provider marked, for the web to chip. */
+function recreateRunningTabProse(providers: string[]): Prose {
   const name = (provider: string) =>
     provider.charAt(0).toUpperCase() + provider.slice(1)
   const cautious = providers
@@ -60,12 +69,18 @@ export function recreateRunningTabClause(providers: string[]): string {
     .map(name)
   if (cautious.length === 0) {
     const only = providers.length > 0 ? name(providers[0]) : "Claude"
-    return `A running ${only} tab keeps working in the recreated copy by itself.`
+    return [
+      "A running ",
+      chip(only),
+      " tab keeps working in the recreated copy by itself.",
+    ]
   }
-  return (
-    `A running ${providersJoined(cautious)} tab cannot follow the folder: ` +
-    `stop it and start the agent again to continue in the recreated copy.`
-  )
+  return [
+    "A running ",
+    ...providersJoined(cautious),
+    " tab cannot follow the folder: " +
+      "stop it and start the agent again to continue in the recreated copy.",
+  ]
 }
 
 /** The body of the recreate confirmation.
@@ -81,32 +96,42 @@ export function recreateRunningTabClause(providers: string[]): string {
  * cannot happen, and the same path buys it nothing.
  *
  * `providers` are the providers of the tabs running right now, or the agent's
- * own when none is, from `recreateRunningProviders`. */
-export function recreateConfirmBody(
+ * own when none is, from `recreateRunningProviders`.
+ *
+ * The path and every branch are marked for the web to chip. dux-core's
+ * `recreate_confirm_prose` builds the same segments for the terminal UI, and
+ * both are pinned by `crates/dux-core/tests/fixtures/prose_cross_language.json`. */
+export function recreateConfirmProse(
   worktreeLabel: string,
   branchName: string,
   sourceBranch: string,
   conversationResumes: boolean,
   providers: string[],
-): string {
+): Prose {
   const conversation = conversationResumes
     ? `The conversation may resume, because the agent's CLI keys its history ` +
       `by directory path and dux recreates the working copy at the same path.`
     : `The conversation will not resume: this agent's CLI has no way to pick ` +
       `a conversation back up, so it starts fresh wherever it runs.`
-  return (
-    `Recreate the working copy for this agent at ${worktreeLabel}?\n\n` +
-    `If branch "${branchName}" still exists locally, dux checks it out there ` +
-    `again. If it is gone locally but still on the remote, dux creates it ` +
-    `again from "origin/${branchName}", holding everything that had been ` +
-    `pushed. If it is gone everywhere, dux creates it again from ` +
-    `"${sourceBranch}", and the commits that branch held are not coming ` +
-    `back.\n\n` +
-    `Any code changes that were in the old directory are gone either way: this ` +
-    `puts the directory back, not its contents. ${conversation}\n\n` +
-    `${recreateRunningTabClause(providers)} ` +
-    `A terminal still open in the old directory keeps ` +
-    `working in a directory that is gone; close it and open one in the ` +
-    `recreated copy.`
-  )
+  return [
+    "Recreate the working copy for this agent at ",
+    chip(worktreeLabel),
+    "?\n\nIf branch ",
+    quotedChip(branchName),
+    ` still exists locally, dux checks it out there ` +
+      `again. If it is gone locally but still on the remote, dux creates it ` +
+      `again from `,
+    quotedChip(`origin/${branchName}`),
+    `, holding everything that had been ` +
+      `pushed. If it is gone everywhere, dux creates it again from `,
+    quotedChip(sourceBranch),
+    `, and the commits that branch held are not coming ` +
+      `back.\n\n` +
+      `Any code changes that were in the old directory are gone either way: this ` +
+      `puts the directory back, not its contents. ${conversation}\n\n`,
+    ...recreateRunningTabProse(providers),
+    ` A terminal still open in the old directory keeps ` +
+      `working in a directory that is gone; close it and open one in the ` +
+      `recreated copy.`,
+  ]
 }

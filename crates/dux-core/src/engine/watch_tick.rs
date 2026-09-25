@@ -445,7 +445,10 @@ mod tests {
 
     /// An engine with one claude agent whose slot tab runs `client`, and
     /// `rules` configured for claude.
-    fn engine_with_tab(client: PtyClient, rules: Vec<WatchRule>) -> (Engine, tempfile::TempDir) {
+    fn engine_with_tab(
+        client: PtyClient,
+        rules: Vec<WatchRule>,
+    ) -> (Engine, crate::test_scratch::ScratchDir) {
         let (mut engine, tmp) = test_engine();
         engine.sessions.push(sample_session("s1", "p1", "feature"));
         let mut claude = crate::config::ProviderCommandConfig {
@@ -462,13 +465,13 @@ mod tests {
         (engine, tmp)
     }
 
-    fn log_path(tmp: &tempfile::TempDir) -> PathBuf {
+    fn log_path(tmp: &crate::test_scratch::ScratchDir) -> PathBuf {
         tmp.path().join("typed.log")
     }
 
     #[test]
     fn a_matching_rule_types_the_body_then_submits_it_in_a_later_write() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_scratch::ScratchDir::new();
         let log = log_path(&tmp);
         let client = recording_pty("API Error: rate limited", &log);
         let (mut engine, _guard) = engine_with_tab(
@@ -513,7 +516,7 @@ mod tests {
 
     #[test]
     fn a_tab_the_user_just_typed_into_is_left_alone() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_scratch::ScratchDir::new();
         let log = log_path(&tmp);
         let client = recording_pty("rate limited", &log);
         let (mut engine, _guard) =
@@ -622,7 +625,7 @@ mod tests {
 
     #[test]
     fn a_suppression_window_holds_the_tab_then_rebaselines_stale_matches() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = crate::test_scratch::ScratchDir::new();
         let log = log_path(&tmp);
         let client = recording_pty("[task-done]", &log);
         let (mut engine, _guard) =

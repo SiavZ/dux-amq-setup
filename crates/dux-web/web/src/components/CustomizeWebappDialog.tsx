@@ -40,6 +40,7 @@ import {
 } from "@/lib/settingsDescriptors"
 import { configApi } from "@/lib/configApi"
 import { renderInlineCode } from "@/lib/inlineMarkdown"
+import { wireProse } from "@/lib/prose"
 import {
   changesPaneVisible,
   closeCustomizeWebapp,
@@ -507,8 +508,9 @@ async function persist(
       configApi
         .setTailscaleMode(mode)
         .then((reply) => {
-          if (reply.warning) notifyWarning(reply.message)
-          else notifyInfo(reply.message)
+          const said = wireProse(reply.message, reply.segments)
+          if (reply.warning) notifyWarning(said)
+          else notifyInfo(said)
           return true
         })
         .catch((e) => {

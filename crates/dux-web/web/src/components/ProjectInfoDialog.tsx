@@ -7,6 +7,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
 import { formatRegularCount } from "@/lib/formatRegularCount"
 import { projectBranchDisplay } from "@/lib/projectBranch"
@@ -48,18 +49,14 @@ export function ProjectInfoDialog() {
     body = (
       <dl className="flex flex-col gap-3">
         <InfoRow label="Path">
-          <span className="font-mono break-all">{project.path}</span>
+          <InlineCode>{project.path}</InlineCode>
         </InfoRow>
         <InfoRow label="Current branch">
           {branch ? (
             <SimpleTooltip content={branch.tooltip ?? undefined}>
-              <span
-                className={`font-mono break-all ${
-                  branch.warn ? "text-amber-500" : ""
-                }`}
-              >
+              <InlineCode className={branch.warn ? "text-amber-500" : undefined}>
                 {branch.branch}
-              </span>
+              </InlineCode>
             </SimpleTooltip>
           ) : (
             <span className="text-muted-foreground">Unknown</span>
@@ -67,14 +64,14 @@ export function ProjectInfoDialog() {
         </InfoRow>
         <InfoRow label="Default branch">
           {project.leading_branch ? (
-            <span className="font-mono break-all">{project.leading_branch}</span>
+            <InlineCode>{project.leading_branch}</InlineCode>
           ) : (
             <span className="text-muted-foreground">Not detected</span>
           )}
         </InfoRow>
         <InfoRow label="Added">{formatDisplayDate(project.created_at)}</InfoRow>
         <InfoRow label="Default provider">
-          {project.default_provider}
+          <InlineCode>{project.default_provider}</InlineCode>
           {providerExplicit ? (
             <span className="text-muted-foreground"> (explicit)</span>
           ) : null}
@@ -88,9 +85,7 @@ export function ProjectInfoDialog() {
         </InfoRow>
         <InfoRow label="Startup command">
           {project.startup_command ? (
-            <span className="font-mono break-all">
-              {project.startup_command}
-            </span>
+            <InlineCode>{project.startup_command}</InlineCode>
           ) : (
             <span className="text-muted-foreground">None</span>
           )}

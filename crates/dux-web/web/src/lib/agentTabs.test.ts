@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest"
 
+import { chip } from "./prose"
+
 import {
   agentTabSocketGone,
   ONLY_TAB_CLOSE_REFUSAL,
@@ -512,7 +514,8 @@ describe("closeTabConsequences", () => {
   it("names the provider's session and detaches when the closing tab is the last live one", () => {
     const only = extraTab("t1", true)
     const result = closeTabConsequences(sessionWithSlot("t1", [only]), only)
-    expect(result.sessionLabel).toBe("the codex session")
+    // The provider is a name, so the web draws it as a chip.
+    expect(result.sessionLabel).toEqual(["the ", chip("codex"), " session"])
     expect(result.willDetach).toBe(true)
   })
 
@@ -540,7 +543,7 @@ describe("closeTabConsequences", () => {
 
   it("falls back to the bare session wording when no tab is in hand", () => {
     const result = closeTabConsequences(undefined, undefined)
-    expect(result.sessionLabel).toBe("the session")
+    expect(result.sessionLabel).toEqual(["the session"])
     expect(result.willDetach).toBe(true)
     expect(result.successorLabel).toBeUndefined()
   })

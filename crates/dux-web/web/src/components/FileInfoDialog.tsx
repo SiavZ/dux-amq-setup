@@ -11,6 +11,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { InlineCode } from "@/components/ui/inline-code"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useVanishedTargetGuard } from "@/hooks/use-vanished-target"
 import { FileApiError, fileApi } from "@/lib/fileApi"
@@ -129,14 +130,12 @@ export function FileInfoDialog({
           ) : (
             <dl className="flex flex-col gap-2 pr-3">
               <InfoRow label="Path">
-                <span className="font-mono break-all">{info.path}</span>
+                <InlineCode>{info.path}</InlineCode>
               </InfoRow>
               <InfoRow label="Kind">{entryKindLabel(info.kind)}</InfoRow>
               {info.symlink_target !== null && (
                 <InfoRow label="Links to">
-                  <span className="font-mono break-all">
-                    {info.symlink_target}
-                  </span>
+                  <InlineCode>{info.symlink_target}</InlineCode>
                 </InfoRow>
               )}
               <InfoRow label="Size">{formatBytes(info.size)}</InfoRow>
@@ -144,10 +143,10 @@ export function FileInfoDialog({
                 {formatModified(info.modified)}
               </InfoRow>
               <InfoRow label="Permissions">
-                <span className="font-mono">{info.permissions}</span>
+                <InlineCode>{info.permissions}</InlineCode>
               </InfoRow>
               <InfoRow label="Mode">
-                <span className="font-mono">{info.mode}</span>
+                <InlineCode>{info.mode}</InlineCode>
               </InfoRow>
               <InfoRow label="Git">
                 <div className="flex flex-col gap-1">

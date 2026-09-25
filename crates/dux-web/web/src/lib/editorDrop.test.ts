@@ -8,6 +8,7 @@ import {
 } from "./editorDrop"
 import { FileDropApiError } from "./fileDropApi"
 import type { DropToast } from "./fileDrop"
+import { type Prose, proseText } from "./prose"
 
 const saved = (requestedName: string, savedName = requestedName) =>
   ({ kind: "saved", requestedName, savedName }) as const
@@ -164,7 +165,7 @@ describe("performTreeDrop", () => {
         calls.push("search")
         return Promise.resolve()
       }),
-      reportBusy: vi.fn((m: string) => calls.push(`busy:${m}`)),
+      reportBusy: vi.fn((m: Prose) => calls.push(`busy:${proseText(m)}`)),
       reportFinal: vi.fn((t: DropToast) => {
         calls.push(`final:${t.tone}`)
         finals.push(t)
