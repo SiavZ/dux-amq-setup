@@ -23358,6 +23358,60 @@ mod tests {
         );
     }
 
+    /// In these themes the single-line renderer's caret is painted in exactly
+    /// the name chip's two colors, so a wrapper that recognised a chip by its
+    /// colors would keep caret-styled text whole as if it were a name. Taken
+    /// from the renderer itself and wrapped beside a real chip, text in the
+    /// caret's style still breaks at its spaces while the chip stays on one
+    /// row.
+    #[test]
+    fn caret_styled_text_wraps_at_its_spaces_while_a_chip_stays_whole() {
+        let app = test_app(default_bindings());
+        for id in ["github_light", "flexoki_light", "light_owl"] {
+            let theme = crate::theme::load(id, &app.engine.paths)
+                .unwrap_or_else(|err| panic!("{id}: {err}"));
+            let field = render_single_line_cursor_input(
+                "",
+                "ab",
+                0,
+                theme.input_cursor_fg,
+                theme.input_cursor_bg,
+                true,
+            );
+            let caret = field
+                .spans
+                .iter()
+                .find(|span| span.content == "a")
+                .expect("the caret sits on a")
+                .style;
+            let chip = theme.name_style();
+            assert_eq!(
+                (caret.fg, caret.bg),
+                (chip.fg, chip.bg),
+                "{id}: the caret no longer shares the chip colors; pick a theme that does"
+            );
+
+            let line = Line::from(vec![
+                Span::styled("aa bb cc dd ee ff gg", caret),
+                Span::raw(" "),
+                name_chip("My Cool Project", &theme),
+            ]);
+            let rows: Vec<String> = wrap_styled_lines(&[line], 18)
+                .iter()
+                .map(|row| row.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect();
+            assert_eq!(
+                rows,
+                vec![
+                    "aa bb cc dd ee ff".to_string(),
+                    "gg".to_string(),
+                    " My Cool Project ".to_string(),
+                ],
+                "{id}: caret-styled text is word-wrapped, the chip kept whole"
+            );
+        }
+    }
+
     #[test]
     fn render_single_line_cursor_input_clamps_a_caret_inside_a_character() {
         // A byte offset that is not a char boundary must not panic; it clamps

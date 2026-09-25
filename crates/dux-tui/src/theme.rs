@@ -737,37 +737,20 @@ impl Theme {
     /// every dialog is the same shape.
     ///
     /// This style is also how a chip is RECOGNISED: `wrap_styled_lines` keeps
-    /// any span in exactly this style whole, never breaking a row inside it. It
-    /// knows a chip by [`NAME_CHIP_MARKER`] rather than by the two colors,
-    /// which are ordinary theme colors a caret or a highlight may share. Do
-    /// not reuse this style for other text, or that text will refuse to wrap;
-    /// a look that merely resembles a chip needs a style of its own.
+    /// any span carrying [`NAME_CHIP_MARKER`] whole, never breaking a row
+    /// inside it, including a chip a caller has since restyled (the marker
+    /// survives `Style::patch`). It knows a chip by that marker rather than by
+    /// the two colors, which are ordinary theme colors a caret or a highlight
+    /// may share. Do not reuse this style for other text, or that text will
+    /// refuse to wrap; a look that merely resembles a chip needs a style of its
+    /// own.
     pub fn name_style(&self) -> Style {
         Style::default()
             .fg(self.overlay_bg)
             .bg(self.text_fg)
             .remove_modifier(NAME_CHIP_MARKER)
     }
-}
 
-/// What makes a style a name chip's: this modifier in the style's REMOVE set.
-///
-/// A chip is told apart structurally, never by its colors, because its colors
-/// are the dialog body's own swapped and anything else drawn in that pair (a
-/// text-input caret, in themes whose caret tokens resolve to it) would
-/// otherwise be kept whole by the wrapper as if it were a name. Removing
-/// `HIDDEN` paints nothing: a chip is never hidden, so the cell looks exactly
-/// as it would without the marker, and nothing else in dux removes it. The
-/// marker survives `Style::patch`, so a caller that restyles a chip (dims it
-/// for a disabled row) still has a chip.
-pub const NAME_CHIP_MARKER: Modifier = Modifier::HIDDEN;
-
-/// Whether `style` is a name chip's: whether it carries [`NAME_CHIP_MARKER`].
-pub fn is_name_chip(style: Style) -> bool {
-    style.sub_modifier.contains(NAME_CHIP_MARKER)
-}
-
-impl Theme {
     pub fn selection_style(&self) -> Style {
         Style::default()
             .fg(self.selection_fg)
@@ -841,6 +824,23 @@ impl Theme {
     pub fn dim_key_badge_default<'a>(&self, key: &'a str) -> Vec<Span<'a>> {
         self.dim_key_badge(key, self.app_bg)
     }
+}
+
+/// What makes a style a name chip's: this modifier in the style's REMOVE set.
+///
+/// A chip is told apart structurally, never by its colors, because its colors
+/// are the dialog body's own swapped and anything else drawn in that pair (a
+/// text-input caret, in themes whose caret tokens resolve to it) would
+/// otherwise be kept whole by the wrapper as if it were a name. Removing
+/// `HIDDEN` paints nothing: a chip is never hidden, so the cell looks exactly
+/// as it would without the marker, and nothing else in dux removes it. The
+/// marker survives `Style::patch`, so a caller that restyles a chip (dims it
+/// for a disabled row) still has a chip.
+pub const NAME_CHIP_MARKER: Modifier = Modifier::HIDDEN;
+
+/// Whether `style` is a name chip's: whether it carries [`NAME_CHIP_MARKER`].
+pub fn is_name_chip(style: Style) -> bool {
+    style.sub_modifier.contains(NAME_CHIP_MARKER)
 }
 
 #[cfg(test)]
@@ -1556,11 +1556,8 @@ info = "info"
     }
 
     /// The name chip is the dialog body's own two colors swapped, in every
-    /// theme dux can load: its text reads exactly as well as the body text it
-    /// sits in, and it stands off the dialog surface by that same contrast, so
-    /// no theme can draw a chip that is fainter than its own sentence or that
-    /// melts into the modal. There is nothing to pin per theme, because there
-    /// is nothing derived.
+    /// theme dux can load, never bold, and it stands off the dialog surface
+    /// far enough to read as a chip rather than melting into the modal.
     #[test]
     fn every_loadable_theme_draws_the_name_chip_as_the_dialog_body_colors_swapped() {
         let (_tmp, paths) = scratch_paths();
@@ -1581,13 +1578,7 @@ info = "info"
             assert_eq!(
                 (fg, bg),
                 (theme.overlay_bg, theme.text_fg),
-                "theme {id}: the chip is the body text colors swapped"
-            );
-            let body = contrast(theme.text_fg, theme.overlay_bg);
-            assert!(
-                (contrast(fg, bg) - body).abs() < 1e-9,
-                "theme {id}: chip text contrast {} differs from the body's {body}",
-                contrast(fg, bg)
+                "theme {id}: the design draws a chip in the dialog body's colors swapped"
             );
             assert_ne!(
                 bg, theme.overlay_bg,
@@ -1619,27 +1610,6 @@ info = "info"
             .name_style()
             .patch(Style::default().fg(Color::Red).bg(Color::Blue));
         assert!(is_name_chip(patched));
-    }
-
-    /// Why the chip needs a marker at all: in real themes the text-input caret
-    /// resolves to exactly the chip's two colors, so a wrapper that recognised
-    /// chips by color would keep a caret whole as if it were a name.
-    #[test]
-    fn a_caret_can_share_the_chip_colors_and_is_still_not_a_chip() {
-        let (_tmp, paths) = scratch_paths();
-        for id in ["github_light", "flexoki_light", "light_owl"] {
-            let theme = load(id, &paths).unwrap_or_else(|err| panic!("{id}: {err}"));
-            let caret = Style::default()
-                .fg(theme.input_cursor_fg)
-                .bg(theme.input_cursor_bg);
-            let chip = theme.name_style();
-            assert_eq!(
-                (caret.fg, caret.bg),
-                (chip.fg, chip.bg),
-                "{id}: the caret no longer shares the chip colors; pick a theme that does"
-            );
-            assert!(!is_name_chip(caret), "{id}: a caret is not a name");
-        }
     }
 
     /// The marker never changes what a chip looks like: painted into a cell it

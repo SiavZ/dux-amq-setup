@@ -1263,7 +1263,7 @@ fn assert_body_text(app: &App, buf: &Buffer, words: &str) {
 
 /// A light theme is where the terminal's default foreground (white in a dark
 /// terminal) disappears into the modal surface, so the body text is asked
-/// about there: the prose around a chip, and a checkbox label.
+/// about there: the prose around a chip, in two dialogs.
 #[test]
 fn dialog_body_text_is_the_themes_text_color_on_a_light_theme() {
     let mut app = test_app(default_bindings());
@@ -1272,7 +1272,7 @@ fn dialog_body_text_is_the_themes_text_color_on_a_light_theme() {
     let buf = open(
         &mut app,
         PromptState::ConfirmDeleteProject {
-            project_id,
+            project_id: project_id.clone(),
             project_name: "proj-light".to_string(),
             agent_count: 2,
             focus: ConfirmFocus::Cancel,
@@ -1283,15 +1283,13 @@ fn dialog_body_text_is_the_themes_text_color_on_a_light_theme() {
 
     let buf = open(
         &mut app,
-        delete_agent_prompt(
-            DeleteAgentTarget::Managed {
-                branch_name: "light-br".to_string(),
-                initial_branch: "light-br".to_string(),
-                branch_provenance: dux_core::model::BranchProvenance::CreatedByDux,
-                worktree_shared: false,
-            },
-            true,
-        ),
+        PromptState::ConfirmRemoveProject {
+            project_id,
+            project_name: "proj-light".to_string(),
+            agent_count: 2,
+            orphaned: false,
+            focus: ConfirmFocus::Cancel,
+        },
     );
-    assert_body_text(&app, &buf, "Also delete the worktree");
+    assert_body_text(&app, &buf, "This removes");
 }

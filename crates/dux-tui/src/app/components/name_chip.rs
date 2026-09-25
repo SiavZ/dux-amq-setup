@@ -5,9 +5,10 @@
 //! colors swapped (the modal surface `overlay_bg` on the body text `text_fg`),
 //! padded by one cell on each side, with no bold and no quotes: the chip is the
 //! delimiter. Swapping the body's pair means a chip reads exactly as well as
-//! the sentence around it, in every theme, with nothing to configure. A padded chip is exactly as wide as the
-//! quoted text it replaces, so a sentence that used to quote its names keeps
-//! its width. It is the terminal counterpart of the web's inline code chip.
+//! the sentence around it, in every theme, with nothing to configure. A padded
+//! chip is exactly as wide as the quoted text it replaces, so a sentence that
+//! used to quote its names keeps its width. It is the terminal counterpart of
+//! the web's inline code chip.
 //!
 //! Sentences are built as [`Prose`] (constant words and names), including the
 //! ones dux-core shares with the web, and turned into spans only here. A call
@@ -25,9 +26,9 @@ use crate::theme::Theme;
 /// terminal carries nothing invisible. What keeps the chip whole when a body
 /// wraps is [`super::wrap_styled_lines`], which treats a span carrying the chip
 /// marker ([`crate::theme::NAME_CHIP_MARKER`]) as one unbreakable unit, inner
-/// spaces and pads included. A chip must
-/// therefore reach the screen through that wrapper: ratatui's own `Wrap` would
-/// break at a pad or between the words of "My Cool Project".
+/// spaces and pads included. A chip must therefore reach the screen through
+/// that wrapper: ratatui's own `Wrap` would break at a pad or between the words
+/// of "My Cool Project".
 pub(crate) fn name_chip(name: &str, theme: &Theme) -> Span<'static> {
     Span::styled(format!(" {name} "), theme.name_style())
 }
