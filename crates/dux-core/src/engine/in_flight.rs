@@ -39,7 +39,11 @@ pub enum InFlightKey {
     /// A one-shot PR check (foreground/refs-watcher/exit trigger) is running for
     /// this session id. Bounds concurrent `gh` subprocesses for one session (a
     /// call can run up to `GH_CALL_TIMEOUT`, longer than the debounce). Cleared
-    /// by the `PrStatusReady`/`PrCheckAborted` handlers.
+    /// by the `PrStatusReady`/`PrCheckAborted` handlers. The set of these keys
+    /// is also COUNTED for the workspace-wide cap
+    /// (`ui.max_concurrent_pr_checks`), which is why the cap has no separate
+    /// counter: this one registry is the single source of truth for both the
+    /// per-session guard and the global bound.
     PrCheck(String),
     /// A manual pull-request attach is resolving for this session id, spanning
     /// the `gh` lookup and the attach that follows it. While set, this

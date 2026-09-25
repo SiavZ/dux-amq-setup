@@ -1997,6 +1997,29 @@ impl Engine {
         self.in_flight.contains(key)
     }
 
+    /// How many one-shot PR checks are running right now, across every session.
+    /// Derived by counting the live `InFlightKey::PrCheck(_)` entries in
+    /// `self.in_flight` rather than by a second counter, so the global cap the
+    /// number feeds can never disagree with the per-session guard or the
+    /// completion handlers that clear the keys.
+    pub fn pr_checks_in_flight(&self) -> usize {
+        self.in_flight
+            .iter()
+            .filter(|key| matches!(key, InFlightKey::PrCheck(_)))
+            .count()
+    }
+
+    /// The configured ceiling for [`Self::pr_checks_in_flight`], from
+    /// `ui.max_concurrent_pr_checks`. Read from `self.config` on every check
+    /// rather than cached at startup, so a config reload retunes the cap live
+    /// (the same reload path that retunes the PR poll intervals). `0` means
+    /// unlimited, which saturates to `usize::MAX` so the comparison stays a
+    /// plain `>=` rather than growing a special case.
+    fn pr_check_cap(&self) -> usize {
+        let cap = self.config.ui.max_concurrent_pr_checks;
+        if cap == 0 { usize::MAX } else { cap }
+    }
+
     pub fn spawn_project_persistence(
         &mut self,
         action: ProjectPersistenceAction,
@@ -3781,6 +3804,12 @@ impl Engine {
     /// `PrStatusReady` has been processed, cannot bypass the rate limit and
     /// spawn concurrent `gh` subprocesses.
     ///
+    /// Two things bound the concurrent `gh` subprocesses: the per-session key
+    /// above, and a workspace-wide cap (`ui.max_concurrent_pr_checks`, default
+    /// 4, `0` = unlimited) that refuses the check BEFORE the debounce stamp, so
+    /// a check skipped at the cap leaves the session eligible for the next
+    /// trigger rather than pretending it was just checked.
+    ///
     /// Reports whether a check was actually dispatched, so a caller that must
     /// not silently lose one can retry.
     pub fn spawn_pr_check_for_session(&mut self, session_id: &str, min_interval: Duration) -> bool {
@@ -3810,6 +3839,24 @@ impl Engine {
         // the debounce forward). Backed-off hosts are skipped inside the sync
         // itself (per-host), so no host check is needed here.
         if self.is_in_flight(&InFlightKey::PrCheck(session_id.to_string())) {
+            return false;
+        }
+        // ...and not for the whole workspace either: the per-session guards above
+        // cannot stop N different agents' events from spawning N concurrent `gh`
+        // subprocesses (a refs-watcher cascade, a workspace-wide exit sweep), so
+        // the same in-flight set is counted for a global cap. Counting the set
+        // rather than keeping a separate counter means the two can never drift
+        // apart (the set is the same source the per-session guard and the
+        // PrStatusReady/PrCheckAborted clearing use). Refused BEFORE the debounce
+        // stamp below, like every other skip, so a check lost to the cap is not
+        // recorded as having happened.
+        if self.pr_checks_in_flight() >= self.pr_check_cap() {
+            crate::logger::debug(&format!(
+                "[gh-integration] skipping PR check for {session_id}: {} already in flight \
+                 (cap {})",
+                self.pr_checks_in_flight(),
+                self.pr_check_cap(),
+            ));
             return false;
         }
         // The user detached this agent's pull request, so there is nothing to
@@ -4216,8 +4263,10 @@ impl Engine {
             // minutes or hours later, always gets its check.
             if !self.spawn_pr_check_for_session(&session_id, PR_CHECK_MIN_INTERVAL) {
                 // Refused, commonly because GitHub was unavailable at the
-                // moment the agent came back. Owe it one retry rather than
-                // leaving the badge as stale as the slow clock left it.
+                // moment the agent came back, or because the concurrent-check
+                // cap is full (no debounce was stamped, so an ordinary trigger
+                // retries it as soon as a slot frees). Owe it one retry rather
+                // than leaving the badge as stale as the slow clock left it.
                 self.pr_return_checks_owed.insert(session_id);
             }
         }
