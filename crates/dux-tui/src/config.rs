@@ -4734,6 +4734,45 @@ args = [\"-l\"]
         );
     }
 
+    /// A fork config's `schema_version` is consumed by the load that migrates
+    /// it and is gone from the persisted file, so its one-time fixes never run
+    /// again: a user who turns claude's `forward_mouse` back on afterwards keeps
+    /// that choice across restarts.
+    #[test]
+    fn a_fork_schema_version_is_consumed_once_and_never_reapplied() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let paths = dux_core::config::DuxPaths {
+            config_path: root.join("config.toml"),
+            sessions_db_path: root.join("sessions.sqlite3"),
+            lock_path: root.join("dux.lock"),
+            worktrees_root: root.join("worktrees"),
+            root,
+        };
+        fs::write(
+            &paths.config_path,
+            "schema_version = 3\n\n[providers.claude]\ncommand = \"claude\"\nforward_mouse = true\n",
+        )
+        .expect("seed fork config");
+
+        let migrated = ensure_config(&paths).expect("load and persist");
+        assert!(!migrated.providers.commands["claude"].forwards_mouse());
+        let persisted = fs::read_to_string(&paths.config_path).expect("read");
+        assert!(
+            !persisted.contains("schema_version"),
+            "the fork marker must be consumed: {persisted}"
+        );
+
+        // The user opts back in; the next load keeps it.
+        fs::write(
+            &paths.config_path,
+            persisted.replace("forward_mouse = false", "forward_mouse = true"),
+        )
+        .expect("user edit");
+        let reloaded = ensure_config(&paths).expect("reload");
+        assert!(reloaded.providers.commands["claude"].forwards_mouse());
+    }
+
     /// Fork d945e200 (`config_v1_removes_only_the_legacy_open_worktree_binding`).
     /// There is no config schema number here, so the fork's v1 migration arm is a
     /// load rule: a `[keys]` row that is EXACTLY the retired plain `o` default is
