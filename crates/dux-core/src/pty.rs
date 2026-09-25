@@ -7822,6 +7822,18 @@ mod tests {
             .expect("background descendant must not make PtyClient::drop hang");
     }
 
+    /// Drop hangs up before it kills, so a provider's HUP handler gets to run.
+    ///
+    /// The child sleeps in the background and blocks in the `wait` builtin,
+    /// because a trapped signal interrupts `wait` at once (POSIX), whereas a
+    /// FOREGROUND command defers the trap until it exits. The test drops the
+    /// client the moment `ready` appears, which is exactly when the shell forks
+    /// its sleeper; a HUP landing between that fork and the exec is absorbed by
+    /// the forked shell's own handler, so a foreground `sleep 30` survived it,
+    /// the parent's trap waited on it, and the grace ran out into SIGKILL with
+    /// no marker written (about 1 run in 13 under load). With `wait` the trap
+    /// runs whether or not the sleeper survives, and a surviving sleeper is
+    /// still reaped by the escalation to SIGKILL.
     #[test]
     fn dropping_pty_client_allows_hup_handler_to_flush() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7829,7 +7841,7 @@ mod tests {
             "/bin/sh",
             &[
                 "-c".to_string(),
-                "trap 'printf flushed > hup.marker; exit 0' HUP; : > ready; while :; do sleep 30; done"
+                "trap 'printf flushed > hup.marker; exit 0' HUP; sleep 30 & : > ready; wait"
                     .to_string(),
             ],
             tmp.path(),
@@ -7839,7 +7851,7 @@ mod tests {
         )
         .unwrap();
         let ready = tmp.path().join("ready");
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !ready.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
