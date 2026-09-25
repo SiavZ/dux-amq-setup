@@ -202,6 +202,16 @@ impl SessionStore {
     }
 
     fn connect(path: &std::path::Path) -> Result<Self> {
+        // `Connection::open` is lazy: a file that is not a database at all
+        // opens fine and only fails on the first statement below. Name the
+        // file on every one of those failures, as the fork did, so the user
+        // knows which database to restore from its `.bak` (fork
+        // `integrity_check_failure_returns_error_not_panic`).
+        Self::connect_unnamed(path)
+            .with_context(|| format!("failed to open session database {}", path.display()))
+    }
+
+    fn connect_unnamed(path: &std::path::Path) -> Result<Self> {
         let conn =
             Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
         // The engine keeps one connection open for the lifetime of the process

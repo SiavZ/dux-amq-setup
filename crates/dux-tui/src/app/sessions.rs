@@ -152,6 +152,17 @@ impl App {
         // `BranchWarningKind` for the ConfirmNonDefaultBranch dialog. `None`
         // (default branch or detached HEAD) falls through to the direct add.
         let warning_kind = match &plan.warning {
+            // A project registered in shared mode (fork
+            // `shared_registration_does_not_switch_real_checkout_or_create_link`)
+            // is used as-is: its agents run in this checkout on whatever branch
+            // the user has there, and dux never switches it. So there is no
+            // "not on the default branch" question to ask, and no offer to
+            // `git switch` the user's real checkout.
+            _ if self.engine.config.default_workspace_mode()
+                == dux_core::config::WorkspaceMode::Shared =>
+            {
+                None
+            }
             AddProjectWarning::NotOnDefaultBranch { default_branch } => {
                 Some(BranchWarningKind::Known {
                     default_branch: default_branch.clone(),
@@ -5368,6 +5379,76 @@ mod tests {
         assert!(
             matches!(app.prompt, PromptState::ConfirmCreateInitialCommit { .. }),
             "unborn repo must prompt for a commit, not the branch warning, got {:?}",
+            app.prompt
+        );
+    }
+
+    /// Fork `shared_registration_does_not_switch_real_checkout_or_create_link`:
+    /// registering a project whose agents will run in shared mode must use the
+    /// checkout as-is. No "switch to the default branch?" prompt (whose
+    /// accept path runs `git switch` in the user's real checkout), no branch
+    /// change, and no `dux-worktrees` link in the checkout.
+    #[test]
+    fn shared_registration_does_not_switch_real_checkout_or_create_link() {
+        fn run_git(cwd: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+        let repo = tempdir().expect("repo");
+        run_git(repo.path(), &["init", "-b", "main"]);
+        run_git(repo.path(), &["config", "user.name", "test"]);
+        run_git(repo.path(), &["config", "user.email", "t@t"]);
+        run_git(repo.path(), &["commit", "--allow-empty", "-m", "init"]);
+        run_git(repo.path(), &["switch", "-c", "feature"]);
+        let path = repo
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let mut app = test_app_with_sessions(Vec::new(), Vec::new());
+        app.engine.config.workspace = Some(dux_core::config::WorkspaceConfig {
+            default_mode: dux_core::config::WorkspaceMode::Shared,
+            auto_resume_shared: false,
+        });
+        app.add_project(path.clone(), "demo".to_string())
+            .expect("register shared project");
+
+        assert!(
+            matches!(app.prompt, PromptState::None),
+            "a shared registration must not ask to switch branches, got {:?}",
+            app.prompt
+        );
+        assert_eq!(app.engine.projects.len(), 1, "the project is registered");
+        assert_eq!(
+            dux_core::git::current_branch(repo.path()).unwrap(),
+            "feature"
+        );
+        assert!(
+            !repo
+                .path()
+                .join(dux_core::git::PROJECT_WORKTREES_LINK_NAME)
+                .exists()
+        );
+
+        // Worktree mode still asks: the guard is specific to shared mode.
+        let other = tempdir().expect("repo");
+        run_git(other.path(), &["init", "-b", "main"]);
+        run_git(other.path(), &["config", "user.name", "test"]);
+        run_git(other.path(), &["config", "user.email", "t@t"]);
+        run_git(other.path(), &["commit", "--allow-empty", "-m", "init"]);
+        run_git(other.path(), &["switch", "-c", "feature"]);
+        app.engine.config.workspace = None;
+        app.add_project(other.path().to_string_lossy().to_string(), "w".to_string())
+            .expect("register worktree project");
+        assert!(
+            matches!(app.prompt, PromptState::ConfirmNonDefaultBranch { .. }),
+            "{:?}",
             app.prompt
         );
     }

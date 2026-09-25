@@ -2351,39 +2351,40 @@ impl Engine {
                     Ok(guard) => guard.clone(),
                     Err(_) => return LoopControl::Continue,
                 };
-                let mut updates = Vec::new();
-                for entry in &snapshot {
-                    let worktree = Path::new(&entry.worktree_path);
-                    let read = crate::git::current_branch(worktree);
-                    if let Err(err) = &read {
-                        crate::logger::error(&format!(
-                            "branch sync could not read the branch of {}: {err:#}",
-                            worktree.display()
-                        ));
-                        report_missing_directory(tx, &entry.session_id, worktree);
-                        // A blip is ordinary here (the agent's own commit holds
-                        // the index lock), so only a streak is worth a sentence.
-                        if streaks.record_failure(&entry.worktree_path) {
-                            let _ = tx.send(WorkerEvent::PollerStatus(
-                                crate::poller_status::branch_sync_stuck(
-                                    &entry.worktree_path,
-                                    &format!("{err:#}"),
-                                ),
+                let updates = collect_branch_sync_updates_with(
+                    &snapshot,
+                    crate::git::current_branch_opt,
+                    |entry, read| match read {
+                        Err(err) => {
+                            let worktree = Path::new(&entry.worktree_path);
+                            crate::logger::error(&format!(
+                                "branch sync could not read the branch of {}: {err:#}",
+                                worktree.display()
                             ));
+                            report_missing_directory(tx, &entry.session_id, worktree);
+                            // A blip is ordinary here (the agent's own commit
+                            // holds the index lock), so only a streak is worth
+                            // a sentence.
+                            if streaks.record_failure(&entry.worktree_path) {
+                                let _ = tx.send(WorkerEvent::PollerStatus(
+                                    crate::poller_status::branch_sync_stuck(
+                                        &entry.worktree_path,
+                                        &format!("{err:#}"),
+                                    ),
+                                ));
+                            }
                         }
-                        continue;
-                    }
-                    if streaks.record_success(&entry.worktree_path) {
-                        let _ = tx.send(WorkerEvent::PollerStatus(
-                            crate::poller_status::branch_sync_recovered(&entry.worktree_path),
-                        ));
-                    }
-                    if let Ok(actual) = read
-                        && actual != entry.branch_name
-                    {
-                        updates.push((entry.session_id.clone(), actual));
-                    }
-                }
+                        Ok(()) => {
+                            if streaks.record_success(&entry.worktree_path) {
+                                let _ = tx.send(WorkerEvent::PollerStatus(
+                                    crate::poller_status::branch_sync_recovered(
+                                        &entry.worktree_path,
+                                    ),
+                                ));
+                            }
+                        }
+                    },
+                );
                 if !updates.is_empty() && tx.send(WorkerEvent::BranchSyncReady(updates)).is_err() {
                     return LoopControl::Break; // receiver dropped, app is shutting down
                 }
@@ -2391,6 +2392,79 @@ impl Engine {
             },
         );
     }
+}
+
+/// One branch-sync pass over `snapshot`: the `(session_id, branch)` pairs
+/// whose recorded branch no longer matches the checkout.
+///
+/// `head_branch` reads a directory's current branch (`Ok(None)` for a detached
+/// HEAD). `on_read` is told the outcome for every entry, so the caller's
+/// failure streaks and missing-directory reports see each agent.
+///
+/// A worktree agent's directory is read on its own, and a detached HEAD there
+/// is reported as an error, as before: dux created that branch and a missing
+/// one means something went wrong.
+///
+/// Shared-workspace agents (fork `shared_branch_sync_queries_canonical_path_once_and_fans_out`)
+/// run in the project's real checkout, and several may share it, possibly by
+/// different spellings (a symlink). Their paths are grouped by canonical
+/// directory and each checkout is read ONCE, with the answer fanned out to
+/// every agent in it; a detached HEAD there is the user's own choice and is
+/// recorded as [`crate::agent_job::SHARED_DETACHED_HEAD_LABEL`].
+pub(crate) fn collect_branch_sync_updates_with(
+    snapshot: &[BranchSyncEntry],
+    mut head_branch: impl FnMut(&Path) -> anyhow::Result<Option<String>>,
+    mut on_read: impl FnMut(&BranchSyncEntry, Result<(), &anyhow::Error>),
+) -> Vec<(String, String)> {
+    let mut updates = Vec::new();
+    let mut shared_groups: Vec<(PathBuf, Vec<&BranchSyncEntry>)> = Vec::new();
+    for entry in snapshot {
+        if entry.shared_workspace {
+            let canonical =
+                crate::project_browser::canonical_or_original(Path::new(&entry.worktree_path));
+            match shared_groups
+                .iter_mut()
+                .find(|(path, _)| *path == canonical)
+            {
+                Some((_, entries)) => entries.push(entry),
+                None => shared_groups.push((canonical, vec![entry])),
+            }
+            continue;
+        }
+        let read = head_branch(Path::new(&entry.worktree_path)).and_then(|branch| {
+            branch.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "HEAD is detached in {}, so it has no current branch",
+                    entry.worktree_path
+                )
+            })
+        });
+        match read {
+            Err(err) => on_read(entry, Err(&err)),
+            Ok(actual) => {
+                on_read(entry, Ok(()));
+                if actual != entry.branch_name {
+                    updates.push((entry.session_id.clone(), actual));
+                }
+            }
+        }
+    }
+    for (path, entries) in shared_groups {
+        match head_branch(&path) {
+            Err(err) => entries.iter().for_each(|entry| on_read(entry, Err(&err))),
+            Ok(branch) => {
+                let actual = branch
+                    .unwrap_or_else(|| crate::agent_job::SHARED_DETACHED_HEAD_LABEL.to_string());
+                for entry in entries {
+                    on_read(entry, Ok(()));
+                    if entry.branch_name != actual {
+                        updates.push((entry.session_id.clone(), actual.clone()));
+                    }
+                }
+            }
+        }
+    }
+    updates
 }
 
 /// Tell the engine a poller found an agent's directory gone.
@@ -3804,6 +3878,7 @@ impl Engine {
             // the flag the blind poll narrows on has nothing to say here; it is
             // recorded truthfully all the same.
             inactive: crate::flat_list::is_inactive(session),
+            shared_workspace: session.shared_workspace(),
         };
         let label = format!("pr-check:{}", entry.session_id);
         let backoff = Arc::clone(&self.pr_backoff);
@@ -3941,6 +4016,7 @@ impl Engine {
                         session_id: s.id.clone(),
                         worktree_path: managed.worktree_path.clone(),
                         branch_name: managed.branch_name.clone(),
+                        shared_workspace: s.shared_workspace(),
                     })
                 })
                 .collect();
@@ -4208,6 +4284,7 @@ impl Engine {
                         agent_exited: !self.providers.contains_key(s.slot_tab_id()),
                         pinned: pinned_row.map(pinned_pr_from_stored),
                         inactive: crate::flat_list::is_inactive(s),
+                        shared_workspace: s.shared_workspace(),
                     })
                 })
                 .collect();
@@ -4829,6 +4906,26 @@ impl Engine {
                 ),
             };
             return Ok(ReconnectPlan::WorktreeMissing { message });
+        }
+        // A shared agent relaunches in the real checkout, so that checkout
+        // must still be outside dux's own state tree (fork
+        // `reconnect_rejects_shared_project_inside_managed_root`). The path
+        // was valid at creation, but the project could have been moved, or a
+        // symlink retargeted, into DUX_HOME since; a cleanup there could then
+        // remove the user's work. Refused with the same error surface as a
+        // missing directory, so both the TUI and the web show it. The fork ran
+        // this on a worker; here it sits beside the directory probe just
+        // above, which already touches the same path on this thread.
+        if session.shared_workspace()
+            && let Err(err) =
+                crate::config::validate_shared_workspace_path(session.directory(), &self.paths)
+        {
+            return Ok(ReconnectPlan::WorktreeMissing {
+                message: format!(
+                    "Shared workspace is not eligible for reconnect: {}",
+                    crate::sanitize::for_terminal(&format!("{err:#}"))
+                ),
+            });
         }
 
         if force {
@@ -9115,6 +9212,7 @@ mod tests {
                 session_id: "session-1".to_string(),
                 worktree_path: worktree.to_string_lossy().to_string(),
                 branch_name: format!("{actual}-stale"),
+                shared_workspace: false,
             });
 
         // An hour, so nothing polls unless the loop notices the retune.
@@ -9138,6 +9236,104 @@ mod tests {
             .recv_timeout(Duration::from_secs(30))
             .expect("the retuned interval produces a branch sync");
         assert!(matches!(event, WorkerEvent::BranchSyncReady(_)));
+    }
+
+    fn branch_entry(id: &str, path: &Path, branch: &str, shared: bool) -> BranchSyncEntry {
+        BranchSyncEntry {
+            session_id: id.to_string(),
+            worktree_path: path.to_string_lossy().to_string(),
+            branch_name: branch.to_string(),
+            shared_workspace: shared,
+        }
+    }
+
+    /// Fork `shared_branch_sync_queries_canonical_path_once_and_fans_out`:
+    /// shared agents in one checkout (even reached through a symlink) cost
+    /// ONE branch read between them, and the answer reaches all of them; a
+    /// worktree agent keeps its own read.
+    #[test]
+    fn shared_branch_sync_queries_canonical_path_once_and_fans_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        let alias = dir.path().join("shared-alias");
+        std::os::unix::fs::symlink(&shared, &alias).unwrap();
+        let worktree_canonical = worktree.canonicalize().unwrap();
+        let snapshot = vec![
+            branch_entry("shared-a", &shared, "old", true),
+            branch_entry("shared-b", &alias, "old", true),
+            branch_entry("worktree", &worktree, "old", false),
+        ];
+        let calls = std::cell::Cell::new(0);
+        let mut reads = Vec::new();
+
+        let updates = collect_branch_sync_updates_with(
+            &snapshot,
+            |path| {
+                calls.set(calls.get() + 1);
+                Ok(Some(
+                    if path.canonicalize().unwrap() == worktree_canonical {
+                        "worktree-live".to_string()
+                    } else {
+                        "shared-live".to_string()
+                    },
+                ))
+            },
+            |entry, read| reads.push((entry.session_id.clone(), read.is_ok())),
+        );
+
+        assert_eq!(
+            calls.get(),
+            2,
+            "one shared checkout read plus one worktree read"
+        );
+        assert_eq!(
+            updates,
+            vec![
+                ("worktree".to_string(), "worktree-live".to_string()),
+                ("shared-a".to_string(), "shared-live".to_string()),
+                ("shared-b".to_string(), "shared-live".to_string()),
+            ]
+        );
+        assert_eq!(reads.len(), 3, "every agent's streak sees the outcome");
+    }
+
+    /// The branch half of fork
+    /// `detached_shared_head_fans_out_label_and_skips_pr_discovery`: a user's
+    /// detached HEAD in a shared checkout is a state, not a failure, and every
+    /// agent there is labelled with it. The same answer for a worktree agent
+    /// is still an error (dux made that branch).
+    #[test]
+    fn detached_shared_head_fans_out_label_and_skips_pr_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = vec![
+            branch_entry("shared-a", dir.path(), "main", true),
+            branch_entry("shared-b", dir.path(), "main", true),
+            branch_entry("worktree", dir.path(), "feature", false),
+        ];
+        let mut failed = Vec::new();
+
+        let updates = collect_branch_sync_updates_with(
+            &snapshot,
+            |_| Ok(None),
+            |entry, read| {
+                if read.is_err() {
+                    failed.push(entry.session_id.clone());
+                }
+            },
+        );
+
+        let label = crate::agent_job::SHARED_DETACHED_HEAD_LABEL.to_string();
+        assert_eq!(
+            updates,
+            vec![
+                ("shared-a".to_string(), label.clone()),
+                ("shared-b".to_string(), label),
+            ]
+        );
+        assert_eq!(failed, vec!["worktree".to_string()]);
     }
 
     /// git falling over in one worktree for a whole streak is said out loud, and
@@ -9168,6 +9364,7 @@ mod tests {
                 session_id: "session-1".to_string(),
                 worktree_path: worktree_path.clone(),
                 branch_name: "agent-branch".to_string(),
+                shared_workspace: false,
             });
 
         engine.config.ui.branch_sync_interval = 1;
@@ -10250,6 +10447,45 @@ mod tab_ops_tests {
             }
             other => panic!("expected AlreadyConnected, got {other:?}"),
         }
+    }
+
+    /// Fork `reconnect_rejects_shared_project_inside_managed_root`: a shared
+    /// agent whose checkout now sits inside dux's managed worktrees root must
+    /// not be relaunched there, and nothing is started.
+    #[test]
+    fn reconnect_rejects_shared_project_inside_managed_root() {
+        let (mut engine, _tmp) = test_engine();
+        let inside = engine.paths.worktrees_root.join("moved-project");
+        std::fs::create_dir_all(&inside).unwrap();
+        let mut session = sample_session("shared", "p1", "main");
+        session.shared_workspace = true;
+        session
+            .workspace
+            .as_managed_mut()
+            .expect("managed test session")
+            .worktree_path = inside.to_string_lossy().to_string();
+        engine.sessions.push(session.clone());
+
+        match engine
+            .reconnect_plan("shared", false, (24, 80))
+            .expect("plan")
+        {
+            ReconnectPlan::WorktreeMissing { message } => {
+                assert!(message.contains("not eligible for reconnect"), "{message}");
+            }
+            other => panic!("expected the shared reconnect to be refused, got {other:?}"),
+        }
+        assert!(!engine.session_has_live_provider("shared"));
+
+        // The same checkout for an ISOLATED agent is its ordinary worktree:
+        // the guard is specific to shared agents.
+        engine.sessions[0].shared_workspace = false;
+        assert!(matches!(
+            engine
+                .reconnect_plan("shared", false, (24, 80))
+                .expect("plan"),
+            ReconnectPlan::Launch { .. }
+        ));
     }
 
     #[test]

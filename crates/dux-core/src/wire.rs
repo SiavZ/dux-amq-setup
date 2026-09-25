@@ -2956,6 +2956,19 @@ impl Engine {
         let validated = self
             .validate_project_add_path(path)
             .map_err(|e| anyhow::anyhow!(e))?;
+        // A project registered in shared mode runs its agents in this very
+        // checkout, on whatever branch the user has there; dux never switches
+        // it (fork `shared_registration_does_not_switch_real_checkout_or_create_link`).
+        // Refused here, the one place every surface's "check out the default
+        // and add" funnels through.
+        if self.config.default_workspace_mode() == crate::config::WorkspaceMode::Shared {
+            anyhow::bail!(
+                "New projects are registered in shared mode, where dux uses your checkout as \
+                 it is and never switches its branch. Add \"{}\" without checking out the \
+                 default branch.",
+                validated.display()
+            );
+        }
         // A confirmed unborn repo has no default branch to check out; reject
         // explicitly rather than relying on `branch_warning_kind` to bail with a
         // less specific message. Fail open on an indeterminate git result.
@@ -8722,6 +8735,31 @@ mod tests {
             res.is_err(),
             "checkout-default of a commit-less repo must be rejected, not registered"
         );
+        assert!(engine.projects.is_empty());
+    }
+
+    /// The web half of fork
+    /// `shared_registration_does_not_switch_real_checkout_or_create_link`:
+    /// with shared mode as the default, "check out the default and add" is
+    /// refused before any `git switch`, so the user's checkout keeps its branch.
+    #[test]
+    fn apply_wire_add_project_checkout_default_refuses_under_shared_mode() {
+        let (_origin, _clone, work) = clone_repo_on_feature_branch("main");
+        let (mut engine, _tmp) = test_engine();
+        engine.config.workspace = Some(crate::config::WorkspaceConfig {
+            default_mode: crate::config::WorkspaceMode::Shared,
+            auto_resume_shared: false,
+        });
+        let before = current_git_branch(&work);
+
+        let err = engine
+            .apply_wire(WireCommand::AddProjectCheckoutDefault {
+                path: work.to_string_lossy().into_owned(),
+                name: "Demo".to_string(),
+            })
+            .expect_err("a shared registration never switches the checkout");
+        assert!(format!("{err:#}").contains("shared mode"), "{err:#}");
+        assert_eq!(current_git_branch(&work), before);
         assert!(engine.projects.is_empty());
     }
 
