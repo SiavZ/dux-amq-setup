@@ -1714,6 +1714,77 @@ mod tests {
         assert!(message.contains("\nsecond line"), "newlines are kept");
     }
 
+    /// The fork's escape sanitizer and upstream's structured parts meet at
+    /// this one chokepoint. A sentence built from parts must come through it
+    /// with BOTH halves safe: the message sanitized, and the parts either
+    /// sanitized to the same words or dropped so the web falls back to the
+    /// plain text. An escape must never survive in the parts while the message
+    /// shows it filtered.
+    #[test]
+    fn a_status_built_from_parts_is_sanitized_in_both_halves() {
+        let mut status = KeyedStatusController::with_clear_after(Duration::from_secs(6));
+        let poisoned = crate::status_text![
+            "Checked out ",
+            q("feat\u{1b}]0;pwned\u{7}"),
+            " in ",
+            n("/src\u{1b}[2Japp")
+        ];
+        // `set` takes a plain string (it re-wraps `StatusText::plain`, which
+        // carries no parts); the structured path is `set_scoped`, which is
+        // what the web actor and every producer building from parts uses.
+        status.set_scoped(
+            Instant::now(),
+            None,
+            StatusTone::Info,
+            poisoned,
+            super::StatusScope::All,
+            false,
+        );
+        let snapshot = status.snapshot();
+        let entry = &snapshot[0];
+        let message = &entry.message;
+        assert!(
+            !message.contains('\u{1b}') && !message.contains('\u{7}'),
+            "the plain text must be sanitized: {message:?}"
+        );
+        // An escape inside a name changes what the parts spell (the sanitizer
+        // shows `\x1b` in the message), so the parts can no longer agree with
+        // the message and the fallback DROPS them rather than rendering a raw
+        // escape in a chip. Either outcome is safe; a raw escape is not.
+        if let Some(segments) = entry.segments.as_ref() {
+            for segment in segments {
+                let text = match segment {
+                    crate::prose::ProseSegment::Text(text) => text,
+                    crate::prose::ProseSegment::Name { name, .. } => name,
+                };
+                assert!(
+                    !text.contains('\u{1b}') && !text.contains('\u{7}'),
+                    "a part must never carry a raw escape: {segment:?}"
+                );
+            }
+        }
+        // A clean sentence keeps its parts, and they still spell the message.
+        // The controller holds a queue: the clean message is the second entry.
+        let clean = crate::status_text!["Checked out ", q("feat/branch"), "."];
+        status.set_scoped(
+            Instant::now(),
+            None,
+            StatusTone::Info,
+            clean,
+            super::StatusScope::All,
+            false,
+        );
+        let snapshot = status.snapshot();
+        let held = snapshot
+            .iter()
+            .find(|entry| entry.message.contains("Checked out \"feat/branch\"."))
+            .expect("the clean status is held");
+        assert!(
+            held.segments.is_some(),
+            "clean parts survive the chokepoint"
+        );
+    }
+
     #[test]
     fn wire_tone_round_trips() {
         for tone in [
