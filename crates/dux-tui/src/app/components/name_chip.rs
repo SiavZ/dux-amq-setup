@@ -1,11 +1,14 @@
 //! The name chip: how a variable inside a dialog's prose looks.
 //!
 //! Every branch, path, file, command, and agent, project, terminal or provider
-//! name a dialog sentence carries renders as one span in the theme's
-//! `name_fg` on `name_bg`, padded by one cell on each side, with no bold and no
-//! quotes: the chip is the delimiter. A padded chip is exactly as wide as the
-//! quoted text it replaces, so a sentence that used to quote its names keeps
-//! its width. It is the terminal counterpart of the web's inline code chip.
+//! name a dialog sentence carries renders as one span in the dialog body's own
+//! colors swapped (the modal surface `overlay_bg` on the body text `text_fg`),
+//! padded by one cell on each side, with no bold and no quotes: the chip is the
+//! delimiter. Swapping the body's pair means a chip reads exactly as well as
+//! the sentence around it, in every theme, with nothing to configure. A padded
+//! chip is exactly as wide as the quoted text it replaces, so a sentence that
+//! used to quote its names keeps its width. It is the terminal counterpart of
+//! the web's inline code chip.
 //!
 //! Sentences are built as [`Prose`] (constant words and names), including the
 //! ones dux-core shares with the web, and turned into spans only here. A call
@@ -21,10 +24,11 @@ use crate::theme::Theme;
 ///
 /// The padding is an ordinary space, so a name copied out of the host
 /// terminal carries nothing invisible. What keeps the chip whole when a body
-/// wraps is [`super::wrap_styled_lines`], which treats a span in the chip style
-/// as one unbreakable unit, inner spaces and pads included. A chip must
-/// therefore reach the screen through that wrapper: ratatui's own `Wrap` would
-/// break at a pad or between the words of "My Cool Project".
+/// wraps is [`super::wrap_styled_lines`], which treats a span carrying the chip
+/// marker ([`crate::theme::NAME_CHIP_MARKER`]) as one unbreakable unit, inner
+/// spaces and pads included. A chip must therefore reach the screen through
+/// that wrapper: ratatui's own `Wrap` would break at a pad or between the words
+/// of "My Cool Project".
 pub(crate) fn name_chip(name: &str, theme: &Theme) -> Span<'static> {
     Span::styled(format!(" {name} "), theme.name_style())
 }
@@ -93,20 +97,22 @@ mod tests {
 
     fn theme() -> Theme {
         let mut theme = Theme::default_dark();
-        theme.name_fg = Color::Rgb(1, 2, 3);
-        theme.name_bg = Color::Rgb(4, 5, 6);
+        theme.text_fg = Color::Rgb(4, 5, 6);
+        theme.overlay_bg = Color::Rgb(1, 2, 3);
         theme
     }
 
     #[test]
-    fn a_name_is_padded_by_one_cell_in_the_chip_colors_and_never_bold() {
+    fn a_name_is_padded_by_one_cell_in_the_dialog_colors_swapped_and_never_bold() {
         let chip = name_chip("feat/login", &theme());
         assert_eq!(
             chip.content, " feat/login ",
             "the pads are ordinary spaces, so a copied name carries nothing invisible"
         );
+        // The dialog surface's color on the dialog body text's color.
         assert_eq!(chip.style.fg, Some(Color::Rgb(1, 2, 3)));
         assert_eq!(chip.style.bg, Some(Color::Rgb(4, 5, 6)));
+        assert!(crate::theme::is_name_chip(chip.style));
         assert!(!chip.style.add_modifier.contains(Modifier::BOLD));
     }
 

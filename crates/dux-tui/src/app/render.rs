@@ -1148,13 +1148,8 @@ pub(super) fn indented_body_lines(text: &str, inner_width: u16) -> Vec<String> {
 /// Paint a dialog body into `area`, wrapped by the shared wrapper rather than
 /// by the `Paragraph`, so a name chip in it stays whole on one row with both
 /// pads. A body that already fits is painted exactly as it was built.
-fn render_wrapped_body(
-    lines: &[Line<'_>],
-    area: Rect,
-    buf: &mut ratatui::buffer::Buffer,
-    theme: &Theme,
-) {
-    Paragraph::new(wrap_styled_lines(lines, usize::from(area.width), theme)).render(area, buf);
+fn render_wrapped_body(lines: &[Line<'_>], area: Rect, buf: &mut ratatui::buffer::Buffer) {
+    Paragraph::new(wrap_styled_lines(lines, usize::from(area.width))).render(area, buf);
 }
 
 /// A dialog body pre-wrapped to `inner_width`, with its row count.
@@ -1163,8 +1158,8 @@ fn render_wrapped_body(
 /// `Paragraph`, because a chip changes where a word ends and a character-count
 /// estimate disagrees with where whole words and whole chips end: a height that
 /// is one row short clips the last line of a body that does not scroll.
-fn exact_body(lines: &[Line<'_>], inner_width: u16, theme: &Theme) -> (Vec<Line<'static>>, u16) {
-    let wrapped = wrap_styled_lines(lines, usize::from(inner_width), theme);
+fn exact_body(lines: &[Line<'_>], inner_width: u16) -> (Vec<Line<'static>>, u16) {
+    let wrapped = wrap_styled_lines(lines, usize::from(inner_width));
     let height = u16::try_from(wrapped.len()).unwrap_or(u16::MAX);
     (wrapped, height)
 }
@@ -1172,8 +1167,8 @@ fn exact_body(lines: &[Line<'_>], inner_width: u16, theme: &Theme) -> (Vec<Line<
 /// How many rows `lines` take once the shared wrapper has wrapped them to
 /// `width`: the height a dialog sized to its body must use, because that
 /// wrapper is what paints the body.
-fn wrapped_rows(lines: &[Line<'_>], width: u16, theme: &Theme) -> u16 {
-    exact_body(lines, width, theme).1
+fn wrapped_rows(lines: &[Line<'_>], width: u16) -> u16 {
+    exact_body(lines, width).1
 }
 
 /// The macro editor's popup size. Tall enough that the body still gets a
@@ -1233,7 +1228,7 @@ impl App {
         body_lines: Vec<Line<'static>>,
         focus: DeleteAgentFocus,
     ) {
-        let body_height = wrapped_rows(&body_lines, inner_width, &self.theme);
+        let body_height = wrapped_rows(&body_lines, inner_width);
         let area = centered_rect_exact(dialog_width, 2 + body_height + 1 + 3, frame.area());
         self.clear_overlay_area(frame, area);
         let outer = self.themed_overlay_block("Delete Agent");
@@ -1249,7 +1244,7 @@ impl App {
             ])
             .areas(inner);
 
-        render_wrapped_body(&body_lines, body_area, frame.buffer_mut(), &self.theme);
+        render_wrapped_body(&body_lines, body_area, frame.buffer_mut());
 
         let btn_width = 16u16;
         let gap = 2u16;
@@ -1315,7 +1310,7 @@ impl App {
     fn prose_body(&self, prose: &Prose, inner_width: u16) -> (Vec<Line<'static>>, u16) {
         let mut lines = vec![Line::from("")];
         lines.extend(prose_lines(prose, " ", Style::default(), &self.theme));
-        exact_body(&lines, inner_width, &self.theme)
+        exact_body(&lines, inner_width)
     }
 
     /// [`indented_body_lines`] for a sentence that names something: every row
@@ -1329,7 +1324,7 @@ impl App {
     ) -> Vec<Line<'static>> {
         let sentence = prose_lines(prose, "", style, &self.theme);
         let width = usize::from(inner_width).saturating_sub(1).max(1);
-        wrap_styled_lines(&sentence, width, &self.theme)
+        wrap_styled_lines(&sentence, width)
             .into_iter()
             .map(|row| {
                 let mut spans = vec![Span::styled(" ", style)];
@@ -2938,7 +2933,7 @@ impl App {
         let sources: Vec<Vec<Line<'static>>> =
             blocks.iter().map(|block| self.card_source(block)).collect();
         let measure = |index: usize, width: u16| {
-            u16::try_from(wrap_styled_lines(&sources[index], width as usize, &self.theme).len())
+            u16::try_from(wrap_styled_lines(&sources[index], width as usize).len())
                 .unwrap_or(u16::MAX)
         };
 
@@ -2968,7 +2963,7 @@ impl App {
         // line in the wrong place.
         let wrapped: Vec<Vec<Line<'static>>> = sources
             .iter()
-            .map(|source| wrap_styled_lines(source, plan.content_width as usize, &self.theme))
+            .map(|source| wrap_styled_lines(source, plan.content_width as usize))
             .collect();
         self.paint_pane_card(frame, title, &plan, blocks, &wrapped, &kept)
     }
@@ -3268,7 +3263,7 @@ impl App {
             render_centered_lines(
                 frame.buffer_mut(),
                 Rect::new(tip_x, tip_y, tip_width, TIP_MAX_LINES),
-                &wrap_styled_lines(&[tip_line], usize::from(tip_width), &self.theme),
+                &wrap_styled_lines(&[tip_line], usize::from(tip_width)),
                 Style::default(),
             );
         }
@@ -3928,7 +3923,6 @@ impl App {
                 Style::default().fg(self.theme.hint_desc_fg),
             ))],
             prose_w as usize,
-            &self.theme,
         );
         let prose_rows = u16::try_from(prose_lines.len()).unwrap_or(u16::MAX);
 
@@ -5468,7 +5462,7 @@ impl App {
         // clamp below is built from the line count, and a wrapping paragraph
         // renders more rows than it has lines without reporting how many.
         // Pre-wrapping makes `wrapped.len()` the rendered height by construction.
-        let wrapped = wrap_styled_lines(&lines, content_area.width as usize, &self.theme);
+        let wrapped = wrap_styled_lines(&lines, content_area.width as usize);
 
         // Track content size for scroll clamping in input handler.
         let total_lines = u16::try_from(wrapped.len()).unwrap_or(u16::MAX);
@@ -6984,7 +6978,7 @@ impl App {
                 &self.theme,
             )),
         }
-        let (body_lines, body_height) = exact_body(&body_lines, inner_width, &self.theme);
+        let (body_lines, body_height) = exact_body(&body_lines, inner_width);
         let checkbox_spacing = u16::from(has_checkbox);
         let area = centered_rect_exact(
             dialog_width,
@@ -7009,7 +7003,7 @@ impl App {
             ])
             .areas(inner);
 
-        render_wrapped_body(&body_lines, body_area, frame.buffer_mut(), &self.theme);
+        render_wrapped_body(&body_lines, body_area, frame.buffer_mut());
 
         let checkbox_rect = if has_checkbox {
             let checkbox_state = if prompt.focus == DeleteWorktreeFocus::Checkbox {
@@ -7435,7 +7429,7 @@ impl App {
                 Style::default().fg(self.theme.hint_desc_fg),
             )),
         ];
-        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
+        render_wrapped_body(&lines, body_area, frame.buffer_mut());
 
         let btn_width = 16u16;
         let gap = 2u16;
@@ -7719,7 +7713,7 @@ impl App {
                 body_lines.push(Line::from(Span::styled(row, style)));
             }
         }
-        let body_height = wrapped_rows(&body_lines, inner_width, &self.theme);
+        let body_height = wrapped_rows(&body_lines, inner_width);
         let area = centered_rect_exact(dialog_width, 2 + body_height + 3, frame.area());
         self.clear_overlay_area(frame, area);
 
@@ -7741,7 +7735,7 @@ impl App {
             .constraints([Constraint::Length(body_height), Constraint::Length(3)])
             .areas(inner);
 
-        render_wrapped_body(&body_lines, body_area, frame.buffer_mut(), &self.theme);
+        render_wrapped_body(&body_lines, body_area, frame.buffer_mut());
 
         let btn_width = shared_button_width(&["Close"]);
         let close_area = Rect {
@@ -7812,7 +7806,7 @@ impl App {
                 Style::default().fg(self.theme.warning_fg),
             )));
         }
-        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
+        render_wrapped_body(&lines, body_area, frame.buffer_mut());
 
         let btn_width = 16u16;
         let gap = 2u16;
@@ -7917,7 +7911,7 @@ impl App {
         // exactly where the promotion sentence has to be readable.
         let dialog_width = 60u16.min(frame.area().width.max(1));
         let inner_width = dialog_width.saturating_sub(2);
-        let (lines, body_height) = exact_body(&lines, inner_width, &self.theme);
+        let (lines, body_height) = exact_body(&lines, inner_width);
         let area = centered_rect_exact(dialog_width, 2 + body_height + 1 + 3, frame.area());
         self.clear_overlay_area(frame, area);
         let outer = self.themed_overlay_block("Close Tab");
@@ -7933,7 +7927,7 @@ impl App {
             ])
             .areas(inner);
 
-        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
+        render_wrapped_body(&lines, body_area, frame.buffer_mut());
 
         let btn_width = 16u16;
         let gap = 2u16;
@@ -8020,7 +8014,7 @@ impl App {
             ])
             .areas(inner);
 
-        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
+        render_wrapped_body(&lines, body_area, frame.buffer_mut());
 
         let btn_width = 16u16;
         let gap = 2u16;
@@ -8113,7 +8107,7 @@ impl App {
             ])
             .areas(inner);
 
-        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
+        render_wrapped_body(&lines, body_area, frame.buffer_mut());
 
         let btn_width = 16u16;
         let gap = 2u16;
@@ -8197,7 +8191,7 @@ impl App {
             ])
             .areas(inner);
 
-        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
+        render_wrapped_body(&lines, body_area, frame.buffer_mut());
 
         let btn_width = shared_button_width(&["Cancel", CHECKOUT_DEFAULT_BRANCH_LABEL]);
         let gap = 2u16;
@@ -8367,7 +8361,7 @@ impl App {
             ])
             .areas(inner);
 
-        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
+        render_wrapped_body(&lines, body_area, frame.buffer_mut());
 
         let btn_width = shared_button_width(&["Cancel", dialog.confirm_label]);
         let gap = 2u16;
@@ -8455,7 +8449,7 @@ impl App {
                 Style::default().fg(self.theme.hint_desc_fg),
             )),
         ];
-        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
+        render_wrapped_body(&lines, body_area, frame.buffer_mut());
 
         let btn_width = 16u16;
         let gap = 2u16;
@@ -8537,7 +8531,7 @@ impl App {
                 Style::default().fg(self.theme.warning_fg),
             )),
         ];
-        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
+        render_wrapped_body(&lines, body_area, frame.buffer_mut());
 
         let btn_width = 16u16;
         let gap = 2u16;
@@ -8621,7 +8615,7 @@ impl App {
                 Style::default().fg(self.theme.hint_desc_fg),
             )),
         ];
-        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
+        render_wrapped_body(&lines, body_area, frame.buffer_mut());
 
         let btn_width = 22u16;
         let gap = 2u16;
@@ -8726,7 +8720,7 @@ impl App {
             " Your existing files are left untouched (untracked).",
             Style::default().fg(self.theme.hint_desc_fg),
         )));
-        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
+        render_wrapped_body(&lines, body_area, frame.buffer_mut());
 
         let btn_width = 22u16;
         let gap = 2u16;
@@ -8830,14 +8824,11 @@ impl App {
         // dialog under the pointer.
         let worktree_line_height = [true, false]
             .into_iter()
-            .map(|checked| wrapped_rows(&worktree_line(checked), inner_width, &self.theme))
+            .map(|checked| wrapped_rows(&worktree_line(checked), inner_width))
             .max()
             .unwrap_or(1);
-        let worktree_line_extra = worktree_line_height.saturating_sub(wrapped_rows(
-            &worktree_line(*checkout_default),
-            inner_width,
-            &self.theme,
-        ));
+        let worktree_line_extra = worktree_line_height
+            .saturating_sub(wrapped_rows(&worktree_line(*checkout_default), inner_width));
         body_lines.extend(worktree_line(*checkout_default));
         for _ in 0..worktree_line_extra {
             body_lines.push(Line::from(""));
@@ -8851,7 +8842,7 @@ impl App {
                 &self.theme,
             ));
         }
-        let body_height = wrapped_rows(&body_lines, inner_width, &self.theme);
+        let body_height = wrapped_rows(&body_lines, inner_width);
 
         // Checkbox height is measured up-front so the outer rect can
         // be sized exactly, mirroring the Delete Agent modal.
@@ -8900,7 +8891,7 @@ impl App {
             ])
             .areas(inner);
 
-        render_wrapped_body(&body_lines, body_area, frame.buffer_mut(), &self.theme);
+        render_wrapped_body(&body_lines, body_area, frame.buffer_mut());
 
         let checkbox_rect = if has_checkbox {
             let BranchWarningKind::Known { default_branch } = kind else {
@@ -9125,7 +9116,7 @@ impl App {
             " allowing you to continue working on it.",
             Style::default().fg(self.theme.warning_fg),
         )));
-        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
+        render_wrapped_body(&lines, body_area, frame.buffer_mut());
 
         let btn_width = 16u16;
         let gap = 2u16;
@@ -10640,7 +10631,7 @@ impl App {
                 Style::default().fg(self.theme.hint_desc_fg),
             )));
         }
-        let body_height = wrapped_rows(&body_lines, inner_width, &self.theme);
+        let body_height = wrapped_rows(&body_lines, inner_width);
         let checkbox_spacing = u16::from(!worktree_shared);
         let button_spacing = u16::from(!worktree_shared);
         let area = centered_rect_exact(
@@ -10677,7 +10668,7 @@ impl App {
             ])
             .areas(inner);
 
-        render_wrapped_body(&body_lines, body_area, frame.buffer_mut(), &self.theme);
+        render_wrapped_body(&body_lines, body_area, frame.buffer_mut());
 
         let checkbox_rect = if offers_checkbox {
             let checkbox_state = if *focus == DeleteAgentFocus::WorktreeCheckbox {
@@ -11683,7 +11674,7 @@ impl App {
             ]),
             Line::from(""),
         ];
-        render_wrapped_body(&lines, body_area, frame.buffer_mut(), &self.theme);
+        render_wrapped_body(&lines, body_area, frame.buffer_mut());
 
         let btn_width = 16u16;
         let gap = 2u16;
@@ -12228,7 +12219,11 @@ impl App {
     }
 
     fn paint_modal_surface(&self, frame: &mut Frame, area: Rect, surface_bg: Color) {
-        let surface_style = Style::default().bg(surface_bg);
+        // The surface carries the body text color as well as its background,
+        // so text a dialog paints with no color of its own reads in the
+        // theme's `text_fg` rather than the host terminal's default
+        // foreground, which is unreadable on a light theme's surface.
+        let surface_style = Style::default().fg(self.theme.text_fg).bg(surface_bg);
         let isolation_style = Style::default()
             .fg(self.theme.overlay_dim_fg)
             .bg(self.theme.overlay_dim_bg);
@@ -12249,7 +12244,7 @@ impl App {
         Clear.render(area, frame.buffer_mut());
         frame
             .buffer_mut()
-            .set_style(area, Style::default().bg(self.theme.overlay_bg));
+            .set_style(area, self.theme.overlay_surface_style());
     }
 
     pub(super) fn themed_overlay_block<'a>(&self, title: &'a str) -> Block<'a> {
@@ -12293,8 +12288,10 @@ impl App {
             // popup cells to `Color::Reset`. Filling the block with overlay_bg
             // means the modal interior (borders, surrounding chrome, the gap
             // around the inner widgets) tracks the active theme instead of
-            // reading terminal-default behind the border ring.
-            .style(Style::default().bg(self.theme.overlay_bg))
+            // reading terminal-default behind the border ring. The body text
+            // color rides along, so prose with no color of its own is drawn
+            // in `text_fg`, never the host terminal's default foreground.
+            .style(self.theme.overlay_surface_style())
     }
 
     /// Lay out and paint the scrollable message pane the error dialogs share, and
@@ -12319,7 +12316,7 @@ impl App {
         // scroll clamp and the marker are measured in. A wrapping paragraph draws
         // more rows than it has lines and never reports how many, the trap the
         // help page hit, where the bottom of the page was unreachable.
-        let wrapped = wrap_styled_lines(&body_lines, inner_width as usize, &self.theme);
+        let wrapped = wrap_styled_lines(&body_lines, inner_width as usize);
         let total_rows = u16::try_from(wrapped.len()).unwrap_or(u16::MAX);
 
         // Cap the message pane so the dialog still fits the terminal WITH its
@@ -19902,7 +19899,7 @@ mod tests {
     fn wrapped_rows_counts_unwrapped_lines() {
         let lines = vec![Line::from(" short line"), Line::from(" another short line")];
 
-        assert_eq!(wrapped_rows(&lines, 40, &Theme::default_dark()), 2);
+        assert_eq!(wrapped_rows(&lines, 40), 2);
     }
 
     #[test]
@@ -19916,7 +19913,7 @@ mod tests {
             Span::raw("?"),
         ])];
 
-        assert!(wrapped_rows(&lines, 20, &Theme::default_dark()) > 1);
+        assert!(wrapped_rows(&lines, 20) > 1);
     }
 
     // ── Unit tests for capitalize ─────────────────────────────────
@@ -21111,7 +21108,7 @@ mod tests {
                 })
                 .expect("render frame");
 
-            let wrapped = wrap_styled_lines(&lines, width as usize, &app.theme);
+            let wrapped = wrap_styled_lines(&lines, width as usize);
             let mut ours = Terminal::new(TestBackend::new(width, height)).expect("terminal");
             ours.draw(|frame| {
                 Paragraph::new(wrapped.clone()).render(frame.area(), frame.buffer_mut());
@@ -23917,6 +23914,60 @@ mod tests {
                 .all(|s| s.style.bg != Some(Color::Black)),
             "an unfocused field paints no caret cell"
         );
+    }
+
+    /// In these themes the single-line renderer's caret is painted in exactly
+    /// the name chip's two colors, so a wrapper that recognised a chip by its
+    /// colors would keep caret-styled text whole as if it were a name. Taken
+    /// from the renderer itself and wrapped beside a real chip, text in the
+    /// caret's style still breaks at its spaces while the chip stays on one
+    /// row.
+    #[test]
+    fn caret_styled_text_wraps_at_its_spaces_while_a_chip_stays_whole() {
+        let app = test_app(default_bindings());
+        for id in ["github_light", "flexoki_light", "light_owl"] {
+            let theme = crate::theme::load(id, &app.engine.paths)
+                .unwrap_or_else(|err| panic!("{id}: {err}"));
+            let field = render_single_line_cursor_input(
+                "",
+                "ab",
+                0,
+                theme.input_cursor_fg,
+                theme.input_cursor_bg,
+                true,
+            );
+            let caret = field
+                .spans
+                .iter()
+                .find(|span| span.content == "a")
+                .expect("the caret sits on a")
+                .style;
+            let chip = theme.name_style();
+            assert_eq!(
+                (caret.fg, caret.bg),
+                (chip.fg, chip.bg),
+                "{id}: the caret no longer shares the chip colors; pick a theme that does"
+            );
+
+            let line = Line::from(vec![
+                Span::styled("aa bb cc dd ee ff gg", caret),
+                Span::raw(" "),
+                name_chip("My Cool Project", &theme),
+            ]);
+            let rows: Vec<String> = wrap_styled_lines(&[line], 18)
+                .iter()
+                .map(|row| row.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect();
+            assert_eq!(
+                rows,
+                vec![
+                    "aa bb cc dd ee ff".to_string(),
+                    "gg".to_string(),
+                    " My Cool Project ".to_string(),
+                ],
+                "{id}: caret-styled text is word-wrapped, the chip kept whole"
+            );
+        }
     }
 
     #[test]

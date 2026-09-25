@@ -83,7 +83,10 @@ On confirmation dux creates a worktree on a new branch, branched from the projec
 leading branch. That is settled when you add the project: if the repository was on some
 other branch than its default, the add dialog asks whether to check the default out first.
 Say yes and the default branch leads; say no and the branch it was on leads instead.
-Checking out the project's default branch later makes the default lead from then on.
+Checking out the project's default branch later makes the default lead from then on. If
+dux cannot save that change, the checkout still happens but the old leading branch stays
+in charge, and dux tells you so in an error that stays up until you close it; run the
+checkout again once the problem is fixed.
 
 If the name matches an existing local branch, dux asks whether to attach to that branch
 instead, which is what you want when continuing work that already started.

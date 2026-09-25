@@ -1408,23 +1408,59 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
+    /// Paint `prompt` twice: as the theme draws it, and as a probe with the
+    /// text-input caret recolored to colors no chip uses. A cell whose colors
+    /// differ between the two is the caret's, whatever colors the theme gave
+    /// it; a chip's colors come from the body tokens and never move.
+    fn painted_with_caret_probe(
+        app: &mut App,
+        prompt: PromptState,
+        width: u16,
+        height: u16,
+    ) -> (ratatui::buffer::Buffer, ratatui::buffer::Buffer) {
+        use ratatui::style::Color;
+        let buf = painted_buffer(app, prompt.clone(), width, height);
+        let theme = app.theme;
+        app.theme.input_cursor_fg = Color::Rgb(0x12, 0x34, 0x56);
+        app.theme.input_cursor_bg = Color::Rgb(0x65, 0x43, 0x21);
+        let chip = theme.name_style();
+        assert!(
+            chip.fg != Some(app.theme.input_cursor_fg)
+                && chip.bg != Some(app.theme.input_cursor_bg),
+            "the probe's caret colors must not be the chip's"
+        );
+        let probe = painted_buffer(app, prompt, width, height);
+        app.theme = theme;
+        (buf, probe)
+    }
+
     /// Every chip-colored run the dialog added to a row that begins mid-name,
-    /// as `(row, run)`. A chip opens on its pad space, so a run that does not
-    /// is the continuation of a name the wrap cut across rows. A run that opens
-    /// on its pad but ends early is a name clipped by the edge of a row that
-    /// does not wrap, which is a different question. Cells already
+    /// as `(row, run)`. A cell is chip-colored when it carries the chip's
+    /// foreground AND background in `buf` and still does in `probe` (the same
+    /// dialog painted with the caret recolored, see
+    /// [`painted_with_caret_probe`]): several themes paint a text-input caret
+    /// in exactly the chip's two colors, and the probe is what tells that
+    /// caret from a name. A chip opens on its pad space, so a run that does
+    /// not is the continuation of a name the wrap cut across rows. A run that
+    /// opens on its pad but ends early is a name clipped by the edge of a row
+    /// that does not wrap, which is a different question. Cells already
     /// chip-colored with no dialog open belong to the screen behind it.
     fn split_chips(
         buf: &ratatui::buffer::Buffer,
+        probe: &ratatui::buffer::Buffer,
         baseline: &ratatui::buffer::Buffer,
-        name_bg: ratatui::style::Color,
+        chip: (ratatui::style::Color, ratatui::style::Color),
     ) -> Vec<(u16, String)> {
         let area = buf.area;
         let mut found = Vec::new();
         for y in 0..area.height {
             let mut x = 0;
             while x < area.width {
-                let is_chip = |x: u16| buf[(x, y)].bg == name_bg && baseline[(x, y)] != buf[(x, y)];
+                let is_chip = |x: u16| {
+                    (buf[(x, y)].fg, buf[(x, y)].bg) == chip
+                        && (probe[(x, y)].fg, probe[(x, y)].bg) == chip
+                        && baseline[(x, y)] != buf[(x, y)]
+                };
                 if !is_chip(x) {
                     x += 1;
                     continue;
@@ -1448,16 +1484,30 @@ mod tests {
     /// space inside a name is exactly where a word wrap would cut it.
     #[test]
     fn no_dialog_splits_a_chip_across_rows() {
-        let mut app = test_app(default_bindings());
-        app.engine.projects[0].name = "My Cool Project".to_string();
-        let name_bg = app.theme.name_bg;
         let mut offenders = Vec::new();
-        for width in 44..=100u16 {
-            let baseline = painted_buffer(&mut app, PromptState::None, width, 40);
-            for (name, prompt) in every_prompt(&app) {
-                let buf = painted_buffer(&mut app, prompt, width, 40);
-                for (row, run) in split_chips(&buf, &baseline, name_bg) {
-                    offenders.push(format!("{name} at width {width}, row {row}: {run:?}"));
+        // github_light paints its text-input caret in exactly the chip's two
+        // colors, so it is where a caret could pass for half a chip.
+        for theme in [None, Some("github_light")] {
+            let mut app = test_app(default_bindings());
+            if let Some(id) = theme {
+                app.theme = crate::theme::load(id, &app.engine.paths).expect("theme loads");
+            }
+            let theme = theme.unwrap_or("default");
+            app.engine.projects[0].name = "My Cool Project".to_string();
+            let chip_style = app.theme.name_style();
+            let chip = (
+                chip_style.fg.expect("the chip names its text color"),
+                chip_style.bg.expect("the chip names its background"),
+            );
+            for width in 44..=100u16 {
+                let baseline = painted_buffer(&mut app, PromptState::None, width, 40);
+                for (name, prompt) in every_prompt(&app) {
+                    let (buf, probe) = painted_with_caret_probe(&mut app, prompt, width, 40);
+                    for (row, run) in split_chips(&buf, &probe, &baseline, chip) {
+                        offenders.push(format!(
+                            "{name} ({theme}) at width {width}, row {row}: {run:?}"
+                        ));
+                    }
                 }
             }
         }
@@ -1468,37 +1518,134 @@ mod tests {
         );
     }
 
+    /// No dialog paints text in the host terminal's default foreground. That
+    /// default is whatever the terminal was configured with (white, in a dark
+    /// terminal), so on a light theme's modal surface it is unreadable: text on
+    /// the surface takes a theme color, the body's own `text_fg` when nothing
+    /// more specific applies. Asked on a light theme, where the failure shows.
+    #[test]
+    fn no_dialog_paints_text_in_the_terminal_default_foreground() {
+        let mut app = test_app(default_bindings());
+        app.theme = crate::theme::load("github_light", &app.engine.paths).expect("github_light");
+        let surface = app.theme.overlay_bg;
+        let (width, height) = (100, 40);
+        let baseline = painted_buffer(&mut app, PromptState::None, width, height);
+        let mut offenders = Vec::new();
+        for (name, prompt) in every_prompt(&app) {
+            let buf = painted_buffer(&mut app, prompt, width, height);
+            for y in 0..height {
+                let row: String = (0..width)
+                    .filter(|&x| {
+                        let cell = &buf[(x, y)];
+                        cell != &baseline[(x, y)]
+                            && cell.bg == surface
+                            && cell.fg == ratatui::style::Color::Reset
+                            && !cell.symbol().trim().is_empty()
+                    })
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect();
+                if !row.is_empty() {
+                    offenders.push(format!("{name}, row {y}: {row:?}"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these dialogs paint text in the terminal's default foreground:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     /// The split scan on the shapes it must catch and the ones it must not.
     #[test]
     fn the_split_chip_scan_tells_a_whole_chip_from_half_of_one() {
         use ratatui::buffer::Buffer;
         use ratatui::style::{Color, Style};
-        let bg = Color::Rgb(1, 2, 3);
-        let chip = Style::default().bg(bg);
+        let colors = (Color::Rgb(4, 5, 6), Color::Rgb(1, 2, 3));
+        let chip = Style::default().fg(colors.0).bg(colors.1);
         let blank = Buffer::empty(Rect::new(0, 0, 12, 2));
         let mut buf = blank.clone();
         buf.set_string(0, 0, "a ", Style::default());
         buf.set_string(2, 0, " My Cool ", chip);
-        assert!(split_chips(&buf, &blank, bg).is_empty(), "a whole chip");
+        assert!(
+            split_chips(&buf, &buf, &blank, colors).is_empty(),
+            "a whole chip"
+        );
         let mut clipped = blank.clone();
         clipped.set_string(8, 0, " My ", chip);
         clipped.set_string(10, 1, " M", chip);
         assert!(
-            split_chips(&clipped, &blank, bg).is_empty(),
+            split_chips(&clipped, &clipped, &blank, colors).is_empty(),
             "a chip clipped by the row's edge is not a split"
         );
         let mut cut = blank.clone();
         cut.set_string(9, 0, " My", chip);
         cut.set_string(0, 1, "Cool ", chip);
         assert_eq!(
-            split_chips(&cut, &blank, bg),
+            split_chips(&cut, &cut, &blank, colors),
             vec![(1, "Cool ".to_string())],
             "the continuation row is what proves the cut"
         );
         assert!(
-            split_chips(&cut, &cut, bg).is_empty(),
+            split_chips(&cut, &cut, &cut, colors).is_empty(),
             "chip colors already on screen with no dialog open are not the dialog's"
         );
+        let mut caret = blank.clone();
+        caret.set_string(0, 0, "ab", Style::default());
+        caret.set_string(1, 0, "b", chip);
+        let mut recolored = caret.clone();
+        recolored.set_string(1, 0, "b", Style::default().fg(Color::Black));
+        assert!(
+            split_chips(&caret, &recolored, &blank, colors).is_empty(),
+            "a caret in the chip's colors is not half a chip once the probe moves it"
+        );
+        assert_eq!(
+            split_chips(&caret, &caret, &blank, colors),
+            vec![(0, "b".to_string())],
+            "without the probe that caret reads as a cut chip"
+        );
+    }
+
+    /// On a theme whose text-input caret is painted in exactly the chip's two
+    /// colors, a real dialog with its caret on a letter mid-name is not half a
+    /// chip: the caret's lone cell opens on a letter, as a cut chip's
+    /// continuation does, so only knowing which cells are the caret's tells
+    /// them apart.
+    #[test]
+    fn the_split_chip_scan_passes_a_caret_in_the_chip_colors() {
+        let mut app = test_app(default_bindings());
+        app.theme = crate::theme::load("github_light", &app.engine.paths).expect("github_light");
+        let chip_style = app.theme.name_style();
+        let chip = (
+            chip_style.fg.expect("the chip names its text color"),
+            chip_style.bg.expect("the chip names its background"),
+        );
+        assert_eq!(
+            (app.theme.input_cursor_fg, app.theme.input_cursor_bg),
+            chip,
+            "github_light no longer paints its caret in the chip colors; pick a theme that does"
+        );
+        let mut input = TextInput::with_text("name".to_string());
+        input.cursor = 1;
+        let prompt = PromptState::RenameSession {
+            session_id: "s1".to_string(),
+            input,
+            rename_branch: false,
+            focus: RenameSessionFocus::Input,
+            branch_named: true,
+        };
+        let (width, height) = (80, 30);
+        let baseline = painted_buffer(&mut app, PromptState::None, width, height);
+        let (buf, probe) = painted_with_caret_probe(&mut app, prompt, width, height);
+        let caret: Vec<(u16, u16)> = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let cell = &buf[(x, y)];
+                (cell.fg, cell.bg) == chip && cell.symbol() == "a"
+            })
+            .collect();
+        assert_eq!(caret.len(), 1, "the caret sits on the one letter a");
+        assert!(split_chips(&buf, &probe, &baseline, chip).is_empty());
     }
 
     /// The scan itself, on the shapes it has to catch and the ones it must not.

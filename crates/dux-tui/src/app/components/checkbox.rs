@@ -110,7 +110,7 @@ impl<'a> Checkbox<'a> {
                 .collect(),
             CheckboxLabel::Prose(prose, theme) => {
                 let sentence = prose_lines(prose, "", label_style, theme);
-                let wrapped = wrap_styled_lines(&sentence, label_width, theme);
+                let wrapped = wrap_styled_lines(&sentence, label_width);
                 if wrapped.is_empty() {
                     vec![Vec::new()]
                 } else {
