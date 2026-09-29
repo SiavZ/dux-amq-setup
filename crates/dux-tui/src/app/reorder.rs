@@ -47,6 +47,44 @@ pub(crate) fn move_in_order<T: Clone>(order: &[T], idx: usize, dir: MoveDir) -> 
     out
 }
 
+/// Move the item at `idx` past its nearest neighbour in the same group,
+/// returning the new order. `in_group(i)` says whether the item at index `i`
+/// belongs to the moved item's group; items of other groups are stepped over
+/// and keep their relative order.
+///
+/// This is `move_in_order` for the grouped agent list, where the rows on screen
+/// under one project header are not adjacent in the stored order. Swapping with
+/// the stored neighbour would move the agent past a row of another project,
+/// which changes nothing the user can see under the header they are looking at.
+/// `Top` and `Bottom` go to the group's own edge. No neighbour in that
+/// direction returns the order unchanged.
+pub(crate) fn move_within_group<T: Clone>(
+    order: &[T],
+    idx: usize,
+    dir: MoveDir,
+    in_group: impl Fn(usize) -> bool,
+) -> Vec<T> {
+    let mut out = order.to_vec();
+    if idx >= out.len() {
+        return out;
+    }
+    let before = || (0..idx).filter(|&i| in_group(i));
+    let after = || (idx + 1..order.len()).filter(|&i| in_group(i));
+    let target = match dir {
+        MoveDir::Up => before().last(),
+        MoveDir::Top => before().next(),
+        MoveDir::Down => after().next(),
+        MoveDir::Bottom => after().last(),
+    };
+    if let Some(target) = target {
+        // The target's slot is its index in the ORIGINAL order, as in
+        // `move_to_target`: moving down lands just below the target.
+        let item = out.remove(idx);
+        out.insert(target, item);
+    }
+    out
+}
+
 /// Move `active` to the slot `over` currently occupies, returning the new order.
 /// The cross-language twin of the web's `moveItem` (`lib/reorder.ts`), down to
 /// the no-op cases: identical ids, or an id that is not in `order`, return the
@@ -100,7 +138,21 @@ impl App {
         let Some(idx) = order.iter().position(|id| *id == session_id) else {
             return;
         };
-        let new_order = move_in_order(&order, idx, dir);
+        let new_order = if self.engine.config.ui.group_agents_by_project {
+            // Under project headers a move stays inside the agent's own group:
+            // the rows it can pass are the ones shown beside it.
+            let group_of = |index: usize| {
+                let project_id = self.engine.sessions.get(index)?.project_id()?;
+                self.engine
+                    .projects
+                    .iter()
+                    .position(|project| project.id == project_id)
+            };
+            let group = group_of(idx);
+            move_within_group(&order, idx, dir, |index| group_of(index) == group)
+        } else {
+            move_in_order(&order, idx, dir)
+        };
         self.apply_agent_order(&order, new_order, &session_id);
     }
 
@@ -352,6 +404,46 @@ mod tests {
         );
         assert_eq!(move_to_target(&["a", "b"], &"x", &"a"), vec!["a", "b"]);
         assert_eq!(move_to_target(&["a", "b"], &"a", &"x"), vec!["a", "b"]);
+    }
+
+    /// Agents of one project are not adjacent in the stored order, so a move
+    /// under a project header steps over the other projects' agents.
+    #[test]
+    fn a_grouped_move_passes_the_nearest_agent_of_the_same_group() {
+        // a1 and a2 and a3 share a group; b1 and b2 belong to another.
+        let order = ["a1", "b1", "a2", "b2", "a3"];
+        let in_a = |i: usize| order[i].starts_with('a');
+
+        assert_eq!(
+            move_within_group(&order, 2, MoveDir::Up, in_a),
+            ["a2", "a1", "b1", "b2", "a3"],
+        );
+        assert_eq!(
+            move_within_group(&order, 2, MoveDir::Down, in_a),
+            ["a1", "b1", "b2", "a3", "a2"],
+        );
+        assert_eq!(
+            move_within_group(&order, 4, MoveDir::Top, in_a),
+            ["a3", "a1", "b1", "a2", "b2"],
+        );
+        assert_eq!(
+            move_within_group(&order, 0, MoveDir::Bottom, in_a),
+            ["b1", "a2", "b2", "a3", "a1"],
+        );
+    }
+
+    #[test]
+    fn a_grouped_move_at_the_edge_of_its_group_is_a_no_op() {
+        let order = ["a1", "b1", "a2"];
+        let in_a = |i: usize| order[i].starts_with('a');
+        let in_b = |i: usize| order[i].starts_with('b');
+
+        assert_eq!(move_within_group(&order, 0, MoveDir::Up, in_a), order);
+        assert_eq!(move_within_group(&order, 2, MoveDir::Down, in_a), order);
+        // The only agent of its group has nowhere to go in either direction.
+        assert_eq!(move_within_group(&order, 1, MoveDir::Up, in_b), order);
+        assert_eq!(move_within_group(&order, 1, MoveDir::Bottom, in_b), order);
+        assert_eq!(move_within_group(&order, 9, MoveDir::Up, in_a), order);
     }
 
     #[test]

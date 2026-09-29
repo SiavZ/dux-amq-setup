@@ -449,6 +449,12 @@ fn apply_patches(doc: &mut DocumentMut, config: &Config) {
         "always_show_tab_strip",
         config.ui.always_show_tab_strip,
     );
+    patch_table_bool(
+        doc,
+        "ui",
+        "group_agents_by_project",
+        config.ui.group_agents_by_project,
+    );
     patch_table_bool(doc, "ui", "tab_reaches_agent", config.ui.tab_reaches_agent);
     patch_table_str(doc, "ui", "upload_directory", &config.ui.upload_directory);
     patch_table_bool(

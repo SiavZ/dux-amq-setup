@@ -432,6 +432,7 @@ mod tests {
                 "attach-pull-request",
                 "recreate-working-copy",
                 "toggle-always-show-tabs",
+                "toggle-project-grouping",
                 "toggle-randomized-pet-name-default",
                 "toggle-pr-banner-position",
                 "toggle-project",

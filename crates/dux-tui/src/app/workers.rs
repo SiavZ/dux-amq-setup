@@ -1520,6 +1520,9 @@ impl App {
                     .iter()
                     .position(|item| matches!(item, LeftItem::Session(index) if self.engine.sessions.get(*index).map(|candidate| candidate.id.as_str()) == Some(outcome.session.id.as_str())))
                     .unwrap_or(0);
+                // Row 0 is a project header in the grouped list, never a
+                // resting place for the cursor.
+                self.ensure_selectable_left_item();
                 // The selection just moved onto the freshly created agent, so a
                 // lingering `manage-projects` target no longer matches what the
                 // cursor points at; clear it so a follow-up project action

@@ -817,6 +817,13 @@ fn config_schema() -> Vec<ConfigEntry> {
             value_fn: |c| FieldValue::Bool(c.ui.always_show_tab_strip),
         },
         ConfigEntry::Field {
+            key: "group_agents_by_project",
+            comment: Some(CommentSource::Static(
+                "# Group the agent list under one header per project instead of one flat\n# list. Default false keeps the flat list. When true, each project that\n# has agents gets a header followed by its agents, in project order, and\n# agents without a project come last. agent_sort still orders the agents\n# inside each group. The Inactive section is not shown in this mode.\n# Toggle it at runtime with the `toggle-project-grouping` palette command.\n# TUI only: the web sidebar keeps its flat list.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.ui.group_agents_by_project),
+        },
+        ConfigEntry::Field {
             key: "tab_reaches_agent",
             comment: Some(CommentSource::Static(
                 "# Send Tab and Shift-Tab to the agent in the center pane instead of moving\n# between panes with them. Default false: Tab has cycled panes since dux's\n# first version. Turn it on for agents that use Tab to autocomplete and\n# Shift-Tab to cycle modes. Panes still move either way, with the chords bound\n# under [keys] as focus_next and focus_prev (Ctrl-o and Ctrl-y by default).\n# Toggle at runtime from the TUI command palette, or the web UI's Preferences\n# dialog.",
@@ -3679,6 +3686,19 @@ name = "test"
         assert!(
             rendered.contains("Ctrl-o") && rendered.contains("Ctrl-y"),
             "the comment must name the pane chords: {rendered}"
+        );
+    }
+
+    /// The grouped layout is off by default, and the template says what it
+    /// does and how to flip it without editing the file.
+    #[test]
+    fn canonical_template_documents_group_agents_by_project() {
+        let rendered = render_default_config();
+        assert!(rendered.contains("group_agents_by_project = false"));
+        assert!(
+            rendered.contains("one header per project")
+                && rendered.contains("toggle-project-grouping"),
+            "the comment must say what the setting does and name its command: {rendered}"
         );
     }
 

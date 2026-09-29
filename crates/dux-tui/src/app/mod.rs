@@ -3547,6 +3547,11 @@ pub(crate) enum LeftItem {
     /// The collapsible "Inactive · N" toggle separating active agents (above) from
     /// detached/exited ones (below). Selectable; Enter/Space toggles the tail.
     InactiveToggle,
+    /// Grouped mode only (`ui.group_agents_by_project`): the header above one
+    /// project's agents. `Some(index)` indexes `engine.projects`; `None` heads
+    /// the agents that have no project record to sit under (standalone agents
+    /// and orphans). A label, never a selection: the cursor steps over it.
+    ProjectHeader(Option<usize>),
 }
 
 impl LeftItem {
@@ -3706,6 +3711,55 @@ pub(crate) fn build_left_items(
         if !inactive_collapsed {
             items.extend(order.inactive.into_iter().map(LeftItem::Session));
         }
+    }
+    items
+}
+
+/// Build the grouped left-pane list (`ui.group_agents_by_project`): one
+/// `ProjectHeader` per project that has a visible agent, in `projects` order,
+/// each followed by that project's agents. Agents with no project record
+/// (standalone agents, orphans) come last under a `ProjectHeader(None)`.
+///
+/// Inside a group the order is the flat list's own: the ordering still comes
+/// from `dux_core::flat_list::order_sessions`, active agents ahead of inactive
+/// ones, so `agent_sort` means the same thing in both layouts. There is no
+/// `InactiveToggle` here. The flat list needs it to keep dormant agents from
+/// burying the live ones; under a project header an agent is found by where it
+/// belongs, and hiding it would empty the group it is the reason for.
+///
+/// A project with no visible agent gets no header, so a filter query prunes
+/// groups as well as rows.
+pub(crate) fn build_grouped_left_items(
+    sessions: &[AgentSession],
+    projects: &[Project],
+    sort_mode: AgentSortMode,
+    is_hot: &dyn Fn(usize) -> bool,
+    is_visible: &dyn Fn(usize) -> bool,
+) -> Vec<LeftItem> {
+    let order = dux_core::flat_list::order_sessions(
+        sessions,
+        sort_mode.to_flat_sort_mode(),
+        is_hot,
+        is_visible,
+    );
+    let ordered: Vec<usize> = order.active.into_iter().chain(order.inactive).collect();
+    let group_of = |index: usize| -> Option<usize> {
+        let project_id = sessions[index].project_id()?;
+        projects.iter().position(|project| project.id == project_id)
+    };
+
+    let mut items = Vec::with_capacity(ordered.len() + projects.len() + 1);
+    for group in (0..projects.len()).map(Some).chain(std::iter::once(None)) {
+        let mut members = ordered
+            .iter()
+            .copied()
+            .filter(|&index| group_of(index) == group)
+            .peekable();
+        if members.peek().is_none() {
+            continue;
+        }
+        items.push(LeftItem::ProjectHeader(group));
+        items.extend(members.map(LeftItem::Session));
     }
     items
 }
@@ -5372,6 +5426,10 @@ impl App {
                 self.toggle_always_show_tab_strip();
                 Ok(())
             }
+            "toggle-project-grouping" => {
+                self.toggle_project_grouping();
+                Ok(())
+            }
             "toggle-tab-to-agent" => {
                 self.toggle_tab_reaches_agent();
                 Ok(())
@@ -5789,13 +5847,23 @@ impl App {
         // (mirroring the hot mask above, and avoiding a second `self.engine` borrow).
         // An absent or whitespace-only query makes everything visible.
         let visible: Vec<bool> = self.agent_visibility_mask();
-        self.left_items_cache = build_left_items(
-            &self.engine.sessions,
-            effective_collapsed,
-            mode,
-            &|i| hot[i],
-            &|i| visible[i],
-        );
+        self.left_items_cache = if self.engine.config.ui.group_agents_by_project {
+            build_grouped_left_items(
+                &self.engine.sessions,
+                &self.engine.projects,
+                mode,
+                &|i| hot[i],
+                &|i| visible[i],
+            )
+        } else {
+            build_left_items(
+                &self.engine.sessions,
+                effective_collapsed,
+                mode,
+                &|i| hot[i],
+                &|i| visible[i],
+            )
+        };
         self.ensure_selectable_left_item();
         // The same query prunes the terminal list (`terminal_items`), so the
         // terminal cursor is repaired in the same breath as the agent one: this
@@ -5949,6 +6017,13 @@ impl App {
     /// put something. A drag that wanders over one shows no marker and drops
     /// nothing.
     pub(crate) fn is_reorderable_left_item(&self, index: usize) -> bool {
+        // The grouped list interleaves project headers with agents, and the
+        // stored order is one sequence across every project: a slot between two
+        // groups has no place in it. Reordering stays with the `move-agent-*`
+        // commands, which move the agent within that one sequence.
+        if self.engine.config.ui.group_agents_by_project {
+            return false;
+        }
         let items = self.left_items();
         if !matches!(items.get(index), Some(LeftItem::Session(_))) {
             return false;
@@ -6030,6 +6105,16 @@ impl App {
     /// as the old per-project collapse (Space / `ToggleProject`) and to Enter on
     /// the `InactiveToggle` row. Keeps the cursor on the toggle row afterward.
     pub(crate) fn toggle_collapse_selected_project(&mut self) {
+        // The grouped list has no Inactive tail to fold: every agent sits under
+        // its project. Say so rather than flipping a state nothing shows.
+        if self.engine.config.ui.group_agents_by_project {
+            let palette_key = self.bindings.label_for(Action::OpenPalette);
+            self.set_ui_hint(format!(
+                "Agents are grouped by project, so there is no Inactive section to fold. \
+                 Press {palette_key} and run toggle-project-grouping for the flat list."
+            ));
+            return;
+        }
         // A manual toggle takes over from the auto-manage in `rebuild_left_items`.
         self.inactive_collapse_overridden = true;
         if self.inactive_tail_forced_open() {
@@ -8095,6 +8180,237 @@ mod tests {
             !list.exit_search_clearing_filter(),
             "an idle, empty search row has nothing to leave"
         );
+    }
+
+    fn test_project(id: &str) -> Project {
+        Project {
+            id: id.to_string(),
+            name: format!("{id}-name"),
+            path: format!("/tmp/{id}"),
+            explicit_default_provider: None,
+            default_provider: ProviderKind::from_str("codex"),
+            leading_branch: Some("main".to_string()),
+            auto_reopen_agents: None,
+            startup_command: None,
+            env: Default::default(),
+            current_branch: "main".to_string(),
+            branch_status: ProjectBranchStatus::Unknown,
+            path_missing: false,
+            created_at: None,
+        }
+    }
+
+    /// Grouped: one header per project in project order, that project's agents
+    /// under it with the active ones first, and no Inactive toggle, because no
+    /// agent is hidden in this layout.
+    #[test]
+    fn build_grouped_left_items_heads_each_project_with_its_agents() {
+        let projects = vec![test_project("front"), test_project("infra")];
+        let mut live = test_session("front-live", "front", 0);
+        live.status = SessionStatus::Active;
+        let sessions = vec![
+            test_session("infra-idle", "infra", 0),
+            test_session("front-idle", "front", 0),
+            live,
+        ];
+
+        assert_eq!(
+            build_grouped_left_items(
+                &sessions,
+                &projects,
+                AgentSortMode::Manual,
+                &|_| false,
+                &|_| true
+            ),
+            vec![
+                LeftItem::ProjectHeader(Some(0)),
+                LeftItem::Session(2),
+                LeftItem::Session(1),
+                LeftItem::ProjectHeader(Some(1)),
+                LeftItem::Session(0),
+            ],
+        );
+    }
+
+    /// An agent whose project record is gone and a standalone agent have no
+    /// project to sit under, so they share the last group.
+    #[test]
+    fn build_grouped_left_items_puts_agents_without_a_project_last() {
+        let projects = vec![test_project("front")];
+        let sessions = vec![
+            test_session("orphan", "gone", 0),
+            test_standalone_session("solo", "/tmp/solo"),
+            test_session("front-1", "front", 0),
+        ];
+
+        assert_eq!(
+            build_grouped_left_items(
+                &sessions,
+                &projects,
+                AgentSortMode::Manual,
+                &|_| false,
+                &|_| true
+            ),
+            vec![
+                LeftItem::ProjectHeader(Some(0)),
+                LeftItem::Session(2),
+                LeftItem::ProjectHeader(None),
+                LeftItem::Session(0),
+                LeftItem::Session(1),
+            ],
+        );
+    }
+
+    /// A header exists for the agents under it. A project with no agents, or
+    /// with none the filter leaves visible, gets no header.
+    #[test]
+    fn build_grouped_left_items_drops_the_header_of_a_group_with_nothing_to_show() {
+        let projects = vec![
+            test_project("front"),
+            test_project("empty"),
+            test_project("infra"),
+        ];
+        let sessions = vec![
+            test_session("front-1", "front", 0),
+            test_session("infra-1", "infra", 0),
+        ];
+
+        assert_eq!(
+            build_grouped_left_items(
+                &sessions,
+                &projects,
+                AgentSortMode::Manual,
+                &|_| false,
+                &|_| true
+            ),
+            vec![
+                LeftItem::ProjectHeader(Some(0)),
+                LeftItem::Session(0),
+                LeftItem::ProjectHeader(Some(2)),
+                LeftItem::Session(1),
+            ],
+        );
+        // A query that only the infra agent matches prunes the front group.
+        assert_eq!(
+            build_grouped_left_items(
+                &sessions,
+                &projects,
+                AgentSortMode::Manual,
+                &|_| false,
+                &|index| index == 1
+            ),
+            vec![LeftItem::ProjectHeader(Some(2)), LeftItem::Session(1)],
+        );
+        assert!(
+            build_grouped_left_items(&[], &projects, AgentSortMode::Manual, &|_| false, &|_| {
+                true
+            })
+            .is_empty()
+        );
+    }
+
+    /// An app with two projects, one agent in each, the second added here.
+    fn two_project_app() -> App {
+        let mut app = test_support::test_app(test_support::default_bindings());
+        let mut second = app.engine.projects[0].clone();
+        second.id = "project-2".to_string();
+        second.name = "second".to_string();
+        app.engine.projects.push(second);
+        app.engine
+            .sessions
+            .push(test_session("other", "project-2", 0));
+        app.engine.config.ui.agent_sort = "manual".to_string();
+        app
+    }
+
+    /// The cursor never rests on a project header: it starts on the first
+    /// agent, and moving between groups passes over the header between them.
+    #[test]
+    fn the_cursor_steps_over_project_headers() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = two_project_app();
+        app.engine.config.ui.group_agents_by_project = true;
+        app.selected_left = 0;
+        app.rebuild_left_items();
+
+        assert_eq!(
+            app.left_items(),
+            [
+                LeftItem::ProjectHeader(Some(0)),
+                LeftItem::Session(0),
+                LeftItem::ProjectHeader(Some(1)),
+                LeftItem::Session(1),
+            ],
+        );
+        assert_eq!(app.selected_left, 1, "row 0 is a header");
+
+        app.focus = FocusPane::Left;
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.selected_left, 3, "Down passes the second header");
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.selected_left, 1, "Up passes it on the way back");
+        // The list wraps: Up from the first agent lands on the last one, and
+        // the header above it is passed over like any other.
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.selected_left, 3, "the wrap lands on an agent too");
+
+        assert!(
+            !app.is_reorderable_left_item(1),
+            "a drag has no slot between two groups to land in"
+        );
+    }
+
+    /// Toggling the layout regroups the list in place and leaves the cursor on
+    /// the agent it was on, in both directions.
+    #[test]
+    fn toggling_project_grouping_regroups_and_keeps_the_cursor_on_its_agent() {
+        let mut app = two_project_app();
+        app.rebuild_left_items();
+        let other = app
+            .left_items()
+            .iter()
+            .position(|item| matches!(item, LeftItem::Session(1)))
+            .expect("the second agent has a row");
+        app.selected_left = other;
+        let has_headers = |app: &App| {
+            app.left_items()
+                .iter()
+                .any(|item| matches!(item, LeftItem::ProjectHeader(_)))
+        };
+        assert!(!has_headers(&app), "the flat list is the default");
+
+        app.toggle_project_grouping();
+        assert!(app.engine.config.ui.group_agents_by_project);
+        assert!(has_headers(&app));
+        assert_eq!(app.selected_session().map(|s| s.id.as_str()), Some("other"));
+
+        app.toggle_project_grouping();
+        assert!(!app.engine.config.ui.group_agents_by_project);
+        assert!(!has_headers(&app));
+        assert_eq!(app.selected_session().map(|s| s.id.as_str()), Some("other"));
+    }
+
+    /// Under project headers the Inactive section does not exist, so the key
+    /// that folds it says so and changes nothing.
+    #[test]
+    fn folding_the_inactive_section_is_refused_in_the_grouped_list() {
+        let mut app = two_project_app();
+        app.engine.config.ui.group_agents_by_project = true;
+        app.rebuild_left_items();
+        let before = (app.inactive_collapsed, app.inactive_collapse_overridden);
+        let items = app.left_items().to_vec();
+
+        app.toggle_collapse_selected_project();
+
+        assert_eq!(
+            (app.inactive_collapsed, app.inactive_collapse_overridden),
+            before
+        );
+        assert_eq!(app.left_items(), items);
     }
 
     #[test]

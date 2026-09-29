@@ -591,6 +591,13 @@ pub const PALETTE_COMMANDS: &[PaletteCommand] = &[
         // the Preferences dialog), not an app-menu entry.
     },
     PaletteCommand {
+        action: Action::ToggleProjectGrouping,
+        name: "toggle-project-grouping",
+        description: "Toggle grouping the agent list under one header per project",
+        // TUI only: the web sidebar is a flat list by design, and
+        // ui.group_agents_by_project changes nothing there.
+    },
+    PaletteCommand {
         action: Action::ToggleTabReachesAgent,
         name: "toggle-tab-to-agent",
         description: "Toggle whether Tab reaches the agent instead of moving between panes",

@@ -132,7 +132,7 @@ Already have a Git worktree you want dux to use? In the browser, **Worktrees…*
 
 In the terminal UI, the interface has three panes:
 
-- **Left:** a flat list of your agents, most-active first by default, with search and a project chooser
+- **Left:** a flat list of your agents, most-active first by default, with search and a project chooser (set `[ui] group_agents_by_project = true`, or run `toggle-project-grouping` from the palette, to group them under one header per project instead)
 - **Center:** the agent's live terminal (or a file diff). Focus it and type: your keystrokes go straight to the agent, right there in the window, while dux's own shortcuts keep working around it
 - **Right:** changed files, staging, and diffs
 

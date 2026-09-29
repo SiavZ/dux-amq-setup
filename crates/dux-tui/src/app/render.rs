@@ -2034,6 +2034,8 @@ impl App {
                     }
                 }
             }
+            // A header is a label the cursor never rests on.
+            LeftItem::ProjectHeader(_) => {}
         }
     }
 
@@ -2201,6 +2203,42 @@ impl App {
         }
     }
 
+    /// Draw a dim rule from the end of each project header's label to the right
+    /// gutter, the same rule the "Inactive (N)" label carries, so a header reads
+    /// as a divider between groups and not as one more agent.
+    fn paint_project_header_rules(&self, buf: &mut ratatui::buffer::Buffer, list_content: Rect) {
+        let items = self.left_items();
+        let map = &self.mouse_layout.left_row_to_item;
+        let x0 = list_content.x;
+        let x1 = list_content.x + list_content.width;
+        let x_right = x1.saturating_sub(LEFT_PANE_GUTTER);
+        let mut previous = None;
+        for (rel, &index) in map.iter().enumerate() {
+            // The label is the first row of the item; its spacer follows. A
+            // header scrolled half out of view shows only its spacer, and the
+            // offset the map starts from is always an item's first row.
+            if previous == Some(index) {
+                continue;
+            }
+            previous = Some(index);
+            if !matches!(items.get(index), Some(LeftItem::ProjectHeader(_))) {
+                continue;
+            }
+            let y = list_content.y + rel as u16;
+            let mut text_end = x0;
+            for x in x0..x1 {
+                if buf[(x, y)].symbol() != " " {
+                    text_end = x;
+                }
+            }
+            for x in text_end.saturating_add(2)..x_right {
+                buf[(x, y)]
+                    .set_symbol("─")
+                    .set_fg(self.theme.provider_label_fg);
+            }
+        }
+    }
+
     fn render_collapsed_left(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
         self.mouse_layout.left_list = self.themed_block("", focused).inner(area);
         let collapsed_left_items = self.left_items();
@@ -2251,10 +2289,11 @@ impl App {
                     }
                     ListItem::new(Line::from(spans))
                 }
-                LeftItem::InactiveToggle => ListItem::new(Line::from(Span::styled(
-                    "─",
-                    Style::default().fg(self.theme.header_separator_fg),
-                ))),
+                // The icon rail has no room for a name: a header shows as the
+                // same short rule that stands in for the Inactive toggle.
+                LeftItem::InactiveToggle | LeftItem::ProjectHeader(_) => ListItem::new(Line::from(
+                    Span::styled("─", Style::default().fg(self.theme.header_separator_fg)),
+                )),
             })
             .collect::<Vec<_>>();
         let mut state = ListState::default().with_selected(Some(self.selected_left));
@@ -2348,7 +2387,29 @@ impl App {
     ) -> (Vec<ListItem<'static>>, Vec<u16>) {
         let items = left_items
             .iter()
-            .map(|item| match item {
+            .enumerate()
+            .map(|(position, item)| match item {
+                LeftItem::ProjectHeader(group) => {
+                    // The agents of this group are the rows up to the next
+                    // header, so the count is what the user can see under it.
+                    let count = left_items[position + 1..]
+                        .iter()
+                        .take_while(|next| matches!(next, LeftItem::Session(_)))
+                        .count();
+                    let name = self.project_header_name(*group);
+                    let suffix = format!(" ({count})");
+                    let name_width = row_text_width
+                        .saturating_sub(suffix.chars().count().try_into().unwrap_or(u16::MAX));
+                    let label = Line::from(Span::styled(
+                        format!("{}{suffix}", truncate_to_width(&name, name_width)),
+                        Style::default()
+                            .fg(self.theme.provider_label_fg)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    // The trailing spacer is the row the first agent's
+                    // selection frame draws its top edge on.
+                    ListItem::new(vec![label, Line::from("")])
+                }
                 LeftItem::InactiveToggle => {
                     let icon = if self.inactive_collapsed {
                         "▸"
@@ -2380,10 +2441,19 @@ impl App {
             .map(|item| match item {
                 LeftItem::Session(_) => 3,
                 LeftItem::InactiveToggle if has_active => 3,
-                LeftItem::InactiveToggle => 2,
+                LeftItem::InactiveToggle | LeftItem::ProjectHeader(_) => 2,
             })
             .collect();
         (items, heights)
+    }
+
+    /// The name a project header shows: the project's own name, or a fixed
+    /// label for the group of agents that have no project record.
+    fn project_header_name(&self, group: Option<usize>) -> String {
+        group
+            .and_then(|index| self.engine.projects.get(index))
+            .map(|project| project.name.clone())
+            .unwrap_or_else(|| "No project".to_string())
     }
 
     fn agent_sidebar_geometry(
@@ -2517,6 +2587,7 @@ impl App {
         // but only while the toggle is not the current selection.
         if !body_will_dim {
             self.paint_inactive_rule(frame.buffer_mut(), geometry.content);
+            self.paint_project_header_rules(frame.buffer_mut(), geometry.content);
         }
 
         body_will_dim
@@ -14949,6 +15020,88 @@ mod tests {
             Some(theme.provider_label_fg),
             "the state word keeps its own color; the tone is identity, not state"
         );
+    }
+
+    /// Grouped by project, a header names its project and how many agents sit
+    /// under it, carries the divider rule, and takes two rows of the click map:
+    /// its label and the spacer the first agent's selection frame draws on.
+    #[test]
+    fn a_project_header_names_its_group_above_its_agents() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_app(default_bindings());
+        app.engine.config.ui.group_agents_by_project = true;
+        app.focus = FocusPane::Left;
+        app.rebuild_left_items();
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render frame");
+
+        assert_eq!(
+            app.mouse_layout.left_row_to_item.get(..5),
+            Some(&[0, 0, 1, 1, 1][..]),
+            "two header rows, then the three rows of the agent under it"
+        );
+        assert!(!app.is_selectable_left_item(0), "a header is not a target");
+        assert_eq!(app.selected_left, 1);
+
+        let buffer = terminal.backend().buffer();
+        let list = app.mouse_layout.left_list;
+        let row_text = |y: u16| -> String {
+            (list.x..list.x + list.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        };
+        let header = row_text(list.y);
+        assert!(
+            header.contains("demo (1)"),
+            "the header names the project and counts its agents: {header:?}"
+        );
+        assert!(
+            header.contains("───"),
+            "the header carries the divider rule: {header:?}"
+        );
+        assert!(
+            row_text(list.y + 2).contains("agent-branch"),
+            "the agent sits under its header: {:?}",
+            row_text(list.y + 2)
+        );
+    }
+
+    /// The flat list is the default and shows no header: the first row is the
+    /// agent itself.
+    #[test]
+    fn the_flat_list_shows_no_project_header() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_app(default_bindings());
+        assert!(!app.engine.config.ui.group_agents_by_project);
+        app.rebuild_left_items();
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render frame");
+
+        assert!(
+            app.left_items()
+                .iter()
+                .all(|item| !matches!(item, LeftItem::ProjectHeader(_)))
+        );
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!rendered.contains("demo (1)"), "{rendered}");
     }
 
     #[test]

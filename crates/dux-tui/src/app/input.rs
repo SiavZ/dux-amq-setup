@@ -9657,7 +9657,9 @@ impl App {
             }
             // Enter/activate on the Inactive tail toggles it open/closed.
             Some(LeftItem::InactiveToggle) => self.toggle_collapse_selected_project(),
-            None => {}
+            // A project header is never the selection, so there is nothing to
+            // activate.
+            Some(LeftItem::ProjectHeader(_)) | None => {}
         }
         Ok(())
     }
@@ -10498,6 +10500,36 @@ impl App {
         let palette_key = self.bindings.label_for(Action::OpenPalette);
         self.set_ui_hint(format!(
             "Always-show tab strip {state}. Press {palette_key} to open the palette and toggle back."
+        ));
+    }
+
+    /// Flip `ui.group_agents_by_project` and persist it to `config.toml`, then
+    /// rebuild the agent list in the new layout with the cursor kept on the
+    /// agent it was on. TUI only: the web sidebar has no grouped layout.
+    pub(crate) fn toggle_project_grouping(&mut self) {
+        let next = !self.engine.config.ui.group_agents_by_project;
+        self.engine.config.ui.group_agents_by_project = next;
+        self.engine
+            .config_writer
+            .save_lazy(self.engine.config.clone());
+        let keep = self.selected_session().map(|session| session.id.clone());
+        self.rebuild_left_items();
+        if let Some(id) = keep
+            && let Some(position) = self.left_items().iter().position(|item| {
+                matches!(item, LeftItem::Session(index)
+                    if self.engine.sessions.get(*index).is_some_and(|s| s.id == id))
+            })
+        {
+            self.selected_left = position;
+        }
+        let palette_key = self.bindings.label_for(Action::OpenPalette);
+        let layout = if next {
+            "grouped by project"
+        } else {
+            "as one flat list"
+        };
+        self.set_ui_hint(format!(
+            "Agents are now shown {layout}. Press {palette_key} to open the palette and toggle back."
         ));
     }
 

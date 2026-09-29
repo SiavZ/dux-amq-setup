@@ -188,6 +188,9 @@ pub enum Action {
     /// the Preferences dialog's Tailscale row.
     SetTailscaleMode,
     ToggleAlwaysShowTabs,
+    /// Flip `ui.group_agents_by_project`: whether the TUI's agent list is
+    /// grouped under one header per project.
+    ToggleProjectGrouping,
     /// Flip `ui.tab_reaches_agent`: whether the typeable center pane sends Tab
     /// and Shift-Tab to the agent instead of cycling panes with them.
     ToggleTabReachesAgent,
@@ -354,6 +357,7 @@ impl Action {
             Action::StopBackgroundServer => "stop_background_server",
             Action::SetTailscaleMode => "set_tailscale_mode",
             Action::ToggleAlwaysShowTabs => "toggle_always_show_tabs",
+            Action::ToggleProjectGrouping => "toggle_project_grouping",
             Action::ToggleTabReachesAgent => "toggle_tab_reaches_agent",
             Action::OpenAgentInfo => "open_agent_info",
             Action::ShowWelcomeScreen => "show_welcome_screen",
@@ -601,6 +605,9 @@ impl Action {
             Action::ToggleAlwaysShowTabs => {
                 "Toggle always showing the agent tab strip, even with a single tab."
             }
+            Action::ToggleProjectGrouping => {
+                "Toggle grouping the agent list under one header per project."
+            }
             Action::ToggleTabReachesAgent => {
                 "Toggle whether Tab and Shift-Tab reach the agent instead of moving between panes."
             }
@@ -766,6 +773,7 @@ impl Action {
             | Action::StopBackgroundServer
             | Action::SetTailscaleMode
             | Action::ToggleAlwaysShowTabs
+            | Action::ToggleProjectGrouping
             | Action::ToggleTabReachesAgent
             | Action::OpenAgentInfo
             | Action::ShowWelcomeScreen

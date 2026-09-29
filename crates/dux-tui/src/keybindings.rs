@@ -1397,6 +1397,13 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         hint_contexts: &[],
     },
     BindingDef {
+        action: Action::ToggleProjectGrouping,
+        default_keys: &[],
+        scopes: &[],
+        help: None,
+        hint_contexts: &[],
+    },
+    BindingDef {
         action: Action::ToggleTabReachesAgent,
         default_keys: &[],
         scopes: &[],
@@ -3360,6 +3367,7 @@ mod tests {
             "toggle-pr-banner-position",
             "toggle-project",
             "toggle-project-auto-reopen-agents",
+            "toggle-project-grouping",
             "toggle-randomized-pet-name-default",
             "toggle-remove-git-pane",
             "toggle-sidebar",

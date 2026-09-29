@@ -1710,6 +1710,14 @@ pub struct UiConfig {
     /// Preferences dialog persists the new value here immediately; it is a
     /// shared preference, not a per-session override.
     pub always_show_tab_strip: bool,
+    /// Group the TUI's agent list under one header per project instead of
+    /// showing a single flat list. Default false keeps the flat list. When
+    /// true, every project that has agents gets a header row followed by its
+    /// agents, in the project order; agents without a project come last under
+    /// their own header. `agent_sort` still orders the agents inside each
+    /// group, and the Inactive section is not shown because every agent sits
+    /// under its project. TUI only: the web sidebar ignores it.
+    pub group_agents_by_project: bool,
     /// Hand `Tab` and `Shift-Tab` to a live agent in the typeable center pane
     /// instead of cycling panes with them. Default false, because Tab has moved
     /// between panes since dux's first version. The pane chords bound to
@@ -2267,6 +2275,7 @@ impl Default for UiConfig {
             auto_reopen_agents: false,
             show_changes_pane: true,
             always_show_tab_strip: false,
+            group_agents_by_project: false,
             tab_reaches_agent: false,
             attention_indicator: true,
             attention_on_bell: true,
@@ -3002,6 +3011,7 @@ impl Default for Config {
                 auto_reopen_agents: false,
                 show_changes_pane: true,
                 always_show_tab_strip: false,
+                group_agents_by_project: false,
                 tab_reaches_agent: false,
                 attention_indicator: true,
                 attention_on_bell: true,
