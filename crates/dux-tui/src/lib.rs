@@ -193,9 +193,13 @@ pub fn resume_after_failed_reload(
     mut engine: Box<Engine>,
     companion: Box<dyn dux_core::background_serve::BackgroundServeCompanion>,
     reason: String,
+    selected_session: Option<String>,
 ) -> Result<TuiExit> {
     engine.resume_all_pty_readers();
     let mut app = app::App::resume(*engine)?;
+    // Back on the agent the user was looking at, not "No agent selected".
+    app.reload_selected_session = selected_session;
+    app.restore_selection_after_reload();
     app.set_error(reason);
     run_app(app, companion)
 }

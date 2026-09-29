@@ -4780,6 +4780,7 @@ mod tests {
             startup_log_selection: None,
             pending_server_flip: None,
             pending_reload: None,
+            reload_selected_session: None,
             reload_target: dux_core::reload_policy::ReloadTarget::capture(),
             companion: None,
             background_server_preflight_pending: false,

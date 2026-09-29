@@ -633,6 +633,9 @@ pub struct App {
     /// reload is known to be possible. Anything that can fail has already
     /// failed, harmlessly, with the user still running.
     pub(crate) pending_reload: Option<dux_core::reload_handoff::Handoff>,
+    /// The agent that was selected in the image this one reloaded from, read
+    /// from the handoff and consumed once by `restore_selection_after_reload`.
+    pub(crate) reload_selected_session: Option<String>,
     /// The binary this process was launched from, with its mtime as of startup.
     ///
     /// Captured once at boot because a rebuild replaces the file in place: read
@@ -4295,6 +4298,7 @@ impl App {
             startup_log_selection: None,
             pending_server_flip: None,
             pending_reload: None,
+            reload_selected_session: None,
             reload_target: dux_core::reload_policy::ReloadTarget::capture(),
             companion: None,
             background_server_preflight_pending: false,
@@ -4341,6 +4345,7 @@ impl App {
         }
         app.seed_pr_statuses_from_db();
         app.rebuild_left_items();
+        app.restore_selection_after_reload();
         app.reload_changed_files();
         app.engine.update_branch_sync_sessions();
         Ok(app)
@@ -5133,11 +5138,29 @@ impl App {
         // every master so the descriptors survive the exec. Doing it after the
         // refusals means a refused reload leaves no trace (a refusal partway
         // through collection resumes everything it stopped).
-        let Some(handoff) = self.engine.prepare_reload_handoff() else {
+        let Some(mut handoff) = self.engine.prepare_reload_handoff() else {
             self.set_error(ReloadRefusal::HandoffUnavailable.message());
             return;
         };
+        handoff.selected_session = self.selected_session().map(|s| s.id.clone());
         self.pending_reload = Some(handoff);
+    }
+
+    /// Put the cursor back on the agent that was selected before a reload, so
+    /// the new image opens on the same agent (and its carried-over screen)
+    /// rather than on the first project header with an empty agent pane. A
+    /// no-op on a normal launch, and when that agent is gone or hidden.
+    pub(crate) fn restore_selection_after_reload(&mut self) {
+        let Some(id) = self.reload_selected_session.take() else {
+            return;
+        };
+        let position = self.left_items().iter().position(|item| {
+            matches!(item, LeftItem::Session(i)
+                if self.engine.sessions.get(*i).is_some_and(|s| s.id == id))
+        });
+        if let Some(position) = position {
+            self.selected_left = position;
+        }
     }
 
     /// Adopt the PTYs handed over by a previous image, when this process was
@@ -5170,6 +5193,7 @@ impl App {
             }
         };
         let expected = handoff.ptys.len();
+        self.reload_selected_session = handoff.selected_session.clone();
         // SAFETY: the descriptors were inherited through the exec that started
         // this process, which is exactly what the flag means.
         let adopted = unsafe { self.engine.restore_reload_handoff(handoff) };

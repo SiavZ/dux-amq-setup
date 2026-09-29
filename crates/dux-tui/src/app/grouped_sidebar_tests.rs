@@ -444,3 +444,20 @@ fn agents_whose_project_is_gone_still_show_under_an_orphan_group() {
         vec!["gallery-claude".to_string(), "gallery-codex".to_string()]
     );
 }
+
+/// A reload reopens on the agent that was selected, not on the first project
+/// header with an empty agent pane (which read as "the screen was lost").
+#[test]
+fn a_reload_reopens_on_the_agent_that_was_selected() {
+    let mut app = grouped_app();
+    app.selected_left = 0;
+    assert!(matches!(app.left_items()[0], LeftItem::Group(_)));
+    app.reload_selected_session = Some("infra-opencode".to_string());
+    app.restore_selection_after_reload();
+    assert_eq!(selected_id(&app).as_deref(), Some("infra-opencode"));
+    assert!(app.reload_selected_session.is_none(), "consumed once");
+    // An agent that no longer exists leaves the cursor where it was.
+    app.reload_selected_session = Some("gone".to_string());
+    app.restore_selection_after_reload();
+    assert_eq!(selected_id(&app).as_deref(), Some("infra-opencode"));
+}

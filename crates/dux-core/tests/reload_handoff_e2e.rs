@@ -209,6 +209,7 @@ fn generation_one(handoff_path: &Path) {
     let mut handoff = Handoff {
         written_by: std::process::id(),
         ptys: vec![entry],
+        selected_session: None,
     };
     handoff.write(handoff_path).expect("write the handoff");
     // The bytes live on disk now; dropping the in-memory copy is honest and

@@ -123,11 +123,14 @@ fn run_tui_with_flip() -> Result<()> {
         match next {
             dux_tui::TuiExit::Done => break,
             dux_tui::TuiExit::Reload { engine, handoff } => {
+                // Kept aside so a failed exec reopens on the same agent.
+                let selected = handoff.selected_session.clone();
                 let Err((engine, reason)) = exec_reload(engine, handoff);
                 next = dux_tui::resume_after_failed_reload(
                     engine,
                     Box::new(companion::WebCompanion::new()),
                     reason,
+                    selected,
                 )?;
             }
             dux_tui::TuiExit::FlipToServer {

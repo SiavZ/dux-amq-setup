@@ -1734,6 +1734,7 @@ impl Engine {
             crate::reload_handoff::Handoff {
                 written_by: std::process::id(),
                 ptys,
+                selected_session: None,
             }
             .abandon();
             return None;
@@ -1742,6 +1743,7 @@ impl Engine {
         Some(crate::reload_handoff::Handoff {
             written_by: std::process::id(),
             ptys,
+            selected_session: None,
         })
     }
 

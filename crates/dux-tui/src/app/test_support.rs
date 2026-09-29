@@ -372,6 +372,7 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
         startup_log_selection: None,
         pending_server_flip: None,
         pending_reload: None,
+        reload_selected_session: None,
         reload_target: None,
         companion: None,
         background_server_preflight_pending: false,

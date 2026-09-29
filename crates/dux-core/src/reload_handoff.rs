@@ -127,6 +127,13 @@ pub struct Handoff {
     /// is recognisable rather than silently adopted.
     pub written_by: u32,
     pub ptys: Vec<HandoffPty>,
+    /// The agent that was selected when the reload started, so the new image
+    /// opens on the same agent instead of the top of the list. Without it a
+    /// reload lands on a project header with an empty agent pane, which reads
+    /// as "the screen was lost" even though every terminal came across.
+    /// `None` from an older dux, or when no agent row was selected.
+    #[serde(default)]
+    pub selected_session: Option<String>,
 }
 
 impl Handoff {
@@ -292,6 +299,8 @@ mod tests {
                     repaint_bytes: Vec::new(),
                 },
             ],
+            // Carried so the round trip proves the selection crosses too.
+            selected_session: Some("s1".to_string()),
         }
     }
 
