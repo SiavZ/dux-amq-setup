@@ -98,7 +98,12 @@ keys Enter; sleep 0.5
 keys -l "echo TERM-MARKER-before"
 keys Enter
 wait_for "the terminal marker" 10 "tmux capture-pane -t $SESSION -p | grep -q 'TERM-MARKER-before'"
-SHELL_PID=$(ps -Ao pid,ppid,command | awk -v p="$DUX_PID" -v a="$AGENT_PID" '$2==p && $1!=a {print $1}' | head -1)
+# Match the shell itself: dux also forks short-lived helpers (`gh auth status`
+# probes), and picking "any other child" sometimes caught one of those, which
+# had exited by the post-reload check and read as a lost terminal.
+TERM_SHELL=$(basename "${SHELL:-/bin/sh}")
+SHELL_PID=$(ps -Ao pid,ppid,command | awk -v p="$DUX_PID" -v a="$AGENT_PID" -v s="$TERM_SHELL" \
+  '$2==p && $1!=a && ($3 ~ ("(^|/|-)" s "$")) {print $1}' | head -1)
 [ -n "$SHELL_PID" ] || fail "could not find the terminal shell pid"
 echo "before: dux=$DUX_PID agent=$AGENT_PID shell=$SHELL_PID"
 keys 'C-]'; sleep 1; keys C-g; sleep 1
@@ -114,8 +119,10 @@ grep -q "reload: adopted 2 of 2" "$WORK/home/dux.log" && pass "adopted agent + t
 ps -p "$AGENT_PID" >/dev/null && pass "alt-screen agent still running" || fail "agent died"
 ps -p "$SHELL_PID" >/dev/null && pass "companion shell still running" || fail "companion shell gone"
 sleep 1
-screen | grep -q "1 terminal" && pass "terminal still attached to its agent" || fail "terminal no longer shown on the agent"
-screen | grep -q 'ALT-FRAME-TOP' && pass "full-screen frame drawn after reload (not blank)" || fail "alt-screen frame missing after reload"
+wait_for "the terminal on its agent row" 10 "tmux capture-pane -t $SESSION -p | grep -q '1 terminal'"
+pass "terminal still attached to its agent"
+wait_for "the full-screen frame" 10 "tmux capture-pane -t $SESSION -p | grep -q 'ALT-FRAME-TOP'"
+pass "full-screen frame drawn after reload (not blank)"
 C1=$(screen | grep -o 'counter-[0-9]*' | head -1 | sed 's/counter-//'); sleep 3
 C2=$(screen | grep -o 'counter-[0-9]*' | head -1 | sed 's/counter-//')
 [ -n "$C1" ] && [ -n "$C2" ] && [ "$C2" -gt "$C1" ] && pass "alt-screen agent keeps redrawing ($C1 -> $C2)" || fail "counter not advancing ($C1 -> $C2)"
