@@ -539,6 +539,45 @@ fn ellipsize_spans(spans: Vec<Span<'static>>, max_w: u16) -> Vec<Span<'static>> 
     out
 }
 
+/// The provider suffix on an agent row's first line: ` (codex)`, or
+/// ` (claude → codex)` while a provider swap is pending (the running process is
+/// still the old one; the next launch uses the new one), so the row never
+/// claims a harness that is not the one running.
+pub(crate) fn agent_row_provider_suffix(
+    running: &ProviderKind,
+    configured: &ProviderKind,
+) -> String {
+    if running != configured {
+        format!(" ({} → {})", running.as_str(), configured.as_str())
+    } else {
+        format!(" ({})", configured.as_str())
+    }
+}
+
+/// Fit `left` followed by `suffix` into `max_w` cells, ellipsizing `left` (the
+/// name) before the suffix loses a cell. Only when the suffix alone does not
+/// fit next to at least a glyph and one name cell does the whole run ellipsize
+/// as one.
+fn fit_name_with_suffix(
+    left: Vec<Span<'static>>,
+    suffix: Span<'static>,
+    max_w: u16,
+) -> Vec<Span<'static>> {
+    let suffix_w = suffix.content.as_ref().cell_width();
+    let glyph_w = left
+        .first()
+        .map(|s| s.content.as_ref().cell_width())
+        .unwrap_or(0);
+    if max_w <= suffix_w.saturating_add(glyph_w).saturating_add(1) {
+        let mut all = left;
+        all.push(suffix);
+        return ellipsize_spans(all, max_w);
+    }
+    let mut out = ellipsize_spans(left, max_w - suffix_w);
+    out.push(suffix);
+    out
+}
+
 /// Lay a line out with `left` packed to the left and `right` flush to the right
 /// edge of `total_w`, separated by at least `min_gap` blank cells. The left
 /// group is ellipsized to whatever space remains after the right group and the
@@ -1972,6 +2011,26 @@ impl App {
             )
         });
         let right: Vec<Span<'static>> = shared_badge.into_iter().chain(pr_badge).collect();
+        // The harness rides right after the name, as on the fork: several
+        // agents in one project are usually told apart by it. The name gives
+        // way first so the provider stays readable.
+        let provider_span = Span::styled(
+            agent_row_provider_suffix(
+                &self.engine.running_provider_for(session),
+                &session.provider,
+            ),
+            italic(Style::default().fg(muted)),
+        );
+        let right_w = right
+            .iter()
+            .map(|s| s.content.as_ref().cell_width())
+            .fold(0u16, |a, b| a.saturating_add(b));
+        let left_budget = if right.is_empty() {
+            text_width
+        } else {
+            text_width.saturating_sub(right_w.saturating_add(2))
+        };
+        let line1_left = fit_name_with_suffix(line1_left, provider_span, left_budget);
         let line1 = if right.is_empty() {
             ellipsize_spans(line1_left, text_width)
         } else {

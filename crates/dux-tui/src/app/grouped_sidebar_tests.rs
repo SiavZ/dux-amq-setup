@@ -320,3 +320,42 @@ fn the_grouped_sidebar_renders_headers_with_counts_and_every_harness() {
         assert!(screen.contains(name), "{name} missing:\n{screen}");
     }
 }
+
+#[test]
+fn every_agent_row_names_its_harness_in_both_styles() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    for style in ["grouped", "flat"] {
+        let mut app = grouped_app();
+        app.engine.config.ui.sidebar_style = style.to_string();
+        app.inactive_collapsed = false;
+        app.inactive_collapse_overridden = true;
+        app.rebuild_left_items();
+        app.left_width_pct = 40;
+        let mut terminal = Terminal::new(TestBackend::new(120, 50)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("render");
+        let screen = screen_text(terminal.backend().buffer());
+        for row in [
+            "infra-claude (claude)",
+            "infra-engineer (codex)",
+            "infra-opencode (opencode)",
+            "web-dev (claude)",
+        ] {
+            assert!(screen.contains(row), "{style}: {row} missing:\n{screen}");
+        }
+    }
+}
+
+#[test]
+fn a_pending_provider_swap_shows_both_harnesses() {
+    let codex = ProviderKind::from_str("codex");
+    let claude = ProviderKind::from_str("claude");
+    assert_eq!(
+        super::render::agent_row_provider_suffix(&codex, &codex),
+        " (codex)"
+    );
+    assert_eq!(
+        super::render::agent_row_provider_suffix(&claude, &codex),
+        " (claude → codex)"
+    );
+}
