@@ -21,9 +21,8 @@ enable_randomized_pet_name_by_default = false
 command = "claude-amq"
 # Fork the session on resume so deferred tools don't block the resumed pane.
 resume_args = ["--continue", "--fork-session"]
-# Tri-state since upstream: absent is auto. Pin it so the wheel always reaches
-# Claude's renderer.
-forward_scroll = true
+# forward_scroll stays unset (auto): the wheel reaches Claude only while it
+# asks for mouse input. Pinning it true broke scrolling in Claude panes.
 # Plain drags stay in dux so pane text can be selected and copied (bc3a9eec).
 forward_mouse = false
 
