@@ -1,0 +1,110 @@
+name: Website CI
+
+# Sanity-check that the getdux.app site still builds before it can be merged or
+# deployed. Runs only when site-relevant files change so unrelated PRs aren't
+# slowed down. The deploy itself lives in pages.yml and happens on release.
+on:
+  pull_request:
+    paths:
+      - "website/**"
+      # The docs-screenshot loop test reads these, so deleting a scene has to run
+      # the site suite even when nothing under website/ changed.
+      - "tools/preview-env/screens/scenes/**"
+      - "install.sh"
+      - "assets/dux-logo.png"
+      - "assets/dux-screenshot.svg"
+      - ".github/workflows/website-ci.yml"
+      - ".github/workflows/pages.yml"
+  push:
+    branches: [main]
+    paths:
+      - "website/**"
+      # The docs-screenshot loop test reads these, so deleting a scene has to run
+      # the site suite even when nothing under website/ changed.
+      - "tools/preview-env/screens/scenes/**"
+      - "install.sh"
+      - "assets/dux-logo.png"
+      - "assets/dux-screenshot.svg"
+      - ".github/workflows/website-ci.yml"
+      - ".github/workflows/pages.yml"
+
+concurrency:
+  group: website-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Verify canonical assets the build copies are present
+        run: |
+          missing=0
+          for f in install.sh assets/dux-logo.png assets/dux-screenshot.svg; do
+            if [ ! -f "$f" ]; then
+              echo "::error::$f is missing at the repo root; the website build copies it."
+              missing=1
+            fi
+          done
+          [ "$missing" = 0 ]
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          cache: npm
+          # Both projects: the site's figure test renders the web UI's real
+          # components, so the app's dependencies are part of this job too.
+          cache-dependency-path: |
+            website/package-lock.json
+            crates/dux-web/web/package-lock.json
+
+      - name: Install dependencies
+        working-directory: website
+        run: npm ci
+
+      # The unit tests run before `npm run build`, whose `prep` step is what
+      # installs the web app's dependencies on a fresh clone. The figure test
+      # resolves React through the app's node_modules, so without this it fails
+      # on every CI run with "Cannot find module .../react-dom-server.mjs".
+      - name: Install the web app's dependencies (the figure test renders it)
+        working-directory: crates/dux-web/web
+        run: npm ci --no-audit --no-fund
+
+      - name: Unit tests
+        working-directory: website
+        run: npm test
+
+      - name: Build
+        working-directory: website
+        env:
+          NODE_ENV: production
+          # Lets the contributor fetch use the authenticated rate limit instead
+          # of falling back to the committed snapshot on every PR (pages.yml
+          # passes the same token for the deploy build).
+          #
+          # Only for code this repository's own branches carry. A pull request
+          # from a fork runs the fork's copy of the build scripts, which could
+          # read the token and send it anywhere, so it gets none: the build then
+          # keeps the committed contributor snapshot, the documented degradation
+          # (see website/scripts/fetch-contributors.mjs).
+          GH_TOKEN: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && github.token || '' }}
+        run: npm run build
+
+      - name: Verify build output
+        run: |
+          for f in index.html CNAME install.sh dux-logo.png dux-screenshot.svg pagefind/pagefind.js; do
+            if [ ! -f "website/dist/$f" ]; then
+              echo "::error::website/dist/$f missing from build output."
+              exit 1
+            fi
+          done
+          echo "Site built successfully."
+
+      - name: Verify search index (docs-only scope)
+        working-directory: website
+        run: npm run test:search

@@ -1,0 +1,36 @@
+{
+  "name": "@patrickdappollonio/dux",
+  "version": "0.0.0-dev",
+  "description": "Run multiple AI coding agents side by side in isolated git worktrees, driven from a terminal UI or from a browser.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "dux": "bin/dux.js"
+  },
+  "files": [
+    "bin",
+    "vendor",
+    "README.md",
+    "LICENSE",
+    "assets"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/patrickdappollonio/dux"
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "cli",
+    "terminal",
+    "tui",
+    "web-ui",
+    "browser",
+    "server",
+    "pty",
+    "worktrees"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

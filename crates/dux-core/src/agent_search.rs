@@ -1,0 +1,236 @@
+//! Pure search matching for the flat agent/terminal list: the core-owned rule
+//! the TUI's pane filter and the web's sidebar and hub search both apply, so a
+//! query filters identically on either surface.
+//!
+//! Mirrors the web's `crates/dux-web/web/src/lib/agentSearch.ts` exactly, and the
+//! tests below share vectors with it. A query matches case-insensitively as a
+//! substring against a small set of fields per row kind; an empty or whitespace
+//! query matches everything.
+
+/// Normalize a raw query: trimmed and lowercased. An empty result means "match
+/// everything".
+pub fn normalize_query(query: &str) -> String {
+    query.trim().to_lowercase()
+}
+
+fn haystack_has(query: &str, fields: &[Option<&str>]) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    fields
+        .iter()
+        .any(|field| field.unwrap_or("").to_lowercase().contains(query))
+}
+
+/// Match an agent row against a raw query. Fields: the display name, the
+/// branch, and the LOCATION.
+///
+/// `branch_name` is `None` for a standalone agent, and `location` is whatever
+/// the row's second line shows: the project name for a managed agent, the folder
+/// label for a standalone one. The field that appears on the row is the field
+/// that should match, so typing part of a path finds a standalone agent.
+///
+/// Provider names are deliberately NOT searched: "claude" and "codex" are far
+/// too generic, so a provider-only hit would surface almost every agent.
+pub fn matches_session(
+    title: Option<&str>,
+    branch_name: Option<&str>,
+    location: Option<&str>,
+    query: &str,
+) -> bool {
+    let q = normalize_query(query);
+    if q.is_empty() {
+        return true;
+    }
+    haystack_has(&q, &[title, branch_name, location])
+}
+
+/// The CHAR range (start inclusive, end exclusive, never bytes) of the first
+/// case-insensitive occurrence of `query` in `field`, or `None` when the query
+/// is empty or whitespace or does not occur. It applies the exact normalization
+/// the filter applies, so what highlights is what matched.
+///
+/// Char indices, deliberately: user-visible labels carry multi-byte UTF-8, and
+/// byte-based slicing panics inside a multi-byte char. Lowercasing can EXPAND a
+/// char (ß becomes ss), so the haystack is lowered char by char while recording
+/// each lowered char's SOURCE char index, and the range is mapped back through
+/// that record.
+pub fn match_char_range(field: &str, query: &str) -> Option<(usize, usize)> {
+    let q: Vec<char> = normalize_query(query).chars().collect();
+    if q.is_empty() {
+        return None;
+    }
+    let mut lowered: Vec<char> = Vec::new();
+    let mut source_index: Vec<usize> = Vec::new();
+    for (index, ch) in field.chars().enumerate() {
+        for lower in ch.to_lowercase() {
+            lowered.push(lower);
+            source_index.push(index);
+        }
+    }
+    if q.len() > lowered.len() {
+        return None;
+    }
+    for start in 0..=(lowered.len() - q.len()) {
+        if lowered[start..start + q.len()] == q[..] {
+            let from = source_index[start];
+            let to = source_index[start + q.len() - 1] + 1;
+            return Some((from, to));
+        }
+    }
+    None
+}
+
+/// Match a terminal row against a raw query. Fields: the terminal's label and its
+/// running foreground command, the owner label ("agent name" or "project"), and the
+/// project name.
+pub fn matches_terminal(
+    label: &str,
+    foreground_cmd: Option<&str>,
+    owner_label: &str,
+    project_name: &str,
+    query: &str,
+) -> bool {
+    let q = normalize_query(query);
+    haystack_has(
+        &q,
+        &[
+            Some(label),
+            foreground_cmd,
+            Some(owner_label),
+            Some(project_name),
+        ],
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn match_char_range_finds_a_case_insensitive_hit_in_char_indices() {
+        assert_eq!(match_char_range("API-Refactor", "refactor"), Some((4, 12)));
+        assert_eq!(match_char_range("feature/login", "LOGIN"), Some((8, 13)));
+        assert_eq!(match_char_range("abc", "abc"), Some((0, 3)));
+    }
+
+    #[test]
+    fn match_char_range_returns_none_for_no_hit_or_empty_query() {
+        assert_eq!(match_char_range("api", "zzz"), None);
+        assert_eq!(match_char_range("api", ""), None);
+        assert_eq!(match_char_range("api", "   "), None);
+    }
+
+    #[test]
+    fn match_char_range_counts_chars_not_bytes_for_multibyte_labels() {
+        // "höhe-fix": the umlaut is two UTF-8 bytes but ONE char; "fix" starts
+        // at char index 5, not byte index 6.
+        assert_eq!(match_char_range("höhe-fix", "fix"), Some((5, 8)));
+        // An emoji (single char here) before the hit shifts the range by one.
+        assert_eq!(match_char_range("🦆 duck", "duck"), Some((2, 6)));
+        // Matching THROUGH multi-byte chars works too.
+        assert_eq!(match_char_range("日本語テスト", "語テ"), Some((2, 4)));
+    }
+
+    #[test]
+    fn empty_query_matches_everything() {
+        assert!(matches_session(Some("api"), Some("main"), Some("proj"), ""));
+        assert!(matches_session(None, Some("main"), Some("proj"), "   "));
+        assert!(matches_terminal("shell", None, "owner", "proj", ""));
+    }
+
+    #[test]
+    fn matches_name_branch_and_project_case_insensitively() {
+        // Title.
+        assert!(matches_session(
+            Some("API-Refactor"),
+            Some("b"),
+            Some("proj"),
+            "refactor"
+        ));
+        // Branch (name falls back to branch, but branch is matched directly too).
+        assert!(matches_session(
+            None,
+            Some("feature/login"),
+            Some("proj"),
+            "LOGIN"
+        ));
+        // Project name.
+        assert!(matches_session(
+            Some("x"),
+            Some("b"),
+            Some("demo-web"),
+            "web"
+        ));
+        // Non-match.
+        assert!(!matches_session(Some("x"), Some("b"), Some("proj"), "zzz"));
+    }
+
+    /// A standalone agent's row shows its FOLDER where an ordinary agent shows
+    /// its project, so the folder joins the haystack: typing part of a path
+    /// must find the agent, exactly as terminal searching already works.
+    ///
+    /// Shared vectors with the web twin in
+    /// `crates/dux-web/web/src/lib/agentSearch.ts`.
+    #[test]
+    fn a_standalone_agents_folder_is_searchable() {
+        // No branch, no project: the folder is the only location field it has.
+        assert!(matches_session(
+            Some("notes"),
+            None,
+            Some("~/work/scratch"),
+            "scratch"
+        ));
+        assert!(matches_session(
+            Some("notes"),
+            None,
+            Some("~/work/scratch"),
+            "WORK"
+        ));
+        assert!(!matches_session(
+            Some("notes"),
+            None,
+            Some("~/work/scratch"),
+            "zzz"
+        ));
+    }
+
+    #[test]
+    fn provider_names_do_not_match() {
+        // Provider names ("claude", "codex", ...) are too generic as search
+        // terms, so an agent named nothing like the query must NOT surface
+        // just because it runs that provider. (Providers were once a searched
+        // field; this pins the removal.)
+        assert!(!matches_session(
+            Some("api"),
+            Some("main"),
+            Some("proj"),
+            "codex"
+        ));
+    }
+
+    #[test]
+    fn terminal_matches_label_command_owner_project() {
+        assert!(matches_terminal(
+            "Terminal 2",
+            Some("npm run dev"),
+            "api-agent",
+            "proj",
+            "dev"
+        ));
+        assert!(matches_terminal(
+            "Terminal 2",
+            None,
+            "api-agent",
+            "proj",
+            "agent"
+        ));
+        assert!(!matches_terminal(
+            "Terminal 2",
+            None,
+            "api-agent",
+            "proj",
+            "zzz"
+        ));
+    }
+}

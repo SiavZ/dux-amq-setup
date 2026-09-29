@@ -42,6 +42,10 @@ ignore = [
 [bans]
 multiple-versions = "warn"   # warn first; tighten to "deny" once tree is clean
 wildcards = "deny"
+# The workspace crates depend on each other by `path`, which cargo-deny reads
+# as a wildcard version. They are `publish = false`, so path deps between them
+# can never reach a registry; only third-party wildcards stay denied.
+allow-wildcard-paths = true
 highlight = "all"
 # Specific crates we never want pulled in. Empty for now.
 deny = []
@@ -58,6 +62,9 @@ skip-tree = []
 # Licenses
 # ---------------------------------------------------------------------------
 [licenses]
+# The workspace crates themselves are MIT (see LICENSE) and unpublished, so
+# they carry no `license` field; ignore them rather than tag every manifest.
+private = { ignore = true }
 # SPDX expressions accepted across the dependency tree. Strict allowlist —
 # additions must be justified in the PR.
 allow = [
@@ -82,6 +89,10 @@ allow = [
   "OFL-1.1",
   "Bitstream-Vera",
   "BSL-1.0",
+  # Permissive data license (attribution-free, no copyleft) on the Mozilla
+  # CA root list in `webpki-roots`, pulled by upstream's `ureq` release-notes
+  # fetch in dux-core. Data, not code; the allowlist predates that dependency.
+  "CDLA-Permissive-2.0",
 ]
 # Confidence threshold for the license detector. The default 0.8 catches
 # almost all real licenses without false positives.

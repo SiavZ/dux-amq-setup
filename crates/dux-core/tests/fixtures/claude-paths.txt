@@ -1,0 +1,45 @@
+# Fixture file: Claude Code on-disk project-dir encoding.
+#
+# Each non-blank, non-comment line is TAB-separated:
+#   <input-path>\t<expected-encoded-dir>
+#
+# Source of truth: a probe run against a live Claude Code 2.1.111 on
+# Linux. For each input path the probe ran `claude --print 'hi'` from
+# that directory, then read the resulting `~/.claude/projects/<dir>`
+# entry. See dux-amq/scripts/encode-claude-project-dir for the rules
+# we derived from these observations.
+#
+# Recorded encoder rules (one rule, three corollaries):
+#   - Replace every char outside [A-Za-z0-9-] with `-`.
+#   - Runs of unsafe chars do NOT collapse: `__` → `--`, `..` → `--`.
+#   - Case is preserved (Foo_Bar → Foo-Bar, NOT foo-bar).
+#
+# Cases covered (must be at least 6 — audit02 Phase 12 acceptance):
+#   1. plain hyphenated path
+#   2. underscore in component
+#   3. dot in component
+#   4. dot-prefixed component
+#   5. trailing slash on input
+#   6. mixed case preserved
+#   (plus extras: spaces, double-underscore, multi-segment, special chars)
+#
+# Phase 27 will re-validate against the kernel-pinned Claude version.
+# If Anthropic ships a new encoder, fixtures here MUST be regenerated
+# by re-running the probe — do NOT special-case the encoder.
+#
+# Format reminder: separator MUST be a single TAB. Editors that auto-
+# convert tabs to spaces will silently break the test.
+#
+# input	expected
+/tmp/probe/with-dash	-tmp-probe-with-dash
+/tmp/probe/with_underscore	-tmp-probe-with-underscore
+/tmp/probe/with.dot	-tmp-probe-with-dot
+/tmp/probe/.dot-prefix	-tmp-probe--dot-prefix
+/tmp/probe/trailing/	-tmp-probe-trailing
+/tmp/probe/MixedCase	-tmp-probe-MixedCase
+/tmp/probe/has space dir	-tmp-probe-has-space-dir
+/tmp/probe/multi__under	-tmp-probe-multi--under
+/tmp/probe/with..dotdot	-tmp-probe-with--dotdot
+/tmp/probe/end_	-tmp-probe-end-
+/data/state/dux/worktrees/audit02-12-path-encoding	-data-state-dux-worktrees-audit02-12-path-encoding
+/home/siavash_kiani_jobzy_fi/Projects/dux-amq-setup	-home-siavash-kiani-jobzy-fi-Projects-dux-amq-setup

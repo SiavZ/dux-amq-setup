@@ -1,55 +1,72 @@
-[package]
-name = "dux"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = [
+    "crates/dux-core",
+    "crates/dux-tui",
+    "crates/dux",
+    "crates/dux-web",
+]
+resolver = "3"
 
-[dependencies]
+# Single source of truth for the crate version so the TUI (dux-tui) and the web
+# (dux-core's display_version) can never show different versions.
+[workspace.package]
+version = "0.1.0"
+# The MSRV. Checked by the `msrv` job in .github/workflows/pr.yml. Declared here
+# rather than pinned in a rust-toolchain.toml so contributors and CI build on
+# current stable while a too-new language or std feature still fails a PR.
+rust-version = "1.88"
+
+[workspace.dependencies]
+# 1.0.103 is a floor: earlier releases carry RUSTSEC-2026-0190 (unsound
+# `Error::downcast_mut`), which the Security job denies.
 anyhow = "1.0.103"
-arboard = "3.4.1"
 chrono = { version = "0.4.41", features = ["serde"] }
-content_inspector = "0.2.4"
-crossterm = "0.29.0"
-home = "0.5.11"
-ratatui = "0.30.0"
-rusqlite = { version = "0.39.0", features = ["bundled", "chrono", "backup"] }
+rustix = { version = "1.1", features = ["termios", "process", "event", "stdio", "fs", "time"] }
+dux-core = { path = "crates/dux-core" }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
-toml = { version = "1.1.2", features = ["preserve_order"] }
-toml_edit = "0.25"
-uuid = { version = "1.17.0", features = ["v4"] }
-portable-pty = "0.9"
-rustix = { version = "1.1", features = ["termios", "process", "event", "stdio", "fs"] }
-signal-hook = "0.4"
-alacritty_terminal = "0.26.0"
-petname = { version = "3.0.0", default-features = false, features = ["default-rng", "default-words"] }
-similar = "3"
-syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-onig"] }
-crokey = "1.4.0"
 indexmap = { version = "2.13.0", features = ["serde"] }
-compact_str = "0.9"
-sysinfo = "0.35"
-notify = "7"
-regex = "1"
-rand = { version = "0.8", features = ["small_rng"] }
-opaline = { version = "0.4", features = ["ratatui", "builtin-themes"] }
+uuid = { version = "1.17.0", features = ["v4"] }
+home = "0.5.11"
+content_inspector = "0.2.4"
 tempfile = "3.20.0"
+notify = "7"
+flate2 = "1"
+# Structured logging: `tracing` macros write JSON Lines into dux.log through
+# dux-core's own rotating writer (logger::JsonLinesLayer), so only the
+# registry is needed from tracing-subscriber, not its fmt/json/env-filter.
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter", "fmt"] }
-tracing-appender = "0.2.5"
-
-[dev-dependencies]
-filetime = "0.2"
-serial_test = "3.5.0"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
+# 0.36 is a floor, not a preference: 0.35 reports every process's CPU usage as
+# exactly 0.0 on macOS, which is the whole of what the resource panel shows.
+# The 0.36.0 changelog entry is "Linux/macOS: Fix CPU usage update", and the
+# two versions were measured side by side on the same machine with the same
+# refresh calls (0.35.2: 0%, 0.36.0: 100%) before this bound was moved.
+sysinfo = "0.36"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal"] }
+libc = "0.2"
+url = "2.5"
+percent-encoding = "2.3"
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
+# The websocket CLIENT the integration tests connect with. Held at the version
+# axum itself depends on, so a test speaks to the server through the same
+# protocol implementation the server is running rather than a second, older one.
+# Bump it whenever axum's does: `cargo tree -p tokio-tungstenite` names both.
+tokio-tungstenite = "0.29"
 
 [profile.release]
-opt-level = "z"   # Optimize for size.
-lto = true        # Enable link time optimization.
-codegen-units = 1 # Reduce parallel code generation units.
-# audit02 Phase 24 (P2-4) — `line-tables-only` keeps file:line in panic
-# backtraces (huge diagnostics win) at a small (~1-2%) size cost. Strip
-# below still removes the symbol table from the shipped binary.
+opt-level = "z"    # Optimize for size.
+lto = true         # Enable link time optimization.
+codegen-units = 1  # Reduce parallel code generation units.
+# Line tables only (fork e79bfbe5, P2-4): file:line for panic locations and,
+# where the platform keeps them, backtraces, at a ~1-2% size cost. The
+# `strip` below still removes the symbol table from the shipped binary.
 debug = "line-tables-only"
-strip = true      # Strip symbols at link.
+# Strip symbols here, in Cargo, so every release build is small by the same
+# mechanism (CI has no separate strip step). The symbol-keeping path for
+# profilers is [profile.profiling] below.
+strip = "symbols"
 
 [profile.profiling]
 inherits = "release"

@@ -312,7 +312,7 @@ header:   /dev/disk/by-id/... (luksDump available to root)
 If neither, the doctor should print a one-line warning pointing back
 to this playbook so the operator has an actionable next step. The
 implementation lives in Phase 20; this playbook only specifies the
-expected output. See `docs/plans/audits/audit02/artifacts/25-doctor-followup.txt`
+expected output. See `docs/plans/rustport/20-dux-amq-rust-doctor-and-installer.md`
 for the open follow-up item.
 
 ## 6. GDPR Article 32 note

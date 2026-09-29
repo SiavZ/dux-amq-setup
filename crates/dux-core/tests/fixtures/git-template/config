@@ -1,0 +1,9 @@
+# The template every test fixture repository is created from; see
+# `dux_core::test_git`. A fixture commit must never be signed with the
+# developer's key, and a repository's own config outranks their global
+# `commit.gpgsign` and `tag.gpgsign`, including for the git commands the code
+# under test runs inside the fixture.
+[commit]
+	gpgsign = false
+[tag]
+	gpgsign = false

@@ -1,0 +1,41 @@
+// The macro bar over an agent pane, listing the macros that pane can take.
+module.exports = async ({ createAgent, focusPane, sendKeys, sleep, waitFor }) => {
+  await createAgent(0, "retry-budget")
+  await waitFor("Waiting for the next instruction", 20000)
+  // The macro bar belongs to the pane, so the pane has to hold the focus; the
+  // chord is its own rather than a palette command.
+  await focusPane()
+  sendKeys("C-\\")
+  await waitFor("Macros", 10000)
+  await sleep(800)
+}
+
+// The macros the bar lists. Seeded into the config rather than typed through the
+// editor, because this shot is of the bar, not of how macros are written.
+module.exports.config = (text) =>
+  `${text}
+[macros.Review]
+text = "review this code for bugs"
+surface = "agent"
+
+[macros."Write tests"]
+text = "write unit tests for what you just changed"
+surface = "agent"
+
+[macros."Explain failure"]
+text = "explain the last test failure and propose a fix"
+surface = "agent"
+
+[macros.Lint]
+text = "cargo clippy --all-targets"
+surface = "agent"
+`
+
+// The bar and the macros it lists, which are what the caption is about.
+module.exports.expectText = ["Macros", "Review", "Write tests", "Explain failure"]
+
+module.exports.file = "tui-macro-bar.png"
+module.exports.cols = 160
+module.exports.rows = 26
+module.exports.theme = "dux_dark"
+module.exports.fixture = "steady"

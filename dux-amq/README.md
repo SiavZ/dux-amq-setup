@@ -1,6 +1,6 @@
 # dux-amq overlay
 
-Setup scripts that wire **dux** (the worktree TUI from `patrickdappollonio/dux`) together with **AMQ** (file-based agent-to-agent messaging from `avivsinai/agent-message-queue`) on a Linux VM with a persistent disk.
+Setup scripts that wire **dux** (this repository's fork of `patrickdappollonio/dux`, which `install.sh` downloads from this repo's own releases) together with **AMQ** (file-based agent-to-agent messaging from `avivsinai/agent-message-queue`) on a Linux VM with a persistent disk.
 
 This directory does **not** modify dux source. It sits alongside the dux Rust source in this fork so I can keep both pieces under one fork while still pulling upstream.
 
@@ -25,13 +25,15 @@ dux-amq/
 ├── wrappers/
 │   ├── claude-amq                     # wraps `claude` with AMQ co-op + history seed
 │   ├── codex-amq                      # wraps `codex` with AMQ co-op
-│   └── gemini-amq                     # wraps `gemini` with AMQ co-op
+│   ├── gemini-amq                     # wraps `gemini` with AMQ co-op
+│   └── jcode-amq                      # wraps `jcode` with AMQ co-op (--no-update forced)
 ├── scripts/
 │   └── finalize-claude-migration.sh   # moves ~/.claude + ~/.agents onto /data
 ├── config/
 │   ├── bashrc-additions.sh            # env vars + amq shell-setup eval
 │   ├── claude-md-additions.md         # global CLAUDE.md fragment teaching AMQ usage
-│   └── dux-config-changes.toml        # dux config diff to apply post-first-launch
+│   ├── dux-config.sed                 # the provider edits install.sh applies to dux's config.toml
+│   └── dux-config-changes.toml        # the same end state in config form (validated by crates/dux/tests/overlay_config.rs)
 └── vscode/
     └── settings-additions.json        # VSCode Remote-SSH terminal Ctrl-G fix
 ```
@@ -173,7 +175,7 @@ The auto-drain step is deliberate: dux should inject the actual unread AMQ conte
 
 The drainer is a tick-driven worker inside the dux process. It owns the queue and is responsible for landing each body in the right agent PTY at the right time.
 
-- **Receiver→session mapping** (see `match_receiver` in `src/app/inject_runtime.rs`) mirrors the wrapper's identity-derivation priority: try `sanitise(basename(worktree_path))` first, then `sanitise(branch_name)`, then exact session id. This is necessary because dux sessions can change `branch_name` after worktree creation while the directory name is fixed — without basename matching, every queued message for those sessions would orphan in `.inflight`.
+- **Receiver→session mapping** (see `match_receiver` in the inject runtime, formerly `src/app/inject_runtime.rs`) mirrors the wrapper's identity-derivation priority: try `sanitise(basename(worktree_path))` first, then `sanitise(branch_name)`, then exact session id. This is necessary because dux sessions can change `branch_name` after worktree creation while the directory name is fixed — without basename matching, every queued message for those sessions would orphan in `.inflight`.
 - **Idle detection.** Before delivering, the drainer scans the last `[amq.inject].busy_scan_lines` rows of the agent's PTY (default 5) for any of `[amq.inject].busy_markers` (default `["esc to interrupt", "ctrl+c to interrupt"]`). If a marker matches, the body stays queued. The same `InputTarget::Agent` guard the watch engine uses also applies, so a user typing in a session is never interrupted.
 - **Two-phase delivery.** Once idle, the drainer sends the body in **phase 1** and a discrete `\r` in **phase 2** after the configured delay. Claude and Codex receive the body as explicit bracketed paste so rapid-input heuristics cannot strip or capture it; Gemini and custom providers keep Alt-Enter (`\e\r`) encoding for interior newlines. The separate `\r` then submits the complete prompt.
 - **Auto-clear collaboration guard.** Worker-mode `auto_clear_on_task_done` never fires while that agent has unread AMQ mail, pending outbox drafts, pending dux inject files, or recent AMQ inbox/outbox/receipt activity. The recent-activity window is `[amq.inject].auto_clear_collaboration_quiet_secs` (default 1800 seconds). This keeps back-and-forth collaboration threads from losing context between replies; orchestrator and attended modes still never auto-clear.

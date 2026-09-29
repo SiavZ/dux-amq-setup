@@ -1,0 +1,21 @@
+---
+// The "what's new" stamp for the hero, in flow beside the logo and version pill.
+// Pink on purpose: cyan is already carrying the headline accent and the primary
+// button. Renders nothing when WHATS_NEW_BADGE is null, which is how it retires.
+import { WHATS_NEW_BADGE, WHATS_NEW_HREF } from "../lib/version";
+---
+
+{
+  WHATS_NEW_BADGE && (
+    <a
+      href={WHATS_NEW_HREF}
+      class="inline-flex items-center gap-1.5 whitespace-nowrap rounded-full border border-[color:var(--color-pink)]/50 bg-[color:var(--color-pink)]/10 px-2.5 py-1 text-[11px] font-semibold text-[color:var(--color-pink)] backdrop-blur transition-colors hover:border-[color:var(--color-pink)] hover:bg-[color:var(--color-pink)]/20"
+    >
+      <span
+        aria-hidden="true"
+        class="h-1.5 w-1.5 shrink-0 rounded-full bg-[color:var(--color-pink)]"
+      />
+      new · {WHATS_NEW_BADGE}
+    </a>
+  )
+}

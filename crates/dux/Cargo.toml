@@ -1,0 +1,21 @@
+[package]
+name = "dux"
+version.workspace = true
+rust-version.workspace = true
+edition = "2024"
+# Ships only inside the dux binary, never on crates.io. cargo-deny keys its
+# private-crate exemptions (license, path wildcards) on this.
+publish = false
+
+[dependencies]
+dux-tui = { path = "../dux-tui" }
+dux-web = { path = "../dux-web" }
+dux-core.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+# tests/overlay_config.rs parses dux-amq's config snippet and a sed-patched
+# config through dux-core's own types.
+tempfile.workspace = true
+chrono.workspace = true
+toml = { version = "1.1.2", features = ["preserve_order"] }

@@ -1,125 +1,116 @@
 # Schema policy
 
-dux persists user data to two places that have versioned schemas:
+dux persists user data in two places whose shape changes over time:
 
-1. The SQLite database `sessions.sqlite3`, governed by the `MIGRATIONS`
-   slice in `src/storage.rs` and the SQL files under
-   `src/storage/migrations/`.
-2. The TOML file `config.toml`, governed by the `schema_version` field
-   on `Config` and the `migrate_config` ladder in `src/config.rs`.
+1. The SQLite database `sessions.sqlite3`, created and upgraded by
+   `SessionStore::migrate()` in `crates/dux-core/src/storage.rs`.
+2. The TOML file `config.toml`, parsed by `crates/dux-core/src/config.rs`
+   and upgraded by the load-time migrations in
+   `crates/dux-core/src/config_migrate.rs`.
 
-Both follow the same forward-only, append-only contract: old data must
-keep loading on a newer dux build, and migrations are written once and
-never edited.
+Both follow the same contract: data written by any older dux build must keep
+loading on a newer one, with nothing lost, and every upgrade path is backed by
+a test.
 
-## SQLite schema (`PRAGMA user_version`)
+## SQLite schema
+
+### How upgrades work
+
+There are no numbered migration files and no `PRAGMA user_version` ledger.
+`migrate()` runs on every `SessionStore::open` and is idempotent:
+
+- `create table if not exists ...` declares each table in its current shape,
+  so a fresh database is created complete.
+- `ensure_column(conn, table, column, decl)` adds a column only when it is
+  missing, and returns whether it did. An older database therefore gains each
+  new column the first time a newer dux opens it.
+- One-time backfills (for example `title`, `initial_branch`, `sort_order`) run
+  keyed off the `true` that `ensure_column` returns, or are written to be safe
+  to repeat, so a second open never rewrites data.
+
+Because `open` runs at every startup and on background persistence, every step
+must be safe to run any number of times.
 
 ### Adding a column
 
-- Always nullable (or `DEFAULT`-ed). A new column on a populated table
-  must not break inserts written by older dux builds during a staged
-  rollout.
-- Pick a fresh name. **Never reuse a column name** that has been
-  dropped — even if the type matches — because backups taken before
-  the drop may still carry the old data.
+- Add it to the `create table if not exists` statement AND append an
+  `ensure_column` call for it in `migrate()`. The first covers fresh databases,
+  the second covers upgrades.
+- Always nullable or `DEFAULT`-ed. An older dux binary's `INSERT` names none of
+  the new columns and must still satisfy the schema after a downgrade.
+- If the default encodes a safety decision, choose the value that is safe for
+  pre-existing rows whose true state is unknowable (see `branch_provenance`,
+  which defaults to `'created'`).
+- Pick a fresh name. Never reuse the name of a dropped column, because backups
+  taken before the drop may still carry the old data.
 
-### Renaming a column
+### One block per workstream
 
-Don't. Introduce a new column with the new name, copy data over inside
-the migration, deprecate the old column in code, and only drop it after
-one full release where the deprecation log line has fired.
+Several workstreams extend the schema in parallel (shared workspace, resume,
+peer messaging, and others). Each appends its own clearly commented block of
+`ensure_column` calls and backfills at the end of `migrate()`, rather than
+interleaving edits into existing blocks. This keeps merges mechanical and makes
+the provenance of each column obvious. Never reorder or edit another block.
 
-### Dropping a column or table
+### Changes `ensure_column` cannot express
 
-Allowed only after one full release in which:
+`ALTER TABLE ADD COLUMN` cannot add `NOT NULL` without a default, `UNIQUE`, or
+`CHECK` constraints. When a change needs one of those, rebuild the table inside
+a single transaction (create new, copy, drop old, rename, recreate indexes, run
+`foreign_key_check`) and make the rebuild detect whether it already happened so
+it stays idempotent. Rebuilding a table referenced by a foreign key (such as
+`session_prs`) must carry the child rows through the same transaction.
 
-- A deprecation log line fires whenever the field is read or written.
-- The release notes call out the upcoming drop.
+### Renaming or dropping
 
-Then the next release's migration may `DROP COLUMN` / `DROP TABLE`. This
-gives external tooling (backup scripts, dashboards) a window to stop
-depending on the column.
+Don't rename. Introduce a new column, copy data inside `migrate()`, deprecate
+the old one in code, and drop it only after one full release in which a
+deprecation log line fired and the release notes announced the drop.
 
-### Writing a migration
+### Required test
 
-1. Create `src/storage/migrations/000N_description.sql` with the next
-   integer `N`. Do not skip numbers.
-2. Add `(N, include_str!("storage/migrations/000N_description.sql"))`
-   to the `MIGRATIONS` slice in `src/storage.rs`.
-3. The migration runs inside an implicit SQLite transaction. After it
-   succeeds, the runner sets `PRAGMA user_version = N`.
-4. **Never edit a previously-committed migration.** If a bug shipped in
-   migration `N`, write migration `N+1` that corrects the data. Even if
-   the bug means migration `N` aborted on production databases, the fix
-   goes in `N+1`; reusing `N` would skip over databases where it
-   succeeded.
-5. Add an integration test in `tests/storage_migrations.rs` that opens
-   a fresh in-memory DB, runs `MIGRATIONS`, and asserts the resulting
-   schema or data shape.
+Every schema change must be covered in `crates/dux-core/tests/upgrade_database.rs`,
+which opens databases transcribed from real older releases and asserts that:
 
-### Backups
+- the open succeeds;
+- every pre-existing row survives with the same content;
+- new columns arrive at their documented default and backfills ran;
+- a second open changes nothing.
 
-`Storage::backup_to` (added in audit02 P1-W) uses the SQLite Online
-Backup API, which preserves `PRAGMA user_version` byte-for-byte. A
-`.bak` file therefore carries its source schema version automatically
-and re-running the migration loop against a restored backup is safe.
+Unit tests for a single backfill live next to `migrate()` in `storage.rs`.
 
-### `ensure_column` is deprecated
-
-The legacy `ensure_column` helper in `src/storage.rs` is
-`#[deprecated]`. It is retained for one path only: legacy databases
-created before `PRAGMA user_version` was wired up that may be missing
-columns the canonical schema (`0001_initial_schema.sql`) declares. New
-schema additions **must** go through a numbered migration.
-
-## Config TOML (`schema_version`)
+## Config TOML
 
 ### Field-level rules
 
-- New fields ride a `#[serde(default = …)]` so existing configs without
-  the key continue to deserialize cleanly.
-- Renames follow the same flow as SQL columns: introduce the new key,
-  add a migration arm in `migrate_config` that copies and clears the
-  old key, and drop the old key only after one release.
-- Type changes (e.g. `u32` → `Option<u32>`) require a migration arm
-  even when serde would accept the old shape — the migration is the
-  audit trail.
+- New fields use `#[serde(default = ...)]` so configs without the key keep
+  deserializing.
+- Every setting is documented inline in the rendered default config.
+- Renames and removals go through `config_migrate.rs`: add a deprecated-key
+  migration that rewrites the old key to its replacement. The migration is the
+  audit trail, even where serde would accept the old shape.
+- Migrations operate on a `toml_edit::DocumentMut`, so user comments and
+  formatting survive. They are applied in memory at every entrypoint and
+  persisted by the TUI.
 
-### Bumping `CONFIG_SCHEMA_CURRENT`
+### User data wins
 
-When you add an arm to `migrate_config` that fills in new defaults or
-rewrites an old key:
+If a migration cannot interpret a value, it leaves it in place rather than
+discarding it. A user-customized block is never pruned, even for a retired
+provider.
 
-1. Increment `CONFIG_SCHEMA_CURRENT` in `src/config.rs`.
-2. Add a `match` arm for the previous version that does the rewrite
-   and bumps `c.schema_version` to the new value.
-3. The `ensure_config` loader detects the bump and saves the migrated
-   form back to `config.toml`, so the next launch is a no-op.
-4. Add a test in `tests/storage_migrations.rs` that loads an old
-   config and asserts the migrated shape.
+### Required test
 
-### Backwards-compat window
-
-dux reads configs whose `schema_version` is at least one minor release
-behind the current version. Older configs still load, but a warning
-log line points the user at `dux config regenerate` so they can adopt
-the latest canonical shape with their values preserved.
-
-### Configs from the future
-
-If `schema_version` exceeds `CONFIG_SCHEMA_CURRENT` (e.g. the user
-downgraded dux), `migrate_config` returns the value unchanged and the
-loader logs a warning. It does **not** rewrite the file — preserving
-the user's data is more important than the canonical shape on disk.
+Config upgrades are covered in `crates/dux-core/tests/upgrade_config.rs` and the
+unit tests in `config_migrate.rs`: load an old config and assert the migrated
+shape and that no user value was lost.
 
 ## Review checklist
 
-When reviewing a PR that touches either schema:
-
-- [ ] No edits to previously-committed migration files.
-- [ ] Migration number is monotonically increasing.
-- [ ] `MIGRATIONS` slice has the new entry in the right slot.
-- [ ] `CONFIG_SCHEMA_CURRENT` bumped iff `migrate_config` gained an arm.
-- [ ] New test in `tests/storage_migrations.rs` covers the migration.
-- [ ] Renames or drops have a corresponding deprecation log line.
-- [ ] Release notes call out drops at least one release ahead of time.
+- [ ] New column appears in both `create table if not exists` and an
+      `ensure_column` call.
+- [ ] Column is nullable or defaulted, and the default is safe for old rows.
+- [ ] Changes sit in the workstream's own appended block in `migrate()`.
+- [ ] Backfills are idempotent (second open is a no-op).
+- [ ] `upgrade_database.rs` or `upgrade_config.rs` covers the change.
+- [ ] Renames or drops have a deprecation log line and a release-note entry.

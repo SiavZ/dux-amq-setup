@@ -205,7 +205,7 @@ fi
 # Step 2a — under dux, always go to the queue.
 #
 # `DUX_PANE` is set by dux when it spawns the agent's PTY (see
-# `apply_terminal_env` in src/pty.rs). Children of that PTY (the
+# `apply_terminal_env` in crates/dux-core/src/pty.rs). Children of that PTY (the
 # wrapper, then AMQ's owner-bound wake, then the inject-bridge spawned
 # by AMQ) inherit it. When present, we skip tmux entirely and let
 # the dux-side drainer deliver the body — it knows when the agent

@@ -7,9 +7,10 @@
 # dependency; recompute hashes against fresh downloads (see Validation section
 # in docs/plans/audits/audit01/01-supply-chain-hardening.md).
 #
-#   dux        v0.4.0
+#   dux        dux-amq-v0.1.1   (SiavZ/dux-amq-setup, i.e. THIS fork's release;
+#                                 upstream's builds lack peer/AMQ/watch)
 #     tarball: dux-linux-amd64.tar.gz
-#     sha256:  a1c449989e9c4dd53b260d75d29d0d5d6832b3852cf5327f3725b5e7bb881102
+#     sha256:  09a58a4371010e847b5361c4a95bc7887e12dccaf5e24fb62f36ce375f81ff4b
 #
 #   amq        v0.61.0   (commit ad3f9341724822326dcab01f27b09343766246c2)
 #     tarball: amq_0.61.0_linux_amd64.tar.gz
@@ -31,8 +32,9 @@ HERE="${BASH_SOURCE[0]%/*}"
 HERE="$(cd "$HERE" && pwd)"
 
 # Pinned versions + sha256 (overrideable for testing only; CI must use defaults).
-DUX_TAG="${DUX_TAG:-v0.4.0}"
-DUX_SHA256="${DUX_SHA256:-a1c449989e9c4dd53b260d75d29d0d5d6832b3852cf5327f3725b5e7bb881102}"
+DUX_REPO="${DUX_REPO:-SiavZ/dux-amq-setup}"
+DUX_TAG="${DUX_TAG:-dux-amq-v0.1.1}"
+DUX_SHA256="${DUX_SHA256:-09a58a4371010e847b5361c4a95bc7887e12dccaf5e24fb62f36ce375f81ff4b}"
 AMQ_TAG="${AMQ_TAG:-v0.61.0}"
 AMQ_VERSION="${AMQ_VERSION:-0.61.0}"
 AMQ_SHA256="${AMQ_SHA256:-36edf7f1f08ab12e845916ebafd5a3e633d5d055e6ee0b8b437298c99c83038c}"
@@ -221,7 +223,7 @@ if ! command -v dux >/dev/null 2>&1; then
   say "installing dux $DUX_TAG"
   TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
   curl -fsSL -o "$TMP/dux.tar.gz" \
-    "https://github.com/patrickdappollonio/dux/releases/download/${DUX_TAG}/dux-linux-amd64.tar.gz"
+    "https://github.com/${DUX_REPO}/releases/download/${DUX_TAG}/dux-linux-amd64.tar.gz"
   verify_sha256 "$TMP/dux.tar.gz" "$DUX_SHA256" "dux ${DUX_TAG}"
   tar -xzf "$TMP/dux.tar.gz" -C "$TMP"
   install -m 0755 "$TMP/dux" "$LOCAL_BIN/dux"
@@ -419,22 +421,10 @@ if [[ ! -e "$STATE_ROOT/dux/config.toml" && ! -L "$STATE_ROOT/dux/config.toml" ]
   DUX_HOME="$STATE_ROOT/dux" dux config regenerate --yes >/dev/null
 fi
 say "patching $STATE_ROOT/dux/config.toml"
-sed -i --follow-symlinks \
-  -e '1,/^\[/ s|^prompt_for_name = false$|prompt_for_name = true|' \
-  -e '/^\[providers\.claude\]$/,/^\[/ s|^command = "claude"$|command = "claude-amq"|' \
-  -e '/^\[providers\.codex\]$/,/^\[/ s|^command = "codex"$|command = "codex-amq"|' \
-  -e '/^\[providers\.gemini\]$/,/^\[/ s|^command = "gemini"$|command = "gemini-amq"|' \
-  -e '/^\[providers\.jcode\]$/,/^\[/ s|^command = "jcode"$|command = "jcode-amq"|' \
-  -e '/^\[providers\.claude\]$/,/^\[/ s|^resume_args = \["--continue"\]$|resume_args = ["--continue", "--fork-session"]|' \
-  -e '/^\[providers\.claude\]$/,/^\[/ s|^forward_scroll = false$|forward_scroll = true|' \
-  -e '/^\[providers\.claude\]$/,/^\[/ s|^forward_mouse = true$|forward_mouse = false|' \
-  -e '/^\[providers\.codex\]$/,/^\[/ s|^args = \[\]$|args = ["--no-alt-screen"]|' \
-  -e '/^\[providers\.codex\]$/,/^\[/ s|^resume_args = \["resume", "--last"\]$|resume_args = ["--no-alt-screen", "resume", "--last"]|' \
-  -e '/^\[providers\.codex\]$/,/^\[/ s|^resume_by_id_args = \["resume", "{session_id}"\]$|resume_by_id_args = ["--no-alt-screen", "resume", "{session_id}"]|' \
-  -e '/^\[providers\.codex\]$/,/^\[/ s|^forward_scroll = true$|forward_scroll = false|' \
-  -e '/^\[providers\.codex\]$/,/^\[/ s|^forward_mouse = true$|forward_mouse = false|' \
-  -e '/^\[providers\.gemini\]$/,/^\[/ s|^forward_scroll = false$|forward_scroll = true|' \
-  "$STATE_ROOT/dux/config.toml"
+# The rules live in config/dux-config.sed so crates/dux/tests/overlay_config.rs
+# can run the exact same program over a freshly rendered config and prove every
+# rule still matches what the current dux emits.
+sed -i --follow-symlinks -f "$HERE/config/dux-config.sed" "$STATE_ROOT/dux/config.toml"
 
 # 7. shell rc ----------------------------------------------------------------
 # Audit01 P1-7: delete-then-rewrite (the pyenv/sdkman pattern). On every

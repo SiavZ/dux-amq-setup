@@ -1,0 +1,85 @@
+# Isolated dux preview stack. Brought up by ./up.sh, which builds the dux binary
+# on the host and exports DUX_BIN, DUX_PORT, DUX_TUI_PORT and BASE_IMAGE before
+# invoking compose.
+#
+# Every variable here has a default, deliberately: compose interpolates the whole
+# file whatever service or profile you asked for, so a required-variable form on
+# the capture service would make a bare `./up.sh` and even a bare
+# `docker compose down` fail over a screenshot journey neither of them runs. The
+# defaults are the same paths the scripts pass, so running compose by hand does
+# the same thing the scripts do.
+#
+# Isolation: the long-running preview shares only the read-only binary. Its
+# config, sessions, and repos live in Docker volumes. The opt-in capture profile
+# additionally mounts one journey read-only and its output directory. Neither
+# service can reach the host's ~/.config/dux. Every published port is loopback.
+services:
+  dux:
+    build:
+      context: .
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-archlinux:latest}
+    image: dux-preview
+    container_name: dux-preview
+    ports:
+      - "127.0.0.1:${DUX_PORT:-8790}:8790"
+      # The concurrent-TUI journey's port. That journey runs the TUI in this
+      # container with `[server] serve_while_tui` on and its background server
+      # bound here, so the host harness can reach a TUI-hosted serve without
+      # touching the `dux server` one above (the two modes bind the same
+      # addresses, so they cannot share a port). Published now because a port
+      # mapping needs a container restart and a journey script cannot add one;
+      # nothing listens on it until a journey configures that port. Loopback
+      # only, exactly like its sibling, and it moves with DUX_PORT (up.sh
+      # derives it as DUX_PORT + 208) so a second stack collides on neither.
+      - "127.0.0.1:${DUX_TUI_PORT:-8998}:8998"
+    environment:
+      - DUX_PORT=8790
+      # The screenshot tool's two switches, both off for an ordinary preview.
+      # DUX_SCREENS installs the stand-in gh and the transcript provider;
+      # DUX_NO_TAILSCALE=0 drops the flag so the Preferences dialog carries the
+      # general Tailscale copy. reshoot.sh sets both.
+      - DUX_SCREENS=${DUX_SCREENS:-0}
+      - DUX_NO_TAILSCALE=${DUX_NO_TAILSCALE:-1}
+    volumes:
+      # Host-built binary, read-only. Rebuild on the host + `docker compose
+      # restart dux` to pick up new code (a new inode needs a container restart).
+      - ${DUX_BIN:-../../target/release/dux}:/usr/local/bin/dux:ro
+      # Read-only, and inert unless DUX_SCREENS asks the entrypoint to install
+      # them, so mounting them costs a plain preview nothing.
+      - ./screens/fixtures:/fixtures:ro
+      - dux-data:/data
+      - dux-repos:/repos
+    # A PTY-heavy app; the defaults are enough (Docker provides /dev/ptmx), but
+    # give it a tty/stdin so any diagnostic that expects one behaves.
+    tty: true
+    stdin_open: true
+
+  tui-shot:
+    profiles: ["capture"]
+    build:
+      context: .
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-archlinux:latest}
+    image: dux-preview
+    entrypoint: ["node", "/usr/local/bin/tui-driver.js"]
+    working_dir: /
+    environment:
+      - DUX_HOME=/capture/dux
+      - TERM=xterm-256color
+      - COLORTERM=truecolor
+      - LANG=C.UTF-8
+      - TZ=UTC
+    volumes:
+      # tui-shot.sh exports all three; the defaults are its own defaults, so
+      # `docker compose --profile capture run --rm tui-shot` by hand captures
+      # the example journey into ./shots.
+      - ${DUX_BIN:-../../target/release/dux}:/usr/local/bin/dux:ro
+      - ${DUX_TUI_OUTPUT_DIR:-./shots}:/output
+      - ${DUX_TUI_JOURNEY:-./tui-journey.example.js}:/journey.js:ro
+    tmpfs:
+      - /capture
+
+volumes:
+  dux-data:
+  dux-repos:

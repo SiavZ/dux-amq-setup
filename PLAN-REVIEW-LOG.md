@@ -1,4 +1,16 @@
 # Plan Review Log: shared main-workspace mode for dux agents
+
+> **Historical record, pre-workspace paths.** File paths in this document
+> refer to the fork-main single-crate layout, before the `crates/`
+> restructure. Mapping: `src/` -> `crates/dux-core/src/` (engine, config,
+> storage, pty, git, model) or `crates/dux-tui/src/` (`src/app/`, `src/cli.rs`,
+> keys, rendering); `tests/` -> `crates/*/tests/`. Storage no longer uses
+> numbered migrations (`src/storage/migrations/000N_*.sql`, `PRAGMA
+> user_version`): it uses idempotent `ensure_column` calls in
+> `crates/dux-core/src/storage.rs`. See
+> [docs/contributing/schema-policy.md](docs/contributing/schema-policy.md).
+> The body is left as written.
+
 Act 1 (grill) complete — plan locked with the user. MAX_ROUNDS=5.
 
 Grill resolved: motivation (agents' files drift out of sync; usually one agent per codebase), shared-as-default with worktree opt-in, use-whatever-branch-is-checked-out, allow multiple agents to share, per-session AM_ME identity (verified dux-only fix), delete/purge never touch the workspace, leave-existing + opt-in worktree cleanup. Two integration landmines verified in code (AMQ collision check is handle-keyed → OK; Claude Peers ids are per-PID random → OK) and one safety addition surfaced (purge is a second deletion path that must be gated).

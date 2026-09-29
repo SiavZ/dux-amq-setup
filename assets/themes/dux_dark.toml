@@ -58,16 +58,29 @@ ansi_darkgray = "#808080"
 "dux.title_normal"         = "#8c8c8c"
 
 # ── Selection ────────────────────────────────────────────────────────
-"dux.selection_fg"         = "ansi_black"
-"dux.selection_bg"         = "ansi_cyan"
+# Off-canonical RGB on purpose: the exact ANSI values (#000000 / #00ffff) are
+# remapped to the named Color::Black / Color::Cyan (see into_ratatui), which the
+# terminal's own 16-color profile then controls — and bold + named black renders
+# as "bright black" (grey), giving a low-contrast grey-on-teal selection. These
+# literal RGB values render identically on every terminal: near-black text on a
+# bright cyan highlight, matching how the other themes key selection off RGB.
+"dux.selection_fg"         = "#141414"
+"dux.selection_bg"         = "#00e5e5"
 
 # ── Project & session indicators ─────────────────────────────────────
 "dux.project_icon"         = "#6495ed"
 "dux.project_missing_fg"   = "#b4a050"
+# The standalone star and its directory label, on agent and terminal rows
+# alike: an identity tone, not a state color, so a soft slate blue that
+# stays quieter than the state cues.
+"dux.standalone_location_fg" = "#7d96a0"
 "dux.session_active"       = "#d2d2d2"
 "dux.session_detached"     = "ansi_yellow"
 "dux.session_exited"       = "#646464"
 "dux.session_deleting"     = "#646464"
+"dux.session_attention"    = "ansi_cyan"
+"dux.session_typing"       = "#c586e0"
+"dux.session_working"      = "#22c55e"
 
 # ── Status line ──────────────────────────────────────────────────────
 "dux.status_info_fg"       = "#646464"
@@ -86,6 +99,7 @@ ansi_darkgray = "#808080"
 "dux.diff_add_bg"          = "#143214"
 "dux.diff_remove_bg"       = "#3c1414"
 "dux.diff_binary_fg"       = "ansi_yellow"
+"dux.diff_excluded_fg"     = "#8c8c8c"
 "dux.diff_stat_add_fg"     = "ansi_green"
 "dux.diff_stat_remove_fg"  = "ansi_red"
 "dux.diff_line_number_fg"  = "#5a5a6e"
@@ -103,6 +117,9 @@ ansi_darkgray = "#808080"
 
 # ── Overlays / modals ────────────────────────────────────────────────
 "dux.overlay_border"       = "ansi_cyan"
+# Flashed over dux.overlay_border while a modal refuses an outside click
+# because it is holding unsaved work. Must contrast with dux.overlay_border.
+"dux.overlay_border_refused" = "ansi_red"
 "dux.overlay_bg"           = "#141414"
 "dux.overlay_dim_bg"       = "#0a0a0a"
 "dux.overlay_dim_fg"       = "ansi_darkgray"
@@ -115,6 +132,8 @@ ansi_darkgray = "#808080"
 "dux.scroll_indicator_fg"  = "#d2d2d2"
 "dux.scroll_indicator_bg"  = "#373737"
 "dux.warning_fg"           = "ansi_yellow"
+# Emphasis on the part of a row label the agent-list search matched.
+"dux.search_match_fg"      = "ansi_yellow"
 
 # ── Buttons ──────────────────────────────────────────────────────────
 "dux.button_active_fg"     = "ansi_white"
