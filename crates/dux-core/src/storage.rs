@@ -1097,7 +1097,9 @@ impl SessionStore {
             return Ok(());
         }
         let repaired = {
-            let tx = self.conn.unchecked_transaction()
+            let tx = self
+                .conn
+                .unchecked_transaction()
                 .context("failed to start the shared-title repair")?;
             let repaired = tx
                 .execute(
@@ -3213,7 +3215,10 @@ mod tests {
         store.migrate().unwrap();
 
         let loaded = store.load_sessions().unwrap();
-        for (id, handle) in [("secops", "shopingly-secops"), ("engineer", "shopingly-seops-claude")] {
+        for (id, handle) in [
+            ("secops", "shopingly-secops"),
+            ("engineer", "shopingly-seops-claude"),
+        ] {
             let s = loaded.iter().find(|s| s.id == id).expect("shared row");
             assert_eq!(
                 s.title.as_deref(),
@@ -3288,7 +3293,10 @@ mod tests {
         store.migrate().unwrap();
 
         let loaded = store.load_sessions().unwrap();
-        for (id, handle) in [("secops", "shopingly-secops"), ("engineer", "shopingly-seops-claude")] {
+        for (id, handle) in [
+            ("secops", "shopingly-secops"),
+            ("engineer", "shopingly-seops-claude"),
+        ] {
             let s = loaded.iter().find(|s| s.id == id).expect("shared row");
             assert_eq!(
                 s.title.as_deref(),
@@ -3354,7 +3362,10 @@ mod tests {
         // can tell a deliberate rename from remaining damage.
         store
             .conn
-            .execute("update agent_sessions set title = 'main' where id = 'secops'", [])
+            .execute(
+                "update agent_sessions set title = 'main' where id = 'secops'",
+                [],
+            )
             .unwrap();
         // A reopen: migrate() runs again on every open.
         store.migrate().unwrap();
