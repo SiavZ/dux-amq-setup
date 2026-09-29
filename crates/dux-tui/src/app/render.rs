@@ -2352,6 +2352,43 @@ impl App {
         }
     }
 
+    /// Draw the divider rule `ui.sidebar_header_rule` asks for: from the end of
+    /// each project header's text to the right gutter, in the same dim tone
+    /// and with the same gap as the rule after the flat list's "Inactive"
+    /// label. The selected header is skipped, because it takes the full-width
+    /// highlight instead, exactly as the Inactive toggle does.
+    ///
+    /// The header's text row is found by looking at what was drawn rather than
+    /// by counting rows: a comfortable header is its label between spacers, a
+    /// compact one is the label alone, and either may be cut short by the edge
+    /// of the list. The row with text in it is the label in every case, and a
+    /// header whose label is off screen gets no rule.
+    fn paint_group_header_rules(&self, buf: &mut ratatui::buffer::Buffer, list_content: Rect) {
+        if !self.engine.config.ui.sidebar_header_rule {
+            return;
+        }
+        let items = self.left_items();
+        let selected = (self.left_section == LeftSection::Projects).then_some(self.selected_left);
+        let x0 = list_content.x;
+        let x1 = list_content.x + list_content.width;
+        let x_right = x1.saturating_sub(LEFT_PANE_GUTTER);
+        for (rel, &index) in self.mouse_layout.left_row_to_item.iter().enumerate() {
+            if !matches!(items.get(index), Some(LeftItem::Group(_))) || selected == Some(index) {
+                continue;
+            }
+            let y = list_content.y + rel as u16;
+            let Some(text_end) = (x0..x1).rev().find(|&x| buf[(x, y)].symbol() != " ") else {
+                // A spacer row of the header, not its label.
+                continue;
+            };
+            for x in text_end.saturating_add(2)..x_right {
+                buf[(x, y)]
+                    .set_symbol("─")
+                    .set_fg(self.theme.provider_label_fg);
+            }
+        }
+    }
+
     fn render_collapsed_left(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
         self.mouse_layout.left_list = self.themed_block("", focused).inner(area);
         let collapsed_left_items = self.left_items();
@@ -2958,6 +2995,7 @@ impl App {
         // but only while the toggle is not the current selection.
         if !body_will_dim {
             self.paint_inactive_rule(frame.buffer_mut(), geometry.content);
+            self.paint_group_header_rules(frame.buffer_mut(), geometry.content);
         }
 
         body_will_dim
