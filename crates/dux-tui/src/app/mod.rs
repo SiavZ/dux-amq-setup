@@ -4566,7 +4566,15 @@ impl App {
     }
 
     fn draw_run_frame(&mut self, terminal: &mut ratatui::DefaultTerminal) -> bool {
-        if let Err(err) = terminal.draw(|frame| self.render(frame)) {
+        // Queued, not flushed: it leaves in the same write as the frame the
+        // terminal library flushes, so the terminal never gets the hidden
+        // cursor on its own with nothing after it.
+        let _ = redraw::begin_frame(&mut stdout());
+        let drawn = terminal.draw(|frame| self.render(frame));
+        // Whatever the draw did, the terminal is never left holding updates
+        // back.
+        let _ = redraw::end_frame(&mut stdout());
+        if let Err(err) = drawn {
             // The gate consumed the mark for a frame that never landed.
             self.mark_frame_dirty();
             self.report_runtime_error("terminal draw failed", &err);
