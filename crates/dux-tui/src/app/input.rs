@@ -9811,9 +9811,17 @@ impl App {
         // clicks, so dux must never steal a rapid pair of them to fullscreen
         // itself. (The press itself is forwarded by `begin_center_mouse_forward`;
         // a double click on a mouse-mode child is just two forwarded clicks.)
-        if self
-            .selected_terminal_surface_client()
-            .is_some_and(|p| p.has_mouse_mode())
+        //
+        // `forward_mouse = false` is the exception: the user has told dux to
+        // keep a plain left press for itself (the jcode default in dux-amq's
+        // config), so those presses never reached the child as a double click
+        // anyway, and the gesture must behave exactly as for every other
+        // harness. Without this, jcode (which turns mouse tracking on) was the
+        // one agent a double click would not open.
+        if self.selected_surface_forwards_mouse()
+            && self
+                .selected_terminal_surface_client()
+                .is_some_and(|p| p.has_mouse_mode())
         {
             return;
         }
@@ -18393,11 +18401,26 @@ not_a_real_action = ["x"]
 
     /// A double click never steals clicks from a mouse-aware child: with
     /// mouse tracking on, both clicks are forwarded to the child and the
-    /// pane stays minimized.
+    /// pane stays minimized. This holds while the provider forwards mouse
+    /// presses (`forward_mouse = true`); see the next test for `false`.
     #[test]
     fn mouse_double_click_does_not_maximize_a_mouse_mode_child() {
+        mouse_mode_child_double_click(true);
+    }
+
+    /// With `forward_mouse = false` (how dux-amq ships jcode) the presses were
+    /// never the child's, so a double click opens the agent fullscreen exactly
+    /// as it does for every other harness. Regression: jcode turns mouse
+    /// tracking on, and was the one agent a double click would not open.
+    #[test]
+    fn mouse_double_click_maximizes_a_mouse_mode_child_that_does_not_forward_presses() {
+        mouse_mode_child_double_click(false);
+    }
+
+    fn mouse_double_click_mouse_mode_setup(forward_mouse: bool) -> App {
         let mut app = test_app(default_bindings());
         install_mouse_layout(&mut app);
+        pin_forward_mouse(&mut app, forward_mouse);
         app.selected_left = 1;
         app.center_mode = CenterMode::Agent;
         app.focus = FocusPane::Center;
@@ -18432,7 +18455,11 @@ not_a_real_action = ["x"]
             mouse_mode,
             "test setup: the child must have mouse tracking on"
         );
+        app
+    }
 
+    fn mouse_mode_child_double_click(forward_mouse: bool) {
+        let mut app = mouse_double_click_mouse_mode_setup(forward_mouse);
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 30, 5));
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 30, 5));
 
@@ -18441,12 +18468,21 @@ not_a_real_action = ["x"]
             FocusPane::Center,
             "the clicks still focus the pane"
         );
-        assert_eq!(
-            app.fullscreen_overlay,
-            FullscreenOverlay::None,
-            "a mouse-aware child owns its clicks, so a double click must not maximize"
-        );
-        assert_eq!(app.input_target, InputTarget::None);
+        if forward_mouse {
+            assert_eq!(
+                app.fullscreen_overlay,
+                FullscreenOverlay::None,
+                "a mouse-aware child owns its clicks, so a double click must not maximize"
+            );
+            assert_eq!(app.input_target, InputTarget::None);
+        } else {
+            assert_eq!(
+                app.fullscreen_overlay,
+                FullscreenOverlay::Agent,
+                "presses stay with dux, so the double click opens the agent like any other"
+            );
+            assert_eq!(app.input_target, InputTarget::Agent);
+        }
     }
 
     // -- Windowed click forwarding to a mouse-aware child --
