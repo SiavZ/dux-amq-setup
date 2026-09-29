@@ -406,3 +406,41 @@ fn a_brace_on_a_collapsed_header_opens_it_and_steps_in() {
     press(&mut app, '}');
     assert_eq!(selected_id(&app).as_deref(), Some("infra-claude"));
 }
+
+/// The user's real database holds two agents whose project was removed from
+/// the config (Gallery2): the grouped sidebar must still list them, under an
+/// orphan group after the real projects, never drop them silently.
+#[test]
+fn agents_whose_project_is_gone_still_show_under_an_orphan_group() {
+    let mut app = grouped_app();
+    app.engine.sessions.push(shared_agent(
+        "gallery-claude",
+        "gone-project",
+        "claude",
+        SessionStatus::Detached,
+    ));
+    app.engine.sessions.push(shared_agent(
+        "gallery-codex",
+        "gone-project",
+        "codex",
+        SessionStatus::Detached,
+    ));
+    app.rebuild_left_items();
+    let labels = labels(&app);
+    let header = labels
+        .iter()
+        .position(|l| l.starts_with('#') && l.contains("gone-pro"))
+        .expect("an orphan header for the removed project");
+    assert!(
+        header > labels.iter().position(|l| l == "#Jobzy-web").unwrap(),
+        "orphans come after the real projects: {labels:?}"
+    );
+    // Both removed-project agents sit under that header (order follows the
+    // active sort, which is not what this test pins).
+    let mut members = labels[header + 1..header + 3].to_vec();
+    members.sort();
+    assert_eq!(
+        members,
+        vec!["gallery-claude".to_string(), "gallery-codex".to_string()]
+    );
+}
