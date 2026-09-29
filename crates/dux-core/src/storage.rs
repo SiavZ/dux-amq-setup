@@ -28,6 +28,13 @@ pub struct StoredPr {
 /// shown. One key, one meaning; see [`SessionStore::last_seen_version`].
 const LAST_SEEN_VERSION_KEY: &str = "last_seen_version";
 
+/// The `app_state` key marking that the one-time shared-title repair has run
+/// on this database. See [`SessionStore::repair_shared_titles_once`] for why
+/// the repair must never run twice: after it, a user who deliberately renames
+/// a shared agent to exactly the checkout's branch name owns that name, and no
+/// later boot may take it away again.
+const SHARED_TITLE_REPAIR_KEY: &str = "shared_title_repair_done";
+
 const STORE_ID_FILE: &str = "store-id";
 const STORE_ID_LOCK: &str = ".store-id.lock";
 
@@ -388,6 +395,13 @@ impl SessionStore {
         // is the honest spelling: there is no folder, as opposed to an empty
         // one.
         ensure_column(&self.conn, "agent_sessions", "folder_path", "text")?;
+        // The shared-workspace identity columns must exist BEFORE the title
+        // freeze below: the freeze now gates on `shared_workspace`, so an
+        // upstream-shaped database (no identity columns yet) would otherwise
+        // hit a missing column inside the freeze. The helper is idempotent and
+        // only ALTERs this table, so the later call near the slot passes is a
+        // no-op on every shape but keeps its own invariants documented there.
+        self.ensure_shared_workspace_identity_columns()?;
         // Only the backfill UPDATEs run in a transaction so a crash mid-backfill
         // rolls them back and the step is retried cleanly on the next boot (the
         // idempotent/ungated portion below self-heals a partially-applied run).
@@ -437,9 +451,21 @@ impl SessionStore {
                 // title would leave the row with no label at all. A standalone
                 // agent always has a title anyway (creation enforces one), so
                 // this arm has nothing to do for one.
+                //
+                // Also gated on `shared_workspace = 0` (fork): a shared-workspace
+                // agent runs in the project checkout, so EVERY agent in that repo
+                // carries the same `branch_name` (the checkout's branch). Freezing
+                // it into `title` would give every harness sharing one repo the
+                // same name and erase the distinct identity each one already has
+                // in `agent_handle` (the name AMQ inboxes are named after). Their
+                // `title` stays NULL for the one-time repair below, which freezes
+                // the handle in instead — exactly like an auto-named isolated
+                // agent keeping `title` NULL, except the value it would track is
+                // shared by every sibling, so a distinct one is materialized.
                 Some(tx.execute(
                     "update agent_sessions set title = branch_name \
-                     where workspace_kind = 'managed' and title is null",
+                     where workspace_kind = 'managed' and shared_workspace = 0 \
+                       and title is null",
                     [],
                 )?)
             } else {
@@ -646,6 +672,13 @@ impl SessionStore {
             );
             "#,
         )?;
+        // REPAIR for the damaged databases: an earlier build's freeze wrote the
+        // shared checkout's branch into every shared agent's title, so every
+        // harness in one repo answered to the same name and became
+        // indistinguishable in the sidebar. It must run AFTER `app_state`
+        // exists, because the marker that makes it one-time lives there (see
+        // [`SessionStore::repair_shared_titles_once`]).
+        self.repair_shared_titles_once()?;
         // Per-session settings blob (context mode, YOLO, AMQ verify override,
         // watch-rule overrides, auto-clear, system prompt) as JSON.
         // `{}`, NULL and malformed values all read as
@@ -1033,6 +1066,69 @@ impl SessionStore {
     /// Record `version` as seen, so its what's-new screen does not reappear.
     pub fn set_last_seen_version(&self, version: &str) -> Result<()> {
         self.set_app_state(LAST_SEEN_VERSION_KEY, version)
+    }
+
+    /// One-time repair, called from [`Self::migrate`] once `app_state` exists:
+    /// restore the titles of shared-workspace agents an earlier build's title
+    /// freeze damaged.
+    ///
+    /// The damage signature is exact: `title = branch_name` on a
+    /// `shared_workspace = 1` row. A shared agent runs in the project
+    /// checkout, so every harness in one repo carries the SAME branch, and the
+    /// freeze gave every sibling the same frozen name ("main") — the reported
+    /// "the update forces only one agent per repo". A still-NULL title on a
+    /// shared row is the same wound one step earlier: the display would fall
+    /// back to that same shared branch name, so it is repaired too. The honest
+    /// replacement in both cases is the row's own unique `agent_handle`: AMQ
+    /// inboxes on disk are named after it and it can never collide between
+    /// siblings. An isolated agent whose frozen title legitimately equals its
+    /// own DISTINCT branch is untouched (`shared_workspace = 1` keeps the
+    /// freeze's intended result for them).
+    ///
+    /// ONE-TIME by marker, not by self-limitation: `title = branch_name` is
+    /// also a name a user may deliberately type later, and a repair that
+    /// re-ran on every open would strip that rename on every boot (the NULL
+    /// arm is safe to re-run in principle — a rename always writes a title —
+    /// but one gate covers both arms). The UPDATE and the marker commit in ONE
+    /// transaction, so a crash between them can never re-run the repair
+    /// against rows a later user rename made look damaged.
+    fn repair_shared_titles_once(&self) -> Result<()> {
+        if self.app_state(SHARED_TITLE_REPAIR_KEY)?.is_some() {
+            return Ok(());
+        }
+        let repaired = {
+            let tx = self.conn.unchecked_transaction()
+                .context("failed to start the shared-title repair")?;
+            let repaired = tx
+                .execute(
+                    "update agent_sessions set title = agent_handle \
+                     where deleted_at is null \
+                       and workspace_kind = 'managed' \
+                       and shared_workspace = 1 \
+                       and (title = branch_name or title is null) \
+                       and branch_name <> '' \
+                       and agent_handle <> ''",
+                    [],
+                )
+                .context("failed to repair shared-workspace titles")?;
+            tx.execute(
+                "insert into app_state(key, value) values(?1, '1')",
+                params![SHARED_TITLE_REPAIR_KEY],
+            )
+            .context("failed to record the shared-title repair")?;
+            tx.commit()
+                .context("failed to commit the shared-title repair")?;
+            repaired
+        };
+        if repaired > 0 {
+            crate::logger::info(&format!(
+                "one-time migration: restored the titles of {} from their agent \
+                 handles (a shared-workspace agent is named after its handle, not \
+                 the checkout's branch)",
+                count_of(repaired, "shared-workspace agent")
+            ));
+        }
+        Ok(())
     }
 
     /// Insert a new extra tab row.
@@ -3053,6 +3149,222 @@ mod tests {
             "a frozen empty branch name would leave the row with no label at all"
         );
         assert!(!session.display_label().is_empty());
+    }
+
+    /// The fork's multi-harness setup, in the pre-upgrade shape the user
+    /// actually had: several shared-workspace agents in ONE project checkout,
+    /// all on the checkout's branch ('main'), each with a distinct
+    /// `agent_handle` and a NULL title. Upgrading must end with each sibling
+    /// named after its own handle — never the shared branch name, which every
+    /// sibling carries and which made them indistinguishable (the reported
+    /// "the update forces only one agent per repo"). An isolated agent still
+    /// freezes its own DISTINCT branch, exactly as before.
+    #[test]
+    fn upgrading_names_each_shared_harness_after_its_own_handle() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Fork shape: the identity columns exist, `initial_branch` does not, so
+        // the one-time freeze really fires during this migrate().
+        conn.execute_batch(
+            r#"
+            create table agent_sessions (
+                id text primary key,
+                project_id text not null,
+                provider text not null,
+                source_branch text not null,
+                branch_name text not null,
+                worktree_path text not null,
+                title text,
+                project_path text,
+                status text not null,
+                created_at text not null,
+                updated_at text not null,
+                workspace_kind text not null default 'managed',
+                folder_path text,
+                agent_handle text not null default '',
+                shared_workspace integer not null default 0
+            );
+            "#,
+        )
+        .unwrap();
+        for (id, provider, handle) in [
+            ("secops", "codex", "shopingly-secops"),
+            ("engineer", "claude", "shopingly-seops-claude"),
+        ] {
+            conn.execute(
+                "insert into agent_sessions (id, project_id, provider, source_branch, \
+                 branch_name, worktree_path, title, project_path, status, created_at, \
+                 updated_at, workspace_kind, folder_path, agent_handle, shared_workspace) \
+                 values (?1, 'p1', ?2, 'main', 'main', '/tmp/shopingly', null, null, 'detached', \
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'managed', null, ?3, 1)",
+                params![id, provider, handle],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "insert into agent_sessions (id, project_id, provider, source_branch, \
+             branch_name, worktree_path, title, project_path, status, created_at, \
+             updated_at, workspace_kind, folder_path, agent_handle, shared_workspace) \
+             values ('iso', 'p1', 'claude', 'feat-x', 'feat-x', '/tmp/wt-iso', null, null, \
+             'detached', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'managed', null, 'iso-1', 0)",
+            [],
+        )
+        .unwrap();
+        let store = SessionStore { conn };
+        store.migrate().unwrap();
+
+        let loaded = store.load_sessions().unwrap();
+        for (id, handle) in [("secops", "shopingly-secops"), ("engineer", "shopingly-seops-claude")] {
+            let s = loaded.iter().find(|s| s.id == id).expect("shared row");
+            assert_eq!(
+                s.title.as_deref(),
+                Some(handle),
+                "a shared harness is named after its own handle, never the shared branch"
+            );
+        }
+        let iso = loaded.iter().find(|s| s.id == "iso").expect("isolated row");
+        assert_eq!(iso.title.as_deref(), Some("feat-x"));
+    }
+
+    /// The repair for databases the earlier freeze already damaged: a shared
+    /// agent whose title was frozen to the shared branch ('main') gets its
+    /// durable name restored from its unique `agent_handle`. An isolated agent
+    /// whose frozen title legitimately equals its own DISTINCT branch is
+    /// untouched.
+    #[test]
+    fn migrate_repairs_a_shared_title_the_earlier_freeze_froze_to_the_branch() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Post-upgrade shape: `initial_branch` already exists, so the one-time
+        // freeze does not fire; only the repair can act.
+        conn.execute_batch(
+            r#"
+            create table agent_sessions (
+                id text primary key,
+                project_id text not null,
+                provider text not null,
+                source_branch text not null,
+                branch_name text not null,
+                initial_branch text not null default '',
+                worktree_path text not null,
+                title text,
+                project_path text,
+                status text not null,
+                created_at text not null,
+                updated_at text not null,
+                workspace_kind text not null default 'managed',
+                folder_path text,
+                agent_handle text not null default '',
+                shared_workspace integer not null default 0
+            );
+            "#,
+        )
+        .unwrap();
+        // The damaged state the user's database is in: every shared sibling
+        // froze the checkout's branch into its title.
+        for (id, provider, handle) in [
+            ("secops", "codex", "shopingly-secops"),
+            ("engineer", "claude", "shopingly-seops-claude"),
+        ] {
+            conn.execute(
+                "insert into agent_sessions (id, project_id, provider, source_branch, \
+                 branch_name, initial_branch, worktree_path, title, project_path, status, \
+                 created_at, updated_at, workspace_kind, folder_path, agent_handle, shared_workspace) \
+                 values (?1, 'p1', ?2, 'main', 'main', 'main', '/tmp/shopingly', 'main', null, \
+                 'detached', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'managed', null, ?3, 1)",
+                params![id, provider, handle],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "insert into agent_sessions (id, project_id, provider, source_branch, \
+             branch_name, initial_branch, worktree_path, title, project_path, status, \
+             created_at, updated_at, workspace_kind, folder_path, agent_handle, shared_workspace) \
+             values ('iso', 'p1', 'claude', 'feat-x', 'feat-x', 'feat-x', '/tmp/wt-iso', 'feat-x', \
+             null, 'detached', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'managed', null, \
+             'iso-1', 0)",
+            [],
+        )
+        .unwrap();
+        let store = SessionStore { conn };
+        store.migrate().unwrap();
+
+        let loaded = store.load_sessions().unwrap();
+        for (id, handle) in [("secops", "shopingly-secops"), ("engineer", "shopingly-seops-claude")] {
+            let s = loaded.iter().find(|s| s.id == id).expect("shared row");
+            assert_eq!(
+                s.title.as_deref(),
+                Some(handle),
+                "the repair restores the handle name the earlier freeze overwrote"
+            );
+        }
+        let iso = loaded.iter().find(|s| s.id == "iso").expect("isolated row");
+        assert_eq!(
+            iso.title.as_deref(),
+            Some("feat-x"),
+            "an isolated agent's legitimately frozen title is not stripped"
+        );
+    }
+
+    /// The repair is ONE-TIME by marker: after it has run, a shared agent the
+    /// user deliberately renames to exactly the checkout's branch name owns
+    /// that name, and no later boot takes it away again. This is the rename
+    /// case the ungated form of the repair got wrong on every reopen.
+    #[test]
+    fn a_shared_agent_renamed_to_the_branch_name_after_the_repair_owns_that_name() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            create table agent_sessions (
+                id text primary key,
+                project_id text not null,
+                provider text not null,
+                source_branch text not null,
+                branch_name text not null,
+                initial_branch text not null default '',
+                worktree_path text not null,
+                title text,
+                project_path text,
+                status text not null,
+                created_at text not null,
+                updated_at text not null,
+                workspace_kind text not null default 'managed',
+                folder_path text,
+                agent_handle text not null default '',
+                shared_workspace integer not null default 0
+            );
+            "#,
+        )
+        .unwrap();
+        conn.execute(
+            "insert into agent_sessions (id, project_id, provider, source_branch, \
+             branch_name, initial_branch, worktree_path, title, project_path, status, \
+             created_at, updated_at, workspace_kind, folder_path, agent_handle, shared_workspace) \
+             values ('secops', 'p1', 'codex', 'main', 'main', 'main', '/tmp/shopingly', 'main', \
+             null, 'detached', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'managed', null, \
+             'shopingly-secops', 1)",
+            [],
+        )
+        .unwrap();
+        let store = SessionStore { conn };
+        store.migrate().unwrap();
+        let loaded = store.load_sessions().unwrap();
+        let s = loaded.iter().find(|s| s.id == "secops").expect("row");
+        assert_eq!(s.title.as_deref(), Some("shopingly-secops"));
+        // The user renames the agent to exactly the checkout's branch name —
+        // the same value the damaged rows carried, so only the one-time marker
+        // can tell a deliberate rename from remaining damage.
+        store
+            .conn
+            .execute("update agent_sessions set title = 'main' where id = 'secops'", [])
+            .unwrap();
+        // A reopen: migrate() runs again on every open.
+        store.migrate().unwrap();
+        let loaded = store.load_sessions().unwrap();
+        let s = loaded.iter().find(|s| s.id == "secops").expect("row");
+        assert_eq!(
+            s.title.as_deref(),
+            Some("main"),
+            "a deliberate rename to the branch name survives a reopen"
+        );
     }
 
     /// A standalone row stores empty text under `project_id` (the column is NOT
