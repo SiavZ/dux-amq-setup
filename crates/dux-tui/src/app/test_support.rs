@@ -250,6 +250,7 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
         engine,
         bindings,
         selected_left: 0,
+        left_scroll_offset: 0,
         left_section: crate::app::LeftSection::Projects,
         selected_terminal_index: 0,
         right_section: RightSection::Unstaged,

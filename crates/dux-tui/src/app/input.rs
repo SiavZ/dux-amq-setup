@@ -9889,6 +9889,48 @@ impl App {
     }
 
     fn handle_left_mouse_wheel(&mut self, down: bool, column: u16, row: u16) {
+        let item_count = self.left_items().len();
+        // Distinct items the last frame showed (rows are 1 line compact, 3
+        // comfortable, so count items, not rows).
+        let visible = {
+            let mut shown = self.mouse_layout.left_row_to_item.clone();
+            shown.dedup();
+            shown.len()
+        };
+        // The list overflows its pane: the wheel scrolls the VIEW, three items
+        // a notch (fork aaa59319), and the selection is only nudged back
+        // inside what is now on screen. Moving the selection one row a notch
+        // instead crawled, and left the view stuck until the cursor reached
+        // an edge.
+        if item_count > 0 && visible > 0 && item_count > visible {
+            self.focus = FocusPane::Left;
+            self.left_section = LeftSection::Projects;
+            self.left_scroll_offset = if down {
+                self.left_scroll_offset + MOUSE_WHEEL_LINES
+            } else {
+                self.left_scroll_offset.saturating_sub(MOUSE_WHEEL_LINES)
+            }
+            .min(item_count - 1);
+            // Rows from the new offset that the next frame will show, using
+            // the item heights the last frame measured.
+            let first = self.left_scroll_offset;
+            let last_visible = (first + visible).saturating_sub(1).min(item_count - 1);
+            let target = self.selected_left.clamp(first, last_visible);
+            let target = if self.is_selectable_left_item(target) {
+                Some(target)
+            } else if down {
+                self.next_selectable_left_item_after(target)
+            } else {
+                self.previous_selectable_left_item_before(target)
+            };
+            if let Some(target) = target
+                && target != self.selected_left
+            {
+                self.set_left_selection(target);
+            }
+            return;
+        }
+
         let target_index = match self.mouse_target(column, row) {
             Some(MouseTarget::LeftRow(index)) => index,
             _ => self.selected_left,

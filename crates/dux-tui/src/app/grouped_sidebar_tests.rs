@@ -699,3 +699,115 @@ fn the_config_documents_sidebar_density() {
     assert!(rendered.contains("#                   ├ ◐ backend (codex)"));
     assert!(rendered.contains("# two-line rows. Unknown values fall back to \"compact\"."));
 }
+
+/// Many real-shaped projects: enough rows that the list overflows its pane.
+fn long_grouped_app() -> App {
+    let mut app = test_app(default_bindings());
+    let mut projects = Vec::new();
+    let mut sessions = Vec::new();
+    for p in 0..20 {
+        let id = format!("p{p:02}");
+        projects.push(project(&id, &format!("Project-{p:02}")));
+        for (h, provider) in ["claude", "codex"].iter().enumerate() {
+            sessions.push(shared_agent(
+                &format!("{id}-a{h}"),
+                &id,
+                provider,
+                SessionStatus::Active,
+            ));
+        }
+    }
+    app.engine.projects = projects;
+    app.engine.sessions = sessions;
+    app.engine.config.ui.sidebar_style = "grouped".to_string();
+    app.engine.config.ui.sidebar_density = "compact".to_string();
+    app.rebuild_left_items();
+    app
+}
+
+fn first_visible(app: &App) -> usize {
+    app.mouse_layout
+        .left_row_to_item
+        .first()
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Moving back up after scrolling down must not jump: the view only moves
+/// once the selection reaches its top edge, one item at a time.
+#[test]
+fn moving_back_up_scrolls_one_row_at_a_time_without_jumping() {
+    let mut app = long_grouped_app();
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).expect("terminal");
+    terminal.draw(|f| app.render(f)).unwrap();
+    for _ in 0..40 {
+        press(&mut app, 'j');
+        terminal.draw(|f| app.render(f)).unwrap();
+    }
+    let top_after_down = first_visible(&app);
+    assert!(top_after_down > 0, "the list scrolled down");
+    // One step up keeps the same view: the selection just moves inside it.
+    press(&mut app, 'k');
+    terminal.draw(|f| app.render(f)).unwrap();
+    assert_eq!(
+        first_visible(&app),
+        top_after_down,
+        "no jump on the first k"
+    );
+    // Walk up until the selection reaches the top edge; from then on the
+    // view follows by exactly one item per step.
+    while app.selected_left > first_visible(&app) {
+        press(&mut app, 'k');
+        terminal.draw(|f| app.render(f)).unwrap();
+    }
+    let top = first_visible(&app);
+    press(&mut app, 'k');
+    terminal.draw(|f| app.render(f)).unwrap();
+    assert_eq!(first_visible(&app), top - 1, "the view follows by one row");
+    assert_eq!(app.selected_left, top - 1);
+}
+
+/// The wheel scrolls the view itself, down and back up, and the selection
+/// always stays on screen.
+#[test]
+fn the_wheel_scrolls_the_view_both_ways() {
+    use crossterm::event::{MouseEvent, MouseEventKind};
+    let mut app = long_grouped_app();
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).expect("terminal");
+    terminal.draw(|f| app.render(f)).unwrap();
+    let list = app.mouse_layout.left_list;
+    let wheel = |app: &mut App, kind| {
+        app.handle_mouse(MouseEvent {
+            kind,
+            column: list.x + 2,
+            row: list.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+    };
+    for _ in 0..5 {
+        wheel(&mut app, MouseEventKind::ScrollDown);
+        terminal.draw(|f| app.render(f)).unwrap();
+    }
+    let down_top = first_visible(&app);
+    assert!(
+        down_top >= 12,
+        "five notches moved the view: top {down_top}"
+    );
+    assert!(
+        app.mouse_layout
+            .left_row_to_item
+            .contains(&app.selected_left)
+    );
+    for _ in 0..5 {
+        wheel(&mut app, MouseEventKind::ScrollUp);
+        terminal.draw(|f| app.render(f)).unwrap();
+    }
+    assert_eq!(first_visible(&app), 0, "back at the top");
+    assert!(
+        app.mouse_layout
+            .left_row_to_item
+            .contains(&app.selected_left)
+    );
+}

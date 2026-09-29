@@ -244,6 +244,11 @@ pub struct App {
     pub(crate) engine: Engine,
     pub(crate) bindings: RuntimeBindings,
     pub(crate) selected_left: usize,
+    /// First visible item of the agent list, kept across frames. Without it
+    /// the list is rebuilt from the top on every draw and only scrolls far
+    /// enough to show the selection, so scrolling back up jumps, and the
+    /// wheel cannot move the view on its own (fork `left_scroll_offset`).
+    pub(crate) left_scroll_offset: usize,
     pub(crate) left_section: LeftSection,
     pub(crate) selected_terminal_index: usize,
     pub(crate) right_section: RightSection,
@@ -4209,6 +4214,7 @@ impl App {
             bindings,
             engine,
             selected_left: 0,
+            left_scroll_offset: 0,
             left_section: LeftSection::Projects,
             selected_terminal_index: 0,
             right_section: RightSection::Unstaged,

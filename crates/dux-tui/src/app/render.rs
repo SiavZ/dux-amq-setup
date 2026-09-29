@@ -359,6 +359,48 @@ pub(crate) fn left_row_to_item(offset: usize, heights: &[u16], area_height: u16)
     map
 }
 
+/// The first visible item of a list of `heights` in `area_height` rows,
+/// starting from the `offset` kept since the last frame. The view only moves
+/// when it must: up to reveal a `selected` item above it, down (by the fewest
+/// items) to reveal one below it, and back up when the tail would leave empty
+/// rows at the bottom. Otherwise the offset is kept, which is what lets the
+/// wheel scroll the view and keeps a move back up from jumping.
+pub(crate) fn clamp_list_offset(
+    offset: usize,
+    selected: Option<usize>,
+    heights: &[u16],
+    area_height: u16,
+) -> usize {
+    if heights.is_empty() {
+        return 0;
+    }
+    let area = usize::from(area_height).max(1);
+    let h = |i: usize| usize::from(heights[i].max(1));
+    // The largest offset whose items still fill the area to the bottom.
+    let mut max_offset = heights.len() - 1;
+    let mut used = h(max_offset);
+    while max_offset > 0 && used + h(max_offset - 1) <= area {
+        max_offset -= 1;
+        used += h(max_offset);
+    }
+    let mut offset = offset.min(max_offset);
+    if let Some(sel) = selected.filter(|&s| s < heights.len()) {
+        if sel < offset {
+            offset = sel;
+        } else {
+            // Advance until the selected item's last row is inside the area.
+            loop {
+                let rows: usize = (offset..=sel).map(h).sum();
+                if rows <= area || offset == sel {
+                    break;
+                }
+                offset += 1;
+            }
+        }
+    }
+    offset
+}
+
 /// Split `label` into up to three spans around a matched CHAR range
 /// (`dux_core::agent_search::match_char_range` semantics: start inclusive, end
 /// exclusive, char indices): the text before the hit in `base`, the hit in
@@ -2860,12 +2902,21 @@ impl App {
             )
             .render(search_area, frame.buffer_mut());
         }
-        let mut state =
-            ListState::default().with_selected(if self.left_section == LeftSection::Projects {
-                Some(self.selected_left)
-            } else {
-                None
-            });
+        // Start from the scroll position kept across frames, pulled just far
+        // enough to keep the selection on screen. `ListState` would otherwise
+        // start at 0 every draw and only scroll until the selection is the
+        // LAST visible row, so moving back up jumped and the wheel never
+        // moved the view.
+        let selected = (self.left_section == LeftSection::Projects).then_some(self.selected_left);
+        self.left_scroll_offset = clamp_list_offset(
+            self.left_scroll_offset,
+            selected,
+            &item_heights,
+            geometry.content.height,
+        );
+        let mut state = ListState::default()
+            .with_selected(selected)
+            .with_offset(self.left_scroll_offset);
         // No widget highlight: the selection is painted by hand below (an accent
         // bar plus a faint tint) so it keeps each row's text colors and leaves the
         // Inactive separator row untouched, neither of which a whole-cell List
