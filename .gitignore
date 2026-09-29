@@ -1,4 +1,7 @@
 /target
+# Side build directories (CARGO_TARGET_DIR pointed at e.g. target-pr, used to
+# review a branch without disturbing the main build cache).
+/target-*/
 /dist
 
 # Node caches. The web app's real node_modules lives under crates/dux-web/web
@@ -19,6 +22,17 @@ dist.orig/
 flamegraph.svg
 perf.data
 perf.data.old
+
+# Debug output: logs, crash dumps, and coverage/profiling data from local runs.
+*.log
+# Recorded measurement logs are kept on purpose, next to their write-ups.
+!tools/preview-env/measurements/*.log
+*.profraw
+*.profdata
+dux-crash.log
+core
+core.*
+.DS_Store
 
 # Local-only branch catch-up notes (not for version control)
 docs/server-mode-summary.md

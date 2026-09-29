@@ -62,11 +62,13 @@ fn run_peer(args: impl Iterator<Item = String>) -> Result<()> {
 /// the TUI. Failing a reload must cost a status line, not the agents.
 fn exec_reload(
     engine: Box<dux_core::engine::Engine>,
-    handoff: dux_core::reload_handoff::Handoff,
+    mut handoff: dux_core::reload_handoff::Handoff,
 ) -> std::result::Result<std::convert::Infallible, (Box<dux_core::engine::Engine>, String)> {
     let handoff_path =
         dux_core::reload_handoff::Handoff::path_for(&engine.paths.root, std::process::id());
-    let give_back = |engine, reason: String| {
+    // Takes the handoff by reference so the calls below can borrow it mutably
+    // for the write and immutably for the undo without fighting the closure.
+    let give_back = |engine, handoff: &dux_core::reload_handoff::Handoff, reason: String| {
         handoff.abandon();
         Err((engine, reason))
     };
@@ -74,6 +76,7 @@ fn exec_reload(
     if let Err(err) = handoff.write(&handoff_path) {
         return give_back(
             engine,
+            &handoff,
             format!("Reload failed: could not write the handoff ({err:#}). Nothing was changed."),
         );
     }
@@ -81,6 +84,7 @@ fn exec_reload(
         let _ = std::fs::remove_file(&handoff_path);
         return give_back(
             engine,
+            &handoff,
             "Reload failed: dux could not find its own binary. Nothing was changed.".to_string(),
         );
     };
@@ -100,6 +104,7 @@ fn exec_reload(
     let _ = std::fs::remove_file(&handoff_path);
     give_back(
         engine,
+        &handoff,
         format!(
             "Reload failed: could not start {} ({err}). Your agents are untouched.",
             exe.display()
@@ -118,11 +123,14 @@ fn run_tui_with_flip() -> Result<()> {
         match next {
             dux_tui::TuiExit::Done => break,
             dux_tui::TuiExit::Reload { engine, handoff } => {
+                // Kept aside so a failed exec reopens on the same agent.
+                let selected = handoff.selected_session.clone();
                 let Err((engine, reason)) = exec_reload(engine, handoff);
                 next = dux_tui::resume_after_failed_reload(
                     engine,
                     Box::new(companion::WebCompanion::new()),
                     reason,
+                    selected,
                 )?;
             }
             dux_tui::TuiExit::FlipToServer {

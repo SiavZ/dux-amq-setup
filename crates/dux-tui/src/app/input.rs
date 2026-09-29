@@ -1209,6 +1209,66 @@ impl App {
         self.update_missing_project_warning();
     }
 
+    /// Move the selection to the next (or previous) agent that shares the
+    /// selected agent's project, in the order the sidebar shows them, wrapping
+    /// at the ends. On a grouped project header it steps into that project.
+    /// Works in both sidebar styles; rows a filter or a collapsed Inactive tail
+    /// hides are skipped, because the cursor can only land on a visible row.
+    pub(crate) fn select_sibling_agent(&mut self, forward: bool) {
+        let project_key = match self.left_items().get(self.selected_left) {
+            Some(LeftItem::Session(i)) => self
+                .engine
+                .sessions
+                .get(*i)
+                .map(|s| s.project_id().map(str::to_string)),
+            Some(LeftItem::Group(g)) => self
+                .left_group(*g)
+                .map(|group| (group.key != STANDALONE_GROUP_KEY).then(|| group.key.clone())),
+            _ => None,
+        };
+        let Some(project_key) = project_key else {
+            self.set_info("Select an agent to cycle through its project's agents.");
+            return;
+        };
+        // A collapsed project hides its agents; open it so there is somewhere
+        // to go, the way the fork's tree did.
+        if let Some((_, group)) = self.left_group_of_item(self.selected_left)
+            && group.collapsed
+        {
+            let key = group.key.clone();
+            self.collapsed_groups.remove(&key);
+            self.rebuild_left_items();
+        }
+        let siblings: Vec<usize> = self
+            .left_items()
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, item)| match item {
+                LeftItem::Session(i) => self
+                    .engine
+                    .sessions
+                    .get(*i)
+                    .filter(|s| s.project_id().map(str::to_string) == project_key)
+                    .map(|_| pos),
+                _ => None,
+            })
+            .collect();
+        if siblings.is_empty() {
+            return;
+        }
+        let current = siblings.iter().position(|pos| *pos == self.selected_left);
+        let next = match (current, forward) {
+            (Some(i), true) => siblings[(i + 1) % siblings.len()],
+            (Some(i), false) => siblings[(i + siblings.len() - 1) % siblings.len()],
+            // From a header: forward lands on its first agent, back on its last.
+            (None, true) => siblings[0],
+            (None, false) => siblings[siblings.len() - 1],
+        };
+        if next != self.selected_left {
+            self.select_left_agent_item(next);
+        }
+    }
+
     /// Move the Left pane's cursor one row DOWN, across the whole sidebar: the
     /// agent rows, then the terminal rows below them, then back to the top.
     ///
@@ -1313,6 +1373,9 @@ impl App {
                 Action::ChooseWorktreeEditor => self.open_worktree_editor_picker()?,
                 Action::MoveAgentDown => self.move_selected_agent(super::reorder::MoveDir::Down),
                 Action::MoveAgentUp => self.move_selected_agent(super::reorder::MoveDir::Up),
+                Action::NewTerminal => self.new_companion_terminal()?,
+                Action::NextSiblingAgent => self.select_sibling_agent(true),
+                Action::PrevSiblingAgent => self.select_sibling_agent(false),
                 Action::ToggleProject => self.toggle_collapse_selected_project(),
                 Action::InteractAgent => {
                     if self.selected_session().is_some()
@@ -9657,6 +9720,8 @@ impl App {
             }
             // Enter/activate on the Inactive tail toggles it open/closed.
             Some(LeftItem::InactiveToggle) => self.toggle_collapse_selected_project(),
+            // Enter/activate (and a double click) on a project header folds it.
+            Some(LeftItem::Group(_)) => self.toggle_collapse_selected_project(),
             None => {}
         }
         Ok(())
@@ -9746,9 +9811,17 @@ impl App {
         // clicks, so dux must never steal a rapid pair of them to fullscreen
         // itself. (The press itself is forwarded by `begin_center_mouse_forward`;
         // a double click on a mouse-mode child is just two forwarded clicks.)
-        if self
-            .selected_terminal_surface_client()
-            .is_some_and(|p| p.has_mouse_mode())
+        //
+        // `forward_mouse = false` is the exception: the user has told dux to
+        // keep a plain left press for itself (the jcode default in dux-amq's
+        // config), so those presses never reached the child as a double click
+        // anyway, and the gesture must behave exactly as for every other
+        // harness. Without this, jcode (which turns mouse tracking on) was the
+        // one agent a double click would not open.
+        if self.selected_surface_forwards_mouse()
+            && self
+                .selected_terminal_surface_client()
+                .is_some_and(|p| p.has_mouse_mode())
         {
             return;
         }
@@ -9824,6 +9897,48 @@ impl App {
     }
 
     fn handle_left_mouse_wheel(&mut self, down: bool, column: u16, row: u16) {
+        let item_count = self.left_items().len();
+        // Distinct items the last frame showed (rows are 1 line compact, 3
+        // comfortable, so count items, not rows).
+        let visible = {
+            let mut shown = self.mouse_layout.left_row_to_item.clone();
+            shown.dedup();
+            shown.len()
+        };
+        // The list overflows its pane: the wheel scrolls the VIEW, three items
+        // a notch (fork aaa59319), and the selection is only nudged back
+        // inside what is now on screen. Moving the selection one row a notch
+        // instead crawled, and left the view stuck until the cursor reached
+        // an edge.
+        if item_count > 0 && visible > 0 && item_count > visible {
+            self.focus = FocusPane::Left;
+            self.left_section = LeftSection::Projects;
+            self.left_scroll_offset = if down {
+                self.left_scroll_offset + MOUSE_WHEEL_LINES
+            } else {
+                self.left_scroll_offset.saturating_sub(MOUSE_WHEEL_LINES)
+            }
+            .min(item_count - 1);
+            // Rows from the new offset that the next frame will show, using
+            // the item heights the last frame measured.
+            let first = self.left_scroll_offset;
+            let last_visible = (first + visible).saturating_sub(1).min(item_count - 1);
+            let target = self.selected_left.clamp(first, last_visible);
+            let target = if self.is_selectable_left_item(target) {
+                Some(target)
+            } else if down {
+                self.next_selectable_left_item_after(target)
+            } else {
+                self.previous_selectable_left_item_before(target)
+            };
+            if let Some(target) = target
+                && target != self.selected_left
+            {
+                self.set_left_selection(target);
+            }
+            return;
+        }
+
         let target_index = match self.mouse_target(column, row) {
             Some(MouseTarget::LeftRow(index)) => index,
             _ => self.selected_left,
@@ -10889,6 +11004,9 @@ impl App {
         }
         let target = over_row
             .filter(|index| *index != drag.source)
+            .filter(|index| {
+                drag.list != RowDragList::Agents || self.left_items_share_group(drag.source, *index)
+            })
             .and_then(|index| self.row_drag_id(drag.list, index).map(|id| (index, id)));
         drag.hover = target.as_ref().map(|(index, _)| *index);
         drag.hover_id = target.map(|(_, id)| id);
@@ -18283,11 +18401,26 @@ not_a_real_action = ["x"]
 
     /// A double click never steals clicks from a mouse-aware child: with
     /// mouse tracking on, both clicks are forwarded to the child and the
-    /// pane stays minimized.
+    /// pane stays minimized. This holds while the provider forwards mouse
+    /// presses (`forward_mouse = true`); see the next test for `false`.
     #[test]
     fn mouse_double_click_does_not_maximize_a_mouse_mode_child() {
+        mouse_mode_child_double_click(true);
+    }
+
+    /// With `forward_mouse = false` (how dux-amq ships jcode) the presses were
+    /// never the child's, so a double click opens the agent fullscreen exactly
+    /// as it does for every other harness. Regression: jcode turns mouse
+    /// tracking on, and was the one agent a double click would not open.
+    #[test]
+    fn mouse_double_click_maximizes_a_mouse_mode_child_that_does_not_forward_presses() {
+        mouse_mode_child_double_click(false);
+    }
+
+    fn mouse_double_click_mouse_mode_setup(forward_mouse: bool) -> App {
         let mut app = test_app(default_bindings());
         install_mouse_layout(&mut app);
+        pin_forward_mouse(&mut app, forward_mouse);
         app.selected_left = 1;
         app.center_mode = CenterMode::Agent;
         app.focus = FocusPane::Center;
@@ -18322,7 +18455,11 @@ not_a_real_action = ["x"]
             mouse_mode,
             "test setup: the child must have mouse tracking on"
         );
+        app
+    }
 
+    fn mouse_mode_child_double_click(forward_mouse: bool) {
+        let mut app = mouse_double_click_mouse_mode_setup(forward_mouse);
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 30, 5));
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 30, 5));
 
@@ -18331,12 +18468,21 @@ not_a_real_action = ["x"]
             FocusPane::Center,
             "the clicks still focus the pane"
         );
-        assert_eq!(
-            app.fullscreen_overlay,
-            FullscreenOverlay::None,
-            "a mouse-aware child owns its clicks, so a double click must not maximize"
-        );
-        assert_eq!(app.input_target, InputTarget::None);
+        if forward_mouse {
+            assert_eq!(
+                app.fullscreen_overlay,
+                FullscreenOverlay::None,
+                "a mouse-aware child owns its clicks, so a double click must not maximize"
+            );
+            assert_eq!(app.input_target, InputTarget::None);
+        } else {
+            assert_eq!(
+                app.fullscreen_overlay,
+                FullscreenOverlay::Agent,
+                "presses stay with dux, so the double click opens the agent like any other"
+            );
+            assert_eq!(app.input_target, InputTarget::Agent);
+        }
     }
 
     // -- Windowed click forwarding to a mouse-aware child --

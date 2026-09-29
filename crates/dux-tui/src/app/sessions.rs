@@ -4562,6 +4562,9 @@ mod tests {
             config: {
                 let mut config = dux_core::test_provider::harmless_config();
                 config.workspace = None;
+                // Flat sidebar geometry; grouped tests opt in (see test_app).
+                config.ui.sidebar_style = "flat".to_string();
+                config.ui.sidebar_density = "comfortable".to_string();
                 config
             },
             paths,
@@ -4658,6 +4661,7 @@ mod tests {
             bindings,
             missing_project_warning_gen: None,
             selected_left: 0,
+            left_scroll_offset: 0,
             left_section: crate::app::LeftSection::Projects,
             selected_terminal_index: 0,
             right_section: RightSection::Unstaged,
@@ -4731,6 +4735,8 @@ mod tests {
             inactive_search_dismissed: None,
             inactive_collapse_overridden: false,
             left_items_cache: Vec::new(),
+            left_groups_cache: Vec::new(),
+            collapsed_groups: HashSet::new(),
             mouse_layout: MouseLayoutState::default(),
             overlay_layout: OverlayMouseLayoutState::default(),
             mouse_drag: None,
@@ -4776,6 +4782,7 @@ mod tests {
             startup_log_selection: None,
             pending_server_flip: None,
             pending_reload: None,
+            reload_selected_session: None,
             reload_target: dux_core::reload_policy::ReloadTarget::capture(),
             companion: None,
             background_server_preflight_pending: false,
@@ -4915,6 +4922,8 @@ mod tests {
         let mut config = dux_core::test_provider::harmless_config();
         config.ui.auto_reopen_agents = true;
         config.workspace = None;
+        config.ui.sidebar_style = "flat".to_string();
+        config.ui.sidebar_density = "comfortable".to_string();
         let config_writer =
             dux_core::config_queue::ConfigWriteQueue::new(paths.config_path.clone());
         let engine = dux_core::engine::Engine {

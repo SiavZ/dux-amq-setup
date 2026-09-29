@@ -1,13 +1,15 @@
 //! Whether a reload may proceed, and onto which binary.
 //!
-//! The transport (`dux_core::reload_handoff` and friends) can hand live agents
-//! across an `exec`. This module answers the question that comes first: should
-//! it, right now?
+//! The transport (`dux_core::reload_handoff` and friends) can hand live agents,
+//! their terminals' contents included, across an `exec`. This module answers
+//! the question that comes first: should it, right now?
 //!
-//! Both rules are borrowed from jcode, which has run this in production:
-//! it refuses while a turn is in flight (`if self.is_processing { return false }`)
-//! and only reloads when the binary on disk is actually newer
-//! (`has_newer_binary`). The reasons are the same here.
+//! One rule is borrowed from jcode, which has run this in production: only
+//! reload when the binary on disk is actually newer (`has_newer_binary`). The
+//! other jcode rule, "never mid-turn", is deliberately NOT ported: a reload
+//! here carries the terminal state and the unread output with it, so an agent
+//! that is streaming right now comes back mid-stream in the next image with
+//! nothing lost.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -15,8 +17,6 @@ use std::time::SystemTime;
 /// Why a reload was refused, in the words the user sees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReloadRefusal {
-    /// An agent is mid-turn.
-    AgentWorking { tab_id: String },
     /// The binary on disk is the one already running.
     NoNewerBinary,
     /// A PTY could not be prepared for the handoff, so the exec would strand it.
@@ -28,10 +28,6 @@ impl ReloadRefusal {
     /// user can do, because "reload failed" alone leaves them guessing.
     pub fn message(&self) -> String {
         match self {
-            Self::AgentWorking { tab_id } => format!(
-                "Not reloading: {tab_id} is still working. Reloading now would \
-                 cut off its output mid-turn. Try again when it settles."
-            ),
             Self::NoNewerBinary => {
                 "Already running the newest dux on disk, so there is nothing to \
                  reload onto."
@@ -233,15 +229,6 @@ mod tests {
     fn every_refusal_says_what_to_do_about_it() {
         // A refusal the user cannot act on is a dead end, so each one names both
         // the cause and the way forward.
-        let working = ReloadRefusal::AgentWorking {
-            tab_id: "s1-slot".to_string(),
-        };
-        assert!(working.message().contains("s1-slot"));
-        assert!(
-            working.message().contains("Try again"),
-            "a busy refusal must tell the user it is worth retrying"
-        );
-
         assert!(
             ReloadRefusal::NoNewerBinary.message().contains("newest"),
             "the no-op case must say the binary is already current"

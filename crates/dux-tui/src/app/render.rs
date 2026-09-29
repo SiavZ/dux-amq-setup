@@ -359,6 +359,48 @@ pub(crate) fn left_row_to_item(offset: usize, heights: &[u16], area_height: u16)
     map
 }
 
+/// The first visible item of a list of `heights` in `area_height` rows,
+/// starting from the `offset` kept since the last frame. The view only moves
+/// when it must: up to reveal a `selected` item above it, down (by the fewest
+/// items) to reveal one below it, and back up when the tail would leave empty
+/// rows at the bottom. Otherwise the offset is kept, which is what lets the
+/// wheel scroll the view and keeps a move back up from jumping.
+pub(crate) fn clamp_list_offset(
+    offset: usize,
+    selected: Option<usize>,
+    heights: &[u16],
+    area_height: u16,
+) -> usize {
+    if heights.is_empty() {
+        return 0;
+    }
+    let area = usize::from(area_height).max(1);
+    let h = |i: usize| usize::from(heights[i].max(1));
+    // The largest offset whose items still fill the area to the bottom.
+    let mut max_offset = heights.len() - 1;
+    let mut used = h(max_offset);
+    while max_offset > 0 && used + h(max_offset - 1) <= area {
+        max_offset -= 1;
+        used += h(max_offset);
+    }
+    let mut offset = offset.min(max_offset);
+    if let Some(sel) = selected.filter(|&s| s < heights.len()) {
+        if sel < offset {
+            offset = sel;
+        } else {
+            // Advance until the selected item's last row is inside the area.
+            loop {
+                let rows: usize = (offset..=sel).map(h).sum();
+                if rows <= area || offset == sel {
+                    break;
+                }
+                offset += 1;
+            }
+        }
+    }
+    offset
+}
+
 /// Split `label` into up to three spans around a matched CHAR range
 /// (`dux_core::agent_search::match_char_range` semantics: start inclusive, end
 /// exclusive, char indices): the text before the hit in `base`, the hit in
@@ -539,6 +581,45 @@ fn ellipsize_spans(spans: Vec<Span<'static>>, max_w: u16) -> Vec<Span<'static>> 
     out
 }
 
+/// The provider suffix on an agent row's first line: ` (codex)`, or
+/// ` (claude → codex)` while a provider swap is pending (the running process is
+/// still the old one; the next launch uses the new one), so the row never
+/// claims a harness that is not the one running.
+pub(crate) fn agent_row_provider_suffix(
+    running: &ProviderKind,
+    configured: &ProviderKind,
+) -> String {
+    if running != configured {
+        format!(" ({} → {})", running.as_str(), configured.as_str())
+    } else {
+        format!(" ({})", configured.as_str())
+    }
+}
+
+/// Fit `left` followed by `suffix` into `max_w` cells, ellipsizing `left` (the
+/// name) before the suffix loses a cell. Only when the suffix alone does not
+/// fit next to at least a glyph and one name cell does the whole run ellipsize
+/// as one.
+fn fit_name_with_suffix(
+    left: Vec<Span<'static>>,
+    suffix: Span<'static>,
+    max_w: u16,
+) -> Vec<Span<'static>> {
+    let suffix_w = suffix.content.as_ref().cell_width();
+    let glyph_w = left
+        .first()
+        .map(|s| s.content.as_ref().cell_width())
+        .unwrap_or(0);
+    if max_w <= suffix_w.saturating_add(glyph_w).saturating_add(1) {
+        let mut all = left;
+        all.push(suffix);
+        return ellipsize_spans(all, max_w);
+    }
+    let mut out = ellipsize_spans(left, max_w - suffix_w);
+    out.push(suffix);
+    out
+}
+
 /// Lay a line out with `left` packed to the left and `right` flush to the right
 /// edge of `total_w`, separated by at least `min_gap` blank cells. The left
 /// group is ellipsized to whatever space remains after the right group and the
@@ -678,8 +759,11 @@ fn fit_agent_meta_line(
     // Everything except the two truncatable fields is fixed: the marker, the
     // name->word separator + word, the separator before the branch (its text is
     // flexible, its separator is not), and the separator + tab count.
+    // A blank marker with no name (a grouped row whose header already names
+    // the project) leads straight into the word, with no separator before it.
+    let lead_sep = name.is_some() || !marker.content.trim().is_empty();
     let mut fixed = width(&marker)
-        .saturating_add(SEP_W)
+        .saturating_add(if lead_sep { SEP_W } else { 0 })
         .saturating_add(width(&word));
     if branch.is_some() {
         fixed = fixed.saturating_add(SEP_W);
@@ -717,7 +801,9 @@ fn fit_agent_meta_line(
     if let Some(name) = name {
         out.extend(ellipsize_field_highlighted(name, name_alloc, highlight));
     }
-    out.push(sep());
+    if lead_sep {
+        out.push(sep());
+    }
     out.push(word);
     if let Some(branch) = branch {
         out.push(sep());
@@ -1892,6 +1978,23 @@ impl App {
         // so the tone stays on line two. The standalone terminal row wears the
         // same star at the same indent; owned terminal rows keep their arrow.
         let (marker, name_span) = self.agent_row_owner_spans(session, found, muted);
+        // Under a grouped project header the project name is already on screen
+        // one row up, so a healthy row spends that width on the state word and
+        // branch instead; a warning (missing path, removed project, missing
+        // working copy) and a standalone folder keep their tag.
+        let (marker, name_span) = if self.sidebar_style() == SidebarStyle::Grouped
+            && matches!(
+                agent_row_owner_tag(
+                    session,
+                    found,
+                    self.engine.working_copy_missing(&session.id)
+                ),
+                AgentRowOwnerTag::Project(ProjectTagKind::Healthy, _)
+            ) {
+            (Span::styled("  ", Style::default().fg(muted)), None)
+        } else {
+            (marker, name_span)
+        };
         let word = agent_state_word(session.status, working, typing, needs_attention);
         // The one working cue: the word pulses between the working token and the
         // muted tone beside it, and a cycling ellipsis runs after it in a slot
@@ -1950,6 +2053,26 @@ impl App {
             )
         });
         let right: Vec<Span<'static>> = shared_badge.into_iter().chain(pr_badge).collect();
+        // The harness rides right after the name, as on the fork: several
+        // agents in one project are usually told apart by it. The name gives
+        // way first so the provider stays readable.
+        let provider_span = Span::styled(
+            agent_row_provider_suffix(
+                &self.engine.running_provider_for(session),
+                &session.provider,
+            ),
+            italic(Style::default().fg(muted)),
+        );
+        let right_w = right
+            .iter()
+            .map(|s| s.content.as_ref().cell_width())
+            .fold(0u16, |a, b| a.saturating_add(b));
+        let left_budget = if right.is_empty() {
+            text_width
+        } else {
+            text_width.saturating_sub(right_w.saturating_add(2))
+        };
+        let line1_left = fit_name_with_suffix(line1_left, provider_span, left_budget);
         let line1 = if right.is_empty() {
             ellipsize_spans(line1_left, text_width)
         } else {
@@ -2014,14 +2137,26 @@ impl App {
         let Some(item) = items.get(sel).copied() else {
             return;
         };
+        if self.sidebar_density() == SidebarDensity::Compact {
+            // Every compact item is one line: a single-row tint, no frame.
+            if let Some(rel) = map.iter().position(|&i| i == sel) {
+                let tint = self.theme.selection_bar_tint();
+                let y = list_inner.y + rel as u16;
+                for x in list_inner.x..list_inner.x + list_inner.width {
+                    buf[(x, y)].set_bg(tint);
+                }
+            }
+            return;
+        }
         match item {
             LeftItem::Session(_) => {
                 // The three-line framed selection, shared with terminal rows.
                 self.paint_framed_row_selection(buf, list_inner, map, sel, top_pad_y);
             }
-            LeftItem::InactiveToggle => {
-                // Only the label row (the toggle ends with a trailing spacer, so
-                // the label is the second-to-last row); no frame edges.
+            LeftItem::InactiveToggle | LeftItem::Group(_) => {
+                // Only the label row (the toggle and a project header both end
+                // with a trailing spacer, so the label is the second-to-last
+                // row); no frame edges.
                 let Some(rel_end) = map.iter().rposition(|&i| i == sel) else {
                     return;
                 };
@@ -2151,6 +2286,18 @@ impl App {
         let Some(y) = marker_y else {
             return;
         };
+        if list == RowDragList::Agents && self.sidebar_density() == SidebarDensity::Compact {
+            // Compact rows have no spacer to draw the rule on, so the row above
+            // the gap is underlined instead of overwritten.
+            for x in x0..x1 {
+                buf[(x, y)].set_style(
+                    Style::default()
+                        .fg(self.theme.border_focused)
+                        .add_modifier(Modifier::UNDERLINED),
+                );
+            }
+            return;
+        }
         for x in x0..x1 {
             buf[(x, y)]
                 .set_symbol("\u{2500}")
@@ -2177,9 +2324,13 @@ impl App {
         let Some(rel_end) = map.iter().rposition(|&i| i == toggle_idx) else {
             return;
         };
-        // The toggle ends with a trailing spacer, so the label sits one row above
-        // the item's last row.
-        let y = list_content.y + rel_end.saturating_sub(1) as u16;
+        // The comfortable toggle ends with a trailing spacer, so the label sits
+        // one row above the item's last row; a compact toggle is its label.
+        let label_rel = match self.sidebar_density() {
+            SidebarDensity::Compact => rel_end,
+            SidebarDensity::Comfortable => rel_end.saturating_sub(1),
+        };
+        let y = list_content.y + label_rel as u16;
         let x0 = list_content.x;
         let x1 = list_content.x + list_content.width;
         // Stop a gutter short of the right edge so the rule keeps the same right
@@ -2255,6 +2406,13 @@ impl App {
                     "─",
                     Style::default().fg(self.theme.header_separator_fg),
                 ))),
+                LeftItem::Group(g) => {
+                    let collapsed = self.left_group(*g).is_some_and(|group| group.collapsed);
+                    ListItem::new(Line::from(Span::styled(
+                        if collapsed { "▸" } else { "▾" },
+                        Style::default().fg(self.theme.project_icon),
+                    )))
+                }
             })
             .collect::<Vec<_>>();
         let mut state = ListState::default().with_selected(Some(self.selected_left));
@@ -2340,15 +2498,78 @@ impl App {
         format!("Agents ({visible}/{total})")
     }
 
-    fn agent_sidebar_items(
+    /// A grouped-sidebar project header: fold arrow, project name, and the
+    /// project's agent count, like the fork's `▾ Jobzy-infra (3)`. A project
+    /// whose folder is gone or whose record was removed wears the warning tone;
+    /// the standalone group wears the standalone star and identity tone.
+    fn render_group_header(&self, index: usize, text_width: u16) -> Line<'static> {
+        let Some(group) = self.left_group(index) else {
+            return Line::from("");
+        };
+        let arrow = if group.collapsed || group.agent_count == 0 {
+            "▸ "
+        } else {
+            "▾ "
+        };
+        let (glyph, name_color) = match group.kind {
+            LeftGroupKind::Project {
+                path_missing: false,
+            } => (arrow.to_string(), self.theme.text_fg),
+            LeftGroupKind::Project { path_missing: true } | LeftGroupKind::Orphan => {
+                ("⚠ ".to_string(), self.theme.project_missing_fg)
+            }
+            LeftGroupKind::Standalone => (
+                format!("{} ", crate::theme::STANDALONE_GLYPH),
+                self.theme.standalone_location_fg,
+            ),
+        };
+        let glyph_color = match group.kind {
+            LeftGroupKind::Project {
+                path_missing: false,
+            } => self.theme.project_icon,
+            _ => name_color,
+        };
+        let name = match group.kind {
+            LeftGroupKind::Orphan => format!("{} (removed project)", group.name),
+            _ => group.name.clone(),
+        };
+        let mut spans = vec![
+            Span::styled(glyph, Style::default().fg(glyph_color)),
+            Span::styled(
+                name,
+                Style::default().fg(name_color).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if group.agent_count > 0 {
+            spans.push(Span::styled(
+                format!(" ({})", group.agent_count),
+                Style::default().fg(self.theme.provider_label_fg),
+            ));
+        }
+        Line::from(ellipsize_spans(spans, text_width))
+    }
+
+    pub(crate) fn agent_sidebar_items(
         &self,
         left_items: &[LeftItem],
         has_active: bool,
         row_text_width: u16,
     ) -> (Vec<ListItem<'static>>, Vec<u16>) {
+        if self.sidebar_density() == SidebarDensity::Compact {
+            return self.agent_sidebar_items_compact(left_items, row_text_width);
+        }
         let items = left_items
             .iter()
-            .map(|item| match item {
+            .enumerate()
+            .map(|(pos, item)| match item {
+                LeftItem::Group(g) => {
+                    let label = self.render_group_header(*g, row_text_width);
+                    if pos > 0 {
+                        ListItem::new(vec![Line::from(""), label, Line::from("")])
+                    } else {
+                        ListItem::new(vec![label, Line::from("")])
+                    }
+                }
                 LeftItem::InactiveToggle => {
                     let icon = if self.inactive_collapsed {
                         "▸"
@@ -2377,13 +2598,218 @@ impl App {
             .collect();
         let heights = left_items
             .iter()
-            .map(|item| match item {
+            .enumerate()
+            .map(|(pos, item)| match item {
+                LeftItem::Group(_) if pos > 0 => 3,
+                LeftItem::Group(_) => 2,
                 LeftItem::Session(_) => 3,
                 LeftItem::InactiveToggle if has_active => 3,
                 LeftItem::InactiveToggle => 2,
             })
             .collect();
         (items, heights)
+    }
+
+    /// The compact agent list (`ui.sidebar_density = "compact"`): every item is
+    /// exactly one line, with no spacers, so `heights` is all ones. In grouped
+    /// style an agent row hangs off its header by a tree connector, `└` on the
+    /// last agent before the next header (or toggle, or the list's end).
+    fn agent_sidebar_items_compact(
+        &self,
+        left_items: &[LeftItem],
+        row_text_width: u16,
+    ) -> (Vec<ListItem<'static>>, Vec<u16>) {
+        let grouped = self.sidebar_style() == SidebarStyle::Grouped;
+        let items = left_items
+            .iter()
+            .enumerate()
+            .map(|(pos, item)| match item {
+                LeftItem::Group(g) => ListItem::new(self.render_group_header(*g, row_text_width)),
+                LeftItem::InactiveToggle => {
+                    let icon = if self.inactive_collapsed {
+                        "▸"
+                    } else {
+                        "▾"
+                    };
+                    ListItem::new(Line::from(Span::styled(
+                        format!("{icon} Inactive ({})", self.visible_inactive_count()),
+                        Style::default().fg(self.theme.provider_label_fg),
+                    )))
+                }
+                LeftItem::Session(index) => {
+                    let connector = grouped.then(|| {
+                        let last = !left_items
+                            .get(pos + 1)
+                            .is_some_and(|next| matches!(next, LeftItem::Session(_)));
+                        if last { "└ " } else { "├ " }
+                    });
+                    self.engine
+                        .sessions
+                        .get(*index)
+                        .map(|session| {
+                            ListItem::new(self.render_compact_agent_row(
+                                session,
+                                row_text_width,
+                                connector,
+                                !grouped,
+                            ))
+                        })
+                        .unwrap_or_else(|| ListItem::new(Line::from("")))
+                }
+            })
+            .collect();
+        (items, vec![1u16; left_items.len()])
+    }
+
+    /// One compact agent line: `[connector] glyph name (provider)`, plus the
+    /// project in flat style (there is no header to carry it), and the SHARED,
+    /// pull-request and missing-working-copy badges pinned right only when they
+    /// fit beside the full left run; otherwise they are dropped rather than
+    /// cutting the name.
+    fn render_compact_agent_row(
+        &self,
+        session: &AgentSession,
+        text_width: u16,
+        connector: Option<&'static str>,
+        show_project: bool,
+    ) -> Line<'static> {
+        let label = session.display_label();
+        let cues = self.agent_row_cues(session);
+        let deleting = cues.deleting;
+        let (steady_dot, steady_color) = self.theme.session_dot(&session.status);
+        let dot = self.agent_row_glyph(cues, steady_dot);
+        let (base_color, glyph_color) = self.agent_row_colors(session.status, cues, steady_color);
+        let italic = |style: Style| {
+            if deleting {
+                style.add_modifier(Modifier::ITALIC)
+            } else {
+                style
+            }
+        };
+        let name_style = italic(Style::default().fg(base_color));
+        let muted = if deleting {
+            self.theme.session_deleting
+        } else {
+            self.theme.provider_label_fg
+        };
+        let search_range = self
+            .agent_filter
+            .as_ref()
+            .and_then(|input| dux_core::agent_search::match_char_range(&label, &input.text));
+        let name_spans: Vec<Span<'static>> = if let Some(range) = search_range {
+            search_highlight_spans(
+                &label,
+                name_style,
+                italic(
+                    Style::default()
+                        .fg(self.theme.search_match_fg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                range,
+            )
+        } else {
+            vec![Span::styled(label.clone(), name_style)]
+        };
+        let width = |spans: &[Span<'static>]| {
+            spans
+                .iter()
+                .map(|s| s.content.as_ref().cell_width())
+                .fold(0u16, |a, b| a.saturating_add(b))
+        };
+
+        let mut prefix: Vec<Span<'static>> = Vec::new();
+        if let Some(connector) = connector {
+            prefix.push(Span::styled(
+                connector,
+                Style::default().fg(self.theme.project_icon),
+            ));
+        }
+        let mut head = vec![Span::styled(
+            format!("{dot} "),
+            italic(Style::default().fg(glyph_color)),
+        )];
+        head.extend(name_spans);
+        let provider_span = Span::styled(
+            agent_row_provider_suffix(
+                &self.engine.running_provider_for(session),
+                &session.provider,
+            ),
+            italic(Style::default().fg(muted)),
+        );
+
+        let found = session
+            .project_id()
+            .and_then(|project_id| self.engine.projects.iter().find(|p| p.id == project_id));
+        let owner_tag = agent_row_owner_tag(
+            session,
+            found,
+            self.engine.working_copy_missing(&session.id),
+        );
+        // Flat style names the project (or folder, or warning) after the
+        // harness, since no header carries it.
+        let project_spans: Vec<Span<'static>> = if show_project {
+            let (marker, name) = self.agent_row_owner_spans(session, found, muted);
+            let marker = Span::styled(format!(" {}", marker.content.trim_start()), marker.style);
+            std::iter::once(marker).chain(name).collect()
+        } else {
+            Vec::new()
+        };
+
+        let mut right: Vec<Span<'static>> = Vec::new();
+        if session.shared_workspace() {
+            right.push(Span::styled(
+                SHARED_WORKSPACE_BADGE,
+                Style::default()
+                    .fg(self.theme.warning_fg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let Some(pr) = self.engine.pr_statuses.get(&session.id) {
+            let pr_color = match pr.state {
+                crate::model::PrState::Merged => self.theme.pr_merged_label,
+                crate::model::PrState::Closed => self.theme.pr_closed_label,
+                crate::model::PrState::Open => self.theme.pr_open_label,
+            };
+            right.push(Span::styled(
+                format!("{PR_BADGE_GLYPH}#{}", pr.number),
+                Style::default().fg(pr_color),
+            ));
+        }
+        if !show_project && matches!(owner_tag, AgentRowOwnerTag::WorkingCopyMissing) {
+            if !right.is_empty() {
+                right.push(Span::raw(" "));
+            }
+            right.push(Span::styled(
+                "⚠",
+                Style::default().fg(self.theme.project_missing_fg),
+            ));
+        }
+
+        let prefix_w = width(&prefix);
+        let avail = text_width.saturating_sub(prefix_w);
+        let mut full: Vec<Span<'static>> = head.clone();
+        full.push(provider_span.clone());
+        let base_w = width(&full);
+        // The project gives way before the name and harness do.
+        if !project_spans.is_empty() {
+            let room = avail.saturating_sub(base_w);
+            if width(&project_spans) <= room {
+                full.extend(project_spans);
+            } else if room >= 4 {
+                full.extend(ellipsize_spans(project_spans, room));
+            }
+        }
+        let full_w = width(&full);
+        let right_w = width(&right);
+        let body = if !right.is_empty() && full_w.saturating_add(2 + right_w) <= avail {
+            right_align_line(full, right, avail, 2)
+        } else if full_w <= avail {
+            full
+        } else {
+            fit_name_with_suffix(head, provider_span, avail)
+        };
+        prefix.extend(body);
+        Line::from(prefix)
     }
 
     fn agent_sidebar_geometry(
@@ -2446,7 +2872,13 @@ impl App {
         let row_text_width = inner.width.saturating_sub(LEFT_PANE_GUTTER * 2);
         let (items, item_heights) =
             self.agent_sidebar_items(left_items, has_active, row_text_width);
-        let geometry = Self::agent_sidebar_geometry(inner, self.agent_filter.is_some(), has_active);
+        // A compact list has no framed selection, so it reserves no top row for
+        // the frame's upper edge.
+        let geometry = Self::agent_sidebar_geometry(
+            inner,
+            self.agent_filter.is_some(),
+            has_active && self.sidebar_density() == SidebarDensity::Comfortable,
+        );
         self.mouse_layout.left_list = geometry.content;
         block.render(projects_area, frame.buffer_mut());
         if let Some(search_area) = geometry.search_area {
@@ -2470,12 +2902,21 @@ impl App {
             )
             .render(search_area, frame.buffer_mut());
         }
-        let mut state =
-            ListState::default().with_selected(if self.left_section == LeftSection::Projects {
-                Some(self.selected_left)
-            } else {
-                None
-            });
+        // Start from the scroll position kept across frames, pulled just far
+        // enough to keep the selection on screen. `ListState` would otherwise
+        // start at 0 every draw and only scroll until the selection is the
+        // LAST visible row, so moving back up jumped and the wheel never
+        // moved the view.
+        let selected = (self.left_section == LeftSection::Projects).then_some(self.selected_left);
+        self.left_scroll_offset = clamp_list_offset(
+            self.left_scroll_offset,
+            selected,
+            &item_heights,
+            geometry.content.height,
+        );
+        let mut state = ListState::default()
+            .with_selected(selected)
+            .with_offset(self.left_scroll_offset);
         // No widget highlight: the selection is painted by hand below (an accent
         // bar plus a faint tint) so it keeps each row's text colors and leaves the
         // Inactive separator row untouched, neither of which a whole-cell List

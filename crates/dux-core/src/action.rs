@@ -33,6 +33,10 @@ pub enum Action {
     ReconnectAgent,
     DeleteSession,
     DeleteTerminal,
+    /// Select the next / previous agent in the selected agent's project (the
+    /// harnesses sharing its checkout), wrapping. Fork binding `}` / `{`.
+    NextSiblingAgent,
+    PrevSiblingAgent,
     // Agent pane
     InteractAgent,
     ShowTerminal,
@@ -251,6 +255,8 @@ impl Action {
             Action::ReconnectAgent => "reconnect_agent",
             Action::DeleteSession => "delete_session",
             Action::DeleteTerminal => "delete_terminal",
+            Action::NextSiblingAgent => "next_sibling_agent",
+            Action::PrevSiblingAgent => "prev_sibling_agent",
             Action::InteractAgent => "interact_agent",
             Action::ShowTerminal => "show_terminal",
             Action::NextTab => "next_tab",
@@ -418,6 +424,12 @@ impl Action {
             Action::ReconnectAgent => "Restart the CLI for the selected agent.",
             Action::DeleteSession => "Delete the selected session and worktree.",
             Action::DeleteTerminal => "Delete the selected companion terminal.",
+            Action::NextSiblingAgent => {
+                "Select the next agent in the selected agent's project (the agents sharing its checkout), wrapping around."
+            }
+            Action::PrevSiblingAgent => {
+                "Select the previous agent in the selected agent's project (the agents sharing its checkout), wrapping around."
+            }
             Action::InteractAgent => {
                 "Open the selected agent fullscreen, where keys go to the agent verbatim."
             }
@@ -662,7 +674,9 @@ impl Action {
             | Action::InteractAgent
             | Action::ReconnectAgent
             | Action::DeleteSession
-            | Action::DeleteTerminal => Some("Projects pane"),
+            | Action::DeleteTerminal
+            | Action::NextSiblingAgent
+            | Action::PrevSiblingAgent => Some("Projects pane"),
             Action::NewAgentFromPr | Action::ManageProjects | Action::ManageWorktrees => None,
             Action::OpenMacroBar
             | Action::OpenCurrentPullRequest

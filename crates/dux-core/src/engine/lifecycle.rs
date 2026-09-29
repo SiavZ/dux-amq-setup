@@ -1703,25 +1703,9 @@ impl Engine {
             .collect()
     }
 
-    /// The first agent that is mid-turn, if any.
-    ///
-    /// A reload clears every transcript (the scrollback lives in this image's
-    /// memory), so doing it while an agent is streaming throws away the output
-    /// of a turn the user is still waiting on. The agent itself would survive,
-    /// but what it had just said would not.
-    ///
-    /// Uses the same `is_agent_streaming` signal the sidebar's "Working" word
-    /// reads, so a refusal always matches what the user can see on screen. This
-    /// is dux's equivalent of jcode's `is_processing` check.
-    pub fn agent_blocking_reload(&self) -> Option<String> {
-        self.providers
-            .keys()
-            .find(|tab_id| self.is_agent_streaming(tab_id.as_str()))
-            .map(|tab_id| tab_id.as_str().to_string())
-    }
-
     /// Describe every live PTY so the image on the other side of a reload can
-    /// adopt them, and make their descriptors survive the `exec`.
+    /// adopt them, make their descriptors survive the `exec`, and carry their
+    /// terminal state across.
     ///
     /// This is the counterpart to [`shutdown_ptys`](Self::shutdown_ptys), and
     /// the difference is the whole point: shutdown SIGTERMs every child, while
@@ -1732,30 +1716,50 @@ impl Engine {
     /// worst outcome available: the agents that could not cross would keep
     /// running as orphans nothing can reach or stop, while their rows come back
     /// looking merely dead. Refusing leaves the user exactly where they were,
-    /// with everything still working.
+    /// with everything still working, including, explicitly, the reader
+    /// threads of the PTYs already prepared, which a refusal restarts.
     ///
     /// Companion terminals are included for the same reason agents are: they are
     /// the user's own shells, and killing them to pick up a new binary is the
     /// behaviour this feature exists to avoid.
-    pub fn prepare_reload_handoff(&self) -> Option<crate::reload_handoff::Handoff> {
+    pub fn prepare_reload_handoff(&mut self) -> Option<crate::reload_handoff::Handoff> {
         let mut ptys = Vec::new();
-        let Some(()) = self.collect_reload_ptys(&mut ptys) else {
+        if self.collect_reload_ptys(&mut ptys).is_none() {
             // Refused partway: the masters collected so far already had
-            // close-on-exec cleared. There is no exec coming, so put it back,
-            // or every git, gh or editor process this image spawns from now on
-            // inherits a copy of those agents' terminals.
+            // close-on-exec cleared and their readers stopped. There is no exec
+            // coming, so put both back, or every git, gh or editor process this
+            // image spawns from now on inherits a copy of those agents'
+            // terminals and the terminals themselves stop updating.
+            self.resume_all_pty_readers();
             crate::reload_handoff::Handoff {
                 written_by: std::process::id(),
                 ptys,
+                selected_session: None,
             }
             .abandon();
             return None;
-        };
+        }
         self.pre_exec_quiesce();
         Some(crate::reload_handoff::Handoff {
             written_by: std::process::id(),
             ptys,
+            selected_session: None,
         })
+    }
+
+    /// Restart the reader thread of every PTY a reload stopped.
+    ///
+    /// Called whenever a reload that already prepared some PTYs will not exec
+    /// after all: the refusal inside [`Self::prepare_reload_handoff`], and the
+    /// failed-exec path that hands the engine back to the TUI. No-op for any
+    /// PTY whose reader never stopped (or whose stream already ended).
+    pub fn resume_all_pty_readers(&mut self) {
+        for client in self.providers.values_mut() {
+            client.resume_after_failed_reload();
+        }
+        for terminal in self.companion_terminals.values_mut() {
+            terminal.client.resume_after_failed_reload();
+        }
     }
 
     /// Checks that only need `&self` and must hold as soon as the handoff is
@@ -1785,29 +1789,59 @@ impl Engine {
         crate::logger::info(&format!("reload: quiesced background workers: {report:?}"));
     }
 
-    /// Describe every provider and companion terminal into `ptys`, clearing
-    /// close-on-exec on each master as it goes. `None` as soon as one cannot be
-    /// handed over, with `ptys` holding the ones already prepared so the caller
-    /// can undo them.
-    fn collect_reload_ptys(&self, ptys: &mut Vec<crate::reload_handoff::HandoffPty>) -> Option<()> {
-        for (tab_id, client) in &self.providers {
-            let session_id = self
-                .agent_tabs
-                .get(tab_id.as_ref())
-                .map(|tab| tab.session_id.clone())
-                .or_else(|| {
-                    // A session-slot tab has no `agent_tabs` row: the slot IS the
-                    // session's own tab, so the link runs the other way.
-                    self.sessions
-                        .iter()
-                        .find(|s| s.is_slot_tab(tab_id.as_ref()))
-                        .map(|s| s.id.clone())
-                });
-            let entry = client.prepare_for_reload(tab_id.as_str(), session_id.as_deref())?;
+    /// Describe every provider and companion terminal into `ptys`, quiescing
+    /// each PTY's reader, draining its writer, snapshotting its terminal and
+    /// clearing close-on-exec on its master as it goes. `None` as soon as one
+    /// cannot be handed over, with `ptys` holding the ones already prepared so
+    /// the caller can undo them.
+    ///
+    /// The quiesce is two passes on purpose. Every reader's stop flag goes up
+    /// FIRST, then each is joined, snapshot and drain included. The readers all
+    /// poll at the same bounded interval, so with N agents the joins together
+    /// wait out roughly ONE interval; joining each reader before asking the
+    /// next to stop would wait out N of them while the TUI sits frozen, an
+    /// easy second of dead UI for the busy workspaces this feature is for.
+    fn collect_reload_ptys(
+        &mut self,
+        ptys: &mut Vec<crate::reload_handoff::HandoffPty>,
+    ) -> Option<()> {
+        for client in self.providers.values_mut() {
+            client.request_reader_stop();
+        }
+        for terminal in self.companion_terminals.values_mut() {
+            terminal.client.request_reader_stop();
+        }
+
+        // Session ids are resolved up front because the loop below needs a
+        // mutable borrow of the clients; the lookup tables are immutable.
+        let session_of: std::collections::HashMap<String, Option<String>> = self
+            .providers
+            .keys()
+            .map(|tab_id| {
+                let session_id = self
+                    .agent_tabs
+                    .get(tab_id.as_ref())
+                    .map(|tab| tab.session_id.clone())
+                    .or_else(|| {
+                        // A session-slot tab has no `agent_tabs` row: the slot IS the
+                        // session's own tab, so the link runs the other way.
+                        self.sessions
+                            .iter()
+                            .find(|s| s.is_slot_tab(tab_id.as_ref()))
+                            .map(|s| s.id.clone())
+                    });
+                (tab_id.as_str().to_string(), session_id)
+            })
+            .collect();
+        for (tab_id, client) in &mut self.providers {
+            let session_id = session_of
+                .get(tab_id.as_str())
+                .and_then(|session| session.as_deref());
+            let entry = client.prepare_for_reload(tab_id.as_str(), session_id)?;
             ptys.push(entry);
         }
 
-        for (tab_id, terminal) in &self.companion_terminals {
+        for (tab_id, terminal) in &mut self.companion_terminals {
             let mut entry = terminal.client.prepare_for_reload(tab_id.as_str(), None)?;
             // A terminal has no database row: its owner, label and order exist
             // only here, so they have to travel in the handoff or the user's
@@ -1872,6 +1906,7 @@ impl Engine {
                     entry.cols,
                     entry.scrollback_capacity,
                     &entry.spawn_dir,
+                    &entry.repaint_bytes,
                 )
             } {
                 Ok(client) => client,
@@ -6939,7 +6974,7 @@ mod tests {
         // session a slot tab belongs to. A slot tab has no `agent_tabs` entry,
         // which is exactly the case a naive lookup would return None for and
         // silently orphan the row after the reload.
-        let (engine, _tmp) = engine_with_one_live_agent();
+        let (mut engine, _tmp) = engine_with_one_live_agent();
 
         let handoff = engine
             .prepare_reload_handoff()
@@ -6964,7 +6999,7 @@ mod tests {
         // The load-bearing side effect. Collecting the descriptor numbers is
         // useless unless the kernel also stops closing them on exec, and that
         // is invisible in the returned value, so it is asserted directly.
-        let (engine, _tmp) = engine_with_one_live_agent();
+        let (mut engine, _tmp) = engine_with_one_live_agent();
 
         let handoff = engine.prepare_reload_handoff().expect("handoff");
         let fd = handoff.ptys[0].master_fd;
@@ -6980,7 +7015,7 @@ mod tests {
         // Reloading with no agents is the common case (a quiet session picking
         // up a new build) and must not be refused: an empty handoff is a valid
         // one, distinct from the `None` that means "do not exec".
-        let (engine, _tmp) = test_engine();
+        let (mut engine, _tmp) = test_engine();
         let handoff = engine
             .prepare_reload_handoff()
             .expect("an idle engine has nothing to fail at");
@@ -6994,7 +7029,7 @@ mod tests {
         // still answering. The exec itself is covered end to end by
         // `tests/reload_handoff_e2e.rs`; what this pins is that the ENGINE puts
         // the pty back in the row it came from.
-        let (donor, tmp) = engine_with_one_live_agent();
+        let (mut donor, tmp) = engine_with_one_live_agent();
         let slot = donor
             .providers
             .keys()
@@ -7088,7 +7123,7 @@ mod tests {
         // must not discard the agents that are still reachable. (The collecting
         // side is all-or-nothing for the opposite reason: refusing before the
         // exec costs the user nothing.)
-        let (donor, tmp) = engine_with_one_live_agent();
+        let (mut donor, tmp) = engine_with_one_live_agent();
         let mut handoff = donor.prepare_reload_handoff().expect("collect");
         std::mem::forget(donor);
 
@@ -7105,6 +7140,8 @@ mod tests {
             cols: 80,
             spawn_dir: tmp.path().to_path_buf(),
             scrollback_capacity: 1000,
+            repaint: None,
+            repaint_bytes: Vec::new(),
         });
 
         let (mut receiver, _tmp2) = test_engine();
@@ -7151,13 +7188,16 @@ mod tests {
         );
         let good_fd = engine
             .providers
-            .values()
+            .values_mut()
             .next()
             .expect("the fixture's agent")
             .prepare_for_reload("probe", None)
             .expect("the healthy agent can be prepared")
             .master_fd;
-        // Undo the probe so the test starts from the real resting state.
+        // Undo the probe so the test starts from the real resting state. The
+        // probe also stopped this client's reader; the refusal below must put
+        // it back, which is exactly what this test's companion assertion now
+        // covers through the engine's own resume path.
         crate::pty_reattach::set_close_on_exec(good_fd).unwrap();
 
         assert!(
@@ -7168,6 +7208,158 @@ mod tests {
             !crate::pty_reattach::survives_exec(good_fd).unwrap(),
             "a refused reload must leave the agent's master close-on-exec"
         );
+    }
+
+    /// An engine with one answering agent, so a test can watch its output.
+    fn engine_with_one_answering_agent() -> (Engine, crate::test_scratch::ScratchDir) {
+        let (mut engine, tmp) = test_engine();
+        let worktree = tmp.path();
+        engine
+            .projects
+            .push(sample_project("p1", worktree.to_string_lossy().as_ref()));
+        let session = sample_session("s1", "p1", "feat");
+        let slot = session.slot_tab_id().to_owned();
+        engine.sessions.push(session);
+
+        let client = crate::pty::PtyClient::spawn_with_env(
+            "/bin/sh",
+            &[
+                "-c".to_string(),
+                "while IFS= read -r line; do echo \"got:$line\"; done".to_string(),
+            ],
+            worktree,
+            24,
+            80,
+            1000,
+            &[],
+        )
+        .expect("spawn agent");
+        engine.providers.insert(slot, client);
+        (engine, tmp)
+    }
+
+    /// Write a line to the engine's only agent and wait for its reply to reach
+    /// the terminal grid. Bounded, so a broken expectation fails the test
+    /// rather than hanging it.
+    fn wait_for_agent_reply(engine: &mut Engine, slot: &str, needle: &str) -> String {
+        let client = engine
+            .providers
+            .get_mut(TabIdRef::new(slot))
+            .expect("the fixture's agent");
+        let _ = client.write_bytes(format!("{needle}\n").as_bytes());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let text = client.visible_text_excerpt(100);
+            if text.contains(&format!("got:{needle}")) || Instant::now() >= deadline {
+                return text;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_refused_reload_resumes_the_readers_it_stopped() {
+        // Preparing a handoff stops every reader. A refusal (here: a terminal
+        // that cannot cross) must put them back, or the "harmless" refusal
+        // leaves the agent running with a terminal that never updates again.
+        let (mut engine, tmp) = engine_with_one_answering_agent();
+        let slot = engine
+            .providers
+            .keys()
+            .next()
+            .expect("the fixture has one provider")
+            .as_str()
+            .to_string();
+        let text = wait_for_agent_reply(&mut engine, &slot, "before");
+        assert!(text.contains("got:before"), "premise: the agent answered");
+
+        let mut bad = crate::pty::PtyClient::spawn_with_env(
+            "sleep",
+            &["30".to_string()],
+            tmp.path(),
+            24,
+            80,
+            1000,
+            &[],
+        )
+        .expect("spawn terminal");
+        bad.make_unhandoverable_for_test();
+        engine.companion_terminals.insert(
+            "term-1".to_string(),
+            crate::model::CompanionTerminal {
+                owner: crate::model::TerminalOwner::Standalone,
+                label: "t".to_string(),
+                foreground_cmd: None,
+                client: bad,
+                sort_order: 1,
+                created_at: chrono::Utc::now(),
+            },
+        );
+
+        assert!(
+            engine.prepare_reload_handoff().is_none(),
+            "premise: the reload is refused"
+        );
+
+        let text = wait_for_agent_reply(&mut engine, &slot, "after");
+        assert!(
+            text.contains("got:after"),
+            "a refused reload must resume the agent's reader, or its terminal \
+             silently stops updating"
+        );
+    }
+
+    #[test]
+    fn an_adopted_terminal_arrives_with_its_screen_and_not_read_as_streaming() {
+        // The round trip with content: collect from one engine while the agent
+        // has output on screen, restore into another, and check BOTH halves of
+        // the promise: the screen came back, and the replay did not light up
+        // the Working indicator for an agent that is not doing anything.
+        let (mut donor, tmp) = engine_with_one_answering_agent();
+        let slot = donor
+            .providers
+            .keys()
+            .next()
+            .expect("the fixture has one provider")
+            .as_str()
+            .to_string();
+        let text = wait_for_agent_reply(&mut donor, &slot, "visible");
+        assert!(text.contains("got:visible"), "premise: the agent answered");
+
+        let handoff = donor.prepare_reload_handoff().expect("collect");
+        assert!(
+            handoff.ptys[0]
+                .repaint_bytes
+                .windows(b"got:visible".len())
+                .any(|w| w == b"got:visible"),
+            "the serialized terminal must carry the pre-reload output"
+        );
+        // The donor must not close the descriptors it just handed over, exactly
+        // as the outgoing image must not before it execs.
+        std::mem::forget(donor);
+
+        let (mut receiver, _tmp2) = test_engine();
+        // SAFETY: the descriptors are owned by this process and were not closed,
+        // which is the same guarantee an exec provides.
+        let adopted = unsafe { receiver.restore_reload_handoff(handoff) };
+        assert_eq!(adopted, 1);
+
+        let client = receiver
+            .providers
+            .get(TabIdRef::new(slot.as_str()))
+            .expect("the agent must come back in the tab it left from");
+        let screen = client.visible_text_excerpt(100);
+        assert!(
+            screen.contains("got:visible"),
+            "the adopted terminal must arrive showing the pre-reload screen, got \
+             {screen:?}"
+        );
+        assert!(
+            !receiver.is_agent_streaming(slot.as_str()),
+            "replaying a handed-over screen is restored state, not agent \
+             activity, and must not read as streaming"
+        );
+        drop(tmp);
     }
 
     /// The boot sequence a reload runs through: adopt the handoff, then the

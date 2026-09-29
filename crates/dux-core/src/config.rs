@@ -1737,6 +1737,26 @@ pub struct UiConfig {
     /// not what that screen is allowed to contain.
     pub disable_release_notes: bool,
     pub pr_banner_position: String,
+    /// The left pane's shape: one tree of projects each holding that repo's
+    /// agents ("grouped", the fork's layout and the default), or one flat,
+    /// globally ordered agent list with an Inactive tail ("flat", upstream's
+    /// layout). Grouping keeps every harness sharing one repo visible as
+    /// siblings under the repo's header; the flat list scatters them by
+    /// activity.
+    ///
+    /// Stored as a string, not an enum, following the
+    /// `pr_banner_position`/`agent_sort` convention: an unknown value must
+    /// degrade to the default at the one place that reads it, not refuse the
+    /// whole config file. TUI-only (the web sidebar keeps its own layout).
+    pub sidebar_style: String,
+    /// How much vertical room each agent-list row takes: "compact" (the
+    /// default, the fork's one line per project header and one line per agent
+    /// with a tree connector) or "comfortable" (upstream's two-line agent rows
+    /// with blank spacers and the state word and branch on the second line).
+    ///
+    /// A string for the same reason as `sidebar_style`: an unknown value
+    /// degrades to "compact" at the one reading site. TUI-only.
+    pub sidebar_density: String,
     /// The agent-list sort mode, persisted so a chosen order (and the manual
     /// drag order it enables) survives restarts and is shared across clients:
     /// "active" (working/attention float up, the default), "updated", "created",
@@ -2274,6 +2294,8 @@ impl Default for UiConfig {
             disable_release_notes: false,
             pr_banner_position: "bottom".to_string(),
             agent_sort: "active".to_string(),
+            sidebar_style: "grouped".to_string(),
+            sidebar_density: "compact".to_string(),
             theme: crate::theme::DEFAULT_THEME_NAME.to_string(),
         }
     }
@@ -3009,6 +3031,8 @@ impl Default for Config {
                 disable_release_notes: false,
                 pr_banner_position: "bottom".to_string(),
                 agent_sort: "active".to_string(),
+                sidebar_style: "grouped".to_string(),
+                sidebar_density: "compact".to_string(),
                 theme: crate::theme::DEFAULT_THEME_NAME.to_string(),
             },
             capabilities: CapabilitiesConfig::default(),

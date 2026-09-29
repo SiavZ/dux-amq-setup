@@ -43,11 +43,12 @@ Open the command palette and run **`reload-binary`**.
 
 It refuses, on the status line, when:
 - the binary on disk is not newer than the one running
-- any agent is mid-turn (a reload clears transcripts)
 - a PTY cannot be handed over
 
 Every refusal happens before anything is touched, so a refused reload leaves the
-session exactly as it was.
+session exactly as it was (and restarts any reader thread it had already
+stopped). Reloading while an agent is streaming is fine: its terminal state and
+unread output cross the `exec` with it.
 
 ## What is built
 
@@ -55,11 +56,41 @@ session exactly as it was.
   type has private fields and no from-fd constructor, but the trait is small)
 - `pty_adopt_child` — wrap the surviving process as a `Child` (thin: same
   `waitpid`/`kill` the original made)
-- `reload_handoff` — the manifest naming which fd belongs to which tab
+- `reload_handoff`: the manifest naming which fd belongs to which tab, plus a
+  repaint sidecar per pty holding its serialized terminal
 - `reload_policy` — the guards, the exec, and the `--reload-handoff` flag
 - `PtyClient::prepare_for_reload` / `adopt_after_reload`
 - `Engine::prepare_reload_handoff` / `restore_reload_handoff`
 - `RunExit::Reload` → `TuiExit::Reload` → `exec_reload` in the binary
+
+### Carrying the terminal across
+
+The alacritty grid lives in memory, so a reload that handed over only the file
+descriptors would bring every agent back with an empty screen. It does not:
+
+- At handoff time each pty's reader thread is quiesced (a stop flag its poll
+  loop checks) and the writer drained, so nothing is in flight. Bytes the child
+  writes from that moment stay queued in the KERNEL pty buffer, which crosses
+  the exec with the descriptor.
+- The terminal is then serialized with the same `reconnect_repaint()` a
+  reconnecting browser gets: viewport, scrollback, modes, scroll region,
+  cursor and palette. The bytes ride in a `reload-repaint-<pid>-<n>.bin`
+  sidecar beside the manifest (megabytes of raw ANSI do not belong in JSON).
+- The new image feeds those bytes into the fresh grid through `process()`
+  BEFORE starting its reader, discarding the replies (they would answer device
+  queries nobody asked) and leaving the streaming heuristics untouched, so a
+  replayed screen does not read as agent activity. The new reader then drains
+  the kernel backlog, and the agent's output continues exactly where it left
+  off.
+- Quiescing is two passes: every reader's stop flag goes up first, then each is
+  joined, so N agents wake from the same poll interval rather than paying one
+  each (a busy workspace must not freeze for a second per reload).
+
+A reload that is refused or fails (collection refused partway, the handoff
+unwritable, the exec itself failing) undoes all of this: close-on-exec goes
+back on, sidecars are removed, and every stopped reader thread is respawned
+with its web-viewer subscriptions intact. The quiesced reader never
+disconnects them, because its stream is paused, not ended.
 
 ### Deliberate asymmetry
 
@@ -142,9 +173,11 @@ live: a reloaded dux, with an adopted agent and two terminals, exits cleanly on
 
 ### Known cost
 
-Scrollback is not carried. The alacritty grid lives in the old image's memory, so
-a reloaded row is blank until the agent writes again. The agent itself never
-stops, which is the point.
+Scrollback IS carried now (see "Carrying the terminal across" above), with two
+honest limits: a terminal whose repaint sidecar cannot be read adopts empty
+(logged, degraded, not wrong), and output past the scrollback ring's capacity
+was already gone before the reload. Geometry never changes across an exec, so
+no `SIGWINCH` is synthesized on adopt.
 
 ## Live verification
 
@@ -207,7 +240,6 @@ now reads the rebuilt client's own pid.
 
 ## Not done
 
-- No default keybinding (palette only, deliberately: a reload clears transcripts)
-- Scrollback is not preserved
+- No default keybinding (palette only, deliberately)
 - Only exercised on macOS
 

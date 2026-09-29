@@ -154,7 +154,7 @@ pub const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         action: Action::ReloadBinary,
         name: "reload-binary",
-        description: "Restart dux onto a newer build, keeping your agents running",
+        description: "Restart dux onto a newer build, keeping agents and their terminals",
         // TUI-only: this replaces the process the terminal UI is running in.
         // A browser is attached to a server, not to this image, so the question
         // does not arise there.

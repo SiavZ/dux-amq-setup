@@ -866,6 +866,20 @@ fn config_schema() -> Vec<ConfigEntry> {
             value_fn: |c| FieldValue::Str(c.ui.agent_sort.clone()),
         },
         ConfigEntry::Field {
+            key: "sidebar_style",
+            comment: Some(CommentSource::Static(
+                "# Shape of the TUI's agent list. One of:\n#   \"grouped\" (default) one collapsible header per project, with every\n#             agent in that project (each harness sharing one checkout\n#             included) listed as its own row underneath. Space or Enter on\n#             a header collapses/expands it.\n#   \"flat\"    one list of every agent ordered by agent_sort, the project\n#             named on each row, with detached/exited agents folded under a\n#             collapsible \"Inactive\" tail.\n# agent_sort orders the rows inside each project in \"grouped\" mode.\n# Unknown values fall back to \"grouped\". The web UI keeps its own layout.",
+            )),
+            value_fn: |c| FieldValue::Str(c.ui.sidebar_style.clone()),
+        },
+        ConfigEntry::Field {
+            key: "sidebar_density",
+            comment: Some(CommentSource::Static(
+                "# How much room each row of the TUI's agent list takes. One of:\n#   \"compact\"     (default) one line per row and no blank spacers. In\n#                 \"grouped\" style a project is one header line and each\n#                 agent one line under it, joined by a tree connector:\n#                   ▾ my-project (2)\n#                   ├ ◐ backend (codex)\n#                   └ ◎ frontend (claude)       SHARED\n#                 The status dot or spinner carries the agent's state, and the\n#                 SHARED / pull-request / missing-working-copy badges show only\n#                 when they fit beside the full name. In \"flat\" style each agent\n#                 is one line naming its harness and project. The branch of\n#                 the selected agent is in the top bar.\n#   \"comfortable\" two lines per agent (name, then project, state word and\n#                 branch) with a blank line between rows.\n# Applies to both sidebar_style values; the Terminals list keeps its\n# two-line rows. Unknown values fall back to \"compact\".",
+            )),
+            value_fn: |c| FieldValue::Str(c.ui.sidebar_density.clone()),
+        },
+        ConfigEntry::Field {
             key: "theme",
             comment: Some(CommentSource::Static(
                 "# Visual theme for the dux interface.\n# Built-in options include \"dux_dark\" (the default), plus any theme\n# bundled with the opaline engine, for example: \"catppuccin_mocha\",\n# \"catppuccin_frappe\", \"nord\", \"dracula\", \"gruvbox_dark\",\n# \"tokyo_night\", \"solarized_dark\", \"one_dark\", \"rose_pine\", and others.\n# To use a custom theme, drop a TOML file into <config_dir>/themes/<name>.toml\n# (with the same token format as opaline themes) and reference it here\n# by file stem. Unknown names fall back to dux_dark with a warning.\n# Use the `change-theme` command in the palette (Ctrl-p) for an interactive picker.",
