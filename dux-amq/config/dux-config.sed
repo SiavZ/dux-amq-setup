@@ -26,12 +26,11 @@
 # untouched stock block), so this only fires for a gemini block the user kept.
 /^\[providers\.gemini\]$/,/^\[/ s|^command = "gemini"$|command = "gemini-amq"|
 
-# claude: resume forks the session so deferred tools do not block, and the
-# wheel always goes to Claude's own renderer. forward_scroll is tri-state now:
-# the stock file leaves it commented out (auto), so uncomment it pinned true.
+# claude: resume forks the session so deferred tools do not block. The wheel
+# is left on auto (forward_scroll commented out, the stock default): pinning it
+# true sent every notch to Claude even when it had not asked for mouse input,
+# and the pane stopped scrolling. Auto forwards only while Claude wants it.
 /^\[providers\.claude\]$/,/^\[/ s|^resume_args = \["--continue"\]$|resume_args = ["--continue", "--fork-session"]|
-/^\[providers\.claude\]$/,/^\[/ s|^# forward_scroll = true$|forward_scroll = true|
-/^\[providers\.claude\]$/,/^\[/ s|^forward_scroll = false$|forward_scroll = true|
 # forward_mouse = false keeps plain drags in dux so text in the pane can be
 # selected and copied (bc3a9eec). Current dux renders it false for claude, and
 # fills an absent key with that on load; only an explicit `true` in a kept
