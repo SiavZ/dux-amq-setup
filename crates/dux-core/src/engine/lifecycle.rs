@@ -706,6 +706,27 @@ fn pty_has_exited(client: &mut PtyClient) -> bool {
     client.is_exited() || client.try_wait().is_some()
 }
 
+/// Whether the shutdown wait may stop waiting on this PTY: its reader reached
+/// end of input, or its child was reaped and the reader has had
+/// [`REAPED_DRAIN_GRACE`] to drain the rest.
+///
+/// Stricter than [`pty_has_exited`] on purpose. The reap and the reader's EOF
+/// are independent facts that land in either order, and a loaded machine can
+/// put the reader thread's wake well after the reap. Ending the wait on the
+/// reap alone returned an engine whose terminal still read as running, with the
+/// child's last output (a provider's goodbye, a flushed transcript line) not yet
+/// ingested. The grace keeps a grandchild that holds the slave open from
+/// stretching the wait, exactly as it bounds the exit prune.
+fn pty_has_finished(client: &mut PtyClient) -> bool {
+    if client.is_exited() {
+        return true;
+    }
+    client.try_wait().is_some()
+        && client
+            .reaped_at()
+            .is_some_and(|at| at.elapsed() >= REAPED_DRAIN_GRACE)
+}
+
 fn force_survivors_and_count_exited<'a>(clients: impl Iterator<Item = &'a mut PtyClient>) -> usize {
     let mut exited = 0;
     for client in clients {
@@ -2044,11 +2065,11 @@ impl Engine {
     }
 
     fn all_shutdown_ptys_exited(&mut self) -> bool {
-        let agents_exited = self.providers.values_mut().all(pty_has_exited);
+        let agents_exited = self.providers.values_mut().all(pty_has_finished);
         let terminals_exited = self
             .companion_terminals
             .values_mut()
-            .all(|terminal| pty_has_exited(&mut terminal.client));
+            .all(|terminal| pty_has_finished(&mut terminal.client));
         agents_exited && terminals_exited
     }
 
