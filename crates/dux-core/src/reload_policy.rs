@@ -12,6 +12,7 @@
 //! nothing lost.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::SystemTime;
 
 /// Why a reload was refused, in the words the user sees.
@@ -66,6 +67,61 @@ pub fn binary_is_newer(candidate: &Path, running_started: Option<SystemTime>) ->
         .is_ok_and(|candidate_mtime| candidate_mtime > running)
 }
 
+/// What Linux appends to `/proc/self/exe` once the file a process was started
+/// from has been unlinked. Replacing a binary by rename, which is how every
+/// installer has to do it because a running binary cannot be written over,
+/// unlinks the old file: from then on the running process reads its own path
+/// as `/usr/local/bin/dux (deleted)`, a path nothing can be started from.
+const DELETED_MARK: &[u8] = b" (deleted)";
+
+/// The path this process was started from, read before anything could have
+/// replaced the file. `None` inside when the platform could not say.
+static STARTUP_EXE: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Remember where this process was started from. Called first thing in
+/// `main`, while the answer is still the path on disk.
+pub fn remember_startup_exe() {
+    STARTUP_EXE.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .map(|path| without_deleted_mark(&path))
+    });
+}
+
+/// The binary a reload execs onto: the path dux was started from, which is
+/// where a newer build is installed.
+///
+/// Asking the OS again at reload time is exactly wrong on Linux. A reload is
+/// only offered once the file has been replaced, and once it has been replaced
+/// the OS answers with the unlinked file's marked path, so the exec fails with
+/// "No such file or directory" in the one situation the reload exists for.
+pub fn reload_exe() -> Option<PathBuf> {
+    if let Some(Some(path)) = STARTUP_EXE.get() {
+        return Some(path.clone());
+    }
+    std::env::current_exe()
+        .ok()
+        .map(|path| without_deleted_mark(&path))
+}
+
+/// `path` without the mark Linux puts on an unlinked executable's path.
+///
+/// A path that exists is returned as it is, so a file that really is named
+/// "something (deleted)" is never mistaken for a marked one.
+pub fn without_deleted_mark(path: &Path) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+
+    if path.exists() {
+        return path.to_path_buf();
+    }
+    match path.as_os_str().as_bytes().strip_suffix(DELETED_MARK) {
+        Some(unmarked) if !unmarked.is_empty() => {
+            PathBuf::from(std::ffi::OsStr::from_bytes(unmarked))
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
 /// The binary a reload would exec onto, and its mtime when the process started.
 ///
 /// Captured once at startup precisely because the file can be replaced
@@ -79,7 +135,7 @@ pub struct ReloadTarget {
 impl ReloadTarget {
     /// Read the current executable and stamp its mtime now.
     pub fn capture() -> Option<Self> {
-        let path = std::env::current_exe().ok()?;
+        let path = reload_exe()?;
         let started_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         Some(Self {
             path,
@@ -145,6 +201,54 @@ mod tests {
         let mut f = std::fs::File::create(path).expect("create");
         f.write_all(body).expect("write");
         f.sync_all().expect("sync");
+    }
+
+    /// What an install does to a running dux on Linux: the file is replaced
+    /// by rename, the old one is unlinked, and the process reads its own path
+    /// with the mark on it. The reload has to land on the path without it,
+    /// where the new build now is.
+    #[test]
+    fn a_replaced_binary_is_found_at_the_path_it_was_started_from() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let installed = dir.path().join("dux");
+        write_file(&installed, b"the new build");
+        let as_the_os_reports_it = dir.path().join("dux (deleted)");
+
+        assert!(!as_the_os_reports_it.exists());
+        assert_eq!(without_deleted_mark(&as_the_os_reports_it), installed);
+    }
+
+    #[test]
+    fn a_path_that_is_not_marked_is_left_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let installed = dir.path().join("dux");
+        write_file(&installed, b"build");
+        assert_eq!(without_deleted_mark(&installed), installed);
+
+        // Missing and unmarked: nothing to take off.
+        let missing = dir.path().join("gone");
+        assert_eq!(without_deleted_mark(&missing), missing);
+    }
+
+    /// A file that really has the words in its name is a file, not a mark.
+    #[test]
+    fn a_file_really_named_deleted_is_not_mistaken_for_a_mark() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let odd = dir.path().join("dux (deleted)");
+        write_file(&odd, b"build");
+        assert_eq!(without_deleted_mark(&odd), odd);
+    }
+
+    /// Paths are bytes on Unix, and the mark is taken off as bytes, so a
+    /// directory name that is not valid UTF-8 survives untouched.
+    #[test]
+    fn the_mark_comes_off_a_path_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let marked = PathBuf::from(std::ffi::OsStr::from_bytes(
+            b"/nonexistent-\xff-dir/dux (deleted)",
+        ));
+        let expected = PathBuf::from(std::ffi::OsStr::from_bytes(b"/nonexistent-\xff-dir/dux"));
+        assert_eq!(without_deleted_mark(&marked), expected);
     }
 
     #[test]
