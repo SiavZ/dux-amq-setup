@@ -2968,10 +2968,18 @@ impl App {
             tv_nsec: (poll_ms * 1_000_000) as i64,
         };
         let stdin_borrow = stdin_handle.as_fd();
+        let mut gone = false;
         let ready = crate::io_retry::retry_on_interrupt_errno(|| {
             let mut pollfd = [PollFd::new(&stdin_borrow, PollFlags::IN)];
-            poll(&mut pollfd, Some(&timeout))
+            let ready = poll(&mut pollfd, Some(&timeout))?;
+            gone = ready != 0
+                && super::hangup::classify_terminal_poll(pollfd[0].revents())
+                    == super::hangup::TerminalInput::Gone;
+            Ok(ready)
         })?;
+        if gone {
+            return Ok(self.quit_because_terminal_is_gone());
+        }
         if ready == 0 {
             self.resolve_pending_bare_esc(&stdin_borrow, None, &mut buf)?;
             return Ok(false);
@@ -2981,7 +2989,10 @@ impl App {
         let mut stdin_lock = stdin_handle.lock();
         let n = crate::io_retry::retry_on_interrupt(|| stdin_lock.read(&mut buf))?;
         if n == 0 {
-            return Ok(false);
+            // A terminal in raw mode has no way to type an end of file: a
+            // read of nothing is the hang-up, seen a moment after the poll.
+            drop(stdin_lock);
+            return Ok(self.quit_because_terminal_is_gone());
         }
         // Raw bytes are input like any other: local state (scroll, selection,
         // the macro bar) can move before the child echoes anything.

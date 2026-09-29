@@ -3929,6 +3929,7 @@ pub(crate) use background_server::{BackgroundServerStart, CompanionRouting};
 // disagree about that produce rows too wide for the box they were measured for.
 pub(crate) mod components;
 mod first_load;
+mod hangup;
 mod input;
 pub(crate) mod modal;
 mod orphan_worktrees;
@@ -4444,7 +4445,15 @@ impl App {
             EnableBracketedPaste
         )?;
 
+        // From here a quit signal is a promise: if the loop below cannot act
+        // on it, the watchdog does. It retires the moment the loop returns.
+        let watchdog = hangup::QuitWatchdog::spawn(
+            Arc::clone(&self.shutdown_flag),
+            hangup::QUIT_WATCHDOG_GRACE,
+            hangup::exit_because_wedged,
+        );
         let result = self.run_loop(&mut terminal);
+        watchdog.run_loop_left();
 
         // Stop PTY forwarders while the engine and terminal screen are still owned here.
         self.stop_background_server_quietly();
@@ -4631,9 +4640,21 @@ impl App {
     fn poll_structured_run_input(&mut self) -> bool {
         let idle_poll_ms = if self.any_row_animating() { 33 } else { 100 };
         let poll_ms = idle_poll_ms.min(self.max_poll_ms());
-        let ready = match crate::io_retry::retry_on_interrupt(|| {
-            event::poll(Duration::from_millis(poll_ms))
-        }) {
+        // The wait is dux's own, on the terminal itself, so a terminal that
+        // went away is seen for what it is. Crossterm must never be handed one:
+        // its reader spins on a hung-up tty and does not come back.
+        match hangup::wait_for_terminal_input(std::io::stdin(), Duration::from_millis(poll_ms)) {
+            Ok(hangup::TerminalInput::Gone) => return self.quit_because_terminal_is_gone(),
+            Ok(hangup::TerminalInput::Idle | hangup::TerminalInput::Ready) => {}
+            Err(err) => {
+                self.report_runtime_error("terminal wait failed; input handling was skipped", &err);
+                return false;
+            }
+        }
+        // The waiting is done, so crossterm only looks. It is asked even after
+        // an idle wait, because its queue also carries the resize it watches
+        // for on its own pipe.
+        let ready = match crate::io_retry::retry_on_interrupt(|| event::poll(Duration::ZERO)) {
             Ok(ready) => ready,
             Err(err) => {
                 self.report_runtime_error("event polling failed; input handling was skipped", &err);
@@ -4644,6 +4665,17 @@ impl App {
             return false;
         }
         self.drain_terminal_input()
+    }
+
+    /// The terminal dux was drawing on is gone: the window was closed, or the
+    /// connection it came over dropped. Nobody can see or reach this interface
+    /// again, so it ends the way a quit does, agents wound down and all.
+    pub(crate) fn quit_because_terminal_is_gone(&mut self) -> bool {
+        logger::info(
+            "the terminal is gone (hung up); quitting as if asked to, since nothing can \
+             reach this interface any more",
+        );
+        true
     }
 
     fn drain_terminal_input(&mut self) -> bool {
