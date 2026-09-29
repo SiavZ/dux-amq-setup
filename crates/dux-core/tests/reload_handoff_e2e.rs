@@ -164,7 +164,7 @@ fn handoff_from_env() -> PathBuf {
 fn generation_one(handoff_path: &Path) {
     // An agent that answers, so the next image can prove it reached this exact
     // process rather than merely holding an open descriptor.
-    let client = PtyClient::spawn_with_env(
+    let mut client = PtyClient::spawn_with_env(
         "/bin/sh",
         &[
             "-c".to_string(),
@@ -178,20 +178,43 @@ fn generation_one(handoff_path: &Path) {
     )
     .expect("spawn agent");
 
-    // Prepares the descriptor AND describes the pty: exactly what the engine
-    // calls for every provider before a reload.
+    // Output BEFORE the handoff: it must come back through the serialized
+    // terminal, not the live stream.
+    client.write_bytes(b"warmup\n").expect("write warmup");
+    let warmup = wait_for_text(&client, "got:warmup", std::time::Duration::from_secs(10));
+    assert!(
+        warmup.contains("got:warmup"),
+        "premise: the agent answered before the handoff, got {warmup:?}"
+    );
+
+    // Prepares the descriptor, quiesces the reader AND serializes the
+    // terminal: exactly what the engine calls for every provider before a
+    // reload. From here the reader is stopped, so the reply to `during` stays
+    // queued in the kernel pty buffer for the next image.
     let entry = client
         .prepare_for_reload("e2e-tab", Some("e2e-session"))
         .expect("prepare the pty for reload");
+    assert!(
+        !entry.repaint_bytes.is_empty(),
+        "a terminal with output must serialize into the handoff"
+    );
+
+    // Output WHILE the handoff is in flight: written after the reader stopped,
+    // so only a lossless reload can ever show it in the next image.
+    client.write_bytes(b"during\n").expect("write during");
+    std::thread::sleep(std::time::Duration::from_millis(300));
 
     println!("GEN1_CHILD_PID={}", entry.child_pid.unwrap_or(0));
 
-    Handoff {
+    let mut handoff = Handoff {
         written_by: std::process::id(),
         ptys: vec![entry],
-    }
-    .write(handoff_path)
-    .expect("write the handoff");
+    };
+    handoff.write(handoff_path).expect("write the handoff");
+    // The bytes live on disk now; dropping the in-memory copy is honest and
+    // proves the next image reads them from the sidecar, not from this
+    // process's memory.
+    drop(handoff);
 
     // Hold the single-instance lock across the exec the way dux does: it lives
     // inside the engine, and the engine is never dropped before the exec.
@@ -244,9 +267,21 @@ fn generation_two(handoff_path: &Path) {
             entry.cols,
             entry.scrollback_capacity,
             &entry.spawn_dir,
+            &entry.repaint_bytes,
         )
     }
     .expect("rebuild the client from the handoff");
+
+    // The handed-over terminal must arrive ALREADY showing what the agent said
+    // before the reload: this is the replay, before any new byte is written.
+    let replayed = client.visible_text_excerpt(200);
+    println!("REPLAYED={}", replayed.replace('\n', "\\n"));
+
+    // And the output that was in flight (written by the child after the old
+    // reader stopped) must surface through the new reader, not be lost with
+    // the old image's memory.
+    let inflight = wait_for_text(&client, "got:during", std::time::Duration::from_secs(10));
+    println!("INFLIGHT={}", inflight.contains("got:during"));
 
     client.write_bytes(b"ping\n").expect("write to the agent");
     let reply = wait_for_text(&client, "got:ping", std::time::Duration::from_secs(10));
@@ -312,7 +347,7 @@ fn format_fds(fds: &[i32]) -> String {
 /// Spawn an agent, then prepare it for a reload, reporting which descriptors
 /// were inheritable before and after.
 fn fd_audit() {
-    let client = PtyClient::spawn_with_env(
+    let mut client = PtyClient::spawn_with_env(
         "/bin/sh",
         &["-c".to_string(), "sleep 30".to_string()],
         &std::env::current_dir().expect("cwd"),
@@ -397,6 +432,23 @@ fn an_agent_survives_a_reload_and_answers_the_next_image() {
         reply.contains("got:ping"),
         "the agent started before the reload must answer the image that came \
          after it.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // The reload is lossless or it is not a reload worth having. The screen
+    // the old image showed must already be on the new one (the replayed
+    // terminal, before any new write), and the output that was in flight while
+    // the handoff was prepared must surface too (it sat in the kernel pty
+    // buffer after the old reader stopped).
+    assert!(
+        field(&stdout, "REPLAYED=")
+            .unwrap_or_default()
+            .contains("got:warmup"),
+        "output from before the reload must still be on the adopted terminal:\n{stdout}"
+    );
+    assert_eq!(
+        field(&stdout, "INFLIGHT="),
+        Some("true"),
+        "output the child wrote while the handoff was prepared must not be lost:\n{stdout}"
     );
 
     // And it must come back in the row it belonged to.

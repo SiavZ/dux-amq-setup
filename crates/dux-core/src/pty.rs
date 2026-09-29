@@ -508,10 +508,44 @@ const PTY_WRITE_QUEUE_CAP: usize = 1024;
 /// the thread is abandoned rather than hanging the dropping thread indefinitely.
 const PTY_WRITER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long the reader thread waits for child output before re-checking its
+/// stop flag. Readiness wakes it immediately; this interval only bounds how
+/// long a reload handoff, which sets that flag, waits to quiesce the reader.
+const PTY_READER_POLL_INTERVAL_MS: i32 = 100;
+
+/// Whether `fd` has data (or a hangup/error) ready to read within `timeout_ms`.
+///
+/// `false` means only "nothing yet": the caller re-checks its stop flag and
+/// polls again. Poll errors other than `EINTR` report `true` deliberately, so
+/// the `read` that follows surfaces the real error through the ordinary
+/// end-of-stream path instead of the loop spinning on a failed poll.
+fn wait_readable(fd: std::os::fd::RawFd, timeout_ms: i32) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `poll` reads and writes only the one `pollfd` this call owns; an
+    // invalid descriptor is reported through the structure (`POLLNVAL`), not
+    // as misbehaviour.
+    let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    match rc {
+        0 => false,
+        1 => true,
+        _ => std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted,
+    }
+}
+
 /// Messages sent to the PTY writer thread.
 enum PtyWriteMsg {
     /// Forward these bytes to the underlying PTY master writer.
     Bytes(Vec<u8>),
+    /// Acknowledge once every message queued before this one has been written.
+    /// The channel is FIFO, so the reply is a promise that nothing queued ahead
+    /// of the barrier is still pending. Used by [`PtyWriter::drain`] before a
+    /// reload `exec`, which would otherwise take queued-but-unwritten input with
+    /// the old image.
+    Drain(std::sync::mpsc::Sender<()>),
     /// Exit the writer thread unconditionally. Sent by [`PtyWriter::drop`] so
     /// teardown is independent of how many sender clones are still alive (the
     /// reader thread holds one), and independent of whether a write is blocked.
@@ -576,11 +610,22 @@ impl PtyWriter {
             // reader thread holds one) can never prevent the thread from stopping.
             // Loop exits on `Shutdown` or a channel error (the pattern stops
             // matching), or on a write error (explicit break below).
-            while let Ok(PtyWriteMsg::Bytes(chunk)) = rx.recv() {
-                if writer.write_all(&chunk).is_err() {
-                    break;
+            loop {
+                match rx.recv() {
+                    Ok(PtyWriteMsg::Bytes(chunk)) => {
+                        if writer.write_all(&chunk).is_err() {
+                            break;
+                        }
+                        let _ = writer.flush();
+                    }
+                    // FIFO: everything queued before the barrier has already
+                    // been through `write_all` above, so the acknowledgement is
+                    // exact. The writer keeps running afterwards.
+                    Ok(PtyWriteMsg::Drain(done)) => {
+                        let _ = done.send(());
+                    }
+                    Ok(PtyWriteMsg::Shutdown) | Err(_) => break,
                 }
-                let _ = writer.flush();
             }
         });
         Self {
@@ -605,6 +650,44 @@ impl PtyWriter {
         match self.tx.as_ref() {
             Some(tx) => pty_queue_send(tx, bytes),
             None => true,
+        }
+    }
+
+    /// Wait until every byte queued before now has been handed to the master,
+    /// bounded by `timeout`.
+    ///
+    /// A reload `exec` ends this image's threads instantly, and a chunk still
+    /// sitting in the queue (typed keystrokes, parser replies) would go with
+    /// them. The barrier rides the queue behind those chunks, so its reply
+    /// means they are written. Best effort by design: a writer wedged on a
+    /// child that stopped reading cannot be hurried, and the queue is already
+    /// dropping new chunks at that point, so the answer is logged and false
+    /// rather than blocking the reload indefinitely.
+    fn drain(&self, timeout: std::time::Duration) -> bool {
+        let Some(tx) = self.tx.as_ref() else {
+            return true;
+        };
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        match tx.try_send(PtyWriteMsg::Drain(done_tx)) {
+            Ok(()) => match done_rx.recv_timeout(timeout) {
+                Ok(()) => true,
+                Err(_) => {
+                    logger::warn(
+                        "reload: the pty writer did not drain within the timeout; \
+                         input queued for a child that is not reading may be lost",
+                    );
+                    false
+                }
+            },
+            // The writer thread is gone, so nothing is queued.
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => true,
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                logger::warn(
+                    "reload: the pty write queue is full, so the writer is wedged \
+                     on a child that is not reading; queued input may be lost",
+                );
+                false
+            }
         }
     }
 }
@@ -783,7 +866,14 @@ impl MasterPty for FdlessMaster {
 #[cfg(test)]
 impl PtyClient {
     /// Make this client's PTY impossible to hand over across a reload.
+    ///
+    /// Also quiesces the reader first, because swapping the master drops (and
+    /// so closes) the real one, which would leave the reader polling a dead
+    /// descriptor number. A stopped reader is exactly the state a refused
+    /// reload leaves behind anyway.
     pub(crate) fn make_unhandoverable_for_test(&mut self) {
+        self.stop_reader.store(true, Ordering::Release);
+        self.reader_thread = None;
         self.master = Box::new(FdlessMaster);
     }
 }
@@ -873,7 +963,19 @@ pub struct PtyClient {
     next_sub_id: AtomicU64,
     /// Handle to the background reader thread. Joined in `Drop` (after the
     /// child is killed and reaped) so the thread does not outlive the client.
+    /// `None` while the reader is quiesced for a reload handoff (see
+    /// [`Self::prepare_for_reload`]) until it is resumed, and permanently once
+    /// the stream has ended.
     reader_thread: Option<thread::JoinHandle<()>>,
+    /// The reader thread's stop flag, shared so a reload handoff can quiesce
+    /// the reader without killing the child or closing anything.
+    stop_reader: Arc<AtomicBool>,
+    /// The three facts `start_reader` needs to relaunch the reader after a
+    /// quiesce was undone (a refused reload): what to log, whether to scan for
+    /// agent signals, and which descriptor to poll.
+    reader_label: String,
+    track_agent_signals: bool,
+    reader_poll_fd: Option<std::os::fd::RawFd>,
     /// Consuming flag set by the reader loop's raw-byte scanner when it sees a
     /// bare terminal bell (`0x07` outside any escape sequence). Drained by
     /// [`PtyClient::take_attention`]. Never set for companion terminals, which
@@ -934,6 +1036,18 @@ struct ReaderLoopState {
     progress: Arc<Mutex<Option<ProgressReport>>>,
     passthrough: Arc<Mutex<VecDeque<crate::attention::CapturedSeq>>>,
     track_agent_signals: bool,
+    /// Set to stop the reader WITHOUT end-of-stream semantics: a reload
+    /// handoff quiesces the reader (see [`PtyClient::prepare_for_reload`]) so
+    /// bytes the child writes afterwards stay queued in the kernel pty buffer
+    /// for the next image to read, instead of being consumed into a grid that
+    /// is about to be exec'd away.
+    stop: Arc<AtomicBool>,
+    /// The descriptor the reader polls for readiness instead of blocking in
+    /// `read`. It is a dup of the same master the boxed reader reads, so
+    /// readiness observed on it is readiness of the reader's own stream. `None`
+    /// only for a master that exposes no descriptor (a test stand-in), where
+    /// the loop falls back to a plain blocking read and cannot be quiesced.
+    poll_fd: Option<std::os::fd::RawFd>,
 }
 
 impl ReaderLoopState {
@@ -1165,19 +1279,18 @@ impl PtyClient {
         // fails we must reap it before returning `Err`, or a live orphaned
         // process leaks with no `PtyClient` (and no `providers` entry) to track
         // or terminate it: the tab-create failure cleanup relies on a spawn
-        // `Err` meaning "no live process".
-        let reader = match pair
+        // `Err` meaning "no live process". The cloned reader itself is dropped
+        // here: `start_reader` makes its own clone from the master once the
+        // client exists. This is a canary, not the thread's reader.
+        if let Err(err) = pair
             .master
             .try_clone_reader()
             .context("failed to clone PTY reader")
         {
-            Ok(reader) => reader,
-            Err(err) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(err);
-            }
-        };
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
         let pty_writer = match pair
             .master
             .take_writer()
@@ -1198,7 +1311,6 @@ impl PtyClient {
         // independent flag like `attention_notify`.
         let attention_bell = Arc::new(AtomicBool::new(false));
         let writer = PtyWriter::spawn(pty_writer);
-        let writer_tx = writer.sender();
         let exited = Arc::new(AtomicBool::new(false));
         let exited_at: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
         let read_error: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
@@ -1210,27 +1322,13 @@ impl PtyClient {
         let progress: Arc<Mutex<Option<ProgressReport>>> = Arc::new(Mutex::new(None));
         let passthrough: Arc<Mutex<VecDeque<crate::attention::CapturedSeq>>> =
             Arc::new(Mutex::new(VecDeque::new()));
+        let stop_reader = Arc::new(AtomicBool::new(false));
+        // Captured before the master moves into the client: the reader thread
+        // polls this descriptor for readiness, and it stays valid for the
+        // client's whole life (the master is dropped only with the client).
+        let reader_poll_fd = pair.master.as_raw_fd();
 
-        let reader_state = ReaderLoopState {
-            terminal: Arc::clone(&terminal),
-            writer_tx,
-            exited: Arc::clone(&exited),
-            exited_at: Arc::clone(&exited_at),
-            read_error: Arc::clone(&read_error),
-            label: format!("\"{command}\" in {}", cwd.display()),
-            has_output: Arc::clone(&has_output),
-            dirty: Arc::clone(&dirty),
-            received_data: Arc::clone(&received_data),
-            subscribers: Arc::clone(&subscribers),
-            attention_bell: Arc::clone(&attention_bell),
-            attention_notify: Arc::clone(&attention_notify),
-            progress: Arc::clone(&progress),
-            passthrough: Arc::clone(&passthrough),
-            track_agent_signals,
-        };
-        let reader_thread = thread::spawn(move || Self::reader_loop(reader, reader_state));
-
-        Ok(Self {
+        let mut client = Self {
             master: pair.master,
             writer,
             terminal,
@@ -1248,12 +1346,18 @@ impl PtyClient {
             last_resize_at: Mutex::new(None),
             subscribers,
             next_sub_id: AtomicU64::new(0),
-            reader_thread: Some(reader_thread),
+            reader_thread: None,
+            stop_reader,
+            reader_label: format!("\"{command}\" in {}", cwd.display()),
+            track_agent_signals,
+            reader_poll_fd,
             attention_bell,
             attention_notify,
             progress,
             passthrough,
-        })
+        };
+        client.start_reader()?;
+        Ok(client)
     }
 
     /// Rebuild a client around a PTY and child inherited from the previous image
@@ -1264,10 +1368,15 @@ impl PtyClient {
     /// Rust values that described it, which were lost with the old image's
     /// memory.
     ///
-    /// The terminal starts EMPTY. The scrollback lived in the previous image and
-    /// cannot be recovered, so the row shows nothing until the agent writes
-    /// again. That is the one visible cost of a reload, and it is a deliberate
-    /// trade: a cleared transcript in exchange for an agent that never stopped.
+    /// `repaint` is the terminal state the previous image serialized at handoff
+    /// time (see [`TerminalState::reconnect_repaint`]). It is replayed into the
+    /// fresh grid BEFORE the reader thread starts, so the screen and scrollback
+    /// come back exactly as they were and the child's still-streaming output
+    /// continues on top of them; bytes the child wrote while the handoff was in
+    /// flight were never consumed by the old image and are still queued in the
+    /// kernel pty buffer, waiting for the reader started here. An empty `repaint`
+    /// (a handoff from an older build, or a sidecar that could not be read)
+    /// starts the row empty, which is what a reload always used to cost.
     ///
     /// # Safety
     ///
@@ -1280,6 +1389,7 @@ impl PtyClient {
         cols: u16,
         scrollback_lines: usize,
         spawn_dir: &Path,
+        repaint: &[u8],
     ) -> Result<Self> {
         // SAFETY: the caller guarantees the descriptor is an owned, inherited
         // PTY master. `adopt` additionally refuses anything that is not a tty,
@@ -1287,23 +1397,16 @@ impl PtyClient {
         let master = unsafe { crate::pty_reattach::ReattachedMaster::adopt(master_fd) }
             .context("adopting the inherited PTY master")?;
 
-        let reader = master
-            .try_clone_reader()
-            .context("cloning the reader for an adopted PTY")?;
-        let pty_writer = master
-            .take_writer()
-            .context("taking the writer for an adopted PTY")?;
-
+        let pid = child_pid.context("the reload handoff carried no pid for this PTY")?;
         // Without a pid there is nothing to wait on or signal. Refusing is the
         // honest answer: a client that cannot reap its child would report the
-        // agent as running forever.
-        let pid = child_pid.context("the reload handoff carried no pid for this PTY")?;
+        // agent as running forever. (Checked after `adopt` so a bad descriptor
+        // is named as the fault it is; the master is dropped with this frame.)
+        let reader_poll_fd = Some(master.raw_fd());
         let child = crate::pty_adopt_child::AdoptedChild::new(pid);
 
         let terminal = Arc::new(Mutex::new(TerminalState::new(rows, cols, scrollback_lines)));
         let attention_bell = Arc::new(AtomicBool::new(false));
-        let writer = PtyWriter::spawn(pty_writer);
-        let writer_tx = writer.sender();
         let exited = Arc::new(AtomicBool::new(false));
         let exited_at: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
         let read_error: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
@@ -1315,29 +1418,18 @@ impl PtyClient {
         let progress: Arc<Mutex<Option<ProgressReport>>> = Arc::new(Mutex::new(None));
         let passthrough: Arc<Mutex<VecDeque<crate::attention::CapturedSeq>>> =
             Arc::new(Mutex::new(VecDeque::new()));
+        let stop_reader = Arc::new(AtomicBool::new(false));
 
-        let reader_state = ReaderLoopState {
-            terminal: Arc::clone(&terminal),
-            writer_tx,
-            exited: Arc::clone(&exited),
-            exited_at: Arc::clone(&exited_at),
-            read_error: Arc::clone(&read_error),
-            label: format!("adopted pty {pid} in {}", spawn_dir.display()),
-            has_output: Arc::clone(&has_output),
-            dirty: Arc::clone(&dirty),
-            received_data: Arc::clone(&received_data),
-            subscribers: Arc::clone(&subscribers),
-            attention_bell: Arc::clone(&attention_bell),
-            attention_notify: Arc::clone(&attention_notify),
-            progress: Arc::clone(&progress),
-            passthrough: Arc::clone(&passthrough),
-            // Agent signal tracking is rebuilt from the live stream; there is no
-            // carried-over scanner state to honour.
-            track_agent_signals: true,
-        };
-        let reader_thread = thread::spawn(move || Self::reader_loop(reader, reader_state));
+        // The writer is taken BEFORE the terminal is replayed: if it cannot be
+        // cloned the entry is refused whole, and no terminal content is worth
+        // an agent dux cannot talk to. (The reader is cloned by
+        // `start_reader`, after the replay.)
+        let pty_writer = master
+            .take_writer()
+            .context("taking the writer for an adopted PTY")?;
+        let writer = PtyWriter::spawn(pty_writer);
 
-        Ok(Self {
+        let mut client = Self {
             master: Box::new(master),
             writer,
             terminal,
@@ -1358,19 +1450,175 @@ impl PtyClient {
             last_resize_at: Mutex::new(None),
             subscribers,
             next_sub_id: AtomicU64::new(0),
-            reader_thread: Some(reader_thread),
+            reader_thread: None,
+            stop_reader,
+            reader_label: format!("adopted pty {pid} in {}", spawn_dir.display()),
+            // Agent signal tracking is rebuilt from the live stream; there is no
+            // carried-over scanner state to honour.
+            track_agent_signals: true,
+            reader_poll_fd,
             attention_bell,
             attention_notify,
             progress,
             passthrough,
-        })
+        };
+        client.replay_prior_screen(repaint);
+        client.start_reader()?;
+        Ok(client)
+    }
+
+    /// Spawn (or re-spawn) this client's reader thread around the master.
+    ///
+    /// Shared by the two constructors and by [`Self::resume_after_failed_reload`].
+    /// The caller guarantees no reader thread is running: construction paths
+    /// call it exactly once, and the resume path only after the previous thread
+    /// was joined and the stop flag cleared.
+    fn start_reader(&mut self) -> Result<()> {
+        let reader = self
+            .master
+            .try_clone_reader()
+            .context("cloning the PTY reader")?;
+        let reader_state = ReaderLoopState {
+            terminal: Arc::clone(&self.terminal),
+            writer_tx: self.writer.sender(),
+            exited: Arc::clone(&self.exited),
+            exited_at: Arc::clone(&self.exited_at),
+            read_error: Arc::clone(&self.read_error),
+            label: self.reader_label.clone(),
+            has_output: Arc::clone(&self.has_output),
+            dirty: Arc::clone(&self.dirty),
+            received_data: Arc::clone(&self.received_data),
+            subscribers: Arc::clone(&self.subscribers),
+            attention_bell: Arc::clone(&self.attention_bell),
+            attention_notify: Arc::clone(&self.attention_notify),
+            progress: Arc::clone(&self.progress),
+            passthrough: Arc::clone(&self.passthrough),
+            track_agent_signals: self.track_agent_signals,
+            stop: Arc::clone(&self.stop_reader),
+            poll_fd: self.reader_poll_fd,
+        };
+        self.reader_thread = Some(thread::spawn(move || {
+            Self::reader_loop(reader, reader_state)
+        }));
+        Ok(())
+    }
+
+    /// Replay a handed-over terminal screen into this client's fresh grid.
+    ///
+    /// Must run before the reader thread starts: the replay is the base state,
+    /// and the child's live stream continues on top of it. The replies
+    /// `process` generates are DISCARDED on purpose (they answer device
+    /// queries the previous image's terminal never asked, and forwarding them
+    /// to the child would confuse it), and the replay is not agent activity, so
+    /// it sets neither the content-change flag the streaming heuristic reads
+    /// nor `received_data`. It does set `has_output` when it painted anything,
+    /// so an adopted agent that is quiet right now still reads as having
+    /// output.
+    fn replay_prior_screen(&self, repaint: &[u8]) {
+        if repaint.is_empty() {
+            return;
+        }
+        let Ok(mut terminal) = self.terminal.lock() else {
+            logger::warn("reload: could not lock the terminal to replay the handed-over screen");
+            return;
+        };
+        let _replies = terminal.process(repaint);
+        let _ = terminal.take_content_change();
+        if terminal.has_visible_output() {
+            self.has_output.store(true, Ordering::Release);
+        }
+    }
+
+    /// Ask this client's reader thread to stop, without waiting for it.
+    ///
+    /// Deliberately cheap and idempotent: [`Engine::prepare_reload_handoff`]
+    /// sets this on EVERY pty first and joins them afterwards, so N agents all
+    /// wake from the same poll interval instead of paying one interval each
+    /// while the TUI waits. A reload of a busy workspace must feel like a
+    /// hiccup, not a freeze.
+    pub(crate) fn request_reader_stop(&self) {
+        self.stop_reader.store(true, Ordering::Release);
+    }
+
+    /// Join a reader that was asked to stop, and drain the writer, so nothing
+    /// either side of the pty is in flight when the process execs onto a new
+    /// image.
+    ///
+    /// The reader must stop CONSUMING before the terminal is serialized: bytes
+    /// the old image reads after the snapshot die with its memory, while bytes
+    /// left in the kernel pty buffer are inherited by the next image's reader.
+    /// The writer drain pushes anything still queued (keystrokes, parser
+    /// replies) into the master first, because the exec ends this image's
+    /// threads instantly and would take an unwritten chunk with them.
+    ///
+    /// [`Self::request_reader_stop`] must have been called (here or by the
+    /// engine's first pass). Joining is what waits out the poll interval the
+    /// reader needs to notice the flag.
+    fn join_quiesced_reader_for_reload(&mut self) -> Result<()> {
+        self.request_reader_stop();
+        if let Some(handle) = self.reader_thread.take()
+            && handle.join().is_err()
+        {
+            // A reader that panicked may hold the terminal lock poisoned or have
+            // left half-parsed state; handing this pty over would hand over a
+            // guess. Refuse: the agent keeps running and the reload tries again.
+            return Err(anyhow::anyhow!("the pty reader thread panicked"));
+        }
+        self.writer.drain(PTY_WRITER_SHUTDOWN_TIMEOUT);
+        Ok(())
+    }
+
+    /// Undo a quiesce: put the reader thread back the way it was.
+    ///
+    /// A reload that is refused after this client was prepared (another pty
+    /// could not cross, the handoff could not be written, the exec itself
+    /// failed) must leave every agent exactly as it found it, and that includes
+    /// reading its output again. A no-op when the reader never stopped, and
+    /// deliberately nothing at all when the stream has already ended: there is
+    /// no output left to resume.
+    pub fn resume_after_failed_reload(&mut self) {
+        if self.reader_thread.is_some() {
+            return;
+        }
+        if self.exited.load(Ordering::Acquire) {
+            return;
+        }
+        self.stop_reader.store(false, Ordering::Release);
+        if let Err(err) = self.start_reader() {
+            logger::warn(&format!(
+                "reload: could not resume the reader for {}: {err:#}; its terminal \
+                 will not receive new output",
+                self.reader_label
+            ));
+        }
     }
 
     fn reader_loop(mut reader: Box<dyn std::io::Read + Send>, state: ReaderLoopState) {
         let mut buf = [0u8; 4096];
         let mut scanner = crate::attention::AttentionScanner::new();
         let mut overflow_seen = 0u64;
+        // Whether the loop is ending because it was ASKED to stop (a reload
+        // handoff) rather than because the stream ended. A quiesced reader
+        // leaves its subscribers registered: the stream is paused, not over,
+        // and a resumed reader (a refused reload) continues their fan-out from
+        // the kernel's unread backlog exactly where it left off.
+        let mut quiesced = false;
         loop {
+            // The stop check comes first on every pass, so a quiesced reader
+            // (reload handoff) exits without end-of-stream semantics and
+            // without consuming anything more from the kernel buffer.
+            if state.stop.load(Ordering::Acquire) {
+                quiesced = true;
+                break;
+            }
+            // Wait for the child to write something rather than parking in a
+            // bare blocking read, so the stop flag above is re-checked at a
+            // bounded interval. On readiness the read below cannot block.
+            if let Some(fd) = state.poll_fd
+                && !wait_readable(fd, PTY_READER_POLL_INTERVAL_MS)
+            {
+                continue;
+            }
             match crate::io_retry::retry_on_interrupt(|| reader.read(&mut buf)) {
                 Ok(0) => {
                     state.mark_eof();
@@ -1391,7 +1639,9 @@ impl PtyClient {
                 }
             }
         }
-        state.disconnect_subscribers();
+        if !quiesced {
+            state.disconnect_subscribers();
+        }
     }
 
     /// Write raw bytes to the PTY (forwards keystrokes to the child process).
@@ -1906,35 +2156,63 @@ impl PtyClient {
     }
 
     /// Describe this PTY so the image on the other side of a reload can pick the
-    /// same child back up, and make its master descriptor survive the `exec`.
+    /// same child back up, make its master descriptor survive the `exec`, and
+    /// carry its terminal state across.
     ///
-    /// Both halves have to happen here, together. Recording the descriptor
-    /// number without clearing `FD_CLOEXEC` hands the next image a number the
-    /// kernel already closed; clearing the flag without recording the number
-    /// leaves an inherited descriptor nobody can identify. Doing both in one
-    /// call means a caller cannot get half of it right.
+    /// Three halves have to happen here, together:
+    ///
+    /// - the reader is quiesced (stopped and joined) and the writer drained, so
+    ///   nothing is in flight: bytes the child writes from here on stay queued
+    ///   in the kernel pty buffer, where the next image's reader finds them,
+    ///   and every input chunk already queued has been written to the master;
+    /// - the terminal is serialized with [`TerminalState::reconnect_repaint`],
+    ///   the same repaint a reconnecting browser gets, which round-trips the
+    ///   viewport, the scrollback, the modes, the scroll region, the cursor and
+    ///   the palette. Without this, the alacritty grid would die with this
+    ///   image's memory and the reloaded row would start blank;
+    /// - `FD_CLOEXEC` is cleared on the master and the descriptor recorded,
+    ///   because recording the number without clearing the flag hands the next
+    ///   image a descriptor the kernel already closed, and clearing without
+    ///   recording leaves an inherited descriptor nobody can identify.
     ///
     /// Returns `None` when this PTY cannot be handed over, which the caller must
     /// treat as "do not reload": a provider that cannot cross the exec would
     /// come back as a dead row with a live orphan behind it. That happens when
-    /// the master has no descriptor to pass, or when clearing the flag fails.
-    ///
-    /// Does NOT carry the terminal grid. The scrollback lives in this process's
-    /// memory and dies with it, so the replacement image starts the row clean and
-    /// repaints from the child's next output. The agent keeps running either way,
-    /// which is the part that matters.
+    /// the master has no descriptor to pass, when clearing the flag fails, or
+    /// when the reader could not be quiesced. Every refusal undoes its own
+    /// quiesce, so the PTY keeps working exactly as before.
     pub fn prepare_for_reload(
-        &self,
+        &mut self,
         tab_id: &str,
         session_id: Option<&str>,
     ) -> Option<crate::reload_handoff::HandoffPty> {
         let fd = self.master.as_raw_fd()?;
+        if let Err(err) = self.join_quiesced_reader_for_reload() {
+            logger::warn(&format!(
+                "reload: tab {tab_id} cannot hand over its pty: {err:#}"
+            ));
+            self.resume_after_failed_reload();
+            return None;
+        }
         if let Err(err) = crate::pty_reattach::keep_open_across_exec(fd) {
             logger::warn(&format!(
                 "reload: tab {tab_id} cannot hand over its pty: {err:#}"
             ));
+            self.resume_after_failed_reload();
             return None;
         }
+        let repaint = match self.terminal.lock() {
+            Ok(terminal) => Some(terminal.reconnect_repaint()),
+            Err(_) => None,
+        };
+        let Some(repaint) = repaint else {
+            logger::warn(&format!(
+                "reload: tab {tab_id} cannot hand over its pty: the terminal \
+                 lock is poisoned"
+            ));
+            self.resume_after_failed_reload();
+            return None;
+        };
         let (rows, cols) = self.grid_size().unwrap_or((24, 80));
         Some(crate::reload_handoff::HandoffPty {
             tab_id: tab_id.to_string(),
@@ -1948,6 +2226,10 @@ impl PtyClient {
             cols,
             spawn_dir: self.spawn_dir.clone(),
             scrollback_capacity: self.scrollback_capacity,
+            // The sidecar path is assigned by `Handoff::write`, which owns the
+            // handoff directory; until then the bytes ride in memory.
+            repaint: None,
+            repaint_bytes: repaint,
         })
     }
 
@@ -2268,6 +2550,13 @@ fn pointer_from_button_bits(cb: u32) -> PointerReport {
 
 impl Drop for PtyClient {
     fn drop(&mut self) {
+        // The reader's stop flag is deliberately NOT raised yet. The grace loop
+        // below reads "reader finished" as "the reader saw EOF, so the whole
+        // group released the slave"; a reader stopped by the flag would finish
+        // at once, skip the KILL escalation, and leave `child.wait()` blocking
+        // on a child that ignored (or has not yet acted on) the hangup. The
+        // flag is raised only after the child is reaped, to bound the join.
+        //
         // Signal the child's whole process group, not just the direct child. The
         // child is its own session/process-group leader (portable-pty calls
         // `setsid` before exec, so its PGID equals its PID), and anything it
@@ -2316,8 +2605,11 @@ impl Drop for PtyClient {
             let _ = self.child.wait();
         }
         // With the group dead the slave is released, the master read returns
-        // EOF and the reader thread returns. Join it so the thread does not
-        // outlive this client.
+        // EOF and the reader thread returns. Raising the stop flag now also
+        // bounds the join by one poll interval when something outside the
+        // group (a double-forked daemon) still holds the slave open. Join it so
+        // the thread does not outlive this client.
+        self.stop_reader.store(true, Ordering::Release);
         let _ = handle.join();
     }
 }
@@ -4344,6 +4636,92 @@ mod tests {
         );
     }
 
+    /// Every character on every line of the grid, history and viewport alike,
+    /// so a round-trip test can compare the WHOLE terminal rather than the
+    /// viewport alone (a repaint that forgot scrollback would otherwise pass).
+    fn full_grid_text(terminal: &TerminalState) -> String {
+        let grid = terminal.term.grid();
+        let mut out = String::new();
+        for line in grid.topmost_line().0..=grid.bottommost_line().0 {
+            for cell in grid[Line(line)].into_iter() {
+                out.push(cell.c);
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn a_reload_replay_round_trips_scrollback_and_viewport() {
+        // What a reload hands over is exactly `reconnect_repaint`'s bytes, fed
+        // into a fresh terminal. The reload is lossless if and only if that
+        // round trip is, so pin it: history, viewport, and the half-typed line
+        // the cursor is sitting on must all come back.
+        let mut src = TerminalState::with_scrollback(6, 40, 200);
+        for i in 0..30 {
+            src.process(format!("history-{i:02}\r\n").as_bytes());
+        }
+        src.process(b"still typing");
+        assert!(
+            src.term.grid().history_size() > 0,
+            "precondition: the source terminal has scrollback"
+        );
+
+        let replay = src.reconnect_repaint();
+        let mut dst = TerminalState::with_scrollback(6, 40, 200);
+        // The reload path discards replies and clears the content-change flag:
+        // mirror it, so the test measures what adopt_after_reload really does.
+        let _replies = dst.process(&replay);
+        let _ = dst.take_content_change();
+
+        assert_eq!(
+            dst.visible_text_excerpt(100),
+            src.visible_text_excerpt(100),
+            "the viewport, including the unfinished line, must come back identically"
+        );
+        assert_eq!(
+            dst.term.grid().history_size(),
+            src.term.grid().history_size(),
+            "the same number of lines must have scrolled into history"
+        );
+        let dst_text = full_grid_text(&dst);
+        assert!(
+            dst_text.contains("history-00"),
+            "the oldest line the ring kept must survive, or scrollback is lossy"
+        );
+        assert!(dst_text.contains("still typing"));
+    }
+
+    #[test]
+    fn a_reload_replay_round_trips_the_alt_screen() {
+        // A full-screen TUI caught mid-run on the alternate screen is the
+        // reload case that most looks unrecoverable. The replay must put the
+        // fresh terminal back on the alt screen with its content, so the
+        // child's next repaint continues the same picture.
+        let mut src = TerminalState::with_scrollback(6, 40, 200);
+        src.process(b"main screen text\r\n");
+        src.process(b"\x1b[?1049h\x1b[H\x1b[2J");
+        src.process(b"\x1b[3;5Hfull-screen app");
+        assert!(
+            src.is_alt_screen(),
+            "premise: the child took the alt screen"
+        );
+
+        let replay = src.reconnect_repaint();
+        let mut dst = TerminalState::with_scrollback(6, 40, 200);
+        let _replies = dst.process(&replay);
+
+        assert!(
+            dst.is_alt_screen(),
+            "the rebuilt terminal must still be on the alternate screen"
+        );
+        assert!(
+            dst.visible_text_excerpt(10).contains("full-screen app"),
+            "the alt-screen content must be repainted, got {:?}",
+            dst.visible_text_excerpt(10)
+        );
+    }
+
     /// Read the scrolling region a live terminal is ACTUALLY using, without an
     /// accessor for it.
     ///
@@ -5700,10 +6078,181 @@ mod tests {
             progress: Arc::new(Mutex::new(None)),
             passthrough: Arc::new(Mutex::new(VecDeque::new())),
             track_agent_signals: true,
+            stop: Arc::new(AtomicBool::new(false)),
+            // No descriptor to poll: the loop falls back to a plain blocking
+            // read, which is all these synthetic readers need.
+            poll_fd: None,
         };
         // The receiver is handed back so the writer channel is not hung up under
         // the loop.
         (state, exited, read_error, writer_rx)
+    }
+
+    /// Wait until the client's terminal shows `needle`, bounded, so a broken
+    /// expectation fails the test instead of hanging it.
+    fn wait_for_visible(client: &PtyClient, needle: &str, within: std::time::Duration) -> String {
+        let deadline = Instant::now() + within;
+        loop {
+            let text = client.visible_text_excerpt(100);
+            if text.contains(needle) || Instant::now() >= deadline {
+                return text;
+            }
+            thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_reload_handoff_keeps_output_that_arrives_after_the_snapshot() {
+        // The two halves of a lossless reload, on one real pty. Output the
+        // child produces AFTER the handoff snapshot must stay unread (the
+        // kernel buffer holds it), and undoing the handoff (a refused reload)
+        // must then drain it, while everything snapshotted before stays put.
+        let dir = tempfile::tempdir().unwrap();
+        let mut client = PtyClient::spawn(
+            "/bin/sh",
+            &[
+                "-c".to_string(),
+                "while IFS= read -r line; do echo \"got:$line\"; done".to_string(),
+            ],
+            dir.path(),
+            24,
+            80,
+            1000,
+        )
+        .expect("spawn echo agent");
+
+        client.write_bytes(b"first\n").expect("write first");
+        let before = wait_for_visible(&client, "got:first", std::time::Duration::from_secs(10));
+        assert!(before.contains("got:first"), "premise: the agent answered");
+
+        let entry = client
+            .prepare_for_reload("tab", None)
+            .expect("the healthy pty can be handed over");
+        assert!(
+            !entry.repaint_bytes.is_empty(),
+            "a terminal with output must serialize into the handoff"
+        );
+        assert!(
+            String::from_utf8_lossy(&entry.repaint_bytes).contains("got:first"),
+            "the snapshot must carry the pre-reload output"
+        );
+
+        // The writer still works with the reader stopped; the child replies,
+        // but the reply must stay OUT of the terminal, queued in the kernel.
+        client.write_bytes(b"second\n").expect("write second");
+        thread::sleep(std::time::Duration::from_millis(400));
+        assert!(
+            !client.visible_text_excerpt(50).contains("got:second"),
+            "a quiesced reader must not consume the child's reply"
+        );
+
+        // A refused reload undoes the quiesce; the queued reply must surface.
+        client.resume_after_failed_reload();
+        let after = wait_for_visible(&client, "got:second", std::time::Duration::from_secs(10));
+        assert!(
+            after.contains("got:second"),
+            "the reply that arrived while quiesced must not be lost"
+        );
+        assert!(
+            after.contains("got:first"),
+            "output from before the handoff must still be there too"
+        );
+    }
+
+    #[test]
+    fn a_quiesced_reader_keeps_its_subscribers_and_a_resumed_one_feeds_them() {
+        // A reader stopped for a reload is paused, not finished. Web viewers
+        // subscribed to the stream must stay registered and connected, so a
+        // refused or failed reload resumes their fan-out instead of dropping
+        // every browser attached to the agent.
+        let dir = tempfile::tempdir().unwrap();
+        let mut client = PtyClient::spawn(
+            "/bin/sh",
+            &[
+                "-c".to_string(),
+                "while IFS= read -r line; do echo \"got:$line\"; done".to_string(),
+            ],
+            dir.path(),
+            24,
+            80,
+            1000,
+        )
+        .expect("spawn echo agent");
+        let (_guard, rx) = client.subscribe();
+        assert_eq!(client.subscriber_count(), 1, "premise: one viewer");
+
+        client
+            .prepare_for_reload("tab", None)
+            .expect("the healthy pty can be handed over");
+        assert_eq!(
+            client.subscriber_count(),
+            1,
+            "a quiesced reader must not disconnect its subscribers"
+        );
+        assert!(
+            !matches!(
+                rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            ),
+            "the viewer's channel must still be open while the reader is paused"
+        );
+        // Drain anything the viewer got before the pause.
+        while rx.try_recv().is_ok() {}
+
+        client.write_bytes(b"resumed\n").expect("write");
+        client.resume_after_failed_reload();
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let mut seen = Vec::new();
+        while Instant::now() < deadline && !String::from_utf8_lossy(&seen).contains("got:resumed") {
+            if let Ok(chunk) = rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                seen.extend_from_slice(&chunk);
+            }
+        }
+        assert!(
+            String::from_utf8_lossy(&seen).contains("got:resumed"),
+            "the surviving viewer must receive output again after the resume, got {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+    }
+
+    #[test]
+    fn stopping_every_reader_first_quiesces_them_all_within_one_interval() {
+        // The engine asks every reader to stop BEFORE joining any, because a
+        // busy workspace cannot pay one poll interval per agent. If each
+        // reader were stopped only when its turn came, the readers later in
+        // the queue would still be running after the earlier joins; with the
+        // flags all raised at once, every reader exits on its own within one
+        // interval and the joins are free.
+        let dir = tempfile::tempdir().unwrap();
+        let mut clients = Vec::new();
+        for _ in 0..6 {
+            let client = PtyClient::spawn(
+                "/bin/sh",
+                &["-c".to_string(), "sleep 30".to_string()],
+                dir.path(),
+                24,
+                80,
+                100,
+            )
+            .expect("spawn idle agent");
+            client.request_reader_stop();
+            clients.push(client);
+        }
+        // One poll interval, plus slack for a loaded machine. No join has run:
+        // every thread that has exited did so on its own.
+        thread::sleep(std::time::Duration::from_millis(
+            u64::try_from(PTY_READER_POLL_INTERVAL_MS).unwrap() * 3,
+        ));
+        for (index, client) in clients.iter().enumerate() {
+            assert!(
+                client
+                    .reader_thread
+                    .as_ref()
+                    .is_some_and(|t| t.is_finished()),
+                "reader {index} should have exited within one interval of the stop \
+                 flag being raised for all of them at once",
+            );
+        }
     }
 
     /// A read error and a clean end of input both stop the reader and both mark

@@ -619,10 +619,10 @@ pub struct App {
     /// succeeds. LOCAL MODE may bind more than one address (loopback + Tailscale).
     pub(crate) pending_server_flip: Option<(Vec<std::net::TcpListener>, Vec<String>)>,
     /// When set, the run loop exits with [`RunExit::Reload`], handing the
-    /// manifest of live PTYs to the binary so it can exec onto a newer dux
-    /// while every agent keeps running.
+    /// manifest of live PTYs (each with its serialized terminal state) to the
+    /// binary so it can exec onto a newer dux while every agent keeps running.
     ///
-    /// Populated by `request_reload` only after BOTH guards pass and the
+    /// Populated by `request_reload` only after both guards pass and the
     /// handoff has actually been collected, so by the time this is `Some` the
     /// reload is known to be possible. Anything that can fail has already
     /// failed, harmlessly, with the user still running.
@@ -4922,11 +4922,14 @@ impl App {
     /// Everything that can refuse does so HERE, while the app is still running
     /// normally and a refusal costs the user nothing but a status line. By the
     /// time `pending_reload` is set, the reload has already been shown to be
-    /// possible: the guards passed and the handoff was collected.
+    /// possible: the guards passed and the handoff was collected, with every
+    /// agent's terminal state serialized into it.
     ///
     /// The order matters. The cheap, common refusal (no newer build) is checked
     /// before the one that touches every PTY, so the usual "nothing to do" case
-    /// does not clear `FD_CLOEXEC` on descriptors that are not going anywhere.
+    /// does not stop readers or clear `FD_CLOEXEC` on descriptors that are not
+    /// going anywhere. An agent that is streaming does NOT refuse: its terminal
+    /// and unread output cross the exec with it.
     pub(crate) fn request_reload(&mut self) {
         use dux_core::reload_policy::ReloadRefusal;
 
@@ -4940,13 +4943,11 @@ impl App {
             self.set_error(ReloadRefusal::NoNewerBinary.message());
             return;
         }
-        if let Some(tab_id) = self.engine.agent_blocking_reload() {
-            self.set_error(ReloadRefusal::AgentWorking { tab_id }.message());
-            return;
-        }
-        // Last, because this is the step with a side effect: it clears
-        // `FD_CLOEXEC` on every master so the descriptors survive the exec.
-        // Doing it after the refusals means a refused reload leaves no trace.
+        // Last, because this is the step with side effects: it stops every
+        // reader thread, serializes every terminal and clears `FD_CLOEXEC` on
+        // every master so the descriptors survive the exec. Doing it after the
+        // refusals means a refused reload leaves no trace (a refusal partway
+        // through collection resumes everything it stopped).
         let Some(handoff) = self.engine.prepare_reload_handoff() else {
             self.set_error(ReloadRefusal::HandoffUnavailable.message());
             return;

@@ -186,11 +186,15 @@ pub fn resume_after_server(
 ///
 /// The engine never left this process, so this is the same rebuild as coming
 /// back from the web server: no session relaunch, every provider still live.
+/// The handoff had already stopped every PTY's reader thread, so they are
+/// restarted first. Without that, the resumed TUI would show terminals that
+/// never update again.
 pub fn resume_after_failed_reload(
-    engine: Box<Engine>,
+    mut engine: Box<Engine>,
     companion: Box<dyn dux_core::background_serve::BackgroundServeCompanion>,
     reason: String,
 ) -> Result<TuiExit> {
+    engine.resume_all_pty_readers();
     let mut app = app::App::resume(*engine)?;
     app.set_error(reason);
     run_app(app, companion)
