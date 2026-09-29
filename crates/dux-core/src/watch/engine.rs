@@ -293,6 +293,19 @@ impl WatchEngine {
         }
     }
 
+    /// Whether [`Self::rebaseline_kind`] would change anything for `kind` on
+    /// this snapshot: some armed rule of that kind sees more matches than its
+    /// baseline. When this is false the rebaseline is a no-op, so a caller can
+    /// skip an expensive policy check that only exists to decide whether to
+    /// rebaseline.
+    pub fn kind_has_fresh_match(&self, snapshot: &str, kind: WatchRuleKind) -> bool {
+        self.rules.iter().any(|rule| {
+            rule.kind == kind
+                && !matches!(rule.state, RuleState::Disarmed)
+                && rule.regex.find_iter(snapshot).count() > rule.baseline_match_count
+        })
+    }
+
     /// Advance the baseline only for rules with the given internal kind.
     /// Used when app-level policy wants to suppress a built-in rule
     /// without blocking user-configured watch rules in the same engine.
@@ -990,6 +1003,41 @@ mod tests {
                 |effect| matches!(effect, WatchEffect::SendText { text, .. } if text == "/clear")
             ),
             "auto-clear rule should be suppressed by kind rebaseline"
+        );
+    }
+
+    #[test]
+    fn kind_has_fresh_match_is_true_only_until_the_match_is_absorbed() {
+        let auto = crate::watch::builtin::auto_clear_rule_for("/clear");
+        let user = rule("rate limited");
+        let (mut engine, errors) = WatchEngine::new("s1", &[auto, user]);
+        assert!(errors.is_empty(), "load errors: {errors:?}");
+        let kind = WatchRuleKind::BuiltInAutoClear;
+
+        assert!(
+            !engine.kind_has_fresh_match("working...", kind),
+            "no sentinel"
+        );
+        assert!(
+            !engine.kind_has_fresh_match("rate limited", kind),
+            "another kind's match is not this kind's"
+        );
+        assert!(engine.kind_has_fresh_match("[task-done]", kind));
+
+        engine.rebaseline_kind("[task-done]", kind);
+        assert!(
+            !engine.kind_has_fresh_match("[task-done]", kind),
+            "an absorbed sentinel is no longer fresh"
+        );
+        assert!(
+            engine.kind_has_fresh_match("[task-done]\n[task-done]", kind),
+            "a second sentinel is"
+        );
+
+        engine.disarm(0);
+        assert!(
+            !engine.kind_has_fresh_match("[task-done]\n[task-done]", kind),
+            "a disarmed rule never needs the guard"
         );
     }
 }

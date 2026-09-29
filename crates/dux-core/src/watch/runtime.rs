@@ -37,6 +37,10 @@ pub struct WatchRuntime {
     /// AMQ inject wrote a postscript that could itself match a rule). When the
     /// window ends the engine rebaselines once, absorbing any stale match.
     pub suppress_until: HashMap<TabId, Instant>,
+    /// How many times a tick consulted the auto-clear guard. Tests pin that a
+    /// quiet screen never pays for the guard's mailbox reads.
+    #[cfg(test)]
+    pub auto_clear_guard_checks: std::sync::atomic::AtomicUsize,
 }
 
 impl WatchRuntime {
