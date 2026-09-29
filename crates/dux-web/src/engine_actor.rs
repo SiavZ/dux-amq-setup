@@ -2160,6 +2160,43 @@ pub(crate) struct EngineService {
     tailscale_mode_control: Arc<std::sync::OnceLock<crate::serve_legs::TailscaleModeControl>>,
 }
 
+/// How long [`EngineService`]'s drop waits for a sender that already holds a
+/// channel permit to finish pushing its request. The push follows the permit
+/// synchronously inside one `send` poll, so this is microseconds in practice;
+/// the bound only guards against a caller parked on a reserved permit.
+const REQUEST_CHANNEL_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
+impl Drop for EngineService {
+    /// Close the request channel and drop every request still in it, INCLUDING
+    /// one whose sender won its permit before the close but pushes after it.
+    ///
+    /// Letting the `Receiver` drop on its own is not enough. Tokio's
+    /// `Rx::drop` closes and drains once, so a request whose `send` acquired
+    /// its permit before that close and pushed after the drain stays inside the
+    /// shared channel until the LAST `EngineHandle` clone drops. Its oneshot
+    /// reply sender goes with it, so the caller awaiting the reply (a web
+    /// request racing a shutdown, or `apply_wire` right after `shutdown()`)
+    /// waits forever instead of seeing "engine thread gone". Draining until the
+    /// channel reports `Disconnected`, which tokio only does once every permit
+    /// is returned, catches that late push and drops its reply sender.
+    fn drop(&mut self) {
+        self.req_rx.close();
+        let deadline = Instant::now() + REQUEST_CHANNEL_CLOSE_TIMEOUT;
+        loop {
+            match self.req_rx.try_recv() {
+                Ok(request) => drop(request),
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::yield_now();
+                }
+            }
+        }
+    }
+}
+
 impl EngineService {
     pub(crate) fn new(engine: &Engine, ends: ActorLoopEnds, shutdown_echo: ShutdownEcho) -> Self {
         let ActorLoopEnds {
@@ -4258,6 +4295,35 @@ mod tests {
         };
         std::fs::create_dir_all(&paths.worktrees_root).unwrap();
         (tmp, paths)
+    }
+
+    /// A request whose sender won its channel permit before the loop stopped,
+    /// but pushed only after the service dropped, must still release its caller.
+    /// This is the race behind `shutdown_acks_and_stops_the_engine_thread`
+    /// hanging about once in several thousand runs: tokio's receiver drop drains
+    /// once, so the late push used to sit in the channel (with its reply sender)
+    /// for as long as any `EngineHandle` lived, and the caller awaited forever.
+    /// The reserved permit makes the late push deterministic.
+    #[tokio::test]
+    async fn a_request_pushed_after_the_service_drops_still_releases_its_caller() {
+        let (_tmp, paths) = temp_paths();
+        let engine = crate::test_support::bootstrap_test_engine(&paths).expect("engine");
+        let (handle, ends) = build_actor_channels(&engine);
+        let svc = EngineService::new(&engine, ends, ShutdownEcho::Silent);
+
+        let permit = handle.req_tx.reserve().await.expect("a permit");
+        let dropper = std::thread::spawn(move || drop(svc));
+        // Let the drop close the channel and start waiting on the permit.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        permit.send(EngineRequest::Shutdown(reply_tx));
+        dropper.join().expect("the service dropped");
+
+        let reply = tokio::time::timeout(Duration::from_secs(2), reply_rx)
+            .await
+            .expect("the late request's reply sender must be dropped, not parked");
+        assert!(reply.is_err(), "nothing served the request, so no reply");
+        drop(handle);
     }
 
     /// The pre-consume seam announces a reload the drainer has not applied yet, so
