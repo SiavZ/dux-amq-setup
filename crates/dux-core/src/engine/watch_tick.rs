@@ -84,6 +84,10 @@ impl Engine {
     /// mail, the collaboration quiet window): see
     /// [`Engine::amq_blocks_auto_clear`].
     pub fn watch_auto_clear_suppressed(&self, _tab_id: &TabIdRef, session_id: &str) -> bool {
+        #[cfg(test)]
+        self.watch
+            .auto_clear_guard_checks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.amq_blocks_auto_clear(session_id)
     }
 
@@ -219,12 +223,16 @@ impl Engine {
             let session_id = self
                 .owning_session_for_tab(tab.as_str())
                 .unwrap_or_default();
-            let hold_auto_clear = self
-                .watch
-                .attached
-                .get(&tab)
-                .is_some_and(|a| a.auto_clear_idx.is_some())
-                && self.watch_auto_clear_suppressed(tab.as_ref_id(), &session_id);
+            // The AMQ guard reads the agent's mailbox directories, which can
+            // hold tens of thousands of files. Ask it only when the answer can
+            // matter: a fresh `[task-done]` the rebaseline below would absorb.
+            // Asking every tick for every Worker pinned the UI thread.
+            let hold_auto_clear = self.watch.attached.get(&tab).is_some_and(|a| {
+                a.auto_clear_idx.is_some()
+                    && a.engine
+                        .kind_has_fresh_match(&snapshot, WatchRuleKind::BuiltInAutoClear)
+            }) && self
+                .watch_auto_clear_suppressed(tab.as_ref_id(), &session_id);
             let effects = match self.watch.attached.get_mut(&tab) {
                 Some(attached) => {
                     if hold_auto_clear {
@@ -668,5 +676,80 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(200));
         assert!(read_log(&log).is_empty(), "{:?}", read_log(&log));
+    }
+
+    /// The auto-clear guard reads the agent's AMQ mailbox directories, which
+    /// in real use hold tens of thousands of files. Consulting it on every
+    /// tick for every Worker pinned dux's UI thread in `fstatat`. It must run
+    /// only when a fresh `[task-done]` makes its answer matter, and it must
+    /// still hold that sentinel when the agent is mid-collaboration.
+    #[test]
+    fn the_auto_clear_guard_runs_only_for_a_fresh_sentinel() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let tmp = crate::test_scratch::ScratchDir::new();
+        let go = tmp.path().join("go");
+        // Quiet until `go` exists, then a finished-task sentinel above a busy
+        // footer (the default `esc to interrupt` marker), so the guard holds.
+        let script = format!(
+            "printf 'working on it\\n'; while [ ! -e '{}' ]; do sleep 0.02; done; \
+             printf '[task-done]\\nesc to interrupt\\n'; exec sleep 30",
+            go.display()
+        );
+        let client = PtyClient::spawn(
+            "sh",
+            &["-c".to_string(), script],
+            &std::env::temp_dir(),
+            24,
+            80,
+            100,
+        )
+        .expect("spawn scripted pty");
+        let (mut engine, _guard) = engine_with_tab(client, Vec::new());
+        engine.amq.session_settings.insert(
+            "s1".to_string(),
+            crate::session_settings::SessionSettings {
+                mode: crate::session_settings::ContextMode::Worker,
+                auto_clear_on_task_done: true,
+                ..Default::default()
+            },
+        );
+        let tab = TabIdRef::new("s1-slot");
+        let screen = |engine: &Engine| engine.providers[tab].scan_recent_lines(WATCH_SCAN_ROWS);
+        assert!(wait_for(|| screen(&engine).contains("working on it")));
+
+        for _ in 0..20 {
+            engine.tick_watch_rules();
+        }
+        let built_in = |engine: &Engine| {
+            engine
+                .watch_rule_rows()
+                .into_iter()
+                .find(|row| row.built_in)
+                .expect("the built-in auto-clear rule is attached for a Worker")
+                .snapshot
+                .state
+        };
+        assert_eq!(built_in(&engine), crate::watch::RuleStateKind::Idle);
+        assert_eq!(
+            engine.watch.auto_clear_guard_checks.load(Relaxed),
+            0,
+            "a screen with no sentinel must never consult the guard"
+        );
+
+        std::fs::write(&go, b"").unwrap();
+        assert!(wait_for(|| screen(&engine).contains("esc to interrupt")));
+        for _ in 0..20 {
+            engine.tick_watch_rules();
+        }
+        assert_eq!(
+            engine.watch.auto_clear_guard_checks.load(Relaxed),
+            1,
+            "the guard runs once for the fresh sentinel, which it then absorbs"
+        );
+        assert_eq!(
+            built_in(&engine),
+            crate::watch::RuleStateKind::Idle,
+            "a held sentinel must not schedule a clear"
+        );
     }
 }
