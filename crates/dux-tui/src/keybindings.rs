@@ -1214,10 +1214,18 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         hint_contexts: &[],
     },
     BindingDef {
+        // Plain `o` opens the selected agent's worktree in a NEW companion
+        // terminal (fork habit). It is an in-app pane, never an external
+        // window, so the stray-keypress hazard that retired `o` from
+        // open_worktree_in_editor (4fb6a866) does not apply; the editor
+        // launch stays unbound.
         action: Action::NewTerminal,
-        default_keys: &[],
-        scopes: &[],
-        help: None,
+        default_keys: &[key!(o)],
+        scopes: &[BindingScope::Left],
+        help: Some(HelpEntry {
+            section: "Projects pane",
+            description: "Open the agent's worktree in a new companion terminal",
+        }),
         hint_contexts: &[],
     },
     BindingDef {
@@ -1431,6 +1439,36 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         default_keys: &[],
         scopes: &[],
         help: None,
+        hint_contexts: &[],
+    },
+    // Hop between the agents of one project (the harnesses sharing a
+    // checkout) without walking past the other projects' rows. `[` and `]`
+    // stay on the sidebar and git-pane toggles; the braces are their shifted
+    // twins and were free in every scope.
+    BindingDef {
+        action: Action::NextSiblingAgent,
+        default_keys: &[KeyCombination::one_key(
+            KeyCode::Char('}'),
+            KeyModifiers::NONE,
+        )],
+        scopes: &[BindingScope::Left],
+        help: Some(HelpEntry {
+            section: "Projects pane",
+            description: "Next agent in the same project",
+        }),
+        hint_contexts: &[],
+    },
+    BindingDef {
+        action: Action::PrevSiblingAgent,
+        default_keys: &[KeyCombination::one_key(
+            KeyCode::Char('{'),
+            KeyModifiers::NONE,
+        )],
+        scopes: &[BindingScope::Left],
+        help: Some(HelpEntry {
+            section: "Projects pane",
+            description: "Previous agent in the same project",
+        }),
         hint_contexts: &[],
     },
     // Manual reordering, the TUI equivalent of the web's drag-to-reorder. Up
@@ -3704,7 +3742,18 @@ mod tests {
     fn open_worktree_is_not_bound_to_plain_o_by_default() {
         let bindings = default_bindings();
         let key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE);
-        assert_eq!(bindings.lookup(&key, BindingScope::Left), None);
+        // Plain `o` never launches the external editor from the sidebar
+        // (4fb6a866). It deliberately opens the worktree in a new companion
+        // terminal instead: an in-app pane, so a stray press costs a tab, not
+        // a window.
+        assert_ne!(
+            bindings.lookup(&key, BindingScope::Left),
+            Some(Action::OpenWorktreeInEditor)
+        );
+        assert_eq!(
+            bindings.lookup(&key, BindingScope::Left),
+            Some(Action::NewTerminal)
+        );
         // And the sidebar hint no longer advertises it with an empty badge.
         assert!(
             bindings

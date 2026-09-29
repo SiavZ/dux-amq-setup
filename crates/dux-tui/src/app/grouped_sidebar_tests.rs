@@ -359,3 +359,50 @@ fn a_pending_provider_swap_shows_both_harnesses() {
         " (claude → codex)"
     );
 }
+
+fn press(app: &mut App, c: char) {
+    app.focus = FocusPane::Left;
+    app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+        .unwrap();
+}
+
+fn selected_id(app: &App) -> Option<String> {
+    app.selected_session().map(|s| s.id.clone())
+}
+
+#[test]
+fn braces_cycle_the_harnesses_of_one_project_and_wrap() {
+    let mut app = grouped_app();
+    app.selected_left = 1; // infra-claude
+    press(&mut app, '}');
+    assert_eq!(selected_id(&app).as_deref(), Some("infra-engineer"));
+    press(&mut app, '}');
+    assert_eq!(selected_id(&app).as_deref(), Some("infra-opencode"));
+    // Wraps inside the project, never onto web-dev.
+    press(&mut app, '}');
+    assert_eq!(selected_id(&app).as_deref(), Some("infra-claude"));
+    press(&mut app, '{');
+    assert_eq!(selected_id(&app).as_deref(), Some("infra-opencode"));
+}
+
+#[test]
+fn braces_skip_other_projects_in_the_flat_list_too() {
+    let mut app = grouped_app();
+    app.engine.config.ui.sidebar_style = "flat".to_string();
+    app.rebuild_left_items();
+    // Flat active order: infra-claude, web-dev, infra-engineer.
+    app.selected_left = 0;
+    assert_eq!(selected_id(&app).as_deref(), Some("infra-claude"));
+    press(&mut app, '}');
+    assert_eq!(selected_id(&app).as_deref(), Some("infra-engineer"));
+}
+
+#[test]
+fn a_brace_on_a_collapsed_header_opens_it_and_steps_in() {
+    let mut app = grouped_app();
+    app.collapsed_groups.insert("infra".to_string());
+    app.rebuild_left_items();
+    app.selected_left = 0;
+    press(&mut app, '}');
+    assert_eq!(selected_id(&app).as_deref(), Some("infra-claude"));
+}

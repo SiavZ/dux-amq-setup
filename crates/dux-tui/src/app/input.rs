@@ -1209,6 +1209,66 @@ impl App {
         self.update_missing_project_warning();
     }
 
+    /// Move the selection to the next (or previous) agent that shares the
+    /// selected agent's project, in the order the sidebar shows them, wrapping
+    /// at the ends. On a grouped project header it steps into that project.
+    /// Works in both sidebar styles; rows a filter or a collapsed Inactive tail
+    /// hides are skipped, because the cursor can only land on a visible row.
+    pub(crate) fn select_sibling_agent(&mut self, forward: bool) {
+        let project_key = match self.left_items().get(self.selected_left) {
+            Some(LeftItem::Session(i)) => self
+                .engine
+                .sessions
+                .get(*i)
+                .map(|s| s.project_id().map(str::to_string)),
+            Some(LeftItem::Group(g)) => self
+                .left_group(*g)
+                .map(|group| (group.key != STANDALONE_GROUP_KEY).then(|| group.key.clone())),
+            _ => None,
+        };
+        let Some(project_key) = project_key else {
+            self.set_info("Select an agent to cycle through its project's agents.");
+            return;
+        };
+        // A collapsed project hides its agents; open it so there is somewhere
+        // to go, the way the fork's tree did.
+        if let Some((_, group)) = self.left_group_of_item(self.selected_left)
+            && group.collapsed
+        {
+            let key = group.key.clone();
+            self.collapsed_groups.remove(&key);
+            self.rebuild_left_items();
+        }
+        let siblings: Vec<usize> = self
+            .left_items()
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, item)| match item {
+                LeftItem::Session(i) => self
+                    .engine
+                    .sessions
+                    .get(*i)
+                    .filter(|s| s.project_id().map(str::to_string) == project_key)
+                    .map(|_| pos),
+                _ => None,
+            })
+            .collect();
+        if siblings.is_empty() {
+            return;
+        }
+        let current = siblings.iter().position(|pos| *pos == self.selected_left);
+        let next = match (current, forward) {
+            (Some(i), true) => siblings[(i + 1) % siblings.len()],
+            (Some(i), false) => siblings[(i + siblings.len() - 1) % siblings.len()],
+            // From a header: forward lands on its first agent, back on its last.
+            (None, true) => siblings[0],
+            (None, false) => siblings[siblings.len() - 1],
+        };
+        if next != self.selected_left {
+            self.select_left_agent_item(next);
+        }
+    }
+
     /// Move the Left pane's cursor one row DOWN, across the whole sidebar: the
     /// agent rows, then the terminal rows below them, then back to the top.
     ///
@@ -1313,6 +1373,9 @@ impl App {
                 Action::ChooseWorktreeEditor => self.open_worktree_editor_picker()?,
                 Action::MoveAgentDown => self.move_selected_agent(super::reorder::MoveDir::Down),
                 Action::MoveAgentUp => self.move_selected_agent(super::reorder::MoveDir::Up),
+                Action::NewTerminal => self.new_companion_terminal()?,
+                Action::NextSiblingAgent => self.select_sibling_agent(true),
+                Action::PrevSiblingAgent => self.select_sibling_agent(false),
                 Action::ToggleProject => self.toggle_collapse_selected_project(),
                 Action::InteractAgent => {
                     if self.selected_session().is_some()
