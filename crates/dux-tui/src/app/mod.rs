@@ -3599,6 +3599,28 @@ impl SidebarStyle {
 /// are UUIDs or config ids, never this, so it cannot collide with a project.
 pub(crate) const STANDALONE_GROUP_KEY: &str = "\u{0}standalone";
 
+/// How tall the TUI agent list's rows are, read from `config.ui.sidebar_density`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SidebarDensity {
+    /// One line per project header, agent, and Inactive toggle, no spacers
+    /// (the fork's layout). The default.
+    Compact,
+    /// Upstream's two-line agent rows with blank spacers between rows.
+    Comfortable,
+}
+
+impl SidebarDensity {
+    /// Parse `config.ui.sidebar_density`. Unknown values degrade to the default
+    /// (`Compact`) here, at the one reading site, rather than refusing the
+    /// config file (the `sidebar_style` convention).
+    pub(crate) fn from_config_str(s: &str) -> SidebarDensity {
+        match s.trim() {
+            "comfortable" => SidebarDensity::Comfortable,
+            _ => SidebarDensity::Compact,
+        }
+    }
+}
+
 /// What a grouped-sidebar header stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LeftGroupKind {
@@ -5961,6 +5983,11 @@ impl App {
     /// The configured agent-list shape (`config.ui.sidebar_style`).
     pub(crate) fn sidebar_style(&self) -> SidebarStyle {
         SidebarStyle::from_config_str(&self.engine.config.ui.sidebar_style)
+    }
+
+    /// The configured agent-list row height (`config.ui.sidebar_density`).
+    pub(crate) fn sidebar_density(&self) -> SidebarDensity {
+        SidebarDensity::from_config_str(&self.engine.config.ui.sidebar_density)
     }
 
     /// The grouped-sidebar header behind `LeftItem::Group(index)`.

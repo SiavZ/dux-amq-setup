@@ -2095,6 +2095,17 @@ impl App {
         let Some(item) = items.get(sel).copied() else {
             return;
         };
+        if self.sidebar_density() == SidebarDensity::Compact {
+            // Every compact item is one line: a single-row tint, no frame.
+            if let Some(rel) = map.iter().position(|&i| i == sel) {
+                let tint = self.theme.selection_bar_tint();
+                let y = list_inner.y + rel as u16;
+                for x in list_inner.x..list_inner.x + list_inner.width {
+                    buf[(x, y)].set_bg(tint);
+                }
+            }
+            return;
+        }
         match item {
             LeftItem::Session(_) => {
                 // The three-line framed selection, shared with terminal rows.
@@ -2233,6 +2244,18 @@ impl App {
         let Some(y) = marker_y else {
             return;
         };
+        if list == RowDragList::Agents && self.sidebar_density() == SidebarDensity::Compact {
+            // Compact rows have no spacer to draw the rule on, so the row above
+            // the gap is underlined instead of overwritten.
+            for x in x0..x1 {
+                buf[(x, y)].set_style(
+                    Style::default()
+                        .fg(self.theme.border_focused)
+                        .add_modifier(Modifier::UNDERLINED),
+                );
+            }
+            return;
+        }
         for x in x0..x1 {
             buf[(x, y)]
                 .set_symbol("\u{2500}")
@@ -2259,9 +2282,13 @@ impl App {
         let Some(rel_end) = map.iter().rposition(|&i| i == toggle_idx) else {
             return;
         };
-        // The toggle ends with a trailing spacer, so the label sits one row above
-        // the item's last row.
-        let y = list_content.y + rel_end.saturating_sub(1) as u16;
+        // The comfortable toggle ends with a trailing spacer, so the label sits
+        // one row above the item's last row; a compact toggle is its label.
+        let label_rel = match self.sidebar_density() {
+            SidebarDensity::Compact => rel_end,
+            SidebarDensity::Comfortable => rel_end.saturating_sub(1),
+        };
+        let y = list_content.y + label_rel as u16;
         let x0 = list_content.x;
         let x1 = list_content.x + list_content.width;
         // Stop a gutter short of the right edge so the rule keeps the same right
@@ -2480,12 +2507,15 @@ impl App {
         Line::from(ellipsize_spans(spans, text_width))
     }
 
-    fn agent_sidebar_items(
+    pub(crate) fn agent_sidebar_items(
         &self,
         left_items: &[LeftItem],
         has_active: bool,
         row_text_width: u16,
     ) -> (Vec<ListItem<'static>>, Vec<u16>) {
+        if self.sidebar_density() == SidebarDensity::Compact {
+            return self.agent_sidebar_items_compact(left_items, row_text_width);
+        }
         let items = left_items
             .iter()
             .enumerate()
@@ -2536,6 +2566,208 @@ impl App {
             })
             .collect();
         (items, heights)
+    }
+
+    /// The compact agent list (`ui.sidebar_density = "compact"`): every item is
+    /// exactly one line, with no spacers, so `heights` is all ones. In grouped
+    /// style an agent row hangs off its header by a tree connector, `└` on the
+    /// last agent before the next header (or toggle, or the list's end).
+    fn agent_sidebar_items_compact(
+        &self,
+        left_items: &[LeftItem],
+        row_text_width: u16,
+    ) -> (Vec<ListItem<'static>>, Vec<u16>) {
+        let grouped = self.sidebar_style() == SidebarStyle::Grouped;
+        let items = left_items
+            .iter()
+            .enumerate()
+            .map(|(pos, item)| match item {
+                LeftItem::Group(g) => ListItem::new(self.render_group_header(*g, row_text_width)),
+                LeftItem::InactiveToggle => {
+                    let icon = if self.inactive_collapsed {
+                        "▸"
+                    } else {
+                        "▾"
+                    };
+                    ListItem::new(Line::from(Span::styled(
+                        format!("{icon} Inactive ({})", self.visible_inactive_count()),
+                        Style::default().fg(self.theme.provider_label_fg),
+                    )))
+                }
+                LeftItem::Session(index) => {
+                    let connector = grouped.then(|| {
+                        let last = !left_items
+                            .get(pos + 1)
+                            .is_some_and(|next| matches!(next, LeftItem::Session(_)));
+                        if last { "└ " } else { "├ " }
+                    });
+                    self.engine
+                        .sessions
+                        .get(*index)
+                        .map(|session| {
+                            ListItem::new(self.render_compact_agent_row(
+                                session,
+                                row_text_width,
+                                connector,
+                                !grouped,
+                            ))
+                        })
+                        .unwrap_or_else(|| ListItem::new(Line::from("")))
+                }
+            })
+            .collect();
+        (items, vec![1u16; left_items.len()])
+    }
+
+    /// One compact agent line: `[connector] glyph name (provider)`, plus the
+    /// project in flat style (there is no header to carry it), and the SHARED,
+    /// pull-request and missing-working-copy badges pinned right only when they
+    /// fit beside the full left run; otherwise they are dropped rather than
+    /// cutting the name.
+    fn render_compact_agent_row(
+        &self,
+        session: &AgentSession,
+        text_width: u16,
+        connector: Option<&'static str>,
+        show_project: bool,
+    ) -> Line<'static> {
+        let label = session.display_label();
+        let cues = self.agent_row_cues(session);
+        let deleting = cues.deleting;
+        let (steady_dot, steady_color) = self.theme.session_dot(&session.status);
+        let dot = self.agent_row_glyph(cues, steady_dot);
+        let (base_color, glyph_color) = self.agent_row_colors(session.status, cues, steady_color);
+        let italic = |style: Style| {
+            if deleting {
+                style.add_modifier(Modifier::ITALIC)
+            } else {
+                style
+            }
+        };
+        let name_style = italic(Style::default().fg(base_color));
+        let muted = if deleting {
+            self.theme.session_deleting
+        } else {
+            self.theme.provider_label_fg
+        };
+        let search_range = self
+            .agent_filter
+            .as_ref()
+            .and_then(|input| dux_core::agent_search::match_char_range(&label, &input.text));
+        let name_spans: Vec<Span<'static>> = if let Some(range) = search_range {
+            search_highlight_spans(
+                &label,
+                name_style,
+                italic(
+                    Style::default()
+                        .fg(self.theme.search_match_fg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                range,
+            )
+        } else {
+            vec![Span::styled(label.clone(), name_style)]
+        };
+        let width = |spans: &[Span<'static>]| {
+            spans
+                .iter()
+                .map(|s| s.content.as_ref().cell_width())
+                .fold(0u16, |a, b| a.saturating_add(b))
+        };
+
+        let mut prefix: Vec<Span<'static>> = Vec::new();
+        if let Some(connector) = connector {
+            prefix.push(Span::styled(
+                connector,
+                Style::default().fg(self.theme.project_icon),
+            ));
+        }
+        let mut head = vec![Span::styled(
+            format!("{dot} "),
+            italic(Style::default().fg(glyph_color)),
+        )];
+        head.extend(name_spans);
+        let provider_span = Span::styled(
+            agent_row_provider_suffix(
+                &self.engine.running_provider_for(session),
+                &session.provider,
+            ),
+            italic(Style::default().fg(muted)),
+        );
+
+        let found = session
+            .project_id()
+            .and_then(|project_id| self.engine.projects.iter().find(|p| p.id == project_id));
+        let owner_tag = agent_row_owner_tag(
+            session,
+            found,
+            self.engine.working_copy_missing(&session.id),
+        );
+        // Flat style names the project (or folder, or warning) after the
+        // harness, since no header carries it.
+        let project_spans: Vec<Span<'static>> = if show_project {
+            let (marker, name) = self.agent_row_owner_spans(session, found, muted);
+            let marker = Span::styled(format!(" {}", marker.content.trim_start()), marker.style);
+            std::iter::once(marker).chain(name).collect()
+        } else {
+            Vec::new()
+        };
+
+        let mut right: Vec<Span<'static>> = Vec::new();
+        if session.shared_workspace() {
+            right.push(Span::styled(
+                SHARED_WORKSPACE_BADGE,
+                Style::default()
+                    .fg(self.theme.warning_fg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let Some(pr) = self.engine.pr_statuses.get(&session.id) {
+            let pr_color = match pr.state {
+                crate::model::PrState::Merged => self.theme.pr_merged_label,
+                crate::model::PrState::Closed => self.theme.pr_closed_label,
+                crate::model::PrState::Open => self.theme.pr_open_label,
+            };
+            right.push(Span::styled(
+                format!("{PR_BADGE_GLYPH}#{}", pr.number),
+                Style::default().fg(pr_color),
+            ));
+        }
+        if !show_project && matches!(owner_tag, AgentRowOwnerTag::WorkingCopyMissing) {
+            if !right.is_empty() {
+                right.push(Span::raw(" "));
+            }
+            right.push(Span::styled(
+                "⚠",
+                Style::default().fg(self.theme.project_missing_fg),
+            ));
+        }
+
+        let prefix_w = width(&prefix);
+        let avail = text_width.saturating_sub(prefix_w);
+        let mut full: Vec<Span<'static>> = head.clone();
+        full.push(provider_span.clone());
+        let base_w = width(&full);
+        // The project gives way before the name and harness do.
+        if !project_spans.is_empty() {
+            let room = avail.saturating_sub(base_w);
+            if width(&project_spans) <= room {
+                full.extend(project_spans);
+            } else if room >= 4 {
+                full.extend(ellipsize_spans(project_spans, room));
+            }
+        }
+        let full_w = width(&full);
+        let right_w = width(&right);
+        let body = if !right.is_empty() && full_w.saturating_add(2 + right_w) <= avail {
+            right_align_line(full, right, avail, 2)
+        } else if full_w <= avail {
+            full
+        } else {
+            fit_name_with_suffix(head, provider_span, avail)
+        };
+        prefix.extend(body);
+        Line::from(prefix)
     }
 
     fn agent_sidebar_geometry(
@@ -2598,7 +2830,13 @@ impl App {
         let row_text_width = inner.width.saturating_sub(LEFT_PANE_GUTTER * 2);
         let (items, item_heights) =
             self.agent_sidebar_items(left_items, has_active, row_text_width);
-        let geometry = Self::agent_sidebar_geometry(inner, self.agent_filter.is_some(), has_active);
+        // A compact list has no framed selection, so it reserves no top row for
+        // the frame's upper edge.
+        let geometry = Self::agent_sidebar_geometry(
+            inner,
+            self.agent_filter.is_some(),
+            has_active && self.sidebar_density() == SidebarDensity::Comfortable,
+        );
         self.mouse_layout.left_list = geometry.content;
         block.render(projects_area, frame.buffer_mut());
         if let Some(search_area) = geometry.search_area {

@@ -152,6 +152,9 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
             // FLAT sidebar's; those tests are the flat mode's regression suite.
             // Grouped-mode tests opt in explicitly.
             config.ui.sidebar_style = "flat".to_string();
+            // Likewise the COMFORTABLE row heights (three-line agent rows);
+            // compact-density tests opt in explicitly.
+            config.ui.sidebar_density = "comfortable".to_string();
             config
         },
         paths,

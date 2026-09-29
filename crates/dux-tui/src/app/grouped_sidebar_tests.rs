@@ -461,3 +461,241 @@ fn a_reload_reopens_on_the_agent_that_was_selected() {
     app.restore_selection_after_reload();
     assert_eq!(selected_id(&app).as_deref(), Some("infra-opencode"));
 }
+
+// ---- ui.sidebar_density = "compact" (the default) ----
+
+fn compact_app(style: &str) -> App {
+    let mut app = grouped_app();
+    app.engine.config.ui.sidebar_style = style.to_string();
+    app.engine.config.ui.sidebar_density = "compact".to_string();
+    app.inactive_collapsed = false;
+    app.inactive_collapse_overridden = true;
+    app.rebuild_left_items();
+    app.left_width_pct = 40;
+    app
+}
+
+fn draw(app: &mut App) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let mut terminal = Terminal::new(TestBackend::new(120, 50)).expect("terminal");
+    terminal.draw(|frame| app.render(frame)).expect("render");
+    terminal.backend().buffer().clone()
+}
+
+/// The agent list's visible rows as text (gutters stripped, right-trimmed),
+/// one per screen row of the list content, up to the first blank row.
+fn sidebar_rows(app: &App, buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+    let list = app.mouse_layout.left_list;
+    (list.y..list.y + list.height)
+        .map(|y| {
+            let mut row = String::new();
+            for x in list.x + 1..list.x + list.width.saturating_sub(1) {
+                row.push_str(buffer[(x, y)].symbol());
+            }
+            row.trim_end().to_string()
+        })
+        .take_while(|row| !row.is_empty())
+        .collect()
+}
+
+#[test]
+fn compact_is_the_default_density_and_unknown_values_degrade_to_it() {
+    assert_eq!(
+        dux_core::config::Config::default().ui.sidebar_density,
+        "compact"
+    );
+    assert_eq!(
+        SidebarDensity::from_config_str("comfortable"),
+        SidebarDensity::Comfortable
+    );
+    assert_eq!(
+        SidebarDensity::from_config_str("compact"),
+        SidebarDensity::Compact
+    );
+    assert_eq!(
+        SidebarDensity::from_config_str("dense"),
+        SidebarDensity::Compact
+    );
+    assert_eq!(SidebarDensity::from_config_str(""), SidebarDensity::Compact);
+    let mut app = compact_app("grouped");
+    app.engine.config.ui.sidebar_density = "dense".to_string();
+    assert_eq!(app.sidebar_density(), SidebarDensity::Compact);
+}
+
+#[test]
+fn compact_grouped_renders_one_line_per_header_and_agent_with_tree_connectors() {
+    let mut app = compact_app("grouped");
+    let buffer = draw(&mut app);
+    let rows = sidebar_rows(&app, &buffer);
+    assert_eq!(rows.len(), 6, "{rows:#?}");
+    let expected: [(&str, bool); 6] = [
+        ("▾ Jobzy-infra (3)", false),
+        ("├ ● infra-claude (claude)", true),
+        ("├ ● infra-engineer (codex)", true),
+        ("└ ◎ infra-opencode (opencode)", true),
+        ("▾ Jobzy-web (1)", false),
+        ("└ ● web-dev (claude)", true),
+    ];
+    for (row, (left, shared)) in rows.iter().zip(expected) {
+        assert!(row.starts_with(left), "{row:?} should start {left:?}");
+        if shared {
+            // The SHARED badge is pinned to the right edge, past a gap.
+            assert!(row.ends_with("SHARED"), "{row:?}");
+            let gap = &row[left.len()..row.len() - "SHARED".len()];
+            assert!(gap.len() >= 2 && gap.trim().is_empty(), "{row:?}");
+        } else {
+            assert_eq!(row, left);
+        }
+    }
+}
+
+#[test]
+fn compact_heights_are_all_one_and_clicks_map_row_n_to_item_n() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let mut app = compact_app("grouped");
+    let row_width = 40;
+    let (_, heights) = app.agent_sidebar_items(app.left_items(), true, row_width);
+    assert_eq!(heights, vec![1u16; app.left_items().len()]);
+    draw(&mut app);
+    let map = app.mouse_layout.left_row_to_item.clone();
+    assert_eq!(&map[..6], &[0, 1, 2, 3, 4, 5]);
+    for n in [5usize, 3, 1, 4] {
+        let list = app.mouse_layout.left_list;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: list.x + 2,
+            row: list.y + n as u16,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: list.x + 2,
+            row: list.y + n as u16,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.selected_left, n, "click on row {n}");
+        draw(&mut app);
+    }
+}
+
+#[test]
+fn compact_selection_tints_exactly_one_row_for_agents_and_headers() {
+    for selected in [2usize, 4] {
+        let mut app = compact_app("grouped");
+        app.focus = FocusPane::Left;
+        app.left_section = LeftSection::Projects;
+        app.selected_left = selected;
+        let buffer = draw(&mut app);
+        let list = app.mouse_layout.left_list;
+        let tint = app.theme.selection_bar_tint();
+        let tinted: Vec<u16> = (list.y..list.y + list.height)
+            .filter(|&y| (list.x..list.x + list.width).all(|x| buffer[(x, y)].bg == tint))
+            .collect();
+        assert_eq!(tinted, vec![list.y + selected as u16], "item {selected}");
+        // No half-cell frame edges anywhere in the list.
+        for y in list.y..list.y + list.height {
+            for x in list.x..list.x + list.width {
+                let s = buffer[(x, y)].symbol();
+                assert!(s != "▄" && s != "▀", "frame edge at {x},{y}");
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_list_reserves_no_top_margin_row() {
+    let mut app = compact_app("grouped");
+    let buffer = draw(&mut app);
+    let rows = sidebar_rows(&app, &buffer);
+    assert_eq!(rows.first().map(String::as_str), Some("▾ Jobzy-infra (3)"));
+    // The list starts on the block's first inner row.
+    let list = app.mouse_layout.left_list;
+    let above: String = (list.x..list.x + list.width)
+        .map(|x| buffer[(x, list.y - 1)].symbol().to_string())
+        .collect();
+    assert!(
+        above.contains("Agents"),
+        "the title border sits right above: {above:?}"
+    );
+}
+
+#[test]
+fn compact_flat_rows_name_harness_and_project_on_one_line() {
+    let mut app = compact_app("flat");
+    let buffer = draw(&mut app);
+    let rows = sidebar_rows(&app, &buffer);
+    let find = |needle: &str| {
+        rows.iter()
+            .find(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} missing: {rows:#?}"))
+            .clone()
+    };
+    assert!(find("infra-claude (claude)").contains("※ Jobzy-infra"));
+    assert!(find("web-dev (claude)").contains("※ Jobzy-web"));
+    assert!(find("infra-opencode (opencode)").contains("※ Jobzy-infra"));
+    // No tree connectors in flat style, and no headers.
+    assert!(
+        rows.iter()
+            .all(|r| !r.starts_with('├') && !r.starts_with('└'))
+    );
+    assert!(rows.iter().any(|r| r.starts_with("▾ Inactive (1)")));
+    let (_, heights) = app.agent_sidebar_items(app.left_items(), true, 40);
+    assert!(heights.iter().all(|&h| h == 1));
+}
+
+#[test]
+fn comfortable_keeps_two_line_rows_with_spacers() {
+    let mut app = compact_app("grouped");
+    app.engine.config.ui.sidebar_density = "comfortable".to_string();
+    let (_, heights) = app.agent_sidebar_items(app.left_items(), true, 40);
+    assert_eq!(heights, vec![2, 3, 3, 3, 3, 3]);
+    let buffer = draw(&mut app);
+    let screen = screen_text(&buffer);
+    assert!(!screen.contains("├ "), "{screen}");
+    assert!(screen.contains("infra-claude (claude)"), "{screen}");
+}
+
+#[test]
+fn compact_long_name_drops_the_badge_before_cutting_the_name() {
+    let mut app = compact_app("grouped");
+    // Fits beside the connector, glyph and harness, but not with SHARED too.
+    app.engine.sessions[0].title = Some("a-rather-long-agent-name-here".to_string());
+    let buffer = draw(&mut app);
+    let rows = sidebar_rows(&app, &buffer);
+    let row = rows
+        .iter()
+        .find(|r| r.contains("a-rather-long"))
+        .expect("row");
+    assert_eq!(row, "├ ● a-rather-long-agent-name-here (claude)");
+}
+
+#[test]
+fn compact_filter_highlights_the_name() {
+    let mut app = compact_app("grouped");
+    app.open_agent_filter();
+    for c in "engineer".chars() {
+        app.agent_filter.as_mut().unwrap().insert_char(c);
+    }
+    app.rebuild_left_items();
+    let buffer = draw(&mut app);
+    let list = app.mouse_layout.left_list;
+    let hit = app.theme.search_match_fg;
+    let found = (list.y..list.y + list.height).any(|y| {
+        (list.x..list.x + list.width)
+            .any(|x| buffer[(x, y)].symbol() == "e" && buffer[(x, y)].fg == hit)
+    });
+    assert!(found, "{}", screen_text(&buffer));
+}
+
+#[test]
+fn the_config_documents_sidebar_density() {
+    let rendered = crate::config::render_default_config();
+    assert!(
+        rendered.contains("sidebar_density = \"compact\""),
+        "{rendered}"
+    );
+    assert!(rendered.contains("# How much room each row of the TUI's agent list takes."));
+    assert!(rendered.contains("#                   ├ ◐ backend (codex)"));
+    assert!(rendered.contains("# two-line rows. Unknown values fall back to \"compact\"."));
+}

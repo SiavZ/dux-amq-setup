@@ -4564,6 +4564,7 @@ mod tests {
                 config.workspace = None;
                 // Flat sidebar geometry; grouped tests opt in (see test_app).
                 config.ui.sidebar_style = "flat".to_string();
+                config.ui.sidebar_density = "comfortable".to_string();
                 config
             },
             paths,
@@ -4921,6 +4922,7 @@ mod tests {
         config.ui.auto_reopen_agents = true;
         config.workspace = None;
         config.ui.sidebar_style = "flat".to_string();
+        config.ui.sidebar_density = "comfortable".to_string();
         let config_writer =
             dux_core::config_queue::ConfigWriteQueue::new(paths.config_path.clone());
         let engine = dux_core::engine::Engine {
