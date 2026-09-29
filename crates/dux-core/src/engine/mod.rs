@@ -5228,14 +5228,34 @@ impl Engine {
             .detach_conflicting_worktree_session(session.directory(), &session.id)
             .map(|detached| detached.label);
 
-        // The one resume decision: collision-aware, used for BOTH the request and
-        // the announced message. Force never resumes.
-        let resume = if force {
-            false
-        } else {
-            self.tab_resume_decision(&session, session.slot_tab_id(), &session.provider, true)
-        };
-        let mut msg = self.agent_reconnect_status_message(&session, resume);
+        // What the user asked for, before any rule narrows it. Force never
+        // resumes.
+        let requested = !force;
+        // The resume-latest decision: collision-aware, and only ever "yes" for a
+        // provider with `resume_args` whose agent has its directory to itself.
+        let resume = self.tab_resume_decision(
+            &session,
+            session.slot_tab_id(),
+            &session.provider,
+            requested,
+        );
+        // Whether the relaunch continues a conversation at all. A provider with
+        // no `resume_args` (jcode) and a shared agent never resume-latest, yet
+        // both resume by an id dux can name. So the request is built from what
+        // the user asked, not from the resume-latest answer: handing `resume`
+        // on as the request made every such agent start fresh. The announced
+        // message reads the same answer the request will carry.
+        let resumes = resume
+            || self
+                .provider_session_launch(
+                    &session,
+                    session.slot_tab_id(),
+                    &session.provider,
+                    requested,
+                    resume,
+                )
+                .is_resume_id();
+        let mut msg = self.agent_reconnect_status_message(&session, resumes);
         if let Some(detached) = &detached_label {
             msg.push(crate::status_text![
                 " Agent ",
@@ -5278,8 +5298,8 @@ impl Engine {
         // banner, so nothing is owed. A fresh one comes up empty and the
         // sentence is the only thing that says why.
         let request = self
-            .build_agent_launch_request(session, resume, pty_size, kind)
-            .quiet_status_on(if resume {
+            .build_agent_launch_request(session, requested, pty_size, kind)
+            .quiet_status_on(if resumes {
                 crate::statusline::QuietSurfaces::BOTH
             } else {
                 crate::statusline::QuietSurfaces::LOUD
@@ -5292,7 +5312,7 @@ impl Engine {
         Ok(ReconnectPlan::Launch {
             request: Box::new(request),
             busy_message,
-            resume,
+            resume: resumes,
             detached_label,
         })
     }
@@ -6085,8 +6105,9 @@ pub enum ReconnectPlan {
     /// (the TUI as a status error, the web as a 400).
     WorktreeMissing { message: StatusText },
     /// Relaunch: dispatch `request` and surface `busy_message` as the pending
-    /// status. `resume` is the collision-aware decision the request carries, so a
-    /// surface can announce it truthfully. `detached_label` names any conflicting
+    /// status. `resume` is whether the request continues a conversation, by the
+    /// provider's resume-latest flag or by a recorded id, so a surface can
+    /// announce it truthfully. `detached_label` names any conflicting
     /// same-worktree agent that was detached to make room (already applied).
     Launch {
         request: Box<crate::worker::AgentLaunchRequest>,

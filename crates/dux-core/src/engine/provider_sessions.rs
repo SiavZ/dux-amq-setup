@@ -475,6 +475,48 @@ mod tests {
         );
     }
 
+    /// Reconnect hands the launch the user's request, not the resume-latest
+    /// answer. jcode has no `resume_args`, so resume-latest is always "no", and
+    /// passing that on as the request started every jcode agent fresh even with
+    /// its conversation id on record.
+    #[test]
+    fn reconnect_resumes_a_provider_that_only_resumes_by_id() {
+        let (mut engine, tmp) = test_engine();
+        let mut session = session_in(tmp.path(), "s1", "jcode");
+        session.started_providers = vec!["jcode".to_string()];
+        engine.session_store.create_session(&session).unwrap();
+        engine.sessions.push(session.clone());
+        engine
+            .session_store
+            .set_provider_session_id("s1", "jcode", "session_cactus_1_ab")
+            .unwrap();
+
+        match engine.reconnect_plan("s1", false, (24, 80)).expect("plan") {
+            crate::engine::ReconnectPlan::Launch {
+                request, resume, ..
+            } => {
+                assert_eq!(
+                    request.provider_session,
+                    ProviderSessionLaunch::ResumeId("session_cactus_1_ab".to_string())
+                );
+                assert!(!request.resume, "jcode has no resume-latest flag to pass");
+                assert!(resume, "the plan announces the resumed conversation");
+            }
+            other => panic!("expected a launch, got {other:?}"),
+        }
+
+        // A forced reconnect is a request for a fresh agent, id or no id.
+        match engine.reconnect_plan("s1", true, (24, 80)).expect("plan") {
+            crate::engine::ReconnectPlan::Launch {
+                request, resume, ..
+            } => {
+                assert!(!request.resumes_a_conversation());
+                assert!(!resume);
+            }
+            other => panic!("expected a launch, got {other:?}"),
+        }
+    }
+
     #[test]
     fn captured_id_is_persisted_through_the_dedicated_setter() {
         let (mut engine, tmp) = test_engine();
