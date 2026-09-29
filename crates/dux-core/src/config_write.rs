@@ -489,6 +489,7 @@ fn apply_patches(doc: &mut DocumentMut, config: &Config) {
         &config.ui.pr_banner_position,
     );
     patch_table_str(doc, "ui", "agent_sort", &config.ui.agent_sort);
+    patch_table_str(doc, "ui", "sidebar_style", &config.ui.sidebar_style);
     patch_table_str(doc, "ui", "theme", &config.ui.theme);
 
     // --- [capabilities] ---

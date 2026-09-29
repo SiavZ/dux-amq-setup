@@ -92,6 +92,10 @@ impl App {
             self.set_error("Select an agent to move.");
             return;
         };
+        if self.sidebar_style() == SidebarStyle::Grouped {
+            self.move_selected_agent_within_project(&session_id, dir);
+            return;
+        }
         let order: Vec<String> = self.engine.sessions.iter().map(|s| s.id.clone()).collect();
         if order.len() < 2 {
             self.set_info("Only one agent; nothing to reorder.");
@@ -102,6 +106,47 @@ impl App {
         };
         let new_order = move_in_order(&order, idx, dir);
         self.apply_agent_order(&order, new_order, &session_id);
+    }
+
+    /// The grouped sidebar's move: the agent trades places with its neighbour
+    /// among the agents of its OWN project (or the standalone group), in the
+    /// order the screen shows, so every move is visible where the user is
+    /// looking. The whole-roster baseline is still what gets persisted, as with
+    /// a drag.
+    fn move_selected_agent_within_project(&mut self, session_id: &str, dir: MoveDir) {
+        let baseline = self.agent_drag_baseline();
+        let project_of = |id: &str| {
+            self.engine
+                .sessions
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| s.project_id().map(str::to_string))
+        };
+        let Some(own) = project_of(session_id) else {
+            return;
+        };
+        let siblings: Vec<&String> = baseline
+            .iter()
+            .filter(|id| project_of(id) == Some(own.clone()))
+            .collect();
+        if siblings.len() < 2 {
+            self.set_info("Only one agent in this project; nothing to reorder.");
+            return;
+        }
+        let Some(pos) = siblings.iter().position(|id| id.as_str() == session_id) else {
+            return;
+        };
+        let target = match dir {
+            MoveDir::Up => pos.checked_sub(1).map(|p| siblings[p]),
+            MoveDir::Down => siblings.get(pos + 1).copied(),
+            MoveDir::Top => Some(siblings[0]),
+            MoveDir::Bottom => siblings.last().copied(),
+        };
+        let Some(target) = target.cloned() else {
+            return;
+        };
+        let next = move_to_target(&baseline, &session_id.to_string(), &target);
+        self.apply_agent_order(&baseline, next, session_id);
     }
 
     /// The complete agent id order a drop is computed against: the whole roster

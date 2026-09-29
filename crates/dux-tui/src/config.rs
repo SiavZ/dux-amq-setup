@@ -866,6 +866,13 @@ fn config_schema() -> Vec<ConfigEntry> {
             value_fn: |c| FieldValue::Str(c.ui.agent_sort.clone()),
         },
         ConfigEntry::Field {
+            key: "sidebar_style",
+            comment: Some(CommentSource::Static(
+                "# Shape of the TUI's agent list. One of:\n#   \"grouped\" (default) one collapsible header per project, with every\n#             agent in that project (each harness sharing one checkout\n#             included) listed as its own row underneath. Space or Enter on\n#             a header collapses/expands it.\n#   \"flat\"    one list of every agent ordered by agent_sort, the project\n#             named on each row, with detached/exited agents folded under a\n#             collapsible \"Inactive\" tail.\n# agent_sort orders the rows inside each project in \"grouped\" mode.\n# Unknown values fall back to \"grouped\". The web UI keeps its own layout.",
+            )),
+            value_fn: |c| FieldValue::Str(c.ui.sidebar_style.clone()),
+        },
+        ConfigEntry::Field {
             key: "theme",
             comment: Some(CommentSource::Static(
                 "# Visual theme for the dux interface.\n# Built-in options include \"dux_dark\" (the default), plus any theme\n# bundled with the opaline engine, for example: \"catppuccin_mocha\",\n# \"catppuccin_frappe\", \"nord\", \"dracula\", \"gruvbox_dark\",\n# \"tokyo_night\", \"solarized_dark\", \"one_dark\", \"rose_pine\", and others.\n# To use a custom theme, drop a TOML file into <config_dir>/themes/<name>.toml\n# (with the same token format as opaline themes) and reference it here\n# by file stem. Unknown names fall back to dux_dark with a warning.\n# Use the `change-theme` command in the palette (Ctrl-p) for an interactive picker.",

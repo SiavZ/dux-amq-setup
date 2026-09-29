@@ -476,6 +476,12 @@ pub struct App {
     /// `dismissedQuery`.
     pub(crate) inactive_search_dismissed: Option<String>,
     pub(crate) left_items_cache: Vec<LeftItem>,
+    /// The grouped sidebar's headers, rebuilt with `left_items_cache`
+    /// (`LeftItem::Group(i)` indexes here). Empty in the flat style.
+    pub(crate) left_groups_cache: Vec<LeftGroup>,
+    /// Collapse keys (project id, or `STANDALONE_GROUP_KEY`) of the grouped
+    /// sidebar's collapsed headers. Runtime-only, like the Inactive tail.
+    pub(crate) collapsed_groups: HashSet<String>,
     pub(crate) mouse_layout: MouseLayoutState,
     pub(crate) overlay_layout: OverlayMouseLayoutState,
     pub(crate) mouse_drag: Option<ResizeDragState>,
@@ -3541,18 +3547,77 @@ pub(crate) enum LeftSection {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LeftItem {
+    /// A project header in the grouped sidebar (index into `App::left_groups`,
+    /// rebuilt together with the item list). Selectable; Enter/Space collapses
+    /// or expands the group. Never present in the flat sidebar.
+    Group(usize),
     /// An agent row (index into `engine.sessions`). The flat model shows the
-    /// project inline on the row rather than under a header.
+    /// project inline on the row; the grouped model lists it under its header.
     Session(usize),
     /// The collapsible "Inactive · N" toggle separating active agents (above) from
     /// detached/exited ones (below). Selectable; Enter/Space toggles the tail.
+    /// Flat sidebar only: the grouped sidebar keeps each project's inactive
+    /// agents in place below its active ones.
     InactiveToggle,
 }
 
 impl LeftItem {
     pub(crate) fn is_selectable(self) -> bool {
-        matches!(self, LeftItem::Session(_) | LeftItem::InactiveToggle)
+        matches!(
+            self,
+            LeftItem::Group(_) | LeftItem::Session(_) | LeftItem::InactiveToggle
+        )
     }
+}
+
+/// The shape of the TUI agent list, read from `config.ui.sidebar_style`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SidebarStyle {
+    /// One collapsible header per project with every agent in it underneath
+    /// (the fork's layout). The default.
+    Grouped,
+    /// Upstream's single activity-sorted list with an Inactive tail.
+    Flat,
+}
+
+impl SidebarStyle {
+    /// Parse `config.ui.sidebar_style`. Unknown values degrade to the default
+    /// (`Grouped`) here, at the one reading site, rather than refusing the
+    /// config file (the `agent_sort`/`pr_banner_position` convention).
+    pub(crate) fn from_config_str(s: &str) -> SidebarStyle {
+        match s.trim() {
+            "flat" => SidebarStyle::Flat,
+            _ => SidebarStyle::Grouped,
+        }
+    }
+}
+
+/// The collapse key of the grouped sidebar's "Standalone" group. Project ids
+/// are UUIDs or config ids, never this, so it cannot collide with a project.
+pub(crate) const STANDALONE_GROUP_KEY: &str = "\u{0}standalone";
+
+/// What a grouped-sidebar header stands for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LeftGroupKind {
+    /// A registered project. `path_missing` marks one whose folder is gone.
+    Project { path_missing: bool },
+    /// Agents whose project record was removed.
+    Orphan,
+    /// Project-less (standalone folder) agents.
+    Standalone,
+}
+
+/// One header of the grouped sidebar, rebuilt with the item list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LeftGroup {
+    /// The project id (or [`STANDALONE_GROUP_KEY`]); also the collapse key.
+    pub(crate) key: String,
+    pub(crate) name: String,
+    pub(crate) kind: LeftGroupKind,
+    /// Every agent in the group, filtered or not: the header's "(N)".
+    pub(crate) agent_count: usize,
+    /// Whether the header renders collapsed (a live filter forces it open).
+    pub(crate) collapsed: bool,
 }
 
 /// The agent-list display sort mode, driven by the shared `config.ui.agent_sort`
@@ -3710,6 +3775,122 @@ pub(crate) fn build_left_items(
     items
 }
 
+/// Build the GROUPED left-pane list: one header per project, each followed by
+/// every agent in that project (so every harness sharing one checkout appears
+/// as its own row under the same header), then orphaned (removed-project)
+/// groups, then a "Standalone" group for project-less agents.
+///
+/// Grouping is the core-owned `dux_core::sidebar::build_sidebar` (the same
+/// projection the web renders), called with no agent-less split. Within a group
+/// rows follow the same `flat_list::order_sessions` the flat list uses, active
+/// ones first and the group's inactive ones straight after (inactive agents
+/// stay under their own project instead of being collected in a global tail).
+///
+/// A header lists all agents in `agent_count` whatever the filter. While a
+/// filter is live (`filter_active`), a group with no visible agent is dropped
+/// and every surviving group renders expanded so a hit is never hidden behind
+/// a collapsed header. Projects with no agents still get a header (like the
+/// fork) so the tree shows every project the user registered, but only when no
+/// filter is live.
+pub(crate) fn build_grouped_left_items(
+    projects: &[Project],
+    sessions: &[AgentSession],
+    collapsed: &HashSet<String>,
+    filter_active: bool,
+    sort_mode: AgentSortMode,
+    is_hot: &dyn Fn(usize) -> bool,
+    is_visible: &dyn Fn(usize) -> bool,
+) -> (Vec<LeftItem>, Vec<LeftGroup>) {
+    let model = dux_core::sidebar::build_sidebar(projects, sessions, &HashSet::new(), 0);
+    let order = dux_core::flat_list::order_sessions(
+        sessions,
+        sort_mode.to_flat_sort_mode(),
+        is_hot,
+        is_visible,
+    );
+    // Display rank of every visible session: active bucket first, then inactive.
+    let mut rank: HashMap<usize, usize> = HashMap::new();
+    for (pos, index) in order.active.iter().chain(order.inactive.iter()).enumerate() {
+        rank.insert(*index, pos);
+    }
+    let index_of: HashMap<&str, usize> = sessions
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.id.as_str(), i))
+        .collect();
+
+    let mut items = Vec::new();
+    let mut groups = Vec::new();
+    let push_group = |key: String,
+                      name: String,
+                      kind: LeftGroupKind,
+                      members: Vec<usize>,
+                      items: &mut Vec<LeftItem>,
+                      groups: &mut Vec<LeftGroup>| {
+        let mut visible: Vec<usize> = members
+            .iter()
+            .copied()
+            .filter(|i| rank.contains_key(i))
+            .collect();
+        if filter_active && visible.is_empty() {
+            return;
+        }
+        visible.sort_by_key(|i| rank[i]);
+        let is_collapsed = !filter_active && collapsed.contains(&key);
+        groups.push(LeftGroup {
+            key,
+            name,
+            kind,
+            agent_count: members.len(),
+            collapsed: is_collapsed,
+        });
+        items.push(LeftItem::Group(groups.len() - 1));
+        if !is_collapsed {
+            items.extend(visible.into_iter().map(LeftItem::Session));
+        }
+    };
+
+    for group in model.groups {
+        let members: Vec<usize> = group
+            .session_ids
+            .iter()
+            .filter_map(|id| index_of.get(id.as_str()).copied())
+            .collect();
+        let kind = if group.orphaned {
+            LeftGroupKind::Orphan
+        } else {
+            LeftGroupKind::Project {
+                path_missing: group.path_missing,
+            }
+        };
+        push_group(
+            group.project_id,
+            group.name,
+            kind,
+            members,
+            &mut items,
+            &mut groups,
+        );
+    }
+    let standalone: Vec<usize> = sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.project_id().is_none())
+        .map(|(i, _)| i)
+        .collect();
+    if !standalone.is_empty() {
+        push_group(
+            STANDALONE_GROUP_KEY.to_string(),
+            "Standalone".to_string(),
+            LeftGroupKind::Standalone,
+            standalone,
+            &mut items,
+            &mut groups,
+        );
+    }
+    (items, groups)
+}
+
 mod background_server;
 mod changes_job;
 pub(crate) use background_server::{BackgroundServerStart, CompanionRouting};
@@ -3733,6 +3914,8 @@ mod reorder;
 mod session_settings;
 mod sessions;
 pub(crate) use session_settings::{SessionSettingsPrompt, SettingsFocus};
+#[cfg(test)]
+mod grouped_sidebar_tests;
 #[cfg(test)]
 mod shared_workspace_tests;
 #[cfg(test)]
@@ -4064,6 +4247,8 @@ impl App {
             inactive_search_dismissed: None,
             inactive_collapse_overridden: false,
             left_items_cache: Vec::new(),
+            left_groups_cache: Vec::new(),
+            collapsed_groups: HashSet::new(),
             mouse_layout: MouseLayoutState::default(),
             overlay_layout: OverlayMouseLayoutState::default(),
             mouse_drag: None,
@@ -5018,6 +5203,11 @@ impl App {
                     let p = self.engine.projects.iter().find(|p| p.id == project_id)?;
                     p.path_missing.then(|| p.path.clone())
                 }
+                LeftItem::Group(g) => {
+                    let group = self.left_group(g)?;
+                    let p = self.engine.projects.iter().find(|p| p.id == group.key)?;
+                    p.path_missing.then(|| p.path.clone())
+                }
                 _ => None,
             });
         if let Some(path) = missing_path {
@@ -5744,6 +5934,54 @@ impl App {
         &self.left_items_cache
     }
 
+    /// The configured agent-list shape (`config.ui.sidebar_style`).
+    pub(crate) fn sidebar_style(&self) -> SidebarStyle {
+        SidebarStyle::from_config_str(&self.engine.config.ui.sidebar_style)
+    }
+
+    /// The grouped-sidebar header behind `LeftItem::Group(index)`.
+    pub(crate) fn left_group(&self, index: usize) -> Option<&LeftGroup> {
+        self.left_groups_cache.get(index)
+    }
+
+    /// The group header an item belongs to: the header itself, or for an agent
+    /// row the nearest header above it. `None` in the flat sidebar.
+    pub(crate) fn left_group_of_item(&self, index: usize) -> Option<(usize, &LeftGroup)> {
+        self.left_items()
+            .iter()
+            .take(index.saturating_add(1))
+            .enumerate()
+            .rev()
+            .find_map(|(pos, item)| match item {
+                LeftItem::Group(g) => self.left_group(*g).map(|group| (pos, group)),
+                _ => None,
+            })
+    }
+
+    /// Collapse or expand the grouped-sidebar header owning the selected row
+    /// (the header itself, or the agent row's own project), leaving the cursor
+    /// on that header. Returns `false` when there is no such header.
+    fn toggle_selected_group(&mut self) -> bool {
+        let Some((_, group)) = self.left_group_of_item(self.selected_left) else {
+            return false;
+        };
+        let key = group.key.clone();
+        if group.agent_count == 0 {
+            // Nothing to fold away; keep the arrow honest.
+            return true;
+        }
+        if !self.collapsed_groups.remove(&key) {
+            self.collapsed_groups.insert(key.clone());
+        }
+        self.rebuild_left_items();
+        if let Some(pos) = self.left_items().iter().position(|item| {
+            matches!(item, LeftItem::Group(g) if self.left_group(*g).is_some_and(|gr| gr.key == key))
+        }) {
+            self.selected_left = pos;
+        }
+        true
+    }
+
     pub(crate) fn rebuild_left_items(&mut self) {
         // Until the user toggles the Inactive section by hand, auto-manage it:
         // expand when every agent is inactive (don't hide a wholly-dormant
@@ -5790,13 +6028,31 @@ impl App {
         // (mirroring the hot mask above, and avoiding a second `self.engine` borrow).
         // An absent or whitespace-only query makes everything visible.
         let visible: Vec<bool> = self.agent_visibility_mask();
-        self.left_items_cache = build_left_items(
-            &self.engine.sessions,
-            effective_collapsed,
-            mode,
-            &|i| hot[i],
-            &|i| visible[i],
-        );
+        match self.sidebar_style() {
+            SidebarStyle::Flat => {
+                self.left_items_cache = build_left_items(
+                    &self.engine.sessions,
+                    effective_collapsed,
+                    mode,
+                    &|i| hot[i],
+                    &|i| visible[i],
+                );
+                self.left_groups_cache.clear();
+            }
+            SidebarStyle::Grouped => {
+                let (items, groups) = build_grouped_left_items(
+                    &self.engine.projects,
+                    &self.engine.sessions,
+                    &self.collapsed_groups,
+                    current_query.is_some(),
+                    mode,
+                    &|i| hot[i],
+                    &|i| visible[i],
+                );
+                self.left_items_cache = items;
+                self.left_groups_cache = groups;
+            }
+        }
         self.ensure_selectable_left_item();
         // The same query prunes the terminal list (`terminal_items`), so the
         // terminal cursor is repaired in the same breath as the agent one: this
@@ -5951,8 +6207,18 @@ impl App {
     /// nothing.
     pub(crate) fn is_reorderable_left_item(&self, index: usize) -> bool {
         let items = self.left_items();
-        if !matches!(items.get(index), Some(LeftItem::Session(_))) {
+        let Some(LeftItem::Session(session_index)) = items.get(index) else {
             return false;
+        };
+        if self.sidebar_style() == SidebarStyle::Grouped {
+            // Grouped: the inactive rows at the foot of each project are the
+            // same derived bucket the flat tail is, so they are not drop
+            // targets either.
+            return self
+                .engine
+                .sessions
+                .get(*session_index)
+                .is_some_and(|s| !dux_core::flat_list::is_inactive(s));
         }
         match items
             .iter()
@@ -5960,6 +6226,19 @@ impl App {
         {
             Some(tail) => index < tail,
             None => true,
+        }
+    }
+
+    /// Whether two agent-list items may trade places: always in the flat list,
+    /// only within one project in the grouped list (a drag cannot move an agent
+    /// into another project, so a cross-project drop would do nothing visible).
+    pub(crate) fn left_items_share_group(&self, a: usize, b: usize) -> bool {
+        if self.sidebar_style() == SidebarStyle::Flat {
+            return true;
+        }
+        match (self.left_group_of_item(a), self.left_group_of_item(b)) {
+            (Some((ga, _)), Some((gb, _))) => ga == gb,
+            _ => false,
         }
     }
 
@@ -6031,6 +6310,12 @@ impl App {
     /// as the old per-project collapse (Space / `ToggleProject`) and to Enter on
     /// the `InactiveToggle` row. Keeps the cursor on the toggle row afterward.
     pub(crate) fn toggle_collapse_selected_project(&mut self) {
+        // Grouped sidebar: fold the selected project (the header, or the
+        // selected agent's own project) like the fork's per-project collapse.
+        if self.sidebar_style() == SidebarStyle::Grouped {
+            self.toggle_selected_group();
+            return;
+        }
         // A manual toggle takes over from the auto-manage in `rebuild_left_items`.
         self.inactive_collapse_overridden = true;
         if self.inactive_tail_forced_open() {
@@ -6082,6 +6367,11 @@ impl App {
                         .find(|project| project.id == project_id)
                 })
             }
+            // A grouped-sidebar project header selects its project, as the
+            // fork's project rows did.
+            Some(LeftItem::Group(g)) => self
+                .left_group(*g)
+                .and_then(|group| self.engine.projects.iter().find(|p| p.id == group.key)),
             _ => None,
         }
     }

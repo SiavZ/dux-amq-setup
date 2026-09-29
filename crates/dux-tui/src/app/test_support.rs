@@ -148,6 +148,10 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
         config: {
             let mut config = dux_core::test_provider::harmless_config();
             config.workspace = None;
+            // The harness's row geometry (indexes, the Inactive tail) is the
+            // FLAT sidebar's; those tests are the flat mode's regression suite.
+            // Grouped-mode tests opt in explicitly.
+            config.ui.sidebar_style = "flat".to_string();
             config
         },
         paths,
@@ -321,6 +325,8 @@ pub(crate) fn test_app(bindings: RuntimeBindings) -> App {
         inactive_search_dismissed: None,
         inactive_collapse_overridden: false,
         left_items_cache: Vec::new(),
+        left_groups_cache: Vec::new(),
+        collapsed_groups: std::collections::HashSet::new(),
         mouse_layout: MouseLayoutState::default(),
         overlay_layout: OverlayMouseLayoutState::default(),
         mouse_drag: None,

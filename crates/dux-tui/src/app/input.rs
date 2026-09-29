@@ -9657,6 +9657,8 @@ impl App {
             }
             // Enter/activate on the Inactive tail toggles it open/closed.
             Some(LeftItem::InactiveToggle) => self.toggle_collapse_selected_project(),
+            // Enter/activate (and a double click) on a project header folds it.
+            Some(LeftItem::Group(_)) => self.toggle_collapse_selected_project(),
             None => {}
         }
         Ok(())
@@ -10889,6 +10891,9 @@ impl App {
         }
         let target = over_row
             .filter(|index| *index != drag.source)
+            .filter(|index| {
+                drag.list != RowDragList::Agents || self.left_items_share_group(drag.source, *index)
+            })
             .and_then(|index| self.row_drag_id(drag.list, index).map(|id| (index, id)));
         drag.hover = target.as_ref().map(|(index, _)| *index);
         drag.hover_id = target.map(|(_, id)| id);

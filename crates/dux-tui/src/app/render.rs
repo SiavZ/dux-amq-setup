@@ -678,8 +678,11 @@ fn fit_agent_meta_line(
     // Everything except the two truncatable fields is fixed: the marker, the
     // name->word separator + word, the separator before the branch (its text is
     // flexible, its separator is not), and the separator + tab count.
+    // A blank marker with no name (a grouped row whose header already names
+    // the project) leads straight into the word, with no separator before it.
+    let lead_sep = name.is_some() || !marker.content.trim().is_empty();
     let mut fixed = width(&marker)
-        .saturating_add(SEP_W)
+        .saturating_add(if lead_sep { SEP_W } else { 0 })
         .saturating_add(width(&word));
     if branch.is_some() {
         fixed = fixed.saturating_add(SEP_W);
@@ -717,7 +720,9 @@ fn fit_agent_meta_line(
     if let Some(name) = name {
         out.extend(ellipsize_field_highlighted(name, name_alloc, highlight));
     }
-    out.push(sep());
+    if lead_sep {
+        out.push(sep());
+    }
     out.push(word);
     if let Some(branch) = branch {
         out.push(sep());
@@ -1892,6 +1897,23 @@ impl App {
         // so the tone stays on line two. The standalone terminal row wears the
         // same star at the same indent; owned terminal rows keep their arrow.
         let (marker, name_span) = self.agent_row_owner_spans(session, found, muted);
+        // Under a grouped project header the project name is already on screen
+        // one row up, so a healthy row spends that width on the state word and
+        // branch instead; a warning (missing path, removed project, missing
+        // working copy) and a standalone folder keep their tag.
+        let (marker, name_span) = if self.sidebar_style() == SidebarStyle::Grouped
+            && matches!(
+                agent_row_owner_tag(
+                    session,
+                    found,
+                    self.engine.working_copy_missing(&session.id)
+                ),
+                AgentRowOwnerTag::Project(ProjectTagKind::Healthy, _)
+            ) {
+            (Span::styled("  ", Style::default().fg(muted)), None)
+        } else {
+            (marker, name_span)
+        };
         let word = agent_state_word(session.status, working, typing, needs_attention);
         // The one working cue: the word pulses between the working token and the
         // muted tone beside it, and a cycling ellipsis runs after it in a slot
@@ -2019,9 +2041,10 @@ impl App {
                 // The three-line framed selection, shared with terminal rows.
                 self.paint_framed_row_selection(buf, list_inner, map, sel, top_pad_y);
             }
-            LeftItem::InactiveToggle => {
-                // Only the label row (the toggle ends with a trailing spacer, so
-                // the label is the second-to-last row); no frame edges.
+            LeftItem::InactiveToggle | LeftItem::Group(_) => {
+                // Only the label row (the toggle and a project header both end
+                // with a trailing spacer, so the label is the second-to-last
+                // row); no frame edges.
                 let Some(rel_end) = map.iter().rposition(|&i| i == sel) else {
                     return;
                 };
@@ -2255,6 +2278,13 @@ impl App {
                     "─",
                     Style::default().fg(self.theme.header_separator_fg),
                 ))),
+                LeftItem::Group(g) => {
+                    let collapsed = self.left_group(*g).is_some_and(|group| group.collapsed);
+                    ListItem::new(Line::from(Span::styled(
+                        if collapsed { "▸" } else { "▾" },
+                        Style::default().fg(self.theme.project_icon),
+                    )))
+                }
             })
             .collect::<Vec<_>>();
         let mut state = ListState::default().with_selected(Some(self.selected_left));
@@ -2340,6 +2370,57 @@ impl App {
         format!("Agents ({visible}/{total})")
     }
 
+    /// A grouped-sidebar project header: fold arrow, project name, and the
+    /// project's agent count, like the fork's `▾ Jobzy-infra (3)`. A project
+    /// whose folder is gone or whose record was removed wears the warning tone;
+    /// the standalone group wears the standalone star and identity tone.
+    fn render_group_header(&self, index: usize, text_width: u16) -> Line<'static> {
+        let Some(group) = self.left_group(index) else {
+            return Line::from("");
+        };
+        let arrow = if group.collapsed || group.agent_count == 0 {
+            "▸ "
+        } else {
+            "▾ "
+        };
+        let (glyph, name_color) = match group.kind {
+            LeftGroupKind::Project {
+                path_missing: false,
+            } => (arrow.to_string(), self.theme.text_fg),
+            LeftGroupKind::Project { path_missing: true } | LeftGroupKind::Orphan => {
+                ("⚠ ".to_string(), self.theme.project_missing_fg)
+            }
+            LeftGroupKind::Standalone => (
+                format!("{} ", crate::theme::STANDALONE_GLYPH),
+                self.theme.standalone_location_fg,
+            ),
+        };
+        let glyph_color = match group.kind {
+            LeftGroupKind::Project {
+                path_missing: false,
+            } => self.theme.project_icon,
+            _ => name_color,
+        };
+        let name = match group.kind {
+            LeftGroupKind::Orphan => format!("{} (removed project)", group.name),
+            _ => group.name.clone(),
+        };
+        let mut spans = vec![
+            Span::styled(glyph, Style::default().fg(glyph_color)),
+            Span::styled(
+                name,
+                Style::default().fg(name_color).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if group.agent_count > 0 {
+            spans.push(Span::styled(
+                format!(" ({})", group.agent_count),
+                Style::default().fg(self.theme.provider_label_fg),
+            ));
+        }
+        Line::from(ellipsize_spans(spans, text_width))
+    }
+
     fn agent_sidebar_items(
         &self,
         left_items: &[LeftItem],
@@ -2348,7 +2429,16 @@ impl App {
     ) -> (Vec<ListItem<'static>>, Vec<u16>) {
         let items = left_items
             .iter()
-            .map(|item| match item {
+            .enumerate()
+            .map(|(pos, item)| match item {
+                LeftItem::Group(g) => {
+                    let label = self.render_group_header(*g, row_text_width);
+                    if pos > 0 {
+                        ListItem::new(vec![Line::from(""), label, Line::from("")])
+                    } else {
+                        ListItem::new(vec![label, Line::from("")])
+                    }
+                }
                 LeftItem::InactiveToggle => {
                     let icon = if self.inactive_collapsed {
                         "▸"
@@ -2377,7 +2467,10 @@ impl App {
             .collect();
         let heights = left_items
             .iter()
-            .map(|item| match item {
+            .enumerate()
+            .map(|(pos, item)| match item {
+                LeftItem::Group(_) if pos > 0 => 3,
+                LeftItem::Group(_) => 2,
                 LeftItem::Session(_) => 3,
                 LeftItem::InactiveToggle if has_active => 3,
                 LeftItem::InactiveToggle => 2,

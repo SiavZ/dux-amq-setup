@@ -4562,6 +4562,8 @@ mod tests {
             config: {
                 let mut config = dux_core::test_provider::harmless_config();
                 config.workspace = None;
+                // Flat sidebar geometry; grouped tests opt in (see test_app).
+                config.ui.sidebar_style = "flat".to_string();
                 config
             },
             paths,
@@ -4731,6 +4733,8 @@ mod tests {
             inactive_search_dismissed: None,
             inactive_collapse_overridden: false,
             left_items_cache: Vec::new(),
+            left_groups_cache: Vec::new(),
+            collapsed_groups: HashSet::new(),
             mouse_layout: MouseLayoutState::default(),
             overlay_layout: OverlayMouseLayoutState::default(),
             mouse_drag: None,
@@ -4915,6 +4919,7 @@ mod tests {
         let mut config = dux_core::test_provider::harmless_config();
         config.ui.auto_reopen_agents = true;
         config.workspace = None;
+        config.ui.sidebar_style = "flat".to_string();
         let config_writer =
             dux_core::config_queue::ConfigWriteQueue::new(paths.config_path.clone());
         let engine = dux_core::engine::Engine {
