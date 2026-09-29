@@ -215,6 +215,15 @@ mod tests {
             )
         };
         assert_eq!(rc, 0, "openpty failed");
+        // Other tests spawn children. Without close-on-exec each child keeps a
+        // copy of the master, and the slave is not hung up until it exits.
+        for fd in [master, slave] {
+            // SAFETY: fd is one of the descriptors openpty just returned.
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+        }
         // SAFETY: openpty returned two fresh descriptors this test owns.
         unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) }
     }
@@ -252,6 +261,12 @@ mod tests {
             wait_for_terminal_input(&slave, Duration::from_secs(2)).unwrap(),
             TerminalInput::Ready
         );
+        // Read what was typed, as the run loop would. Left unread, it keeps the
+        // slave readable, and a poll that runs before the hang-up is delivered
+        // (a fork elsewhere in the test process can hold a copy of the master
+        // for a moment) reports Ready instead of Gone.
+        let mut typed = [0u8; 8];
+        assert_eq!(rustix::io::read(&slave, &mut typed).unwrap(), 2);
 
         drop(master);
         assert_eq!(
