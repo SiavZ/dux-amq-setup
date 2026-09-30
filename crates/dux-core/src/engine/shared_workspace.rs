@@ -80,9 +80,7 @@ impl Engine {
             .iter()
             .filter(|s| s.shared_workspace() && self.session_has_live_provider(&s.id))
         {
-            let key = crate::project_browser::canonical_or_original(std::path::Path::new(
-                session.directory(),
-            ));
+            let key = canonical_checkout(session.directory());
             match counts.iter_mut().find(|(path, _)| *path == key) {
                 Some((_, count)) => *count += 1,
                 None => counts.push((key, 1)),
@@ -108,6 +106,36 @@ impl Engine {
     pub fn project_link_allowed(&self, project_id: &str) -> bool {
         project_link_allowed(&self.sessions, project_id)
     }
+}
+
+/// [`crate::project_browser::canonical_or_original`] for a shared checkout,
+/// remembered for a few seconds. The header asks for every live shared agent
+/// on every frame, and with dozens of agents that was dozens of `realpath`
+/// calls per frame. A checkout's canonical path only changes if a symlink on
+/// the way to it is repointed, so a short-lived answer is safe.
+fn canonical_checkout(dir: &str) -> std::path::PathBuf {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    const TTL: Duration = Duration::from_secs(5);
+    static CACHE: Mutex<Option<HashMap<String, (Instant, std::path::PathBuf)>>> = Mutex::new(None);
+
+    let now = Instant::now();
+    if let Ok(mut guard) = CACHE.lock() {
+        let cache = guard.get_or_insert_with(HashMap::new);
+        if let Some((at, path)) = cache.get(dir)
+            && now.duration_since(*at) < TTL
+        {
+            return path.clone();
+        }
+        let path = crate::project_browser::canonical_or_original(std::path::Path::new(dir));
+        if cache.len() > 4096 {
+            cache.clear();
+        }
+        cache.insert(dir.to_string(), (now, path.clone()));
+        return path;
+    }
+    crate::project_browser::canonical_or_original(std::path::Path::new(dir))
 }
 
 /// [`Engine::project_link_allowed`] over a plain session list, for callers
