@@ -37,10 +37,12 @@ pub struct WatchRuntime {
     /// AMQ inject wrote a postscript that could itself match a rule). When the
     /// window ends the engine rebaselines once, absorbing any stale match.
     pub suppress_until: HashMap<TabId, Instant>,
-    /// The last text each tab's rules were run against and the terminal
-    /// generation it came from. A tab whose terminal has not changed reuses it
-    /// instead of rescanning its grid on every UI tick.
-    pub last_snapshot: HashMap<TabId, (u64, std::sync::Arc<str>)>,
+    /// The last text each tab's rules were run against, the terminal
+    /// generation it came from and when it was scanned. A tab whose terminal
+    /// has not changed reuses it instead of rescanning its grid on every UI
+    /// tick, and one that keeps changing is rescanned at most every
+    /// `WATCH_RESCAN_INTERVAL`.
+    pub last_snapshot: HashMap<TabId, (u64, Instant, std::sync::Arc<str>)>,
     /// How many times a tick consulted the auto-clear guard. Tests pin that a
     /// quiet screen never pays for the guard's mailbox reads.
     #[cfg(test)]

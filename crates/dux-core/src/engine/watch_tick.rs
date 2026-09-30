@@ -28,6 +28,15 @@ pub const WATCH_SCAN_ROWS: usize = 30;
 /// rules react to terminal states (the fork capped its quiet window at 5s).
 pub const WATCH_TYPING_QUIET: Duration = Duration::from_secs(5);
 
+/// The least time between two rescans of one tab whose screen keeps changing.
+/// A working agent redraws a spinner several times a second, so its screen is
+/// new on nearly every UI tick; rescanning and re-matching all of them on
+/// every tick was the UI thread's largest remaining cost with dozens of busy
+/// agents. Well under the shortest rule backoff in use (250 ms), so a rule
+/// still sees a new match within one interval. Clocks (pending fires,
+/// cooldowns) keep advancing every tick on the text from the last rescan.
+pub const WATCH_RESCAN_INTERVAL: Duration = Duration::from_millis(200);
+
 /// The per-session inputs the watch engine reads from the session settings
 /// store (Worker mode + auto-clear opt-in, and manual arm overrides).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -206,21 +215,30 @@ impl Engine {
             }
             // An unchanged terminal reuses the text its rules last ran on:
             // rescanning a grid that has not moved is pure cost, and with
-            // dozens of tabs it ran on every UI tick.
-            let seen = self.watch.last_snapshot.get(&tab).map(|(g, _)| *g);
+            // dozens of tabs it ran on every UI tick. A changed one is rescanned
+            // at most every WATCH_RESCAN_INTERVAL.
+            let cached = self.watch.last_snapshot.get(&tab);
+            let seen = cached.map(|(g, _, _)| *g);
+            let recently_scanned =
+                cached.is_some_and(|(_, at, _)| now.duration_since(*at) < WATCH_RESCAN_INTERVAL);
             let Some(client) = self.providers.get(tab.as_ref_id()) else {
                 continue;
             };
-            let snapshot = match client.scan_recent_lines_if_changed(WATCH_SCAN_ROWS, seen) {
+            let rescan = if recently_scanned {
+                None
+            } else {
+                client.scan_recent_lines_if_changed(WATCH_SCAN_ROWS, seen)
+            };
+            let snapshot = match rescan {
                 Some((text, generation)) => {
                     let text: std::sync::Arc<str> = text.into();
                     self.watch
                         .last_snapshot
-                        .insert(tab.clone(), (generation, text.clone()));
+                        .insert(tab.clone(), (generation, now, text.clone()));
                     text
                 }
                 None => match self.watch.last_snapshot.get(&tab) {
-                    Some((_, text)) => text.clone(),
+                    Some((_, _, text)) => text.clone(),
                     None => continue,
                 },
             };
@@ -753,6 +771,9 @@ mod tests {
 
         std::fs::write(&go, b"").unwrap();
         assert!(wait_for(|| screen(&engine).contains("esc to interrupt")));
+        // Past the rescan interval, as a real tick loop would be, so the next
+        // tick reads the new screen.
+        std::thread::sleep(WATCH_RESCAN_INTERVAL);
         for _ in 0..20 {
             engine.tick_watch_rules();
         }
@@ -766,5 +787,71 @@ mod tests {
             crate::watch::RuleStateKind::Idle,
             "a held sentinel must not schedule a clear"
         );
+    }
+
+    /// A screen that changes on every tick (a working agent's spinner) is
+    /// rescanned at most once per WATCH_RESCAN_INTERVAL, and a match that
+    /// appears is still seen once the interval has passed.
+    #[test]
+    fn a_busy_screen_is_rescanned_at_most_once_per_interval() {
+        let tmp = crate::test_scratch::ScratchDir::new();
+        let go = tmp.path().join("go");
+        // A spinner redrawn every 20 ms, then, once `go` exists, a real hit.
+        let script = format!(
+            "i=0; while [ ! -e '{}' ]; do i=$((i+1)); printf '\\rspinner %d' $i; sleep 0.02; done; \
+             printf '\\nAPI Error: rate limited\\n'; exec sleep 30",
+            go.display()
+        );
+        let client = PtyClient::spawn(
+            "sh",
+            &["-c".to_string(), script],
+            &std::env::temp_dir(),
+            24,
+            80,
+            100,
+        )
+        .expect("spawn spinner pty");
+        let (mut engine, _guard) = engine_with_tab(
+            client,
+            vec![instant_rule("rate limited", "please continue")],
+        );
+        let tab = TabId::new("s1-slot");
+        assert!(wait_for(|| engine.providers[tab.as_ref_id()]
+            .scan_recent_lines(WATCH_SCAN_ROWS)
+            .contains("spinner")));
+
+        // Tick for about three intervals while the spinner keeps changing.
+        let started = Instant::now();
+        let mut scans = 0;
+        let mut last_seen = None;
+        while started.elapsed() < WATCH_RESCAN_INTERVAL * 3 {
+            engine.tick_watch_rules();
+            let at = engine.watch.last_snapshot.get(&tab).map(|(_, at, _)| *at);
+            if at != last_seen {
+                scans += 1;
+                last_seen = at;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            (2..=4).contains(&scans),
+            "a busy screen was rescanned {scans} times in three intervals"
+        );
+
+        // A hit that appears is picked up within one interval and fires.
+        std::fs::write(&go, b"").unwrap();
+        assert!(wait_for(|| engine.providers[tab.as_ref_id()]
+            .scan_recent_lines(WATCH_SCAN_ROWS)
+            .contains("rate limited")));
+        let deadline = Instant::now() + WATCH_RESCAN_INTERVAL * 3;
+        let mut fired = false;
+        while Instant::now() < deadline && !fired {
+            fired = engine
+                .tick_watch_rules()
+                .iter()
+                .any(|s| s.message.contains("fired (attempt 1/3)"));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(fired, "the rule must still fire on a busy screen");
     }
 }
