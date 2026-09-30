@@ -116,6 +116,8 @@ impl App {
         let maintenance = self.apply_pruned_pty_events();
         self.note_companion_maintenance(&maintenance);
         self.refresh_resource_monitor_if_due();
+        // After the prune, so a PTY that exited this tick is not resized.
+        self.presize_background_agent_ptys(Instant::now());
         self.engine.sync_has_active_processes();
     }
 
