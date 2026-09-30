@@ -491,6 +491,12 @@ fn apply_patches(doc: &mut DocumentMut, config: &Config) {
     patch_table_str(doc, "ui", "agent_sort", &config.ui.agent_sort);
     patch_table_str(doc, "ui", "sidebar_style", &config.ui.sidebar_style);
     patch_table_str(doc, "ui", "sidebar_density", &config.ui.sidebar_density);
+    patch_table_bool(
+        doc,
+        "ui",
+        "sidebar_header_rule",
+        config.ui.sidebar_header_rule,
+    );
     patch_table_str(doc, "ui", "theme", &config.ui.theme);
 
     // --- [capabilities] ---

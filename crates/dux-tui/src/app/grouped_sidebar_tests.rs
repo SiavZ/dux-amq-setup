@@ -811,3 +811,119 @@ fn the_wheel_scrolls_the_view_both_ways() {
             .contains(&app.selected_left)
     );
 }
+
+/// The rule is off unless asked for: a header is its text and nothing more,
+/// which is what every test above this one reads.
+#[test]
+fn headers_carry_no_rule_by_default() {
+    let mut app = compact_app("grouped");
+    assert!(!app.engine.config.ui.sidebar_header_rule);
+    let buffer = draw(&mut app);
+    let rows = sidebar_rows(&app, &buffer);
+    assert!(rows.iter().all(|row| !row.contains('─')), "{rows:#?}");
+}
+
+/// With `sidebar_header_rule` on, a header that is not the selection is
+/// followed by a rule to the right edge, one blank cell after its text. The
+/// agent rows under it are untouched.
+#[test]
+fn a_compact_header_carries_a_rule_to_the_edge_when_asked() {
+    let mut app = compact_app("grouped");
+    app.engine.config.ui.sidebar_header_rule = true;
+    // Put the selection on an agent so neither header is the selected row.
+    app.selected_left = 1;
+    let buffer = draw(&mut app);
+    let rows = sidebar_rows(&app, &buffer);
+
+    for header in ["▾ Jobzy-infra (3)", "▾ Jobzy-web (1)"] {
+        let row = rows
+            .iter()
+            .find(|row| row.starts_with(header))
+            .unwrap_or_else(|| panic!("{header} missing: {rows:#?}"));
+        let rest = &row[header.len()..];
+        assert!(
+            rest.starts_with(" ─") && rest.trim_start().chars().all(|c| c == '─'),
+            "after the header comes a gap and then only the rule: {row:?}"
+        );
+        assert!(
+            rest.chars().count() > 10,
+            "the rule runs to the edge: {row:?}"
+        );
+    }
+    for row in rows.iter().filter(|row| !row.starts_with('▾')) {
+        assert!(!row.contains('─'), "an agent row carries no rule: {row:?}");
+    }
+}
+
+/// The selected header shows its highlight, not the rule, as the flat list's
+/// Inactive toggle does.
+#[test]
+fn the_selected_header_shows_its_highlight_instead_of_the_rule() {
+    let mut app = compact_app("grouped");
+    app.engine.config.ui.sidebar_header_rule = true;
+    app.focus = FocusPane::Left;
+    app.selected_left = 0;
+    let buffer = draw(&mut app);
+    let rows = sidebar_rows(&app, &buffer);
+
+    assert_eq!(rows[0], "▾ Jobzy-infra (3)", "{rows:#?}");
+    assert!(
+        rows.iter().any(|row| row.starts_with("▾ Jobzy-web (1) ─")),
+        "the other header keeps its rule: {rows:#?}"
+    );
+}
+
+/// In the comfortable density a header is its label between blank spacers.
+/// The rule goes on the label and the spacers stay blank.
+#[test]
+fn a_comfortable_header_carries_its_rule_on_the_label_row_only() {
+    let mut app = compact_app("grouped");
+    app.engine.config.ui.sidebar_density = "comfortable".to_string();
+    app.engine.config.ui.sidebar_header_rule = true;
+    app.rebuild_left_items();
+    app.selected_left = 1;
+    let buffer = draw(&mut app);
+
+    let list = app.mouse_layout.left_list;
+    let rows: Vec<String> = (list.y..list.y + list.height)
+        .map(|y| {
+            (list.x + 1..list.x + list.width.saturating_sub(1))
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect();
+    let ruled: Vec<&String> = rows.iter().filter(|row| row.contains('─')).collect();
+    assert_eq!(ruled.len(), 2, "one rule per header: {rows:#?}");
+    assert!(ruled[0].starts_with("▾ Jobzy-infra (3) ─"), "{ruled:#?}");
+    assert!(ruled[1].starts_with("▾ Jobzy-web (1) ─"), "{ruled:#?}");
+}
+
+/// The flat list has no project headers, so the setting draws nothing there
+/// beyond the rule the Inactive label always had.
+#[test]
+fn the_flat_list_is_untouched_by_the_header_rule() {
+    let plain = {
+        let mut app = compact_app("flat");
+        let buffer = draw(&mut app);
+        sidebar_rows(&app, &buffer)
+    };
+    let mut app = compact_app("flat");
+    app.engine.config.ui.sidebar_header_rule = true;
+    let buffer = draw(&mut app);
+    assert_eq!(sidebar_rows(&app, &buffer), plain);
+}
+
+#[test]
+fn the_config_documents_sidebar_header_rule() {
+    let rendered = crate::config::render_default_config();
+    assert!(
+        rendered.contains("sidebar_header_rule = false"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("divider line after each project header"),
+        "{rendered}"
+    );
+}
