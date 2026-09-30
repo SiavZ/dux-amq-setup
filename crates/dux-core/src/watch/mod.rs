@@ -25,5 +25,5 @@ pub mod reset_time;
 pub mod rule;
 pub mod runtime;
 
-pub use engine::{RuleSnapshot, RuleStateKind, WatchEffect, WatchEngine};
+pub use engine::{RuleSnapshot, RuleStateKind, SnapshotKey, WatchEffect, WatchEngine};
 pub use rule::{WaitFormat, WatchAction, WatchBackoff, WatchBudget, WatchRule, WatchRuleKind};

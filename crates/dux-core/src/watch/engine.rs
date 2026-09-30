@@ -113,10 +113,12 @@ struct RuleRuntime {
 /// without keeping a copy of it. A different snapshot that collided on both
 /// (about 1 in 2^64 per tick) would reuse the previous count for that tick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SnapshotKey(usize, u64);
+pub struct SnapshotKey(usize, u64);
 
 impl SnapshotKey {
-    fn of(snapshot: &str) -> Self {
+    /// Fingerprint `snapshot`. Callers that drive several engine calls on one
+    /// snapshot compute this once and pass it to the `*_keyed` methods.
+    pub fn of(snapshot: &str) -> Self {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         snapshot.hash(&mut hasher);
@@ -306,7 +308,17 @@ impl WatchEngine {
     ///
     /// Returns the list of effects to dispatch this tick.
     pub fn observe(&mut self, snapshot: &str, now: Instant) -> Vec<WatchEffect> {
-        let key = SnapshotKey::of(snapshot);
+        self.observe_keyed(snapshot, SnapshotKey::of(snapshot), now)
+    }
+
+    /// [`Self::observe`] with the snapshot's key already computed. `key` must
+    /// be `SnapshotKey::of(snapshot)`.
+    pub fn observe_keyed(
+        &mut self,
+        snapshot: &str,
+        key: SnapshotKey,
+        now: Instant,
+    ) -> Vec<WatchEffect> {
         let mut effects = Vec::new();
         for rule in &mut self.rules {
             rule.tick(snapshot, key, now, &mut self.rng, &mut effects);
@@ -320,7 +332,11 @@ impl WatchEngine {
     /// so the engine treats those occurrences as pre-existing rather than
     /// fresh incidents.
     pub fn rebaseline(&mut self, snapshot: &str) {
-        let key = SnapshotKey::of(snapshot);
+        self.rebaseline_keyed(snapshot, SnapshotKey::of(snapshot));
+    }
+
+    /// [`Self::rebaseline`] with the snapshot's key precomputed.
+    pub fn rebaseline_keyed(&mut self, snapshot: &str, key: SnapshotKey) {
         for rule in &mut self.rules {
             if matches!(rule.state, RuleState::Disarmed) {
                 continue;
@@ -338,7 +354,16 @@ impl WatchEngine {
     /// skip an expensive policy check that only exists to decide whether to
     /// rebaseline.
     pub fn kind_has_fresh_match(&mut self, snapshot: &str, kind: WatchRuleKind) -> bool {
-        let key = SnapshotKey::of(snapshot);
+        self.kind_has_fresh_match_keyed(snapshot, SnapshotKey::of(snapshot), kind)
+    }
+
+    /// [`Self::kind_has_fresh_match`] with the snapshot's key precomputed.
+    pub fn kind_has_fresh_match_keyed(
+        &mut self,
+        snapshot: &str,
+        key: SnapshotKey,
+        kind: WatchRuleKind,
+    ) -> bool {
         self.rules.iter_mut().any(|rule| {
             rule.kind == kind
                 && !matches!(rule.state, RuleState::Disarmed)
@@ -350,7 +375,11 @@ impl WatchEngine {
     /// Used when app-level policy wants to suppress a built-in rule
     /// without blocking user-configured watch rules in the same engine.
     pub fn rebaseline_kind(&mut self, snapshot: &str, kind: WatchRuleKind) {
-        let key = SnapshotKey::of(snapshot);
+        self.rebaseline_kind_keyed(snapshot, SnapshotKey::of(snapshot), kind);
+    }
+
+    /// [`Self::rebaseline_kind`] with the snapshot's key precomputed.
+    pub fn rebaseline_kind_keyed(&mut self, snapshot: &str, key: SnapshotKey, kind: WatchRuleKind) {
         for rule in &mut self.rules {
             if rule.kind != kind || matches!(rule.state, RuleState::Disarmed) {
                 continue;
