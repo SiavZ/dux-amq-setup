@@ -20,6 +20,9 @@ Options:
   -h, --help              Print this help and exit.";
 
 fn main() -> Result<()> {
+    // Before anything else: once a newer build is installed over this one,
+    // the OS no longer says where this process was started from.
+    dux_core::reload_policy::remember_startup_exe();
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("server") => run_server(args),
@@ -80,7 +83,7 @@ fn exec_reload(
             format!("Reload failed: could not write the handoff ({err:#}). Nothing was changed."),
         );
     }
-    let Ok(exe) = std::env::current_exe() else {
+    let Some(exe) = dux_core::reload_policy::reload_exe() else {
         let _ = std::fs::remove_file(&handoff_path);
         return give_back(
             engine,
