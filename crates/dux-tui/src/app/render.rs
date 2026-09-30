@@ -13975,16 +13975,15 @@ fn truncate_status_text(text: &str, available: usize) -> String {
     }
 }
 
-fn status_footer_lines(status_text: &str, width: u16) -> u16 {
-    if width == 0 {
-        return 1;
-    }
-    let status_text_len = status_text.chars().count() + 3; // " ● " prefix
-    if status_text_len > width as usize {
-        2
-    } else {
-        1
-    }
+/// Rows the status line takes in the footer. Always one: a long message is cut
+/// with an ellipsis instead of wrapping onto a second row. Letting the footer
+/// grow with the text moved the pane above it, so every long status (entering
+/// or leaving fullscreen, "scroll mode ended", a background warning) resized the
+/// selected agent's PTY. The child saw a SIGWINCH, a Claude pane cleared and
+/// repainted its whole transcript, and whatever the user had scrolled to was
+/// thrown away, then again when the status expired and the row came back.
+fn status_footer_lines(_status_text: &str, _width: u16) -> u16 {
+    1
 }
 
 /// Whether closing one tab detaches its agent: it does when the close removes
@@ -20970,10 +20969,34 @@ mod tests {
     }
 
     #[test]
-    fn status_footer_lines_allows_at_most_two_status_rows() {
+    fn the_status_line_never_takes_a_second_row() {
         assert_eq!(status_footer_lines("short", 40), 1);
-        assert_eq!(status_footer_lines("this message is too wide", 10), 2);
+        assert_eq!(status_footer_lines("this message is too wide", 10), 1);
         assert_eq!(status_footer_lines("anything", 0), 1);
+    }
+
+    /// A long status must not move the agent pane: its PTY size is the same
+    /// with a one-word status and with one far wider than the terminal. Before,
+    /// the wide one took a second footer row and the PTY lost a row, which a
+    /// Claude pane answers by repainting and dropping the user's scroll.
+    #[test]
+    fn a_long_status_does_not_resize_the_agent_pane() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        // A fresh app per status: two infos in one tick are shown in turn, so
+        // reusing one app would still be showing the first.
+        let body_and_footer = |status: String| {
+            let mut app = test_app(default_bindings());
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+            app.set_info(status);
+            terminal.draw(|frame| app.render(frame)).expect("render");
+            let footer = buffer_rows(terminal.backend().buffer())[29].clone();
+            (app.mouse_layout.center, footer)
+        };
+        let (short_body, _) = body_and_footer("ok".to_string());
+        let (long_body, footer) = body_and_footer("x".repeat(400));
+        assert_eq!(long_body, short_body, "the body keeps its height");
+        assert!(footer.contains('…'), "the long status is cut: {footer:?}");
     }
 
     // --- resource_monitor_columns (pure column-budget helper) ---
