@@ -20,9 +20,12 @@ use super::render::minimized_agent_term_size;
 use super::*;
 
 /// How long the windowed center pane must keep one geometry before background
-/// PTYs follow it, so dragging a window edge does not make every agent redraw
-/// at every intermediate size.
-const PRESIZE_SETTLE: Duration = Duration::from_secs(1);
+/// PTYs follow it. Every presize costs a hidden agent a full transcript
+/// repaint, so a layout that is only passing through must not trigger it:
+/// dragging a window edge, or toggling a pane for a few seconds and back, would
+/// otherwise make all sixty agents redraw twice for nothing. A swap soon after
+/// a change still resizes only the agent it shows, exactly as before.
+const PRESIZE_SETTLE: Duration = Duration::from_secs(10);
 
 /// At most this many background PTYs are resized per UI tick, so a window
 /// resize does not make sixty agents redraw in the same instant.
@@ -357,6 +360,39 @@ mod tests {
         assert_eq!(grid(&app, "session-1-slot"), Some(fullscreen));
         assert_eq!(app.presize_background_agent_ptys(settled()), 1);
         assert_eq!(grid(&app, "session-1-slot"), Some(pane));
+    }
+
+    /// A layout that is only passing through (a pane toggled for a few seconds
+    /// and back, a window edge mid-drag) must not make every hidden agent
+    /// repaint. Measured on 64 agents with a 1 s settle: a 5 s detour sent
+    /// every agent two SIGWINCHes, one each way, where the previous build sent
+    /// none. Nothing moves until the geometry has held for the full settle.
+    #[test]
+    fn a_layout_held_for_less_than_the_settle_presizes_nothing() {
+        let mut app = two_agents();
+        render(&mut app);
+        let stale = grid(&app, "session-2-slot");
+        let now = Instant::now();
+        assert_eq!(
+            app.presize_background_agent_ptys(now + PRESIZE_SETTLE / 2),
+            0,
+            "half way through the settle nothing is presized"
+        );
+        assert_eq!(
+            app.presize_background_agent_ptys(now + PRESIZE_SETTLE - Duration::from_millis(100)),
+            0,
+            "just short of the settle nothing is presized"
+        );
+        assert_eq!(
+            grid(&app, "session-2-slot"),
+            stale,
+            "the hidden agent kept its grid"
+        );
+        assert!(
+            PRESIZE_SETTLE >= Duration::from_secs(5),
+            "a pane toggled for a few seconds and back must stay inside the settle"
+        );
+        assert_eq!(app.presize_background_agent_ptys(settled()), 1);
     }
 
     /// Presizing is not a claim. While a web server is serving, a PTY another
