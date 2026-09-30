@@ -808,9 +808,9 @@ mod tests {
         assert_eq!(out.flushes, 1, "the terminal is told to present the frame");
     }
 
-    /// What the terminal is sent for one frame that ends with the cursor at an
-    /// agent's prompt: hidden first, every repaint in between, and only then
-    /// shown and placed. Nothing in the frame shows the cursor early.
+    /// A panic in `render` unwinds past the draw. The guard must still close
+    /// the synchronized update and bring the cursor back, or the user's shell
+    /// is left with no cursor after dux exits.
     #[test]
     fn a_panic_mid_frame_still_closes_the_frame_and_shows_the_cursor() {
         let wire = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
