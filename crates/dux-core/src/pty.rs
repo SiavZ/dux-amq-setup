@@ -2898,6 +2898,7 @@ impl TerminalState {
     /// so a CJK or emoji glyph reads as one character.
     fn scan_recent_lines(&self, max_rows: usize) -> String {
         use std::collections::BTreeMap;
+        let row_capacity = usize::from(self.cols).max(1);
         let mut by_line: BTreeMap<i32, String> = BTreeMap::new();
         for indexed in self.term.renderable_content().display_iter {
             if indexed
@@ -2909,19 +2910,29 @@ impl TerminalState {
             }
             by_line
                 .entry(indexed.point.line.0)
-                .or_default()
+                .or_insert_with(|| String::with_capacity(row_capacity))
                 .push(indexed.cell.c);
         }
-        let mut lines: Vec<String> = by_line
-            .into_values()
-            .map(|s| s.trim_end().to_string())
+        // Newest non-blank rows, kept as slices into the row strings so only
+        // the joined result is allocated, sized up front.
+        let mut lines: Vec<&str> = by_line
+            .values()
+            .map(|s| s.trim_end())
             .filter(|s| !s.is_empty())
             .collect();
         if lines.len() > max_rows {
             let drop = lines.len() - max_rows;
             lines.drain(..drop);
         }
-        lines.join("\n")
+        let total = lines.iter().map(|l| l.len()).sum::<usize>() + lines.len().saturating_sub(1);
+        let mut out = String::with_capacity(total);
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(line);
+        }
+        out
     }
 
     fn visible_text_excerpt(&self, max_lines: usize) -> String {
