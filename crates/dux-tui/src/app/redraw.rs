@@ -302,6 +302,31 @@ pub(crate) fn end_frame(out: &mut impl std::io::Write) -> std::io::Result<()> {
     crossterm::execute!(out, crossterm::terminal::EndSynchronizedUpdate)
 }
 
+/// Closes the frame [`begin_frame`] opened when it goes out of scope, so the
+/// close also runs when a panic in `render` unwinds past the draw. The cursor
+/// was hidden behind ratatui's back, so its `Terminal` drop cannot know to show
+/// it again; on a panic the guard shows it, or the user's shell is left with no
+/// cursor and a synchronized update still open.
+pub(crate) struct FrameGuard<W: std::io::Write> {
+    out: W,
+}
+
+impl<W: std::io::Write> FrameGuard<W> {
+    pub(crate) fn begin(mut out: W) -> Self {
+        let _ = begin_frame(&mut out);
+        Self { out }
+    }
+}
+
+impl<W: std::io::Write> Drop for FrameGuard<W> {
+    fn drop(&mut self) {
+        let _ = end_frame(&mut self.out);
+        if std::thread::panicking() {
+            let _ = crossterm::execute!(self.out, crossterm::cursor::Show);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,6 +806,45 @@ mod tests {
         end_frame(&mut out).expect("end");
         assert_eq!(out.bytes, b"\x1b[?2026l");
         assert_eq!(out.flushes, 1, "the terminal is told to present the frame");
+    }
+
+    /// What the terminal is sent for one frame that ends with the cursor at an
+    /// agent's prompt: hidden first, every repaint in between, and only then
+    /// shown and placed. Nothing in the frame shows the cursor early.
+    #[test]
+    fn a_panic_mid_frame_still_closes_the_frame_and_shows_the_cursor() {
+        let wire = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let out = Shared(wire.clone());
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _frame = FrameGuard::begin(out);
+            panic!("render bug");
+        }));
+        assert!(caught.is_err(), "the panic must propagate");
+        let wire = wire.lock().unwrap().clone();
+        let find = |needle: &[u8]| wire.windows(needle.len()).position(|w| w == needle);
+        let hidden = find(b"\x1b[?25l").expect("hidden at the start of the frame");
+        let closed = find(b"\x1b[?2026l").expect("the synchronized update is closed");
+        let shown = find(b"\x1b[?25h").expect("the cursor is shown again");
+        assert!(hidden < closed && closed < shown, "{wire:?}");
+    }
+
+    /// A frame that draws normally is closed but leaves the cursor to ratatui:
+    /// the guard shows it only on a panic.
+    #[test]
+    fn a_normal_frame_leaves_the_cursor_to_ratatui() {
+        let mut wire: Vec<u8> = Vec::new();
+        drop(FrameGuard::begin(&mut wire));
+        assert_eq!(wire, b"\x1b[?2026h\x1b[?25l\x1b[?2026l");
     }
 
     /// What the terminal is sent for one frame that ends with the cursor at an
