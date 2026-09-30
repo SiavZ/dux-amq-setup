@@ -14,6 +14,77 @@ use dux_core::text::{count_of, count_of_with};
 use ratatui::buffer::{CellDiffOption, CellWidth};
 use std::path::Path;
 
+/// Split the center lane into `(pr_banner_area, pane_area)`. The banner row is
+/// one row tall when `banner` is set and zero rows otherwise.
+pub(crate) fn center_pane_split(area: Rect, banner: bool, at_bottom: bool) -> (Rect, Rect) {
+    let banner_height: u16 = if banner { 1 } else { 0 };
+    if at_bottom {
+        let [pane_area, pr_area] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(banner_height)])
+            .areas(area);
+        (pr_area, pane_area)
+    } else {
+        let [pr_area, pane_area] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(banner_height), Constraint::Min(1)])
+            .areas(area);
+        (pr_area, pane_area)
+    }
+}
+
+/// Whether the agent tab strip is drawn over `area`: two or more tabs (or the
+/// always-show setting), and room for the 3-row band above a usable terminal.
+pub(crate) fn tab_strip_visible(tab_count: usize, always_show: bool, area: Rect) -> bool {
+    (tab_count >= 2 || always_show) && area.height >= 6 && area.width >= 12
+}
+
+/// Split `area` into the 3-row tab strip and the terminal block below it.
+pub(crate) fn tab_strip_split(area: Rect) -> [Rect; 2] {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .areas(area)
+}
+
+/// Split the agent block's inner rect into the terminal grid and the 2-row
+/// hint area under it, or `None` when the block is too small to hold a grid.
+pub(crate) fn agent_term_hint_split(inner: Rect) -> Option<[Rect; 2]> {
+    if inner.height < 2 || inner.width < 4 {
+        return None;
+    }
+    // Reserve 2 lines at the bottom for the hint bar (top border + text).
+    let hint_height = 2;
+    Some(
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(hint_height)])
+            .areas(inner),
+    )
+}
+
+/// The `(rows, cols)` an agent's PTY gets when it is shown in the windowed
+/// (not fullscreen) center pane: the same chain of splits `render_center`,
+/// `render_agent_tab_strip_if_needed` and `render_agent_terminal` apply to
+/// `center`. `None` when the pane is too small to hold a grid.
+pub(crate) fn minimized_agent_term_size(
+    center: Rect,
+    banner: bool,
+    tab_count: usize,
+    always_show_tab_strip: bool,
+) -> Option<(u16, u16)> {
+    // The banner row costs the same height at either edge.
+    let (_, pane_area) = center_pane_split(center, banner, false);
+    let block_area = if tab_strip_visible(tab_count, always_show_tab_strip, pane_area) {
+        tab_strip_split(pane_area)[1]
+    } else {
+        pane_area
+    };
+    let inner = Block::bordered().inner(block_area);
+    let [term_area, _] = agent_term_hint_split(inner)?;
+    (term_area.height > 0 && term_area.width > 0).then_some((term_area.height, term_area.width))
+}
+
 /// The width a pane card's button paints at. One rule, read by the planner (to
 /// refuse a layout too narrow for it) and by the painter (to place it), so the
 /// two can never disagree about whether the label fits.
@@ -3189,21 +3260,13 @@ impl App {
         } else {
             None
         };
-        let pr_banner_height: u16 = if pr_info.is_some() { 1 } else { 0 };
+        if !covered {
+            // The windowed geometry background PTYs are presized to.
+            self.note_minimized_center_area(area);
+        }
 
-        let (pr_area, pane_area) = if self.pr_banner_at_bottom {
-            let [pane_area, pr_area] = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(pr_banner_height)])
-                .areas(area);
-            (pr_area, pane_area)
-        } else {
-            let [pr_area, pane_area] = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(pr_banner_height), Constraint::Min(1)])
-                .areas(area);
-            (pr_area, pane_area)
-        };
+        let (pr_area, pane_area) =
+            center_pane_split(area, pr_info.is_some(), self.pr_banner_at_bottom);
 
         if let Some(ref pr) = pr_info {
             self.render_pr_banner(frame, pr_area, pr);
@@ -3837,7 +3900,7 @@ impl App {
         // The strip is a 3-row band of rounded boxes (top border, label,
         // bottom border), the same bordered-and-rounded idiom every other
         // dux surface uses, so it needs a taller minimum than a flat row.
-        if (tab_ids.len() < 2 && !always_show) || area.height < 6 || area.width < 12 {
+        if !tab_strip_visible(tab_ids.len(), always_show, area) {
             return area;
         }
         let focused_id = self.focused_tab_id(&session_id);
@@ -3883,10 +3946,7 @@ impl App {
         let spinner_idx = self.spinner_frame_index();
         let blink_on = self.attention_blink_on();
 
-        let [strip_area, term_area] = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(1)])
-            .areas(area);
+        let [strip_area, term_area] = tab_strip_split(area);
 
         // No "+" add button: new tabs are created via the `new-agent-tab`
         // palette command (or the NewTab keybinding), so the boxes get the
@@ -5008,9 +5068,9 @@ impl App {
             }
         }
 
-        if inner.height < 2 || inner.width < 4 {
+        let Some([term_area, hint_area]) = agent_term_hint_split(inner) else {
             return;
-        }
+        };
 
         let context = self.agent_terminal_context();
         let active_surface = context.active_surface;
@@ -5018,12 +5078,6 @@ impl App {
         let session_provider_name = context.provider_name.as_deref();
         // The hardware caret follows every typeable pane and anchors IME UI.
         // Bounds naturally hide it while the cursor is outside scrollback view.
-        // Reserve 2 lines at the bottom for the hint bar (top border + text).
-        let hint_height = 2;
-        let [term_area, hint_area] = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(hint_height)])
-            .areas(inner);
         self.mouse_layout.agent_term = Some(term_area);
 
         self.resize_agent_terminal(term_area);

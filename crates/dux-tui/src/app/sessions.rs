@@ -4723,6 +4723,7 @@ mod tests {
             pending_pty_takeover: None,
             last_refused_pty_resize: None,
             grid_generation: 0,
+            presize: Default::default(),
             scroll_mode: std::collections::HashSet::new(),
             last_diff_height: 0,
             last_diff_visual_lines: 0,

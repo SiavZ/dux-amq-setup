@@ -1878,6 +1878,17 @@ impl PtyClient {
         // purely a view change now, so there is nothing to synchronize beyond
         // marking the grid dirty.
         let guard = self.terminal.lock();
+        // Already at this grid: nothing to tell the kernel or the child. Skipping
+        // here keeps a repeated resize from stamping `last_resize_at` (which
+        // mutes activity detection for 500 ms) and from dirtying the snapshot.
+        // Checked under the same lock the resize below holds, so it cannot race
+        // a concurrent resize to a different size.
+        if let Ok(terminal) = guard.as_ref()
+            && terminal.rows == rows
+            && terminal.cols == cols
+        {
+            return Ok(());
+        }
         self.master
             .resize(PtySize {
                 rows,
@@ -6677,6 +6688,32 @@ mod tests {
                 "the reap instant must be the FIRST observation, not the latest poll"
             );
         }
+    }
+
+    #[test]
+    fn a_resize_to_the_current_grid_is_a_no_op() {
+        // A same-size resize must not stamp the resize instant: that stamp mutes
+        // activity detection for 500 ms, and a background presize or a repeated
+        // pane measurement would otherwise hide real output for no reason.
+        let client = PtyClient::spawn("cat", &[], Path::new("."), 5, 40, 100).expect("spawn");
+        client.resize(5, 40).expect("same-size resize");
+        assert!(
+            client
+                .last_resize_at
+                .lock()
+                .expect("not poisoned")
+                .is_none(),
+            "a resize to the grid the child already has must not be recorded"
+        );
+        client.resize(6, 40).expect("real resize");
+        assert!(
+            client
+                .last_resize_at
+                .lock()
+                .expect("not poisoned")
+                .is_some()
+        );
+        assert_eq!(client.grid_size(), Some((6, 40)));
     }
 
     #[test]
