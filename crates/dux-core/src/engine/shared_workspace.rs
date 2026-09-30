@@ -109,33 +109,64 @@ impl Engine {
 }
 
 /// [`crate::project_browser::canonical_or_original`] for a shared checkout,
-/// remembered for a few seconds. The header asks for every live shared agent
-/// on every frame, and with dozens of agents that was dozens of `realpath`
-/// calls per frame. A checkout's canonical path only changes if a symlink on
-/// the way to it is repointed, so a short-lived answer is safe.
+/// remembered. The header asks for every live shared agent on every frame, and
+/// with dozens of agents that was dozens of `realpath` calls per frame.
+///
+/// A checkout's canonical path only changes if a symlink on the way to it is
+/// repointed, so an answer is kept and refreshed now and then. The refresh is
+/// spread out: an expired entry is served stale while another refresh already
+/// ran recently, so at most one `realpath` runs per [`REFRESH_SPACING`].
+/// Expiring every entry at once made one frame in every few seconds
+/// canonicalize every checkout, and on a busy disk that single frame stalled
+/// the UI for hundreds of milliseconds.
 fn canonical_checkout(dir: &str) -> std::path::PathBuf {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    use std::time::{Duration, Instant};
-    const TTL: Duration = Duration::from_secs(5);
-    static CACHE: Mutex<Option<HashMap<String, (Instant, std::path::PathBuf)>>> = Mutex::new(None);
+    canonical_checkout_with(dir, std::time::Instant::now(), |dir| {
+        crate::project_browser::canonical_or_original(std::path::Path::new(dir))
+    })
+}
 
-    let now = Instant::now();
-    if let Ok(mut guard) = CACHE.lock() {
-        let cache = guard.get_or_insert_with(HashMap::new);
-        if let Some((at, path)) = cache.get(dir)
-            && now.duration_since(*at) < TTL
-        {
+/// How long a canonical answer is trusted before it is refreshed.
+const CANONICAL_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Minimum gap between two refreshes of already-known checkouts.
+const REFRESH_SPACING: std::time::Duration = std::time::Duration::from_millis(250);
+
+struct CanonicalCache {
+    entries: std::collections::HashMap<String, (std::time::Instant, std::path::PathBuf)>,
+    last_refresh: Option<std::time::Instant>,
+}
+
+static CANONICAL_CACHE: std::sync::Mutex<Option<CanonicalCache>> = std::sync::Mutex::new(None);
+
+fn canonical_checkout_with(
+    dir: &str,
+    now: std::time::Instant,
+    resolve: impl FnOnce(&str) -> std::path::PathBuf,
+) -> std::path::PathBuf {
+    let Ok(mut guard) = CANONICAL_CACHE.lock() else {
+        return resolve(dir);
+    };
+    let cache = guard.get_or_insert_with(|| CanonicalCache {
+        entries: std::collections::HashMap::new(),
+        last_refresh: None,
+    });
+    if let Some((at, path)) = cache.entries.get(dir) {
+        let fresh = now.saturating_duration_since(*at) < CANONICAL_TTL;
+        let refreshed_recently = cache
+            .last_refresh
+            .is_some_and(|last| now.saturating_duration_since(last) < REFRESH_SPACING);
+        if fresh || refreshed_recently {
             return path.clone();
         }
-        let path = crate::project_browser::canonical_or_original(std::path::Path::new(dir));
-        if cache.len() > 4096 {
-            cache.clear();
-        }
-        cache.insert(dir.to_string(), (now, path.clone()));
-        return path;
+        cache.last_refresh = Some(now);
     }
-    crate::project_browser::canonical_or_original(std::path::Path::new(dir))
+    // A checkout seen for the first time has no answer to serve, so it is
+    // resolved at once; that happens once per checkout per process.
+    let path = resolve(dir);
+    if cache.entries.len() > 4096 {
+        cache.entries.clear();
+    }
+    cache.entries.insert(dir.to_string(), (now, path.clone()));
+    path
 }
 
 /// [`Engine::project_link_allowed`] over a plain session list, for callers
@@ -471,5 +502,71 @@ mod tests {
         engine.clear_tab_runtime(&second_slot);
         assert_eq!(engine.shared_multi_writer_summary(), None);
         engine.shutdown_ptys(std::time::Duration::ZERO);
+    }
+
+    /// Once every checkout's answer has expired, the header must not
+    /// canonicalize all of them in one frame: that single frame stalled the UI.
+    /// One refresh runs per spacing and the rest are served stale until their
+    /// turn. The cache is process-wide, so the keys are unique to this test.
+    #[test]
+    fn expired_checkouts_refresh_one_at_a_time_instead_of_all_in_one_frame() {
+        use std::cell::Cell;
+        use std::time::Duration;
+        let dirs: Vec<String> = (0..8)
+            .map(|i| format!("/canonical-spread-test/{}/checkout-{i}", std::process::id()))
+            .collect();
+        let resolved = Cell::new(0usize);
+        let resolve = |dir: &str| {
+            resolved.set(resolved.get() + 1);
+            std::path::PathBuf::from(dir)
+        };
+        let t0 = std::time::Instant::now();
+        // First sight resolves each checkout once.
+        for dir in &dirs {
+            canonical_checkout_with(dir, t0, resolve);
+        }
+        assert_eq!(
+            resolved.get(),
+            dirs.len(),
+            "first sight resolves every checkout"
+        );
+
+        // Within the TTL, frames are free.
+        resolved.set(0);
+        for dir in &dirs {
+            canonical_checkout_with(dir, t0 + Duration::from_secs(1), resolve);
+        }
+        assert_eq!(resolved.get(), 0, "a fresh answer is reused");
+
+        // Everything has expired: one frame refreshes at most one checkout.
+        resolved.set(0);
+        let expired = t0 + CANONICAL_TTL + Duration::from_secs(1);
+        for dir in &dirs {
+            let path = canonical_checkout_with(dir, expired, resolve);
+            assert_eq!(
+                path,
+                std::path::PathBuf::from(dir),
+                "stale answers are still answers"
+            );
+        }
+        assert_eq!(
+            resolved.get(),
+            1,
+            "one refresh per frame, not one per checkout"
+        );
+
+        // Frame after frame, spaced out, every checkout is refreshed in turn.
+        let mut at = expired;
+        for _ in 0..dirs.len() * 2 {
+            at += REFRESH_SPACING;
+            for dir in &dirs {
+                canonical_checkout_with(dir, at, resolve);
+            }
+        }
+        assert_eq!(
+            resolved.get(),
+            dirs.len(),
+            "each expired checkout is refreshed exactly once"
+        );
     }
 }
