@@ -101,6 +101,42 @@ struct RuleRuntime {
     /// Resolved label (rule.label, or a truncated copy of the pattern).
     label: String,
     kind: WatchRuleKind,
+    /// The match count for the last snapshot this rule counted, keyed by that
+    /// snapshot's fingerprint. The engine runs every UI tick against screens
+    /// that are mostly unchanged; a user pattern can be a large alternation,
+    /// so recounting identical text on every tick for every tab was most of
+    /// the UI thread's work.
+    count_cache: Option<(SnapshotKey, usize)>,
+}
+
+/// A snapshot's length and 64-bit hash, so a repeat of the same text is found
+/// without keeping a copy of it. A different snapshot that collided on both
+/// (about 1 in 2^64 per tick) would reuse the previous count for that tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SnapshotKey(usize, u64);
+
+impl SnapshotKey {
+    fn of(snapshot: &str) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        snapshot.hash(&mut hasher);
+        Self(snapshot.len(), hasher.finish())
+    }
+}
+
+impl RuleRuntime {
+    /// Occurrences of the pattern in `snapshot`, from the cache when this
+    /// rule already counted the same text.
+    fn count(&mut self, snapshot: &str, key: SnapshotKey) -> usize {
+        if let Some((cached_key, count)) = self.count_cache
+            && cached_key == key
+        {
+            return count;
+        }
+        let count = self.regex.find_iter(snapshot).count();
+        self.count_cache = Some((key, count));
+        count
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -179,6 +215,7 @@ impl WatchEngine {
                 baseline_match_count: 0,
                 label,
                 kind: rule.kind,
+                count_cache: None,
             });
         }
 
@@ -269,9 +306,10 @@ impl WatchEngine {
     ///
     /// Returns the list of effects to dispatch this tick.
     pub fn observe(&mut self, snapshot: &str, now: Instant) -> Vec<WatchEffect> {
+        let key = SnapshotKey::of(snapshot);
         let mut effects = Vec::new();
         for rule in &mut self.rules {
-            rule.tick(snapshot, now, &mut self.rng, &mut effects);
+            rule.tick(snapshot, key, now, &mut self.rng, &mut effects);
         }
         effects
     }
@@ -282,11 +320,12 @@ impl WatchEngine {
     /// so the engine treats those occurrences as pre-existing rather than
     /// fresh incidents.
     pub fn rebaseline(&mut self, snapshot: &str) {
+        let key = SnapshotKey::of(snapshot);
         for rule in &mut self.rules {
             if matches!(rule.state, RuleState::Disarmed) {
                 continue;
             }
-            let matches = rule.regex.find_iter(snapshot).count();
+            let matches = rule.count(snapshot, key);
             if matches > rule.baseline_match_count {
                 rule.baseline_match_count = matches;
             }
@@ -298,11 +337,12 @@ impl WatchEngine {
     /// baseline. When this is false the rebaseline is a no-op, so a caller can
     /// skip an expensive policy check that only exists to decide whether to
     /// rebaseline.
-    pub fn kind_has_fresh_match(&self, snapshot: &str, kind: WatchRuleKind) -> bool {
-        self.rules.iter().any(|rule| {
+    pub fn kind_has_fresh_match(&mut self, snapshot: &str, kind: WatchRuleKind) -> bool {
+        let key = SnapshotKey::of(snapshot);
+        self.rules.iter_mut().any(|rule| {
             rule.kind == kind
                 && !matches!(rule.state, RuleState::Disarmed)
-                && rule.regex.find_iter(snapshot).count() > rule.baseline_match_count
+                && rule.count(snapshot, key) > rule.baseline_match_count
         })
     }
 
@@ -310,11 +350,12 @@ impl WatchEngine {
     /// Used when app-level policy wants to suppress a built-in rule
     /// without blocking user-configured watch rules in the same engine.
     pub fn rebaseline_kind(&mut self, snapshot: &str, kind: WatchRuleKind) {
+        let key = SnapshotKey::of(snapshot);
         for rule in &mut self.rules {
             if rule.kind != kind || matches!(rule.state, RuleState::Disarmed) {
                 continue;
             }
-            let matches = rule.regex.find_iter(snapshot).count();
+            let matches = rule.count(snapshot, key);
             if matches > rule.baseline_match_count {
                 rule.baseline_match_count = matches;
             }
@@ -334,6 +375,7 @@ impl RuleRuntime {
     fn tick(
         &mut self,
         snapshot: &str,
+        key: SnapshotKey,
         now: Instant,
         rng: &mut SmallRng,
         out: &mut Vec<WatchEffect>,
@@ -342,7 +384,7 @@ impl RuleRuntime {
             return;
         }
 
-        let matches = self.regex.find_iter(snapshot).count();
+        let matches = self.count(snapshot, key);
 
         // Ratchet baseline down when matches scroll out, so a future
         // occurrence is detected as an increase even if the count drops to
@@ -505,6 +547,45 @@ mod tests {
             cooldown_ms: 500,
             ..Default::default()
         }
+    }
+
+    /// The count cache must be invisible: an engine fed the same screen for
+    /// many ticks, then a changed one, fires exactly as a fresh count would.
+    /// A cached count is reused for identical text and recomputed for any
+    /// change, including one of the same length.
+    #[test]
+    fn a_repeated_screen_reuses_its_count_and_a_changed_one_recounts() {
+        let mut r = rule("rate limited");
+        r.backoff.initial_ms = 0;
+        let (mut engine, errors) = WatchEngine::new("s1", &[r]);
+        assert!(errors.is_empty(), "{errors:?}");
+        let now = Instant::now();
+
+        let quiet = "working on it...";
+        for _ in 0..50 {
+            assert!(engine.observe(quiet, now).is_empty());
+        }
+        let key = SnapshotKey::of(quiet);
+        assert_eq!(engine.rules[0].count_cache, Some((key, 0)));
+
+        // Same length as a real hit, different text: must be recounted.
+        let near = "rate limitee";
+        let hit = "rate limited";
+        assert_eq!(near.len(), hit.len());
+        assert!(engine.observe(near, now).is_empty());
+        assert_eq!(engine.rules[0].count_cache.map(|(_, c)| c), Some(0));
+
+        // The real hit schedules (backoff 0), and the next tick on the same
+        // screen fires from the cached count.
+        assert!(engine.observe(hit, now).is_empty(), "first tick schedules");
+        let fired = engine.observe(hit, now);
+        assert!(
+            fired.iter().any(
+                |e| matches!(e, WatchEffect::SendText { text, .. } if text == "please continue")
+            ),
+            "{fired:?}"
+        );
+        assert_eq!(engine.rules[0].count_cache.map(|(_, c)| c), Some(1));
     }
 
     #[test]

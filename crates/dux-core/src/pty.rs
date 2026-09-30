@@ -1976,6 +1976,22 @@ impl PtyClient {
             .unwrap_or_default()
     }
 
+    /// Like [`Self::scan_recent_lines`], but skips the scan when the grid has
+    /// not changed since the caller last saw generation `seen`: returns `None`
+    /// then. Otherwise returns the scan and the generation it reflects. Both
+    /// are read under one lock, so the pair is consistent.
+    pub fn scan_recent_lines_if_changed(
+        &self,
+        max_rows: usize,
+        seen: Option<u64>,
+    ) -> Option<(String, u64)> {
+        let terminal = self.terminal.lock().ok()?;
+        if seen == Some(terminal.generation) {
+            return None;
+        }
+        Some((terminal.scan_recent_lines(max_rows), terminal.generation))
+    }
+
     /// Returns a short plain-text excerpt from the visible terminal viewport.
     pub fn visible_text_excerpt(&self, max_lines: usize) -> String {
         self.terminal
@@ -2686,6 +2702,11 @@ struct TerminalState {
     /// See [`crate::scroll_margins`] for why it is a mirror of the engine's
     /// behaviour rather than an independent reading of the specification.
     scroll_region: ScrollRegionTracker,
+    /// Bumped by every call that can change what the grid shows: parsed
+    /// output, a scroll, a resize. A reader that remembers the value can tell
+    /// "nothing on this terminal changed" without rescanning it, which the
+    /// watch engine needs: it runs on every UI tick for every live tab.
+    generation: u64,
 }
 
 impl TerminalState {
@@ -2708,6 +2729,7 @@ impl TerminalState {
             cols,
             last_content_hash: None,
             scroll_region: ScrollRegionTracker::new(rows, cols),
+            generation: 0,
         }
     }
 
@@ -2746,6 +2768,7 @@ impl TerminalState {
     }
 
     fn process(&mut self, data: &[u8]) -> Vec<u8> {
+        self.generation = self.generation.wrapping_add(1);
         self.parser.advance(&mut self.term, data);
         self.clamp_display_offset_to_history();
         // The same bytes, through a second parser that watches only the scrolling
@@ -3212,11 +3235,13 @@ impl TerminalState {
     }
 
     fn scroll(&mut self, up: bool, amount: usize) {
+        self.generation = self.generation.wrapping_add(1);
         let delta = if up { amount as i32 } else { -(amount as i32) };
         self.term.scroll_display(Scroll::Delta(delta));
     }
 
     fn set_scrollback(&mut self, rows: usize) {
+        self.generation = self.generation.wrapping_add(1);
         let current = self.term.grid().display_offset();
         let target = rows.min(self.term.grid().history_size());
         let delta = target as i32 - current as i32;
@@ -3224,6 +3249,7 @@ impl TerminalState {
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
+        self.generation = self.generation.wrapping_add(1);
         self.rows = rows;
         self.cols = cols;
         self.term.resize(TerminalDimensions::new(rows, cols));
@@ -5633,6 +5659,33 @@ mod tests {
             "one\ntwo\nthree\n\u{4f60}ok"
         );
         assert_eq!(terminal.scan_recent_lines(0), "");
+    }
+
+    /// Output, a scroll and a resize each move the generation, so a cached
+    /// scan is never reused for a grid that changed. Reading does not.
+    #[test]
+    fn the_generation_moves_with_every_grid_change_and_only_then() {
+        let mut terminal = TerminalState::new(6, 20, 100);
+        let start = terminal.generation;
+        let _ = terminal.scan_recent_lines(10);
+        let _ = terminal.take_content_change();
+        assert_eq!(terminal.generation, start, "reading changes nothing");
+
+        terminal.process(b"one\r\ntwo\r\n");
+        let after_output = terminal.generation;
+        assert_ne!(after_output, start, "output");
+        for _ in 0..10 {
+            terminal.process(b"line\r\n");
+        }
+        let before_scroll = terminal.generation;
+        terminal.scroll(true, 2);
+        assert_ne!(terminal.generation, before_scroll, "scroll");
+        let before_jump = terminal.generation;
+        terminal.set_scrollback(0);
+        assert_ne!(terminal.generation, before_jump, "scroll to bottom");
+        let before_resize = terminal.generation;
+        terminal.resize(8, 30);
+        assert_ne!(terminal.generation, before_resize, "resize");
     }
 
     #[test]
