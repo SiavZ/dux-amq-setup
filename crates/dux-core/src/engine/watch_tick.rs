@@ -204,20 +204,34 @@ impl Engine {
             if typed_recently {
                 continue;
             }
-            let Some(snapshot) = self
-                .providers
-                .get(tab.as_ref_id())
-                .map(|p| p.scan_recent_lines(WATCH_SCAN_ROWS))
-            else {
+            // An unchanged terminal reuses the text its rules last ran on:
+            // rescanning a grid that has not moved is pure cost, and with
+            // dozens of tabs it ran on every UI tick.
+            let seen = self.watch.last_snapshot.get(&tab).map(|(g, _)| *g);
+            let Some(client) = self.providers.get(tab.as_ref_id()) else {
                 continue;
             };
+            let snapshot = match client.scan_recent_lines_if_changed(WATCH_SCAN_ROWS, seen) {
+                Some((text, generation)) => {
+                    let text: std::sync::Arc<str> = text.into();
+                    self.watch
+                        .last_snapshot
+                        .insert(tab.clone(), (generation, text.clone()));
+                    text
+                }
+                None => match self.watch.last_snapshot.get(&tab) {
+                    Some((_, text)) => text.clone(),
+                    None => continue,
+                },
+            };
+            let snapshot: &str = &snapshot;
             if let Some(until) = self.watch.suppress_until.get(&tab).copied() {
                 if now < until {
                     continue;
                 }
                 self.watch.suppress_until.remove(&tab);
                 if let Some(attached) = self.watch.attached.get_mut(&tab) {
-                    attached.engine.rebaseline(&snapshot);
+                    attached.engine.rebaseline(snapshot);
                 }
             }
             let session_id = self
@@ -227,20 +241,21 @@ impl Engine {
             // hold tens of thousands of files. Ask it only when the answer can
             // matter: a fresh `[task-done]` the rebaseline below would absorb.
             // Asking every tick for every Worker pinned the UI thread.
-            let hold_auto_clear = self.watch.attached.get(&tab).is_some_and(|a| {
+            let fresh_sentinel = self.watch.attached.get_mut(&tab).is_some_and(|a| {
                 a.auto_clear_idx.is_some()
                     && a.engine
-                        .kind_has_fresh_match(&snapshot, WatchRuleKind::BuiltInAutoClear)
-            }) && self
-                .watch_auto_clear_suppressed(tab.as_ref_id(), &session_id);
+                        .kind_has_fresh_match(snapshot, WatchRuleKind::BuiltInAutoClear)
+            });
+            let hold_auto_clear =
+                fresh_sentinel && self.watch_auto_clear_suppressed(tab.as_ref_id(), &session_id);
             let effects = match self.watch.attached.get_mut(&tab) {
                 Some(attached) => {
                     if hold_auto_clear {
                         attached
                             .engine
-                            .rebaseline_kind(&snapshot, WatchRuleKind::BuiltInAutoClear);
+                            .rebaseline_kind(snapshot, WatchRuleKind::BuiltInAutoClear);
                     }
-                    attached.engine.observe(&snapshot, now)
+                    attached.engine.observe(snapshot, now)
                 }
                 None => continue,
             };
