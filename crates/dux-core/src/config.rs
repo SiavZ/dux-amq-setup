@@ -1757,6 +1757,14 @@ pub struct UiConfig {
     /// A string for the same reason as `sidebar_style`: an unknown value
     /// degrades to "compact" at the one reading site. TUI-only.
     pub sidebar_density: String,
+    /// Draw a divider rule after each project header of the grouped agent
+    /// list, from the end of the header's text to the right edge of the pane,
+    /// the way the flat list's "Inactive" label carries one. Default false:
+    /// headers are their text and nothing more. With it on, each project reads
+    /// as a section of its own, which helps most in the "comfortable" density,
+    /// where a header is one line among many two-line rows. No effect on the
+    /// flat list, which has no project headers. TUI-only.
+    pub sidebar_header_rule: bool,
     /// The agent-list sort mode, persisted so a chosen order (and the manual
     /// drag order it enables) survives restarts and is shared across clients:
     /// "active" (working/attention float up, the default), "updated", "created",
@@ -2296,6 +2304,7 @@ impl Default for UiConfig {
             agent_sort: "active".to_string(),
             sidebar_style: "grouped".to_string(),
             sidebar_density: "compact".to_string(),
+            sidebar_header_rule: false,
             theme: crate::theme::DEFAULT_THEME_NAME.to_string(),
         }
     }
@@ -3033,6 +3042,7 @@ impl Default for Config {
                 agent_sort: "active".to_string(),
                 sidebar_style: "grouped".to_string(),
                 sidebar_density: "compact".to_string(),
+                sidebar_header_rule: false,
                 theme: crate::theme::DEFAULT_THEME_NAME.to_string(),
             },
             capabilities: CapabilitiesConfig::default(),

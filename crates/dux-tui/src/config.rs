@@ -880,6 +880,13 @@ fn config_schema() -> Vec<ConfigEntry> {
             value_fn: |c| FieldValue::Str(c.ui.sidebar_density.clone()),
         },
         ConfigEntry::Field {
+            key: "sidebar_header_rule",
+            comment: Some(CommentSource::Static(
+                "# Draw a divider line after each project header of the grouped agent\n# list, from the end of the header's text to the right edge of the pane:\n#   ▾ my-project (2) ──────────────\n# Default false: a header is its text and nothing more. Turn it on to make\n# each project read as a section of its own, which helps most with\n# sidebar_density = \"comfortable\". The selected header shows its highlight\n# instead of the line. No effect with sidebar_style = \"flat\".",
+            )),
+            value_fn: |c| FieldValue::Bool(c.ui.sidebar_header_rule),
+        },
+        ConfigEntry::Field {
             key: "theme",
             comment: Some(CommentSource::Static(
                 "# Visual theme for the dux interface.\n# Built-in options include \"dux_dark\" (the default), plus any theme\n# bundled with the opaline engine, for example: \"catppuccin_mocha\",\n# \"catppuccin_frappe\", \"nord\", \"dracula\", \"gruvbox_dark\",\n# \"tokyo_night\", \"solarized_dark\", \"one_dark\", \"rose_pine\", and others.\n# To use a custom theme, drop a TOML file into <config_dir>/themes/<name>.toml\n# (with the same token format as opaline themes) and reference it here\n# by file stem. Unknown names fall back to dux_dark with a warning.\n# Use the `change-theme` command in the palette (Ctrl-p) for an interactive picker.",

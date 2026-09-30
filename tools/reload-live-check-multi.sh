@@ -121,8 +121,8 @@ sleep 2
 keys C-p
 keys -l "reload-binary"
 keys Enter
-sleep 2
-screen | grep -q "Already running the newest dux" && pass "refused: no newer build" || fail "no refusal shown for an unchanged binary"
+wait_for "the refusal message" 15 "tmux capture-pane -t $SESSION -p | grep -q 'Already running the newest dux'"
+pass "refused: no newer build"
 ps -p $DUX_PID -o command= | grep -q -- --reload-handoff && fail "exec happened on refusal" || pass "no exec on refusal"
 [ "$(ps -Ao pid,ppid,command | awk -v p="$DUX_PID" '$2==p && $3=="sh" {print $1}' | sort | tr '\n' ' ')" = "$PIDS_BEFORE" ] && pass "agents untouched by refusal" || fail "agents changed on refusal"
 screen | grep -q 'got:marker-gamma' && pass "screen still live after refusal" || fail "screen lost after refusal"
@@ -143,8 +143,8 @@ sleep 1
 keys C-p
 keys -l "reload-binary"
 keys Enter
-sleep 4
-screen | grep -q "Reload failed" && pass "failed exec reported" || fail "no failure message for a failed exec"
+wait_for "the failed-exec message" 15 "tmux capture-pane -t $SESSION -p | grep -q 'Reload failed'"
+pass "failed exec reported"
 [ "$(pgrep -f "^$WORK/dux" | head -1)" = "$DUX_PID" ] && pass "same dux after failed exec" || fail "dux pid changed after failed exec"
 [ "$(ps -Ao pid,ppid,command | awk -v p="$DUX_PID" '$2==p && $3=="sh" {print $1}' | sort | tr '\n' ' ')" = "$PIDS_BEFORE" ] && pass "agents untouched by failed exec" || fail "agents changed on failed exec"
 T1=$(last_tick); sleep 3; T2=$(last_tick)

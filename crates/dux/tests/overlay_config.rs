@@ -222,6 +222,18 @@ fn the_installer_sed_is_a_no_op_on_an_already_patched_config() {
     assert_eq!(once, twice);
 }
 
+/// Pinning claude's `forward_scroll = true` sent every wheel notch to Claude
+/// even while it had not asked for mouse input, and the pane stopped
+/// scrolling. The overlay must leave the stock auto (unset) in place.
+#[test]
+fn the_installer_sed_leaves_claude_scroll_on_auto() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let stock = regenerate_stock_config(tmp.path());
+    let patched = run_overlay_sed(tmp.path(), &stock);
+    let config = load(tmp.path(), &patched);
+    assert_eq!(config.providers.commands["claude"].forward_scroll, None);
+}
+
 /// gemini is no longer a stock provider, so a fresh config never exercises
 /// its rules. A block the user kept must still be routed through the wrapper.
 #[test]
