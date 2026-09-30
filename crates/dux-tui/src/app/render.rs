@@ -5520,6 +5520,49 @@ impl App {
             .constraints([Constraint::Length(1), Constraint::Min(1)])
             .areas(area);
 
+        // A status too wide for its row borrows the hints row above it instead
+        // of growing the footer: the footer's height (and so the agent pane's
+        // PTY size) never depends on the status text, yet an error whose
+        // actionable part is at the end stays readable. The hints come back
+        // when the status expires.
+        let status_text = self
+            .status
+            .most_recent_tui()
+            .map_or(String::new(), |(_, t)| t);
+        let status_w = display_width(&status_text) + 3; // " ● " prefix
+        let status_room = usize::from(status_area.width) * usize::from(status_area.height);
+        if status_w > status_room && area.height >= 2 {
+            let (status_line, status_bg) = self.footer_status_line(area);
+            // Hard-wrapped by column rather than by word: the ellipsis budget
+            // is rows x width, and a word wrap would push a long unbroken word
+            // (a path, a URL) whole onto the next row and its tail off-screen.
+            let width = usize::from(area.width);
+            let mut rows: Vec<Line<'static>> = Vec::new();
+            let mut row: Vec<Span<'static>> = Vec::new();
+            let mut used = 0usize;
+            for span in status_line.spans {
+                let mut rest: &str = span.content.as_ref();
+                while let Some(first) = rest.chars().next() {
+                    // A wide char that does not fit the rest of the row starts
+                    // the next one, as the terminal itself would.
+                    if used > 0 && used + char_display_width(first) > width {
+                        rows.push(Line::from(std::mem::take(&mut row)));
+                        used = 0;
+                    }
+                    let head = head_within_width(rest, width.saturating_sub(used));
+                    used += display_width(&head);
+                    rest = &rest[head.len()..];
+                    row.push(Span::styled(head, span.style));
+                }
+            }
+            rows.push(Line::from(row));
+            // chip-free: the status line is outside the chip rule, names and all.
+            Paragraph::new(rows)
+                .style(Style::default().bg(status_bg))
+                .render(area, frame.buffer_mut());
+            return;
+        }
+
         let hint_spans = self.footer_hint_spans(&hints, hints_area.width as usize);
         Paragraph::new(Line::from(hint_spans))
             .style(Style::default().bg(self.theme.hint_bar_bg))
@@ -13975,16 +14018,16 @@ fn truncate_status_text(text: &str, available: usize) -> String {
     }
 }
 
-fn status_footer_lines(status_text: &str, width: u16) -> u16 {
-    if width == 0 {
-        return 1;
-    }
-    let status_text_len = status_text.chars().count() + 3; // " ● " prefix
-    if status_text_len > width as usize {
-        2
-    } else {
-        1
-    }
+/// Rows the status line takes in the footer. Always one: a message too wide
+/// for it borrows the hints row (see `render_footer`), and one too wide for
+/// both is cut with an ellipsis, instead of the footer growing a row. Letting
+/// the footer grow with the text moved the pane above it, so every long status (entering
+/// or leaving fullscreen, "scroll mode ended", a background warning) resized the
+/// selected agent's PTY. The child saw a SIGWINCH, a Claude pane cleared and
+/// repainted its whole transcript, and whatever the user had scrolled to was
+/// thrown away, then again when the status expired and the row came back.
+fn status_footer_lines(_status_text: &str, _width: u16) -> u16 {
+    1
 }
 
 /// Whether closing one tab detaches its agent: it does when the close removes
@@ -20658,7 +20701,8 @@ mod tests {
             Instant::now(),
             None,
             StatusTone::Warning,
-            "abcdefghijklmnopqrstuvwxyz",
+            // Fits the two status rows, so the hints row stays the hints.
+            "abcdefghijklmno",
         );
 
         let mut terminal = Terminal::new(TestBackend::new(9, 3)).expect("terminal");
@@ -20970,10 +21014,65 @@ mod tests {
     }
 
     #[test]
-    fn status_footer_lines_allows_at_most_two_status_rows() {
+    fn the_status_line_never_takes_a_second_row() {
         assert_eq!(status_footer_lines("short", 40), 1);
-        assert_eq!(status_footer_lines("this message is too wide", 10), 2);
+        assert_eq!(status_footer_lines("this message is too wide", 10), 1);
         assert_eq!(status_footer_lines("anything", 0), 1);
+    }
+
+    /// A long status must not move the agent pane: its PTY size is the same
+    /// with a one-word status and with one far wider than the terminal. Before,
+    /// the wide one took a second footer row and the PTY lost a row, which a
+    /// Claude pane answers by repainting and dropping the user's scroll.
+    #[test]
+    fn a_long_status_does_not_resize_the_agent_pane() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        // A fresh app per status: two infos in one tick are shown in turn, so
+        // reusing one app would still be showing the first.
+        let body_and_footer = |status: String| {
+            let mut app = test_app(default_bindings());
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+            app.set_info(status);
+            terminal.draw(|frame| app.render(frame)).expect("render");
+            let rows = buffer_rows(terminal.backend().buffer());
+            (app.mouse_layout.center, format!("{}{}", rows[28], rows[29]))
+        };
+        let (short_body, _) = body_and_footer("ok".to_string());
+        let (long_body, footer) = body_and_footer("x".repeat(400));
+        assert_eq!(long_body, short_body, "the body keeps its height");
+        assert!(footer.contains('…'), "the long status is cut: {footer:?}");
+    }
+
+    /// A status a little wider than the terminal (an error whose actionable
+    /// half is at the end) is still readable in full: it borrows the hints row
+    /// rather than adding a row, so the agent pane keeps its size.
+    #[test]
+    fn a_status_wider_than_one_row_borrows_the_hints_row() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let render = |status: String| {
+            let mut app = test_app(default_bindings());
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+            app.set_error(status);
+            terminal.draw(|frame| app.render(frame)).expect("render");
+            let rows = buffer_rows(terminal.backend().buffer());
+            (app.mouse_layout.center, format!("{}{}", rows[28], rows[29]))
+        };
+        let (short_body, short_footer) = render("ok".to_string());
+        let tail = "run `gh auth login` and retry";
+        let long = format!("{} {tail}", "Could not push the branch.".repeat(4));
+        let (long_body, long_footer) = render(long);
+        assert_eq!(long_body, short_body, "the body keeps its height");
+        assert!(
+            long_footer.contains(tail),
+            "the end of the status is readable: {long_footer:?}"
+        );
+        assert!(!long_footer.contains('…'), "{long_footer:?}");
+        assert_ne!(
+            short_footer, long_footer,
+            "a short status leaves the hints row alone"
+        );
     }
 
     // --- resource_monitor_columns (pure column-budget helper) ---
