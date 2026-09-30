@@ -271,6 +271,62 @@ impl App {
     }
 }
 
+/// What goes to the terminal ahead of a frame.
+///
+/// A frame is painted by moving the terminal's own cursor to every cell that
+/// changed and writing there. While an agent pane has the keyboard that cursor
+/// is on show at the agent's prompt, so without this it is seen leaving the
+/// prompt, flashing at each cell being repainted, and coming back, once per
+/// frame, and with agents working there are twenty frames a second. It reads as
+/// a cursor blinking far too fast and as stray marks where the last cell of a
+/// frame was written.
+///
+/// So the cursor is put out of sight for the length of the repaint. The frame
+/// itself shows it again at the end, where it belongs, or leaves it hidden
+/// when nothing on screen takes input. The synchronized update around it asks
+/// the terminal to present the whole frame at once; a terminal that does not
+/// know the mode ignores it, and the hidden cursor does the work alone.
+///
+/// Queued rather than flushed, so it travels in the same write as the frame.
+pub(crate) fn begin_frame(out: &mut impl std::io::Write) -> std::io::Result<()> {
+    crossterm::queue!(
+        out,
+        crossterm::terminal::BeginSynchronizedUpdate,
+        crossterm::cursor::Hide
+    )
+}
+
+/// What goes to the terminal after a frame, drawn or failed: the end of the
+/// synchronized update, flushed, so the terminal presents what it was given.
+pub(crate) fn end_frame(out: &mut impl std::io::Write) -> std::io::Result<()> {
+    crossterm::execute!(out, crossterm::terminal::EndSynchronizedUpdate)
+}
+
+/// Closes the frame [`begin_frame`] opened when it goes out of scope, so the
+/// close also runs when a panic in `render` unwinds past the draw. The cursor
+/// was hidden behind ratatui's back, so its `Terminal` drop cannot know to show
+/// it again; on a panic the guard shows it, or the user's shell is left with no
+/// cursor and a synchronized update still open.
+pub(crate) struct FrameGuard<W: std::io::Write> {
+    out: W,
+}
+
+impl<W: std::io::Write> FrameGuard<W> {
+    pub(crate) fn begin(mut out: W) -> Self {
+        let _ = begin_frame(&mut out);
+        Self { out }
+    }
+}
+
+impl<W: std::io::Write> Drop for FrameGuard<W> {
+    fn drop(&mut self) {
+        let _ = end_frame(&mut self.out);
+        if std::thread::panicking() {
+            let _ = crossterm::execute!(self.out, crossterm::cursor::Show);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,6 +772,123 @@ mod tests {
         assert!(
             !app.frame_needed(now),
             "the gate is consuming, so it must be asked exactly once per iteration"
+        );
+    }
+
+    /// The cursor is out of sight before the first cell of a frame is written,
+    /// inside a synchronized update, and nothing is flushed on its own.
+    #[test]
+    fn a_frame_begins_by_hiding_the_cursor_inside_a_synchronized_update() {
+        struct Recorder {
+            bytes: Vec<u8>,
+            flushes: usize,
+        }
+        impl std::io::Write for Recorder {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+        let mut out = Recorder {
+            bytes: Vec::new(),
+            flushes: 0,
+        };
+
+        begin_frame(&mut out).expect("begin");
+        assert_eq!(out.bytes, b"\x1b[?2026h\x1b[?25l");
+        assert_eq!(out.flushes, 0, "it must travel with the frame");
+
+        out.bytes.clear();
+        end_frame(&mut out).expect("end");
+        assert_eq!(out.bytes, b"\x1b[?2026l");
+        assert_eq!(out.flushes, 1, "the terminal is told to present the frame");
+    }
+
+    /// A panic in `render` unwinds past the draw. The guard must still close
+    /// the synchronized update and bring the cursor back, or the user's shell
+    /// is left with no cursor after dux exits.
+    #[test]
+    fn a_panic_mid_frame_still_closes_the_frame_and_shows_the_cursor() {
+        let wire = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let out = Shared(wire.clone());
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _frame = FrameGuard::begin(out);
+            panic!("render bug");
+        }));
+        assert!(caught.is_err(), "the panic must propagate");
+        let wire = wire.lock().unwrap().clone();
+        let find = |needle: &[u8]| wire.windows(needle.len()).position(|w| w == needle);
+        let hidden = find(b"\x1b[?25l").expect("hidden at the start of the frame");
+        let closed = find(b"\x1b[?2026l").expect("the synchronized update is closed");
+        let shown = find(b"\x1b[?25h").expect("the cursor is shown again");
+        assert!(hidden < closed && closed < shown, "{wire:?}");
+    }
+
+    /// A frame that draws normally is closed but leaves the cursor to ratatui:
+    /// the guard shows it only on a panic.
+    #[test]
+    fn a_normal_frame_leaves_the_cursor_to_ratatui() {
+        let mut wire: Vec<u8> = Vec::new();
+        drop(FrameGuard::begin(&mut wire));
+        assert_eq!(wire, b"\x1b[?2026h\x1b[?25l\x1b[?2026l");
+    }
+
+    /// What the terminal is sent for one frame that ends with the cursor at an
+    /// agent's prompt: hidden first, every repaint in between, and only then
+    /// shown and placed. Nothing in the frame shows the cursor early.
+    #[test]
+    fn the_cursor_is_shown_only_after_the_frame_is_painted() {
+        use ratatui::backend::CrosstermBackend;
+
+        let mut wire: Vec<u8> = Vec::new();
+        begin_frame(&mut wire).expect("begin");
+        {
+            let mut terminal = Terminal::with_options(
+                CrosstermBackend::new(&mut wire),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 40, 5)),
+                },
+            )
+            .expect("terminal");
+            terminal
+                .draw(|frame| {
+                    frame
+                        .render_widget(ratatui::widgets::Paragraph::new("repainted"), frame.area());
+                    frame.set_cursor_position((3, 2));
+                })
+                .expect("draw");
+        }
+        end_frame(&mut wire).expect("end");
+
+        let find = |needle: &[u8]| {
+            wire.windows(needle.len())
+                .position(|window| window == needle)
+                .unwrap_or_else(|| panic!("{needle:?} missing from {wire:?}"))
+        };
+        let hidden = find(b"\x1b[?25l");
+        let painted = find(b"repainted");
+        let shown = find(b"\x1b[?25h");
+        assert!(hidden < painted, "hidden before anything is painted");
+        assert!(painted < shown, "shown only once the painting is done");
+        assert!(find(b"\x1b[?2026h") < hidden && shown < find(b"\x1b[?2026l"));
+        assert_eq!(
+            wire.windows(6).filter(|w| *w == b"\x1b[?25h").count(),
+            1,
+            "shown exactly once"
         );
     }
 }
