@@ -2709,6 +2709,15 @@ struct TerminalState {
     generation: u64,
 }
 
+/// Where a new terminal's generation starts. Each terminal gets its own
+/// range, 2^32 apart, so a PTY relaunched under the same tab id can never
+/// report a generation the previous one used, and a cache keyed on the
+/// value alone cannot hand the new terminal the old one's text.
+fn next_terminal_generation_base() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed) << 32
+}
+
 impl TerminalState {
     fn new(rows: u16, cols: u16, scrollback_lines: usize) -> Self {
         Self::with_scrollback(rows, cols, scrollback_lines)
@@ -2729,7 +2738,7 @@ impl TerminalState {
             cols,
             last_content_hash: None,
             scroll_region: ScrollRegionTracker::new(rows, cols),
-            generation: 0,
+            generation: next_terminal_generation_base(),
         }
     }
 
@@ -5686,6 +5695,21 @@ mod tests {
         let before_resize = terminal.generation;
         terminal.resize(8, 30);
         assert_ne!(terminal.generation, before_resize, "resize");
+    }
+
+    /// A PTY relaunched under the same tab gets a new terminal. Its
+    /// generations must never repeat the old one's, or the watch cache,
+    /// which is keyed by tab and generation, would reuse the dead process's
+    /// screen for the new one.
+    #[test]
+    fn a_new_terminal_never_reuses_an_old_terminals_generation() {
+        let mut old = TerminalState::new(6, 20, 100);
+        let fresh = TerminalState::new(6, 20, 100);
+        assert_ne!(old.generation, fresh.generation);
+        for _ in 0..1000 {
+            old.process(b"x");
+        }
+        assert_ne!(old.generation, fresh.generation);
     }
 
     #[test]
