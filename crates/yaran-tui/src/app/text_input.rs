@@ -1643,9 +1643,9 @@ mod tests {
             vec![
                 "/var/home/",
                 "user/.conf",
-                "ig/yaran/wor",
-                "ktrees/pro",
-                "ject"
+                "ig/yaran/w",
+                "orktrees/p",
+                "roject"
             ]
         );
     }
@@ -1655,10 +1655,10 @@ mod tests {
         // Path embedded in text with spaces
         let text = "check /usr/local/bin/yaran for details";
         // "check " (6) fits, "/usr/local/bin/" (15) fits exactly,
-        // "yaran for details" (15) fits exactly
+        // "yaran for details" (17) wraps at the space before "details".
         assert_eq!(
             wordwrap_visual_lines(text, Some(15)),
-            vec!["check ", "/usr/local/bin/", "yaran for details"]
+            vec!["check ", "/usr/local/bin/", "yaran for ", "details"]
         );
     }
 

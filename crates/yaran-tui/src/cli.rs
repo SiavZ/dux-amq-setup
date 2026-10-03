@@ -2249,8 +2249,10 @@ mod tests {
         let agent_dir = amq_root.join("agents").join(session.agent_handle());
         fs::create_dir_all(agent_dir.join("inbox")).unwrap();
         fs::create_dir_all(amq_root.join("meta")).unwrap();
+        // The durable marker keeps its legacy filename so both generations
+        // can prove ownership before removing an inbox or its database.
         fs::write(
-            agent_dir.join(".yaran-amq-source"),
+            agent_dir.join(".dux-amq-source"),
             format!(
                 r#"{{"store_id":"{}","session_id":"{}"}}"#,
                 yaran_core::storage::load_store_id(&harness.paths.root).unwrap(),
