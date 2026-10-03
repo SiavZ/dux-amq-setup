@@ -9,7 +9,7 @@ the tenet wins.
 
 - **Rust** (stable). The workspace tracks whatever `dtolnay/rust-toolchain@stable`
   installs in CI, so a current stable toolchain is the right target.
-- **Node 22 or newer** plus npm. The web UI is a React app that is **compiled into
+- **Node 22.12 or newer** plus npm. The web UI is a React app that is **compiled into
   the `yaran` binary**, so a normal `cargo build` builds it. If you have no Node
   toolchain, see [Building without the web UI](#building-without-the-web-ui).
 - **`git`**, which yaran is built around.

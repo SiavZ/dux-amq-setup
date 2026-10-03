@@ -2,23 +2,33 @@
 
 ![GitHub License](https://img.shields.io/github/license/SiavZ/dux-amq-setup)
 
-<img src="assets/yaran-logo.svg" width="160" align="right" />
+<img src="assets/yaran-logo.svg" alt="Yaran branching Y logo" width="160" align="right" />
 
-**A collaborative workspace for coding agents.** Yaran, pronounced "yaa-raan", runs your coding agents in shared checkouts or isolated git worktrees. Coordinate them through cross-provider messaging and peer routing, keep their sessions resumable, and manage terminals, provider tabs, macros, and git changes in one workspace. Use the terminal UI, or run `yaran server` to use the browser UI, including on your phone.
+**A collaborative workspace for coding agents.** Yaran runs coding agents in shared checkouts or isolated git worktrees. Coordinate them through cross-provider messaging and peer routing, resume their sessions, and manage provider tabs, terminals, macros, and git changes from the terminal or browser.
 
 Agents run as real CLIs in real terminals. Their MCP servers, hooks, skills, slash commands, and permission dialogs remain their own.
 
 Yaran builds on [dux](https://github.com/patrickdappollonio/dux) by Patrick D'Appollonio. The original MIT license and attribution are preserved. This repository's shared-workspace, messaging, orchestration, and session-management work is maintained under the Yaran name.
 
+[Install](#install) · [Workspace modes](#workspace-modes) · [Peer routing](#peer-routing) · [Server mode](#server-mode) · [Documentation](#documentation) · [Upgrade compatibility](docs/operations/rebranding.md)
+
 ## Why Yaran?
 
-Most AI coding tools give you one agent in one directory. yaran gives you **unlimited agents across unlimited worktrees**, all visible at once. Spawn five agents on five branches and let them work in parallel. Fork a session to try a different approach without losing the original. Run several provider tabs inside a single agent to point, say, Claude and Codex at the very same checkout at once. Open companion terminals next to your agents for builds, tests, or just poking around.
+Keep several coding agents in one workspace without losing track of which checkout, provider, or conversation each one uses:
+
+- Choose a shared checkout for collaboration or isolated worktrees for changes that need separate branches. Forking a session always creates an isolated worktree.
+- Send messages across providers using immutable agent handles. Shared-workspace messages use AMQ rather than ambiguous directory-based routing.
+- Run several provider tabs inside an agent, resume supported conversations, and open companion terminals for builds and tests.
+- Use the same workspace from the terminal and browser, with live terminals, file editing, git staging, and diffs.
+- Set resource limits, schedule session backups, and use `yaran doctor` for diagnostics.
+
+Fresh configurations default to **shared workspaces**. Agents in that mode share files, the git index, and branch state. Choose `workspace.default_mode = "worktree"` when you need isolation. [Workspace modes](#workspace-modes) explains the settings and the upgrade behavior for older configurations.
 
 Every agent runs through a PTY, the same pseudo-terminal your shell uses. That means the CLI tool (Claude, Codex, Copilot, OpenCode, or literally anything else) runs exactly like it would in your regular terminal. Your MCP servers, hooks, skills, slash commands, and permission dialogs all work. We don't mess with your setup.
 
-## Two Front Ends, One Workspace
+## Two front ends, one workspace
 
-yaran has two front ends over one running app: a terminal UI and a web UI. Both are first class, and both are staying. They share the same projects, the same agents, the same worktrees and the same config file, so an agent you start in one is the same agent in the other.
+Yaran has a terminal UI and a web UI over one running app. They share projects, agents, worktrees, and configuration. An agent you start in one is the same agent in the other.
 
 They are not identical, on purpose. Each surface does what its medium is good at. The terminal gives you full keyboard control, rebindable keys, a command palette that knows more tricks than you do, and themes. The browser gives you reach: any device on your network, including a phone, plus editing files in the page and desktop notifications. Where a capability only makes sense on one side, it lives on one side, and the page that covers it says why.
 
@@ -28,10 +38,12 @@ One thing worth knowing before you point a browser at anything: **there is no lo
 
 ## Prerequisites
 
-- **`git`**: yaran is built around git worktrees, so git is non-negotiable. If it's not on your PATH, yaran won't get very far.
+- **Rust stable** and **Node 22.12 or newer with npm** to build the executable and its embedded web UI.
+- **`git`** on your PATH for project and worktree operations.
+- The coding-agent CLIs you want to run, installed and authenticated through their own tools.
 - **`gh` CLI** *(optional)*: authenticate it with your GitHub account and yaran can pull PR statuses, check details, and show them right in the interface. Not required, but you'll miss it once you've tried it.
 
-Building from source instead? `cargo build` is the whole story, though it also builds the React web UI (which is compiled into the binary), so you'll want Node 22+ on your PATH. [`CONTRIBUTING.md`](CONTRIBUTING.md) has the details, including how to skip the web UI build if you only care about the Rust side.
+[`CONTRIBUTING.md`](CONTRIBUTING.md) covers build and test commands, including the Rust-only option for contributors who do not need the web UI.
 
 ## Install
 
@@ -39,14 +51,24 @@ Yaran supports macOS and Linux. Windows users can build and run it inside WSL2.
 
 ### Build from source
 
-Install Rust and Node 22 or newer, then build this checkout:
+Clone the current repository into a Yaran-named checkout, then install the executable:
 
 ```bash
+git clone https://github.com/SiavZ/dux-amq-setup.git yaran
+cd yaran
 cargo install --path crates/yaran --locked
 yaran
 ```
 
 The build includes the React web UI. For development, `cargo build` places the executable at `target/debug/yaran`. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full build and test instructions.
+
+To start with the browser instead of the terminal UI:
+
+```bash
+yaran server --bind 127.0.0.1:3890 --no-tailscale
+```
+
+Open `http://127.0.0.1:3890`, add a project, and create an agent with an installed provider. This command serves only your local machine. **Yaran has no built-in login**, so read [server mode](#server-mode) before exposing it to another device. If the TUI is already running, use its `start-web-server` or `start-background-server` palette command instead of starting a second process for the same workspace.
 
 ### Release binaries
 
@@ -85,9 +107,9 @@ The documentation sources live in [website/docs/](website/docs/). The README is 
 - **Naming a web instance**: `[server] title` and `favicon`, so you can tell several yaran tabs apart.
 - **Hosting yaran behind a login**: a reverse proxy and oauth2-proxy in front, since yaran has no login of its own.
 
-## How It Works
+## How it works
 
-yaran organizes work around **projects** (git repos) and **agents** (worktree sessions). When you create an agent, yaran branches off a new git worktree so the agent has its own isolated copy of the code. No conflicts with your main checkout, no stepping on other agents' changes.
+Yaran organizes work around **projects**, which are git repositories, and **agents**, which run provider sessions. A shared agent uses the registered checkout directly. In worktree mode, Yaran creates a separate checkout and branch for the agent, leaving the registered checkout in place. The project's workspace setting determines which mode a new agent uses.
 
 You can also point an agent at a folder you already have, with no project, no branch and no worktree of yaran's: a **standalone agent**. In the terminal UI it has a key of its own in the agents pane and inside the project chooser (the `?` help overlay names both, and they are rebindable), plus the `new-standalone-agent` palette command; in the browser it lives in the launcher's `⋯` menu. Both surfaces ask you to name it once you have picked the folder, and the name is optional: a blank name means the folder's name, and a typed one is used as you typed it, interior spaces and punctuation included, with surrounding whitespace trimmed. yaran runs the provider there and never creates, moves or removes that folder. The branch-identity features (push, pull, fork, pull requests) do not exist for one, and the changes panel follows the folder: you get a real one when the folder is itself a git repository. Having no project, it gets the global `[env]` table with no project overlay on top, and no startup command runs, because a startup command is a provisioning step for a worktree yaran just made. One more thing to know: the hidden upload directory yaran keeps inside the folder for files you drop on the agent outlives the agent, since deleting a standalone agent removes yaran's own record and nothing of yours; remove that directory yourself if you don't want it.
 
@@ -257,7 +279,7 @@ Point yaran at any folder. A git repository joins the workspace as-is; a plain f
 
 ### First Run and What's New
 
-The first time yaran launches on a machine, it opens a one-time welcome screen instead of an empty sidebar: what a project is, what an agent is (its own git worktree, its own branch-style name), the fact that any AI CLI can be a provider, and the real path to your config file on this machine, which was written fully commented so you never have to leave it. Two buttons: add your first project, or close the screen. The website's address is printed beside them, and the frame names the key that closes it.
+The first time Yaran launches, it opens a welcome screen explaining projects, agents, providers, and the actual config path on your machine. You can add your first project or dismiss the screen and explore. The web UI's **View project** link opens this GitHub repository. Yaran does not send you to the upstream dux website as if it were the fork's own site.
 
 After an update, yaran shows a **What's new** screen for the release you just moved to: that release's headline, its opening paragraphs, and its feature titles, plus a button to the full notes on GitHub. yaran asks GitHub for the tag it is actually running, not for whatever is newest, so you never get shown features you don't have. The notes are fetched at launch, with no account or token involved, and a copy is kept next to your config. If the fetch can't get through, yaran shows nothing and stays quiet: a failure that might clear up (offline, timeout, rate limit) leaves the version unrecorded, so the notes are waiting on a later launch that has a network. A development build never auto-shows the what's-new screen, since there's no published release to describe.
 
