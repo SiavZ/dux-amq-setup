@@ -47,3 +47,36 @@ Published `dux-amq-v*` tags, original archive/member names, and checksums are im
 5. Rename this checkout directory only after all running agents and shells stop using its current absolute path. This rebrand leaves the live working directory untouched.
 
 Captured audits, port-validation reports, measurement logs, original release-note fixtures, and historical upstream blog content retain their original terminology and source URLs. They describe what was actually measured or published, not current Yaran branding.
+
+## Verification on October 3, 2026
+
+These checks ran locally on macOS arm64, rather than relying only on renamed source text:
+
+- Complete CLI and core unit, integration, and documentation suites passed. The actual build script was exercised with new and legacy release flags, including conflicting and explicitly empty values.
+- All 2,427 TUI tests passed. Rebrand-sensitive checks cover wordmark geometry, narrow layouts, theme aliases, helper discovery, and reset ownership through the durable `.dux-amq-source` marker.
+- The complete Rust web unit, integration, and documentation suites passed. One initial missing-worktree HTTP assertion received a transient 409; the isolated five-test suite and the complete four-thread rerun both passed without changing production code or weakening the assertions.
+- The web app passed 4,796 tests across 280 files, ESLint, and its TypeScript/Vite production build. The website passed its tests and 31-page production build, including figure verification and historical-capture byte comparisons.
+- The installer/overlay suite completed 159 cases: 150 executed passes and nine explicit platform skips. ShellCheck, shell syntax, local checksum fixtures, and an actual synthetic npm artifact build and host dispatch also passed. No live install or publishing was used as a test.
+- A real Rust executable served the embedded app, vector logo, and generated favicon. Desktop and mobile browser checks verified the Yaran title, actual fork destination, loaded logos, copied-but-retained legacy preferences, no horizontal overflow, and no JavaScript exceptions. CLI checks reused a legacy home without changing its config bytes and confirmed new-home override precedence.
+- License, historical capture, audit evidence, and the original SQL fixture were compared against pre-rebrand commit `5a90e206` and remained unchanged.
+
+The nine shell skips require GNU `mv`, GNU `tar`, or the Linux `/data` installer fixture. Two saved-session Jcode acceptance tests require an installed Jcode plus saved replay input and remained ignored. Identity-free child-helper entries are intentionally ignored as standalone tests and are invoked by their parent tests.
+
+Formatting, diff whitespace checks, and strict all-target workspace Clippy passed during the rebrand. The later direct-stable compiler run emitted three inherited `Atomic::fetch_update` deprecation warnings in `activity.rs` and `config_queue.rs`. Those unrelated calls were not changed to a newer API as part of the rename.
+
+To repeat the repository gates with dependencies installed:
+
+```sh
+cargo fmt --all -- --check
+cargo test -p yaran -p yaran-core --locked
+cargo test -p yaran-tui --lib --locked
+cargo test -p yaran-web --no-fail-fast --locked -- --test-threads=4
+npm --prefix crates/yaran-web/web test
+npm --prefix crates/yaran-web/web run lint
+npm --prefix crates/yaran-web/web run build
+npm --prefix website test
+npm --prefix website run build
+make overlay-test
+bash .github/scripts/test_install_checksum.sh
+cargo build -p yaran --locked
+```
