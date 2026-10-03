@@ -228,7 +228,7 @@ describe("ConfirmCloseTabDialog", () => {
     render(<ConfirmCloseTabDialog />)
     const link = screen.getByRole("link", { name: /how closing a tab works/i })
     expect(link.getAttribute("href")).toBe(
-      "https://github.com/SiavZ/dux-amq-setup/blob/main/website/docs/agent-tabs.md#closing-a-tab-is-one-way",
+      "https://github.com/SiavZ/yaran/blob/main/website/docs/agent-tabs.md#closing-a-tab-is-one-way",
     )
     expect(link.getAttribute("target")).toBe("_blank")
     // noopener/noreferrer: don't hand the docs tab a window.opener back into yaran.

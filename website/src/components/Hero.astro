@@ -11,10 +11,10 @@ import { getLatestVersion } from "../lib/version";
 
 // Read at build time from the repository's latest published release, so the pill
 // cannot go stale; `null` on any lookup failure, and then it does not render.
-const version = await getLatestVersion("SiavZ/dux-amq-setup");
+const version = await getLatestVersion("SiavZ/yaran");
 
 // Only report this fork's download count, never upstream npm or Homebrew totals.
-const downloads = await getReleaseDownloads("SiavZ/dux-amq-setup");
+const downloads = await getReleaseDownloads("SiavZ/yaran");
 const installSegments = downloads === null
   ? []
   : [`${formatCount(downloads)} GitHub downloads`];

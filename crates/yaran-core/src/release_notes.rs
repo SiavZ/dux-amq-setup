@@ -1564,12 +1564,12 @@ Its description.
     fn the_endpoint_is_the_unauthenticated_latest_release_path() {
         assert_eq!(
             latest_release_endpoint(crate::urls::GITHUB_API_BASE),
-            "https://api.github.com/repos/SiavZ/dux-amq-setup/releases/latest"
+            "https://api.github.com/repos/SiavZ/yaran/releases/latest"
         );
         // A trailing slash on an injected base must not double up.
         assert_eq!(
             latest_release_endpoint("http://127.0.0.1:1234/"),
-            "http://127.0.0.1:1234/repos/SiavZ/dux-amq-setup/releases/latest"
+            "http://127.0.0.1:1234/repos/SiavZ/yaran/releases/latest"
         );
     }
 
@@ -1577,11 +1577,11 @@ Its description.
     fn the_by_tag_endpoint_names_the_running_version() {
         assert_eq!(
             tag_release_endpoint(crate::urls::GITHUB_API_BASE, "v0.6.0"),
-            "https://api.github.com/repos/SiavZ/dux-amq-setup/releases/tags/v0.6.0"
+            "https://api.github.com/repos/SiavZ/yaran/releases/tags/v0.6.0"
         );
         assert_eq!(
             tag_release_endpoint("http://127.0.0.1:1234/", "v0.6.0"),
-            "http://127.0.0.1:1234/repos/SiavZ/dux-amq-setup/releases/tags/v0.6.0"
+            "http://127.0.0.1:1234/repos/SiavZ/yaran/releases/tags/v0.6.0"
         );
     }
 
@@ -1610,7 +1610,7 @@ Its description.
             assert!(is_path_safe_tag(tag));
             assert_eq!(
                 tag_release_endpoint(crate::urls::GITHUB_API_BASE, tag),
-                format!("https://api.github.com/repos/SiavZ/dux-amq-setup/releases/tags/{tag}")
+                format!("https://api.github.com/repos/SiavZ/yaran/releases/tags/{tag}")
             );
         }
     }

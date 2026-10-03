@@ -32,7 +32,7 @@ HERE="${BASH_SOURCE[0]%/*}"
 HERE="$(cd "$HERE" && pwd)"
 
 # Pinned versions + sha256 (overrideable for testing only; CI must use defaults).
-YARAN_REPO="${YARAN_REPO-${DUX_REPO:-SiavZ/dux-amq-setup}}"
+YARAN_REPO="${YARAN_REPO-${DUX_REPO:-SiavZ/yaran}}"
 YARAN_TAG="${YARAN_TAG-${DUX_TAG:-dux-amq-v0.1.1}}"
 YARAN_SHA256="${YARAN_SHA256-${DUX_SHA256:-09a58a4371010e847b5361c4a95bc7887e12dccaf5e24fb62f36ce375f81ff4b}}"
 AMQ_TAG="${AMQ_TAG:-v0.61.0}"

@@ -2,7 +2,7 @@
 // and set of section anchors. The anchors are github-slugger slugs of headings in
 // website/docs/agent-tabs.md, which live in a separate package: renaming one there
 // breaks these silently, and docs.test.ts is what catches it.
-const DOCS_BASE = "https://github.com/SiavZ/dux-amq-setup/blob/main/website/docs"
+const DOCS_BASE = "https://github.com/SiavZ/yaran/blob/main/website/docs"
 const DOCS_AGENT_TABS = `${DOCS_BASE}/agent-tabs.md`
 
 // "### Closing a tab is one-way" answers "why can't this be reopened?".

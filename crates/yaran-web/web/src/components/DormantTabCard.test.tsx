@@ -175,7 +175,7 @@ describe("DormantTabCard", () => {
     render(<DormantTabCard sessionId="s1" tabId="b2" provider="claude" />)
     const link = screen.getByRole("link", { name: /how resume works/i })
     expect(link.getAttribute("href")).toBe(
-      "https://github.com/SiavZ/dux-amq-setup/blob/main/website/docs/agent-tabs.md#how-resume-works",
+      "https://github.com/SiavZ/yaran/blob/main/website/docs/agent-tabs.md#how-resume-works",
     )
     expect(link.getAttribute("target")).toBe("_blank")
     expect(link.getAttribute("rel")).toContain("noopener")

@@ -4,7 +4,7 @@ set -euo pipefail
 # This fork's releases, not upstream's: upstream's builds carry none of the
 # AMQ/peer/watch features this repository ships (244b33c6, audit03 P1-07).
 # YARAN_REPO exists for mirrors and tests.
-REPO="${YARAN_REPO-${DUX_REPO:-SiavZ/dux-amq-setup}}"
+REPO="${YARAN_REPO-${DUX_REPO:-SiavZ/yaran}}"
 BINARY="yaran"
 
 # Allow overriding the version and install directory via environment variables.

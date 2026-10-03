@@ -74,7 +74,7 @@ impl FakeGithub {
             "tag_name": tag,
             "name": tag,
             "body": SAMPLE,
-            "html_url": format!("https://github.com/SiavZ/dux-amq-setup/releases/tag/{tag}"),
+            "html_url": format!("https://github.com/SiavZ/yaran/releases/tag/{tag}"),
         });
         Self::start("HTTP/1.1 200 OK", json.to_string())
     }

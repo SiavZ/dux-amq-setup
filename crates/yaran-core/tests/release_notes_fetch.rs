@@ -161,7 +161,7 @@ fn cache_file(dir: &Path) -> std::path::PathBuf {
 fn a_successful_fetch_returns_the_parsed_release_and_sends_the_headers_github_requires() {
     let server = TestServer::serving_sample_release(
         "v0.6.0",
-        "https://github.com/SiavZ/dux-amq-setup/releases/tag/v0.6.0",
+        "https://github.com/SiavZ/yaran/releases/tag/v0.6.0",
     );
 
     let notes = release_notes::fetch_latest(&server.base_url).expect("fetch should succeed");
@@ -171,13 +171,13 @@ fn a_successful_fetch_returns_the_parsed_release_and_sends_the_headers_github_re
     assert_eq!(notes.paragraphs.len(), 2);
     assert_eq!(notes.sections.len(), 6);
     assert_eq!(
-        notes.html_url, "https://github.com/SiavZ/dux-amq-setup/releases/tag/v0.6.0",
+        notes.html_url, "https://github.com/SiavZ/yaran/releases/tag/v0.6.0",
         "the API's own html_url is preferred over a constructed one"
     );
 
     let req = server.request().expect("the server saw a request");
     assert_eq!(
-        req.request_line, "GET /repos/SiavZ/dux-amq-setup/releases/latest HTTP/1.1",
+        req.request_line, "GET /repos/SiavZ/yaran/releases/latest HTTP/1.1",
         "unauthenticated latest-release endpoint, one request"
     );
     // GitHub rejects requests with no User-Agent outright.
@@ -212,19 +212,19 @@ fn the_startup_path_asks_for_the_running_versions_own_tag_never_the_latest_relea
     // published must be told about v0.7.0, the version they actually have.
     let server = TestServer::serving_sample_release(
         "v0.7.0",
-        "https://github.com/SiavZ/dux-amq-setup/releases/tag/v0.7.0",
+        "https://github.com/SiavZ/yaran/releases/tag/v0.7.0",
     );
 
     let notes = release_notes::fetch_release_by_tag(&server.base_url, "v0.7.0").expect("fetch");
     assert_eq!(notes.version, "v0.7.0");
     assert_eq!(
         notes.html_url,
-        "https://github.com/SiavZ/dux-amq-setup/releases/tag/v0.7.0"
+        "https://github.com/SiavZ/yaran/releases/tag/v0.7.0"
     );
 
     let req = server.request().expect("the server saw a request");
     assert_eq!(
-        req.request_line, "GET /repos/SiavZ/dux-amq-setup/releases/tags/v0.7.0 HTTP/1.1",
+        req.request_line, "GET /repos/SiavZ/yaran/releases/tags/v0.7.0 HTTP/1.1",
         "the by-tag endpoint, not /releases/latest"
     );
     assert!(
@@ -242,7 +242,7 @@ fn current_display_version_fetches_the_canonical_fork_release() {
     let tag = "yaran-v1.2.3";
     let server = TestServer::serving_sample_release(
         tag,
-        "https://github.com/SiavZ/dux-amq-setup/releases/tag/yaran-v1.2.3",
+        "https://github.com/SiavZ/yaran/releases/tag/yaran-v1.2.3",
     );
     let root = tempfile::tempdir().unwrap();
     let notes =
@@ -251,7 +251,7 @@ fn current_display_version_fetches_the_canonical_fork_release() {
     assert_eq!(notes.version, tag);
     assert_eq!(
         server.request().unwrap().request_line,
-        "GET /repos/SiavZ/dux-amq-setup/releases/tags/yaran-v1.2.3 HTTP/1.1"
+        "GET /repos/SiavZ/yaran/releases/tags/yaran-v1.2.3 HTTP/1.1"
     );
 }
 
@@ -265,7 +265,7 @@ fn historical_explicit_release_tags_are_not_rebranded() {
         assert_eq!(notes.version, tag);
         assert_eq!(
             server.request().unwrap().request_line,
-            format!("GET /repos/SiavZ/dux-amq-setup/releases/tags/{tag} HTTP/1.1")
+            format!("GET /repos/SiavZ/yaran/releases/tags/{tag} HTTP/1.1")
         );
     }
 }
@@ -355,7 +355,7 @@ fn the_development_build_path_still_asks_for_the_newest_release() {
     assert_eq!(notes.version, "v0.9.0");
     assert_eq!(
         server.request().expect("a request").request_line,
-        "GET /repos/SiavZ/dux-amq-setup/releases/latest HTTP/1.1"
+        "GET /repos/SiavZ/yaran/releases/latest HTTP/1.1"
     );
 }
 

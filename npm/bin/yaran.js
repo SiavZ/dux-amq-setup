@@ -23,7 +23,7 @@ if (!current) {
   throw new Error(
     `Unsupported platform combination: ${process.platform}/${process.arch}. ` +
       "Please open an issue to request support: " +
-      "https://github.com/SiavZ/dux-amq-setup/issues/new"
+      "https://github.com/SiavZ/yaran/issues/new"
   );
 }
 
@@ -35,7 +35,7 @@ if (!existsSync(binaryPath)) {
   throw new Error(
     `yaran binary not found for ${current.key}. ` +
       "Please reinstall the package or open an issue: " +
-      "https://github.com/SiavZ/dux-amq-setup/issues/new"
+      "https://github.com/SiavZ/yaran/issues/new"
   );
 }
 

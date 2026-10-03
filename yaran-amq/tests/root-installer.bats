@@ -127,8 +127,8 @@ archive_checksum() {
   run env YARAN_VERSION=yaran-v1.2.3 YARAN_INSTALL_DIR="$INSTALL_DIR" "$REPO_ROOT/install.sh"
   [ "$status" -eq 0 ]
   [ -x "$INSTALL_DIR/yaran" ]
-  grep -Fq -- "github.com/SiavZ/dux-amq-setup/releases/download/yaran-v1.2.3/yaran-linux-amd64.tar.gz" "$CURL_LOG"
-  grep -Fq -- "github.com/SiavZ/dux-amq-setup/releases/download/yaran-v1.2.3/yaran-linux-amd64.tar.gz.sha256" "$CURL_LOG"
+  grep -Fq -- "github.com/SiavZ/yaran/releases/download/yaran-v1.2.3/yaran-linux-amd64.tar.gz" "$CURL_LOG"
+  grep -Fq -- "github.com/SiavZ/yaran/releases/download/yaran-v1.2.3/yaran-linux-amd64.tar.gz.sha256" "$CURL_LOG"
   ! grep -Fq -- "patrickdappollonio" "$CURL_LOG" || false
   [[ "$output" == *"Checksum verified"* ]]
 }
@@ -151,8 +151,8 @@ archive_checksum() {
   run env YARAN_VERSION=dux-amq-v0.1.1 YARAN_INSTALL_DIR="$INSTALL_DIR" "$REPO_ROOT/install.sh"
   [ "$status" -eq 0 ]
   [ -x "$INSTALL_DIR/yaran" ]
-  grep -Fxq -- "https://github.com/SiavZ/dux-amq-setup/releases/download/dux-amq-v0.1.1/dux-linux-amd64.tar.gz" "$CURL_LOG"
-  grep -Fq -- "github.com/SiavZ/dux-amq-setup/releases/download/dux-amq-v0.1.1/SHA256SUMS" "$CURL_LOG"
+  grep -Fxq -- "https://github.com/SiavZ/yaran/releases/download/dux-amq-v0.1.1/dux-linux-amd64.tar.gz" "$CURL_LOG"
+  grep -Fq -- "github.com/SiavZ/yaran/releases/download/dux-amq-v0.1.1/SHA256SUMS" "$CURL_LOG"
   [[ "$output" == *"Checksum verified"* ]]
 }
 
@@ -176,7 +176,7 @@ archive_checksum() {
   run env FAKE_API_LATEST=404 FAKE_API_LIST=yaran-v0.2.0-rc1 \
     YARAN_INSTALL_DIR="$INSTALL_DIR" "$REPO_ROOT/install.sh"
   [ "$status" -eq 0 ]
-  grep -Fq -- "api.github.com/repos/SiavZ/dux-amq-setup/releases?per_page=1" "$CURL_LOG"
+  grep -Fq -- "api.github.com/repos/SiavZ/yaran/releases?per_page=1" "$CURL_LOG"
   grep -Fq -- "releases/download/yaran-v0.2.0-rc1/yaran-linux-amd64.tar.gz" "$CURL_LOG"
 }
 
@@ -189,7 +189,7 @@ archive_checksum() {
 
   run env FAKE_API_LATEST=yaran-v0.3.0 YARAN_INSTALL_DIR="$INSTALL_DIR" "$REPO_ROOT/install.sh"
   [ "$status" -eq 0 ]
-  grep -Fxq -- "https://github.com/SiavZ/dux-amq-setup/releases/download/yaran-v0.3.0/yaran-linux-amd64.tar.gz" "$CURL_LOG"
+  grep -Fxq -- "https://github.com/SiavZ/yaran/releases/download/yaran-v0.3.0/yaran-linux-amd64.tar.gz" "$CURL_LOG"
   ! grep -q -- ' ' "$CURL_LOG" || false
 }
 
@@ -199,12 +199,12 @@ archive_checksum() {
 
   run env FAKE_API_LATEST=404 FAKE_API_LIST=404 YARAN_INSTALL_DIR="$INSTALL_DIR" "$REPO_ROOT/install.sh"
   [ "$status" -ne 0 ]
-  [[ "$output" == *"Could not determine the latest release for SiavZ/dux-amq-setup"* ]]
+  [[ "$output" == *"Could not determine the latest release for SiavZ/yaran"* ]]
   [[ "$output" == *"YARAN_VERSION=dux-amq-v0.1.1"* ]]
   [ ! -e "$INSTALL_DIR/yaran" ]
 }
 
-@test "legacy installer inputs preserve the actual historical release tag" {
+@test "legacy installer inputs preserve the original repository and historical release tag" {
   install_fake_curl "$(archive_checksum)"
   install_fake_tar
   run env -u YARAN_VERSION -u YARAN_INSTALL_DIR -u YARAN_REPO \
@@ -219,11 +219,11 @@ archive_checksum() {
   install_fake_curl "$(archive_checksum)"
   install_fake_tar
   run env YARAN_VERSION=yaran-v1.2.3 DUX_VERSION=dux-amq-v0.1.1 \
-    YARAN_REPO=SiavZ/dux-amq-setup DUX_REPO=wrong/repo \
+    YARAN_REPO=SiavZ/yaran DUX_REPO=wrong/repo \
     YARAN_INSTALL_DIR="$INSTALL_DIR" DUX_INSTALL_DIR="$TEST_HOME/unused" "$REPO_ROOT/install.sh"
   [ "$status" -eq 0 ]
   [ -x "$INSTALL_DIR/yaran" ]
-  grep -Fxq -- "https://github.com/SiavZ/dux-amq-setup/releases/download/yaran-v1.2.3/yaran-linux-amd64.tar.gz" "$CURL_LOG"
+  grep -Fxq -- "https://github.com/SiavZ/yaran/releases/download/yaran-v1.2.3/yaran-linux-amd64.tar.gz" "$CURL_LOG"
   [ ! -e "$TEST_HOME/unused" ]
 }
 
@@ -233,7 +233,7 @@ archive_checksum() {
   run env YARAN_VERSION= DUX_VERSION=dux-amq-v0.1.1 FAKE_API_LATEST=yaran-v2.0.0 \
     YARAN_INSTALL_DIR="$INSTALL_DIR" "$REPO_ROOT/install.sh"
   [ "$status" -eq 0 ]
-  grep -Fxq -- "https://github.com/SiavZ/dux-amq-setup/releases/download/yaran-v2.0.0/yaran-linux-amd64.tar.gz" "$CURL_LOG"
+  grep -Fxq -- "https://github.com/SiavZ/yaran/releases/download/yaran-v2.0.0/yaran-linux-amd64.tar.gz" "$CURL_LOG"
 }
 
 @test "bare version selects a canonical Yaran release" {
@@ -241,7 +241,7 @@ archive_checksum() {
   install_fake_tar
   run env YARAN_VERSION=1.2.3 YARAN_INSTALL_DIR="$INSTALL_DIR" "$REPO_ROOT/install.sh"
   [ "$status" -eq 0 ]
-  grep -Fxq -- "https://github.com/SiavZ/dux-amq-setup/releases/download/yaran-v1.2.3/yaran-linux-amd64.tar.gz" "$CURL_LOG"
+  grep -Fxq -- "https://github.com/SiavZ/yaran/releases/download/yaran-v1.2.3/yaran-linux-amd64.tar.gz" "$CURL_LOG"
 }
 
 @test "legacy library guard only defines functions without making requests" {

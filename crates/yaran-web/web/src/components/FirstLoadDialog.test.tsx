@@ -58,7 +58,7 @@ const NOTES = {
 }
 
 const bootstrap = {
-  website_url: "https://github.com/SiavZ/dux-amq-setup",
+  website_url: "https://github.com/SiavZ/yaran",
   welcome_screen: {
     tagline: "One git worktree per coding agent, and a real terminal.",
     paragraphs: [
@@ -204,11 +204,11 @@ describe("FirstLoadDialog", () => {
       const site = within(footer()).getByRole("link", {
         name: /view project/i,
       })
-      expect(site.getAttribute("href")).toBe("https://github.com/SiavZ/dux-amq-setup")
+      expect(site.getAttribute("href")).toBe("https://github.com/SiavZ/yaran")
       expect(site.getAttribute("target")).toBe("_blank")
       expect(site.getAttribute("rel")).toContain("noopener")
       // The footer names the destination before it is clicked.
-      expect(screen.getByText("https://github.com/SiavZ/dux-amq-setup")).toBeTruthy()
+      expect(screen.getByText("https://github.com/SiavZ/yaran")).toBeTruthy()
     })
 
     it("dismisses the screen when the website link is used, so the version is recorded", () => {

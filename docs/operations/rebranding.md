@@ -38,13 +38,24 @@ New release tags are **`yaran-vX.Y.Z`**. New archives are `yaran-<os>-<arch>.tar
 
 Published `dux-amq-v*` tags, original archive/member names, and checksums are immutable provenance. Pinning one of those tags must still request its original archive bytes, not fabricate a Yaran archive at the old URL. The overlay's pinned legacy release is an explicit compatibility bootstrap, not a newly published Yaran release.
 
-## External steps not performed by this change
+## Hosted repository
 
-1. Rename the hosted GitHub repository only after choosing its final address. It currently remains `SiavZ/dux-amq-setup`, and source, issue, and release URLs use that real address.
-2. Publish and verify a first `yaran-vX.Y.Z` release containing the new executable and real web UI before advertising a new-brand binary install. Until then, build with `cargo install --path crates/yaran --locked`.
-3. Choose and deploy a website origin. Set `YARAN_SITE_URL` for that deployment. The repository's website sources do not establish ownership of a public domain.
-4. Create a Yaran npm package or Homebrew formula only if those distribution channels are wanted. The local npm wrapper is private, and upstream installers still install upstream dux.
-5. Rename this checkout directory only after all running agents and shells stop using its current absolute path. This rebrand leaves the live working directory untouched.
+The existing GitHub repository was renamed in place to `SiavZ/yaran` on October 3, 2026. Its repository ID, branches, historical release tags, asset IDs, filenames, sizes, and published digests remained unchanged. Current source, issue, documentation, release API, and installer-default URLs use the new address.
+
+The previous `SiavZ/dux-amq-setup` address is a legacy redirect, not a separate repository. Do not recreate a repository under that old name, because doing so would replace GitHub's redirect. Existing `DUX_REPO` overrides remain accepted, including the original address. Captured historical evidence retains the coordinates it actually measured.
+
+Existing clones can update their remote without moving their checkout:
+
+```sh
+git remote set-url origin https://github.com/SiavZ/yaran.git
+```
+
+## Remaining external steps
+
+1. Publish and verify a first `yaran-vX.Y.Z` release containing the new executable and real web UI before advertising a new-brand binary install. Until then, build with `cargo install --path crates/yaran --locked`.
+2. Choose and deploy a website origin. Set `YARAN_SITE_URL` for that deployment. The repository's website sources do not establish ownership of a public domain.
+3. Create a Yaran npm package or Homebrew formula only if those distribution channels are wanted. The local npm wrapper is private, and upstream installers still install upstream dux.
+4. Rename this checkout directory only after all running agents and shells stop using its current absolute path. The hosted rename leaves the live working directory untouched.
 
 Captured audits, port-validation reports, measurement logs, original release-note fixtures, and historical upstream blog content retain their original terminology and source URLs. They describe what was actually measured or published, not current Yaran branding.
 

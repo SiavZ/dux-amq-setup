@@ -22,7 +22,7 @@ function makeBootstrap(overrides: Partial<Bootstrap> = {}): Bootstrap {
     always_show_tab_strip: false,
     global_env: {},
     status_clear_seconds: 6,
-    website_url: "https://github.com/SiavZ/dux-amq-setup",
+    website_url: "https://github.com/SiavZ/yaran",
     welcome_screen: {
       tagline: "One git worktree per coding agent.",
       paragraphs: ["Start by adding a project."],

@@ -3,7 +3,7 @@
 ## Product identity and compatibility
 
 - Product and executable: **Yaran** / `yaran`. Future releases use `yaran-vX.Y.Z`, not `yaran-amq-vX.Y.Z`.
-- The actual repository remains `SiavZ/dux-amq-setup`. Do not invent a deployed domain, npm package, Homebrew formula, or unpublished release.
+- The canonical repository is `SiavZ/yaran`. Do not invent a deployed domain, npm package, Homebrew formula, or unpublished release.
 - `YARAN_*` settings take precedence, including explicit empty values. `DUX_*` is a fallback only when the new variable is absent.
 - Preserve existing state and durable interoperability names. Do not mechanically rename `dux.lock`, AMQ queues/ownership markers, stored provenance, immutable migrations, or captured historical evidence.
 - See [rebrand compatibility notes](docs/operations/rebranding.md) before changing discovery, storage, installers, or release naming.

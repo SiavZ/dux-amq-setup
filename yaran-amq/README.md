@@ -54,8 +54,8 @@ Prerequisites:
 
 Install:
 ```bash
-git clone https://github.com/SiavZ/dux-amq-setup.git
-cd dux-amq-setup/yaran-amq
+git clone https://github.com/SiavZ/yaran.git
+cd yaran/yaran-amq
 ./install.sh
 exec bash -l
 ```

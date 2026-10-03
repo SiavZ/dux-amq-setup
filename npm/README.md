@@ -33,8 +33,8 @@ The safe shapes are loopback (the default), your own tailnet, or a reverse proxy
 No Yaran npm package or binary release is published yet. Build this fork from source:
 
 ```bash
-git clone https://github.com/SiavZ/dux-amq-setup.git
-cd dux-amq-setup
+git clone https://github.com/SiavZ/yaran.git
+cd yaran
 cargo build --release
 mkdir -p ~/.local/bin
 install -m 755 target/release/yaran ~/.local/bin/yaran
@@ -56,4 +56,4 @@ yaran
 
 The full README, screenshots, and configuration documentation live in this fork's repository. Historical dux releases are not Yaran releases:
 
-https://github.com/SiavZ/dux-amq-setup
+https://github.com/SiavZ/yaran

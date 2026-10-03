@@ -18,10 +18,10 @@ const doc = readFileSync(
 describe("agent-tabs docs anchors", () => {
   it("the exported links point at the intended anchors", () => {
     expect(DOCS_AGENT_TABS_RESUME).toBe(
-      "https://github.com/SiavZ/dux-amq-setup/blob/main/website/docs/agent-tabs.md#how-resume-works",
+      "https://github.com/SiavZ/yaran/blob/main/website/docs/agent-tabs.md#how-resume-works",
     )
     expect(DOCS_AGENT_TABS_CLOSING).toBe(
-      "https://github.com/SiavZ/dux-amq-setup/blob/main/website/docs/agent-tabs.md#closing-a-tab-is-one-way",
+      "https://github.com/SiavZ/yaran/blob/main/website/docs/agent-tabs.md#closing-a-tab-is-one-way",
     )
   })
 

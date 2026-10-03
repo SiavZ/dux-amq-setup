@@ -12,7 +12,7 @@ GitHub UI (Settings → Branches → Protection rules → main).
   - Dismiss stale approvals on push: yes
   - Require approval from CODEOWNERS: yes
 - **Required status checks** (the contexts currently enforced on `main`;
-  verify with `gh api /repos/SiavZ/dux-amq-setup/branches/main/protection`).
+  verify with `gh api /repos/SiavZ/yaran/branches/main/protection`).
   These job names are kept stable on purpose. Upstream's workspace CI names
   its jobs `Test` and `Clippy and test (macOS)`; this fork renames them back so
   the protection that already exists keeps gating. Each job carries a
@@ -60,7 +60,7 @@ GitHub UI (Settings → Branches → Protection rules → main).
 # add the matching `-f 'required_status_checks[contexts][]=...'` lines.
 gh api -X PUT \
   -H "Accept: application/vnd.github+json" \
-  /repos/SiavZ/dux-amq-setup/branches/main/protection \
+  /repos/SiavZ/yaran/branches/main/protection \
   -f required_status_checks[strict]=true \
   -f 'required_status_checks[contexts][]=Test (ubuntu-24.04)' \
   -f 'required_status_checks[contexts][]=Test (macos-14)' \
@@ -78,5 +78,5 @@ gh api -X PUT \
 
 **Verify after applying:**
 ```bash
-gh api /repos/SiavZ/dux-amq-setup/branches/main/protection | jq .
+gh api /repos/SiavZ/yaran/branches/main/protection | jq .
 ```

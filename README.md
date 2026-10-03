@@ -1,6 +1,6 @@
 # Yaran
 
-![GitHub License](https://img.shields.io/github/license/SiavZ/dux-amq-setup)
+![GitHub License](https://img.shields.io/github/license/SiavZ/yaran)
 
 <img src="assets/yaran-logo.svg" alt="Yaran branching Y logo" width="160" align="right" />
 
@@ -54,7 +54,7 @@ Yaran supports macOS and Linux. Windows users can build and run it inside WSL2.
 Clone the current repository into a Yaran-named checkout, then install the executable:
 
 ```bash
-git clone https://github.com/SiavZ/dux-amq-setup.git yaran
+git clone https://github.com/SiavZ/yaran.git yaran
 cd yaran
 cargo install --path crates/yaran --locked
 yaran
@@ -72,11 +72,11 @@ Open `http://127.0.0.1:3890`, add a project, and create an agent with an install
 
 ### Release binaries
 
-Yaran releases use `yaran-vX.Y.Z` tags and `yaran-<os>-<arch>.tar.gz` archives. The GitHub repository still lives at [SiavZ/dux-amq-setup](https://github.com/SiavZ/dux-amq-setup). That is its existing address, not the product name.
+The canonical repository is [SiavZ/yaran](https://github.com/SiavZ/yaran). Yaran releases use `yaran-vX.Y.Z` tags and `yaran-<os>-<arch>.tar.gz` archives. The previous `SiavZ/dux-amq-setup` address remains a legacy redirect.
 
 The renamed installer requires a release containing the new `yaran` binary. Until the first Yaran release is published, use the source-build instructions above. Older `dux-amq-v*` releases contain the previous `dux` executable.
 
-For a published Yaran release, download its `install.sh` from this repository's [releases](https://github.com/SiavZ/dux-amq-setup/releases), inspect it, and run it:
+For a published Yaran release, download its `install.sh` from this repository's [releases](https://github.com/SiavZ/yaran/releases), inspect it, and run it:
 
 ```bash
 YARAN_VERSION=yaran-vX.Y.Z bash install.sh

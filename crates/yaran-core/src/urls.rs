@@ -8,19 +8,19 @@
 pub const WEBSITE: &str = REPO;
 
 /// The documentation source in the actual project repository.
-pub const DOCS: &str = "https://github.com/SiavZ/dux-amq-setup/tree/main/website/docs";
+pub const DOCS: &str = "https://github.com/SiavZ/yaran/tree/main/website/docs";
 
-/// `owner/repo`, the one place the coordinates are spelled out. Everything
-/// below is built from it so a rename is a one-line change.
-pub const REPO_SLUG: &str = "SiavZ/dux-amq-setup";
+/// `owner/repo`, shared by release API requests. Keep the public URL constants
+/// below aligned with this slug; the tests verify that relationship.
+pub const REPO_SLUG: &str = "SiavZ/yaran";
 
 /// The source repository.
-pub const REPO: &str = "https://github.com/SiavZ/dux-amq-setup";
+pub const REPO: &str = "https://github.com/SiavZ/yaran";
 
 /// The releases index. Also the fallback destination when there is no release
 /// matching the running version (a dev build, or a tag GitHub has not published
 /// a release for).
-pub const RELEASES: &str = "https://github.com/SiavZ/dux-amq-setup/releases";
+pub const RELEASES: &str = "https://github.com/SiavZ/yaran/releases";
 
 /// The GitHub REST API root. Injectable at the call site so tests can point a
 /// fetcher at a local server instead of the network.
@@ -64,7 +64,7 @@ mod tests {
     fn release_tag_points_at_the_versions_own_page() {
         assert_eq!(
             release_tag("v0.6.0"),
-            "https://github.com/SiavZ/dux-amq-setup/releases/tag/v0.6.0"
+            "https://github.com/SiavZ/yaran/releases/tag/v0.6.0"
         );
     }
 }
