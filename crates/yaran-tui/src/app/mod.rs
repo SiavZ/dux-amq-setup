@@ -423,6 +423,8 @@ pub struct App {
     /// `drop_drifted_selection` needs and the one the scroll numbers cannot
     /// answer once the history ring is full.
     pub(crate) grid_generation: u64,
+    /// Background agent PTY presizing (see `presize.rs`).
+    pub(crate) presize: presize::PresizeState,
     /// Which terminal surfaces (focused tab ids, companion terminal ids) the
     /// user has put into scroll mode. Empty means nobody is scrolled back.
     ///
@@ -3934,6 +3936,7 @@ mod input;
 pub(crate) mod modal;
 mod orphan_worktrees;
 mod overlay_dismiss;
+mod presize;
 mod pty_ownership;
 mod redraw;
 pub(crate) use redraw::RedrawGate;
@@ -4270,6 +4273,7 @@ impl App {
             pending_pty_takeover: None,
             last_refused_pty_resize: None,
             grid_generation: 0,
+            presize: Default::default(),
             scroll_mode: std::collections::HashSet::new(),
             last_diff_height: 0,
             last_diff_visual_lines: 0,

@@ -14,6 +14,77 @@ use std::path::Path;
 use yaran_core::prose::Prose;
 use yaran_core::text::{count_of, count_of_with};
 
+/// Split the center lane into `(pr_banner_area, pane_area)`. The banner row is
+/// one row tall when `banner` is set and zero rows otherwise.
+pub(crate) fn center_pane_split(area: Rect, banner: bool, at_bottom: bool) -> (Rect, Rect) {
+    let banner_height: u16 = if banner { 1 } else { 0 };
+    if at_bottom {
+        let [pane_area, pr_area] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(banner_height)])
+            .areas(area);
+        (pr_area, pane_area)
+    } else {
+        let [pr_area, pane_area] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(banner_height), Constraint::Min(1)])
+            .areas(area);
+        (pr_area, pane_area)
+    }
+}
+
+/// Whether the agent tab strip is drawn over `area`: two or more tabs (or the
+/// always-show setting), and room for the 3-row band above a usable terminal.
+pub(crate) fn tab_strip_visible(tab_count: usize, always_show: bool, area: Rect) -> bool {
+    (tab_count >= 2 || always_show) && area.height >= 6 && area.width >= 12
+}
+
+/// Split `area` into the 3-row tab strip and the terminal block below it.
+pub(crate) fn tab_strip_split(area: Rect) -> [Rect; 2] {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .areas(area)
+}
+
+/// Split the agent block's inner rect into the terminal grid and the 2-row
+/// hint area under it, or `None` when the block is too small to hold a grid.
+pub(crate) fn agent_term_hint_split(inner: Rect) -> Option<[Rect; 2]> {
+    if inner.height < 2 || inner.width < 4 {
+        return None;
+    }
+    // Reserve 2 lines at the bottom for the hint bar (top border + text).
+    let hint_height = 2;
+    Some(
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(hint_height)])
+            .areas(inner),
+    )
+}
+
+/// The `(rows, cols)` an agent's PTY gets when it is shown in the windowed
+/// (not fullscreen) center pane: the same chain of splits `render_center`,
+/// `render_agent_tab_strip_if_needed` and `render_agent_terminal` apply to
+/// `center`. `None` when the pane is too small to hold a grid.
+pub(crate) fn minimized_agent_term_size(
+    center: Rect,
+    banner: bool,
+    tab_count: usize,
+    always_show_tab_strip: bool,
+) -> Option<(u16, u16)> {
+    // The banner row costs the same height at either edge.
+    let (_, pane_area) = center_pane_split(center, banner, false);
+    let block_area = if tab_strip_visible(tab_count, always_show_tab_strip, pane_area) {
+        tab_strip_split(pane_area)[1]
+    } else {
+        pane_area
+    };
+    let inner = Block::bordered().inner(block_area);
+    let [term_area, _] = agent_term_hint_split(inner)?;
+    (term_area.height > 0 && term_area.width > 0).then_some((term_area.height, term_area.width))
+}
+
 /// The width a pane card's button paints at. One rule, read by the planner (to
 /// refuse a layout too narrow for it) and by the painter (to place it), so the
 /// two can never disagree about whether the label fits.
@@ -3174,21 +3245,13 @@ impl App {
         } else {
             None
         };
-        let pr_banner_height: u16 = if pr_info.is_some() { 1 } else { 0 };
+        if !covered {
+            // The windowed geometry background PTYs are presized to.
+            self.note_minimized_center_area(area);
+        }
 
-        let (pr_area, pane_area) = if self.pr_banner_at_bottom {
-            let [pane_area, pr_area] = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(pr_banner_height)])
-                .areas(area);
-            (pr_area, pane_area)
-        } else {
-            let [pr_area, pane_area] = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(pr_banner_height), Constraint::Min(1)])
-                .areas(area);
-            (pr_area, pane_area)
-        };
+        let (pr_area, pane_area) =
+            center_pane_split(area, pr_info.is_some(), self.pr_banner_at_bottom);
 
         if let Some(ref pr) = pr_info {
             self.render_pr_banner(frame, pr_area, pr);
@@ -3822,7 +3885,7 @@ impl App {
         // The strip is a 3-row band of rounded boxes (top border, label,
         // bottom border), the same bordered-and-rounded idiom every other
         // yaran surface uses, so it needs a taller minimum than a flat row.
-        if (tab_ids.len() < 2 && !always_show) || area.height < 6 || area.width < 12 {
+        if !tab_strip_visible(tab_ids.len(), always_show, area) {
             return area;
         }
         let focused_id = self.focused_tab_id(&session_id);
@@ -3868,10 +3931,7 @@ impl App {
         let spinner_idx = self.spinner_frame_index();
         let blink_on = self.attention_blink_on();
 
-        let [strip_area, term_area] = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(1)])
-            .areas(area);
+        let [strip_area, term_area] = tab_strip_split(area);
 
         // No "+" add button: new tabs are created via the `new-agent-tab`
         // palette command (or the NewTab keybinding), so the boxes get the
@@ -4993,9 +5053,9 @@ impl App {
             }
         }
 
-        if inner.height < 2 || inner.width < 4 {
+        let Some([term_area, hint_area]) = agent_term_hint_split(inner) else {
             return;
-        }
+        };
 
         let context = self.agent_terminal_context();
         let active_surface = context.active_surface;
@@ -5003,12 +5063,6 @@ impl App {
         let session_provider_name = context.provider_name.as_deref();
         // The hardware caret follows every typeable pane and anchors IME UI.
         // Bounds naturally hide it while the cursor is outside scrollback view.
-        // Reserve 2 lines at the bottom for the hint bar (top border + text).
-        let hint_height = 2;
-        let [term_area, hint_area] = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(hint_height)])
-            .areas(inner);
         self.mouse_layout.agent_term = Some(term_area);
 
         self.resize_agent_terminal(term_area);
@@ -5504,6 +5558,49 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(1)])
             .areas(area);
+
+        // A status too wide for its row borrows the hints row above it instead
+        // of growing the footer: the footer's height (and so the agent pane's
+        // PTY size) never depends on the status text, yet an error whose
+        // actionable part is at the end stays readable. The hints come back
+        // when the status expires.
+        let status_text = self
+            .status
+            .most_recent_tui()
+            .map_or(String::new(), |(_, t)| t);
+        let status_w = display_width(&status_text) + 3; // " ● " prefix
+        let status_room = usize::from(status_area.width) * usize::from(status_area.height);
+        if status_w > status_room && area.height >= 2 {
+            let (status_line, status_bg) = self.footer_status_line(area);
+            // Hard-wrapped by column rather than by word: the ellipsis budget
+            // is rows x width, and a word wrap would push a long unbroken word
+            // (a path, a URL) whole onto the next row and its tail off-screen.
+            let width = usize::from(area.width);
+            let mut rows: Vec<Line<'static>> = Vec::new();
+            let mut row: Vec<Span<'static>> = Vec::new();
+            let mut used = 0usize;
+            for span in status_line.spans {
+                let mut rest: &str = span.content.as_ref();
+                while let Some(first) = rest.chars().next() {
+                    // A wide char that does not fit the rest of the row starts
+                    // the next one, as the terminal itself would.
+                    if used > 0 && used + char_display_width(first) > width {
+                        rows.push(Line::from(std::mem::take(&mut row)));
+                        used = 0;
+                    }
+                    let head = head_within_width(rest, width.saturating_sub(used));
+                    used += display_width(&head);
+                    rest = &rest[head.len()..];
+                    row.push(Span::styled(head, span.style));
+                }
+            }
+            rows.push(Line::from(row));
+            // chip-free: the status line is outside the chip rule, names and all.
+            Paragraph::new(rows)
+                .style(Style::default().bg(status_bg))
+                .render(area, frame.buffer_mut());
+            return;
+        }
 
         let hint_spans = self.footer_hint_spans(&hints, hints_area.width as usize);
         Paragraph::new(Line::from(hint_spans))
@@ -13966,16 +14063,16 @@ fn truncate_status_text(text: &str, available: usize) -> String {
     }
 }
 
-fn status_footer_lines(status_text: &str, width: u16) -> u16 {
-    if width == 0 {
-        return 1;
-    }
-    let status_text_len = status_text.chars().count() + 3; // " ● " prefix
-    if status_text_len > width as usize {
-        2
-    } else {
-        1
-    }
+/// Rows the status line takes in the footer. Always one: a message too wide
+/// for it borrows the hints row (see `render_footer`), and one too wide for
+/// both is cut with an ellipsis, instead of the footer growing a row. Letting
+/// the footer grow with the text moved the pane above it, so every long status (entering
+/// or leaving fullscreen, "scroll mode ended", a background warning) resized the
+/// selected agent's PTY. The child saw a SIGWINCH, a Claude pane cleared and
+/// repainted its whole transcript, and whatever the user had scrolled to was
+/// thrown away, then again when the status expired and the row came back.
+fn status_footer_lines(_status_text: &str, _width: u16) -> u16 {
+    1
 }
 
 /// Whether closing one tab detaches its agent: it does when the close removes
@@ -20690,7 +20787,8 @@ mod tests {
             Instant::now(),
             None,
             StatusTone::Warning,
-            "abcdefghijklmnopqrstuvwxyz",
+            // Fits the two status rows, so the hints row stays the hints.
+            "abcdefghijklmno",
         );
 
         let mut terminal = Terminal::new(TestBackend::new(9, 3)).expect("terminal");
@@ -21002,10 +21100,65 @@ mod tests {
     }
 
     #[test]
-    fn status_footer_lines_allows_at_most_two_status_rows() {
+    fn the_status_line_never_takes_a_second_row() {
         assert_eq!(status_footer_lines("short", 40), 1);
-        assert_eq!(status_footer_lines("this message is too wide", 10), 2);
+        assert_eq!(status_footer_lines("this message is too wide", 10), 1);
         assert_eq!(status_footer_lines("anything", 0), 1);
+    }
+
+    /// A long status must not move the agent pane: its PTY size is the same
+    /// with a one-word status and with one far wider than the terminal. Before,
+    /// the wide one took a second footer row and the PTY lost a row, which a
+    /// Claude pane answers by repainting and dropping the user's scroll.
+    #[test]
+    fn a_long_status_does_not_resize_the_agent_pane() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        // A fresh app per status: two infos in one tick are shown in turn, so
+        // reusing one app would still be showing the first.
+        let body_and_footer = |status: String| {
+            let mut app = test_app(default_bindings());
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+            app.set_info(status);
+            terminal.draw(|frame| app.render(frame)).expect("render");
+            let rows = buffer_rows(terminal.backend().buffer());
+            (app.mouse_layout.center, format!("{}{}", rows[28], rows[29]))
+        };
+        let (short_body, _) = body_and_footer("ok".to_string());
+        let (long_body, footer) = body_and_footer("x".repeat(400));
+        assert_eq!(long_body, short_body, "the body keeps its height");
+        assert!(footer.contains('…'), "the long status is cut: {footer:?}");
+    }
+
+    /// A status a little wider than the terminal (an error whose actionable
+    /// half is at the end) is still readable in full: it borrows the hints row
+    /// rather than adding a row, so the agent pane keeps its size.
+    #[test]
+    fn a_status_wider_than_one_row_borrows_the_hints_row() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let render = |status: String| {
+            let mut app = test_app(default_bindings());
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+            app.set_error(status);
+            terminal.draw(|frame| app.render(frame)).expect("render");
+            let rows = buffer_rows(terminal.backend().buffer());
+            (app.mouse_layout.center, format!("{}{}", rows[28], rows[29]))
+        };
+        let (short_body, short_footer) = render("ok".to_string());
+        let tail = "run `gh auth login` and retry";
+        let long = format!("{} {tail}", "Could not push the branch.".repeat(4));
+        let (long_body, long_footer) = render(long);
+        assert_eq!(long_body, short_body, "the body keeps its height");
+        assert!(
+            long_footer.contains(tail),
+            "the end of the status is readable: {long_footer:?}"
+        );
+        assert!(!long_footer.contains('…'), "{long_footer:?}");
+        assert_ne!(
+            short_footer, long_footer,
+            "a short status leaves the hints row alone"
+        );
     }
 
     // --- resource_monitor_columns (pure column-budget helper) ---

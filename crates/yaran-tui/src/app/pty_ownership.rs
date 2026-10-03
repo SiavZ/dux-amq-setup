@@ -147,7 +147,7 @@ pub(crate) const UNNAMED_DEVICE: &str = "another device";
 
 impl App {
     /// This surface's seat in the registry, or `None` when nothing is serving.
-    fn pty_ownership(&self) -> Option<TuiOwnership> {
+    pub(super) fn pty_ownership(&self) -> Option<TuiOwnership> {
         self.companion
             .as_ref()
             .and_then(|companion| companion.ownership())

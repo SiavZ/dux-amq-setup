@@ -13,8 +13,8 @@ use crate::watch::delivery::{
     MIN_ENTER_PHASE_DELAY_MS, effective_enter_phase_delay, inject_body_bytes_for_provider,
     submit_key_bytes_for_provider,
 };
-use crate::watch::runtime::AttachedWatch;
-use crate::watch::{RuleSnapshot, WatchEffect, WatchEngine, WatchRule, WatchRuleKind};
+use crate::watch::runtime::{AttachedWatch, WatchSnapshot};
+use crate::watch::{RuleSnapshot, SnapshotKey, WatchEffect, WatchEngine, WatchRule, WatchRuleKind};
 
 use super::{Engine, StatusUpdate};
 
@@ -36,6 +36,22 @@ pub const WATCH_TYPING_QUIET: Duration = Duration::from_secs(5);
 /// still sees a new match within one interval. Clocks (pending fires,
 /// cooldowns) keep advancing every tick on the text from the last rescan.
 pub const WATCH_RESCAN_INTERVAL: Duration = Duration::from_millis(200);
+
+/// The rescan budget of one tick is the tab count split over this many ticks,
+/// so a herd of tabs that fall due together is drained in at most this many
+/// ticks. At the UI's tick rate that stays well inside one more
+/// WATCH_RESCAN_INTERVAL.
+pub const WATCH_RESCAN_SPREAD_TICKS: usize = 4;
+
+/// Fewer tabs than this are all rescanned in one tick: spreading a handful
+/// buys nothing and would only delay them.
+pub const WATCH_MIN_RESCANS_PER_TICK: usize = 4;
+
+/// How many changed tabs one tick may rescan, given `tabs` attached tabs.
+pub fn watch_rescans_per_tick(tabs: usize) -> usize {
+    tabs.div_ceil(WATCH_RESCAN_SPREAD_TICKS)
+        .max(WATCH_MIN_RESCANS_PER_TICK)
+}
 
 /// The per-session inputs the watch engine reads from the session settings
 /// store (Worker mode + auto-clear opt-in, and manual arm overrides).
@@ -204,7 +220,14 @@ impl Engine {
             return statuses;
         }
         let now = Instant::now();
-        let tabs: Vec<TabId> = self.watch.attached.keys().cloned().collect();
+        let tabs = self.watch_tabs_in_scan_order();
+        // Rescans are capped per tick so tabs that all became due together
+        // (they start, and so keep being rescanned, in step) are spread over
+        // the next few ticks instead of all landing in one. The order rotates
+        // past the last tab rescanned, so a tab skipped for budget goes first
+        // next tick and every changed tab is rescanned within a few ticks of
+        // falling due.
+        let mut budget = watch_rescans_per_tick(tabs.len());
         for tab in tabs {
             let typed_recently = self
                 .pty_input
@@ -218,27 +241,40 @@ impl Engine {
             // dozens of tabs it ran on every UI tick. A changed one is rescanned
             // at most every WATCH_RESCAN_INTERVAL.
             let cached = self.watch.last_snapshot.get(&tab);
-            let seen = cached.map(|(g, _, _)| *g);
+            let seen = cached.map(|c| c.generation);
             let recently_scanned =
-                cached.is_some_and(|(_, at, _)| now.duration_since(*at) < WATCH_RESCAN_INTERVAL);
+                cached.is_some_and(|c| now.duration_since(c.scanned_at) < WATCH_RESCAN_INTERVAL);
             let Some(client) = self.providers.get(tab.as_ref_id()) else {
                 continue;
             };
-            let rescan = if recently_scanned {
+            let rescan = if recently_scanned || budget == 0 {
                 None
             } else {
                 client.scan_recent_lines_if_changed(WATCH_SCAN_ROWS, seen)
             };
-            let snapshot = match rescan {
+            let (snapshot, key) = match rescan {
                 Some((text, generation)) => {
+                    budget -= 1;
+                    self.watch.rescan_cursor = Some(tab.clone());
+                    #[cfg(test)]
+                    {
+                        self.watch.rescans += 1;
+                    }
                     let text: std::sync::Arc<str> = text.into();
-                    self.watch
-                        .last_snapshot
-                        .insert(tab.clone(), (generation, now, text.clone()));
-                    text
+                    let key = SnapshotKey::of(&text);
+                    self.watch.last_snapshot.insert(
+                        tab.clone(),
+                        WatchSnapshot {
+                            generation,
+                            scanned_at: now,
+                            text: text.clone(),
+                            key,
+                        },
+                    );
+                    (text, key)
                 }
                 None => match self.watch.last_snapshot.get(&tab) {
-                    Some((_, _, text)) => text.clone(),
+                    Some(c) => (c.text.clone(), c.key),
                     None => continue,
                 },
             };
@@ -249,7 +285,7 @@ impl Engine {
                 }
                 self.watch.suppress_until.remove(&tab);
                 if let Some(attached) = self.watch.attached.get_mut(&tab) {
-                    attached.engine.rebaseline(snapshot);
+                    attached.engine.rebaseline_keyed(snapshot, key);
                 }
             }
             let session_id = self
@@ -261,19 +297,24 @@ impl Engine {
             // Asking every tick for every Worker pinned the UI thread.
             let fresh_sentinel = self.watch.attached.get_mut(&tab).is_some_and(|a| {
                 a.auto_clear_idx.is_some()
-                    && a.engine
-                        .kind_has_fresh_match(snapshot, WatchRuleKind::BuiltInAutoClear)
+                    && a.engine.kind_has_fresh_match_keyed(
+                        snapshot,
+                        key,
+                        WatchRuleKind::BuiltInAutoClear,
+                    )
             });
             let hold_auto_clear =
                 fresh_sentinel && self.watch_auto_clear_suppressed(tab.as_ref_id(), &session_id);
             let effects = match self.watch.attached.get_mut(&tab) {
                 Some(attached) => {
                     if hold_auto_clear {
-                        attached
-                            .engine
-                            .rebaseline_kind(snapshot, WatchRuleKind::BuiltInAutoClear);
+                        attached.engine.rebaseline_kind_keyed(
+                            snapshot,
+                            key,
+                            WatchRuleKind::BuiltInAutoClear,
+                        );
                     }
-                    attached.engine.observe(snapshot, now)
+                    attached.engine.observe_keyed(snapshot, key, now)
                 }
                 None => continue,
             };
@@ -282,6 +323,22 @@ impl Engine {
             }
         }
         statuses
+    }
+
+    /// Attached tabs sorted by id and rotated to start just after the tab
+    /// the last capped rescan reached, so the per-tick rescan budget goes
+    /// round-robin.
+    fn watch_tabs_in_scan_order(&self) -> Vec<TabId> {
+        let mut tabs: Vec<TabId> = self.watch.attached.keys().cloned().collect();
+        tabs.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        if let Some(cursor) = &self.watch.rescan_cursor {
+            let start = tabs.partition_point(|t| t.as_str() <= cursor.as_str());
+            // The cursor need not still be attached: rotation only needs its
+            // position in the sorted order.
+            let start = start % tabs.len().max(1);
+            tabs.rotate_left(start);
+        }
+        tabs
     }
 
     fn apply_watch_effect(
@@ -826,7 +883,7 @@ mod tests {
         let mut last_seen = None;
         while started.elapsed() < WATCH_RESCAN_INTERVAL * 3 {
             engine.tick_watch_rules();
-            let at = engine.watch.last_snapshot.get(&tab).map(|(_, at, _)| *at);
+            let at = engine.watch.last_snapshot.get(&tab).map(|c| c.scanned_at);
             if at != last_seen {
                 scans += 1;
                 last_seen = at;
@@ -853,5 +910,130 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(fired, "the rule must still fire on a busy screen");
+    }
+
+    /// A PTY whose screen changes every 20 ms, forever.
+    fn spinner_pty() -> PtyClient {
+        PtyClient::spawn(
+            "sh",
+            &[
+                "-c".to_string(),
+                "i=0; while :; do i=$((i+1)); printf '\\rspinner %d' $i; sleep 0.02; done"
+                    .to_string(),
+            ],
+            &std::env::temp_dir(),
+            24,
+            80,
+            100,
+        )
+        .expect("spawn spinner pty")
+    }
+
+    /// `n` agents whose slot tabs all run `spawn()` and one claude rule.
+    fn engine_with_tabs(
+        n: usize,
+        spawn: impl Fn() -> PtyClient,
+    ) -> (Engine, crate::test_scratch::ScratchDir, Vec<TabId>) {
+        let (mut engine, tmp) = engine_with_tab(
+            spawn(),
+            vec![instant_rule("rate limited", "please continue")],
+        );
+        let mut tabs = vec![TabId::new("s1-slot")];
+        for i in 2..=n {
+            let id = format!("s{i}");
+            engine
+                .sessions
+                .push(sample_session(&id, "p1", &format!("f{i}")));
+            let tab = TabId::new(format!("{id}-slot"));
+            engine.providers.insert(tab.clone(), spawn());
+            tabs.push(tab);
+        }
+        (engine, tmp, tabs)
+    }
+
+    #[test]
+    fn rescan_budget_scales_with_tab_count() {
+        assert_eq!(watch_rescans_per_tick(1), WATCH_MIN_RESCANS_PER_TICK);
+        assert_eq!(watch_rescans_per_tick(64), 16);
+        assert_eq!(watch_rescans_per_tick(65), 17);
+    }
+
+    /// Tabs that all change on every tick fall due together, but no tick
+    /// rescans more than the per-tick budget, and round-robin still rescans
+    /// every tab within two intervals of its last scan.
+    #[test]
+    fn busy_tabs_are_spread_across_ticks_and_none_starves() {
+        const N: usize = 12;
+        let (mut engine, _guard, tabs) = engine_with_tabs(N, spinner_pty);
+        for tab in &tabs {
+            assert!(wait_for(|| engine.providers[tab.as_ref_id()]
+                .scan_recent_lines(WATCH_SCAN_ROWS)
+                .contains("spinner")));
+        }
+        let cap = watch_rescans_per_tick(N);
+        assert!(cap < N, "the test needs the cap to bind");
+
+        let started = Instant::now();
+        let mut max_gap = Duration::ZERO;
+        let mut last: std::collections::HashMap<TabId, Instant> = Default::default();
+        while started.elapsed() < WATCH_RESCAN_INTERVAL * 6 {
+            let before = engine.watch.rescans;
+            engine.tick_watch_rules();
+            let did = engine.watch.rescans - before;
+            assert!(did <= cap, "one tick rescanned {did} tabs, cap {cap}");
+            for tab in &tabs {
+                let at = engine.watch.last_snapshot.get(tab).map(|c| c.scanned_at);
+                if let Some(at) = at
+                    && let Some(prev) = last.insert(tab.clone(), at)
+                    && prev != at
+                {
+                    max_gap = max_gap.max(at - prev);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(last.len(), N, "every tab was scanned");
+        assert!(
+            max_gap <= WATCH_RESCAN_INTERVAL * 2,
+            "a busy tab waited {max_gap:?} between rescans"
+        );
+    }
+
+    /// A tab whose grid has not moved is never rescanned, however many ticks
+    /// pass after its interval.
+    #[test]
+    fn an_unchanged_tab_is_not_rescanned() {
+        let client = PtyClient::spawn(
+            "sh",
+            &[
+                "-c".to_string(),
+                "printf 'idle\\n'; exec sleep 30".to_string(),
+            ],
+            &std::env::temp_dir(),
+            24,
+            80,
+            100,
+        )
+        .expect("spawn idle pty");
+        let (mut engine, _guard) = engine_with_tab(
+            client,
+            vec![instant_rule("rate limited", "please continue")],
+        );
+        let tab = TabId::new("s1-slot");
+        assert!(wait_for(|| engine.providers[tab.as_ref_id()]
+            .scan_recent_lines(WATCH_SCAN_ROWS)
+            .contains("idle")));
+        std::thread::sleep(Duration::from_millis(100));
+        engine.tick_watch_rules();
+        let after_first = engine.watch.rescans;
+        assert_eq!(after_first, 1);
+        std::thread::sleep(WATCH_RESCAN_INTERVAL);
+        for _ in 0..50 {
+            engine.tick_watch_rules();
+        }
+        assert_eq!(
+            engine.watch.rescans, after_first,
+            "an idle tab was rescanned"
+        );
     }
 }

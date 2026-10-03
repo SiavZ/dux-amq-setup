@@ -12,6 +12,17 @@ use crate::ids::TabId;
 
 use super::{WatchEngine, WatchRule};
 
+/// The text a tab's rules last ran on, with the terminal generation it came
+/// from, when it was scanned, and its fingerprint, so the rules reuse the key
+/// instead of rehashing the same text on every tick.
+#[derive(Clone)]
+pub struct WatchSnapshot {
+    pub generation: u64,
+    pub scanned_at: Instant,
+    pub text: std::sync::Arc<str>,
+    pub key: super::SnapshotKey,
+}
+
 /// One tab's attached engine plus the inputs it was built from, so a config
 /// reload that changes the rules (or the session settings that add the
 /// built-in auto-clear rule) rebuilds it, and one that does not keeps its
@@ -42,7 +53,13 @@ pub struct WatchRuntime {
     /// has not changed reuses it instead of rescanning its grid on every UI
     /// tick, and one that keeps changing is rescanned at most every
     /// `WATCH_RESCAN_INTERVAL`.
-    pub last_snapshot: HashMap<TabId, (u64, Instant, std::sync::Arc<str>)>,
+    pub last_snapshot: HashMap<TabId, WatchSnapshot>,
+    /// The tab the last capped rescan reached. The next tick's rescans start
+    /// after it, so the per-tick budget goes round-robin.
+    pub rescan_cursor: Option<TabId>,
+    /// How many grid rescans ticks have performed. Tests pin the per-tick cap.
+    #[cfg(test)]
+    pub rescans: usize,
     /// How many times a tick consulted the auto-clear guard. Tests pin that a
     /// quiet screen never pays for the guard's mailbox reads.
     #[cfg(test)]
