@@ -99,20 +99,20 @@
     let searchToken = 0; // guards against out-of-order async responses
 
     // Sassy prompt-state lines, rotated one at a time so the empty search box
-    // always has a bit of dux personality. Sequential (not random) so the same
+    // always has a bit of yaran personality. Sequential (not random) so the same
     // line never repeats back to back.
-    const DUX_FACTS = [
-      "Type to search the docs and the blog. dux runs your agents in parallel, one worktree each, or right in a folder you already have.",
-      "Looking for something? dux spawns real CLIs in real PTYs. No protocol layer, no JSON-RPC, no nonsense.",
-      "Search away. And yes, it really is pronounced dooks.",
-      "Start typing. dux gives project agents their own git worktree, so they never step on each other.",
-      "Find your answer here while dux juggles Claude, Codex, Copilot, and OpenCode side by side.",
-      "Type to begin. dux is written in Rust, so it sips RAM while the agents do the heavy lifting.",
+    const YARAN_FACTS = [
+      "Type to search the docs and the blog. yaran runs your agents in parallel, one worktree each, or right in a folder you already have.",
+      "Looking for something? yaran spawns real CLIs in real PTYs. No protocol layer, no JSON-RPC, no nonsense.",
+      "Search Yaran's docs and the preserved upstream history.",
+      "Start typing. yaran gives project agents their own git worktree, so they never step on each other.",
+      "Find your answer here while yaran juggles Claude, Codex, Copilot, and OpenCode side by side.",
+      "Type to begin. yaran is written in Rust, so it sips RAM while the agents do the heavy lifting.",
       "Search on. The same workspace answers to a terminal and to a browser, so pick whichever is nearer.",
     ];
     let factIndex = 0;
     function promptStatus() {
-      setStatus(DUX_FACTS[factIndex % DUX_FACTS.length]);
+      setStatus(YARAN_FACTS[factIndex % YARAN_FACTS.length]);
       factIndex += 1;
     }
 

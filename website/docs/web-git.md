@@ -27,7 +27,7 @@ the filter, describing exactly the rows you can see. When the worktree is
 clean it says so plainly.
 
 Untracked files are the one place with a ceiling on the counting. git has never seen them,
-so their lines have to be counted by reading each file, and dux does that for the first two
+so their lines have to be counted by reading each file, and yaran does that for the first two
 thousand untracked files in a worktree. Any beyond that are still listed, in full, with
 their status; they simply carry no line counts and are left out of the sums, the same way
 an empty file already looks.
@@ -80,7 +80,7 @@ Clicking a row still opens its diff; only the checkbox selects. For a single
 file, hover a row for its `⋯` menu:
 
 - **Stage** and **Unstage** move a file between the two groups. The row jumps to its new
-  group as soon as dux confirms.
+  group as soon as yaran confirms.
 - **Edit** opens the file in the editor (desktop only, and hidden for deleted files).
 - **Discard…** throws away a file's uncommitted changes. It only shows up on **unstaged**
   rows, both in the menu and on the server: unstage a file first if you want to discard it.
@@ -125,7 +125,7 @@ in **Preferences** (the cog menu).
 
 ### Attaching a PR by hand
 
-dux normally finds the PR itself by matching the agent's branch name against the repository
+yaran normally finds the PR itself by matching the agent's branch name against the repository
 on GitHub. When that misses (the PR lives on a fork, or under a head branch that no longer
 matches), attach one by hand: **Attach pull request…** in the agent's ⋯ menu, or the
 `attach-pull-request` command in the terminal UI's command palette. The field takes a full
@@ -138,7 +138,7 @@ second-guessing it, and the Agent Info dialog says "manually attached".
 
 **Detach pull request** (same menu, or `detach-pull-request` in the palette) means this
 agent has no pull request. The badge goes immediately, a pin is dropped if there was one,
-and dux stops looking for a PR on the agent's branch. It works on an autodetected PR too,
+and yaran stops looking for a PR on the agent's branch. It works on an autodetected PR too,
 not only on a pin, and the detach is remembered across restarts.
 
 Two things bring detection back: attaching a PR by hand, or **Resume PR autodetection**,
@@ -155,7 +155,7 @@ the badge comes back.
 
 There is no file watcher behind the Changes pane.
 
-The pane updates the moment dux itself changes a file: a stage, an unstage, a discard, a
+The pane updates the moment yaran itself changes a file: a stage, an unstage, a discard, a
 commit, a file saved in the editor, and a file you drop onto a pane once it lands somewhere
 git is watching.
 
@@ -164,11 +164,11 @@ running, and within ten seconds when none is: an agent writing files in its work
 as much as a file you delete from a companion terminal.
 
 > [!IMPORTANT]
-> A change dux did not make is never invisible, it is just up to ten seconds late.
+> A change yaran did not make is never invisible, it is just up to ten seconds late.
 > **Refresh changes** in the header menu skips that wait and says what it found. The
 > terminal UI has the same action as its `refresh-changes` command.
 
-If a git operation collides with a lock, dux keeps retrying, so a single blip usually
+If a git operation collides with a lock, yaran keeps retrying, so a single blip usually
 clears itself. If it does not, you get a "Couldn't load changes" card with a Refresh button,
 and a warning toast once the failures persist. A commit you make in the browser is an
 ordinary commit, visible everywhere.
@@ -176,7 +176,7 @@ ordinary commit, visible everywhere.
 ## When an agent deletes its own working copy
 
 An agent works inside a git worktree, and it can remove that worktree from inside it:
-merging its branch and then deleting the branch takes the directory with it. dux cannot
+merging its branch and then deleting the branch takes the directory with it. yaran cannot
 stop that, so it says so instead. The Changes pane goes quiet with a sentence naming the
 directory that is gone, and the agent's row in the sidebar says **working copy missing**
 where it would normally name the project.
@@ -196,8 +196,8 @@ where it would normally name the project.
 > recreate, so stop the tab and start the agent again to continue there. The confirmation
 > says which of the two you are getting.
 
-If the branch is gone locally but still on the remote, dux creates it again from
-`origin/<branch>`, holding everything that had been pushed. If it is gone everywhere, dux
+If the branch is gone locally but still on the remote, yaran creates it again from
+`origin/<branch>`, holding everything that had been pushed. If it is gone everywhere, yaran
 creates it again from the project's source branch, and the commits that branch held are not
 coming back. The confirmation says all three, and the message afterwards names the one that
 actually happened.

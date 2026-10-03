@@ -1,13 +1,13 @@
-# dux rustport — full production-readiness plan
+# yaran rustport — full production-readiness plan
 
 > **Historical record, pre-workspace paths.** File paths in this plan set
 > refer to the fork-main single-crate layout, before the `crates/`
-> restructure. Mapping: `src/` -> `crates/dux-core/src/` (engine, config,
-> storage, pty, git, model) or `crates/dux-tui/src/` (`src/app/`, `src/cli.rs`,
+> restructure. Mapping: `src/` -> `crates/yaran-core/src/` (engine, config,
+> storage, pty, git, model) or `crates/yaran-tui/src/` (`src/app/`, `src/cli.rs`,
 > keys, rendering); `tests/` -> `crates/*/tests/`. Storage no longer uses
 > numbered migrations (`src/storage/migrations/000N_*.sql`, `PRAGMA
 > user_version`): it uses idempotent `ensure_column` calls in
-> `crates/dux-core/src/storage.rs`. See
+> `crates/yaran-core/src/storage.rs`. See
 > [docs/contributing/schema-policy.md](../../contributing/schema-policy.md).
 > The body is left as written.
 
@@ -18,9 +18,9 @@
 
 ## What this actually is
 
-The premise "port dux to Rust" needed correcting before planning began. **dux is
+The premise "port yaran to Rust" needed correcting before planning began. **yaran is
 already Rust** — 69,515 lines across `src/`. The port surface is ~3,600 lines of
-bash under `dux-amq/`. The larger body of work your brief describes — modularity,
+bash under `yaran-amq/`. The larger body of work your brief describes — modularity,
 the 500-line rule, coherence, "upgrade debt we've been avoiding" — is a
 **refactor of the existing Rust**, plus a **bash→Rust port** of the overlay.
 
@@ -112,9 +112,9 @@ TRACK D — Decomposition                 [6 phases, parallel; requires Track B]
 └── 17 app-input-render-decomposition
 
 TRACK E — Serialized integration        [7 phases, strictly sequential]
-├── 18 workspace-and-dux-amq-rust-foundation
-├── 19 dux-amq-rust-wrappers-and-bridge
-├── 20 dux-amq-rust-doctor-and-installer
+├── 18 workspace-and-yaran-amq-rust-foundation
+├── 19 yaran-amq-rust-wrappers-and-bridge
+├── 20 yaran-amq-rust-doctor-and-installer
 ├── 21 state-encapsulation
 ├── 22 session-capture-strategy
 ├── 23 threat-model-and-security-docs

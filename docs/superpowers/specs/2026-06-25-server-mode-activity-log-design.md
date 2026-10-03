@@ -2,13 +2,13 @@
 
 ## Problem
 
-When `dux` flips into server mode from inside the TUI (`Ctrl-Shift-S` / palette
-action), it shows a static splash screen (`crates/dux-tui/src/server_screen.rs`):
+When `yaran` flips into server mode from inside the TUI (`Ctrl-Shift-S` / palette
+action), it shows a static splash screen (`crates/yaran-tui/src/server_screen.rs`):
 the ASCII logo, the bound URLs, an uptime counter, an auth line, and exit hints.
 It is correct but inert — once it is up, nothing on it changes except the uptime
 second.
 
-Meanwhile, the `dux server` CLI path prints a live, colored console of the
+Meanwhile, the `yaran server` CLI path prints a live, colored console of the
 server's life: clients connecting and disconnecting, login successes/failures,
 logouts, config reloads, ACME lifecycle, and a per-request access log. That
 surface is **thrown away** in the flip path: the in-process server is built with
@@ -31,14 +31,14 @@ theme engine in a rounded-border panel consistent with the rest of the app.
   lines are dropped. There is deliberately no scroll, no search, no pager.
 - **No per-request access log in the panel.** The access log is high-volume and
   would flood a 50-line tail during normal use. It stays a CLI-only surface.
-- **No change to the `dux server` CLI path.** That path keeps its real stdout
+- **No change to the `yaran server` CLI path.** That path keeps its real stdout
   console exactly as today. Only the in-TUI flip path gains the panel.
 - **No new logging framework, broadcast channel, or protocol layer.** This is a
   redirect of events that already exist into a buffer the screen can read.
 
 ## Key insight: the capture seam
 
-`crates/dux-web/src/console.rs` already funnels every lifecycle event through a
+`crates/yaran-web/src/console.rs` already funnels every lifecycle event through a
 single private choke point, `Console::emit(tone, message)`. The toned lifecycle
 events — `client_connected`, `client_disconnected`, `login_ok`, `login_failed`,
 `login_rate_limited`, `logout`, `acme`, `reload`, `bind_degraded` — all flow
@@ -55,11 +55,11 @@ out.
 
 ## Architecture
 
-### Shared types in `dux-core`
+### Shared types in `yaran-core`
 
-Both `dux-web` (the producer, via `Console`) and `dux-tui` (the consumer, via
-`ServerStatusScreen`) already depend on `dux-core`, so the shared buffer lives
-there (e.g. `dux_core::activity`).
+Both `yaran-web` (the producer, via `Console`) and `yaran-tui` (the consumer, via
+`ServerStatusScreen`) already depend on `yaran-core`, so the shared buffer lives
+there (e.g. `yaran_core::activity`).
 
 ```rust
 /// The tone of a captured activity event — the public mirror of the console's
@@ -121,7 +121,7 @@ capture push is gated on the capture `Option`, not on `is_active()`.
 
 ### Consumer: `ServerStatusScreen`
 
-`main.rs` (the only crate depending on both `dux-tui` and `dux-web`) creates one
+`main.rs` (the only crate depending on both `yaran-tui` and `yaran-web`) creates one
 `ActivityRing`, builds the flip-path console with `Console::capture(ring.clone())`,
 and passes the other clone into `ServerStatusScreen::new(...)`.
 
@@ -163,18 +163,18 @@ churn) while making new events appear promptly. Resize still forces a redraw.
 
 ## Testing
 
-- **`dux-core` (`ActivityRing`)**: caps at 50 and drops the oldest; preserves
+- **`yaran-core` (`ActivityRing`)**: caps at 50 and drops the oldest; preserves
   insertion order; `generation` advances on push; `connection_opened` /
   `connection_closed` increment/decrement; `connection_closed` saturates at 0
   (never underflows).
-- **`dux-web` (`Console` capture)**: each lifecycle method (`client_connected`,
+- **`yaran-web` (`Console` capture)**: each lifecycle method (`client_connected`,
   `client_disconnected`, `login_ok`, `login_failed`, `login_rate_limited`,
   `logout`, `acme`, `reload`, `bind_degraded`) pushes exactly one structured
   event with the right tone; `access()` and `banner()` push **nothing**;
   `client_connected` / `client_disconnected` move the counter the right way; a
   `Console::capture` console reports the existing stdout-`is_active()` contract
   unchanged.
-- **`dux-tui` (`server_screen`)**: the header still renders the logo, URLs,
+- **`yaran-tui` (`server_screen`)**: the header still renders the logo, URLs,
   uptime, and auth line; the new log helper maps each tone to the expected style;
   only the last N events that fit the panel are rendered (tail behavior); the
   connection count renders in the panel title. Pure helpers stay terminal-free so

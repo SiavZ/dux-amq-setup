@@ -1,0 +1,21 @@
+[package]
+name = "yaran"
+version.workspace = true
+rust-version.workspace = true
+edition = "2024"
+# Ships only inside the yaran binary, never on crates.io. cargo-deny keys its
+# private-crate exemptions (license, path wildcards) on this.
+publish = false
+
+[dependencies]
+yaran-tui = { path = "../yaran-tui" }
+yaran-web = { path = "../yaran-web" }
+yaran-core.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+# tests/overlay_config.rs parses yaran-amq's config snippet and a sed-patched
+# config through yaran-core's own types.
+tempfile.workspace = true
+chrono.workspace = true
+toml = { version = "1.1.2", features = ["preserve_order"] }

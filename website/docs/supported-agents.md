@@ -1,16 +1,16 @@
 ---
 title: Supported agents
-description: The four agents dux ships wired in, what each one can and cannot do inside dux, and how to add any other CLI.
+description: The four agents yaran ships wired in, what each one can and cannot do inside yaran, and how to add any other CLI.
 group: Getting started
 order: 1.5
 ---
 
-dux runs an agent the way you would in a terminal: it starts the CLI in your agent's
+yaran runs an agent the way you would in a terminal: it starts the CLI in your agent's
 working copy and shows you its screen. Four agents come wired in, with a provider entry
 each in `config.toml`, and `claude` is the default for new agents until you pick another.
 
 > [!TIP]
-> dux works with any agent. If a CLI runs in a terminal, dux can run it: add a
+> yaran works with any agent. If a CLI runs in a terminal, yaran can run it: add a
 > `[providers.<name>]` block with its `command` to `config.toml` and it shows up in the
 > provider picker like the four below. No adapters, no plugins. See
 > [Custom CLI agents](/docs/custom-agents).
@@ -35,7 +35,7 @@ how they read a pasted path. That is what the table and notes below cover.
 | OpenCode | `opencode` | Yes, per worktree | No signal today | `curl -fsSL https://opencode.ai/install \| bash` |
 | Copilot | `copilot` | Never | Progress yes, finished turn after a setting | `curl -fsSL https://gh.io/copilot-install \| bash` |
 
-When an agent's CLI is missing, dux says so and prints that install line for you.
+When an agent's CLI is missing, yaran says so and prints that install line for you.
 
 ## Claude Code
 
@@ -47,22 +47,22 @@ so quoting it would only corrupt an apostrophe in the path.
 
 ## Codex
 
-Resumes per worktree on a recent enough Codex build. To light up dux's attention
+Resumes per worktree on a recent enough Codex build. To light up yaran's attention
 indicators, set `tui.notification_method` in Codex's config to any value. Two things to
 know about giving Codex a file:
 
 - A pasted or dropped path is single-quoted for it, because Codex reads its input like a
   shell and takes only one token: a bare path with a space in it would fail silently.
-- Codex accepts at most 1000 characters in one attachment. Past that, dux still saves the
+- Codex accepts at most 1000 characters in one attachment. Past that, yaran still saves the
   file and shows you its full path to reference yourself, rather than sending something
   Codex would silently ignore.
 
 ## OpenCode
 
-Resumes per worktree. If resuming hangs before OpenCode shows anything, dux waits three
+Resumes per worktree. If resuming hangs before OpenCode shows anything, yaran waits three
 seconds, then starts it fresh instead of leaving you with a blank screen. OpenCode has no attention
-signal dux can see today (its notifications go through plugins), so its rows never light up
-on their own; when a future version rings a bell, dux picks it up with no change on your
+signal yaran can see today (its notifications go through plugins), so its rows never light up
+on their own; when a future version rings a bell, yaran picks it up with no change on your
 side. A pasted path goes in as written.
 
 ## Copilot

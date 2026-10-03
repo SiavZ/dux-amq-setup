@@ -4,29 +4,29 @@
 
 **Goal:** Give the in-TUI server-mode screen a live, themed "Activity" panel that tails the server's lifecycle events (client connect/disconnect, login, logout, reload, ACME) and shows a live active-connection count.
 
-**Architecture:** A bounded, thread-safe `ActivityRing` lives in `dux-core`. The `dux-web` `Console` — the single choke point that already emits these events — gains a capture sink that pushes structured events into the ring at its `emit()` method (which structurally excludes the banner and per-request access log). The flip path builds a capture-backed console and hands the same ring to `dux-tui`'s `ServerStatusScreen`, which renders a rounded, theme-styled panel below the existing logo/status header.
+**Architecture:** A bounded, thread-safe `ActivityRing` lives in `yaran-core`. The `yaran-web` `Console` — the single choke point that already emits these events — gains a capture sink that pushes structured events into the ring at its `emit()` method (which structurally excludes the banner and per-request access log). The flip path builds a capture-backed console and hands the same ring to `yaran-tui`'s `ServerStatusScreen`, which renders a rounded, theme-styled panel below the existing logo/status header.
 
 **Tech Stack:** Rust, `ratatui` 0.30 + `crossterm` (TUI), `tokio`/`axum` (web), `std::sync` primitives (`Mutex`, `Arc`, atomics), `chrono` (timestamps).
 
 ## Global Constraints
 
 - **Target platforms are macOS and Linux only.** No `#[cfg(windows)]`, no `cfg!(windows)`. Assume Unix.
-- **All new UI derives colors/styles from `Theme` (`crates/dux-tui/src/theme.rs`).** Never hardcode `Color::*` in rendering. Reuse an existing semantic field when it fits; only add a new field if none fits, and wire every theme/default mapping in the same change.
+- **All new UI derives colors/styles from `Theme` (`crates/yaran-tui/src/theme.rs`).** Never hardcode `Color::*` in rendering. Reuse an existing semantic field when it fits; only add a new field if none fits, and wire every theme/default mapping in the same change.
 - **Rounded borders, theme engine, consistent panels** — match the rest of the TUI (`BorderType::Rounded`, `theme.overlay_border`).
 - **No byte-based truncation of user-visible strings.** Use `.chars().count()` / `.chars().take(n)` for any width math on text that can contain multi-byte characters.
 - **Wall-clock, not tick-count, for refresh cadence** — redraw decisions key off elapsed seconds and an event generation counter, never a raw tick count.
-- **The `dux server` CLI path must not change behavior.** Only the in-TUI flip path gains the capture console + panel.
+- **The `yaran server` CLI path must not change behavior.** Only the in-TUI flip path gains the capture console + panel.
 - **Tests prove the work.** Every task ends green on `cargo test`. The CI gate is `cargo clippy --all-targets --all-features -- -D warnings` — it must pass with zero warnings.
 - **Verification commands** (run from repo root): `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`.
 
 ---
 
-### Task 1: `ActivityRing` shared buffer in `dux-core`
+### Task 1: `ActivityRing` shared buffer in `yaran-core`
 
 **Files:**
-- Create: `crates/dux-core/src/activity.rs`
-- Modify: `crates/dux-core/src/lib.rs` (register the module)
-- Test: inline `#[cfg(test)]` module in `crates/dux-core/src/activity.rs`
+- Create: `crates/yaran-core/src/activity.rs`
+- Modify: `crates/yaran-core/src/lib.rs` (register the module)
+- Test: inline `#[cfg(test)]` module in `crates/yaran-core/src/activity.rs`
 
 **Interfaces:**
 - Consumes: nothing (leaf module; `std::sync` + `std::collections::VecDeque`).
@@ -46,7 +46,7 @@
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `crates/dux-core/src/activity.rs` with ONLY the test module first (the types come in Step 3):
+Create `crates/yaran-core/src/activity.rs` with ONLY the test module first (the types come in Step 3):
 
 ```rust
 #[cfg(test)]
@@ -130,12 +130,12 @@ mod tests {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p dux-core activity::`
+Run: `cargo test -p yaran-core activity::`
 Expected: FAIL to compile — `ActivityRing`, `ActivityEvent`, `ActivityTone`, `ACTIVITY_CAP` are not defined.
 
 - [ ] **Step 3: Write the minimal implementation**
 
-Prepend the implementation ABOVE the test module in `crates/dux-core/src/activity.rs`:
+Prepend the implementation ABOVE the test module in `crates/yaran-core/src/activity.rs`:
 
 ```rust
 //! A bounded, thread-safe tail of the web server's lifecycle events plus a live
@@ -261,7 +261,7 @@ impl ActivityRing {
 }
 ```
 
-Register the module in `crates/dux-core/src/lib.rs` — add this line in the alphabetical `pub mod` block (between `pub mod action;` and `pub mod agent_job;`):
+Register the module in `crates/yaran-core/src/lib.rs` — add this line in the alphabetical `pub mod` block (between `pub mod action;` and `pub mod agent_job;`):
 
 ```rust
 pub mod activity;
@@ -269,38 +269,38 @@ pub mod activity;
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p dux-core activity::`
+Run: `cargo test -p yaran-core activity::`
 Expected: PASS (6 tests).
 
 - [ ] **Step 5: Lint and commit**
 
 ```bash
 cargo fmt
-cargo clippy -p dux-core --all-targets --all-features -- -D warnings
-git add crates/dux-core/src/activity.rs crates/dux-core/src/lib.rs
+cargo clippy -p yaran-core --all-targets --all-features -- -D warnings
+git add crates/yaran-core/src/activity.rs crates/yaran-core/src/lib.rs
 git commit -m "Add a bounded ActivityRing for server-mode lifecycle events"
 ```
 
 ---
 
-### Task 2: `Console` capture sink in `dux-web`
+### Task 2: `Console` capture sink in `yaran-web`
 
 **Files:**
-- Modify: `crates/dux-web/src/console.rs`
-- Test: extend the existing `#[cfg(test)] mod tests` in `crates/dux-web/src/console.rs`
+- Modify: `crates/yaran-web/src/console.rs`
+- Test: extend the existing `#[cfg(test)] mod tests` in `crates/yaran-web/src/console.rs`
 
 **Interfaces:**
-- Consumes: `dux_core::activity::{ActivityRing, ActivityEvent, ActivityTone}` (Task 1).
+- Consumes: `yaran_core::activity::{ActivityRing, ActivityEvent, ActivityTone}` (Task 1).
 - Produces:
   - `Console::capture(ring: ActivityRing) -> Console` — a console whose stdout sink is `Noop` but which pushes structured events into `ring`. Used by the flip path (Task 4).
   - Behavior change: `emit()` pushes to the capture ring (when present); `client_connected`/`client_disconnected` additionally move the ring's connection counter. `banner()` and `access()` remain capture-free (they never call `emit()`).
 
 - [ ] **Step 1: Write the failing tests**
 
-Add these tests inside the existing `mod tests` in `crates/dux-web/src/console.rs` (the `ip(..)` and `sample_banner()` helpers already exist there):
+Add these tests inside the existing `mod tests` in `crates/yaran-web/src/console.rs` (the `ip(..)` and `sample_banner()` helpers already exist there):
 
 ```rust
-    use dux_core::activity::{ActivityRing, ActivityTone};
+    use yaran_core::activity::{ActivityRing, ActivityTone};
 
     #[test]
     fn capture_console_pushes_lifecycle_events_with_tones() {
@@ -311,7 +311,7 @@ Add these tests inside the existing `mod tests` in `crates/dux-web/src/console.r
         console.login_failed(ip("10.0.0.3"));
         console.acme(true, "order failed");
 
-        let snap = ring.snapshot(dux_core::activity::ACTIVITY_CAP);
+        let snap = ring.snapshot(yaran_core::activity::ACTIVITY_CAP);
         let tones: Vec<ActivityTone> = snap.events.iter().map(|e| e.tone).collect();
         assert_eq!(
             tones,
@@ -336,7 +336,7 @@ Add these tests inside the existing `mod tests` in `crates/dux-web/src/console.r
         console.access("GET", "/api/me", 200, 3);
         // Neither the banner nor the access log flows through emit(), so the ring
         // stays empty — the panel never shows the high-volume access log.
-        assert!(ring.snapshot(dux_core::activity::ACTIVITY_CAP).events.is_empty());
+        assert!(ring.snapshot(yaran_core::activity::ACTIVITY_CAP).events.is_empty());
         assert_eq!(ring.generation(), 0);
     }
 
@@ -371,15 +371,15 @@ Add these tests inside the existing `mod tests` in `crates/dux-web/src/console.r
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p dux-web console::tests::capture_console`
+Run: `cargo test -p yaran-web console::tests::capture_console`
 Expected: FAIL to compile — `Console::capture` does not exist.
 
 - [ ] **Step 3: Add the capture target to `ConsoleInner` and constructors**
 
-In `crates/dux-web/src/console.rs`, add the import near the top (with the other `use` lines):
+In `crates/yaran-web/src/console.rs`, add the import near the top (with the other `use` lines):
 
 ```rust
-use dux_core::activity::{ActivityEvent, ActivityRing, ActivityTone};
+use yaran_core::activity::{ActivityEvent, ActivityRing, ActivityTone};
 ```
 
 Map the private `Tone` to the public `ActivityTone` (place after the `impl Tone` block):
@@ -492,15 +492,15 @@ Leave `banner()` and `access()` untouched — they call `write_line` directly, n
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test -p dux-web console::`
+Run: `cargo test -p yaran-web console::`
 Expected: PASS — the new capture tests pass and every pre-existing console test (noop, writer-thread, banner, access) still passes.
 
 - [ ] **Step 6: Lint and commit**
 
 ```bash
 cargo fmt
-cargo clippy -p dux-web --all-targets --all-features -- -D warnings
-git add crates/dux-web/src/console.rs
+cargo clippy -p yaran-web --all-targets --all-features -- -D warnings
+git add crates/yaran-web/src/console.rs
 git commit -m "Add a capture sink to the web console feeding an ActivityRing"
 ```
 
@@ -509,12 +509,12 @@ git commit -m "Add a capture sink to the web console feeding an ActivityRing"
 ### Task 3: Render the Activity panel in `ServerStatusScreen`
 
 **Files:**
-- Modify: `crates/dux-tui/src/server_screen.rs`
-- Modify: `crates/dux/src/main.rs` (create the ring, pass it to `ServerStatusScreen::new`)
-- Test: extend the existing `#[cfg(test)] mod tests` in `crates/dux-tui/src/server_screen.rs`
+- Modify: `crates/yaran-tui/src/server_screen.rs`
+- Modify: `crates/yaran/src/main.rs` (create the ring, pass it to `ServerStatusScreen::new`)
+- Test: extend the existing `#[cfg(test)] mod tests` in `crates/yaran-tui/src/server_screen.rs`
 
 **Interfaces:**
-- Consumes: `dux_core::activity::{ActivityRing, ActivityTone, ActivityEvent, ActivitySnapshot, ACTIVITY_CAP}` (Task 1).
+- Consumes: `yaran_core::activity::{ActivityRing, ActivityTone, ActivityEvent, ActivitySnapshot, ACTIVITY_CAP}` (Task 1).
 - Produces:
   - `ServerStatusScreen::new(urls, loopback, auth_enabled, user_count, theme_name, paths, activity: ActivityRing) -> Result<Self>` — the new trailing `activity` parameter.
   - Internal pure helpers: `header_lines(...)`, `footer_hint_lines()`, `activity_lines(events: &[ActivityEvent], max_rows: usize) -> Vec<ScreenLine>`.
@@ -524,10 +524,10 @@ This task makes the screen render the panel from whatever the ring holds. The ri
 
 - [ ] **Step 1: Write the failing tests**
 
-Add to `mod tests` in `crates/dux-tui/src/server_screen.rs` (the `one(..)` and `plain_text(..)` helpers already exist there):
+Add to `mod tests` in `crates/yaran-tui/src/server_screen.rs` (the `one(..)` and `plain_text(..)` helpers already exist there):
 
 ```rust
-    use dux_core::activity::{ActivityEvent, ActivityTone};
+    use yaran_core::activity::{ActivityEvent, ActivityTone};
 
     fn ev(hms: &str, msg: &str, tone: ActivityTone) -> ActivityEvent {
         ActivityEvent { hms: hms.to_string(), tone, message: msg.to_string() }
@@ -537,12 +537,12 @@ Add to `mod tests` in `crates/dux-tui/src/server_screen.rs` (the `one(..)` and `
     fn header_lines_keep_logo_urls_uptime_but_no_exit_hints() {
         let lines = header_lines(&one("http://127.0.0.1:8080"), true, false, 0, 42);
         let text = plain_text(&lines);
-        assert!(text.contains("dux server running"));
+        assert!(text.contains("yaran server running"));
         assert!(text.contains("http://127.0.0.1:8080"));
         assert!(text.contains("up 0:42"));
         // The exit hints moved to the footer — they are NOT in the header now.
-        assert!(!text.contains("return to dux"));
-        assert!(!text.contains("quit dux entirely"));
+        assert!(!text.contains("return to yaran"));
+        assert!(!text.contains("quit yaran entirely"));
         // The wordmark is still the first line.
         assert_eq!(lines[0][0].1, Role::Logo);
     }
@@ -560,8 +560,8 @@ Add to `mod tests` in `crates/dux-tui/src/server_screen.rs` (the `one(..)` and `
         assert!(keys.contains(&"Esc"));
         assert!(keys.contains(&"Ctrl-C"));
         let text = plain_text(&lines);
-        assert!(text.contains("return to dux"));
-        assert!(text.contains("quit dux entirely"));
+        assert!(text.contains("return to yaran"));
+        assert!(text.contains("quit yaran entirely"));
     }
 
     #[test]
@@ -613,15 +613,15 @@ Add to `mod tests` in `crates/dux-tui/src/server_screen.rs` (the `one(..)` and `
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p dux-tui server_screen::`
+Run: `cargo test -p yaran-tui server_screen::`
 Expected: FAIL to compile — `header_lines`, `footer_hint_lines`, `activity_lines`, and `Role::Log` do not exist.
 
 - [ ] **Step 3: Add the `Log` role and split the content builders**
 
-In `crates/dux-tui/src/server_screen.rs`, add the import near the top (with the other `use` lines):
+In `crates/yaran-tui/src/server_screen.rs`, add the import near the top (with the other `use` lines):
 
 ```rust
-use dux_core::activity::{ActivityEvent, ActivityRing, ActivityTone};
+use yaran_core::activity::{ActivityEvent, ActivityRing, ActivityTone};
 ```
 
 Add a `Log` variant to the `Role` enum (it carries the tone so `line_for` can style it):
@@ -651,7 +651,7 @@ fn header_lines(
     }
 
     lines.push(vec![(String::new(), Role::Spacer)]);
-    lines.push(vec![("dux server running".to_string(), Role::Heading)]);
+    lines.push(vec![("yaran server running".to_string(), Role::Heading)]);
     for url in urls {
         lines.push(vec![(url.to_string(), Role::Url)]);
     }
@@ -685,11 +685,11 @@ fn footer_hint_lines() -> Vec<ScreenLine> {
         vec![
             ("q".to_string(), Role::Key),
             ("Esc".to_string(), Role::Key),
-            (" stop the server and return to dux".to_string(), Role::HintDesc),
+            (" stop the server and return to yaran".to_string(), Role::HintDesc),
         ],
         vec![
             ("Ctrl-C".to_string(), Role::Key),
-            (" quit dux entirely".to_string(), Role::HintDesc),
+            (" quit yaran entirely".to_string(), Role::HintDesc),
         ],
     ]
 }
@@ -750,7 +750,7 @@ Update `ServerStatusScreen::new` to take the trailing `activity: ActivityRing` p
         auth_enabled: bool,
         user_count: usize,
         theme_name: &str,
-        paths: &DuxPaths,
+        paths: &YaranPaths,
         activity: ActivityRing,
     ) -> Result<Self> {
 ```
@@ -765,7 +765,7 @@ Update `ServerStatusScreen::new` to take the trailing `activity: ActivityRing` p
 Note: the initial `screen.draw(0)?` call below the literal must be updated to pass a snapshot — see the new `draw` signature. Replace the bottom of `new` (`screen.draw(0)?; screen.last_drawn_secs = 0; Ok(screen)`) with:
 
 ```rust
-        let snapshot = screen.activity.snapshot(dux_core::activity::ACTIVITY_CAP);
+        let snapshot = screen.activity.snapshot(yaran_core::activity::ACTIVITY_CAP);
         screen.last_drawn_generation = snapshot.generation;
         screen.draw(0, &snapshot)?;
         screen.last_drawn_secs = 0;
@@ -776,7 +776,7 @@ Update `tick` to also redraw when the activity generation advanced. Replace the 
 
 ```rust
         let secs = self.started.elapsed().as_secs();
-        let snapshot = self.activity.snapshot(dux_core::activity::ACTIVITY_CAP);
+        let snapshot = self.activity.snapshot(yaran_core::activity::ACTIVITY_CAP);
         if secs != self.last_drawn_secs || snapshot.generation != self.last_drawn_generation {
             let _ = self.draw(secs, &snapshot);
             self.last_drawn_secs = secs;
@@ -882,19 +882,19 @@ Remove the now-unused `content_width_for` helper and its test (`content_width_ex
 
 - [ ] **Step 5: Update the `main.rs` caller**
 
-In `crates/dux/src/main.rs`, inside the `FlipToServer` arm, create the ring before constructing the screen and pass it in. Add right after the `let user_count = ...;` line (around line 79):
+In `crates/yaran/src/main.rs`, inside the `FlipToServer` arm, create the ring before constructing the screen and pass it in. Add right after the `let user_count = ...;` line (around line 79):
 
 ```rust
                 // The activity buffer is shared between the web console (the
                 // producer, wired in serve_with_engine) and the status screen
                 // (the consumer). Created here so both get the same handle.
-                let activity = dux_core::activity::ActivityRing::new();
+                let activity = yaran_core::activity::ActivityRing::new();
 ```
 
 Update the `ServerStatusScreen::new(..)` call to pass `activity.clone()` as the final argument:
 
 ```rust
-                let mut screen = match dux_tui::ServerStatusScreen::new(
+                let mut screen = match yaran_tui::ServerStatusScreen::new(
                     &urls,
                     loopback,
                     auth_enabled,
@@ -909,20 +909,20 @@ Update the `ServerStatusScreen::new(..)` call to pass `activity.clone()` as the 
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
-Run: `cargo test -p dux-tui server_screen::`
+Run: `cargo test -p yaran-tui server_screen::`
 Expected: PASS — the new header/footer/activity tests pass; the remaining pre-existing `screen_lines`-based tests were renamed to `header_lines`/`footer_hint_lines` (update any that still reference `screen_lines` — `content_includes_url_and_heading_and_uptime`, `content_lists_all_bound_urls`, `loopback_auth_off_omits_the_warning`, `non_loopback_auth_off_includes_the_loud_warning`, `auth_on_shows_quiet_login_line_not_the_warning`, `auth_on_singular_user_uses_singular_noun`, `content_includes_the_wordmark` → point them at `header_lines`; `content_includes_both_exit_hints` → split into the `footer_hint_lines` test above).
 
 - [ ] **Step 7: Build the binary to confirm the caller compiles**
 
-Run: `cargo build -p dux`
+Run: `cargo build -p yaran`
 Expected: Success (the new `ServerStatusScreen::new` argument is supplied).
 
 - [ ] **Step 8: Lint and commit**
 
 ```bash
 cargo fmt
-cargo clippy -p dux-tui -p dux --all-targets --all-features -- -D warnings
-git add crates/dux-tui/src/server_screen.rs crates/dux/src/main.rs
+cargo clippy -p yaran-tui -p yaran --all-targets --all-features -- -D warnings
+git add crates/yaran-tui/src/server_screen.rs crates/yaran/src/main.rs
 git commit -m "Render a themed Activity panel on the server status screen"
 ```
 
@@ -931,23 +931,23 @@ git commit -m "Render a themed Activity panel on the server status screen"
 ### Task 4: Feed the panel — capture console through `serve_with_engine`
 
 **Files:**
-- Modify: `crates/dux-web/src/lib.rs` (`serve_with_engine` signature + console wiring)
-- Modify: `crates/dux/src/main.rs` (pass the ring into `serve_with_engine`)
-- Test: extend `#[cfg(test)] mod tests` in `crates/dux-web/src/lib.rs` if a seam is reachable (see Step 4); otherwise rely on the Task 2 capture tests + the integration assertion below.
+- Modify: `crates/yaran-web/src/lib.rs` (`serve_with_engine` signature + console wiring)
+- Modify: `crates/yaran/src/main.rs` (pass the ring into `serve_with_engine`)
+- Test: extend `#[cfg(test)] mod tests` in `crates/yaran-web/src/lib.rs` if a seam is reachable (see Step 4); otherwise rely on the Task 2 capture tests + the integration assertion below.
 
 **Interfaces:**
-- Consumes: `dux_core::activity::ActivityRing` (Task 1), `Console::capture` (Task 2).
+- Consumes: `yaran_core::activity::ActivityRing` (Task 1), `Console::capture` (Task 2).
 - Produces: `serve_with_engine(engine, listeners, activity: ActivityRing, on_tick) -> Result<(Engine, ServerExit)>` — a new `activity` parameter threaded before `on_tick`. The flip path's router and reload arm now use `Console::capture(activity)` instead of `Console::noop()`.
 
 - [ ] **Step 1: Add the `activity` parameter and build the capture console**
 
-In `crates/dux-web/src/lib.rs`, change the `serve_with_engine` signature to accept the ring:
+In `crates/yaran-web/src/lib.rs`, change the `serve_with_engine` signature to accept the ring:
 
 ```rust
 pub fn serve_with_engine(
     mut engine: Engine,
     listeners: Vec<std::net::TcpListener>,
-    activity: dux_core::activity::ActivityRing,
+    activity: yaran_core::activity::ActivityRing,
     mut on_tick: impl FnMut() -> ServerTick,
 ) -> Result<(Engine, ServerExit)> {
 ```
@@ -982,10 +982,10 @@ Add `.with_console(console.clone(), false)` to the flip router build (around lin
 
 - [ ] **Step 2: Update the `main.rs` caller to pass the ring**
 
-In `crates/dux/src/main.rs`, pass `activity` into `serve_with_engine` (the ring was created in Task 3, Step 5). Change the call (around line 104):
+In `crates/yaran/src/main.rs`, pass `activity` into `serve_with_engine` (the ring was created in Task 3, Step 5). Change the call (around line 104):
 
 ```rust
-                let (engine, exit) = dux_web::serve_with_engine(*engine, listeners, activity, || {
+                let (engine, exit) = yaran_web::serve_with_engine(*engine, listeners, activity, || {
 ```
 
 (The screen got `activity.clone()`; `serve_with_engine` takes ownership of the original `activity` — both share the same underlying `Arc`.)
@@ -993,22 +993,22 @@ In `crates/dux/src/main.rs`, pass `activity` into `serve_with_engine` (the ring 
 - [ ] **Step 3: Build the whole workspace to confirm the wiring**
 
 Run: `cargo build`
-Expected: Success. If any in-crate test in `dux-web` calls `serve_with_engine` directly, update it to pass `dux_core::activity::ActivityRing::new()` as the new argument.
+Expected: Success. If any in-crate test in `yaran-web` calls `serve_with_engine` directly, update it to pass `yaran_core::activity::ActivityRing::new()` as the new argument.
 
 - [ ] **Step 4: Add a wiring regression test (if a seam exists)**
 
-`serve_with_engine` spins a full tokio server, so do not start it in a unit test. Instead, prove the wiring contract that matters — that the flip path uses a *capturing* console, not a noop — by asserting the helper that builds it. Add to `crates/dux-web/src/lib.rs` `mod tests`:
+`serve_with_engine` spins a full tokio server, so do not start it in a unit test. Instead, prove the wiring contract that matters — that the flip path uses a *capturing* console, not a noop — by asserting the helper that builds it. Add to `crates/yaran-web/src/lib.rs` `mod tests`:
 
 ```rust
     #[test]
     fn flip_console_captures_into_the_shared_ring() {
         // The flip path builds its console from the shared ring; a client-connect
         // event on that console must land in the ring the status screen reads.
-        let ring = dux_core::activity::ActivityRing::new();
+        let ring = yaran_core::activity::ActivityRing::new();
         let console = crate::console::Console::capture(ring.clone());
         console.client_connected("10.0.0.7".parse().unwrap());
         assert_eq!(ring.connections(), 1);
-        assert_eq!(ring.snapshot(dux_core::activity::ACTIVITY_CAP).events.len(), 1);
+        assert_eq!(ring.snapshot(yaran_core::activity::ACTIVITY_CAP).events.len(), 1);
     }
 ```
 
@@ -1016,7 +1016,7 @@ Expected: Success. If any in-crate test in `dux-web` calls `serve_with_engine` d
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test -p dux-web`
+Run: `cargo test -p yaran-web`
 Expected: PASS.
 
 - [ ] **Step 6: Lint and commit**
@@ -1024,7 +1024,7 @@ Expected: PASS.
 ```bash
 cargo fmt
 cargo clippy --all-targets --all-features -- -D warnings
-git add crates/dux-web/src/lib.rs crates/dux/src/main.rs
+git add crates/yaran-web/src/lib.rs crates/yaran/src/main.rs
 git commit -m "Feed the server-mode Activity panel through a capture console"
 ```
 
@@ -1042,7 +1042,7 @@ git commit -m "Feed the server-mode Activity panel through a capture console"
 
 - [ ] **Step 1: Check whether docs describe the server-mode screen**
 
-Run: `grep -rin "server status\|server mode\|status screen\|dux server\|flip" README.md website/ 2>/dev/null | grep -vi node_modules`
+Run: `grep -rin "server status\|server mode\|status screen\|yaran server\|flip" README.md website/ 2>/dev/null | grep -vi node_modules`
 Expected: a list of references. For each that describes what the server-mode screen *shows*, update the prose to mention the live Activity panel and connection count. Match the site's existing playful tone (per CLAUDE.md). Do NOT enumerate keybindings. If nothing describes the screen's contents, note that and make no change.
 
 - [ ] **Step 2: If the website documents server mode, add the Activity panel**
@@ -1080,9 +1080,9 @@ git commit -m "Document the server-mode Activity panel"
 - Rolling lifecycle log capped at 50, drop oldest, no scroll → Task 1 (`ACTIVITY_CAP`, drop-oldest), Task 3 (tail render). ✓
 - Capture at the `emit()` choke point; exclude banner + access log → Task 2 (+ explicit exclusion test). ✓
 - Keep ASCII logo; themed rounded panel → Task 3 (`header_lines` keeps `ASCII_LOGO`; `BorderType::Rounded` + `theme.overlay_border`). ✓
-- Shared type in `dux-core` (both crates depend on it) → Task 1. ✓
+- Shared type in `yaran-core` (both crates depend on it) → Task 1. ✓
 - Redraw on new event, wall-clock cadence → Task 3 (`generation` compare in `tick`). ✓
-- `dux server` CLI path unchanged → only `serve_with_engine` (flip) touched; `build_console` (CLI) untouched. ✓
+- `yaran server` CLI path unchanged → only `serve_with_engine` (flip) touched; `build_console` (CLI) untouched. ✓
 - Tone→theme via existing fields, no new theme field → Task 3 (`provider_label_fg`/`status_info_fg`/`warning_fg`/`status_error_fg`). ✓
 - Tests at every layer → Tasks 1-4 each ship tests. ✓
 - Docs/site sync → Task 5. ✓

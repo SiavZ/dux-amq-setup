@@ -4,7 +4,7 @@ module.exports = async ({ createAgent, palette, seedLooseWorktree, sendKeys, sle
   await createAgent(0, "retry-budget")
   await createAgent(0, "cache-warmup")
   // A worktree with no agent behind it, which is the only kind this dialog can
-  // remove. Made with git directly, because dux only ever leaves one behind by
+  // remove. Made with git directly, because yaran only ever leaves one behind by
   // deleting an agent and keeping its worktree.
   seedLooseWorktree("demo-api", "docs-pass")
   await palette("manage-worktrees")
@@ -21,5 +21,5 @@ module.exports.expectText = ["Manage Worktrees", "docs-pass", "retry-budget", "c
 module.exports.file = "tui-worktree-manager.png"
 module.exports.cols = 140
 module.exports.rows = 40
-module.exports.theme = "dux_dark"
+module.exports.theme = "yaran_dark"
 module.exports.fixture = "steady"

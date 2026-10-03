@@ -12,7 +12,7 @@ import { createServer } from "vite";
 
 import { webUiAlias, webUiReactBridge } from "../src/lib/web-ui-alias.mjs";
 
-const APP = fileURLToPath(new URL("../../crates/dux-web/web/", import.meta.url));
+const APP = fileURLToPath(new URL("../../crates/yaran-web/web/", import.meta.url));
 const OUT = fileURLToPath(new URL("../src/figure/figure.html", import.meta.url));
 
 // A fresh clone has this repository's source but not the sibling app's
@@ -23,13 +23,13 @@ const OUT = fileURLToPath(new URL("../src/figure/figure.html", import.meta.url))
 if (!existsSync(APP + "node_modules/react/index.js")) {
   if (!existsSync(APP + "package.json")) {
     console.error(
-      "render-figure: crates/dux-web/web is missing from this checkout, so the " +
+      "render-figure: crates/yaran-web/web is missing from this checkout, so the " +
         "figure cannot be rendered. This should not happen in a clone.",
     );
     process.exit(1);
   }
 
-  console.log("render-figure: installing the dux web app's dependencies (first run only)...");
+  console.log("render-figure: installing the yaran web app's dependencies (first run only)...");
   const lockfile = existsSync(APP + "package-lock.json");
   const install = spawnSync("npm", [lockfile ? "ci" : "install", "--no-audit", "--no-fund"], {
     cwd: APP,
@@ -37,8 +37,8 @@ if (!existsSync(APP + "node_modules/react/index.js")) {
   });
   if (install.status !== 0) {
     console.error(
-      "render-figure: installing the dux web app's dependencies failed. Run " +
-        "`cd crates/dux-web/web && npm ci` to see why.",
+      "render-figure: installing the yaran web app's dependencies failed. Run " +
+        "`cd crates/yaran-web/web && npm ci` to see why.",
     );
     process.exit(1);
   }

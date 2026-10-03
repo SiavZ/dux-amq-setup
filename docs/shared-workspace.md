@@ -7,9 +7,9 @@ This page describes what runs on the crates layout today.
 
 ## What it is
 
-By default dux gives every agent its own git worktree. In shared mode a new
+By default yaran gives every agent its own git worktree. In shared mode a new
 project agent runs **directly in the registered project checkout** instead.
-dux creates no worktree and no branch, never switches the checkout, runs no
+yaran creates no worktree and no branch, never switches the checkout, runs no
 startup command there, and never writes `.git/info/exclude`.
 
 ## Configuration
@@ -28,7 +28,7 @@ workspace_mode = "worktree"  # optional per-project override; omit to inherit
   no `[workspace]` table and keeps worktree mode. Only a freshly created
   config renders `default_mode = "shared"`. Saving an unrelated setting never
   adds the section.
-- A shared project may not live inside `DUX_HOME` or its worktrees root
+- A shared project may not live inside `YARAN_HOME` or its worktrees root
   (symlinks and not-yet-created paths are resolved). The TUI refuses to load
   such a config, and a shared create is refused before any row is written.
 - `Config.schema_version` from the fork is **not** ported. Upstream migrates
@@ -40,7 +40,7 @@ workspace_mode = "worktree"  # optional per-project override; omit to inherit
 | Behaviour | Where | Test |
 |---|---|---|
 | New agent in a shared project runs in the checkout, records live HEAD (detached accepted) | `agent_job::run_create_shared_agent_job` | `shared_create_uses_real_checkout_without_worktree_or_link`, `shared_registration_accepts_detached_head_without_checkout` |
-| Shared checkout inside dux state is refused before persisting | same, via `config::validate_shared_workspace_path` | `shared_create_rejects_managed_root_before_persisting`, `config_load_rejects_shared_project_inside_managed_root` |
+| Shared checkout inside yaran state is refused before persisting | same, via `config::validate_shared_workspace_path` | `shared_create_rejects_managed_root_before_persisting`, `config_load_rejects_shared_project_inside_managed_root` |
 | Fork, PR and adopted-worktree agents stay isolated | create request choice | `fork_from_shared_session_still_creates_isolated_worktree_row`, `fork_stays_isolated_under_shared_project_default` |
 | Delete never removes the checkout; asking to is refused out loud | `AgentSession::deletion_may_remove_directory`, `Engine::{do,begin}_delete_session` | `begin_delete_session_never_removes_shared_workspace`, `shared_delete_dialog_hides_worktree_checkbox` |
 | Branch rename refused, title rename allowed, handle immutable | `Engine::prepare_branch_rename` | `shared_session_rejects_real_branch_rename`, `shared_session_rename_changes_only_display_title` |
@@ -63,12 +63,12 @@ affected.
 
 ## Honest limits
 
-- The multi-writer warning sees only this dux home's agents. Agents under
-  another `DUX_HOME` and unmanaged processes in the checkout are invisible, so
+- The multi-writer warning sees only this yaran home's agents. Agents under
+  another `YARAN_HOME` and unmanaged processes in the checkout are invisible, so
   the absence of the badge is not proof of exclusive access.
 - Shared writers share one index, staging area and branch. One can stage,
   commit, discard or switch branch under another. Use Fork or worktree mode
   when changes must diverge.
 - AMQ routing by immutable `agent_handle` for shared endpoints, and the AMQ
   ownership protocol under a shared root, live in the peer router
-  (`crates/dux-core/src/peer`).
+  (`crates/yaran-core/src/peer`).

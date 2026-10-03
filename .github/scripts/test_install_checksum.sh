@@ -3,7 +3,7 @@
 # Drive install.sh's checksum verification directly, with no network and no
 # release.
 #
-# install.sh only calls main() when DUX_INSTALL_SH_LIB is unset, so sourcing it
+# install.sh only calls main() when YARAN_INSTALL_SH_LIB is unset, so sourcing it
 # with that variable set gives us verify_checksum and sha256_of as plain
 # functions over local files. Each case below builds a real tar.gz, computes a
 # real digest, and asserts on the exit status and the message.
@@ -57,13 +57,13 @@ failures=0
 pass() { printf 'PASS: %s\n' "$1"; }
 fail() { printf 'FAIL: %s\n' "$1" >&2; failures=$((failures + 1)); }
 
-# Build a real archive, shaped like a release archive (a dux binary at the root).
+# Build a real archive, shaped like a release archive (a yaran binary at the root).
 mkdir -p "$WORK/payload"
-printf '#!/bin/sh\necho dux\n' > "$WORK/payload/dux"
-chmod 755 "$WORK/payload/dux"
-tar czf "$WORK/dux-test.tar.gz" -C "$WORK/payload" dux
+printf '#!/bin/sh\necho yaran\n' > "$WORK/payload/yaran"
+chmod 755 "$WORK/payload/yaran"
+tar czf "$WORK/yaran-test.tar.gz" -C "$WORK/payload" yaran
 
-ARCHIVE="$WORK/dux-test.tar.gz"
+ARCHIVE="$WORK/yaran-test.tar.gz"
 
 if command -v sha256sum >/dev/null 2>&1; then
   REAL_SUM="$(sha256sum "$ARCHIVE" | cut -d' ' -f1)"
@@ -82,8 +82,8 @@ run_verify() {
   (
     set +e
     # shellcheck disable=SC1090
-    DUX_INSTALL_SH_LIB=1 source "$INSTALL_SH"
-    verify_checksum "$archive" "$sums" "dux-test.tar.gz"
+    YARAN_INSTALL_SH_LIB=1 source "$INSTALL_SH"
+    verify_checksum "$archive" "$sums" "yaran-test.tar.gz"
   ) 2>&1
 }
 
@@ -107,12 +107,12 @@ expect() {
 }
 
 # 1. Correct checksum passes.
-printf '%s  dux-test.tar.gz\n' "$REAL_SUM" > "$WORK/good.sha256"
+printf '%s  yaran-test.tar.gz\n' "$REAL_SUM" > "$WORK/good.sha256"
 expect "correct checksum verifies" 0 "Checksum verified" "$ARCHIVE" "$WORK/good.sha256"
 
 # 2. Wrong checksum is a hard failure. Same length and character class as a real
 #    digest, so this is a mismatch and not a malformed-file rejection.
-printf '%s  dux-test.tar.gz\n' \
+printf '%s  yaran-test.tar.gz\n' \
   "0000000000000000000000000000000000000000000000000000000000000000" \
   > "$WORK/bad.sha256"
 expect "wrong checksum fails hard" 1 "Checksum mismatch" "$ARCHIVE" "$WORK/bad.sha256"
@@ -123,8 +123,8 @@ expect "wrong checksum fails hard" 1 "Checksum mismatch" "$ARCHIVE" "$WORK/bad.s
 sentinel_out="$(
   (
     set +e
-    DUX_INSTALL_SH_LIB=1 source "$INSTALL_SH"
-    verify_checksum "$ARCHIVE" "$WORK/bad.sha256" "dux-test.tar.gz" || true
+    YARAN_INSTALL_SH_LIB=1 source "$INSTALL_SH"
+    verify_checksum "$ARCHIVE" "$WORK/bad.sha256" "yaran-test.tar.gz" || true
     echo "REACHED-INSTALL-STEP"
   ) 2>&1
 )" || true
@@ -162,8 +162,8 @@ run_verify_status() {
   (
     set +e
     # shellcheck disable=SC1090
-    DUX_INSTALL_SH_LIB=1 source "$INSTALL_SH"
-    verify_checksum "$archive" "$sums" "dux-test.tar.gz" "$fetch_status"
+    YARAN_INSTALL_SH_LIB=1 source "$INSTALL_SH"
+    verify_checksum "$archive" "$sums" "yaran-test.tar.gz" "$fetch_status"
   ) 2>&1
 }
 
@@ -175,7 +175,7 @@ if [ "$fetchfail_status" = "0" ]; then
   fail "a failed checksum fetch must not report success"
 elif [ "${fetchfail_out#*"could not be fetched"}" = "$fetchfail_out" ]; then
   fail "a failed checksum fetch must say the fetch failed, got: ${fetchfail_out}"
-elif [ "${fetchfail_out#*"before dux"}" != "$fetchfail_out" ]; then
+elif [ "${fetchfail_out#*"before yaran"}" != "$fetchfail_out" ]; then
   fail "a failed checksum fetch must NOT blame the release for predating checksums"
 else
   pass "a failed checksum fetch is reported as a fetch failure, not a missing checksum"
@@ -194,7 +194,7 @@ fi
 
 # 4. A malformed checksum file is a hard failure, not a warning: the release is
 #    broken and guessing is worse than stopping.
-printf 'not-a-digest  dux-test.tar.gz\n' > "$WORK/malformed.sha256"
+printf 'not-a-digest  yaran-test.tar.gz\n' > "$WORK/malformed.sha256"
 expect "malformed checksum file fails hard" 1 "malformed" \
   "$ARCHIVE" "$WORK/malformed.sha256"
 
@@ -204,9 +204,12 @@ expect "malformed checksum file fails hard" 1 "malformed" \
 noimpl_out="$(
   (
     set +e
-    DUX_INSTALL_SH_LIB=1 source "$INSTALL_SH"
-    has_cmd() { case "$1" in sha256sum|shasum) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
-    verify_checksum "$ARCHIVE" "$WORK/good.sha256" "dux-test.tar.gz"
+    YARAN_INSTALL_SH_LIB=1 source "$INSTALL_SH"
+    has_cmd() {
+      if [ "$1" = sha256sum ] || [ "$1" = shasum ]; then return 1; fi
+      command -v "$1" >/dev/null 2>&1
+    }
+    verify_checksum "$ARCHIVE" "$WORK/good.sha256" "yaran-test.tar.gz"
     echo "STATUS=$?"
   ) 2>&1
 )" || true
@@ -227,9 +230,12 @@ if command -v shasum >/dev/null 2>&1; then
   shasum_out="$(
     (
       set +e
-      DUX_INSTALL_SH_LIB=1 source "$INSTALL_SH"
-      has_cmd() { case "$1" in sha256sum) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
-      verify_checksum "$ARCHIVE" "$WORK/good.sha256" "dux-test.tar.gz"
+      YARAN_INSTALL_SH_LIB=1 source "$INSTALL_SH"
+      has_cmd() {
+        if [ "$1" = sha256sum ]; then return 1; fi
+        command -v "$1" >/dev/null 2>&1
+      }
+      verify_checksum "$ARCHIVE" "$WORK/good.sha256" "yaran-test.tar.gz"
     ) 2>&1
   )" && shasum_status=0 || shasum_status=$?
   printf -- '--- shasum fallback (sha256sum hidden) ---\n%s\n(exit status %s)\n' \
@@ -246,7 +252,7 @@ fi
 # 6. The digest install.sh computes agrees with the harness's own.
 own_sum="$(
   (
-    DUX_INSTALL_SH_LIB=1 source "$INSTALL_SH"
+    YARAN_INSTALL_SH_LIB=1 source "$INSTALL_SH"
     sha256_of "$ARCHIVE"
   )
 )"
@@ -270,18 +276,18 @@ fi
 #    fetch reaching the real network, which quietly turned the mismatch case below
 #    into a no-checksum case that installed the binary anyway.
 mkdir -p "$WORK/release"
-cp "$ARCHIVE" "$WORK/release/dux-linux-amd64.tar.gz"
-cp "$ARCHIVE" "$WORK/release/dux-linux-arm64.tar.gz"
-cp "$ARCHIVE" "$WORK/release/dux-darwin-amd64.tar.gz"
-cp "$ARCHIVE" "$WORK/release/dux-darwin-arm64.tar.gz"
+cp "$ARCHIVE" "$WORK/release/yaran-linux-amd64.tar.gz"
+cp "$ARCHIVE" "$WORK/release/yaran-linux-arm64.tar.gz"
+cp "$ARCHIVE" "$WORK/release/yaran-darwin-amd64.tar.gz"
+cp "$ARCHIVE" "$WORK/release/yaran-darwin-arm64.tar.gz"
 
 run_main_offline() {
   local install_dir="$1"
   (
     set +e
-    export DUX_VERSION="v9.9.9"
-    export DUX_INSTALL_DIR="$install_dir"
-    DUX_INSTALL_SH_LIB=1 source "$INSTALL_SH"
+    export YARAN_VERSION="yaran-v9.9.9"
+    export YARAN_INSTALL_DIR="$install_dir"
+    YARAN_INSTALL_SH_LIB=1 source "$INSTALL_SH"
     # Serve from the local release directory instead of GitHub. Returns non-zero
     # for anything absent, which is how a real 404 reaches the caller.
     http_download() {
@@ -319,7 +325,7 @@ if [ "$supported_os" -eq 1 ] && [ "$supported_arch" -eq 1 ]; then
   mkdir -p "$WORK/bin-mismatch"
   out="$(run_main_offline "$WORK/bin-mismatch")" || true
   printf -- '--- end to end, wrong checksum ---\n%s\n' "$out"
-  if [ -e "$WORK/bin-mismatch/dux" ]; then
+  if [ -e "$WORK/bin-mismatch/yaran" ]; then
     fail "end to end mismatch: a binary was installed anyway"
   elif [ -z "$(ls -A "$WORK/bin-mismatch")" ]; then
     pass "end to end mismatch: install directory left empty"
@@ -338,10 +344,10 @@ if [ "$supported_os" -eq 1 ] && [ "$supported_arch" -eq 1 ]; then
   mkdir -p "$WORK/bin-ok"
   out="$(run_main_offline "$WORK/bin-ok")" || true
   printf -- '--- end to end, correct checksum ---\n%s\n' "$out"
-  if [ -x "$WORK/bin-ok/dux" ]; then
+  if [ -x "$WORK/bin-ok/yaran" ]; then
     pass "end to end match: binary installed"
   else
-    fail "end to end match: no binary at $WORK/bin-ok/dux"
+    fail "end to end match: no binary at $WORK/bin-ok/yaran"
   fi
 
   # 7c. No checksum published at all: warns, and still installs.
@@ -349,7 +355,7 @@ if [ "$supported_os" -eq 1 ] && [ "$supported_arch" -eq 1 ]; then
   mkdir -p "$WORK/bin-nosum"
   out="$(run_main_offline "$WORK/bin-nosum")" || true
   printf -- '--- end to end, no checksum published ---\n%s\n' "$out"
-  if [ -x "$WORK/bin-nosum/dux" ] && [ "${out#*"WARNING: no published checksum"}" != "$out" ]; then
+  if [ -x "$WORK/bin-nosum/yaran" ] && [ "${out#*"WARNING: no published checksum"}" != "$out" ]; then
     pass "end to end no checksum: warned, and installed anyway"
   else
     fail "end to end no checksum: expected a warning and an installed binary"
@@ -362,7 +368,7 @@ if [ "$supported_os" -eq 1 ] && [ "$supported_arch" -eq 1 ]; then
   #      and a SHA256SUMS with no line for this archive is "no published
   #      checksum", not a pass.
   case "$arch_now" in x86_64|amd64) arch_name=amd64 ;; *) arch_name=arm64 ;; esac
-  this_archive="dux-${os_now}-${arch_name}.tar.gz"
+  this_archive="yaran-${os_now}-${arch_name}.tar.gz"
   (
     cd "$WORK/release"
     for f in *.tar.gz; do
@@ -372,7 +378,7 @@ if [ "$supported_os" -eq 1 ] && [ "$supported_arch" -eq 1 ]; then
   mkdir -p "$WORK/bin-sums-ok"
   out="$(run_main_offline "$WORK/bin-sums-ok")" || true
   printf -- '--- end to end, combined SHA256SUMS only ---\n%s\n' "$out"
-  if [ -x "$WORK/bin-sums-ok/dux" ] && [ "${out#*"Checksum verified"}" != "$out" ]; then
+  if [ -x "$WORK/bin-sums-ok/yaran" ] && [ "${out#*"Checksum verified"}" != "$out" ]; then
     pass "end to end SHA256SUMS fallback: verified and installed"
   else
     fail "end to end SHA256SUMS fallback: expected a verified install"
@@ -384,7 +390,7 @@ if [ "$supported_os" -eq 1 ] && [ "$supported_arch" -eq 1 ]; then
   mkdir -p "$WORK/bin-sums-bad"
   out="$(run_main_offline "$WORK/bin-sums-bad")" || true
   printf -- '--- end to end, combined SHA256SUMS mismatch ---\n%s\n' "$out"
-  if [ ! -e "$WORK/bin-sums-bad/dux" ] && [ "${out#*"Checksum mismatch"}" != "$out" ]; then
+  if [ ! -e "$WORK/bin-sums-bad/yaran" ] && [ "${out#*"Checksum mismatch"}" != "$out" ]; then
     pass "end to end SHA256SUMS fallback mismatch: nothing installed"
   else
     fail "end to end SHA256SUMS fallback mismatch: a binary was installed or no mismatch reported"
@@ -415,9 +421,9 @@ if [ "$supported_os" -eq 1 ] && [ "$supported_arch" -eq 1 ]; then
     local install_dir="$1"
     (
       set +e
-      export DUX_VERSION="v9.9.9"
-      export DUX_INSTALL_DIR="$install_dir"
-      DUX_INSTALL_SH_LIB=1 source "$INSTALL_SH"
+      export YARAN_VERSION="yaran-v9.9.9"
+      export YARAN_INSTALL_DIR="$install_dir"
+      YARAN_INSTALL_SH_LIB=1 source "$INSTALL_SH"
       http_download() {
         local name="${1##*/}"
         [ -f "$WORK/release/$name" ] || return 1
@@ -434,11 +440,11 @@ if [ "$supported_os" -eq 1 ] && [ "$supported_arch" -eq 1 ]; then
   mkdir -p "$WORK/bin-fetchfail"
   out="$(run_main_fetchfail "$WORK/bin-fetchfail")" || true
   printf -- '--- end to end, checksum fetch failed ---\n%s\n' "$out"
-  if [ ! -x "$WORK/bin-fetchfail/dux" ]; then
+  if [ ! -x "$WORK/bin-fetchfail/yaran" ]; then
     fail "end to end fetch failure: the archive downloaded, so the install should proceed"
   elif [ "${out#*"could not be fetched"}" = "$out" ]; then
     fail "end to end fetch failure: expected a warning naming the failed fetch"
-  elif [ "${out#*"before dux"}" != "$out" ]; then
+  elif [ "${out#*"before yaran"}" != "$out" ]; then
     fail "end to end fetch failure: must not claim the release predates checksums"
   else
     pass "end to end fetch failure: warned about the fetch, installed anyway"
@@ -469,7 +475,7 @@ else
   cat > "$WORK/fixture.py" <<'PY'
 import http.server, socketserver, sys, threading
 
-BODY = b"0000000000000000000000000000000000000000000000000000000000000000  dux-test.tar.gz\n"
+BODY = b"0000000000000000000000000000000000000000000000000000000000000000  yaran-test.tar.gz\n"
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -522,7 +528,7 @@ PY
       local tool="$1" url="$2" dest="$WORK/fetched.out"
       (
         # shellcheck disable=SC1090
-        DUX_INSTALL_SH_LIB=1 source "$INSTALL_SH"
+        YARAN_INSTALL_SH_LIB=1 source "$INSTALL_SH"
         # AFTER the source, not before: install.sh's own `set -euo pipefail` runs
         # when it is sourced, so an outcome of 1 or 2 (which is the entire point
         # of this function) would otherwise kill the subshell before it reports.

@@ -1,11 +1,11 @@
 # Session database schema
 
-dux stores session metadata in `sessions.sqlite3`. There is no numbered
-migration ledger: `SessionStore::migrate()` in `crates/dux-core/src/storage.rs`
+yaran stores session metadata in `sessions.sqlite3`. There is no numbered
+migration ledger: `SessionStore::migrate()` in `crates/yaran-core/src/storage.rs`
 runs on every open, creating tables with `create table if not exists` and adding
 newer columns with the idempotent `ensure_column` helper. See
 [the schema policy](../contributing/schema-policy.md) for the rules and
-`crates/dux-core/tests/upgrade_database.rs` for the upgrade tests.
+`crates/yaran-core/tests/upgrade_database.rs` for the upgrade tests.
 
 The sections below describe the fork's additions to that schema. Each lands as
 its own appended block in `migrate()`.
@@ -52,11 +52,11 @@ so there is no parent-table rebuild to survive.
 
 ## AMQ ownership metadata
 
-Each DUX_HOME has a stable UUID in `store-id`. Creation is serialized by
+Each YARAN_HOME has a stable UUID in `store-id`. Creation is serialized by
 `.store-id.lock`. The UUID is written and synced once, then reused across
 restarts.
 
-Under a configured shared AMQ root, `agents/<agent_handle>/.dux-amq-source`
+Under a configured shared AMQ root, `agents/<agent_handle>/.yaran-amq-source`
 is an atomic JSON ownership record containing `store_id`, `session_id`, and an
 optional legacy `wake_pid` left by pre-managed-wake installs. New wrappers let
 AMQ bind wake to the provider process and record its lifecycle in `.wake.lock`

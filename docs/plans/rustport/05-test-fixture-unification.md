@@ -34,7 +34,7 @@ tests reaching private items via `use super::*`.
 | `peer.rs` | 2,281 | 1,332 | **949** | — |
 
   The 500-line arithmetic **does not work** without moving these.
-- **No file under `tests/` covers `src/app/`** — `dux::app` appears zero times across
+- **No file under `tests/` covers `src/app/`** — `yaran::app` appears zero times across
   all 13 integration test files, even though `lib.rs:14` declares `pub mod app` and
   `App` is public. Nor does any `tests/` file cover keybindings, themes, or CLI parsing.
 
@@ -92,7 +92,7 @@ promotion of a few genuinely integration-level tests into `tests/`.
 - [ ] Per-file before/after test counts recorded in the PR description and equal.
 - [ ] No `*_tests.rs` file exceeds 500 lines, or carries a justified
       `// allow-long-file:` directive.
-- [ ] `tests/` contains at least one file exercising `dux::app` (currently zero).
+- [ ] `tests/` contains at least one file exercising `yaran::app` (currently zero).
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings` still exits 0.
 - [ ] No assertion text changed in any migrated test (verify with
       `git diff --stat` showing pure moves plus the `#[path]` declarations).

@@ -6,7 +6,7 @@ order: 12
 ---
 
 The left sidebar holds every agent and every terminal. You have two ways to arrange
-it: pick a sort mode and let dux keep the list in order, or place things by hand.
+it: pick a sort mode and let yaran keep the list in order, or place things by hand.
 
 > [!NOTE]
 > There is one sort control, not one per kind. Whichever mode you pick applies to
@@ -36,7 +36,7 @@ picked out, and the pane title counts what survived.
 
 > [!NOTE]
 > The `✷` star means the same thing wherever you see it: this one lives in your own
-> folder, not in a working copy dux manages. A
+> folder, not in a working copy yaran manages. A
 > [standalone agent](/docs/creating-agents#running-an-agent-in-a-folder-you-already-have)
 > wears it over its folder and a standalone terminal wears it over its directory.
 > Anything owned keeps the `↳` arrow pointing at its owner.
@@ -50,7 +50,7 @@ command palette, which cycles the modes:
   everything else keeps its order. This is the default.
 - **Recently updated** and **Recently created**: newest at the top.
 - **By name**: alphabetical by title, or by branch when an agent is untitled.
-- **Manual**: your exact hand-placed order, left untouched by dux.
+- **Manual**: your exact hand-placed order, left untouched by yaran.
 
 Terminals follow the same choice. Sort by name and terminals sort by their command
 too; pick manual and each holds the spot you put it in.
@@ -78,13 +78,13 @@ commands appear only when you have a terminal to move; the agent ones are always
 > [!IMPORTANT]
 > Dragging or moving a row switches the sort to **manual**, for the whole list, agents
 > and terminals together, whichever surface you did it on. Otherwise a computed sort would snap your row straight back.
-> Cycle the sort to "active first" to hand the arranging back to dux.
+> Cycle the sort to "active first" to hand the arranging back to yaran.
 
 ## What sticks around
 
-Your **agent** order is saved. Quit dux, reopen it, and your agents come back in the
+Your **agent** order is saved. Quit yaran, reopen it, and your agents come back in the
 order you left them.
 
 Your **terminal** order is not, because terminals themselves do not survive a restart.
-A terminal is a live shell; when dux stops, it is gone. New terminals start in creation
+A terminal is a live shell; when yaran stops, it is gone. New terminals start in creation
 order until you rearrange them.

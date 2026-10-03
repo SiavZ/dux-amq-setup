@@ -696,7 +696,7 @@
 
   /* Semantic node roles. A DOT source picks one of these by class; it never
      picks a color. `d-outside` is the untrusted side of the boundary,
-     `d-gate` is whatever authenticates, `d-app` is dux itself, and `d-plain`
+     `d-gate` is whatever authenticates, `d-app` is yaran itself, and `d-plain`
      is scenery. */
   .diagram .d-outside > path,
   .diagram .d-outside > polygon {

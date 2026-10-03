@@ -61,7 +61,7 @@ written under.
     **skip under root** (`chmod 000` is a no-op for root), so a containerized CI running as
     root silently skips the only test proving rsync-warning surfacing works.
 12. **Run the environment-gated tests for real.** `install-idempotency.bats` tests 2–3 skip
-    unless `/data` exists and both `dux` and `amq` are on `PATH`. Assert they **ran**, not
+    unless `/data` exists and both `yaran` and `amq` are on `PATH`. Assert they **ran**, not
     merely that they did not fail.
 13. **Memory acceptance, measured.** 8 panes at 200 cols with saturated scrollback under
     100 MiB RSS (baseline: ~400 MiB at those settings, ~816 MiB at 16 panes). Record the
@@ -96,10 +96,10 @@ written under.
     versions, `cargo auditable build`, `strip`, CycloneDX SBOM, double-package + `cmp`
     reproducibility, build-provenance attestation, `SHA256SUMS`.
 23. **Verify the artifact contains the fork's own code** — extract and confirm `peer.rs`,
-    `amq_inject.rs`, `purge.rs`, `watch/`, and the `dux-amq-rust` applets are present. This
+    `amq_inject.rs`, `purge.rs`, `watch/`, and the `yaran-amq-rust` applets are present. This
     is the check whose absence produced finding F1.
 24. **Run the release smoke test** on clean Linux and clean macOS hosts: install via the
-    documented command, then `dux --version`, `dux doctor`, create an agent, send a peer
+    documented command, then `yaran --version`, `yaran doctor`, create an agent, send a peer
     message, and resume a session.
 25. **Confirm `/releases/latest` resolves** and the documented install path in `README.md`
     works end-to-end — the thing that returned HTTP 404 at baseline.
@@ -134,14 +134,14 @@ written under.
 # gates
 ci/check-file-length.sh
 cargo run -p xtask -- module-trees --check
-cargo modules orphans --deny --bin dux
-cargo modules dependencies --acyclic --bin dux
+cargo modules orphans --deny --bin yaran
+cargo modules dependencies --acyclic --bin yaran
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 
 # suites
 cargo test --workspace --all-features
-bats dux-amq/tests                    # as a non-root user, Rust binary on PATH
+bats yaran-amq/tests                    # as a non-root user, Rust binary on PATH
 
 # supply chain
 cargo audit                            # zero --ignore
@@ -149,13 +149,13 @@ cargo deny --all-features check
 
 # release verification
 gh release view <tag> --json assets
-tar tzf dux-linux-amd64.tar.gz | grep -E 'peer|amq_inject|purge|watch'
+tar tzf yaran-linux-amd64.tar.gz | grep -E 'peer|amq_inject|purge|watch'
 curl -s -o /dev/null -w '%{http_code}\n' \
   https://api.github.com/repos/SiavZ/dux-amq-setup/releases/latest   # expect 200
 
 # smoke, on clean Linux and clean macOS
 curl -fsSL https://raw.githubusercontent.com/SiavZ/dux-amq-setup/main/install.sh | bash
-dux --version && dux doctor && dux-amq --version
+yaran --version && yaran doctor && yaran-amq --version
 ```
 
 ## Risks

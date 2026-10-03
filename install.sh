@@ -3,19 +3,19 @@ set -euo pipefail
 
 # This fork's releases, not upstream's: upstream's builds carry none of the
 # AMQ/peer/watch features this repository ships (244b33c6, audit03 P1-07).
-# DUX_REPO exists for mirrors and tests.
-REPO="${DUX_REPO:-SiavZ/dux-amq-setup}"
-BINARY="dux"
+# YARAN_REPO exists for mirrors and tests.
+REPO="${YARAN_REPO-${DUX_REPO:-SiavZ/dux-amq-setup}}"
+BINARY="yaran"
 
 # Allow overriding the version and install directory via environment variables.
-VERSION="${DUX_VERSION:-}"
-INSTALL_DIR="${DUX_INSTALL_DIR:-}"
-DUX_TMPDIR=""
+VERSION="${YARAN_VERSION-${DUX_VERSION:-}}"
+INSTALL_DIR="${YARAN_INSTALL_DIR-${DUX_INSTALL_DIR:-}}"
+YARAN_TMPDIR=""
 
 log() { printf '%s\n' "$@" >&2; }
 err() { log "$@"; exit 1; }
 cleanup() {
-    [ -n "$DUX_TMPDIR" ] && rm -rf "$DUX_TMPDIR"
+    [ -n "$YARAN_TMPDIR" ] && rm -rf "$YARAN_TMPDIR"
 }
 
 detect_os() {
@@ -156,7 +156,7 @@ sha256_of() {
 # NOT protection against a tampered release. Anyone able to replace an archive on
 # the release page can replace the checksum file sitting beside it just as
 # easily, because both come from the same place over the same channel. Only
-# signed artifacts would defend against that, and dux does not sign releases yet.
+# signed artifacts would defend against that, and yaran does not sign releases yet.
 #
 # Outcomes:
 #   * checksum present and matching  -> return 0, install proceeds
@@ -203,7 +203,7 @@ verify_checksum() {
     if [ ! -s "$checksum_file" ]; then
         log ""
         log "WARNING: no published checksum for ${label}."
-        log "         The download was NOT verified. Releases published before dux"
+        log "         The download was NOT verified. Releases published before yaran"
         log "         started emitting checksums do not have one."
         log ""
         return 1
@@ -262,11 +262,11 @@ checksum_line_from_sums() {
 
 resolve_version() {
     if [ -n "$VERSION" ]; then
-        # Fork releases are tagged `dux-amq-vX.Y.Z`, so they never collide with
-        # upstream's `vX.Y.Z`. A bare `X.Y.Z` still gets the `v` prefix.
+        # New releases use yaran-vX.Y.Z. Historical dux-amq-vX.Y.Z tags
+        # remain immutable. A bare X.Y.Z selects the canonical Yaran tag.
         case "$VERSION" in
-            dux-amq-*|v*) echo "$VERSION" ;;
-            *)            echo "v$VERSION" ;;
+            yaran-v*|dux-amq-v*|v*) echo "$VERSION" ;;
+            *)                     echo "yaran-v$VERSION" ;;
         esac
         return
     fi
@@ -296,7 +296,7 @@ resolve_version() {
             "" \
             "Install a specific version instead:" \
             "  curl -sSfL https://github.com/${REPO}/releases/latest/download/install.sh \\" \
-            "    | DUX_VERSION=dux-amq-v0.1.1 bash" \
+            "    | YARAN_VERSION=dux-amq-v0.1.1 bash" \
             "" \
             "Available releases: https://github.com/${REPO}/releases"
     fi
@@ -323,30 +323,34 @@ resolve_install_dir() {
 }
 
 main() {
-    local os arch version install_dir archive base_url url checksum_file checksum_status
+    local os arch version install_dir archive base_url url checksum_file checksum_status archive_binary
 
     os="$(detect_os)"
     arch="$(detect_arch)"
     version="$(resolve_version)"
     install_dir="$(resolve_install_dir)"
-    archive="${BINARY}-${os}-${arch}.tar.gz"
+    archive_binary="$BINARY"
+    case "$version" in
+        dux-amq-v*|v*) archive_binary="dux" ;;
+    esac
+    archive="${archive_binary}-${os}-${arch}.tar.gz"
     base_url="https://github.com/${REPO}/releases/download/${version}"
     url="${base_url}/${archive}"
 
     log "Installing ${BINARY} ${version} (${os}/${arch}) to ${install_dir}"
 
-    DUX_TMPDIR="$(mktemp -d)"
+    YARAN_TMPDIR="$(mktemp -d)"
     trap cleanup EXIT
 
     log "Downloading ${url}..."
-    http_download "$url" "${DUX_TMPDIR}/${archive}"
+    http_download "$url" "${YARAN_TMPDIR}/${archive}"
 
-    # Fetching the checksum is best effort: releases from before dux published
+    # Fetching the checksum is best effort: releases from before yaran published
     # them answer this URL with a 404, and that must not abort the install. It
     # goes through http_fetch_optional rather than http_download so that a 404
     # and a failed request stay distinguishable, and the warning can name the
     # cause it actually observed.
-    checksum_file="${DUX_TMPDIR}/${archive}.sha256"
+    checksum_file="${YARAN_TMPDIR}/${archive}.sha256"
     checksum_status=0
     http_fetch_optional "${url}.sha256" "$checksum_file" || checksum_status=$?
 
@@ -356,25 +360,25 @@ main() {
     # of SHA256SUMS so those releases stay verified rather than warned through.
     if [ "$checksum_status" -eq 1 ]; then
         checksum_status=0
-        http_fetch_optional "${base_url}/SHA256SUMS" "${DUX_TMPDIR}/SHA256SUMS" || checksum_status=$?
+        http_fetch_optional "${base_url}/SHA256SUMS" "${YARAN_TMPDIR}/SHA256SUMS" || checksum_status=$?
         if [ "$checksum_status" -eq 0 ]; then
-            checksum_line_from_sums "${DUX_TMPDIR}/SHA256SUMS" "$archive" > "$checksum_file"
+            checksum_line_from_sums "${YARAN_TMPDIR}/SHA256SUMS" "$archive" > "$checksum_file"
         fi
     fi
 
     # A mismatch exits from inside here without installing anything. A missing or
     # unfetchable checksum warns and returns non-zero, which is not a failure of
     # the install.
-    verify_checksum "${DUX_TMPDIR}/${archive}" "$checksum_file" "$archive" "$checksum_status" || true
+    verify_checksum "${YARAN_TMPDIR}/${archive}" "$checksum_file" "$archive" "$checksum_status" || true
 
-    tar xzf "${DUX_TMPDIR}/${archive}" -C "$DUX_TMPDIR"
+    tar xzf "${YARAN_TMPDIR}/${archive}" -C "$YARAN_TMPDIR"
 
     # Install the binary: use sudo only if the target directory is not writable.
     if [ -w "$install_dir" ]; then
-        install -m 755 "${DUX_TMPDIR}/${BINARY}" "${install_dir}/${BINARY}"
+        install -m 755 "${YARAN_TMPDIR}/${archive_binary}" "${install_dir}/${BINARY}"
     else
         log "Installation directory ${install_dir} is not writable, using sudo..."
-        sudo install -m 755 "${DUX_TMPDIR}/${BINARY}" "${install_dir}/${BINARY}"
+        sudo install -m 755 "${YARAN_TMPDIR}/${archive_binary}" "${install_dir}/${BINARY}"
     fi
 
     log ""
@@ -388,10 +392,10 @@ main() {
     fi
 }
 
-# Setting DUX_INSTALL_SH_LIB=1 defines the functions above without installing
+# Setting YARAN_INSTALL_SH_LIB=1 defines the functions above without installing
 # anything, so the checksum logic can be driven directly by
 # .github/scripts/test_install_checksum.sh with no network and no release.
 # Nothing outside that test should set it.
-if [ "${DUX_INSTALL_SH_LIB:-}" != "1" ]; then
+if [ "${YARAN_INSTALL_SH_LIB-${DUX_INSTALL_SH_LIB:-}}" != "1" ]; then
     main
 fi

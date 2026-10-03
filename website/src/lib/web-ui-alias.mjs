@@ -2,7 +2,7 @@ import { createRequire } from "node:module"
 import { fileURLToPath } from "node:url"
 
 // The homepage figure imports the real React components out of
-// `crates/dux-web/web/src`, and two things must hold for that to resolve the way
+// `crates/yaran-web/web/src`, and two things must hold for that to resolve the way
 // it does inside the web app itself:
 //
 //   1. `@/…`, the web app's own alias for its `src` directory, which every one of
@@ -18,12 +18,12 @@ import { fileURLToPath } from "node:url"
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url))
 
-export const WEB_UI_SRC = here("../../../crates/dux-web/web/src")
-export const WEB_UI_MODULES = here("../../../crates/dux-web/web/node_modules")
+export const WEB_UI_SRC = here("../../../crates/yaran-web/web/src")
+export const WEB_UI_MODULES = here("../../../crates/yaran-web/web/node_modules")
 // The app's project root. The dev server must be allowed to READ from here, not
 // just resolve into it: the components pull real assets out of the app's
 // dependencies, and Vite refuses to serve a file outside its root unless allowed.
-export const WEB_UI_ROOT = here("../../../crates/dux-web/web")
+export const WEB_UI_ROOT = here("../../../crates/yaran-web/web")
 
 /**
  * Every React import, this project's and the app's components' alike, points at

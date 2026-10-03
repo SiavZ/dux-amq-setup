@@ -43,14 +43,14 @@ describe("mapResult", () => {
   it("normalizes the url, title, and excerpt", () => {
     const result = mapResult({
       url: "/docs/themes/index.html",
-      excerpt: "  Pick a   <mark>theme</mark> for dux.  ",
+      excerpt: "  Pick a   <mark>theme</mark> for yaran.  ",
       meta: { title: "Themes" },
       sub_results: [],
     });
     expect(result).toEqual({
       url: "/docs/themes",
       title: "Themes",
-      excerpt: "Pick a <mark>theme</mark> for dux.",
+      excerpt: "Pick a <mark>theme</mark> for yaran.",
       subResults: [],
     });
   });

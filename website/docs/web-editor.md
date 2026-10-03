@@ -57,11 +57,11 @@ agent's editor, with the full git surface.
 A terminal-rooted editor has no **Diff** view (a plain directory has no last-committed
 version to compare against) and no live changed-files updates. Everything else is the same
 editor, and freshness still works off the other two signals: come back to the tab, or
-click into it, and dux re-checks what is open.
+click into it, and yaran re-checks what is open.
 
 > [!WARNING]
 > An editor never outlives what it is rooted at. Close the terminal and its editor goes
-> with it, saying so rather than blanking. If you had unsaved text in it, dux stops and
+> with it, saying so rather than blanking. If you had unsaved text in it, yaran stops and
 > asks first, and keeps the words on screen so you can copy them out. There is nowhere left
 > to save them to.
 
@@ -90,7 +90,7 @@ Save with the button or with `Ctrl+S` / `Cmd+S`. A toast confirms the write, and
 renaming, moving and deleting each confirm with a toast naming what happened, or say
 plainly when something went wrong.
 
-The header also shows the file's syntax language as a dropdown. dux lets Monaco guess from
+The header also shows the file's syntax language as a dropdown. yaran lets Monaco guess from
 the file name, and when the guess is wrong (a `Cargo.lock` that is really TOML, a config
 file with no extension) you can pick the right one from the full list. The choice applies
 to the open file including its diff view, follows a rename or move, and lasts until you
@@ -108,7 +108,7 @@ take over.
 
 You can have as many permanent tabs as you like, each with its own edit history, scroll
 position and cursor location. Close a tab with its `×` control or a middle-click; if it has
-unsaved changes, dux asks before discarding them.
+unsaved changes, yaran asks before discarding them.
 
 ## Finding a file
 
@@ -125,7 +125,7 @@ the same status icon as the [Changes pane](/docs/web-git).
 
 The tree keeps up with files you did not create yourself, which is most of them when an
 agent is working in the worktree. It picks them up whenever the changed-file list moves,
-whenever you come back to the window or to dux's browser tab, and whenever you switch
+whenever you come back to the window or to yaran's browser tab, and whenever you switch
 editor tabs. **Search files…** is refreshed on the same occasions, so anything the tree
 has just shown you can also be found by name. For anything else, and for a file git never
 mentions, **Refresh files** in the explorer's `⋯` menu fetches the listing again on the
@@ -146,7 +146,7 @@ cap.
 Any file inside the worktree is editable. Open it, type, and the dirty dot appears; save
 writes it to disk.
 
-dux keeps you inside the worktree: files outside it, inside `.git`, or binary blobs come
+yaran keeps you inside the worktree: files outside it, inside `.git`, or binary blobs come
 back read-only or not at all, with a badge explaining why.
 
 Unsaved edits survive the editor closing. Close it with the button, Escape, or the
@@ -157,7 +157,7 @@ one real discard is closing a dirty **tab**, which still asks first.
 > Drafts live in the page, so a hard refresh or closing the browser tab loses them. The
 > browser asks before leaving while any draft is unsaved, even if the editor is closed at
 > the time. Save it or discard its tab and the prompt stops. The one silent exception: when
-> dux itself restarts the page reloads without asking, and in-page drafts do not survive.
+> yaran itself restarts the page reloads without asking, and in-page drafts do not survive.
 
 Two size limits, both generous:
 
@@ -177,12 +177,12 @@ changed on disk, offering **Reload from disk** (which confirms first, because it
 everything you typed) and **Keep mine**. If the file was deleted rather than changed, the
 notice says so and offers to close the tab or keep your copy open.
 
-**Your save cannot clobber the agent's work.** dux refuses a save that would overwrite a
+**Your save cannot clobber the agent's work.** yaran refuses a save that would overwrite a
 file changed since you opened it, and gives you three choices: overwrite anyway, reload the
 disk version, or cancel. Cancelling keeps your text exactly as typed.
 
 > [!NOTE]
-> dux does not watch the filesystem. It checks when git reports the file as changed, when
+> yaran does not watch the filesystem. It checks when git reports the file as changed, when
 > you come back to the browser window, and when you switch to the tab. The one gap is a
 > file that changes while you sit on its tab with the window already focused and git
 > silent, and looking away and back resolves it.
@@ -199,7 +199,7 @@ Right-click anywhere in the file tree:
   folder you right-clicked, resolved exactly as New File would. It pastes nothing into any
   terminal (see [Dropping and pasting files](/docs/dropping-files)) and is absent when the
   server has uploads switched off.
-- **Rename…** works on files and folders alike. If the file has unsaved changes, dux blocks
+- **Rename…** works on files and folders alike. If the file has unsaved changes, yaran blocks
   the rename until you save or discard them.
 - **Move…** puts the entry in a different folder, name unchanged. You get a folder browser
   opening on the folder the entry is already in, and the line above it always spells out
@@ -235,7 +235,7 @@ retargets those tabs, and a delete closes them.
 
 Drag files from your own machine onto the file tree and let go, and they are saved into the
 worktree on the server. This is how you get a logo, a fixture, a CSV or a screenshot **into
-the project** from a laptop that is not the machine dux runs on.
+the project** from a laptop that is not the machine yaran runs on.
 
 Where they land is where you point:
 
@@ -259,7 +259,7 @@ Nothing on disk is overwritten. If a name is taken the file is saved under a new
 a timestamp and a counter, and the toast tells you what it is called now. (**Move…** above
 instead refuses an occupied destination outright, because a move names one exact
 destination while a drop names only a folder. Neither overwrites.) Your filenames are kept
-exactly as you had them, accents and all, and a name dux cannot use is refused with the
+exactly as you had them, accents and all, and a name yaran cannot use is refused with the
 reason rather than rewritten.
 
 Dropping outside the worktree or into `.git` is refused, exactly as creating, renaming or
@@ -273,7 +273,7 @@ moving into either is.
 
 The tree and the file search pick them up as soon as they land.
 
-dux takes **files**, not folders. Dropping a folder is refused by name, with the files
+yaran takes **files**, not folders. Dropping a folder is refused by name, with the files
 dropped alongside it still saved, and one toast says which was which. A drop that misses the
 tree entirely, landing on the editor or the tab strip, does nothing at all, rather than the
 browser navigating the tab away and taking everything unsaved with it.
@@ -300,7 +300,7 @@ For Markdown files (`.md`, `.markdown`, and friends) a **Preview / Edit** toggle
 current buffer, unsaved edits included. It handles GitHub-flavored Markdown and rewrites
 relative image paths so they load from the worktree. A leading YAML frontmatter block is
 rendered the way GitHub renders it, as a key/value table above the page, with lists joined
-inline and a nested key shown as `parent.child`. Nothing you wrote is dropped: a value dux
+inline and a nested key shown as `parent.child`. Nothing you wrote is dropped: a value yaran
 cannot read is shown as your raw text, and so is a whole block it cannot make a table of.
 
 SVG files get the same treatment: they open as text and the toggle renders the drawing from
@@ -336,7 +336,7 @@ The **Open local editor ▾** dropdown launches **Cursor, VS Code, Zed, VSCodium
 Text** on the file.
 
 > [!IMPORTANT]
-> It spawns that editor **on the server** (the machine dux runs on), so it only makes sense
-> when you are sitting at that machine. dux enables it only for local-access URLs (loopback,
-> `0.0.0.0`, or a private LAN address) and disables it with a tooltip when you reached dux
+> It spawns that editor **on the server** (the machine yaran runs on), so it only makes sense
+> when you are sitting at that machine. yaran enables it only for local-access URLs (loopback,
+> `0.0.0.0`, or a private LAN address) and disables it with a tooltip when you reached yaran
 > over a remote URL.

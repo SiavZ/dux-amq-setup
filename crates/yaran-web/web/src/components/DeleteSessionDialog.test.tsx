@@ -1,0 +1,639 @@
+// @vitest-environment jsdom
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+
+import type { YaranState } from "@/lib/store"
+
+// Override `useYaran` (seeded spine + target) and spy the store actions the
+// dialog fires, while every other store export stays intact.
+let mockState: YaranState
+vi.mock("@/lib/store", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/store")>()
+  return {
+    ...actual,
+    useYaran: () => mockState,
+    deleteSession: vi.fn(),
+    closeDelete: vi.fn(),
+  }
+})
+
+// The branch-risk read is a real HTTP call; stub the one method the dialog
+// uses and leave the rest of the client alone.
+vi.mock("@/lib/sessionsApi", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/sessionsApi")>()
+  return {
+    ...actual,
+    sessionsApi: { ...actual.sessionsApi, branchUnpushed: vi.fn() },
+  }
+})
+
+function installBootStubs() {
+  const mem = new Map<string, string>()
+  vi.stubGlobal("localStorage", {
+    getItem: (k: string) => mem.get(k) ?? null,
+    setItem: (k: string, v: string) => void mem.set(k, String(v)),
+    removeItem: (k: string) => void mem.delete(k),
+    clear: () => mem.clear(),
+  })
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(() => Promise.reject(new Error("offline test"))),
+  )
+}
+installBootStubs()
+const { DeleteSessionDialog } = await import("./DeleteSessionDialog")
+const store = await import("@/lib/store")
+const api = await import("@/lib/sessionsApi")
+const deleteSession = vi.mocked(store.deleteSession)
+const closeDelete = vi.mocked(store.closeDelete)
+const branchUnpushed = vi.mocked(api.sessionsApi.branchUnpushed)
+
+function managed(branch: string) {
+  return {
+    kind: "managed" as const,
+    project_id: "p1",
+    branch_name: branch,
+    initial_branch: branch,
+    branch_provenance: "created" as const,
+    source_branch: "main",
+    worktree_path: "/tmp/" + branch,
+  }
+}
+
+const session1 = {
+  id: "s1",
+  title: "quacky-mallard",
+  workspace: managed("yaran/s1"),
+}
+const session2 = {
+  id: "s2",
+  title: "wobbly-duckling",
+  workspace: managed("yaran/s2"),
+}
+const attachedSession = {
+  id: "s3",
+  title: "attached",
+  workspace: {
+    kind: "managed" as const,
+    project_id: "p1",
+    branch_name: "develop",
+    initial_branch: "develop",
+    branch_provenance: "attached" as const,
+    source_branch: "main",
+    worktree_path: "/tmp/develop",
+  },
+}
+
+// An agent whose worktree has moved onto a branch it was not born on. Deleting
+// it removes BOTH branches, which is the case the dialog has to name in full.
+const driftedSession = {
+  id: "s6",
+  title: "drifted",
+  workspace: {
+    kind: "managed" as const,
+    project_id: "p1",
+    branch_name: "develop-next",
+    initial_branch: "develop",
+    branch_provenance: "attached" as const,
+    source_branch: "main",
+    worktree_path: "/tmp/develop",
+  },
+}
+
+function seed(target: string | null, sessions: unknown[]) {
+  mockState = {
+    deleteTarget: target,
+    spine: { sessions },
+  } as unknown as YaranState
+}
+
+beforeEach(() => {
+  installBootStubs()
+  deleteSession.mockClear()
+  closeDelete.mockClear()
+  branchUnpushed.mockReset()
+  branchUnpushed.mockResolvedValue({
+    branches: ["develop"],
+    unpushed: { count: 0, has_remote_refs: true },
+  })
+})
+
+afterEach(() => {
+  cleanup()
+  vi.unstubAllGlobals()
+})
+
+// A sentence with names in it is split across chips, so it is found by the
+// paragraph's whole text rather than by one text node.
+function paragraph(pattern: RegExp): HTMLElement {
+  const found = screen
+    .getAllByText((_, el) => el?.tagName === "P" && pattern.test(el.textContent ?? ""))
+  return found[0]
+}
+
+function chipsIn(el: HTMLElement): (string | null)[] {
+  return [...el.querySelectorAll("code")].map((c) => c.textContent)
+}
+
+describe("DeleteSessionDialog", () => {
+  it("opens for an existing session", () => {
+    seed("s1", [session1])
+    render(<DeleteSessionDialog />)
+    expect(screen.getByText("Delete agent?")).toBeTruthy()
+    expect(screen.getByText(/quacky-mallard/)).toBeTruthy()
+  })
+
+  // The branch is its own decision now, so it is its own box. It appears only
+  // once the worktree is going, because git will not delete a branch that is
+  // still checked out in a worktree.
+  it("offers the branch box only once the worktree box is ticked", () => {
+    seed("s1", [session1])
+    render(<DeleteSessionDialog />)
+    expect(screen.queryByRole("checkbox", { name: /Also delete the branch/ }))
+      .toBeNull()
+
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "Also delete the git worktree (irreversible)",
+      }),
+    )
+    expect(
+      screen.getByRole("checkbox", {
+        name: "Also delete the branch yaran/s1",
+      }),
+    ).toBeTruthy()
+  })
+
+  it("starts the branch box ticked for a branch yaran created", () => {
+    seed("s1", [session1])
+    render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("checkbox"))
+    const branchBox = screen.getByRole("checkbox", {
+      name: /Also delete the branch/,
+    })
+    expect(branchBox.getAttribute("aria-checked")).toBe("true")
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }))
+    expect(deleteSession).toHaveBeenCalledWith("s1", true, true)
+  })
+
+  // The mirror, and the reason the box is a control rather than a label: it
+  // spares a branch yaran would otherwise have deleted unasked.
+  it("sends a declined branch deletion for a branch yaran created", () => {
+    seed("s1", [session1])
+    render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("checkbox"))
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: /Also delete the branch/ }),
+    )
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }))
+    expect(deleteSession).toHaveBeenCalledWith("s1", true, false)
+  })
+
+  // With the worktree kept there is no branch offer on screen at all, so the
+  // request must carry no branch answer either: an answer nobody was asked for
+  // is the server deciding on a click that never happened.
+  it("sends no branch answer when the worktree is kept", () => {
+    seed("s1", [session1])
+    render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }))
+    expect(deleteSession).toHaveBeenCalledWith("s1", false, null)
+  })
+
+  // THE PIN. There is no worktree to remove and no branch to delete, so the
+  // checkbox is not merely unchecked, it does not exist: the offer cannot be
+  // rendered, so it cannot be ticked. The copy says the folder is untouched,
+  // because "removes the agent from yaran" alone reads as though something on
+  // disk went with it.
+  it("offers no worktree checkbox for a standalone agent, and says the folder is untouched", () => {
+    seed("sa1", [
+      {
+        id: "sa1",
+        title: "notes",
+        workspace: {
+          kind: "folder",
+          folder_path: "/home/someone/notes",
+          folder_label: "~/notes",
+          repo_status: "no_repo",
+          quiet_reason: "This folder has no git repository.",
+        },
+      },
+    ])
+    render(<DeleteSessionDialog />)
+    expect(screen.queryByRole("checkbox")).toBeNull()
+    expect(screen.getByText(/left untouched/i)).toBeTruthy()
+    expect(screen.getByText(/~\/notes/)).toBeTruthy()
+  })
+
+  // And the request that reaches the server must never ask for the removal:
+  // the default is false, and with no control to flip it there is no way for
+  // it to become true.
+  it("never asks the server to remove a standalone agent's folder", () => {
+    seed("sa1", [
+      {
+        id: "sa1",
+        title: "notes",
+        workspace: {
+          kind: "folder",
+          folder_path: "/home/someone/notes",
+          folder_label: "~/notes",
+          repo_status: "working_repo",
+          quiet_reason: "",
+        },
+      },
+    ])
+    render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }))
+    expect(deleteSession).toHaveBeenCalledWith("sa1", false, null)
+  })
+
+  // The checkbox state outlives one open: the dialog stays mounted. A box ticked
+  // for a managed agent and then reopened on a standalone one would send
+  // `delete_worktree: true` for an agent that has no worktree, which the server
+  // refuses out loud, with no control on screen to clear it.
+  it("does not carry a ticked worktree box over to a standalone agent", () => {
+    const standalone = {
+      id: "sa1",
+      title: "notes",
+      workspace: {
+        kind: "folder",
+        folder_path: "/home/someone/notes",
+        folder_label: "~/notes",
+        repo_status: "working_repo",
+        quiet_reason: "",
+      },
+    }
+    seed("s1", [session1, standalone])
+    const { rerender } = render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("checkbox"))
+
+    seed("sa1", [session1, standalone])
+    rerender(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }))
+    expect(deleteSession).toHaveBeenCalledWith("sa1", false, null)
+  })
+
+  // A branch that predates the agent is still offered, because the user may
+  // genuinely want it gone and nothing else can reach it once the worktree is
+  // removed. It starts UNTICKED and it comes with the sentence that says why.
+  it("offers a pre-existing branch unticked, with the warning that says why", () => {
+    seed("s3", [attachedSession])
+    render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("checkbox"))
+    const branchBox = screen.getByRole("checkbox", {
+      name: /Also delete the branch/,
+    })
+    expect(branchBox.getAttribute("aria-checked")).toBe("false")
+    expect(screen.getByText(/This branch existed before the agent\./)).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }))
+    expect(deleteSession).toHaveBeenCalledWith("s3", true, false)
+  })
+
+  it("sends the override when the user ticks a pre-existing branch", () => {
+    seed("s3", [attachedSession])
+    render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("checkbox"))
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: /Also delete the branch/ }),
+    )
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }))
+    expect(deleteSession).toHaveBeenCalledWith("s3", true, true)
+  })
+
+  it("warns about nothing for a branch yaran created", () => {
+    // The branch is yaran's own; there is no prior owner to warn about, and a
+    // sentence here would be noise on the one screen that must be read.
+    seed("s1", [session1])
+    render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("checkbox"))
+    expect(screen.queryByText(/existed before the agent/)).toBeNull()
+  })
+
+  it("says an adopted branch came with its worktree", () => {
+    seed("s4", [
+      {
+        id: "s4",
+        title: "adopted",
+        workspace: {
+          kind: "managed",
+          project_id: "",
+          branch_name: "main",
+          initial_branch: "main",
+          branch_provenance: "adopted",
+          source_branch: "",
+          worktree_path: "",
+        },
+      },
+    ])
+    render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("checkbox"))
+    expect(
+      screen.getByText(
+        /This branch came with the worktree this agent adopted\./,
+      ),
+    ).toBeTruthy()
+  })
+
+  // The count is a git answer that arrives after the dialog is already up, so
+  // the warning grows a sentence rather than waiting for it.
+  it("names how many commits are pushed nowhere once the count arrives", async () => {
+    branchUnpushed.mockResolvedValue({
+      branches: ["develop"],
+      unpushed: { count: 3, has_remote_refs: true },
+    })
+    seed("s3", [attachedSession])
+    render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("checkbox"))
+    expect(
+      await screen.findByText(/It has 3 commits not pushed anywhere\./),
+    ).toBeTruthy()
+  })
+
+  // In a repository with no remote-tracking refs the count is the whole
+  // history, because there is nowhere to have pushed to. "N commits not pushed
+  // anywhere" is true there and reads as an accusation; the sentence says what
+  // is actually the case instead.
+  it("words the count honestly when the repository has no remote", async () => {
+    branchUnpushed.mockResolvedValue({
+      branches: ["develop"],
+      unpushed: { count: 12, has_remote_refs: false },
+    })
+    seed("s3", [attachedSession])
+    render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("checkbox"))
+    expect(
+      await screen.findByText(
+        /Nothing on it has been pushed anywhere: all 12 of its commits exist only on this machine\./,
+      ),
+    ).toBeTruthy()
+    expect(screen.queryByText(/not pushed anywhere\./)).toBeNull()
+  })
+
+  // One commit is still a whole history, and "all 1 of its commits" is the
+  // sentence admitting a number was slotted into a plural.
+  it("counts a single unpushed commit in the singular", async () => {
+    branchUnpushed.mockResolvedValue({
+      branches: ["develop"],
+      unpushed: { count: 1, has_remote_refs: false },
+    })
+    seed("s3", [attachedSession])
+    render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("checkbox"))
+    expect(
+      await screen.findByText(
+        /Nothing on it has been pushed anywhere: its one commit exists only on this machine\./,
+      ),
+    ).toBeTruthy()
+  })
+
+  it("says nothing about commits when there are none unpushed", async () => {
+    branchUnpushed.mockResolvedValue({
+    branches: ["develop"],
+    unpushed: { count: 0, has_remote_refs: true },
+  })
+    seed("s3", [attachedSession])
+    render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("checkbox"))
+    expect(
+      await screen.findByText(/This branch existed before the agent\./),
+    ).toBeTruthy()
+    expect(screen.queryByText(/not pushed anywhere/)).toBeNull()
+  })
+
+  // git may simply not answer (the branch is already gone, the repository is
+  // locked). The warning that matters does not depend on it.
+  it("keeps the provenance warning when git cannot count", async () => {
+    branchUnpushed.mockRejectedValue(new Error("no repo"))
+    seed("s3", [attachedSession])
+    render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("checkbox"))
+    expect(
+      await screen.findByText(/This branch existed before the agent\./),
+    ).toBeTruthy()
+    expect(screen.queryByText(/not pushed anywhere/)).toBeNull()
+  })
+
+  it("asks git nothing until the branch box is on screen", () => {
+    // One git call, bought only where its answer is rendered: with the worktree
+    // kept there is no branch offer at all.
+    seed("s1", [session1])
+    render(<DeleteSessionDialog />)
+    expect(branchUnpushed).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole("checkbox"))
+    expect(branchUnpushed).toHaveBeenCalledWith("s1")
+  })
+
+  // THE CONSENT PIN, browser half. A drifted agent's delete removes the branch
+  // the worktree moved onto AND the one it was born on, so the box has to name
+  // both: a label promising one deletion would be taking consent for the other.
+  it("names both branches of a drifted agent, and counts them together", async () => {
+    branchUnpushed.mockResolvedValue({
+      branches: ["develop-next", "develop"],
+      unpushed: { count: 4, has_remote_refs: true },
+    })
+    seed("s6", [driftedSession])
+    render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("checkbox"))
+    expect(
+      screen.getByRole("checkbox", {
+        name: "Also delete the branches develop-next and develop",
+      }),
+    ).toBeTruthy()
+    await screen.findByRole("checkbox", {
+      name: "Also delete the branches develop-next and develop",
+    })
+    expect(
+      paragraph(
+        /The worktree moved from develop onto develop-next, so deleting the agent removes both\./,
+      ),
+    ).toBeTruthy()
+    expect(
+      paragraph(/They have 4 commits not pushed anywhere between them\./),
+    ).toBeTruthy()
+  })
+
+  // A branch yaran created still warns once the agent has drifted: the branch the
+  // worktree moved onto is not one yaran made, and the tick takes it too.
+  it("warns about a drifted agent even when yaran created its branch", () => {
+    seed("s7", [
+      {
+        id: "s7",
+        title: "drifted from yaran's own",
+        workspace: {
+          kind: "managed",
+          project_id: "p1",
+          branch_name: "yaran/s7-next",
+          initial_branch: "yaran/s7",
+          branch_provenance: "created",
+          source_branch: "main",
+          worktree_path: "/tmp/yaran-s7",
+        },
+      },
+    ])
+    render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("checkbox"))
+    expect(
+      paragraph(
+        /The worktree moved from yaran\/s7 onto yaran\/s7-next, so deleting the agent removes both\./,
+      ),
+    ).toBeTruthy()
+    expect(screen.queryByText(/existed before the agent/)).toBeNull()
+  })
+
+  // The server counted a set of branches; the dialog names THAT set rather than
+  // working it out again from its own copy of the session, so the question the
+  // user answers is the one the server would act on.
+  it("renders the branches the server answered with", async () => {
+    branchUnpushed.mockResolvedValue({
+      branches: ["develop", "older-branch"],
+      unpushed: { count: 0, has_remote_refs: true },
+    })
+    seed("s3", [attachedSession])
+    render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("checkbox"))
+    expect(
+      await screen.findByRole("checkbox", {
+        name: "Also delete the branches develop and older-branch",
+      }),
+    ).toBeTruthy()
+  })
+
+  // A provenance a NEWER server writes and this page has never heard of. The
+  // branch survives, so the dialog must say so, but it must not borrow one of
+  // the sentences it does know and assert something nobody here can know.
+  it("says only what is known about an unrecognized provenance", () => {
+    seed("s5", [
+      {
+        id: "s5",
+        title: "from the future",
+        workspace: {
+          kind: "managed",
+          project_id: "",
+          branch_name: "mystery",
+          initial_branch: "mystery",
+          branch_provenance: "unknown",
+          source_branch: "",
+          worktree_path: "",
+        },
+      },
+    ])
+    render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("checkbox"))
+    expect(
+      screen
+        .getByRole("checkbox", { name: /Also delete the branch/ })
+        .getAttribute("aria-checked"),
+    ).toBe("false")
+    expect(
+      screen.getByText(/This branch is not one yaran created\./),
+    ).toBeTruthy()
+    expect(screen.queryByText(/existed before the agent/)).toBeNull()
+  })
+
+  it("keeps the branch-deleting default for a server too old to say", () => {
+    // An older server omits the field, and it deletes the branch alongside the
+    // worktree, so the absent case must default to ticked rather than quietly
+    // promising the safer behavior.
+    seed("s1", [session1])
+    render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("checkbox"))
+    expect(
+      screen
+        .getByRole("checkbox", { name: /Also delete the branch/ })
+        .getAttribute("aria-checked"),
+    ).toBe("true")
+  })
+
+  it("calls closeDelete when the session vanishes mid-open", () => {
+    seed("s1", [session1])
+    const { rerender } = render(<DeleteSessionDialog />)
+    seed("s1", [])
+    rerender(<DeleteSessionDialog />)
+    expect(closeDelete).toHaveBeenCalled()
+  })
+
+  it("resets the checkbox on a vanish-close, so reopening for another session is unchecked", () => {
+    seed("s1", [session1])
+    const { rerender } = render(<DeleteSessionDialog />)
+
+    const checkbox = screen.getByRole("checkbox")
+    fireEvent.click(checkbox)
+    expect(checkbox.getAttribute("aria-checked")).toBe("true")
+
+    // The session vanishes mid-open, the dialog closes.
+    seed("s1", [])
+    rerender(<DeleteSessionDialog />)
+    expect(closeDelete).toHaveBeenCalled()
+
+    // Reopen for another existing session; the checkbox must render unchecked.
+    seed("s2", [session2])
+    rerender(<DeleteSessionDialog />)
+    expect(screen.getByText(/wobbly-duckling/)).toBeTruthy()
+    const reopenedCheckbox = screen.getByRole("checkbox")
+    expect(reopenedCheckbox.getAttribute("aria-checked")).toBe("false")
+  })
+})
+
+// Every name the dialog shows is the shared chip, and the chip replaces the
+// quotes the sentences used to wrap names in.
+describe("DeleteSessionDialog names", () => {
+  it("chips the agent's name in the opening sentence", () => {
+    seed("s1", [session1])
+    render(<DeleteSessionDialog />)
+    const opening = paragraph(/This removes the agent session/)
+    expect(opening.textContent).toBe(
+      "This removes the agent session quacky-mallard from yaran.",
+    )
+    expect(chipsIn(opening)).toEqual(["quacky-mallard"])
+  })
+
+  it("chips the branch in the branch box's label", () => {
+    seed("s1", [session1])
+    render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("checkbox"))
+    const box = screen.getByRole("checkbox", {
+      name: "Also delete the branch yaran/s1",
+    })
+    expect(box).toBeTruthy()
+    const label = document.querySelector('label[for="delete-branch"]') as HTMLElement
+    expect(chipsIn(label)).toEqual(["yaran/s1"])
+  })
+
+  it("chips both branches of a drifted agent, in the label and the warning", async () => {
+    branchUnpushed.mockResolvedValue({
+      branches: ["develop-next", "develop"],
+      unpushed: { count: 4, has_remote_refs: true },
+    })
+    seed("s6", [driftedSession])
+    render(<DeleteSessionDialog />)
+    fireEvent.click(screen.getByRole("checkbox"))
+    const box = await screen.findByRole("checkbox", {
+      name: "Also delete the branches develop-next and develop",
+    })
+    expect(box).toBeTruthy()
+    const label = document.querySelector('label[for="delete-branch"]') as HTMLElement
+    expect(chipsIn(label)).toEqual(["develop-next", "develop"])
+    const warning = paragraph(/The worktree moved from/)
+    expect(chipsIn(warning)).toEqual(["develop", "develop-next", "develop"])
+    expect(warning.textContent).toContain("develop existed before the agent.")
+  })
+
+  it("chips a standalone agent's folder with no quotes around it", () => {
+    seed("sa1", [
+      {
+        id: "sa1",
+        title: "notes",
+        workspace: {
+          kind: "folder",
+          folder_path: "/home/someone/notes",
+          folder_label: "~/notes",
+          repo_status: "no_repo",
+          quiet_reason: "This folder has no git repository.",
+        },
+      },
+    ])
+    render(<DeleteSessionDialog />)
+    const folder = paragraph(/Its folder/)
+    expect(chipsIn(folder)).toEqual(["~/notes"])
+    expect(folder.textContent).toContain("Its folder ~/notes is left untouched")
+  })
+})

@@ -5,11 +5,11 @@ This document is the long-form companion to the STRIDE table in
 the concrete attack scenario, the mitigation in code (with
 file:line references taken from `docs/audits/audit02/audit02.md`), the
 residual risk after mitigation, and the detection mechanism — what
-shows up in `dux.log` or `dux-amq doctor` output when the threat
+shows up in `yaran.log` or `yaran-amq doctor` output when the threat
 fires.
 
-Code paths below point at the crates workspace (`crates/dux-core`,
-`crates/dux-tui`). Line numbers from the audits refer to the older
+Code paths below point at the crates workspace (`crates/yaran-core`,
+`crates/yaran-tui`). Line numbers from the audits refer to the older
 single-crate layout, so treat them as hints and search by symbol.
 
 The audit reports in `docs/audits/` are point-in-time snapshots.
@@ -21,7 +21,7 @@ updated whenever new attack surface is added.
 ## T1 — Malicious repo executes through permission, sandbox, or hook-trust bypasses
 
 **Attack scenario.** An operator clones a third-party repository
-and opens a `dux` pane. The repo contains a `.claude/`
+and opens a `yaran` pane. The repo contains a `.claude/`
 configuration, a poisoned README, or a doc string that prompt-injects
 the running Claude session. Because the wrapper previously passed
 `--dangerously-skip-permissions` to `claude` and
@@ -36,13 +36,13 @@ CVE-2026-35020/35021/35022).
 
 **Mitigation in code.** Permission and sandbox bypasses are off by
 default. An operator who knowingly accepts the risk enables the
-per-session `yolo_permissions` setting. Dux maps that setting to
+per-session `yolo_permissions` setting. Yaran maps that setting to
 `CLAUDE_AMQ_YOLO=1` or `CODEX_AMQ_YOLO=1` for wrapper providers and to
 OpenCode's native `--auto` launch argument; OpenCode receives no such
 argument when the setting is false. Codex hook trust review is a
 separate control and remains enabled even in YOLO mode. Disabling that
 review requires the explicit `CODEX_AMQ_BYPASS_HOOK_TRUST=1` opt-in in
-`dux-amq/wrappers/codex-amq`. The wrappers also fail closed below the
+`yaran-amq/wrappers/codex-amq`. The wrappers also fail closed below the
 reviewed provider-CLI floors (Claude 2.1.163, Codex 0.39.0, Gemini
 0.39.1), including when a version string cannot be parsed.
 
@@ -67,7 +67,7 @@ in the error message.
 **Status: accepted-risk in single-user-VM mode.** The Phase 08
 HMAC mitigation is preserved as opt-in but no longer the default.
 The full reasoning lives below; the short version is that the
-mitigation defends against an attacker that doesn't exist in dux's
+mitigation defends against an attacker that doesn't exist in yaran's
 declared trust model.
 
 **Attack scenario.** Two panes share `$STATE_ROOT/amq`. Pane `bob`
@@ -81,25 +81,25 @@ way to verify the sender; AMQ wrappers
 
 **Why the original Phase 08 HMAC mitigation does not actually defend
 this surface.** Phase 08 added an HMAC-signed envelope: each
-`amq send` (via `dux-amq/scripts/amq-send-signed`) reads a per-VM
+`amq send` (via `yaran-amq/scripts/amq-send-signed`) reads a per-VM
 secret from `$AMQ_SECRET_PATH` (default
-`$HOME/.local/share/dux-amq/amq-secret`, mode 0600) and signs the
-payload + a nonce. The current DUX2 format binds the sender, recipient,
+`$HOME/.local/share/yaran-amq/amq-secret`, mode 0600) and signs the
+payload + a nonce. The current YARAN2 format binds the sender, recipient,
 UTC timestamp, 96-bit nonce, and base64 body. Receivers bind the signed
 recipient to their actual handle, preserve body bytes, and use atomic
 directory creation so simultaneous replay checks have one winner.
 Implementation-wise this works as designed.
 
 But the trust model in [SECURITY.md](../../SECURITY.md) explicitly
-states: *"dux runs as a single-user, single-Linux-account TUI. All
-panes spawned by dux share the same `$HOME`, the same filesystem
+states: *"yaran runs as a single-user, single-Linux-account TUI. All
+panes spawned by yaran share the same `$HOME`, the same filesystem
 permissions, and the same environment. There is no in-VM isolation
 between panes. One compromised pane = one compromised user account."*
 
 Inside that model, every "peer" is a process running as the same
 Linux user. Same-UID processes can:
 
-- `cat $HOME/.local/share/dux-amq/amq-secret` and forge envelopes
+- `cat $HOME/.local/share/yaran-amq/amq-secret` and forge envelopes
   with valid MACs (the secret is mode 0600 by the same UID).
 - `ptrace` the signing process and read the secret from memory.
 - `LD_PRELOAD` the signer to substitute the body before signing.
@@ -122,10 +122,10 @@ adding a meaningful defense.
 **Mitigation in code (current).**
 
 - The bridge defaults to **skip mode**: it byte-safely decodes a
-  `DUX2\t...` envelope when present, retains DUX1 compatibility for
+  `YARAN2\t...` envelope when present, retains YARAN1 compatibility for
   already queued messages, and treats plain bodies as raw. No HMAC check.
 - Strict mode is opt-in via `[amq.inject].verify_envelope = true`
-  in dux's `config.toml`. dux exports `DUX_AMQ_VERIFY=1` to
+  in yaran's `config.toml`. yaran exports `YARAN_AMQ_VERIFY=1` to
   spawned PTYs at bootstrap; the bridge calls
   `amq-receive-verify`; unsigned, misaddressed, replayed, stale, and
   MAC-mismatched envelopes are dropped silently. Reserved for environments that genuinely
@@ -148,14 +148,14 @@ risk is the original Phase 08 risk: attackers with read access to
 
 **Detection.** When strict mode is active, rejected envelopes are
 written to `$AMQ_GLOBAL_ROOT/agents/<me>/.wake.log` by
-`amq-receive-verify`'s stderr. dux's main JSON log records every
-delivered wake under `target: "dux::amq_inject"` for the
+`amq-receive-verify`'s stderr. yaran's main JSON log records every
+delivered wake under `target: "yaran::amq_inject"` for the
 post-bridge half of the path; the bridge itself stays silent on
 the happy path so AMQ's `--inject-via` retry contract is preserved.
 
 **Reverting accepted-risk status.** If a future deployment lands
 in a context where `same-UID` does become a meaningful boundary
-(e.g. a setuid-segregated multi-tenant variant of dux), this
+(e.g. a setuid-segregated multi-tenant variant of yaran), this
 section must be updated and `verify_envelope = true` shipped as
 the default. `[amq.inject].verify_envelope` was named
 deliberately so the policy flip is a one-line config change.
@@ -185,7 +185,7 @@ should additionally `chmod 0444` the wrapper and own it by root.
 
 **Detection.** A mismatch prints
 `AMQ binary integrity check failed — refusing to load` on every
-new shell, and the same line appears in `dux.log` when `dux-amq
+new shell, and the same line appears in `yaran.log` when `yaran-amq
 doctor` runs. The doctor's `amq.binary` section displays the
 expected vs actual sha pair.
 
@@ -193,8 +193,8 @@ expected vs actual sha pair.
 
 ## T4 — Spot-VM preemption mid-sqlite write
 
-**Attack scenario.** dux runs on a GCE spot VM. The VM is
-preempted while `crates/dux-core/src/storage.rs` is mid-transaction on
+**Attack scenario.** yaran runs on a GCE spot VM. The VM is
+preempted while `crates/yaran-core/src/storage.rs` is mid-transaction on
 `sessions.sqlite3`. Because the database opened with the default
 rollback journal and no `synchronous=NORMAL`/WAL settings
 (`storage.rs:22`), the operator returns to find a session row
@@ -214,9 +214,9 @@ check on launch but before the next backup still loses the
 intervening transactions. Filesystem-level corruption (failing
 disk) is outside the scope of WAL.
 
-**Detection.** `dux.log` records
+**Detection.** `yaran.log` records
 `sqlite integrity_check: ok` or the failing pragma output on every
-launch. `dux-amq doctor` surfaces the same line and the age of the
+launch. `yaran-amq doctor` surfaces the same line and the age of the
 most recent `.bak`. A failing `integrity_check` is the operator's
 cue to restore from `.bak`.
 
@@ -245,7 +245,7 @@ provider CLIs require plaintext credential files at runtime.
 Snapshots taken *after* the disk is mounted-and-decrypted on a
 running VM are still cleartext from the cloud's perspective.
 
-**Detection.** `dux-amq doctor`'s `encryption` line reports
+**Detection.** `yaran-amq doctor`'s `encryption` line reports
 `encrypted (gocryptfs)`, `encrypted (luks)`, or `plaintext — at
 risk`. The installer prints the same warning at first run.
 
@@ -255,13 +255,13 @@ risk`. The installer prints the same warning at first run.
 
 **Attack scenario.** A customer requests deletion of their data
 under GDPR Art. 17. The operator runs the existing
-`reset_agent_data` (`crates/dux-tui/src/cli.rs`), which removes worktrees,
-sqlite, and `dux.log`. It does **not** touch
+`reset_agent_data` (`crates/yaran-tui/src/cli.rs`), which removes worktrees,
+sqlite, and `yaran.log`. It does **not** touch
 `~/.claude/projects/<encoded>/*.jsonl` or
 `/data/state/{codex,gemini}/`. Every prompt and response with
 potential PII survives the delete.
 
-**Mitigation in code.** `dux session purge --hard <target>` resolves a UUID or
+**Mitigation in code.** `yaran session purge --hard <target>` resolves a UUID or
 immutable agent handle, and accepts a branch only when it maps to exactly one
 row. For isolated sessions it cascades through the managed worktree, encoded
 provider-history directories, the exact-owner AMQ inbox, session-scoped log
@@ -273,17 +273,17 @@ guard. Any failed step retains the SQLite identity for retry, and bulk purge
 retains rows whose full target inventory cannot be planned.
 
 Shared sessions never remove the registered checkout. Per-session provider
-history cannot be honestly attributed because sibling Dux sessions and non-Dux
+history cannot be honestly attributed because sibling Yaran sessions and non-Yaran
 conversations use the same provider directory. The default plan therefore
 reports an explicit `INCOMPLETE` item and retains the row, while still erasing
 provably owned AMQ and log records. The operator may explicitly accept residual
-provider data, or confirm a workspace-wide purge that covers every Dux session
+provider data, or confirm a workspace-wide purge that covers every Yaran session
 on that canonical path. The latter deletes the shared provider directory and
-therefore also deletes non-Dux conversations stored under the same workspace.
+therefore also deletes non-Yaran conversations stored under the same workspace.
 `PURGE ALL` is not workspace-wide provider-history consent: bulk purge retains
 shared provider history and its recovery rows while reporting them incomplete.
 
-`dux config reset --all` loads config, active rows, tombstones, durable store
+`yaran config reset --all` loads config, active rows, tombstones, durable store
 identity, and the complete registered-project inventory before its first
 destructive step. It aborts on any incomplete/corrupt inventory, frees every
 exactly-owned AMQ inbox before deleting SQLite, and never removes a shared
@@ -297,7 +297,7 @@ per-session purge that accepts residual data intentionally leaves provider
 transcripts and reports that fact in its purge summary.
 
 **Detection.** Each successful purge logs `session purged
-session_id=<id> files=<n> bytes=<m>` at INFO. `dux-amq doctor
+session_id=<id> files=<n> bytes=<m>` at INFO. `yaran-amq doctor
 --anonymize` reports the count of purges in the last 24 h, which
 the operator can use as a GDPR audit trail.
 
@@ -305,13 +305,13 @@ the operator can use as a GDPR audit trail.
 
 ## T7 — Cross-store or normalized wrapper identity collision
 
-**Attack scenario.** Two DUX_HOME stores share one AMQ root and independently
+**Attack scenario.** Two YARAN_HOME stores share one AMQ root and independently
 allocate the same normalized handle, or a standalone wrapper/path marker
 already occupies that physical `agents/<handle>` key. An unlocked
 read-modify-write can also lose one writer's `config.json` registration. Either
 case can redirect delivery or let one store prune another store's identity.
 
-**Mitigation in code.** Every DUX_HOME has a durable `store-id`. Dux persists
+**Mitigation in code.** Every YARAN_HOME has a durable `store-id`. Yaran persists
 the session UUID and handle before provider launch, then Rust and all three
 wrappers use the same mandatory `flock` on `meta/config.lock` for complete
 owner-marker and registry updates. The atomic marker binds `store_id` and
@@ -329,21 +329,21 @@ an AMQ wrapper has no owner-bound wake, so deletion can reserve/remove its
 registry identity but has no notifier process to manage.
 
 **Detection.** Missing lock support and owner mismatches fail closed with an
-explicit wrapper or `dux::peer` error. `amq doctor --ops` reports managed-wake
+explicit wrapper or `yaran::peer` error. `amq doctor --ops` reports managed-wake
 health. A recycled legacy wake PID that no longer identifies `amq wake` is
 logged and left untouched.
 
 ---
 
-## T8 — Log injection via PTY content into `dux.log`
+## T8 — Log injection via PTY content into `yaran.log`
 
 **Attack scenario.** Producers feed unfiltered byte streams into
 `logger.rs:84-92`: `String::from_utf8_lossy(&output.stderr)` from
-`crates/dux-core/src/git.rs`, GitHub PR titles via `gh pr view`,
+`crates/yaran-core/src/git.rs`, GitHub PR titles via `gh pr view`,
 `/proc/<pid>/comm` from `pty.rs:521-525`, arbitrary user paths.
 A hostile branch name, PR title, or process name with embedded
-ANSI/OSC/DCS bytes lands verbatim in `dux.log`. When the operator
-runs `tail dux.log` or `less dux.log`, those bytes execute as
+ANSI/OSC/DCS bytes lands verbatim in `yaran.log`. When the operator
+runs `tail yaran.log` or `less yaran.log`, those bytes execute as
 terminal escapes: OSC 0/2 rewrites the terminal title, OSC 8
 drops a covering hyperlink, OSC 52 paste-injects clipboard, DCS
 sequences can corrupt subsequent rendering. Same incident class
@@ -351,22 +351,22 @@ as Rails CVE-2025-55193.
 
 **Mitigation in code.** Phase 03 introduces
 `for_terminal(s: &str) -> String` (lives in
-`crates/dux-core/src/sanitize.rs`) which strips
+`crates/yaran-core/src/sanitize.rs`) which strips
 `[\x00-\x08\x0b-\x1f\x7f\x1b]`. Every `logger::*` call and every
-`set_error`/`set_info` status-line writer (`crates/dux-tui/src/app/workers.rs`,
-`crates/dux-tui/src/app/sessions.rs`, `crates/dux-tui/src/app/input.rs`) now routes through
+`set_error`/`set_info` status-line writer (`crates/yaran-tui/src/app/workers.rs`,
+`crates/yaran-tui/src/app/sessions.rs`, `crates/yaran-tui/src/app/input.rs`) now routes through
 the sanitizer. The 17 `git.rs` `anyhow!` sites listed in P0-C
 are wrapped at the consumer side.
 
 **Residual risk.** Bytes that escape the regex (legitimate UTF-8
 that happens to look adversarial when mis-rendered) can still
 confuse a viewer that interprets the file as something other than
-plain text. Operators who `cat dux.log` into a tool that
+plain text. Operators who `cat yaran.log` into a tool that
 re-escapes are on their own.
 
 **Detection.** The sanitizer replaces each stripped byte with its
 `\xNN` hex form (see `for_terminal`), so a hostile payload stays visible
-in `dux.log` as escaped bytes rather than vanishing. A spike in those
+in `yaran.log` as escaped bytes rather than vanishing. A spike in those
 escapes is the signal that something upstream is producing hostile
 content. `doctor` does not currently surface a count; tracked
 for a future iteration.
@@ -386,17 +386,17 @@ memory cap and no PTY-count cap.
 (default 0, no cap), `max_total_scrollback_mb` (default 256), and a
 pair of disk thresholds (`disk_high_water_pct` default 95, which
 refuses new agents; `disk_warn_pct` default 80, which warns). The
-agent-creation path (`crates/dux-core/src/engine/command.rs`, via
+agent-creation path (`crates/yaran-core/src/engine/command.rs`, via
 `Engine::refuse_agent_spawn_for_limits` and `soft_warn_for_pane_count`)
 consults the caps and refuses with a status-line error when a hard cap is
 set and exceeded. A disk watchdog refuses new agents at the high-water mark.
 
 **Residual risk.** A fork-bomb inside an existing pane (`while :;
-do bash & done`) is invisible to dux's pane counter — that's an
+do bash & done`) is invisible to yaran's pane counter — that's an
 OS-level concern. Per-pane RSS is not bounded; we count panes,
 not megabytes.
 
-**Detection.** `dux.log` records the refusal message from
+**Detection.** `yaran.log` records the refusal message from
 `LimitsConfig::refuse_agent_spawn` at WARN, naming the knob that
 blocked the spawn (`limits.max_panes = N` or
 `limits.disk_high_water_pct = N%`) and the way out. `doctor` reports
@@ -425,7 +425,7 @@ preventive — a fast attacker still exhausts inodes between
 checks. A real fix requires upstream rate limiting in `amq`
 itself.
 
-**Detection.** `dux.log` logs
+**Detection.** `yaran.log` logs
 `amq: inbox <handle> reached <n> messages` at WARN every 1 000
 messages. `doctor`'s `amq queue depth` and `oldest message age`
 fields surface the flood.
@@ -439,12 +439,12 @@ fields surface the flood.
 write access to `$HOME` (e.g. via T1) replaces the symlink with
 one pointing into an attacker-controlled directory containing
 forged `.credentials.json`, forged `projects/`, and a poisoned
-`skills/` tree. On the next dux launch every spawned `claude`
+`skills/` tree. On the next yaran launch every spawned `claude`
 pane reads attacker-controlled credentials and skills.
 
 **Mitigation in code.** **Planned, not yet implemented.** The
 audit lists this as `future`. The intended mitigation is a
-launch-time check in `dux-amq doctor` and the dux startup path
+launch-time check in `yaran-amq doctor` and the yaran startup path
 that resolves `~/.claude` and refuses to launch (or warns
 loudly) if the resolved target is not the recorded canonical
 path. Until then, `SECURITY.md` documents this as a known gap.
@@ -453,7 +453,7 @@ path. Until then, `SECURITY.md` documents this as a known gap.
 unmitigated. Operators on shared hosts should
 `chattr +i ~/.claude` after install.
 
-**Detection.** `dux-amq doctor`'s Symlinks section already prints
+**Detection.** `yaran-amq doctor`'s Symlinks section already prints
 each of `~/.claude`, `~/.agents`, `~/.codex`, `~/.gemini` with its
 target and warns when the target is not under the state root (or the
 entry is not a symlink at all). Comparing the recorded canonical path
@@ -463,7 +463,7 @@ against a launch-time check remains future work.
 
 ## T12 — Auto-resume thundering herd on spot-VM reboot
 
-**Attack scenario.** A spot VM is preempted with 50 active dux
+**Attack scenario.** A spot VM is preempted with 50 active yaran
 sessions. On reboot, the startup relaunch pass
 (`Engine::queue_startup_launches` + `Engine::pump_startup_launches`)
 would fire every session's PTY spawn and TLS handshake at once: API
@@ -471,7 +471,7 @@ rate-limit responses, exhausted file descriptors, and OOM during the
 resume burst — which itself triggers another preempt-resume cycle.
 
 **Mitigation in code.** Phase 15 introduces a bounded scheduler
-(`crates/dux-core/src/auto_resume.rs`) driven by the `[auto_resume]`
+(`crates/yaran-core/src/auto_resume.rs`) driven by the `[auto_resume]`
 config block: `concurrency` (default 4) caps startup launches in
 flight, `stagger_ms` (default 250) spaces two dispatches apart, and
 `stale_days` (default 30) skips agents whose directory went untouched
@@ -505,13 +505,13 @@ bytes back into the agent. Two distinct abuse paths follow:
    print specific text) crafts a payload that triggers pathological
    regex behavior, freezing the UI thread on every render tick.
 2. **Spurious-fire.** An attacker crafts output that *legitimately*
-   matches the user's rule, causing dux to write the rule's
+   matches the user's rule, causing yaran to write the rule's
    `text` (e.g. `"please continue"`) back into the agent. For the
    shipped default this only resumes a Claude conversation, but a
    user with a custom rule (e.g. an "auto-yes" pattern) could be
    tricked into auto-confirming dangerous actions.
 
-**Mitigation in code** (`crates/dux-core/src/watch/`, `crates/dux-tui/src/app/mod.rs`).
+**Mitigation in code** (`crates/yaran-core/src/watch/`, `crates/yaran-tui/src/app/mod.rs`).
 
 - *Linear-time matching.* Rules compile via the `regex` crate's
   NFA engine, which is guaranteed linear in input length —
@@ -552,7 +552,7 @@ rules **never** evaluate during oneshot mode (commit-message
 generation), only during interactive PTY sessions in
 `SessionState::Live`.
 
-**Detection.** `dux.log` records
+**Detection.** `yaran.log` records
 `watch rule load error` at WARN whenever a rule fails to compile
 (regex too big, malformed, etc.) and
 `watch send_text failed` at WARN if a PTY write fails after a
@@ -562,14 +562,14 @@ rule fires. The status line surfaces every rule fire
 
 ---
 
-## T14 — Malicious file in `~/.local/share/dux-amq/inject-queue/` injects unauthorised text into a dux session
+## T14 — Malicious file in `~/.local/share/yaran-amq/inject-queue/` injects unauthorised text into a yaran session
 
-**Attack scenario.** dux's drainer (`crate::amq_inject` and
+**Attack scenario.** yaran's drainer (`crate::amq_inject` and
 `crate::app::inject_runtime`) reads files from a per-receiver
-queue under `~/.local/share/dux-amq/inject-queue/<receiver>/<ts>.msg`
+queue under `~/.local/share/yaran-amq/inject-queue/<receiver>/<ts>.msg`
 and types each body into the matching session's PTY. An attacker
 with same-UID write access to the queue dir — i.e. anyone running
-as the dux operator (per the trust model T2 already concedes) —
+as the yaran operator (per the trust model T2 already concedes) —
 can drop a hand-crafted `.msg` file. The drainer would type it
 into whichever session matches the parent directory name, with
 `\r` to submit. Concretely: drop
@@ -591,7 +591,7 @@ any agent-side filtering on AMQ message metadata.
 - Receiver subdirectories that don't match the wrapper's
   sanitisation regex (`[a-z0-9_-]+`, no `..`, no leading dash).
   Anything else is logged at WARN and skipped.
-- Inflight files left behind by a crashed prior dux instance are
+- Inflight files left behind by a crashed prior yaran instance are
   reclaimed at startup (renamed back to `.msg`); bridge-format
   `mktemp .inflight.XXXXXX` files (no `.msg` suffix) are skipped
   on purpose so a concurrent in-progress write isn't corrupted. If a
@@ -617,7 +617,7 @@ drainer's *own* failure modes bounded — operator error and
 filesystem hiccups — rather than to harden against a hostile peer.
 
 **Detection.** Rejections log at WARN under
-`target: "dux::amq_inject"` with `path` and `reason` fields.
+`target: "yaran::amq_inject"` with `path` and `reason` fields.
 Successful deliveries log at INFO with a body preview. The
 status line surfaces "no session matches receiver X" warnings
 (rate-limited to once per minute per receiver) when a queued file
@@ -627,18 +627,18 @@ can't be routed.
 
 ## T15 — Tampered `agent_sessions.session_settings` blob escalates a session into autonomous mode
 
-**Vector.** An attacker (or a buggy version of dux itself) writes a
+**Vector.** An attacker (or a buggy version of yaran itself) writes a
 malformed JSON value into `agent_sessions.session_settings`, or
 crafts one that explicitly enables `yolo_permissions: true` /
 `mode: worker` / `auto_clear_on_task_done: true` for a session the
-operator never opted in. On the next dux launch — or the next time
+operator never opted in. On the next yaran launch — or the next time
 that session re-spawns — those settings would normally drive a
 provider bypass (`CLAUDE_AMQ_YOLO=1` or OpenCode's `--auto`), AMQ
 postscript injection (asking the agent to emit `[task-done]`), and
 the built-in auto-clear watch rule.
 
 The attacker model is the same as T1 / T14: same-UID code with
-write access to `~/.dux/sessions.sqlite3`. The novelty is that the
+write access to `~/.yaran/sessions.sqlite3`. The novelty is that the
 sqlite blob is now load-bearing for autonomous behaviour, which
 makes the parser the primary attack surface.
 
@@ -646,9 +646,9 @@ makes the parser the primary attack surface.
 boundary:
 
 - `SessionSettings::parse_or_default(raw)` (in
-  `crates/dux-core/src/session_settings.rs`, called by
+  `crates/yaran-core/src/session_settings.rs`, called by
   `SessionStore::load_session_settings` in
-  `crates/dux-core/src/storage.rs`)
+  `crates/yaran-core/src/storage.rs`)
   returns `Self::default()` for `None`, empty string, or any blob
   that fails `serde_json::from_str`. The fallback emits a WARN
   carrying the parse error so post-hoc forensics can see what was
@@ -663,9 +663,9 @@ boundary:
   default).
 - Every consumer reads through this filter. PTY launches compose the
   environment through
-  `crates/dux-core/src/agent_env.rs::agent_launch_env` (which layers
-  `SessionSettings::to_pty_env` on the Dux identity variables), and
-  `crates/dux-core/src/amq/delivery.rs::apply_inject_postscript`
+  `crates/yaran-core/src/agent_env.rs::agent_launch_env` (which layers
+  `SessionSettings::to_pty_env` on the Yaran identity variables), and
+  `crates/yaran-core/src/amq/delivery.rs::apply_inject_postscript`
   consults the session's mode for the postscript decision. None of
   those paths read the raw column text directly.
 
@@ -686,10 +686,10 @@ operator-derived key, currently tracked under T5
 (encryption-at-rest playbook).
 
 **Detection.** Malformed-blob rejections log at WARN under
-`dux::session_settings` with the raw input. Settings-driven
+`yaran::session_settings` with the raw input. Settings-driven
 decisions (env var set, postscript appended, built-in rule
 attached) log at DEBUG under the same target so an operator
-running with `RUST_LOG=dux::session_settings=debug` can audit
+running with `RUST_LOG=yaran::session_settings=debug` can audit
 which session enabled what.
 
 ---
@@ -697,9 +697,9 @@ which session enabled what.
 ## T16 — Shared-workspace provider mutates the registered checkout
 
 **Attack scenario.** Shared-workspace mode deliberately launches a provider in
-the user's registered checkout rather than a Dux-owned worktree. A surprising
+the user's registered checkout rather than a Yaran-owned worktree. A surprising
 default change could expose an existing installation to writes it previously
-expected to be isolated. If Dux later confused that checkout with a managed
+expected to be isolated. If Yaran later confused that checkout with a managed
 worktree, automatic branch, cleanup, or link operations could also mutate the
 real repository.
 
@@ -708,7 +708,7 @@ an existing config with no `[workspace]` table resolves to `worktree`, while a
 fresh canonical config writes `default_mode = "shared"` explicitly. A
 per-project override can restore isolation. Before registration, creation, and
 reconnect, shared paths are canonicalized and rejected when they resolve under
-the Dux state or worktree roots. The creation modal identifies shared mode and
+the Yaran state or worktree roots. The creation modal identifies shared mode and
 shows the real checkout path. Persisted `shared_workspace` state, rather than
 path equality or the current project default, gates lifecycle behavior: shared
 sessions set neither worktree nor branch ownership, do not create the repository
@@ -718,10 +718,10 @@ UUID starts fresh and is captured before it can become resumable. Fork is an
 explicit isolation boundary and always creates a worktree.
 
 **Residual risk.** Running a provider in a real checkout grants it the same file
-permissions as the operator and is the purpose of shared mode; Dux is not a
+permissions as the operator and is the purpose of shared mode; Yaran is not a
 sandbox. Shared writers use one index and staging area: one writer can stage,
 unstage, commit, discard, or overwrite another's changes and can switch the
-branch beneath every sibling. Another `DUX_HOME` and unmanaged same-UID
+branch beneath every sibling. Another `YARAN_HOME` and unmanaged same-UID
 processes cannot be observed reliably. Operators who need independent changes
 must use worktree mode or Fork.
 
@@ -731,7 +731,7 @@ confirmation. A persistent header warning is derived from live session state
 on every render and is deliberately labeled `CURRENT STORE ONLY`; it does not
 claim visibility into other stores or unmanaged processes. The database retains
 `shared_workspace = 1`, and eligibility failures are shown before provider
-launch. Branch and PR status are derived from the checkout's live HEAD so Dux
+launch. Branch and PR status are derived from the checkout's live HEAD so Yaran
 does not present a stale per-session branch as authoritative.
 
 ---
@@ -759,7 +759,7 @@ it. The per-item warning reports the last inventoried dirty state; operators
 must review it before confirmation.
 
 **Detection.** Inventory and fail-closed errors use the
-`dux::orphan_worktrees` tracing target. The modal displays the exact sanitized
+`yaran::orphan_worktrees` tracing target. The modal displays the exact sanitized
 path, branch, and dirty status and returns to the remaining candidate list after
 each removal.
 
@@ -769,13 +769,13 @@ each removal.
 
 **Attack scenario.** Startup recovery and fresh Codex capture read JSONL files
 outside `$STATE_ROOT`, under `~/.claude/projects` and `~/.codex/sessions`. A
-forged transcript could claim another worktree CWD so Dux associates one
+forged transcript could claim another worktree CWD so Yaran associates one
 agent's conversation with another. A symlink or special file could redirect a
 Claude copy, an existing destination could be overwritten, or a large provider
 tree could exhaust memory, CPU, or inodes. Concurrent fresh Codex launches in
 one shared CWD could also race and swap their newly-created rollout UUIDs.
 
-**Mitigation in code.** `crates/dux-core/src/resume_recovery.rs` reads provider originals and
+**Mitigation in code.** `crates/yaran-core/src/resume_recovery.rs` reads provider originals and
 never moves, edits, or deletes them. Recovery accepts only regular JSONLs with
 valid UUIDs and an absolute recorded CWD that is exactly
 `<historical-worktrees-root>/<registered-project-name>/<agent-dir>`. It checks
@@ -794,11 +794,11 @@ launch and accepts one new UUID only when its first `session_meta` record has
 the expected canonical CWD. Uncaptured launches are serialized per canonical
 CWD; zero or multiple candidates time out or fail closed and block another
 uncaptured launch in that CWD rather than guessing. All diagnostics sanitize
-provider-controlled fields under the `dux::resume_recovery` tracing target.
+provider-controlled fields under the `yaran::resume_recovery` tracing target.
 
 **Residual risk.** The documented trust model grants same-UID processes access
 to both provider roots. Such a process can race filesystem names or forge one
-otherwise-valid transcript during the capture window; Dux is not a security
+otherwise-valid transcript during the capture window; Yaran is not a security
 boundary against a fully compromised Unix account. Ancestor symlink replacement
 under `~/.claude` remains the broader T11 gap. The generous scan bounds limit,
 but do not eliminate, startup I/O from a very large legitimate history.
@@ -815,16 +815,16 @@ exact provider UUID used for future resumes.
 **Attack scenario.** An operator selects the built-in NTL provider. The
 third-party CLI can send prompts and workspace context to its service, and
 agent mode can request file writes or commands with the same Unix permissions
-as Dux.
+as Yaran.
 
-**Mitigation in code.** NTL is only a default configuration entry: Dux neither
+**Mitigation in code.** NTL is only a default configuration entry: Yaran neither
 installs it nor launches it until the operator selects it. Interactive sessions
 invoke the official executable as `ntl --agent`; one-shot commit-message work
 uses `ntl --chat --no-color -p <prompt>` so it cannot inherit agent mode from
-the CLI's persisted preferences. Dux has no NTL adapter, private API access, or
+the CLI's persisted preferences. Yaran has no NTL adapter, private API access, or
 credential handling, and declares no unsupported resume behavior.
 
-**Residual risk.** Dux is not a sandbox. Once selected, NTL and its remote
+**Residual risk.** Yaran is not a sandbox. Once selected, NTL and its remote
 service receive whatever the official CLI sends and any approved agent action
 runs as the operator. NTL's binary, service, authentication, approvals, and
 data handling remain upstream responsibilities.
@@ -844,7 +844,7 @@ outlives individual panes, and loads the operator's user-scope MCP servers —
 including fleet-messaging servers such as claude-peers — giving the agent a
 path to message other agents under the operator's identity.
 
-**Mitigation in code.** jcode is only a default configuration entry: Dux
+**Mitigation in code.** jcode is only a default configuration entry: Yaran
 neither installs nor launches it until selected. The `jcode-amq` wrapper fails
 closed below a reviewed version floor and probes the version with
 `--no-update` so the probe itself cannot swap the binary. Every wrapped launch
@@ -877,8 +877,8 @@ not.
 
 The inject-bridge can deliver AMQ wakes through each provider's own push
 channel instead of typing into the PTY: claude panes via the claude-peers
-channel (`dux peer send --transport claude-peers`, the live registration
-chosen by host kind: daemon-hosted session, then the pane dux spawned, then
+channel (`yaran peer send --transport claude-peers`, the live registration
+chosen by host kind: daemon-hosted session, then the pane yaran spawned, then
 other clients, daemon spares last) and jcode panes via the daemon's client
 protocol (`jcode debug -S <session> client:message`). The jcode session is
 picked from `clients:map`: a client whose working directory is the receiver's
@@ -887,14 +887,14 @@ matches and exactly one client is connected, that client; if several match,
 the first listed. With no candidate the wake exits non-zero and the message
 stays held in the AMQ inbox rather than going to an arbitrary pane. Native
 delivery therefore isolates by worktree only as far as jcode clients keep
-distinct working directories. This is **opt-in** (`DUX_AMQ_NATIVE_DELIVERY=1`)
+distinct working directories. This is **opt-in** (`YARAN_AMQ_NATIVE_DELIVERY=1`)
 and requires jcode's `display.debug_socket = true`; a stock install keeps the
 file-queue/drainer path. When enabled, readiness is checked before the inbox
 is drained so a held message is retried rather than lost, an unreachable
 daemon falls back to the queue, and every jcode delivery attempt is logged to
 `~/.local/state/inject-bridge-jcode.log`.
 
-**Residual risk.** Dux is not a sandbox. The `serve` daemon, swarm sub-agents,
+**Residual risk.** Yaran is not a sandbox. The `serve` daemon, swarm sub-agents,
 and inherited MCP servers run with the operator's Unix permissions and
 identity; enabling jcode's debug socket for native delivery exposes a
 same-UID control surface (message submission, session listing) that the

@@ -10,19 +10,19 @@ page that covers it in full.
 
 ## Installing & platforms
 
-### Does dux run on Windows?
+### Does yaran run on Windows?
 
-Through WSL2, which is Linux. dux targets macOS and Linux only; there is no
+Through WSL2, which is Linux. yaran targets macOS and Linux only; there is no
 native Windows build, and WSL2 is the supported way to run it on Windows.
 
-### What does dux cost?
+### What does yaran cost?
 
 Nothing. It's open source under the MIT license. You bring your own AI CLIs and
 whatever accounts they need.
 
-### Does dux phone home?
+### Does yaran phone home?
 
-dux itself sends no telemetry. It launches local CLIs in local terminals: no
+yaran itself sends no telemetry. It launches local CLIs in local terminals: no
 analytics, no JSON-RPC, no background uploads.
 
 ## Agents & providers
@@ -36,7 +36,7 @@ other CLI that runs an interactive session in a terminal can be added. See
 ### Why was the Gemini provider removed?
 
 [Google deprecated the Gemini CLI](https://developers.googleblog.com/an-important-update-transitioning-gemini-cli-to-antigravity-cli/),
-so dux does not ship it as a built-in provider. A worktree still pinned to Gemini will
+so yaran does not ship it as a built-in provider. A worktree still pinned to Gemini will
 not launch: switch it to a supported provider and relaunch.
 
 ### How do I add my own CLI as an agent?
@@ -47,7 +47,7 @@ See [Custom CLI Agents](/docs/custom-agents).
 ### Do I have to go fullscreen to type to an agent?
 
 No. Focusing the agent's pane is enough: what you type goes to the agent right there in
-the windowed layout, while dux's own shortcuts (all modifier chords) keep working.
+the windowed layout, while yaran's own shortcuts (all modifier chords) keep working.
 Fullscreen is the escape hatch for when the agent needs every key verbatim, readline
 shortcuts included. The in-app help overlay shows its binding.
 
@@ -60,7 +60,7 @@ way.
 ### The mouse wheel or PgUp won't scroll an agent. Why?
 
 Some agents scroll their own content, Claude Code's full-screen renderer and OpenCode
-included. dux forwards the wheel to any agent that asked for the mouse, and
+included. yaran forwards the wheel to any agent that asked for the mouse, and
 `PgUp`/`PgDn` to one that took over the whole screen, and keeps its own scrollback for
 agents that do neither. Windowed or fullscreen makes no difference. An explicit
 `forward_scroll = true`/`false` in a `[providers.<name>]` block overrides that
@@ -80,37 +80,37 @@ Yes, when the `gh` CLI is installed and authenticated. See
 
 No. Each agent in a project gets its own git worktree on its own branch, so two agents
 on the same project run in complete isolation. A standalone agent runs in a folder you
-picked, and dux refuses to put a second agent in a directory one is already working in,
+picked, and yaran refuses to put a second agent in a directory one is already working in,
 because coding CLIs resume their conversation per directory. See
 [Creating agents](/docs/creating-agents).
 
 ### Can I branch off a running agent?
 
-Yes: fork it. dux makes a fresh worktree from the agent's current state,
+Yes: fork it. yaran makes a fresh worktree from the agent's current state,
 uncommitted edits included. See
 [Forking an existing agent](/docs/creating-agents#forking-an-existing-agent).
 
 ### Do I need the GitHub CLI?
 
 It is optional. Install `gh` for PR tracking, creating agents from PRs, and agent-opened
-PRs; skip it and dux quietly disables anything GitHub.
+PRs; skip it and yaran quietly disables anything GitHub.
 
 ### Any recommended tools or MCP servers?
 
 See [Recommended tools](/docs/recommended-tools) for providers, MCP servers,
-and skills that pair well with dux.
+and skills that pair well with yaran.
 
 ## Server mode & the browser
 
-### Do I have to keep a terminal open to use dux in a browser?
+### Do I have to keep a terminal open to use yaran in a browser?
 
-No. `dux server` runs the web UI on its own, with no terminal UI in front of it, so
+No. `yaran server` runs the web UI on its own, with no terminal UI in front of it, so
 it is happy under `systemd`, `tmux`, or anything else that keeps a process alive. See
 [Server mode overview](/docs/server-mode).
 
 ### Is there a login?
 
-No, and that is deliberate: dux is a single-tenant, trusted-access tool.
+No, and that is deliberate: yaran is a single-tenant, trusted-access tool.
 
 > [!WARNING]
 > There is no password, no token, and no user accounts. Anyone who can reach the port
@@ -120,15 +120,15 @@ No, and that is deliberate: dux is a single-tenant, trusted-access tool.
 
 ### Is server mode a hosted service? Does my code leave my machine?
 
-Neither. There is no dux cloud and no account to make. `dux server` is the same binary
+Neither. There is no yaran cloud and no account to make. `yaran server` is the same binary
 serving a web UI from your own machine, over your own network, and your repos never
-leave it. Your agents' own CLIs talk to whatever AI providers they always talk to; dux
+leave it. Your agents' own CLIs talk to whatever AI providers they always talk to; yaran
 adds no traffic of its own.
 
 ### Can I run the terminal UI and the browser at the same time?
 
 Yes. Set `serve_while_tui = true` under `[server]`, or run the
-`start-background-server` palette command, and one dux process keeps the terminal UI in
+`start-background-server` palette command, and one yaran process keeps the terminal UI in
 front of you and serves the browser behind it. One device drives a given terminal at a
 time and everybody else watches.
 
@@ -138,20 +138,20 @@ hands it back. Your agents keep running through every one of these transitions. 
 [Three ways to serve it](/docs/server-mode#three-ways-to-serve-it).
 
 > [!IMPORTANT]
-> You cannot run two dux processes against one config directory. The second one fails
+> You cannot run two yaran processes against one config directory. The second one fails
 > fast with an "already running" message.
 
 ### Can I reach it from my phone?
 
-Yes. dux binds your Tailscale address by default, so any device on your tailnet can
-open it, and you can turn that leg on or off while dux is serving. Read [Reaching dux over Tailscale](/docs/tailscale) first, because there is no
+Yes. yaran binds your Tailscale address by default, so any device on your tailnet can
+open it, and you can turn that leg on or off while yaran is serving. Read [Reaching yaran over Tailscale](/docs/tailscale) first, because there is no
 login in front of it.
 
 ## Configuration
 
-### Where does dux keep its config and data?
+### Where does yaran keep its config and data?
 
-`~/.config/dux/` on Linux, `~/.dux/` on macOS. See
+`~/.config/yaran/` on Linux, `~/.yaran/` on macOS. See
 [where the config lives](/docs/configuration#where-it-lives).
 
 ### Is it safe to commit my config to git?
@@ -162,11 +162,11 @@ references. See
 
 ### How do I see what I've changed, or get the latest defaults?
 
-`dux config diff` shows your changes; `dux config regenerate` previews the latest
+`yaran config diff` shows your changes; `yaran config regenerate` previews the latest
 template. The summary holds back `[env]` values and project details, so it is
-safe to share, but `dux config diff --raw` prints your whole config including
+safe to share, but `yaran config diff --raw` prints your whole config including
 those values. See
-[what `dux config diff` shows](/docs/configuration#what-dux-config-diff-shows-and-what-it-holds-back).
+[what `yaran config diff` shows](/docs/configuration#what-yaran-config-diff-shows-and-what-it-holds-back).
 
 ### How do I run setup before an agent starts?
 
@@ -175,8 +175,8 @@ Give the project a `startup_command`. See
 
 ### What variables can my startup scripts read?
 
-dux injects `DUX_WORKTREE_PATH` and friends into every startup command. See
-[the injected variables](/docs/startup-commands#dux-injected-variables).
+yaran injects `YARAN_WORKTREE_PATH` and friends into every startup command. See
+[the injected variables](/docs/startup-commands#yaran-injected-variables).
 
 ### What's a macro?
 

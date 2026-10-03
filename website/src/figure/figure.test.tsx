@@ -19,7 +19,7 @@ import { focusedSessionId, spine } from "./workspace"
 // change in the app that makes one of these components need a browser (a
 // `window` read during render, an eager import of something DOM-bound, a hook
 // that has no server snapshot) would turn the homepage into a blank rectangle,
-// and nobody editing `crates/dux-web/web` has any reason to look at the website.
+// and nobody editing `crates/yaran-web/web` has any reason to look at the website.
 //
 // So it is enforced rather than trusted. Every component the figure imports is
 // rendered here STANDALONE, under a plain Node environment with no jsdom, which
@@ -82,7 +82,7 @@ describe("web UI figure", () => {
       "webhook-replay", // a sibling agent, from the sidebar's flat list
       "storefront", // a project
       "billing-api", // a second project
-      "dux/checkout-retry", // the focused agent's branch, in the header
+      "yaran/checkout-retry", // the focused agent's branch, in the header
       "482", // the pull request on the PR lane
       "retry-policy.ts", // a staged file in the changes pane
       "CheckoutSummary.tsx", // an unstaged file in the changes pane

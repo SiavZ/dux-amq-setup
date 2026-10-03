@@ -8,10 +8,10 @@ module.exports = async ({ createAgent, palette, sleep }) => {
 }
 
 // The screen's own frame title and the button the caption names.
-module.exports.expectText = ["Welcome to dux", "Add a project"]
+module.exports.expectText = ["Welcome to yaran", "Add a project"]
 
 module.exports.file = "tui-welcome-screen.png"
 module.exports.cols = 140
 module.exports.rows = 40
-module.exports.theme = "dux_dark"
+module.exports.theme = "yaran_dark"
 module.exports.fixture = "steady"

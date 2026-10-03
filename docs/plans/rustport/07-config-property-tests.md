@@ -36,7 +36,7 @@ no coverage at all.
 - **`detect_conflicts_default_config_clean` (`keybindings.rs:2599-2607`) is the single
   most valuable guardrail** for the `keys/` split — it proves the shipped
   `BINDING_DEFS` never self-conflicts.
-- **`dux config regenerate --yes` takes no backup** (`cli.rs:496-526`).
+- **`yaran config regenerate --yes` takes no backup** (`cli.rs:496-526`).
 
 ## In scope
 
@@ -83,7 +83,7 @@ the `BINDING_DEFS` invariants that Phase 13 depends on.
    `surface` degrades to a default instead of hard-erroring the whole config. Test the
    malformed-macro case explicitly.
 8. **Add a load-time unknown-key warning.** Do not error — that would break the
-   forward-compatibility guarantee that lets an old dux read a newer config. Collect
+   forward-compatibility guarantee that lets an old yaran read a newer config. Collect
    unrecognised keys during deserialization and surface them once via the status line
    and the log, so a typo is visible rather than silent.
 9. **Preserve and extend the keybinding guardrails** Phase 13 depends on:
@@ -95,7 +95,7 @@ the `BINDING_DEFS` invariants that Phase 13 depends on.
     in disjoint scopes (`keybindings.rs:816, 966, 1047`) — `ExitInteractive`,
     `GenerateCommitMessage`, `ExitCommitInput`. Assert all three resolve correctly, so a
     split that flattens scope handling fails.
-11. **Make `dux config regenerate --yes` take a timestamped backup** and test it.
+11. **Make `yaran config regenerate --yes` take a timestamped backup** and test it.
     Combined with item 6 and the `reset --all` gap (Phase 10), a user currently has two
     ways to lose hand-authored config with no recovery path.
 

@@ -12,7 +12,7 @@ trait, an adapter, or a protocol layer.
 ## Evidence
 
 `CLAUDE.md` states: *"Any CLI tool can be a provider. Configure `command` in
-`config.toml` and dux spawns it. No adapters, no protocol layer. Adding a new provider
+`config.toml` and yaran spawns it. No adapters, no protocol layer. Adding a new provider
 is a config-only change, not a code change."*
 
 `ProviderKind` (`model.rs:42-58`) is correctly a thin, unvalidated newtype over
@@ -36,7 +36,7 @@ excluded):
 
 **The compliance gap:** `purge.rs:132-134` and `:561-564` hardcode provider state
 directories for four names. **A user-added provider's chat history is never purged by
-`dux session purge`.** That is a completeness defect in a GDPR feature, not a style issue.
+`yaran session purge`.** That is a completeness defect in a GDPR feature, not a style issue.
 
 **Verified clean** (no production provider branching — do not re-audit):
 `pty.rs`, `provider.rs`, `amq_inject.rs`, `auto_resume.rs`, `statusline.rs`,
@@ -50,9 +50,9 @@ directories.
 ## Out of scope
 
 - **P5, P8, P9, P10, P11 — the session-capture cluster → Phase 22.** These are not flag
-  differences; they encode genuinely different *algorithms*. Claude: dux generates a
+  differences; they encode genuinely different *algorithms*. Claude: yaran generates a
   UUID and injects `--session-id`, then verifies the resume target exists
-  (`resume_recovery.rs:80-92`, `sessions.rs:649`). Codex: dux watches the provider's own
+  (`resume_recovery.rs:80-92`, `sessions.rs:649`). Codex: yaran watches the provider's own
   rollout files and parses them to discover the id after the fact
   (`resume_recovery.rs:94-96, 284-330`), coordinated through a global mutex
   (`CodexCaptureCoordinator` `:101-105`) because concurrent launches in one workspace are

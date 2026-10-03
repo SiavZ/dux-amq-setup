@@ -1,6 +1,6 @@
 ---
 title: Custom CLI Agents
-description: Configure any CLI as a dux provider, no adapters or protocol layer, just config.
+description: Configure any CLI as a yaran provider, no adapters or protocol layer, just config.
 group: Guides
 order: 50
 ---
@@ -12,8 +12,8 @@ config change, not a code change.
 ## The one rule
 
 A tool can be a provider if and only if it supports **PTY mode**: an interactive
-session dux can embed in a pseudo-terminal. If your CLI runs interactively in a
-terminal, dux can drive it, with the same prompts, colors, and login flow it has in
+session yaran can embed in a pseudo-terminal. If your CLI runs interactively in a
+terminal, yaran can drive it, with the same prompts, colors, and login flow it has in
 your own shell.
 
 ## Anatomy of a provider
@@ -30,16 +30,16 @@ args = []
 # that don't support resuming a session scoped to the working directory.
 resume_args = ["--continue"]
 # Optional timeout (ms) for a resumed session that renders nothing. If a resume
-# hangs before showing output, dux kills it and starts fresh. 0 disables it.
+# hangs before showing output, yaran kills it and starts fresh. 0 disables it.
 resume_wait_timeout_ms = 0
 # Hint shown to the user when the command isn't found on PATH.
 install_hint = "curl -fsSL https://claude.ai/install.sh | bash"
 # Where the mouse wheel and PgUp/PgDn go, in the windowed agent pane and in
-# fullscreen alike. Leave this key absent for auto: dux forwards the wheel to
+# fullscreen alike. Leave this key absent for auto: yaran forwards the wheel to
 # the child when it asked for the mouse (a mouse-aware app like an agent's
 # renderer) and the page keys when it owns the alt screen, and otherwise
 # scrolls its own host scrollback. Set true to always forward, or false to never
-# forward (always use dux scrollback).
+# forward (always use yaran scrollback).
 # forward_scroll = true
 # What a dragged, dropped or pasted file's path looks like when the web UI
 # writes it into this provider's prompt. Web only, which is what the "web_"

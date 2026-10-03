@@ -16,5 +16,5 @@ module.exports.expectText = ["add a bounded retry to the request path", "Typing"
 module.exports.file = "tui-typing-in-pane.png"
 module.exports.cols = 160
 module.exports.rows = 45
-module.exports.theme = "dux_dark"
+module.exports.theme = "yaran_dark"
 module.exports.fixture = "steady"

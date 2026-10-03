@@ -13,7 +13,7 @@ make good first targets for validating the tooling.
 
 **`theme.rs` is the lowest-priority split in the entire plan.** At 666 production lines
 it is only 33% over the cap, is already coherent, and carries the strongest test in its
-domain — `dux_dark_matches_original_palette` (`theme.rs:766-862`), an exhaustive
+domain — `yaran_dark_matches_original_palette` (`theme.rs:766-862`), an exhaustive
 78-field oracle. Do `cli/` first; do `theme/` only when the tooling is proven.
 
 ## Module tree — `src/cli/`
@@ -42,10 +42,10 @@ src/cli/
 ```text
 src/theme/
   mod.rs                   ~150   Theme struct (78 fields), SPINNER_FRAMES,
-                                  DEFAULT_THEME_NAME, DUX_DARK_TOML, GITHUB_PR_* (:14-127)
+                                  DEFAULT_THEME_NAME, YARAN_DARK_TOML, GITHUB_PR_* (:14-127)
   loader.rs                ~260   load, load_or_fallback, load_from_file, load_from_str,
                                   discover_available, ThemeSource, ThemeListing (:139-288)
-  defaults.rs              ~135   register_dux_defaults (:290-418)
+  defaults.rs              ~135   register_yaran_defaults (:290-418)
   convert.rs               ~120   into_ratatui and the opaline -> ratatui mapping (:429-442)
   style.rs                 ~120   the ~12 impl Theme style/badge helpers (:444-665)
 ```
@@ -58,9 +58,9 @@ src/theme/
    **do not fix it during the move.** Behaviour changes and relocations stay in separate
    commits.
 3. **`doctor.rs` is the seam Phase 20 will re-point.** Today `resolve_doctor_script`
-   (`cli.rs:879`) shells out to the `dux-amq-doctor` **bash** script, with a hardcoded
+   (`cli.rs:879`) shells out to the `yaran-amq-doctor` **bash** script, with a hardcoded
    binary name and a hardcoded relative fallback path (`cli.rs:892`,
-   `"../dux-amq/scripts/dux-amq-doctor"`). Keep that interface intact here; Phase 20
+   `"../yaran-amq/scripts/yaran-amq-doctor"`). Keep that interface intact here; Phase 20
    swaps the backend to the Rust applet. **Make the script path configurable** while
    you are in the file — it is listed as configurability gaps H24/H25.
 4. **`theme/` second, and only after `cli/` proves the tooling.** The 78-field oracle
@@ -79,8 +79,8 @@ src/theme/
 
 - [ ] `src/cli.rs` and `src/theme.rs` no longer exist; the trees above match.
 - [ ] No file exceeds 500 lines.
-- [ ] `dux_dark_matches_original_palette` green (78-field oracle).
-- [ ] Every `dux` subcommand behaves identically — verify each one's `--help` output
+- [ ] `yaran_dark_matches_original_palette` green (78-field oracle).
+- [ ] Every `yaran` subcommand behaves identically — verify each one's `--help` output
       against a golden file captured before the split.
 - [ ] Phase 06 theme/pane snapshots show **zero** diff.
 - [ ] Doctor script path is configurable rather than hardcoded (H24, H25).
@@ -105,7 +105,7 @@ done
 cargo test --all-features
 cargo insta test          # theme snapshots must not move
 ci/check-file-length.sh
-bats dux-amq/tests/doctor.bats
+bats yaran-amq/tests/doctor.bats
 ```
 
 ## Risks

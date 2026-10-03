@@ -85,7 +85,7 @@ case is therefore "one extra changes GET per reconnect," not zero. (If we ever w
 strict no-op-on-same-rev, change store.ts:520 to `>` — out of scope here.)
 
 ### Files
-- `crates/dux-web/src/server.rs` — refactor `apply_events_frame` to return
+- `crates/yaran-web/src/server.rs` — refactor `apply_events_frame` to return
   newly-inserted fine topics; emit catch-up at the caller (≈1448) via `sink` +
   `changes.peek_rev`.
 - No frontend change required (existing `session.changes` handler converges,
@@ -129,32 +129,32 @@ semantic the old field carried: **"A value of 0 permanently blocks this connecti
 class until the server is restarted with a nonzero value."**
 
 ### Files (expanded by the review — the original list was incomplete)
-- `crates/dux-core/src/config.rs` — remove `max_websocket_connections`; add the
+- `crates/yaran-core/src/config.rs` — remove `max_websocket_connections`; add the
   three fields with `#[serde(default)]` + per-field default consts + the `=0`
   comment. **Correct rationale:** old configs carrying the removed key still load
   because `ServerConfig` has no `#[serde(deny_unknown_fields)]`, so TOML (self-
   describing) silently ignores the now-unknown key — this is *not* a `serde(default)`
   effect.
-- `crates/dux-core/src/config_write.rs` — strip the old key in the **incremental
+- `crates/yaran-core/src/config_write.rs` — strip the old key in the **incremental
   patch path that runs on every save** (mirror the oneshot strip at :491, which is
   in `patch_*`, not "on regenerate"); emit the three new commented keys in the
   canonical renderer.
-- `crates/dux-web/src/server.rs` — replace `ws_semaphore` with three semaphores in
+- `crates/yaran-web/src/server.rs` — replace `ws_semaphore` with three semaphores in
   `AppState`; init from the three config values (:314); **refactor the events
   handler at :1155** (currently an inline `try_acquire_owned`) to use
   `acquire_ws_permit` with the events semaphore; PTY handlers (:767/:834) draw from
   their own via the extended helper. Update the stale access-log comment at :429-432
   (it cites `/api/file/raw?session_id=…`) — folded here or in 5a, see note.
-- `crates/dux-web/src/engine_actor.rs` — **`server_rebind_settings_changed` (:268)
+- `crates/yaran-web/src/engine_actor.rs` — **`server_rebind_settings_changed` (:268)
   references the removed field (compile error).** Replace the single comparison with
   one per new field (OR'd); update the function's doc comment (:252-258) and the
   test `rebind_drift_detects_max_websocket_connections_change` (:1942) into three
   per-field assertions. (Without this, changing a cap via reload silently gives no
   "restart required" warning and the change is inert.)
-- `crates/dux-tui/src/config.rs` — the TUI canonical renderer has its own
+- `crates/yaran-tui/src/config.rs` — the TUI canonical renderer has its own
   `ConfigEntry::Field` for the old key (≈650-663) + a test assertion (≈1292);
   replace with three commented entries + three assertions.
-- `crates/dux-tui/src/cli.rs` — `dux config diff` calls `diff_usize("server.max_
+- `crates/yaran-tui/src/cli.rs` — `yaran config diff` calls `diff_usize("server.max_
   websocket_connections", …)` (≈315-317); replace with three.
 - `lib.rs` + `tests/auth_gate.rs` — field references (compile-error sites).
 - One-time **migration warning:** on load, if the raw TOML still contains
@@ -224,7 +224,7 @@ Persisted nowhere; resets on restart with no consequence (clients refetch on any
 signal).
 
 ### Files
-- `crates/dux-web/src/engine_actor.rs` — bumps at the four sites; streaming counter
+- `crates/yaran-web/src/engine_actor.rs` — bumps at the four sites; streaming counter
   in `poll_pty_activity`; rewrite the spine-check block (≈1159-1178) to be
   signal-gated with the backstop. `spine_fingerprints` itself unchanged.
 
@@ -298,9 +298,9 @@ review — **add the `id_within_bound(&id)` guard** at the top of every new hand
 `session_actions.rs`/`terminal_actions.rs` all have it).
 
 ### Files (expanded — the original list missed the test files)
-- `crates/dux-web/src/git_routes.rs`, `file_routes.rs` — re-path, drop `session_id`,
+- `crates/yaran-web/src/git_routes.rs`, `file_routes.rs` — re-path, drop `session_id`,
   add `id_within_bound`.
-- `crates/dux-web/src/server.rs` — registration unchanged in shape; update the
+- `crates/yaran-web/src/server.rs` — registration unchanged in shape; update the
   access-log comment at :429-432 (cites the old `/api/file/raw?session_id=…`).
 - Frontend: `web/src/lib/git.ts` (6), `fileApi.ts` (5), `markdown.ts:53` (raw URL).
 - **Frontend tests (missed before):** `web/src/lib/gitFileApi.test.ts` (asserts the

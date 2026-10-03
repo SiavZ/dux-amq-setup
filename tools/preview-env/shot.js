@@ -1,4 +1,4 @@
-// Screenshot the running dux preview with the cached Playwright Chromium (driven
+// Screenshot the running yaran preview with the cached Playwright Chromium (driven
 // by puppeteer-core). Runs on the HOST, pointed at the container's forwarded
 // loopback port. Proven pipeline: the PNG it writes is directly readable.
 //

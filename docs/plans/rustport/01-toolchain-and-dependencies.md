@@ -55,7 +55,7 @@ elimination of duplicate majors, and a documented position on `opaline`.
    0.30.2**, **`crokey` 1.4 → 1.5**, **`similar` 3.1 → 3.2**.
 7. **Remove both `--ignore` flags** from `cargo audit` once 4 and 3 land. Delete the
    corresponding `RUSTSEC-2025-0141` / `RUSTSEC-2024-0384` exception rows from
-   `deny.toml` and both workflows. **Note:** `dux-amq/tests/supply-chain-rails.bats`
+   `deny.toml` and both workflows. **Note:** `yaran-amq/tests/supply-chain-rails.bats`
    asserts those advisory IDs and the `2026-08-01` review date appear in all three
    files — that test must be updated in the same commit, not deleted.
 8. **Resolve the duplicate `toml 0.8` / `toml_edit 0.22`.** They enter via
@@ -102,7 +102,7 @@ cargo test --all-features
 cargo audit                                       # no --ignore
 cargo deny --all-features check
 cargo tree -d                                     # inspect remaining duplicates
-bats dux-amq/tests/supply-chain-rails.bats
+bats yaran-amq/tests/supply-chain-rails.bats
 ```
 
 ## Risks

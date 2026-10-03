@@ -37,5 +37,5 @@ module.exports.expectText = ["Macros", "Review", "Write tests", "Explain failure
 module.exports.file = "tui-macro-bar.png"
 module.exports.cols = 160
 module.exports.rows = 26
-module.exports.theme = "dux_dark"
+module.exports.theme = "yaran_dark"
 module.exports.fixture = "steady"

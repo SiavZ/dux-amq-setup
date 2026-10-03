@@ -3,14 +3,14 @@
 // it costs no JavaScript; every rule that hides a panel is an override, so a
 // browser without `:has()` shows a panel rather than blanking.
 //
-// The web panel is the dux web UI's own React components rendered to static HTML
+// The web panel is the yaran web UI's own React components rendered to static HTML
 // at build time (see `src/figure/`), embedded from /figure/web-ui in an iframe.
 // The phone slot is an optional real capture: `publicPng` returns null when
-// public/dux-web-phone.png is absent and the whole block is skipped. PNG only,
+// public/yaran-web-phone.png is absent and the whole block is skipped. PNG only,
 // because the size is read from the PNG header.
 import { publicPng } from "../lib/public-image";
 
-const phone = publicPng("dux-web-phone");
+const phone = publicPng("yaran-web-phone");
 
 // The iframe's logical viewport: it is laid out at exactly this size and scaled
 // down in CSS, so the app always renders its desktop layout however narrow the
@@ -42,17 +42,18 @@ const tab =
         Three panes. <span class="text-[color:var(--color-accent)]">Unlimited</span> agents.
       </h2>
       <p class="mt-4 text-[color:var(--color-muted)] leading-relaxed">
-        Most AI coding tools give you one agent in one directory. dux gives you unlimited agents across unlimited worktrees, all visible at once. Spawn five agents on five branches and let them work in parallel.
+        Most AI coding tools give you one agent in one directory. yaran gives you unlimited agents across unlimited worktrees, all visible at once. Spawn five agents on five branches and let them work in parallel.
       </p>
       <p class="mt-4 text-[color:var(--color-muted)] leading-relaxed">
         Two front ends draw that layout: a terminal UI and a web UI. Both are first
         class, and both are staying. They share the same projects, the same agents,
         the same worktrees and the same config file, so an agent you start in one is
-        the same agent in the other. Flip the figure below between them.
+        the same agent in the other. The web figure below uses current Yaran components;
+        the terminal tab preserves a historical upstream dux capture, before the Yaran rebrand.
       </p>
       <p class="mt-4 text-[color:var(--color-muted)] leading-relaxed">
-        One dux owns your dux directory at a time, and it can wear both faces. A
-        palette command has the dux you are already running start serving in
+        One yaran owns your yaran directory at a time, and it can wear both faces. A
+        palette command has the yaran you are already running start serving in
         place, and leaving that screen drops you back into the terminal; or one
         setting keeps the terminal and serves the browser behind it, so the same
         workspace is on your desk and on your phone at once. Nothing relaunches and
@@ -107,14 +108,14 @@ const tab =
             </span>
           </div>
           <fieldset class="ml-auto flex min-w-0 flex-1 items-end justify-end gap-1 border-0 p-0 sm:flex-none">
-            <legend class="sr-only">Choose which dux surface to show</legend>
+            <legend class="sr-only">Choose which yaran surface to show</legend>
             <label class={tab}>
-              <input class="surface-radio" type="radio" name="dux-surface" value="web" checked />
+              <input class="surface-radio" type="radio" name="yaran-surface" value="web" checked />
               Web UI
             </label>
             <label class={tab}>
-              <input class="surface-radio" type="radio" name="dux-surface" value="tui" />
-              Terminal UI
+              <input class="surface-radio" type="radio" name="yaran-surface" value="tui" />
+              Terminal UI (upstream archive)
             </label>
           </fieldset>
         </div>
@@ -125,12 +126,15 @@ const tab =
           <div class="surface-panel" data-surface="tui">
             <img
               src="/dux-screenshot.svg"
-              alt="dux running in a terminal: a projects pane with a tree of agent sessions on the left, a Claude agent's live terminal in the center, and the dux header bar showing project, branch, agent, and provider."
+              alt="Historical upstream dux terminal capture, before the Yaran rebrand: projects and agent sessions on the left, an agent terminal in the center, and the original dux header bar."
               width="1609"
               height="784"
               loading="lazy"
               class="block w-full"
             />
+            <p class="px-4 py-3 text-sm text-[color:var(--color-muted)]">
+              Historical upstream dux terminal capture, before the Yaran rebrand. Not a current Yaran screenshot.
+            </p>
           </div>
 
           <div class="surface-panel" data-surface="web">
@@ -146,7 +150,7 @@ const tab =
                   non-interactive regardless, because `allow-scripts` is withheld. */}
               <iframe
                 src="/figure/web-ui"
-                title="The dux web UI, rendered from its own components"
+                title="The yaran web UI, rendered from its own components"
                 width={FIGURE_W}
                 height={FIGURE_H}
                 loading="lazy"
@@ -159,10 +163,8 @@ const tab =
         </div>
       </div>
 
-      {/* Neither surface carries a caption. The tab above the window names which
-          one you are looking at, and the prose above the section has already
-          made the case, so a strip of small type under the frame was repeating
-          both. */}
+      {/* The terminal panel names its upstream provenance; the web panel is
+          rendered from current Yaran components. */}
       {
         phone && (
           <figure class="surface-panel mx-auto mt-6 max-w-[280px]" data-surface="web">
@@ -171,7 +173,7 @@ const tab =
                 {phone.webp && <source srcset={phone.webp} type="image/webp" />}
                 <img
                   src={phone.src}
-                  alt="The dux web UI on a phone in portrait: an agent's terminal filling the screen with the accessory key bar and compose bar below it."
+                  alt="The yaran web UI on a phone in portrait: an agent's terminal filling the screen with the accessory key bar and compose bar below it."
                   width={phone.width}
                   height={phone.height}
                   loading="lazy"

@@ -14,7 +14,7 @@ const { captureProblem, decodePng, inkRatio, measureInk } = require("./ink.js")
 // directory's dependencies being installed.
 const puppeteer = () => require("puppeteer-core")
 
-const PORT = process.env.DUX_PORT || "8790"
+const PORT = process.env.YARAN_PORT || "8790"
 const BASE = `http://127.0.0.1:${PORT}`
 
 const DESKTOP = { width: 1440, height: 900 }
@@ -43,7 +43,7 @@ const get = (path) => api("GET", path)
 
 // The fake provider reads its fixture out of the global environment, so the
 // scene picked for an agent is whatever was set when its process was spawned.
-const setFixture = (name) => api("PUT", "/api/v1/global-env", { env: { DUX_FAKE_FIXTURE: name } })
+const setFixture = (name) => api("PUT", "/api/v1/global-env", { env: { YARAN_FAKE_FIXTURE: name } })
 
 // Every agent by its display title, which is the name the seed gave it.
 async function agents() {
@@ -82,7 +82,7 @@ function containerSh(script) {
   if (directDocker === null) {
     directDocker = spawnSync("docker", ["info"], { stdio: "ignore" }).status === 0
   }
-  const args = ["compose", "exec", "-T", "dux", "sh", "-euc", script]
+  const args = ["compose", "exec", "-T", "yaran", "sh", "-euc", script]
   const result = directDocker
     ? spawnSync("docker", args, { cwd: composeDir, encoding: "utf8" })
     : spawnSync(
@@ -90,7 +90,7 @@ function containerSh(script) {
         [
           "docker",
           "-c",
-          `cd ${JSON.stringify(composeDir)} && docker compose exec -T dux sh -euc ${JSON.stringify(script)}`,
+          `cd ${JSON.stringify(composeDir)} && docker compose exec -T yaran sh -euc ${JSON.stringify(script)}`,
         ],
         { encoding: "utf8" },
       )

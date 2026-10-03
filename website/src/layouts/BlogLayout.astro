@@ -23,9 +23,9 @@ const { title, description, author: authorName, pubDate, updatedDate, editPath }
 
 const author = getAuthor(authorName);
 
-const pageTitle = `${title} | getdux.app`;
+const pageTitle = `${title} | Yaran`;
 
-const site = Astro.site ?? new URL("https://getdux.app");
+const site = Astro.site ?? new URL(Astro.url.origin);
 const postUrl = new URL(Astro.url.pathname, site).toString();
 
 const breadcrumb = {

@@ -6,11 +6,11 @@ Status: Proposed (awaiting user review)
 
 ## 1. Problem
 
-dux shows indeterminate ("loading"/`Busy`) status while a background action runs,
+yaran shows indeterminate ("loading"/`Busy`) status while a background action runs,
 and is supposed to replace it with a determinate final state (success or failure)
 when the action finishes. Several operations leak: they show a pending status that
 is never replaced, so the TUI status line eventually flips to a spurious
-"timed out — check dux.log" warning (~20s) and the web shows a loading toast that
+"timed out — check yaran.log" warning (~20s) and the web shows a loading toast that
 spins forever.
 
 A three-surface audit (TUI status line, web server `WireStatus` stream, web React
@@ -179,8 +179,8 @@ keys even if a developer tried.
 Independently of the Rust refactor, the web client must stop discarding the key on the
 synchronous command-result channel:
 
-- `crates/dux-web/web/src/lib/types.ts`: add `key?: string | null` to `CommandStatus`.
-- `crates/dux-web/web/src/lib/store.ts` `onCommandResult`: call
+- `crates/yaran-web/web/src/lib/types.ts`: add `key?: string | null` to `CommandStatus`.
+- `crates/yaran-web/web/src/lib/store.ts` `onCommandResult`: call
   `showStatusToast(status.key, status.tone, status.message)` instead of `undefined`.
 
 This makes the synchronous command channel correlate exactly like the async `status`
@@ -191,9 +191,9 @@ serializes `WireStatus.key`, so no server change is needed for this piece.
 ### 3.6 Guardrails (Layer 2 — make residual leaks loud)
 
 1. **Runtime logging.** When `KeyedStatusController::tick` upgrades a timed-out `Busy`
-   to a `Warning`, log the leaked key + original message at error level to `dux.log`.
+   to a `Warning`, log the leaked key + original message at error level to `yaran.log`.
    A leak becomes diagnosable instead of silent.
-2. **Pairing test harness.** A table-driven test in `dux-core` enumerates every keyed
+2. **Pairing test harness.** A table-driven test in `yaran-core` enumerates every keyed
    operation and, for each, drives dispatch → simulated worker completion across
    `Ok`, `Err`, and the known edge outcomes (session-already-gone, `SessionMissing`,
    `StartupAutoReopen`, `ResumeFallback`), asserting the controller holds **no residual
@@ -203,19 +203,19 @@ serializes `WireStatus.key`, so no server change is needed for this piece.
 
 ## 4. Affected components
 
-- `crates/dux-core/src/statusline.rs` — `StatusOp`, `Final`, `StatusKey`; controller
+- `crates/yaran-core/src/statusline.rs` — `StatusOp`, `Final`, `StatusKey`; controller
   `set` becomes crate-private; tick logs leaked keys.
-- `crates/dux-core/src/engine/events.rs` — `StatusUpdate` busy removal; `status_final`
+- `crates/yaran-core/src/engine/events.rs` — `StatusUpdate` busy removal; `status_final`
   on completion reactions; engine emits keyed finals on all paths (B1/B5/B6).
-- `crates/dux-core/src/engine/command.rs`, `spawn_worker.rs` — `spawn_status_op`
+- `crates/yaran-core/src/engine/command.rs`, `spawn_worker.rs` — `spawn_status_op`
   primitive; dispatch sites construct `StatusOp`s.
-- `crates/dux-core/src/wire.rs` — typed `status_keys`; `drive_*_followup` emit keyed
+- `crates/yaran-core/src/wire.rs` — typed `status_keys`; `drive_*_followup` emit keyed
   finals on every branch (B2/B3/B4); sealed busy `WireStatus` constructors.
-- `crates/dux-core/src/worker.rs` — `status_final` fields on keyed completion events.
-- `crates/dux-tui/src/app/mod.rs`, `workers.rs`, `sessions.rs` — remove `set_busy`;
+- `crates/yaran-core/src/worker.rs` — `status_final` fields on keyed completion events.
+- `crates/yaran-tui/src/app/mod.rs`, `workers.rs`, `sessions.rs` — remove `set_busy`;
   keyed-op success paths apply the engine's keyed final, not anonymous `set_info`
   (A1/A2/A3); guard reload-config busy on actual spawn (A4).
-- `crates/dux-web/web/src/lib/{types.ts,store.ts}` — command-result key routing (3.5).
+- `crates/yaran-web/web/src/lib/{types.ts,store.ts}` — command-result key routing (3.5).
 
 ## 5. Testing strategy
 
@@ -306,7 +306,7 @@ the `StatusOp` object, and the raw busy emitters are sealed:
   both outcomes and the sealed constructors prevent bypass; (2) test-time — each
   migrated op carries a pairing test asserting its busy resolves; (3) runtime —
   the controller upgrades+logs any leaked busy (keyed or anonymous) at the 20s
-  timeout, so even a hypothetical leak self-heals and is diagnosable in `dux.log`.
+  timeout, so even a hypothetical leak self-heals and is diagnosable in `yaran.log`.
 
 A handful of completion events that became status-only after migration were
 deleted rather than kept (`PushCompleted`, `StartupCommandRerunCompleted`); the
@@ -325,7 +325,7 @@ client. Each must end with its pending status replaced/cleared on every path.
   different toast id. Fix per §3.5. *This is the normal-path cause of the reported
   worktree-delete bug.*
 
-### Web server (`crates/dux-core/src/wire.rs`, `engine/events.rs`)
+### Web server (`crates/yaran-core/src/wire.rs`, `engine/events.rs`)
 
 - **B1** Delete, session-already-gone: `drive_delete_followup` returns `vec![]`
   (`wire.rs:1402`) when the session was removed before `WorktreeRemoveSucceeded`. Key
@@ -343,7 +343,7 @@ client. Each must end with its pending status replaced/cleared on every path.
 - **B7** (minor) begin-delete `AlreadyInFlight` emits an *unkeyed* error
   (`wire.rs:1375`) instead of replacing the in-flight `delete:{id}` busy.
 
-### TUI (`crates/dux-tui/src/app/`, `engine/`)
+### TUI (`crates/yaran-tui/src/app/`, `engine/`)
 
 - **A1** Create agent / fork success: keyed busy `create:{id}`
   (`command.rs:459`/`events.rs:1227`); success path writes the **anonymous** slot

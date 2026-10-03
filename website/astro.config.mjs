@@ -14,7 +14,8 @@ import remarkAdmonitions from "./src/lib/remark-admonitions.mjs";
 import remarkGraphviz from "./src/lib/remark-graphviz.mjs";
 
 export default defineConfig({
-  site: "https://getdux.app",
+  // Set only after a real deployment origin has been chosen for this fork.
+  site: process.env.YARAN_SITE_URL,
   output: "static",
   trailingSlash: "ignore",
   // mdx() inherits the markdown config below, so .mdx docs get the same treatment
@@ -32,12 +33,12 @@ export default defineConfig({
     // Newsletter status pages are post-subscribe/post-confirm landing pages
     // (noindex), so they stay out of the sitemap too. /figure/ is the web-UI
     // figure's embed target, not a destination, so it stays out too.
-    sitemap({
+    ...(process.env.YARAN_SITE_URL ? [sitemap({
       filter: (page) =>
         !page.endsWith("/rss.xml") &&
         !page.includes("/newsletter/") &&
         !page.includes("/figure/"),
-    }),
+    })] : []),
   ],
   build: {
     inlineStylesheets: "auto",

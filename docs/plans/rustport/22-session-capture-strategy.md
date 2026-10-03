@@ -15,9 +15,9 @@ algorithm.
 Phase 11 converted 7 of 12 sites into capability fields. The remaining five encode
 **genuinely different algorithms**, not flag differences:
 
-- **Claude:** dux generates a UUID, injects it via `--session-id`, then verifies the
+- **Claude:** yaran generates a UUID, injects it via `--session-id`, then verifies the
   resume target exists (`resume_recovery.rs:80-92`, `app/sessions.rs:649`).
-- **Codex:** dux watches the provider's **own rollout files** and parses them to discover
+- **Codex:** yaran watches the provider's **own rollout files** and parses them to discover
   the session id *after the fact* (`resume_recovery.rs:94-96, 284-330`), coordinated
   through a global mutex (`CodexCaptureCoordinator`, `:101-105`) because concurrent
   launches in one workspace are ambiguous.
@@ -42,8 +42,8 @@ config-selected):
 | `capture_mode` | Behaviour |
 |---|---|
 | `none` (default) | No session-id capture; resume is unavailable. Every provider that is not Claude or Codex today. |
-| `injected_uuid { flag: String }` | dux mints a UUID and passes it via the named flag; resume verifies the target exists. Claude: `flag = "--session-id"`. |
-| `rollout_scan { dir: String, pattern: String }` | dux scans the provider's own state files after launch, coordinated by a mutex. Codex. |
+| `injected_uuid { flag: String }` | yaran mints a UUID and passes it via the named flag; resume verifies the target exists. Claude: `flag = "--session-id"`. |
+| `rollout_scan { dir: String, pattern: String }` | yaran scans the provider's own state files after launch, coordinated by a mutex. Codex. |
 
 This keeps the tenet honest: it is **not** a protocol layer, an adapter binary, or a
 per-provider code path — it is a closed, config-selected strategy set, and the config
@@ -76,7 +76,7 @@ file documents which providers use which.
    rather than leaving it as the one unexplained survivor.**
 8. **Collapse the duplicate path encoders and handle normalisers.** The research flagged
    **three path encoders and two handle normalisers** across the tree. Phase 15 moved
-   `sanitise_handle` to one home and Phase 18 lifted the encoder into `dux-amq-rust`;
+   `sanitise_handle` to one home and Phase 18 lifted the encoder into `yaran-amq-rust`;
    finish the job here so the count is one each. **This is the moment — otherwise the port
    adds a fourth encoder and a third normaliser.**
 9. **Write the config-only-provider resume test.** Extend Phase 11's fake-provider test to
@@ -109,7 +109,7 @@ grep -rn 'provider.*==\s*"' src/ --include='*.rs' | grep -v '_tests.rs'
 
 # duplicate-implementation check
 grep -rn 'fn .*encode.*project_dir\|fn sanitise_handle\|fn normalize_agent_handle' \
-  src/ dux-amq-rust/src/
+  src/ yaran-amq-rust/src/
 # expect: exactly one of each
 
 # manual: resume a Claude session and a Codex session; both must restore the real conversation

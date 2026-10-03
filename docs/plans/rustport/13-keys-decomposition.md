@@ -127,7 +127,7 @@ cargo test --all-features keys
 cargo test --all-features config          # the external consumers
 cargo insta test                          # help/palette snapshots must not move
 ci/check-file-length.sh
-cargo modules dependencies --acyclic --bin dux
+cargo modules dependencies --acyclic --bin yaran
 
 # prove order preservation explicitly
 cargo test --all-features binding_defs_declaration_order

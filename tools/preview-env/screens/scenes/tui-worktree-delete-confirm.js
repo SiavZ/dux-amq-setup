@@ -23,5 +23,5 @@ module.exports.expectText = ["Delete Worktree", "docs-pass"]
 module.exports.file = "tui-worktree-delete-confirm.png"
 module.exports.cols = 140
 module.exports.rows = 40
-module.exports.theme = "dux_dark"
+module.exports.theme = "yaran_dark"
 module.exports.fixture = "steady"

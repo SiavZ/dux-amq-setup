@@ -15,5 +15,5 @@ module.exports.expectText = ["retry-budget", "fake"]
 module.exports.file = "tui-tabs-strip-ordinals.png"
 module.exports.cols = 120
 module.exports.rows = 36
-module.exports.theme = "dux_dark"
+module.exports.theme = "yaran_dark"
 module.exports.fixture = "steady"

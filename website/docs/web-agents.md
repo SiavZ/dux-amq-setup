@@ -5,7 +5,7 @@ group: Web UI
 order: 64
 ---
 
-The whole agent lifecycle runs from the browser: spin one up (in a worktree and branch dux
+The whole agent lifecycle runs from the browser: spin one up (in a worktree and branch yaran
 manages, or standalone in a folder you already have), fork it, adopt an orphaned worktree,
 retarget its provider, and tear it down. This page is the click-by-click version;
 the concepts behind projects, agents, and providers are in
@@ -17,7 +17,7 @@ the concepts behind projects, agents, and providers are in
 > The **Add project** dialog browses the **server's** own disk, not your laptop's, starting
 > from its configured start directory, normally the server's home directory.
 
-Repositories carry a small "git" badge. Pick one, give it an optional name, and dux may
+Repositories carry a small "git" badge. Pick one, give it an optional name, and yaran may
 show a pre-flight step first:
 
 - If the repo is checked out to something other than its default branch, it offers to check
@@ -25,8 +25,8 @@ show a pre-flight step first:
   default branch; untick it and your folder stays where it is, and new agents branch from
   the branch it is on. The dialog names the branch either way.
 - If the repo has no commits yet (a fresh `git init`), it offers to make the initial commit
-  for you. If git on the server cannot work out an identity for that commit, dux fills in
-  `dux@localhost` as the address so the add still succeeds; see
+  for you. If git on the server cannot work out an identity for that commit, yaran fills in
+  `yaran@localhost` as the address so the add still succeeds; see
   [the workspace page](/docs/web-workspace) for what it keeps and what it fills in.
 
 The confirm button's label adapts to whichever applies. A project's `⋯` menu carries
@@ -49,27 +49,27 @@ lives. The Agents header above the list carries a **+** too.
 
 Pick **New agent from PR…** from that `⋯` segment and the dialog opens with the reference
 field first. **No project is chosen and none is asked for.** Paste a PR link (or
-`owner/repo#123`, or a bare `owner/repo`) and dux compares the repository it names against
+`owner/repo#123`, or a bare `owner/repo`) and yaran compares the repository it names against
 every project you have:
 
 ![The New agent from PR dialog with a pull request reference typed into its first field.](/screens/new-agent-from-pr-dialog.png)
 
-- **One project is a checkout of that repository** and dux goes straight on to resolve the
+- **One project is a checkout of that repository** and yaran goes straight on to resolve the
   pull request.
-- **Two or more are** and dux shows you just those and asks which.
-- **None is** and dux names the repository it could not place, then offers the project
+- **Two or more are** and yaran shows you just those and asks which.
+- **None is** and yaran names the repository it could not place, then offers the project
   picker.
 
 > [!IMPORTANT]
-> **dux will not clone a repository it does not have.** Point it at a checkout that already
+> **yaran will not clone a repository it does not have.** Point it at a checkout that already
 > exists on the server, or clone one yourself first.
 
 A number on its own (`#123` or `123`) is the one form this door cannot take, since it does
-not say which repository it belongs to. dux refuses it and points you at "choose an existing
+not say which repository it belongs to. yaran refuses it and points you at "choose an existing
 project" under the field, which switches to the project-first mode below and brings anything
 you typed with it.
 
-The full list of accepted spellings, and what happens to projects dux cannot compare, is in
+The full list of accepted spellings, and what happens to projects yaran cannot compare, is in
 [Creating agents](/docs/creating-agents).
 
 ### Starting from a project
@@ -81,7 +81,7 @@ project and a bare `123` is meaningful.
 ![The New agent dialog with a branch name typed, ready to create the worktree and launch the agent.](/screens/new-agent-dialog.png)
 
 - **New agent…** creates a fresh git worktree and branch and launches the agent. The branch
-  name is optional; leave it blank and dux generates a memorable pet name.
+  name is optional; leave it blank and yaran generates a memorable pet name.
 - **New agent from PR…** fetches a pull request's head branch into a new worktree. Give it
   a PR URL, `#123`, or just `123`. It appears only when GitHub integration and the `gh` CLI
   are available.
@@ -95,20 +95,20 @@ to valid branch characters as you type.
 
 ### The worktree manager
 
-**Worktrees…** lists every worktree dux manages for the project, with its branch, its path
+**Worktrees…** lists every worktree yaran manages for the project, with its branch, its path
 on disk, and a warning when it is holding uncommitted changes. Pick one that has no agent
 and it becomes a live agent again on its existing branch, which is how you reclaim work a
 deleted agent left behind.
 
-![The Worktrees dialog listing every worktree dux manages for a project, with the agent holding each one.](/screens/worktree-manager-dialog.png)
+![The Worktrees dialog listing every worktree yaran manages for a project, with the agent holding each one.](/screens/worktree-manager-dialog.png)
 
 Each unused worktree carries a `⋯` menu with **Delete worktree…**, which removes the
 directory from disk after a confirmation naming the branch and the full path. That
 confirmation carries an **"Also delete the branch"** checkbox, ticked by default, because a
 branch left behind makes creating an agent under that name later fail with "branch already
-exists". Untick it and dux removes the working directory only. A worktree that is not on a
+exists". Untick it and yaran removes the working directory only. A worktree that is not on a
 branch has no branch to offer, so the checkbox does not appear. If git refuses the branch
-deletion (it is checked out somewhere else, say), the worktree still goes and dux tells you
+deletion (it is checked out somewhere else, say), the worktree still goes and yaran tells you
 the branch survived and quotes git's reason.
 
 A worktree that already has an agent names that agent and offers no delete. Delete the agent
@@ -181,13 +181,13 @@ reach an older conversation, use the provider's own history command.
 
 When an agent needs you (a permission prompt, a finished turn), its sidebar icon turns cyan
 and pulses, its tab-strip pill gains a small cyan dot, the browser tab title gains a count
-like `(2) dux`, and the favicon grows a small cyan dot. The flag clears the moment you look
+like `(2) yaran`, and the favicon grows a small cyan dot. The flag clears the moment you look
 at that agent. The whole model, and how to make sure your agents emit the signal, is in
 [Attention indicators](/docs/attention-indicators).
 
 Server mode can also raise a **real browser desktop notification** when an agent asks for
-you. It is strictly opt-in: dux never auto-prompts. Open **Preferences…** from the cog menu,
-use **Enable browser notifications** once, and grant permission. It fires only while the dux
+you. It is strictly opt-in: yaran never auto-prompts. Open **Preferences…** from the cog menu,
+use **Enable browser notifications** once, and grant permission. It fires only while the yaran
 browser window is hidden or unfocused, and only for the agent whose view you have open. This
 is governed by the `web_notifications` capability, detailed in
 [Terminal capabilities](/docs/terminal-capabilities).
@@ -222,7 +222,7 @@ in one go. Both confirmations say so before you commit.
 
 You do not have to be inside the agent's own CLI to end its session. **Detach agent…** in
 the agent's `⋯` menu asks every process the agent is running to shut down, the same way
-closing dux does: a polite signal first, then a wait, then a force-close for anything still
+closing yaran does: a polite signal first, then a wait, then a force-close for anything still
 there. The agent stays in your list as **Detached** and you can resume it later; whatever it
 was doing at that moment is interrupted. The terminal UI reaches the same action with the
 `detach-agent` palette command on the selected agent. The Task Manager's **Force stop** on an
@@ -231,7 +231,7 @@ agent row ends the same processes without the wait, and says so in its own confi
 The entry only appears while the agent has something running, and it always confirms first.
 The confirmation names the wait, which is the top-level `shutdown_timeout_seconds` in your
 `config.toml` (30 seconds by default, and not the same key as the one under `[server]`), and
-says how many of the agent's tabs stop together when it has more than one running. dux then
+says how many of the agent's tabs stop together when it has more than one running. yaran then
 says which way it went: that the agent shut down and is detached, or that it did not exit in
 time and was force-closed.
 
@@ -240,30 +240,30 @@ time and was force-closed.
 > given the shutdown grace to finish and then killed, so anything it had not written out is
 > lost. There is no undo; you can start the agent again, but not the run you stopped.
 
-**Delete** removes the agent from dux entirely. It is the one destructive per-agent action
-dux tints red, and it always confirms first. The confirmation includes an unchecked "also
+**Delete** removes the agent from yaran entirely. It is the one destructive per-agent action
+yaran tints red, and it always confirms first. The confirmation includes an unchecked "also
 delete the git worktree" box, so by default your worktree survives a delete.
 
 Tick it and a second box appears, named after the branch. It only appears there because git
 will not delete a branch that is still checked out in a worktree, so with the worktree
 staying there is nothing to offer. Where it starts depends on where the branch came from:
 
-- **Ticked**, for a branch dux created for the agent. That is the old behavior. Untick it to
+- **Ticked**, for a branch yaran created for the agent. That is the old behavior. Untick it to
   keep the branch.
 - **Unticked**, for a branch that already existed, or that was adopted along with an existing
-  worktree. Underneath it dux says which of the two it is, and adds "It has N commits not
+  worktree. Underneath it yaran says which of the two it is, and adds "It has N commits not
   pushed anywhere" when there are any. In a repository with no remotes it says so differently,
   because there the count is the branch's whole history and nothing was ever going anywhere.
-  Tick it and the branch goes anyway; this is the only way to remove such a branch from dux
+  Tick it and the branch goes anyway; this is the only way to remove such a branch from yaran
   once its worktree is gone.
 
 If the worktree has moved onto another branch since the agent was created, the tick removes
 **both**: the branch it is on now and the one it was born on, which is what keeps creating
 an agent under the old name from failing with "branch already exists". The box names both
-branches, dux says which one predates the agent, and the commit count covers the two of them
+branches, yaran says which one predates the agent, and the commit count covers the two of them
 together.
 
-If git refuses to delete a branch dux did try to remove, dux says which branch is still there
+If git refuses to delete a branch yaran did try to remove, yaran says which branch is still there
 and why rather than reporting a deletion that did not happen.
 
 > [!IMPORTANT]

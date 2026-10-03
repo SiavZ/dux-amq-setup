@@ -1,7 +1,7 @@
 #!/bin/sh
 # Live end-to-end check of `reload-binary` with SEVERAL agents and the two
-# failure paths, against a REAL dux binary (companion to reload-live-check.sh,
-# which covers one agent in depth). Scratch DUX_HOME and scratch AMQ root, so
+# failure paths, against a REAL yaran binary (companion to reload-live-check.sh,
+# which covers one agent in depth). Scratch YARAN_HOME and scratch AMQ root, so
 # nothing touches the user's real state. It checks:
 #
 #   - three printing agents (alpha, beta, gamma) are all adopted, same pids,
@@ -9,10 +9,10 @@
 #   - the reload reopens on the agent that was selected (gamma)
 #   - refusal (binary not newer): no exec, agents untouched, output keeps
 #     flowing
-#   - failed exec (new binary not executable): reported, same dux, same
+#   - failed exec (new binary not executable): reported, same yaran, same
 #     agents, output resumes, no handoff or sidecar files left behind
 #
-# Usage: tools/reload-live-check-multi.sh [path/to/dux]   (default: target/release/dux)
+# Usage: tools/reload-live-check-multi.sh [path/to/yaran]   (default: target/release/yaran)
 # Needs: tmux, sqlite3, git. Exits non-zero on the first failed check.
 #
 # Every wait polls for the state it needs rather than sleeping a fixed time, so
@@ -20,23 +20,23 @@
 
 set -eu
 
-DUX_SRC=${1:-target/release/dux}
-[ -x "$DUX_SRC" ] || { echo "no dux binary at $DUX_SRC (run cargo build --release)"; exit 2; }
+YARAN_SRC=${1:-target/release/yaran}
+[ -x "$YARAN_SRC" ] || { echo "no yaran binary at $YARAN_SRC (run cargo build --release)"; exit 2; }
 for tool in tmux sqlite3 git; do
   command -v "$tool" >/dev/null || { echo "missing $tool"; exit 2; }
 done
 
-# Under $HOME on purpose: dux's folder prompt starts at the home directory.
-WORK=$(mktemp -d "$HOME/.dux-reload-check.XXXXXX")
-SESSION="duxreload-$$"
-DUX_PID=""
-# The launched dux must not register inboxes (or anything else) in the user's
+# Under $HOME on purpose: yaran's folder prompt starts at the home directory.
+WORK=$(mktemp -d "$HOME/.yaran-reload-check.XXXXXX")
+SESSION="yaranreload-$$"
+YARAN_PID=""
+# The launched yaran must not register inboxes (or anything else) in the user's
 # real AMQ root: both env names are pointed at a scratch directory that dies
 # with $WORK. Passed again explicitly inside tmux, because the tmux server
 # inherits its own environment, not this script's.
 export AMQ_GLOBAL_ROOT="$WORK/amq" AM_ROOT="$WORK/amq"
 cleanup() {
-  [ -n "$DUX_PID" ] && kill -9 "$DUX_PID" 2>/dev/null || true
+  [ -n "$YARAN_PID" ] && kill -9 "$YARAN_PID" 2>/dev/null || true
   tmux kill-session -t "$SESSION" 2>/dev/null || true
   rm -rf "$WORK"
 }
@@ -60,11 +60,11 @@ last_tick() { screen | grep -o 'tick-[0-9]*' | sed 's/tick-//' | sort -n | tail 
 keys() { tmux send-keys -t "$SESSION" "$@"; sleep 0.3; }
 
 mkdir -p "$WORK/home" "$WORK/proj" "$WORK/amq"
-cp "$DUX_SRC" "$WORK/dux"
+cp "$YARAN_SRC" "$WORK/yaran"
 git -C "$WORK/proj" init -q
 git -C "$WORK/proj" -c user.email=x@x -c user.name=x commit -q --allow-empty -m init
 
-DUX_HOME="$WORK/home" "$WORK/dux" config regenerate --yes >/dev/null
+YARAN_HOME="$WORK/home" "$WORK/yaran" config regenerate --yes >/dev/null
 CFG="$WORK/home/config.toml"
 # A provider that is BOTH always printing (the reload must happen mid-stream)
 # and answering (typed input must survive the adopted pty). A non-empty
@@ -87,9 +87,9 @@ resume_wait_timeout_ms = 0
 EOF
 
 tmux new-session -d -s "$SESSION" -x 200 -y 50 -c "$WORK/proj" \
-  "env DUX_HOME='$WORK/home' AMQ_GLOBAL_ROOT='$WORK/amq' AM_ROOT='$WORK/amq' '$WORK/dux'; sleep 600"
-wait_for "dux to start" 20 "pgrep -f '^$WORK/dux\$'"
-DUX_PID=$(pgrep -f "^$WORK/dux\$")
+  "env YARAN_HOME='$WORK/home' AMQ_GLOBAL_ROOT='$WORK/amq' AM_ROOT='$WORK/amq' '$WORK/yaran'; sleep 600"
+wait_for "yaran to start" 20 "pgrep -f '^$WORK/yaran\$'"
+YARAN_PID=$(pgrep -f "^$WORK/yaran\$")
 wait_for "the TUI" 20 "tmux capture-pane -t $SESSION -p | grep -q 'Agents (0)'"
 
 # THREE standalone agents in the same folder, each leaves its own marker.
@@ -103,7 +103,7 @@ make_agent() {
   wait_for "the name prompt ($name)" 10 "tmux capture-pane -t $SESSION -p | grep -q 'Name standalone agent'"
   keys -l "$name"
   keys Enter
-  wait_for "agent $name" 15 "[ \$(ps -Ao ppid,command | awk '\$1==$DUX_PID && \$2==\"sh\"' | wc -l) -gt $before ]"
+  wait_for "agent $name" 15 "[ \$(ps -Ao ppid,command | awk '\$1==$YARAN_PID && \$2==\"sh\"' | wc -l) -gt $before ]"
   keys Enter; keys -l "marker-$name"
   keys Enter
   wait_for "marker-$name echoed" 15 "tmux capture-pane -t $SESSION -p | grep -q 'got:marker-$name'"
@@ -114,17 +114,17 @@ make_agent() {
 make_agent alpha 0
 make_agent beta 1
 make_agent gamma 2
-PIDS_BEFORE=$(ps -Ao pid,ppid,command | awk -v p="$DUX_PID" '$2==p && $3=="sh" {print $1}' | sort | tr '\n' ' ')
-echo "before: dux=$DUX_PID agents=$PIDS_BEFORE"
+PIDS_BEFORE=$(ps -Ao pid,ppid,command | awk -v p="$YARAN_PID" '$2==p && $3=="sh" {print $1}' | sort | tr '\n' ' ')
+echo "before: yaran=$YARAN_PID agents=$PIDS_BEFORE"
 sleep 2
 # REFUSAL 1: no newer binary on disk. Nothing may change.
 keys C-p
 keys -l "reload-binary"
 keys Enter
-wait_for "the refusal message" 15 "tmux capture-pane -t $SESSION -p | grep -q 'Already running the newest dux'"
+wait_for "the refusal message" 15 "tmux capture-pane -t $SESSION -p | grep -q 'Already running the newest yaran'"
 pass "refused: no newer build"
-ps -p $DUX_PID -o command= | grep -q -- --reload-handoff && fail "exec happened on refusal" || pass "no exec on refusal"
-[ "$(ps -Ao pid,ppid,command | awk -v p="$DUX_PID" '$2==p && $3=="sh" {print $1}' | sort | tr '\n' ' ')" = "$PIDS_BEFORE" ] && pass "agents untouched by refusal" || fail "agents changed on refusal"
+ps -p $YARAN_PID -o command= | grep -q -- --reload-handoff && fail "exec happened on refusal" || pass "no exec on refusal"
+[ "$(ps -Ao pid,ppid,command | awk -v p="$YARAN_PID" '$2==p && $3=="sh" {print $1}' | sort | tr '\n' ' ')" = "$PIDS_BEFORE" ] && pass "agents untouched by refusal" || fail "agents changed on refusal"
 screen | grep -q 'got:marker-gamma' && pass "screen still live after refusal" || fail "screen lost after refusal"
 # Agents must keep updating after a refusal (readers resumed / never stopped).
 T1=$(last_tick); sleep 3; T2=$(last_tick)
@@ -132,35 +132,35 @@ T1=$(last_tick); sleep 3; T2=$(last_tick)
 # FAILURE 2: the exec itself fails (new binary on disk is not executable).
 # Everything is prepared (readers stopped, sidecars written) and then must be
 # undone: same process, same agents, output flowing again, no files left.
-cp "$WORK/dux" "$WORK/dux.good"
+cp "$WORK/yaran" "$WORK/yaran.good"
 # A truncated Mach-O header: the kernel rejects it (ENOEXEC) and, unlike a
 # text file, it is not handed to /bin/sh, so exec really returns an error.
 # Not executable: execve fails with EACCES before the point of no return,
-# which is the failure dux can actually recover from.
-cp "$WORK/dux" "$WORK/dux.bad"; chmod -x "$WORK/dux.bad"
-mv "$WORK/dux.bad" "$WORK/dux"
+# which is the failure yaran can actually recover from.
+cp "$WORK/yaran" "$WORK/yaran.bad"; chmod -x "$WORK/yaran.bad"
+mv "$WORK/yaran.bad" "$WORK/yaran"
 sleep 1
 keys C-p
 keys -l "reload-binary"
 keys Enter
 wait_for "the failed-exec message" 15 "tmux capture-pane -t $SESSION -p | grep -q 'Reload failed'"
 pass "failed exec reported"
-[ "$(pgrep -f "^$WORK/dux" | head -1)" = "$DUX_PID" ] && pass "same dux after failed exec" || fail "dux pid changed after failed exec"
-[ "$(ps -Ao pid,ppid,command | awk -v p="$DUX_PID" '$2==p && $3=="sh" {print $1}' | sort | tr '\n' ' ')" = "$PIDS_BEFORE" ] && pass "agents untouched by failed exec" || fail "agents changed on failed exec"
+[ "$(pgrep -f "^$WORK/yaran" | head -1)" = "$YARAN_PID" ] && pass "same yaran after failed exec" || fail "yaran pid changed after failed exec"
+[ "$(ps -Ao pid,ppid,command | awk -v p="$YARAN_PID" '$2==p && $3=="sh" {print $1}' | sort | tr '\n' ' ')" = "$PIDS_BEFORE" ] && pass "agents untouched by failed exec" || fail "agents changed on failed exec"
 T1=$(last_tick); sleep 3; T2=$(last_tick)
 [ -n "$T1" ] && [ "$T2" -gt "$T1" ] && pass "output resumes after failed exec ($T1 -> $T2)" || fail "output stalled after failed exec ($T1 -> $T2)"
 ls "$WORK/home"/reload-handoff-* "$WORK/home"/reload-repaint-* >/dev/null 2>&1 && fail "files left after failed exec" || pass "no handoff/sidecar left after failed exec"
-mv "$WORK/dux.good" "$WORK/dux"; chmod +x "$WORK/dux"
-touch "$WORK/dux"
+mv "$WORK/yaran.good" "$WORK/yaran"; chmod +x "$WORK/yaran"
+touch "$WORK/yaran"
 sleep 1
 keys C-p
 keys -l "reload-binary"
 keys Enter
-wait_for "the reload to exec" 20 "ps -p $DUX_PID -o command= | grep -q -- --reload-handoff"
-wait_for "the reloaded TUI" 20 "grep -q 'reload: adopted' '$WORK/home/dux.log'"
-grep -q "reload: adopted 3 of 3" "$WORK/home/dux.log" && pass "adopted 3 of 3" || fail "$(grep 'reload: adopted' "$WORK/home/dux.log")"
+wait_for "the reload to exec" 20 "ps -p $YARAN_PID -o command= | grep -q -- --reload-handoff"
+wait_for "the reloaded TUI" 20 "grep -q 'reload: adopted' '$WORK/home/yaran.log'"
+grep -q "reload: adopted 3 of 3" "$WORK/home/yaran.log" && pass "adopted 3 of 3" || fail "$(grep 'reload: adopted' "$WORK/home/yaran.log")"
 sleep 2
-PIDS_AFTER=$(ps -Ao pid,ppid,command | awk -v p="$DUX_PID" '$2==p && $3=="sh" {print $1}' | sort | tr '\n' ' ')
+PIDS_AFTER=$(ps -Ao pid,ppid,command | awk -v p="$YARAN_PID" '$2==p && $3=="sh" {print $1}' | sort | tr '\n' ' ')
 [ "$PIDS_BEFORE" = "$PIDS_AFTER" ] && pass "same 3 agent pids, no duplicates ($PIDS_AFTER)" || fail "agents changed: $PIDS_BEFORE -> $PIDS_AFTER"
 # The selected agent (gamma, the last one used) must be on screen with its transcript.
 screen | grep -q 'got:marker-gamma' && pass "selected agent gamma shows its pre-reload transcript" || fail "gamma transcript missing"

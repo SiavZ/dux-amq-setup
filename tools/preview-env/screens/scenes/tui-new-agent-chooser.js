@@ -13,5 +13,5 @@ module.exports.expectText = ["New agent in project", "demo-api", "demo-web"]
 module.exports.file = "tui-new-agent-chooser.png"
 module.exports.cols = 160
 module.exports.rows = 30
-module.exports.theme = "dux_dark"
+module.exports.theme = "yaran_dark"
 module.exports.fixture = "steady"

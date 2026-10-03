@@ -24,7 +24,9 @@ pnpm-debug.log*
 
 # generated at build time, sourced from canonical repo assets
 public/install.sh
-public/dux-logo.png
+public/yaran-logo.png
+public/yaran-logo.svg
+# The inherited upstream capture keeps its original historical filename.
 public/dux-screenshot.svg
 
 # generated at build time from raster images by scripts/generate-webp.mjs

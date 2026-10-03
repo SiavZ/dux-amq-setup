@@ -8,10 +8,10 @@ import { BLOG_DESCRIPTION } from "../lib/site";
 // escaping, CDATA, and RFC-822 pubDate formatting.
 export async function GET(context: APIContext) {
   const posts = await getPublishedPosts();
-  const site = context.site ?? new URL("https://getdux.app");
+  const site = context.site ?? new URL(context.url.origin);
 
   return rss({
-    title: "dux blog",
+    title: "yaran blog",
     description: BLOG_DESCRIPTION,
     site,
     items: posts.map((post) => ({

@@ -4,7 +4,7 @@ interface Props {
   title?: string;
 }
 
-const { castId = "IvqL89rXvwCzvSxQ", title = "dux in action" } = Astro.props;
+const { castId = "IvqL89rXvwCzvSxQ", title = "Historical upstream dux recording" } = Astro.props;
 const link = `https://asciinema.org/a/${castId}`;
 const scriptSrc = `https://asciinema.org/a/${castId}.js`;
 const scriptId = `asciicast-${castId}`;
@@ -14,9 +14,9 @@ const scriptId = `asciicast-${castId}`;
   <div id="demo" class="anchor-offset container-app">
     <div class="mb-8 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
       <div>
-        <span class="pill">▶ demo</span>
+        <span class="pill">▶ upstream archive</span>
         <h2 class="heading mt-3 text-3xl font-bold tracking-tight sm:text-4xl">
-          See it before you <span class="text-[color:var(--color-pink)]">trust</span> it.
+          A look at the <span class="text-[color:var(--color-pink)]">upstream</span> terminal.
         </h2>
       </div>
       <a
@@ -34,11 +34,9 @@ const scriptId = `asciicast-${castId}`;
       </a>
     </div>
 
-    {/* Names the surface: the cast is the terminal UI, and without saying so the
-        next section's Web UI tab reads as a different product rather than the
-        same workspace. */}
+    {/* Preserve the inherited recording as history, not a current fork demo. */}
     <p class="mt-4 text-sm text-[color:var(--color-muted)] leading-relaxed">
-      This is the terminal UI, recorded live. The same workspace runs in a browser too, and you can flip between the two in the section below.
+      Historical upstream dux terminal recording, before the Yaran rebrand. The fallback image is an upstream dux terminal capture from the same pre-rebrand era, not a current Yaran screenshot.
     </p>
 
     {/* `.term` carries no margin of its own, so without this the caption above
@@ -50,7 +48,7 @@ const scriptId = `asciicast-${castId}`;
         <span class="term-dot" style="background:#febc2e"></span>
         <span class="term-dot" style="background:#28c840"></span>
         <span class="ml-3 mono text-[11px] text-[color:var(--color-dim)]">{title}</span>
-        <span class="ml-auto pill text-[10px] !py-0.5">live recording</span>
+        <span class="ml-auto pill text-[10px] !py-0.5">historical recording</span>
       </div>
       <div class="bg-black p-2 sm:p-3">
         {/* The sizer reserves the player's final height before anything loads:
@@ -62,7 +60,7 @@ const scriptId = `asciicast-${castId}`;
               injects its player, so an unreachable or blocked asciinema.org
               leaves a real frame rather than an empty box. */}
           <a
-            id="dux-demo-fallback"
+            id="yaran-demo-fallback"
             href={link}
             target="_blank"
             rel="noopener"
@@ -70,7 +68,7 @@ const scriptId = `asciicast-${castId}`;
           >
             <img
               src="/dux-screenshot.svg"
-              alt={`${title}: watch the recording on asciinema.org`}
+              alt="Historical upstream dux terminal capture, before the Yaran rebrand; watch the upstream recording on asciinema.org"
               width="1609"
               height="784"
               loading="lazy"
@@ -79,7 +77,7 @@ const scriptId = `asciicast-${castId}`;
             <span class="pointer-events-none absolute inset-0 grid place-items-center">
               <span class="inline-flex items-center gap-2 rounded-full border border-[color:var(--color-accent)]/60 bg-[color:var(--color-ink)]/80 px-5 py-2.5 text-sm font-semibold text-[color:var(--color-accent)] backdrop-blur">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
-                Watch the recording
+                Watch the upstream recording
               </span>
             </span>
           </a>
@@ -125,7 +123,7 @@ const scriptId = `asciicast-${castId}`;
   <script is:inline>
     (function () {
       var box = document.querySelector(".asciinema-embed");
-      var fb = document.getElementById("dux-demo-fallback");
+      var fb = document.getElementById("yaran-demo-fallback");
       if (!box || !fb) return;
       var tries = 0;
       var poll = setInterval(function () {

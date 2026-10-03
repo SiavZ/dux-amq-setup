@@ -4,7 +4,7 @@
 
 **Goal:** Resolve six deferred web-server hardening items on the `server-mode` branch (reconnect convergence, per-class connection caps, cheaper change-detection, proactive PTY-viewer cleanup, REST route nesting, detached-HEAD tolerance) plus a per-PTY active-owner model with read-only secondary views.
 
-**Architecture:** A Rust axum server (`crates/dux-web`) wraps a single-threaded engine actor (`crates/dux-core`) and serves a React/Vite SPA (`crates/dux-web/web`). All reads/actions are REST (`/api/v1/*`); a single `/ws/events` socket pushes resource-change/status signals; per-PTY binary sockets stream terminals. State is in-memory except SQLite session/changes persistence. Single-tenant, trusted-access by design.
+**Architecture:** A Rust axum server (`crates/yaran-web`) wraps a single-threaded engine actor (`crates/yaran-core`) and serves a React/Vite SPA (`crates/yaran-web/web`). All reads/actions are REST (`/api/v1/*`); a single `/ws/events` socket pushes resource-change/status signals; per-PTY binary sockets stream terminals. State is in-memory except SQLite session/changes persistence. Single-tenant, trusted-access by design.
 
 **Tech Stack:** Rust (axum, tokio, rusqlite, portable-pty, alacritty_terminal), TypeScript/React/Vite/Tailwind v4 (shadcn/base-ui), TOML config via `toml_edit`.
 
@@ -22,7 +22,7 @@
 - **No em-dashes** in code or prose (user preference).
 - **Verification (CI gates), run before every commit:**
   - Rust: `cargo fmt` ; `cargo clippy --all-targets --all-features -- -D warnings` ; `cargo test`
-  - Web (from `crates/dux-web/web`): `npx tsc -b` ; `npx vitest run`
+  - Web (from `crates/yaran-web/web`): `npx tsc -b` ; `npx vitest run`
 - **Commit messages are plain sentences**, no conventional-commit prefixes, no structured trailers.
 
 ## Decisions locked in (from design discussion)
@@ -34,7 +34,7 @@
 
 ## File Structure (what changes and why)
 
-**Rust — `crates/dux-core/src/`**
+**Rust — `crates/yaran-core/src/`**
 - `git.rs` — add `current_branch_opt` (detached-tolerant); make `switch_branch_if_needed` detached-tolerant.
 - `project_browser.rs` — `leading_branch_for_project` signature → `Option<&str>`; `load_projects` + branch-status/checkout-default jobs use `current_branch_opt`.
 - `agent_job.rs` — base-branch fallback routes through `leading_branch_for_project`.
@@ -42,7 +42,7 @@
 - `config_write.rs` — strip old key on every save; render three new commented keys.
 - `wire.rs` — web add-project paths use `current_branch_opt`.
 
-**Rust — `crates/dux-web/src/`**
+**Rust — `crates/yaran-web/src/`**
 - `server.rs` — three semaphores; events-handler permit via helper; PTY active-owner read-only enforcement + size-on-attach already partly present (`PtySizeOwners`); a `ConnectionRegistry`; liveness ping; access-log comment fix; nested git/file route registration.
 - `engine_actor.rs` — `server_rebind_settings_changed` three-field compare; spine-check gating (mutation version + streaming counter + backstop + `cfg(test)` call counter).
 - `git_routes.rs`, `file_routes.rs` — nested under `/api/v1/sessions/:id/...`, `Path<String>` id, `id_within_bound` guard.
@@ -51,13 +51,13 @@
 - `project_reads.rs` — inspect tolerates detached HEAD.
 - `event_bus.rs` — no change expected (interest ref-count stays).
 
-**Rust — `crates/dux-tui/src/`**
+**Rust — `crates/yaran-tui/src/`**
 - `config.rs` — canonical renderer + tests for the three new keys.
 - `cli.rs` — `config diff` for the three new keys.
 - `app/sessions.rs`, `app/workers.rs` — TUI add-project / create-agent pre-check use `current_branch_opt`.
 - `lib.rs`, `tests/auth_gate.rs` — field-reference updates.
 
-**Web — `crates/dux-web/web/src/`**
+**Web — `crates/yaran-web/web/src/`**
 - `lib/git.ts`, `lib/fileApi.ts`, `lib/markdown.ts` — nested URLs, drop `session_id` from bodies/query.
 - `lib/gitFileApi.test.ts`, `lib/markdown.test.ts` — updated URL/body assertions.
 - PTY view component(s) + `lib/store.ts` / `lib/eventsSocket.ts` — send size on attach; render placeholder + read-only for displaced views; foreground-aware ownership.
@@ -73,8 +73,8 @@ Tasks are independent and land as separate commits, except: **Task 6 (active-own
 ## Task 1: Detached-HEAD-tolerant git helper
 
 **Files:**
-- Modify: `crates/dux-core/src/git.rs` (after `current_branch`, ~line 78)
-- Test: `crates/dux-core/src/git.rs` (`#[cfg(test)] mod tests`)
+- Modify: `crates/yaran-core/src/git.rs` (after `current_branch`, ~line 78)
+- Test: `crates/yaran-core/src/git.rs` (`#[cfg(test)] mod tests`)
 
 **Interfaces:**
 - Produces: `pub fn current_branch_opt(repo_path: &Path) -> anyhow::Result<Option<String>>` — `Ok(Some(name))` on a normal branch (trimmed); `Ok(None)` **iff** `git symbolic-ref` exits with code `1` (detached HEAD); `Err` on any other non-zero exit (128 = not a repo, etc.) or spawn failure.
@@ -111,7 +111,7 @@ fn current_branch_opt_errors_on_non_repo() {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p dux-core current_branch_opt`
+Run: `cargo test -p yaran-core current_branch_opt`
 Expected: FAIL — `cannot find function current_branch_opt`.
 
 - [ ] **Step 3: Implement `current_branch_opt`**
@@ -155,13 +155,13 @@ pub fn current_branch_opt(repo_path: &Path) -> Result<Option<String>> {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p dux-core current_branch_opt`
+Run: `cargo test -p yaran-core current_branch_opt`
 Expected: PASS (3 tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/dux-core/src/git.rs
+git add crates/yaran-core/src/git.rs
 git commit -m "Add detached-HEAD-tolerant current_branch_opt git helper"
 ```
 
@@ -170,8 +170,8 @@ git commit -m "Add detached-HEAD-tolerant current_branch_opt git helper"
 ## Task 2: Detached-tolerant leading-branch derivation and switch
 
 **Files:**
-- Modify: `crates/dux-core/src/project_browser.rs` (`leading_branch_for_project` ~line 71; `load_projects` ~line 105; branch-status job ~line 197; checkout-default inspection ~line 224)
-- Modify: `crates/dux-core/src/git.rs` (`switch_branch_if_needed` ~line 231)
+- Modify: `crates/yaran-core/src/project_browser.rs` (`leading_branch_for_project` ~line 71; `load_projects` ~line 105; branch-status job ~line 197; checkout-default inspection ~line 224)
+- Modify: `crates/yaran-core/src/git.rs` (`switch_branch_if_needed` ~line 231)
 - Test: both files' test modules
 
 **Interfaces:**
@@ -195,7 +195,7 @@ fn switch_branch_if_needed_switches_from_detached_head() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p dux-core switch_branch_if_needed_switches_from_detached_head`
+Run: `cargo test -p yaran-core switch_branch_if_needed_switches_from_detached_head`
 Expected: FAIL — current `switch_branch_if_needed` calls `current_branch(...)?` which errors on detached HEAD.
 
 - [ ] **Step 3: Make `switch_branch_if_needed` detached-tolerant**
@@ -238,19 +238,19 @@ Update the three callers in `project_browser.rs`:
 
 - [ ] **Step 5: Run to verify the switch test passes**
 
-Run: `cargo test -p dux-core switch_branch_if_needed_switches_from_detached_head`
+Run: `cargo test -p yaran-core switch_branch_if_needed_switches_from_detached_head`
 Expected: PASS.
 
 - [ ] **Step 6: Fix the compile errors at every `leading_branch_for_project` caller**
 
-Run: `cargo build -p dux-core -p dux-tui -p dux-web`
+Run: `cargo build -p yaran-core -p yaran-tui -p yaran-web`
 Wrap each existing `&current_branch` arg as `Some(current_branch.as_str())` (TUI `app/sessions.rs:58`, `app/workers.rs:1393`, and any test fixtures). Expected after fixes: clean build.
 
 - [ ] **Step 7: Run the full core suite + commit**
 
 ```bash
-cargo test -p dux-core
-git add crates/dux-core/src/git.rs crates/dux-core/src/project_browser.rs crates/dux-core/src/agent_job.rs
+cargo test -p yaran-core
+git add crates/yaran-core/src/git.rs crates/yaran-core/src/project_browser.rs crates/yaran-core/src/agent_job.rs
 git commit -m "Make leading-branch derivation and branch switching tolerate a detached HEAD"
 ```
 
@@ -259,11 +259,11 @@ git commit -m "Make leading-branch derivation and branch switching tolerate a de
 ## Task 3: Detached-HEAD tolerance across all inspection call sites (web + TUI)
 
 **Files:**
-- Modify: `crates/dux-web/src/project_reads.rs` (`inspect_path` ~line 170-195)
-- Modify: `crates/dux-core/src/wire.rs` (`add_project_checkout_default` ~line 1238; `AddProject` handler ~line 2080)
-- Modify: `crates/dux-core/src/agent_job.rs` (base fallback ~lines 60-63, 95-98)
-- Modify: `crates/dux-tui/src/app/sessions.rs` (~line 57), `crates/dux-tui/src/app/workers.rs` (~line 1389)
-- Test: `crates/dux-web/src/project_reads.rs` tests; `crates/dux-core/src/agent_job.rs`/`wire.rs` tests
+- Modify: `crates/yaran-web/src/project_reads.rs` (`inspect_path` ~line 170-195)
+- Modify: `crates/yaran-core/src/wire.rs` (`add_project_checkout_default` ~line 1238; `AddProject` handler ~line 2080)
+- Modify: `crates/yaran-core/src/agent_job.rs` (base fallback ~lines 60-63, 95-98)
+- Modify: `crates/yaran-tui/src/app/sessions.rs` (~line 57), `crates/yaran-tui/src/app/workers.rs` (~line 1389)
+- Test: `crates/yaran-web/src/project_reads.rs` tests; `crates/yaran-core/src/agent_job.rs`/`wire.rs` tests
 
 **Interfaces:**
 - Consumes: `current_branch_opt`, `leading_branch_for_project(Option<&str>)` (Tasks 1-2).
@@ -285,16 +285,16 @@ async fn inspect_non_repo_still_400() {
 
 - [ ] **Step 2: Run to verify the detached test fails (and non-repo still passes)**
 
-Run: `cargo test -p dux-web inspect_detached_head inspect_non_repo`
+Run: `cargo test -p yaran-web inspect_detached_head inspect_non_repo`
 Expected: detached test FAILS (currently 400), non-repo PASSES.
 
 - [ ] **Step 3: Make `inspect_path` use `current_branch_opt`**
 
 In `project_reads.rs` the blocking closure becomes:
 ```rust
-let branch = dux_core::git::current_branch_opt(repo).map_err(|e| format!("{e:#}"))?;
+let branch = yaran_core::git::current_branch_opt(repo).map_err(|e| format!("{e:#}"))?;
 let warning = match branch.as_deref() {
-    Some(b) => dux_core::git::branch_warning_kind(repo, b).map(/* existing mapping */),
+    Some(b) => yaran_core::git::branch_warning_kind(repo, b).map(/* existing mapping */),
     None => None, // detached: no "not on default branch" warning
 };
 Ok::<_, String>((branch, warning))
@@ -341,8 +341,8 @@ async fn create_agent_detached_with_origin_head_uses_default_branch() {
 - [ ] **Step 8: Run all affected tests + commit**
 
 ```bash
-cargo test -p dux-core -p dux-web -p dux-tui
-git add crates/dux-web/src/project_reads.rs crates/dux-core/src/wire.rs crates/dux-core/src/agent_job.rs crates/dux-tui/src/app/sessions.rs crates/dux-tui/src/app/workers.rs
+cargo test -p yaran-core -p yaran-web -p yaran-tui
+git add crates/yaran-web/src/project_reads.rs crates/yaran-core/src/wire.rs crates/yaran-core/src/agent_job.rs crates/yaran-tui/src/app/sessions.rs crates/yaran-tui/src/app/workers.rs
 git commit -m "Tolerate detached HEAD across project inspection, add-project, and create-agent paths"
 ```
 
@@ -351,8 +351,8 @@ git commit -m "Tolerate detached HEAD across project inspection, add-project, an
 ## Task 4: Catch-up on (re)subscribe to close the changes-pane reconnect gap
 
 **Files:**
-- Modify: `crates/dux-web/src/server.rs` (`apply_events_frame` ~1489-1557; its caller in `handle_events_socket` ~line 1448; mirror the lag-recovery block ~1322-1376)
-- Test: `crates/dux-web/src/server.rs` tests; `crates/dux-web/web/src/lib/eventsSocket` or store test for revless handling
+- Modify: `crates/yaran-web/src/server.rs` (`apply_events_frame` ~1489-1557; its caller in `handle_events_socket` ~line 1448; mirror the lag-recovery block ~1322-1376)
+- Test: `crates/yaran-web/src/server.rs` tests; `crates/yaran-web/web/src/lib/eventsSocket` or store test for revless handling
 
 **Interfaces:**
 - Changes: `apply_events_frame(...) -> Vec<String>` returning the **newly-inserted fine topics** (the `session:<id>:changes` topics added by this frame). Caller emits a catch-up `session.changes` per new topic using the in-scope `sink` and `changes.peek_rev(sid)`.
@@ -377,7 +377,7 @@ async fn subscribe_cold_cache_emits_revless_catchup() {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test -p dux-web subscribe_emits_catchup subscribe_cold_cache`
+Run: `cargo test -p yaran-web subscribe_emits_catchup subscribe_cold_cache`
 Expected: FAIL — no catch-up is sent today.
 
 - [ ] **Step 3: Refactor `apply_events_frame` to return newly-subscribed fine topics**
@@ -395,22 +395,22 @@ This mirrors the lag-recovery block at ~1322-1376 (same `sink`/`changes` in scop
 
 - [ ] **Step 5: Run to verify the Rust tests pass**
 
-Run: `cargo test -p dux-web subscribe_emits_catchup subscribe_cold_cache`
+Run: `cargo test -p yaran-web subscribe_emits_catchup subscribe_cold_cache`
 Expected: PASS.
 
 - [ ] **Step 6: Add/verify the frontend revless-handling test**
 
-In `crates/dux-web/web/src/lib/`, add a test asserting that handling a `session.changes` event for the selected session with `rev === undefined` calls `loadChanges` (the existing store logic at store.ts:519 already does this — assert it so a regression is caught).
+In `crates/yaran-web/web/src/lib/`, add a test asserting that handling a `session.changes` event for the selected session with `rev === undefined` calls `loadChanges` (the existing store logic at store.ts:519 already does this — assert it so a regression is caught).
 
-Run (from `crates/dux-web/web`): `npx vitest run`
+Run (from `crates/yaran-web/web`): `npx vitest run`
 Expected: PASS.
 
 - [ ] **Step 7: Gates + commit**
 
 ```bash
-cargo fmt && cargo clippy --all-targets --all-features -- -D warnings && cargo test -p dux-web
-( cd crates/dux-web/web && npx tsc -b && npx vitest run )
-git add crates/dux-web/src/server.rs crates/dux-web/web/src/lib/
+cargo fmt && cargo clippy --all-targets --all-features -- -D warnings && cargo test -p yaran-web
+( cd crates/yaran-web/web && npx tsc -b && npx vitest run )
+git add crates/yaran-web/src/server.rs crates/yaran-web/web/src/lib/
 git commit -m "Send a per-session catch-up on subscribe so the changes pane converges after a reconnect"
 ```
 
@@ -419,8 +419,8 @@ git commit -m "Send a per-session catch-up on subscribe so the changes pane conv
 ## Task 5: Proactive PTY-viewer cleanup (RAII unsubscribe)
 
 **Files:**
-- Modify: `crates/dux-core/src/pty.rs` (subscriber store ~line 427; `subscribe`/`subscribe_with_repaint` ~663/678; reader loop drain ~577)
-- Test: `crates/dux-core/src/pty.rs` tests (existing tests spawn a real PTY, e.g. `/bin/cat`)
+- Modify: `crates/yaran-core/src/pty.rs` (subscriber store ~line 427; `subscribe`/`subscribe_with_repaint` ~663/678; reader loop drain ~577)
+- Test: `crates/yaran-core/src/pty.rs` tests (existing tests spawn a real PTY, e.g. `/bin/cat`)
 
 **Interfaces:**
 - Changes: subscriber store becomes `Vec<(u64, Sender<Vec<u8>>)>` with a monotonic id counter on `PtyClient`.
@@ -451,7 +451,7 @@ fn dropping_one_guard_keeps_the_other_subscriber() {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test -p dux-core dropping_the_guard dropping_one_guard`
+Run: `cargo test -p yaran-core dropping_the_guard dropping_one_guard`
 Expected: FAIL — `subscribe` does not return a guard yet.
 
 - [ ] **Step 3: Implement id-tagged subscribers + the guard**
@@ -469,13 +469,13 @@ The PTY socket handlers (`handle_pty_socket`) must bind the guard for the socket
 
 - [ ] **Step 5: Run tests + gates**
 
-Run: `cargo test -p dux-core dropping_ ; cargo clippy --all-targets --all-features -- -D warnings`
+Run: `cargo test -p yaran-core dropping_ ; cargo clippy --all-targets --all-features -- -D warnings`
 Expected: PASS, no warnings.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/dux-core/src/pty.rs crates/dux-web/src/server.rs
+git add crates/yaran-core/src/pty.rs crates/yaran-web/src/server.rs
 git commit -m "Remove a PTY viewer immediately on disconnect via an RAII unsubscribe guard"
 ```
 
@@ -486,9 +486,9 @@ git commit -m "Remove a PTY viewer immediately on disconnect via an RAII unsubsc
 Builds on the existing `PtySizeOwners` (most-recent attach owns sizing; non-owner resize ignored — server.rs:692-736, claimed at :923, gated at :968, released at :981).
 
 **Files:**
-- Modify: `crates/dux-web/src/server.rs` (PTY socket handlers: enforce input only from the owner; broadcast an ownership-change signal)
-- Modify: PTY view component(s) under `crates/dux-web/web/src/` and `lib/store.ts` / `lib/eventsSocket.ts`
-- Test: `crates/dux-web/src/server.rs` tests (owner-only input); web component test (placeholder + read-only)
+- Modify: `crates/yaran-web/src/server.rs` (PTY socket handlers: enforce input only from the owner; broadcast an ownership-change signal)
+- Modify: PTY view component(s) under `crates/yaran-web/web/src/` and `lib/store.ts` / `lib/eventsSocket.ts`
+- Test: `crates/yaran-web/src/server.rs` tests (owner-only input); web component test (placeholder + read-only)
 
 **Interfaces:**
 - Server: input (binary stdin) frames are applied only when the sending connection is the current sizing owner of that PTY (reuse `PtySizeOwners::may_resize` semantics, or a parallel `may_write`); a non-owner's stdin is dropped. On a new owner claim, emit an event `{event:"pty.owner", id:"<pty_id>"}` so other clients update their view.
@@ -507,7 +507,7 @@ async fn non_owner_stdin_is_dropped() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p dux-web non_owner_stdin_is_dropped`
+Run: `cargo test -p yaran-web non_owner_stdin_is_dropped`
 Expected: FAIL — today both connections' stdin is forwarded.
 
 - [ ] **Step 3: Gate stdin on ownership**
@@ -516,7 +516,7 @@ In the PTY socket handler, before forwarding a binary stdin frame to `engine.wri
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p dux-web non_owner_stdin_is_dropped`
+Run: `cargo test -p yaran-web non_owner_stdin_is_dropped`
 Expected: PASS.
 
 - [ ] **Step 5: Frontend — foreground-aware ownership + size-on-attach**
@@ -536,9 +536,9 @@ Add a web test: rendering with `isOwner=false` shows the placeholder and no edit
 - [ ] **Step 7: Gates + commit**
 
 ```bash
-cargo fmt && cargo clippy --all-targets --all-features -- -D warnings && cargo test -p dux-web
-( cd crates/dux-web/web && npx tsc -b && npx vitest run )
-git add crates/dux-web/src/server.rs crates/dux-web/web/src/
+cargo fmt && cargo clippy --all-targets --all-features -- -D warnings && cargo test -p yaran-web
+( cd crates/yaran-web/web && npx tsc -b && npx vitest run )
+git add crates/yaran-web/src/server.rs crates/yaran-web/web/src/
 git commit -m "Add a per-PTY active-owner model: most-recent foreground device drives size and input, others see a read-only take-over placeholder"
 ```
 
@@ -547,9 +547,9 @@ git commit -m "Add a per-PTY active-owner model: most-recent foreground device d
 ## Task 7: Connection registry, liveness ping, and notification-tag validation
 
 **Files:**
-- Modify: `crates/dux-web/src/server.rs` (add `ConnectionRegistry` to `AppState`; register/deregister on every socket connect/disconnect; liveness ping task)
-- Modify: `crates/dux-web/src/rest_common.rs` (`scope_from_headers` validates against the registry)
-- Test: `crates/dux-web/src/server.rs` tests; `crates/dux-web/src/rest_common.rs` tests
+- Modify: `crates/yaran-web/src/server.rs` (add `ConnectionRegistry` to `AppState`; register/deregister on every socket connect/disconnect; liveness ping task)
+- Modify: `crates/yaran-web/src/rest_common.rs` (`scope_from_headers` validates against the registry)
+- Test: `crates/yaran-web/src/server.rs` tests; `crates/yaran-web/src/rest_common.rs` tests
 
 **Interfaces:**
 - Produces: `ConnectionRegistry` — `{ insert(conn_id, class), remove(conn_id), contains(conn_id) -> bool, count(class) -> usize }`, thread-safe (`Mutex<HashMap<...>>`). Connection ids are the server-minted UUIDs already used for `/ws/events`; PTY sockets register too (for liveness + class counts).
@@ -576,7 +576,7 @@ fn live_connection_id_scopes_to_that_connection() {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test -p dux-web connection_id_falls_back live_connection_id_scopes`
+Run: `cargo test -p yaran-web connection_id_falls_back live_connection_id_scopes`
 Expected: FAIL — `scope_from_headers` does not take a registry yet.
 
 - [ ] **Step 3: Implement the registry + validation**
@@ -591,13 +591,13 @@ Spawn a periodic task (wall-clock interval, e.g. every 30s) that sends a ping on
 
 - [ ] **Step 5: Run tests + gates**
 
-Run: `cargo test -p dux-web ; cargo clippy --all-targets --all-features -- -D warnings`
+Run: `cargo test -p yaran-web ; cargo clippy --all-targets --all-features -- -D warnings`
 Expected: PASS, no warnings.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/dux-web/src/server.rs crates/dux-web/src/rest_common.rs
+git add crates/yaran-web/src/server.rs crates/yaran-web/src/rest_common.rs
 git commit -m "Add a live-connection registry, liveness ping, and notification-tag validation that falls back to broadcasting on an unknown id"
 ```
 
@@ -606,12 +606,12 @@ git commit -m "Add a live-connection registry, liveness ping, and notification-t
 ## Task 8: Split the WebSocket connection cap into three classes
 
 **Files:**
-- Modify: `crates/dux-core/src/config.rs` (remove `max_websocket_connections`; add three fields + defaults + comments)
-- Modify: `crates/dux-core/src/config_write.rs` (strip old key on every save; render three new keys)
-- Modify: `crates/dux-web/src/server.rs` (three semaphores; events handler via helper; ~lines 82/314/637-652/767/834/1155)
-- Modify: `crates/dux-web/src/engine_actor.rs` (`server_rebind_settings_changed` ~268; test ~1942)
-- Modify: `crates/dux-tui/src/config.rs` (renderer ~650-663; test ~1292), `crates/dux-tui/src/cli.rs` (~315-317)
-- Modify: `crates/dux-web/src/lib.rs`, `crates/dux-web/tests/auth_gate.rs` (field refs)
+- Modify: `crates/yaran-core/src/config.rs` (remove `max_websocket_connections`; add three fields + defaults + comments)
+- Modify: `crates/yaran-core/src/config_write.rs` (strip old key on every save; render three new keys)
+- Modify: `crates/yaran-web/src/server.rs` (three semaphores; events handler via helper; ~lines 82/314/637-652/767/834/1155)
+- Modify: `crates/yaran-web/src/engine_actor.rs` (`server_rebind_settings_changed` ~268; test ~1942)
+- Modify: `crates/yaran-tui/src/config.rs` (renderer ~650-663; test ~1292), `crates/yaran-tui/src/cli.rs` (~315-317)
+- Modify: `crates/yaran-web/src/lib.rs`, `crates/yaran-web/tests/auth_gate.rs` (field refs)
 - Test: config back-compat + independence tests
 
 **Interfaces:**
@@ -646,7 +646,7 @@ fn permit_releases_on_drop() {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test -p dux-core -p dux-web max_websocket one_class_saturated permit_releases`
+Run: `cargo test -p yaran-core -p yaran-web max_websocket one_class_saturated permit_releases`
 Expected: FAIL — fields/semaphores don't exist yet.
 
 - [ ] **Step 3: Update `config.rs`**
@@ -677,23 +677,23 @@ In `engine_actor.rs:268`, replace the single comparison with three (OR'd); updat
 - [ ] **Step 6: Update the canonical renderers + diff + remaining refs**
 
 - `config_write.rs`: strip `max_websocket_connections` in the per-save patch path (mirror the oneshot strip at :491, which runs on every save) and render the three new commented keys.
-- `dux-tui/src/config.rs`: replace the single `ConfigEntry::Field` (~650-663) with three commented entries; update the test assertion (~1292) to three.
-- `dux-tui/src/cli.rs`: replace the single `diff_usize("server.max_websocket_connections", ...)` (~315-317) with three.
+- `yaran-tui/src/config.rs`: replace the single `ConfigEntry::Field` (~650-663) with three commented entries; update the test assertion (~1292) to three.
+- `yaran-tui/src/cli.rs`: replace the single `diff_usize("server.max_websocket_connections", ...)` (~315-317) with three.
 - Add a one-time startup log warning when the raw TOML still contains `max_websocket_connections`, naming the three replacements and noting `=0` meant "disable."
-- `dux-web/src/lib.rs`, `tests/auth_gate.rs`: update field references.
+- `yaran-web/src/lib.rs`, `tests/auth_gate.rs`: update field references.
 
 - [ ] **Step 7: Run full gates**
 
 ```bash
 cargo fmt && cargo clippy --all-targets --all-features -- -D warnings && cargo test
-( cd crates/dux-web/web && npx tsc -b && npx vitest run )
+( cd crates/yaran-web/web && npx tsc -b && npx vitest run )
 ```
 Expected: all green.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/dux-core/src/config.rs crates/dux-core/src/config_write.rs crates/dux-web/src/server.rs crates/dux-web/src/engine_actor.rs crates/dux-tui/src/config.rs crates/dux-tui/src/cli.rs crates/dux-web/src/lib.rs crates/dux-web/tests/auth_gate.rs
+git add crates/yaran-core/src/config.rs crates/yaran-core/src/config_write.rs crates/yaran-web/src/server.rs crates/yaran-web/src/engine_actor.rs crates/yaran-tui/src/config.rs crates/yaran-tui/src/cli.rs crates/yaran-web/src/lib.rs crates/yaran-web/tests/auth_gate.rs
 git commit -m "Split the WebSocket connection cap into separate events, agent, and terminal limits"
 ```
 
@@ -702,7 +702,7 @@ git commit -m "Split the WebSocket connection cap into separate events, agent, a
 ## Task 9: Change-gated spine check with a self-healing backstop
 
 **Files:**
-- Modify: `crates/dux-web/src/engine_actor.rs` (spine-check block ~1159-1178; bump sites at ~1345 apply, ~916 worker-drain, ~1107 foreground refresh, ~1112 prune; streaming counter in `poll_pty_activity` ~1102; `spine_fingerprints` ~1330 gets a `cfg(test)` call counter)
+- Modify: `crates/yaran-web/src/engine_actor.rs` (spine-check block ~1159-1178; bump sites at ~1345 apply, ~916 worker-drain, ~1107 foreground refresh, ~1112 prune; streaming counter in `poll_pty_activity` ~1102; `spine_fingerprints` ~1330 gets a `cfg(test)` call counter)
 - Test: `engine_actor.rs` tests (with the required seams)
 
 **Interfaces:**
@@ -738,7 +738,7 @@ fn prune_exit_triggers_a_check_within_one_interval() {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test -p dux-web idle_ticks backstop_emits streaming_transition prune_exit`
+Run: `cargo test -p yaran-web idle_ticks backstop_emits streaming_transition prune_exit`
 Expected: FAIL — seams + gating don't exist.
 
 - [ ] **Step 3: Add the seams**
@@ -755,13 +755,13 @@ Expected: FAIL — seams + gating don't exist.
 
 - [ ] **Step 5: Run tests + gates**
 
-Run: `cargo test -p dux-web idle_ticks backstop_emits streaming_transition prune_exit ; cargo clippy --all-targets --all-features -- -D warnings`
+Run: `cargo test -p yaran-web idle_ticks backstop_emits streaming_transition prune_exit ; cargo clippy --all-targets --all-features -- -D warnings`
 Expected: PASS, no warnings.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/dux-web/src/engine_actor.rs
+git add crates/yaran-web/src/engine_actor.rs
 git commit -m "Gate the spine serialize on actual change with a slow self-healing backstop"
 ```
 
@@ -770,11 +770,11 @@ git commit -m "Gate the spine serialize on actual change with a slow self-healin
 ## Task 10: Nest git/file REST routes under the session
 
 **Files:**
-- Modify: `crates/dux-web/src/git_routes.rs` (6 routes; structs lose `session_id`; add `Path<String>` + `id_within_bound`)
-- Modify: `crates/dux-web/src/file_routes.rs` (6 routes; same)
-- Modify: `crates/dux-web/src/server.rs` (access-log comment ~429-432)
-- Modify: `crates/dux-web/web/src/lib/git.ts`, `lib/fileApi.ts`, `lib/markdown.ts`
-- Modify: `crates/dux-web/web/src/lib/gitFileApi.test.ts`, `lib/markdown.test.ts`
+- Modify: `crates/yaran-web/src/git_routes.rs` (6 routes; structs lose `session_id`; add `Path<String>` + `id_within_bound`)
+- Modify: `crates/yaran-web/src/file_routes.rs` (6 routes; same)
+- Modify: `crates/yaran-web/src/server.rs` (access-log comment ~429-432)
+- Modify: `crates/yaran-web/web/src/lib/git.ts`, `lib/fileApi.ts`, `lib/markdown.ts`
+- Modify: `crates/yaran-web/web/src/lib/gitFileApi.test.ts`, `lib/markdown.test.ts`
 - Test: Rust route tests (positive + negative); web vitest
 
 **Interfaces:**
@@ -797,7 +797,7 @@ async fn nested_git_oversized_id_is_404() { /* id length > MAX_ID_LEN -> 404 via
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test -p dux-web nested_git nested_file`
+Run: `cargo test -p yaran-web nested_git nested_file`
 Expected: FAIL — old paths/struct shapes.
 
 - [ ] **Step 3: Re-path the Rust handlers**
@@ -806,7 +806,7 @@ For each git/file route: change the path string to the nested form, replace the 
 
 - [ ] **Step 4: Run to verify the Rust tests pass**
 
-Run: `cargo test -p dux-web nested_git nested_file`
+Run: `cargo test -p yaran-web nested_git nested_file`
 Expected: PASS.
 
 - [ ] **Step 5: Update the frontend callers + their tests**
@@ -824,9 +824,9 @@ In `server.rs:429-432`, update the example from `/api/file/raw?session_id=…` t
 - [ ] **Step 7: Gates + commit**
 
 ```bash
-cargo fmt && cargo clippy --all-targets --all-features -- -D warnings && cargo test -p dux-web
-( cd crates/dux-web/web && npx tsc -b && npx vitest run )
-git add crates/dux-web/src/git_routes.rs crates/dux-web/src/file_routes.rs crates/dux-web/src/server.rs crates/dux-web/web/src/lib/
+cargo fmt && cargo clippy --all-targets --all-features -- -D warnings && cargo test -p yaran-web
+( cd crates/yaran-web/web && npx tsc -b && npx vitest run )
+git add crates/yaran-web/src/git_routes.rs crates/yaran-web/src/file_routes.rs crates/yaran-web/src/server.rs crates/yaran-web/web/src/lib/
 git commit -m "Nest git and file REST routes under /api/v1/sessions/:id and validate the id"
 ```
 
@@ -837,7 +837,7 @@ git commit -m "Nest git and file REST routes under /api/v1/sessions/:id and vali
 - [ ] `cargo fmt`
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
 - [ ] `cargo test`
-- [ ] `( cd crates/dux-web/web && npx tsc -b && npx vitest run )`
+- [ ] `( cd crates/yaran-web/web && npx tsc -b && npx vitest run )`
 - [ ] Ask the user to `cargo run` and smoke-test: two-device same-session takeover (read-only placeholder on the displaced device, size snaps to the foreground device); reconnect leaves no stuck "loading changes"; saturating terminals does not block an events connection; adding/creating an agent in a detached-HEAD repo works.
 
 ## Docs to update (fold into the relevant task or a final docs commit)

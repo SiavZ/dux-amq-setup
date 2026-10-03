@@ -1,4 +1,4 @@
-# REST-first architecture for dux server mode
+# REST-first architecture for yaran server mode
 
 Date: 2026-06-27
 Status: Draft for review (revised after adversarial review)
@@ -10,12 +10,12 @@ WebSocket to every client, plus an ad-hoc mix of WebSocket commands and a few
 HTTP routes. Two structural problems follow:
 
 1. **Client-view state is stored globally.** The changed-files watch
-   (`watched_session_id` + staged/unstaged lists, `crates/dux-core/src/engine/mod.rs:138`)
+   (`watched_session_id` + staged/unstaged lists, `crates/yaran-core/src/engine/mod.rs:138`)
    lives on the shared engine and rides the broadcast ViewModel. Two clients
    viewing different sessions clobber each other; the loser strands on a
    "Loading changes..." spinner forever. The spinner is rendered in
-   `crates/dux-web/web/src/components/ChangedFiles.tsx:274-288`, gated by the
-   pure helper `shouldShowChangedFiles` (`crates/dux-web/web/src/lib/changedFiles.ts:75`).
+   `crates/yaran-web/web/src/components/ChangedFiles.tsx:274-288`, gated by the
+   pure helper `shouldShowChangedFiles` (`crates/yaran-web/web/src/lib/changedFiles.ts:75`).
    This is the originally reported bug.
 2. **The WebSocket carries bulk data.** Any volatile change re-serializes and
    re-broadcasts the whole ViewModel, including build-static config. The socket
@@ -98,7 +98,7 @@ bug.
 ### Required protections on EVERY socket (and the gate)
 
 The existing `/ws` handler enforces four protections that the new sockets MUST
-replicate (verified in `crates/dux-web/src/server.rs`): they are not optional and
+replicate (verified in `crates/yaran-web/src/server.rs`): they are not optional and
 are not inherited automatically by a new upgrade handler.
 
 1. **Origin / CSWSH check** (`same_origin_allowed`, runs *regardless* of whether
@@ -179,7 +179,7 @@ without a session (using the actual router, not only the probe-route seam).
 ### Auth seam (cookie now)
 
 All `/api/v1/*` routes and both socket families sit behind the existing
-`require_auth` gate (the `gate` middleware defined at `crates/dux-web/src/server.rs:412`
+`require_auth` gate (the `gate` middleware defined at `crates/yaran-web/src/server.rs:412`
 and applied at `server.rs:298`), which validates the session cookie. We do **not**
 add a token abstraction now; we only keep the gate as a single middleware layer
 so a future bearer/API-key check is a localized change. No `AuthIdentity` type is
@@ -253,7 +253,7 @@ persistent error/warning ones) from appearing on every other client. Fixed in
 Phase 1, on the legacy `/ws` status path (where toasts ride in Phase 1 — they do
 not move onto `/ws/events` yet):
 
-- **dux-core (scope on the core status types):** add
+- **yaran-core (scope on the core status types):** add
   `enum StatusScope { All, Connection(String) }` and a `scope` field (default
   `All`) on `StatusUpdate`, `WireStatus` (`#[serde(default)]`), the keyed snapshot
   entry, and `ResolvedFinal` (so a deferred op's final carries its origin across
@@ -412,9 +412,9 @@ only irreversible step and ships last.
 ## Observability (CLAUDE.md status conventions apply to new async paths)
 
 - The changed-files poller runs as a supervised async tokio task (restart on
-  panic with backoff via its `JoinHandle`), NOT the dux-core `spawn_loop_worker`
+  panic with backoff via its `JoinHandle`), NOT the yaran-core `spawn_loop_worker`
   (which runs a synchronous body on an OS thread and cannot await the engine).
-  On repeated git errors for a session it logs to `dux.log` and raises a keyed
+  On repeated git errors for a session it logs to `yaran.log` and raises a keyed
   `Warning` status (cleared on next success). The GET handler logs git errors
   before returning 409.
 - Every `Busy` status still pairs with a final state; no new path emits an

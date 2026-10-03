@@ -77,7 +77,7 @@ silently snaps to 50 on the first resize keypress. The config file is meant to *
 documentation, so this falsifies its own tenet. **Fix the clamp to match the docs**,
 and add a test asserting the constant and the comment agree.
 
-### D5 — `dux config reset --all` destroys worktrees with no confirmation
+### D5 — `yaran config reset --all` destroys worktrees with no confirmation
 
 `run_reset` (`cli.rs:360-388`) calls `reset_agent_data` on `--all`, which removes
 worktrees via `git worktree remove --force` (`:710-720`), falls back to
@@ -89,7 +89,7 @@ The structural guards are good — `whole_workspace_target_is_within` (`:695`),
 complete read-only inventory before the first mutation (`:565-598`). None is *user*
 confirmation.
 
-The inconsistency is stark: `dux session purge` requires **both** `--hard` and a typed
+The inconsistency is stark: `yaran session purge` requires **both** `--hard` and a typed
 `PURGE <branch>` (`cli.rs:218-231`), and `config regenerate` requires `--yes` — yet the
 most destructive command requires neither. Worktrees are explicitly user data under
 `CLAUDE.md`. **Fix:** require a typed confirmation naming what will be destroyed, plus
@@ -184,10 +184,10 @@ Adding an editor is a code change — the same defect class as the provider tene
 (Phase 11), one layer over. **Fix:** make editors config-driven and honour
 `$EDITOR`/`$VISUAL` as a fallback.
 
-### D13 — Diff syntax theme does not follow the dux theme
+### D13 — Diff syntax theme does not follow the yaran theme
 
 `diff.rs:77` hardcodes `"base16-ocean.dark"`. Make it a config key
-(`[ui] syntax_theme`) and default it to something derived from the active dux theme.
+(`[ui] syntax_theme`) and default it to something derived from the active yaran theme.
 
 ## Acceptance criteria
 
@@ -219,7 +219,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 # D2: open Kill Running, Tab to a footer button, press Space -> button fires
 # D3: palette -> "Delete the selected companion terminal" -> confirm dialog appears
 # D4: set right_width_pct = 70, resize once, confirm it is not snapped to 50
-# D5: dux config reset --all  -> must refuse without typed confirmation
+# D5: yaran config reset --all  -> must refuse without typed confirmation
 ```
 
 ## Risks

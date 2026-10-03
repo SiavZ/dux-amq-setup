@@ -1,7 +1,7 @@
 #!/bin/sh
 # Live reload check: a FULL-SCREEN (alternate screen) agent, like Claude Code or
-# Codex, plus a companion terminal opened with `o`, against a REAL dux binary.
-# Scratch DUX_HOME and scratch AMQ root, so nothing touches the user's state.
+# Codex, plus a companion terminal opened with `o`, against a REAL yaran binary.
+# Scratch YARAN_HOME and scratch AMQ root, so nothing touches the user's state.
 #
 #   - both the agent and the terminal are adopted (2 of 2), same pids
 #   - the terminal is still attached to its agent
@@ -9,16 +9,16 @@
 #     it keeps redrawing
 #   - the terminal keeps its transcript and still answers typed commands
 #
-# Usage: tools/reload-live-check-fullscreen.sh [path/to/dux]
+# Usage: tools/reload-live-check-fullscreen.sh [path/to/yaran]
 set -eu
-DUX_SRC=${1:-target/release/dux}
-[ -x "$DUX_SRC" ] || { echo "no dux binary at $DUX_SRC"; exit 2; }
-WORK=$(mktemp -d "$HOME/.dux-reload-check.XXXXXX")
-SESSION="duxalt-$$"
-DUX_PID=""
+YARAN_SRC=${1:-target/release/yaran}
+[ -x "$YARAN_SRC" ] || { echo "no yaran binary at $YARAN_SRC"; exit 2; }
+WORK=$(mktemp -d "$HOME/.yaran-reload-check.XXXXXX")
+SESSION="yaranalt-$$"
+YARAN_PID=""
 export AMQ_GLOBAL_ROOT="$WORK/amq" AM_ROOT="$WORK/amq"
 cleanup() {
-  [ -n "$DUX_PID" ] && kill -9 "$DUX_PID" 2>/dev/null || true
+  [ -n "$YARAN_PID" ] && kill -9 "$YARAN_PID" 2>/dev/null || true
   tmux kill-session -t "$SESSION" 2>/dev/null || true
   rm -rf "$WORK"
 }
@@ -38,7 +38,7 @@ screen() { tmux capture-pane -t "$SESSION" -p; }
 keys() { tmux send-keys -t "$SESSION" "$@"; sleep 0.3; }
 
 mkdir -p "$WORK/home" "$WORK/proj" "$WORK/amq"
-cp "$DUX_SRC" "$WORK/dux"
+cp "$YARAN_SRC" "$WORK/yaran"
 cat >"$WORK/alt-agent.sh" <<'AGENT'
 #!/bin/sh
 # Full-screen (alternate screen) stand-in for a TUI agent like Claude Code:
@@ -58,7 +58,7 @@ AGENT
 chmod +x "$WORK/alt-agent.sh"
 git -C "$WORK/proj" init -q
 git -C "$WORK/proj" -c user.email=x@x -c user.name=x commit -q --allow-empty -m init
-DUX_HOME="$WORK/home" "$WORK/dux" config regenerate --yes >/dev/null
+YARAN_HOME="$WORK/home" "$WORK/yaran" config regenerate --yes >/dev/null
 CFG="$WORK/home/config.toml"
 sed -i.bak \
   -e 's/^provider = "claude"$/provider = "cat"/' \
@@ -69,9 +69,9 @@ sed -i.bak \
 printf '\n[providers.cat]\ncommand = "%s"\nargs = []\nresume_args = ["resumed"]\nresume_wait_timeout_ms = 0\n' "$WORK/alt-agent.sh" >>"$CFG"
 
 tmux new-session -d -s "$SESSION" -x 200 -y 50 -c "$WORK/proj" \
-  "env DUX_HOME='$WORK/home' AMQ_GLOBAL_ROOT='$WORK/amq' AM_ROOT='$WORK/amq' '$WORK/dux'; sleep 600"
-wait_for "dux to start" 20 "pgrep -f '^$WORK/dux\$'"
-DUX_PID=$(pgrep -f "^$WORK/dux\$")
+  "env YARAN_HOME='$WORK/home' AMQ_GLOBAL_ROOT='$WORK/amq' AM_ROOT='$WORK/amq' '$WORK/yaran'; sleep 600"
+wait_for "yaran to start" 20 "pgrep -f '^$WORK/yaran\$'"
+YARAN_PID=$(pgrep -f "^$WORK/yaran\$")
 wait_for "the TUI" 20 "tmux capture-pane -t $SESSION -p | grep -q 'Agents (0)'"
 
 REL=${WORK#"$HOME"/}
@@ -85,7 +85,7 @@ keys Enter
 wait_for "the alt frame" 15 "tmux capture-pane -t $SESSION -p | grep -q 'ALT-FRAME-TOP'"
 wait_for "the counter" 10 "tmux capture-pane -t $SESSION -p | grep -q 'counter-'"
 keys 'C-]'; sleep 1; keys Escape; sleep 0.5; keys BTab; sleep 0.5
-AGENT_PID=$(ps -Ao pid,ppid,command | awk -v p="$DUX_PID" '$2==p && /alt-agent/ {print $1}' | head -1)
+AGENT_PID=$(ps -Ao pid,ppid,command | awk -v p="$YARAN_PID" '$2==p && /alt-agent/ {print $1}' | head -1)
 [ -n "$AGENT_PID" ] || fail "could not find the agent pid"
 
 # Put the cursor on the agent row (a group header sits above it).
@@ -98,24 +98,24 @@ keys Enter; sleep 0.5
 keys -l "echo TERM-MARKER-before"
 keys Enter
 wait_for "the terminal marker" 10 "tmux capture-pane -t $SESSION -p | grep -q 'TERM-MARKER-before'"
-# Match the shell itself: dux also forks short-lived helpers (`gh auth status`
+# Match the shell itself: yaran also forks short-lived helpers (`gh auth status`
 # probes), and picking "any other child" sometimes caught one of those, which
 # had exited by the post-reload check and read as a lost terminal.
 TERM_SHELL=$(basename "${SHELL:-/bin/sh}")
-SHELL_PID=$(ps -Ao pid,ppid,command | awk -v p="$DUX_PID" -v a="$AGENT_PID" -v s="$TERM_SHELL" \
+SHELL_PID=$(ps -Ao pid,ppid,command | awk -v p="$YARAN_PID" -v a="$AGENT_PID" -v s="$TERM_SHELL" \
   '$2==p && $1!=a && ($3 ~ ("(^|/|-)" s "$")) {print $1}' | head -1)
 [ -n "$SHELL_PID" ] || fail "could not find the terminal shell pid"
-echo "before: dux=$DUX_PID agent=$AGENT_PID shell=$SHELL_PID"
+echo "before: yaran=$YARAN_PID agent=$AGENT_PID shell=$SHELL_PID"
 keys 'C-]'; sleep 1; keys C-g; sleep 1
 screen | grep -q '╭ Terminal' && fail "terminal overlay did not minimize"
 
-touch "$WORK/dux"; sleep 1
+touch "$WORK/yaran"; sleep 1
 keys C-p
 keys -l "reload-binary"
 keys Enter
-wait_for "the reload to exec" 20 "ps -p $DUX_PID -o command= | grep -q -- --reload-handoff"
-wait_for "the reloaded TUI" 20 "grep -q 'reload: adopted' '$WORK/home/dux.log'"
-grep -q "reload: adopted 2 of 2" "$WORK/home/dux.log" && pass "adopted agent + terminal (2 of 2)" || fail "$(grep 'reload: adopted' "$WORK/home/dux.log")"
+wait_for "the reload to exec" 20 "ps -p $YARAN_PID -o command= | grep -q -- --reload-handoff"
+wait_for "the reloaded TUI" 20 "grep -q 'reload: adopted' '$WORK/home/yaran.log'"
+grep -q "reload: adopted 2 of 2" "$WORK/home/yaran.log" && pass "adopted agent + terminal (2 of 2)" || fail "$(grep 'reload: adopted' "$WORK/home/yaran.log")"
 ps -p "$AGENT_PID" >/dev/null && pass "alt-screen agent still running" || fail "agent died"
 ps -p "$SHELL_PID" >/dev/null && pass "companion shell still running" || fail "companion shell gone"
 sleep 1

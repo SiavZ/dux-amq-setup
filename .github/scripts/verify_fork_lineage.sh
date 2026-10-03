@@ -12,8 +12,8 @@
 # fork renders carries a `[providers.jcode]` table with the targeted-resume key
 # `resume_by_id_args`. Upstream (checked against v0.6.0) renders neither.
 #
-# RUNTIME (archive executable on this host): run `dux config regenerate --yes`
-#   against a throwaway DUX_HOME and require the jcode provider table and its
+# RUNTIME (archive executable on this host): run `yaran config regenerate --yes`
+#   against a throwaway YARAN_HOME and require the jcode provider table and its
 #   resume_by_id_args line in the result. This asserts what users will see.
 # STATIC (cross-compiled leg this host cannot execute): require the
 #   `resume_by_id_args` string in the binary. Weaker, but it is the same
@@ -28,7 +28,7 @@ TARGET="${2:?usage: verify_fork_lineage.sh <archive.tar.gz> <target>}"
 
 fail() {
   echo "FATAL: $ARCHIVE is not fork lineage: $*" >&2
-  echo "       Release tags for this fork are 'dux-amq-vX.Y.Z' and must point at" >&2
+  echo "       New release tags are 'yaran-vX.Y.Z' and must point at" >&2
   echo "       this repository's code, not an upstream 'v*' tag." >&2
   exit 1
 }
@@ -36,9 +36,9 @@ fail() {
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-tar -xzf "$ARCHIVE" -C "$WORK" dux
-BIN="$WORK/dux"
-[ -x "$BIN" ] || fail "the archive holds no executable 'dux'"
+tar -xzf "$ARCHIVE" -C "$WORK" yaran
+BIN="$WORK/yaran"
+[ -x "$BIN" ] || fail "the archive holds no executable 'yaran'"
 
 case "$TARGET" in
   x86_64-*) want_arch="x86_64|amd64" ;;
@@ -60,12 +60,12 @@ fi
 
 if [ "$runnable" -eq 1 ]; then
   mkdir -p "$WORK/home"
-  if ! DUX_HOME="$WORK/home" "$BIN" config regenerate --yes >"$WORK/regen.log" 2>&1; then
+  if ! YARAN_HOME="$WORK/home" DUX_HOME="$WORK/home" "$BIN" config regenerate --yes >"$WORK/regen.log" 2>&1; then
     cat "$WORK/regen.log" >&2
-    fail "'dux config regenerate --yes' failed"
+    fail "'yaran config regenerate --yes' failed"
   fi
   config="$WORK/home/config.toml"
-  [ -f "$config" ] || fail "'dux config regenerate --yes' wrote no config.toml"
+  [ -f "$config" ] || fail "'yaran config regenerate --yes' wrote no config.toml"
   grep -q '^\[providers\.jcode\]' "$config" \
     || fail "the rendered default config has no [providers.jcode] table"
   grep -q '^resume_by_id_args = ' "$config" \

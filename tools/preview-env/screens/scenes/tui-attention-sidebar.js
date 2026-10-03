@@ -27,6 +27,6 @@ module.exports.expectText = ["Needs you", "retry-budget", "cache-warmup"]
 module.exports.file = "tui-attention-sidebar.png"
 module.exports.cols = 160
 module.exports.rows = 45
-module.exports.theme = "dux_dark"
+module.exports.theme = "yaran_dark"
 module.exports.crop = "sidebar"
 module.exports.fixture = "steady"

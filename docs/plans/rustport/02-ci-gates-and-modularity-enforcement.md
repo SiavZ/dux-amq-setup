@@ -90,7 +90,7 @@ scorecard rule.
 
    **Land it in warn-only mode initially** (22 files currently violate it), flip to
    blocking at the end of Track D. Phase 24 verifies the flip.
-2. **`cargo modules orphans --deny --bin dux`** as a CI step. Invaluable during a
+2. **`cargo modules orphans --deny --bin yaran`** as a CI step. Invaluable during a
    ~140-file split: it catches source files that fell out of the module tree.
 3. **`cargo modules dependencies --acyclic`** as a CI step — non-zero exit on a
    module dependency cycle.
@@ -148,8 +148,8 @@ scorecard rule.
 
 ```bash
 ci/check-file-length.sh || true                   # warn-only until Track D completes
-cargo modules orphans --deny --bin dux
-cargo modules dependencies --acyclic --bin dux
+cargo modules orphans --deny --bin yaran
+cargo modules dependencies --acyclic --bin yaran
 cargo run -p xtask -- module-trees --check
 cargo clippy --all-targets --all-features -- -D warnings
 gh api repos/SiavZ/dux-amq-setup/branches/main/protection   # must show required checks

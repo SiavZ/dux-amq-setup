@@ -9,7 +9,7 @@ EBS, Azure Disk). The default is **not** broken — it is just narrower
 in scope than many readers assume, so this document spells out the
 gap and gives two concrete paths to close it.
 
-If you are running `dux-amq` on a single-user spot VM, the recommended
+If you are running `yaran-amq` on a single-user spot VM, the recommended
 default is **gocryptfs** (Option A). If you operate a long-lived,
 shared, or regulated host, prefer **LUKS** (Option B).
 
@@ -39,7 +39,7 @@ encrypted at rest." It is. What customers often mean is "the data is
 unreadable without my application's key" — that is a different
 guarantee, and the cloud's default does not provide it.
 
-For dux-amq specifically, the things on `/data/state/` that you care
+For yaran-amq specifically, the things on `/data/state/` that you care
 about are:
 
 - `~/.claude/projects/**/*.jsonl` — full Claude transcripts (often
@@ -48,7 +48,7 @@ about are:
 - `~/.agents/**` — agent-specific memory and skills.
 - `/data/state/amq/**` — inter-agent message queue (Maildir-style
   files, may contain task context).
-- `dux` `sessions.sqlite3` — session metadata.
+- `yaran` `sessions.sqlite3` — session metadata.
 
 A compromised cloud IAM principal who attaches the persistent disk to
 their own VM has plaintext access to all of the above under the cloud
@@ -69,7 +69,7 @@ file.
 
 - No kernel changes, no reboot, no reformatting.
 - Per-file granularity means partial corruption is recoverable.
-- ~5% IO overhead in our tests (`dux session purge`, sqlite WAL
+- ~5% IO overhead in our tests (`yaran session purge`, sqlite WAL
   writes, AMQ message append). The audit01 P2-4 benchmark numbers are
   recorded in the artifacts subdirectory of audit02 phase 25.
 - Well-understood failure modes — it's a userland FUSE process, not a
@@ -90,7 +90,7 @@ sudo dnf install -y gocryptfs
 ```
 
 The package is also in Homebrew on macOS, but this overlay's persistent
-disk model is documented as Linux-only in `dux-amq/README.md`, so the
+disk model is documented as Linux-only in `yaran-amq/README.md`, so the
 playbook focuses on Linux.
 
 ### Key management
@@ -114,8 +114,8 @@ agent is part of the threat surface this layer is meant to mitigate.
 ### One-time bootstrap
 
 The repository ships a helper at
-[`dux-amq/scripts/install-gocryptfs.sh`](../../dux-amq/scripts/install-gocryptfs.sh).
-It is **opt-in** — `dux-amq/install.sh`'s main flow does not call it,
+[`yaran-amq/scripts/install-gocryptfs.sh`](../../yaran-amq/scripts/install-gocryptfs.sh).
+It is **opt-in** — `yaran-amq/install.sh`'s main flow does not call it,
 because adding mandatory encryption would change the deployment story
 for users who already trust their cloud-default-at-rest setup.
 
@@ -127,7 +127,7 @@ export GOCRYPT_PASS_FILE=/run/credentials/gocrypt.pass
 # First run on a fresh disk: initializes /data/state.crypt and mounts
 # it at /data/state. Idempotent — re-running on an already-mounted host
 # is a no-op.
-sudo -E /path/to/dux-amq/scripts/install-gocryptfs.sh
+sudo -E /path/to/yaran-amq/scripts/install-gocryptfs.sh
 ```
 
 The helper's behavior:
@@ -137,7 +137,7 @@ The helper's behavior:
 - If `/data/state` is already a mountpoint, prints a notice and exits
   zero (idempotent).
 - Otherwise, mounts the cipher directory at `/data/state` with
-  `-allow_other` so the dux user (and any agent process) can read it.
+  `-allow_other` so the yaran user (and any agent process) can read it.
 
 `-allow_other` requires `user_allow_other` in `/etc/fuse.conf`. If
 absent, gocryptfs will fail with a clear error; add the line and
@@ -148,13 +148,13 @@ re-run.
 This is the genuinely risky step. The safe pattern is **copy and
 swap**, never **encrypt in place**:
 
-1. Stop every agent and dux process. `pgrep -af 'claude|codex|gemini|dux'`
+1. Stop every agent and yaran process. `pgrep -af 'claude|codex|gemini|yaran'`
    should return empty.
 2. Move the plaintext aside: `mv /data/state /data/state.plain`.
 3. Run the helper to create and mount the encrypted view.
 4. `rsync -aH /data/state.plain/ /data/state/` (writes through gocryptfs
    into the cipher directory).
-5. Verify a few files look correct. Run a `dux config diff` and a quick
+5. Verify a few files look correct. Run a `yaran config diff` and a quick
    AMQ `amq list` check.
 6. Only then, `rm -rf /data/state.plain`.
 
@@ -227,14 +227,14 @@ Secret Manager plus offline vault.
 Measured on a representative GCE `e2-standard-4` with a 50 GB
 persistent SSD. Workloads:
 
-- `dux config regenerate` — config-only IO.
-- `dux session purge` — sqlite VACUUM equivalent across `~50` rows.
+- `yaran config regenerate` — config-only IO.
+- `yaran session purge` — sqlite VACUUM equivalent across `~50` rows.
 - AMQ append — 1,000 sequential `amq send` calls (small files).
 
 | Workload                      | Plaintext | gocryptfs | LUKS  | Notes                                |
 |-------------------------------|-----------|-----------|-------|--------------------------------------|
-| `dux config regenerate`       | baseline  | +4%       | +1%   | Single small file write.             |
-| `dux session purge`           | baseline  | +6%       | +2%   | sqlite WAL fsync amplifies overhead. |
+| `yaran config regenerate`       | baseline  | +4%       | +1%   | Single small file write.             |
+| `yaran session purge`           | baseline  | +6%       | +2%   | sqlite WAL fsync amplifies overhead. |
 | 1,000× `amq send` (sequential)| baseline  | +5%       | +2%   | Lots of small file creates.          |
 | Sequential 1 GB tar of `/data/state` | baseline | +5%  | +1%   | IO-bound; CPU mostly idle.           |
 
@@ -256,7 +256,7 @@ encryption layer does not change crash-recovery semantics:
 - **LUKS**: dm-crypt is transparent to the filesystem. ext4 journal
   recovery on next boot is identical to the unencrypted case.
 
-In both cases, the at-risk artifacts on dux-amq specifically are:
+In both cases, the at-risk artifacts on yaran-amq specifically are:
 
 - `sessions.sqlite3` — protected by sqlite WAL (audit02 phase 14).
 - `~/.claude/projects/**/*.jsonl` — append-only, last record may be
@@ -279,17 +279,17 @@ common operator footgun. Document it loudly in your runbook:
   snapshots **plaintext**. Only do this on a host you trust as much as
   the source, and only into storage you trust as much. Otherwise you
   have just exfiltrated your own data.
-- `dux session purge --hard` works inside the mount; it removes
+- `yaran session purge --hard` works inside the mount; it removes
   records via the normal filesystem path. Underlying ciphertext bytes
   are removed via the FUSE layer, which is eventually-consistent on
-  the cipher directory but practically immediate for dux's purposes.
+  the cipher directory but practically immediate for yaran's purposes.
   If you need cryptographic erasure (i.e., guarantee that an attacker
   who later steals the cipher directory cannot recover the deleted
   data), rotate the master key after the purge.
 
 ### Doctor (Phase 20) reporting
 
-The Phase 20 `dux-amq-doctor` tool should detect whether `/data/state`
+The Phase 20 `yaran-amq-doctor` tool should detect whether `/data/state`
 is a gocryptfs FUSE mount or a dm-crypt block device and report it. A
 representative output block:
 
@@ -312,7 +312,7 @@ header:   /dev/disk/by-id/... (luksDump available to root)
 If neither, the doctor should print a one-line warning pointing back
 to this playbook so the operator has an actionable next step. The
 implementation lives in Phase 20; this playbook only specifies the
-expected output. See `docs/plans/rustport/20-dux-amq-rust-doctor-and-installer.md`
+expected output. See `docs/plans/rustport/20-yaran-amq-rust-doctor-and-installer.md`
 for the open follow-up item.
 
 ## 6. GDPR Article 32 note
@@ -328,11 +328,11 @@ worth being honest about:
 - **Cloud-default at-rest encryption is generally accepted by EU DPAs
   as the *baseline*.** Adding a layer like gocryptfs or LUKS on top is
   a defensible enhancement that materially reduces the IAM-takeover
-  blast radius — exactly the threat profile dux-amq cares about
+  blast radius — exactly the threat profile yaran-amq cares about
   because agent transcripts often contain customer-derived data.
 
 If you are processing GDPR-regulated content through agents on
-dux-amq, document this layer in your records of processing activities
+yaran-amq, document this layer in your records of processing activities
 (Art 30) alongside your existing cloud-baseline encryption. A DPA
 auditor will want to see both.
 

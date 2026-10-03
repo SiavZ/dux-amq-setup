@@ -166,7 +166,7 @@ cargo test --test storage_migrations
 cargo test --test watch_engine_integration
 cargo test --test pty_integration
 ci/check-file-length.sh
-cargo modules dependencies --acyclic --bin dux
+cargo modules dependencies --acyclic --bin yaran
 cargo run -p xtask -- module-trees --check
 
 # git-safety regression guard: every invocation must go through run_git

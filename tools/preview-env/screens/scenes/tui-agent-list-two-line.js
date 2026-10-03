@@ -42,6 +42,6 @@ module.exports.expectText = [
 module.exports.file = "tui-agent-list-two-line.png"
 module.exports.cols = 160
 module.exports.rows = 45
-module.exports.theme = "dux_dark"
+module.exports.theme = "yaran_dark"
 module.exports.crop = "sidebar"
 module.exports.fixture = "steady"

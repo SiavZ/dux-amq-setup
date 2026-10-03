@@ -8,7 +8,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-PORT="${DUX_PORT:-8790}"
+PORT="${YARAN_PORT:-8790}"
 
 # Chromium discovery, in preference order: an explicit CHROME=, a cached
 # Playwright build, then common system binaries.

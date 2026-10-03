@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Smoke-test a packaged dux release archive by RUNNING it.
+# Smoke-test a packaged yaran release archive by RUNNING it.
 #
 # Two layers of checking, because they fail in different circumstances.
 #
@@ -11,7 +11,7 @@
 # only check that covers the cross-compiled x86_64-apple-darwin archive, which
 # cannot be started on the arm64 macOS runner that builds it.
 #
-# RUNTIME (needs an executable archive): starts `dux server` on a spare loopback
+# RUNTIME (needs an executable archive): starts `yaran server` on a spare loopback
 # port against a throwaway HOME and verifies what a placeholder cannot satisfy:
 #
 #   1. GET / returns a page that references a content-hashed bundle
@@ -36,9 +36,9 @@
 # What it CAN do, and now does, is stop the release from becoming reachable at
 # all: no archive is uploaded until every platform's smoke test has passed (see
 # the publish-archives job). The other gates are that a failed frontend build
-# fails `cargo build` (crates/dux-web/build.rs), that the release and PR workflows
-# refuse to run with DUX_DISABLE_UI_BUILD set, and that
-# crates/dux-web/tests/static_serving.rs asserts the same properties, with the
+# fails `cargo build` (crates/yaran-web/build.rs), that the release and PR workflows
+# refuse to run with YARAN_DISABLE_UI_BUILD set, and that
+# crates/yaran-web/tests/static_serving.rs asserts the same properties, with the
 # same graph walk, on every pull request.
 #
 # Usage: .github/scripts/smoke_archive.sh <archive.tar.gz> <target-triple> [port]
@@ -60,7 +60,7 @@ SERVER_PID=""
 cleanup() {
   if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
     kill "$SERVER_PID" 2>/dev/null || true
-    # dux traps SIGTERM and tears its PTYs down; give it a moment before SIGKILL.
+    # yaran traps SIGTERM and tears its PTYs down; give it a moment before SIGKILL.
     for _ in 1 2 3 4 5 6 7 8 9 10; do
       kill -0 "$SERVER_PID" 2>/dev/null || break
       sleep 0.5
@@ -74,16 +74,16 @@ trap cleanup EXIT
 fail() {
   echo "FAIL: $*" >&2
   if [ -f "$WORK/server.log" ]; then
-    echo "--- dux server output ---" >&2
+    echo "--- yaran server output ---" >&2
     cat "$WORK/server.log" >&2
-    echo "--- end dux server output ---" >&2
+    echo "--- end yaran server output ---" >&2
   fi
   exit 1
 }
 
 tar xzf "$ARCHIVE" -C "$WORK" || fail "could not unpack $ARCHIVE"
-BIN="$WORK/dux"
-[ -x "$BIN" ] || fail "$ARCHIVE contains no executable 'dux' at its root"
+BIN="$WORK/yaran"
+[ -x "$BIN" ] || fail "$ARCHIVE contains no executable 'yaran' at its root"
 
 # ---------------------------------------------------------------------------
 # STATIC CHECK. Runs on every archive, executable here or not.
@@ -157,13 +157,15 @@ if [ "$host_os" != "$want_os" ] || ! printf '%s\n' $want_arch | grep -qx "$host_
   exit 0
 fi
 
-# A throwaway config directory: dux keeps config, its SQLite store, its log and
-# its single-instance lock under HOME ($XDG_CONFIG_HOME/dux or ~/.config/dux on
-# Linux, ~/.dux on macOS). Pointing HOME at scratch keeps the smoke run from
+# A throwaway config directory: yaran keeps config, its SQLite store, its log and
+# its single-instance lock under HOME ($XDG_CONFIG_HOME/yaran or ~/.config/yaran on
+# Linux, ~/.yaran on macOS). Pointing HOME at scratch keeps the smoke run from
 # touching or locking a real one.
 export HOME="$WORK/home"
 unset XDG_CONFIG_HOME
 mkdir -p "$HOME"
+export YARAN_HOME="$HOME/.yaran"
+export DUX_HOME="$YARAN_HOME"
 
 echo "Starting $ARCHIVE ($TARGET) on 127.0.0.1:$PORT"
 "$BIN" server --bind "127.0.0.1:$PORT" --no-tailscale >"$WORK/server.log" 2>&1 &
@@ -173,7 +175,7 @@ SERVER_PID=$!
 ready=""
 for _ in $(seq 1 60); do
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-    fail "dux server exited before it started listening"
+    fail "yaran server exited before it started listening"
   fi
   if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
     ready="yes"
@@ -181,12 +183,12 @@ for _ in $(seq 1 60); do
   fi
   sleep 0.5
 done
-[ -n "$ready" ] || fail "dux server never answered /healthz on port $PORT within 30s"
+[ -n "$ready" ] || fail "yaran server never answered /healthz on port $PORT within 30s"
 
 # 1. The page.
 curl -fsS --max-time 10 "http://127.0.0.1:$PORT/" -o "$WORK/index.html" \
   || fail "GET / failed"
-if grep -qi 'dux-ui-not-built-notice\|DUX_DISABLE_UI_BUILD' "$WORK/index.html"; then
+if grep -qi 'yaran-ui-not-built-notice\|YARAN_DISABLE_UI_BUILD' "$WORK/index.html"; then
   fail "the served page is the 'web UI not built' notice, so this archive has no web UI"
 fi
 
@@ -217,7 +219,7 @@ fi
 # alphabet is base64url, so a hash can CONTAIN a dash (a real build emits
 # TerminalPane-BrP-ENHg.css); matching only the final dash-separated segment
 # rejects those, so the pattern allows dashes inside the hash. A hand-written
-# assets/dux-logo.png still does not match, its suffix being far too short.
+# assets/yaran-logo.png still does not match, its suffix being far too short.
 HASHED_IN_HTML='assets/[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8,}\.(js|css)'
 QUOTE_CLASS='["'"'"'`]'
 HASHED_IN_JS="${QUOTE_CLASS}(\./)?[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8,}\.(js|css)${QUOTE_CLASS}"

@@ -720,107 +720,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
-name = "dux"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "dux-core",
- "dux-tui",
- "dux-web",
- "tempfile",
- "toml 1.1.2+spec-1.1.0",
-]
-
-[[package]]
-name = "dux-core"
-version = "0.1.0"
-dependencies = [
- "alacritty_terminal",
- "anyhow",
- "chrono",
- "compact_str",
- "content_inspector",
- "filetime",
- "flate2",
- "home",
- "indexmap",
- "libc",
- "notify",
- "percent-encoding",
- "petname",
- "portable-pty",
- "rand 0.8.6",
- "regex",
- "rusqlite",
- "rustix",
- "serde",
- "serde_json",
- "sysinfo",
- "tempfile",
- "toml 1.1.2+spec-1.1.0",
- "toml_edit 0.25.11+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
- "ureq",
- "url",
- "uuid",
- "walkdir",
-]
-
-[[package]]
-name = "dux-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arboard",
- "chrono",
- "crokey",
- "crossterm",
- "dux-core",
- "home",
- "indexmap",
- "libc",
- "notify",
- "opaline",
- "ratatui",
- "rusqlite",
- "rustix",
- "serde",
- "serde_json",
- "signal-hook 0.4.4",
- "similar",
- "syntect",
- "sysinfo",
- "tempfile",
- "toml 1.1.2+spec-1.1.0",
- "toml_edit 0.25.11+spec-1.1.0",
- "uuid",
-]
-
-[[package]]
-name = "dux-web"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "brotli",
- "chrono",
- "dux-core",
- "flate2",
- "futures-util",
- "reqwest",
- "rust-embed",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-tungstenite",
- "tower",
- "uuid",
-]
-
-[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4493,6 +4392,107 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
+
+[[package]]
+name = "yaran"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "tempfile",
+ "toml 1.1.2+spec-1.1.0",
+ "yaran-core",
+ "yaran-tui",
+ "yaran-web",
+]
+
+[[package]]
+name = "yaran-core"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "chrono",
+ "compact_str",
+ "content_inspector",
+ "filetime",
+ "flate2",
+ "home",
+ "indexmap",
+ "libc",
+ "notify",
+ "percent-encoding",
+ "petname",
+ "portable-pty",
+ "rand 0.8.6",
+ "regex",
+ "rusqlite",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tempfile",
+ "toml 1.1.2+spec-1.1.0",
+ "toml_edit 0.25.11+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+ "url",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
+name = "yaran-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "chrono",
+ "crokey",
+ "crossterm",
+ "home",
+ "indexmap",
+ "libc",
+ "notify",
+ "opaline",
+ "ratatui",
+ "rusqlite",
+ "rustix",
+ "serde",
+ "serde_json",
+ "signal-hook 0.4.4",
+ "similar",
+ "syntect",
+ "sysinfo",
+ "tempfile",
+ "toml 1.1.2+spec-1.1.0",
+ "toml_edit 0.25.11+spec-1.1.0",
+ "uuid",
+ "yaran-core",
+]
+
+[[package]]
+name = "yaran-web"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "brotli",
+ "chrono",
+ "flate2",
+ "futures-util",
+ "reqwest",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "tower",
+ "uuid",
+ "yaran-core",
+]
 
 [[package]]
 name = "yoke"

@@ -6,25 +6,18 @@ import {
   fallbackBackgroundSize,
   inkCss,
 } from "../lib/heroFleet";
-import { getReleaseDownloads, getNpmTotal, formatCount } from "../lib/stats";
+import { getReleaseDownloads, formatCount } from "../lib/stats";
 import { getLatestVersion } from "../lib/version";
 
 // Read at build time from the repository's latest published release, so the pill
 // cannot go stale; `null` on any lookup failure, and then it does not render.
-const version = await getLatestVersion("patrickdappollonio/dux");
+const version = await getLatestVersion("SiavZ/dux-amq-setup");
 
-// Either half may fail, so each segment renders only when its own lookup resolved
-// and the total only when both did, leaving no hole either way.
-const [downloads, npm] = await Promise.all([
-  getReleaseDownloads("patrickdappollonio/dux"),
-  getNpmTotal("@patrickdappollonio/dux"),
-]);
-const installSegments: string[] = [];
-if (downloads !== null)
-  installSegments.push(`${formatCount(downloads)} GitHub + Homebrew`);
-if (npm !== null) installSegments.push(`${formatCount(npm)} npm`);
-if (downloads !== null && npm !== null)
-  installSegments.push(`${formatCount(downloads + npm)} installs total`);
+// Only report this fork's download count, never upstream npm or Homebrew totals.
+const downloads = await getReleaseDownloads("SiavZ/dux-amq-setup");
+const installSegments = downloads === null
+  ? []
+  : [`${formatCount(downloads)} GitHub downloads`];
 
 // Generated rather than written down, so the layer the canvas crossfades over
 // cannot drift from the shader it is standing in for.
@@ -46,8 +39,8 @@ const fallback = [
     <div class="hero-column">
       <div class="mb-7 flex flex-wrap items-center gap-3">
         <img
-          src="/dux-logo.png"
-          alt="dux: a duck conductor with a baton"
+          src="/yaran-logo.svg"
+          alt="Yaran branching-Y mark"
           width="56"
           height="56"
           class="h-14 w-14 object-contain drop-shadow-[0_0_24px_rgba(0,212,255,0.25)]"
@@ -94,7 +87,7 @@ const fallback = [
       </h1>
 
       <p class="hero-sub">
-        dux runs multiple AI coding agents in parallel, each in its own git
+        yaran runs multiple AI coding agents in parallel, each in its own git
         worktree. A terminal UI and a web UI over one workspace, whichever you
         happen to be looking at.
       </p>
@@ -116,7 +109,7 @@ const fallback = [
             <line x1="12" y1="12" x2="12" y2="21"></line>
             <path d="M20.88 18.09A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.29"></path>
           </svg>
-          Install dux
+          Install yaran
         </a>
         <span class="hero-meta">
           <span class="hero-plat">macOS + Linux + WSL</span>

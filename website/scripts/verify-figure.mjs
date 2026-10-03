@@ -41,7 +41,7 @@ const EXPECTED = [
   ["a sibling agent (sidebar flat list)", "webhook-replay"],
   ["a project name (sidebar)", "storefront"],
   ["a second project (sidebar)", "billing-api"],
-  ["the focused branch (header crumbs)", "dux/checkout-retry"],
+  ["the focused branch (header crumbs)", "yaran/checkout-retry"],
   ["a project terminal (sidebar terminals section)", "npm run dev"],
   ["the pull request (PR lane)", "482"],
   ["a staged file (changes pane)", "retry-policy.ts"],

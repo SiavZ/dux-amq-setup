@@ -15,8 +15,8 @@ import { fetchJson, githubHeaders } from "./remote-json";
 // @ts-expect-error - plain .mjs helper, shared with the plain-Node build scripts
 import { unexpectedShapeWarning } from "./remote-failure.mjs";
 
-/** Looks like a release tag: `v1`, `v1.2`, `v1.2.3`, optional `-rc.1` suffix. */
-const TAG_SHAPE = /^v\d+(\.\d+){0,2}(-[0-9A-Za-z.-]+)?$/;
+/** Canonical Yaran tags or historical upstream tags, with optional prerelease suffix. */
+const TAG_SHAPE = /^(?:yaran-|dux-amq-)?v\d+(\.\d+){0,2}(-[0-9A-Za-z.-]+)?$/;
 
 /**
  * The latest published release tag for `repo` (e.g. `"v0.7.0"`), or `null` on

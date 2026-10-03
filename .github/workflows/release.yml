@@ -9,24 +9,24 @@ permissions:
 
 jobs:
   # A release binary with no web UI is the failure this guard exists to prevent.
-  # DUX_DISABLE_UI_BUILD makes crates/dux-web/build.rs skip the React build, which
+  # YARAN_DISABLE_UI_BUILD makes crates/yaran-web/build.rs skip the React build, which
   # would produce four platform archives serving a "web UI not built" notice page.
   # Every build job needs this one, so the hatch cannot ship.
   #
-  # DUX_UI_BUILD_STATE is checked alongside it, belt and braces. build.rs stamps
+  # YARAN_UI_BUILD_STATE is checked alongside it, belt and braces. build.rs stamps
   # that name on every path it takes and a cargo:rustc-env beats an ambient value,
   # so a set one can no longer talk the test suite into skipping; the two retired
   # names could, and are listed here so a branch still carrying one is caught
   # rather than quietly ignored.
   no-ui-build-hatch:
-    name: Reject DUX_DISABLE_UI_BUILD
+    name: Reject YARAN_DISABLE_UI_BUILD
     runs-on: ubuntu-latest
     steps:
       - name: Fail if the frontend-build escape hatch is set
         run: |
           set -euo pipefail
           failed=""
-          for name in DUX_DISABLE_UI_BUILD DUX_UI_BUILD_STATE DUX_UI_BUILD_SKIPPED DUX_UI_BUILD_STALE; do
+          for name in YARAN_DISABLE_UI_BUILD DUX_DISABLE_UI_BUILD YARAN_UI_BUILD_STATE DUX_UI_BUILD_STATE YARAN_UI_BUILD_SKIPPED DUX_UI_BUILD_SKIPPED YARAN_UI_BUILD_STALE DUX_UI_BUILD_STALE; do
             value="$(printenv "$name" || true)"
             if [ -n "$value" ]; then
               echo "$name is set to '$value' in this workflow's environment. It skips the" >&2
@@ -43,7 +43,7 @@ jobs:
     name: Prepare release metadata
     runs-on: ubuntu-latest
     # Carries the guard edge even though it only reads the tag, so that "the
-    # release workflow refuses to run with DUX_DISABLE_UI_BUILD set" is true of
+    # release workflow refuses to run with YARAN_DISABLE_UI_BUILD set" is true of
     # the whole workflow rather than of most of it.
     needs: no-ui-build-hatch
     outputs:
@@ -52,20 +52,21 @@ jobs:
     steps:
       - name: Determine release version
         id: release_version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          # This fork's tags are namespaced `dux-amq-vX.Y.Z` so they never collide
-          # with upstream's `vX.Y.Z` sequence (upstream owns v0.1.0 onwards, and
-          # every one of those tags is upstream code). Strip both prefixes to get
-          # the bare semver the manifest needs, and refuse anything that does not
-          # yield one: `dux-amq-v0.1.0-rc1` once reached `cargo set-version`
-          # unstripped and could never have built (244b33c6).
-          VERSION="${{ github.event.release.tag_name }}"
-          VERSION="${VERSION#dux-amq-}"
-          VERSION="${VERSION#v}"
+          # Preserve historical tags verbatim. Only the manifest version loses
+          # its prefix; archive uploads still use the actual release tag.
+          VERSION="$RELEASE_TAG"
+          case "$VERSION" in
+            yaran-v*) VERSION="${VERSION#yaran-v}" ;;
+            dux-amq-v*) VERSION="${VERSION#dux-amq-v}" ;;
+            *) echo "Use yaran-vX.Y.Z (or an existing dux-amq-vX.Y.Z tag)." >&2; exit 1 ;;
+          esac
           if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
-            echo "Tag '${{ github.event.release.tag_name }}' does not yield a semver" >&2
-            echo "after stripping 'dux-amq-' and 'v' prefixes (got '$VERSION')." >&2
-            echo "Tag releases as 'dux-amq-vX.Y.Z'." >&2
+            echo "Tag '$RELEASE_TAG' does not yield a semver" >&2
+            echo "after stripping the release prefix (got '$VERSION')." >&2
+            echo "Tag new releases as 'yaran-vX.Y.Z'." >&2
             exit 1
           fi
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
@@ -104,16 +105,16 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
-            archive: dux-linux-amd64.tar.gz
+            archive: yaran-linux-amd64.tar.gz
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
-            archive: dux-linux-arm64.tar.gz
+            archive: yaran-linux-arm64.tar.gz
           - target: x86_64-apple-darwin
             runner: macos-latest
-            archive: dux-darwin-amd64.tar.gz
+            archive: yaran-darwin-amd64.tar.gz
           - target: aarch64-apple-darwin
             runner: macos-latest
-            archive: dux-darwin-arm64.tar.gz
+            archive: yaran-darwin-arm64.tar.gz
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -159,7 +160,7 @@ jobs:
 
       - name: Build (auditable)
         env:
-          DUX_RELEASE_BUILD: "1"
+          YARAN_RELEASE_BUILD: "1"
         run: cargo auditable build --release --target ${{ matrix.target }}
 
       # Symbol stripping happens in Cargo ([profile.release] strip = "symbols"),
@@ -167,17 +168,17 @@ jobs:
       # exactly one stripping mechanism.
 
       # The SBOM covers the binary crate's dependency graph, which is everything
-      # linked into the shipped executable (the dux crate pulls in dux-core,
-      # dux-tui and dux-web). cargo-cyclonedx also writes one file per workspace
+      # linked into the shipped executable (the yaran crate pulls in yaran-core,
+      # yaran-tui and yaran-web). cargo-cyclonedx also writes one file per workspace
       # member; only the binary's is kept. Limitation: bundled C code
       # (rusqlite's vendored SQLite) is not enumerated, so treat it as
       # Rust-deps-only.
       - name: Generate SBOM
         run: |
           set -euo pipefail
-          cargo cyclonedx --manifest-path crates/dux/Cargo.toml --format json \
+          cargo cyclonedx --manifest-path crates/yaran/Cargo.toml --format json \
             --target ${{ matrix.target }} --override-filename "sbom-${{ matrix.target }}.cdx"
-          mv "crates/dux/sbom-${{ matrix.target }}.cdx.json" .
+          mv "crates/yaran/sbom-${{ matrix.target }}.cdx.json" .
           rm -f crates/*/sbom-*.cdx.json
           ls -la "sbom-${{ matrix.target }}.cdx.json"
 
@@ -194,7 +195,7 @@ jobs:
             "$TAR" --sort=name --owner=0 --group=0 --numeric-owner \
               --mtime="@${SOURCE_DATE_EPOCH}" \
               --use-compress-program='gzip -n' \
-              -cf "$1" -C "target/${{ matrix.target }}/release" dux
+              -cf "$1" -C "target/${{ matrix.target }}/release" yaran
           }
           package "${{ matrix.archive }}.first"
           sleep 2
@@ -251,7 +252,7 @@ jobs:
         run: .github/scripts/verify_fork_lineage.sh ${{ matrix.archive }} ${{ matrix.target }}
 
       # OIDC-keyless build provenance. Verify with
-      #   gh attestation verify dux-linux-amd64.tar.gz --owner SiavZ
+      #   gh attestation verify yaran-linux-amd64.tar.gz --owner SiavZ
       - name: Attest build provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
@@ -288,8 +289,8 @@ jobs:
   # a needs edge requires ALL matrix legs to succeed. The smoke test still gates
   # its own archive inside the build job; this gates the release.
   #
-  # It also publishes a single dux-checksums.txt holding all four lines, for a
-  # human verifying a download by hand: `sha256sum -c dux-checksums.txt` in a
+  # It also publishes a single yaran-checksums.txt holding all four lines, for a
+  # human verifying a download by hand: `sha256sum -c yaran-checksums.txt` in a
   # directory holding the archives. The installer deliberately does NOT use that
   # file, it fetches the per-archive .sha256 instead, so a single-platform user
   # never needs the other three archives present.
@@ -318,17 +319,17 @@ jobs:
           cd dist/artifacts
           # The glob sorts, so the file is byte-stable regardless of the order
           # the matrix jobs happened to finish in.
-          cat *.sha256 > dux-checksums.txt
+          cat *.sha256 > yaran-checksums.txt
           echo "Combined checksums:"
-          cat dux-checksums.txt
+          cat yaran-checksums.txt
           # Four archives in the matrix, so four lines. A short file means a
           # matrix job silently produced nothing.
-          lines="$(wc -l < dux-checksums.txt)"
+          lines="$(wc -l < yaran-checksums.txt)"
           if [ "$lines" -ne 4 ]; then
             echo "Expected 4 checksum lines, got ${lines}." >&2
             exit 1
           fi
-          sha256sum -c dux-checksums.txt
+          sha256sum -c yaran-checksums.txt
 
       # One upload call for everything, so the release page goes from "no assets"
       # to "all assets" rather than filling in over several minutes.
@@ -347,7 +348,7 @@ jobs:
           set -euo pipefail
           cd dist/artifacts
           gh release upload "${{ github.event.release.tag_name }}" --clobber \
-            *.tar.gz *.tar.gz.sha256 dux-checksums.txt sbom-*.cdx.json
+            *.tar.gz *.tar.gz.sha256 yaran-checksums.txt sbom-*.cdx.json
           echo "Published:"
           ls -1
 
@@ -384,7 +385,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: npm-package
-          path: dist/npm/dux-npm-*.tgz
+          path: dist/npm/yaran-npm-*.tgz
           retention-days: 1
           if-no-files-found: error
 
@@ -419,7 +420,7 @@ jobs:
           NPM_TAG: ${{ needs.prepare-release.outputs.npm_tag }}
         run: |
           set -euo pipefail
-          tarball="dist/npm/dux-npm-${VERSION}.tgz"
+          tarball="dist/npm/yaran-npm-${VERSION}.tgz"
           if [[ ! -f "$tarball" ]]; then
             echo "npm tarball $tarball not found"
             exit 1
@@ -484,7 +485,7 @@ jobs:
 
           ## Installation
 
-          Use any of the following options to install dux on your system:
+          Use any of the following options to install yaran on your system:
 
           ${install_section}
 
@@ -497,7 +498,7 @@ jobs:
 
           ## Installation
 
-          Use any of the following options to install dux on your system:
+          Use any of the following options to install yaran on your system:
 
           ${install_section}"
           fi

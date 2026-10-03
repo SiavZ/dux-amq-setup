@@ -5,7 +5,9 @@ author: Patrick D'appollonio
 pubDate: 2026-06-08
 ---
 
-![The dux duck logo.](/dux-logo.png#right) dux now has a blog. This is it. You're reading it. 🦆
+> Historical upstream article by Patrick D'appollonio, preserved at its original slug. This post describes dux, not the Yaran fork.
+
+dux now has a blog. This is it. You're reading it. 🦆
 
 If you're unaware, dux is a terminal multiplexer for the modern era. It allows you to run multiple AI agent sessions in Git worktrees in the same terminal window, and it handles all the messy details of keeping them alive and organized. It's an open source tool, free to use, and [available on GitHub](https://github.com/patrickdappollonio/dux).
 

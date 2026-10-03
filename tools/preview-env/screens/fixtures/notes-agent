@@ -2,7 +2,7 @@
 # Transcript provider for the standalone-agent screenshot: a scripted session
 # rather than the fake provider's stream, because that shot is about what an
 # agent's pane looks like when there is a conversation in it. Installed as
-# `claude` by entrypoint.sh only when DUX_SCREENS=1, so the standalone agent can
+# `claude` by entrypoint.sh only when YARAN_SCREENS=1, so the standalone agent can
 # ask for it by provider name.
 #
 # The trailing counter is what keeps the session reading as Working. It starts

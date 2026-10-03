@@ -1,6 +1,6 @@
 ---
 title: Recommended tools
-description: A curated set of providers, MCP servers, and skills that work well with dux.
+description: A curated set of providers, MCP servers, and skills that work well with yaran.
 group: Reference
 order: 90
 ---
@@ -8,15 +8,15 @@ order: 90
 import ToolGrid from "../src/components/ToolGrid.astro";
 import ToolCard from "../src/components/ToolCard.astro";
 
-dux runs your real CLI in a real terminal, with no protocol layer in between. So
+yaran runs your real CLI in a real terminal, with no protocol layer in between. So
 whatever providers, MCP servers, and skills you already use keep working inside a
-dux agent exactly as they do in your shell. Everything below is hand-picked to
-genuinely pair well with a multi-agent dux workflow.
+yaran agent exactly as they do in your shell. Everything below is hand-picked to
+genuinely pair well with a multi-agent yaran workflow.
 
 ## Tools
 
 Extra tooling that makes your agents faster and sharper. The default providers
-ship bundled with dux, and any CLI can be added as one too (see
+ship bundled with yaran, and any CLI can be added as one too (see
 [Custom CLI Agents](/docs/custom-agents)).
 
 <ToolGrid>
@@ -36,7 +36,7 @@ ship bundled with dux, and any CLI can be added as one too (see
 
 Model Context Protocol servers extend what an agent can reach: repositories,
 browsers, live docs, and more. Configure them in your CLI the way you normally
-would, and they work unchanged inside a dux agent.
+would, and they work unchanged inside a yaran agent.
 
 <ToolGrid>
   <ToolCard
@@ -57,13 +57,13 @@ would, and they work unchanged inside a dux agent.
   <ToolCard
     name="Network Debugging MCP"
     repo="patrickdappollonio/mcp-netutils"
-    tag="same dev as dux"
+    tag="same dev as yaran"
     description="DNS lookups, WHOIS, connectivity tests, TLS inspection, and HTTP endpoint checks, all from the agent."
   />
   <ToolCard
     name="Kubernetes Read-Only MCP"
     repo="patrickdappollonio/mcp-kubernetes-ro"
-    tag="same dev as dux"
+    tag="same dev as yaran"
     description="Read-only Kubernetes access: list resources, read details, and pull pod logs with no risk of mutating the cluster."
   />
 </ToolGrid>
@@ -71,7 +71,7 @@ would, and they work unchanged inside a dux agent.
 ## Skills
 
 Skills are reusable instructions and workflows your CLI loads on demand (for
-example, Claude Code's Agent Skills). Because dux launches the real CLI, your
+example, Claude Code's Agent Skills). Because yaran launches the real CLI, your
 skills apply per agent and per worktree, exactly as they do elsewhere.
 
 <ToolGrid>

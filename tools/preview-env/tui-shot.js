@@ -40,16 +40,16 @@ const DEVICE_SCALE = 2
 const FRAME = 18
 
 // The preferred face. Commercial and not vendored: named here and resolved by
-// the host, so a machine without it falls back to the bundled Dux Mono stack.
+// the host, so a machine without it falls back to the bundled Yaran Mono stack.
 // The exact family name is what `fc-list` reports.
 const PREFERRED_FAMILY = "MonoLisa Nerd Font Mono"
-const DUX_STACK = '"Dux Mono Symbols", "Dux Mono", "Dux Mono Fill", monospace'
-const FONT_STACK = `"${PREFERRED_FAMILY}", ${DUX_STACK}`
+const YARAN_STACK = '"Yaran Mono Symbols", "Yaran Mono", "Yaran Mono Fill", monospace'
+const FONT_STACK = `"${PREFERRED_FAMILY}", ${YARAN_STACK}`
 
 // xterm's DOM renderer lays every cell out at the font's own unrounded advance,
 // and any size whose advance misses a whole device pixel makes Chromium
 // antialias every glyph box edge, turning a row of block glyphs into a comb of
-// seams. Dux Mono's advance is exactly 0.6em and MonoLisa's exactly 0.64em, so a
+// seams. Yaran Mono's advance is exactly 0.6em and MonoLisa's exactly 0.64em, so a
 // size is seam-free for both only when 1.2*size and 1.28*size are both whole.
 // Changing this size means re-measuring: `(advance in CSS px) * 2` must be a
 // whole number for both stacks, or the comb comes back.
@@ -60,7 +60,7 @@ const fontDir = path.dirname(fontPath)
 const fonts = Object.fromEntries(
   ["regular", "bold", "symbols", "fill"].map((face) => [
     face,
-    fs.readFileSync(path.join(fontDir, `dux-mono-${face}.woff2`)).toString("base64"),
+    fs.readFileSync(path.join(fontDir, `yaran-mono-${face}.woff2`)).toString("base64"),
   ]),
 )
 const xtermJs = require.resolve("@xterm/xterm")
@@ -132,7 +132,7 @@ function sidebarCropCells(grid, cell) {
 // so a scene names the words its picture is about. The check lives here rather
 // than in the driver because only this side knows the CROP: a sidebar shot is a
 // picture of thirty columns, and text in the pane beside it is not in it.
-const journeyPath = process.env.DUX_TUI_JOURNEY
+const journeyPath = process.env.YARAN_TUI_JOURNEY
 
 function expectedText() {
   if (!journeyPath || !fs.existsSync(journeyPath)) return null
@@ -187,10 +187,10 @@ function checkPicture(png) {
   })
   await page.setContent('<main id="capture"><div id="terminal"></div></main>')
   await page.addStyleTag({ content: `${xtermCss}
-    @font-face { font-family: "Dux Mono Symbols"; src: url(data:font/woff2;base64,${fonts.symbols}) format("woff2"); font-weight: 400; unicode-range: U+2190-21FF, U+2300-23FF, U+2500-25FF, U+2600-27BF, U+2800-28FF, U+E0A0-E0D7; }
-    @font-face { font-family: "Dux Mono"; src: url(data:font/woff2;base64,${fonts.regular}) format("woff2"); font-weight: 400; }
-    @font-face { font-family: "Dux Mono"; src: url(data:font/woff2;base64,${fonts.bold}) format("woff2"); font-weight: 700; }
-    @font-face { font-family: "Dux Mono Fill"; src: url(data:font/woff2;base64,${fonts.fill}) format("woff2"); font-weight: 400; unicode-range: U+2000-2BFF, U+2E00-2E7F, U+1F000-1FBFF; }
+    @font-face { font-family: "Yaran Mono Symbols"; src: url(data:font/woff2;base64,${fonts.symbols}) format("woff2"); font-weight: 400; unicode-range: U+2190-21FF, U+2300-23FF, U+2500-25FF, U+2600-27BF, U+2800-28FF, U+E0A0-E0D7; }
+    @font-face { font-family: "Yaran Mono"; src: url(data:font/woff2;base64,${fonts.regular}) format("woff2"); font-weight: 400; }
+    @font-face { font-family: "Yaran Mono"; src: url(data:font/woff2;base64,${fonts.bold}) format("woff2"); font-weight: 700; }
+    @font-face { font-family: "Yaran Mono Fill"; src: url(data:font/woff2;base64,${fonts.fill}) format("woff2"); font-weight: 400; unicode-range: U+2000-2BFF, U+2E00-2E7F, U+1F000-1FBFF; }
     * { box-sizing: border-box; }
     html, body { margin: 0; background: #0d1117; }
     #capture { display: inline-block; padding: ${FRAME}px; background: #0d1117; }
@@ -206,7 +206,7 @@ function checkPicture(png) {
   //
   // Each load names one family with a sample inside that family's own
   // unicode-range, so no face depends on where it sits in the stack; the range
-  // literals above mirror crates/dux-web/web/src/index.css, so a range that
+  // literals above mirror crates/yaran-web/web/src/index.css, so a range that
   // moves there moves here too. A load matching no declared face resolves to an
   // empty array rather than rejecting, so every result is checked and an empty
   // one fails the capture out loud. Only bundled faces can be checked this way:
@@ -214,10 +214,10 @@ function checkPicture(png) {
   // probed by measurement further down.
   await page.evaluate(async () => {
     const preloads = [
-      { shorthand: '14px "Dux Mono"', sample: "Ag" },
-      { shorthand: 'bold 14px "Dux Mono"', sample: "Ag" },
-      { shorthand: '14px "Dux Mono Symbols"', sample: "✓⣿─" },
-      { shorthand: '14px "Dux Mono Fill"', sample: "※✷" },
+      { shorthand: '14px "Yaran Mono"', sample: "Ag" },
+      { shorthand: 'bold 14px "Yaran Mono"', sample: "Ag" },
+      { shorthand: '14px "Yaran Mono Symbols"', sample: "✓⣿─" },
+      { shorthand: '14px "Yaran Mono Fill"', sample: "※✷" },
     ]
     const loaded = await Promise.all(
       preloads.map((preload) =>
@@ -243,12 +243,12 @@ function checkPicture(png) {
       context.font = `100px ${stack}`
       return context.measureText(sample).width
     }
-    const absent = widthWith('"Dux No Such Family", monospace')
-    return widthWith(`"${family}", "Dux No Such Family", monospace`) !== absent
+    const absent = widthWith('"Yaran No Such Family", monospace')
+    return widthWith(`"${family}", "Yaran No Such Family", monospace`) !== absent
   }, PREFERRED_FAMILY)
   if (!preferredPresent) {
     console.error(
-      `!! ${PREFERRED_FAMILY} is not installed on this host; falling back to the bundled Dux Mono stack.`,
+      `!! ${PREFERRED_FAMILY} is not installed on this host; falling back to the bundled Yaran Mono stack.`,
     )
     console.error(
       "!! The capture is still correct, but its cell size differs from the committed screenshots,",

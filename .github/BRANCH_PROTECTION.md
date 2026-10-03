@@ -29,7 +29,7 @@ GitHub UI (Settings → Branches → Protection rules → main).
   - `Strict mode (require branches up to date before merging)`: yes
 - **Recommended (not currently required) but run on every PR**:
   - `Format`, `Clippy`, `Web lint`, `Web build and unit tests`,
-    `dux-web dependency isolation`, `Reject DUX_DISABLE_UI_BUILD`, and
+    `yaran-web dependency isolation`, `Reject YARAN_DISABLE_UI_BUILD`, and
     `MSRV (1.88)` (`cargo +1.88.0 check`, which keeps the workspace's
     declared `rust-version` true).
     Add them to the protection if you treat them as merge gates; the recipe
@@ -42,9 +42,9 @@ GitHub UI (Settings → Branches → Protection rules → main).
 
 ## Tag protection
 
-- Pattern: `v*` and `dux-amq-v*`
+- Pattern: `v*`, `dux-amq-v*` (historical), and `yaran-v*`
 - Restrict who can push: maintainers only (CODEOWNERS)
-- Release tags for this fork are `dux-amq-vX.Y.Z`. The release workflow strips
+- New release tags for this fork are `yaran-vX.Y.Z`. Historical releases retain their `dux-amq-vX.Y.Z` tags. The release workflow strips
   the prefix for the crate version and refuses to publish an archive that is not
   fork lineage (`.github/scripts/verify_fork_lineage.sh`).
 

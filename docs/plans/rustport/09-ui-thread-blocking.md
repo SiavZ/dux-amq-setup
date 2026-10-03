@@ -130,7 +130,7 @@ flock -x /path/to/$AMQ_GLOBAL_ROOT/meta/config.lock sleep 60 &
 cargo run   # navigate, switch sessions; must stay responsive
 
 # idle CPU, before vs after
-top -pid $(pgrep -n dux) -l 10 -stats cpu
+top -pid $(pgrep -n yaran) -l 10 -stats cpu
 ```
 
 ## Risks

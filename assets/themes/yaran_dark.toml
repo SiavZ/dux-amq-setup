@@ -1,0 +1,160 @@
+# yaran-dark — the default yaran theme.
+#
+# Hand-ported from the original Theme::default_dark() palette so users see the
+# exact same colors after the Opaline integration. Most colors used by the yaran
+# UI are defined as `yaran.<field>` tokens below; user-authored themes can either
+# define the same tokens explicitly, or rely on the built-in fallback that
+# derives them from Opaline's standard semantic tokens (text.*, accent.*, etc.).
+# GitHub PR colors intentionally are not listed here: missing `yaran.pr_*` tokens
+# fall back to fixed GitHub open/closed/merged colors instead of the active
+# theme palette. User-authored themes may still define those tokens explicitly.
+#
+# Named ratatui colors (Cyan, Yellow, Red, Green, Magenta, White, Black,
+# DarkGray) have been expanded to their canonical 24-bit RGB. On most modern
+# true-color terminals the rendering is identical; terminals that remap the
+# 16-color ANSI palette via their profile will now see these literal RGB
+# values rather than the user-customized "Cyan", which matches what most TUI
+# theme engines do.
+
+[meta]
+name = "yaran_dark"
+author = "yaran"
+variant = "dark"
+description = "The default yaran dark theme."
+
+[palette]
+# Named ANSI canonical RGB
+ansi_white   = "#ffffff"
+ansi_black   = "#000000"
+ansi_cyan    = "#00ffff"
+ansi_yellow  = "#ffff00"
+ansi_red     = "#ff0000"
+ansi_green   = "#00ff00"
+ansi_magenta = "#ff00ff"
+ansi_darkgray = "#808080"
+
+[tokens]
+# ── Frame-wide surface ───────────────────────────────────────────────
+# Painted across the whole yaran frame before any widget renders. Anything
+# that does not set its own background — modal interiors, gutters,
+# the strip under the PR banner — will sit on top of this color.
+"yaran.app_bg"               = "#141414"
+# Primary body-text color used by spans that don't set an explicit
+# foreground (project names, modal "Current: …" labels, etc.). Without
+# this, those spans fall through to the user's terminal default fg and
+# become invisible on light themes.
+"yaran.text_fg"              = "ansi_white"
+
+# ── Header / chrome ──────────────────────────────────────────────────
+"yaran.header_fg"            = "ansi_white"
+"yaran.header_bg"            = "#1e1e1e"
+"yaran.header_label_fg"      = "#787878"
+"yaran.header_separator_fg"  = "#3c3c3c"
+
+# ── Borders & titles ─────────────────────────────────────────────────
+"yaran.border_focused"       = "ansi_cyan"
+"yaran.border_normal"        = "#505050"
+"yaran.title_focused"        = "ansi_cyan"
+"yaran.title_normal"         = "#8c8c8c"
+
+# ── Selection ────────────────────────────────────────────────────────
+# Off-canonical RGB on purpose: the exact ANSI values (#000000 / #00ffff) are
+# remapped to the named Color::Black / Color::Cyan (see into_ratatui), which the
+# terminal's own 16-color profile then controls — and bold + named black renders
+# as "bright black" (grey), giving a low-contrast grey-on-teal selection. These
+# literal RGB values render identically on every terminal: near-black text on a
+# bright cyan highlight, matching how the other themes key selection off RGB.
+"yaran.selection_fg"         = "#141414"
+"yaran.selection_bg"         = "#00e5e5"
+
+# ── Project & session indicators ─────────────────────────────────────
+"yaran.project_icon"         = "#6495ed"
+"yaran.project_missing_fg"   = "#b4a050"
+# The standalone star and its directory label, on agent and terminal rows
+# alike: an identity tone, not a state color, so a soft slate blue that
+# stays quieter than the state cues.
+"yaran.standalone_location_fg" = "#7d96a0"
+"yaran.session_active"       = "#d2d2d2"
+"yaran.session_detached"     = "ansi_yellow"
+"yaran.session_exited"       = "#646464"
+"yaran.session_deleting"     = "#646464"
+"yaran.session_attention"    = "ansi_cyan"
+"yaran.session_typing"       = "#c586e0"
+"yaran.session_working"      = "#22c55e"
+
+# ── Status line ──────────────────────────────────────────────────────
+"yaran.status_info_fg"       = "#646464"
+"yaran.status_info_bg"       = "#191919"
+"yaran.status_busy_fg"       = "ansi_yellow"
+"yaran.status_busy_bg"       = "#28230f"
+"yaran.status_error_fg"      = "ansi_red"
+"yaran.status_error_bg"      = "#321414"
+
+# ── Diff visualization ───────────────────────────────────────────────
+"yaran.diff_add"             = "ansi_green"
+"yaran.diff_remove"          = "ansi_red"
+"yaran.diff_hunk"            = "ansi_magenta"
+"yaran.diff_file_header"     = "ansi_white"
+"yaran.file_status_fg"       = "ansi_yellow"
+"yaran.diff_add_bg"          = "#143214"
+"yaran.diff_remove_bg"       = "#3c1414"
+"yaran.diff_binary_fg"       = "ansi_yellow"
+"yaran.diff_excluded_fg"     = "#8c8c8c"
+"yaran.diff_stat_add_fg"     = "ansi_green"
+"yaran.diff_stat_remove_fg"  = "ansi_red"
+"yaran.diff_line_number_fg"  = "#5a5a6e"
+"yaran.diff_line_number_sep" = "#3c3c46"
+
+# ── Hint / footer bar ────────────────────────────────────────────────
+"yaran.hint_key_fg"          = "ansi_cyan"
+"yaran.hint_bracket_fg"      = "ansi_darkgray"
+"yaran.hint_key_bg"          = "#232323"
+"yaran.hint_desc_fg"         = "#a0a0a0"
+"yaran.hint_dim_key_fg"      = "#508ca0"
+"yaran.hint_dim_bracket_fg"  = "#3c3c3c"
+"yaran.hint_dim_desc_fg"     = "#646464"
+"yaran.hint_bar_bg"          = "#191919"
+
+# ── Overlays / modals ────────────────────────────────────────────────
+"yaran.overlay_border"       = "ansi_cyan"
+# Flashed over yaran.overlay_border while a modal refuses an outside click
+# because it is holding unsaved work. Must contrast with yaran.overlay_border.
+"yaran.overlay_border_refused" = "ansi_red"
+"yaran.overlay_bg"           = "#141414"
+"yaran.overlay_dim_bg"       = "#0a0a0a"
+"yaran.overlay_dim_fg"       = "ansi_darkgray"
+"yaran.prompt_cursor"        = "ansi_cyan"
+
+# ── Provider / branch / scrollback ───────────────────────────────────
+"yaran.provider_label_fg"    = "#646464"
+"yaran.branch_fg"            = "ansi_cyan"
+"yaran.terminal_hint_fg"     = "#505050"
+"yaran.scroll_indicator_fg"  = "#d2d2d2"
+"yaran.scroll_indicator_bg"  = "#373737"
+"yaran.warning_fg"           = "ansi_yellow"
+# Emphasis on the part of a row label the agent-list search matched.
+"yaran.search_match_fg"      = "ansi_yellow"
+
+# ── Buttons ──────────────────────────────────────────────────────────
+"yaran.button_active_fg"     = "ansi_white"
+"yaran.button_confirm_border" = "ansi_cyan"
+"yaran.button_danger_border" = "ansi_red"
+
+# ── Help overlay ─────────────────────────────────────────────────────
+"yaran.help_section_header_fg" = "ansi_cyan"
+"yaran.help_banner_fg"       = "#141414"
+"yaran.help_banner_bg"       = "ansi_cyan"
+"yaran.help_body_fg"         = "#b4b4b4"
+
+# ── Input cursor ─────────────────────────────────────────────────────
+"yaran.input_cursor_fg"      = "ansi_black"
+"yaran.input_cursor_bg"      = "ansi_white"
+"yaran.input_label_fg"       = "ansi_white"
+
+# ── Misc UI surfaces ─────────────────────────────────────────────────
+"yaran.runtime_context_value_fg" = "#7d96a0"
+"yaran.nudge_border"         = "#b49632"
+"yaran.tip_pill_fg"          = "#b4b4b4"
+"yaran.tip_pill_bg"          = "#463278"
+"yaran.tip_text_fg"          = "#5a5a5a"
+"yaran.tip_highlight_fg"     = "#007878"

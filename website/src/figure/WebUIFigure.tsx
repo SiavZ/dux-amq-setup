@@ -6,13 +6,13 @@ import { AgentTabsStrip } from "@/components/AgentTabsStrip"
 import { PrBanner } from "@/components/PrBanner"
 import { AppSidebar } from "@/components/Sidebar"
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
-import { useDux } from "@/lib/store"
+import { useYaran } from "@/lib/store"
 
 import { StaticTerminal } from "./StaticTerminal"
 import { focusedSessionId } from "./workspace"
 
-// The homepage's web-UI figure: the dux web UI's own React components, imported
-// out of `crates/dux-web/web/src` and rendered to static HTML at build time
+// The homepage's web-UI figure: the yaran web UI's own React components, imported
+// out of `crates/yaran-web/web/src` and rendered to static HTML at build time
 // against a fabricated workspace seeded into the real store (`seed.ts`). No
 // client directive anywhere, so it ships zero JavaScript.
 //
@@ -27,7 +27,7 @@ import { focusedSessionId } from "./workspace"
 //   3. `GlobalOverlays` is omitted: it renders nothing until opened and drags in
 //      the editor's eager Monaco import, which cannot initialize off a browser.
 export function WebUIFigure() {
-  const { spine, sidebarWidth } = useDux()
+  const { spine, sidebarWidth } = useYaran()
   const session = spine?.sessions.find((s) => s.id === focusedSessionId)
 
   return (

@@ -30,10 +30,10 @@ const {
   editPath,
 } = Astro.props;
 
-const pageTitle = `${title} · dux docs | getdux.app`;
+const pageTitle = `${title} · yaran docs | Yaran`;
 const toc = headings.filter((h) => h.depth === 2 || h.depth === 3);
 
-const site = Astro.site ?? new URL("https://getdux.app");
+const site = Astro.site ?? new URL(Astro.url.origin);
 const breadcrumb = {
   "@context": "https://schema.org",
   "@type": "BreadcrumbList",

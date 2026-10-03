@@ -1,11 +1,11 @@
 ---
 title: Creating agents
-description: The ways to spin up an agent in dux (fresh branch, GitHub PR, existing worktree, fork, or a plain folder you already have) and how provider selection works at creation time.
+description: The ways to spin up an agent in yaran (fresh branch, GitHub PR, existing worktree, fork, or a plain folder you already have) and how provider selection works at creation time.
 group: Guides
 order: 10
 ---
 
-An agent in dux is usually a CLI tool running in its own git worktree on its own branch.
+An agent in yaran is usually a CLI tool running in its own git worktree on its own branch.
 Two agents on the same project work at the same time without touching each other's files,
 and switching between them is instant.
 
@@ -29,10 +29,10 @@ Creating an agent does three things:
 2. Runs your project's [`startup_command`](/docs/startup-commands), if one is configured.
 3. Launches the provider CLI inside that worktree.
 
-Worktrees live under a `worktrees/` subdirectory of dux's data directory:
+Worktrees live under a `worktrees/` subdirectory of yaran's data directory:
 
-- **Linux:** `~/.config/dux/worktrees/<project-name>/<branch-name>/`
-- **macOS:** `~/.dux/worktrees/<project-name>/<branch-name>/`
+- **Linux:** `~/.config/yaran/worktrees/<project-name>/<branch-name>/`
+- **macOS:** `~/.yaran/worktrees/<project-name>/<branch-name>/`
 
 Because each agent owns a real git worktree, your project's `.gitignore`, git hooks, and
 local config behave exactly as they do in the main checkout.
@@ -43,7 +43,7 @@ Every creation path that makes a branch ends at a naming prompt, and there the n
 the branch name. It becomes a git ref, so only ASCII letters, digits, `-`, `_`, and `/`
 are accepted, and spaces become dashes.
 
-Tick the pet-name checkbox in the naming prompt and dux generates a two-word pet name
+Tick the pet-name checkbox in the naming prompt and yaran generates a two-word pet name
 such as `brave-morse`, for both the agent and the branch. The checkbox starts unticked;
 to make pet names the default for every new agent, turn it on permanently:
 
@@ -53,7 +53,7 @@ enable_randomized_pet_name_by_default = true
 ```
 
 A standalone agent has no branch, so its name is a plain label taken exactly as you type
-it, punctuation included. Leave it empty (at creation, or when renaming later) and dux
+it, punctuation included. Leave it empty (at creation, or when renaming later) and yaran
 names it after the folder rather than
 inventing a pet name.
 
@@ -66,7 +66,7 @@ generated name filled in:
 
 In the browser, open a project's `⋯` menu and pick **New agent…**. In the terminal UI,
 run `new-agent` and pick a project from the chooser (every project is listed, including
-ones with no agents yet). Either way dux checks that project's
+ones with no agents yet). Either way yaran checks that project's
 current branch, then opens the naming prompt.
 
 On both surfaces the project list is ordered by what you touched most recently, so a
@@ -79,20 +79,20 @@ lives, and its footer carries the way out to a standalone agent:
 
 ![The terminal UI project chooser for a new agent, listing two projects with their agent counts and paths, and a footer key for creating a standalone agent instead.](/screens/tui-new-agent-chooser.png)
 
-On confirmation dux creates a worktree on a new branch, branched from the project's
+On confirmation yaran creates a worktree on a new branch, branched from the project's
 leading branch. That is settled when you add the project: if the repository was on some
 other branch than its default, the add dialog asks whether to check the default out first.
 Say yes and the default branch leads; say no and the branch it was on leads instead.
 Checking out the project's default branch later makes the default lead from then on. If
-dux cannot save that change, the checkout still happens but the old leading branch stays
-in charge, and dux tells you so in an error that stays up until you close it; run the
+yaran cannot save that change, the checkout still happens but the old leading branch stays
+in charge, and yaran tells you so in an error that stays up until you close it; run the
 checkout again once the problem is fixed.
 
-If the name matches an existing local branch, dux asks whether to attach to that branch
+If the name matches an existing local branch, yaran asks whether to attach to that branch
 instead, which is what you want when continuing work that already started.
 
 > [!IMPORTANT]
-> Attaching matters at the other end of the agent's life. dux remembers that the branch
+> Attaching matters at the other end of the agent's life. yaran remembers that the branch
 > existed first, so the delete dialog's "also delete the branch" box starts **unticked**
 > for it, with a line saying the branch predates the agent and how many of its commits
 > are pushed nowhere. Tick it and the branch goes anyway; leave it and the worktree goes
@@ -100,7 +100,7 @@ instead, which is what you want when continuing work that already started.
 
 ### Pulling before create
 
-By default dux pulls the leading branch first, so the new agent starts from the freshest
+By default yaran pulls the leading branch first, so the new agent starts from the freshest
 upstream commit:
 
 ```toml
@@ -142,15 +142,15 @@ This path needs the `gh` CLI installed, authenticated with `gh auth login`, and
 github_integration = true
 ```
 
-dux checks `gh` at startup and again whenever you switch the integration on, so running
-`gh auth login` while dux is up is enough. If `gh` is missing or none of its logins work,
+yaran checks `gh` at startup and again whenever you switch the integration on, so running
+`gh auth login` while yaran is up is enough. If `gh` is missing or none of its logins work,
 the path is hidden outright on both front ends. One expired login does not take the
 others down: if you are signed in to two hosts and one token is stale, the working host
 keeps the GitHub features on.
 
-**A failed check is never final.** While GitHub features are unavailable, dux quietly
+**A failed check is never final.** While GitHub features are unavailable, yaran quietly
 asks `gh` again every few minutes and turns them back on the moment it works, so a
-GitHub rate limit or a short outage while dux was starting no longer means restarting it.
+GitHub rate limit or a short outage while yaran was starting no longer means restarting it.
 The interval is yours:
 
 ```toml
@@ -159,13 +159,13 @@ github_probe_interval_secs = 300  # 0 turns the periodic re-check off
 ```
 
 `0` disables the periodic re-check entirely; asking on demand still works. Any other
-value is clamped to between 30 seconds and 21600 seconds (6 hours), and dux logs a
+value is clamped to between 30 seconds and 21600 seconds (6 hours), and yaran logs a
 warning once when it clamps one, so a mistyped `1` cannot have it launching `gh` every
 second.
 
 You can also ask right away: **Re-check GitHub** in the browser's settings menu under
 **Configuration**, or the `recheck-github` palette command in the terminal UI. Either
-way dux tells you what it found, including why it still cannot use `gh`.
+way yaran tells you what it found, including why it still cannot use `gh`.
 
 **GitHub Enterprise works, on any hostname `gh` is logged in to.** A company server at
 `git.company.example` is treated exactly like `github.com` once
@@ -175,24 +175,24 @@ check, which is stricter (any host in trouble switches the GitHub features off),
 recognising `github.com` and `github.*` only; if your enterprise host is spelled anything
 else, upgrade `gh`.
 
-### The reference comes first, and dux works out the project
+### The reference comes first, and yaran works out the project
 
 Open this from the global command and the first thing you see is the reference field. No
-project is asked for: paste the link and dux compares the repository it names against
+project is asked for: paste the link and yaran compares the repository it names against
 every project you have.
 
-- **One project is a checkout of that repository.** dux goes straight on to resolve the
+- **One project is a checkout of that repository.** yaran goes straight on to resolve the
   pull request and name the agent.
-- **Two or more are.** dux shows you just those and asks which one this agent belongs in.
-- **None is.** dux names the repository it could not place and offers the project picker.
+- **Two or more are.** yaran shows you just those and asks which one this agent belongs in.
+- **None is.** yaran names the repository it could not place and offers the project picker.
 
 > [!IMPORTANT]
-> **dux will not clone a repository it does not have.** Every way of adding a project
+> **yaran will not clone a repository it does not have.** Every way of adding a project
 > takes a directory that already exists. If the repository is not on this machine yet,
 > clone it yourself and add it as a project first.
 
 Some projects cannot be compared at all: the directory is gone, git cannot read an
-`origin`, or the address is on a host `gh` is not signed in to. dux reports those as
+`origin`, or the address is on a host `gh` is not signed in to. yaran reports those as
 unknowns rather than claiming no project has the repository, so if the message mentions
 projects it could not check, one of them may be the checkout you wanted.
 
@@ -224,17 +224,17 @@ example/application#123
 123
 ```
 
-`example/application#123` names **no host**, and dux does not assume github.com for it:
+`example/application#123` names **no host**, and yaran does not assume github.com for it:
 it looks for that repository across all your projects on whatever host each one is on, so
 it finds your company server's checkout if that is the only one you have.
 
 A number on its own, `#123` or `123`, is the one form that needs a project already chosen,
-because by itself it does not say which repository it is in. With no project, dux refuses
+because by itself it does not say which repository it is in. With no project, yaran refuses
 it and points you at "choose an existing project".
 
 An address with a scheme is read by the same rules a browser uses, so
 `https://github.com/acme/widget/../gadget` names `acme/gadget`, and percent escapes are
-decoded. A scheme dux does not speak is refused. This leniency applies only to what
+decoded. A scheme yaran does not speak is refused. This leniency applies only to what
 **you** type: a project's own `origin` is read by git's rules, where a trailing path is
 part of the address.
 
@@ -243,22 +243,22 @@ Each project's `origin` is read fresh every time, so editing a remote, changing 
 
 ### Naming and fetching
 
-Once the pull request resolves, dux asks you to confirm or edit the branch name,
+Once the pull request resolves, yaran asks you to confirm or edit the branch name,
 pre-filled with the PR's head branch. In the terminal UI that is a second prompt; in the
 browser the reference and the name are two fields in one dialog. The name you confirm is
-what the fetch targets: dux fetches the PR's head ref into that local branch, then
+what the fetch targets: yaran fetches the PR's head ref into that local branch, then
 creates a worktree on it.
 
-If the branch already exists locally, from a previous fetch say, dux attaches to it
+If the branch already exists locally, from a previous fetch say, yaran attaches to it
 without fetching again, and the delete dialog later offers that branch unticked, the way
-it does for any branch you had first. Otherwise the local branch is dux's own, whether
-dux fetched the pull request head or checked out a copy your project had already fetched
-from the remote, and the box is ticked by default. Nothing dux does to it reaches the
+it does for any branch you had first. Otherwise the local branch is yaran's own, whether
+yaran fetched the pull request head or checked out a copy your project had already fetched
+from the remote, and the box is ticked by default. Nothing yaran does to it reaches the
 remote: the branch on GitHub, and the pull request itself, are untouched either way.
 
 ### How PR status stays fresh
 
-With `github_integration` on, dux shows a PR status pill on each agent branch. Updates
+With `github_integration` on, yaran shows a PR status pill on each agent branch. Updates
 are event-driven: pushing to a branch refreshes that agent's PR, and bringing an agent to
 the foreground refreshes it too. A slow background poll is the fallback, for changes made
 on GitHub itself:
@@ -286,10 +286,10 @@ An agent that comes back from Inactive, because you reconnected to it or started
 again, is checked right away rather than waiting out that slow clock, and the
 event-driven refreshes above ignore which section an agent is in.
 
-When a branch name is reused, dux follows the most recent pull request on it, preferring
+When a branch name is reused, yaran follows the most recent pull request on it, preferring
 one that is open.
 
-If your GitHub API quota runs low, or GitHub starts erroring, dux pauses PR checks until
+If your GitHub API quota runs low, or GitHub starts erroring, yaran pauses PR checks until
 it recovers and tells you: a status line in the terminal UI, a toast in the browser.
 
 Above or below the agent's terminal, a one-line banner carries the pull request's number,
@@ -308,16 +308,16 @@ return to that list. In the terminal UI, the
 `new-agent-from-worktree` palette command. Either opens a picker of every git worktree
 for that project's repository, in two groups:
 
-- **Managed worktrees**, already under dux's `worktrees/` directory. One with no agent
+- **Managed worktrees**, already under yaran's `worktrees/` directory. One with no agent
   yet gets a new session attached without touching the branch or files. An adopted
   worktree's branch came with it, so the delete dialog offers that branch unticked, with
   a line saying it came with the worktree.
 - **External worktrees** (terminal UI only), which exist in the repository but live
-  outside dux's managed directory, such as one you created with `git worktree add`. dux
+  outside yaran's managed directory, such as one you created with `git worktree add`. yaran
   forks these: a new managed worktree branched from the external worktree's current
   `HEAD`, with dirty and untracked files copied across. Gitignored files do not travel.
 
-The main checkout is never selectable; dux keeps that for you. Worktrees that already
+The main checkout is never selectable; yaran keeps that for you. Worktrees that already
 have an agent are shown but disabled, with a tooltip explaining why; in the terminal UI,
 selecting one reports "That worktree already has an agent."
 
@@ -337,7 +337,7 @@ below them, each row naming its branch and saying whether there is uncommitted w
 > Deleting a worktree removes the directory from disk. The confirmation names the branch
 > and the full path, and says specifically when there are uncommitted changes to lose. It
 > also offers to delete the branch, **ticked by default**; untick it and the branch
-> survives. If git refuses the deletion, dux reports the branch as still there with git's
+> survives. If git refuses the deletion, yaran reports the branch as still there with git's
 > own reason.
 
 ![The terminal UI confirmation for deleting a worktree, naming the path, warning about the uncommitted changes, and offering a ticked checkbox that also deletes the branch.](/screens/tui-worktree-delete-confirm.png)
@@ -355,7 +355,7 @@ the worktree is gone neither surface can reach the branch, and `git branch -D` i
 Forking starts from an existing agent rather than a project. In the browser, that agent's
 `⋯` menu and **Fork agent…**; in the terminal UI, select the agent and run `fork-agent`.
 
-dux creates a new worktree branched from the source agent's current `HEAD`, then copies
+yaran creates a new worktree branched from the source agent's current `HEAD`, then copies
 the uncommitted and untracked changes across, so the fork starts where the original is
 right now. Fork at a decision point to explore two approaches to the same problem.
 
@@ -385,7 +385,7 @@ agent in project" chooser too (so you can change your mind once you are already 
 no project fits), and the `new-standalone-agent` palette command. The `?` help overlay
 names the keys, and you can rebind them under `[keys]` in `config.toml`. Every way in
 opens the same folder browser. Any folder is accepted: it does not have to be a git
-repository, and dux initializes nothing in it.
+repository, and yaran initializes nothing in it.
 
 Both surfaces then ask what to call the agent. The name is optional: leave it empty and
 the agent is named after the folder, or type one and it is used as you typed it, interior
@@ -396,16 +396,16 @@ untouched.
 > [!NOTE]
 > Once you start filtering inside the chooser, the key that still works is a modifier
 > chord, because plain letters go into the search box. GNU Screen's flow control can
-> swallow that chord before dux ever sees it; the palette command still works there, and
+> swallow that chord before yaran ever sees it; the palette command still works there, and
 > so does rebinding the key to something your terminal passes through.
 
 What a standalone agent does NOT have:
 
-- **No branch and no worktree.** dux creates nothing on disk for it.
+- **No branch and no worktree.** yaran creates nothing on disk for it.
 - **No project.** It sits among your other agents, told apart by the `✷` star over its
   folder on the row's second line. A standalone terminal wears the same star.
 - **No branch features.** Pushing, pulling, forking, pull requests and branch renaming
-  are about a branch dux manages, so those actions are absent rather than offered and
+  are about a branch yaran manages, so those actions are absent rather than offered and
   refused.
 - **No startup command and no project environment.** Both are project-scoped. A
   standalone agent gets your global environment and nothing layered on top.
@@ -413,11 +413,11 @@ What a standalone agent does NOT have:
 Everything else is there: the embedded terminal, agent tabs, companion terminals, the
 in-browser editor, file drops, renaming, the resource monitor and auto-reopen.
 
-### dux never creates, moves or removes the folder
+### yaran never creates, moves or removes the folder
 
 > [!IMPORTANT]
-> The folder's existence and location are yours alone. dux does not create it, move it or
-> remove it, ever. Deleting the agent removes dux's own record and nothing else, and the
+> The folder's existence and location are yours alone. yaran does not create it, move it or
+> remove it, ever. Deleting the agent removes yaran's own record and nothing else, and the
 > delete dialog says so: there is no "also remove the worktree" checkbox, because there
 > is no worktree. A factory reset skips it too.
 
@@ -425,7 +425,7 @@ Things do get written *inside* it: the agent works in it, a dropped file lands i
 commit writes to its repository.
 
 A file you drop onto a standalone agent is saved in a hidden upload directory inside the
-folder. Because dux never cleans the folder up, that directory stays there after the agent
+folder. Because yaran never cleans the folder up, that directory stays there after the agent
 is gone. Remove it yourself if you do not want it.
 
 ### The changes panel follows the folder
@@ -439,7 +439,7 @@ When the folder is not a repository the panel is quiet, and it says which quiet 
 
 - The folder has no git repository at all.
 - The folder sits **inside** a repository rooted somewhere else.
-- dux could not consult git. Nothing is guessed and no change is written.
+- yaran could not consult git. Nothing is guessed and no change is written.
 
 > [!WARNING]
 > The middle case is quiet on purpose. Git answers questions by walking up parent
@@ -451,7 +451,7 @@ A folder that becomes a repository later is noticed the next time the panel open
 
 ### One standalone agent per folder
 
-dux refuses a second standalone agent in a folder that already has one. Coding CLIs
+yaran refuses a second standalone agent in a folder that already has one. Coding CLIs
 remember their conversation history per directory, so the second agent would silently
 pick up the first one's conversation. To put several agents on one directory, add it as a
 project instead: agents there each get their own worktree, and [tabs](/docs/agent-tabs)
@@ -459,7 +459,7 @@ too.
 
 ## Choosing a provider at creation time
 
-Every agent is tied to one provider. At creation, dux uses the default configured for
+Every agent is tied to one provider. At creation, yaran uses the default configured for
 that project:
 
 ```toml
@@ -470,7 +470,7 @@ name = "web-app"
 default_provider = "claude"
 ```
 
-With no project-level default, and for a standalone agent, which has no project, dux
+With no project-level default, and for a standalone agent, which has no project, yaran
 falls back to the global default:
 
 ```toml
@@ -492,7 +492,7 @@ takes effect the next time that tab launches.
 
 ## Auto-reopening agents on startup
 
-Agents are persistent. Quit dux and reopen it and agents can resume automatically if
+Agents are persistent. Quit yaran and reopen it and agents can resume automatically if
 `auto_reopen_agents` is on. The setting lives at two levels:
 
 ```toml
@@ -511,7 +511,7 @@ Toggle every level without editing the file. In the terminal UI,
 `toggle-agent-auto-reopen` flips a single agent's. In the browser, the global switch is a
 **Preferences…** row, the project one is in **Project settings…**, and an agent's own is
 **Enable/Disable agent auto-reopen** on its `⋯` menu. Changes take effect the next time
-dux starts.
+yaran starts.
 
 If an agent's provider command is not found at reopen time, the worktree is left intact
 and the error is reported. The agent still appears in the list, and you can reconnect it

@@ -1,12 +1,12 @@
 name: overlay-ci
 
-# Baseline CI for the dux-amq overlay (audit01 Phase 00): ShellCheck over every
-# executable overlay/installer script and the bats suite in dux-amq/tests.
+# Baseline CI for the yaran-amq overlay (audit01 Phase 00): ShellCheck over every
+# executable overlay/installer script and the bats suite in yaran-amq/tests.
 # `make overlay-test` runs the same two steps locally.
 #
-# The Rust side of the overlay contract (dux-amq/config/dux-config.sed and
-# dux-config-changes.toml against the current config schema) is a cargo test,
-# crates/dux/tests/overlay_config.rs, so it runs in pr.yml / test.yml.
+# The Rust side of the overlay contract (yaran-amq/config/yaran-config.sed and
+# yaran-config-changes.toml against the current config schema) is a cargo test,
+# crates/yaran/tests/overlay_config.rs, so it runs in pr.yml / test.yml.
 
 on:
   pull_request:
@@ -29,7 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # rsync (finalize-claude-migration.sh), curl (dux-amq/install.sh preflight)
+      # rsync (finalize-claude-migration.sh), curl (yaran-amq/install.sh preflight)
       # and sqlite3 (the doctor's read-only DB test, which skips without it) are
       # on the runner image today; naming them keeps an image change from
       # turning into a confusing failure or a silent skip. Verified in a bare
@@ -43,4 +43,4 @@ jobs:
         run: make overlay-shellcheck
 
       - name: bats overlay tests
-        run: bats dux-amq/tests
+        run: bats yaran-amq/tests

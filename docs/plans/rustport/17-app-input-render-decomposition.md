@@ -146,8 +146,8 @@ further broken up by overlay family). **Nothing genuinely resists a <500-line sp
 cargo test --all-features
 cargo insta test                    # zero diff except the reviewed R4 change
 ci/check-file-length.sh
-cargo modules orphans --deny --bin dux
-cargo modules dependencies --acyclic --bin dux
+cargo modules orphans --deny --bin yaran
+cargo modules dependencies --acyclic --bin yaran
 
 # the contract test must still catch its failure mode after the split:
 #   delete one `ui.overlay_layout.active = ...` write -> test MUST fail -> revert

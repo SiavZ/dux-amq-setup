@@ -1,6 +1,6 @@
 name: Website CI
 
-# Sanity-check that the getdux.app site still builds before it can be merged or
+# Sanity-check that the website builds before it can be merged or
 # deployed. Runs only when site-relevant files change so unrelated PRs aren't
 # slowed down. The deploy itself lives in pages.yml and happens on release.
 on:
@@ -11,7 +11,7 @@ on:
       # the site suite even when nothing under website/ changed.
       - "tools/preview-env/screens/scenes/**"
       - "install.sh"
-      - "assets/dux-logo.png"
+      - "assets/yaran-logo.svg"
       - "assets/dux-screenshot.svg"
       - ".github/workflows/website-ci.yml"
       - ".github/workflows/pages.yml"
@@ -23,7 +23,7 @@ on:
       # the site suite even when nothing under website/ changed.
       - "tools/preview-env/screens/scenes/**"
       - "install.sh"
-      - "assets/dux-logo.png"
+      - "assets/yaran-logo.svg"
       - "assets/dux-screenshot.svg"
       - ".github/workflows/website-ci.yml"
       - ".github/workflows/pages.yml"
@@ -45,7 +45,7 @@ jobs:
       - name: Verify canonical assets the build copies are present
         run: |
           missing=0
-          for f in install.sh assets/dux-logo.png assets/dux-screenshot.svg; do
+          for f in install.sh assets/yaran-logo.svg assets/dux-screenshot.svg; do
             if [ ! -f "$f" ]; then
               echo "::error::$f is missing at the repo root; the website build copies it."
               missing=1
@@ -61,7 +61,7 @@ jobs:
           # components, so the app's dependencies are part of this job too.
           cache-dependency-path: |
             website/package-lock.json
-            crates/dux-web/web/package-lock.json
+            crates/yaran-web/web/package-lock.json
 
       - name: Install dependencies
         working-directory: website
@@ -72,7 +72,7 @@ jobs:
       # resolves React through the app's node_modules, so without this it fails
       # on every CI run with "Cannot find module .../react-dom-server.mjs".
       - name: Install the web app's dependencies (the figure test renders it)
-        working-directory: crates/dux-web/web
+        working-directory: crates/yaran-web/web
         run: npm ci --no-audit --no-fund
 
       - name: Unit tests
@@ -97,7 +97,7 @@ jobs:
 
       - name: Verify build output
         run: |
-          for f in index.html CNAME install.sh dux-logo.png dux-screenshot.svg pagefind/pagefind.js; do
+          for f in index.html install.sh yaran-logo.svg yaran-logo.png dux-screenshot.svg pagefind/pagefind.js; do
             if [ ! -f "website/dist/$f" ]; then
               echo "::error::website/dist/$f missing from build output."
               exit 1

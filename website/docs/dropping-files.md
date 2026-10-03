@@ -1,12 +1,12 @@
 ---
 title: Dropping and pasting files onto an agent
-description: Drag, paste, or pick a file in the browser and dux saves it on the server and pastes its path. Where files land, why agent uploads stay out of git, why an editor drop is an ordinary committable file, and why nothing is ever overwritten.
+description: Drag, paste, or pick a file in the browser and yaran saves it on the server and pastes its path. Where files land, why agent uploads stay out of git, why an editor drop is an ordinary committable file, and why nothing is ever overwritten.
 group: Web UI
 order: 67
 ---
 
 You have a screenshot. Your agent is running on a machine somewhere else, and you are
-looking at it through a browser tab. Drag the image onto the terminal and let go: dux saves
+looking at it through a browser tab. Drag the image onto the terminal and let go: yaran saves
 it on the server and pastes its path into the prompt, ready for you to finish the sentence.
 
 ## Three gestures, one journey
@@ -47,19 +47,19 @@ A few things specific to pasting:
   and is also how you paste very long text as text. It applies to that one keystroke.
 - **On a phone, the path joins your draft** rather than sending anything. The toast says so.
 - **A screenshot usually has no name of its own.** Browsers hand one over as `image.png`, so
-  several pastes collide, and dux saves the next one under a new name and tells you what it
-  is. With no name at all, dux invents one from the clock, like
+  several pastes collide, and yaran saves the next one under a new name and tells you what it
+  is. With no name at all, yaran invents one from the clock, like
   `pasted-2026-08-09-141530.png`.
 
 > [!NOTE]
-> dux reads your clipboard only from a real paste keystroke, never on demand. The on-demand
-> browser API is blocked outside a secure context, and dux is routinely served over plain
+> yaran reads your clipboard only from a real paste keystroke, never on demand. The on-demand
+> browser API is blocked outside a secure context, and yaran is routinely served over plain
 > HTTP on a Tailscale address.
 
 ## A very long paste becomes a file too
 
 Paste a 40 KB error log into an agent and every one of those characters goes into its
-context window. So past a length you set, dux saves the text as a `.txt` file in the agent's
+context window. So past a length you set, yaran saves the text as a `.txt` file in the agent's
 upload folder and pastes **that file's path** instead. The agent can then open it, scan it,
 or grep it.
 
@@ -83,7 +83,7 @@ The details:
   same ignore file and collision-safe naming as everything else here.
 - **The toast says so, and says the way out.** It leads with what happened and the size that
   triggered it, names the file, then tells you your text is still on the clipboard and which
-  chord pastes it literally: *"That paste was 41320 characters, so dux saved it as a file
+  chord pastes it literally: *"That paste was 41320 characters, so yaran saved it as a file
   rather than typing it into the agent."* If the save itself fails it says it **tried** to
   save, and that message waits for you instead of clearing itself, because your text is
   neither typed nor saved and the message is how you get it back.
@@ -103,17 +103,17 @@ the wrong computer. Claude Code shells out to `xclip` or `wl-paste`; Codex takes
 "a terminal that exposes the dropped file path to the TUI".
 
 That is what every terminal emulator does too. Alacritty, kitty, WezTerm, Ghostty, GNOME
-Terminal, Konsole and iTerm2 all answer a drop by typing the path in. dux does the same,
+Terminal, Konsole and iTerm2 all answer a drop by typing the path in. yaran does the same,
 with the one extra step a browser needs: it puts the file on the server first.
 
 ## Where the file lands
 
-Dropping a file means one of two things, and dux gives them different destinations.
+Dropping a file means one of two things, and yaran gives them different destinations.
 Handing an image to an agent is "look at this for me": scratch. Dropping a file into a
 terminal or onto the editor's file tree is "put this here": a file you are placing in a
 folder you chose.
 
-**On an agent's pane**, in that agent's upload folder: `.dux/uploads` inside the agent's
+**On an agent's pane**, in that agent's upload folder: `.yaran/uploads` inside the agent's
 worktree, created the first time you drop something. It is **invisible to git** and
 **deleted with the agent**, so there is nothing to clean up and nothing sitting in your
 changed files. Every tab of one agent shares one worktree, so it does not matter which tab
@@ -122,16 +122,16 @@ outside the workspace they were started in.
 
 **On a terminal**, in the folder that terminal is *actually* in right now, not the one it
 opened in. Open a terminal at your repo root, type `cd docs/images`, and a dropped file lands
-in `docs/images`. dux prefers whatever program is in the foreground over the shell behind it.
+in `docs/images`. yaran prefers whatever program is in the foreground over the shell behind it.
 
 > [!IMPORTANT]
-> If a foreground program has exited but its job is still running, dux looks at the rest of
-> the job before falling back to the shell, and that step is **Linux only**. On macOS dux
+> If a foreground program has exited but its job is still running, yaran looks at the rest of
+> the job before falling back to the shell, and that step is **Linux only**. On macOS yaran
 > refuses the drop in that one situation and asks you to try again rather than quietly
 > saving into the shell's folder. Drop the file again and the program now in the foreground
 > answers for itself. Everything else on this page behaves the same on both platforms.
 
-If dux cannot read the process at all, it refuses the drop and tells you rather than writing
+If yaran cannot read the process at all, it refuses the drop and tells you rather than writing
 somewhere else and naming that instead. A file that lands inside an agent's worktree shows
 up in that agent's Changes pane straight away; one that lands anywhere else changes nothing
 git is watching, and nothing claims otherwise.
@@ -151,7 +151,7 @@ there after the agent is gone. The agent's Changes pane, the file tree and the f
 all pick them up at once. A tree drop pastes nothing into any terminal.
 
 You cannot drop outside the worktree or into `.git`, exactly as you cannot create, rename or
-move anything into either. dux refuses and says so, and nothing is written.
+move anything into either. yaran refuses and says so, and nothing is written.
 
 > [!IMPORTANT]
 > A drop is **stricter than create, rename and move in one way**: those three follow a
@@ -159,7 +159,7 @@ move anything into either. dux refuses and says so, and nothing is written.
 > `libs -> packages/libs` link works, while a drop refuses any folder reached through a link.
 > Drop into the real folder instead.
 
-dux takes **files**, not folders. Drop a folder and it is refused by name, with any files you
+yaran takes **files**, not folders. Drop a folder and it is refused by name, with any files you
 dropped alongside it still saved, and one toast says which was which. If the folder you
 dropped on has been deleted since the tree last listed it, the drop is refused with that
 folder named rather than the folder being recreated.
@@ -173,16 +173,16 @@ file straight away.
 
 ## Keeping the uploads out of git
 
-The upload folder hides itself. dux keeps a `.gitignore` in it containing a single `*`, which
+The upload folder hides itself. yaran keeps a `.gitignore` in it containing a single `*`, which
 ignores everything in the folder **including the ignore file itself**. Run `git status` after
 dropping a screenshot and it prints nothing at all: not the image, not the ignore file, not
 even the folder.
 
-dux rewrites that file on **every** upload, not only the first, so the folder repairs itself:
+yaran rewrites that file on **every** upload, not only the first, so the folder repairs itself:
 delete the ignore file, or create the folder while the setting is off and turn it on later,
 and the next dropped file puts it back.
 
-Two things dux will not do:
+Two things yaran will not do:
 
 - **It never edits a `.gitignore` that is already there.** Your own rules in that folder win,
   and turning the setting on later will not overwrite them.
@@ -194,23 +194,23 @@ These are settings, on `[ui]` in `config.toml`:
 
 | Key | Default | What it does |
 |---|---|---|
-| `upload_directory` | `".dux/uploads"` | Where an agent's dropped and pasted files go, relative to that agent's worktree. Must be a relative path with no `..` in it that a filesystem could actually hold; anything else falls back to the default and says so once in `dux.log`. |
+| `upload_directory` | `".yaran/uploads"` | Where an agent's dropped and pasted files go, relative to that agent's worktree. Must be a relative path with no `..` in it that a filesystem could actually hold; anything else falls back to the default and says so once in `yaran.log`. |
 | `upload_write_gitignore` | `true` | Whether to keep the self-ignoring `.gitignore` in that folder, attempted on every upload. Set it to `false` if you intend to commit what you drop or paste, and your uploads show up as ordinary untracked files again. This one is also a row in the web UI's **Preferences** dialog, as *Hide dropped and pasted files from git*. |
-| `upload_pasted_text_chars` | `4000` | How long a piece of text you paste into an **agent** may be before dux saves it as a `.txt` file in the folder above and pastes that file's path instead. Counted in characters. `0` switches it off. Values between 1 and 199, or above 100000, are clamped with one warning in `dux.log`. Also a row in the web UI's **Preferences** dialog, as *Save long pastes as a file*. Never applies to a terminal. |
+| `upload_pasted_text_chars` | `4000` | How long a piece of text you paste into an **agent** may be before yaran saves it as a `.txt` file in the folder above and pastes that file's path instead. Counted in characters. `0` switches it off. Values between 1 and 199, or above 100000, are clamped with one warning in `yaran.log`. Also a row in the web UI's **Preferences** dialog, as *Save long pastes as a file*. Never applies to a terminal. |
 
 `upload_directory` deliberately has **no** Preferences row: picking a path properly needs a
 directory picker the dialog does not have. Edit it in `config.toml`.
 
-Set `upload_directory = ""`, or point it at anything outside the worktree, and dux will not
+Set `upload_directory = ""`, or point it at anything outside the worktree, and yaran will not
 follow you: uploads have to be somewhere the agent can read and somewhere that dies with the
 agent. The same goes for a value the filesystem could not store, one holding a control
 character or a null byte (a TOML `"\n"` escape will get you one), or one longer than a path
-is allowed to be. Each is caught when the config loads, warned about once in `dux.log`, and
+is allowed to be. Each is caught when the config loads, warned about once in `yaran.log`, and
 replaced.
 
 > [!WARNING]
 > **A rejected value does not survive in your config file.** The correction happens as the
-> config loads, so the next time dux saves `config.toml` for any reason the corrected value
+> config loads, so the next time yaran saves `config.toml` for any reason the corrected value
 > is what gets written and the one you typed is gone. That is the same treatment
 > `terminal_font_size` gets for an out-of-range number. Keep a copy elsewhere while you work
 > out why it was refused.
@@ -232,7 +232,7 @@ Drop `screenshot.png` twice and you get two files. The second is saved under a n
 a timestamp and a counter, and **the toast tells you the new name**, because the whole point
 is to reference the file.
 
-dux refuses to write through a symlink, and if something unexpected is sitting at that name
+yaran refuses to write through a symlink, and if something unexpected is sitting at that name
 the drop fails and says so rather than quietly writing next to it.
 
 A drop on the editor's file tree behaves the same way, and differs from **moving** a file in
@@ -242,7 +242,7 @@ honest answer. Neither overwrites.
 
 ## Your filenames are kept as you had them
 
-dux **validates** a dropped name; it does not rewrite it. Accented, Japanese and Cyrillic
+yaran **validates** a dropped name; it does not rewrite it. Accented, Japanese and Cyrillic
 names, names with spaces, parentheses and apostrophes all arrive exactly as they were.
 
 A handful are refused outright, with the reason named:
@@ -252,11 +252,11 @@ A handful are refused outright, with the reason named:
 - control characters and null bytes, which no terminal can print back to you
 - anything longer than the filesystem will accept
 
-When a name is right at the length limit and a collision forces a suffix, dux trims the front
+When a name is right at the length limit and a collision forces a suffix, yaran trims the front
 of the name to make room and keeps the extension.
 
 The folders above it are held to the same standard, since the whole path ends up in your
-prompt. dux refuses a drop into a folder whose path holds a line feed (which arrives as a
+prompt. yaran refuses a drop into a folder whose path holds a line feed (which arrives as a
 submit), an escape character (which the program reading your terminal simply obeys), or text
 that is not valid at all. Those are the only refusals. Spaces, dollars, backticks, quotes and
 semicolons in a folder name are all fine, which matters because a worktree path is built from
@@ -270,7 +270,7 @@ per-provider setting**, `web_dragdrop_paste`, in the provider's own block in `co
 next to `command` and `resume_args`.
 
 > [!TIP]
-> You almost certainly do not need to touch it. dux ships the value it measured for each CLI
+> You almost certainly do not need to touch it. yaran ships the value it measured for each CLI
 > it knows about.
 
 ```toml
@@ -300,7 +300,7 @@ mangled, with stray quote or backslash characters, the CLI probably wants it `ba
 
 ### Which CLI needs which, and why
 
-Every row was produced by running that CLI's own path handling over the exact bytes dux
+Every row was produced by running that CLI's own path handling over the exact bytes yaran
 sends.
 
 | CLI | What it does with a pasted path | Value |
@@ -311,7 +311,7 @@ sends.
 | Copilot CLI | Closed source, so this one is **not verified**. It is defaulted to `bare`, the do-nothing option and what two of the three CLIs above want. | `bare` (a guess) |
 
 Anything else, including a provider you add yourself, gets `bare`. An absent key means
-`bare`, and so does a value dux does not recognise (it says so once in `dux.log` and carries
+`bare`, and so does a value yaran does not recognise (it says so once in `yaran.log` and carries
 on rather than refusing to load your config).
 
 The `web_` prefix marks the scope: this affects the browser and nothing else. In the terminal
@@ -319,7 +319,7 @@ UI, dropping a file onto the window is your terminal emulator's job.
 
 ### What is known to fail
 
-None of this is something dux can fix from its side. dux sends the correct bytes; the
+None of this is something yaran can fix from its side. yaran sends the correct bytes; the
 receiving tool rewrites them.
 
 - **Single-quoting a path that contains an apostrophe breaks Claude Code.** POSIX quoting
@@ -333,14 +333,14 @@ receiving tool rewrites them.
   characters from *both ends* rather than one matching pair, so a file whose name ends in a
   quote loses that character.
 - **Codex ignores a paste that is too long before it ever looks for a path.** Anything over
-  1000 characters is filed away as generic pasted content, and the quoting dux adds counts
-  toward that. dux measures the finished paste, and when it would go over the limit it does
+  1000 characters is filed away as generic pasted content, and the quoting yaran adds counts
+  toward that. yaran measures the finished paste, and when it would go over the limit it does
   not send it at all: the report tells you the file was saved, gives its full path, and says
   the agent will not pick it up automatically. That report waits for you rather than clearing
   itself. The limit belongs to Codex itself, so it applies whichever `web_dragdrop_paste`
   value you give it and follows Codex under any block name
   (`[providers.myagent] command = "codex"` still gets it), while a block you happened to name
-  `codex` that runs something else does not: dux decides by the `command` you configured,
+  `codex` that runs something else does not: yaran decides by the `command` you configured,
   comparing on its file name, so `/usr/local/bin/codex` counts the same as the bare name. No
   other CLI has been measured to have a limit, and a terminal has none at all.
 
@@ -356,7 +356,7 @@ file by that path. Nothing is lost and nothing is overwritten.
 
 A terminal does not read `web_dragdrop_paste` at all. Its dropped paths are **always
 quoted**, because a shell would otherwise split the path on its spaces, expand a `$` and run
-a command substitution the moment you press Enter. dux permits all of those characters in a
+a command substitution the moment you press Enter. yaran permits all of those characters in a
 destination path, so the quoting is what makes them inert. The path is pasted at your cursor
 as one literal word and nothing is submitted for you. There is no length limit either: that
 limit belongs to Codex's composer, and a shell does not have one.
@@ -378,7 +378,7 @@ This section is about the two **pane** drops and about a file attached from the 
 menus. A drop on the editor's file tree pastes nothing, so none of it applies there: it needs
 no input ownership and a watcher can do it, **Upload here…** included.
 
-Only the device that currently holds input can drop or paste. Terminals in dux are
+Only the device that currently holds input can drop or paste. Terminals in yaran are
 one-writer, many-watchers (see [The workspace in the browser](/docs/web-workspace)), and the
 drop target only appears for the writer.
 
@@ -387,12 +387,12 @@ says the image was not saved and that taking over is the way to paste it here.
 
 > [!IMPORTANT]
 > If you lose input to another device between the file being saved and its path being pasted,
-> dux tells you plainly: the file **was** saved, here is its full path, and the path was not
+> yaran tells you plainly: the file **was** saved, here is its full path, and the path was not
 > sent. Take over input and paste it yourself. That message waits for you instead of clearing
 > itself, because it holds the only copy of that path on screen.
 
 The same applies on a phone: if the compose box goes away mid-upload (you rotated to a wide
-layout, or switched the box off), dux reports the file as saved-but-not-added with its full
+layout, or switched the box off), yaran reports the file as saved-but-not-added with its full
 path rather than claiming it joined a message you can no longer see.
 
 ## Limits, and switching it off
@@ -402,7 +402,7 @@ Two `[server]` settings. See [Server mode overview](/docs/server-mode) for the r
 | Key | Default | What it does |
 |---|---|---|
 | `file_drop_max_bytes` | `104857600` (100 MiB) | Largest single dropped file. A file over it is refused with a message saying so, and nothing is written. Set to `0` to switch file drop off entirely: the pane stops offering a drop target, and the server refuses any upload that reaches it anyway. |
-| `file_drop_max_concurrency` | `2` | How many uploads are accepted at once. This bounds how much upload dux holds in memory, not just how much work it does at a time. An upload beyond the limit waits up to 30 seconds for a slot; if none comes free it is refused with a `503` saying the server is busy, and the browser tells you to try the drop again in a moment. `0` clamps to `1`. |
+| `file_drop_max_concurrency` | `2` | How many uploads are accepted at once. This bounds how much upload yaran holds in memory, not just how much work it does at a time. An upload beyond the limit waits up to 30 seconds for a slot; if none comes free it is refused with a `503` saying the server is busy, and the browser tells you to try the drop again in a moment. `0` clamps to `1`. |
 
 > [!IMPORTANT]
 > Both are read at startup, so changing either needs a **server restart**.

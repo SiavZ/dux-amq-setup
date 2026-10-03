@@ -112,10 +112,10 @@ read paths.
 10. **Box the PTY handle inside `SessionState` (M17).** Every `Vec<AgentSession>`
     element is sized for the largest variant `Live { PtyHandle, .. }` (~150–200 B),
     including exited rows — roughly a 3× shrink.
-11. **Add a per-file size cap to `dux.log` (M19).** Daily rotation with 7 files
+11. **Add a per-file size cap to `yaran.log` (M19).** Daily rotation with 7 files
     retained exists (`logger.rs:65-69`); there is no size bound within a day.
 12. **Reconsider `mmap_size = 128 MiB` (`storage.rs:893`)** for the CLI path. It is
-    virtual, but multiplied by every `dux peer` process as well as the app and the
+    virtual, but multiplied by every `yaran peer` process as well as the app and the
     create-agent worker.
 13. **Document the memory model** in `docs/operations/` — the per-pane arithmetic, what
     the knobs do, and the measurement recipe — so the next person does not have to
@@ -133,7 +133,7 @@ read paths.
 - [ ] Diff has a size cap and a `.deadline()`; oversized files produce a clear message.
 - [ ] Recovery scan filters by mtime before reading transcript bodies.
 - [ ] `SessionState`'s PTY handle boxed; `size_of::<AgentSession>()` measurably smaller.
-- [ ] `dux.log` has a per-file size cap.
+- [ ] `yaran.log` has a per-file size cap.
 - [ ] **Measured**: 8 panes at 200 cols with saturated scrollback stays under 100 MiB RSS
       (was ~400 MiB at these settings, ~816 MiB at 16 panes).
 - [ ] `docs/operations/memory-model.md` written.

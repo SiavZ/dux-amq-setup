@@ -8,7 +8,7 @@ const DOT = `digraph {
   bgcolor="transparent";
   node [shape=box style="rounded,filled" fontname="Helvetica"];
   a [class="d-gate" label="caddy"];
-  b [class="d-app" label="dux"];
+  b [class="d-app" label="yaran"];
   a -> b;
 }`;
 

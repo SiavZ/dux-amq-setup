@@ -73,7 +73,7 @@ fan-out matrix is what determines whether this is a two-day or a two-week job.
    Phase 08 item 10 (boxing the handle); coordinate so the handle is boxed **and** the
    typestate lands together rather than being touched twice.
 7. **Finish the `tracing` migration.** `CLAUDE.md` prefers structured
-   `tracing::{info,warn,error,debug}!` with explicit `target: "dux::<module>"` over the
+   `tracing::{info,warn,error,debug}!` with explicit `target: "yaran::<module>"` over the
    legacy `crate::logger::*` shims. Count the remaining legacy call sites and convert
    them. Preserve the hard constraint documented at the top of `src/sanitize.rs`:
    **never call any logging shim from inside `crate::sanitize::*`** — it is on the legacy
@@ -120,7 +120,7 @@ grep -n 'tracing::\|logger::' src/sanitize.rs     # expect: no output
 grep -rn 'crate::logger::' src/ | wc -l           # expect: 0
 
 ci/check-file-length.sh
-cargo modules dependencies --acyclic --bin dux
+cargo modules dependencies --acyclic --bin yaran
 cargo run -p xtask -- module-trees --check
 ```
 

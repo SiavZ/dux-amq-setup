@@ -1,7 +1,7 @@
 name: Deploy website
 
 on:
-  # Deploy when a new release of dux is published. This ties the live site to
+  # Deploy when a new release of yaran is published. This ties the live site to
   # actually-shipped versions: anything in `website/` only goes live alongside
   # a real release, so half-finished homepage edits never reach getdux.app on
   # their own.
@@ -32,10 +32,9 @@ concurrency:
 jobs:
   build:
     name: Build site
-    # getdux.app (website/public/CNAME) is upstream's site and documents
-    # upstream's install paths. This fork must not deploy it: a release here
-    # would otherwise try to publish getdux.app content to the fork's Pages.
-    # website-ci.yml still builds the site on PRs so upstream merges stay green.
+    # Deployment remains disabled on this fork until its Pages ownership and
+    # optional YARAN_SITE_URL are deliberately configured. Never claim upstream's
+    # getdux.app domain. website-ci.yml still validates the build on fork PRs.
     if: ${{ github.repository == 'patrickdappollonio/dux' }}
     runs-on: ubuntu-latest
     steps:
@@ -76,9 +75,9 @@ jobs:
           # dependencies are part of this build too.
           cache-dependency-path: |
             website/package-lock.json
-            crates/dux-web/web/package-lock.json
+            crates/yaran-web/web/package-lock.json
 
-      # No separate install for the dux web app here. `prep` installs it when it
+      # No separate install for the yaran web app here. `prep` installs it when it
       # is missing (see website/scripts/render-figure.mjs), so a local
       # `npm run dev`, a local `npm run build` and this workflow all take the
       # same path and cannot drift. The Node cache above covers both lockfiles.
@@ -107,10 +106,6 @@ jobs:
         run: |
           if [ ! -f website/dist/install.sh ]; then
             echo "::error::install.sh missing from build output; copy-install step failed."
-            exit 1
-          fi
-          if [ ! -f website/dist/CNAME ]; then
-            echo "::error::CNAME missing from build output."
             exit 1
           fi
           if [ ! -f website/dist/index.html ]; then

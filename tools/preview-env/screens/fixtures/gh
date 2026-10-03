@@ -1,9 +1,9 @@
 #!/bin/sh
 # Stand-in `gh` for the screenshot container, so the pull-request chip, the
 # banner and the from-PR dialog can be shot without a GitHub login. It answers
-# only the two calls dux makes, and fails loudly on anything else rather than
+# only the two calls yaran makes, and fails loudly on anything else rather than
 # pretending: a screenshot of a lie is worse than a screenshot that did not
-# happen. Installed by entrypoint.sh only when DUX_SCREENS=1.
+# happen. Installed by entrypoint.sh only when YARAN_SCREENS=1.
 case "$1 $2" in
   "auth status")
     printf '{"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com"}]}}\n'

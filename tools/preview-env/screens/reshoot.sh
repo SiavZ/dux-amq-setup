@@ -17,17 +17,17 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PREVIEW="$(cd "$HERE/.." && pwd)"
-SRC="${DUX_SRC:-$(cd "$PREVIEW/../.." && pwd)}"
+SRC="${YARAN_SRC:-$(cd "$PREVIEW/../.." && pwd)}"
 SCREENS="$SRC/website/public/screens"
-PORT="${DUX_PORT:-8790}"
+PORT="${YARAN_PORT:-8790}"
 
-# Exported, not just computed: this is derived from DUX_SRC, and without it
+# Exported, not just computed: this is derived from YARAN_SRC, and without it
 # run.js writes beside its own file instead, so a run against another checkout
 # rewrites the pictures of the one the tool lives in.
 export SCREENS_DIR="$SCREENS"
-export DUX_PORT="$PORT"
-export DUX_SCREENS=1
-export DUX_NO_TAILSCALE=0
+export YARAN_PORT="$PORT"
+export YARAN_SCREENS=1
+export YARAN_NO_TAILSCALE=0
 
 fail() {
   echo "error: $1" >&2
@@ -153,7 +153,7 @@ if [ "${#WEB[@]}" -gt 0 ]; then
   # gh nor the transcript provider, and it binds with --no-tailscale. The marker
   # file the entrypoint writes is how the two are told apart.
   answering() { curl -fsS --max-time 3 "http://127.0.0.1:$PORT/api/v1/workspace" > /dev/null 2>&1; }
-  screens_mode() { compose exec -T dux test -f /data/screens-mode > /dev/null 2>&1; }
+  screens_mode() { compose exec -T yaran test -f /data/screens-mode > /dev/null 2>&1; }
 
   if answering && screens_mode; then
     echo ">> preview already serving on $PORT with the screenshot fixtures"

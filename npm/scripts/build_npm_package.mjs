@@ -23,14 +23,14 @@ const distDir = path.join(repoRoot, "dist");
 const artifactsDir = process.env.ARTIFACTS_DIR ?? distDir;
 const npmDistDir = path.join(distDir, "npm");
 const stagingDir = path.join(npmDistDir, "package");
-const tarballName = `dux-npm-${releaseVersion}.tgz`;
+const tarballName = `yaran-npm-${releaseVersion}.tgz`;
 const tarballPath = path.join(npmDistDir, tarballName);
 
 const TARGETS = [
-  { key: "darwin-arm64", archive: "dux-darwin-arm64.tar.gz" },
-  { key: "darwin-x64", archive: "dux-darwin-amd64.tar.gz" },
-  { key: "linux-arm64", archive: "dux-linux-arm64.tar.gz" },
-  { key: "linux-x64", archive: "dux-linux-amd64.tar.gz" }
+  { key: "darwin-arm64", archive: "yaran-darwin-arm64.tar.gz" },
+  { key: "darwin-x64", archive: "yaran-darwin-amd64.tar.gz" },
+  { key: "linux-arm64", archive: "yaran-linux-arm64.tar.gz" },
+  { key: "linux-x64", archive: "yaran-linux-amd64.tar.gz" }
 ];
 
 async function main() {
@@ -64,10 +64,10 @@ async function copyStaticAssets() {
   await fs.cp(path.join(repoRoot, "npm", "bin"), path.join(stagingDir, "bin"), {
     recursive: true
   });
-  await fs.chmod(path.join(stagingDir, "bin", "dux.js"), 0o755);
+  await fs.chmod(path.join(stagingDir, "bin", "yaran.js"), 0o755);
   await fs.copyFile(path.join(repoRoot, "npm", "README.md"), path.join(stagingDir, "README.md"));
   await fs.copyFile(path.join(repoRoot, "LICENSE"), path.join(stagingDir, "LICENSE"));
-  await copyOptionalAsset(path.join("assets", "dux-logo.png"));
+  await copyOptionalAsset(path.join("assets", "yaran-logo.svg"));
 }
 
 async function copyOptionalAsset(relativePath) {
@@ -91,17 +91,17 @@ async function stageBinary(target, archivePath) {
     throw new Error(`Required archive ${archivePath} not found`);
   }
 
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "dux-npm-"));
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "yaran-npm-"));
   try {
     await execFileAsync("tar", ["-xzf", archivePath, "-C", tmpDir]);
-    const binarySrc = await findBinary(tmpDir, "dux");
+    const binarySrc = await findBinary(tmpDir, "yaran");
     if (!binarySrc) {
-      throw new Error(`Unable to find dux inside ${archivePath}`);
+      throw new Error(`Unable to find yaran inside ${archivePath}`);
     }
 
     const destDir = path.join(stagingDir, "vendor", target.key);
     await fs.mkdir(destDir, { recursive: true });
-    const destPath = path.join(destDir, "dux");
+    const destPath = path.join(destDir, "yaran");
     await fs.copyFile(binarySrc, destPath);
     await fs.chmod(destPath, 0o755);
     console.log(`Staged binary for ${target.key}`);

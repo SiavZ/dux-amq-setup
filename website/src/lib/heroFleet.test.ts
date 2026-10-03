@@ -147,7 +147,7 @@ describe("pane content", () => {
     }
   });
 
-  it("has exactly one dux miniature, and it is the frontmost pane in both layouts", () => {
+  it("has exactly one yaran miniature, and it is the frontmost pane in both layouts", () => {
     const tui = PANES.filter((p) => p.tui);
     expect(tui).toHaveLength(1);
     const maxWide = Math.max(...PANES.map((p) => p.wide[2]));

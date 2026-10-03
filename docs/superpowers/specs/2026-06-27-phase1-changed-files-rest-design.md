@@ -14,10 +14,10 @@ proof of the REST + events pattern every later phase reuses.
 
 The changes pane shows a spinner whenever the broadcast ViewModel's global
 `watched_session_id` differs from the client's locally selected session. The
-spinner is rendered in `crates/dux-web/web/src/components/ChangedFiles.tsx:274-288`,
+spinner is rendered in `crates/yaran-web/web/src/components/ChangedFiles.tsx:274-288`,
 gated by the pure helper `shouldShowChangedFiles`
-(`crates/dux-web/web/src/lib/changedFiles.ts:75`). Because `watched_session_id`
-is single, global engine state (field at `crates/dux-core/src/engine/mod.rs:138`,
+(`crates/yaran-web/web/src/lib/changedFiles.ts:75`). Because `watched_session_id`
+is single, global engine state (field at `crates/yaran-core/src/engine/mod.rs:138`,
 mutated by `set_watched_session` at `mod.rs:965`), a second client (or the auto
 `selectSession(null)` on a pruned terminal, or a reconnect race) overwrites it
 and the loser never recovers.
@@ -38,7 +38,7 @@ In:
 - **Status-toast scoping (the F2 leak fix):** a `scope` field on the engine's
   `WireStatus`, per-`/ws`-connection origin correlation, and per-connection
   delivery filtering, so one client's operation toasts stop appearing on every
-  client. (See "Status-toast scoping" below.) Phase 1's dux-core touches are
+  client. (See "Status-toast scoping" below.) Phase 1's yaran-core touches are
   therefore: the status-path scope plumbing (`StatusScope` on
   `StatusUpdate`/`WireStatus`/`KeyedWireStatus`/`ResolvedFinal` + a transient
   `current_origin`), and the `changes_rev` storage table/accessor. Both are
@@ -55,11 +55,11 @@ commit-message snapshot per-session; moving status events onto `/ws/events`
 
 ## Backend design
 
-### EventBus (`crates/dux-web/src/event_bus.rs`)
+### EventBus (`crates/yaran-web/src/event_bus.rs`)
 
 Named `event_bus.rs` to avoid colliding with the existing
-`crates/dux-core/src/engine/events.rs`. Held in `AppState` as `Arc<EventBus>`
-beside `engine` (a pure web-layer concern; no change to dux-core or the engine
+`crates/yaran-core/src/engine/events.rs`. Held in `AppState` as `Arc<EventBus>`
+beside `engine` (a pure web-layer concern; no change to yaran-core or the engine
 actor — this revises the architecture spec's earlier "on the actor" phrasing).
 
 ```rust
@@ -118,7 +118,7 @@ forwarder-dies-but-handler-lives leaks).
   broadcast bus — that would fan one slow connection's recovery out to every
   connection and could itself fill the buffer.
 
-### ChangesService (`crates/dux-web/src/changes.rs`)
+### ChangesService (`crates/yaran-web/src/changes.rs`)
 
 ```rust
 enum Cached { Ok { rev: u64, prev: (Vec<ChangedFileView>, Vec<ChangedFileView>) },
@@ -132,11 +132,11 @@ pub struct ChangesService {
 ```
 
 **`rev` source (SQLite-persisted, via the engine).** The project's only SQLite
-layer is **`rusqlite`** (synchronous `Connection`, `crates/dux-core/src/storage.rs`);
+layer is **`rusqlite`** (synchronous `Connection`, `crates/yaran-core/src/storage.rs`);
 there is no `sqlx`/async pool. The engine owns that `Connection` and serializes
 all access on its actor thread, so the rev counter lives there, not in the web
 layer (this also avoids multi-connection `SQLITE_BUSY`). Concretely (a second,
-small dux-core touch alongside `WireStatus.scope`):
+small yaran-core touch alongside `WireStatus.scope`):
 - Add a housekeeping table via `SessionStore` (`storage.rs`; the struct is
   `SessionStore { conn: Connection }`), separate from the session records:
   `CREATE TABLE IF NOT EXISTS changes_rev (session_id TEXT PRIMARY KEY, rev INTEGER NOT NULL)`.
@@ -157,7 +157,7 @@ with no wall-clock dependency.
    on the async thread (mirrors `resolve_worktree` in `git_routes.rs:70`).
    `session_worktree` returns `Option<String>`, so use `.ok_or(...)?` — a bare `?`
    on an `Option` inside a `Result`-returning fn does not compile on stable Rust.
-2. `spawn_blocking(move || dux_core::git::changed_files(&worktree))` for the git
+2. `spawn_blocking(move || yaran_core::git::changed_files(&worktree))` for the git
    work, then **sort** staged and unstaged by `(path, status)` before comparison
    (the function returns git-order, not sorted; sorting makes change-detection
    stable and avoids spurious or missed events).
@@ -195,7 +195,7 @@ compute must not overwrite a newer one).
 **Errors:** on git error, store `Err { rev: self.engine.next_changes_rev(id).await, at, message }` (an error
 is cached, with a short TTL e.g. 2s, so repeated GETs during a lock don't each
 spawn git and so the GET keeps returning the error rather than stale `Ok` data).
-Log the error to `dux.log`; after N consecutive errors raise a keyed `Warning`
+Log the error to `yaran.log`; after N consecutive errors raise a keyed `Warning`
 status (cleared on next success).
 
 **get(session_id)** -> `Result<ChangesResponse, GitError>`: returns the cached
@@ -209,7 +209,7 @@ the poller. It drops the cached `prev` (forcing the next compute to detect a
 change) and triggers a compute+emit.
 
 **Poller:** a supervised **async tokio task** (NOT `Engine::spawn_loop_worker`,
-which is a dux-core method that runs a synchronous body on an OS thread and posts
+which is a yaran-core method that runs a synchronous body on an OS thread and posts
 to the engine's worker channel — it cannot `await` `session_worktree` or use
 async fan-out). Drive it with `tokio::time::interval`; if the task panics, log
 and restart it with backoff (own its `JoinHandle`). Each tick, for every
@@ -223,13 +223,13 @@ no actor round-trip. (Do not fall back to a fixed 2s — that polls idle session
 5x too often.) Evict a session's cache entry when its interest reaches zero
 (after a short grace) and when the session is deleted.
 
-### `GET /api/v1/sessions/:id/changes` (`crates/dux-web/src/changes_routes.rs`)
+### `GET /api/v1/sessions/:id/changes` (`crates/yaran-web/src/changes_routes.rs`)
 
 - 404 if `engine.session_worktree(id)` is `None` (reuse `resolve_worktree`).
 - 200 with a dedicated `ChangesResponse { rev: u64, staged: Vec<ChangedFileView>,
   unstaged: Vec<ChangedFileView> }`. Do **not** serialize `ChangedFilesView` (it
   carries `watched_session_id`, the global field we are removing, and lacks
-  `rev`). The per-file `ChangedFileView` (`crates/dux-core/src/viewmodel.rs:199`)
+  `rev`). The per-file `ChangedFileView` (`crates/yaran-core/src/viewmodel.rs:199`)
   is reused unchanged.
 - 409 + `Retry-After` on a git lock/rebase error (logged first).
 - `:id` length-bounded before lookup. Route added to the gated sub-router.
@@ -250,7 +250,7 @@ one place:
 
 Fix, end to end (scope is a property of a status from creation to wire):
 
-1. **dux-core status types carry scope.** Add `enum StatusScope { All, Connection(String) }`.
+1. **yaran-core status types carry scope.** Add `enum StatusScope { All, Connection(String) }`.
    Add `scope: StatusScope` (default `All`) to the core `StatusUpdate`
    (`engine/events.rs`), to `WireStatus` (`wire.rs`, `#[serde(default)]`), to the
    keyed snapshot entry `KeyedWireStatus` (`statusline.rs`), AND to
@@ -288,7 +288,7 @@ Fix, end to end (scope is a property of a status from creation to wire):
 5. **Frontend:** unchanged rendering; suppression is server-side, so a client
    stops receiving other clients' operation toasts while still getting `All` ones.
 
-Footprint: this is several touches in the dux-core status path (scope on
+Footprint: this is several touches in the yaran-core status path (scope on
 `StatusUpdate`/`WireStatus`/`KeyedWireStatus`, the transient `current_origin`,
 and the mint sites) plus the web-layer correlation/filtering — larger than a
 one-line change, but it is the price of fixing the leak in Phase 1 and is

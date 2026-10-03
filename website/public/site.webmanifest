@@ -1,6 +1,6 @@
 {
-  "name": "dux · getdux.app",
-  "short_name": "dux",
+  "name": "Yaran",
+  "short_name": "yaran",
   "description": "Run multiple AI coding agents in parallel, one git worktree each, from a terminal or a browser.",
   "start_url": "/",
   "scope": "/",

@@ -1,14 +1,14 @@
 # Schema policy
 
-dux persists user data in two places whose shape changes over time:
+yaran persists user data in two places whose shape changes over time:
 
 1. The SQLite database `sessions.sqlite3`, created and upgraded by
-   `SessionStore::migrate()` in `crates/dux-core/src/storage.rs`.
-2. The TOML file `config.toml`, parsed by `crates/dux-core/src/config.rs`
+   `SessionStore::migrate()` in `crates/yaran-core/src/storage.rs`.
+2. The TOML file `config.toml`, parsed by `crates/yaran-core/src/config.rs`
    and upgraded by the load-time migrations in
-   `crates/dux-core/src/config_migrate.rs`.
+   `crates/yaran-core/src/config_migrate.rs`.
 
-Both follow the same contract: data written by any older dux build must keep
+Both follow the same contract: data written by any older yaran build must keep
 loading on a newer one, with nothing lost, and every upgrade path is backed by
 a test.
 
@@ -23,7 +23,7 @@ There are no numbered migration files and no `PRAGMA user_version` ledger.
   so a fresh database is created complete.
 - `ensure_column(conn, table, column, decl)` adds a column only when it is
   missing, and returns whether it did. An older database therefore gains each
-  new column the first time a newer dux opens it.
+  new column the first time a newer yaran opens it.
 - One-time backfills (for example `title`, `initial_branch`, `sort_order`) run
   keyed off the `true` that `ensure_column` returns, or are written to be safe
   to repeat, so a second open never rewrites data.
@@ -36,7 +36,7 @@ must be safe to run any number of times.
 - Add it to the `create table if not exists` statement AND append an
   `ensure_column` call for it in `migrate()`. The first covers fresh databases,
   the second covers upgrades.
-- Always nullable or `DEFAULT`-ed. An older dux binary's `INSERT` names none of
+- Always nullable or `DEFAULT`-ed. An older yaran binary's `INSERT` names none of
   the new columns and must still satisfy the schema after a downgrade.
 - If the default encodes a safety decision, choose the value that is safe for
   pre-existing rows whose true state is unknowable (see `branch_provenance`,
@@ -69,7 +69,7 @@ deprecation log line fired and the release notes announced the drop.
 
 ### Required test
 
-Every schema change must be covered in `crates/dux-core/tests/upgrade_database.rs`,
+Every schema change must be covered in `crates/yaran-core/tests/upgrade_database.rs`,
 which opens databases transcribed from real older releases and asserts that:
 
 - the open succeeds;
@@ -101,7 +101,7 @@ provider.
 
 ### Required test
 
-Config upgrades are covered in `crates/dux-core/tests/upgrade_config.rs` and the
+Config upgrades are covered in `crates/yaran-core/tests/upgrade_config.rs` and the
 unit tests in `config_migrate.rs`: load an old config and assert the migrated
 shape and that no user value was lost.
 

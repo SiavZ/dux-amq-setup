@@ -47,7 +47,7 @@ enough Codex build) each keep their own history scoped to the worktree, so a Cla
 and a Codex tab can both resume at once. Two tabs of the *same* provider would both
 reopen the identical conversation.
 
-So dux hands the resume slot to a tab **only when it is the sole tab of its provider
+So yaran hands the resume slot to a tab **only when it is the sole tab of its provider
 coming up**, meaning no other tab running that provider is already live or launching. A
 different-provider sibling never blocks it, and tab position has nothing to do with it.
 In practice: reopen an agent that was fully stopped and each provider picks up where it
@@ -65,18 +65,18 @@ left off, but launch a *second* Claude tab on top of a running one and it starts
 
 ### "Resume" reopens the *newest* conversation, not a particular tab
 
-dux does not track which conversation belonged to which tab. When it hands a tab the
+yaran does not track which conversation belonged to which tab. When it hands a tab the
 resume slot, it passes the provider's own continue flag, and that flag grabs the
 **most-recent** conversation in the worktree.
 
-Walk it through. You have a Claude tab mid-conversation, and you quit dux. Every tab
-comes back dormant, and you launch that Claude tab. It comes up alone for Claude, so dux
+Walk it through. You have a Claude tab mid-conversation, and you quit yaran. Every tab
+comes back dormant, and you launch that Claude tab. It comes up alone for Claude, so yaran
 passes `--continue`, and Claude reopens the latest conversation in that folder, which is
-the one you were just in. It *looks* like dux resumed that exact tab. It did not: a
+the one you were just in. It *looks* like yaran resumed that exact tab. It did not: a
 different Claude tab, launched first, would have taken the very same conversation.
 
 > [!TIP]
-> dux cannot target an **older** conversation for you. Start a fresh tab and use the
+> yaran cannot target an **older** conversation for you. Start a fresh tab and use the
 > provider's own "resume a past session" or history command.
 
 ## Switching between tabs
@@ -84,7 +84,7 @@ different Claude tab, launched first, would have taken the very same conversatio
 On the web, click a pill. Tabs are deep-linkable, so the URL points right at one and a
 reload brings you back to it.
 
-dux remembers, per agent, whichever tab you had focused last. Jump to a different agent
+yaran remembers, per agent, whichever tab you had focused last. Jump to a different agent
 and back (on the web, a sidebar click or the plain `#/agent/<id>` link; in the terminal
 UI, reselecting the agent) and you land on that same tab. The memory survives restarts and is shared
 between the terminal UI and the web. A tab you closed is never resurrected by it; you
@@ -93,12 +93,12 @@ been closed.
 
 > [!NOTE]
 > An explicit deep link always wins over the remembered tab, and following one does not
-> overwrite what dux remembers. A link a coworker sends you never changes which tab you
+> overwrite what yaran remembers. A link a coworker sends you never changes which tab you
 > land on next time you reopen the agent yourself.
 
 In the terminal UI, switching is keyboard-driven and every key is yours to rebind; the
 in-app help overlay shows your current bindings. The defaults are modifier chords, and
-chords stay dux's even while you type into the agent in the windowed pane, so you can
+chords stay yaran's even while you type into the agent in the windowed pane, so you can
 hop tabs mid-sentence. Each pill carries its position number, so the switch-by-number
 keys have a visible address. A pill also reports what its own tab is up to, with the
 same cues the agent list uses: a spinner while that tab's provider is working, and a
@@ -114,14 +114,14 @@ is highlighted because it is the tab on screen.
 > Minimize first to hop between tabs.
 
 Switch-to-tab-4 ships with no default key, because most terminals send the same byte for
-`Ctrl-4` and `Ctrl-\` and dux gives that byte to the macro bar. Step to it with the
+`Ctrl-4` and `Ctrl-\` and yaran gives that byte to the macro bar. Step to it with the
 next and previous tab keys, or bind your own key to `select_tab_4`, which the config
 file carries as a commented-out row ready to fill in.
 
 ## Closing tabs
 
 Every tab closes, the **first** one included, as long as the agent has another tab to
-fall back on. Closing one ends that session, so dux asks you to confirm. Closing the
+fall back on. Closing one ends that session, so yaran asks you to confirm. Closing the
 agent's **last running** tab detaches the whole agent: it leaves the sidebar's active list
 but stays in Projects, ready to reopen.
 
@@ -139,7 +139,7 @@ names it before you commit. The promoted tab is untouched otherwise: same conver
 same process if it was running, same link. It simply becomes the tab the agent opens on.
 
 > [!IMPORTANT]
-> An agent always has a first tab, so its **only** tab cannot be closed. dux says so
+> An agent always has a first tab, so its **only** tab cannot be closed. yaran says so
 > rather than closing it, in the same words on both surfaces: on the web the *Close tab*
 > entry is greyed out with the reason above it, and in the terminal UI the close key
 > answers with that note instead of a confirmation. Add another tab first, or detach the
@@ -151,7 +151,7 @@ same process if it was running, same link. It simply becomes the tab the agent o
 > [!CAUTION]
 > Closing a tab is one-way. It throws away the tab's slot, its position, and whatever
 > provider you retargeted it to, with no undo. Your **conversation** is not thrown away:
-> dux never stored it (see [how resume works](#how-resume-works)), so it is still in
+> yaran never stored it (see [how resume works](#how-resume-works)), so it is still in
 > your provider's own per-directory history. Start a fresh tab and use the provider's
 > history command to dig it back up.
 
@@ -175,11 +175,11 @@ failed to launch, or the provider exited with an error), that tab waits for you 
 tab included. It says it isn't running and only *Start session* launches it. Without that,
 a tab that cannot come up would try again every single time you selected the agent, and
 there would be no way to look at the agent without restarting the thing that keeps
-failing. Once a run succeeds, or you stop the tab yourself, or you restart dux, the tab is
+failing. Once a run succeeds, or you stop the tab yourself, or you restart yaran, the tab is
 back to starting on selection.
 
 So a dormant tab shows one of two things, and it is the same on both the terminal UI and
-the web UI. A tab that is simply not running shows the dux idle screen, logo and rotating
+the web UI. A tab that is simply not running shows the yaran idle screen, logo and rotating
 tip and all, with a *Start session* button under it. A tab whose last run ended badly shows
 a card instead: how the run ended and how long ago (a failed launch and the error it gave,
 an exit status, or a run that was over in under five seconds), and, under *Last output*, the
@@ -188,20 +188,20 @@ refusing to resume a conversation that is already open somewhere else says so on
 out.
 
 You do not have to open the agent to find that out. When a resume is refused, and the run
-was over in seconds, the notice dux raises says the agent could not resume its previous
+was over in seconds, the notice yaran raises says the agent could not resume its previous
 session and quotes the provider's own last words, remedy and all: a toast in the browser,
 and in the terminal UI the status line, when that agent is the one on screen. Whatever the
 CLI told you to do about it is in the message; the card still has the full output.
 
 That is the notice you get whenever a resume was over in seconds, nobody had a chance to
 type into it, and it left something readable behind, however short. A single line saying
-*No conversation found to continue* is the provider telling you something, so dux keeps
+*No conversation found to continue* is the provider telling you something, so yaran keeps
 the tab exactly as it ended, repeats those words, and waits for you to start a fresh
 session yourself. It makes no difference whether the CLI treated that as an error or not:
 plenty of them print their refusal and exit perfectly happily, and you get the message
 either way.
 
-The one resume dux restarts on its own is one that ended with nothing readable on screen
+The one resume yaran restarts on its own is one that ended with nothing readable on screen
 at all: a blank screen, or nothing but the control codes a CLI writes on its way in and
-out. There is no ending to read and nothing to quote, so dux treats it as nothing to
+out. There is no ending to read and nothing to quote, so yaran treats it as nothing to
 resume, starts a fresh session, and tells you it did.

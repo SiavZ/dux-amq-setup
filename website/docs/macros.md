@@ -5,7 +5,7 @@ group: Guides
 order: 20
 ---
 
-Macros are named text snippets stored in your config. Trigger one and dux types it into
+Macros are named text snippets stored in your config. Trigger one and yaran types it into
 the focused agent or terminal for you. Good for prompts you repeat constantly, long
 build commands you never want to mistype, or anything you keep copy-pasting.
 
@@ -62,7 +62,7 @@ string:
 The macro bar opens with the `open_macro_bar` binding in `[keys]`; the in-app help
 overlay shows the key it is currently bound to. It works whenever the agent or terminal
 pane has your keys, windowed or fullscreen, so you can fire a macro mid-typing. With no
-macros defined for the current surface, dux says so in the status line and does nothing.
+macros defined for the current surface, yaran says so in the status line and does nothing.
 
 The bar opens at the bottom of the pane, over the agent it will type into, listing only
 the macros that pane can take:
@@ -77,11 +77,11 @@ Once the bar is open:
 - **Enter** to send the highlighted macro and close the bar.
 - **Esc** to dismiss without sending.
 
-dux confirms with `Sent macro "<name>".` in the status line.
+yaran confirms with `Sent macro "<name>".` in the status line.
 
 > [!IMPORTANT]
 > A macro is a write like any other, so it goes through input ownership. If another
-> device is driving that terminal, which can only happen while dux is
+> device is driving that terminal, which can only happen while yaran is
 > [serving in the background](/docs/server-mode#serve-in-the-background-and-keep-the-tui),
 > the macro is not sent. The status line names the device holding it and tells you to
 > take it over first. Nothing half-sends.
@@ -134,11 +134,11 @@ Cancelling writes nothing.
 > focused control. From any other focus stop it does nothing, so it cannot wipe the body
 > while you are on the name field or a button.
 
-Saving requires a name and some text, and refuses a name another macro already uses. dux
+Saving requires a name and some text, and refuses a name another macro already uses. yaran
 says which in the status line and keeps the form open.
 
 Additions, edits, and deletions are written to `config.toml` immediately, and your
-hand-edits survive: dux preserves your formatting and ordering.
+hand-edits survive: yaran preserves your formatting and ordering.
 
 ## Managing macros in the web UI
 
@@ -155,9 +155,9 @@ order:
 
 ## Adding macros directly in config
 
-You can manage macros entirely by hand. Open `config.toml` (`dux config path` locates
-it), add entries under `[macros]`, and save. The changes take effect the next time dux
+You can manage macros entirely by hand. Open `config.toml` (`yaran config path` locates
+it), add entries under `[macros]`, and save. The changes take effect the next time yaran
 reads its config; new sessions need no restart.
 
-- **Linux:** `~/.config/dux/config.toml`
-- **macOS:** `~/.dux/config.toml`
+- **Linux:** `~/.config/yaran/config.toml`
+- **macOS:** `~/.yaran/config.toml`

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SRC="${DUX_SRC:-$(cd "$HERE/../.." && pwd)}"
+SRC="${YARAN_SRC:-$(cd "$HERE/../.." && pwd)}"
 
 usage() {
   echo "usage: ./tui-shot.sh [journey.js] [output.png] [--cols N] [--rows N] [--theme NAME] [--crop sidebar]"
@@ -77,9 +77,9 @@ mkdir -p "$OUTPUT_DIR"
 CHROME_BIN=$(find_chromium)
 [ -x "$CHROME_BIN" ] || fail "no Chromium found; set CHROME=<path>" 1
 
-echo ">> building dux (release) from $SRC"
-(cd "$SRC" && cargo build --release --bin dux)
-DUX_BIN="$SRC/target/release/dux"
+echo ">> building yaran (release) from $SRC"
+(cd "$SRC" && cargo build --release --bin yaran)
+YARAN_BIN="$SRC/target/release/yaran"
 REVISION=$(git -C "$SRC" rev-parse --short HEAD)
 
 if [ ! -d "$HERE/node_modules/@xterm/xterm" ]; then
@@ -89,29 +89,29 @@ fi
 if docker info >/dev/null 2>&1; then
   (
     cd "$HERE"
-    export DUX_BIN DUX_TUI_OUTPUT_DIR="$OUTPUT_DIR" DUX_TUI_JOURNEY="$JOURNEY"
+    export YARAN_BIN YARAN_TUI_OUTPUT_DIR="$OUTPUT_DIR" YARAN_TUI_JOURNEY="$JOURNEY"
     docker compose --profile capture build tui-shot
     docker compose --profile capture run --rm --no-deps \
-      -e DUX_TUI_COLS="$COLS" \
-      -e DUX_TUI_ROWS="$ROWS" \
-      -e DUX_TUI_THEME="$THEME" \
-      -e DUX_TUI_OUTPUT_STEM="$OUTPUT_STEM" \
-      -e DUX_PREVIEW_REVISION="$REVISION" \
-      -e DUX_TUI_JOURNEY_NAME="$(basename "$JOURNEY")" \
+      -e YARAN_TUI_COLS="$COLS" \
+      -e YARAN_TUI_ROWS="$ROWS" \
+      -e YARAN_TUI_THEME="$THEME" \
+      -e YARAN_TUI_OUTPUT_STEM="$OUTPUT_STEM" \
+      -e YARAN_PREVIEW_REVISION="$REVISION" \
+      -e YARAN_TUI_JOURNEY_NAME="$(basename "$JOURNEY")" \
       tui-shot
   )
 else
   command -v sg >/dev/null 2>&1 || fail "docker access denied and sg is unavailable" 1
-  quoted=$(printf '%q ' "$DUX_BIN" "$OUTPUT_DIR" "$JOURNEY" "$COLS" "$ROWS" "$THEME" "$OUTPUT_STEM" "$REVISION" "$(basename "$JOURNEY")")
-  sg docker -c "cd '$HERE' && set -- $quoted && export DUX_BIN=\"\$1\" DUX_TUI_OUTPUT_DIR=\"\$2\" DUX_TUI_JOURNEY=\"\$3\" && docker compose --profile capture build tui-shot && docker compose --profile capture run --rm --no-deps -e DUX_TUI_COLS=\"\$4\" -e DUX_TUI_ROWS=\"\$5\" -e DUX_TUI_THEME=\"\$6\" -e DUX_TUI_OUTPUT_STEM=\"\$7\" -e DUX_PREVIEW_REVISION=\"\$8\" -e DUX_TUI_JOURNEY_NAME=\"\$9\" tui-shot"
+  quoted=$(printf '%q ' "$YARAN_BIN" "$OUTPUT_DIR" "$JOURNEY" "$COLS" "$ROWS" "$THEME" "$OUTPUT_STEM" "$REVISION" "$(basename "$JOURNEY")")
+  sg docker -c "cd '$HERE' && set -- $quoted && export YARAN_BIN=\"\$1\" YARAN_TUI_OUTPUT_DIR=\"\$2\" YARAN_TUI_JOURNEY=\"\$3\" && docker compose --profile capture build tui-shot && docker compose --profile capture run --rm --no-deps -e YARAN_TUI_COLS=\"\$4\" -e YARAN_TUI_ROWS=\"\$5\" -e YARAN_TUI_THEME=\"\$6\" -e YARAN_TUI_OUTPUT_STEM=\"\$7\" -e YARAN_PREVIEW_REVISION=\"\$8\" -e YARAN_TUI_JOURNEY_NAME=\"\$9\" tui-shot"
 fi
 
-# DUX_TUI_JOURNEY reaches the rasterizer too: it is the side that knows the crop,
+# YARAN_TUI_JOURNEY reaches the rasterizer too: it is the side that knows the crop,
 # so it is where a scene's expectText is checked against the cells the picture
 # will actually contain.
-CHROME="$CHROME_BIN" DUX_TUI_JOURNEY="$JOURNEY" node "$HERE/tui-shot.js" \
+CHROME="$CHROME_BIN" YARAN_TUI_JOURNEY="$JOURNEY" node "$HERE/tui-shot.js" \
   "$OUTPUT_DIR/$OUTPUT_STEM.ansi" "$OUT" "$COLS" "$ROWS" \
-  "$SRC/crates/dux-web/web/src/assets/fonts/dux-mono-regular.woff2" $CROP
+  "$SRC/crates/yaran-web/web/src/assets/fonts/yaran-mono-regular.woff2" $CROP
 
 echo ">> PNG:      $OUT"
 echo ">> text:     $OUTPUT_DIR/$OUTPUT_STEM.txt"

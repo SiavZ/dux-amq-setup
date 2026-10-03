@@ -36,13 +36,13 @@ export const FEED: ReadonlyArray<readonly [string, string]> = [
   ["running 41 tests", DIM],
   ["test worktree::adopts_existing ... ok", SUCCESS],
   ["test gate::refuses_second_driver ... ok", SUCCESS],
-  ["   Compiling dux-core v0.9.1", MUTED],
+  ["   Compiling yaran-core v0.9.1", MUTED],
   ["    Finished dev profile in 6.42s", SUCCESS],
   ["@@ -118,7 +118,9 @@ impl Engine {", PURPLE],
   ["+    let decision = self.tab_resume(id);", SUCCESS],
   ["-    let decision = Resume::Always;", ERROR],
   ["  3 files changed, 41 insertions(+)", MUTED],
-  ["reading crates/dux-web/src/api.rs", DIM],
+  ["reading crates/yaran-web/src/api.rs", DIM],
   ["$ git worktree add ../agent-search", TEXT],
   ["Preparing worktree (new branch)", DIM],
   ["warning: unused import: `Duration`", WARNING],
@@ -50,7 +50,7 @@ export const FEED: ReadonlyArray<readonly [string, string]> = [
   ["test statusline::busy_gets_a_final ... ok", SUCCESS],
 ];
 
-/** Rows in the miniature dux TUI's sidebar, as (branch, state, tint). */
+/** Rows in the miniature yaran TUI's sidebar, as (branch, state, tint). */
 export const AGENT_ROWS: ReadonlyArray<readonly [string, string, string]> = [
   ["feature/search-index", "Working", SUCCESS],
   ["fix/pty-owner-race", "", ""],
@@ -58,7 +58,7 @@ export const AGENT_ROWS: ReadonlyArray<readonly [string, string, string]> = [
   ["chore/bump-deps", "Idle", DIM],
 ];
 
-/** Rows in the miniature dux TUI's changes pane, as (status, path, stat, tint). */
+/** Rows in the miniature yaran TUI's changes pane, as (status, path, stat, tint). */
 export const CHANGED_ROWS: ReadonlyArray<
   readonly [string, string, string, string]
 > = [
@@ -74,7 +74,7 @@ export interface PaneDef {
   name: string;
   agent: string;
   state: PaneState;
-  /** The dux TUI miniature; everything else is a plain output feed. */
+  /** The yaran TUI miniature; everything else is a plain output feed. */
   tui?: boolean;
   /** Wide layout, as (x, y, z, scale). */
   wide: readonly [number, number, number, number];
@@ -86,8 +86,8 @@ export interface PaneDef {
 
 export const PANES: readonly PaneDef[] = [
   {
-    name: "dux",
-    agent: "dux",
+    name: "yaran",
+    agent: "yaran",
     state: "run",
     tui: true,
     wide: [1.9, 1.35, 0.4, 1.14],

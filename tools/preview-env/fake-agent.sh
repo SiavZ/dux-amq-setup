@@ -1,7 +1,7 @@
 #!/bin/sh
 # A fake agent provider with deterministic screenshot fixtures. Normal preview
 # use defaults to a live stream so working and idle transitions remain visible.
-fixture="${DUX_FAKE_FIXTURE:-live}"
+fixture="${YARAN_FAKE_FIXTURE:-live}"
 
 case "$fixture" in
   steady)
@@ -42,7 +42,7 @@ case "$fixture" in
     while :; do sleep 60; done
     ;;
   quit-on-command)
-    # A clean exit on demand, for measuring what dux does when a provider ends
+    # A clean exit on demand, for measuring what yaran does when a provider ends
     # the way a user quitting one ends it: status 0, after real typed input.
     echo 'fake-agent: type "quit" and press Enter to end this session cleanly.'
     while IFS= read -r line; do
@@ -63,14 +63,14 @@ case "$fixture" in
     # under two lines a second, which is fine for looking at a working pane and
     # useless for filling a 10,000-line scrollback. Not a screenshot scene: it
     # exists so a memory measurement can put a terminal into a stated state.
-    #   DUX_FAKE_BURST_LINES  how many lines to print (default 10000)
-    #   DUX_FAKE_BURST_COLS   printed width of each line (default 80)
-    #   DUX_FAKE_BURST_DELAY  seconds to idle first, so a measurement can put
+    #   YARAN_FAKE_BURST_LINES  how many lines to print (default 10000)
+    #   YARAN_FAKE_BURST_COLS   printed width of each line (default 80)
+    #   YARAN_FAKE_BURST_DELAY  seconds to idle first, so a measurement can put
     #                         the terminal at a chosen width before anything is
     #                         printed into it (default 0)
-    lines="${DUX_FAKE_BURST_LINES:-10000}"
-    cols="${DUX_FAKE_BURST_COLS:-80}"
-    sleep "${DUX_FAKE_BURST_DELAY:-0}"
+    lines="${YARAN_FAKE_BURST_LINES:-10000}"
+    cols="${YARAN_FAKE_BURST_COLS:-80}"
+    sleep "${YARAN_FAKE_BURST_DELAY:-0}"
     awk -v n="$lines" -v w="$cols" 'BEGIN {
       filler = "abcdefghijklmnopqrstuvwxyz0123456789"
       while (length(filler) < w) filler = filler filler

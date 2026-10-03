@@ -23,7 +23,7 @@ const configHTML = [
   dim("# Suffering builds character, but so does automating the ritual."),
   `${accent("startup_command")} = ${str('"""')}`,
   `${txt("npm install")}`,
-  `${txt('ln -sfn "$DUX_WORKTREE_PATH/.env.local" .env')}`,
+  `${txt('ln -sfn "$YARAN_WORKTREE_PATH/.env.local" .env')}`,
   `${str('"""')}`,
   "",
   "[providers.claude]",
@@ -36,7 +36,7 @@ const configHTML = [
   `${key('"Ship it"')} = { text = ${str('"run tests, fix, commit"')}, surface = ${str('"agent"')} }`,
   "",
   "[ui]",
-  `${accent("theme")}              = ${str('"dux_dark"')}   ${dim("# or catppuccin_mocha, nord, dracula...")}`,
+  `${accent("theme")}              = ${str('"yaran_dark"')}   ${dim("# or catppuccin_mocha, nord, dracula...")}`,
   `${accent("auto_reopen_agents")} = ${bool("true")}         ${dim("# pick up where you left off")}`,
   "",
   "[keys]",
@@ -54,24 +54,24 @@ const configHTML = [
           The config file <span class="text-[color:var(--color-pink)]">is</span> the documentation.
         </h2>
         <p class="mt-4 text-[color:var(--color-muted)] leading-relaxed">
-          Every setting is configurable. Every setting is commented inline. You should never have to leave the file to figure out what an option does. dux writes a fully annotated <span class="mono text-[color:var(--color-text)]">config.toml</span> the first time it launches: themes preselected, keybindings ready to remap, providers wired in.
+          Every setting is configurable. Every setting is commented inline. You should never have to leave the file to figure out what an option does. yaran writes a fully annotated <span class="mono text-[color:var(--color-text)]">config.toml</span> the first time it launches: themes preselected, keybindings ready to remap, providers wired in.
         </p>
 
         <div class="mt-6 grid grid-cols-1 gap-3 text-sm sm:grid-cols-2">
           <div class="card p-3">
             <div class="mono text-[10px] uppercase tracking-wider text-[color:var(--color-dim)]">linux</div>
-            <div class="mt-1 mono text-[color:var(--color-text)] text-[12px]">~/.config/dux/config.toml</div>
+            <div class="mt-1 mono text-[color:var(--color-text)] text-[12px]">~/.config/yaran/config.toml</div>
           </div>
           <div class="card p-3">
             <div class="mono text-[10px] uppercase tracking-wider text-[color:var(--color-dim)]">macOS</div>
-            <div class="mt-1 mono text-[color:var(--color-text)] text-[12px]">~/.dux/config.toml</div>
+            <div class="mt-1 mono text-[color:var(--color-text)] text-[12px]">~/.yaran/config.toml</div>
           </div>
         </div>
 
         <div class="mt-6 space-y-2 text-sm text-[color:var(--color-muted)]">
-          <p><span class="mono text-[color:var(--color-accent)]">dux config path</span> prints where it lives.</p>
-          <p><span class="mono text-[color:var(--color-accent)]">dux config diff</span> shows what you've changed from defaults.</p>
-          <p><span class="mono text-[color:var(--color-accent)]">dux config regenerate</span> previews the latest default config.</p>
+          <p><span class="mono text-[color:var(--color-accent)]">yaran config path</span> prints where it lives.</p>
+          <p><span class="mono text-[color:var(--color-accent)]">yaran config diff</span> shows what you've changed from defaults.</p>
+          <p><span class="mono text-[color:var(--color-accent)]">yaran config regenerate</span> previews the latest default config.</p>
         </div>
 
         <div class="mt-6 rounded-lg border border-dashed border-[color:var(--color-border)] bg-[color:var(--color-panel-2)]/50 p-4">

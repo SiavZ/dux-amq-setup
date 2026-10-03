@@ -50,6 +50,6 @@ module.exports.expectText = ["2/5", "retry-budget", "retry-tests"]
 module.exports.file = "tui-sidebar-search.png"
 module.exports.cols = 160
 module.exports.rows = 45
-module.exports.theme = "dux_dark"
+module.exports.theme = "yaran_dark"
 module.exports.crop = "sidebar"
 module.exports.fixture = "steady"

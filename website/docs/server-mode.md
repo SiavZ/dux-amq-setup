@@ -5,8 +5,8 @@ group: Web UI
 order: 60
 ---
 
-Server mode is dux in a browser. It serves the same workspace the terminal UI serves:
-the same projects, the same agents on the same worktrees, the same dux driving the same
+Server mode is yaran in a browser. It serves the same workspace the terminal UI serves:
+the same projects, the same agents on the same worktrees, the same yaran driving the same
 terminals live, the same config file. Nothing is mirrored or re-synced. An agent you
 start in one front end is the same agent in the other.
 
@@ -25,27 +25,27 @@ Point as many browsers at it as you like. Two devices see the same terminal at t
 moment.
 
 > [!IMPORTANT]
-> You cannot run two dux processes against one config directory. The three ways to serve
+> You cannot run two yaran processes against one config directory. The three ways to serve
 > below are three shapes of one process, not three servers.
 
 ## Three ways to serve it
 
-### `dux server`
+### `yaran server`
 
 Run the web UI with no TUI in front of it:
 
 ```bash
-dux server
+yaran server
 ```
 
 It binds `127.0.0.1:3890` (loopback only) by default and prints a small vite-style
 banner: one row per bound address with its `http://…` URL, plus a reachability note.
-The port is 3890 because that is how you spell "dux" on a phone keypad.
+The port is 3890 because that is how you spell "yaran" on a phone keypad.
 
 The flags:
 
 ```text
-dux server [OPTIONS]
+yaran server [OPTIONS]
 
   --bind <ADDR:PORT>   Bind this exact address, overriding [server] host+port.
                        An IP:port socket (hostnames are NOT resolved), e.g.
@@ -63,12 +63,12 @@ server carries on.
 
 #### Stopping it
 
-`Ctrl-c` (or a `SIGTERM`) starts a graceful shutdown. dux drains open connections and
+`Ctrl-c` (or a `SIGTERM`) starts a graceful shutdown. yaran drains open connections and
 sends `SIGTERM` and `SIGHUP` to every running agent and terminal so each can save state,
 waiting up to `[server] shutdown_timeout_seconds` (30 seconds by default) before
 force-killing whatever is left. A second `Ctrl-c` during that wait exits immediately.
 
-Only one `dux server` (or `dux` TUI) can run against a given config directory. Both take
+Only one `yaran server` (or `yaran` TUI) can run against a given config directory. Both take
 the same single-instance lock, so a second one fails fast with an "already running"
 message rather than two processes fighting over the same SQLite database.
 
@@ -90,15 +90,15 @@ Already in the TUI and want a browser instead? Open the command palette and run
 trigger it by accident.
 
 Your **agents keep running the entire time**: no relaunch, no lost conversations. The
-dux you already have starts serving in place. Your terminal turns into a themed dux
+yaran you already have starts serving in place. Your terminal turns into a themed yaran
 status screen showing the serve URLs and an activity panel. Press `q` or `Esc` there to
 drop back into the TUI with everything still running, which stops serving the web UI;
-you can flip again whenever you like. `Ctrl-c` quits dux entirely.
+you can flip again whenever you like. `Ctrl-c` quits yaran entirely.
 
 > [!IMPORTANT]
-> `dux server` honors your configured `[server] host` and `--bind`. The in-app flip
+> `yaran server` honors your configured `[server] host` and `--bind`. The in-app flip
 > always serves loopback plus your Tailscale address only. To bind a specific interface,
-> start with `dux server`.
+> start with `yaran server`.
 
 ### Serve in the background, and keep the TUI
 
@@ -111,7 +111,7 @@ serve_while_tui = true
 ```
 
 Off by default. The palette commands **start-background-server** and
-**stop-background-server** turn it on and off while dux runs, and save your choice back
+**stop-background-server** turn it on and off while yaran runs, and save your choice back
 to config. When a run starts with this already on, the TUI's status line says so in the
 warning color and holds the message longer than an ordinary note, so a listener that
 came up before you sat down is not something you have to notice for yourself.
@@ -122,7 +122,7 @@ the listener goes away, and connected browsers report the connection closed. Qui
 the TUI stops the listener too, and changes nothing about your saved setting.
 
 **set-tailscale-mode** in the same palette changes whether the Tailscale leg exists,
-without stopping anything: see [Changing the mode while dux is serving](/docs/tailscale#changing-the-mode-while-dux-is-serving).
+without stopping anything: see [Changing the mode while yaran is serving](/docs/tailscale#changing-the-mode-while-yaran-is-serving).
 
 It binds exactly the way the flip does: loopback plus your Tailscale address, never a
 custom host.
@@ -135,7 +135,7 @@ custom host.
 While it serves, the top bar grows a crumb right after the version: `● serving :3890` on
 its own, becoming `● serving :3890 · 3 connected` once somebody is on it. The count is
 browser tabs, not people, so one laptop with two tabs open counts as two, and a tab that
-vanished without saying goodbye keeps counting until dux notices the socket is dead.
+vanished without saying goodbye keeps counting until yaran notices the socket is dead.
 
 ![The terminal UI top bar carrying a serving crumb with the port, above the usual workspace with one agent working.](/screens/tui-serving-crumb.png)
 
@@ -156,13 +156,13 @@ press **Take over** once and it is yours. Either way the card carries
 one button, **Take over**, and two ways to press it: click it, or, with the pane focused,
 use the key that focuses an agent (Enter unless you have rebound it). Typing does not
 claim a terminal, so keys pressed under the card go nowhere. An agent you start yourself
-is yours straight away, with no card over it; agents dux reopens for you at startup wear
+is yours straight away, with no card over it; agents yaran reopens for you at startup wear
 the **Running in the background** card until you press it. Switching the background
-server on while dux is already running, with the palette command or by turning
+server on while yaran is already running, with the palette command or by turning
 `serve_while_tui` on in the config file, keeps everything you had running as yours: every
 agent and terminal stays in your hands with no card over it, and a browser that wants one
-presses **Take over**. When dux starts with the setting already on, it keeps nothing, so
-a browser can pick up any of it. The card calls the terminal UI `the dux
+presses **Take over**. When yaran starts with the setting already on, it keeps nothing, so
+a browser can pick up any of it. The card calls the terminal UI `the yaran
 TUI` when that is what has the keyboard. Taking a terminal over also retargets its size
 to the device that took it, and everyone watching adopts that geometry. Take-over works
 in both directions and is sticky either way: losing a terminal does not silently give it
@@ -175,7 +175,7 @@ back to you.
 
 Which to reach for:
 
-- **`dux server`** when nothing needs a terminal: a headless box, a tmux pane you will
+- **`yaran server`** when nothing needs a terminal: a headless box, a tmux pane you will
   detach from.
 - **The flip** when you are done with the terminal and want the browser to be the whole
   story.
@@ -184,7 +184,7 @@ Which to reach for:
 
 ## The trust model, stated plainly
 
-dux is a single-tenant, trusted-access tool.
+yaran is a single-tenant, trusted-access tool.
 
 > [!WARNING]
 > **There is no login. None.** No password, no token, no user accounts, and nothing to
@@ -197,25 +197,25 @@ dux is a single-tenant, trusted-access tool.
 > actions, and see every session. Do not expose it to people you would not hand a
 > terminal on that machine.
 
-Where dux binds:
+Where yaran binds:
 
-- **Loopback by default.** `127.0.0.1:3890` is reachable only from the machine dux runs
+- **Loopback by default.** `127.0.0.1:3890` is reachable only from the machine yaran runs
   on.
-- **Tailscale, opt-out.** Unless `tailscale = "no"`, dux also binds your machine's
+- **Tailscale, opt-out.** Unless `tailscale = "no"`, yaran also binds your machine's
   Tailscale address, so your tailnet devices can reach it over WireGuard with no further
-  gate. On the default `"auto"` dux binds that address whenever the interface is there,
+  gate. On the default `"auto"` yaran binds that address whenever the interface is there,
   drops the listener when it goes, and binds it again when it comes back, with no
-  restart. See [Reaching dux over Tailscale](/docs/tailscale).
-- **A background listener lasts as long as dux does.** `serve_while_tui = true` means a
+  restart. See [Reaching yaran over Tailscale](/docs/tailscale).
+- **A background listener lasts as long as yaran does.** `serve_while_tui = true` means a
   server runs for the whole time your terminal UI is open.
 
 > [!CAUTION]
 > **Anything wider is on you.** Binding a LAN or public address (say
 > `--bind 0.0.0.0:3890`) puts your agents and worktrees in reach of anyone who can hit
-> that address, with no login in front. dux prints a loud warning before it does this.
+> that address, with no login in front. yaran prints a loud warning before it does this.
 > Put it behind a trusted reverse proxy or keep it on Tailscale.
-> [Hosting dux behind a login](/docs/public-hosting) is one worked example: TLS,
-> `oauth2-proxy` with GitHub, and dux on a private network.
+> [Hosting yaran behind a login](/docs/public-hosting) is one worked example: TLS,
+> `oauth2-proxy` with GitHub, and yaran on a private network.
 
 Two automatic defenses always run. They are about browser attacks, not user
 authentication:
@@ -227,7 +227,7 @@ authentication:
 
 A Tailscale `100.x` IP is allowed automatically, whether or not that leg is bound at the
 moment. A MagicDNS name like `box.tailnet.ts.net` is not an IP literal, so if you reach
-dux by that name you must add it to `allowed_hosts` or the host guard answers `403`.
+yaran by that name you must add it to `allowed_hosts` or the host guard answers `403`.
 
 ## The `[server]` config keys
 
@@ -235,28 +235,28 @@ Every key below carries a full inline comment in your `config.toml`:
 
 ```toml
 [server]
-# Bind host for `dux server`. An IP literal only (hostnames are not resolved):
+# Bind host for `yaran server`. An IP literal only (hostnames are not resolved):
 # 127.0.0.1 is the loopback default, 0.0.0.0 is all interfaces. Serving from
 # inside the TUI ignores this either way and always binds loopback (+ Tailscale).
 host = "127.0.0.1"
 
 # Bind port. Every way of serving uses it. The default is 3890, which is how
-# you spell "dux" on a phone keypad.
+# you spell "yaran" on a phone keypad.
 port = 3890
 
-# Whether dux also binds the machine's Tailscale address, so tailnet devices can
+# Whether yaran also binds the machine's Tailscale address, so tailnet devices can
 # reach it. "auto" (the default) binds it whenever the interface exists and keeps
 # watching, so the listener comes and goes with your tailnet connection; "yes"
 # binds it once and then stops looking; "no" never binds it. If the
-# tailscale CLI is missing or the daemon is down, dux warns and serves the
+# tailscale CLI is missing or the daemon is down, yaran warns and serves the
 # configured host only.
 tailscale = "auto"
 
 # Serve the web UI in the background while the terminal UI keeps running, on
 # loopback plus the Tailscale address, exactly like the palette flip binds. Off
 # by default. The start-background-server and stop-background-server palette
-# commands flip it while dux runs and save the choice back here. With this on,
-# a listener exists for as long as dux does, and there is no login.
+# commands flip it while yaran runs and save the choice back here. With this on,
+# a listener exists for as long as yaran does, and there is no login.
 serve_while_tui = false
 
 # Extra Host header values to accept when a request is not same-origin. List a
@@ -268,10 +268,10 @@ The rest tune presentation and limits:
 
 | Key | Default | What it does |
 |---|---|---|
-| `color` | `"auto"` | Colored, vite-style console output for `dux server` (`auto`, `always`, `never`). Read at startup. |
-| `access_log` | `true` | Print a per-request access log line to the `dux server` console (never to `dux.log`, so pipe stdout to capture it). `/healthz` is always skipped. A config reload applies it. |
-| `title` | `"dux"` | Web-only instance name: the browser tab title and the wordmark in the projects pane. Set `"dux (prod)"` to tell tabs apart. |
-| `favicon` | `""` | Web-only favicon tint so several dux tabs are distinguishable. Empty keeps the yellow duck; otherwise a curated color (violet, blue, sky, cyan, teal, green, amber, orange, red, pink, rose). |
+| `color` | `"auto"` | Colored, vite-style console output for `yaran server` (`auto`, `always`, `never`). Read at startup. |
+| `access_log` | `true` | Print a per-request access log line to the `yaran server` console (never to `yaran.log`, so pipe stdout to capture it). `/healthz` is always skipped. A config reload applies it. |
+| `title` | `"yaran"` | Web-only instance name: the browser tab title and the wordmark in the projects pane. Set `"yaran (prod)"` to tell tabs apart. |
+| `favicon` | `""` | Web-only favicon tint so several yaran tabs are distinguishable. Empty keeps the yellow duck; otherwise a curated color (violet, blue, sky, cyan, teal, green, amber, orange, red, pink, rose). |
 | `shutdown_timeout_seconds` | `30` | Seconds the server waits for agents and terminals to save state after SIGTERM before force-killing. A second Ctrl-c during the wait exits immediately. |
 | `max_websocket_events_connections` | `32` | Cap on the status/event sockets (one per browser tab). |
 | `max_websocket_agent_connections` | `32` | Cap on agent-PTY sockets. |
@@ -283,11 +283,11 @@ The rest tune presentation and limits:
 | `search_index_max_files` | `50000` | Cap on the web editor's "Search files…" flat walk. `0` disables the cap. A config reload applies it. |
 | `replay_wait_seconds` | `8` | How long a browser waits for the terminal's screen to arrive after connecting before it stops waiting quietly and offers a Reconnect button. Counted in time the page is actually on screen, so a phone in your pocket does not burn through it. `0` disables the wait, leaving a slow screen covered indefinitely. A config reload applies it. |
 | `reconnect_backoff_cap_seconds` | `10` | The longest gap a browser leaves between automatic reconnect attempts. It starts at half a second and widens up to this. Raise it to be gentler on a struggling server, lower it to come back faster. A config reload applies it. |
-| `reconnect_attempts` | `8` | How many times in a row a browser tries before it stops and says so, with a Reconnect button to start again. Any attempt that connects gives the whole budget back, and coming back to the tab, unlocking the phone or the network returning all start it over, so this only runs out on a page left sitting in front of a server that is not there. `0` keeps trying forever, though each attempt is still abandoned on the deadline below, so restoring dux's older behaviour exactly means setting this to `0` and raising `reconnect_attempt_timeout_seconds` to `30`. A config reload applies it. |
+| `reconnect_attempts` | `8` | How many times in a row a browser tries before it stops and says so, with a Reconnect button to start again. Any attempt that connects gives the whole budget back, and coming back to the tab, unlocking the phone or the network returning all start it over, so this only runs out on a page left sitting in front of a server that is not there. `0` keeps trying forever, though each attempt is still abandoned on the deadline below, so restoring yaran's older behaviour exactly means setting this to `0` and raising `reconnect_attempt_timeout_seconds` to `30`. A config reload applies it. |
 | `reconnect_attempt_timeout_seconds` | `10` | How long one of those attempts may sit there without connecting before the browser abandons it and counts it as a failure. A server you cannot reach at all does not refuse the connection, it simply never answers, so without this an attempt could hang for most of a minute. It bounds a terminal pane's attach attempt too, not just the page's own connection. Too low and a slow connection never finishes connecting. A config reload applies it. |
 | `heartbeat_seconds` | `15` | How often a visible browser tab checks its terminal connection is really alive. A Wi-Fi to cellular handoff can leave a connection that looks open and answers nothing, and this is what notices. A config reload applies it. |
-| `heartbeat_deadline_seconds` | `30` | How long the browser waits for the answer to that check before deciding the connection is dead and reconnecting. Counted in time the page is on screen. Must be comfortably larger than `heartbeat_seconds`, or a slow network reconnects you needlessly; a value at or below it would reconnect over and over, so dux quietly uses twice `heartbeat_seconds` instead. A config reload applies it. |
-| `pty_send_timeout_seconds` | `60` | How long dux waits for the first two things it sends a browser terminal, the handshake and the screen redraw, to actually arrive, before it gives up on that connection and lets the browser try again. A send finishes when the bytes get there, so on a slow connection this is really a measure of speed, and the screen redraw can be your whole scrollback. Set it too low and a phone on a bad signal can never finish attaching. A config reload applies it to the next terminal connection. |
+| `heartbeat_deadline_seconds` | `30` | How long the browser waits for the answer to that check before deciding the connection is dead and reconnecting. Counted in time the page is on screen. Must be comfortably larger than `heartbeat_seconds`, or a slow network reconnects you needlessly; a value at or below it would reconnect over and over, so yaran quietly uses twice `heartbeat_seconds` instead. A config reload applies it. |
+| `pty_send_timeout_seconds` | `60` | How long yaran waits for the first two things it sends a browser terminal, the handshake and the screen redraw, to actually arrive, before it gives up on that connection and lets the browser try again. A send finishes when the bytes get there, so on a slow connection this is really a measure of speed, and the screen redraw can be your whole scrollback. Set it too low and a phone on a bad signal can never finish attaching. A config reload applies it to the next terminal connection. |
 | `tree_list_max_concurrency` | `8` | How many editor directory listings run at once. `0` disables the bound. Read at startup. |
 | `release_notes_max_concurrency` | `2` | How many release-notes fetches run at once. `0` disables the bound. Read at startup. |
 
@@ -298,9 +298,9 @@ The rest tune presentation and limits:
 > limits. A config reload says so for all of them, on either surface: the browser
 > and the terminal app each warn you.
 >
-> `color` is read once too, but only by `dux server`, which is the only way of
+> `color` is read once too, but only by `yaran server`, which is the only way of
 > serving that prints a console. A reload that changes it says so in the browser
-> and tells you it applies the next time you start `dux server`; the terminal app
+> and tells you it applies the next time you start `yaran server`; the terminal app
 > stays quiet, because nothing it can start reads the setting.
 >
 > The exceptions are `access_log`, `search_index_max_files`, `pty_send_timeout_seconds`
@@ -315,7 +315,7 @@ The rest tune presentation and limits:
 `serve_while_tui` and `tailscale` are the two binding keys that are live switches: a
 config reload that flips either acts on it there and then, in both directions.
 `tailscale` can also be changed without touching the file at all, from the TUI palette
-or the browser's Preferences dialog: see [Changing the mode while dux is serving](/docs/tailscale#changing-the-mode-while-dux-is-serving).
+or the browser's Preferences dialog: see [Changing the mode while yaran is serving](/docs/tailscale#changing-the-mode-while-yaran-is-serving).
 
 Going over a connection cap returns HTTP `503` until a slot frees. Setting a cap to `0`
 blocks that whole class of socket until restart. Leave the caps alone unless you are
@@ -340,7 +340,7 @@ in [Configuration](/docs/configuration).
 
 You do not need shell access to the machine to change settings:
 
-![The Settings dialog scrolled to the row that chooses whether dux binds your Tailscale address.](/screens/preferences-dialog.png)
+![The Settings dialog scrolled to the row that chooses whether yaran binds your Tailscale address.](/screens/preferences-dialog.png)
 
 - **Configuration → Edit config file…** in the cog menu opens a raw Monaco TOML editor
   over your actual `config.toml`. Saving writes the file but does not apply it live, so
@@ -360,7 +360,7 @@ You do not need shell access to the machine to change settings:
   review diffs.
 - [Agents from the browser](/docs/web-agents): create, fork, adopt, and manage agents
   and their provider tabs.
-- [Reaching dux over Tailscale](/docs/tailscale): how the tailnet address is found and
+- [Reaching yaran over Tailscale](/docs/tailscale): how the tailnet address is found and
   bound, why a MagicDNS name needs `allowed_hosts`, and what plain HTTP costs you.
-- [Hosting dux behind a login](/docs/public-hosting): a reverse proxy plus
+- [Hosting yaran behind a login](/docs/public-hosting): a reverse proxy plus
   `oauth2-proxy` with GitHub in one Compose file.

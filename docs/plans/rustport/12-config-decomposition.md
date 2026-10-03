@@ -36,7 +36,7 @@ src/config/
     keys_macros.rs         ~170   KeysConfig, MacroSurface, MacroEntry, MacrosConfig (:158-229, 839-859)
     limits.rs              ~200   StorageConfig, AutoResumeConfig, LimitsConfig + 11 default fns (:362-533)
     amq.rs                 ~250   AmqConfig, AmqInjectConfig (14 keys), AmqOrchestratorConfig + 17 default fns (:534-785)
-  paths.rs                 ~180   DuxPaths, resolve_root, discover_root, expand_path, is_valid_var_name
+  paths.rs                 ~180   YaranPaths, resolve_root, discover_root, expand_path, is_valid_var_name
                                   (:1077-1111, 3108-3237)
   load.rs                  ~180   ensure_config, load_config_read_only, registered_project_paths,
                                   shared-workspace validators (:1112-1254)
@@ -89,7 +89,7 @@ retires tenet violation P12. Sequence 11 before this phase, or absorb that extra
 - [ ] Template coverage property test green after every commit, not just the last.
 - [ ] All `migrate_config` arm tests green; arm logic byte-identical (`git diff` on the
       moved hunks shows pure relocation).
-- [ ] `dux config diff` and `dux config regenerate` produce byte-identical output to
+- [ ] `yaran config diff` and `yaran config regenerate` produce byte-identical output to
       pre-split — capture a golden file before starting and compare.
 - [ ] `cargo test --all-features` green with the same test count.
 - [ ] `cargo modules orphans --deny` and `dependencies --acyclic` pass.
@@ -106,7 +106,7 @@ diff /tmp/config-before.toml /tmp/config-after.toml    # must be empty
 
 cargo test --all-features
 ci/check-file-length.sh
-cargo modules dependencies --acyclic --bin dux
+cargo modules dependencies --acyclic --bin yaran
 cargo run -p xtask -- module-trees --check
 ```
 

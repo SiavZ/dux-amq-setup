@@ -131,8 +131,8 @@ src/app/
 cargo test --all-features
 cargo insta test                     # zero snapshot movement
 ci/check-file-length.sh
-cargo modules orphans --deny --bin dux
-cargo modules dependencies --acyclic --bin dux
+cargo modules orphans --deny --bin yaran
+cargo modules dependencies --acyclic --bin yaran
 
 # epilogue-runs-once guard
 cargo test --all-features drain_events_epilogue

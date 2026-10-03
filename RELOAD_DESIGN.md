@@ -1,6 +1,6 @@
-# TUI hot reload for dux
+# TUI hot reload for yaran
 
-Goal: swap the dux binary without killing running agents, the way jcode does.
+Goal: swap the yaran binary without killing running agents, the way jcode does.
 
 ## How jcode does it
 
@@ -17,9 +17,9 @@ process**; the TUI is only a viewer. So reload is cheap:
 Two guards: `if self.is_processing { return false }` never interrupts a turn,
 and `has_newer_binary()` only reloads when the payload mtime actually changed.
 
-## Why dux is different
+## Why yaran is different
 
-dux has no server for agents. `PtyClient` owns the child **directly**, and
+yaran has no server for agents. `PtyClient` owns the child **directly**, and
 `shutdown_ptys_interruptible` terminates every provider on exit.
 
 That made a daemon split look necessary. It is not.
@@ -108,7 +108,7 @@ would drop every `PtyClient`, closing the masters the next image is about to
 inherit.
 
 The handoff is adopted **before** `restore_sessions`. The restore then has to
-recognise what it adopted, and it does so in dux-core, so the web bootstrap gets
+recognise what it adopted, and it does so in yaran-core, so the web bootstrap gets
 the same answer:
 
 - `normalize_restored_sessions` marks a session with a live tab `Active`. It used
@@ -133,7 +133,7 @@ forever. The rules:
 - `ReattachedMaster::adopt` sets the flag again as soon as the new image owns
   the master, so git, gh, editors and agents spawned after a reload do not get a
   copy. The reader and writer are dups made afterwards, so they inherit it.
-- Everything else dux opens is close-on-exec by default: Rust's `File`,
+- Everything else yaran opens is close-on-exec by default: Rust's `File`,
   `TcpListener` and `tokio` sockets all use `O_CLOEXEC`/`SOCK_CLOEXEC`. That
   covers the single-instance lock, the log, sqlite and the background web
   server's listeners.
@@ -158,7 +158,7 @@ exec, and generation 2 must be able to take it.
 ### When the exec fails
 
 `exec_reload` used to `Box::leak` the engine, then `Box::from_raw` and drop it
-on failure. Dropping it SIGKILLed every agent, and dux then exited. `exec` runs
+on failure. Dropping it SIGKILLed every agent, and yaran then exited. `exec` runs
 no destructors, so owning the engine until the call is enough, with no leak and
 no `unsafe`. On failure the handoff is abandoned (flags restored, file removed)
 and the engine goes back to a resumed TUI, with the reason on the status line.
@@ -166,9 +166,9 @@ and the engine goes back to a resumed TUI, with the reason on the status line.
 ### Signals across the exec
 
 Handlers do not survive `exec` (they reset to default), but the signal mask and
-ignored dispositions do. dux blocks nothing and ignores nothing on the reload
+ignored dispositions do. yaran blocks nothing and ignores nothing on the reload
 path, and the new image registers its own handlers in `bootstrap`. Verified
-live: a reloaded dux, with an adopted agent and two terminals, exits cleanly on
+live: a reloaded yaran, with an adopted agent and two terminals, exits cleanly on
 `SIGTERM`, the same as a cold start.
 
 ### Known cost
@@ -181,35 +181,35 @@ no `SIGWINCH` is synthesized on adopt.
 
 ## Live verification
 
-A release build of dux, driven in tmux with a scratch `DUX_HOME` and a
+A release build of yaran, driven in tmux with a scratch `YARAN_HOME` and a
 throwaway git project (2026-09-24, macOS arm64):
 
-1. Provider `sh -c 'while true; do date; sleep 1; done'`. dux pid 33322,
+1. Provider `sh -c 'while true; do date; sleep 1; done'`. yaran pid 33322,
    agent pid 40037. `reload-binary` was **refused** with "Not reloading: ... is
    still working", because a printing agent reads as mid-turn. That is the
    guard working. Both pids were unchanged afterwards.
-2. Provider `sh -c 'echo ...; exec cat'` (idle). dux pid **53678**, agent `cat`
-   pid **53689**, parent 53678. After `touch dux` and `reload-binary`:
-   - dux pid still **53678**, now running `dux --reload-handoff
+2. Provider `sh -c 'echo ...; exec cat'` (idle). yaran pid **53678**, agent `cat`
+   pid **53689**, parent 53678. After `touch yaran` and `reload-binary`:
+   - yaran pid still **53678**, now running `yaran --reload-handoff
      .../reload-handoff-53678.json`
    - agent still **53689**, parent still **53678**, exactly one `cat`
    - log: `reload: adopted 1 of 1 handed-over ptys`
    - row shows `looper · Idle` (running), and `agent_sessions.status = active`
    - typed input echoed back through the adopted pty
-   - no `reload-handoff-*.json` left in `DUX_HOME`
+   - no `reload-handoff-*.json` left in `YARAN_HOME`
    - `lsof` on the new image: the lock file, and the `ptmx` master with its
      reader and writer dups
 3. Opened a companion terminal (`zsh` pid 60192). Its descriptors are only its
    own tty, with no copy of the agent's master. Reloaded again: `adopted 2 of 2`,
-   dux 53678, agent 53689 and terminal 60192 all unchanged. A terminal opened
+   yaran 53678, agent 53689 and terminal 60192 all unchanged. A terminal opened
    after this reload (pid 63373) got a new id beside the adopted one, and both
    shells kept running (`2 terminals`).
 
-`tools/reload-live-check.sh [path/to/dux]` repeats checks 2 and 3 (minus the
+`tools/reload-live-check.sh [path/to/yaran]` repeats checks 2 and 3 (minus the
 terminal) with polling waits, and cleans up after itself. Run with the status
 fix reverted, it fails on `session status is detached`.
 
-Found along the way but not caused by reload: a dux whose host terminal
+Found along the way but not caused by reload: a yaran whose host terminal
 disappears (its tmux session is killed) keeps running at high CPU and ignores
 `SIGTERM`. A cold start does the same, so it is outside this work.
 
@@ -218,7 +218,7 @@ disappears (its tmux session is killed) keeps running at high CPU and ignores
 The reload work adds 36 tests, including an end-to-end test that execs for real
 and drives a live `PtyClient` on both sides. The e2e test is a `harness = false`
 test target that plays both generations itself. Before, it drove a separate
-`[[bin]]` of dux-core, which `cargo install` and release builds shipped to
+`[[bin]]` of yaran-core, which `cargo install` and release builds shipped to
 users.
 
 Mutation-checked at every load-bearing point, each fails a test when broken:

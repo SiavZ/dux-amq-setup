@@ -494,7 +494,7 @@ export function mountHeroScene(
     drawBorder(p, front);
   }
 
-  // The dux pane draws dux itself: sidebar, centre terminal, changed files.
+  // The yaran pane draws yaran itself: sidebar, centre terminal, changed files.
   function drawTuiPane(p: Pane, t: number, front: boolean): void {
     const ctx = p.ctx;
     const box = drawChrome(p, t);

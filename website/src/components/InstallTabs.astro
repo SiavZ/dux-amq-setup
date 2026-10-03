@@ -15,43 +15,15 @@ interface Props {
 
 const defaultTabs: Tab[] = [
   {
-    id: "shell",
-    label: "Shell",
-    badge: "any unix",
-    cmd: "curl -sSfL https://getdux.app/install.sh | bash",
-    hint: "Sniffs your OS + arch, drops dux in <code>~/.local/bin</code> (or <code>/usr/local/bin</code>).",
-  },
-  {
-    id: "brew",
-    label: "Homebrew",
+    id: "source",
+    label: "Source",
     badge: "mac · linux",
-    cmd: "brew install patrickdappollonio/tap/dux",
-    hint: "Tap and install in one shot. Life's too short for two-command installs.",
-  },
-  {
-    id: "npm",
-    label: "npm",
-    badge: "global",
-    cmd: "npm install -g @patrickdappollonio/dux",
-    hint: "Yes, a terminal app on npm. It travels well, don't @ me.",
-  },
-  {
-    id: "npx",
-    label: "npx",
-    badge: "one-off",
-    cmd: "npx -y @patrickdappollonio/dux",
-    hint: "Run it once, forget it ever existed. Astonishingly low commitment.",
-  },
-  {
-    id: "binary",
-    label: "Binary",
-    badge: "manual",
-    cmd: "curl -sSfL https://github.com/patrickdappollonio/dux/releases/latest/download/dux-<os>-<arch>.tar.gz | tar xz && mv dux ~/.local/bin/",
-    hint: 'The hands-on route: swap <code>&lt;os&gt;-&lt;arch&gt;</code> for your platform (macOS/Linux · amd64/arm64), or just browse the <a href="https://github.com/patrickdappollonio/dux/releases/latest" target="_blank" rel="noopener" class="text-[color:var(--color-accent)] hover:underline">Releases</a> page. Then drop <code>dux</code> wherever you want on your <code>PATH</code>.',
+    cmd: "git clone https://github.com/SiavZ/dux-amq-setup.git && cd dux-amq-setup && cargo build --release",
+    hint: 'Build Yaran from this repository with Rust and Node.js/npm installed. Run <code>target/release/yaran</code>. The <a href="https://github.com/patrickdappollonio/dux/releases" class="text-[color:var(--color-accent)] hover:underline">upstream dux releases</a> remain available separately and do not install Yaran.',
   },
 ];
 
-const { tabs = defaultTabs, defaultId = "shell", compact = false } = Astro.props;
+const { tabs = defaultTabs, defaultId = "source", compact = false } = Astro.props;
 const uid = "tabs-" + Math.random().toString(36).slice(2, 8);
 ---
 
@@ -65,7 +37,7 @@ const uid = "tabs-" + Math.random().toString(36).slice(2, 8);
     <span class="term-dot" style="background:#ff5f56"></span>
     <span class="term-dot" style="background:#febc2e"></span>
     <span class="term-dot" style="background:#28c840"></span>
-    <span class="ml-3 mono text-[11px] text-[color:var(--color-dim)]">~ install dux</span>
+    <span class="ml-3 mono text-[11px] text-[color:var(--color-dim)]">~ install yaran</span>
     <div class="ml-auto flex flex-wrap items-center justify-end gap-1" role="tablist" aria-label="Install methods">
       {
         tabs.map((t) => (

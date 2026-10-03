@@ -15,6 +15,25 @@ afterEach(() => {
 });
 
 describe("getLatestVersion", () => {
+  it("accepts canonical Yaran tags", async () => {
+    stubFetch({ tag_name: "yaran-v1.2.3" });
+    await expect(getLatestVersion("owner/yaran")).resolves.toBe("yaran-v1.2.3");
+  });
+
+  it("accepts canonical Yaran prerelease tags", async () => {
+    stubFetch({ tag_name: "yaran-v1.2.3-rc.1" });
+    await expect(getLatestVersion("owner/yaran-rc")).resolves.toBe("yaran-v1.2.3-rc.1");
+  });
+
+  it("rejects the obsolete overlay-prefixed release name", async () => {
+    stubFetch({ tag_name: "yaran-amq-v1.2.3" });
+    await expect(getLatestVersion("owner/old-prefix")).resolves.toBeNull();
+  });
+  it("accepts historical fork release tags", async () => {
+    stubFetch({ tag_name: "dux-amq-v0.7.0" });
+    await expect(getLatestVersion("owner/legacy-fork")).resolves.toBe("dux-amq-v0.7.0");
+  });
+
   it("returns the release tag", async () => {
     stubFetch({ tag_name: "v0.7.0" });
     await expect(getLatestVersion("owner/good")).resolves.toBe("v0.7.0");

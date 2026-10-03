@@ -1,6 +1,6 @@
 ---
 title: Startup commands & environment variables
-description: How to run per-project setup scripts and inject environment variables into every agent dux creates.
+description: How to run per-project setup scripts and inject environment variables into every agent yaran creates.
 group: Guides
 order: 30
 ---
@@ -12,7 +12,7 @@ symlinking secrets files, warming a cache. Two config features cover it, both in
 
 ## Per-project environment variables
 
-The `env` field on a project is an inline TOML table of `KEY = "value"` pairs. dux
+The `env` field on a project is an inline TOML table of `KEY = "value"` pairs. yaran
 passes them to everything it spawns for that project: agent sessions, companion
 terminals, and the startup command.
 
@@ -25,7 +25,7 @@ env  = { NODE_ENV = "development", API_KEY = "${MY_API_KEY}" }
 ```
 
 > [!TIP]
-> Values expand `$VAR` and `${VAR}` from your shell environment when dux starts. Keep
+> Values expand `$VAR` and `${VAR}` from your shell environment when yaran starts. Keep
 > secrets as references rather than literals and `config.toml` stays safe to commit to
 > your dotfiles.
 
@@ -66,20 +66,20 @@ path = "$HOME/projects/web-app"
 name = "web-app"
 startup_command = """
 npm ci
-ln -sfn "$DUX_PROJECT_PATH/.env.local" .env
+ln -sfn "$YARAN_PROJECT_PATH/.env.local" .env
 """
 ```
 
 - It runs with its working directory set to the **agent's worktree**, not the source
   checkout.
-- dux waits for it to finish before launching the provider.
-- Every run writes a timestamped log under the dux config directory, at
+- yaran waits for it to finish before launching the provider.
+- Every run writes a timestamped log under the yaran config directory, at
   `startup-command-logs/<project-id>/<session-id>/`. Browse them from the command
   palette in the terminal UI or a row's actions menu on the web, for one agent or for
   every agent in a project at once.
 
 > [!IMPORTANT]
-> A startup command that exits non-zero does not block you. dux records the failure in
+> A startup command that exits non-zero does not block you. yaran records the failure in
 > the startup log and launches the agent anyway, so check the log when an agent starts
 > without its dependencies.
 
@@ -109,24 +109,24 @@ redo.
 > agent's whole project, and the change is written back to `config.toml`. None of these
 > four entries appear for a standalone agent, which belongs to no project.
 
-### Dux-injected variables
+### Yaran-injected variables
 
-dux sets these for every startup command, on top of any `[env]` and `[[projects]] env`
+yaran sets these for every startup command, on top of any `[env]` and `[[projects]] env`
 keys you configure:
 
 | Variable | Value |
 |---|---|
-| `DUX_PROJECT_PATH` | Absolute path to the project's source checkout |
-| `DUX_WORKTREE_PATH` | Absolute path to the agent's git worktree |
-| `DUX_AGENT_ID` | UUID that uniquely identifies this agent session |
-| `DUX_AGENT_BRANCH` | Git branch name for this agent's worktree |
-| `DUX_PROVIDER` | Provider name used for this agent (e.g. `claude`, `codex`) |
-| `DUX_STARTUP_COMMAND_LOG` | Absolute path to the log file for this run |
+| `YARAN_PROJECT_PATH` | Absolute path to the project's source checkout |
+| `YARAN_WORKTREE_PATH` | Absolute path to the agent's git worktree |
+| `YARAN_AGENT_ID` | UUID that uniquely identifies this agent session |
+| `YARAN_AGENT_BRANCH` | Git branch name for this agent's worktree |
+| `YARAN_PROVIDER` | Provider name used for this agent (e.g. `claude`, `codex`) |
+| `YARAN_STARTUP_COMMAND_LOG` | Absolute path to the log file for this run |
 
 > [!IMPORTANT]
-> The `DUX_*` variables exist **only** for startup commands. Agent sessions and
-> companion terminals do not get them. They inherit dux's own environment, plus the
-> `TERM`, `COLORTERM` and terminal-identity values dux sets, with your `[env]` and
+> The `YARAN_*` variables exist **only** for startup commands. Agent sessions and
+> companion terminals do not get them. They inherit yaran's own environment, plus the
+> `TERM`, `COLORTERM` and terminal-identity values yaran sets, with your `[env]` and
 > `[[projects]] env` keys layered on top.
 
 A standalone terminal belongs to no project, so it gets the global `[env]` and nothing
@@ -171,7 +171,7 @@ name = "frontend"
 env  = { NODE_ENV = "development" }
 startup_command = """
 npm ci
-ln -sfn "$DUX_PROJECT_PATH/.env.local" .env
+ln -sfn "$YARAN_PROJECT_PATH/.env.local" .env
 """
 ```
 

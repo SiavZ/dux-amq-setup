@@ -1,5 +1,5 @@
 name: Bug report
-description: Report something that is not working as expected in dux.
+description: Report something that is not working as expected in yaran.
 title: "Bug: "
 labels:
   - bug
@@ -7,8 +7,8 @@ body:
   - type: input
     id: version
     attributes:
-      label: What version of dux are you running?
-      placeholder: "dux 0.0.0"
+      label: What version of yaran are you running?
+      placeholder: "yaran 0.0.0"
     validations:
       required: true
 

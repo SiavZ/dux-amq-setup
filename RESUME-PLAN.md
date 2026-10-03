@@ -2,19 +2,19 @@
 
 > **Historical record, pre-workspace paths.** File paths in this document
 > refer to the fork-main single-crate layout, before the `crates/`
-> restructure. Mapping: `src/` -> `crates/dux-core/src/` (engine, config,
-> storage, pty, git, model) or `crates/dux-tui/src/` (`src/app/`, `src/cli.rs`,
+> restructure. Mapping: `src/` -> `crates/yaran-core/src/` (engine, config,
+> storage, pty, git, model) or `crates/yaran-tui/src/` (`src/app/`, `src/cli.rs`,
 > keys, rendering); `tests/` -> `crates/*/tests/`. Storage no longer uses
 > numbered migrations (`src/storage/migrations/000N_*.sql`, `PRAGMA
 > user_version`): it uses idempotent `ensure_column` calls in
-> `crates/dux-core/src/storage.rs`. See
+> `crates/yaran-core/src/storage.rs`. See
 > [docs/contributing/schema-policy.md](docs/contributing/schema-policy.md).
 > The body is left as written.
 
 _Frozen spec — derived from Codex's read-only design pass (2026-07-14)._
 
 ## Goal
-In shared-workspace mode, N dux agents share one CWD (the project checkout). Provider resume selectors (`claude --continue`, `codex resume --last`) pick a conversation by **recency/CWD**, not by dux agent identity, so shared agents cannot resume their own prior conversation — today `should_resume_session` deliberately returns `false` for shared sessions, so they always launch fresh, and each agent's real history is stranded under its **old per-worktree** encoded project dir. Fix: give every agent a durable **provider→session-UUID** mapping, resume shared sessions **only** by that exact UUID (never a latest/recency selector), capture the UUID at launch, and one-time-migrate the already-stranded histories so existing agents resume their real conversations. Per-worktree behavior is unchanged.
+In shared-workspace mode, N yaran agents share one CWD (the project checkout). Provider resume selectors (`claude --continue`, `codex resume --last`) pick a conversation by **recency/CWD**, not by yaran agent identity, so shared agents cannot resume their own prior conversation — today `should_resume_session` deliberately returns `false` for shared sessions, so they always launch fresh, and each agent's real history is stranded under its **old per-worktree** encoded project dir. Fix: give every agent a durable **provider→session-UUID** mapping, resume shared sessions **only** by that exact UUID (never a latest/recency selector), capture the UUID at launch, and one-time-migrate the already-stranded histories so existing agents resume their real conversations. Per-worktree behavior is unchanged.
 
 ## Approach
 
@@ -41,9 +41,9 @@ In shared-workspace mode, N dux agents share one CWD (the project checkout). Pro
 - Keep existing `resume_args` as the legacy per-worktree fallback (`LegacyLatest`). Do NOT add Claude `--fork-session` to the targeted path (it mints a new identity).
 
 ### 4. Capture the UUID at launch (provider-specific, immediate — not at detach)
-- **Claude**: generate a fresh UUID in dux before a `Fresh` launch, persist it into `provider_session_ids["claude"]`, and pass `--session-id <uuid>` in the launch argv (Claude Code supports `--session-id`). This removes all inference for future sessions.
+- **Claude**: generate a fresh UUID in yaran before a `Fresh` launch, persist it into `provider_session_ids["claude"]`, and pass `--session-id <uuid>` in the launch argv (Claude Code supports `--session-id`). This removes all inference for future sessions.
 - **Codex**: no fresh-session-id flag exists. Snapshot the set of known `~/.codex/sessions/**/rollout-*.jsonl` UUIDs before launch, then after launch poll for the newly-created rollout whose first `session_meta` record has the expected canonical `cwd` and whose UUID was absent from the snapshot; persist `payload.id` immediately. **Serialize fresh/uncaptured Codex launches per canonical CWD** until each new JSONL is identified (targeted resumes may stay concurrent). On capture timeout or multiple candidates: do not guess, do not launch another uncaptured Codex agent in that CWD until resolved.
-- Do NOT rely on `DUX_*` env vars as transcript markers (providers don't write them into transcripts); do NOT inject fake prompt markers.
+- Do NOT rely on `YARAN_*` env vars as transcript markers (providers don't write them into transcripts); do NOT inject fake prompt markers.
 
 ### 5. Resume by UUID
 - Claude: `claude … --resume <uuid>`. Claude's installed `--resume` still locates the transcript via the **current encoded project dir** (with a fallback across *currently registered* git worktrees — removed legacy worktrees are NOT reliably discoverable). Therefore the target JSONL **must be present in the shared CWD's encoded Claude project dir** — see step 6 migration.
@@ -54,7 +54,7 @@ In shared-workspace mode, N dux agents share one CWD (the project checkout). Pro
 - Runs **before** shared auto-resume scheduling on startup; idempotent (skip any `(session, provider)` that already has a UUID). The SQL migration only adds the column — recovery is code, not SQL.
 - For every `(agent_session, started_provider)` missing a UUID:
   1. Scan provider JSONLs and read the recorded original `cwd` from the transcript — do NOT reverse Claude's lossy encoded dir name.
-  2. Accept only old paths under dux's historical worktree root.
+  2. Accept only old paths under yaran's historical worktree root.
   3. Normalize the old CWD basename with the **same agent-handle rules** and match to the immutable `agent_handle`.
   4. Independently verify project ownership (old worktree's project parent / registered project path / git origin).
   5. If the handle/project match is **not unique**, leave unmapped and report candidates — never guess.

@@ -12,5 +12,5 @@ module.exports.expectText = ["Help"]
 module.exports.file = "tui-help-overlay.png"
 module.exports.cols = 160
 module.exports.rows = 45
-module.exports.theme = "dux_dark"
+module.exports.theme = "yaran_dark"
 module.exports.fixture = "steady"

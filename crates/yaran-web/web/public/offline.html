@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0a0a0a" />
+    <title>yaran is unreachable</title>
+    <!--
+      Fully self-contained: inline CSS only, no external requests. This page must
+      render with the yaran server unreachable, so it cannot depend on any asset
+      that would itself need a network fetch. That is why the "Yaran Blocks" font
+      below is embedded as a data: URI rather than fetched: the service worker
+      (public/sw.js) deliberately caches nothing but this one file and only
+      intercepts navigations, so a font URL would 404 exactly when this page
+      shows. The font is the same ~6.4KB DejaVu Sans Mono subset the app bundles
+      (src/assets/fonts/yaran-blocks.woff2, license alongside); it exists so the
+      block-glyph wordmark renders every glyph from one font with one advance
+      width instead of shearing when the device's monospace font lacks the
+      Block Elements range. A test pins the two copies byte-identical.
+    -->
+    <style>
+      @font-face {
+        font-family: "Yaran Blocks";
+        src: url(data:font/woff2;base64,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) format("woff2");
+        font-weight: 400;
+        font-style: normal;
+        font-display: block;
+      }
+      :root { color-scheme: dark; }
+      html, body { height: 100%; margin: 0; }
+      body {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #0a0a0a;
+        color: #fafafa;
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+        text-align: center;
+        padding: 1.5rem;
+      }
+      .wrap { max-width: 28rem; }
+      pre {
+        /* inline-block + left-aligned content centers the art as a block
+           (via the body's text-align: center) while keeping every line's
+           internal columns aligned — a plain block pre would center each
+           line independently and shear the letters. */
+        display: inline-block;
+        text-align: left;
+        margin: 0 0 1.5rem;
+        color: #a1a1aa;
+        font-family: "Yaran Blocks", ui-monospace, SFMono-Regular, Menlo, "DejaVu Sans Mono", monospace;
+        font-size: 11px;
+        line-height: 1.15;
+      }
+      h1 { margin: 0 0 0.5rem; font-size: 1.25rem; font-weight: 600; }
+      p { margin: 0 0 1.5rem; color: #a1a1aa; font-size: 0.9rem; line-height: 1.5; }
+      button {
+        appearance: none;
+        cursor: pointer;
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        border-radius: 0.5rem;
+        background: #fafafa;
+        color: #0a0a0a;
+        font: inherit;
+        font-weight: 600;
+        font-size: 0.9rem;
+        padding: 0.5rem 1.25rem;
+      }
+      button:hover { background: #e4e4e7; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <pre aria-label="Yaran">██   ██  █████  ██████   █████  ██   ██
+ ██ ██  ██   ██ ██   ██ ██   ██ ███  ██
+  ███   ███████ ██████  ███████ ██ █ ██
+  ███   ██   ██ ██  ██  ██   ██ ██  ███
+  ███   ██   ██ ██   ██ ██   ██ ██   ██</pre>
+      <h1>yaran is unreachable</h1>
+      <p>
+        The yaran server may be down, or this device may be offline. Reconnect to
+        the network or restart the server, then try again.
+      </p>
+      <button type="button" onclick="location.reload()">Retry</button>
+    </div>
+  </body>
+</html>

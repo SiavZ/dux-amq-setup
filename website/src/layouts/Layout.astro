@@ -24,17 +24,17 @@ const {
 // never loads during local dev or local/PR builds, only on the published site.
 const enableAnalytics = process.env.ENABLE_ANALYTICS === "true";
 
-const site = Astro.site ?? new URL("https://getdux.app");
+const site = Astro.site ?? new URL(Astro.url.origin);
 const canonical = new URL(Astro.url.pathname, site).toString();
 const ogImageURL = new URL(ogImage, site).toString();
 
 // Alt text for the social card: it describes what the card SHOWS rather than
 // defining the product, so only a redraw of public/og.png needs it reworded.
 const ogImageAlt =
-  "dux: your AI agents deserve a proper office. A dux session running several AI coding agents in parallel, one git worktree each.";
+  "Yaran branching-Y mark beside the Yaran wordmark.";
 
 const keywords = [
-  "dux",
+  "yaran",
   "getdux",
   "AI coding agents",
   "Claude Code",
@@ -46,11 +46,11 @@ const keywords = [
   "terminal UI",
   "TUI",
   "Rust TUI",
-  // dux has a web UI as well as the TUI, and people search for both. Neither
-  // set is a claim that dux is only one of them; see lib/site.ts for the
+  // yaran has a web UI as well as the TUI, and people search for both. Neither
+  // set is a claim that yaran is only one of them; see lib/site.ts for the
   // positioning the copy has to carry.
   "web UI",
-  "dux server",
+  "yaran server",
   "AI agents in the browser",
   "self-hosted AI coding",
   "AI coding agents on your phone",
@@ -64,16 +64,16 @@ const sd = {
   software: {
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
-    name: "dux",
-    alternateName: ["getdux", "dux TUI", "dux server"],
+    name: "yaran",
+    alternateName: ["Yaran TUI", "Yaran server"],
     operatingSystem: ["macOS", "Linux", "Windows (WSL2)"],
     applicationCategory: "DeveloperApplication",
     // Two front ends over one workspace, so the subcategory is not a single value.
     applicationSubCategory: ["Terminal UI", "Web UI"],
     description,
     url: site.toString(),
-    downloadUrl: "https://github.com/patrickdappollonio/dux/releases",
-    softwareHelp: "https://github.com/patrickdappollonio/dux#readme",
+    downloadUrl: "https://github.com/SiavZ/dux-amq-setup",
+    softwareHelp: "https://github.com/SiavZ/dux-amq-setup#readme",
     offers: {
       "@type": "Offer",
       price: "0",
@@ -91,7 +91,7 @@ const sd = {
       "One git worktree per agent",
       "PTY-based, runs real CLIs (Claude, Codex, Copilot, OpenCode, any)",
       "Terminal UI and web UI over the same workspace",
-      "Web UI served by `dux server`, reachable from a phone",
+      "Web UI served by `yaran server`, reachable from a phone",
       "Edit files in the browser with a real editor",
       "Built-in git staging, diffs, commit, push, and pull",
       "Macros for reusable prompts",
@@ -105,14 +105,9 @@ const sd = {
   website: {
     "@context": "https://schema.org",
     "@type": "WebSite",
-    name: "dux",
+    name: "yaran",
     url: site.toString(),
     description,
-    publisher: {
-      "@type": "Person",
-      name: "Patrick D'appollonio",
-      url: "https://www.patrickdap.com",
-    },
   },
 };
 ---
@@ -127,29 +122,29 @@ const sd = {
     <title>{title}</title>
     <meta name="description" content={description} />
     <meta name="keywords" content={keywords.join(", ")} />
-    <meta name="author" content="Patrick D'appollonio" />
+    <meta name="author" content="Yaran contributors; upstream dux by Patrick D'appollonio" />
     <meta name="theme-color" content="#0b0b14" />
     <meta name="color-scheme" content="dark" />
-    <meta name="application-name" content="dux" />
-    <meta name="apple-mobile-web-app-title" content="dux" />
+    <meta name="application-name" content="yaran" />
+    <meta name="apple-mobile-web-app-title" content="yaran" />
     {noIndex && <meta name="robots" content="noindex, nofollow" />}
     {!noIndex && <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1" />}
 
-    <link rel="canonical" href={canonical} />
+    {Astro.site && <link rel="canonical" href={canonical} />}
     <link rel="icon" type="image/png" href="/favicon-96x96.png" sizes="96x96" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="shortcut icon" href="/favicon.ico" />
     <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
     <link rel="manifest" href="/site.webmanifest" />
-    <link rel="sitemap" type="application/xml" href="/sitemap-index.xml" />
-    <link rel="alternate" type="application/rss+xml" title="dux blog" href="/rss.xml" />
+    {Astro.site && <link rel="sitemap" type="application/xml" href="/sitemap-index.xml" />}
+    <link rel="alternate" type="application/rss+xml" title="yaran blog" href="/rss.xml" />
 
     {/* Open Graph */}
     <meta property="og:type" content="website" />
-    <meta property="og:url" content={canonical} />
+    {Astro.site && <meta property="og:url" content={canonical} />}
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
-    <meta property="og:site_name" content="dux" />
+    <meta property="og:site_name" content="yaran" />
     <meta property="og:locale" content="en_US" />
     <meta property="og:image" content={ogImageURL} />
     <meta property="og:image:type" content="image/png" />
@@ -163,7 +158,7 @@ const sd = {
     <meta name="twitter:description" content={description} />
     <meta name="twitter:image" content={ogImageURL} />
     <meta name="twitter:image:alt" content={ogImageAlt} />
-    <meta name="twitter:creator" content="@patrickdap" />
+    <!-- Upstream authorship is credited in the footer, not claimed as this fork's social account. -->
 
     {/* Preload / preconnect */}
     <link rel="preconnect" href="https://rsms.me" crossorigin />
@@ -178,7 +173,7 @@ const sd = {
     />
 
     {
-      emitStructuredData && (
+      emitStructuredData && Astro.site && (
         <>
           <script type="application/ld+json" set:html={JSON.stringify(sd.software)} />
           <script type="application/ld+json" set:html={JSON.stringify(sd.website)} />

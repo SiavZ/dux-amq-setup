@@ -1,11 +1,11 @@
-# cargo-deny configuration for dux.
+# cargo-deny configuration for yaran.
 #
 # audit02 Phase 07 (P0-I) — supply-chain advisory + license + source gating
 # in CI. The PR/test workflows run `cargo audit --deny warnings` AND
 # `cargo deny check`; both must stay green for a PR to merge.
 #
 # Adapted from https://github.com/EmbarkStudios/cargo-deny/blob/main/deny.toml
-# and trimmed to the minimum dux actually needs. Each allowlist entry has
+# and trimmed to the minimum yaran actually needs. Each allowlist entry has
 # an inline comment explaining *why* — additions to these lists must be
 # reviewed and justified in the PR description.
 
@@ -91,7 +91,7 @@ allow = [
   "BSL-1.0",
   # Permissive data license (attribution-free, no copyleft) on the Mozilla
   # CA root list in `webpki-roots`, pulled by upstream's `ureq` release-notes
-  # fetch in dux-core. Data, not code; the allowlist predates that dependency.
+  # fetch in yaran-core. Data, not code; the allowlist predates that dependency.
   "CDLA-Permissive-2.0",
 ]
 # Confidence threshold for the license detector. The default 0.8 catches

@@ -53,9 +53,9 @@ The tree **must** be fenced as `` ```text ``.
 - Safety net: `rustdoc::invalid_rust_codeblocks` is warn-by-default and fires on
   doc code blocks that are not parsable as Rust, so a forgotten annotation surfaces
   at `cargo doc` time.
-- Caveat: doctests are extracted from the **library target only**. `dux` has
+- Caveat: doctests are extracted from the **library target only**. `yaran` has
   `src/lib.rs` (`lib.rs:14` declares `pub mod app`), so doctests do run — but the
-  new `dux-amq-rust` crate must keep a lib target for the same protection.
+  new `yaran-amq-rust` crate must keep a lib target for the same protection.
 
 `//!` (inner) is correct, not `//`. Presence is enforced by
 `clippy::missing_docs_in_private_items`; **accuracy of the tree is enforced by the
@@ -149,8 +149,8 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 ci/check-file-length.sh                       # Phase 02
-cargo modules orphans --deny --bin dux        # Phase 02
-bats dux-amq/tests                            # overlay suite
+cargo modules orphans --deny --bin yaran        # Phase 02
+bats yaran-amq/tests                            # overlay suite
 ```
 
 The clippy invocation is a CI gate and must pass with zero warnings. A new stable

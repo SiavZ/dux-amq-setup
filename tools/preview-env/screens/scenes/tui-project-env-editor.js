@@ -31,5 +31,5 @@ module.exports.expectText = [
 module.exports.file = "tui-project-env-editor.png"
 module.exports.cols = 160
 module.exports.rows = 30
-module.exports.theme = "dux_dark"
+module.exports.theme = "yaran_dark"
 module.exports.fixture = "steady"

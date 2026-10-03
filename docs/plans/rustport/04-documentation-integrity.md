@@ -23,14 +23,14 @@ Files still referencing the deleted tree, verified by `grep -rn`:
 
 | Referrer | What breaks |
 |---|---|
-| **`dux-amq/install.sh:8`** | Points operators at `docs/plans/audits/audit01/01-supply-chain-hardening.md` for **how to recompute `DUX_SHA256` / `AMQ_SHA256` / `AMQ_BINARY_SHA256`**. The rotation procedure is unreachable exactly when every pin is stale (Phase 03). |
+| **`yaran-amq/install.sh:8`** | Points operators at `docs/plans/audits/audit01/01-supply-chain-hardening.md` for **how to recompute `YARAN_SHA256` / `AMQ_SHA256` / `AMQ_BINARY_SHA256`**. The rotation procedure is unreachable exactly when every pin is stale (Phase 03). |
 | **`SECURITY.md:51-69`** | Every STRIDE row's provenance column cites a phase number resolving to a deleted file. |
 | **`SECURITY.md:157-161`** | Specifies a CI check `scripts/validate-threat-model.sh` comparing the STRIDE table against "phase files under `docs/plans/audits/`". No `scripts/` dir exists **and** the input tree is gone — the check is doubly dead. |
 | **`src/watch/builtin.rs`** | A source file referencing deleted docs. |
 | **`.github/CODEOWNERS:6,21`** | Ownership rules for paths that no longer exist. |
-| **`dux-amq/tests/finalize-migration.bats`** | A test referencing the deleted tree. |
+| **`yaran-amq/tests/finalize-migration.bats`** | A test referencing the deleted tree. |
 | **`docs/operations/encryption-at-rest.md:315`** | Dangling link. |
-| **`dux-amq/README.md:197`** | Dangling link. |
+| **`yaran-amq/README.md:197`** | Dangling link. |
 | **`docs/audits/audit03/{00-summary,07-coverage-manifest}.md`** | ~74 rows certify review of files that no longer exist. |
 
 `SECURITY.md:146-149` states that stale rows "must be either re-validated or removed
@@ -67,13 +67,13 @@ nobody will read. Instead:
 1. **Recover the hash-rotation procedure** from
    `git show 562419e^:docs/plans/audits/audit01/01-supply-chain-hardening.md` and
    publish it as `docs/operations/supply-chain-pin-rotation.md`, updated for the
-   current pin set. Repoint `dux-amq/install.sh:8`.
+   current pin set. Repoint `yaran-amq/install.sh:8`.
 2. **Recover the branch-protection evidence** from
    `git show 562419e^:docs/plans/audits/audit02/artifacts/27-branch-protection.json`
    into `docs/operations/` so the record is not history-only. Phase 02 supersedes it
    with applied config; keep the original as the "before" state.
 3. **Recover the TIOCSTI verification procedure** (audit01 phase 07 / audit02 phase 13)
-   into `docs/operations/`, since `dux-amq/install.sh` implements the tri-state and
+   into `docs/operations/`, since `yaran-amq/install.sh` implements the tri-state and
    `tiocsti-detect.bats` pins it.
 4. **Rewrite `SECURITY.md`'s provenance column** to cite `docs/audits/auditNN/…`
    (extant) rather than the deleted plan files, or to cite the new
@@ -84,8 +84,8 @@ nobody will read. Instead:
    worse than none — it reads as coverage that does not exist. **Recommendation:**
    write it; Phase 23 depends on the STRIDE table being verifiable.
 6. **Fix `src/watch/builtin.rs`**, `.github/CODEOWNERS:6,21`,
-   `dux-amq/tests/finalize-migration.bats`,
-   `docs/operations/encryption-at-rest.md:315`, `dux-amq/README.md:197`.
+   `yaran-amq/tests/finalize-migration.bats`,
+   `docs/operations/encryption-at-rest.md:315`, `yaran-amq/README.md:197`.
 7. **Fix `docs/audits/audit03/07-coverage-manifest.md:42-100+`** — ~74 rows certifying
    review of deleted files. Either repoint to the reviewed content's current home or
    mark the manifest closed with a note explaining the move.
@@ -109,7 +109,7 @@ nobody will read. Instead:
 
 ## Acceptance criteria
 
-- [ ] `docs/operations/supply-chain-pin-rotation.md` exists and `dux-amq/install.sh:8`
+- [ ] `docs/operations/supply-chain-pin-rotation.md` exists and `yaran-amq/install.sh:8`
       points at it.
 - [ ] Branch-protection evidence and TIOCSTI procedure recovered into `docs/operations/`.
 - [ ] `grep -rn "docs/plans/audits" .` returns **zero** hits outside `.git/` and this
@@ -134,7 +134,7 @@ ci/check-links.sh
 # no tracked non-markdown file references a nonexistent path
 ci/check-path-refs.sh
 
-bats dux-amq/tests/finalize-migration.bats
+bats yaran-amq/tests/finalize-migration.bats
 cargo test --all-features
 ```
 

@@ -14,5 +14,5 @@ module.exports.expectText = ["Command Palette", "new tab", "new-agent-tab"]
 module.exports.file = "tui-palette-matches.png"
 module.exports.cols = 120
 module.exports.rows = 36
-module.exports.theme = "dux_dark"
+module.exports.theme = "yaran_dark"
 module.exports.fixture = "steady"

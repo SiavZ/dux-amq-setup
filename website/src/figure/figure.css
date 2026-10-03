@@ -27,7 +27,7 @@
   actually use.
 */
 
-@import "../../../crates/dux-web/web/src/index.css";
+@import "../../../crates/yaran-web/web/src/index.css";
 
-@source "../../../crates/dux-web/web/src/**/*.{ts,tsx}";
+@source "../../../crates/yaran-web/web/src/**/*.{ts,tsx}";
 @source "./*.tsx";

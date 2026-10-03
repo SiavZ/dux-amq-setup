@@ -50,7 +50,7 @@ function list() {
     const m = scene.mod
     const fields =
       scene.kind === "tui"
-        ? [m.cols || 160, m.rows || 45, m.theme || "dux_dark", m.crop || ""]
+        ? [m.cols || 160, m.rows || 45, m.theme || "yaran_dark", m.crop || ""]
         : [m.viewport, m.staging || DEFAULT_STAGING]
     console.log([scene.name, scene.kind, m.file, ...fields].join("\t"))
   }

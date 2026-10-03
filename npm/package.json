@@ -1,11 +1,12 @@
 {
-  "name": "@patrickdappollonio/dux",
+  "name": "yaran",
+  "private": true,
   "version": "0.0.0-dev",
   "description": "Run multiple AI coding agents side by side in isolated git worktrees, driven from a terminal UI or from a browser.",
   "license": "MIT",
   "type": "module",
   "bin": {
-    "dux": "bin/dux.js"
+    "yaran": "bin/yaran.js"
   },
   "files": [
     "bin",
@@ -16,7 +17,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/patrickdappollonio/dux"
+    "url": "https://github.com/SiavZ/dux-amq-setup.git"
   },
   "keywords": [
     "ai",

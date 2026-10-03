@@ -9,10 +9,10 @@
 
 # Upstream files this fork patches: review changes here with the
 # fork's deltas in mind, since upstream merges touch them too.
-crates/dux-tui/src/clipboard.rs     @SiavZ
-crates/dux-tui/src/app/mod.rs       @SiavZ
-crates/dux-tui/src/app/render.rs    @SiavZ
-crates/dux-core/src/config.rs       @SiavZ
+crates/yaran-tui/src/clipboard.rs     @SiavZ
+crates/yaran-tui/src/app/mod.rs       @SiavZ
+crates/yaran-tui/src/app/render.rs    @SiavZ
+crates/yaran-core/src/config.rs       @SiavZ
 
 # Audit deliverables and the living security docs
 docs/audits/                        @SiavZ
@@ -24,6 +24,6 @@ SECURITY.md                         @SiavZ
 .github/scripts/                    @SiavZ
 .github/dependabot.yml              @SiavZ
 install.sh                          @SiavZ
-dux-amq/install.sh                  @SiavZ
+yaran-amq/install.sh                  @SiavZ
 deny.toml                           @SiavZ
 Cargo.lock                          @SiavZ

@@ -9,7 +9,7 @@ import {
 } from "./workspace"
 
 // Puts the fabricated workspace into the REAL store, so the components read it
-// through the real `useDux()` with nothing mocked and no prop threaded. Runs once
+// through the real `useYaran()` with nothing mocked and no prop threaded. Runs once
 // at build time, before `renderToStaticMarkup`; never shipped to a browser.
 let seeded = false
 

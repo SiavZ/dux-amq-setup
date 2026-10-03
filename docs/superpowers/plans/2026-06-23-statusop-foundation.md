@@ -6,7 +6,7 @@
 
 **Architecture:** A `StatusOp<T, E>` bundles a correlation key, a pending message, and two closures (`&T -> Final`, `&E -> Final`) built where the operation is dispatched. A typestate builder forces both closures to be supplied before the op exists. A new `Engine::spawn_status_op` emits the keyed busy, runs the work on a worker thread, resolves the `Final` there (where the typed result is in scope), and ships only the resolved data back via a new `WorkerEvent::StatusOpCompleted`; the engine turns that into the keyed final (or a clear). This sidesteps any heterogeneous registry: closures run where `T`/`E` are concrete.
 
-**Tech Stack:** Rust, the existing `dux_core` engine/worker/statusline modules, `std::thread`, `std::panic::catch_unwind`.
+**Tech Stack:** Rust, the existing `yaran_core` engine/worker/statusline modules, `std::thread`, `std::panic::catch_unwind`.
 
 ## Global Constraints
 
@@ -22,8 +22,8 @@
 ### Task 1: `Final` outcome type
 
 **Files:**
-- Create: `crates/dux-core/src/engine/status_op.rs`
-- Modify: `crates/dux-core/src/engine/mod.rs` (add `pub mod status_op;` and re-export `Final`, `StatusOp`, `ResolvedFinal`, `status_op`)
+- Create: `crates/yaran-core/src/engine/status_op.rs`
+- Modify: `crates/yaran-core/src/engine/mod.rs` (add `pub mod status_op;` and re-export `Final`, `StatusOp`, `ResolvedFinal`, `status_op`)
 
 **Interfaces:**
 - Produces: `enum Final { Message { tone: StatusTone, text: String }, Clear }` with constructors `Final::info(text)`, `Final::warning(text)`, `Final::error(text)`, `Final::clear()`.
@@ -57,7 +57,7 @@ mod tests {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p dux-core --lib status_op::tests::final_constructors_carry_tone_and_text`
+Run: `cargo test -p yaran-core --lib status_op::tests::final_constructors_carry_tone_and_text`
 Expected: FAIL to compile (`Final` not defined).
 
 - [ ] **Step 3: Write minimal implementation** (top of `status_op.rs`)
@@ -95,7 +95,7 @@ impl Final {
 }
 ```
 
-Add to `crates/dux-core/src/engine/mod.rs` near the other `mod` lines:
+Add to `crates/yaran-core/src/engine/mod.rs` near the other `mod` lines:
 
 ```rust
 pub mod status_op;
@@ -106,13 +106,13 @@ pub use status_op::{status_op, Final, ResolvedFinal, StatusOp};
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p dux-core --lib status_op::tests::final_constructors_carry_tone_and_text`
+Run: `cargo test -p yaran-core --lib status_op::tests::final_constructors_carry_tone_and_text`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/dux-core/src/engine/status_op.rs crates/dux-core/src/engine/mod.rs
+git add crates/yaran-core/src/engine/status_op.rs crates/yaran-core/src/engine/mod.rs
 git commit -m "Add the Final outcome type for the tri-state status object
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
@@ -123,7 +123,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 ### Task 2: `ResolvedFinal` carry-back data
 
 **Files:**
-- Modify: `crates/dux-core/src/engine/status_op.rs`
+- Modify: `crates/yaran-core/src/engine/status_op.rs`
 
 **Interfaces:**
 - Consumes: `Final` (Task 1).
@@ -142,7 +142,7 @@ fn resolved_final_error_builds_a_keyed_error_message() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p dux-core --lib status_op::tests::resolved_final_error_builds_a_keyed_error_message`
+Run: `cargo test -p yaran-core --lib status_op::tests::resolved_final_error_builds_a_keyed_error_message`
 Expected: FAIL to compile (`ResolvedFinal` not defined).
 
 - [ ] **Step 3: Write minimal implementation**
@@ -172,13 +172,13 @@ impl ResolvedFinal {
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p dux-core --lib status_op::tests::resolved_final_error_builds_a_keyed_error_message`
+Run: `cargo test -p yaran-core --lib status_op::tests::resolved_final_error_builds_a_keyed_error_message`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/dux-core/src/engine/status_op.rs
+git add crates/yaran-core/src/engine/status_op.rs
 git commit -m "Add ResolvedFinal, the worker-to-engine status carry-back
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
@@ -189,7 +189,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 ### Task 3: Typestate `StatusOp` builder + `resolve`
 
 **Files:**
-- Modify: `crates/dux-core/src/engine/status_op.rs`
+- Modify: `crates/yaran-core/src/engine/status_op.rs`
 
 **Interfaces:**
 - Consumes: `Final`, `ResolvedFinal`.
@@ -228,7 +228,7 @@ fn status_op_resolves_success_and_failure_with_its_key() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p dux-core --lib status_op::tests::status_op_resolves_success_and_failure_with_its_key`
+Run: `cargo test -p yaran-core --lib status_op::tests::status_op_resolves_success_and_failure_with_its_key`
 Expected: FAIL to compile (`status_op` not defined).
 
 - [ ] **Step 3: Write minimal implementation**
@@ -316,13 +316,13 @@ impl<T, E> StatusOp<T, E> {
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p dux-core --lib status_op::tests::status_op_resolves_success_and_failure_with_its_key`
+Run: `cargo test -p yaran-core --lib status_op::tests::status_op_resolves_success_and_failure_with_its_key`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/dux-core/src/engine/status_op.rs crates/dux-core/src/engine/mod.rs
+git add crates/yaran-core/src/engine/status_op.rs crates/yaran-core/src/engine/mod.rs
 git commit -m "Add the typestate StatusOp builder and its resolve step
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
@@ -333,15 +333,15 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 ### Task 4: `EventReaction::ClearStatus` on both surfaces
 
 **Files:**
-- Modify: `crates/dux-core/src/engine/events.rs` (add `ClearStatus(String)` variant + its `reaction_name` arm)
-- Modify: `crates/dux-tui/src/app/workers.rs` (handle it in `apply_reaction`)
-- Modify: `crates/dux-web/src/engine_actor.rs` (handle it in the worker-event drain)
+- Modify: `crates/yaran-core/src/engine/events.rs` (add `ClearStatus(String)` variant + its `reaction_name` arm)
+- Modify: `crates/yaran-tui/src/app/workers.rs` (handle it in `apply_reaction`)
+- Modify: `crates/yaran-web/src/engine_actor.rs` (handle it in the worker-event drain)
 
 **Interfaces:**
 - Consumes: nothing new.
 - Produces: `EventReaction::ClearStatus(String)` — the engine's way to say "dismiss the keyed status with no replacement". The TUI clears the keyed entry; the web emits a `StatusCleared` via the emitter.
 
-- [ ] **Step 1: Write the failing test** (TUI, in `crates/dux-tui/src/app/workers.rs` tests)
+- [ ] **Step 1: Write the failing test** (TUI, in `crates/yaran-tui/src/app/workers.rs` tests)
 
 ```rust
 #[test]
@@ -354,7 +354,7 @@ fn clear_status_reaction_dismisses_the_keyed_entry() {
         StatusTone::Busy,
         "Pushing…",
     );
-    app.apply_reaction(dux_core::engine::EventReaction::ClearStatus("push:/a".into()));
+    app.apply_reaction(yaran_core::engine::EventReaction::ClearStatus("push:/a".into()));
     assert!(
         app.status.snapshot().iter().all(|s| s.key.as_deref() != Some("push:/a")),
         "ClearStatus must remove the keyed entry"
@@ -364,7 +364,7 @@ fn clear_status_reaction_dismisses_the_keyed_entry() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p dux-tui --lib clear_status_reaction_dismisses_the_keyed_entry`
+Run: `cargo test -p yaran-tui --lib clear_status_reaction_dismisses_the_keyed_entry`
 Expected: FAIL to compile (`ClearStatus` not a variant).
 
 - [ ] **Step 3: Write minimal implementation**
@@ -384,7 +384,7 @@ In `events.rs` `reaction_name` (the debug-name match), add:
             EventReaction::ClearStatus(_) => "ClearStatus",
 ```
 
-In `crates/dux-tui/src/app/workers.rs` `apply_reaction`, add an arm next to `EventReaction::Status`:
+In `crates/yaran-tui/src/app/workers.rs` `apply_reaction`, add an arm next to `EventReaction::Status`:
 
 ```rust
             EventReaction::ClearStatus(key) => {
@@ -392,28 +392,28 @@ In `crates/dux-tui/src/app/workers.rs` `apply_reaction`, add an arm next to `Eve
             }
 ```
 
-In `crates/dux-web/src/engine_actor.rs`, in the worker-event drain (alongside the existing `if let Some(key) = busy_key_to_clear` block), add:
+In `crates/yaran-web/src/engine_actor.rs`, in the worker-event drain (alongside the existing `if let Some(key) = busy_key_to_clear` block), add:
 
 ```rust
-            if let dux_core::engine::EventReaction::ClearStatus(key) = &reaction {
+            if let yaran_core::engine::EventReaction::ClearStatus(key) = &reaction {
                 thread_status_tx.clear(key.clone());
             }
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p dux-tui --lib clear_status_reaction_dismisses_the_keyed_entry`
+Run: `cargo test -p yaran-tui --lib clear_status_reaction_dismisses_the_keyed_entry`
 Expected: PASS.
 
 - [ ] **Step 5: Run the web + core suites to confirm no match-exhaustiveness breaks**
 
-Run: `cargo test -p dux-core -p dux-web --lib`
+Run: `cargo test -p yaran-core -p yaran-web --lib`
 Expected: PASS (fix any non-exhaustive `match reaction` the new variant surfaces by adding a `ClearStatus` arm that returns `vec![]`/`EventReaction::Nothing` as appropriate).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/dux-core/src/engine/events.rs crates/dux-tui/src/app/workers.rs crates/dux-web/src/engine_actor.rs
+git add crates/yaran-core/src/engine/events.rs crates/yaran-tui/src/app/workers.rs crates/yaran-web/src/engine_actor.rs
 git commit -m "Add an EventReaction::ClearStatus for the Final::Clear outcome
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
@@ -424,10 +424,10 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 ### Task 5: `spawn_status_op` primitive + `WorkerEvent::StatusOpCompleted`
 
 **Files:**
-- Modify: `crates/dux-core/src/worker.rs` (add the `StatusOpCompleted` variant)
-- Modify: `crates/dux-core/src/engine/status_op.rs` (add `ResolvedFinal::into_reaction`)
-- Modify: `crates/dux-core/src/engine/spawn_worker.rs` (add `Engine::spawn_status_op`)
-- Modify: `crates/dux-core/src/engine/events.rs` (handle `StatusOpCompleted`)
+- Modify: `crates/yaran-core/src/worker.rs` (add the `StatusOpCompleted` variant)
+- Modify: `crates/yaran-core/src/engine/status_op.rs` (add `ResolvedFinal::into_reaction`)
+- Modify: `crates/yaran-core/src/engine/spawn_worker.rs` (add `Engine::spawn_status_op`)
+- Modify: `crates/yaran-core/src/engine/events.rs` (handle `StatusOpCompleted`)
 
 **Interfaces:**
 - Consumes: `StatusOp`, `ResolvedFinal`, `Final`, `EventReaction::ClearStatus`/`Status`.
@@ -459,7 +459,7 @@ fn resolved_final_into_reaction_maps_message_and_clear() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p dux-core --lib status_op::tests::resolved_final_into_reaction_maps_message_and_clear`
+Run: `cargo test -p yaran-core --lib status_op::tests::resolved_final_into_reaction_maps_message_and_clear`
 Expected: FAIL to compile (`into_reaction` not defined).
 
 - [ ] **Step 3: Write minimal implementation**
@@ -519,7 +519,7 @@ In `spawn_worker.rs`, add to `impl Engine` (mirroring the panic-safety of `spawn
         let key = op.key().to_string();
         let tx = self.worker_tx.clone();
         thread::Builder::new()
-            .name("dux-status-op".into())
+            .name("yaran-status-op".into())
             .spawn(move || {
                 let resolved = match std::panic::catch_unwind(AssertUnwindSafe(|| {
                     let result = work();
@@ -561,7 +561,7 @@ NOTE for the implementer: the `unwrap_or_else` closure cannot reuse `op`/`key` (
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p dux-core --lib status_op::tests::resolved_final_into_reaction_maps_message_and_clear`
+Run: `cargo test -p yaran-core --lib status_op::tests::resolved_final_into_reaction_maps_message_and_clear`
 Expected: PASS.
 
 - [ ] **Step 5: Add an integration test for the round-trip** (in `spawn_worker.rs` or `status_op.rs` tests, using `test_engine()`)
@@ -598,13 +598,13 @@ fn spawn_status_op_emits_pending_then_resolves_via_worker() {
 
 - [ ] **Step 6: Run it**
 
-Run: `cargo test -p dux-core --lib spawn_status_op_emits_pending_then_resolves_via_worker`
+Run: `cargo test -p yaran-core --lib spawn_status_op_emits_pending_then_resolves_via_worker`
 Expected: PASS.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/dux-core/src/engine/status_op.rs crates/dux-core/src/engine/spawn_worker.rs crates/dux-core/src/engine/events.rs crates/dux-core/src/worker.rs
+git add crates/yaran-core/src/engine/status_op.rs crates/yaran-core/src/engine/spawn_worker.rs crates/yaran-core/src/engine/events.rs crates/yaran-core/src/worker.rs
 git commit -m "Add spawn_status_op and the StatusOpCompleted round-trip
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
@@ -615,16 +615,16 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 ### Task 6: Migrate `push` to `StatusOp`
 
 **Files:**
-- Modify: `crates/dux-core/src/engine/command.rs` (the `Command::Push` arm)
-- Modify: `crates/dux-core/src/engine/events.rs` (remove the `WorkerEvent::PushCompleted` handler arm)
-- Modify: `crates/dux-core/src/worker.rs` (remove the `PushCompleted` variant)
+- Modify: `crates/yaran-core/src/engine/command.rs` (the `Command::Push` arm)
+- Modify: `crates/yaran-core/src/engine/events.rs` (remove the `WorkerEvent::PushCompleted` handler arm)
+- Modify: `crates/yaran-core/src/worker.rs` (remove the `PushCompleted` variant)
 - Modify: any test referencing `PushCompleted` (search first)
 
 **Interfaces:**
 - Consumes: `spawn_status_op`, `status_op`, `Final`, `status_keys::push`.
 - Produces: no new public interface; `Command::Push` now routes through `spawn_status_op`.
 
-- [ ] **Step 1: Add `status_keys::push` constructor** (in `crates/dux-core/src/wire.rs`, mirroring the existing typed constructors)
+- [ ] **Step 1: Add `status_keys::push` constructor** (in `crates/yaran-core/src/wire.rs`, mirroring the existing typed constructors)
 
 ```rust
     /// Push operation key, parameterised by worktree path.
@@ -640,7 +640,7 @@ Expected: the `command.rs` panic_event, the `events.rs` handler, the `worker.rs`
 
 - [ ] **Step 3: Write/adjust the failing test**
 
-Update the existing push test (found at `crates/dux-core/src/wire.rs` push test, ~`wire.rs:5439`, named around `push_completed_*`) to instead drive `Command::Push` and assert the pending is keyed and the resolved final is keyed. Concretely, add this test in `command.rs` tests (or adapt the existing one):
+Update the existing push test (found at `crates/yaran-core/src/wire.rs` push test, ~`wire.rs:5439`, named around `push_completed_*`) to instead drive `Command::Push` and assert the pending is keyed and the resolved final is keyed. Concretely, add this test in `command.rs` tests (or adapt the existing one):
 
 ```rust
 #[test]
@@ -673,7 +673,7 @@ fn push_routes_through_status_op_with_matching_key() {
 
 - [ ] **Step 4: Run it to verify it fails**
 
-Run: `cargo test -p dux-core --lib push_routes_through_status_op_with_matching_key`
+Run: `cargo test -p yaran-core --lib push_routes_through_status_op_with_matching_key`
 Expected: FAIL (still old path / key assertions differ), or compile error once `PushCompleted` is removed in Step 5.
 
 - [ ] **Step 5: Rewrite the `Command::Push` arm** in `command.rs`:
@@ -703,21 +703,21 @@ Delete the `WorkerEvent::PushCompleted { key, result } => match result { … }` 
 
 - [ ] **Step 7: Run the push test + full core suite**
 
-Run: `cargo test -p dux-core --lib push_routes_through_status_op_with_matching_key`
+Run: `cargo test -p yaran-core --lib push_routes_through_status_op_with_matching_key`
 Expected: PASS.
-Run: `cargo test -p dux-core --lib`
+Run: `cargo test -p yaran-core --lib`
 Expected: PASS (update/remove any other `PushCompleted` test that no longer compiles).
 
 - [ ] **Step 8: Verify the web push path still resolves**
 
-The web push goes through `wire_statuses_from_reaction` for the pending `Status` and the resolved `Status`/`ClearStatus` through the drain. Run: `cargo test -p dux-web --lib` and a manual check that `Command::Push` over the wire still surfaces a keyed busy then a keyed final. Expected: PASS.
+The web push goes through `wire_statuses_from_reaction` for the pending `Status` and the resolved `Status`/`ClearStatus` through the drain. Run: `cargo test -p yaran-web --lib` and a manual check that `Command::Push` over the wire still surfaces a keyed busy then a keyed final. Expected: PASS.
 
 - [ ] **Step 9: Full verification + commit**
 
 ```bash
 cargo fmt
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test -p dux-core -p dux-web -p dux-tui --lib
+cargo test -p yaran-core -p yaran-web -p yaran-tui --lib
 git add -A
 git commit -m "Route push through the StatusOp object and drop PushCompleted
 

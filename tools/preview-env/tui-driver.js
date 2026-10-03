@@ -2,14 +2,14 @@ const fs = require("fs")
 const path = require("path")
 const { spawnSync } = require("child_process")
 
-const cols = readInteger("DUX_TUI_COLS", 160, 80)
-const rows = readInteger("DUX_TUI_ROWS", 45, 24)
-const theme = process.env.DUX_TUI_THEME || "catppuccin-mocha"
-const outputStem = process.env.DUX_TUI_OUTPUT_STEM || "tui"
+const cols = readInteger("YARAN_TUI_COLS", 160, 80)
+const rows = readInteger("YARAN_TUI_ROWS", 45, 24)
+const theme = process.env.YARAN_TUI_THEME || "catppuccin-mocha"
+const outputStem = process.env.YARAN_TUI_OUTPUT_STEM || "tui"
 const journeyPath = "/journey.js"
-const socket = `dux-shot-${process.pid}`
+const socket = `yaran-shot-${process.pid}`
 const session = "capture"
-const duxHome = process.env.DUX_HOME || "/capture/dux"
+const yaranHome = process.env.YARAN_HOME || "/capture/yaran"
 const repos = "/capture/repos"
 const output = "/output"
 
@@ -62,9 +62,9 @@ function seedRepo(repo) {
   fs.mkdirSync(path.join(repo, "src"), { recursive: true })
   fs.mkdirSync(path.join(repo, "tests"), { recursive: true })
   git(repo, "init", "-q", "-b", "main")
-  git(repo, "config", "user.name", "Dux Preview")
-  git(repo, "config", "user.email", "preview@dux.local")
-  fs.writeFileSync(path.join(repo, "README.md"), `# ${path.basename(repo)}\n\nA deterministic Dux preview project.\n`)
+  git(repo, "config", "user.name", "Yaran Preview")
+  git(repo, "config", "user.email", "preview@yaran.local")
+  fs.writeFileSync(path.join(repo, "README.md"), `# ${path.basename(repo)}\n\nA deterministic Yaran preview project.\n`)
   fs.writeFileSync(path.join(repo, "src/client.rs"), "pub fn request() -> Result<(), String> { Ok(()) }\n")
   fs.writeFileSync(path.join(repo, "tests/client.rs"), "#[test]\nfn request_succeeds() { assert!(true); }\n")
   git(repo, "add", "-A")
@@ -72,7 +72,7 @@ function seedRepo(repo) {
 }
 
 function seedState() {
-  fs.mkdirSync(duxHome, { recursive: true })
+  fs.mkdirSync(yaranHome, { recursive: true })
   fs.mkdirSync(repos, { recursive: true })
   fs.mkdirSync(output, { recursive: true })
   seedRepo(path.join(repos, "demo-api"))
@@ -81,8 +81,8 @@ function seedState() {
   fs.appendFileSync(path.join(repos, "demo-api/README.md"), "\nDocument the retry behavior.\n")
   fs.writeFileSync(path.join(repos, "demo-web/src/status.ts"), 'export const status = "ready"\n')
 
-  run("dux", ["config", "regenerate", "--yes"], { env: { ...process.env, DUX_HOME: duxHome } })
-  const configPath = path.join(duxHome, "config.toml")
+  run("yaran", ["config", "regenerate", "--yes"], { env: { ...process.env, YARAN_HOME: yaranHome } })
+  const configPath = path.join(yaranHome, "config.toml")
   let config = fs.readFileSync(configPath, "utf8")
   config = config
     .replace(/^provider = .*$/m, 'provider = "fake"')
@@ -99,13 +99,13 @@ args = []
 }
 
 /// The fixture the fake provider reads is an environment variable, and the
-/// global `[env]` table is what dux hands a provider it spawns. Rewriting that
+/// global `[env]` table is what yaran hands a provider it spawns. Rewriting that
 /// table and reloading the config therefore changes what the NEXT agent comes up
 /// as, which is how one journey stages agents in different states.
 async function setFixture(name) {
-  const configPath = path.join(duxHome, "config.toml")
+  const configPath = path.join(yaranHome, "config.toml")
   const text = fs.readFileSync(configPath, "utf8").replace(/\n\[env\][\s\S]*?(?=\n\[|$)/, "")
-  fs.writeFileSync(configPath, `${text}\n[env]\nDUX_FAKE_FIXTURE = "${name}"\n`)
+  fs.writeFileSync(configPath, `${text}\n[env]\nYARAN_FAKE_FIXTURE = "${name}"\n`)
   await palette("reload-config")
   await waitFor("Configuration reloaded", 15000)
 }
@@ -114,7 +114,7 @@ async function setFixture(name) {
 /// worktree manager has a removable row to show.
 function seedLooseWorktree(project, branch) {
   const repo = path.join(repos, project)
-  const at = path.join(duxHome, "worktrees", project, branch)
+  const at = path.join(yaranHome, "worktrees", project, branch)
   fs.mkdirSync(path.dirname(at), { recursive: true })
   git(repo, "worktree", "add", "-q", "-b", branch, at, "HEAD")
   fs.appendFileSync(path.join(at, "README.md"), "\nA note left in this worktree.\n")
@@ -203,7 +203,7 @@ async function focusPane() {
 /// Two confirmations, each waited for by name rather than slept over: the
 /// palette command opens the provider chooser, and the chooser's own Enter is
 /// what creates the tab. The pane is then focused AND interactive, so the focus
-/// is aimed back at dux before the caller's next chord.
+/// is aimed back at yaran before the caller's next chord.
 async function addTab(expectedCount) {
   await palette("new-agent-tab")
   await waitFor("New Tab Provider", 15000)
@@ -264,7 +264,7 @@ async function createAgent(projectIndex, name) {
   sendText(name)
   sendKeys("Enter")
   // Wait for the creation to REPORT, not merely for the row to appear. The row
-  // shows up while the worktree is still being made, and dux focuses the new
+  // shows up while the worktree is still being made, and yaran focuses the new
   // agent's pane when it finishes: a journey that carried on at the row would
   // have its next keystrokes stolen by that focus change.
   //
@@ -273,8 +273,8 @@ async function createAgent(projectIndex, name) {
   // line at all: the error pre-empts it and drops the infos queued behind it.
   await waitForAny([`"${name}" in project`, 'Press "r" to relaunch'], 60000)
   await sleep(600)
-  // dux focuses the new agent's pane, and it is interactive there: leave every
-  // journey on the sidebar so the next key is a dux key, whatever it is.
+  // yaran focuses the new agent's pane, and it is interactive there: leave every
+  // journey on the sidebar so the next key is a yaran key, whatever it is.
   await focusSidebar()
 }
 
@@ -298,7 +298,7 @@ async function main() {
   seedState()
   tmux(
     "new-session", "-d", "-c", "/", "-x", String(cols), "-y", String(rows), "-s", session,
-    `env DUX_HOME='${duxHome}' DUX_FAKE_FIXTURE='${fixture}' TERM=xterm-256color COLORTERM=truecolor dux`,
+    `env YARAN_HOME='${yaranHome}' YARAN_FAKE_FIXTURE='${fixture}' TERM=xterm-256color COLORTERM=truecolor yaran`,
   )
   await waitFor("Press a to add a project")
   await addProject("/capture/repos/demo-api", "demo-api")
@@ -308,7 +308,7 @@ async function main() {
     captureText,
     createAgent,
     createStandaloneAgent,
-    duxHome,
+    yaranHome,
     focusPane,
     focusSidebar,
     palette,
@@ -321,7 +321,7 @@ async function main() {
     sleep,
     waitFor,
   })
-  await sleep(Number(process.env.DUX_TUI_SETTLE_MS || 400))
+  await sleep(Number(process.env.YARAN_TUI_SETTLE_MS || 400))
 
   const ansi = tmux("capture-pane", "-p", "-e", "-N", "-t", `${session}:0.0`)
   const text = captureText()
@@ -332,11 +332,11 @@ async function main() {
   fs.writeFileSync(path.join(output, `${outputStem}.ansi`), ansi)
   fs.writeFileSync(path.join(output, `${outputStem}.txt`), text)
   fs.writeFileSync(path.join(output, `${outputStem}.json`), `${JSON.stringify({
-    journey: process.env.DUX_TUI_JOURNEY_NAME || path.basename(journeyPath),
+    journey: process.env.YARAN_TUI_JOURNEY_NAME || path.basename(journeyPath),
     columns: cols,
     rows,
     theme,
-    revision: process.env.DUX_PREVIEW_REVISION || "unknown",
+    revision: process.env.YARAN_PREVIEW_REVISION || "unknown",
     fixture,
   }, null, 2)}\n`)
 }
